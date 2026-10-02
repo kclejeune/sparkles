@@ -104,9 +104,13 @@ impl Walk {
             | Query::Ask { pattern, .. }
             | Query::Describe { pattern, .. } => self.pattern(pattern, 1),
             Query::Construct {
-                template, pattern, ..
+                template,
+                graph_templates,
+                pattern,
+                ..
             } => template
                 .iter()
+                .chain(graph_templates.iter().flat_map(|g| &g.triples))
                 .map(|t| self.triple(t, 1))
                 .fold(self.pattern(pattern, 1), usize::max),
         }
@@ -177,6 +181,7 @@ impl Walk {
                 .max(self.path(path, n))
                 .max(self.term(object, n)),
             GraphPattern::Join { left, right }
+            | GraphPattern::Lateral { left, right }
             | GraphPattern::Union { left, right }
             | GraphPattern::Minus { left, right } => {
                 self.pattern(left, n).max(self.pattern(right, n))
@@ -274,6 +279,10 @@ impl Walk {
             | PropertyPathExpression::ZeroOrOne(a) => self.path(a, n),
             PropertyPathExpression::Sequence(a, b) | PropertyPathExpression::Alternative(a, b) => {
                 self.path(a, n).max(self.path(b, n))
+            }
+            // the planner unrolls up to 32 steps of a range into a chain of joins
+            PropertyPathExpression::Range { path, min, .. } => {
+                self.path(path, n).saturating_add((*min).min(32) as usize)
             }
         }
     }

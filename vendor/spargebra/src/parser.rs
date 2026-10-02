@@ -40,6 +40,8 @@ pub struct SparqlParser {
     base_iri: Option<Iri<String>>,
     prefixes: HashMap<String, String>,
     custom_aggregate_functions: HashSet<NamedNode>,
+    /// Reject Jena ARQ's syntax extensions (see [`SparqlParser::with_arq_syntax`]).
+    sparql_only: bool,
 }
 
 impl SparqlParser {
@@ -109,6 +111,24 @@ impl SparqlParser {
         self
     }
 
+    /// Whether Jena ARQ's extensions of the SPARQL syntax are accepted (the default) or
+    /// are syntax errors: `LATERAL`, path ranges (`p{2}`,
+    /// `p{1,3}`, `p{2,}`, `p{,3}`, `p{*}`, `p{+}`), `GRAPH` blocks in CONSTRUCT
+    /// templates and ARQ's aggregates (`MEDIAN`, `MODE`, `STDEV`, …, `AGG <iri>(…)`).
+    ///
+    /// ```
+    /// use spargebra::SparqlParser;
+    ///
+    /// let q = "SELECT * WHERE { ?s <http://example.com/p>{2} ?o }";
+    /// assert!(SparqlParser::new().parse_query(q).is_ok());
+    /// assert!(SparqlParser::new().with_arq_syntax(false).parse_query(q).is_err());
+    /// ```
+    #[inline]
+    pub fn with_arq_syntax(mut self, enabled: bool) -> Self {
+        self.sparql_only = !enabled;
+        self
+    }
+
     /// Parse the given query string using the already set options.
     ///
     /// ```
@@ -129,6 +149,7 @@ impl SparqlParser {
             self.prefixes,
             self.custom_aggregate_functions,
         );
+        state.arq = !self.sparql_only;
         #[cfg(feature = "standard-unicode-escaping")]
         let query = unescape_unicode_codepoints(query);
         too_deep(&query)?;
@@ -155,6 +176,7 @@ impl SparqlParser {
             self.prefixes,
             self.custom_aggregate_functions,
         );
+        state.arq = !self.sparql_only;
         #[cfg(feature = "standard-unicode-escaping")]
         let update = unescape_unicode_codepoints(update);
         too_deep(&update)?;
@@ -555,6 +577,15 @@ impl<F, T: From<F>> From<FocusedTriplePattern<F>> for FocusedTripleOrPathPattern
             patterns: input.patterns.into_iter().map(Into::into).collect(),
         }
     }
+}
+
+/// The modifier after a path element.
+enum PathMod {
+    ZeroOrOne,
+    ZeroOrMore,
+    OneOrMore,
+    /// ARQ's `{n,m}` forms (see [`PropertyPathExpression::Range`])
+    Range(u64, Option<u64>),
 }
 
 #[derive(Eq, PartialEq, Debug, Clone, Hash)]
@@ -1008,6 +1039,8 @@ pub struct ParserState {
     used_bnodes: HashSet<BlankNode>,
     currently_used_bnodes: HashSet<BlankNode>,
     aggregates: Vec<Vec<(Variable, AggregateExpression)>>,
+    /// Jena ARQ's syntax extensions are accepted (the `arq()` rule)
+    arq: bool,
 }
 
 impl ParserState {
@@ -1023,6 +1056,7 @@ impl ParserState {
             used_bnodes: HashSet::new(),
             currently_used_bnodes: HashSet::new(),
             aggregates: Vec::new(),
+            arq: true,
         }
     }
 
@@ -1193,29 +1227,37 @@ parser! {
         rule ConstructQuery() -> Query =
             i("CONSTRUCT") _ c:ConstructTemplate() ConstructQuery_clear() _ d:DatasetClauses() _ w:WhereClause() _ g:GroupClause()? _ h:HavingClause()? _ o:OrderClause()? _ l:LimitOffsetClauses()? _ v:ValuesClause() {?
                 Ok(Query::Construct {
-                    template: c,
+                    template: c.0,
+                    graph_templates: c.1,
                     dataset: d,
                     pattern: build_select(Selection::default(), w, g, h, o, l, v, state)?,
                     base_iri: state.base_iri.clone()
                 })
             } /
-            i("CONSTRUCT") _ d:DatasetClauses() _ i("WHERE") _ "{" _ c:ConstructQuery_optional_triple_template() _ "}" _ g:GroupClause()? _ h:HavingClause()? _ o:OrderClause()? _ l:LimitOffsetClauses()? _ v:ValuesClause() {?
+            i("CONSTRUCT") _ d:DatasetClauses() _ i("WHERE") _ "{" _ !"." c:ConstructQuads() _ "}" _ g:GroupClause()? _ h:HavingClause()? _ o:OrderClause()? _ l:LimitOffsetClauses()? _ v:ValuesClause() {?
+                // the pattern has the template's shape: its triples, then a GRAPH group
+                // per block
+                let mut pattern = GraphPattern::Bgp { patterns: c.0.clone() };
+                for t in &c.1 {
+                    let name = match &t.name {
+                        TermPattern::NamedNode(n) => NamedNodePattern::NamedNode(n.clone()),
+                        TermPattern::Variable(v) => NamedNodePattern::Variable(v.clone()),
+                        _ => return Err("a GRAPH name of CONSTRUCT WHERE that is an IRI or a variable"),
+                    };
+                    let inner = Box::new(GraphPattern::Bgp { patterns: t.triples.clone() });
+                    pattern = new_join(pattern, GraphPattern::Graph { name, inner });
+                }
                 Ok(Query::Construct {
-                    template: c.clone(),
+                    template: c.0,
+                    graph_templates: c.1,
                     dataset: d,
-                    pattern: build_select(
-                        Selection::default(),
-                        GraphPattern::Bgp { patterns: c },
-                        g, h, o, l, v, state
-                    )?,
+                    pattern: build_select(Selection::default(), pattern, g, h, o, l, v, state)?,
                     base_iri: state.base_iri.clone()
                 })
             }
         rule ConstructQuery_clear() = {
             state.currently_used_bnodes.clear();
         }
-
-        rule ConstructQuery_optional_triple_template() -> Vec<TriplePattern> = TriplesTemplate() / { Vec::new() }
 
         rule DescribeQuery() -> Query =
             i("DESCRIBE") _ "*" _ d:DatasetClauses() _ w:WhereClause()? _ g:GroupClause()? _ h:HavingClause()? _ o:OrderClause()? _ l:LimitOffsetClauses()? _ v:ValuesClause() {?
@@ -1651,7 +1693,7 @@ parser! {
             PartialGraphPattern::Optional(p.0, p.1)
         }
 
-        rule LateralGraphPattern() -> PartialGraphPattern = i("LATERAL") _ p:GroupGraphPattern() {?
+        rule LateralGraphPattern() -> PartialGraphPattern = i("LATERAL") _ arq() p:GroupGraphPattern() {?
                 #[cfg(feature = "sep-0006")]{Ok(PartialGraphPattern::Lateral(p))}
                 #[cfg(not(feature = "sep-0006"))]{Err("The LATERAL modifier is not supported")}
         }
@@ -1745,7 +1787,39 @@ parser! {
             NIL() { Vec::new() }
         rule ExpressionList_item() -> Expression = e:Expression() _ { e }
 
-        rule ConstructTemplate() -> Vec<TriplePattern> = "{" _ t:ConstructTriples() _ "}" { t }
+        rule ConstructTemplate() -> (Vec<TriplePattern>, Vec<GraphTemplate>) = "{" _ t:ConstructQuads() _ "}" { t }
+
+        // Jena ARQ's TriG-like template (`ConstructQuads`): triples, `GRAPH g { … }`
+        // blocks and bare `{ … }` blocks for the default graph, in any order. A SPARQL
+        // template is the triples alone.
+        rule ConstructQuads() -> (Vec<TriplePattern>, Vec<GraphTemplate>) = t:ConstructTriples() _ b:ConstructQuads_block()* {
+            let mut triples = t;
+            let mut graphs = Vec::new();
+            for (graph, more) in b {
+                if let Some(g) = graph {
+                    graphs.push(g);
+                }
+                triples.extend(more);
+            }
+            (triples, graphs)
+        }
+        // a block and the triples after it; a bare block's triples are in the second part
+        rule ConstructQuads_block() -> (Option<GraphTemplate>, Vec<TriplePattern>) = arq() q:ConstructQuadsNotTriples() _ "."? _ t:ConstructTriples() _ {
+            match q {
+                (Some(name), triples) => (Some(GraphTemplate { name, triples }), t),
+                (None, mut triples) => {
+                    triples.extend(t);
+                    (None, triples)
+                }
+            }
+        }
+        rule ConstructQuadsNotTriples() -> (Option<TermPattern>, Vec<TriplePattern>) =
+            i("GRAPH") _ g:ConstructGraphName() _ "{" _ t:ConstructTriples() _ "}" { (Some(g), t) } /
+            "{" _ t:ConstructTriples() _ "}" { (None, t) }
+        rule ConstructGraphName() -> TermPattern =
+            v:Var() { v.into() } /
+            b:BlankNode() { b.into() } /
+            i:iri() { i.into() }
 
         rule ConstructTriples() -> Vec<TriplePattern> = p:ConstructTriples_item() ** ("." _) "."? {
             p.into_iter().flatten().collect()
@@ -1914,17 +1988,29 @@ parser! {
 
         rule PathElt() -> PropertyPathExpression = p:PathPrimary() _ o:PathElt_op()? {
             match o {
-                Some('?') => PropertyPathExpression::ZeroOrOne(Box::new(p)),
-                Some('*') => PropertyPathExpression::ZeroOrMore(Box::new(p)),
-                Some('+') => PropertyPathExpression::OneOrMore(Box::new(p)),
-                Some(_) => unreachable!(),
+                Some(PathMod::ZeroOrOne) => PropertyPathExpression::ZeroOrOne(Box::new(p)),
+                Some(PathMod::ZeroOrMore) => PropertyPathExpression::ZeroOrMore(Box::new(p)),
+                Some(PathMod::OneOrMore) => PropertyPathExpression::OneOrMore(Box::new(p)),
+                Some(PathMod::Range(min, max)) => PropertyPathExpression::Range { path: Box::new(p), min, max },
                 None => p
             }
         }
-        rule PathElt_op() -> char =
-            "*" { '*' } /
-            "+" { '+' } /
-            "?" !(['0'..='9'] / PN_CHARS_U()) { '?' } // We mandate that this is not a variable
+        rule PathElt_op() -> PathMod =
+            "*" { PathMod::ZeroOrMore } /
+            "+" { PathMod::OneOrMore } /
+            "?" !(['0'..='9'] / PN_CHARS_U()) { PathMod::ZeroOrOne } / // We mandate that this is not a variable
+            "{" _ arq() r:PathRange() _ "}" { r }
+        // ARQ's `PathMod` braces: {*} {+} {n} {n,m} {n,} {,m}
+        rule PathRange() -> PathMod =
+            "*" { PathMod::Range(0, None) } /
+            "+" { PathMod::Range(1, None) } /
+            n:PathLength() _ "," _ m:PathLength() {?
+                if n <= m { Ok(PathMod::Range(n, Some(m))) } else { Err("a path range whose minimum is at most its maximum") }
+            } /
+            n:PathLength() _ "," { PathMod::Range(n, None) } /
+            n:PathLength() { PathMod::Range(n, Some(n)) } /
+            "," _ m:PathLength() { PathMod::Range(0, Some(m)) }
+        rule PathLength() -> u64 = n:$(['0'..='9']+) {? n.parse().map_err(|_| "a path length below 2^64") }
 
         rule PathEltOrInverse() -> PropertyPathExpression =
             "^" _ p:PathElt() { PropertyPathExpression::Reverse(Box::new(p)) } /
@@ -2452,10 +2538,10 @@ parser! {
             i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: true } } /
             i("GROUP_CONCAT") _ "(" _ expr:Expression() _ ";" _ i("SEPARATOR") _ "=" _ s:String() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: Some(s) }, expr, distinct: false } } /
             i("GROUP_CONCAT") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: false } } /
-            name:ArqAggregateKeyword() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
-            name:ArqAggregateKeyword() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
-            i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
-            i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
+            arq() name:ArqAggregateKeyword() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
+            arq() name:ArqAggregateKeyword() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
+            arq() i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
+            arq() i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
             name:iri() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" {?
                 if state.custom_aggregate_functions.contains(&name) {
                     Ok(AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true })
@@ -2680,6 +2766,10 @@ parser! {
 
         //comment
         rule comment() = quiet! { ['#'] (!['\r' | '\n'] [_])* }
+
+        // Jena ARQ's syntax extensions are accepted (`SparqlParser::with_arq_syntax`):
+        // the first element of every ARQ-only rule
+        rule arq() = {? if state.arq { Ok(()) } else { Err("ARQ syntax") } }
 
         rule i(literal: &'static str) = input: $([_]*<{literal.len()}>) {?
             if input.eq_ignore_ascii_case(literal) {

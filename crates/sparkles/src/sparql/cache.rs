@@ -357,6 +357,29 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             }
             j.probes.iter().all(|p| p.filter.iter().all(deterministic))
         }
+        Kind::Lateral(l) => {
+            // the right side's text and the constants in force; its blank node labels
+            // and generated names are local to it
+            let _ = write!(
+                s,
+                "{}|{:?}|{:?}|{:?}|{:?}",
+                l.pattern,
+                match &l.graph {
+                    super::plan::ActiveGraph::Var(v) => format!("?{}", ctx.var_name(*v)),
+                    g => format!("{g:?}"),
+                },
+                l.keys.iter().map(|k| ctx.var_name(*k)).collect::<Vec<_>>(),
+                l.outer
+                    .iter()
+                    .map(|(v, id)| (ctx.var_name(*v), id.0))
+                    .collect::<Vec<_>>(),
+                l.outer_scoped
+                    .iter()
+                    .map(|v| ctx.var_name(*v))
+                    .collect::<Vec<_>>(),
+            );
+            super::exists::pure_pattern(&l.pattern)
+        }
         Kind::Filter(es) => es.iter().all(deterministic),
         Kind::Extend(_, e) => deterministic(e),
         Kind::LeftJoin { expr } => expr.as_ref().is_none_or(deterministic),
@@ -384,14 +407,15 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
         } => {
             let _ = write!(
                 s,
-                "{:?}{:?}{}{}{:?}{}{:?}",
+                "{:?}{:?}{}{}{:?}{}{:?}{:?}",
                 spec.subj,
                 spec.obj,
                 spec.min,
                 spec.max_one,
                 spec.simple,
                 bound_from_left,
-                spec.graph
+                spec.graph,
+                spec.count
             );
             if let Some(g) = spec.graph_var {
                 let _ = write!(s, " graph=?{}", ctx.var_name(g));

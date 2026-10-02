@@ -253,6 +253,11 @@ pub struct PathSpec {
     pub graph_var: Option<VarId>,
     /// edge variables of the child plan (src, dst) when not simple
     pub edge_vars: Option<(VarId, VarId)>,
+    /// an ARQ path range `{min,max}` (`max` absent: unbounded), whose solutions are
+    /// counted: one per walk, and per simple path after `min` steps when unbounded (see
+    /// [`PropertyPathExpression::Range`]). `min` above then tells only whether the
+    /// range can match a zero-length path.
+    pub count: Option<(u64, Option<u64>)>,
 }
 
 // `Values` / `Scan` are much larger than the other variants; nodes are few, so this is fine.
@@ -371,6 +376,9 @@ pub enum Kind {
     /// a topological property matched against asserted and derived triples (Query
     /// Rewrite), or `spatial:equals`
     SpatialRelate(Box<super::georewrite::SpatialRelateSpec>),
+    /// `LATERAL`: the right side evaluated per group of the rows of the left side (child
+    /// 0); see [`super::lateral`]
+    Lateral(Box<super::lateral::LateralSpec>),
 }
 
 #[derive(Clone)]
@@ -483,6 +491,7 @@ impl Node {
             Kind::CountJoin { .. } => "CountJoin",
             Kind::Unpack { .. } => "TripleTerm",
             Kind::Path { .. } => "TransitivePath",
+            Kind::Lateral(_) => "Lateral",
             Kind::Service { .. } => "Service",
             Kind::TextSearch(_) => "TextSearch",
             Kind::VectorSearch(_) => "VectorSearch",
@@ -534,6 +543,10 @@ const DP_LIMIT: usize = 12;
 pub struct Planner<'a> {
     pub ctx: &'a Ctx,
     pub subst: FxHashMap<VarId, Id>,
+    /// The variables of `subst` that a sub-select hides unless it projects them: a
+    /// `LATERAL`'s substitutions, where a variable a sub-select does not project is a
+    /// different variable. Initial bindings and EXISTS substitute everywhere.
+    pub scoped: FxHashSet<VarId>,
     bnode_scope: u32,
     /// RDF 1.2 triple-term patterns created while translating triple patterns
     unpacks: std::cell::RefCell<Vec<UnpackItem>>,
@@ -557,6 +570,7 @@ impl<'a> Planner<'a> {
         Planner {
             ctx,
             subst: FxHashMap::default(),
+            scoped: FxHashSet::default(),
             bnode_scope: 0,
             unpacks: Default::default(),
             source: None,
@@ -671,6 +685,20 @@ impl<'a> Planner<'a> {
                 let mut items = Vec::new();
                 self.collect(gp, g, &mut items)?;
                 self.plan_group(items, filters)
+            }
+            GP::Lateral { left, right } if super::lateral::join_equivalent(self, left, right) => {
+                let mut items = Vec::new();
+                self.collect(gp, g, &mut items)?;
+                self.plan_group(items, filters)
+            }
+            GP::Lateral { left, right } => {
+                // filters on variables every left row binds keep their value in the
+                // merged rows, as the right side cannot bind them differently
+                let certain = certain_vars(left, self.ctx);
+                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let l = self.plan(left, g, push)?;
+                let n = super::lateral::plan(self, l, right, g)?;
+                Ok(self.apply_filters(n, top))
             }
             GP::Filter { expr, inner } => {
                 let mut fs = filters;
@@ -816,8 +844,20 @@ impl<'a> Planner<'a> {
             GP::Project { inner, variables } => {
                 // sub-select: fresh scope for blank node labels
                 self.bnode_scope += 1;
-                let child = self.plan(inner, g, Vec::new())?;
                 let vars: Vec<VarId> = variables.iter().map(|v| self.ctx.var(v.as_str())).collect();
+                // a LATERAL's substitution does not reach a variable the sub-select hides
+                let hidden: Vec<(VarId, Id)> = self
+                    .scoped
+                    .iter()
+                    .filter(|v| !vars.contains(v))
+                    .filter_map(|v| self.subst.get(v).map(|id| (*v, *id)))
+                    .collect();
+                for (v, _) in &hidden {
+                    self.subst.remove(v);
+                }
+                let child = self.plan(inner, g, Vec::new());
+                self.subst.extend(hidden);
+                let child = child?;
                 let n = project(child, vars, self.ctx);
                 Ok(self.apply_filters(n, filters))
             }
@@ -906,8 +946,6 @@ impl<'a> Planner<'a> {
                 n.cost = 100_000.0;
                 Ok(self.apply_filters(n, filters))
             }
-            #[allow(unreachable_patterns)]
-            _ => Err(Error::unsupported("unsupported graph pattern (LATERAL)")),
         }
     }
 
@@ -987,6 +1025,10 @@ impl<'a> Planner<'a> {
                 self.collect(left, g, items)?;
                 self.collect(right, g, items)?;
             }
+            GP::Lateral { left, right } if super::lateral::join_equivalent(self, left, right) => {
+                self.collect(left, g, items)?;
+                self.collect(right, g, items)?;
+            }
             GP::Graph { name, inner } if !self.simple_graph_group(name, inner) => {
                 // Per-graph evaluation (Jena OpGraph semantics): evaluate the inner pattern
                 // against each named graph with the graph variable unbound, then join
@@ -995,6 +1037,18 @@ impl<'a> Planner<'a> {
                     unreachable!()
                 };
                 let v = self.ctx.var(gv.as_str());
+                if let Some(&gid) = self.subst.get(&v) {
+                    // a substituted graph variable (EXISTS, LATERAL, initial bindings)
+                    // names one graph
+                    let named = ActiveGraph::Named(gid);
+                    let node = match self.graph_filter(&named) {
+                        Some(_) => self.plan(inner, &named, Vec::new())?,
+                        None => Node::empty(Vec::new()),
+                    };
+                    items.push(Item::Node(node));
+                    items.push(Item::Node(self.graph_names(&named)?));
+                    return Ok(());
+                }
                 let accept = |gid: &Id| {
                     self.ctx
                         .dataset
@@ -1078,6 +1132,33 @@ impl<'a> Planner<'a> {
                 let mid = PT::V(self.ctx.fresh_var());
                 self.collect_path(s, a, mid, g, items);
                 self.collect_path(mid, b, o, g, items);
+            }
+            // ARQ's PathCompiler: `p{n,m}` with n ≥ 1 is n steps of p, then p{0,m-n}
+            // (p{*} when unbounded); the steps are joined like a sequence's
+            PP::Range { path, min, max } if (1..=RANGE_UNROLL).contains(min) => {
+                let mut from = s;
+                for i in 0..*min {
+                    let to = if i + 1 == *min && *max == Some(*min) {
+                        o
+                    } else {
+                        PT::V(self.ctx.fresh_var())
+                    };
+                    self.collect_path(from, path, to, g, items);
+                    from = to;
+                }
+                if *max != Some(*min) {
+                    let rest = PP::Range {
+                        path: path.clone(),
+                        min: 0,
+                        max: max.map(|m| m - min),
+                    };
+                    items.push(Item::Path(PathItem {
+                        s: from,
+                        path: rest,
+                        o,
+                        graph: g.clone(),
+                    }));
+                }
             }
             _ => items.push(Item::Path(PathItem {
                 s,
@@ -2209,10 +2290,15 @@ impl<'a> Planner<'a> {
 
     fn attach_path(&mut self, left: Node, p: PathItem) -> Result<Node> {
         use PropertyPathExpression as PP;
+        let mut count = None;
         let (min, max_one, inner) = match &p.path {
             PP::ZeroOrMore(i) => (0u8, false, &**i),
             PP::OneOrMore(i) => (1, false, &**i),
             PP::ZeroOrOne(i) => (0, true, &**i),
+            PP::Range { path, min, max } => {
+                count = Some((*min, *max));
+                (u8::from(*min > 0), false, &**path)
+            }
             PP::Alternative(..) => {
                 let mut alts = Vec::new();
                 flatten_alt(&p.path, &mut alts);
@@ -2275,6 +2361,11 @@ impl<'a> Planner<'a> {
             Some((id, _)) if id.tag() == Tag::Local && min == 1 => {
                 return Ok(Node::empty(left.vars.clone()));
             }
+            // a predicate that is not in the store: only the zero-length path matches
+            Some((id, _)) if id.tag() == Tag::Local && count.is_some() => {
+                count = Some((0, Some(0)));
+                Some((0, false))
+            }
             Some((id, rev)) if id.tag() != Tag::Local => Some((id.0, rev)),
             _ => {
                 let (a, b) = (self.ctx.fresh_var(), self.ctx.fresh_var());
@@ -2299,6 +2390,7 @@ impl<'a> Planner<'a> {
             graph: gf,
             graph_var: gvar,
             edge_vars,
+            count,
         };
         let mut vars = Vec::new();
         for e in [&spec.subj, &spec.obj] {
@@ -3803,6 +3895,10 @@ fn reorder_scan(spec: &ScanSpec, first: VarId) -> Option<ScanSpec> {
     })
 }
 
+/// The longest prefix of an ARQ path range the planner unrolls into joined steps (see
+/// [`Planner::collect_path`]); a longer range runs whole in the path operator.
+const RANGE_UNROLL: u64 = 32;
+
 fn flatten_union<'g>(gp: &'g GraphPattern, out: &mut Vec<&'g GraphPattern>) {
     if let GraphPattern::Union { left, right } = gp {
         flatten_union(left, out);
@@ -3945,7 +4041,7 @@ fn certain_names(gp: &GraphPattern, out: &mut Vec<String>) {
                 }
             }
         }
-        GP::Join { left, right } => {
+        GP::Join { left, right } | GP::Lateral { left, right } => {
             certain_names(left, out);
             certain_names(right, out);
         }
@@ -4006,7 +4102,10 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
                 walk(left, out);
                 walk(right, out);
             }
-            GP::Join { left, right } | GP::Union { left, right } | GP::Minus { left, right } => {
+            GP::Join { left, right }
+            | GP::Lateral { left, right }
+            | GP::Union { left, right }
+            | GP::Minus { left, right } => {
                 walk(left, out);
                 walk(right, out);
             }

@@ -211,7 +211,7 @@ fn check_prebinding(gp: &GraphPattern, prebound: &[String]) -> Result<()> {
             }
             check_prebinding(inner, prebound)
         }
-        GP::Join { left, right } | GP::Union { left, right } => {
+        GP::Join { left, right } | GP::Lateral { left, right } | GP::Union { left, right } => {
             check_prebinding(left, prebound)?;
             check_prebinding(right, prebound)
         }

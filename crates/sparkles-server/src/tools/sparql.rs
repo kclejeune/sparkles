@@ -28,6 +28,10 @@ pub struct QparseArgs {
     /// Plan against these data files (loaded into memory)
     #[arg(long)]
     data: Vec<PathBuf>,
+    /// The syntax: `arq`, SPARQL with Jena ARQ's extensions, as the server reads queries,
+    /// or `sparql` (also `sparql11`, `sparql12`), strict SPARQL
+    #[arg(long, default_value = "arq", value_parser = parse_syntax)]
+    syntax: Syntax,
 }
 
 #[derive(clap::Args)]
@@ -44,6 +48,45 @@ pub struct UparseArgs {
     /// Base IRI for relative IRIs
     #[arg(long)]
     base: Option<String>,
+    /// The syntax: `arq` (SPARQL with Jena ARQ's extensions) or `sparql` (strict)
+    #[arg(long, default_value = "arq", value_parser = parse_syntax)]
+    syntax: Syntax,
+}
+
+/// Which syntax `qparse` and `uparse` accept (Jena's `--syntax`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Syntax {
+    /// SPARQL with Jena ARQ's extensions (spec G06)
+    Arq,
+    /// SPARQL 1.1 and 1.2 only
+    Sparql,
+}
+
+fn parse_syntax(s: &str) -> std::result::Result<Syntax, String> {
+    match s.to_ascii_lowercase().replace(['_', '-', '.'], "").as_str() {
+        "arq" => Ok(Syntax::Arq),
+        "sparql" | "sparql11" | "sparql12" => Ok(Syntax::Sparql),
+        _ => Err(format!("{s:?}: expected arq or sparql")),
+    }
+}
+
+/// Refuse what strict SPARQL does not accept, with spargebra's message.
+fn check_strict(text: &str, base: Option<&str>, update: bool) {
+    let mut p = spargebra::SparqlParser::new().with_arq_syntax(false);
+    if let Some(b) = base {
+        match p.with_base_iri(b) {
+            Ok(q) => p = q,
+            Err(e) => syntax_error(e),
+        }
+    }
+    let r = if update {
+        p.parse_update(text).map(|_| ())
+    } else {
+        p.parse_query(text).map(|_| ())
+    };
+    if let Err(e) = r {
+        syntax_error(e);
+    }
 }
 
 /// The text from the argument, the file (`-`: standard input), or standard input.
@@ -115,6 +158,9 @@ fn readable_names(text: &str) -> String {
 
 pub fn qparse(a: QparseArgs, opts: StoreOptions) -> Result<()> {
     let text = read_text(a.text, a.query)?;
+    if a.syntax == Syntax::Sparql {
+        check_strict(&text, a.base.as_deref(), false);
+    }
     let parsed = match sparkles::sparql::parse_query(&text, a.base.as_deref(), &[]) {
         Ok(q) => q,
         Err(e) => syntax_error(e),
@@ -152,6 +198,9 @@ pub fn qparse(a: QparseArgs, opts: StoreOptions) -> Result<()> {
 
 pub fn uparse(a: UparseArgs) -> Result<()> {
     let text = read_text(a.text, a.update)?;
+    if a.syntax == Syntax::Sparql {
+        check_strict(&text, a.base.as_deref(), true);
+    }
     let qopts = QueryOptions {
         base_iri: a.base.clone(),
         ..Default::default()

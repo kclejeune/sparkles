@@ -33,8 +33,10 @@ pub enum Query {
     },
     /// [CONSTRUCT](https://www.w3.org/TR/sparql11-query/#construct).
     Construct {
-        /// The query construction template.
+        /// The query construction template: the triples of the default graph.
         template: Vec<TriplePattern>,
+        /// Jena ARQ's `GRAPH g { … }` blocks of the template (empty in SPARQL).
+        graph_templates: Vec<GraphTemplate>,
         /// The [query dataset specification](https://www.w3.org/TR/sparql11-query/#specifyingDataset).
         dataset: Option<QueryDataset>,
         /// The query selection graph pattern.
@@ -142,6 +144,7 @@ impl Query {
             }
             Self::Construct {
                 template,
+                graph_templates,
                 dataset,
                 pattern,
                 base_iri,
@@ -155,6 +158,18 @@ impl Query {
                         f.write_str(" ")?;
                     }
                     t.fmt_sse(f)?;
+                }
+                for (i, g) in graph_templates.iter().enumerate() {
+                    if i > 0 || !template.is_empty() {
+                        f.write_str(" ")?;
+                    }
+                    f.write_str("(graph ")?;
+                    g.name.fmt_sse(f)?;
+                    for t in &g.triples {
+                        f.write_str(" ")?;
+                        t.fmt_sse(f)?;
+                    }
+                    f.write_str(")")?;
                 }
                 f.write_str(") ")?;
                 if let Some(dataset) = dataset {
@@ -243,6 +258,7 @@ impl fmt::Display for Query {
             }
             Self::Construct {
                 template,
+                graph_templates,
                 dataset,
                 pattern,
                 base_iri,
@@ -253,6 +269,9 @@ impl fmt::Display for Query {
                 f.write_str("CONSTRUCT { ")?;
                 for triple in template {
                     write!(f, "{triple} . ")?;
+                }
+                for g in graph_templates {
+                    write!(f, "{g} ")?;
                 }
                 f.write_str("}")?;
                 if let Some(dataset) = dataset {
@@ -325,5 +344,34 @@ impl TryFrom<&String> for Query {
 
     fn try_from(query: &String) -> Result<Self, Self::Error> {
         Self::from_str(query)
+    }
+}
+
+/// A `GRAPH name { triples }` block of a CONSTRUCT template, Jena ARQ's quad templates.
+///
+/// ```
+/// use spargebra::{Query, SparqlParser};
+///
+/// let q = SparqlParser::new().parse_query(
+///     "CONSTRUCT { GRAPH ?g { ?s <http://example.com/p> ?o } } WHERE { GRAPH ?g { ?s <http://example.com/p> ?o } }",
+/// )?;
+/// let Query::Construct { graph_templates, .. } = &q else { unreachable!() };
+/// assert_eq!(graph_templates[0].to_string(), "GRAPH ?g { ?s <http://example.com/p> ?o . }");
+/// # Ok::<_, spargebra::SparqlSyntaxError>(())
+/// ```
+#[derive(Eq, PartialEq, Debug, Clone, Hash)]
+pub struct GraphTemplate {
+    /// The graph name: an IRI, a variable or a blank node.
+    pub name: TermPattern,
+    pub triples: Vec<TriplePattern>,
+}
+
+impl fmt::Display for GraphTemplate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GRAPH {} {{ ", self.name)?;
+        for t in &self.triples {
+            write!(f, "{t} . ")?;
+        }
+        f.write_str("}")
     }
 }

@@ -28,7 +28,10 @@ impl Visitor<'_> {
         use GraphPattern as GP;
         match gp {
             GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => Ok(()),
-            GP::Join { left, right } | GP::Union { left, right } | GP::Minus { left, right } => {
+            GP::Join { left, right }
+            | GP::Lateral { left, right }
+            | GP::Union { left, right }
+            | GP::Minus { left, right } => {
                 self.pattern(left)?;
                 self.pattern(right)
             }

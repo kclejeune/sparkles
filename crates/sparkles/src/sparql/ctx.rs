@@ -16,6 +16,9 @@ use std::time::Instant;
 
 /// Jena's IRI for the default graph (`Quad.defaultGraphIRI`).
 pub const DEFAULT_GRAPH_IRI: &str = "urn:x-arq:DefaultGraph";
+/// Jena's name for the default graph in quads it builds, such as a CONSTRUCT template's
+/// triples outside `GRAPH` (`Quad.defaultGraphNodeGenerated`).
+pub const DEFAULT_GRAPH_NODE_IRI: &str = "urn:x-arq:DefaultGraphNode";
 /// Jena's IRI for the union of all named graphs (`Quad.unionGraph`).
 pub const UNION_GRAPH_IRI: &str = "urn:x-arq:UnionGraph";
 

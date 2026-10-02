@@ -646,23 +646,29 @@ fn run_update_test(t: &TestCase, m: &Manifest) -> Result<(), String> {
     }
 }
 
+/// A syntax test. A positive one must parse with Jena ARQ's extensions accepted (the
+/// default) and without them; a negative one must fail to parse as strict SPARQL. Jena's
+/// runner likewise reads the suite's `.rq` and `.ru` files as SPARQL. ARQ's syntax
+/// accepts some of them, such as `constructwhere06` (`CONSTRUCT WHERE { GRAPH … }`).
 fn run_syntax_test(t: &TestCase, m: &Manifest, positive: bool, update: bool) -> Result<(), String> {
     let a = m.obj(&t.entry, &format!("{MF}action")).ok_or("no action")?;
     let url = iri(&a);
     let text = std::fs::read_to_string(url_to_path(&url)).map_err(|e| e.to_string())?;
-    let parsed = if update {
-        spargebra::SparqlParser::new()
+    let parse = |arq: bool| {
+        let p = spargebra::SparqlParser::new()
             .with_base_iri(&url)
             .unwrap()
-            .parse_update(&text)
-            .map(|_| ())
-    } else {
-        spargebra::SparqlParser::new()
-            .with_base_iri(&url)
-            .unwrap()
-            .parse_query(&text)
-            .map(|_| ())
+            .with_arq_syntax(arq);
+        if update {
+            p.parse_update(&text).map(|_| ())
+        } else {
+            p.parse_query(&text).map(|_| ())
+        }
     };
+    let parsed = parse(false);
+    if positive && let Err(e) = parse(true) {
+        return Err(format!("parse error with ARQ syntax: {e}"));
+    }
     match (parsed, positive) {
         (Ok(()), true) | (Err(_), false) => Ok(()),
         (Err(e), true) => Err(format!("parse error: {e}")),

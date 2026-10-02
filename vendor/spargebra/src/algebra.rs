@@ -15,6 +15,16 @@ pub enum PropertyPathExpression {
     OneOrMore(Box<Self>),
     ZeroOrOne(Box<Self>),
     NegatedPropertySet(Vec<NamedNode>),
+    /// Jena ARQ's path range: `path{n}`, `path{n,m}`, `path{n,}`, `path{,m}` (`min` 0),
+    /// `path{*}` (`{0,}`) and `path{+}` (`{1,}`). Unlike `*`, `+` and `?`, a range counts
+    /// each way through the graph: `path{n,m}` has a solution per walk of `n` to `m` steps,
+    /// and an unbounded range adds a solution per simple path after its `min` steps.
+    Range {
+        path: Box<Self>,
+        min: u64,
+        /// `None` for the unbounded forms
+        max: Option<u64>,
+    },
 }
 
 impl PropertyPathExpression {
@@ -63,6 +73,17 @@ impl PropertyPathExpression {
                 }
                 f.write_str(")")
             }
+            // Jena's SSE: `(pathN n p)`, `(pathN* p)` and `(mod min max p)`
+            Self::Range { path, min, max } => {
+                match (min, max) {
+                    (n, Some(m)) if n == m => write!(f, "(pathN {n} ")?,
+                    (0, None) => f.write_str("(pathN* ")?,
+                    (n, Some(m)) => write!(f, "(mod {n} {m} ")?,
+                    (n, None) => write!(f, "(mod {n} _ ")?,
+                }
+                path.fmt_sse(f)?;
+                f.write_str(")")
+            }
         }
     }
 }
@@ -87,6 +108,13 @@ impl fmt::Display for PropertyPathExpression {
                 }
                 f.write_str(")")
             }
+            // `{0,}` is written `{*}`: Jena reads both, but evaluates `{0,}` as `{+}`
+            Self::Range { path, min, max } => match (min, max) {
+                (n, Some(m)) if n == m => write!(f, "({path}){{{n}}}"),
+                (0, None) => write!(f, "({path}){{*}}"),
+                (n, Some(m)) => write!(f, "({path}){{{n},{m}}}"),
+                (n, None) => write!(f, "({path}){{{n},}}"),
+            },
         }
     }
 }

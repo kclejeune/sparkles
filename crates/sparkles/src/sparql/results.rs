@@ -259,7 +259,9 @@ pub fn write_solutions(
     Ok(())
 }
 
-/// Serialize CONSTRUCT / DESCRIBE results.
+/// Serialize CONSTRUCT / DESCRIBE results. A dataset format (TriG, N-Quads, JSON-LD)
+/// also gets the quads of a CONSTRUCT with `GRAPH` blocks; a graph format, the default
+/// graph only, as Fuseki writes it.
 pub fn write_graph(
     r: &QueryResult,
     fmt: RdfFormat,
@@ -277,6 +279,11 @@ pub fn write_graph(
     let mut s = ser.for_writer(w);
     for t in &r.triples {
         s.serialize_triple(t).map_err(io)?;
+    }
+    if fmt.supports_datasets() {
+        for q in &r.quads {
+            s.serialize_quad(q).map_err(io)?;
+        }
     }
     s.finish().map_err(io)?;
     Ok(())
@@ -357,6 +364,29 @@ pub fn sparkles_json(r: &QueryResult, send: Option<usize>) -> J {
                 })
                 .collect();
             out.insert("triples".into(), J::Array(triples));
+            if !r.quads.is_empty() {
+                // what the row budget leaves after the triples
+                let quads: Vec<J> = r
+                    .quads
+                    .iter()
+                    .take(n.saturating_sub(r.triples.len()))
+                    .map(|q| {
+                        json!([
+                            term_json(&Term::from(q.subject.clone())),
+                            term_json(&Term::NamedNode(q.predicate.clone())),
+                            term_json(&q.object),
+                            match &q.graph_name {
+                                oxrdf::GraphName::NamedNode(g) =>
+                                    term_json(&Term::NamedNode(g.clone())),
+                                oxrdf::GraphName::BlankNode(b) =>
+                                    term_json(&Term::BlankNode(b.clone())),
+                                oxrdf::GraphName::DefaultGraph => J::Null,
+                            }
+                        ])
+                    })
+                    .collect();
+                out.insert("quads".into(), J::Array(quads));
+            }
         }
     }
     out.insert(
