@@ -56,6 +56,42 @@ pub struct ReasoningInfo {
     /// this dataset's automatic re-runs; `None` follows the server's `--auto-reason`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto: Option<AutoSetting>,
+    /// how the last run materialized
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunInfo>,
+}
+
+/// How a materialization ran: in full or incrementally, and what it changed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunInfo {
+    /// `full` or `incremental`
+    pub method: String,
+    /// why a run that could have updated the previous materialization ran in full
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    /// triples added to and removed from the inferred graph
+    pub inferred_added: u64,
+    pub inferred_removed: u64,
+    /// incremental runs: what changed since the previous run
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<RunChanges>,
+}
+
+/// What an incremental run found changed and did.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunChanges {
+    /// default graph triples added and removed since the previous run
+    pub explicit_added: u64,
+    pub explicit_removed: u64,
+    /// derived triples whose other proofs were searched for
+    pub checked: u64,
+    /// derived triples that no longer follow, and new ones (generalized ones included)
+    pub removed: u64,
+    pub derived: u64,
+    /// `memory` (kept by the server) or `store` (read from the dataset)
+    pub source: String,
 }
 
 /// A dataset's own automatic re-run setting (`PUT /$/reason/{ds}/auto`).
@@ -84,9 +120,15 @@ pub struct Dataset {
     pub validation: RwLock<Option<Validation>>,
     /// write-time validation counters (the store's guard observer)
     pub validation_metrics: Arc<crate::obs::ValidationMetrics>,
+    /// the closure of the last materialization, for the next incremental run
+    #[cfg(feature = "reasoning")]
+    pub closure: sparkles_reasoner::Cache,
 }
 
 pub use crate::write_validation::Validation;
+
+/// Default of `serve --reason-cache-triples`.
+pub const DEFAULT_REASON_CACHE_TRIPLES: usize = 10_000_000;
 
 /// Install a store's write-time validation from its `validation.json`. A configuration
 /// that cannot be loaded leaves the dataset refusing writes (the store fails closed).
@@ -237,6 +279,9 @@ pub struct AppState {
     pub map_style_url: Option<String>,
     /// automatic re-materialization of stale inferences (`serve --auto-reason`)
     pub auto_reason: Option<crate::reasoning::AutoReason>,
+    /// the largest closure a dataset keeps in memory for incremental reasoning, in
+    /// triples (`serve --reason-cache-triples`)
+    pub reason_cache_triples: usize,
     /// dataset names being created by a task (clone), with the task id
     reserved: Mutex<BTreeMap<String, String>>,
     /// datasets being replaced in place (an in-place restore), with the task id: every
@@ -504,6 +549,7 @@ impl AppState {
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
             auto_reason: None,
+            reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
             reserved: Mutex::new(BTreeMap::new()),
             restoring: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "backup")]
@@ -564,6 +610,7 @@ impl AppState {
             metrics: crate::obs::Metrics::new(false, 100),
             phase: AtomicU8::new(crate::obs::Phase::Ready as u8),
             auto_reason: None,
+            reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
             reserved: Mutex::new(BTreeMap::new()),
             restoring: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "backup")]
@@ -608,6 +655,8 @@ impl AppState {
             schema_cache: Mutex::new(None),
             validation: RwLock::new(validation),
             validation_metrics,
+            #[cfg(feature = "reasoning")]
+            closure: sparkles_reasoner::Cache::new(self.reason_cache_triples),
         }))
     }
 

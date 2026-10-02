@@ -75,7 +75,9 @@ running queries.
 **Reasoning**
 * RDFS, OWL 2 RL and Jena's rule syntax, materialized by semi-naive forward chaining.
 * Sparkles reports when inferences are stale and, if asked, re-runs them automatically.
-  It checks for OWL 2 RL inconsistencies ([API](docs/API.md#reasoning-status-and-diagnostics)).
+  A re-run updates the previous materialization incrementally, so a small change takes
+  milliseconds. Sparkles also checks for OWL 2 RL inconsistencies
+  ([API](docs/API.md#reasoning-status-and-diagnostics)).
 
 **Validation**
 * SHACL Core and SHACL-SPARQL, with Fuseki's `/{ds}/shacl` endpoint. Both W3C suites

@@ -10,21 +10,28 @@
 //! Rule sets: [`Profile::Rdfs`] (full RDFS entailment), [`Profile::RdfsSimple`]
 //! (subClassOf / subPropertyOf / domain / range), [`Profile::OwlRl`] (an OWL 2 RL subset
 //! comparable to Jena's OWL Mini) or any Jena rule text ([`Profile::Rules`]).
+//!
+//! [`materialize_incremental`] updates a previous materialization from the changes to
+//! the default graph since its commit, with the same result as a full run.
 
 mod builtins;
 pub mod diagnostics;
 mod engine;
 pub mod extras;
 mod graph;
+mod incremental;
+mod maintain;
 pub mod parser;
 mod terms;
 
 pub use extras::{Extras, UnknownVocabulary, Vocabulary};
+pub use maintain::{Cache, DEFAULT_CACHE_TRIPLES};
 pub use parser::{
     BuiltinCall, Clause, Direction, Node, Rule, RuleParseError, TriplePattern, parse_rules,
 };
 
 use anyhow::Context as _;
+use incremental::Fallback;
 use oxrdf::{NamedNode, NamedOrBlankNode, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles::id::{Id, Tag};
@@ -35,7 +42,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
-use terms::{Kind, LocalTerm, Terms};
+use terms::{LocalTerm, Terms};
 
 /// Named graph holding materialized entailments.
 pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
@@ -159,6 +166,52 @@ pub struct ReasonReport {
     /// the commit that wrote the inferences, or the unchanged head (at which the data
     /// was read) when the run changed nothing; `None` for [`infer`] (a dry run)
     pub receipt: Option<sparkles::commit::Receipt>,
+    /// how the run materialized
+    pub method: Method,
+    /// why a run asked to update a previous materialization ran in full
+    pub fallback: Option<String>,
+    /// what an incremental run changed
+    pub changes: Option<Changes>,
+    /// triples the run added to [`INFERRED_GRAPH`]
+    pub inferred_added: u64,
+    /// triples the run removed from [`INFERRED_GRAPH`]
+    pub inferred_removed: u64,
+}
+
+/// How a run materialized.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Method {
+    /// every rule over the whole default graph
+    #[default]
+    Full,
+    /// the previous closure, updated with the changes since its commit
+    Incremental,
+}
+
+impl Method {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Method::Full => "full",
+            Method::Incremental => "incremental",
+        }
+    }
+}
+
+/// What an incremental run changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Changes {
+    /// triples added to the default graph since the previous run
+    pub base_added: u64,
+    /// triples removed from the default graph since the previous run
+    pub base_removed: u64,
+    /// derived facts whose other proofs were searched for
+    pub checked: u64,
+    /// facts that left the closure (some came back with the added triples)
+    pub removed: u64,
+    /// facts that joined the closure
+    pub derived: u64,
+    /// where the previous closure came from: `memory` or `store`
+    pub source: String,
 }
 
 fn progress(opts: &ReasonOptions, f: f32, msg: &str) {
@@ -200,15 +253,7 @@ fn derive(
     extras: &Extras,
     opts: &ReasonOptions,
 ) -> anyhow::Result<Derivation> {
-    let mut rules = profile
-        .rules()
-        .with_context(|| format!("parsing rules for profile '{}'", profile.name()))?;
-    for v in &extras.vocabularies {
-        rules.extend(
-            v.rules()
-                .with_context(|| format!("parsing the {v} vocabulary"))?,
-        );
-    }
+    let rules = profile_rules(profile, extras)?;
     progress(opts, 0.0, "loading default graph");
     let mut g = load_default_graph(&snap)?;
     // rows from here on are derived
@@ -227,7 +272,7 @@ fn derive(
         progress: opts.progress.clone(),
     };
     progress(opts, 0.1, "reasoning");
-    let out = engine::run(&mut g, &compiled, &terms, &limits)?;
+    let out = engine::run(&mut g, &compiled, &terms, &limits, None)?;
     Ok(Derivation {
         base_len,
         graph: g,
@@ -281,10 +326,55 @@ impl Derivation {
 
     /// Is this (possibly generalized) triple valid RDF?
     fn valid(&self, t: &[u64; 3]) -> bool {
-        matches!(self.terms.kind(t[0]), Kind::Iri | Kind::BNode)
-            && self.terms.kind(t[1]) == Kind::Iri
-            && self.terms.kind(t[2]) != Kind::Other
+        self.terms.valid(t)
     }
+}
+
+/// The rules of a profile with the axioms of the vocabularies of `extras`.
+fn profile_rules(profile: &Profile, extras: &Extras) -> anyhow::Result<Vec<Rule>> {
+    let mut rules = profile
+        .rules()
+        .with_context(|| format!("parsing rules for profile '{}'", profile.name()))?;
+    for v in &extras.vocabularies {
+        rules.extend(
+            v.rules()
+                .with_context(|| format!("parsing the {v} vocabulary"))?,
+        );
+    }
+    Ok(rules)
+}
+
+/// A digest of everything that determines a materialization besides the data: the rule
+/// text of the profile and its vocabularies, and the switches of `extras`. An incremental
+/// run needs the previous run's digest to be the same.
+pub fn rules_digest(profile: &Profile, extras: &Extras) -> u64 {
+    use maintain::{FNV_START, fnv};
+    let mut h = fnv(b"sparkles-reasoner closure 1\0", FNV_START);
+    h = fnv(profile.name().as_bytes(), h);
+    h = fnv(b"\0", h);
+    h = fnv(profile.text().as_bytes(), h);
+    for v in &extras.vocabularies {
+        h = fnv(b"\0", h);
+        h = fnv(v.text().as_bytes(), h);
+    }
+    fnv(&[extras.geo_default_geometry as u8], h)
+}
+
+/// A run that removes more than one explicit triple in this many (of 10,000 or more)
+/// runs in full: the search for other proofs of their consequences then costs more than
+/// deriving everything again (measured on the benchmark data: removing 10% of 100,000 triples
+/// took longer incrementally, removing 1% of 1,000,000 took a quarter of a full run).
+const LARGE_DELETION: u64 = 20;
+
+/// What an incremental run asks for.
+#[derive(Clone, Copy, Default)]
+pub struct Incremental<'a> {
+    /// The commit of the materialization to update: the one its recorded status names,
+    /// when that status belongs to this dataset. `None` materializes in full.
+    pub since: Option<u64>,
+    /// The closure kept in memory between runs. Without it, a run reads the previous
+    /// closure from the dataset (persistent datasets only).
+    pub cache: Option<&'a Cache>,
 }
 
 /// [`materialize`] with the vocabularies and switches of `extras` added to the profile.
@@ -303,14 +393,260 @@ pub fn materialize_with(
     extras: &Extras,
     opts: &ReasonOptions,
 ) -> anyhow::Result<ReasonReport> {
+    materialize_incremental(store, profile, extras, Incremental::default(), opts)
+}
+
+/// [`materialize_with`], updating the materialization of commit `inc.since`
+/// incrementally when it can.
+///
+/// An incremental run takes the explicit triples added to and removed from the default
+/// graph since that commit (the commit diff), and maintains the previous closure with the
+/// backward/forward algorithm: it deletes the consequences of removed triples that have
+/// no other proof, then derives the consequences of added ones semi-naively. The
+/// inferred graph it writes is the one a full run would write.
+///
+/// It needs the previous closure, from `inc.cache` or saved with a persistent dataset,
+/// the same rules (see [`rules_digest`]), and a commit the diff still reaches. Rules
+/// that are not monotonic, or that create blank nodes, need a full run, and so do RDF
+/// lists that change while the rules read lists. The run then materializes in full and
+/// says why in [`ReasonReport::fallback`].
+pub fn materialize_incremental(
+    store: &Store,
+    profile: &Profile,
+    extras: &Extras,
+    inc: Incremental<'_>,
+    opts: &ReasonOptions,
+) -> anyhow::Result<ReasonReport> {
     extras.validate()?;
     let t0 = Instant::now();
-    let mut txn = store.write_as(sparkles::commit::CommitKind::Reason);
+    let (mut txn, raw) = lock_with_changes(store, inc);
     let snap = txn.base().clone();
+    let digest = rules_digest(profile, extras);
+    let mut fallback = None;
+    if let (Some(since), Some(raw)) = (inc.since, raw) {
+        match update_closure(
+            store, &mut txn, &snap, profile, extras, since, digest, inc, raw, opts,
+        ) {
+            Ok(done) => {
+                return finish(store, txn, &snap, profile, digest, inc, opts, t0, done);
+            }
+            Err(e) => {
+                let f = e.downcast::<Fallback>()?;
+                tracing::info!(reason = %f.0, "materializing in full");
+                fallback = Some(f.0);
+            }
+        }
+    }
     let d = derive(snap.clone(), profile, extras, opts)?;
     progress(opts, 0.8, "writing inferred graph");
     let mut warnings = d.warnings.clone();
+    let w = write_full(&mut txn, &snap, &d, opts)?;
+    if w.generalized > 0 {
+        warnings.push(format!(
+            "{} derived generalized triples (literal subjects or non-IRI predicates) were not written",
+            w.generalized
+        ));
+    }
+    let generalized: FxHashSet<[u64; 3]> = d
+        .derived()
+        .iter()
+        .filter(|t| !d.valid(t))
+        .copied()
+        .collect();
+    let done = Done {
+        closure: (!extras.geo_default_geometry)
+            .then(|| incremental::Closure::new(d.graph, d.terms, d.base_len)),
+        generalized,
+        generalized_saved: None,
+        written: w,
+        rules: d.rules,
+        iterations: d.iterations,
+        warnings,
+        method: Method::Full,
+        fallback,
+        changes: None,
+    };
+    finish(store, txn, &snap, profile, digest, inc, opts, t0, done)
+}
 
+/// Take the writer lock, with the changes since `inc.since` up to the state it locks.
+///
+/// The commit diff takes the writer lock itself, so the changes are read before. A commit
+/// that lands in between makes them stale. A closure kept in memory then gives the
+/// changes from its deltas, under the lock; otherwise the lock is released and they are
+/// read again, up to three times.
+fn lock_with_changes<'s>(
+    store: &'s Store,
+    inc: Incremental<'_>,
+) -> (
+    sparkles::store::WriteTxn<'s>,
+    Option<Result<maintain::RawChanges, String>>,
+) {
+    let Some(since) = inc.since else {
+        return (store.write_as(sparkles::commit::CommitKind::Reason), None);
+    };
+    for _ in 0..3 {
+        let live = store.snapshot();
+        let raw = maintain::changes(store, since, &live, inc.cache);
+        let txn = store.write_as(sparkles::commit::CommitKind::Reason);
+        if txn.base().commit == live.commit {
+            return (txn, Some(raw));
+        }
+        if let Some(raw) = maintain::kept_changes(store, since, txn.base(), inc.cache) {
+            return (txn, Some(raw));
+        }
+    }
+    (
+        store.write_as(sparkles::commit::CommitKind::Reason),
+        Some(Err(
+            "commits kept arriving while the changes were read".into()
+        )),
+    )
+}
+
+/// A run's result before its commit.
+struct Done {
+    /// the closure, for the next incremental run
+    closure: Option<incremental::Closure>,
+    generalized: FxHashSet<[u64; 3]>,
+    /// the saved generalized facts the run started from, and its changes to them
+    generalized_saved: Option<(maintain::SavedMeta, maintain::GeneralizedChanges)>,
+    written: Written,
+    rules: usize,
+    iterations: usize,
+    warnings: Vec<String>,
+    method: Method,
+    fallback: Option<String>,
+    changes: Option<Changes>,
+}
+
+/// What a run wrote to the inferred graph.
+#[derive(Default)]
+struct Written {
+    added: u64,
+    removed: u64,
+    /// triples in the inferred graph after the run
+    inferred: u64,
+    /// derived triples that are not valid RDF, not written
+    generalized: u64,
+    /// local ids the run stored, with their store ids
+    stored: FxHashMap<u64, Id>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    store: &Store,
+    txn: sparkles::store::WriteTxn<'_>,
+    snap: &Arc<Snapshot>,
+    profile: &Profile,
+    digest: u64,
+    inc: Incremental<'_>,
+    opts: &ReasonOptions,
+    t0: Instant,
+    done: Done,
+) -> anyhow::Result<ReasonReport> {
+    if opts
+        .cancel
+        .as_ref()
+        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        anyhow::bail!("reasoning cancelled");
+    }
+    let receipt = txn.commit()?;
+    progress(opts, 1.0, "done");
+    let warnings = done.warnings;
+    if let Some(closure) = done.closure {
+        let saved = maintain::save(
+            store,
+            &receipt,
+            digest,
+            &closure.terms,
+            &done.generalized,
+            done.generalized_saved.as_ref().map(|(m, c)| (m, c)),
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!("saving the closure state for incremental runs: {e:#}");
+            None
+        });
+        maintain::keep(
+            store,
+            inc.cache,
+            &receipt,
+            snap,
+            digest,
+            closure,
+            done.generalized,
+            &done.written.stored,
+            saved,
+        );
+    } else if let Some(c) = inc.cache {
+        c.clear();
+    }
+    let report = ReasonReport {
+        profile: profile.name().to_string(),
+        rules: done.rules,
+        iterations: done.iterations,
+        inferred: done.written.inferred,
+        millis: t0.elapsed().as_millis() as u64,
+        warnings,
+        receipt: Some(receipt),
+        method: done.method,
+        fallback: done.fallback,
+        changes: done.changes,
+        inferred_added: done.written.added,
+        inferred_removed: done.written.removed,
+    };
+    tracing::info!(
+        profile = %report.profile,
+        method = report.method.as_str(),
+        rules = report.rules,
+        iterations = report.iterations,
+        inferred = report.inferred,
+        added = report.inferred_added,
+        removed = report.inferred_removed,
+        millis = report.millis,
+        "materialized inferences"
+    );
+    Ok(report)
+}
+
+/// Map a derived triple's local ids to store ids, interning the terms.
+fn store_ids(
+    txn: &mut sparkles::store::WriteTxn<'_>,
+    terms: &Terms,
+    stored: &mut FxHashMap<u64, Id>,
+    t: &[u64; 3],
+) -> anyhow::Result<[Id; 3]> {
+    let mut ids = [Id::UNDEF; 3];
+    for (i, &x) in t.iter().enumerate() {
+        ids[i] = if Id(x).tag() == Tag::Local {
+            match stored.get(&x) {
+                Some(&id) => id,
+                None => {
+                    let id = match terms.local(x) {
+                        Some(LocalTerm::Key(k)) => txn.intern_key(&k)?,
+                        Some(LocalTerm::BNode) => txn.new_bnode(),
+                        None => anyhow::bail!("dangling local term id {x:#x}"),
+                    };
+                    stored.insert(x, id);
+                    id
+                }
+            }
+        } else {
+            Id(x)
+        };
+    }
+    Ok(ids)
+}
+
+/// Replace the inferred graph with the valid derived triples of a full run.
+fn write_full(
+    txn: &mut sparkles::store::WriteTxn<'_>,
+    snap: &Snapshot,
+    d: &Derivation,
+    opts: &ReasonOptions,
+) -> anyhow::Result<Written> {
+    let mut w = Written::default();
     // existing inferred graph
     let old_graph = snap.lookup_iri(INFERRED_GRAPH);
     let old: Vec<[Id; 4]> = match old_graph {
@@ -324,38 +660,12 @@ pub fn materialize_with(
 
     // map local ids to store ids and collect the new graph content
     let mut new_triples: Vec<[Id; 3]> = Vec::new();
-    let mut local_ids: FxHashMap<u64, Id> = FxHashMap::default();
-    let mut generalized = 0u64;
     for t in d.derived() {
         if !d.valid(t) {
-            generalized += 1;
+            w.generalized += 1;
             continue;
         }
-        let mut ids = [Id::UNDEF; 3];
-        for (i, &x) in t.iter().enumerate() {
-            ids[i] = if Id(x).tag() == Tag::Local {
-                match local_ids.get(&x) {
-                    Some(&id) => id,
-                    None => {
-                        let id = match d.terms.local(x) {
-                            Some(LocalTerm::Key(k)) => txn.intern_key(&k)?,
-                            Some(LocalTerm::BNode) => txn.new_bnode(),
-                            None => anyhow::bail!("dangling local term id {x:#x}"),
-                        };
-                        local_ids.insert(x, id);
-                        id
-                    }
-                }
-            } else {
-                Id(x)
-            };
-        }
-        new_triples.push(ids);
-    }
-    if generalized > 0 {
-        warnings.push(format!(
-            "{generalized} derived generalized triples (literal subjects or non-IRI predicates) were not written"
-        ));
+        new_triples.push(store_ids(txn, &d.terms, &mut w.stored, t)?);
     }
 
     let new_set: FxHashSet<[Id; 3]> = new_triples.iter().copied().collect();
@@ -364,6 +674,7 @@ pub fn materialize_with(
         let t = [q[0], q[1], q[2]];
         if !new_set.contains(&t) {
             txn.delete(*q)?;
+            w.removed += 1;
         } else {
             old_set.insert(t);
         }
@@ -378,6 +689,7 @@ pub fn materialize_with(
             .filter(|t| !old_set.contains(*t))
             .map(|t| [t[0], t[1], t[2], g])
             .collect();
+        w.added = added.len() as u64;
         if opts
             .cancel
             .as_ref()
@@ -388,26 +700,172 @@ pub fn materialize_with(
         // large batches are merged into a rebuilt index generation on commit
         txn.insert_bulk(added)?;
     }
-    let receipt = txn.commit()?;
-    progress(opts, 1.0, "done");
-    let report = ReasonReport {
-        profile: profile.name().to_string(),
-        rules: d.rules,
-        iterations: d.iterations,
-        inferred: new_set.len() as u64,
-        millis: t0.elapsed().as_millis() as u64,
-        warnings,
-        receipt: Some(receipt),
+    w.inferred = new_set.len() as u64;
+    Ok(w)
+}
+
+/// Update the closure of the materialization at `since` to the store's state now, and
+/// write the changes of the inferred graph.
+#[allow(clippy::too_many_arguments)]
+fn update_closure(
+    store: &Store,
+    txn: &mut sparkles::store::WriteTxn<'_>,
+    snap: &Arc<Snapshot>,
+    profile: &Profile,
+    extras: &Extras,
+    since: u64,
+    digest: u64,
+    inc: Incremental<'_>,
+    raw: Result<maintain::RawChanges, String>,
+    opts: &ReasonOptions,
+) -> anyhow::Result<Done> {
+    if extras.geo_default_geometry {
+        return Err(Fallback("GeoSPARQL default geometries are not monotonic".into()).into());
+    }
+    if since > snap.commit {
+        return Err(Fallback("the store position moved backwards".into()).into());
+    }
+    let rules = profile_rules(profile, extras)?;
+    {
+        let terms = Terms::new(snap.clone());
+        let mut w = Vec::new();
+        for r in engine::compile(&rules, &terms, &mut w) {
+            if let Some(why) = engine::incremental_blocker(&r, &terms) {
+                return Err(Fallback(why).into());
+            }
+        }
+    }
+    if let Ok(r) = &raw {
+        let removed = r.base_removed() as u64;
+        let explicit = snap.count(Perm::Gspo, &[Id::DEFAULT_GRAPH.0])? + removed;
+        if explicit >= 10_000 && removed * LARGE_DELETION > explicit {
+            return Err(Fallback(format!(
+                "{removed} of {explicit} explicit triples were removed, more than a full run handles faster"
+            ))
+            .into());
+        }
+    }
+    progress(opts, 0.0, "reading the previous closure");
+    let prev = maintain::previous(store, snap, since, digest, inc.cache, raw)?;
+    let mut closure = prev.closure;
+    let mut warnings = Vec::new();
+    let compiled = engine::compile(&rules, &closure.terms, &mut warnings);
+    let limits = engine::Limits {
+        max_iterations: opts.max_iterations,
+        max_inferred: opts.max_inferred,
+        cancel: opts.cancel.clone(),
+        progress: opts.progress.clone(),
     };
-    tracing::info!(
-        profile = %report.profile,
-        rules = report.rules,
-        iterations = report.iterations,
-        inferred = report.inferred,
-        millis = report.millis,
-        "materialized inferences"
-    );
-    Ok(report)
+    let ch = &prev.changes;
+    progress(opts, 0.1, "updating the closure");
+    let up = incremental::update(
+        &mut closure,
+        &compiled,
+        &limits,
+        &ch.base_added,
+        &ch.base_removed,
+    )?;
+    let mut generalized = prev.generalized;
+    let mut gen_changes = maintain::GeneralizedChanges::default();
+    for t in &up.deleted {
+        if closure.graph.position(t).is_none() && generalized.remove(t) {
+            gen_changes.removed.push(*t);
+        }
+    }
+    let added: Vec<[u64; 3]> = up.added(&closure).collect();
+    for t in &added {
+        if !closure.explicit(t) && !closure.terms.valid(t) && generalized.insert(*t) {
+            gen_changes.added.push(*t);
+        }
+    }
+    progress(opts, 0.8, "writing inferred graph");
+    let candidates = up
+        .deleted
+        .iter()
+        .chain(&added)
+        .chain(&ch.base_added)
+        .chain(&ch.base_removed)
+        .chain(&ch.inferred_added)
+        .chain(&ch.inferred_removed);
+    let written = write_changes(txn, snap, &closure, candidates)?;
+    let changes = Changes {
+        base_added: ch.base_added.len() as u64,
+        base_removed: ch.base_removed.len() as u64,
+        checked: up.checked,
+        removed: up.deleted.len() as u64,
+        derived: added.len() as u64,
+        source: prev.source.to_string(),
+    };
+    tracing::debug!(?changes, "incremental update");
+    if !generalized.is_empty() {
+        warnings.push(format!(
+            "{} derived generalized triples (literal subjects or non-IRI predicates) were not written",
+            generalized.len()
+        ));
+    }
+    Ok(Done {
+        closure: Some(closure),
+        generalized_saved: prev.saved.map(|m| (m, gen_changes)),
+        generalized,
+        written,
+        rules: compiled.len(),
+        iterations: up.iterations,
+        warnings,
+        method: Method::Incremental,
+        fallback: None,
+        changes: Some(changes),
+    })
+}
+
+/// Bring the inferred graph in line with the closure for the triples that may have
+/// changed: a triple belongs there when it is live, derived (not explicit) and valid RDF.
+fn write_changes<'a>(
+    txn: &mut sparkles::store::WriteTxn<'_>,
+    snap: &Snapshot,
+    c: &incremental::Closure,
+    candidates: impl Iterator<Item = &'a [u64; 3]>,
+) -> anyhow::Result<Written> {
+    let mut w = Written::default();
+    let graph = snap.lookup_iri(INFERRED_GRAPH);
+    let mut seen: FxHashSet<[u64; 3]> = FxHashSet::default();
+    let mut insert: Vec<[u64; 3]> = Vec::new();
+    for t in candidates {
+        if !seen.insert(*t) {
+            continue;
+        }
+        let want = c.graph.position(t).is_some_and(|r| !c.is_base(r)) && c.terms.valid(t);
+        let local = t.iter().any(|&x| Id(x).tag() == Tag::Local);
+        let have = match graph {
+            Some(g) if !local => txn.contains(&[Id(t[0]), Id(t[1]), Id(t[2]), g])?,
+            _ => false,
+        };
+        if want && !have {
+            insert.push(*t);
+        } else if !want && have {
+            let g = graph.expect("present");
+            txn.delete([Id(t[0]), Id(t[1]), Id(t[2]), g])?;
+            w.removed += 1;
+        }
+    }
+    let before = match graph {
+        Some(g) => snap.count(Perm::Gspo, &[g.0])?,
+        None => 0,
+    };
+    if !insert.is_empty() {
+        let g = match graph {
+            Some(g) => g,
+            None => txn.intern(&Term::NamedNode(NamedNode::new_unchecked(INFERRED_GRAPH)))?,
+        };
+        let mut quads = Vec::with_capacity(insert.len());
+        for t in &insert {
+            let ids = store_ids(txn, &c.terms, &mut w.stored, t)?;
+            quads.push([ids[0], ids[1], ids[2], g]);
+        }
+        w.added = quads.len() as u64;
+        txn.insert_bulk(quads)?;
+    }
+    w.inferred = before + w.added - w.removed;
+    Ok(w)
 }
 
 /// Clear [`INFERRED_GRAPH`], run the rules over the default graph, and write every
@@ -426,6 +884,7 @@ pub fn materialize(
 
 /// Remove [`INFERRED_GRAPH`]. Returns the number of triples removed.
 pub fn clear(store: &Store) -> anyhow::Result<u64> {
+    maintain::remove_saved(store);
     let mut txn = store.write_as(sparkles::commit::CommitKind::ReasonClear);
     let snap = txn.base().clone();
     let Some(g) = snap.lookup_iri(INFERRED_GRAPH) else {
@@ -440,6 +899,45 @@ pub fn clear(store: &Store) -> anyhow::Result<u64> {
     }
     txn.commit()?;
     Ok(n)
+}
+
+/// How many facts of the closure of `snap`'s default graph DRed would delete first if
+/// the triples `removed` were removed from it: the facts with a derivation that uses one
+/// of them, transitively. Backward/forward deletes only those without another proof. For
+/// measurements.
+#[doc(hidden)]
+pub fn dred_overdeletion(
+    snap: Arc<Snapshot>,
+    profile: &Profile,
+    removed: &[Triple],
+) -> anyhow::Result<usize> {
+    let d = derive(snap, profile, &Extras::default(), &ReasonOptions::default())?;
+    let mut warnings = Vec::new();
+    let rules = engine::compile(
+        &profile_rules(profile, &Extras::default())?,
+        &d.terms,
+        &mut warnings,
+    );
+    let removed: Vec<[u64; 3]> = removed
+        .iter()
+        .map(|t| {
+            [
+                d.terms.id_for(&t.subject.clone().into()),
+                d.terms.id_for(&t.predicate.clone().into()),
+                d.terms.id_for(&t.object),
+            ]
+        })
+        .collect();
+    let limits = engine::Limits {
+        max_iterations: usize::MAX,
+        max_inferred: usize::MAX,
+        cancel: None,
+        progress: None,
+    };
+    let mut c = incremental::Closure::new(d.graph, d.terms, d.base_len);
+    Ok(incremental::dred_overdeletion(
+        &mut c, &rules, &limits, &removed,
+    ))
 }
 
 /// Run the rules over a snapshot's default graph and return the derived triples that
@@ -477,6 +975,7 @@ pub fn infer(
         millis: t0.elapsed().as_millis() as u64,
         warnings: d.warnings,
         receipt: None,
+        ..Default::default()
     };
     Ok((out, report))
 }

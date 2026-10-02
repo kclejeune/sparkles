@@ -77,6 +77,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | The embedded Rust API (`sparkles::Dataset`) and a fluent query builder (`sparkles::querybuilder`); see [USAGE.md](USAGE.md#embedding-the-library). | ✅ |
 | Python bindings: the `sparkles` package (`crates/sparkles-py`, PyO3 and maturin, abi3 wheels for CPython 3.10 and later). It has persistent and in-memory datasets, loads of every format with compressed inputs, SPARQL queries and updates, term classes that convert to and from rdflib's, streaming quad iteration, transactions, dumps, compaction, reasoning and SHACL and ShEx validation, with type stubs. Calls release the GIL. See [USAGE.md](USAGE.md#python) and [spec P01](specs/P01-python-bindings.md). | ✅ |
 | RDFS and OWL 2 RL materialization, and Jena rule syntax (`sparkles-reasoner`, `/$/reason`, `sparkles infer`). | ✅ |
+| Incremental materialization. A re-run, an automatic run or `sparkles infer` updates the previous materialization from the default graph's changes since its commit, with the backward/forward algorithm, and writes what a full run would. Rules that are not monotonic or create blank nodes, RDF list changes under OWL 2 RL, and large deletions run in full. | ✅ |
 | Inference freshness. Sparkles records the commit the inferences were made at, and only a later change to the default graph makes them stale. `GET /$/reason/{ds}`, dataset info, `/$/stats` and a `Sparkles-Inferences` header report it. Automatic re-runs are opt-in, server-wide with `serve --auto-reason` or per dataset with `PUT /$/reason/{ds}/auto`. | ✅ |
 | Inconsistency diagnostics: 16 checks cover every OWL 2 RL rule with a `false` conclusion except `dt-not-type`. They run through `GET /$/reason/{ds}/diagnostics`, in JSON or Turtle, and `sparkles infer --check`. The checks never prove consistency. | ✅ |
 | SHACL Core and SHACL-SPARQL validation (`sparkles-shacl`), parallel and index-backed. It passes the W3C suites: 98/98 for Core and 20/20 for SPARQL. It also selects focus nodes with SHACL 1.2's `sh:targetWhere`. | ✅ |
@@ -122,8 +123,10 @@ These are features other RDF stores have and Sparkles does not have yet.
   execution, FSST vocabulary compression, IRI encoding, pattern trick, pinned results,
   materialized views or live query monitoring.
 * **Inference.** Inference is forward materialization only. There are no on-the-fly or
-  backward (LP) rules and no incremental maintenance, so stale inferences are re-run in
-  full. Inconsistency checks cover a fixed subset of OWL 2 RL.
+  backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,
+  `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the
+  first run after a compaction without retained history, compute everything again.
+  Inconsistency checks cover a fixed subset of OWL 2 RL.
 * **SPARQL extensions.** Sparkles has none of ARQ's extensions: property functions such
   as `list:member` and `apf:*`, `LET`, custom aggregates, `cdt:` literals and JavaScript
   functions. It has only the common `fn:`, `afn:` and `math:` functions. SERVICE is plain,

@@ -8,6 +8,8 @@
 //! counts every commit.
 
 use crate::state::{AppState, Dataset, ReasoningInfo};
+#[cfg(feature = "reasoning")]
+use crate::state::{RunChanges, RunInfo};
 use axum::http::HeaderValue;
 use parking_lot::Mutex;
 use serde_json::{Value as J, json};
@@ -153,6 +155,9 @@ pub fn status_value(info: &ReasoningInfo, store: &Store, auto: J) -> J {
     if let Some(r) = f.reason {
         j["staleReason"] = r.into();
     }
+    if let Some(run) = &info.run {
+        j["run"] = serde_json::to_value(run).unwrap_or(J::Null);
+    }
     if !info.vocabularies.is_empty() {
         j["vocabularies"] = info.vocabularies.clone().into();
     }
@@ -256,6 +261,60 @@ pub fn recorded(
         millis: Some(report.millis),
         inherited_stale: false,
         auto: None,
+        run: Some(run_info(report)),
+    }
+}
+
+/// How a run materialized, for the status.
+#[cfg(feature = "reasoning")]
+pub fn run_info(report: &sparkles_reasoner::ReasonReport) -> RunInfo {
+    RunInfo {
+        method: report.method.as_str().to_string(),
+        fallback: report.fallback.clone(),
+        inferred_added: report.inferred_added,
+        inferred_removed: report.inferred_removed,
+        changes: report.changes.as_ref().map(|c| RunChanges {
+            explicit_added: c.base_added,
+            explicit_removed: c.base_removed,
+            checked: c.checked,
+            removed: c.removed,
+            derived: c.derived,
+            source: c.source.clone(),
+        }),
+    }
+}
+
+/// The commit of the recorded materialization that a run can update incrementally: the
+/// status's own commit, when the status belongs to this dataset.
+#[cfg(feature = "reasoning")]
+pub fn incremental_since(info: Option<&ReasoningInfo>, store: &Store) -> Option<u64> {
+    let info = info?;
+    if info.inherited_stale
+        || info.position_source.as_deref() != Some("commit")
+        || info.dataset_id.as_deref() != Some(store.dataset_id().to_string().as_str())
+    {
+        return None;
+    }
+    info.commit
+}
+
+/// One line on how a run went: `incremental: 3 explicit triples added, 1 removed; …`.
+#[cfg(feature = "reasoning")]
+pub fn run_text(report: &sparkles_reasoner::ReasonReport) -> String {
+    let graph = format!(
+        "inferred graph +{} -{}",
+        report.inferred_added, report.inferred_removed
+    );
+    match (&report.changes, &report.fallback) {
+        (Some(c), _) => format!(
+            "incremental: {} explicit triples added, {} removed; {} derived triples removed, {} added; {graph}",
+            c.base_added, c.base_removed, c.removed, c.derived
+        ),
+        (None, Some(why)) => format!(
+            "full, {} iterations, because {why}; {graph}",
+            report.iterations
+        ),
+        (None, None) => format!("full, {} iterations; {graph}", report.iterations),
     }
 }
 
@@ -293,6 +352,10 @@ pub enum Trigger {
 
 /// Start a `reason` task: materialize, then record the status (data first, then the
 /// status file, so a crash in between reads as stale). The task can be cancelled.
+///
+/// With `incremental`, the run updates the recorded materialization when it can (see
+/// [`sparkles_reasoner::materialize_incremental`]), with the closure the dataset keeps
+/// in memory or, after a restart, the one saved with it.
 #[cfg(feature = "reasoning")]
 pub fn start_reason(
     st: &Arc<AppState>,
@@ -300,6 +363,7 @@ pub fn start_reason(
     profile: sparkles_reasoner::Profile,
     extras: sparkles_reasoner::Extras,
     trigger: Trigger,
+    incremental: bool,
 ) -> crate::state::Task {
     let st2 = st.clone();
     let name = ds.name.clone();
@@ -342,7 +406,19 @@ pub fn start_reason(
                     }
                 });
             }
-            let r = sparkles_reasoner::materialize_with(&ds.store, &profile, &extras, &opts);
+            let since = if incremental {
+                incremental_since(ds.reasoning.read().as_ref(), &ds.store)
+            } else {
+                None
+            };
+            ds.closure.set_max_triples(st2.reason_cache_triples);
+            let inc = sparkles_reasoner::Incremental {
+                since,
+                cache: Some(&ds.closure),
+            };
+            let r = sparkles_reasoner::materialize_incremental(
+                &ds.store, &profile, &extras, inc, &opts,
+            );
             done.store(true, Ordering::Relaxed);
             r
         });
@@ -370,11 +446,16 @@ pub fn start_reason(
         info.auto = ds.reasoning.read().as_ref().and_then(|i| i.auto.clone());
         ds.set_reasoning(Some(info))?;
         st2.save_registry()?;
+        let mut detail = serde_json::to_value(run_info(&report)).unwrap_or(J::Null);
+        detail["inferred"] = report.inferred.into();
+        detail["millis"] = report.millis.into();
+        detail["iterations"] = report.iterations.into();
+        h.set_detail(detail);
         Ok(format!(
-            "{prefix}{} inferred triples in {} ms ({} iterations){}",
+            "{prefix}{} inferred triples in {} ms ({}){}",
             report.inferred,
             report.millis,
-            report.iterations,
+            run_text(&report),
             if report.warnings.is_empty() {
                 String::new()
             } else {
@@ -609,7 +690,7 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
         let trigger = Trigger::Auto {
             superseded_by_writes: !forced,
         };
-        let task = start_reason(st, ds.clone(), profile, extras, trigger);
+        let task = start_reason(st, ds.clone(), profile, extras, trigger, true);
         p.task = Some((task.id, head));
         p.since = now;
     }

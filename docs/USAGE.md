@@ -146,6 +146,7 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--outbound-request-timeout S` | 4 × `--outbound-timeout` (`240`) | Time that all the SERVICE calls and LOADs of one query or update may take, summed. |
 | `--load-dir DIR` | | Let `LOAD <file:…>` read the regular files under `DIR`, with symbolic links resolved and nothing outside it. Without this flag, the server refuses file loads. |
 | `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. |
+| `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. A closure takes about 135 bytes per triple. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 
 `sparkles serve --help` lists the other options, including `--read-only`,
 `--result-cache-mb`, `--auto-reason`, `--auth-config`, `--unix-socket`,
@@ -185,7 +186,8 @@ sparkles stats   --loc db
 sparkles log     --loc db                     # commit history (works next to a running server)
 sparkles diff    --loc db 41 42               # what commit 42 changed, as + and - N-Quads lines
 sparkles check   --loc db                     # verify the files, read-only (--quick, --format json)
-sparkles infer   --loc db --profile owl-rl    # materialize inferences
+sparkles infer   --loc db --profile owl-rl    # materialize inferences, updating the last run when it can
+sparkles infer   --loc db --profile owl-rl --full   # materialize in full
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
@@ -200,6 +202,13 @@ sparkles vector list|status|rebuild|drop --loc db [--name emb]   # or --server U
 sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes it, no flag prints it
 sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
 ```
+
+`sparkles infer` updates the materialization that `reasoning.json` records when its
+rules are the same and monotonic and the commit diff still reaches its commit. It reads
+the previous closure from the database, removes what the removed triples no longer
+support and derives what the added triples support. It prints whether the run was
+full or incremental and, for a full run that could have been incremental, why
+([API.md](API.md#reasoning-status-and-diagnostics)).
 
 `sparkles vector create` writes the index to `vector.json`, builds it, and waits for the
 build. Later openings of the database map the built index from its file. Every
