@@ -487,4 +487,42 @@ fn configuration_errors() {
             .contains("cannot be a source")
     );
     assert!(s.reembed("x").is_err());
+    // credentials belong in apiKey
+    let mut c = config(&mock, |_| {});
+    c.embedding.as_mut().unwrap().url = "http://user:secret@127.0.0.1:1/v1/embeddings".into();
+    assert!(
+        s.create_vector_index("y", c)
+            .unwrap_err()
+            .to_string()
+            .contains("credentials go in apiKey")
+    );
+}
+
+#[test]
+fn text_that_changes_while_its_request_is_out_is_embedded_again() {
+    use sparkles::vector::embed::Prepared;
+    let mock = MockProvider::start(DIM);
+    let s = store(&mock, |_| {});
+    run(&s, "INSERT DATA { ex:a rdfs:label \"first\" }");
+    let batch = loop {
+        match s.embed_prepare() {
+            Prepared::Batch(b) => break b,
+            Prepared::Progress => continue,
+            _ => panic!("no batch"),
+        }
+    };
+    let done = batch.run(&|_| true);
+    run(
+        &s,
+        "DELETE DATA { ex:a rdfs:label \"first\" } ; INSERT DATA { ex:a rdfs:label \"second\" }",
+    );
+    s.embed_apply(done);
+    // the stale vector was not written, and the new text waits
+    assert!(vectors(&s, "http://example.org/a", None).is_empty());
+    assert_eq!(s.embedding_status("docs").unwrap().backlog, 1);
+    embed(&s);
+    assert_eq!(
+        vectors(&s, "http://example.org/a", None),
+        [expected("second")]
+    );
 }

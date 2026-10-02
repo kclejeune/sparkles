@@ -762,6 +762,7 @@ impl Store {
         Some(Batch {
             index: name.to_string(),
             target: predicate.to_string(),
+            prepared_at: snap.commit,
             epoch,
             emb,
             dimension,
@@ -909,10 +910,13 @@ impl Store {
                 });
                 continue;
             };
-            let now = pair_inputs(&view, &batch.emb, &src, s, g)?;
-            if now != it.inputs {
-                out.push(Outcome::Skipped);
-                continue;
+            // without a commit since the batch was prepared, its inputs still hold
+            if view.commit != batch.prepared_at {
+                let now = pair_inputs(&view, &batch.emb, &src, s, g)?;
+                if now != it.inputs {
+                    out.push(Outcome::Skipped);
+                    continue;
+                }
             }
             let mut desired = Vec::new();
             let mut failed: Option<String> = None;

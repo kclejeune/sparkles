@@ -478,6 +478,8 @@ pub struct Batch {
     pub(crate) index: String,
     /// the index's predicate
     pub(crate) target: String,
+    /// the commit whose state the inputs were read from
+    pub(crate) prepared_at: u64,
     pub(crate) epoch: u64,
     pub(crate) emb: EmbeddingConfig,
     pub(crate) dimension: usize,
