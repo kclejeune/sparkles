@@ -173,7 +173,7 @@ fn joins(
             let x = if sa { a.cost } else { a.cost + a.est + a.sc };
             let y = if sb { b.cost } else { b.cost + b.est + b.sc };
             out.push(Cand {
-                cost: x + y + (a.est + b.est) + est,
+                cost: x + y + (a.est + b.est) * plan::merge_row_cost() + est,
                 sorted: Some(s.v),
                 how: How::Merge(s.v),
                 chain: None,
