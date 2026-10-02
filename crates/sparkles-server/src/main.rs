@@ -239,6 +239,7 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
                 Retention {
                     keep_commits,
                     keep_age_ms: keep_age.as_deref().map(parse_duration_ms).transpose()?,
+                    max_bytes: None,
                 }
             };
             print_history(&store.set_retention(r)?, "text")?;

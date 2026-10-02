@@ -416,7 +416,7 @@ fn statistics_on_random_updates(seed: u64, union_default_graph: bool, default_sh
     // corrected again
     s.set_retention(crate::history::Retention {
         keep_commits: Some(10_000),
-        keep_age_ms: None,
+        ..Default::default()
     })
     .unwrap();
     s.compact().unwrap();

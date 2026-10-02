@@ -328,6 +328,7 @@ pub(super) async fn put_history(
     let r = Retention {
         keep_commits,
         keep_age_ms,
+        max_bytes: None,
     };
     blocking(move || {
         let h = ds.store.set_retention(r)?;

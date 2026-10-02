@@ -11,11 +11,15 @@
 //!   `CURRENT` (TDB2 `Data-NNNN` compaction).
 
 mod backup;
+mod diff;
 mod geo;
+mod mem_history;
+mod schedule;
 pub use backup::{
     BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard, MEMORY_CAPTURE_PREFIX,
     MemoryCaptureOptions,
 };
+pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions};
 
 use crate::builder::{BuildOptions, Builder, IndexMeta, Slot, Stats};
 use crate::codec::{Codec, Level};
@@ -817,6 +821,8 @@ pub struct Store {
     geo: arc_swap::ArcSwapOption<crate::geo::GeoIndex>,
     /// pins, retention, generations and materialized past states (persistent stores)
     history: Option<Arc<Mutex<crate::history::HistoryState>>>,
+    /// pins and the retention window of an in-memory store, as kept snapshots
+    mem_history: Option<Mutex<crate::history::MemHistory>>,
     /// write guard checked before every commit (write-time validation)
     guard: parking_lot::RwLock<Option<Arc<dyn crate::guard::CommitGuard>>>,
     /// told the outcome of every guard decision (metrics)
@@ -919,6 +925,7 @@ impl Store {
             text: Default::default(),
             geo: Default::default(),
             history: None,
+            mem_history: Some(Mutex::new(Default::default())),
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(false),
@@ -1131,6 +1138,7 @@ impl Store {
             text: Default::default(),
             geo: Default::default(),
             history: Some(Arc::new(Mutex::new(history))),
+            mem_history: None,
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(guard_required_by(root)),
@@ -1255,6 +1263,11 @@ impl Store {
                 .history
                 .as_ref()
                 .and_then(|h| h.lock().pins.get(name).map(|p| p.seq))
+                .or_else(|| {
+                    self.mem_history
+                        .as_ref()
+                        .and_then(|h| h.lock().pins.get(name).map(|p| p.0.seq))
+                })
                 .ok_or_else(|| Error::NotFound(format!("no snapshot '{name}'")))?,
         };
         if seq > head.seq {
@@ -1271,14 +1284,7 @@ impl Store {
             };
             return Err(match &self.history {
                 Some(h) => self.history_gone(&h.lock(), seq, head.seq, snapshot, None),
-                None => Error::HistoryGone(Box::new(crate::history::HistoryGone {
-                    message: format!("commit {seq} is no longer reconstructable"),
-                    seq,
-                    head: head.seq,
-                    snapshot,
-                    reconstructable: Vec::new(),
-                    metadata: None,
-                })),
+                None => self.mem_gone(seq, head.seq, snapshot, None),
             });
         };
         Ok(crate::history::Resolved {
@@ -1308,12 +1314,29 @@ impl Store {
                 },
             ));
         }
+        let seq = r.commit.seq;
+        if let Some(mem) = &self.mem_history {
+            let mut m = mem.lock();
+            return match m.get(seq) {
+                Some(snap) => {
+                    m.hits += 1;
+                    Ok((snap, r))
+                }
+                None => {
+                    drop(m);
+                    let name = match at {
+                        crate::history::At::Snapshot(n) => Some(n.clone()),
+                        _ => None,
+                    };
+                    Err(self.mem_gone(seq, r.head, name, Some(r.commit)))
+                }
+            };
+        }
         let (Some(_), Some(hist)) = (&self.root, &self.history) else {
             return Err(Error::HistoryUnsupported(
                 "point-in-time reads need a persistent dataset".into(),
             ));
         };
-        let seq = r.commit.seq;
         let current = commit::generation_number(&live.generation.name);
         let snapshot_name = match at {
             crate::history::At::Snapshot(n) => Some(n.clone()),
@@ -1431,6 +1454,7 @@ impl Store {
             commit: self.catalog.lock().get(p.seq),
             created_ms: p.created_ms,
             note: p.note.clone(),
+            expires_ms: p.expires_ms,
             generation: owner.and_then(|o| h.gens.get(&o)).map(|g| g.name.clone()),
             reconstructable: owner.is_some(),
         }
@@ -1439,7 +1463,7 @@ impl Store {
     /// The named snapshots, by commit then name.
     pub fn snapshots(&self) -> Vec<crate::history::NamedSnapshot> {
         let Some(hist) = &self.history else {
-            return Vec::new();
+            return self.mem_snapshots();
         };
         let head = self.head_commit().seq;
         let current = commit::generation_number(&self.snapshot().generation.name);
@@ -1465,6 +1489,19 @@ impl Store {
         at: &crate::history::At,
         note: Option<String>,
     ) -> Result<(crate::history::NamedSnapshot, bool)> {
+        self.create_snapshot_with(name, at, note, None)
+    }
+
+    /// [`create_snapshot`](Self::create_snapshot) with an expiry: the pin lapses at
+    /// `expires_ms` (milliseconds since the epoch), at the next
+    /// [`history_tick`](Self::history_tick).
+    pub fn create_snapshot_with(
+        &self,
+        name: &str,
+        at: &crate::history::At,
+        note: Option<String>,
+        expires_ms: Option<i64>,
+    ) -> Result<(crate::history::NamedSnapshot, bool)> {
         if !crate::history::valid_name(name) {
             return Err(Error::invalid(format!(
                 "invalid snapshot name {name:?}: letters, digits, '.', '_' and '-', 1 to 64, starting with a letter or digit"
@@ -1472,6 +1509,9 @@ impl Store {
         }
         if note.as_ref().is_some_and(|n| n.len() > 1024) {
             return Err(Error::invalid("the note is longer than 1024 bytes"));
+        }
+        if self.mem_history.is_some() {
+            return self.mem_create_snapshot(name, at, note, expires_ms);
         }
         let (Some(root), Some(hist)) = (&self.root, &self.history) else {
             return Err(Error::HistoryUnsupported(
@@ -1524,9 +1564,12 @@ impl Store {
             seq,
             created_ms: self.now_ms(),
             note,
+            expires_ms,
         };
         h.pins.insert(name.to_string(), pin.clone());
-        if let Err(e) = crate::history::write_file(root, self.dataset_id, &h.pins, h.retention) {
+        if let Err(e) =
+            crate::history::write_file(root, self.dataset_id, &h.pins, h.retention, &h.schedules)
+        {
             h.pins.remove(name);
             return Err(e);
         }
@@ -1538,7 +1581,7 @@ impl Store {
     /// whether it existed.
     pub fn delete_snapshot(&self, name: &str) -> Result<bool> {
         let (Some(root), Some(hist)) = (&self.root, &self.history) else {
-            return Ok(false);
+            return Ok(self.mem_delete_snapshot(name));
         };
         let w = self.writer.lock();
         let current = commit::generation_number(&self.snapshot().generation.name);
@@ -1546,7 +1589,9 @@ impl Store {
         let Some(pin) = h.pins.remove(name) else {
             return Ok(false);
         };
-        if let Err(e) = crate::history::write_file(root, self.dataset_id, &h.pins, h.retention) {
+        if let Err(e) =
+            crate::history::write_file(root, self.dataset_id, &h.pins, h.retention, &h.schedules)
+        {
             h.pins.insert(name.to_string(), pin);
             return Err(e);
         }
@@ -1555,6 +1600,9 @@ impl Store {
     }
 
     pub fn retention(&self) -> crate::history::Retention {
+        if let Some(m) = &self.mem_history {
+            return m.lock().retention;
+        }
         self.history
             .as_ref()
             .map(|h| h.lock().retention)
@@ -1566,6 +1614,10 @@ impl Store {
         &self,
         r: crate::history::Retention,
     ) -> Result<crate::history::HistoryStatus> {
+        if self.mem_history.is_some() {
+            self.mem_set_retention(r);
+            return Ok(self.history());
+        }
         let (Some(root), Some(hist)) = (&self.root, &self.history) else {
             return Err(Error::HistoryUnsupported(
                 "retention needs a persistent dataset".into(),
@@ -1577,7 +1629,9 @@ impl Store {
             let mut h = hist.lock();
             let old = h.retention;
             h.retention = r;
-            if let Err(e) = crate::history::write_file(root, self.dataset_id, &h.pins, r) {
+            if let Err(e) =
+                crate::history::write_file(root, self.dataset_id, &h.pins, r, &h.schedules)
+            {
                 h.retention = old;
                 return Err(e);
             }
@@ -1592,16 +1646,19 @@ impl Store {
         let head = self.head_commit().seq;
         let current = commit::generation_number(&self.snapshot().generation.name);
         let Some(hist) = &self.history else {
+            let m = self.mem_history.as_ref().map(|m| m.lock());
             return HistoryStatus {
                 head,
-                reconstructable: vec![(head, head)],
+                reconstructable: m
+                    .as_ref()
+                    .map_or_else(|| vec![(head, head)], |m| m.reconstructable(head)),
                 generations: Vec::new(),
                 bytes: 0,
-                retention: Default::default(),
-                snapshots: 0,
-                cache_entries: 0,
+                retention: m.as_ref().map(|m| m.retention).unwrap_or_default(),
+                snapshots: m.as_ref().map_or(0, |m| m.pins.len()),
+                cache_entries: m.as_ref().map_or(0, |m| m.window.len()),
                 cache_bytes: 0,
-                hits: 0,
+                hits: m.as_ref().map_or(0, |m| m.hits),
                 misses: 0,
                 materializations: 0,
             };
@@ -2658,6 +2715,9 @@ impl Store {
         }
         // a new generation needs its own spatial base (bulk commits and compactions)
         self.rebuild_geo_locked(&mut new_snap, snap);
+        if bulk.is_some() {
+            self.remember_past(head.seq);
+        }
         self.current.store(Arc::new(new_snap));
         // The old generation is kept if history needs it, else removed; open readers
         // keep their mmaps alive.
@@ -3545,6 +3605,7 @@ impl WriteTxn<'_> {
         };
         self.store.maintain_text(&mut snap, &self.log);
         self.store.maintain_geo(&mut snap, &self.log);
+        self.store.remember_past(c.seq);
         self.store.current.store(Arc::new(snap));
         if validation.is_some() {
             self.store.guard_committed(c.seq);
@@ -3769,8 +3830,9 @@ fn open_history(
 ) -> Result<crate::history::HistoryState> {
     use crate::history;
     history::remove_deleting(root)?;
-    let (pins, retention) = history::read_file(root, dataset_id)?;
-    let mut h = history::HistoryState::new(pins, retention);
+    let cfg = history::read_file(root, dataset_id)?;
+    let mut h = history::HistoryState::new(cfg.pins, cfg.retention);
+    h.schedules = cfg.schedules;
     for (no, name, base, fold_legacy) in history::scan_generations(root, dataset_id)? {
         let dir = root.join(&name);
         if no > current {

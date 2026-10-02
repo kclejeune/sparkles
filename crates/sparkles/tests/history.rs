@@ -211,6 +211,7 @@ fn bulk_commits_and_the_commit_window() {
     s.set_retention(Retention {
         keep_commits: Some(10),
         keep_age_ms: None,
+        max_bytes: None,
     })
     .unwrap();
     upd(&s, "INSERT DATA { <urn:x1> <urn:p> 1 }");
@@ -244,6 +245,7 @@ fn the_age_window() {
     s.set_retention(Retention {
         keep_commits: None,
         keep_age_ms: Some(1_500),
+        max_bytes: None,
     })
     .unwrap();
     // now 3500: the cutoff is 2000, so commit 2 (the head until 3000) stays readable
@@ -305,15 +307,26 @@ fn damage_after_the_target_commit_does_not_matter() {
 }
 
 #[test]
-fn in_memory_stores_have_no_past() {
+fn in_memory_stores_keep_only_what_pins_and_the_window_hold() {
     let s = Store::in_memory(StoreOptions::default());
     upd(&s, "INSERT DATA { <urn:a> <urn:p> 1 }");
     upd(&s, "INSERT DATA { <urn:b> <urn:p> 1 }");
     assert!(matches!(
         s.snapshot_at(&At::Commit(1), &Default::default()),
-        Err(Error::HistoryUnsupported(_))
+        Err(Error::HistoryGone(_))
     ));
     assert!(s.snapshot_at(&At::Head, &Default::default()).is_ok());
+    s.set_retention(Retention {
+        keep_commits: Some(2),
+        ..Default::default()
+    })
+    .unwrap();
+    upd(&s, "INSERT DATA { <urn:c> <urn:p> 1 }");
+    upd(&s, "INSERT DATA { <urn:d> <urn:p> 1 }");
+    // commits 3 and 4 are the last two: 3 is kept as a past state
+    assert_eq!(at(&s, "3").unwrap().len(), 3);
+    assert!(matches!(at(&s, "2"), Err(Error::HistoryGone(_))));
+    assert_eq!(s.history().reconstructable, [(3, 4)]);
 }
 
 #[test]
