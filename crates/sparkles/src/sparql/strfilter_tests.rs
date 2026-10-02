@@ -3,7 +3,7 @@
 //! the generic operators on random data with every kind of term, in named graphs, with
 //! the union default graph and with updates that are not compacted.
 
-use super::opt_tests::{has_op, run, solutions};
+use super::opt_tests::{has_desc, has_op, run, solutions};
 use super::*;
 use crate::io::{RdfFormat, Source};
 use crate::store::{Store, StoreOptions};
@@ -115,6 +115,11 @@ const SHAPES: &[&str] = &[
     "SELECT (COUNT(*) AS ?c) WHERE { {P} FILTER({E}) }",
     "SELECT (COUNT(?s) AS ?c) WHERE { {P} FILTER({E}) }",
     "SELECT (COUNT(DISTINCT {X}) AS ?c) WHERE { {P} FILTER({E}) }",
+    "SELECT ?s ?v WHERE { {P} FILTER({E}) }",
+    "SELECT ?s ?v WHERE { {P} FILTER({E} && ?s != ex:s1) }",
+    "SELECT ?s ?v ?w WHERE { {P} FILTER({E}) ?s ex:w ?w }",
+    "SELECT ?s ?v WHERE { {P} FILTER({E}) } ORDER BY {X} LIMIT 9",
+    "SELECT ?x (COUNT(*) AS ?n) WHERE { {P} FILTER({E}) BIND(STR({X}) AS ?x) } GROUP BY ?x",
 ];
 
 const PATTERNS: &[&str] = &[
@@ -126,17 +131,21 @@ const PATTERNS: &[&str] = &[
 ];
 
 fn without() -> Optimizations {
-    Optimizations::ALL.disable("count_filter_runs").unwrap()
+    Optimizations::ALL
+        .disable("count_filter_runs,filter_scan_runs")
+        .unwrap()
 }
 
-/// Same solutions with every optimization, without this one and with none; whether the
-/// count was taken from the runs.
+/// Same solutions with every optimization, without these and with none; whether the
+/// filter was tested on the runs of a scan.
 fn check(s: &Store, q: &str) -> bool {
     let fast = run(s, q, Optimizations::ALL);
     let a = solutions(&fast);
     assert_eq!(a, solutions(&run(s, q, without())), "{q}");
     assert_eq!(a, solutions(&run(s, q, Optimizations::NONE)), "{q}");
-    has_op(&fast.plan, "CountFilterFromRuns")
+    let counts = Optimizations::ALL.disable("filter_scan_runs").unwrap();
+    assert_eq!(a, solutions(&run(s, q, counts)), "{q}");
+    has_op(&fast.plan, "CountFilterFromRuns") || has_desc(&fast.plan, "[runs of ?")
 }
 
 fn queries(next: &mut impl FnMut() -> u64, n: usize) -> Vec<String> {
@@ -208,6 +217,63 @@ fn counts_from_runs_match_the_generic_filter() {
     }
 }
 
+/// Values that pass only at the first or last row of an index block, and runs that
+/// span blocks.
+#[test]
+fn runs_at_block_boundaries() {
+    let b = crate::index::BLOCK_ROWS;
+    let n = 2 * b + 100;
+    let mut nt = String::new();
+    for i in 0..n {
+        // the value of row i sorts at row i of the predicate's rows; the last values
+        // repeat across the boundary of the second and third blocks
+        let v = (i.min(2 * b - 50)) as u64;
+        nt.push_str(&format!(
+            "<http://ex.org/s{i}> <http://ex.org/u> \"v{v:07}\" .\n"
+        ));
+    }
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let rows = |q: &str| {
+        let fast = run(&s, q, Optimizations::ALL);
+        let a = solutions(&fast);
+        assert_eq!(a, solutions(&run(&s, q, without())), "{q}");
+        assert!(
+            has_op(&fast.plan, "CountFilterFromRuns") || has_desc(&fast.plan, "[runs of ?"),
+            "{q}: {:#?}",
+            fast.plan
+        );
+        a
+    };
+    for i in [0, b - 1, b, b + 1, 2 * b - 51, 2 * b - 50] {
+        let needle = format!("{:07}", i as u64);
+        let one = format!("SELECT ?s WHERE {{ ?s ex:u ?v FILTER(CONTAINS(?v, \"{needle}\")) }}");
+        let expect = if i == 2 * b - 50 { n - i } else { 1 };
+        assert_eq!(rows(&one).len(), expect, "{one}");
+        let count = format!(
+            "SELECT (COUNT(*) AS ?c) WHERE {{ ?s ex:u ?v FILTER(STRENDS(?v, \"{needle}\")) }}"
+        );
+        assert_eq!(
+            rows(&count),
+            vec![format!(
+                "\"{expect}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+            )]
+        );
+        let distinct = format!(
+            "SELECT (COUNT(DISTINCT ?v) AS ?c) WHERE {{ ?s ex:u ?v FILTER(STRENDS(?v, \"{needle}\")) }}"
+        );
+        assert_eq!(
+            rows(&distinct),
+            vec!["\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_string()]
+        );
+    }
+}
+
 #[test]
 fn counts_from_runs_are_chosen_and_explained() {
     let s = store(7, 5000, false);
@@ -215,18 +281,14 @@ fn counts_from_runs_are_chosen_and_explained() {
     let r = run(&s, q, Optimizations::ALL);
     assert!(has_op(&r.plan, "CountFilterFromRuns"), "{:#?}", r.plan);
     assert!(
-        super::opt_tests::has_desc(&r.plan, "values tested on vocabulary keys"),
+        has_desc(&r.plan, "values tested on vocabulary keys"),
         "{:#?}",
         r.plan
     );
     // a generic expression is evaluated per value
     let q = "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(STRLEN(STR(?v)) > 3) }";
     let r = run(&s, q, Optimizations::ALL);
-    assert!(
-        super::opt_tests::has_desc(&r.plan, "values tested, "),
-        "{:#?}",
-        r.plan
-    );
+    assert!(has_desc(&r.plan, "values tested, "), "{:#?}", r.plan);
     // not over two variables, an impure expression or EXISTS, nor when switched off
     for q in [
         "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(CONTAINS(?v, \"b\") && ?s != ex:s1) }",

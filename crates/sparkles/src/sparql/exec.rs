@@ -317,9 +317,27 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             out
         }
         Kind::Filter(es) => {
-            let mut t = child(0, &mut infos)?;
-            expr_report = apply_filter(ctx, &mut t, es)?;
+            let runs = match &n.children[0].kind {
+                Kind::Scan(spec) if ctx.opt.filter_scan_runs => {
+                    filter_scan_runs(ctx, spec, &n.children[0], es)?
+                }
+                _ => None,
+            };
+            let (mut t, rest, runs_note) = match runs {
+                Some(r) => {
+                    let mut info = describe(ctx, &n.children[0]);
+                    info.actual_rows = r.read as i64;
+                    infos.push(info);
+                    held.add(r.table.mem_bytes())?;
+                    (r.table, r.rest, Some(r.note))
+                }
+                None => (child(0, &mut infos)?, es.clone(), None),
+            };
+            expr_report = apply_filter(ctx, &mut t, &rest)?;
             (note, counters) = super::exists::explain(ctx, es);
+            if let Some(r) = runs_note {
+                note = Some(note.map_or(r.clone(), |n| format!("{r} {n}")));
+            }
             t
         }
         Kind::Extend(v, e) => {
@@ -799,6 +817,130 @@ fn block_runs(spec: &ScanSpec, b: &Block, s: usize, e: usize, mut f: impl FnMut(
     if let Some((v, n)) = cur {
         f(v, n);
     }
+}
+
+/// A scan filtered on its first free key column by [`filter_scan_runs`].
+struct FilteredScan {
+    /// the rows whose value passed, in scan order
+    table: Table,
+    /// conjuncts that read other variables, still to be applied
+    rest: Vec<Expr>,
+    /// rows of the scan, passed or not
+    read: u64,
+    note: String,
+}
+
+/// A FILTER over a scan sorted on a variable it tests: the conjuncts that read only that
+/// variable are tested once per run of its values (on vocabulary keys when they can be),
+/// and only the rows of the values that pass are copied out of the index blocks, in
+/// parallel. `None` when no conjunct reads only the sort variable, when union-graph dedup
+/// compares neighbouring rows, or when the delta has keys in the scan's range.
+fn filter_scan_runs(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    scan: &Node,
+    exprs: &[Expr],
+) -> Result<Option<FilteredScan>> {
+    let Some(&(kc, key)) = spec.cols.first() else {
+        return Ok(None);
+    };
+    if spec.dedup || exprs.is_empty() {
+        return Ok(None);
+    }
+    let (on_key, rest): (Vec<Expr>, Vec<Expr>) = exprs
+        .iter()
+        .cloned()
+        .partition(|e| super::exprcache::input(&[e]) == Ok(Some(key)));
+    if on_key.is_empty() {
+        return Ok(None);
+    }
+    let Some((keys, counts)) = par_key_runs(ctx, spec)? else {
+        return Ok(None);
+    };
+    let read: u64 = counts.iter().sum();
+    let (hit, on_keys) = super::exprcache::filter_values(ctx, &keys, key, &on_key)?;
+    drop(counts);
+    let passed = hit.iter().filter(|h| **h).count();
+    let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
+    let width = spec.cols.len();
+    let parts =
+        ctx.snap
+            .par_blocks_between_cols(spec.perm, lo, hi, scan_mask(ctx, spec), |b, s, e| {
+                let mut cols: Vec<Vec<Id>> = vec![Vec::new(); width];
+                if s >= e {
+                    return Ok(cols);
+                }
+                let col = &b.cols[kc];
+                // the block's values among the runs, and whether any of them passed
+                let j0 = keys.partition_point(|k| k.0 < col[s]);
+                let j1 = keys.partition_point(|k| k.0 <= col[e - 1]);
+                if !hit[j0..j1].iter().any(|h| *h) {
+                    return Ok(cols);
+                }
+                let mut j = j0;
+                if block_passes(spec, b, s, e) {
+                    let mut i = s;
+                    while i < e {
+                        let run = run_len(&col[i..e], col[i]);
+                        while keys[j].0 < col[i] {
+                            j += 1;
+                        }
+                        if hit[j] {
+                            for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+                                cols[c].extend(b.cols[kc][i..i + run].iter().map(|&x| Id(x)));
+                            }
+                        }
+                        i += run;
+                    }
+                } else {
+                    for i in s..e {
+                        let k = b.key(i);
+                        if !spec.graph.accepts(k[spec.graph_col])
+                            || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
+                        {
+                            continue;
+                        }
+                        while keys[j].0 < k[kc] {
+                            j += 1;
+                        }
+                        if hit[j] {
+                            for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+                                cols[c].push(Id(k[kc]));
+                            }
+                        }
+                    }
+                }
+                ctx.check()?;
+                Ok(cols)
+            })?;
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
+    let rows: usize = parts.iter().map(|p| p[0].len()).sum();
+    ctx.check_output(rows, width)?;
+    let mut table = Table::new(scan.vars.clone());
+    for c in &mut table.cols {
+        c.reserve_exact(rows);
+    }
+    for p in parts {
+        for (c, part) in p.into_iter().enumerate() {
+            table.cols[c].extend(part);
+        }
+    }
+    table.len = rows;
+    table.sorted = scan.sorted.clone();
+    let note = format!(
+        "[runs of ?{}: {} values tested{}, {passed} passed]",
+        ctx.var_name(key),
+        keys.len(),
+        if on_keys { " on vocabulary keys" } else { "" }
+    );
+    Ok(Some(FilteredScan {
+        table,
+        rest,
+        read,
+        note,
+    }))
 }
 
 /// [`key_runs`] with the index blocks read in parallel, when the snapshot's delta has no

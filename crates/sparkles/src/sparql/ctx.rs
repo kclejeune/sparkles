@@ -92,10 +92,13 @@ pub struct Optimizations {
     /// COUNT(*) over a FILTER on one variable of a single scan tests the filter once per
     /// run of the variable in a permutation sorted on it and sums the run lengths
     pub count_filter_runs: bool,
+    /// a FILTER over a scan sorted on a variable it tests reads the runs of that
+    /// variable, tests each value once and copies only the rows of the values that pass
+    pub filter_scan_runs: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 20] = [
+    pub const NAMES: [&str; 21] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -116,6 +119,7 @@ impl Optimizations {
         "delta_statistics",
         "pruned_join_order",
         "count_filter_runs",
+        "filter_scan_runs",
     ];
 
     /// Everything on.
@@ -140,6 +144,7 @@ impl Optimizations {
         delta_statistics: true,
         pruned_join_order: true,
         count_filter_runs: true,
+        filter_scan_runs: true,
     };
 
     /// Everything off: the generic operators only.
@@ -164,6 +169,7 @@ impl Optimizations {
         delta_statistics: false,
         pruned_join_order: false,
         count_filter_runs: false,
+        filter_scan_runs: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -188,6 +194,7 @@ impl Optimizations {
             "delta_statistics" => &mut self.delta_statistics,
             "pruned_join_order" => &mut self.pruned_join_order,
             "count_filter_runs" => &mut self.count_filter_runs,
+            "filter_scan_runs" => &mut self.filter_scan_runs,
             _ => return None,
         })
     }
