@@ -116,6 +116,7 @@ impl Store {
                 self.collect_locked(&mut hist.lock(), current, w.head.seq);
             }
             report.pruned = self.prune_commits_with(false)?;
+            report.warmed = self.warm_snapshots();
         } else if let Some(m) = &self.mem_history {
             let head = self.writer.lock().head.seq;
             let mut m = m.lock();

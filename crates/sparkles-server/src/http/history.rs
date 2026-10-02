@@ -137,6 +137,7 @@ fn snapshot_json(s: &NamedSnapshot) -> J {
         "note": s.note,
         "generation": s.generation,
         "reconstructable": s.reconstructable,
+        "warm": s.warm,
     })
 }
 
@@ -261,10 +262,11 @@ pub(super) async fn create_snapshot(
         "application/json" => {
             let j: J = serde_json::from_slice(&body)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
-            for k in ["name", "at", "note", "expires"] {
+            for k in ["name", "at", "note", "expires", "warm"] {
                 match j.get(k) {
                     Some(J::String(v)) => params.0.push((k.to_string(), v.clone())),
                     Some(J::Number(n)) => params.0.push((k.to_string(), n.to_string())),
+                    Some(J::Bool(b)) => params.0.push((k.to_string(), b.to_string())),
                     _ => {}
                 }
             }
@@ -298,10 +300,17 @@ pub(super) async fn create_snapshot(
             })?,
         ),
     };
+    let warm = params.get("warm").is_some_and(truthy);
     blocking(move || {
-        let (snap, created) = ds
-            .store
-            .create_snapshot_with(&snap_name, &at, note, expires)?;
+        let (snap, created) = ds.store.create_snapshot_opts(
+            &snap_name,
+            &at,
+            &sparkles::history::SnapshotOptions {
+                note,
+                expires_ms: expires,
+                warm,
+            },
+        )?;
         let status = if created {
             StatusCode::CREATED
         } else {

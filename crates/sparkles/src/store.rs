@@ -1553,11 +1553,47 @@ impl Store {
                 end,
             },
         );
+        // evict the least recently used states, warm pins' last
+        let warm: Vec<(u32, u64)> = h
+            .pins
+            .values()
+            .filter(|p| p.warm)
+            .filter_map(|p| h.owner(p.seq, current, r.head).map(|o| (o, p.seq)))
+            .collect();
         let mut total: u64 = h.cache.iter().map(|e| e.bytes).sum();
         while total > budget && h.cache.len() > 1 {
-            total -= h.cache.pop().map_or(0, |e| e.bytes);
+            let i = (0..h.cache.len())
+                .rev()
+                .find(|&i| !warm.contains(&(h.cache[i].generation, h.cache[i].seq)))
+                .unwrap_or(h.cache.len() - 1);
+            total -= h.cache.remove(i).bytes;
         }
         Ok((snap, r))
+    }
+
+    /// Materialize the warm pins' states that the history cache does not hold (a
+    /// persistent store's; an in-memory store keeps its pinned states). Returns how many
+    /// were built; a state that cannot be built is logged and skipped.
+    pub fn warm_snapshots(&self) -> usize {
+        let Some(hist) = &self.history else {
+            return 0;
+        };
+        let warm: Vec<(String, u64)> = hist
+            .lock()
+            .pins
+            .iter()
+            .filter(|(_, p)| p.warm)
+            .map(|(n, p)| (n.clone(), p.seq))
+            .collect();
+        let mut built = 0;
+        for (name, seq) in warm {
+            let before = hist.lock().materializations;
+            match self.snapshot_at(&crate::history::At::Commit(seq), &Default::default()) {
+                Ok(_) => built += usize::from(hist.lock().materializations > before),
+                Err(e) => tracing::warn!("warm snapshot {name} (commit {seq}): {e}"),
+            }
+        }
+        built
     }
 
     /// Generation `owner`, open for reading: the live one if it is current, else from
@@ -1688,6 +1724,7 @@ impl Store {
             expires_ms: p.expires_ms,
             generation: owner.and_then(|o| h.gens.get(&o)).map(|g| g.name.clone()),
             reconstructable: owner.is_some(),
+            warm: p.warm,
         }
     }
 
@@ -1733,6 +1770,39 @@ impl Store {
         note: Option<String>,
         expires_ms: Option<i64>,
     ) -> Result<(crate::history::NamedSnapshot, bool)> {
+        self.create_snapshot_opts(
+            name,
+            at,
+            &crate::history::SnapshotOptions {
+                note,
+                expires_ms,
+                warm: false,
+            },
+        )
+    }
+
+    /// Pin commit `at` under `name` with options (a note, an expiry, warm). A warm pin's
+    /// state is materialized before this returns.
+    pub fn create_snapshot_opts(
+        &self,
+        name: &str,
+        at: &crate::history::At,
+        o: &crate::history::SnapshotOptions,
+    ) -> Result<(crate::history::NamedSnapshot, bool)> {
+        let r = self.create_snapshot_inner(name, at, o)?;
+        if o.warm && r.1 {
+            self.warm_snapshots();
+        }
+        Ok(r)
+    }
+
+    fn create_snapshot_inner(
+        &self,
+        name: &str,
+        at: &crate::history::At,
+        o: &crate::history::SnapshotOptions,
+    ) -> Result<(crate::history::NamedSnapshot, bool)> {
+        let (note, expires_ms) = (o.note.clone(), o.expires_ms);
         if !crate::history::valid_name(name) {
             return Err(Error::invalid(format!(
                 "invalid snapshot name {name:?}: letters, digits, '.', '_' and '-', 1 to 64, starting with a letter or digit"
@@ -1742,7 +1812,7 @@ impl Store {
             return Err(Error::invalid("the note is longer than 1024 bytes"));
         }
         if self.mem_history.is_some() {
-            return self.mem_create_snapshot(name, at, note, expires_ms);
+            return self.mem_create_snapshot(name, at, o);
         }
         let (Some(root), Some(hist)) = (&self.root, &self.history) else {
             return Err(Error::HistoryUnsupported(
@@ -1796,6 +1866,7 @@ impl Store {
             created_ms: self.now_ms(),
             note,
             expires_ms,
+            warm: o.warm,
         };
         h.pins.insert(name.to_string(), pin.clone());
         if let Err(e) = crate::history::write_file(

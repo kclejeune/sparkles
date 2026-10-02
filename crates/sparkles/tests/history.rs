@@ -407,6 +407,55 @@ fn check_accepts_generations_kept_for_history() {
     assert_eq!(leftovers(&root), ["gen-0001"]);
 }
 
+/// A warm pin's state is built when the pin is made and after a restart, and the
+/// history cache keeps it while other states come and go.
+#[test]
+fn warm_pins_stay_materialized() {
+    use sparkles::history::SnapshotOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    // room for two past states of a few quads, not three
+    let opts = StoreOptions {
+        history_cache_bytes: 6_000,
+        ..Default::default()
+    };
+    {
+        let s = open(&root, opts.clone());
+        for i in 0..6 {
+            upd(&s, &format!("INSERT DATA {{ <urn:s{i}> <urn:p> 1, 2, 3 }}"));
+        }
+        let (p, created) = s
+            .create_snapshot_opts(
+                "hot",
+                &At::Commit(2),
+                &SnapshotOptions {
+                    warm: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(created && p.warm);
+        let h = s.history();
+        assert_eq!((h.cache_entries, h.materializations), (1, 1));
+        for seq in [3, 4, 5, 1] {
+            s.snapshot_at(&At::Commit(seq), &HistoryOptions::default())
+                .unwrap();
+        }
+        // the warm state was kept: reading it is a hit
+        let misses = s.history().misses;
+        s.snapshot_at(&At::Snapshot("hot".into()), &HistoryOptions::default())
+            .unwrap();
+        assert_eq!(s.history().misses, misses);
+        assert!(s.history().cache_entries <= 2);
+    }
+    let s = open(&root, opts);
+    assert!(s.named_snapshot("hot").unwrap().warm);
+    assert_eq!(s.history().cache_entries, 0);
+    assert_eq!(s.history_tick().unwrap().warmed, 1);
+    assert_eq!(s.history().cache_entries, 1);
+    assert_eq!(s.history_tick().unwrap().warmed, 0);
+}
+
 /// The quads of the live state, as sorted N-Quads lines.
 fn dump_lines(s: &Store) -> Vec<String> {
     let mut out = Vec::new();

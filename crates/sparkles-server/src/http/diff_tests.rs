@@ -480,6 +480,36 @@ async fn the_change_feed_keeps_its_budget() {
 }
 
 #[tokio::test]
+async fn warm_snapshots_are_materialized() {
+    let s = server(|_| {}).await;
+    let r = send(
+        &s.app,
+        Request::post("/$/snapshots/h")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"name": "w", "at": "commit:2", "warm": true}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["warm"], true);
+    let h = get(&s.app, "/$/history/h").await.json();
+    assert_eq!(h["cache"]["entries"], 1);
+    assert_eq!(get(&s.app, "/$/snapshots/h/w").await.json()["warm"], true);
+    // a form works too, and a pin is not warm unless asked
+    let r = send(
+        &s.app,
+        Request::post("/$/snapshots/h")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("name=c&at=commit:1"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.json()["warm"], false);
+}
+
+#[tokio::test]
 async fn the_catalog_horizon_prunes_commits() {
     let s = server(|_| {}).await;
     let r = send(

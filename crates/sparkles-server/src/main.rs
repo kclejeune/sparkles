@@ -114,6 +114,9 @@ enum SnapshotCmd {
         /// time (a running server's history upkeep, or the next `snapshot gc`)
         #[arg(long)]
         expires: Option<String>,
+        /// keep the pinned state materialized in a server's history cache
+        #[arg(long)]
+        warm: bool,
     },
     /// List named snapshots
     List {
@@ -219,6 +222,7 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             at,
             note,
             expires,
+            warm,
         } => {
             let store = Store::open(&loc, opts)?;
             let at: At = at.as_deref().unwrap_or("head").parse()?;
@@ -234,7 +238,15 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
                     }
                 }),
             };
-            let (s, created) = store.create_snapshot_with(&name, &at, note, expires)?;
+            let (s, created) = store.create_snapshot_opts(
+                &name,
+                &at,
+                &sparkles::history::SnapshotOptions {
+                    note,
+                    expires_ms: expires,
+                    warm,
+                },
+            )?;
             println!(
                 "{} → commit {}{}",
                 s.name,

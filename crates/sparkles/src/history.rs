@@ -110,6 +110,21 @@ pub struct NamedSnapshot {
     pub generation: Option<String>,
     /// false only after external damage (its generation is gone)
     pub reconstructable: bool,
+    /// kept materialized (see [`SnapshotOptions::warm`])
+    pub warm: bool,
+}
+
+/// Options of a named snapshot ([`Store::create_snapshot_opts`](crate::store::Store::create_snapshot_opts)).
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotOptions {
+    pub note: Option<String>,
+    /// when the pin lapses (milliseconds since the epoch)
+    pub expires_ms: Option<i64>,
+    /// Keep the pinned state materialized: it is built when the pin is made and by the
+    /// history upkeep (after a restart, say), and the history cache evicts it only when
+    /// warm states alone pass its budget. An in-memory dataset keeps every pinned state
+    /// in memory anyway.
+    pub warm: bool,
 }
 
 /// The retention window: the states that were the head within the last `keep_commits`
@@ -225,6 +240,8 @@ pub struct TickReport {
     pub created: Vec<String>,
     pub expired: Vec<String>,
     pub rotated: Vec<String>,
+    /// warm pins materialized
+    pub warmed: usize,
     /// commit records pruned from the catalog
     pub pruned: u64,
 }
@@ -339,6 +356,8 @@ struct PinFile {
     note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expires: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    warm: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -347,6 +366,8 @@ pub(crate) struct Pin {
     pub created_ms: i64,
     pub note: Option<String>,
     pub expires_ms: Option<i64>,
+    /// kept materialized in the history cache
+    pub warm: bool,
 }
 
 /// What `history.json` holds.
@@ -394,6 +415,7 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
                     created_ms,
                     note: p.note,
                     expires_ms: p.expires.as_deref().and_then(commit::parse_rfc3339_ms),
+                    warm: p.warm,
                 },
             )
         })
@@ -427,6 +449,7 @@ pub(crate) fn write_file(
                 created: commit::rfc3339_ms(p.created_ms),
                 note: p.note.clone(),
                 expires: p.expires_ms.map(commit::rfc3339_ms),
+                warm: p.warm,
             })
             .collect(),
         schedules: schedules.to_vec(),
@@ -1008,6 +1031,7 @@ mod tests {
                 created_ms: 0,
                 note: None,
                 expires_ms: None,
+                warm: false,
             },
         );
         h.pins.insert(
@@ -1017,6 +1041,7 @@ mod tests {
                 created_ms: 0,
                 note: None,
                 expires_ms: None,
+                warm: false,
             },
         );
         let n = h.needed(3, 12, 0, &ts, 8);
@@ -1031,6 +1056,7 @@ mod tests {
                 created_ms: 0,
                 note: None,
                 expires_ms: None,
+                warm: false,
             },
         );
         assert!(h.needed(3, 12, 0, &ts, 8).is_empty());
@@ -1089,6 +1115,7 @@ mod tests {
                 created_ms: 0,
                 note: None,
                 expires_ms: None,
+                warm: false,
             },
         );
         assert_eq!(keep(&h), [1]);
