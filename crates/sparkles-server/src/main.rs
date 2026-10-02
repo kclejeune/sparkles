@@ -68,6 +68,10 @@ struct Cli {
     /// Memory for materialized past states (point-in-time reads), in MiB
     #[arg(long, global = true, default_value_t = 1024)]
     history_cache_mb: u64,
+    /// Memory for packed vectors and HNSW graphs (`spk:vectorSearch`, vector indexes),
+    /// per index generation, in MiB
+    #[arg(long, global = true, default_value_t = 4096)]
+    vector_memory_mb: u64,
     /// Old index generations named snapshots may keep per dataset
     #[arg(long, global = true, default_value_t = 8)]
     history_max_generations: usize,
@@ -438,9 +442,6 @@ enum Cmd {
         /// Maximum number of rows of any intermediate result
         #[arg(long, default_value_t = 200_000_000)]
         max_rows: usize,
-        /// Memory for the packed vectors of `spk:vectorSearch`, per index generation, in MiB
-        #[arg(long, default_value_t = 4096)]
-        vector_memory_mb: u64,
         /// Honor `validate=false` on writes, which skips write-time validation
         #[arg(long)]
         allow_unvalidated_writes: bool,
@@ -954,6 +955,7 @@ enum Cmd {
 }
 
 fn store_opts(cli: &Cli) -> StoreOptions {
+    sparkles::vector::set_budget(cli.vector_memory_mb << 20);
     StoreOptions {
         cache_bytes: cli.cache_mb << 20,
         result_cache_bytes: cli.result_cache_mb << 20,
@@ -1314,7 +1316,6 @@ fn run() -> Result<()> {
             max_export_mb,
             max_rows,
             update_timeout,
-            vector_memory_mb,
             allow_unvalidated_writes,
             auto_reason,
             auto_reason_max_delay,
@@ -1410,7 +1411,6 @@ fn run() -> Result<()> {
                 &http_compression_level,
                 &http_compression_algorithms,
             )?;
-            sparkles::vector::set_budget(vector_memory_mb << 20);
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
             st.task_queue.set_max(max_tasks);
