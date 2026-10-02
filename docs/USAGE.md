@@ -182,7 +182,7 @@ feature.
 The other commands are:
 
 * `schema`, `shacl` and `shex validate|parse`;
-* `validation`, for write-time validation;
+* `validation`, for write-time validation ([API](API.md#write-time-validation));
 * `snapshot`, for named snapshots and history retention;
 * `repo` and `backup create|list|show|restore|verify|delete|policy`
   ([below](#backup-repositories));

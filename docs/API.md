@@ -98,6 +98,7 @@ JSON object per line.
 | `sparkles_validation_total` | counter | `dataset`, `language` = `shacl` \| `shex`, `status` = `passed` \| `warned` \| `rejected` \| `skipped` \| `bypassed` \| `timeout` \| `error` |
 | `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `language`, `strategy` = `full` \| `incremental` |
 | `sparkles_validation_results_total` | counter. Results found by validated writes. ShEx counts nonconformant associations as `violation`. | `dataset`, `language`, `severity` = `violation` \| `warning` \| `info` |
+| `sparkles_validation_fallbacks_total` | counter. Validated writes that ran a full validation, or validated some shapes in full. | `dataset`, `language`, `reason` = `baseline` \| `shapes` \| `subclass` \| `sparql` \| `recursive` \| `bulk` \| `budget` |
 | `sparkles_geo_rows` | gauge. Rows of the spatial index. | `dataset`, `part` = `base` \| `overlay` \| `tail` |
 | `sparkles_geo_build_seconds` | gauge. Duration of the last build of the index's base. | `dataset` |
 | `sparkles_geo_candidates_total`, `sparkles_geo_refined_total`, `sparkles_geo_matches_total`, `sparkles_geo_rechecked_total` | counter. Summed over the spatial operators of queries, in order: rows the index found, exact geometry tests, rows that passed them, and candidates the index could not place. | `dataset` |
@@ -2143,6 +2144,7 @@ versions, format 1 without `language`, are still read:
 | `shapes` (SHACL) | `{ "graphs": [iri, …] }` or `{ "inline": "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, or shapes given inline. Named graphs are read from the state being validated, so changes to them are validated too and must parse. Inline shapes are copied to `validation-shapes.ttl`. |
 | `dataGraph` | `"default"`, `"union"`, `[iri, …]` | `"default"` | The data graph. It never includes the shapes graphs, and includes the inferred graph only with `includeInferences`. |
 | `threshold` (SHACL) | `violation`, `warning`, `info` | `violation` | Results at or above it block. |
+| `baseline` (SHACL) | `strict`, `grandfather` | `strict` | With `strict`, any blocking result in the state after a write decides. With `grandfather`, only the blocking results the write introduces decide, so results the data already has do not block unrelated writes, and `reject` can be enabled on data that does not conform. |
 | `timeoutSeconds`, `reportLimit` | number, 1–10000 | 10, 100 | `timeoutSeconds` is the time budget per write. Exceeding it fails the write with `408`. `reportLimit` is the number of results a report carries. |
 
 **ShEx.** A ShEx configuration names a schema and a query shape map instead of shapes:
@@ -2168,20 +2170,24 @@ selectors are refused because every validated write would run them.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/$/validation/{ds}` | `{ language, config, status }`, or `{ config: null }`. `status` holds the mode, the shape count, the baseline of the last commit, counters and warnings. ShEx adds `associations`, the size of the last expanded map. |
+| GET | `/$/validation/{ds}` | `{ language, config, status }`, or `{ config: null }`. `status` holds the mode, the shape count, the `baseline` of the last commit with its counts by severity, counters and warnings. It also holds `lastCheck`, the last validated write, and `recentRejections`, the last ten rejected writes. Each of these has the time, the commit kind, the status, the strategy, the counts, the focus nodes validated, the fallback reason and the first result. SHACL adds `incremental`, with the number of shapes validated incrementally and the shapes validated in full on every write. ShEx adds `associations`, the size of the result map. |
 | PUT | `/$/validation/{ds}` | Sets the configuration, in either language, and replaces the other language's files. The current data is validated under the writer lock. A `reject` configuration on data that does not pass is refused with `409` and the summary. `400` for a bad configuration, or for shapes or a schema that cannot be used. `501` for a language this binary was built without. |
 | DELETE | `/$/validation/{ds}` | Turns validation off (`204`) and removes every validation file. |
 
 **Writes** are validated once per request, on the final state, before any byte is
 written. This covers updates, Graph Store PUT/POST/DELETE and uploads, and in the CLI
 `load`, `update`, `infer` and bulk loads. A write that touches neither the data graph nor
-the shapes graphs is skipped. ShEx also skips a write when every quad it changes has a
-predicate that no triple constraint and no `{FOCUS p …}` selector mentions, because a
-neighbourhood holds only the arcs of the predicates its shape mentions. It does not skip
-the write when a shape is `CLOSED`. Responses carry
-`Sparkles-Validation: status=passed|warned|rejected|skipped|bypassed, mode=…, strategy=full|none, blocking=N, total=N, violations=N, warnings=N, infos=N, ms=N`.
-ShEx adds `lang=shex` after `strategy`. Receipts (`receipt=true`) include a `validation`
-object with its `language`. A rejection is `422 Unprocessable Content`:
+the shapes graphs is skipped. A write is also skipped when no shape reads any predicate
+it changes. For SHACL the predicates read are those of paths, targets, `sh:equals` and
+its siblings, and `rdf:type` and `rdfs:subClassOf` for classes. SHACL needs the state of
+the head to be known for this skip. For ShEx they are the predicates of triple
+constraints and `{FOCUS p …}` selectors, because a neighbourhood holds only the arcs of
+the predicates its shape mentions. A closed shape reads every predicate, and so does a
+SHACL-SPARQL constraint, so neither language skips writes then. Responses carry
+`Sparkles-Validation: status=passed|warned|rejected|skipped|bypassed, mode=…, strategy=full|incremental|none, blocking=N, total=N, violations=N, warnings=N, infos=N, ms=N`.
+ShEx adds `lang=shex` after `strategy`. In grandfather mode `introduced=N` follows
+`blocking`. Receipts (`receipt=true`) include a `validation` object with its `language`.
+A rejection is `422 Unprocessable Content`:
 
 ```json
 { "error": "SHACL validation failed: 2 blocking results (threshold violation); nothing was committed",
@@ -2212,8 +2218,39 @@ only on a server started with `--allow-unvalidated-writes`. On other servers it 
 refuses writes with `501` rather than accepting them unvalidated. This happens, for
 example, when a binary built without `shex` opens a ShEx configuration.
 
+**Incremental validation.** The guard knows the exact result counts of the head. A full
+validation sets them when validation is turned on, and every validated write keeps them
+up to date. They are also written to `validation-status.json` after each validated
+commit, so a restart keeps them. The file is trusted only when it names the head commit
+and the current `validation.json`, so a crash or an unvalidated write leaves the state
+unknown rather than wrong. With the counts known, a write validates only the focus nodes
+whose results it can change. These are the nodes that reach a changed triple through the
+paths and references of the shapes, plus the nodes a changed triple may add to or remove
+from a target. The guard validates them in the states before and after the write and
+moves the counts by the difference. The decision and the counts are those of a full
+validation. The summary then has `strategy: "incremental"` and lists the results of the
+focus nodes it validated. `focusNodes` says how many there were, and `total` and
+`bySeverity` still count the whole state.
+
+A write is skipped when no shape reads any predicate it changes. It is validated in full
+in these cases, and `fallback` names the reason:
+
+| `fallback` | Case |
+|---|---|
+| `baseline` | The state of the head is unknown, for example after a bypassed write. In strict `reject` mode, the head also has blocking results. |
+| `shapes` | The write changed a shapes graph. |
+| `subclass` | The write changed `rdfs:subClassOf` and a shape reads classes. |
+| `bulk` | The write was a bulk load, which renumbers terms. |
+| `budget` | The write affects more than 50,000 focus nodes, or more than 512 of one shape's focus nodes when that is over a quarter of them. The search for affected nodes may also visit at most 100,000 nodes. |
+| `sparql`, `recursive` | Some shapes are validated in full on every write, because they have SHACL-SPARQL constraints or refer to themselves. The other shapes stay incremental. |
+
+ShEx works the same way on the associations of the shape map. A node is affected when a
+changed triple is an arc its shape reads, or an arc a reference from it reaches. ShEx
+falls back for `baseline`, `bulk`, `budget`, and `sparql` for a map with a SPARQL
+selector. ShEx has no grandfather mode.
+
 In the CLI, `sparkles validation` sets the configuration. For SHACL it is
-`sparkles validation --loc DB --mode reject|warn (--shapes-graph IRI … | --shapes FILE) [--data-graph …] [--threshold …]`.
+`sparkles validation --loc DB --mode reject|warn (--shapes-graph IRI … | --shapes FILE) [--data-graph …] [--threshold …] [--grandfather]`.
 For ShEx it is
 `sparkles validation --loc DB [--lang shex] --schema FILE [--schema-format shexc|shexj|shexr] --shape-map MAP --mode reject|warn [--data-graph …]`.
 `--schema` and `--shape-map` imply `--lang shex`, and imports resolve against the schema's
@@ -2229,8 +2266,10 @@ rejected fails with
 `inferences rejected by SHACL validation: N blocking results (first: <shape> at <node>)`.
 Rejections are logged at INFO under `sparkles::validation`, with the dataset, language,
 kind, counts, and first shape and focus node. The counters, with a `language` label, are
-listed under [Metrics](#metrics). Each validated write runs a full validation of the data
-graph, which takes about 160 ms at 1M triples for SHACL. Skipped writes cost nothing.
+listed under [Metrics](#metrics). A write validated incrementally costs about as much as
+the write itself when it affects few focus nodes. A full validation takes about 160 ms at
+1M triples for SHACL, and writes that fall back to it wait that long. Skipped writes cost
+nothing.
 
 ## SHACL validation
 

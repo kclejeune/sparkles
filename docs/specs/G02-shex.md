@@ -6,9 +6,9 @@
 > maps and stratified typing, plus `POST /{ds}/shex`, `sparkles shex validate|parse`, the
 > shexTest harness and `bench:shex`. Phase 2 is write-time ShEx validation with
 > `validation.json` format 2, ShExR, `SPARQL """…"""` selectors, the UI's SHACL | ShEx
-> switch and `bench:shex-write`. Two Phase 3 items are also built: the MCP tools
-> `validate_shacl` and `validate_shex`, and the interval matcher, which became the Phase 1
-> matcher.
+> switch and `bench:shex-write`. Three Phase 3 items are also built: the MCP tools
+> `validate_shacl` and `validate_shex`, the interval matcher, which became the Phase 1
+> matcher, and incremental guard validation.
 >
 > **User docs:** [API: ShEx validation](../API.md#shex-validation) ·
 > [API: Write-time validation](../API.md#write-time-validation) ·
@@ -1687,6 +1687,25 @@ current numbers. SHACL stayed at 98/98 + 20/20 through the shared-code moves.
 [BENCHMARKS.md](../BENCHMARKS.md) publishes no ShEx numbers yet, so the §9 targets are
 unverified.
 
-**Deferred or rejected.** Incremental guard validation, ShExR schemas in named graphs for
-the guard, SHACL and ShEx guards on one dataset, and ShEx 2.2 (`EXTENDS`, `ABSTRACT`) are
-not built. The guard validates the full post-state on every relevant write.
+**Incremental guard validation** landed on 2026-10-02 with C10 Phase 2. The guard keeps
+the counts of the head's result map, in memory and in `validation-status.json`. A write
+validates the associations of the nodes it can affect, in the states before and after
+it, and moves the counts by the difference.
+* The affected nodes are found per node rather than per pair. They are the endpoints of
+  changed triples whose predicate a triple constraint reads, plus the nodes that reach
+  them backwards over triple constraints whose value expression refers to a shape. This
+  over-approximates the pair dependencies of the design, and needs no typing of the
+  states.
+* The map's associations at those nodes are recomputed in each state. Term selectors
+  select their node in both, and `{FOCUS p o}` and `{s p FOCUS}` selectors are checked
+  against the state's arcs.
+* The fallbacks are those of C10 that apply: an unknown state, `reject` on a head that
+  does not conform, bulk writes, more than 50,000 affected nodes or 100,000 visited, and
+  SPARQL selectors, which the guard refuses anyway.
+* A property test checks the counts and the listed associations against full
+  validations, over recursive, inverse and negated references with and without a
+  `CLOSED` shape.
+
+**Deferred or rejected.** ShExR schemas in named graphs for the guard, SHACL and ShEx
+guards on one dataset, grandfather mode for ShEx, and ShEx 2.2 (`EXTENDS`, `ABSTRACT`) are
+not built.

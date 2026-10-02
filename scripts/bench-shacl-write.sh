@@ -12,15 +12,20 @@
 # (crates/sparkles-shex/examples/bench.shex, bench.smap), which the data does not conform
 # to; `reject` uses bench-write.shex, the same schema loosened until the data conforms,
 # with the same map. Both have a CLOSED shape, so no write to the data graph is skipped.
-# The timed triple goes into the default graph (the data graph), so every timed
-# write is validated; an untimed --prepare deletes it first, so every run inserts. The
+# Two writes are timed. `plain` inserts a triple no shape constrains into the default
+# graph (the data graph); with a CLOSED shape every such write is still validated, and
+# incremental validation finds no focus node it affects. `person` inserts a foaf:knows
+# arc between two generated people, which the shapes read through a sequence path and
+# sh:class, so incremental validation re-validates the person. An untimed --prepare
+# deletes the timed triple first, so every run inserts. The
 # standalone full validation time is what `sparkles validation` reports when it turns
 # validation on. The delta quads are foaf:name triples of untyped subjects: no new
 # results, but every foaf:name scan merges them.
-# Results go to WORKDIR/results/{shacl,shex}-write.{json,md}.
-# Env: WARMUP (default 3), RUNS (default 20), DELTA (default 10000), SPARKLES (binary,
-# default target/release/sparkles), PORT (default 3937), LANG_SEL (shacl or shex, as
-# --lang).
+# Results go to WORKDIR/results/{shacl,shex}-write[-LABEL].{json,md}.
+# Env: WARMUP (default 3), RUNS (default 20), DELTA (default 10000; 0 runs only the
+# round without pending delta quads), SPARKLES (binary, default target/release/sparkles),
+# PORT (default 3937), LANG_SEL (shacl or shex, as --lang), LABEL (a suffix for the
+# result files, to keep runs of different binaries apart).
 set -euo pipefail
 
 LANG_SEL=${LANG_SEL:-shacl}
@@ -43,6 +48,8 @@ DELTA=${DELTA:-10000}
 PORT=${PORT:-3937}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
+LABEL=${LABEL:+-$LABEL}
+RES=$LANG_SEL-write$LABEL
 mkdir -p "$WORK/results"
 WORK=$(cd "$WORK" && pwd)
 cd "$WORK"
@@ -150,12 +157,17 @@ validation_on() { # validation_on <db> <mode>
 }
 
 T='<http://example.org/bench/s> <http://example.org/bench/p> "v"'
-printf 'INSERT DATA { %s }' "$T" > insert.ru
-printf 'DELETE DATA { %s }' "$T" > delete.ru
+printf 'INSERT DATA { %s }' "$T" > insert-plain.ru
+printf 'DELETE DATA { %s }' "$T" > delete-plain.ru
+T='<http://example.org/person/1> <http://xmlns.com/foaf/0.1/knows> <http://example.org/person/2>'
+printf 'INSERT DATA { %s }' "$T" > insert-person.ru
+printf 'DELETE DATA { %s }' "$T" > delete-person.ru
 upd() { echo "curl -sf -o /dev/null --data-urlencode update@$WORK/$1 localhost:$PORT/bench/update"; }
+DELTAS=(0)
+[ "$DELTA" -gt 0 ] && DELTAS+=("$DELTA")
 
 declare -A FULL_MS
-for delta in 0 "$DELTA"; do
+for delta in "${DELTAS[@]}"; do
   db=$WORK/db-$delta
   rm -rf "$db"
   "$SPARKLES" load --loc "$db" "$DATA"
@@ -178,45 +190,49 @@ for delta in 0 "$DELTA"; do
       FULL_MS["$delta-$mode"]=$(echo "$out" | sed -n 's/.* in \([0-9]*\) ms$/\1/p')
     fi
     start_server "$db"
-    eval "$(upd delete.ru)"
-    # every timed write must be a validated insertion
-    hdr=$(curl -sf -D - -o /dev/null --data-urlencode "update@insert.ru" "localhost:$PORT/bench/update" | tr -d '\r' | grep -i '^sparkles-validation:' || true)
-    echo "$mode: ${hdr:-no Sparkles-Validation header}"
-    case "$mode" in
-      off) [ -z "$hdr" ] ;;
-      warn) [[ "$hdr" == *"status=warned"* ]] ;;
-      reject) [[ "$hdr" == *"status=passed"* ]] ;;
-    esac || {
-      echo "unexpected validation status for $mode" >&2
-      exit 1
-    }
-    hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic \
-      --prepare "$(upd delete.ru)" --command-name "$mode/delta=$delta" "$(upd insert.ru)" \
-      --export-json "results/$LANG_SEL-write.new.json"
-    merge "results/$LANG_SEL-write.new.json" "results/$LANG_SEL-write.json"
+    for w in plain person; do
+      eval "$(upd "delete-$w.ru")"
+      # every timed write must be a validated insertion
+      hdr=$(curl -sf -D - -o /dev/null --data-urlencode "update@insert-$w.ru" "localhost:$PORT/bench/update" | tr -d '\r' | grep -i '^sparkles-validation:' || true)
+      echo "$mode/$w: ${hdr:-no Sparkles-Validation header}"
+      case "$mode" in
+        off) [ -z "$hdr" ] ;;
+        warn) [[ "$hdr" == *"status=warned"* ]] ;;
+        reject) [[ "$hdr" == *"status=passed"* ]] ;;
+      esac || {
+        echo "unexpected validation status for $mode" >&2
+        exit 1
+      }
+      hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic \
+        --prepare "$(upd "delete-$w.ru")" --command-name "$mode/$w/delta=$delta" "$(upd "insert-$w.ru")" \
+        --export-json "results/$RES.new.json"
+      merge "results/$RES.new.json" "results/$RES.json"
+    done
     stop_server
   done
 done
 
 args=()
 for k in "${!FULL_MS[@]}"; do args+=("$k=${FULL_MS[$k]}"); done
-python3 - "results/$LANG_SEL-write.json" "results/$LANG_SEL-write.md" "$N" "$(wc -l < "$DATA")" "$LANG_SEL" "${args[@]}" << 'EOF'
+python3 - "results/$RES.json" "results/$RES.md" "$N" "$(wc -l < "$DATA")" "$LANG_SEL" "${args[@]}" << 'EOF'
 import json, sys
 src, dest, people, triples, lang = sys.argv[1:6]
 full = dict(kv.split("=", 1) for kv in sys.argv[6:])
 res = {r["command"]: r for r in json.load(open(src))["results"]}
 deltas = sorted({c.split("delta=")[1] for c in res}, key=int)
+writes = [w for w in ("plain", "person") if any(f"/{w}/" in c for c in res)]
 ms = lambda r: f'{r["mean"] * 1e3:.2f} ± {r["stddev"] * 1e3:.2f}' if r.get("stddev") is not None else f'{r["mean"] * 1e3:.2f}'
 title = {"shacl": "SHACL", "shex": "ShEx"}[lang]
 out = [f"{title}: 1-triple INSERT DATA latency (ms, mean ± sd) over {triples} triples ({people} people)", "",
-       "| pending delta | off | warn | reject | full validation (warn / reject) | reject ≤ full + 10 ms |",
-       "|---:|---:|---:|---:|---:|:---:|"]
-for d in deltas:
-    cell = lambda m: ms(res[f"{m}/delta={d}"]) if f"{m}/delta={d}" in res else "–"
-    fw, fr = full.get(f"{d}-warn", "?"), full.get(f"{d}-reject", "?")
-    rj = res.get(f"reject/delta={d}")
-    ok = "yes" if rj and fr.isdigit() and rj["mean"] * 1e3 <= int(fr) + 10 else "no"
-    out.append(f"| {d} | {cell('off')} | {cell('warn')} | {cell('reject')} | {fw} / {fr} ms | {ok} |")
+       "| write | pending delta | off | warn | reject | full validation (warn / reject) | reject ≤ full + 10 ms |",
+       "|---|---:|---:|---:|---:|---:|:---:|"]
+for w in writes:
+    for d in deltas:
+        cell = lambda m: ms(res[f"{m}/{w}/delta={d}"]) if f"{m}/{w}/delta={d}" in res else "–"
+        fw, fr = full.get(f"{d}-warn", "?"), full.get(f"{d}-reject", "?")
+        rj = res.get(f"reject/{w}/delta={d}")
+        ok = "yes" if rj and fr.isdigit() and rj["mean"] * 1e3 <= int(fr) + 10 else "no"
+        out.append(f"| {w} | {d} | {cell('off')} | {cell('warn')} | {cell('reject')} | {fw} / {fr} ms | {ok} |")
 open(dest, "w").write("\n".join(out) + "\n")
 print("\n".join(out))
 EOF
