@@ -21,6 +21,11 @@ use std::time::Instant;
 
 const PAR_THRESHOLD: usize = 16_384;
 
+/// Parallel iterators over rows hand out pieces of at least this many rows, so a small
+/// input is processed on the calling thread: waking the pool for it would cost more
+/// than the work, and a short request would wait for threads on idle cores to wake.
+pub(super) const PAR_MIN_LEN: usize = 4096;
+
 /// Map `f` over rows `0..n` (in parallel when `par`) in chunks, checking cancellation and
 /// the deadline between chunks: one clock read per chunk rather than per row, while an
 /// expensive expression still stops within one chunk of the deadline.
@@ -1690,7 +1695,13 @@ fn anti_join(
     let _held = ctx.charge((b.len() * 16) as u64)?;
     let set: FxHashSet<Id> = b.iter().copied().collect();
     ctx.check()?;
-    Ok((a.par_iter().map(|id| !set.contains(id)).collect(), "hash"))
+    Ok((
+        a.par_iter()
+            .with_min_len(PAR_MIN_LEN)
+            .map(|id| !set.contains(id))
+            .collect(),
+        "hash",
+    ))
 }
 
 // ------------------------------------------------------------ expressions ------
@@ -1863,6 +1874,7 @@ fn topk_candidates(ctx: &Ctx, t: &Table, keys: &[(Expr, bool)], k: usize) -> Opt
     let sign = if *asc { -1.0 } else { 1.0 };
     let f: Vec<f64> = col
         .par_iter()
+        .with_min_len(PAR_MIN_LEN)
         .map(|&id| approx(id).map(|d| d * sign))
         .collect::<Option<Vec<f64>>>()?;
     let mut sorted = f.clone();

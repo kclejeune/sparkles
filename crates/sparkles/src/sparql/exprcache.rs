@@ -23,6 +23,7 @@
 //! to the query's memory budget while they are built.
 
 use super::ctx::Ctx;
+use super::exec::PAR_MIN_LEN;
 use super::expr::{Expr, Func, needs_values};
 use super::table::{Table, VarId};
 use crate::error::Result;
@@ -190,6 +191,7 @@ impl<T> PerValue<T> {
         match &self.slot {
             Some(s) => s
                 .par_iter()
+                .with_min_len(PAR_MIN_LEN)
                 .map(|&j| self.vals[j as usize].clone())
                 .collect(),
             None => vec![self.vals[0].clone(); n],
@@ -338,7 +340,10 @@ fn distinct(
             .enumerate()
             .map(|(j, id)| (*id, j as u32))
             .collect();
-        col.par_iter().map(|id| at[id]).collect()
+        col.par_iter()
+            .with_min_len(PAR_MIN_LEN)
+            .map(|id| at[id])
+            .collect()
     } else if runs {
         // `uniq` lists the runs in column order
         let mut j = 0u32;
@@ -353,6 +358,7 @@ fn distinct(
             .collect()
     } else {
         col.par_iter()
+            .with_min_len(PAR_MIN_LEN)
             .map(|id| uniq.binary_search(id).unwrap() as u32)
             .collect()
     };
@@ -445,6 +451,7 @@ pub fn filter(
             None => hit.rows(t.len()),
             Some(mut k) => {
                 k.par_iter_mut()
+                    .with_min_len(PAR_MIN_LEN)
                     .enumerate()
                     .for_each(|(i, k)| *k = *k && *hit.get(i));
                 k
