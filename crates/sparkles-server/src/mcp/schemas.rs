@@ -28,6 +28,7 @@ pub fn all_tools() -> Vec<&'static str> {
     if cfg!(feature = "fmt") {
         v.push("format");
     }
+    v.push("sparql_update");
     v
 }
 
@@ -39,6 +40,8 @@ pub struct ToolDef {
     pub output: Option<Value>,
     pub read_only: bool,
     pub open_world: bool,
+    /// may destroy data (`destructiveHint`, and `idempotentHint: false`)
+    pub destructive: bool,
 }
 
 fn ds() -> Value {
@@ -90,6 +93,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         output,
         read_only: true,
         open_world: false,
+        destructive: false,
     };
     let schema_class = json!({"type":"object","required":["iri","instances","declared"],"properties":{
         "iri":{"type":"string"},"label":{"type":"string"},"instances":{"type":"integer"},
@@ -338,8 +342,28 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                     "code":{"type":"string"},"message":{"type":"string"},
                     "line":{"type":"integer"},"column":{"type":"integer"}}}}}})),
         ),
+        ToolDef {
+            name: "sparql_update",
+            title: "Run a SPARQL update",
+            description: "Run a SPARQL 1.1 Update (INSERT DATA, DELETE DATA, DELETE/INSERT WHERE, CLEAR, DROP, …) on a dataset. The dataset's prefixes are predeclared. LOAD is refused. The write passes the dataset's write-time validation, and message is recorded with the commit. Returns the commit and the quads inserted and deleted. Changes are committed immediately and cannot be undone through this server.",
+            input: json!({"type":"object","additionalProperties":false,"required":["update"],"properties":{
+                "dataset": ds(),
+                "update": {"type":"string","minLength":1,"maxLength":1_048_576},
+                "message": {"type":"string","maxLength":1024,"description":"Commit message recorded with the change (one line, at most 1024 bytes)"},
+                "timeoutSeconds": to(cfg)}}),
+            output: Some(json!({"type":"object","required":["dataset","committed","commit","inserted","deleted","elapsedMs"],"properties":{
+                "dataset":{"type":"string"},"committed":{"type":"boolean"},"commit":{"type":"integer"},
+                "inserted":{"type":"integer"},"deleted":{"type":"integer"},
+                "message":{"type":"string"},
+                "validation":{"type":"object"},
+                "elapsedMs":{"type":"number"}}})),
+            read_only: false,
+            open_world: false,
+            destructive: true,
+        },
     ]
     .into_iter()
     .filter(|t| all_tools().contains(&t.name))
+    .filter(|t| t.name != "sparql_update" || cfg.allow_update)
     .collect()
 }

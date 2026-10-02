@@ -81,11 +81,13 @@ pub enum Op {
     Shex,
     Explain,
     Admin,
+    /// a message to the MCP endpoint (`/$/mcp`)
+    Mcp,
     Other,
 }
 
 impl Op {
-    pub const ALL: [Op; 9] = [
+    pub const ALL: [Op; 10] = [
         Op::Query,
         Op::Update,
         Op::Gsp,
@@ -94,6 +96,7 @@ impl Op {
         Op::Shex,
         Op::Explain,
         Op::Admin,
+        Op::Mcp,
         Op::Other,
     ];
 
@@ -107,6 +110,7 @@ impl Op {
             Op::Shex => "shex",
             Op::Explain => "explain",
             Op::Admin => "admin",
+            Op::Mcp => "mcp",
             Op::Other => "other",
         }
     }
@@ -223,6 +227,9 @@ fn quiet(route: Option<&str>) -> bool {
 /// content type (a form body is refined by the handler's report).
 fn route_op(route: Option<&str>, req: &Request) -> Op {
     let Some(r) = route else { return Op::Other };
+    if r == "/$/mcp" {
+        return Op::Mcp;
+    }
     if r.starts_with("/$/") {
         return Op::Admin;
     }

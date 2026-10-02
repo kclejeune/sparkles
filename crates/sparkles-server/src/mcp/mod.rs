@@ -1,27 +1,33 @@
 //! Model Context Protocol server: tools that let LLM agents discover datasets, learn
-//! their schema and query them with bounded, compact results (`sparkles mcp`, stdio).
+//! their schema and query them with bounded, compact results. `sparkles mcp` serves it
+//! over stdio, and `sparkles serve --mcp` over Streamable HTTP at `/$/mcp`.
 //!
-//! The tool logic here is transport-neutral ([`McpServer::call`]); `adapter.rs` is the
-//! only file that knows the MCP SDK. Every call runs under the engine's budgets
-//! (timeout, memory, intermediate rows), reads exactly one snapshot, and names the
-//! commit it read so later calls can pin it with `atCommit`. SERVICE is off unless
-//! allowed, and the default tool set cannot write.
+//! The tool logic here is transport-neutral ([`McpServer::call`]); `adapter.rs` and
+//! `http.rs` are the only files that know the MCP SDK. Every call runs as a
+//! [`Principal`] and sees only the datasets it may read. Every call runs under the
+//! engine's budgets (timeout, memory, intermediate rows), reads exactly one snapshot,
+//! and names the commit it read so later calls can pin it with `atCommit`. SERVICE is
+//! off unless allowed, and the default tool set cannot write.
 
 mod adapter;
+mod context;
 mod errors;
 #[cfg(feature = "fmt")]
 mod format;
+pub mod http;
 mod pins;
 mod render;
 mod schemas;
 mod search;
 mod tools;
+mod update;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validate;
 
 #[cfg(test)]
 mod tests;
 
+use crate::auth::{Level, Principal};
 use crate::state::{AppState, Dataset, DbType};
 use anyhow::{Context, Result, bail};
 use errors::ToolError;
@@ -63,6 +69,10 @@ pub struct McpArgs {
     /// data anywhere)
     #[arg(long)]
     pub allow_service: bool,
+    /// Offer the sparql_update tool, which writes to the datasets (without it the process
+    /// never writes)
+    #[arg(long)]
+    pub allow_update: bool,
     #[command(flatten)]
     pub outbound: crate::outbound::OutboundArgs,
     /// Largest query timeout a call may request, in seconds (calls default to 30)
@@ -104,9 +114,13 @@ pub struct McpConfig {
     /// memory budget of every call's queries (`None`: unlimited)
     pub query_memory_bytes: Option<u64>,
     pub allow_service: bool,
+    /// offer sparql_update (never on a read-only server)
+    pub allow_update: bool,
     pub max_concurrent: usize,
     /// tools removed with `--disable-tool`
     pub disabled: BTreeSet<String>,
+    /// the dataset names (`*` patterns) the tools may see; empty: all
+    pub datasets: Vec<String>,
 }
 
 impl Default for McpConfig {
@@ -117,8 +131,10 @@ impl Default for McpConfig {
             max_timeout: Duration::from_secs(60),
             query_memory_bytes: Some(2 << 30),
             allow_service: false,
+            allow_update: false,
             max_concurrent: 4,
             disabled: BTreeSet::new(),
+            datasets: Vec::new(),
         }
     }
 }
@@ -183,13 +199,24 @@ pub struct Call {
     pub cancel: Arc<AtomicBool>,
     /// the JSON-RPC request id, for logs and internal errors
     pub request_id: String,
+    /// who calls: the HTTP request's principal, or the local principal on stdio
+    pub principal: Principal,
+    /// the HTTP request's headers (`Sparkles-Commit-Message`); `None` on stdio
+    pub headers: Option<axum::http::HeaderMap>,
+    /// the HTTP request's share of its rate-limit permits, held (never read) until the
+    /// work ends
+    #[allow(dead_code)]
+    pub held: Option<http::HeldShare>,
 }
 
 impl McpServer {
     pub fn new(state: Arc<AppState>, cfg: McpConfig) -> McpServer {
+        let read_only = state.read_only;
         let tools = schemas::tools(&cfg)
             .into_iter()
             .filter(|t| !cfg.disabled.contains(t.name))
+            // a read-only server never offers the write tool
+            .filter(|t| !(read_only && t.name == "sparql_update"))
             .collect();
         McpServer {
             state,
@@ -215,6 +242,43 @@ impl McpServer {
         self.shared.tools.iter().any(|t| t.name == name)
     }
 
+    /// Whether `p` may call `sparql_update`: the server offers it and `p` may write to a
+    /// dataset it can see. Tool listings leave the tool out otherwise.
+    pub fn may_update(&self, p: &Principal) -> bool {
+        self.offers("sparql_update")
+            && self
+                .visible(p)
+                .iter()
+                .any(|ds| p.can(&ds.name, Level::Write))
+    }
+
+    /// The offered tools `p` may call, in `tools/list` order.
+    pub fn tools_for(&self, p: &Principal) -> Vec<&schemas::ToolDef> {
+        let update = self.may_update(p);
+        self.shared
+            .tools
+            .iter()
+            .filter(|t| t.name != "sparql_update" || update)
+            .collect()
+    }
+
+    /// Whether MCP may show the dataset `name` at all (`serve --mcp-dataset`).
+    fn exposed(&self, name: &str) -> bool {
+        let patterns = &self.shared.cfg.datasets;
+        patterns.is_empty() || patterns.iter().any(|p| crate::auth::glob(p, name))
+    }
+
+    /// The datasets `p` may read through MCP, in name order.
+    pub fn visible(&self, p: &Principal) -> Vec<Arc<Dataset>> {
+        self.state
+            .datasets
+            .read()
+            .values()
+            .filter(|ds| self.exposed(&ds.name) && p.can(&ds.name, Level::Read))
+            .cloned()
+            .collect()
+    }
+
     /// Run one tool call: wait for a slot, then run the tool on a blocking thread.
     pub async fn call(
         &self,
@@ -225,37 +289,46 @@ impl McpServer {
         if !self.offers(name) {
             return Err(UnknownTool(name.to_string()));
         }
+        Ok(self.run(name, args, call).await)
+    }
+
+    /// [`McpServer::call`] for a tool whether or not it is offered (resources are read
+    /// through the tools).
+    async fn run(
+        &self,
+        name: &str,
+        args: Map<String, Value>,
+        call: Call,
+    ) -> Result<Outcome, ToolError> {
         let Ok(permit) = self.shared.slots.clone().acquire_owned().await else {
-            return Ok(Err(ToolError::internal(&call.request_id)));
+            return Err(ToolError::internal(&call.request_id));
         };
         let server = self.clone();
         let name = name.to_string();
         let request_id = call.request_id.clone();
         let joined = tokio::task::spawn_blocking(move || {
-            // the slot is held until the work itself ends, even if the caller is gone
+            // the slot, and the request's rate-limit permits in `call.held`, are held
+            // until the work itself ends, even if the caller is gone
             let _permit = permit;
             tools::run(&server, &name, args, &call)
         })
         .await;
-        Ok(joined.unwrap_or_else(|e| {
+        joined.unwrap_or_else(|e| {
             tracing::error!(request_id, "MCP tool call panicked: {e}");
             Err(ToolError::internal(&request_id))
-        }))
+        })
     }
 
-    /// The dataset a call names; may be omitted when there is exactly one.
-    pub fn dataset(&self, name: Option<&str>) -> Result<Arc<Dataset>, ToolError> {
-        let datasets = self.state.datasets.read();
+    /// The dataset a call of `p` names; it may be omitted when `p` sees exactly one. A
+    /// dataset `p` may not read is reported like one that does not exist.
+    pub fn dataset(&self, p: &Principal, name: Option<&str>) -> Result<Arc<Dataset>, ToolError> {
+        let datasets = self.visible(p);
         let available = || {
-            let names: Vec<&str> = datasets.keys().map(String::as_str).collect();
+            let names: Vec<&str> = datasets.iter().map(|d| d.name.as_str()).collect();
             format!("available datasets: {}", names.join(", "))
         };
         match name {
-            None if datasets.len() == 1 => Ok(datasets
-                .values()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| unreachable!())),
+            None if datasets.len() == 1 => Ok(datasets[0].clone()),
             None => Err(ToolError::new(
                 "unknown-dataset",
                 404,
@@ -276,10 +349,14 @@ impl McpServer {
                         "invalid dataset name '{n}': use a name from list_datasets"
                     )));
                 }
-                datasets.get(n).cloned().ok_or_else(|| {
-                    ToolError::new("unknown-dataset", 404, format!("no dataset '{n}'"))
-                        .hint(available())
-                })
+                datasets
+                    .iter()
+                    .find(|d| d.name == n)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ToolError::new("unknown-dataset", 404, format!("no dataset '{n}'"))
+                            .hint(available())
+                    })
             }
         }
     }
@@ -309,8 +386,8 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
     }
     let timeout = Duration::from_secs_f64(args.timeout);
     let mut st = AppState::standalone(store_opts, timeout);
-    // the process never writes: no write tool is offered
-    st.read_only = true;
+    // without --allow-update the process never writes: no write tool is offered
+    st.read_only = !args.allow_update;
     st.allow_service = args.allow_service;
     st.outbound = args.outbound.policy()?;
     st.schema_max_entries = args.schema_max_entries;
@@ -363,8 +440,10 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         max_timeout: timeout,
         query_memory_bytes: memory,
         allow_service: args.allow_service,
+        allow_update: args.allow_update,
         max_concurrent: args.max_concurrent,
         disabled: args.disable_tool.into_iter().collect(),
+        datasets: Vec::new(),
     };
     let server = McpServer::new(st, cfg);
     let rt = tokio::runtime::Builder::new_multi_thread()

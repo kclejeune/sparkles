@@ -89,7 +89,7 @@ impl Tools<'_> {
         at_commit: Option<u64>,
     ) -> Result<Target, ToolError> {
         let timeout = self.timeout(timeout_seconds)?;
-        let ds = self.server.dataset(dataset)?;
+        let ds = self.dataset(dataset)?;
         let prefixes = dataset_prefixes(&ds);
         let graph = match graph.map(str::trim) {
             None | Some("default") => GraphParam::Default,

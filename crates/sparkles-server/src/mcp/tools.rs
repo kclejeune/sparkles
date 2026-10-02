@@ -53,6 +53,7 @@ pub fn run(
         "validate_shex" => t.validate_shex(args),
         #[cfg(feature = "fmt")]
         "format" => t.format(args),
+        "sparql_update" => t.sparql_update(args),
         _ => Err(ToolError::internal(&call.request_id)),
     }
 }
@@ -357,6 +358,11 @@ impl Tools<'_> {
         self.server.cfg()
     }
 
+    /// The dataset the call names, among those its principal may read.
+    pub(super) fn dataset(&self, name: Option<&str>) -> Result<Arc<Dataset>, ToolError> {
+        self.server.dataset(&self.call.principal, name)
+    }
+
     pub(super) fn ctx<'n>(
         &'n self,
         prefix_names: &'n [&'n str],
@@ -396,7 +402,7 @@ impl Tools<'_> {
         deadline: Instant,
         prefixes: &BTreeMap<String, String>,
     ) -> Result<QueryOptions, Error> {
-        Ok(QueryOptions {
+        let mut opts = QueryOptions {
             timeout: Some(remaining(deadline)?),
             max_rows: Some(self.server.state.limits.max_rows),
             max_memory_bytes: self.cfg().query_memory_bytes,
@@ -410,7 +416,10 @@ impl Tools<'_> {
             },
             prefixes: prefix_vec(prefixes),
             ..Default::default()
-        })
+        };
+        // SERVICE and LOAD are the principal's server permissions, as over HTTP
+        crate::auth::restrict(&mut opts, &self.call.principal);
+        Ok(opts)
     }
 
     /// Parse a query, telling SPARQL Update apart from a syntax error.
@@ -440,15 +449,9 @@ impl Tools<'_> {
     fn list_datasets(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let NoArgs {} = parse(args)?;
         let cfg = self.cfg();
-        let updates = self.server.offers("sparql_update");
-        let datasets: Vec<Arc<Dataset>> = self
-            .server
-            .state
-            .datasets
-            .read()
-            .values()
-            .cloned()
-            .collect();
+        let p = &self.call.principal;
+        let updates = self.server.may_update(p);
+        let datasets = self.server.visible(p);
         let list: Vec<Value> = datasets
             .iter()
             .map(|ds| {
@@ -466,7 +469,7 @@ impl Tools<'_> {
                     "modified": modified,
                     "reasoning": reasoning,
                     "textSearch": ds.store.text_enabled(),
-                    "writable": updates && !self.server.state.read_only,
+                    "writable": updates && p.can(&ds.name, crate::auth::Level::Write),
                 })
             })
             .collect();
@@ -497,7 +500,7 @@ impl Tools<'_> {
             1,
             500,
         )? as usize;
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
@@ -753,7 +756,7 @@ impl Tools<'_> {
         let exact_total = a.exact_total.unwrap_or(true);
         let format = a.format.unwrap_or(Format::Table);
         let timeout = self.timeout(a.timeout_seconds)?;
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
@@ -835,7 +838,7 @@ impl Tools<'_> {
     fn explain_query(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: ExplainArgs = parse(args)?;
         query_text(&a.query)?;
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
@@ -901,7 +904,9 @@ impl Tools<'_> {
                 ),
             }));
         }
-        if !self.cfg().allow_service && has_service(pattern(&parsed)) {
+        let service =
+            self.cfg().allow_service && self.call.principal.has(crate::auth::ServerPerm::Federate);
+        if !service && has_service(pattern(&parsed)) {
             warnings.push(json!({
                 "code": "service-disabled",
                 "message": "SERVICE is disabled for MCP calls.",
@@ -928,7 +933,7 @@ impl Tools<'_> {
         let max_triples = bounded("maxTriples", a.max_triples, 50, 1, 500)? as usize;
         let direction = a.direction.unwrap_or(Direction::Both);
         let lang = a.lang.unwrap_or_else(|| "en".to_string());
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
@@ -1050,7 +1055,7 @@ impl Tools<'_> {
     fn list_commits(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: ListCommitsArgs = parse(args)?;
         let limit = bounded("limit", a.limit, 10, 1, 100)? as usize;
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
         let range = a.before.map_or(CommitRange::Latest, CommitRange::Before);
         let head = ds.store.head_commit().seq;
         let page = ds.store.commits(range, limit);

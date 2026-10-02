@@ -25,6 +25,8 @@ mod geo;
 #[cfg(feature = "geo")]
 mod geo_convert;
 mod loads;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod open;
 #[cfg(feature = "reasoning")]
 mod reasoning;

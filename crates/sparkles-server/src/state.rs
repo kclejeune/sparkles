@@ -239,6 +239,9 @@ pub struct AppState {
     /// `POST /$/format` (`serve --format-*`)
     #[cfg(feature = "fmt")]
     pub format: FormatConf,
+    /// the MCP endpoint `/$/mcp` (`serve --mcp`); `None`: not mounted
+    #[cfg(feature = "mcp")]
+    pub mcp: Option<Arc<crate::mcp::http::HttpConf>>,
 }
 
 /// Who may use `POST /$/format` (`serve --format-endpoint`).
@@ -484,6 +487,8 @@ impl AppState {
             task_queue: TaskQueue::new(DEFAULT_MAX_TASKS),
             #[cfg(feature = "fmt")]
             format: FormatConf::default(),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         // clones that were being built when the server stopped are never registered
         for e in std::fs::read_dir(data_dir.join("databases"))?.flatten() {
@@ -542,6 +547,8 @@ impl AppState {
             task_queue: TaskQueue::new(DEFAULT_MAX_TASKS),
             #[cfg(feature = "fmt")]
             format: FormatConf::default(),
+            #[cfg(feature = "mcp")]
+            mcp: None,
             rate_limit: None,
             auth: None,
             cors_origins: Vec::new(),

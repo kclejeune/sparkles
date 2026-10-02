@@ -46,6 +46,8 @@ pub use api::{
     server_json, spawn_reload_on_sighup, throttle,
 };
 pub use proxy::Peer;
+#[cfg(feature = "mcp")]
+pub use routes::authentication_required;
 pub use routes::{AuthReport, Denied, dataset_denial, forbidden, middleware};
 #[cfg(test)]
 pub use routes::{ROUTES, need};

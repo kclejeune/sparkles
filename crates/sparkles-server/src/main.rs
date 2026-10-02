@@ -595,6 +595,9 @@ enum Cmd {
         #[cfg(feature = "fmt")]
         #[arg(long, default_value_t = 10.0, value_name = "SECS")]
         format_timeout: f64,
+        #[cfg(feature = "mcp")]
+        #[command(flatten)]
+        mcp: mcp::http::ServeArgs,
     },
     /// Authentication: hashes, tokens, configuration checks
     #[cfg(feature = "auth")]
@@ -1380,6 +1383,8 @@ fn run() -> Result<()> {
             format_max_mb,
             #[cfg(feature = "fmt")]
             format_timeout,
+            #[cfg(feature = "mcp")]
+            mcp,
             ..
         } => {
             // an open server on the network, or a bad auth configuration, stops the
@@ -1478,6 +1483,11 @@ fn run() -> Result<()> {
                     timeout: Duration::from_secs_f64(format_timeout),
                     ..Default::default()
                 };
+            }
+            // after the limits: MCP calls stay within them
+            #[cfg(feature = "mcp")]
+            {
+                st.mcp = mcp.conf(&st)?.map(Arc::new);
             }
             if let Some(max) = st.limits.max_timeout
                 && (st.default_timeout > max || st.limits.update_timeout.is_some_and(|u| u > max))
@@ -1632,6 +1642,11 @@ fn run() -> Result<()> {
                 let shutdown = async move {
                     shutdown_signal().await;
                     st2.set_phase(obs::Phase::Draining);
+                    // open MCP streams would hold the shutdown up
+                    #[cfg(feature = "mcp")]
+                    if let Some(m) = &st2.mcp {
+                        m.shutdown.cancel();
+                    }
                     tracing::info!("shutting down: finishing requests in flight");
                 };
                 // the peer address feeds trusted-proxy checks
