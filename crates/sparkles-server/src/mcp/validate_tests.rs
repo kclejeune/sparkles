@@ -451,6 +451,39 @@ async fn shacl_graphs() {
 
 #[cfg(feature = "shacl")]
 #[tokio::test(flavor = "multi_thread")]
+async fn shacl_compact_syntax() {
+    let mut c = Client::start(people_server());
+    let turtle = c
+        .structured("validate_shacl", json!({"shapes": SHAPES}))
+        .await;
+    // the same shapes, with the named property shape written inline
+    let compact = r#"PREFIX ex: <http://ex.org/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+shape ex:PersonShape -> ex:Person {
+    foaf:name xsd:string [1..*] .
+    foaf:age maxInclusive=150 severity=sh:Warning message="too old" .
+}"#;
+    let r = c
+        .structured(
+            "validate_shacl",
+            json!({"shapes": compact, "shapesFormat": "shaclc"}),
+        )
+        .await;
+    assert_eq!(r["conforms"], turtle["conforms"]);
+    assert_eq!(r["total"], turtle["total"]);
+    assert_eq!(r["bySeverity"], turtle["bySeverity"]);
+    let (t, e) = c
+        .error(
+            "validate_shacl",
+            json!({"shapes": "shape {", "shapesFormat": "shaclc"}),
+        )
+        .await;
+    assert_eq!(e, json!({"code": "syntax", "status": 400}));
+    assert!(t.contains("SHACLC syntax error at line 1"), "{t}");
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test(flavor = "multi_thread")]
 async fn shacl_errors() {
     let mut c = Client::start(people_server());
     let (t, e) = c

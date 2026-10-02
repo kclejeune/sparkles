@@ -306,10 +306,11 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         read(
             "validate_shacl",
             "Validate with SHACL",
-            "Validate a dataset's data graph against a SHACL shapes graph (Turtle; SHACL Core and SHACL-SPARQL). Returns conforms, the result counts by severity and the first maxResults results, most severe first: focus node, path, value, shape, constraint component, severity and message. Runs under a timeout and a memory budget; nothing is written.",
+            "Validate a dataset's data graph against a SHACL shapes graph (Turtle or SHACLC; SHACL Core, SHACL 1.2 list constraints and SHACL-SPARQL). Returns conforms, the result counts by severity and the first maxResults results, most severe first: focus node, path, value, shape, constraint component, severity and message. Runs under a timeout and a memory budget; nothing is written.",
             json!({"type":"object","additionalProperties":false,"required":["shapes"],"properties":{
                 "dataset": ds(),
-                "shapes": {"type":"string","minLength":1,"maxLength":1_048_576,"description":"The shapes graph in Turtle"},
+                "shapes": {"type":"string","minLength":1,"maxLength":1_048_576,"description":"The shapes graph in Turtle, or in SHACLC with shapesFormat"},
+                "shapesFormat": {"enum":["turtle","shaclc"],"default":"turtle","description":"The syntax of `shapes`: Turtle, or the SHACL Compact Syntax"},
                 "graph": graph(),
                 "reasoning": rs(),
                 "maxResults": max_results(cfg),

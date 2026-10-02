@@ -23,8 +23,9 @@ pub struct ValidationArgs {
     /// shapes graph of the dataset (repeatable; SHACL)
     #[arg(long)]
     pub shapes_graph: Vec<String>,
-    /// a shapes file (Turtle), copied into the database (SHACL); with --shapes-graph,
-    /// merged with the graphs
+    /// a shapes file (Turtle, another RDF syntax by its extension, or SHACLC as `.shaclc`
+    /// or `.shc`), stored in the database as Turtle (SHACL); with --shapes-graph, merged
+    /// with the graphs
     #[arg(long)]
     pub shapes: Option<PathBuf>,
     /// a schema file (ShExC, ShExJ, or ShExR in Turtle), copied into the database with
@@ -212,8 +213,13 @@ fn set_shacl(
         ..Default::default()
     };
     if let Some(f) = &a.shapes {
-        shapes.inline = Some(std::fs::read_to_string(f)?);
+        shapes.inline =
+            Some(std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?);
         shapes.source = Some(f.display().to_string());
+        // the syntax from the file name: SHACLC, or an RDF syntax (Turtle by default)
+        if let Some((syntax, _)) = sparkles_shacl::ShapesSyntax::from_path(f) {
+            shapes.format = Some(syntax.media_type().to_string());
+        }
     }
     let cfg = ValidationConfig {
         format: 2,
