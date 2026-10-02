@@ -1122,7 +1122,8 @@ SHACL suite (98/98 Core, 20/20 SPARQL) stayed green.
     is finer than SHACL's, which works per graph.
 
 **Cost at Phase 1.** Every validated write ran a full validation of the data graph. For
-SHACL that took about 160 ms at 1M triples. Skipped writes were free. The standalone validator's numbers are in
+SHACL that took about 160 ms at 1M triples. Skipped writes were free. The standalone
+validator's numbers are in
 [BENCHMARKS: Other measurements](../BENCHMARKS.md#other-measurements).
 
 **Phase 2 shipped on 2026-10-02.**
@@ -1161,11 +1162,11 @@ SHACL that took about 160 ms at 1M triples. Skipped writes were free. The standa
   `lastCheck`, `recentRejections` and, for SHACL, `incremental`.
 - **Tests.** A15 runs random shapes over every path form and the core components,
   including SHACL-SPARQL and recursive shapes, with random data and writes in `warn`,
-  strict `reject` and grandfather `reject`. Every write is checked against full
-  validations of the states before and after it: the decision, the counts, and that
-  every new result is listed. At landing, 60 scenarios per mode with 150 writes each
-  (23,550 writes) passed, with every fallback reason hit. CI runs a smaller set. A16 is
-  a unit test that checks one focus node and the incremental strategy.
+  strict `reject` and grandfather `reject`. Each write's decision and counts are checked
+  against full validations of the states before and after it, and every new result must
+  be listed. At landing, 180 scenarios with 23,550 writes in all passed. They hit every
+  fallback reason except `shapes` and `bulk`, which unit tests cover. CI runs a smaller
+  set. A16 is a unit test that checks one focus node and the incremental strategy.
 - **Cost.** `bench:shacl-write` gained a write that touches a person, which the shapes
   read through a sequence path and `sh:class`. It also gained `TIMEOUT`, because a full
   validation of 10.5M triples can exceed the default budget of 10 s. On a machine busy

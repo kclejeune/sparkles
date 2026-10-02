@@ -2232,8 +2232,7 @@ validation. The summary then has `strategy: "incremental"` and lists the results
 focus nodes it validated. `focusNodes` says how many there were, and `total` and
 `bySeverity` still count the whole state.
 
-A write is skipped when no shape reads any predicate it changes. It is validated in full
-in these cases, and `fallback` names the reason:
+A write is validated in full in these cases, and `fallback` names the reason:
 
 | `fallback` | Case |
 |---|---|
