@@ -426,6 +426,37 @@ proptest! {
     }
 }
 
+/// Found by the property test: long strings over two lines, and a label redefined with
+/// neither binding used. Both declarations of `o:` go, streamed or not.
+#[test]
+fn unused_redefinitions_stream_like_they_format() {
+    let opts = Options {
+        prune_prefixes: true,
+        ..Options::default()
+    };
+    let cases = [
+        (
+            "PREFIX ex: <http://example.org/>\n PREFIX o: <http://example.org/o/> ex:s ex:p _:x . ex:s ex:p '''two\nlines''', '''two\nlines''' . @prefix o: <http://other.org/> . ex:s ex:p '''two\nlines''' .\n",
+            "PREFIX ex: <http://example.org/>\n\nex:s ex:p _:x .\n\nex:s\n  ex:p \"\"\"two\nlines\"\"\", \"\"\"two\nlines\"\"\" ;\n.\n\nex:s ex:p \"\"\"two\nlines\"\"\" .\n",
+        ),
+        (
+            "PREFIX ex: <http://example.org/>\n @prefix o: <http://other.org/> .\n# c\nex:s ex:p _:x . ex:s ex:p '''two\nlines''' . PREFIX o: <http://example.org/o/> ex:s ex:p '''two\nlines''' .\n",
+            "PREFIX ex: <http://example.org/>\n\n# c\nex:s ex:p _:x .\n\nex:s ex:p \"\"\"two\nlines\"\"\" .\n\nex:s ex:p \"\"\"two\nlines\"\"\" .\n",
+        ),
+    ];
+    for (doc, expected) in cases {
+        let formatted = format(doc, Language::Turtle, &opts).unwrap().text;
+        assert_eq!(formatted, expected);
+        assert_eq!(
+            format(&formatted, Language::Turtle, &opts).unwrap().text,
+            formatted,
+            "not a fixpoint"
+        );
+        agrees(doc, false, &opts).unwrap();
+        assert_eq!(stream(doc, false, &opts, &cfg(1, 1)).unwrap(), expected);
+    }
+}
+
 // --------------------------------------------------------------- the edges ------
 
 #[test]

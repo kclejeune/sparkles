@@ -1192,6 +1192,7 @@ mod tests {
             exact: true,
             reconstructed: false,
             default_graph: true,
+            unvalidated: false,
         };
         let m = ManifestCommit::from(&c);
         assert_eq!(

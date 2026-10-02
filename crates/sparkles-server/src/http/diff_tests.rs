@@ -216,6 +216,338 @@ async fn diffs_as_json_and_lines() {
 }
 
 #[tokio::test]
+async fn diffs_as_rdf_patch() {
+    let s = server(|_| {}).await;
+    let id = s.state.datasets.read()["h"].store.dataset_id();
+    let r = get_with(
+        &s.app,
+        "/h/diff?from=1&to=4",
+        "accept",
+        "application/rdf-patch",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(
+        r.header("content-type")
+            .unwrap()
+            .starts_with("application/rdf-patch")
+    );
+    assert_eq!(
+        r.text(),
+        format!(
+            "H id <urn:uuid:{id}#commit:4> .\nH prev <urn:uuid:{id}#commit:1> .\nTX .\n\
+             D <urn:a> <urn:p> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
+             A <urn:c> <urn:p> \"three\" .\n\
+             A <urn:b> <urn:p> \"2\"^^<http://www.w3.org/2001/XMLSchema#integer> <urn:g1> .\n\
+             TC .\n"
+        )
+    );
+    // text/rdf-patch names the same format
+    let r = get_with(&s.app, "/h/diff?from=1&to=4", "accept", "text/rdf-patch").await;
+    assert!(
+        r.header("content-type")
+            .unwrap()
+            .starts_with("text/rdf-patch")
+    );
+    assert!(r.text().starts_with("H id "));
+    // binary: Thrift compact rows, the first a header
+    let r = get(
+        &s.app,
+        "/h/diff?from=commit:1&to=commit:4&format=patch-binary",
+    )
+    .await;
+    assert_eq!(
+        r.header("content-type").as_deref(),
+        Some("application/rdf-patch+thrift")
+    );
+    assert_eq!(&r.body[..5], &[0x1C, 0x18, 2, b'i', b'd']);
+    let tag = r.header("etag").unwrap();
+    assert!(tag.contains(":patch-binary"), "{tag}");
+    // a patch lists every change
+    assert_eq!(
+        get(&s.app, "/h/diff?from=1&format=patch&limit=1")
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+/// The `data:` of each `commit` event a stream sends until `n` arrived, and their ids.
+async fn read_events(body: &mut axum::body::BodyDataStream, n: usize) -> Vec<(String, String)> {
+    use futures_util::StreamExt;
+    let mut buf = String::new();
+    let mut out = Vec::new();
+    while out.len() < n {
+        let chunk = tokio::time::timeout(Duration::from_secs(10), body.next())
+            .await
+            .expect("an event within 10 s")
+            .expect("the stream is open")
+            .unwrap();
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(end) = buf.find("\n\n") {
+            let ev: String = buf.drain(..end + 2).collect();
+            // a field's value, without the one space after the colon
+            let field = |k: &str| {
+                ev.lines()
+                    .filter_map(|l| l.strip_prefix(k))
+                    .map(|v| v.strip_prefix(' ').unwrap_or(v))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            if field("event:") == "commit" {
+                out.push((field("id:"), field("data:")));
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn the_change_feed() {
+    let s = server(|_| {}).await;
+    let id = s.state.datasets.read()["h"].store.dataset_id();
+    // every commit after 0, oldest first
+    let r = get(&s.app, "/h/changes?after=0").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.header("sparkles-changes-next").as_deref(), Some("4"));
+    assert_eq!(r.header("sparkles-head").as_deref(), Some("4"));
+    let j = r.json();
+    assert_eq!(
+        (j["after"].as_u64(), j["next"].as_u64()),
+        (Some(0), Some(4))
+    );
+    let c = j["commits"].as_array().unwrap();
+    assert_eq!(c.len(), 4);
+    assert_eq!(c[0]["commit"]["seq"], 1);
+    assert_eq!(c[0]["complete"], true);
+    assert_eq!(c[0]["changes"][0]["op"], "+");
+    assert_eq!(c[0]["changes"][0]["subject"], "<urn:a>");
+    assert_eq!(c[2]["changes"][0]["op"], "-");
+    assert_eq!(c[1]["changes"][0]["graph"], "<urn:g1>");
+    // pages
+    let r = get(&s.app, "/h/changes?after=commit:1&limit=2").await;
+    assert_eq!(r.header("sparkles-changes-next").as_deref(), Some("3"));
+    assert_eq!(r.json()["commits"].as_array().unwrap().len(), 2);
+    // nothing after the head (the default)
+    let j = get(&s.app, "/h/changes").await.json();
+    assert_eq!(j["commits"], json!([]));
+    assert_eq!(j["next"], 4);
+    // RDF Patch: one patch per commit, chained by prev
+    let r = get_with(
+        &s.app,
+        "/h/changes?after=2",
+        "accept",
+        "application/rdf-patch",
+    )
+    .await;
+    assert_eq!(
+        r.text(),
+        format!(
+            "H id <urn:uuid:{id}#commit:3> .\nH prev <urn:uuid:{id}#commit:2> .\nTX .\n\
+             D <urn:a> <urn:p> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .\nTC .\n\
+             H id <urn:uuid:{id}#commit:4> .\nH prev <urn:uuid:{id}#commit:3> .\nTX .\n\
+             A <urn:c> <urn:p> \"three\" .\nTC .\n"
+        )
+    );
+    // errors
+    assert_eq!(
+        get(&s.app, "/h/changes?after=99").await.status,
+        StatusCode::NOT_FOUND
+    );
+    for q in [
+        "limit=0",
+        "limit=1001",
+        "wait=soon",
+        "format=diff",
+        "after=x",
+    ] {
+        assert_eq!(
+            get(&s.app, &format!("/h/changes?{q}")).await.status,
+            StatusCode::BAD_REQUEST,
+            "{q}"
+        );
+    }
+    // long polling: nothing new within the wait
+    let t = std::time::Instant::now();
+    let j = get(&s.app, "/h/changes?after=4&wait=0.3").await.json();
+    assert_eq!(j["commits"], json!([]));
+    assert!(t.elapsed() >= Duration::from_millis(250));
+    // and a commit that arrives during it
+    let app = s.app.clone();
+    let poll = tokio::spawn(async move { get(&app, "/h/changes?after=4&wait=30").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let t = std::time::Instant::now();
+    update(&s.app, "h", "INSERT DATA { <urn:d> <urn:p> 4 }").await;
+    let r = poll.await.unwrap();
+    assert!(t.elapsed() < Duration::from_secs(10));
+    assert_eq!(r.json()["commits"][0]["commit"]["seq"], 5);
+    assert_eq!(r.header("sparkles-changes-next").as_deref(), Some("5"));
+    // server-sent events: the commits after 3, then new ones as they come
+    let res = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/h/changes?after=3")
+                .header("accept", "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        res.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    let mut body = res.into_body().into_data_stream();
+    let ev = read_events(&mut body, 2).await;
+    assert_eq!(ev[0].0, "4");
+    assert_eq!(ev[1].0, "5");
+    let first: J = serde_json::from_str(&ev[0].1).unwrap();
+    assert_eq!(first["changes"][0]["object"], "\"three\"");
+    update(&s.app, "h", "INSERT DATA { <urn:e> <urn:p> 5 }").await;
+    let ev = read_events(&mut body, 1).await;
+    assert_eq!(ev[0].0, "6");
+    drop(body);
+    // a reconnect resumes after Last-Event-ID, here with patches as data
+    let res = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/h/changes?format=patch")
+                .header("accept", "text/event-stream")
+                .header("last-event-id", "5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = res.into_body().into_data_stream();
+    let ev = read_events(&mut body, 1).await;
+    assert_eq!(ev[0].0, "6");
+    assert!(
+        ev[0]
+            .1
+            .starts_with(&format!("H id <urn:uuid:{id}#commit:6> .\nH prev")),
+        "{}",
+        ev[0].1
+    );
+    assert!(ev[0].1.ends_with("TC ."));
+}
+
+#[tokio::test]
+async fn the_change_feed_keeps_its_budget() {
+    let s = server(|l| l.max_rows = 1).await;
+    update(
+        &s.app,
+        "h",
+        "INSERT DATA { <urn:x> <urn:p> 1 . <urn:y> <urn:p> 2 }",
+    )
+    .await;
+    // commits 1–4 change one quad each; 5 changes two, more than a page may list
+    let j = get(&s.app, "/h/changes?after=0").await.json();
+    assert_eq!(j["commits"].as_array().unwrap().len(), 1);
+    let j = get(&s.app, "/h/changes?after=4").await.json();
+    let c = &j["commits"][0];
+    assert_eq!(
+        (c["complete"].as_bool(), c["added"].as_u64()),
+        (Some(false), Some(2))
+    );
+    assert!(c.get("changes").is_none());
+    // a patch cannot leave changes out
+    let r = get(&s.app, "/h/changes?after=4&format=patch").await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(r.json()["code"], "changes-too-large");
+    assert_eq!(r.json()["commit"], 5);
+    // history that is gone is 410
+    let r = send(
+        &s.app,
+        Request::post("/$/compact/h").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(r.status.is_success());
+    for _ in 0..200 {
+        let r = get(&s.app, "/h/changes?after=1").await;
+        if r.status == StatusCode::GONE {
+            assert_eq!(r.json()["code"], "history-gone");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("commit 1 stayed readable after compaction");
+}
+
+#[tokio::test]
+async fn warm_snapshots_are_materialized() {
+    let s = server(|_| {}).await;
+    let r = send(
+        &s.app,
+        Request::post("/$/snapshots/h")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"name": "w", "at": "commit:2", "warm": true}"#,
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["warm"], true);
+    let h = get(&s.app, "/$/history/h").await.json();
+    assert_eq!(h["cache"]["entries"], 1);
+    assert_eq!(get(&s.app, "/$/snapshots/h/w").await.json()["warm"], true);
+    // a form works too, and a pin is not warm unless asked
+    let r = send(
+        &s.app,
+        Request::post("/$/snapshots/h")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("name=c&at=commit:1"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.json()["warm"], false);
+}
+
+#[tokio::test]
+async fn the_catalog_horizon_prunes_commits() {
+    let s = server(|_| {}).await;
+    let r = send(
+        &s.app,
+        Request::post("/$/compact/h").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(r.status.is_success());
+    for _ in 0..500 {
+        if get(&s.app, "/$/history/h").await.json()["oldestReconstructable"] == 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let r = put_json(&s.app, "/$/history/h", r#"{"catalog": {"keepCommits": 2}}"#).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["catalog"]["keepCommits"], 2);
+    assert_eq!(j["catalog"]["firstRetained"], 3);
+    assert_eq!(get(&s.app, "/$/commits/h/1").await.status, StatusCode::GONE);
+    assert_eq!(get(&s.app, "/$/commits/h").await.json()["firstRetained"], 3);
+    // a PUT without `catalog` keeps the horizon; null turns it off
+    let j = put_json(&s.app, "/$/history/h", "{}").await.json();
+    assert_eq!(j["catalog"]["keepCommits"], 2);
+    let j = put_json(&s.app, "/$/history/h", r#"{"catalog": null}"#)
+        .await
+        .json();
+    assert_eq!(j["catalog"]["keepCommits"], J::Null);
+    for bad in [r#"{"catalog": 3}"#, r#"{"catalog": {"keepAge": "soon"}}"#] {
+        assert_eq!(
+            put_json(&s.app, "/$/history/h", bad).await.status,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn diff_errors_tags_and_budgets() {
     let s = server(|l| l.max_rows = 1).await;
     let r = get(&s.app, "/h/diff?from=abc").await;

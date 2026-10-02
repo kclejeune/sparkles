@@ -10,7 +10,7 @@ use sparkles::history::{At, HistoryOptions, Retention, Schedule};
 use sparkles::io::{RdfFormat, Source};
 use sparkles::sparql::QueryOptions;
 use sparkles::sparql::update::update;
-use sparkles::store::{DiffMethod, DiffOp, DiffOptions, Store, StoreOptions};
+use sparkles::store::{ChangesOptions, DiffMethod, DiffOp, DiffOptions, Store, StoreOptions};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -287,6 +287,120 @@ fn random_histories_across_compactions_and_bulk_commits() {
         let k = bulks.first().expect("a bulk commit");
         assert_eq!(check(&s, k - 1, *k, None), DiffMethod::Compare);
     }
+}
+
+/// Read the change feed from `after` to the head in pages; checks each commit's changes
+/// against the diff of that one commit. Returns the commits read and how many were
+/// listed without their changes.
+fn follow(s: &Store, after: u64, o: &ChangesOptions) -> (Vec<u64>, usize) {
+    let (mut seen, mut partial, mut at) = (Vec::new(), 0, after);
+    loop {
+        let page = s.changes(at, o).unwrap();
+        assert!(page.commits.len() <= o.max_commits.max(1));
+        if page.commits.is_empty() {
+            assert_eq!(at, s.head_commit().seq);
+            return (seen, partial);
+        }
+        for c in &page.commits {
+            let seq = c.commit.seq;
+            assert_eq!(seq, at + 1, "commits come in order");
+            let d = s
+                .diff(&At::Commit(seq - 1), &At::Commit(seq), &Default::default())
+                .unwrap();
+            assert_eq!(
+                (c.added, c.removed),
+                (d.added, d.removed),
+                "counts of {seq}"
+            );
+            if c.complete() {
+                let got: Vec<String> = c
+                    .iter()
+                    .map(|(op, q)| format!("{} {}", op.sign(), nquads_line(&q)))
+                    .collect();
+                let want: Vec<String> = d
+                    .iter()
+                    .map(|(op, q)| format!("{} {}", op.sign(), nquads_line(&q)))
+                    .collect();
+                assert_eq!(got, want, "changes of {seq}");
+            } else {
+                partial += 1;
+                assert!(o.max_quads > 0 && c.added + c.removed > o.max_quads);
+            }
+            seen.push(seq);
+            at = seq;
+        }
+        assert_eq!(page.next(), at);
+    }
+}
+
+#[test]
+fn the_change_feed_lists_each_commit_once() {
+    for seed in [3, 4] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(
+            &dir.path().join("db"),
+            StoreOptions {
+                bulk_threshold: 6,
+                history_max_generations: 64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.set_retention(keep_all()).unwrap();
+        let mut r = Rng(seed * 104_729);
+        let log = random_history(&s, &mut r, 60, 6);
+        assert!(log.iter().any(|l| l.1 == Did::Bulk));
+        let head = s.head_commit().seq;
+        for (after, max_commits, max_quads) in [(0, 100, 0), (0, 3, 0), (5, 7, 4), (head, 10, 0)] {
+            let o = ChangesOptions {
+                max_commits,
+                max_quads,
+                ..Default::default()
+            };
+            let (seen, partial) = follow(&s, after, &o);
+            assert_eq!(seen, (after + 1..=head).collect::<Vec<_>>());
+            if max_quads == 0 {
+                assert_eq!(partial, 0);
+            }
+        }
+        // past the head
+        assert!(matches!(
+            s.changes(head + 1, &Default::default()),
+            Err(Error::NotFound(_))
+        ));
+    }
+}
+
+#[test]
+fn the_change_feed_stops_at_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    let u = |q: &str| update(&s, q, &QueryOptions::default()).unwrap();
+    u("INSERT DATA { <urn:a> <urn:p> 1 }");
+    u("INSERT DATA { <urn:b> <urn:p> 2 }");
+    u("INSERT DATA { <urn:c> <urn:p> 3 }");
+    s.create_snapshot("v", &At::Commit(1), None).unwrap();
+    s.compact().unwrap(); // gen 2 from commit 3
+    u("DELETE DATA { <urn:a> <urn:p> 1 }");
+    u("INSERT DATA { <urn:a> <urn:p> 11 }");
+    s.compact().unwrap(); // gen 3 from commit 5; gen 2 is collected
+    u("INSERT DATA { <urn:d> <urn:p> 4 }");
+    assert_eq!(s.history().reconstructable, [(0, 3), (5, 6)]);
+    // up to the gap, then the commit that cannot be read
+    let page = s.changes(1, &Default::default()).unwrap();
+    assert_eq!(page.next(), 3);
+    let e = s.changes(3, &Default::default()).err().unwrap();
+    assert!(matches!(&e, Error::HistoryGone(g) if g.seq == 4), "{e}");
+    let e = s.changes(4, &Default::default()).err().unwrap();
+    assert!(matches!(&e, Error::HistoryGone(g) if g.seq == 4), "{e}");
+    // and after it
+    let (seen, _) = follow(&s, 5, &Default::default());
+    assert_eq!(seen, [6]);
+    // waiting for commits: the watch sees the next one
+    let mut rx = s.subscribe_commits();
+    u("INSERT DATA { <urn:e> <urn:p> 5 }");
+    assert!(rx.has_changed().unwrap());
+    assert_eq!(*rx.borrow_and_update(), 7);
 }
 
 #[test]

@@ -114,6 +114,9 @@ enum SnapshotCmd {
         /// time (a running server's history upkeep, or the next `snapshot gc`)
         #[arg(long)]
         expires: Option<String>,
+        /// keep the pinned state materialized in a server's history cache
+        #[arg(long)]
+        warm: bool,
     },
     /// List named snapshots
     List {
@@ -170,11 +173,25 @@ enum SnapshotCmd {
         #[arg(long)]
         remove: Option<String>,
     },
-    /// Drop expired pins, make the pins schedules call for, and collect the history
-    /// nothing keeps any more (a running server does this every minute)
+    /// Drop expired pins, make the pins schedules call for, collect the history nothing
+    /// keeps any more and prune the commit catalog (a running server does this every
+    /// minute)
     Gc {
         #[arg(long)]
         loc: PathBuf,
+    },
+    /// Prune the metadata of commits that can no longer be read: keep the last N
+    /// commits and/or those of a duration (90s, 30m, 12h, 7d), beyond the readable ones
+    Catalog {
+        #[arg(long)]
+        loc: PathBuf,
+        #[arg(long)]
+        keep_commits: Option<u64>,
+        #[arg(long)]
+        keep_age: Option<String>,
+        /// keep every commit's metadata (the default)
+        #[arg(long, conflicts_with_all = ["keep_commits", "keep_age"])]
+        off: bool,
     },
 }
 
@@ -205,6 +222,7 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             at,
             note,
             expires,
+            warm,
         } => {
             let store = Store::open(&loc, opts)?;
             let at: At = at.as_deref().unwrap_or("head").parse()?;
@@ -220,7 +238,15 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
                     }
                 }),
             };
-            let (s, created) = store.create_snapshot_with(&name, &at, note, expires)?;
+            let (s, created) = store.create_snapshot_opts(
+                &name,
+                &at,
+                &sparkles::history::SnapshotOptions {
+                    note,
+                    expires_ms: expires,
+                    warm,
+                },
+            )?;
             println!(
                 "{} → commit {}{}",
                 s.name,
@@ -344,7 +370,28 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             for n in t.expired.iter().chain(&t.rotated) {
                 println!("removed {n}");
             }
+            let pruned = t.pruned + store.prune_commits()?;
+            if pruned > 0 {
+                println!("pruned {pruned} commit records");
+            }
             print_history(&store.history(), "text")?;
+        }
+        SnapshotCmd::Catalog {
+            loc,
+            keep_commits,
+            keep_age,
+            off,
+        } => {
+            let store = Store::open(&loc, opts)?;
+            let c = if off {
+                sparkles::history::CatalogHorizon::default()
+            } else {
+                sparkles::history::CatalogHorizon {
+                    keep_commits,
+                    keep_age_ms: keep_age.as_deref().map(parse_duration_ms).transpose()?,
+                }
+            };
+            print_history(&store.set_catalog_horizon(c)?, "text")?;
         }
     }
     Ok(())
@@ -359,8 +406,8 @@ fn diff_cmd(
     opts: StoreOptions,
 ) -> Result<()> {
     use sparkles::store::{DiffOp, DiffOptions};
-    if !matches!(format, "diff" | "json" | "count") {
-        bail!("unknown format {format:?}: use diff, json or count");
+    if !matches!(format, "diff" | "json" | "count" | "patch" | "patch-binary") {
+        bail!("unknown format {format:?}: use diff, json, count, patch or patch-binary");
     }
     let store = Store::open(loc, opts)?;
     let graph = match graph {
@@ -418,6 +465,18 @@ fn diff_cmd(
             serde_json::to_writer_pretty(&mut out, &j)?;
             writeln!(out)?;
         }
+        "patch" | "patch-binary" => {
+            use sparkles::patch::{PatchWriter, commit_iri, write_patch};
+            let id = store.dataset_id();
+            let quads: Vec<(DiffOp, oxrdf::Quad)> = d.iter().collect();
+            let mut w = PatchWriter::new(&mut out, format == "patch-binary");
+            write_patch(
+                &mut w,
+                &commit_iri(id, d.to.commit.seq),
+                Some(&commit_iri(id, d.from.commit.seq)),
+                quads.iter().map(|(op, q)| (*op, q)),
+            )?;
+        }
         _ => {
             for (op, q) in d.iter() {
                 let sign = if op == DiffOp::Add { '+' } else { '-' };
@@ -440,6 +499,8 @@ fn print_history(h: &sparkles::history::HistoryStatus, format: &str) -> Result<(
                 "current": g.current, "heldBy": g.held_by.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
             "retention": h.retention,
+            "catalog": h.catalog,
+            "firstRetained": h.first_commit,
             "snapshots": h.snapshots,
         });
         println!("{}", serde_json::to_string_pretty(&j)?);
@@ -488,6 +549,20 @@ fn print_history(h: &sparkles::history::HistoryStatus, format: &str) -> Result<(
             )
             .trim_end()
             .to_string(),
+        }
+    );
+    let c = &h.catalog;
+    println!(
+        "commit catalog: from commit {}, {}",
+        h.first_commit,
+        match (c.keep_commits, c.keep_age_ms) {
+            (None, None) => "keeps every commit".to_string(),
+            (n, a) => format!(
+                "keeps the readable commits{}{}",
+                n.map(|n| format!(" and the last {n}")).unwrap_or_default(),
+                a.map(|a| format!(" and those of the last {}s", a / 1000))
+                    .unwrap_or_default()
+            ),
         }
     );
     Ok(())
@@ -586,6 +661,11 @@ enum Cmd {
         /// Enable the spatial index (GeoSPARQL) for a dataset: NAME, or NAME=geo.json
         #[arg(long)]
         geo: Vec<String>,
+        /// Set a dataset's write-time validation at startup from NAME=CONFIG.json (the
+        /// body of PUT /$/validation/{ds}), or with NAME alone validate it with the
+        /// configuration it has; the data is validated in full and the result logged
+        #[arg(long, value_name = "NAME[=CONFIG]")]
+        validate: Vec<String>,
         /// Memory for each dataset's spatial index, in MiB; a build that would exceed it
         /// is refused and queries run without the index
         #[arg(long, default_value_t = 4096)]
@@ -1067,7 +1147,8 @@ enum Cmd {
         /// only this graph (an IRI, or `default`)
         #[arg(long)]
         graph: Option<String>,
-        /// diff (lines marked + and -), json, or count
+        /// diff (lines marked + and -), json, count, patch (RDF Patch) or
+        /// patch-binary (RDF Patch in RDF Thrift)
         #[arg(long, default_value = "diff")]
         format: String,
     },
@@ -1211,6 +1292,19 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         commit_digests: cli.commit_digests,
         ..Default::default()
     }
+}
+
+/// `serve --validate NAME[=CONFIG]`
+#[cfg(any(feature = "shacl", feature = "shex"))]
+fn validate_at_startup(st: &state::AppState, spec: &str) -> Result<()> {
+    let line = write_validation::validate_at_startup(st, spec)?;
+    tracing::info!("{line}");
+    Ok(())
+}
+
+#[cfg(not(any(feature = "shacl", feature = "shex")))]
+fn validate_at_startup(_: &state::AppState, _: &str) -> Result<()> {
+    bail!("built without write-time validation (cargo features \"shacl\" and \"shex\")")
 }
 
 /// `serve --text NAME[=CONFIG]`
@@ -1394,6 +1488,12 @@ fn print_log(
             .and_then(|a| a.message.as_deref())
             .map(|m| format!("  {m}"))
             .unwrap_or_default();
+        // a write that bypassed the dataset's write-time validation
+        let message = if c.unvalidated {
+            format!("  [unvalidated]{message}")
+        } else {
+            message
+        };
         let line = format!(
             "{:>6}{}  {:<24}  {:<12} {:>10} {:>10} {:>12}  {:<10}{message}",
             c.seq,
@@ -1574,6 +1674,7 @@ fn run() -> Result<()> {
             idle_release_ms,
             text,
             geo,
+            validate,
             geo_mb,
             geo_op_vertices,
             no_geo_rewrite,
@@ -1823,6 +1924,9 @@ fn run() -> Result<()> {
             }
             for g in geo {
                 geo::enable_for(&st, &g)?;
+            }
+            for v in validate {
+                validate_at_startup(&st, &v)?;
             }
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()

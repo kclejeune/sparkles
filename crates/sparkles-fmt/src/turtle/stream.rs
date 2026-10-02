@@ -34,12 +34,15 @@
 //!
 //! `prune-prefixes` needs facts about the whole document: whether a declaration is used
 //! anywhere in its scope (as printed: compacted IRIs count, `a` and dropped datatypes do
-//! not), and whether a label is bound to different namespaces anywhere. A first pass
-//! over the same windows collects them ([`crate::normalize::prune`] on each window), and
-//! the formatting pass hands them to the printer: a trailer that uses every prefix whose
-//! declaration is used after the window, and a synthetic second binding of each label
-//! bound twice in the document. A window never ends right after a directive block then,
-//! so a block that prints nothing always has its neighbors in the same window.
+//! not), and which labels the declarations printed so far bind (an unused redefinition
+//! stays when the binding it replaces was printed with another namespace). A first pass
+//! over the same windows collects the uses ([`crate::normalize::prune`] on each window),
+//! and the formatting pass hands both to the printer: a trailer that uses every prefix
+//! whose declaration is used after the window, and a statement after the prologue that
+//! uses every label the output has declared so far. The printer then keeps the
+//! prologue's bindings of those labels and drops the others, as the output did. A window
+//! never ends right after a directive block then, so a block that prints nothing always
+//! has its neighbors in the same window.
 //!
 //! **Safety checks.** Each window goes through [`crate::check::run`] (comments,
 //! idempotence), and its output slice through two checks over the whole document's
@@ -157,11 +160,7 @@ pub fn format_stream<R: BufRead>(
         };
         let scanned = drive(open().map_err(io_error)?, trig, true, &cfg, &mut a)?;
         if scanned.any_statement {
-            let used = a.used;
-            facts = Some(Facts {
-                used,
-                conflicts: conflicts(&scanned.bindings),
-            });
+            facts = Some(Facts { used: a.used });
         } else {
             // a document of directives alone is printed as written
             opts.prune_prefixes = false;
@@ -341,19 +340,25 @@ impl Prologue {
 
     /// Apply one directive's significant tokens (`PREFIX` / `@prefix`, `BASE` /
     /// `@base`; anything else, a `VERSION` or a malformed directive, changes nothing).
-    fn apply(&mut self, toks: &[(TokenKind, &str)], id: u64) -> Option<(String, String)> {
-        let kw = toks.first()?.1.trim_start_matches('@').to_ascii_lowercase();
+    /// Whether it declared a prefix.
+    fn apply(&mut self, toks: &[(TokenKind, &str)], id: u64) -> bool {
+        let Some(kw) = toks
+            .first()
+            .map(|t| t.1.trim_start_matches('@').to_ascii_lowercase())
+        else {
+            return false;
+        };
         match (kw.as_str(), toks.get(1), toks.get(2)) {
             ("prefix", Some(&(TokenKind::PnameNs, label)), Some(&(TokenKind::IriRef, iri))) => {
                 let label = label.strip_suffix(':').unwrap_or(label);
                 self.declare(label, iri, id);
-                Some((label.to_string(), iri[1..iri.len() - 1].to_string()))
+                true
             }
             ("base", Some(&(TokenKind::IriRef, iri)), _) => {
                 self.rebase(iri);
-                None
+                false
             }
-            _ => None,
+            _ => false,
         }
     }
 
@@ -371,11 +376,8 @@ impl Prologue {
     }
 
     /// The directives, one per line, a relative namespace after the base it was declared
-    /// under; `extra` first (synthetic declarations).
-    fn write(&self, out: &mut String, extra: &[(String, String)]) {
-        for (label, iri) in extra {
-            out.push_str(&format!("PREFIX {label}: {iri}\n"));
-        }
+    /// under.
+    fn write(&self, out: &mut String) {
         let mut written: Option<Rc<str>> = None;
         let base = |out: &mut String, b: &Option<Rc<str>>| {
             out.push_str("BASE ");
@@ -585,8 +587,6 @@ struct Scanner {
     started: bool,
     /// the file header holds `# sparkles-fmt: ignore-file`
     ignore_file: bool,
-    /// every namespace each label is bound to
-    bindings: HashMap<String, HashSet<String>>,
     cuts: VecDeque<Cut>,
     /// a token no Turtle or TriG document holds was seen (a malformed IRI lexes as
     /// `<` and words): where items end is unknown from there, so the rest is one item,
@@ -598,7 +598,6 @@ struct Scanner {
 struct Scanned {
     statements: u64,
     any_statement: bool,
-    bindings: HashMap<String, HashSet<String>>,
     /// copied as written (`ignore-file`)
     verbatim: bool,
 }
@@ -679,7 +678,6 @@ impl Scanner {
             any_statement: false,
             started: false,
             ignore_file: false,
-            bindings: HashMap::new(),
             cuts: VecDeque::new(),
             poisoned: false,
         }
@@ -737,6 +735,11 @@ impl Scanner {
         let t = tokens[i];
         match t.kind {
             TokenKind::Unknown => t.text(text).starts_with(['"', '\'']),
+            // a long string not closed yet lexes as an empty string and a lone quote
+            TokenKind::String1 | TokenKind::String2 => {
+                let s = t.text(text);
+                s.len() == 2 && text[t.start as usize + 2..].starts_with(&s[..1])
+            }
             TokenKind::LBracket | TokenKind::LParen => tokens[i + 1..]
                 .iter()
                 .all(|t| matches!(t.kind, TokenKind::Whitespace | TokenKind::Eof)),
@@ -836,9 +839,8 @@ impl Scanner {
                         toks.iter().map(|(k, r)| (*k, text(r))).collect();
                     let id = self.next_id;
                     let state = Rc::make_mut(&mut self.state);
-                    if let Some((label, iri)) = state.apply(&words, id) {
+                    if state.apply(&words, id) {
                         self.next_id += 1;
-                        self.bindings.entry(label).or_default().insert(iri);
                         let run = self.run.as_mut().expect("a directive run");
                         run.decls.push((toks[2].1.start, id));
                     }
@@ -1096,20 +1098,18 @@ struct Texts {
 
 /// The text of window `w`: its prologue and barrier (the opener of a resumed graph
 /// block), the input from `w.g`, then the closer of a graph block left open and the
-/// trailer using the prefixes `uses`. The second bindings of the labels bound twice
-/// (`conflicts`) open the prologue, or follow the trailer in the first window.
-fn window_text(
-    buf: &Buffer,
-    w: &Window<'_>,
-    conflicts: &[(String, String)],
-    uses: &[String],
-) -> Texts {
+/// trailer using the prefixes `uses`. A statement using the prefixes `kept` (each
+/// `label:`) follows the prologue: with `prune-prefixes`, their declarations there stay.
+fn window_text(buf: &Buffer, w: &Window<'_>, kept: &[String], uses: &[String]) -> Texts {
     let end = w.end(buf);
     let mut text = String::with_capacity((end - w.g) as usize + 512);
-    let mut trailing_conflicts = conflicts;
     if let Some(ctx) = w.ctx {
-        ctx.before.write(&mut text, conflicts);
-        trailing_conflicts = &[];
+        ctx.before.write(&mut text);
+        if !kept.is_empty() {
+            text.push_str("<#b> <#b> ");
+            text.push_str(&kept.join(", "));
+            text.push_str(" .\n");
+        }
         text.push_str(BARRIER);
         if let Some(b) = ctx.inner() {
             text.push_str(&b.opener);
@@ -1129,9 +1129,6 @@ fn window_text(
             false => text.push_str(&uses.join(", ")),
         }
         text.push_str(" .\n");
-        for (label, iri) in trailing_conflicts {
-            text.push_str(&format!("PREFIX {label}: {iri}\n"));
-        }
     }
     Texts {
         window: text,
@@ -1179,7 +1176,6 @@ fn drive(
             return Ok(Scanned {
                 statements: 0,
                 any_statement: true,
-                bindings: HashMap::new(),
                 verbatim: true,
             });
         }
@@ -1247,7 +1243,6 @@ fn drive(
     Ok(Scanned {
         statements: sc.statements,
         any_statement: sc.any_statement,
-        bindings: std::mem::take(&mut sc.bindings),
         verbatim: false,
     })
 }
@@ -1258,7 +1253,7 @@ fn too_large(buf: &Buffer, ctx: Option<&Cut>, g: u64, trig: bool) -> FormatError
     let from = ctx.map_or(g, |c| c.end);
     let mut text = String::new();
     if let Some(c) = ctx {
-        c.after.write(&mut text, &[]);
+        c.after.write(&mut text);
         if let Some(b) = c.inner() {
             text.push_str(&b.opener);
             text.push(' ');
@@ -1291,32 +1286,12 @@ fn too_large(buf: &Buffer, ctx: Option<&Cut>, g: u64, trig: bool) -> FormatError
     }
 }
 
-/// The labels bound to different namespaces, each with a synthetic namespace none of
-/// them uses (not plain, so it compacts nothing).
-fn conflicts(bindings: &HashMap<String, HashSet<String>>) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = bindings
-        .iter()
-        .filter(|(_, iris)| iris.len() > 1)
-        .map(|(label, iris)| {
-            let iri = (0..)
-                .map(|n| format!("urn:x-sparkles-fmt:./{n}"))
-                .find(|i| !iris.contains(i))
-                .expect("a free namespace");
-            (label.clone(), format!("<{iri}>"))
-        })
-        .collect();
-    out.sort();
-    out
-}
-
 // ------------------------------------------------------------- the first pass ------
 
 /// The global facts `prune-prefixes` needs.
 struct Facts {
     /// the declarations used in their scope
     used: HashSet<u64>,
-    /// the labels bound to different namespaces, with a synthetic namespace each
-    conflicts: Vec<(String, String)>,
 }
 
 /// The first pass: which declarations the printed document uses.
@@ -1544,10 +1519,22 @@ impl<W: Write> Pass for Formatter<'_, W> {
         check::deadline(self.opts.deadline)?;
         let end = w.end(buf);
         let last = w.last();
-        // the prefixes used after the window, and the labels bound twice
-        let (conflicts, uses) = match self.facts {
-            None => (&[][..], Vec::new()),
+        // the labels whose declarations the output printed (their bindings in the
+        // prologue stay), and the prefixes used after the window
+        let (kept, uses) = match self.facts {
+            None => (Vec::new(), Vec::new()),
             Some(f) => {
+                let kept = w
+                    .ctx
+                    .map(|c| {
+                        c.before
+                            .prefixes
+                            .iter()
+                            .filter(|p| self.out_state.prefixes.iter().any(|q| q.label == p.label))
+                            .map(|p| format!("{}:", p.label))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let uses = last
                     .map(|l| {
                         l.after
@@ -1558,19 +1545,17 @@ impl<W: Write> Pass for Formatter<'_, W> {
                             .collect()
                     })
                     .unwrap_or_default();
-                // a window holding the whole document has all its bindings
-                let whole = w.ctx.is_none() && last.is_none();
-                (if whole { &[][..] } else { &f.conflicts[..] }, uses)
+                (kept, uses)
             }
         };
-        let t = window_text(buf, w, conflicts, &uses);
+        let t = window_text(buf, w, &kept, &uses);
         let at = |abs: u64| t.head + (abs - w.g) as usize;
         let from = w.from();
         // the input slice after the prologue in force
         let mut check_in = String::new();
         let opener = w.ctx.and_then(Cut::inner).map(|b| b.opener.as_str());
         if let Some(ctx) = w.ctx {
-            ctx.after.write(&mut check_in, &[]);
+            ctx.after.write(&mut check_in);
         }
         if let Some(o) = opener {
             check_in.push_str(o);
@@ -1727,7 +1712,7 @@ impl<W: Write> Formatter<'_, W> {
             check: Check::Graph,
         };
         let mut text = String::new();
-        self.out_state.write(&mut text, &[]);
+        self.out_state.write(&mut text);
         let mut labels: HashSet<String> = HashSet::new();
         if let Some(o) = opener {
             text.push_str(o);
@@ -1924,6 +1909,50 @@ mod tests {
             false,
             &o,
         );
+        // redefinitions: an unused one stays only after a binding of its label printed
+        // with another namespace
+        same(
+            "PREFIX ex: <http://example.org/>\n PREFIX o: <http://example.org/o/> ex:s ex:p _:x . ex:s ex:p '''two\nlines''', '''two\nlines''' . @prefix o: <http://other.org/> . ex:s ex:p '''two\nlines''' .\n",
+            false,
+            &o,
+        );
+        same(
+            "PREFIX a: <http://e/1#>\na:s a:p 1 .\n<http://e/s> <http://e/p> 1 .\nPREFIX a: <http://e/1#>\n<http://e/s> <http://e/p> 2 .\nPREFIX a: <http://e/2#>\n<http://e/s> <http://e/p> <http://e/1#o> .\nPREFIX a: <http://e/3#>\n<http://e/s> <http://e/p> 3 .\n",
+            false,
+            &o,
+        );
+        same(
+            "PREFIX a: <http://e/1#>\n<http://e/s> <http://e/p> 1 .\n<http://e/s> <http://e/p> 2 .\nPREFIX a: <http://e/2#>\n<http://e/s> <http://e/p> 3 .\nPREFIX a: <http://e/3#>\na:s a:p 4 .\n",
+            false,
+            &o,
+        );
+    }
+
+    #[test]
+    fn long_strings_wait_for_their_end() {
+        // `'''` read without its end lexes as `''` and a lone quote: the scanner waits
+        // for more lines, and every statement still ends an item
+        struct Count(Vec<usize>);
+        impl Pass for Count {
+            fn window(&mut self, _: &Buffer, w: &Window<'_>) -> Result<bool, FormatError> {
+                self.0.push(w.new.len());
+                Ok(false)
+            }
+
+            fn verbatim(&mut self, _: &[u8]) -> Result<bool, FormatError> {
+                Ok(false)
+            }
+        }
+        let text = "<a> <b> '''two\nlines''' . <a> <b> \"\"\"\nx\"\"\" .\n<a> <b> '''\n''' .\n";
+        let cfg = StreamConfig {
+            window_bytes: 1,
+            read_bytes: 1,
+            ..StreamConfig::default()
+        };
+        let mut count = Count(Vec::new());
+        let scanned = drive(text.as_bytes(), false, false, &cfg, &mut count).unwrap();
+        assert_eq!(scanned.statements, 3);
+        assert_eq!(count.0, [1, 1, 1, 0]);
     }
 
     #[test]

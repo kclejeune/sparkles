@@ -118,6 +118,7 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--format-timeout S` | `10` | Seconds a `POST /$/format` request may take, including the wait for a free slot (one per core). A slower request gets `408`. |
 | `--vector-memory-mb N` | `4096` | Memory for packed vectors and HNSW graphs (`spk:vectorSearch` and vector indexes), per index generation. A build past it leaves the index `over-budget`, and a search past it gets `507`. A global flag. |
 | `--text NAME[=FILE]` | | Enable full-text search for a dataset. `FILE` is a `text.json`-shaped configuration file. |
+| `--validate NAME[=FILE]` | | Set a dataset's write-time validation from `FILE`, a `PUT /$/validation/{ds}` body, or with `NAME` alone validate the dataset with the configuration it has. Shapes and schemas without inline text are read from the path in `source`, relative to `FILE`. The data is validated in full before the server listens, and the result is logged. A `reject` configuration the data does not pass stops the start ([API](API.md#write-time-validation)). |
 | `--geo NAME[=FILE]` | | Enable the spatial index for a dataset. `FILE` is a `geo.json`-shaped configuration file. The build runs before the server starts listening. |
 | `--geo-mb N` | `4096` | Memory for each dataset's spatial index (geometry column and trees). A build that would exceed it is refused, the status says `over-budget`, and queries run without the index. |
 | `--geo-op-vertices N` | `2000000` | Largest total of input vertices for one geometry operation (overlay, buffer, hull, relate). A larger operation is a type error. |
@@ -224,27 +225,49 @@ sparkles load   --server http://localhost:3030 --dataset ds --message 'Nightly i
 sparkles log    --loc db                      # the message follows each commit's columns
 ```
 
+A commit that skipped the dataset's write-time validation, through `--no-validate` or an
+HTTP bypass, shows `[unvalidated]` before its message in `sparkles log`.
+
 Past states are read with `--at`, which takes a commit number, `commit:N`,
 `time:<RFC 3339>` or `snapshot:NAME`. Every commit since the last compaction or bulk
 commit can be read, and `sparkles log` marks them with `*`. A named snapshot or the
 retention window keeps older ones. `sparkles diff` shows the quads added and removed
-between two states, and `--format json` or `--format count` change its output.
+between two states, and `--format json`, `--format count` or `--format patch` change its
+output. `patch` writes an RDF Patch that Jena's tools read, and `patch-binary` writes it
+as RDF Thrift.
 
 ```sh
 sparkles query    --loc db --at snapshot:release-1 'SELECT ...'
 sparkles dump     --loc db --at time:2026-09-30T14:00:00Z > then.nq
 sparkles clone    --loc db --to sandbox --at commit:40
 sparkles diff     --loc db snapshot:release-1 head --graph http://ex.org/g
+sparkles diff     --loc db 40 head --format patch > changes.rdfp
 sparkles snapshot create   --loc db release-1 --note 'before the migration'
 sparkles snapshot create   --loc db tmp --expires 7d
+sparkles snapshot create   --loc db hot --at commit:40 --warm   # kept materialized
 sparkles snapshot retain   --loc db --keep-age 7d --max-bytes 20GiB
 sparkles snapshot schedule --loc db --prefix daily- --every 1d --keep-last 7
-sparkles snapshot gc       --loc db        # expire pins, make scheduled ones, collect
+sparkles snapshot catalog  --loc db --keep-commits 100000 --keep-age 90d
+sparkles snapshot gc       --loc db        # expire pins, make scheduled ones, collect, prune
 ```
 
-A running server does the work of `snapshot gc` every minute. Over HTTP the same
-features are `?at=`, `GET /{ds}/diff`, `/$/snapshots/{ds}` and `/$/history/{ds}`
+A running server does the work of `snapshot gc` every minute. `snapshot catalog` sets how
+long the commit catalog keeps the metadata of commits that can no longer be read. Without
+it, every commit stays listed. Over HTTP the same features are `?at=`, `GET /{ds}/diff`,
+`/$/snapshots/{ds}` and `/$/history/{ds}`
 ([API: Point-in-time reads and snapshots](API.md#point-in-time-reads-and-snapshots)).
+
+A server also offers a change feed, `GET /{ds}/changes?after=N`. It lists the commits after
+commit N with their changes, as JSON or as one RDF Patch per commit. With `wait=30` a
+request waits for the next commit, and with `Accept: text/event-stream` the commits arrive
+as server-sent events that resume after the last one a client saw
+([API: Change feed](API.md#change-feed)).
+
+```sh
+curl 'http://localhost:3030/ds/changes?after=41&wait=30'
+curl -H 'Accept: application/rdf-patch' 'http://localhost:3030/ds/changes?after=41'
+curl -N -H 'Accept: text/event-stream' 'http://localhost:3030/ds/changes?after=41'
+```
 
 The global flag `--commit-digests` makes a command record a change digest with every
 commit of the databases it opens. A database keeps the setting once it is on, so later

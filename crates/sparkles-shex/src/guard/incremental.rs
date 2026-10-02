@@ -12,6 +12,16 @@
 //! write and in the state after it (the first changed arc on the way from the node is
 //! reached over unchanged arcs, so it is reached in both).
 //!
+//! That walk reaches every node that refers to a changed one, however little the write
+//! changes. When the guard knows the typing of the head (every pair the validations of
+//! the map discovered, with its value), it walks only where typings change: it types
+//! the pairs of the nodes the write touched, reading the other pairs the head had as
+//! `true` from that typing, and goes on to the nodes that refer to a pair whose value
+//! changed. A pair the head had as `false` is typed again wherever it is read, because
+//! a greatest fixed point can turn it `true`, unless it failed with every reference
+//! unknown: only a change to its own neighbourhood can turn such a pair `true`. So a new `foaf:knows` arc between two
+//! people who conform validates one node, not every person who knows them.
+//!
 //! A `{FOCUS p o}` or `{s p FOCUS}` selector selects a node by an arc, so a changed `p`
 //! arc can add or remove an association at its subject (or object). A term selector
 //! selects its node in every state. A SPARQL selector can select anything, so a map
@@ -101,6 +111,75 @@ impl Plan {
         p
     }
 
+    /// Whether a validation follows references from a node to its values (the case
+    /// where a changed arc can change the results of other nodes).
+    pub fn refers(&self) -> bool {
+        !self.steps.is_empty()
+    }
+
+    /// The plan's predicates as ids of `view` (predicates it does not have are left
+    /// out: no arc has them).
+    pub fn resolve(&self, view: &Snapshot) -> Resolved {
+        let ids = |ps: &mut dyn Iterator<Item = &String>| -> FxHashSet<Id> {
+            ps.filter_map(|p| view.lookup_iri(p)).collect()
+        };
+        Resolved {
+            out: self.out.as_ref().map(|o| ids(&mut o.iter())),
+            inn: ids(&mut self.inn.iter()),
+            selectors: self
+                .selectors
+                .iter()
+                .filter_map(|(p, subj)| view.lookup_iri(p).map(|id| (id, *subj)))
+                .collect(),
+            steps: self
+                .steps
+                .iter()
+                .filter_map(|(p, d)| view.lookup_iri(p).map(|id| (id, *d)))
+                .collect(),
+        }
+    }
+
+    /// The nodes whose neighbourhood a changed triple (`(s, p, o)`, ids of `view`) is
+    /// part of, and those a changed selector arc may select or unselect.
+    pub fn direct(r: &Resolved, changes: &[[Id; 3]]) -> Vec<Id> {
+        let mut seen: FxHashSet<Id> = FxHashSet::default();
+        let mut out = Vec::new();
+        let mut add = |x: Id| {
+            if seen.insert(x) {
+                out.push(x);
+            }
+        };
+        for &[s, p, o] in changes {
+            if r.out.as_ref().is_none_or(|out| out.contains(&p)) {
+                add(s);
+            }
+            if r.inn.contains(&p) {
+                add(o);
+            }
+            for &(sp, subj) in &r.selectors {
+                if sp == p {
+                    add(if subj { s } else { o });
+                }
+            }
+        }
+        out
+    }
+
+    /// The nodes that read the neighbourhood of `y` through one referring constraint, in
+    /// `data`.
+    pub fn readers(r: &Resolved, data: &DataGraph, y: Id) -> sparkles::Result<Vec<Id>> {
+        let mut out = Vec::new();
+        for &(p, d) in &r.steps {
+            out.extend(match d {
+                // (x, p, y): x reads y's neighbourhood
+                Dir::Out => data.subjects(p, y)?,
+                // (y, p, x): an inverse constraint at x
+                Dir::In => data.objects(y, p)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// The nodes whose associations the changed triples (`(s, p, o)`, ids of `view`)
     /// can affect, over the data graphs of the states before and after the write;
     /// `None` when the walk visits more than `max_visit` nodes.
@@ -111,67 +190,34 @@ impl Plan {
         changes: &[[Id; 3]],
         max_visit: usize,
     ) -> sparkles::Result<Option<Vec<Id>>> {
-        let ids = |ps: &mut dyn Iterator<Item = &String>| -> FxHashSet<Id> {
-            ps.filter_map(|p| view.lookup_iri(p)).collect()
-        };
-        let out = self.out.as_ref().map(|o| ids(&mut o.iter()));
-        let inn = ids(&mut self.inn.iter());
-        let selectors: Vec<(Id, bool)> = self
-            .selectors
-            .iter()
-            .filter_map(|(p, subj)| view.lookup_iri(p).map(|id| (id, *subj)))
-            .collect();
-        let steps: Vec<(Id, Dir)> = self
-            .steps
-            .iter()
-            .filter_map(|(p, d)| view.lookup_iri(p).map(|id| (id, *d)))
-            .collect();
-        let mut seen: FxHashSet<Id> = FxHashSet::default();
-        let mut stack = Vec::new();
-        let add = |x: Id, seen: &mut FxHashSet<Id>, stack: &mut Vec<Id>| {
-            if seen.insert(x) {
-                stack.push(x);
-            }
-        };
-        for &[s, p, o] in changes {
-            if out.as_ref().is_none_or(|o| o.contains(&p)) {
-                add(s, &mut seen, &mut stack);
-            }
-            if inn.contains(&p) {
-                add(o, &mut seen, &mut stack);
-            }
-            for &(sp, subj) in &selectors {
-                if sp == p {
-                    add(if subj { s } else { o }, &mut seen, &mut stack);
-                }
-            }
-        }
+        let r = self.resolve(view);
+        let mut stack = Plan::direct(&r, changes);
+        let mut seen: FxHashSet<Id> = stack.iter().copied().collect();
         // walk the referring constraints backwards
         while let Some(y) = stack.pop() {
-            for &(p, d) in &steps {
-                for data in states.iter().flatten() {
-                    let from = match d {
-                        // (x, p, y): x reads y's neighbourhood
-                        Dir::Out => data.subjects(p, y)?,
-                        // (y, p, x): an inverse constraint at x
-                        Dir::In => data.objects(y, p)?,
-                    };
-                    for x in from {
-                        add(x, &mut seen, &mut stack);
+            for data in states.iter().flatten() {
+                for x in Plan::readers(&r, data, y)? {
+                    if seen.insert(x) {
+                        stack.push(x);
                     }
                 }
-                if seen.len() > max_visit {
-                    return Ok(None);
-                }
             }
-        }
-        if seen.len() > max_visit {
-            return Ok(None);
+            if seen.len() > max_visit {
+                return Ok(None);
+            }
         }
         let mut v: Vec<Id> = seen.into_iter().collect();
         v.sort_unstable();
         Ok(Some(v))
     }
+}
+
+/// A [`Plan`] with its predicates resolved against one state.
+pub(super) struct Resolved {
+    out: Option<FxHashSet<Id>>,
+    inn: FxHashSet<Id>,
+    selectors: Vec<(Id, bool)>,
+    steps: Vec<(Id, Dir)>,
 }
 
 /// The associations of `map` at `nodes` (ids and terms of the state after the write)

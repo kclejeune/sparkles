@@ -243,6 +243,35 @@ impl DataGraph {
         self.distinct_second(Perm::Pos, p)
     }
 
+    /// Whether `o` is the object of some triple of the data graph.
+    pub fn has_in_edge(&self, o: Id) -> Result<bool> {
+        if !Self::stored(o) {
+            return Ok(false);
+        }
+        let mut found = false;
+        self.scan(Perm::Osp, &[o.0], |_| {
+            found = true;
+            false
+        })?;
+        Ok(found)
+    }
+
+    /// The nodes of the data graph: every distinct subject and object (RDF 1.2 Concepts
+    /// §3.1), subjects first.
+    pub fn nodes(&self) -> Result<Vec<Id>> {
+        let mut out = Vec::new();
+        let mut seen = rustc_hash::FxHashSet::default();
+        for perm in [Perm::Spo, Perm::Osp] {
+            self.scan_distinct(perm, &[], 0, |x| {
+                if seen.insert(x) {
+                    out.push(x);
+                }
+                true
+            })?;
+        }
+        Ok(out)
+    }
+
     fn distinct_second(&self, perm: Perm, p: Id) -> Result<Vec<Id>> {
         let mut out = Vec::new();
         if !Self::stored(p) {

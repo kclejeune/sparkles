@@ -517,3 +517,275 @@ fn grandfather_mode_blocks_only_new_results() {
         (Strategy::Full, Some(2))
     );
 }
+
+/// A uniqueness constraint in SHACL-SPARQL is anchored at the focus node: a write
+/// validates the nodes that share the changed value, not every node.
+const UNIQUE_SPARQL: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://ex.org/> .
+ex:KeyUnique a sh:NodeShape ; sh:targetSubjectsOf ex:key ;
+  sh:sparql [ sh:select """
+    SELECT $this ?value WHERE {
+      $this <http://ex.org/key> ?value . ?other <http://ex.org/key> ?value .
+      FILTER (?other != $this)
+    }""" ] .
+"#;
+
+#[test]
+fn anchored_sparql_constraints_are_validated_incrementally() {
+    use sparkles::guard::Strategy;
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..300 {
+        data.push_str(&format!("ex:n{i} ex:key \"k{i}\" .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let g = match guard::set_config(&s, Some(inline(GuardMode::Reject, UNIQUE_SPARQL))).unwrap() {
+        SetOutcome::Installed(g, _) => g,
+        _ => panic!("installed"),
+    };
+    let st = g.status();
+    assert!(st.incremental.full_shapes.is_empty(), "{st:?}");
+    let v = summary(upd(&s, "INSERT DATA { ex:m ex:key \"new\" }").unwrap());
+    assert_eq!(
+        (v.status, v.strategy, v.fallback.as_deref(), v.focus_nodes),
+        (GuardStatus::Passed, Strategy::Incremental, None, Some(1))
+    );
+    // a duplicate key: both holders are validated, and both have a result
+    let Err(Error::Rejected(r)) = upd(&s, "INSERT DATA { ex:z ex:key \"k7\" }") else {
+        panic!("rejected")
+    };
+    assert_eq!(
+        (
+            r.summary.strategy,
+            r.summary.blocking,
+            r.summary.focus_nodes
+        ),
+        (Strategy::Incremental, 2, Some(2))
+    );
+    // a query that is not anchored is validated in full on every write
+    let global = UNIQUE_SPARQL.replace("$this <http://ex.org/key> ?value .", "");
+    let g = match guard::set_config(&s, Some(inline(GuardMode::Warn, &global))).unwrap() {
+        SetOutcome::Installed(g, _) => g,
+        _ => panic!("installed"),
+    };
+    assert_eq!(g.status().incremental.full_shapes[0].reason, "sparql");
+}
+
+#[test]
+fn where_targets_select_the_nodes_that_conform() {
+    use sparkles::guard::Strategy;
+    let shapes = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://ex.org/> .
+ex:AdultPerson a sh:NodeShape ;
+  sh:targetWhere [ sh:class ex:Person ;
+    sh:property [ sh:path ex:age ; sh:minInclusive 18 ; sh:minCount 1 ] ] ;
+  sh:property [ sh:path ex:licence ; sh:minCount 1 ] .
+"#;
+    let parsed = sparkles_shacl::Shapes::parse(shapes, RdfFormat::Turtle, None).unwrap();
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { ex:alice a ex:Person . ex:bob a ex:Person ; ex:age 21 ; ex:licence \"B\" . ex:carl a ex:Person ; ex:age 12 }",
+    )
+    .unwrap();
+    // the specification's example: only bob is a focus node, and he conforms
+    let report = sparkles_shacl::validate(&s.snapshot(), &parsed, &Default::default()).unwrap();
+    assert!(report.conforms, "{:?}", report.results);
+    enable(&s, inline(GuardMode::Reject, shapes));
+    // carl turns 18 and becomes a focus node without a licence
+    let Err(Error::Rejected(r)) = upd(
+        &s,
+        "DELETE DATA { ex:carl ex:age 12 } ; INSERT DATA { ex:carl ex:age 18 }",
+    ) else {
+        panic!("rejected")
+    };
+    assert_eq!(
+        (r.summary.strategy, r.summary.blocking),
+        (Strategy::Incremental, 1)
+    );
+    assert_eq!(
+        r.summary.results[0]["focusNode"]["value"],
+        "http://ex.org/carl"
+    );
+    // a where target that does not narrow the nodes reads every edge of the focus node:
+    // the new nodes ex:x and "y" are validated, and the literals "B", 21, 12 and "y"
+    // are not IRIs
+    let open = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://ex.org/> .
+ex:NotPerson a sh:NodeShape ; sh:targetWhere [ sh:not [ sh:class ex:Person ] ] ;
+  sh:nodeKind sh:IRI .
+"#;
+    enable(&s, inline(GuardMode::Warn, open));
+    let v = summary(upd(&s, "INSERT DATA { ex:x ex:other \"y\" }").unwrap());
+    assert_eq!(
+        (v.strategy, v.focus_nodes, v.blocking),
+        (Strategy::Incremental, Some(2), 4)
+    );
+}
+
+#[test]
+fn subclass_changes_validate_the_instances_they_affect() {
+    use sparkles::guard::Strategy;
+    let shapes = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://ex.org/> .
+ex:AgentShape a sh:NodeShape ; sh:targetClass ex:Agent ;
+  sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+"#;
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { ex:a a ex:Robot . ex:b a ex:Robot ; ex:name \"B\" . ex:c a ex:Agent ; ex:name \"C\" }",
+    )
+    .unwrap();
+    enable(&s, inline(GuardMode::Warn, shapes));
+    // robots become agents: the two robots are validated, and one has no name
+    let v = summary(
+        upd(
+            &s,
+            "INSERT DATA { ex:Robot <http://www.w3.org/2000/01/rdf-schema#subClassOf> ex:Agent }",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        (v.strategy, v.fallback.as_deref(), v.blocking, v.focus_nodes),
+        (Strategy::Incremental, None, 1, Some(2))
+    );
+}
+
+#[test]
+fn shapes_from_graphs_and_a_file_are_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    s.load(&[Source::from_bytes(
+        SHAPES.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        Some(oxrdf::NamedNode::new("urn:shapes").unwrap()),
+    )])
+    .unwrap();
+    let mut c = cfg(GuardMode::Reject);
+    c.shapes.inline = Some(UNIQUE.into());
+    enable(&s, c);
+    assert!(root.join(guard::SHAPES_FILE).exists());
+    // the graph's shapes and the file's both apply
+    assert!(matches!(
+        upd(&s, "INSERT DATA { ex:p a ex:Person }"),
+        Err(Error::Rejected(_))
+    ));
+    upd(
+        &s,
+        "INSERT DATA { ex:p a ex:Person ; ex:name \"P\" ; ex:email \"e\" }",
+    )
+    .unwrap();
+    assert!(matches!(
+        upd(&s, "INSERT DATA { ex:q ex:email \"e\" }"),
+        Err(Error::Rejected(_))
+    ));
+    // a change to the shapes graph is read with the file's shapes
+    let add = "INSERT DATA { GRAPH <urn:shapes> { ex:PersonShape <http://www.w3.org/ns/shacl#property> [ <http://www.w3.org/ns/shacl#path> ex:email ; <http://www.w3.org/ns/shacl#minCount> 1 ] } }";
+    upd(&s, add).unwrap();
+    assert!(matches!(
+        upd(&s, "INSERT DATA { ex:q ex:email \"e\" }"),
+        Err(Error::Rejected(_))
+    ));
+    assert!(matches!(
+        upd(&s, "INSERT DATA { ex:r a ex:Person ; ex:name \"R\" }"),
+        Err(Error::Rejected(_))
+    ));
+    drop(s);
+    // the configuration names both, and reinstalls
+    let stored = guard::read_config(&root).unwrap().unwrap();
+    assert!(stored.shapes.graphs.is_some() && stored.shapes.file.is_some());
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    guard::install(&s).unwrap().unwrap();
+    assert!(matches!(
+        upd(&s, "INSERT DATA { ex:q ex:email \"e\" }"),
+        Err(Error::Rejected(_))
+    ));
+    upd(
+        &s,
+        "INSERT DATA { ex:r a ex:Person ; ex:name \"R\" ; ex:email \"r\" }",
+    )
+    .unwrap();
+}
+
+/// A write that bypasses validation is flagged in the commit catalog, which keeps the
+/// flag across a restart and rebuilds it from the WAL.
+#[test]
+fn bypassed_writes_are_flagged_in_the_commit_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let catalog = |root: &std::path::Path| -> Vec<(u64, bool)> {
+        let (_, cs) = sparkles::commit::read_catalog(&root.join("commits.bin"))
+            .unwrap()
+            .unwrap();
+        cs.iter().map(|c| (c.seq, c.unvalidated)).collect()
+    };
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        enable(&s, inline(GuardMode::Reject, SHAPES));
+        let bypass = QueryOptions {
+            write: sparkles::guard::WriteOptions {
+                bypass_validation: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let st = update(
+            &s,
+            &format!("{P}INSERT DATA {{ ex:x a ex:Person }}"),
+            &bypass,
+        )
+        .unwrap();
+        let c = st.commit.unwrap();
+        assert!(c.commit.unvalidated);
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["commit"]["unvalidated"],
+            true
+        );
+        let st = upd(&s, "DELETE DATA { ex:x a ex:Person }").unwrap();
+        assert!(!st.commit.unwrap().commit.unvalidated);
+    }
+    // a library write to a validated database without its guard is a bypass too
+    {
+        let s = Store::open(
+            &root,
+            StoreOptions {
+                unvalidated_writes: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let st = upd(&s, "INSERT DATA { ex:y a ex:Person }").unwrap();
+        let c = st.commit.unwrap();
+        assert!(c.commit.unvalidated);
+        assert_eq!(
+            c.validation.unwrap().status,
+            sparkles::guard::GuardStatus::Bypassed
+        );
+    }
+    let flags = catalog(&root);
+    let n = flags.len();
+    assert_eq!(
+        flags[n - 3..].iter().map(|x| x.1).collect::<Vec<_>>(),
+        [true, false, true]
+    );
+    // the WAL records the flag: a rebuilt catalog has it
+    std::fs::remove_file(root.join("commits.bin")).unwrap();
+    drop(
+        Store::open(
+            &root,
+            StoreOptions {
+                unvalidated_writes: true,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(catalog(&root), flags);
+}

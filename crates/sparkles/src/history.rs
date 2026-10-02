@@ -110,6 +110,21 @@ pub struct NamedSnapshot {
     pub generation: Option<String>,
     /// false only after external damage (its generation is gone)
     pub reconstructable: bool,
+    /// kept materialized (see [`SnapshotOptions::warm`])
+    pub warm: bool,
+}
+
+/// Options of a named snapshot ([`Store::create_snapshot_opts`](crate::store::Store::create_snapshot_opts)).
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotOptions {
+    pub note: Option<String>,
+    /// when the pin lapses (milliseconds since the epoch)
+    pub expires_ms: Option<i64>,
+    /// Keep the pinned state materialized: it is built when the pin is made and by the
+    /// history upkeep (after a restart, say), and the history cache evicts it only when
+    /// warm states alone pass its budget. An in-memory dataset keeps every pinned state
+    /// in memory anyway.
+    pub warm: bool,
 }
 
 /// The retention window: the states that were the head within the last `keep_commits`
@@ -128,6 +143,51 @@ impl Retention {
     /// Whether the window keeps anything.
     pub fn is_on(&self) -> bool {
         self.keep_commits.is_some_and(|n| n > 0) || self.keep_age_ms.is_some()
+    }
+}
+
+/// How long the commit catalog keeps the metadata of commits whose state can no longer
+/// be read: the last `keep_commits` commits, and the commits made in the last
+/// `keep_age_ms` milliseconds. Records older than both the readable history and the
+/// horizon are pruned. With neither set, nothing is pruned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogHorizon {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_commits: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_age_ms: Option<u64>,
+}
+
+impl CatalogHorizon {
+    /// Whether the catalog is pruned at all.
+    pub fn is_on(&self) -> bool {
+        self.keep_commits.is_some() || self.keep_age_ms.is_some()
+    }
+
+    fn is_off(&self) -> bool {
+        !self.is_on()
+    }
+
+    /// The oldest commit the horizon keeps (`head` is the newest commit, and
+    /// `made_since(ms)` the first commit made at or after `ms`). A commit is kept if
+    /// either limit keeps it; `None` when the horizon is off.
+    pub fn cutoff(
+        &self,
+        head: u64,
+        now_ms: i64,
+        made_since: &dyn Fn(i64) -> Option<u64>,
+    ) -> Option<u64> {
+        let by_count = self
+            .keep_commits
+            .map(|n| head.saturating_sub(n.saturating_sub(1)));
+        let by_age = self.keep_age_ms.map(|age| {
+            made_since(now_ms.saturating_sub(age.min(i64::MAX as u64) as i64)).unwrap_or(head)
+        });
+        match (by_count, by_age) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 }
 
@@ -180,6 +240,10 @@ pub struct TickReport {
     pub created: Vec<String>,
     pub expired: Vec<String>,
     pub rotated: Vec<String>,
+    /// warm pins materialized
+    pub warmed: usize,
+    /// commit records pruned from the catalog
+    pub pruned: u64,
 }
 
 /// Why a generation is kept.
@@ -223,6 +287,10 @@ pub struct HistoryStatus {
     pub bytes: u64,
     pub retention: Retention,
     pub snapshots: usize,
+    /// how long the commit catalog keeps metadata
+    pub catalog: CatalogHorizon,
+    /// the oldest commit whose metadata the catalog keeps
+    pub first_commit: u64,
     pub cache_entries: usize,
     pub cache_bytes: u64,
     pub hits: u64,
@@ -275,6 +343,8 @@ struct HistoryFile {
     snapshots: Vec<PinFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     schedules: Vec<Schedule>,
+    #[serde(default, skip_serializing_if = "CatalogHorizon::is_off")]
+    catalog: CatalogHorizon,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -286,6 +356,8 @@ struct PinFile {
     note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expires: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    warm: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -294,6 +366,8 @@ pub(crate) struct Pin {
     pub created_ms: i64,
     pub note: Option<String>,
     pub expires_ms: Option<i64>,
+    /// kept materialized in the history cache
+    pub warm: bool,
 }
 
 /// What `history.json` holds.
@@ -302,9 +376,11 @@ pub(crate) struct HistoryConfig {
     pub pins: BTreeMap<String, Pin>,
     pub retention: Retention,
     pub schedules: Vec<Schedule>,
+    pub catalog: CatalogHorizon,
 }
 
-/// Pins, retention and schedules from `history.json` (none if the file is missing).
+/// Pins, retention, schedules and the catalog horizon from `history.json` (none if the
+/// file is missing).
 pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryConfig> {
     let bytes = match std::fs::read(root.join("history.json")) {
         Ok(b) => b,
@@ -339,6 +415,7 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
                     created_ms,
                     note: p.note,
                     expires_ms: p.expires.as_deref().and_then(commit::parse_rfc3339_ms),
+                    warm: p.warm,
                 },
             )
         })
@@ -347,6 +424,7 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
         pins,
         retention: f.retention,
         schedules: f.schedules,
+        catalog: f.catalog,
     })
 }
 
@@ -357,6 +435,7 @@ pub(crate) fn write_file(
     pins: &BTreeMap<String, Pin>,
     retention: Retention,
     schedules: &[Schedule],
+    catalog: CatalogHorizon,
 ) -> Result<()> {
     let f = HistoryFile {
         format: 1,
@@ -370,9 +449,11 @@ pub(crate) fn write_file(
                 created: commit::rfc3339_ms(p.created_ms),
                 note: p.note.clone(),
                 expires: p.expires_ms.map(commit::rfc3339_ms),
+                warm: p.warm,
             })
             .collect(),
         schedules: schedules.to_vec(),
+        catalog,
     };
     crate::store::write_atomic(
         &root.join("history.json"),
@@ -387,7 +468,7 @@ pub(crate) fn reidentify_file(root: &Path, old: uuid::Uuid, new: uuid::Uuid) -> 
         return Ok(());
     }
     let c = read_file(root, old)?;
-    write_file(root, new, &c.pins, c.retention, &c.schedules)
+    write_file(root, new, &c.pins, c.retention, &c.schedules, c.catalog)
 }
 
 // ------------------------------------------------------------ generation table ------
@@ -414,11 +495,25 @@ pub(crate) struct Lease {
     pub label: String,
 }
 
+/// A materialized past state in the history cache.
+pub(crate) struct Cached {
+    /// the generation that served it
+    pub generation: u32,
+    pub seq: u64,
+    pub snap: Arc<Snapshot>,
+    /// the memory its delta is estimated to take
+    pub bytes: u64,
+    /// where its commit ends in the generation's log: a later read of a nearby commit
+    /// starts from this state
+    pub end: crate::store::wal::WalPoint,
+}
+
 /// The in-memory history state of a persistent store.
 pub(crate) struct HistoryState {
     pub pins: BTreeMap<String, Pin>,
     pub retention: Retention,
     pub schedules: Vec<Schedule>,
+    pub catalog: CatalogHorizon,
     /// backup leases by lease id
     pub leases: BTreeMap<u64, Lease>,
     /// the id of the next lease
@@ -427,8 +522,8 @@ pub(crate) struct HistoryState {
     pub gens: BTreeMap<u32, GenEntry>,
     /// sealed generations open for reading, most recent first
     pub open: Vec<(u32, Arc<Generation>)>,
-    /// materialized past states by (generation, commit), most recent first
-    pub cache: Vec<((u32, u64), Arc<Snapshot>, u64)>,
+    /// materialized past states, most recent first
+    pub cache: Vec<Cached>,
     pub hits: u64,
     pub misses: u64,
     pub materializations: u64,
@@ -441,6 +536,7 @@ impl HistoryState {
             pins,
             retention,
             schedules: Vec::new(),
+            catalog: CatalogHorizon::default(),
             leases: BTreeMap::new(),
             next_lease: 1,
             gens: BTreeMap::new(),
@@ -860,6 +956,7 @@ mod tests {
             exact: true,
             reconstructed: false,
             default_graph: true,
+            unvalidated: false,
         }
     }
 
@@ -935,6 +1032,7 @@ mod tests {
                 created_ms: 0,
                 note: None,
                 expires_ms: None,
+                warm: false,
             },
         );
         h.pins.insert(
@@ -944,6 +1042,7 @@ mod tests {
                 created_ms: 0,
                 note: None,
                 expires_ms: None,
+                warm: false,
             },
         );
         let n = h.needed(3, 12, 0, &ts, 8);
@@ -958,6 +1057,7 @@ mod tests {
                 created_ms: 0,
                 note: None,
                 expires_ms: None,
+                warm: false,
             },
         );
         assert!(h.needed(3, 12, 0, &ts, 8).is_empty());
@@ -1016,11 +1116,40 @@ mod tests {
                 created_ms: 0,
                 note: None,
                 expires_ms: None,
+                warm: false,
             },
         );
         assert_eq!(keep(&h), [1]);
         h.pins.clear();
         h.retention.max_bytes = None;
+    }
+
+    #[test]
+    fn the_catalog_horizon_keeps_either_limit() {
+        // commit s was made at 1000·s
+        let made_since = |ms: i64| Some(((ms.max(0) + 999) / 1000) as u64).filter(|s| *s <= 50);
+        let h = |n: Option<u64>, a: Option<u64>| CatalogHorizon {
+            keep_commits: n,
+            keep_age_ms: a,
+        };
+        assert_eq!(h(None, None).cutoff(50, 50_000, &made_since), None);
+        assert_eq!(h(Some(5), None).cutoff(50, 50_000, &made_since), Some(46));
+        assert_eq!(h(Some(500), None).cutoff(50, 50_000, &made_since), Some(0));
+        assert_eq!(
+            h(None, Some(10_000)).cutoff(50, 50_000, &made_since),
+            Some(40)
+        );
+        // nothing made recently: only the head
+        assert_eq!(h(None, Some(10)).cutoff(50, 90_000, &made_since), Some(50));
+        // both: what either keeps
+        assert_eq!(
+            h(Some(5), Some(10_000)).cutoff(50, 50_000, &made_since),
+            Some(40)
+        );
+        assert_eq!(
+            h(Some(20), Some(1_000)).cutoff(50, 50_000, &made_since),
+            Some(31)
+        );
     }
 
     #[test]

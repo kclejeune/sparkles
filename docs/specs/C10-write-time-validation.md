@@ -6,8 +6,10 @@
 > every write's post-state, `/$/validation/{ds}`, `sparkles validation`, metrics, logs and
 > `bench:shacl-write`. Phase 2 shipped in most parts: the predicate relevance filter,
 > incremental validation with its fallbacks, the persisted baseline, grandfather mode and
-> a status panel on the dataset page. Phase 3 was not started. ShEx later became a second
-> guard language ([G02](G02-shex.md)), and its guard is incremental too.
+> a status panel on the dataset page. Phase 3 shipped: localizable SHACL-SPARQL,
+> `sh:targetWhere`, the refinement of F3, the `unvalidated` catalog flag,
+> `serve --validate` and mixed shapes sources. ShEx later became a second guard language
+> ([G02](G02-shex.md)), and its guard is incremental too.
 >
 > **User docs:** [API: Write-time validation](../API.md#write-time-validation) ·
 > [API: Metrics](../API.md#metrics) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
@@ -1174,9 +1176,83 @@ validator's numbers are in
   as long as with validation off, against 1.3 to 4.4 s before. At 10.5M triples they took
   9 to 20 ms, against 9.8 to 14.8 s before.
 
-**Not built.** The `sparkles_validation_focus_nodes` histogram was not added. Summaries
-carry `focusNodes` instead. The panel has no configuration form, and the query page shows
-a `422` as an error rather than a results table. Phase 3 has not started. It covers
-localizable SHACL-SPARQL, `sh:targetWhere`, the refinement of F3, the `unvalidated`
-catalog flag, `serve --validate` and mixed shapes sources. The open questions of §10 keep
-their Phase 1 defaults.
+**Not built in Phase 2.** The `sparkles_validation_focus_nodes` histogram was not added.
+Summaries carry `focusNodes` instead. The panel has no configuration form, and the query
+page shows a `422` as an error rather than a results table. The open questions of §10
+keep their Phase 1 defaults.
+
+**Phase 3 shipped on 2026-10-02.**
+
+- **Localizable SHACL-SPARQL (§6.3).** A constraint or SPARQL-based component is
+  localized when every triple pattern of its query connects to `$this`, or to `$value`
+  for an ASK validator, which the shape's path reaches. Each pattern reached at a node
+  over a path π reads its predicate there, as a dependency `(π, p, out)` or
+  `(π, p, in)`, and extends the path to its other end. Every edge a solution matches is
+  reached from the focus node over edges of the same solution, so the soundness sketch of
+  §6.2.2 carries over in the state the solution belongs to. The design asked for no
+  closures in query paths. The implementation accepts them, because shape paths already
+  take closures through the same reverse evaluation. `FILTER NOT EXISTS`, `OPTIONAL`,
+  `UNION`, `BIND`, aggregates and `GROUP BY` are localized when their patterns are
+  anchored by the enclosing ones. A variable bound in only one branch of a `UNION`, or
+  only inside an `OPTIONAL`, anchors nothing after it, because a solution may leave it
+  unbound. A variable predicate reads every predicate at its node and reaches no path,
+  so patterns may continue from its object only through another anchor. Subqueries,
+  `GRAPH`, `SERVICE`, `VALUES`, `MINUS`, triple terms and negated property sets inside a
+  longer path keep F4. The SPARQL uniqueness constraint of §6.3 now validates the holders
+  of the changed key.
+- **`sh:targetWhere`.** The SHACL 1.2 Core Working Draft of 18 September 2026, §3.1.3.6,
+  defines the target as the nodes of the data graph that conform to the given shape. Its
+  note says an engine may have to test every node. Sparkles parses the target, and both
+  the on-demand validator and the guard support it. Candidates are narrowed when the
+  where shape has `sh:class`, `sh:hasValue`, `sh:in`, or a predicate or inverse predicate
+  property with `sh:minCount` of at least 1, directly or through `sh:node`,
+  `sh:property` and `sh:and`. Otherwise every subject and object of the data graph is
+  tested. Membership reads what conformance to the where shape reads at the focus node,
+  so the target delta of §6.2.2 needs no new rule. Without narrowing, being a node of the
+  data graph also reads every edge of the node. A where shape that is recursive or has a
+  query that is not anchored makes its shape fall back like any other. The draft's node
+  expressions for `sh:targetNode` were left out, because their vocabulary is in a
+  separate, less settled draft.
+- **F3 refined.** A changed `(s, rdfs:subClassOf, o)` is replaced by changed `rdf:type`
+  edges of the instances of `s` and of its subclasses, in both states. Those instances are
+  the only nodes whose class membership the change can alter. The fallback remains when
+  there are more than `max_visit` (100,000) of them.
+- **The `unvalidated` flag.** A commit whose guard check was bypassed carries
+  `unvalidated: true` in `/$/commits`, receipts and `sparkles log` (`[unvalidated]`). So
+  does a write of a library store opened with `unvalidated_writes` on a database that
+  requires validation, which is how `--no-validate` works. Such a write is now reported as
+  `bypassed` like the HTTP bypass. The flag is bit 0 of byte 27 of the WAL commit record
+  and is covered by its CRC. In the catalog it takes bit 4 of the flags byte, because bit
+  3 had gone to the default-graph flag after this spec was written. `commit.json` gains an
+  `unvalidated` member. Older records read as validated.
+- **`serve --validate NAME[=CONFIG.json]`.** With a file, the dataset's configuration is
+  set at startup as by `PUT /$/validation/{ds}`. Shapes or a schema without inline text
+  are read from the path in `source`, relative to the file. With `NAME` alone, the
+  dataset is validated with the configuration it has. Either way the data is validated
+  in full before the server listens, which also makes the state of the head known after a
+  restart without `validation-status.json`. A file whose `reject` mode the data does not
+  pass stops the start. A dataset validated by `NAME` alone that does not pass is
+  reported and keeps its configuration.
+- **Mixed shapes sources.** `shapes` may name graphs and a file together, and the CLI
+  takes `--shapes` with `--shapes-graph`. The file's triples, with fresh blank nodes,
+  are merged with the graphs. A write to a shapes graph merges the file's shapes again.
+- **Grandfather mode for ShEx** shipped with this phase ([G02](G02-shex.md#outcome)).
+- **Tests.** A15 gained random `sh:targetWhere` targets with and without narrowing, nine
+  query forms of SHACL-SPARQL constraints, seven anchored and two not, and an ASK
+  component on random paths. It also counts the writes that change `rdfs:subClassOf` and
+  stay incremental. At landing, 600 scenarios with 32,880 writes passed in warn, strict
+  reject and grandfather reject. The sweep also exposed a flaw of the generator: a shape
+  with two qualified value shapes is not well formed, and the two parses of such a shape
+  could disagree. The generator now gives a shape at most one. Unit tests cover the
+  uniqueness constraint, the specification's example of `sh:targetWhere`, a subclass
+  change, mixed sources across a restart, the flag through a catalog rebuilt from the
+  WAL, and `serve --validate`. The W3C suites stayed at 98/98 and 20/20.
+- **Cost.** `bench:shacl-write` gained `EXTRA=1`, which adds a SHACL-SPARQL constraint on
+  every person (each person they know must have a name) and a shape whose focus nodes
+  are the people of 60 and over, by `sh:targetWhere`. It also gained `MODES`, whose
+  `grandfather` mode is `reject --grandfather` over the shapes the data does not conform
+  to. At 1.05M triples, on a machine with a load average near 30 from other builds, every
+  timed write was validated incrementally. The person write took 16 to 19 ms in `warn`,
+  `reject` and grandfather `reject`, against 18 ms with validation off. The write no
+  shape reads took 13 to 19 ms. Validating the SHACL-SPARQL shape alone in full takes
+  about 0.8 s, which every write paid before this phase, twice in grandfather mode.
