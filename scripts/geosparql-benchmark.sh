@@ -14,9 +14,14 @@
 # correct answers and the score per requirement, and writes every answer and comparison
 # under target/geosparql-benchmark/results/.
 #
-# The database is set up for every conformance class the benchmark tests: RDFS entailment
-# with the GeoSPARQL vocabulary (`infer --profile rdfs --vocab geosparql`) and the query
-# rewrite extension (`"queryRewrite": true` in geo.json). EXTENSIONS=0 leaves both out.
+# Each requirement runs against the configuration of its conformance class. R25 to R30
+# (the RDFS entailment and query rewrite extensions) go to a second database with RDFS
+# entailment of the GeoSPARQL vocabulary (`infer --profile rdfs --vocab geosparql`) and
+# query rewrite (`"queryRewrite": true` in geo.json). The other requirements test the
+# asserted data, so they go to a database with neither, since entailment and rewrite add
+# answers to them. EXTENSIONS=0 sends every query to the plain database. GML and KML
+# literals are compared by their coordinates too, after the server converts them to
+# GeoJSON (`POST /$/geo/convert`).
 #
 # Env: SPARKLES (default target/release/sparkles), PORT (default 3942),
 # GSB_COMMIT (default the pinned commit below), MAX_TIME (seconds per query, default 60),
@@ -49,14 +54,15 @@ git -C "$SRC" fetch --quiet origin "$GSB_COMMIT" 2> /dev/null || true
 git -C "$SRC" -c advice.detachedHead=false checkout --quiet "$GSB_COMMIT"
 
 DB=$WORK/db
-rm -rf "$DB" "$WORK/server" "$WORK/results"
+DBX=$WORK/db-extensions
+rm -rf "$DB" "$DBX" "$WORK/server" "$WORK/results"
 mkdir -p "$WORK/results"
 "$SPARKLES" load --loc "$DB" "$RES/gsb_dataset/dataset.rdf"
-if [ "${EXTENSIONS:-1}" != 0 ]; then
-  "$SPARKLES" infer --loc "$DB" --profile rdfs --vocab geosparql
-  echo '{"queryRewrite": true}' > "$DB/geo.json"
-fi
 "$SPARKLES" geo-index --loc "$DB"
+"$SPARKLES" load --loc "$DBX" "$RES/gsb_dataset/dataset.rdf"
+"$SPARKLES" infer --loc "$DBX" --profile rdfs --vocab geosparql
+echo '{"queryRewrite": true}' > "$DBX/geo.json"
+"$SPARKLES" geo-index --loc "$DBX"
 
 SPID=
 stop() {
@@ -64,18 +70,23 @@ stop() {
   true
 }
 trap stop EXIT
-"$SPARKLES" serve --data "$WORK/server" --loc gsb="$DB" --port "$PORT" > "$WORK/server.log" 2>&1 &
+"$SPARKLES" serve --data "$WORK/server" --loc gsb="$DB" --loc gsbx="$DBX" --port "$PORT" \
+  > "$WORK/server.log" 2>&1 &
 SPID=$!
 for _ in $(seq 1 600); do
-  curl -sf "localhost:$PORT/\$/geo/gsb" > /dev/null 2>&1 && break
+  curl -sf "localhost:$PORT/\$/geo/gsbx" > /dev/null 2>&1 && break
   sleep 0.5
 done
 
-python3 - "$RES" "localhost:$PORT/gsb/sparql" "$WORK/results" "$ROOT/scripts/bench-answers.py" << 'EOF'
+python3 - "$RES" "localhost:$PORT" "$WORK/results" "$ROOT/scripts/bench-answers.py" "${EXTENSIONS:-1}" << 'EOF'
 import collections, importlib.util, json, math, os, re, sys, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 
-res, endpoint, out, answers_py = sys.argv[1:5]
+res, server, out, answers_py, extensions = sys.argv[1:6]
+GEO = "http://www.opengis.net/ont/geosparql#"
+XML_GEOMETRY = (GEO + "gmlLiteral", GEO + "kmlLiteral")
+# the requirements of the RDFS entailment and query rewrite extensions
+EXTENSION_REQS = set(range(25, 31)) if extensions != "0" else set()
 sys.dont_write_bytecode = True  # no __pycache__ next to bench-answers.py
 spec = importlib.util.spec_from_file_location("bench_answers", answers_py)
 ba = importlib.util.module_from_spec(spec)
@@ -98,12 +109,33 @@ def norm(t):
         return ("lang", value, t["xml:lang"].lower())
     if dt in (ba.WKT, ba.GEOJSON):
         return ("geom", ba.geometry(value, dt) or value)
+    if dt in XML_GEOMETRY:
+        return ("geom", converted(value, dt))
     if dt in NUMERIC:
         try:
             return ("num", float(value))
         except ValueError:
             pass
     return ("lit", value, dt)
+
+
+def converted(value, dt):
+    """A GML or KML literal's canonical form, through the server's GeoJSON conversion."""
+    req = urllib.request.Request(
+        f"http://{server}/$/geo/convert",
+        data=json.dumps({"literals": [{"value": value, "datatype": dt}]}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            g = json.load(r)["results"][0].get("geometry")
+    except Exception:  # noqa: BLE001 - compared as written
+        g = None
+    if g is None:
+        return value
+    if g == {"type": "GeometryCollection", "geometries": []}:
+        return "EMPTY"
+    return ba.geometry(json.dumps(g), ba.GEOJSON) or value
 
 
 def same(a, b):
@@ -150,9 +182,9 @@ def expected(path):
     return ("select", sols)
 
 
-def actual(query):
+def actual(query, dataset):
     req = urllib.request.Request(
-        "http://" + endpoint,
+        f"http://{server}/{dataset}/sparql",
         data=urllib.parse.urlencode({"query": query}).encode(),
         headers={"Accept": "application/sparql-results+json"},
     )
@@ -178,7 +210,8 @@ for f in sorted(os.listdir(qdir)):
         continue
     name, req = m.group(1), m.group(2)
     try:
-        got = actual(open(os.path.join(qdir, f)).read())
+        dataset = "gsbx" if int(req) in EXTENSION_REQS else "gsb"
+        got = actual(open(os.path.join(qdir, f)).read(), dataset)
         error = None
     except Exception as e:  # noqa: BLE001 - recorded as a failure
         got, error = None, str(e)[:300]
