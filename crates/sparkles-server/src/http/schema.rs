@@ -120,14 +120,27 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri, p: &Principal) -> ApiResult<Req
         .map(|c| Cursor::decode(c).ok_or_else(|| bad("malformed cursor")))
         .transpose()?;
     let at = super::history::at_param(&params)?;
+    let mut subject_classes = false;
+    for d in params.all("detail") {
+        for d in d.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+            match d {
+                "subjectClasses" => subject_classes = true,
+                d => return Err(bad(format!("unknown detail '{d}': subjectClasses"))),
+            }
+        }
+    }
     let declared_name = declared_graph.as_ref().unwrap_or(&graph).name().to_string();
     // a caller limited to some graphs gets a report of those only
     let graphs = p.view(&ds.name, crate::auth::Endpoint::Info);
     let view = graphs.as_ref().map_or(String::new(), |g| g.read_key());
-    let selection = fnv(&format!(
+    let mut selection = format!(
         "{}\n{declared_name}\n{reasoning}\n{declared_all}\n{view}",
         graph.name()
-    ));
+    );
+    if subject_classes {
+        selection.push_str("\nsubjectClasses");
+    }
+    let selection = fnv(&selection);
     Ok(Request {
         opts: SchemaOptions {
             graph,
@@ -140,7 +153,7 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri, p: &Principal) -> ApiResult<Req
             max_entries: st.schema_max_entries,
             term_totals: false,
             graphs,
-            subject_classes: false,
+            subject_classes,
         },
         selection,
         limit,
@@ -168,7 +181,10 @@ fn schema_error(e: SchemaError, timeout: Duration) -> ApiError {
 
 /// The report the request is answered from: the cached one when it matches the cursor
 /// or the current snapshot, otherwise a fresh one (which replaces the cache).
-fn report(ds: &Dataset, req: &mut Request) -> ApiResult<Arc<SchemaReport>> {
+fn report(
+    ds: &Dataset,
+    req: &mut Request,
+) -> ApiResult<(Arc<SchemaReport>, Arc<sparkles::store::Snapshot>)> {
     let (snap, current) = match &req.at {
         None => {
             let snap = ds.store.snapshot();
@@ -194,7 +210,7 @@ fn report(ds: &Dataset, req: &mut Request) -> ApiResult<Arc<SchemaReport>> {
     let wanted = match &req.cursor {
         Some(c) if c.h != req.selection => {
             return Err(bad(
-                "the cursor belongs to different graph/declaredGraph/reasoning/declared parameters",
+                "the cursor belongs to different graph/declaredGraph/reasoning/declared/detail parameters",
             ));
         }
         Some(c) => c.v,
@@ -205,7 +221,7 @@ fn report(ds: &Dataset, req: &mut Request) -> ApiResult<Arc<SchemaReport>> {
         && e.selection == req.selection
         && (e.report.term_totals.is_some() || !req.opts.term_totals)
     {
-        return Ok(e.report.clone());
+        return Ok((e.report.clone(), snap));
     }
     if wanted != current {
         return Err(err(
@@ -234,7 +250,7 @@ fn report(ds: &Dataset, req: &mut Request) -> ApiResult<Arc<SchemaReport>> {
             report: report.clone(),
         });
     }
-    Ok(report)
+    Ok((report, snap))
 }
 
 /// One page of `items` after the request's cursor.
@@ -311,6 +327,13 @@ fn rdf_format(params: &Params, headers: &HeaderMap) -> ApiResult<Option<RdfForma
 async fn serve(st: St, name: String, uri: Uri, p: Principal, what: What) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut req = parse(&st, &ds, &uri, &p)?;
+    // the constraints layer goes with the JSON summary only
+    let shapes = match what {
+        What::Summary => Some(constraints::ShapesRequest::parse(&Params::from_query(
+            &uri,
+        ))?),
+        _ => None,
+    };
     // VoID is always complete (no cursor), and reports the distinct subjects and objects
     // of the selection as well
     if matches!(what, What::Void(..)) {
@@ -318,7 +341,7 @@ async fn serve(st: St, name: String, uri: Uri, p: Principal, what: What) -> ApiR
         req.cursor = None;
     }
     blocking(move || {
-        let report = report(&ds, &mut req)?;
+        let (report, snap) = report(&ds, &mut req)?;
         let r = &*report;
         Ok(match what {
             What::Void(format, declarations) => {
@@ -336,12 +359,21 @@ async fn serve(st: St, name: String, uri: Uri, p: Principal, what: What) -> ApiR
                     .into_response()
             }
             // the summary always starts both lists at the top
-            What::Summary => Json(r.summary(
-                &ds.name,
-                page(r, &r.classes, &req, false),
-                page(r, &r.predicates, &req, false),
-            ))
-            .into_response(),
+            What::Summary => {
+                let layer = match &shapes {
+                    Some(s) => constraints::layer(&ds, &snap, s, req.opts.graphs.as_deref())?,
+                    None => None,
+                };
+                Json(
+                    r.summary(
+                        &ds.name,
+                        page(r, &r.classes, &req, false),
+                        page(r, &r.predicates, &req, false),
+                    )
+                    .with_constraints(layer.as_ref()),
+                )
+                .into_response()
+            }
             What::Classes => Json(page(r, &r.classes, &req, true)).into_response(),
             What::Predicates => Json(page(r, &r.predicates, &req, true)).into_response(),
         })
@@ -395,6 +427,9 @@ pub(super) async fn predicates(
 
 mod shapes;
 pub(super) use shapes::shapes;
+
+mod constraints;
+pub(super) use constraints::constraints;
 
 #[cfg(test)]
 mod tests;
