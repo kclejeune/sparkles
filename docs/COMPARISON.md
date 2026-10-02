@@ -200,8 +200,9 @@ authentication.
   come from runs in the blocks; the scan is never materialized.
 * **Planner details.** Filters are placed as soon as their variables are bound. Scan sizes
   are exact from block metadata (at most two block decodes). Join estimates use
-  per-predicate distinct subject and object counts with QLever's 0.7 correction factor.
-  Merge joins gallop through skewed inputs. `COUNT(*)` over one pattern comes from index
+  per-predicate distinct subject and object counts with QLever's 0.7 correction factor. A
+  pattern with a single free subject, predicate or object has a distinct value of it per
+  row. Merge joins gallop through skewed inputs. `COUNT(*)` over one pattern comes from index
   metadata. Transitive paths traverse from the bound side, with index lookups per
   frontier node, instead of materializing the closure.
 * **Executed-plan feedback.** Every query returns a runtime-information tree (estimated

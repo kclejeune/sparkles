@@ -1680,9 +1680,13 @@ impl<'a> Planner<'a> {
                 _ => None,
             };
             let quads = snap.len().max(1) as f64;
+            // a pattern with one free subject, predicate or object column has a value of it
+            // per triple
+            let free_spo = cols.iter().filter(|(kc, _)| order[*kc] != G).count();
             for &(kc, v) in &cols {
                 let comp = order[kc];
                 let d = match (comp, pstat.as_ref()) {
+                    (S | P | O, _) if free_spo == 1 => est,
                     (S, Some(ps)) if pstat.is_some() => {
                         ps.distinct_subjects as f64 * est / ps.count.max(1) as f64
                     }
