@@ -277,8 +277,12 @@ fn rdf_format(params: &Params, headers: &HeaderMap) -> ApiResult<Option<RdfForma
 async fn serve(st: St, name: String, uri: Uri, what: What) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut req = parse(&st, &ds, &uri)?;
-    // VoID reports the distinct subjects and objects of the selection as well
-    req.opts.term_totals = matches!(what, What::Void(..));
+    // VoID is always complete (no cursor), and reports the distinct subjects and objects
+    // of the selection as well
+    if matches!(what, What::Void(..)) {
+        req.opts.term_totals = true;
+        req.cursor = None;
+    }
     blocking(move || {
         let report = report(&ds, &mut req)?;
         let r = &*report;
