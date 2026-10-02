@@ -7,6 +7,7 @@ mod dataset;
 mod errors;
 mod interrupt;
 mod io;
+mod querybuilder;
 mod results;
 mod terms;
 mod txn;
@@ -33,6 +34,7 @@ fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     results::register(m)?;
     validate::register(m)?;
     admin::register(m)?;
+    querybuilder::register(m)?;
     m.add_class::<dataset::PyDataset>()?;
     m.add_class::<txn::PyTransaction>()?;
     m.add_class::<interrupt::PyCancelToken>()?;
