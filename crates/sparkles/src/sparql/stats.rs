@@ -115,12 +115,13 @@ impl Counts {
 }
 
 /// Counts already worked out, kept with a generation (the part that depends only on the
-/// base) or with a snapshot (the final answers), and the FILTER selectivities measured on
-/// samples of a snapshot (see [`super::sample`]).
+/// base) or with a snapshot (the final answers), and the FILTER selectivities and key
+/// probes measured on a snapshot (see [`super::sample`] and [`super::keyprobe`]).
 #[derive(Default)]
 pub struct CountCache {
     counts: Mutex<FxHashMap<CountKey, Arc<Counts>>>,
     sampled: Mutex<FxHashMap<String, super::sample::Sampled>>,
+    probed: Mutex<FxHashMap<String, Option<super::keyprobe::Measure>>>,
 }
 
 impl CountCache {
@@ -150,6 +151,20 @@ impl CountCache {
             m.clear();
         }
         m.insert(k, s);
+    }
+
+    /// What probing a pattern for the values of a small input measured, by both.
+    #[allow(clippy::option_option)]
+    pub(super) fn probed(&self, k: &str) -> Option<Option<super::keyprobe::Measure>> {
+        self.probed.lock().get(k).copied()
+    }
+
+    pub(super) fn set_probed(&self, k: String, m: Option<super::keyprobe::Measure>) {
+        let mut p = self.probed.lock();
+        if p.len() >= Self::ENTRIES {
+            p.clear();
+        }
+        p.insert(k, m);
     }
 }
 

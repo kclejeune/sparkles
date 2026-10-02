@@ -1853,6 +1853,9 @@ impl<'a> Planner<'a> {
         for n in nodes {
             leaves.push(vec![n]);
         }
+        if self.ctx.opt.probed_keys && leaves.len() > 1 {
+            super::keyprobe::prepare(self.ctx, &leaves);
+        }
         let mut result = if leaves.is_empty() {
             Node::unit()
         } else if leaves.iter().any(|l| l[0].is_empty()) {
@@ -2343,20 +2346,55 @@ impl<'a> Planner<'a> {
 // node constructors (with estimates)
 // ------------------------------------------------------------------------------
 
-/// The distinct-value estimates of the join of `a` and `b` into `est` rows; `star` is the
-/// join variable with the share of the product of its distinct values that the join
-/// keeps, when the characteristic sets estimate it.
+/// How a join on one variable was estimated, when not from the distinct values on
+/// either side.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum JoinModel {
+    /// from characteristic sets: the shares of the product of the inputs' rows and of the
+    /// product of their distinct values that the join keeps (see [`super::charsets`])
+    Star { rr: f64, rd: f64 },
+    /// from probing the values of a small input; `a_src` tells whether the first input
+    /// holds it (see [`super::keyprobe`])
+    Probe {
+        m: super::keyprobe::Measure,
+        a_src: bool,
+    },
+}
+
+impl JoinModel {
+    /// The estimated rows of the join of inputs of `a_est` and `b_est` rows.
+    pub(super) fn est(&self, a_est: f64, b_est: f64) -> f64 {
+        match self {
+            JoinModel::Star { rr, .. } => star_est(a_est, b_est, *rr),
+            JoinModel::Probe { m, a_src: true } => super::keyprobe::est(a_est, b_est, m),
+            JoinModel::Probe { m, a_src: false } => super::keyprobe::est(b_est, a_est, m),
+        }
+    }
+
+    /// The distinct values of the join variable after the join, from the inputs' `da`
+    /// and `db`.
+    pub(super) fn distinct(&self, da: f64, db: f64) -> f64 {
+        match self {
+            JoinModel::Star { rd, .. } => super::charsets::distinct(da, db, *rd),
+            JoinModel::Probe { m, a_src: true } => super::keyprobe::distinct(da, db, m),
+            JoinModel::Probe { m, a_src: false } => super::keyprobe::distinct(db, da, m),
+        }
+    }
+}
+
+/// The distinct-value estimates of the join of `a` and `b` into `est` rows; `model` is
+/// the join variable with how the join was estimated, when not from distinct values.
 pub(super) fn merge_dist(
     a: &Node,
     b: &Node,
     est: f64,
-    star: Option<(VarId, f64)>,
+    model: Option<(VarId, JoinModel)>,
 ) -> FxHashMap<VarId, f64> {
     let mut d = FxHashMap::default();
     for v in a.vars.iter().chain(b.vars.iter()) {
         let x = match (a.vars.contains(v), b.vars.contains(v)) {
-            (true, true) => match star {
-                Some((s, rd)) if s == *v => super::charsets::distinct(a.d(*v), b.d(*v), rd),
+            (true, true) => match model {
+                Some((s, m)) if s == *v => m.distinct(a.d(*v), b.d(*v)),
                 _ => a.d(*v).min(b.d(*v)),
             },
             (true, false) => a.d(*v),
@@ -2378,15 +2416,16 @@ pub(super) fn join_est(a: &Node, b: &Node, keys: &[VarId]) -> f64 {
     join_est_from(a.est, b.est, denom)
 }
 
-/// The estimated rows of joining `a` and `b` on `keys`, and, when the characteristic sets
-/// estimate the join, its variable with the share of the product of its distinct values
-/// that the join keeps.
+/// The estimated rows of joining `a` and `b` on `keys`, and, when the join is on one
+/// variable and estimated from characteristic sets or probed values, the variable with
+/// how it was estimated. The sets come first: they hold how the predicates of a star
+/// occur together, where probes see only the small input and one pattern.
 pub(super) fn join_est_with(
     a: &Node,
     b: &Node,
     keys: &[VarId],
     ctx: &Ctx,
-) -> (f64, Option<(VarId, f64)>) {
+) -> (f64, Option<(VarId, JoinModel)>) {
     if let [v] = keys
         && ctx.opt.characteristic_sets
     {
@@ -2398,8 +2437,20 @@ pub(super) fn join_est_with(
             super::charsets::mask_of(&qb, *v),
         );
         if let Some((rr, rd)) = super::charsets::factor(ctx, *v, qa, qb) {
-            return (star_est(a.est, b.est, rr), Some((*v, rd)));
+            let model = JoinModel::Star { rr, rd };
+            return (model.est(a.est, b.est), Some((*v, model)));
         }
+    }
+    if let [v] = keys
+        && ctx.opt.probed_keys
+        && let (Some(sa), Some(sb)) = (
+            super::keyprobe::side(ctx, a, *v),
+            super::keyprobe::side(ctx, b, *v),
+        )
+        && let Some((m, a_src)) = super::keyprobe::applies(ctx, *v, sa, sb)
+    {
+        let model = JoinModel::Probe { m, a_src };
+        return (model.est(a.est, b.est), Some((*v, model)));
     }
     (join_est(a, b, keys), None)
 }

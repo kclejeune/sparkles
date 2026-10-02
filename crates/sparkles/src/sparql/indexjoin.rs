@@ -203,6 +203,9 @@ pub(super) struct ProbeSide {
     pub key: VarId,
     rows: f64,
     per_key: f64,
+    /// a star pattern on the key, which a fused star reads with the index joins on the
+    /// key below it (when fused stars are costed so)
+    pub star: bool,
 }
 
 /// The pattern under `probe` as the probed side of an index join, if it can be one.
@@ -216,7 +219,41 @@ pub(super) fn probe_side(probe: &Node, ctx: &Ctx) -> Option<ProbeSide> {
         key,
         rows: ctx.snap.estimate(spec.perm, &spec.prefix) as f64,
         per_key: scan.est / scan.d(key),
+        star: ctx.opt.fused_star_costs && ctx.opt.star_fusion && star_pattern(spec, key).is_some(),
     })
+}
+
+/// The keys a fused star would probe its patterns for, when plan `n` is (under its
+/// filters) an index join on `key` of star patterns: the distinct keys of the input of
+/// the lowest index join of the chain.
+pub(super) fn chain_keys(n: &Node, key: VarId) -> Option<f64> {
+    let mut n = n;
+    while let Kind::Filter(es) = &n.kind {
+        if es.iter().any(Expr::has_exists) {
+            return None;
+        }
+        n = &n.children[0];
+    }
+    match &n.kind {
+        Kind::IndexJoin(j) if j.key == key && j.probes.iter().all(|p| p.star.is_some()) => {
+            let c = &n.children[0];
+            Some(chain_keys(c, key).unwrap_or_else(|| c.d(key).min(c.est).max(1.0)))
+        }
+        _ => None,
+    }
+}
+
+/// The key and the keys a fused star would probe for (see [`chain_keys`]), when plan
+/// `n` is an index join of star patterns.
+pub(super) fn chain_of(n: &Node) -> Option<(VarId, f64)> {
+    let mut m = n;
+    while let Kind::Filter(_) = &m.kind {
+        m = &m.children[0];
+    }
+    let Kind::IndexJoin(j) = &m.kind else {
+        return None;
+    };
+    chain_keys(n, j.key).map(|k| (j.key, k))
 }
 
 impl ProbeSide {
@@ -248,9 +285,8 @@ struct Offer<'p> {
     filter: Vec<Expr>,
     key: VarId,
     est: f64,
-    /// the key with the share of the product of its distinct values the join keeps, when
-    /// the characteristic sets estimate it
-    star: Option<(VarId, f64)>,
+    /// the key with how the join was estimated, when not from distinct values
+    star: Option<(VarId, super::plan::JoinModel)>,
     cost: f64,
     sorted: Vec<VarId>,
     desc: String,
@@ -270,7 +306,10 @@ fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx) -> Option<Offer<'p>> {
         );
         return None;
     }
-    let keys_in = drive.d(key).min(drive.est).max(1.0);
+    let keys_in = match chain_keys(drive, key) {
+        Some(k) if side.star => k,
+        _ => drive.d(key).min(drive.est).max(1.0),
+    };
     let Some(probe_cost) = side.cost(keys_in, probe.cost) else {
         tracing::debug!(
             "index join on {} into {} not offered: probing {keys_in:.0} keys costs more than scanning {:.0} rows",

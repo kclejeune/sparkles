@@ -105,10 +105,16 @@ pub struct Optimizations {
     /// joins on a subject variable of patterns with constant predicates are estimated
     /// from the characteristic sets in the statistics
     pub characteristic_sets: bool,
+    /// a join of a small input (VALUES, or a pattern of few rows) with a pattern is
+    /// estimated by counting the pattern's rows for a sample of the input's values
+    pub probed_keys: bool,
+    /// index joins that a fused star reads together are costed for the keys of the
+    /// star's input, which a fused star probes in every pattern
+    pub fused_star_costs: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 24] = [
+    pub const NAMES: [&str; 26] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -133,6 +139,8 @@ impl Optimizations {
         "filter_key_ranges",
         "sampled_filters",
         "characteristic_sets",
+        "probed_keys",
+        "fused_star_costs",
     ];
 
     /// Everything on.
@@ -161,6 +169,8 @@ impl Optimizations {
         filter_key_ranges: true,
         sampled_filters: true,
         characteristic_sets: true,
+        probed_keys: true,
+        fused_star_costs: true,
     };
 
     /// Everything off: the generic operators only.
@@ -189,6 +199,8 @@ impl Optimizations {
         filter_key_ranges: false,
         sampled_filters: false,
         characteristic_sets: false,
+        probed_keys: false,
+        fused_star_costs: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -217,6 +229,8 @@ impl Optimizations {
             "filter_key_ranges" => &mut self.filter_key_ranges,
             "sampled_filters" => &mut self.sampled_filters,
             "characteristic_sets" => &mut self.characteristic_sets,
+            "probed_keys" => &mut self.probed_keys,
+            "fused_star_costs" => &mut self.fused_star_costs,
             _ => return None,
         })
     }
@@ -310,6 +324,9 @@ pub struct Ctx {
     sampled: parking_lot::Mutex<FxHashMap<String, super::sample::Sampled>>,
     /// the star predicates registered per subject variable (see [`super::charsets`])
     pub(super) stars: parking_lot::Mutex<FxHashMap<VarId, super::charsets::StarVar>>,
+    /// the small input of a variable and the patterns probed with its values (see
+    /// [`super::keyprobe`])
+    pub(super) probes: parking_lot::Mutex<FxHashMap<VarId, super::keyprobe::VarProbe>>,
 }
 
 impl Ctx {
@@ -344,6 +361,7 @@ impl Ctx {
             warnings: Default::default(),
             sampled: Default::default(),
             stars: Default::default(),
+            probes: Default::default(),
         }
     }
 

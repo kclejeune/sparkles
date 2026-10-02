@@ -15,6 +15,7 @@ pub mod georewrite;
 pub mod indexjoin;
 mod joinorder;
 mod keyfilter;
+mod keyprobe;
 pub mod plan;
 pub mod results;
 mod sample;
@@ -728,6 +729,8 @@ mod exprcache_tests;
 mod indexjoin_tests;
 #[cfg(test)]
 mod joinorder_tests;
+#[cfg(test)]
+mod keyprobe_tests;
 #[cfg(test)]
 mod opt_tests;
 #[cfg(test)]

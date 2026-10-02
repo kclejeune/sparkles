@@ -8,10 +8,19 @@ use crate::store::{Store, StoreOptions};
 
 const PREFIXES: &str = "PREFIX ex: <http://ex.org/> ";
 
+/// Estimates from characteristic sets, without those from probed values that a small
+/// store would otherwise use for most joins.
+fn sets() -> Optimizations {
+    Optimizations {
+        probed_keys: false,
+        ..Optimizations::ALL
+    }
+}
+
 fn off() -> Optimizations {
     Optimizations {
         characteristic_sets: false,
-        ..Optimizations::ALL
+        ..sets()
     }
 }
 
@@ -121,12 +130,8 @@ fn stars_of_independent_predicates_are_estimated_exactly() {
             40.0,
         ),
     ] {
-        assert_eq!(
-            answer(&snap, q, Optimizations::ALL).len() as f64,
-            rows,
-            "{q}"
-        );
-        let est = root_est(&snap, q, Optimizations::ALL);
+        assert_eq!(answer(&snap, q, sets()).len() as f64, rows, "{q}");
+        let est = root_est(&snap, q, sets());
         assert!((est - rows).abs() < 0.5, "{q}: estimated {est} for {rows}");
         let old = root_est(&snap, q, off());
         assert!(old > rows * 1.3, "{q}: {old} without the sets");
@@ -144,11 +149,7 @@ fn other_patterns_keep_the_estimate_from_distinct_values() {
         "SELECT * WHERE { ?s ex:c ?x ; ex:c ?y }",
         "SELECT * WHERE { ?s ex:d ?o . ?o ex:b ?b }",
     ] {
-        assert_eq!(
-            root_est(&snap, q, Optimizations::ALL),
-            root_est(&snap, q, off()),
-            "{q}"
-        );
+        assert_eq!(root_est(&snap, q, sets()), root_est(&snap, q, off()), "{q}");
     }
 }
 
@@ -188,10 +189,6 @@ fn estimates_from_sets_never_change_answers() {
             q.push_str(" FILTER(STRLEN(STR(?s)) > 6)");
         }
         q.push_str(" }");
-        assert_eq!(
-            answer(&snap, &q, Optimizations::ALL),
-            answer(&snap, &q, off()),
-            "{q}"
-        );
+        assert_eq!(answer(&snap, &q, sets()), answer(&snap, &q, off()), "{q}");
     }
 }
