@@ -5,7 +5,8 @@
 > **Phases:** Phase 1 is complete: Basic users, API tokens, OIDC sign-in for the UI,
 > trusted proxy headers, CLI logins, remote `query`/`update`/`load`, and the UI pages.
 > Phase 2 is built in part: rate limiting of failed logins and a Content Security Policy
-> for the UI. Phase 3, graph-level ACLs, is not built.
+> for the UI. Phase 3, graph-level ACLs and endpoint permissions, is specified in
+> [C12](C12-graph-access-control.md).
 >
 > **User docs:** [API: Authentication and access control](../API.md#authentication-and-access-control) · [API: Rate limiting](../API.md#rate-limiting) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
@@ -1508,7 +1509,7 @@ the whole dataset is visible:
   over the union all touch every graph.
 
 Phase 1 prepares for this: every request carries a `Principal`, which can later reach the
-engine through `QueryOptions`.
+engine through `QueryOptions`. [C12](C12-graph-access-control.md) specifies this phase.
 
 ### 12.4 Phase 2 design note: IdP JWTs on the API
 
