@@ -1537,7 +1537,13 @@ fn unpack(
     Ok(out)
 }
 
-fn join_tables(ctx: &Ctx, l: &Table, r: &Table, _keys: &[VarId], merge: bool) -> Result<Table> {
+pub(super) fn join_tables(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    _keys: &[VarId],
+    merge: bool,
+) -> Result<Table> {
     let lay = layout(l, r);
     let pairs = join_pairs(ctx, l, r, &lay, merge)?;
     ctx.check_output(pairs.len(), lay.vars.len() + 1)?;
