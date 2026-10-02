@@ -68,6 +68,9 @@ pub struct Dataset {
     pub validation: RwLock<Option<Validation>>,
     /// write-time validation counters (the store's guard observer)
     pub validation_metrics: Arc<crate::obs::ValidationMetrics>,
+    /// taken offline by `POST /$/datasets/{ds}?state=offline` (Fuseki): its services
+    /// answer `503` until `?state=active`; not persisted
+    pub offline: AtomicBool,
 }
 
 pub use crate::write_validation::Validation;
@@ -112,31 +115,90 @@ struct RegistryEntry {
     reasoning: Option<ReasoningInfo>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// A background task. Its JSON form also carries Fuseki's names for its fields
+/// (`taskId`, `task`, `started`, `finished`, `success`; see [`Task::serialize`]).
+#[derive(Clone, Debug)]
 pub struct Task {
     pub id: String,
     pub kind: String,
     pub dataset: String,
     /// the dataset a task creates (clone)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     pub state: String,
     pub started_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<f32>,
     /// `DELETE /$/tasks/{id}` may cancel it (now)
     pub cancellable: bool,
     /// the task's typed result (a backup summary, a verify or GC report, a policy run)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
     /// set by a cancel request; the work checks it
-    #[serde(skip)]
     pub cancel: Arc<AtomicBool>,
+}
+
+impl Serialize for Task {
+    /// The Sparkles fields, then Fuseki's: `taskId` (the id), `task` (Fuseki's name for
+    /// a compaction or a backup, else the kind), `started`, and once the task has ended
+    /// `finished` and `success`. Fuseki clients poll `/$/tasks/{taskId}` until
+    /// `finished` appears.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire<'a> {
+            id: &'a str,
+            kind: &'a str,
+            dataset: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            target: Option<&'a str>,
+            state: &'a str,
+            started_at: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            finished_at: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            message: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            progress: Option<f32>,
+            cancellable: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            detail: Option<&'a serde_json::Value>,
+            task_id: &'a str,
+            task: &'a str,
+            started: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            finished: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            success: Option<bool>,
+        }
+        let ended = !self.active();
+        Wire {
+            id: &self.id,
+            kind: &self.kind,
+            dataset: &self.dataset,
+            target: self.target.as_deref(),
+            state: &self.state,
+            started_at: &self.started_at,
+            finished_at: self.finished_at.as_deref(),
+            message: self.message.as_deref(),
+            progress: self.progress,
+            cancellable: self.cancellable,
+            detail: self.detail.as_ref(),
+            task_id: &self.id,
+            task: match self.kind.as_str() {
+                "compact" => "Compact",
+                "backup" => "Backup",
+                k => k,
+            },
+            started: &self.started_at,
+            finished: if ended {
+                Some(self.finished_at.as_deref().unwrap_or(&self.started_at))
+            } else {
+                None
+            },
+            success: ended.then(|| self.state == task_state::DONE),
+        }
+        .serialize(s)
+    }
 }
 
 /// Task states (`Task::state`).
@@ -219,6 +281,9 @@ pub struct AppState {
     /// the MapLibre style of the UI's maps (`serve --map-style-url`); `None`: the
     /// bundled basemap
     pub map_style_url: Option<String>,
+    /// Fuseki's Graph Store direct naming (`serve --gsp-direct-naming`): `/{ds}/{path}`
+    /// names the graph whose IRI is the request URL
+    pub gsp_direct_naming: bool,
     /// automatic re-materialization of stale inferences (`serve --auto-reason`)
     pub auto_reason: Option<crate::reasoning::AutoReason>,
     /// dataset names being created by a task (clone), with the task id
@@ -473,6 +538,7 @@ impl AppState {
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
             map_style_url: None,
+            gsp_direct_naming: false,
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
             auto_reason: None,
@@ -547,6 +613,7 @@ impl AppState {
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
             map_style_url: None,
+            gsp_direct_naming: false,
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
         }
@@ -576,6 +643,7 @@ impl AppState {
             schema_cache: Mutex::new(None),
             validation: RwLock::new(validation),
             validation_metrics,
+            offline: AtomicBool::new(false),
         }))
     }
 

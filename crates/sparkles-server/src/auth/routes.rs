@@ -36,14 +36,23 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/ui/{*path}", &["GET"]),
     ("/$/ping", &["GET", "POST"]),
     ("/$/whoami", &["GET"]),
-    ("/$/server", &["GET"]),
+    ("/$/server", &["GET", "POST"]),
     ("/$/metrics", &["GET"]),
     ("/$/ready", &["GET"]),
     ("/$/ready/{ds}", &["GET"]),
     ("/$/datasets", &["GET", "POST"]),
-    ("/$/datasets/{ds}", &["GET", "DELETE"]),
+    // POST: Fuseki's `?state=offline|active`
+    ("/$/datasets/{ds}", &["GET", "POST", "DELETE"]),
     ("/$/datasets/{ds}/clone", &["POST"]),
-    ("/$/stats/{ds}", &["GET"]),
+    ("/$/stats/{ds}", &["GET", "POST"]),
+    // Fuseki's routes (`http/fuseki.rs`)
+    ("/$/stats", &["GET", "POST"]),
+    ("/$/backups-list", &["GET", "POST"]),
+    ("/$/validate/query", &["GET", "POST"]),
+    ("/$/validate/update", &["GET", "POST"]),
+    ("/$/validate/iri", &["GET", "POST"]),
+    ("/$/validate/data", &["GET", "POST"]),
+    ("/$/validate/langtag", &["GET", "POST"]),
     ("/$/schema/{ds}", &["GET"]),
     ("/$/schema/{ds}/classes", &["GET"]),
     ("/$/schema/{ds}/predicates", &["GET"]),
@@ -114,6 +123,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/shex", &["POST"]),
     ("/{ds}/geo", &["GET"]),
     ("/{ds}/prefixes", &["*"]),
+    // Graph Store direct naming (`serve --gsp-direct-naming`)
+    ("/{ds}/{*graph}", &["*"]),
 ];
 
 /// Routes of the CLI grants: they identify the client by a device code or a PKCE
@@ -163,6 +174,15 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/auth/device/{user_code}/deny"
         | "/$/auth/cli/authorize" => Interactive,
         "/$/server" | "/$/tasks" | "/$/tasks/{id}" => Caller,
+        // filtered by the handlers: datasets the caller may read (stats), administers
+        // (backup files); the validators read no dataset
+        "/$/stats"
+        | "/$/backups-list"
+        | "/$/validate/query"
+        | "/$/validate/update"
+        | "/$/validate/iri"
+        | "/$/validate/data"
+        | "/$/validate/langtag" => Caller,
         // reads no dataset; `--format-endpoint authenticated|off` is the handler's
         "/$/format" => Caller,
         // a pure computation over the request's literals
@@ -240,8 +260,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/backups/{ds}/{repo}/{backup}/restore"
         | "/$/backups/{ds}/{repo}/{backup}/verify" => Dataset(Admin),
         "/{ds}/update" | "/{ds}/upload" => Dataset(Write),
-        "/{ds}/data" if get => Dataset(Read),
-        "/{ds}/data" => Dataset(Write),
+        "/{ds}/data" | "/{ds}/{*graph}" if get => Dataset(Read),
+        "/{ds}/data" | "/{ds}/{*graph}" => Dataset(Write),
         "/{ds}" => {
             let ct = media_type(headers);
             if has_param(uri, "update") || ct == "application/sparql-update" {

@@ -227,7 +227,7 @@ fn route_op(route: Option<&str>, req: &Request) -> Op {
     match r {
         "/{ds}/sparql" | "/{ds}/query" => Op::Query,
         "/{ds}/update" => Op::Update,
-        "/{ds}/data" | "/{ds}/get" => Op::Gsp,
+        "/{ds}/data" | "/{ds}/get" | "/{ds}/{*graph}" => Op::Gsp,
         "/{ds}/upload" => Op::Upload,
         "/{ds}/shacl" => Op::Shacl,
         "/{ds}/shex" => Op::Shex,
@@ -690,6 +690,24 @@ impl Metrics {
     #[cfg_attr(not(feature = "backup"), allow(dead_code))]
     pub fn max_datasets(&self) -> usize {
         self.max_datasets
+    }
+
+    /// Requests to a dataset per operation, as Fuseki's `/$/stats` counts them: those
+    /// that succeeded and those that failed. Empty for a dataset without its own series
+    /// (metrics off, or past `--metrics-max-datasets`).
+    pub fn request_counts(&self, dataset: &str) -> Vec<(Op, u64, u64)> {
+        let Some(m) = self.datasets.read().get(dataset).cloned() else {
+            return Vec::new();
+        };
+        Op::ALL
+            .iter()
+            .map(|&op| {
+                let o = &m.ops[op.index()].outcomes;
+                let all: u64 = o.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+                let good = o[Outcome::Ok.index()].load(Ordering::Relaxed);
+                (op, good, all - good)
+            })
+            .collect()
     }
 
     /// Drop a deleted dataset's series (a recreated name starts again at zero).

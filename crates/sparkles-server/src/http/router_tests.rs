@@ -20,6 +20,7 @@ mod clone;
 mod cost;
 #[cfg(feature = "fmt")]
 mod format;
+mod fuseki;
 #[cfg(feature = "geo")]
 mod geo;
 #[cfg(feature = "geo")]

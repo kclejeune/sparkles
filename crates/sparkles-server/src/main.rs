@@ -414,6 +414,11 @@ enum Cmd {
         /// Largest number of classes, and of predicates, a schema report may have
         #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
         schema_max_entries: usize,
+        /// Fuseki's Graph Store direct naming on every dataset: a request to
+        /// /{ds}/{path} that names no endpoint reads or writes the graph whose IRI is
+        /// the request URL
+        #[arg(long)]
+        gsp_direct_naming: bool,
         /// Do not log one line per request (target `sparkles::access`)
         #[arg(long)]
         no_access_log: bool,
@@ -1302,6 +1307,7 @@ fn run() -> Result<()> {
             no_geo_rewrite,
             map_style_url,
             schema_max_entries,
+            gsp_direct_naming,
             no_access_log,
             no_metrics,
             metrics_max_datasets,
@@ -1400,6 +1406,7 @@ fn run() -> Result<()> {
             st.outbound = outbound.policy()?;
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
             st.schema_max_entries = schema_max_entries;
+            st.gsp_direct_naming = gsp_direct_naming;
             st.allow_unvalidated_writes = allow_unvalidated_writes;
             st.http_compression = compress::HttpCompression::parse(
                 &http_compression,

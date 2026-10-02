@@ -1569,6 +1569,7 @@ fn route_coverage() {
     let routers = [
         include_str!("../../../http.rs"),
         include_str!("../../../http/format.rs"),
+        include_str!("../../../http/fuseki.rs"),
         include_str!("../../../geo.rs"),
         include_str!("../../../auth/api.rs"),
         include_str!("../../../auth/handlers.rs"),
