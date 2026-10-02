@@ -672,3 +672,46 @@ fn the_full_text_index_sees_nothing() {
     let after = s.text_status().unwrap();
     assert_eq!((before.docs, before.seq), (after.docs, after.seq));
 }
+
+/// A Graph Store `PUT` through the WAL logs only the difference between the graph and
+/// its new content (C15 §6): its receipt is unchanged, and the WAL grows by the quads
+/// that changed.
+#[test]
+fn a_put_logs_only_the_difference() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    let body = |n: usize| -> String {
+        (0..n)
+            .map(|i| format!("<urn:x{i}> <urn:p> \"v{i}\" .\n"))
+            .collect()
+    };
+    let put = |text: String| {
+        s.replace_with(
+            ReplaceTarget::Named(named("urn:g")),
+            &[Source::from_bytes(
+                text.into_bytes(),
+                RdfFormat::NTriples,
+                Some(named("urn:g")),
+            )],
+            CommitKind::GspPut,
+            &Default::default(),
+        )
+        .unwrap()
+        .1
+    };
+    put(body(100));
+    let before = s.wal_bytes();
+    // the same content and one more quad: one insert record and the commit record
+    let r = put(body(101));
+    assert_eq!((r.commit.inserted, r.commit.deleted), (1, 0));
+    assert_eq!(s.wal_bytes() - before, 2 * 33);
+    // a quad less: one delete record
+    let before = s.wal_bytes();
+    let r = put(body(100));
+    assert_eq!((r.commit.inserted, r.commit.deleted), (0, 1));
+    assert_eq!(s.wal_bytes() - before, 2 * 33);
+    // the same content: no commit
+    let r = put(body(100));
+    assert!(!r.committed);
+    assert_eq!(state(&s).len(), 100);
+}

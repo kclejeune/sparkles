@@ -2908,14 +2908,6 @@ impl Store {
                 v
             }
         };
-        for g in graphs {
-            for (i, k) in view.scan_keys(Perm::Gspo, &[g.0])?.into_iter().enumerate() {
-                if i % 65_536 == 65_535 {
-                    o.check()?;
-                }
-                txn.delete(Perm::Gspo.to_quad(&k))?;
-            }
-        }
         let mut ids = Vec::new();
         for quads in &parsed {
             o.check()?;
@@ -2924,6 +2916,22 @@ impl Store {
                 ids.push(txn.encode_quad(q, &mut labels)?);
             }
         }
+        // Only the old quads the new content lacks are deleted, and inserting a quad
+        // the graph still has changes nothing, so the transaction logs the difference
+        // alone. The result is the same as clearing the graphs first.
+        let keep: rustc_hash::FxHashSet<[Id; 4]> = ids.iter().copied().collect();
+        for g in graphs {
+            for (i, k) in view.scan_keys(Perm::Gspo, &[g.0])?.into_iter().enumerate() {
+                if i % 65_536 == 65_535 {
+                    o.check()?;
+                }
+                let q = Perm::Gspo.to_quad(&k);
+                if !keep.contains(&q) {
+                    txn.delete(q)?;
+                }
+            }
+        }
+        drop(keep);
         let n = ids.len() as u64;
         txn.insert_bulk(ids)?;
         let r = txn.commit()?;
