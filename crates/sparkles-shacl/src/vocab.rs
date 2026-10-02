@@ -20,6 +20,7 @@ pub mod sh {
         TARGET_CLASS = "targetClass",
         TARGET_SUBJECTS_OF = "targetSubjectsOf",
         TARGET_OBJECTS_OF = "targetObjectsOf",
+        TARGET_WHERE = "targetWhere",
         DEACTIVATED = "deactivated",
         SEVERITY = "severity",
         MESSAGE = "message",
