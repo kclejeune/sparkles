@@ -430,13 +430,11 @@ pub fn materialize_incremental(
             Ok(done) => {
                 return finish(store, txn, &snap, profile, digest, inc, opts, t0, done);
             }
-            Err(e) => match e.downcast::<Fallback>() {
-                Ok(f) => {
-                    tracing::info!(reason = %f.0, "materializing in full");
-                    fallback = Some(f.0);
-                }
-                Err(e) => return Err(e),
-            },
+            Err(e) => {
+                let f = e.downcast::<Fallback>()?;
+                tracing::info!(reason = %f.0, "materializing in full");
+                fallback = Some(f.0);
+            }
         }
     }
     let d = derive(snap.clone(), profile, extras, opts)?;

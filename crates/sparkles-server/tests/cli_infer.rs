@@ -1,5 +1,6 @@
 //! `sparkles infer` updates the previous materialization incrementally, run as the real
 //! binary: each run is a new process, so the closure comes from the database.
+#![cfg(feature = "reasoning")]
 
 use std::process::{Command, Output};
 
@@ -22,7 +23,6 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-#[cfg(feature = "reasoning")]
 #[test]
 fn infer_runs_incrementally() {
     let dir = tempfile::tempdir().unwrap();

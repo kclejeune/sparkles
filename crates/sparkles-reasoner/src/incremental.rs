@@ -307,11 +307,14 @@ pub(crate) fn dred_overdeletion(
 
 // ------------------------------------------------------------------ plans ----
 
+/// A plan that starts with the variables of a rule head bound, and those variables.
+type BackPlan = (Vec<Step>, Vec<usize>);
+
 /// The plans an update evaluates with, made once per update.
 struct Plans {
     /// per rule and head: the plan with the head's variables bound (those that some atom
     /// binds), and those variables
-    back: Vec<Vec<Option<(Vec<Step>, Vec<usize>)>>>,
+    back: Vec<Vec<Option<BackPlan>>>,
     /// heads by constant predicate: (rule, head)
     by_pred: FxHashMap<u64, Vec<(usize, usize)>>,
     /// heads with a variable predicate
@@ -704,6 +707,28 @@ impl Search {
     }
 }
 
+/// Bindings of rule `ri`'s head `hi` unified with `t` (only the variables in `pre`), or
+/// `None` when a constant differs.
+fn bind_head(rule: &CRule, hi: usize, pre: &[usize], t: Triple) -> Option<Vec<u64>> {
+    let CHead::Triple(s, p, o) = &rule.head[hi] else {
+        return None;
+    };
+    let mut b = vec![0u64; rule.nvars];
+    for (slot, v) in [(s, t[0]), (p, t[1]), (o, t[2])] {
+        match *slot {
+            Slot::Const(c) if c != v => return None,
+            Slot::Var(x) if pre.contains(&x) => {
+                if b[x] != 0 && b[x] != v {
+                    return None;
+                }
+                b[x] = v;
+            }
+            _ => {}
+        }
+    }
+    Some(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,26 +1081,4 @@ mod tests {
             differential(rules, true, false, seed, 25);
         }
     }
-}
-
-/// Bindings of rule `ri`'s head `hi` unified with `t` (only the variables in `pre`), or
-/// `None` when a constant differs.
-fn bind_head(rule: &CRule, hi: usize, pre: &[usize], t: Triple) -> Option<Vec<u64>> {
-    let CHead::Triple(s, p, o) = &rule.head[hi] else {
-        return None;
-    };
-    let mut b = vec![0u64; rule.nvars];
-    for (slot, v) in [(s, t[0]), (p, t[1]), (o, t[2])] {
-        match *slot {
-            Slot::Const(c) if c != v => return None,
-            Slot::Var(x) if pre.contains(&x) => {
-                if b[x] != 0 && b[x] != v {
-                    return None;
-                }
-                b[x] = v;
-            }
-            _ => {}
-        }
-    }
-    Some(b)
 }
