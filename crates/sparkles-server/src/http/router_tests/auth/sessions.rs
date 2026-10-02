@@ -138,6 +138,39 @@ async fn login_failures_and_login_csrf() {
     assert_eq!(cross.json()["error"], "cross-origin request refused");
     let bad = login(&s, r#"{"nothing":1}"#, "http://localhost:3030").await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+}
+
+/// The fixture server with `[session] token_login = true`.
+fn token_login_server() -> AuthServer {
+    build(Fixture {
+        extra: "[session]\ntoken_login = true\n".into(),
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn token_login_is_off_unless_configured() {
+    let s = auth_server();
+    let config = get_as(&s.app, "/$/auth/config", None).await.json();
+    assert_eq!(config["methods"], serde_json::json!(["password"]));
+    // a valid minted token opens no session
+    let m = mint_as(&s.app, &[("authorization", &b("bob"))], r#"{"name":"ui"}"#).await;
+    let token = m.json()["token"].as_str().unwrap().to_string();
+    let r = login(
+        &s,
+        &format!(r#"{{"token":"{token}"}}"#),
+        "http://localhost:3030",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert!(r.set_cookie("sparkles_session").is_none());
+    // the token still authenticates API requests
+    let who = get_as(&s.app, "/$/whoami", Some(&bearer(&token))).await;
+    assert_eq!(who.json()["principal"]["kind"], "token");
+    // turned on, the login page offers it, and a static token is still refused
+    let s = token_login_server();
+    let config = get_as(&s.app, "/$/auth/config", None).await.json();
+    assert_eq!(config["methods"], serde_json::json!(["token", "password"]));
     let stat = login(
         &s,
         &format!(r#"{{"token":"{}"}}"#, t_prom()),
@@ -149,7 +182,7 @@ async fn login_failures_and_login_csrf() {
 
 #[tokio::test]
 async fn token_login_dies_with_its_token() {
-    let s = auth_server();
+    let s = token_login_server();
     let m = mint_as(
         &s.app,
         &[("authorization", &b("bob"))],
@@ -287,7 +320,7 @@ async fn sessions_follow_the_policy() {
 #[tokio::test]
 async fn one_owner_cannot_log_everyone_out() {
     use crate::auth::MAX_SESSIONS_PER_OWNER;
-    let s = auth_server();
+    let s = token_login_server();
     let (alice, _) = password_session(&s, "alice").await;
     // bob mints one token and signs in with it over and over
     let m = mint_as(&s.app, &[("authorization", &b("bob"))], r#"{"name":"ui"}"#).await;

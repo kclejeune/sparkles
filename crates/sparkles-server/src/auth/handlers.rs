@@ -157,7 +157,9 @@ async fn config(State(st): St) -> Response {
         methods.push("oidc");
         doc["oidc"] = json!({ "loginUrl": "/$/auth/oidc/login", "displayName": o.display_name });
     }
-    methods.push("token");
+    if p.token_login {
+        methods.push("token");
+    }
     if p.has_users() {
         methods.push("password");
     }
@@ -301,6 +303,13 @@ async fn login(
                 return r;
             }
         },
+        (None, None, Some(_)) if !policy.token_login => {
+            // refused before the token is looked at, so the answer says nothing about it
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "signing in with an API token is turned off ([session] token_login)",
+            );
+        }
         (None, None, Some(t)) => {
             let rec = match auth.token_principal(&policy, &t, Scheme::Bearer) {
                 Ok(p) if !p.info.static_token => p

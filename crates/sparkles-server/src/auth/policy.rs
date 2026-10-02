@@ -116,6 +116,8 @@ pub struct Policy {
     pub session_ttl: i64,
     /// a session unused for this long ends
     pub session_idle: Option<i64>,
+    /// `POST /$/auth/login` accepts `{token}` (`[session] token_login`)
+    pub token_login: bool,
     pub oidc: Option<config::OidcCfg>,
     pub proxy: Option<ProxySettings>,
     pub cloudflare: Option<config::CloudflareAccessCfg>,
@@ -258,6 +260,7 @@ impl Policy {
                 .as_deref()
                 .map(config::parse_duration)
                 .transpose()?,
+            token_login: cfg.session.token_login,
             oidc: cfg.oidc.clone(),
             proxy: cfg.proxy.as_ref().map(ProxySettings::from_config),
             cloudflare: cfg.cloudflare_access.clone(),

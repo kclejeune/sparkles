@@ -402,6 +402,10 @@ pub struct SessionCfg {
     /// default `<data>/auth/session.key`, created on first start
     #[serde(default)]
     pub key_file: Option<String>,
+    /// whether the UI's login page may exchange an API token for a session; off unless
+    /// set, so that a leaked token cannot open the UI
+    #[serde(default)]
+    pub token_login: bool,
 }
 
 impl Default for SessionCfg {
@@ -410,6 +414,7 @@ impl Default for SessionCfg {
             ttl: session_ttl(),
             idle_timeout: None,
             key_file: None,
+            token_login: false,
         }
     }
 }

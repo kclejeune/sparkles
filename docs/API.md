@@ -5027,7 +5027,7 @@ Without auth, the response is `{"authEnabled": false, "principal": {"kind": "loc
 `{"enabled": true, "methods": ["oidc", "token", "password", "proxy"], "oidc": {"loginUrl",
 "displayName"}, "cli": {"authorizeUrl", "deviceAuthorizationEndpoint", "tokenEndpoint",
 "deviceVerificationUri"}}`, or `{"enabled": false}`. Without auth, the other `/$/auth/*`
-routes return `404`.
+routes return `404`. `token` is listed only when `session.token_login` is on.
 
 ### Web UI sign-in and sessions
 
@@ -5035,6 +5035,11 @@ routes return `404`.
   and a session cookie. The cookie is `HttpOnly`, `SameSite=Lax` and `Secure` over https,
   with `Max-Age` = `session.ttl` (default 12 h). A token session ends with its token.
   Wrong credentials get `401`.
+* Signing in to the UI with an API token is off by default, so that a token copied into
+  a script or a CI secret cannot also open a browser session. With
+  `[session] token_login = true` the login page offers it. Otherwise `{"token"}` gets
+  `403` before the token is looked up, and API tokens keep working as `Bearer`
+  credentials.
 * `GET /$/auth/oidc/login?return_to=/ui/…` redirects (`302`) to the provider. It uses the
   authorization code flow with PKCE `S256`, a `state` bound to the browser by a login
   cookie, and a `nonce`. The callback `GET /$/auth/oidc/callback` checks the state and
@@ -5244,6 +5249,7 @@ default_roles = []
 [session]
 ttl = "12h"                                  # the longest a session lasts
 # idle_timeout = "30m"                       # a session unused this long ends
+# token_login = false                        # true: the login page accepts API tokens
 # key_file = "/var/lib/sparkles/auth/session.key"
 
 [proxy]                                      # off unless present
