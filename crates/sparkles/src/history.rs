@@ -414,6 +414,19 @@ pub(crate) struct Lease {
     pub label: String,
 }
 
+/// A materialized past state in the history cache.
+pub(crate) struct Cached {
+    /// the generation that served it
+    pub generation: u32,
+    pub seq: u64,
+    pub snap: Arc<Snapshot>,
+    /// the memory its delta is estimated to take
+    pub bytes: u64,
+    /// where its commit ends in the generation's log: a later read of a nearby commit
+    /// starts from this state
+    pub end: crate::store::wal::WalPoint,
+}
+
 /// The in-memory history state of a persistent store.
 pub(crate) struct HistoryState {
     pub pins: BTreeMap<String, Pin>,
@@ -427,8 +440,8 @@ pub(crate) struct HistoryState {
     pub gens: BTreeMap<u32, GenEntry>,
     /// sealed generations open for reading, most recent first
     pub open: Vec<(u32, Arc<Generation>)>,
-    /// materialized past states by (generation, commit), most recent first
-    pub cache: Vec<((u32, u64), Arc<Snapshot>, u64)>,
+    /// materialized past states, most recent first
+    pub cache: Vec<Cached>,
     pub hits: u64,
     pub misses: u64,
     pub materializations: u64,

@@ -406,3 +406,229 @@ fn check_accepts_generations_kept_for_history() {
     std::fs::remove_file(root.join("history.json")).unwrap();
     assert_eq!(leftovers(&root), ["gen-0001"]);
 }
+
+/// The quads of the live state, as sorted N-Quads lines.
+fn dump_lines(s: &Store) -> Vec<String> {
+    let mut out = Vec::new();
+    s.dump_nquads(&mut out).unwrap();
+    let mut v: Vec<String> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    v.sort();
+    v
+}
+
+/// The quads of the state at `seq`, as sorted N-Quads lines.
+fn dump_lines_at(s: &Store, seq: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    s.dump_nquads_at(&At::Commit(seq), &mut out).unwrap();
+    let mut v: Vec<String> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    v.sort();
+    v
+}
+
+/// Past states are the same whichever known state they start from: the base, a cached
+/// state before or after them, or the live state (replayed backward), across more
+/// commits than the WAL index's spacing, with deletes of base quads, re-inserts and
+/// changes undone within a transaction; in a sealed generation as well.
+#[test]
+fn past_states_agree_whatever_they_start_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let nt: String = (0..40)
+        .map(|i| {
+            format!(
+                "<urn:s{}> <urn:p{}> \"{i}\" <urn:g{}> .\n",
+                i % 7,
+                i % 3,
+                i % 2
+            )
+        })
+        .collect();
+    let mut states: Vec<(u64, Vec<String>)> = Vec::new();
+    let mut r = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rnd = |n: u64| {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        r % n
+    };
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        s.load(&[Source::from_bytes(nt.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        s.compact().unwrap();
+        states.push((s.head_commit().seq, dump_lines(&s)));
+        while states.len() < 1_300 {
+            let kind = rnd(4);
+            let mut q = || {
+                let i = rnd(60);
+                format!(
+                    "GRAPH <urn:g{}> {{ <urn:s{}> <urn:p{}> \"{i}\" }}",
+                    i % 2,
+                    i % 7,
+                    i % 3
+                )
+            };
+            let u = match kind {
+                0 => format!("DELETE DATA {{ {} }}", q()),
+                1 => format!("INSERT DATA {{ {} {} }}", q(), q()),
+                2 => {
+                    let a = q();
+                    format!(
+                        "INSERT DATA {{ {a} }} ; DELETE DATA {{ {a} }} ; INSERT DATA {{ {} }}",
+                        q()
+                    )
+                }
+                _ => format!("DELETE DATA {{ {} }} ; INSERT DATA {{ {} }}", q(), q()),
+            };
+            update(&s, &u, &QueryOptions::default()).unwrap();
+            let head = s.head_commit().seq;
+            if states.last().unwrap().0 != head {
+                states.push((head, dump_lines(&s)));
+            }
+        }
+    }
+    let check = |s: &Store, order: &[usize]| {
+        for &i in order {
+            let (seq, want) = &states[i];
+            assert_eq!(&dump_lines_at(s, *seq), want, "commit {seq}");
+        }
+    };
+    let n = states.len();
+    // a fresh store: the middle from the base or the live state, then neighbours of
+    // cached states on either side, far jumps, and the base
+    let order: Vec<usize> = [n / 2, n / 2 + 1, n / 2 - 1, n - 2, 1, n / 3, 2 * n / 3, 0]
+        .into_iter()
+        .chain((0..n).step_by(97))
+        .chain((0..n).rev().step_by(89))
+        .collect();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    check(&s, &order);
+    // a cache that keeps one state at a time
+    let small = StoreOptions {
+        history_cache_bytes: 1,
+        ..Default::default()
+    };
+    drop(s);
+    let s = Store::open(&root, small.clone()).unwrap();
+    let mut order: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        order.swap(i, rnd(i as u64 + 1) as usize);
+    }
+    check(&s, &order[..300]);
+    // sealed: a pin keeps the generation through a compaction
+    s.create_snapshot("first", &At::Commit(states[1].0), None)
+        .unwrap();
+    s.compact().unwrap();
+    drop(s);
+    let s = Store::open(&root, small).unwrap();
+    check(&s, &order[..300]);
+    let d = s
+        .diff(
+            &At::Commit(states[n / 2].0),
+            &At::Commit(states[n / 2 + 1].0),
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(d.method, sparkles::store::DiffMethod::Log);
+}
+
+/// Timings of point-in-time reads: `cargo test --release -p sparkles --test history --
+/// --ignored --nocapture history_performance`. `HIST_BASE` quads (default 1,000,000) in
+/// a bulk-built base, then `HIST_COMMITS` single-quad commits (default 50,000) in one
+/// generation, as in the F06 benchmark at a smaller scale.
+#[test]
+#[ignore = "a benchmark"]
+fn history_performance() {
+    use oxrdf::{Literal, NamedNode, Term};
+    use sparkles::id::Id;
+    use std::time::Instant;
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (base, commits) = (env("HIST_BASE", 1_000_000), env("HIST_COMMITS", 50_000));
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let nt: String = (0..base)
+        .map(|i| format!("<urn:s{}> <urn:p{}> \"v{i}\" .\n", i / 10, i % 7))
+        .collect();
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    s.compact().unwrap();
+    let first = s.head_commit().seq;
+    let t = Instant::now();
+    for c in 0..commits {
+        let mut w = s.write();
+        let subj = w
+            .intern(&Term::NamedNode(NamedNode::new_unchecked(format!(
+                "urn:s{}",
+                c * 7919 % (base / 10)
+            ))))
+            .unwrap();
+        let pred = w
+            .intern(&Term::NamedNode(NamedNode::new_unchecked("urn:p0")))
+            .unwrap();
+        let obj = w
+            .intern(&Term::Literal(Literal::new_simple_literal(format!("n{c}"))))
+            .unwrap();
+        w.insert([subj, pred, obj, Id::DEFAULT_GRAPH]).unwrap();
+        w.commit().unwrap();
+    }
+    eprintln!("{commits} single-quad commits: {:.2?}", t.elapsed());
+    let head = s.head_commit().seq;
+    let read = |s: &Store, what: &str, seq: u64| {
+        let t = Instant::now();
+        let (snap, _) = s
+            .snapshot_at(&At::Commit(seq), &HistoryOptions::default())
+            .unwrap();
+        let took = t.elapsed();
+        assert_eq!(snap.commit, seq);
+        eprintln!("read {what} (commit {seq}): {took:.2?}");
+    };
+    let diff = |s: &Store, what: &str, a: u64, b: u64| {
+        let t = Instant::now();
+        let d = s
+            .diff(&At::Commit(a), &At::Commit(b), &Default::default())
+            .unwrap();
+        eprintln!(
+            "diff {what}: +{} -{} in {:.2?}",
+            d.added,
+            d.removed,
+            t.elapsed()
+        );
+    };
+    let mid = first + commits / 2;
+    read(&s, "the middle, first", mid);
+    read(&s, "the middle, again", mid);
+    read(&s, "the middle + 1", mid + 1);
+    read(&s, "the middle + 5,000", mid + 5_000);
+    read(&s, "the middle - 3,000", mid - 3_000);
+    read(&s, "the head - 100", head - 100);
+    read(&s, "the base + 1,000", first + 1_000);
+    diff(&s, "one commit at the end", head - 1, head);
+    diff(&s, "the last 100 commits", head - 100, head);
+    diff(&s, "one commit in the middle", mid, mid + 1);
+    diff(&s, "every commit", first, head);
+    drop(s);
+    let t = Instant::now();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    eprintln!("reopen (replays {commits} commits): {:.2?}", t.elapsed());
+    read(&s, "the middle after reopening", mid);
+    read(&s, "the head - 10 after reopening", head - 10);
+    diff(&s, "one commit at the end after reopening", head - 1, head);
+}
