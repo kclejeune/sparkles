@@ -35,7 +35,7 @@ behaviour, and the Outcome explains the difference.
 | Prefix | Group |
 |---|---|
 | `CI` | Durable commit identity. The commit sequence, dataset ids and receipts that most later features build on. |
-| `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, cloning, inference freshness, access control, write-time validation and the MCP server. |
+| `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, cloning, inference freshness, access control, write-time validation, the MCP server and write previews. |
 | `F` | Larger data features: full-text and vector search, backups to object storage, retained history and point-in-time reads. |
 | `G` | Gaps against Apache Jena that were out of scope for the first version: GeoSPARQL and ShEx. |
 | `P` | Bindings that embed the engine in other languages: Python. |
@@ -62,6 +62,7 @@ not built; the status block says which. *Designed, not built* means there is no 
 | [C10](C10-write-time-validation.md) | A per-dataset SHACL guard that validates the state after each write before the write commits | implemented in part (Phases 1–3) |
 | [C11](C11-mcp-server.md) | `sparkles mcp`, a Model Context Protocol server with read-only query, schema, search, validation and formatting tools | implemented in part (Phase 1, part of Phase 2) |
 | [C12](C12-graph-access-control.md) | Grants limited to some named graphs or endpoints of a dataset, enforced by a filtered dataset view in the engine | implemented |
+| [C15](C15-write-previews.md) | Dry runs of updates, Graph Store writes, uploads and the MCP write tool, which report the commit, the changes, validation, quota and preconditions and roll back | designed, not built |
 | [F03](F03-full-text-search.md) | BM25 full-text search over literals with Tantivy, through Jena's `text:query` | implemented in part (Phase 1, part of Phase 2) |
 | [F04](F04-vector-search.md) | `spk:vector` literals, similarity functions and exact top-k `spk:vectorSearch` | implemented in part (Phase 1) |
 | [F05](F05-snapshot-repositories.md) | Incremental, deduplicated backups to a file system or S3, restore, verification, policies and GC | implemented in part (Phase 1, most of Phase 2) |

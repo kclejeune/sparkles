@@ -208,6 +208,28 @@ implementation landed.
   - deny rules, Solid WAC ACL documents, and a parser for Fuseki's `access:` assembler
     vocabulary.
 
+## Write previews
+
+- **Spec:** [`C15-write-previews.md`](C15-write-previews.md), written on 2026-10-02
+  independently from:
+  - the Sparkles code and the specs CI, C10, C12 and G02;
+  - the W3C SPARQL 1.1 Graph Store HTTP Protocol (PUT, POST and PATCH semantics);
+  - the Kubernetes documentation of server-side dry run (the `dryRun` parameter, the
+    same pipeline and authorization, admission without side effects);
+  - the RDF4J `RepositoryConnection` Javadoc (`prepare` and `rollback`);
+  - SPARQL 1.1 Update and Protocol, RFC 9110, RFC 4918, RFC 6648, RFC 7240 and Apache
+    Jena's RDF Patch, cited from working knowledge.
+
+  Fluree was not consulted.
+- **Implementation:** from the spec plus Sparkles code only.
+  - **Dependencies:** none added.
+- **Rejected** (spec §8):
+  - a separate preview endpoint and `Prefer: dry-run`;
+  - holding a previewed transaction for a later commit;
+  - a `200` for every outcome, and stopping at the first refusal;
+  - turning bulk writes into transactional ones for a preview;
+  - upsert and graph-sync verbs, which SPARQL Update and Graph Store `PUT` already cover.
+
 ## Write-time SHACL validation
 
 - **Spec:** [`C10-write-time-validation.md`](C10-write-time-validation.md), written on
