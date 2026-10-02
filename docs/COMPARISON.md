@@ -45,7 +45,7 @@ full feature list is in [FEATURES.md](FEATURES.md).
 |---|---|---|
 | Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Tested to 10.5M. The external-sort path has tests but no measurements at 100M+. |
 | Streaming execution | Lazy, block-wise scans, joins, filters and GROUP BY; results streamed to the client | Every operator materializes its result, within row and memory budgets. Responses over 1 MiB are streamed as they are serialized. |
-| Block prefiltering | FILTER ranges and STRSTARTS checked against block min/max to skip blocks | Numeric range FILTERs on a scan's sort column read only the matching id ranges (inline integers and decimals). Non-canonical numerals are tested row by row. |
+| Block prefiltering | FILTER ranges and STRSTARTS checked against block min/max to skip blocks | Numeric range FILTERs on a scan's sort column read only the matching id ranges (inline integers and decimals). Non-canonical numerals are tested row by row. `STRSTARTS` and a `REGEX` anchored on a literal start read only the vocabulary ids of the keys with that start. |
 | Pattern trick | `ql:has-predicate`, per-subject predicate patterns | ✗ (predicate counts come from index runs) |
 | Text and spatial | `ql:contains-word`, BM25 scoring, spatial joins, a geo index | BM25 search through `text:query` (no text/entity co-occurrence index). GeoSPARQL functions, a spatial index, spatial joins and nearest-neighbour ORDER BY. |
 | Vocabulary compression | FSST string compression, numeric IRIs encoded as ids | Front coding; no IRI encoding |
@@ -218,8 +218,35 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
 * **Filters on vocabulary keys.** `CONTAINS`, `STRSTARTS`, `STRENDS` and `REGEX` over `?v`
   or `STR(?v)`, and `LANGMATCHES(LANG(?v), …)`, are tested on the stored key bytes
   (`"lexical 0xFF @lang`, `<iri`). Each front-coded block is read once, in parallel,
-  without allocating a string per term. Terms added by updates are tested on their delta
-  keys. Inline values (numbers, dates) go through the general evaluator.
+  without allocating a string per term. A `CONTAINS` needle is searched with a substring
+  finder built once, and a key is checked to be UTF-8 only when it matches, since a byte
+  match of UTF-8 text is a match of the strings. Each parallel task tests with its own
+  copy of a regular expression, because threads that share one wait for its match caches.
+  Terms added by updates are tested on their delta keys. Inline values (numbers, dates)
+  go through the general evaluator.
+* **Filtered counts from index runs** (`count_filter_runs`). `COUNT(*)`, `COUNT(?x)` and
+  `COUNT(DISTINCT ?v)` over a FILTER that reads only `?v` of a single triple pattern read
+  the pattern from the permutation sorted on `?v`. The filter is tested once per run of
+  equal ids, and the count is the sum of the lengths of the runs that pass, or the number
+  of such runs for `COUNT(DISTINCT ?v)` (`CountFilterFromRuns`). No rows are
+  materialized. When the snapshot's delta has no key in the pattern's range, the index
+  blocks are read in parallel and each block's vocabulary ids are tested on their keys as
+  the block is read, in pieces of 8192 rows so that a short scan still uses every thread.
+  Otherwise the runs are read in order with the delta merged in. At 10.5M triples,
+  counting the `foaf:name` values that contain "Ada" tests 1.02M names and takes about
+  4 ms in the server, against 14 ms when the name column was materialized first.
+* **Filters on the runs of a scan** (`filter_scan_runs`). A FILTER directly over a scan
+  sorted on a variable it tests evaluates the conjuncts that read only that variable once
+  per value, then copies out of the index blocks only the rows of the values that pass,
+  in parallel. The other conjuncts are applied to those rows. EXPLAIN notes
+  `[runs of ?v: N values tested on vocabulary keys, M passed]`. Union-graph dedup, which
+  compares neighbouring rows, and a delta with keys in the scan's range keep the generic
+  scan and filter.
+* **Key ranges for a fixed start** (`filter_key_ranges`). Under a `STRSTARTS`, or a
+  `REGEX` anchored on a literal start (`^abc` with no flag other than `s` and no
+  alternation), the two operators above read only the base-vocabulary ids of the keys
+  with that start: literals for `?v`, literals and IRIs for `STR(?v)`. Ids outside the
+  base vocabulary (inline values and terms added by updates) are still read and tested.
 * **Pure expressions per distinct value** (`expr_cache`). A FILTER conjunct, BIND, ORDER BY
   key or aggregate argument that reads one variable and gives the same result for the same
   term is evaluated once per distinct id of that variable. Rows look up the result, errors
