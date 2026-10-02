@@ -428,9 +428,9 @@ async fn diagnostics_endpoint() {
         .await;
         assert_eq!(r.status, StatusCode::OK);
         let ttl = r.text();
-        assert!(ttl.contains("spx:DiagnosticsReport"), "{ttl}");
+        assert!(ttl.contains("spk:DiagnosticsReport"), "{ttl}");
         assert!(ttl.contains("sh:focusNode ex:tom"), "{ttl}");
-        assert!(ttl.contains("spx:dataset \"t\""), "{ttl}");
+        assert!(ttl.contains("spk:dataset \"t\""), "{ttl}");
     }
     let r = get_json(&app, "/$/reason/t/diagnostics?closure=none").await;
     assert_eq!(r["status"], "none-found");

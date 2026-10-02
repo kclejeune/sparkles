@@ -2154,18 +2154,18 @@ fail with `408`. Errors are `400` for an unknown check id or a bad `limit`, `clo
 `format`, `404` for an unknown dataset, and `501` without the `reasoning` feature.
 Diagnostics are read-only and also work on `--read-only` servers.
 
-The Turtle form describes one `spx:DiagnosticsReport`, where `spx:` is `urn:x-sparkles:`.
+The Turtle form describes one `spk:DiagnosticsReport`, where `spk:` is `urn:x-sparkles:`.
 Each finding is an `sh:result` with the SHACL result properties `sh:focusNode`,
 `sh:resultSeverity`, `sh:resultMessage` and `sh:sourceConstraintComponent`. The last one
-names the check, as in `spx:check:disjoint-classes`. The rule, the basis and the evidence
-are `spx:` properties, and evidence with several terms is an RDF list. The report has no
+names the check, as in `spk:check:disjoint-classes`. The rule, the basis and the evidence
+are `spk:` properties, and evidence with several terms is an RDF list. The report has no
 `sh:conforms`, because finding nothing does not establish consistency.
 
 ```turtle
-[] a spx:DiagnosticsReport ; spx:dataset "t" ; spx:status "violations-found" ;
-   sh:result [ a spx:Finding ; sh:focusNode ex:tom ; sh:resultSeverity sh:Violation ;
+[] a spk:DiagnosticsReport ; spk:dataset "t" ; spk:status "violations-found" ;
+   sh:result [ a spk:Finding ; sh:focusNode ex:tom ; sh:resultSeverity sh:Violation ;
                sh:sourceConstraintComponent <urn:x-sparkles:check:disjoint-classes> ;
-               spx:rule "cax-dw" ; spx:basis "asserted" ; spx:classes ( ex:Cat ex:Dog ) ;
+               spk:rule "cax-dw" ; spk:basis "asserted" ; spk:classes ( ex:Cat ex:Dog ) ;
                sh:resultMessage "ex:tom is an instance of the disjoint classes ex:Cat and ex:Dog" ] .
 ```
 

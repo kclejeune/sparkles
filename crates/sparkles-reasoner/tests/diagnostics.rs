@@ -318,7 +318,7 @@ fn turtle_rendering_uses_shacl_result_properties() {
         prefixes: &prefixes,
         ..Default::default()
     });
-    assert!(ttl.contains("@prefix spx: <urn:x-sparkles:>"), "{ttl}");
+    assert!(ttl.contains("@prefix spk: <urn:x-sparkles:>"), "{ttl}");
     assert!(ttl.contains("sh:focusNode ex:tom"), "{ttl}");
     assert!(!ttl.contains("conforms"), "never claims conformance: {ttl}");
     // it parses, and the evidence lists keep their order

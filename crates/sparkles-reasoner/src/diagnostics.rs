@@ -393,7 +393,7 @@ impl DiagnosticsReport {
         })
     }
 
-    /// The report as RDF: one `spx:DiagnosticsReport` (`spx:` is `urn:x-sparkles:`)
+    /// The report as RDF: one `spk:DiagnosticsReport` (`spk:` is `urn:x-sparkles:`)
     /// whose findings use the SHACL result properties (`sh:focusNode`,
     /// `sh:resultSeverity`, `sh:resultMessage`, `sh:sourceConstraintComponent`). There is
     /// no `sh:conforms`: finding nothing does not establish consistency.
@@ -407,52 +407,52 @@ impl DiagnosticsReport {
         add(
             &report,
             rdf::TYPE.into_owned(),
-            spx("DiagnosticsReport").into(),
+            spk("DiagnosticsReport").into(),
         );
         if let Some(d) = ctx.dataset {
-            add(&report, spx("dataset"), s(d));
+            add(&report, spk("dataset"), s(d));
         }
-        add(&report, spx("commit"), int(self.commit));
+        add(&report, spk("commit"), int(self.commit));
         add(
             &report,
-            spx("computedAt"),
+            spk("computedAt"),
             Literal::new_typed_literal(&self.computed_at, xsd::DATE_TIME).into(),
         );
-        add(&report, spx("status"), s(self.status.name()));
-        add(&report, spx("note"), s(NOTE));
-        add(&report, spx("closure"), s(self.closure.name()));
-        add(&report, spx("inferencesIncluded"), bool_(self.inferences));
+        add(&report, spk("status"), s(self.status.name()));
+        add(&report, spk("note"), s(NOTE));
+        add(&report, spk("closure"), s(self.closure.name()));
+        add(&report, spk("inferencesIncluded"), bool_(self.inferences));
         if self.inferences {
             if let Some(p) = ctx.profile {
-                add(&report, spx("inferencesProfile"), s(p));
+                add(&report, spk("inferencesProfile"), s(p));
             }
             if let Some(stale) = ctx.stale {
-                add(&report, spx("inferencesStale"), bool_(stale));
+                add(&report, spk("inferencesStale"), bool_(stale));
             }
             if let Some(n) = ctx.commits_since {
-                add(&report, spx("commitsSince"), int(n));
+                add(&report, spk("commitsSince"), int(n));
             }
         }
         for c in &self.checks {
             let node = BlankNode::default();
-            add(&report, spx("check"), node.clone().into());
-            add(&node, spx("id"), s(c.id));
+            add(&report, spk("check"), node.clone().into());
+            add(&node, spk("id"), s(c.id));
             for r in c.rules {
-                add(&node, spx("rule"), s(r));
+                add(&node, spk("rule"), s(r));
             }
-            add(&node, spx("severity"), s(c.severity.name()));
-            add(&node, spx("status"), s(c.status.name()));
-            add(&node, spx("findings"), int(c.findings as u64));
-            add(&node, spx("millis"), int(c.millis));
+            add(&node, spk("severity"), s(c.severity.name()));
+            add(&node, spk("status"), s(c.status.name()));
+            add(&node, spk("findings"), int(c.findings as u64));
+            add(&node, spk("millis"), int(c.millis));
             if let Some(e) = &c.error {
-                add(&node, spx("error"), s(e));
+                add(&node, spk("error"), s(e));
             }
         }
         let mut lists = Vec::new();
         for f in &self.findings {
             let node = BlankNode::default();
             add(&report, sh("result"), node.clone().into());
-            add(&node, rdf::TYPE.into_owned(), spx("Finding").into());
+            add(&node, rdf::TYPE.into_owned(), spk("Finding").into());
             add(&node, sh("focusNode"), f.focus.clone());
             let severity = match f.severity {
                 Severity::Inconsistency => "Violation",
@@ -463,10 +463,10 @@ impl DiagnosticsReport {
             add(
                 &node,
                 sh("sourceConstraintComponent"),
-                spx(&format!("check:{}", f.check)).into(),
+                spk(&format!("check:{}", f.check)).into(),
             );
-            add(&node, spx("rule"), s(f.rule));
-            add(&node, spx("basis"), s(f.basis.name()));
+            add(&node, spk("rule"), s(f.rule));
+            add(&node, spk("basis"), s(f.basis.name()));
             for (k, v) in &f.evidence {
                 let o = match v {
                     Evidence::One(t) => t.clone(),
@@ -477,7 +477,7 @@ impl DiagnosticsReport {
                         head.into()
                     }
                 };
-                add(&node, spx(k), o);
+                add(&node, spk(k), o);
             }
         }
         // the evidence lists, as RDF collections
@@ -497,13 +497,13 @@ impl DiagnosticsReport {
         out
     }
 
-    /// Turtle serialization of [`to_rdf`](Self::to_rdf), with the `sh:`, `spx:`, `rdf:`
+    /// Turtle serialization of [`to_rdf`](Self::to_rdf), with the `sh:`, `spk:`, `rdf:`
     /// and `xsd:` prefixes and the context's prefixes.
     pub fn to_turtle(&self, ctx: &ReportContext<'_>) -> String {
         let mut ser = oxttl::TurtleSerializer::new();
         let fixed = [
             ("sh", SH),
-            ("spx", SPX),
+            ("spk", SPK),
             ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
             ("xsd", "http://www.w3.org/2001/XMLSchema#"),
         ];
@@ -543,11 +543,11 @@ pub struct ReportContext<'a> {
 }
 
 /// Namespace of the report vocabulary.
-pub const SPX: &str = "urn:x-sparkles:";
+pub const SPK: &str = "urn:x-sparkles:";
 const SH: &str = "http://www.w3.org/ns/shacl#";
 
-fn spx(local: &str) -> NamedNode {
-    NamedNode::new_unchecked(format!("{SPX}{local}"))
+fn spk(local: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("{SPK}{local}"))
 }
 
 fn sh(local: &str) -> NamedNode {
