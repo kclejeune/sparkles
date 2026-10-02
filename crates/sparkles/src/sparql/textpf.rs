@@ -34,6 +34,8 @@ pub struct TextCall {
     pub lang: Option<String>,
     /// `Some(n)` keeps the top `n` hits
     pub limit: Option<usize>,
+    /// `"highlight:…"`: the literal output becomes the highlighted fragments
+    pub highlight: Option<crate::text::HighlightOpts>,
 }
 
 fn bad(msg: impl Into<String>) -> Error {
@@ -192,10 +194,20 @@ fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<TextCall
         None => return Err(bad("malformed argument list")),
     };
     let mut limit = None;
+    let mut highlight = None;
     let rest: Vec<TermPattern> = args.collect();
-    if rest.len() > 2 {
+    if rest.len() > 3 {
         return Err(bad("malformed argument list"));
     }
+    // each of limit, lang: and highlight: at most once
+    let mut seen = [false; 3];
+    let mut once = |i: usize| {
+        if std::mem::replace(&mut seen[i], true) {
+            Err(bad("malformed argument list"))
+        } else {
+            Ok(())
+        }
+    };
     for a in rest {
         let TermPattern::Literal(l) = a else {
             return Err(match a {
@@ -208,12 +220,17 @@ fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<TextCall
         if let Some(tag) = l.value().strip_prefix("lang:")
             && l.datatype() == xsd::STRING
         {
+            once(0)?;
             lang = Some(tag.to_ascii_lowercase());
-        } else if l.value().starts_with("highlight:") {
-            return Err(bad("highlight is not supported yet"));
+        } else if let Some(opts) = l.value().strip_prefix("highlight:")
+            && l.datatype() == xsd::STRING
+        {
+            once(1)?;
+            highlight = Some(crate::text::HighlightOpts::parse(opts).map_err(bad)?);
         } else if let Ok(n) = l.value().parse::<i64>()
             && l.datatype() != xsd::STRING
         {
+            once(2)?;
             limit = (n > 0).then_some(n as usize);
         } else {
             return Err(bad(format!("unexpected argument {l}")));
@@ -229,6 +246,7 @@ fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<TextCall
         query,
         lang,
         limit,
+        highlight,
     })
 }
 
@@ -289,9 +307,35 @@ mod tests {
             "SELECT * { (?s 1) text:query \"x\" }",
             "SELECT * { ?s text:query (?q) }",
             "SELECT * { ?s text:query (\"x\" 1 2 3) }",
-            "SELECT * { ?s text:query (\"x\" \"highlight:\") }",
+            "SELECT * { ?s text:query (\"x\" 1 2) }",
+            "SELECT * { ?s text:query (\"x\" \"highlight:\" \"highlight:\") }",
+            "SELECT * { ?s text:query (\"x\" \"highlight:q:1\") }",
+            "SELECT * { ?s text:query (\"x\" \"highlight:z:0\") }",
+            "SELECT * { ?s text:query (\"x\" \"highlight:jh:maybe\") }",
         ] {
             assert!(extract(&bgp(q)).is_err(), "{q}");
         }
+    }
+
+    #[test]
+    fn decodes_highlight_options() {
+        let (calls, _) = extract(&bgp(
+            "SELECT * { (?s ?sc ?lit) text:query (\"x\" 10 \"lang:en\" \"highlight:\") }",
+        ))
+        .unwrap();
+        assert_eq!(calls[0].highlight, Some(Default::default()));
+        let (calls, _) = extract(&bgp(
+            "SELECT * { (?s ?sc ?lit) text:query (\"x\" \"highlight:s:<em class='hiLite'> | e:</em> | z:30 | m:1 | jh:n | jf:y | f: … \") }",
+        ))
+        .unwrap();
+        let h = calls[0].highlight.clone().unwrap();
+        assert_eq!(
+            (h.start.as_str(), h.end.as_str(), h.frag_size, h.max_frags),
+            ("<em class='hiLite'>", "</em>", 30, 1)
+        );
+        assert_eq!(
+            (h.join_hi, h.join_frags, h.frag_sep.as_str()),
+            (false, true, " …")
+        );
     }
 }

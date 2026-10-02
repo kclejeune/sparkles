@@ -25,6 +25,8 @@
 use crate::error::{Error, Result};
 
 #[cfg(feature = "text")]
+mod highlight;
+#[cfg(feature = "text")]
 mod lazydir;
 #[cfg(feature = "text")]
 mod lucene;
@@ -145,6 +147,75 @@ impl Default for TextConfig {
             max_hits: default_max_hits(),
             docstore_compression: None,
         }
+    }
+}
+
+/// Jena's `highlight:` options of `text:query`: the literal output becomes the best
+/// fragments of the literal with the matched words marked.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HighlightOpts {
+    /// fragments kept at most (`m:`, 3)
+    pub max_frags: usize,
+    /// the length of a fragment in characters (`z:`, 128)
+    pub frag_size: usize,
+    /// the marks around a match (`s:` and `e:`, ↦ and ↤)
+    pub start: String,
+    pub end: String,
+    /// between fragments (`f:`, ∣)
+    pub frag_sep: String,
+    /// marks consecutive matches as one (`jh:`, yes)
+    pub join_hi: bool,
+    /// merges adjacent fragments (`jf:`, yes)
+    pub join_frags: bool,
+}
+
+impl Default for HighlightOpts {
+    fn default() -> Self {
+        HighlightOpts {
+            max_frags: 3,
+            frag_size: 128,
+            start: "\u{21a6}".into(),
+            end: "\u{21a4}".into(),
+            frag_sep: "\u{2223}".into(),
+            join_hi: true,
+            join_frags: true,
+        }
+    }
+}
+
+impl HighlightOpts {
+    /// Parse the options after `highlight:`, separated by `|`, such as
+    /// `s:<em> | e:</em> | z:150`.
+    pub fn parse(s: &str) -> std::result::Result<HighlightOpts, String> {
+        let mut o = HighlightOpts::default();
+        for opt in s.split('|').map(str::trim).filter(|o| !o.is_empty()) {
+            let (key, val) = opt
+                .split_once(':')
+                .ok_or_else(|| format!("highlight option {opt:?} is not key:value"))?;
+            let num = |v: &str| {
+                v.trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("highlight option {key}: needs a positive number"))
+            };
+            let flag = |v: &str| match v.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" | "true" => Ok(true),
+                "n" | "no" | "false" => Ok(false),
+                _ => Err(format!("highlight option {key}: is y or n")),
+            };
+            match key.trim() {
+                "m" => o.max_frags = num(val)?,
+                "z" => o.frag_size = num(val)?,
+                "s" => o.start = val.to_string(),
+                "e" => o.end = val.to_string(),
+                "f" => o.frag_sep = val.to_string(),
+                "jh" => o.join_hi = flag(val)?,
+                "jf" => o.join_frags = flag(val)?,
+                k => return Err(format!("unknown highlight option {k:?}")),
+            }
+        }
+        Ok(o)
     }
 }
 

@@ -40,9 +40,79 @@ const FUZZY_EXPANSIONS: usize = 50;
 /// The deepest nesting of parentheses a query string may have.
 const MAX_DEPTH: usize = 64;
 
+/// A parsed query string: the query, and what its words match, for highlighting.
+pub(super) struct Parsed {
+    pub(super) query: Box<dyn Query>,
+    pub(super) matchers: Matchers,
+}
+
+/// What the words of a query (except the excluded ones) match in a literal's tokens, as
+/// Lucene's highlighter marks them: every occurrence of a query word, a word a fuzzy
+/// term expanded to, or a token a prefix, wildcard, regular expression or range matches.
+#[derive(Default)]
+pub(super) struct Matchers {
+    words: rustc_hash::FxHashSet<String>,
+    prefixes: Vec<String>,
+    patterns: Vec<regex::Regex>,
+    ranges: Vec<(Bound<String>, Bound<String>)>,
+    all: bool,
+    /// phrases: each word with its offset, and whether the last one is a prefix
+    phrases: Vec<(Vec<(usize, String)>, bool)>,
+}
+
+impl Matchers {
+    /// Which of a literal's tokens (position and text) the query matches.
+    pub(super) fn marks(&self, toks: &[(usize, &str)]) -> Vec<bool> {
+        let mut out: Vec<bool> = toks.iter().map(|(_, t)| self.matches(t)).collect();
+        for (words, prefix) in &self.phrases {
+            for start in 0..toks.len() {
+                let base = toks[start].0;
+                // the token at each phrase position, matched in order
+                let mut at = start;
+                let mut hit = Vec::with_capacity(words.len());
+                for (k, (off, w)) in words.iter().enumerate() {
+                    while at < toks.len() && toks[at].0 < base + off {
+                        at += 1;
+                    }
+                    let Some(&(pos, t)) = toks.get(at) else {
+                        break;
+                    };
+                    let last = *prefix && k + 1 == words.len();
+                    if pos != base + off || !(t == w || (last && t.starts_with(w.as_str()))) {
+                        break;
+                    }
+                    hit.push(at);
+                }
+                if hit.len() == words.len() {
+                    hit.into_iter().for_each(|i| out[i] = true);
+                }
+            }
+        }
+        out
+    }
+
+    fn matches(&self, token: &str) -> bool {
+        self.all
+            || self.words.contains(token)
+            || self.prefixes.iter().any(|p| token.starts_with(p.as_str()))
+            || self.patterns.iter().any(|r| r.is_match(token))
+            || self.ranges.iter().any(|(lo, hi)| {
+                (match lo {
+                    Bound::Included(l) => token >= l.as_str(),
+                    Bound::Excluded(l) => token > l.as_str(),
+                    Bound::Unbounded => true,
+                }) && (match hi {
+                    Bound::Included(h) => token <= h.as_str(),
+                    Bound::Excluded(h) => token < h.as_str(),
+                    Bound::Unbounded => true,
+                })
+            })
+    }
+}
+
 /// Parse a `text:query` string into a query over `field`. Fuzzy terms are expanded
 /// against the terms of `searcher`.
-pub(super) fn parse(src: &str, searcher: &Searcher, field: Field) -> Res<Box<dyn Query>> {
+pub(super) fn parse(src: &str, searcher: &Searcher, field: Field) -> Res<Parsed> {
     let toks = lex(src)?;
     let mut p = Parser { toks, pos: 0 };
     let ast = p.query(0)?;
@@ -59,12 +129,17 @@ pub(super) fn parse(src: &str, searcher: &Searcher, field: Field) -> Res<Box<dyn
             .index()
             .tokenizer_for_field(field)
             .map_err(|e| e.to_string())?,
+        matchers: Default::default(),
+        positive: std::cell::Cell::new(true),
     };
     if !ast.clauses.iter().any(|(o, _)| *o != Occur::MustNot) {
         return Err("the query needs a word that is not excluded".into());
     }
     match b.clauses(&ast)? {
-        Some(q) => Ok(q),
+        Some(query) => Ok(Parsed {
+            query,
+            matchers: b.matchers.into_inner(),
+        }),
         None => Err("the query has no word to search for".into()),
     }
 }
@@ -575,9 +650,29 @@ struct Builder<'a> {
     searcher: &'a Searcher,
     field: Field,
     analyzer: TextAnalyzer,
+    matchers: std::cell::RefCell<Matchers>,
+    /// whether the clause being built is not excluded (its words are highlighted)
+    positive: std::cell::Cell<bool>,
 }
 
 impl Builder<'_> {
+    /// Record what a clause matches, unless it is excluded.
+    fn mark(&self, f: impl FnOnce(&mut Matchers)) {
+        if self.positive.get() {
+            f(&mut self.matchers.borrow_mut());
+        }
+    }
+
+    fn mark_words<'a>(&self, words: impl IntoIterator<Item = &'a str>) {
+        self.mark(|m| m.words.extend(words.into_iter().map(str::to_string)));
+    }
+
+    fn mark_pattern(&self, re: &str) {
+        if let Ok(r) = regex::Regex::new(&format!("^(?:{re})$")) {
+            self.mark(|m| m.patterns.push(r));
+        }
+    }
+
     fn term(&self, t: &str) -> Term {
         Term::from_field_text(self.field, t)
     }
@@ -604,7 +699,11 @@ impl Builder<'_> {
     fn clauses(&self, c: &Clauses) -> Res<Option<Box<dyn Query>>> {
         let mut out: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for (o, ast) in &c.clauses {
-            if let Some(q) = self.build(ast)? {
+            let positive = self.positive.get();
+            self.positive.set(positive && *o != Occur::MustNot);
+            let q = self.build(ast);
+            self.positive.set(positive);
+            if let Some(q) = q? {
                 out.push((*o, q));
             }
         }
@@ -630,9 +729,13 @@ impl Builder<'_> {
             Ast::Boost(q, b) => self
                 .build(q)?
                 .map(|q| Box::new(BoostQuery::new(q, *b)) as Box<dyn Query>),
-            Ast::All => Some(Box::new(AllQuery)),
+            Ast::All => {
+                self.mark(|m| m.all = true);
+                Some(Box::new(AllQuery))
+            }
             Ast::Word(w) => {
                 let toks = self.tokens(w);
+                self.mark_words(toks.iter().map(|(_, t)| t.as_str()));
                 match toks.len() {
                     0 => None,
                     1 => Some(self.term_query(&toks[0].1)),
@@ -651,6 +754,23 @@ impl Builder<'_> {
                     .iter()
                     .map(|(p, t)| (p - first, self.term(t)))
                     .collect();
+                if toks.len() > 1 && *slop == 0 {
+                    // Lucene's highlighter marks a phrase only where it occurs
+                    self.mark(|m| {
+                        m.phrases.push((
+                            toks.iter().map(|(p, t)| (p - first, t.clone())).collect(),
+                            *prefix,
+                        ))
+                    });
+                } else if *prefix {
+                    let last = toks.len().saturating_sub(1);
+                    self.mark_words(toks[..last].iter().map(|(_, t)| t.as_str()));
+                    if let Some((_, t)) = toks.get(last) {
+                        self.mark(|m| m.prefixes.push(t.clone()));
+                    }
+                } else {
+                    self.mark_words(toks.iter().map(|(_, t)| t.as_str()));
+                }
                 match (terms.len(), prefix) {
                     (0, _) => None,
                     (1, false) => Some(self.term_query(&toks[0].1)),
@@ -683,12 +803,16 @@ impl Builder<'_> {
                     }
                 }
                 flush(&mut lit, &mut re);
+                self.mark_pattern(&re);
                 Some(self.regex(&re)?)
             }
             Ast::Fuzzy(w, sim) => Some(self.fuzzy(&normalize(w), *sim)?),
             Ast::Regex(r) => {
                 lucene_regex(r)?;
-                Some(self.regex(&normalize(r))?)
+                let r = normalize(r);
+                let q = self.regex(&r)?;
+                self.mark_pattern(&r);
+                Some(q)
             }
             Ast::Range {
                 lo,
@@ -698,13 +822,14 @@ impl Builder<'_> {
             } => {
                 let bound = |b: &Option<String>, incl: bool| match b {
                     None => Bound::Unbounded,
-                    Some(b) if incl => Bound::Included(self.term(&normalize(b))),
-                    Some(b) => Bound::Excluded(self.term(&normalize(b))),
+                    Some(b) if incl => Bound::Included(normalize(b)),
+                    Some(b) => Bound::Excluded(normalize(b)),
                 };
-                Some(Box::new(RangeQuery::new(
-                    bound(lo, *lo_incl),
-                    bound(hi, *hi_incl),
-                )))
+                let (lo, hi) = (bound(lo, *lo_incl), bound(hi, *hi_incl));
+                let term = |b: &Bound<String>| b.as_ref().map(|s| self.term(s));
+                let q = RangeQuery::new(term(&lo), term(&hi));
+                self.mark(|m| m.ranges.push((lo, hi)));
+                Some(Box::new(q))
             }
         })
     }
@@ -733,6 +858,7 @@ impl Builder<'_> {
             ((1.0 - f64::from(sim)) * len as f64).min(2.0) as u8
         };
         if edits == 0 {
+            self.mark_words([w]);
             return Ok(self.term_query(w));
         }
         let dfa = automaton(edits).build_dfa(w);
@@ -768,6 +894,7 @@ impl Builder<'_> {
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(b.1)));
         scored.truncate(FUZZY_EXPANSIONS);
+        self.mark_words(scored.iter().map(|(_, t)| *t));
         Ok(Box::new(BooleanQuery::new(
             scored
                 .iter()

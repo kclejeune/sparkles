@@ -51,16 +51,17 @@ pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
     ctx.check()?;
     let resolved = view.resolved()?;
     // fuzzy terms expand against the searcher's terms
-    let text = super::lucene::parse(&spec.query, &resolved.searcher, sh.fields.text)
+    let parsed = super::lucene::parse(&spec.query, &resolved.searcher, sh.fields.text)
         .map_err(|e| Error::invalid(format!("text:query: {e}")))?;
-    let Some(query) = scoped(snap, spec, sh.fields, text) else {
+    let matchers = parsed.matchers;
+    let Some(query) = scoped(snap, spec, sh.fields, parsed.query) else {
         return Ok(Table::empty(vars.to_vec()));
     };
     let out = Outputs::new(spec, vars, resolved, &sh.ids);
     let max = sh.config.max_hits;
     // A limit within maxHits keeps that many of the best hits. Without a limit, or with
     // one above maxHits, every hit is returned, and more than maxHits is an error.
-    let t = match spec.limit.filter(|&n| n <= max) {
+    let mut t = match spec.limit.filter(|&n| n <= max) {
         Some(n) => {
             // with dedup (a merged default graph) or documents filtered out against the
             // snapshot, fetch more until enough hits remain
@@ -100,6 +101,45 @@ pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
             out.rows(ctx, resolved, &hits, usize::MAX)?
         }
     };
+    if let (Some(opts), Some(c)) = (&spec.highlight, out.clit) {
+        // Jena's highlight: the literal output becomes its highlighted fragments
+        let mut analyzer = resolved
+            .searcher
+            .index()
+            .tokenizer_for_field(sh.fields.text)
+            .map_err(text_err)?;
+        let mut done: FxHashMap<Id, Id> = Default::default();
+        for (i, id) in t.cols[c].iter_mut().enumerate() {
+            if i % 4096 == 4095 {
+                ctx.check()?;
+            }
+            if let Some(&h) = done.get(id) {
+                *id = h;
+                continue;
+            }
+            let h = match snap.term(*id) {
+                Some(oxrdf::Term::Literal(l)) => {
+                    match super::highlight::highlight(l.value(), opts, &matchers, &mut analyzer) {
+                        Some(text) => {
+                            let lit = match l.language() {
+                                Some(lang) => {
+                                    oxrdf::Literal::new_language_tagged_literal_unchecked(
+                                        text, lang,
+                                    )
+                                }
+                                None => oxrdf::Literal::new_typed_literal(text, l.datatype()),
+                            };
+                            ctx.intern_term(&oxrdf::Term::Literal(lit))
+                        }
+                        None => *id,
+                    }
+                }
+                _ => *id,
+            };
+            done.insert(*id, h);
+            *id = h;
+        }
+    }
     Ok(t)
 }
 

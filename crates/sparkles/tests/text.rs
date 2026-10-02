@@ -584,6 +584,108 @@ fn lucene_query_syntax() {
     }
 }
 
+/// Jena's `highlight:` option, with the examples of jena-text's documentation.
+#[test]
+fn highlighting() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        br#"
+@prefix ex: <http://example.org/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:a rdfs:label "the quick brown fox jumped over the lazy baboon"@en .
+ex:b rdfs:comment "one two three four five six seven eight nine ten eleven twelve fox thirteen fourteen fifteen sixteen fox seventeen" .
+ex:c rdfs:comment "Foxes are not foxglove" .
+"#
+        .to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.enable_text(TextConfig::default()).unwrap();
+    let hl = |q: &str, opts: &str| {
+        let r = query(
+            s.snapshot(),
+            &format!(
+                "{P}SELECT ?lit {{ (?s ?sc ?lit) text:query (\"{q}\" \"highlight:{opts}\") }} ORDER BY ?lit"
+            ),
+            &QueryOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("{q} {opts}: {e}"));
+        r.rows()
+            .into_iter()
+            .map(|row| match row[0].as_ref().unwrap() {
+                oxrdf::Term::Literal(l) => {
+                    format!(
+                        "{}{}",
+                        l.value(),
+                        l.language().map(|t| format!("@{t}")).unwrap_or_default()
+                    )
+                }
+                t => panic!("{t}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    // the documented defaults: arrows, and a phrase marked as one
+    assert_eq!(
+        hl("brown fox", ""),
+        [
+            "one two three four five six seven eight nine ten eleven twelve ↦fox↤ thirteen fourteen fifteen sixteen ↦fox↤ seventeen",
+            "the quick ↦brown fox↤ jumped over the lazy baboon@en",
+        ]
+    );
+    assert_eq!(
+        hl("+brown +fox", "jh:n"),
+        ["the quick ↦brown↤ ↦fox↤ jumped over the lazy baboon@en"]
+    );
+    assert_eq!(
+        hl("+brown +fox", "s:<em class='hiLite'> | e:</em>"),
+        ["the quick <em class='hiLite'>brown fox</em> jumped over the lazy baboon@en"]
+    );
+    // fragments of about z: characters (each starts with the space before its first
+    // word, as in Lucene), the best m: ones first, joined by f:
+    assert_eq!(
+        hl("+thirteen +fox", "z:20"),
+        [" twelve ↦fox thirteen↤∣ sixteen ↦fox↤ seventeen"]
+    );
+    assert_eq!(
+        hl("+thirteen +fox", "z:20 | m:2 | f: … "),
+        [" twelve ↦fox thirteen↤ … sixteen ↦fox↤ seventeen"]
+    );
+    assert_eq!(
+        hl("+thirteen +fox", "z:20 | m:1"),
+        [" twelve ↦fox thirteen↤"]
+    );
+    // adjacent fragments are merged unless jf:n
+    assert_eq!(
+        hl("+fourteen +fox", "z:20"),
+        [" twelve ↦fox↤ thirteen ↦fourteen↤ fifteen sixteen ↦fox↤ seventeen"]
+    );
+    assert_eq!(
+        hl("+fourteen +fox", "z:20 | jf:n"),
+        [" twelve ↦fox↤ thirteen∣ ↦fourteen↤ fifteen∣ sixteen ↦fox↤ seventeen"]
+    );
+    // prefixes, wildcards and fuzzy words are marked; excluded words are not
+    assert_eq!(
+        hl("fox*", ""),
+        [
+            "one two three four five six seven eight nine ten eleven twelve ↦fox↤ thirteen fourteen fifteen sixteen ↦fox↤ seventeen",
+            "↦Foxes↤ are not ↦foxglove↤",
+            "the quick brown ↦fox↤ jumped over the lazy baboon@en",
+        ]
+    );
+    assert_eq!(
+        hl("foxs~1 -twelve", ""),
+        [
+            "↦Foxes↤ are not foxglove",
+            "the quick brown ↦fox↤ jumped over the lazy baboon@en",
+        ]
+    );
+    assert_eq!(
+        hl("f?x -twelve", "s:[|e:]"),
+        ["the quick brown [fox] jumped over the lazy baboon@en"]
+    );
+}
+
 /// An explicit limit above `maxHits` is no limit: more hits than `maxHits` are an error,
 /// as without a limit, instead of the first `maxHits` + 1.
 #[test]

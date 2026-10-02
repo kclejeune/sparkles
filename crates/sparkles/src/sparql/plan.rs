@@ -197,6 +197,8 @@ pub struct TextSpec {
     pub graph_var: Option<VarId>,
     /// merge hits of the same (s, p, o) from different graphs (merged default graph)
     pub dedup: bool,
+    /// `highlight:` options: the literal output is the highlighted fragments
+    pub highlight: Option<crate::text::HighlightOpts>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1235,7 +1237,7 @@ impl<'a> Planner<'a> {
             }
         }
         let desc = format!(
-            "{} ← {:?}{}{}{}",
+            "{} ← {:?}{}{}{}{}",
             vars.iter()
                 .map(|v| format!("?{}", self.ctx.var_name(*v)))
                 .collect::<Vec<_>>()
@@ -1258,6 +1260,11 @@ impl<'a> Planner<'a> {
                 .map(|l| format!(" lang={l}"))
                 .unwrap_or_default(),
             c.limit.map(|l| format!(" limit {l}")).unwrap_or_default(),
+            // the options are part of the description, and so of the result cache key
+            match (&c.highlight, literal) {
+                (Some(h), Some(_)) => format!(" highlight {h:?}"),
+                _ => String::new(),
+            },
         );
         let spec = TextSpec {
             query: c.query,
@@ -1276,6 +1283,7 @@ impl<'a> Planner<'a> {
             graph,
             graph_var,
             dedup,
+            highlight: c.highlight.filter(|_| literal.is_some()),
         };
         let est = spec.limit.unwrap_or(1000) as f64;
         let mut n = Node::leaf(Kind::TextSearch(Box::new(spec)), vars, est, desc);
