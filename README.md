@@ -135,6 +135,8 @@ benchmarks such as LUBM, BSBM and WatDiv. [docs/BENCHMARKS.md](docs/BENCHMARKS.m
 every number for both data sizes, and the queries where Sparkles loses. A harness for
 real data on DBpedia, from 10M up to 1.24 billion triples, is ready to run with
 `mise run bench:billion [scale]` ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#benchmark-scripts)).
+A harness for WatDiv's 20 basic query templates on all five engines is ready to run with
+`mise run bench:watdiv [scale]`.
 
 ## Getting started
 
