@@ -916,6 +916,42 @@ implementation landed.
   - templates that read the target dataset;
   - CSV bodies in the Graph Store protocol.
 
+## Applying RDF Patch, replication and read replicas
+
+- **Spec:** [`F10-replication.md`](F10-replication.md), written on 2026-10-02
+  independently from:
+  - the Sparkles code and the [CI](CI-commit-identity.md),
+    [F06](F06-snapshots-and-point-in-time.md), [C13](C13-automatic-compaction.md),
+    [F05](F05-snapshot-repositories.md), [C09](C09-dataset-access-control.md) and
+    [C12](C12-graph-access-control.md) specs;
+  - Apache Jena's `jena-rdfpatch`, `jena-cmds` (`rdfpatch`) and Fuseki (`PatchApply`,
+    `FusekiConfig`, `OperationRegistry`) sources and `GraphView` (Apache-2.0), read for
+    behaviour. No code was copied;
+  - the RDF Patch documentation of Apache Jena and the RDF Delta documentation (patch
+    logs, `id` and `prev`), fetched;
+  - the PostgreSQL documentation of log-shipping standby servers and hot standby, the
+    LiteFS documentation and Oxigraph 0.3's `Store` documentation, fetched for
+    behaviour;
+  - Litestream's design, the Raft paper and the etcd documentation, PostgreSQL timelines
+    and RFCs 9110, 9530, 9651 and 6648, cited from general knowledge.
+
+  Fluree was not consulted, and the descriptions of Fluree in the project's planning notes
+  and comparison table were not used.
+- **Implementation:** not started.
+- **Rejected** (spec §10):
+  - physical replication of WAL bytes and generation files;
+  - the public change feed as the replication protocol;
+  - shipping SPARQL Update text;
+  - push from the primary;
+  - followers that read the primary's files;
+  - consensus (Raft) in Phases 1 and 2;
+  - keeping the dataset id on promotion;
+  - replicating every compaction as a generation copy;
+  - applying bulk commits from their changes by default;
+  - redirecting writes from a replica to the primary;
+  - Jena's blank-node labels as identities;
+  - one commit per `TX … TC` block as the default.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):
