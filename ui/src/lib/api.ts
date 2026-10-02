@@ -188,6 +188,16 @@ export type DatasetStats = {
   reasoning?: ReasoningStatus | null;
   /** Spatial index status (null: disabled); absent on servers that predate it. */
   geo?: GeoStatus | null;
+  /** The commit the statistics describe; absent on servers that predate it. */
+  commit?: number;
+  /** The selector of a past state (`commit:42`), or null at the head. */
+  at?: string | null;
+  history?: {
+    bytes: number;
+    generations: number;
+    snapshots: number;
+    oldestReconstructable: number | null;
+  };
 };
 
 export type TaskKind =
@@ -278,6 +288,8 @@ export type SparklesResult = {
   };
   /** From the `Sparkles-Inferences` header: the result used outdated inferences. */
   inferences?: InferencesNotice;
+  /** From the `Sparkles-At` headers: the state a query with `at` read. */
+  at?: AtInfo;
 };
 
 export type ExplainResult = { algebra: string; plan: PlanNode };
@@ -542,7 +554,9 @@ export const createDataset = (dbName: string, dbType: DatasetType) =>
 export const deleteDataset = (ds: string) =>
   json<unknown>(`/$/datasets/${enc(ds)}`, { method: 'DELETE' });
 
-export const datasetStats = (ds: string) => json<DatasetStats>(`/$/stats/${enc(ds)}`);
+/** `GET /$/stats/{ds}`, of the state `at` selects when given. */
+export const datasetStats = (ds: string, at?: string) =>
+  json<DatasetStats>(`/$/stats/${enc(ds)}${at ? `?at=${enc(at)}` : ''}`);
 
 export const compact = (ds: string) => json<Task>(`/$/compact/${enc(ds)}`, { method: 'POST' });
 
@@ -735,11 +749,14 @@ export type QueryOptions = {
   reasoning?: boolean;
   /** Bypass the server's result cache. */
   nocache?: boolean;
+  /** Read a past state: `head`, `42`, `commit:42`, `time:<RFC 3339>`, `snapshot:NAME`. */
+  at?: string;
   signal?: AbortSignal;
 };
 
 function queryParams(opts: QueryOptions): string {
   const p = new URLSearchParams();
+  if (opts.at) p.set('at', opts.at);
   if (opts.nocache) p.set('nocache', 'true');
   if (opts.send != null) p.set('send', String(opts.send));
   if (opts.timeout != null) p.set('timeout', String(opts.timeout));
@@ -763,6 +780,8 @@ export async function query(
   const body = (await res.json()) as SparklesResult;
   const inferences = parseInferencesHeader(res.headers.get('Sparkles-Inferences'));
   if (inferences) body.inferences = inferences;
+  const at = atInfo(res.headers);
+  if (at) body.at = at;
   return normalizeResult(body);
 }
 
@@ -1257,6 +1276,12 @@ export type Commit = {
   exact: boolean;
   /** Rebuilt from a write-ahead log record without commit metadata. */
   reconstructed?: boolean;
+  /** A point-in-time read (`at`) can still see this commit; absent on older servers. */
+  reconstructable?: boolean;
+  /** Named snapshots that pin this commit. */
+  snapshots?: string[];
+  /** The message recorded with the commit. */
+  message?: string;
 };
 
 /** What a write produced: the new commit, or the unchanged head when nothing changed. */
@@ -1289,6 +1314,9 @@ export type CommitPage = {
   firstRetained: number;
   /** false while the catalog lags the write-ahead log after a write error. */
   complete: boolean;
+  /** Oldest commit a point-in-time read can see; absent on older servers. */
+  oldestReconstructable?: number | null;
+  reconstructable?: { from: number; to: number }[];
   commits: Commit[];
   /** URL of the next (older) page, or null. */
   next: string | null;
@@ -1498,3 +1526,170 @@ export const disableText = (ds: string) =>
 /** Rebuild the index from the current data (`409` while a rebuild runs). */
 export const rebuildText = (ds: string) =>
   json<Task>(`/$/text/${enc(ds)}/rebuild`, { method: 'POST' });
+
+// --- point-in-time reads, named snapshots and diffs ------------------------------
+
+/** The state a read with `at` saw, from its response headers. */
+export type AtInfo = {
+  /** canonical selector: `head`, `commit:42`, `time:…`, `snapshot:NAME` */
+  selector: string;
+  commit: number | null;
+  head: number | null;
+  /** a past state (the server sent `Memento-Datetime`) */
+  historical: boolean;
+  /** `Memento-Datetime` as an ISO time, for a past state */
+  datetime: string | null;
+};
+
+/** The `Sparkles-At` family of headers, or undefined when the read had no `at`. */
+export function atInfo(h: Headers): AtInfo | undefined {
+  const selector = h.get('Sparkles-At');
+  if (!selector) return undefined;
+  const num = (v: string | null) => (v != null && /^\d+$/.test(v) ? Number(v) : null);
+  const memento = h.get('Memento-Datetime');
+  const t = memento ? new Date(memento) : null;
+  return {
+    selector,
+    commit: num(h.get('Sparkles-Commit')),
+    head: num(h.get('Sparkles-Head')),
+    historical: memento != null,
+    datetime: t && !Number.isNaN(t.getTime()) ? t.toISOString() : null,
+  };
+}
+
+/** A named snapshot: a durable name for a commit that keeps it readable. */
+export type NamedSnapshot = {
+  name: string;
+  /** `snapshot:NAME` */
+  ref: string;
+  seq: number;
+  /** the pinned commit's metadata (null once the catalog no longer has it) */
+  commit: Commit | null;
+  created: string;
+  /** when the pin lapses, or null */
+  expires: string | null;
+  note: string | null;
+  generation: string | null;
+  reconstructable: boolean;
+};
+
+export type SnapshotList = {
+  dataset: string;
+  datasetId: string;
+  head: number;
+  snapshots: NamedSnapshot[];
+};
+
+/** `GET /$/snapshots/{ds}`, sorted by commit then name. */
+export const snapshots = (ds: string, signal?: AbortSignal) =>
+  json<SnapshotList>(`/$/snapshots/${enc(ds)}`, { signal, cache: 'no-store' });
+
+/**
+ * `POST /$/snapshots/{ds}`: pin `at` (default the head) as `name`. `expires` is an RFC 3339
+ * time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). Creating a name that
+ * already pins the same commit succeeds again; another commit is a 409.
+ */
+export const createSnapshot = (
+  ds: string,
+  body: { name: string; at?: string; note?: string; expires?: string },
+) => json<NamedSnapshot>(`/$/snapshots/${enc(ds)}`, jsonBody(body));
+
+/** `DELETE /$/snapshots/{ds}/{name}`; the history only it kept is collected. */
+export const deleteSnapshot = (ds: string, name: string) =>
+  json<unknown>(`/$/snapshots/${enc(ds)}/${enc(name)}`, { method: 'DELETE' });
+
+export type Retention = {
+  keepCommits: number | null;
+  /** seconds, as `"86400s"` */
+  keepAge: string | null;
+  maxBytes?: number | null;
+};
+
+export type PinSchedule = { prefix: string; every: string; keepLast: number };
+
+/** `GET /$/history/{ds}`: retained generations, readable commits and retention. */
+export type HistoryStatus = {
+  dataset: string;
+  datasetId: string;
+  head: number;
+  oldestReconstructable: number | null;
+  reconstructable: { from: number; to: number }[];
+  bytes: number;
+  generations: {
+    name: string;
+    baseSeq: number;
+    endSeq: number;
+    bytes: number;
+    current: boolean;
+    heldBy: string[];
+  }[];
+  retention: Retention;
+  schedules?: PinSchedule[];
+  snapshots: number;
+};
+
+export const history = (ds: string, signal?: AbortSignal) =>
+  json<HistoryStatus>(`/$/history/${enc(ds)}`, { signal, cache: 'no-store' });
+
+/** `PUT /$/history/{ds}`: the retention window, and the pin schedules when given. */
+export const setHistory = (
+  ds: string,
+  body: {
+    keepCommits?: number | null;
+    keepAge?: string | number | null;
+    maxBytes?: string | number | null;
+    schedules?: PinSchedule[] | null;
+  },
+) =>
+  json<HistoryStatus>(`/$/history/${enc(ds)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+export type DiffQuad = {
+  op: '+' | '-';
+  subject: string;
+  predicate: string;
+  object: string;
+  /** null for the default graph */
+  graph: string | null;
+};
+
+/** `GET /{ds}/diff`: the net change from one state to another. */
+export type Diff = {
+  dataset: string;
+  datasetId: string;
+  from: { selector: string; commit: Commit };
+  to: { selector: string; commit: Commit };
+  added: number;
+  removed: number;
+  /** `log` (read from the write-ahead logs), `compare` (state against state) or `same` */
+  method: 'log' | 'compare' | 'same';
+  /** with `quads`: removals first, then additions */
+  quads?: DiffQuad[];
+};
+
+export type DiffOptions = {
+  /** default: the commit before `to` */
+  from?: string;
+  /** default: the head */
+  to?: string;
+  /** an IRI, or `default` */
+  graph?: string;
+  /** list the changed quads (at most `limit` of them) */
+  quads?: boolean;
+  limit?: number;
+  signal?: AbortSignal;
+};
+
+export function diff(ds: string, opts: DiffOptions = {}): Promise<Diff> {
+  const p = new URLSearchParams();
+  if (opts.from) p.set('from', opts.from);
+  if (opts.to) p.set('to', opts.to);
+  if (opts.graph) p.set('graph', opts.graph);
+  if (opts.quads) p.set('quads', 'true');
+  if (opts.limit != null) p.set('limit', String(opts.limit));
+  const qs = p.toString();
+  return json<Diff>(`/${enc(ds)}/diff${qs ? `?${qs}` : ''}`, { signal: opts.signal });
+}

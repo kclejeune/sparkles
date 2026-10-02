@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
@@ -13,6 +14,7 @@
     nextBefore,
   } from '$lib/commits';
   import { fmtInt, fmtRelative } from '$lib/format';
+  import { diffLine, diffSummary, normalizeAt, readable, validAt } from '$lib/history';
   import { LatestRun } from '$lib/supersede';
   import Icon from './Icon.svelte';
 
@@ -92,6 +94,58 @@
   );
   const unsupported = $derived(error instanceof api.ApiError && error.status === 404 && !page);
 
+  // --- point-in-time reads and diffs ---------------------------------------------
+
+  /** Changes listed in the diff view at most. */
+  const DIFF_LIMIT = 500;
+  let diffForm = $state<{ from: string; to: string } | null>(null);
+  let diff = $state<api.Diff | null>(null);
+  let diffError = $state<api.ApiError | Error | null>(null);
+  let diffLoading = $state(false);
+
+  async function loadDiff() {
+    if (!diffForm || !validAt(diffForm.from) || !validAt(diffForm.to)) return;
+    const owns = runs.claim('diff');
+    diffLoading = true;
+    try {
+      const d = await api.diff(name, {
+        from: normalizeAt(diffForm.from) ?? 'head',
+        to: normalizeAt(diffForm.to) ?? 'head',
+        quads: true,
+        limit: DIFF_LIMIT,
+      });
+      if (!owns()) return;
+      diff = d;
+      diffError = null;
+    } catch (e) {
+      if (owns()) {
+        diff = null;
+        diffError = e as Error;
+      }
+    } finally {
+      if (owns()) diffLoading = false;
+    }
+  }
+
+  /** Show what commit `c` changed (against its parent). */
+  function showDiff(c: api.Commit) {
+    diffForm = { from: String(Math.max(c.seq - 1, 0)), to: String(c.seq) };
+    void loadDiff();
+  }
+
+  function closeDiff() {
+    runs.claim('diff');
+    diffForm = null;
+    diff = null;
+    diffError = null;
+  }
+
+  function queryAt(c: api.Commit) {
+    app.setDataset(name);
+    app.queryAt = c.seq === page?.head ? '' : c.ref;
+    goto(resolve('/query'));
+  }
+
   async function copyId(id: string) {
     try {
       await navigator.clipboard.writeText(id);
@@ -168,17 +222,26 @@
               <th>When</th>
               <th class="num">Change</th>
               <th class="num" title="Quads in the dataset after the commit">Quads after</th>
+              <th><span class="sr-only">Actions</span></th>
             </tr>
           </thead>
           <tbody>
             {#each shown as c (c.seq)}
-              <tr class:head={c.seq === page.head}>
-                <td class="num mono seq" title={c.ref}>{c.seq}</td>
+              <tr class:head={c.seq === page.head} class:unreadable={!readable(c)}>
+                <td
+                  class="num mono seq"
+                  title={readable(c)
+                    ? `${c.ref}: a point-in-time read can see it`
+                    : `${c.ref}: its data is no longer kept`}>{c.seq}</td
+                >
                 <td
                   ><div class="kind">
                     <span>{commitKindLabel(c.kind)}</span>
                     {#each commitFlags(c) as f (f.label)}
                       <span class="badge flag" class:warn={f.warn} title={f.title}>{f.label}</span>
+                    {/each}
+                    {#each c.snapshots ?? [] as s (s)}
+                      <span class="badge flag snap" title="Pinned by the snapshot {s}">{s}</span>
                     {/each}
                   </div></td
                 >
@@ -197,11 +260,93 @@
                   {/if}
                 </td>
                 <td class="num">{fmtInt(c.quads)}</td>
+                <td class="row-actions">
+                  <button
+                    class="btn ghost sm"
+                    title="Show what this commit changed"
+                    disabled={!readable(c) || c.seq === 0}
+                    onclick={() => showDiff(c)}>Diff</button
+                  >
+                  <button
+                    class="btn ghost icon sm"
+                    aria-label="Query at commit {c.seq}"
+                    title="Query the dataset at this commit"
+                    disabled={!readable(c)}
+                    onclick={() => queryAt(c)}><Icon name="query" size={12} /></button
+                  >
+                </td>
               </tr>
             {/each}
           </tbody>
         </table>
       </div>
+      {#if diffForm}
+        <div class="diff">
+          <form
+            class="diff-head"
+            onsubmit={(e) => {
+              e.preventDefault();
+              void loadDiff();
+            }}
+          >
+            <strong>Changes</strong>
+            <label
+              ><span class="faint">from</span>
+              <input
+                class="input sm mono"
+                class:invalid={!validAt(diffForm.from)}
+                size="8"
+                bind:value={diffForm.from}
+              /></label
+            >
+            <label
+              ><span class="faint">to</span>
+              <input
+                class="input sm mono"
+                class:invalid={!validAt(diffForm.to)}
+                size="8"
+                placeholder="head"
+                bind:value={diffForm.to}
+              /></label
+            >
+            <button class="btn sm" disabled={diffLoading}>
+              {#if diffLoading}<span class="spinner"></span>{/if} Compare
+            </button>
+            <span class="spacer"></span>
+            <button
+              type="button"
+              class="btn ghost icon sm"
+              aria-label="Close the changes"
+              onclick={closeDiff}><Icon name="x" size={12} /></button
+            >
+          </form>
+          {#if diffError}
+            <div class="error-box">
+              <strong>Could not compare these commits.</strong>
+              <span class="muted">{api.errorMessage(diffError)}</span>
+            </div>
+          {:else if diff}
+            <p class="faint diff-sum">
+              commit {diff.from.commit.seq} → commit {diff.to.commit.seq}:
+              <span class="mono">{diffSummary(diff)}</span>
+              {#if diff.method === 'compare'}· compared state against state{/if}
+            </p>
+            {#if diff.quads?.length}
+              <pre class="diff-lines">{#each diff.quads as q, i (i)}<span
+                    class:ins={q.op === '+'}
+                    class:del={q.op === '-'}>{diffLine(q)}{'\n'}</span
+                  >{/each}</pre>
+              {#if diff.added + diff.removed > diff.quads.length}
+                <p class="faint diff-sum">
+                  Showing the first {fmtInt(diff.quads.length)} of {fmtInt(
+                    diff.added + diff.removed,
+                  )} changes.
+                </p>
+              {/if}
+            {/if}
+          {/if}
+        </div>
+      {/if}
       <div class="foot row">
         <span class="faint">
           {fmtInt(shown.length)} of {fmtInt(page.head - page.firstRetained + 1)} retained commits
@@ -323,5 +468,61 @@
     padding: 8px 14px;
     border-top: 1px solid var(--border);
     font-size: var(--fs-sm);
+  }
+  tr.unreadable td {
+    color: var(--text-2);
+  }
+  .snap {
+    background: color-mix(in srgb, var(--iri) 14%, transparent);
+    color: var(--iri);
+  }
+  .row-actions {
+    text-align: right;
+    width: 1%;
+  }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+  .diff {
+    border-top: 1px solid var(--border);
+    padding: 8px 14px;
+    font-size: var(--fs-sm);
+    display: grid;
+    gap: 6px;
+  }
+  .diff-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+  }
+  .diff-head label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .diff-head input.invalid {
+    border-color: var(--danger);
+  }
+  .diff-sum {
+    margin: 0;
+  }
+  .diff-lines {
+    margin: 0;
+    max-height: 280px;
+    overflow: auto;
+    font-size: 11.5px;
+    line-height: 1.45;
+    white-space: pre;
+  }
+  .diff-lines .ins {
+    color: var(--ok);
+  }
+  .diff-lines .del {
+    color: var(--danger);
   }
 </style>
