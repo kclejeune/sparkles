@@ -664,6 +664,10 @@ enum Cmd {
         /// zstd, brotli or lz4
         #[arg(long, default_value = "auto")]
         compression: String,
+        /// Skip the validation of IRIs and language tags, for data whose IRIs are not all
+        /// valid (DBpedia's, for one); syntax errors still fail the load
+        #[arg(long)]
+        lenient: bool,
         /// A server to send this to instead of a local database (with --dataset)
         #[arg(long, env = "SPARKLES_SERVER")]
         server: Option<String>,
@@ -1603,11 +1607,15 @@ fn run() -> Result<()> {
             graph,
             files,
             compression,
+            lenient,
             server,
             dataset,
             insecure_http,
         } => {
             let Some(loc) = loc else {
+                if lenient {
+                    bail!("--lenient applies to a local database (--loc) only");
+                }
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
                 #[cfg(feature = "auth")]
                 return remote::client::load(
@@ -1634,6 +1642,7 @@ fn run() -> Result<()> {
                 .map(|f| -> Result<Source> {
                     let mut s = Source::from_path(f, g.clone())?;
                     s.compression = explicit;
+                    s.lenient = lenient;
                     // fail before loading anything
                     s.codec()?;
                     Ok(s)

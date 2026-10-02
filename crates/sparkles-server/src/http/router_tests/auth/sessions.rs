@@ -165,12 +165,14 @@ async fn token_login_dies_with_its_token() {
     )
     .await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
-    // the session ends no later than the token
-    assert!(
-        r.set_cookie("sparkles_session")
-            .unwrap()
-            .contains("Max-Age=3600")
-    );
+    // the session ends no later than the token (a second may pass between the two)
+    let set = r.set_cookie("sparkles_session").unwrap();
+    let max_age: u64 = set
+        .split(';')
+        .find_map(|a| a.trim().strip_prefix("Max-Age="))
+        .and_then(|v| v.parse().ok())
+        .unwrap();
+    assert!((3590..=3600).contains(&max_age), "{set}");
     let cookie = r.cookie("sparkles_session").unwrap();
     let who = call(&s.app, "GET", "/$/whoami", &[("cookie", &cookie)], "")
         .await

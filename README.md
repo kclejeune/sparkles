@@ -132,7 +132,9 @@ that all engines return the same answers. At 10.5M triples:
 
 Nothing has been measured above 10.5M triples, with cold caches, or with standard
 benchmarks such as LUBM, BSBM and WatDiv. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has
-every number for both data sizes, and the queries where Sparkles loses.
+every number for both data sizes, and the queries where Sparkles loses. A harness for
+real data on DBpedia, from 10M up to 1.24 billion triples, is ready to run with
+`mise run bench:billion [scale]` ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#benchmark-scripts)).
 
 ## Getting started
 

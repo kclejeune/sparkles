@@ -1466,6 +1466,7 @@ impl Spooled {
                     graph,
                     base: None,
                     name: "<request body>".into(),
+                    lenient: false,
                 },
                 Some(f),
             ),

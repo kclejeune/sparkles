@@ -36,6 +36,9 @@ pub struct BuildOptions {
     pub threads: usize,
     /// Quads per partial vocabulary batch.
     pub batch_quads: usize,
+    /// Bytes of distinct vocabulary keys per batch: a batch also ends here, so data with
+    /// long literals (abstracts) does not hold `batch_quads` of them per parser thread.
+    pub batch_key_bytes: usize,
     /// Max quads sorted in memory at once (32 bytes each).
     pub sort_mem_quads: usize,
     /// First blank node id to allocate.
@@ -47,6 +50,7 @@ impl Default for BuildOptions {
         BuildOptions {
             threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
             batch_quads: 4_000_000,
+            batch_key_bytes: 128 << 20,
             sort_mem_quads: 64_000_000,
             first_bnode: 0,
         }
@@ -221,6 +225,7 @@ impl Builder {
             b: self,
             scope,
             keys: FxHashMap::default(),
+            key_bytes: 0,
             quads: Vec::new(),
             keybuf: Vec::with_capacity(128),
             taken: 0,
@@ -511,6 +516,8 @@ pub struct Encoder<'b> {
     b: &'b Builder,
     scope: Arc<LabelScope>,
     keys: FxHashMap<Box<[u8]>, u32>,
+    /// total length of `keys`
+    key_bytes: usize,
     quads: Vec<[u64; 4]>,
     keybuf: Vec<u8>,
     /// quads taken, for the [`InterruptFn`] calls
@@ -524,6 +531,7 @@ impl Encoder<'_> {
         }
         let i = self.keys.len() as u32;
         self.keys.insert(key.into(), i);
+        self.key_bytes += key.len();
         Id::local(i as u64).0
     }
 
@@ -606,7 +614,9 @@ impl Encoder<'_> {
         if self.taken.is_multiple_of(INTERRUPT_EVERY) {
             self.b.interrupted()?;
         }
-        if self.quads.len() >= self.b.opts.batch_quads {
+        if self.quads.len() >= self.b.opts.batch_quads
+            || self.key_bytes >= self.b.opts.batch_key_bytes
+        {
             self.flush()?;
         }
         Ok(())
@@ -615,6 +625,7 @@ impl Encoder<'_> {
     pub fn flush(&mut self) -> Result<()> {
         let keys = std::mem::take(&mut self.keys);
         let quads = std::mem::take(&mut self.quads);
+        self.key_bytes = 0;
         self.b.write_batch(keys, quads)
     }
 }
@@ -892,15 +903,24 @@ mod tests {
         };
         let small = build(BuildOptions {
             batch_quads: 7,
+            batch_key_bytes: usize::MAX,
             sort_mem_quads: 50,
             threads: 3,
             first_bnode: 0,
+        });
+        // batches that end at a few keys' bytes rather than at a quad count
+        let short = build(BuildOptions {
+            batch_key_bytes: 100,
+            sort_mem_quads: 50,
+            threads: 3,
+            ..Default::default()
         });
         let big = build(BuildOptions::default());
         assert!(small.0 > 1000);
         assert_eq!(small.0, big.0);
         assert_eq!(small.1, big.1);
         assert_eq!(small.2, big.2);
+        assert_eq!(short, big);
     }
 
     #[test]
@@ -937,7 +957,7 @@ mod tests {
             batch_quads: 5,
             sort_mem_quads: 20,
             threads: 2,
-            first_bnode: 0,
+            ..Default::default()
         });
         let (_, in_memory) = stats(BuildOptions::default());
         assert_eq!(quads, 80);

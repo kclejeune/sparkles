@@ -35,6 +35,10 @@ pub struct Source {
     pub base: Option<String>,
     /// Human-readable name for errors.
     pub name: String,
+    /// Skip the validation of IRIs and language tags (oxttl's lenient mode), for data
+    /// such as DBpedia's whose IRIs are not all valid RFC 3987 IRIs. Syntax errors still
+    /// fail.
+    pub lenient: bool,
 }
 
 impl Source {
@@ -51,6 +55,7 @@ impl Source {
             graph,
             base: Some(format!("file://{}", abs.display())),
             name: path.display().to_string(),
+            lenient: false,
         })
     }
 
@@ -63,6 +68,7 @@ impl Source {
             graph,
             base: None,
             name: "<request body>".into(),
+            lenient: false,
         }
     }
 
@@ -240,13 +246,15 @@ pub trait QuadSink: Send {
 /// Parse a source, splitting line-based and Turtle documents into chunks parsed in
 /// parallel (QLever-style parallel parsing). `make_sink` is called once per chunk.
 /// Returns the prefixes declared in the document.
+///
+/// Compressed N-Triples and N-Quads are decompressed and parsed as a stream of blocks
+/// (see [`STREAM_BLOCK`]), so their decompressed size is not bounded by memory; other
+/// compressed documents are decompressed into memory first.
 pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
     src: &Source,
     parallelism: usize,
     make_sink: F,
 ) -> Result<BTreeMap<String, String>> {
-    let bytes = load_bytes(src)?;
-    let slice = bytes.as_ref();
     let mut parser = RdfParser::from_format(src.format);
     if let Some(base) = &src.base {
         parser = parser
@@ -256,6 +264,24 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
     if let Some(g) = &src.graph {
         parser = parser.with_default_graph(GraphName::NamedNode(g.clone()));
     }
+    if src.lenient {
+        parser = parser.lenient();
+    }
+    let line_based = matches!(src.format, RdfFormat::NTriples | RdfFormat::NQuads);
+    if line_based && src.codec()? != Codec::None {
+        let block = STREAM_BLOCK.max(parallelism.max(1) * PARALLEL_MIN_CHUNK);
+        parse_stream(
+            src,
+            parser,
+            parallelism,
+            block,
+            PARALLEL_MIN_CHUNK,
+            make_sink,
+        )?;
+        return Ok(BTreeMap::new());
+    }
+    let bytes = load_bytes(src)?;
+    let slice = bytes.as_ref();
     let prefixes = Mutex::new(BTreeMap::new());
     let splittable = matches!(
         src.format,
@@ -295,6 +321,118 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
         sink.finish()?;
     }
     Ok(prefixes.into_inner())
+}
+
+/// Decompressed bytes per block of a streamed source: blocks end at a line break and
+/// are split for parallel parsing like a whole document. One block is parsed while the
+/// next one is decompressed.
+const STREAM_BLOCK: usize = 256 << 20;
+
+/// Parse compressed N-Triples / N-Quads block by block: a thread decompresses the next
+/// block while the current one is parsed in parallel. Each of `parallelism` sinks takes
+/// one chunk of every block, so sinks (and the batches they write) span blocks.
+fn parse_stream<S: QuadSink, F: Fn() -> S + Sync>(
+    src: &Source,
+    parser: RdfParser,
+    parallelism: usize,
+    block: usize,
+    min_chunk: usize,
+    make_sink: F,
+) -> Result<()> {
+    let codec = src.codec()?;
+    let parallelism = parallelism.max(1);
+    let mut sinks: Vec<S> = Vec::new();
+    std::thread::scope(|scope| -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(u64, Vec<u8>)>>(1);
+        scope.spawn(move || {
+            if let Err(e) = read_blocks(src, codec, block, &tx) {
+                let _ = tx.send(Err(e));
+            }
+        });
+        for msg in rx {
+            let (start, bytes) = msg?;
+            let n = (bytes.len() / min_chunk).clamp(1, parallelism);
+            let parsers = parser.clone().split_slice_for_parallel_parsing(&bytes, n);
+            while sinks.len() < parsers.len() {
+                sinks.push(make_sink());
+            }
+            let err = |e: &dyn std::fmt::Display| {
+                Error::RdfParse(format!(
+                    "{} (in the decompressed bytes from offset {start}): {e}",
+                    src.name
+                ))
+            };
+            sinks
+                .par_iter_mut()
+                .zip(parsers)
+                .try_for_each(|(sink, p)| -> Result<()> {
+                    for q in p {
+                        sink.quad(q.map_err(|e| err(&e))?)?;
+                    }
+                    Ok(())
+                })?;
+        }
+        Ok(())
+    })?;
+    sinks.into_par_iter().try_for_each(QuadSink::finish)
+}
+
+/// Send `src` decompressed in blocks of at least `block` bytes that end at a line break
+/// (the last one at the end of the data), with their offsets. Stops when the receiver
+/// is gone.
+fn read_blocks(
+    src: &Source,
+    codec: Codec,
+    block: usize,
+    tx: &std::sync::mpsc::SyncSender<Result<(u64, Vec<u8>)>>,
+) -> Result<()> {
+    let raw: Box<dyn Read + '_> = match &src.data {
+        SourceData::File(p) => Box::new(File::open(p)?),
+        SourceData::Bytes(b) => Box::new(&b[..]),
+    };
+    let mut r = codec.reader(raw, src.max_decompressed)?;
+    let mut offset = 0u64;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut target = block;
+    let mut eof = false;
+    loop {
+        while buf.len() < target && !eof {
+            let have = buf.len();
+            buf.resize(target, 0);
+            match r.read(&mut buf[have..]) {
+                Ok(0) => {
+                    buf.truncate(have);
+                    eof = true;
+                }
+                Ok(k) => buf.truncate(have + k),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => buf.truncate(have),
+                Err(e) => return Err(crate::codec::io_error(e)),
+            }
+        }
+        let cut = match buf.iter().rposition(|&c| c == b'\n') {
+            _ if eof => buf.len(),
+            Some(i) => i + 1,
+            // a line longer than a block: read on
+            None => {
+                target = buf.len() + block;
+                continue;
+            }
+        };
+        let rest = buf.split_off(cut);
+        let len = buf.len() as u64;
+        if len > 0
+            && tx
+                .send(Ok((offset, std::mem::replace(&mut buf, rest))))
+                .is_err()
+        {
+            return Ok(());
+        }
+        offset += len;
+        target = block;
+        if eof {
+            return Ok(());
+        }
+    }
 }
 
 /// Parse a source fully into memory (small inputs: updates, uploads, rule files).
@@ -361,5 +499,90 @@ mod tests {
             many,
         );
         assert_eq!(ser.format(), RdfFormat::NTriples);
+    }
+
+    struct Collect<'a>(&'a Mutex<Vec<String>>, Vec<String>, &'a Mutex<usize>);
+    impl QuadSink for Collect<'_> {
+        fn quad(&mut self, q: Quad) -> Result<()> {
+            self.1.push(q.to_string());
+            Ok(())
+        }
+        fn finish(self) -> Result<()> {
+            *self.2.lock() += 1;
+            self.0.lock().extend(self.1);
+            Ok(())
+        }
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut w = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut w, data).unwrap();
+        w.finish().unwrap()
+    }
+
+    #[test]
+    fn compressed_line_formats_parse_in_blocks() {
+        let mut nt = String::new();
+        for i in 0..2000 {
+            nt += &format!("<http://e/s{i}> <http://e/p> \"line {i}\\nmore\" .\n");
+            nt += &format!("_:b{} <http://e/q> <http://e/o{i}> .\n", i % 7);
+        }
+        // a line longer than a block, and no line break at the end
+        nt += &format!("<http://e/long> <http://e/p> \"{}\" .\n", "x".repeat(5000));
+        nt += "<http://e/last> <http://e/p> <http://e/o> .";
+        let mut want: Vec<String> = RdfParser::from_format(RdfFormat::NTriples)
+            .for_slice(nt.as_bytes())
+            .map(|q| q.unwrap().to_string())
+            .collect();
+        want.sort();
+        assert_eq!(want.len(), 4002);
+        let src = Source::from_bytes(gzip(nt.as_bytes()), RdfFormat::NTriples, None);
+        for (block, chunk, threads) in [(1000, 300, 3), (1 << 20, 1 << 20, 4), (64, 64, 1)] {
+            let (out, finished) = (Mutex::new(Vec::new()), Mutex::new(0));
+            let parser = RdfParser::from_format(RdfFormat::NTriples);
+            parse_stream(&src, parser, threads, block, chunk, || {
+                Collect(&out, Vec::new(), &finished)
+            })
+            .unwrap();
+            let mut got = out.into_inner();
+            got.sort();
+            assert_eq!(got, want, "block {block}");
+            // one sink per parallel slot, kept across blocks
+            assert!(*finished.lock() <= threads);
+        }
+        // the public entry point takes the same path, and reports parse errors
+        let (out, finished) = (Mutex::new(Vec::new()), Mutex::new(0));
+        parse_source(&src, 4, || Collect(&out, Vec::new(), &finished)).unwrap();
+        assert_eq!(out.into_inner().len(), 4002);
+        let bad = Source::from_bytes(
+            gzip(b"<http://e/s> <http://e/p> .\n"),
+            RdfFormat::NTriples,
+            None,
+        );
+        let (out, finished) = (Mutex::new(Vec::new()), Mutex::new(0));
+        let e = parse_source(&bad, 4, || Collect(&out, Vec::new(), &finished)).unwrap_err();
+        assert!(e.to_string().contains("offset 0"), "{e}");
+    }
+
+    #[test]
+    fn lenient_sources_take_invalid_iris() {
+        let nt = "<http://e/s> <http://e/p> <http://e/a\u{fffd}b> .\n";
+        for compressed in [false, true] {
+            let data = if compressed {
+                gzip(nt.as_bytes())
+            } else {
+                nt.as_bytes().to_vec()
+            };
+            let mut src = Source::from_bytes(data, RdfFormat::NTriples, None);
+            let (out, finished) = (Mutex::new(Vec::new()), Mutex::new(0));
+            assert!(parse_source(&src, 2, || Collect(&out, Vec::new(), &finished)).is_err());
+            src.lenient = true;
+            let (out, finished) = (Mutex::new(Vec::new()), Mutex::new(0));
+            parse_source(&src, 2, || Collect(&out, Vec::new(), &finished)).unwrap();
+            assert_eq!(
+                out.into_inner(),
+                ["<http://e/s> <http://e/p> <http://e/a\u{fffd}b>"]
+            );
+        }
     }
 }

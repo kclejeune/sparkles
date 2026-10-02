@@ -132,6 +132,48 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 [BENCHMARKS.md](BENCHMARKS.md) has the results and describes how each run was set up.
 
 * `scripts/bench.sh` (`mise run bench [people] [workdir]`) runs the engine comparison.
+* `scripts/bench-billion.sh` (`mise run bench:billion [scale]`) runs a comparison on real
+  data: English DBpedia, release 2022.12.01 (every English file of its generic, mappings
+  and text groups, and the DBpedia ontology), 1.24 billion triples in all. The files, their
+  URLs and checksums are in `scripts/bench-billion/dbpedia-2022.12.tsv`. The scale is a
+  parameter, so routine runs stay small and the full dataset is one command away:
+
+  ```sh
+  mise run bench:billion            # about 50M triples, Sparkles and QLever
+  mise run bench:billion 10m --no-cold --runs 3
+  mise run bench:billion 250m --engines "sparkles qlever oxigraph"
+  mise run bench:billion full       # every file: 1.24B triples
+  ```
+
+  The first run downloads 12.7 GB (resumable, checksum-verified) into
+  `target/bench-billion` (`--workdir`) and recompresses it as N-Triples with zstd (16 GB
+  more, no uncompressed copies). The release's `.ttl` files are N-Triples except for
+  96,021 lines of `images` with a `\n` escape in an IRI, which no N-Triples parser takes:
+  they are dropped, so every engine loads the same triples. Some IRIs hold U+FFFD and are
+  not valid RFC 3987 IRIs; QLever, Jena and lenient Oxigraph keep them, and Sparkles
+  loads them with `sparkles load --lenient`.
+
+  A scale below `full` keeps a fixed sample of the subjects (by a hash of the subject),
+  with all their triples in every file, about that many lines; files repeat some
+  triples, so the engines hold fewer distinct ones (41.1M at `50m`). Every slice contains
+  the smaller ones. Each scale has its own directory with its data, the engines' indexes
+  and `results/summary.md`. Downloads, slices and indexes are reused by later runs;
+  `--reload` rebuilds the indexes, and steps can run alone (`--steps load`,
+  `--steps "queries report"`).
+
+  The queries (`scripts/bench-billion/queries`) are DBpedia-style lookups instantiated
+  with a fixed seed from the entities of the `10m` slice, in the manner of the DBpedia
+  SPARQL Benchmark (whose templates are not copied: they were published without a license), plus
+  analytic queries over the whole dataset: counts, group-bys, a property path, text and
+  range filters. `scripts/bench-billion/instantiate.py` regenerates them. Every engine's
+  answers are compared first (`scripts/bench-answers.py`), then each query is timed warm
+  (hyperfine), cold (one run after a restart with the engine's files evicted from the
+  page cache; `--no-cold` skips it), and two of them under 16 concurrent clients. Loads
+  record their time, peak RSS (GNU `time`) and index size. `--engines` also takes `jena`
+  (TDB2 `xloader` and Fuseki) and `oxigraph`. Jena and Oxigraph store `xsd:float`
+  literals as values, so latitudes written with different precision that round to the
+  same float are one triple there and two in Sparkles and QLever (3 triples at `50m`):
+  `count-all` and `predicate-counts` then have no majority answer and are not ranked.
 * `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 * `scripts/gen-geo.py N` generates a GeoSPARQL dataset and its queries. The data has
   points around cities, lines, polygons and an administrative hierarchy.

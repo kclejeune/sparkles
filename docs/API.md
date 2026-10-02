@@ -2688,10 +2688,17 @@ pass. Storage quotas per dataset do not exist yet.
 `--compression auto|none|gzip|zstd|brotli|lz4`. `auto` goes by magic bytes, then by the
 extension. Brotli has no magic bytes, so it needs `.br` or `--compression brotli`. When a
 file's name and its data disagree, the data wins and a warning is logged. An explicit
-`--compression` that disagrees is an error. `sparkles dump --out FILE` and
-`sparkles backup` take `--compress CODEC`, `--level N` and `--threads N` (zstd).
-`sparkles backup` and `/$/backup` write zstd (level 3) by default, which is about five
-times faster than gzip for a slightly larger file. `--compress gzip`
+`--compression` that disagrees is an error. Compressed N-Triples and N-Quads are
+decompressed and parsed as a stream, so they need neither an uncompressed copy nor memory
+for their decompressed size. Other compressed formats are decompressed into memory first.
+
+`sparkles load --lenient` skips the validation of IRIs and language tags. It is meant for
+data whose IRIs are not all valid RFC 3987 IRIs; DBpedia, for example, has some that
+contain U+FFFD. Syntax errors still fail the load.
+
+`sparkles dump --out FILE` and `sparkles backup` take `--compress CODEC`, `--level N` and
+`--threads N` (zstd). `sparkles backup` and `/$/backup` write zstd (level 3) by default,
+which is about five times faster than gzip for a slightly larger file. `--compress gzip`
 (`?compression=gzip`) gives `.nq.gz`, as Fuseki writes. `sparkles dump --out FILE` goes by
 the file's extension, and writes uncompressed without one.
 

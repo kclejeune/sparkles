@@ -1,0 +1,12 @@
+# entity-summary, seed 42, from 963 candidates
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?l ?c ?t WHERE { <http://dbpedia.org/resource/I'm_an_Explosive> rdfs:label ?l OPTIONAL { <http://dbpedia.org/resource/I'm_an_Explosive> rdfs:comment ?c FILTER(LANGMATCHES(LANG(?c), "en")) } OPTIONAL { <http://dbpedia.org/resource/I'm_an_Explosive> dbo:thumbnail ?t } }
