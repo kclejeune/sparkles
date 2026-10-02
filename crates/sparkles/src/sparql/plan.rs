@@ -1512,20 +1512,29 @@ impl<'a> Planner<'a> {
 
     pub(super) fn graph_filter(&self, g: &ActiveGraph) -> Option<(GraphFilter, Option<VarId>)> {
         let ds = &self.ctx.dataset;
+        let set_of = |set: &[Id]| {
+            let mut s: Vec<u64> = set.iter().map(|i| i.0).collect();
+            s.sort_unstable();
+            s.dedup();
+            s
+        };
         Some(match g {
+            // an empty default graph (a dataset of named graphs only) matches nothing
             ActiveGraph::Default => match &ds.default {
+                Some(set) if set.is_empty() => return None,
                 Some(set) if set.len() == 1 => (GraphFilter::One(set[0].0), None),
-                Some(set) => {
-                    let mut s: Vec<u64> = set.iter().map(|i| i.0).collect();
-                    s.sort_unstable();
-                    (GraphFilter::Set(s), None)
-                }
+                Some(set) => (GraphFilter::Set(set_of(set)), None),
                 None if ds.union_default || self.ctx.snap.union_default_graph => {
                     (GraphFilter::Named, None)
                 }
                 None => (GraphFilter::Default, None),
             },
-            ActiveGraph::Union => (GraphFilter::Named, None),
+            // the union graph of a graph view is the union of the named graphs it sees
+            ActiveGraph::Union => match (&self.ctx.graphs, &ds.named) {
+                (Some(_), Some(set)) if set.is_empty() => return None,
+                (Some(_), Some(set)) => (GraphFilter::Set(set_of(set)), None),
+                _ => (GraphFilter::Named, None),
+            },
             ActiveGraph::Named(id) => {
                 if id.tag() == Tag::Local {
                     return None;
@@ -1540,11 +1549,8 @@ impl<'a> Planner<'a> {
             ActiveGraph::Var(v) => match self.subst.get(v) {
                 Some(id) => return self.graph_filter(&ActiveGraph::Named(*id)),
                 None => match &ds.named {
-                    Some(set) => {
-                        let mut s: Vec<u64> = set.iter().map(|i| i.0).collect();
-                        s.sort_unstable();
-                        (GraphFilter::Set(s), Some(*v))
-                    }
+                    Some(set) if set.is_empty() => return None,
+                    Some(set) => (GraphFilter::Set(set_of(set)), Some(*v)),
                     None => (GraphFilter::Named, Some(*v)),
                 },
             },

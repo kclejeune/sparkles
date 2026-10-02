@@ -2365,6 +2365,7 @@ impl Store {
             net_ins: 0,
             net_del: 0,
             opts,
+            writable: Default::default(),
         }
     }
 
@@ -2485,7 +2486,10 @@ impl Store {
         o: &crate::guard::WriteOptions,
     ) -> Result<Receipt> {
         let snap = self.snapshot();
-        if snap.is_empty() || estimated_quads(sources) > self.opts.bulk_threshold {
+        // a write limited to some graphs checks each quad, which a rebuild does not
+        if o.graphs.is_none()
+            && (snap.is_empty() || estimated_quads(sources) > self.opts.bulk_threshold)
+        {
             let mut w = self.lock_writer(o)?;
             if w.poisoned {
                 return Err(Error::Poisoned);
@@ -2551,7 +2555,24 @@ impl Store {
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
     ) -> Result<(u64, Receipt)> {
-        if estimated_quads(sources) > self.opts.bulk_threshold {
+        if let Some(a) = &o.graphs {
+            // the target is checked before it is looked up, so the answer does not
+            // depend on whether it exists
+            match &target {
+                ReplaceTarget::Default if !a.writable(None) => {
+                    return Err(crate::access::GraphAccess::refused(None));
+                }
+                ReplaceTarget::Named(n) if !a.writable_iri(n.as_str()) => {
+                    return Err(crate::access::GraphAccess::refused_iri(n.as_str()));
+                }
+                ReplaceTarget::All if !(a.read.is_all() && a.write.is_all()) => {
+                    return Err(Error::NotPermitted(
+                        "replacing the whole dataset needs write access to every graph".into(),
+                    ));
+                }
+                _ => {}
+            }
+        } else if estimated_quads(sources) > self.opts.bulk_threshold {
             return self.replace_bulk(target, sources, kind, o);
         }
         let mut parsed = Vec::with_capacity(sources.len());
@@ -3403,9 +3424,37 @@ pub struct WriteTxn<'s> {
     net_del: u64,
     /// options for the write guard
     opts: crate::guard::WriteOptions,
+    /// graphs already checked against [`WriteOptions::graphs`](crate::guard::WriteOptions::graphs)
+    writable: rustc_hash::FxHashMap<u64, bool>,
 }
 
 impl WriteTxn<'_> {
+    /// [`Error::NotPermitted`] unless the write's graph view lets it change graph `g`.
+    /// Called before a quad is looked up, so the answer never depends on the data.
+    fn check_graph(&mut self, g: Id) -> Result<()> {
+        let Some(access) = self.opts.graphs.clone() else {
+            return Ok(());
+        };
+        let ok = match self.writable.get(&g.0) {
+            Some(ok) => *ok,
+            None => {
+                let ok = access.check_write(&self.view(), g).is_ok();
+                self.writable.insert(g.0, ok);
+                ok
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            access.check_write(&self.view(), g)
+        }
+    }
+
+    /// The graph view of this transaction's writes, if it does not cover every graph.
+    pub fn graphs(&self) -> Option<&Arc<crate::access::GraphAccess>> {
+        self.opts.graphs.as_ref()
+    }
+
     /// Snapshot view including this transaction's uncommitted changes. It keeps the
     /// committed version number but not its result cache: the data differs from that
     /// version, so cached results must neither be read nor written through this view.
@@ -3554,6 +3603,7 @@ impl WriteTxn<'_> {
         {
             return Err(Error::invalid("cannot store query-local or unbound terms"));
         }
+        self.check_graph(q[3])?;
         if self.contains(&q)? {
             return Ok(false);
         }
@@ -3571,6 +3621,7 @@ impl WriteTxn<'_> {
 
     /// Delete a quad; returns true if it was present.
     pub fn delete(&mut self, q: [Id; 4]) -> Result<bool> {
+        self.check_graph(q[3])?;
         if !self.contains(&q)? {
             return Ok(false);
         }
@@ -3596,6 +3647,11 @@ impl WriteTxn<'_> {
     /// bulk quads are not visible through [`view`](Self::view) / [`contains`](Self::contains)
     /// before commit.
     pub fn insert_bulk(&mut self, quads: Vec<[Id; 4]>) -> Result<()> {
+        if self.opts.graphs.is_some() {
+            for q in &quads {
+                self.check_graph(q[3])?;
+            }
+        }
         if (quads.len() as u64) < self.store.opts.bulk_threshold {
             for q in quads {
                 self.insert(q)?;

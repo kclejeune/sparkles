@@ -90,6 +90,9 @@ pub struct QueryOptions {
     pub prefixes: Vec<(String, String)>,
     /// Executor optimizations in effect (all on by default; see [`Optimizations`]).
     pub optimizations: Option<Optimizations>,
+    /// The graphs the request may read (and, in an update, write); `None` is every
+    /// graph. See [`crate::access`].
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
 }
 
 /// Which files `LOAD <file:…>` may read.
@@ -293,7 +296,7 @@ fn make_ctx(
     opts: &QueryOptions,
     dataset: Option<&QueryDataset>,
     base: Option<&oxiri::Iri<String>>,
-) -> Ctx {
+) -> Result<Ctx> {
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
     let mut ctx = Ctx::new(snap);
@@ -366,7 +369,25 @@ fn make_ctx(
         ds.default = Some(d);
     }
     ctx.dataset = ds;
-    ctx
+    restrict_ctx(&mut ctx, opts.graphs.as_ref())?;
+    Ok(ctx)
+}
+
+/// Limit a query context's dataset to a graph view that does not read every graph (see
+/// [`DatasetSpec::restrict`]).
+pub(crate) fn restrict_ctx(
+    ctx: &mut Ctx,
+    graphs: Option<&Arc<crate::access::GraphAccess>>,
+) -> Result<()> {
+    let Some(a) = graphs.filter(|a| !a.reads_all()) else {
+        return Ok(());
+    };
+    let mut ds = std::mem::take(&mut ctx.dataset);
+    let snap = ctx.snap.clone();
+    ds.restrict(&snap, a, &|id| ctx.term(id))?;
+    ctx.dataset = ds;
+    ctx.graphs = Some(a.clone());
+    Ok(())
 }
 
 fn split(
@@ -464,7 +485,7 @@ fn execute_parsed(
 ) -> Result<QueryResult> {
     let t1 = Instant::now();
     let (pattern, dataset, base) = split(parsed);
-    let ctx = Arc::new(make_ctx(snap, opts, dataset, base));
+    let ctx = Arc::new(make_ctx(snap, opts, dataset, base)?);
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
     let mut planner = Planner::new(&ctx);
     planner.source = Some(parsed);
@@ -493,6 +514,9 @@ fn execute_parsed(
     let t2 = Instant::now();
     let (table, mut plan) = exec::execute(&ctx, &node)?;
     plan.warnings = ctx.warnings();
+    if ctx.graphs.is_some() {
+        plan.redact();
+    }
     let mut result = QueryResult {
         kind,
         vars: Vec::new(),
@@ -565,13 +589,16 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
     let depth = depth::check_query(&parsed)?;
     depth::with_stack(depth, || {
         let (pattern, dataset, base) = split(&parsed);
-        let ctx = make_ctx(snap, opts, dataset, base);
+        let ctx = make_ctx(snap, opts, dataset, base)?;
         crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
         let mut planner = Planner::new(&ctx);
         planner.source = Some(&parsed);
         let node = planner.plan(pattern, &ActiveGraph::Default, Vec::new())?;
         let mut info = exec::describe(&ctx, &node);
         info.warnings = ctx.warnings();
+        if ctx.graphs.is_some() {
+            info.redact();
+        }
         Ok((parsed.to_sse(), info))
     })
 }
@@ -717,6 +744,8 @@ fn describe(ctx: &Ctx, t: &Table) -> Result<Vec<Triple>> {
     Ok(out)
 }
 
+#[cfg(test)]
+mod access_tests;
 #[cfg(test)]
 mod charsets_tests;
 #[cfg(test)]

@@ -126,7 +126,16 @@ fn run_update(
     };
     // the request's cancellation and deadline also end the wait for the writer lock
     // and the write guard
+    // graphs named by constants are checked before the writer lock is taken
+    if let Some(access) = opts.graphs.as_ref() {
+        for op in &parsed.operations {
+            check_constant_graphs(access, op)?;
+        }
+    }
     let mut wopts = opts.write.clone();
+    if wopts.graphs.is_none() {
+        wopts.graphs = opts.graphs.clone();
+    }
     if wopts.cancel.is_none() {
         wopts.cancel = opts.cancel.clone();
     }
@@ -287,8 +296,19 @@ fn run_op(
                         .collect()
                 });
             }
+            // the WHERE clause reads the request's graph view only
+            super::restrict_ctx(&mut ctx, req.opts.graphs.as_ref())?;
             let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;
             let (table, _) = super::exec::execute(&ctx, &node)?;
+            // a graph a template takes from a variable is checked for every solution,
+            // before anything else of the quad is looked up
+            let access = req.opts.graphs.clone();
+            let check = |g: Option<Id>| -> Result<()> {
+                match (&access, g) {
+                    (Some(a), Some(g)) => check_graph_id(a, &ctx, g),
+                    _ => Ok(()),
+                }
+            };
             stats.mem_peak_bytes = stats.mem_peak_bytes.max(ctx.mem_peak());
             let map = table.var_map(ctx.nvars());
             let get = |ctx: &Ctx, name: &str, i: usize| -> Option<Id> {
@@ -332,6 +352,9 @@ fn run_op(
                             }
                         }
                     };
+                    if let GraphNamePattern::Variable(v) = &q.graph_name {
+                        check(get(&ctx, v.as_str(), i))?;
+                    }
                     let s = gt(&q.subject);
                     let p = named_pat(&ctx, &q.predicate, |n| get(&ctx, n, i), true);
                     let o = gt(&q.object);
@@ -342,6 +365,9 @@ fn run_op(
                 }
                 let mut bnodes: FxHashMap<String, Id> = FxHashMap::default();
                 for q in insert {
+                    if let GraphNamePattern::Variable(v) = &q.graph_name {
+                        check(get(&ctx, v.as_str(), i))?;
+                    }
                     let mut tp = |txn: &mut WriteTxn<'_>, t: &TermPattern| -> Result<Option<Id>> {
                         Ok(match t {
                             TermPattern::Variable(v) => match get(&ctx, v.as_str(), i) {
@@ -459,6 +485,19 @@ fn run_op(
                     .lookup_term(&Term::NamedNode(n.clone()))
                     .into_iter()
                     .collect(),
+                // with a graph view: the graphs it sees, each of which must be writable
+                GraphTarget::NamedGraphs | GraphTarget::AllGraphs
+                    if let Some(a) = req.opts.graphs.as_ref().filter(|a| !a.reads_all()) =>
+                {
+                    let mut v = a.visible_named(&view)?.to_vec();
+                    if matches!(graph, GraphTarget::AllGraphs) && a.read.default_graph() {
+                        v.push(Id::DEFAULT_GRAPH);
+                    }
+                    for g in &v {
+                        a.check_write(&view, *g)?;
+                    }
+                    v
+                }
                 GraphTarget::NamedGraphs => view.graph_ids()?,
                 GraphTarget::AllGraphs => {
                     let mut v = view.graph_ids()?;
@@ -478,6 +517,92 @@ fn run_op(
         GraphUpdateOperation::Create { .. } => {}
     }
     let _ = store;
+    Ok(())
+}
+
+/// [`Error::NotPermitted`] unless graph `g` (an id of the WHERE clause's context) may
+/// be written.
+fn check_graph_id(access: &crate::access::GraphAccess, ctx: &Ctx, g: Id) -> Result<()> {
+    if g == Id::DEFAULT_GRAPH {
+        return if access.writable(None) {
+            Ok(())
+        } else {
+            Err(crate::access::GraphAccess::refused(None))
+        };
+    }
+    let t = match g.tag() {
+        Tag::BNode => Some(Term::BlankNode(crate::store::bnode_for(g))),
+        _ => ctx.term(g),
+    };
+    if access.writable(t.as_ref()) {
+        Ok(())
+    } else {
+        Err(crate::access::GraphAccess::refused(t.as_ref()))
+    }
+}
+
+/// The graphs an operation names by constants, checked against the request's graph view
+/// before anything is read or written: data quads, template graphs, and the targets of
+/// `LOAD … INTO`, `CLEAR`, `DROP` and `CREATE`.
+fn check_constant_graphs(
+    access: &crate::access::GraphAccess,
+    op: &GraphUpdateOperation,
+) -> Result<()> {
+    let check = |g: Option<&NamedNode>| -> Result<()> {
+        let t = g.map(|n| Term::NamedNode(n.clone()));
+        if access.writable(t.as_ref()) {
+            Ok(())
+        } else {
+            Err(crate::access::GraphAccess::refused(t.as_ref()))
+        }
+    };
+    fn name(g: &GraphName) -> Option<&NamedNode> {
+        match g {
+            GraphName::NamedNode(n) => Some(n),
+            GraphName::DefaultGraph => None,
+        }
+    }
+    match op {
+        GraphUpdateOperation::InsertData { data } => {
+            for q in data {
+                check(name(&q.graph_name))?;
+            }
+        }
+        GraphUpdateOperation::DeleteData { data } => {
+            for q in data {
+                check(name(&q.graph_name))?;
+            }
+        }
+        GraphUpdateOperation::DeleteInsert { delete, insert, .. } => {
+            let pat = |g: &GraphNamePattern| -> Result<()> {
+                match g {
+                    GraphNamePattern::NamedNode(n) => check(Some(n)),
+                    GraphNamePattern::DefaultGraph => check(None),
+                    GraphNamePattern::Variable(_) => Ok(()),
+                }
+            };
+            for q in delete {
+                pat(&q.graph_name)?;
+            }
+            for q in insert {
+                pat(&q.graph_name)?;
+            }
+        }
+        GraphUpdateOperation::Load { destination, .. } => {
+            if let GraphName::NamedNode(n) = destination {
+                check(Some(n))?;
+            }
+        }
+        GraphUpdateOperation::Clear { graph, .. } | GraphUpdateOperation::Drop { graph, .. } => {
+            match graph {
+                GraphTarget::NamedNode(n) => check(Some(n))?,
+                GraphTarget::DefaultGraph => check(None)?,
+                // the graphs of the view, checked when the operation runs
+                GraphTarget::NamedGraphs | GraphTarget::AllGraphs => {}
+            }
+        }
+        GraphUpdateOperation::Create { graph, .. } => check(Some(graph))?,
+    }
     Ok(())
 }
 

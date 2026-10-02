@@ -1889,9 +1889,11 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
             geo_op_vertices: 9,
             ..Default::default()
         });
-        let ctx = super::super::make_ctx(s.snapshot(), &QueryOptions::default(), None, None);
+        let ctx =
+            super::super::make_ctx(s.snapshot(), &QueryOptions::default(), None, None).unwrap();
         assert_eq!(ctx.geo.op_vertices(), 9);
-        let ctx = super::super::make_ctx(store().snapshot(), &QueryOptions::default(), None, None);
+        let ctx = super::super::make_ctx(store().snapshot(), &QueryOptions::default(), None, None)
+            .unwrap();
         assert_eq!(ctx.geo.op_vertices(), 2_000_000);
         // a union of two 5-point polygons is over a limit of 9 vertices: unbound
         let q = format!("SELECT ?u {{ BIND(geof:union({GA}, {GC}) AS ?u) }}");
