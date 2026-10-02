@@ -941,14 +941,23 @@ pub(crate) fn remove_deleting(root: &Path) -> Result<()> {
 
 /// Remove a generation directory crash-safely: rename, sync the parent, delete.
 pub(crate) fn delete_generation(root: &Path, dir: &Path) -> Result<()> {
+    if let Some(doomed) = retire_generation(root, dir)? {
+        std::fs::remove_dir_all(&doomed)?;
+    }
+    Ok(())
+}
+
+/// The first half of [`delete_generation`]: rename the directory to `*.deleting` and
+/// sync the parent. The caller deletes the returned directory, perhaps later, and an
+/// open finishes the deletion after a crash.
+pub(crate) fn retire_generation(root: &Path, dir: &Path) -> Result<Option<PathBuf>> {
     let Some(name) = dir.file_name() else {
-        return Ok(());
+        return Ok(None);
     };
     let doomed = root.join(format!("{}.deleting", name.to_string_lossy()));
     std::fs::rename(dir, &doomed)?;
     crate::store::sync_dir(root)?;
-    std::fs::remove_dir_all(&doomed)?;
-    Ok(())
+    Ok(Some(doomed))
 }
 
 #[cfg(test)]

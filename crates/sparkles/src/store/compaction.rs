@@ -1004,6 +1004,7 @@ impl Store {
         self.commits.send_replace(view.commit);
         self.vectors_switched(&view);
         self.compaction.rebased(base.seq, cu.oldest_ms);
+        let mut retired = Vec::new();
         if let (Some(root), Some(h), Some(old)) = (&self.root, &self.history, &view.generation.dir)
             && old.starts_with(root)
         {
@@ -1024,11 +1025,16 @@ impl Store {
                     bytes: 0,
                 },
             );
-            self.collect_locked(&mut h, new_no, view.commit);
+            retired = self.retire_locked(&mut h, new_no, view.commit);
         }
         let lock = tl.elapsed();
         drop(w);
         drop(run);
+        // the old generation's files go after the writer lock is released (an open
+        // finishes the deletion after a crash)
+        for d in retired {
+            let _ = std::fs::remove_dir_all(d);
+        }
         self.quota.invalidate();
         Ok(CompactReport {
             generation: name,

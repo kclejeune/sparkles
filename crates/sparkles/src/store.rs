@@ -1353,7 +1353,23 @@ impl Store {
     /// Collect unneeded generations; call with the writer lock held (or at open).
     /// Lock order: writer, then history, then catalog.
     fn collect_locked(&self, h: &mut crate::history::HistoryState, current: u32, head: u64) {
-        let Some(root) = &self.root else { return };
+        for dir in self.retire_locked(h, current, head) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Like [`collect_locked`](Self::collect_locked), but the unneeded generations are
+    /// only renamed: the caller deletes the returned directories, after it released the
+    /// writer lock.
+    fn retire_locked(
+        &self,
+        h: &mut crate::history::HistoryState,
+        current: u32,
+        head: u64,
+    ) -> Vec<PathBuf> {
+        let Some(root) = &self.root else {
+            return Vec::new();
+        };
         collect_generations(
             root,
             self.now_ms(),
@@ -1362,7 +1378,7 @@ impl Store {
             current,
             head,
             self.opts.history_max_generations,
-        );
+        )
     }
 
     /// What a backup lease guard needs to collect history after it drops the lease.
@@ -4350,8 +4366,9 @@ fn delta_bytes(d: &Delta) -> u64 {
     (d.inserts() + d.deletes()) as u64 * DELTA_QUAD_BYTES
 }
 
-/// Remove the generations history no longer needs (`current` is the current generation
-/// and `head` the latest commit); call with the writer lock held.
+/// Retire the generations history no longer needs (`current` is the current generation
+/// and `head` the latest commit); call with the writer lock held. They are renamed to
+/// `*.deleting`, and the caller deletes the returned directories.
 fn collect_generations(
     root: &Path,
     now_ms: i64,
@@ -4360,7 +4377,7 @@ fn collect_generations(
     current: u32,
     head: u64,
     max_gens: usize,
-) {
+) -> Vec<PathBuf> {
     let needed = {
         let ts = |s: u64| cat.get(s).map(|c| c.timestamp_ms);
         h.needed(current, head, now_ms, &ts, max_gens)
@@ -4371,16 +4388,19 @@ fn collect_generations(
         .filter(|(no, _)| **no != current && !needed.contains_key(no))
         .map(|(no, g)| (*no, g.dir.clone()))
         .collect();
+    let mut retired = Vec::new();
     for (no, dir) in doomed {
         h.open.retain(|(n, _)| *n != no);
         h.cache.retain(|c| c.generation != no);
-        match crate::history::delete_generation(root, &dir) {
-            Ok(()) => {
+        match crate::history::retire_generation(root, &dir) {
+            Ok(d) => {
                 h.gens.remove(&no);
+                retired.extend(d);
             }
             Err(e) => tracing::warn!("could not remove {}: {e}", dir.display()),
         }
     }
+    retired
 }
 
 /// A persistent store's history collection, held weakly (by backup lease guards): it
@@ -4430,7 +4450,7 @@ impl Collector {
         let cur = commit::generation_number(&current.load().generation.name);
         // lock order: writer, history, catalog
         let mut h = history.lock();
-        collect_generations(
+        let retired = collect_generations(
             &self.root,
             now,
             &catalog.lock(),
@@ -4439,6 +4459,9 @@ impl Collector {
             w.head.seq,
             self.max_gens,
         );
+        for dir in retired {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
