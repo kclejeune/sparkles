@@ -9,6 +9,8 @@
 
 mod adapter;
 mod errors;
+#[cfg(feature = "fmt")]
+mod format;
 mod pins;
 mod render;
 mod schemas;

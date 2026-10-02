@@ -4,9 +4,9 @@
 >
 > **Phases:** Phase 1 shipped: `sparkles mcp` over stdio with six read-only tools,
 > snapshot pins and cancellation. Phase 2's `search_text` and `similar_entities` shipped
-> with it, and `validate_shacl` and `validate_shex` were added later. Phase 2's HTTP
-> transport (`/$/mcp`), `sparql_update`, resources and prompts were not built, and
-> neither was Phase 3.
+> with it, and `validate_shacl`, `validate_shex` and `format` were added later. Phase
+> 2's HTTP transport (`/$/mcp`), `sparql_update`, resources and prompts were not built,
+> and neither was Phase 3.
 >
 > **User docs:** [API: MCP server](../API.md#mcp-server) ·
 > [Usage: MCP server](../USAGE.md#mcp-server-llm-agents) ·
@@ -1471,6 +1471,16 @@ session on the same streams. It also answers malformed tool calls with `-32602`.
 [G02](G02-shex.md). Three choices were made during implementation, and the maintainer may
 revisit them. Both tools are on by default; they are read-only and follow the same access
 rules as the query tool. `maxResults` defaults to 20. ShEx imports are refused.
+
+A `format` tool was added on 2026-10-02. It is the MCP tool that [X02](X02-formatter.md)
+deferred. It formats SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD with the engine
+of `sparkles fmt`, and it takes the camelCase style options of `POST /$/format`. Like the
+other tools, it is read-only and closed-world, and it answers with `structuredContent`.
+The result holds the language, the formatted text, whether the text changed and the
+warnings. A call runs within `timeoutSeconds`. A text over 1 MiB or a result over
+`--mcp-max-bytes` is refused, and a syntax error is a tool error with the code `syntax`.
+The tool takes no `dataset`, because it reads none. It is in builds with the `fmt`
+feature, which is on by default.
 
 Tests drive the server with JSON-RPC lines over an in-memory stream. An end-to-end test
 runs a session against the built binary.

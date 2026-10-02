@@ -51,6 +51,8 @@ pub fn run(
         "validate_shacl" => t.validate_shacl(args),
         #[cfg(feature = "shex")]
         "validate_shex" => t.validate_shex(args),
+        #[cfg(feature = "fmt")]
+        "format" => t.format(args),
         _ => Err(ToolError::internal(&call.request_id)),
     }
 }

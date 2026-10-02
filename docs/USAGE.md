@@ -515,6 +515,9 @@ The tools are read-only:
 * `validate_shacl` and `validate_shex` check a shapes graph, or a ShEx schema with a
   shape map, against a snapshot. They return counts and the first 20 results with node,
   shape and reason. They do not follow imports.
+* `format` formats a SPARQL query or update, Turtle, TriG, N-Triples, N-Quads or JSON-LD
+  the way `sparkles fmt` does, and returns the text with any warnings. It reads no
+  dataset.
 
 [API.md](API.md#mcp-server) has the tool schemas. Results are sized for a model's
 context. Query rows come back as a compact table with the dataset's prefixes, up to 100

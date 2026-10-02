@@ -140,8 +140,9 @@ built for Fuseki keep working. The Sparkles families stay as they are.
 | `process_uptime_seconds`, `process_start_time_seconds` | gauge | `application="fuseki"` | The time since the server started, and the start time. |
 | `system_cpu_count` | gauge | `application="fuseki"` | Processors available to the server. |
 
-`dataset` is the dataset path, as Fuseki writes it: `/ds`, or `/$other` for the datasets
-past `--metrics-max-datasets`. Requests that name no existing dataset are not counted.
+`dataset` is the dataset path as Fuseki writes it, such as `/ds`. The datasets past
+`--metrics-max-datasets` share `/$other`. Requests that name no existing dataset are not
+counted.
 `endpoint`, `operation` and `description` are Fuseki's names for the dataset's services.
 
 | Request | `endpoint` | `operation` | `description` |
@@ -161,12 +162,12 @@ request ends, so `fuseki_requests` always equals good plus bad. An endpoint's se
 appear after its first request, like the Sparkles series. Fuseki lists every configured
 endpoint from the start with zeros.
 
-Some of Fuseki's metrics have no equivalent. Its other meters come from Micrometer's JVM
-and system binders: the `jvm_*` memory, garbage collector, thread and class loader
-gauges, `process_files_*`, `process_cpu_usage`, `system_cpu_usage`,
-`system_load_average_1m`, `disk_free_bytes` and `disk_total_bytes`. Sparkles does not
-emit them. `/{ds}/shex`, `/{ds}/explain`, `/{ds}/prefixes` and the `/$/` routes have no
-Fuseki endpoint, so only the Sparkles names count them.
+Fuseki's other meters come from Micrometer's JVM and system binders, and Sparkles has no
+equivalent for them. They are the `jvm_*` memory, garbage collector, thread and class
+loader gauges, `process_files_*`, `process_cpu_usage`, `system_cpu_usage`,
+`system_load_average_1m`, `disk_free_bytes` and `disk_total_bytes`. `/{ds}/shex`,
+`/{ds}/explain`, `/{ds}/prefixes` and the `/$/` routes have no Fuseki endpoint, so only
+the Sparkles names count them.
 
 #### Metrics listener
 
@@ -671,12 +672,13 @@ The counts come from one ordered pass over the PSO index and one over the POS in
 predicate, so a report costs about two sequential reads of the selected triples.
 
 **VoID export.** The summary is also served as RDF, as a description in the
-[VoID](https://www.w3.org/TR/void/) vocabulary. Ask for it with `Accept: text/turtle`,
-another RDF media type (`application/n-triples`, `application/ld+json`,
-`application/rdf+xml`, `application/trig`, `application/n-quads`), or the `format`
-parameter (`turtle`, `ntriples`, `jsonld`, `rdfxml`, `trig`, `nquads`, or `json` for the
-JSON document). JSON stays the default. The selection parameters apply as above, and
-`limit` and `cursor` do not, because the description is always complete.
+[VoID](https://www.w3.org/TR/void/) vocabulary. Ask for it with an RDF media type in
+`Accept`, or with the `format` parameter. The media types are `text/turtle`,
+`application/n-triples`, `application/ld+json`, `application/rdf+xml`,
+`application/trig` and `application/n-quads`. The `format` values are `turtle`,
+`ntriples`, `jsonld`, `rdfxml`, `trig` and `nquads`, and `format=json` asks for the JSON
+document, which stays the default. The selection parameters apply as above. `limit` and
+`cursor` do not, because the description is always complete.
 
 ```turtle
 <urn:x-sparkles:schema:wiki:42> a void:Dataset ;
@@ -2566,6 +2568,9 @@ module takes this endpoint's JSON and answers in the same shape. The UI calls
 load or run. `--format-endpoint authenticated` or `off` therefore does not stop such a UI
 from formatting. It limits only the endpoint.
 
+The MCP server offers the same formatter as its `format` tool, with the same options
+(see [MCP server](#mcp-server)).
+
 **JSON body.** The UI sends `Content-Type: application/json` with this body:
 
 ```ts
@@ -3394,6 +3399,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: an exact `spk:vectorSearch` over the stored `spk:vector` literals. The tool never computes embeddings. `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
+| `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
 
 Every tool except `sparql_query` declares an `outputSchema` and returns
 `structuredContent` plus the same object as one compact JSON text block. `tools/list`
