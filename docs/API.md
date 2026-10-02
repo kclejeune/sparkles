@@ -23,7 +23,7 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 | GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }`. When auth is on, anonymous callers get no `version` or `limits`. |
 | GET    | `/$/whoami`   | The caller and its permissions. See [whoami](#whoami). |
 | POST   | `/$/format`   | Formats a SPARQL query or update. See [Formatting](#formatting). |
-| GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. |
+| GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. `--metrics-addr` serves it on a second address too. |
 
 ```ts
 type ReadyInfo = {
@@ -126,6 +126,55 @@ server ignores those headers.
 
 Backup repositories add the `sparkles_backup_*` families listed under
 [Backup repositories](#backup-metrics).
+
+#### Fuseki metric names
+
+`serve --metrics-fuseki-names` adds the gauges that Fuseki exports, so that dashboards
+built for Fuseki keep working. The Sparkles families stay as they are.
+
+| Name | Type | Labels | Value |
+|------|------|--------|-------|
+| `fuseki_requests` | gauge | `application="fuseki"`, `dataset`, `description`, `endpoint`, `operation` | Finished requests to the endpoint. |
+| `fuseki_requests_good` | gauge | the same | Requests with the `ok` outcome. |
+| `fuseki_requests_bad` | gauge | the same | Requests with any other outcome. |
+| `process_uptime_seconds`, `process_start_time_seconds` | gauge | `application="fuseki"` | The time since the server started, and the start time. |
+| `system_cpu_count` | gauge | `application="fuseki"` | Processors available to the server. |
+
+`dataset` is the dataset path, as Fuseki writes it: `/ds`, or `/$other` for the datasets
+past `--metrics-max-datasets`. Requests that name no existing dataset are not counted.
+`endpoint`, `operation` and `description` are Fuseki's names for the dataset's services.
+
+| Request | `endpoint` | `operation` | `description` |
+|---------|------------|-------------|---------------|
+| `/{ds}/sparql`, `/{ds}/query` | `sparql`, `query` | `query` | `SPARQL Query` |
+| `/{ds}/update` | `update` | `update` | `SPARQL Update` |
+| `/{ds}/data` | `data` | `gsp-rw`, or `gsp-r` on a read-only server | `Graph Store Protocol`, or `Graph Store Protocol (Read)` |
+| `/{ds}/get` | `get` | `gsp-r` | `Graph Store Protocol (Read)` |
+| `/{ds}/upload` | `upload` | `upload` | `File Upload` |
+| `/{ds}/shacl` | `shacl` | `SHACL` | `SHACL Validation` |
+| `/{ds}` | empty | `query`, `update`, `gsp-rw` or `gsp-r`, by the request | As above. |
+
+The good and bad counts split `sparkles_requests_total` for the same dataset and route.
+`good` is `outcome="ok"`, and `bad` is the sum of the other outcomes. Fuseki counts a
+request when it starts and its outcome when it ends, while Sparkles counts both when the
+request ends, so `fuseki_requests` always equals good plus bad. An endpoint's series
+appear after its first request, like the Sparkles series. Fuseki lists every configured
+endpoint from the start with zeros.
+
+Some of Fuseki's metrics have no equivalent. Its other meters come from Micrometer's JVM
+and system binders: the `jvm_*` memory, garbage collector, thread and class loader
+gauges, `process_files_*`, `process_cpu_usage`, `system_cpu_usage`,
+`system_load_average_1m`, `disk_free_bytes` and `disk_total_bytes`. Sparkles does not
+emit them. `/{ds}/shex`, `/{ds}/explain`, `/{ds}/prefixes` and the `/$/` routes have no
+Fuseki endpoint, so only the Sparkles names count them.
+
+#### Metrics listener
+
+`serve --metrics-addr HOST:PORT` also serves `/$/metrics` on a second address, such as a
+port that only the Prometheus server can reach. That listener serves nothing else. It
+applies the same authentication, `metrics` permission and `Host` check as the main
+listener. The main listener keeps `/$/metrics`, because the UI's Server page reads it.
+Without `--auth-config`, an address that is not loopback needs `--allow-open-network`.
 
 ```ts
 type MetricsSnapshot = {

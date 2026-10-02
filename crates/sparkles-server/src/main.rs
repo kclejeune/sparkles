@@ -423,6 +423,15 @@ enum Cmd {
         /// Datasets with their own metric labels; the others share `$other`
         #[arg(long, default_value_t = 100)]
         metrics_max_datasets: usize,
+        /// Also expose Fuseki's metric names (fuseki_requests, fuseki_requests_good,
+        /// fuseki_requests_bad, ...) on /$/metrics, for dashboards built for Fuseki
+        #[arg(long, conflicts_with = "no_metrics")]
+        metrics_fuseki_names: bool,
+        /// Also serve /$/metrics on this address (HOST:PORT), under the same
+        /// authentication; a non-loopback address without --auth-config needs
+        /// --allow-open-network
+        #[arg(long, value_name = "HOST:PORT", conflicts_with = "no_metrics")]
+        metrics_addr: Option<String>,
         /// Budget for the estimated memory of a query's intermediate results, in MiB
         /// (0: unlimited)
         #[arg(long, default_value_t = 8192)]
@@ -1305,6 +1314,8 @@ fn run() -> Result<()> {
             no_access_log,
             no_metrics,
             metrics_max_datasets,
+            metrics_fuseki_names,
+            metrics_addr,
             query_memory_mb,
             max_result_mb,
             max_export_mb,
@@ -1354,6 +1365,9 @@ fn run() -> Result<()> {
                 auth_config.is_some(),
                 allow_open_network,
             )?;
+            if let Some(addr) = &metrics_addr {
+                exposure::check_metrics_addr(addr, auth_config.is_some(), allow_open_network)?;
+            }
             // one server per data directory (held until the process exits)
             #[cfg(feature = "backup")]
             let _data_lock = backup::lock_data_dir(&data)?;
@@ -1409,6 +1423,7 @@ fn run() -> Result<()> {
             sparkles::vector::set_budget(vector_memory_mb << 20);
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
+            st.metrics.fuseki_names = metrics_fuseki_names;
             st.task_queue.set_max(max_tasks);
             let mib = |m: u64| (m > 0).then_some(m << 20);
             st.limits = state::Limits {
@@ -1541,6 +1556,20 @@ fn run() -> Result<()> {
                     ),
                     Some(_) => None,
                 };
+                // the metrics listener ends with the runtime, after the main one
+                if let Some(maddr) = &metrics_addr {
+                    let l = tokio::net::TcpListener::bind(maddr)
+                        .await
+                        .with_context(|| format!("binding --metrics-addr {maddr}"))?;
+                    tracing::info!("metrics at http://{maddr}/$/metrics");
+                    let service = obs::metrics_router(st.clone())
+                        .into_make_service_with_connect_info::<auth::Peer>();
+                    tokio::spawn(async move {
+                        if let Err(e) = axum::serve(l, service).await {
+                            tracing::error!("metrics listener failed: {e}");
+                        }
+                    });
+                }
                 #[cfg(unix)]
                 let unix = match &unix_socket {
                     Some(path) => Some(bind_unix(path)?),

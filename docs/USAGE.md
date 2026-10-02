@@ -117,6 +117,8 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--no-access-log` | | No per-request log lines. |
 | `--no-metrics` | | `/$/metrics` answers `404`, and no request metrics are kept. |
 | `--metrics-max-datasets N` | `100` | Datasets that get their own metric labels. The rest share `$other`. |
+| `--metrics-fuseki-names` | off | Also expose Fuseki's metric names (`fuseki_requests`, `fuseki_requests_good`, `fuseki_requests_bad`) on `/$/metrics`, for dashboards built for Fuseki. See [API.md](API.md#fuseki-metric-names). |
+| `--metrics-addr HOST:PORT` | | Also serve `/$/metrics` on this address, with the same authentication. Without `--auth-config`, an address that is not loopback needs `--allow-open-network`. |
 | `--otel` | off | Export traces and metrics over OTLP. `OTEL_EXPORTER_OTLP_ENDPOINT` also turns this on, and the standard `OTEL_*` variables apply (see [API.md](API.md), OpenTelemetry). |
 | `--otel-logs` | off | Export log events over OTLP as well. |
 | `--otel-query-text` | off | Record query text (`db.query.text`) and plan operator descriptions in spans. These may hold data. |
@@ -656,6 +658,10 @@ is the client.
 `loadDir` passes `--load-dir`, so `LOAD <file:…>` over HTTP may read from that
 directory only. The service gets the directory read-only. It must not contain `dataDir`
 or lie under `/tmp`.
+
+`metrics.fusekiNames = true` passes `--metrics-fuseki-names`, and
+`metrics.listenAddress = "127.0.0.1:9464"` passes `--metrics-addr` for a scrape port of
+its own. The firewall is not opened for that port.
 
 With `auth.configFile`, the service starts with `--auth-config`, and
 `systemctl reload sparkles` re-reads the file (SIGHUP). Keep the file out of the Nix

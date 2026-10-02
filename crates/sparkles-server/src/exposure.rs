@@ -100,6 +100,25 @@ pub fn check(host: &str, unix_socket: bool, auth: bool, allow_open: bool) -> any
     )
 }
 
+/// Check `--metrics-addr` (`HOST:PORT`): without authentication, a network address
+/// needs `allow_open`, since the metrics name every dataset.
+pub fn check_metrics_addr(addr: &str, auth: bool, allow_open: bool) -> anyhow::Result<()> {
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        anyhow::bail!("--metrics-addr '{addr}': expected HOST:PORT, such as 127.0.0.1:9464");
+    };
+    if host.is_empty() || port.parse::<u16>().is_err() {
+        anyhow::bail!("--metrics-addr '{addr}': expected HOST:PORT, such as 127.0.0.1:9464");
+    }
+    if auth || allow_open || loopback(host) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to serve metrics on {host} without authentication: they name every \
+         dataset and count its requests. Use --auth-config FILE (callers then need the \
+         metrics permission), a loopback address, or --allow-open-network"
+    )
+}
+
 /// Whether a rate-limit configuration limits requests (a `query`, `update` or `admin`
 /// limit, on every dataset or on one); `auth` and `preauth` alone limit only logins and
 /// authentication failures.
@@ -163,6 +182,22 @@ mod tests {
             "",
         ] {
             assert!(!loopback(h), "{h}");
+        }
+    }
+
+    #[test]
+    fn metrics_addresses() {
+        assert!(check_metrics_addr("127.0.0.1:9464", false, false).is_ok());
+        assert!(check_metrics_addr("[::1]:9464", false, false).is_ok());
+        assert!(check_metrics_addr("localhost:9464", false, false).is_ok());
+        let e = check_metrics_addr("0.0.0.0:9464", false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--allow-open-network"), "{e}");
+        assert!(check_metrics_addr("0.0.0.0:9464", true, false).is_ok());
+        assert!(check_metrics_addr("0.0.0.0:9464", false, true).is_ok());
+        for bad in ["9464", ":9464", "127.0.0.1:", "127.0.0.1:x"] {
+            assert!(check_metrics_addr(bad, true, true).is_err(), "{bad}");
         }
     }
 

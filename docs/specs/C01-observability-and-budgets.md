@@ -6,8 +6,9 @@
 > metrics, readiness, memory and result-size budgets, and cancel on disconnect. Part of
 > Phase 2 shipped with it: the JSON metrics snapshot, the Server page panels,
 > `meta.memory` and `requestId` in error bodies. From Phase 3, OpenTelemetry export with
-> `traceparent` propagation and per-class concurrency caps shipped. The rest of Phases 2
-> and 3 is not built. [Outcome](#outcome) has the details.
+> `traceparent` propagation, per-class concurrency caps and the `--metrics-addr` listener
+> shipped, and Fuseki's metric names followed as an option. The rest of Phases 2 and 3 is
+> not built. [Outcome](#outcome) has the details.
 >
 > **User docs:** [API: Server](../API.md#server) ·
 > [API: Request ids and the access log](../API.md#request-ids-and-the-access-log) ·
@@ -925,6 +926,18 @@ followed the same day.
 - Some Phase 3 work shipped. OpenTelemetry exports OTLP traces, metrics and logs,
   propagates `traceparent` in and out, and is off by default. Per-class concurrency caps
   in the rate limiter answer `503` with `Retry-After`.
+- Fuseki's metric names arrived on 2026-10-02 behind `--metrics-fuseki-names`. Fuseki
+  exports `fuseki_requests`, `fuseki_requests_good` and `fuseki_requests_bad` as gauges
+  per dataset endpoint, labelled `dataset`, `endpoint`, `operation`, `description` and
+  `application="fuseki"`, and Sparkles renders the same series. Good is the `ok` outcome
+  and bad is any other outcome. Micrometer's uptime and processor gauges are rendered
+  too, and the JVM gauges have no equivalent. The mapping is in
+  [API.md](../API.md#fuseki-metric-names). This settles open question 6. The names are
+  off by default, and Fuseki's source counts every failed request as bad, from a
+  validation error to a cancelled query.
+- `--metrics-addr` arrived the same day. The second listener serves only `/$/metrics`,
+  behind the same authentication and `Host` check. Without auth it may bind a network
+  address only with `--allow-open-network`, because the metrics name every dataset.
 
 **Performance.** With access logging and metrics on, the 20 harness queries at 10.5M
 triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is noise.
@@ -936,7 +949,5 @@ triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is n
 - per-request budget overrides (`?memory-mb=`);
 - `--shutdown-grace`;
 - bind-before-open startup with the `opening`, `failed` and `degraded` states;
-- opt-in Fuseki-compatible metric names;
 - the `rows_produced` work budget;
-- a server-wide query memory pool;
-- a separate `--metrics-addr` listener.
+- a server-wide query memory pool.
