@@ -10,6 +10,7 @@ pub fn all_tools() -> Vec<&'static str> {
     let mut v = vec![
         "list_datasets",
         "describe_schema",
+        "draft_shapes",
         "sparql_query",
         "explain_query",
         "describe_resource",
@@ -176,6 +177,34 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "next":nullable("string"),
                 "prefixes":prefixes()}}),
             ),
+        ),
+        read(
+            "draft_shapes",
+            "Draft shapes from the data",
+            "Draft SHACL shapes (or a ShEx schema with its shape map) from the data: one shape per class with the observed cardinalities, node kinds, datatypes, classes, small value sets and languages. A constraint is drafted when at least `support` of the instances it applies to satisfy it; at support 1 the current data conforms. `excluding` lists the constraints that would reject existing instances, with their counts. The draft is text to review, nothing is installed.",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "dataset": ds(),
+                "graph": graph(),
+                "reasoning": {"type":"boolean","default":false,"description":"Include materialized inferences (write-time validation leaves them out by default)"},
+                "language": {"enum":["shacl","shex"],"default":"shacl"},
+                "support": {"type":"number","exclusiveMinimum":0,"maximum":1,"default":1},
+                "classes": {"type":"array","items":{"type":"string"},"description":"Draft only these classes (IRIs or prefixed names)"},
+                "minInstances": {"type":"integer","minimum":1,"default":1},
+                "maxIn": {"type":"integer","minimum":0,"maximum":64,"default":10,"description":"Largest sh:in list (0: none)"},
+                "maxCount": {"type":"integer","minimum":0,"default":1,"description":"Largest sh:maxCount drafted (0: none)"},
+                "closed": {"type":"boolean","default":false},
+                "atCommit": at(),
+                "timeoutSeconds": to(cfg)}}),
+            Some(json!({"type":"object","required":["dataset","commit","graph","support","language","totals","shapes"],"properties":{
+                "dataset":{"type":"string"},"commit":{"type":"integer"},"graph":{"type":"string"},
+                "support":{"type":"number"},"language":{"enum":["shacl","shex"]},
+                "totals":{"type":"object"},
+                "shapes":{"type":"array","items":{"type":"object","required":["class","shape","instances","properties","constraints","excluding"],"properties":{
+                    "class":{"type":"string"},"shape":{"type":"string"},"instances":{"type":"integer"},
+                    "properties":{"type":"integer"},"constraints":{"type":"integer"},
+                    "excluding":{"type":"array","items":{"type":"object","required":["path","component","excluded"],"properties":{
+                        "path":{"type":"string"},"component":{"type":"string"},"excluded":{"type":"integer"}}}}}}},
+                "shacl":{"type":"string"},"shex":{"type":"string"},"shapeMap":{"type":"string"}}})),
         ),
         sparql_query,
         read(

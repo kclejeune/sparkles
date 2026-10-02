@@ -1951,3 +1951,207 @@ export async function writeValidation(
   });
   return body && body.config ? (body as WriteValidation) : null;
 }
+
+/**
+ * `PUT /$/validation/{ds}` in warn mode with inline shapes (SHACL Turtle) or an inline ShEx
+ * schema and its shape map. It replaces any configuration the dataset has; needs admin.
+ */
+export function installWarnGuard(
+  ds: string,
+  g: { language: 'shacl'; shapes: string } | { language: 'shex'; schema: string; shapeMap: string },
+): Promise<unknown> {
+  const body =
+    g.language === 'shacl'
+      ? { language: 'shacl', mode: 'warn', shapes: { inline: g.shapes } }
+      : {
+          language: 'shex',
+          mode: 'warn',
+          schema: { inline: g.schema, format: 'shexc' },
+          shapeMap: g.shapeMap,
+        };
+  return json(`/$/validation/${enc(ds)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+// ------------------------------------------------------------ drafted shapes ------
+
+/** One constraint of a drafted property shape, with what it would exclude. */
+export type DraftConstraint = {
+  component: string;
+  value: number | string | string[] | boolean;
+  applicable: number;
+  satisfied: number;
+  excluded: number;
+};
+
+export type DraftProperty = {
+  path: string;
+  instances: number;
+  maxValues: number;
+  constraints: DraftConstraint[];
+  rejected: DraftConstraint[];
+};
+
+export type DraftShape = {
+  shape: string;
+  class: string;
+  instances: number;
+  closed: boolean;
+  properties: DraftProperty[];
+};
+
+/** `GET /$/schema/{ds}/shapes` (JSON): shapes drafted from the data. */
+export type ShapesDraft = {
+  draftFormat: number;
+  dataset: string;
+  snapshot: { version: number; generation: string; computedAt: string };
+  selection: { graph: string; reasoning: boolean };
+  options: {
+    support: number;
+    minInstances: number;
+    maxIn: number;
+    maxCount: number;
+    closed: boolean;
+    base: string;
+    classes: string[];
+  };
+  totals: {
+    shapes: number;
+    propertyShapes: number;
+    constraints: number;
+    rejected: number;
+    skippedClasses: number;
+  };
+  shapes: DraftShape[];
+  /** The shapes graph in Turtle. */
+  shacl: string;
+  /** The ShEx schema in ShExC. */
+  shex: string;
+  /** The query shape map of the ShEx schema. */
+  shapeMap: string;
+};
+
+export type DraftOptions = {
+  support?: number;
+  closed?: boolean;
+  graph?: string;
+  reasoning?: boolean;
+  classes?: string[];
+  signal?: AbortSignal;
+};
+
+/** The URL of a draft request. */
+export function draftShapesPath(ds: string, opts: DraftOptions = {}): string {
+  const p = new URLSearchParams();
+  if (opts.support != null && opts.support !== 1) p.set('support', String(opts.support));
+  if (opts.closed) p.set('closed', 'true');
+  if (opts.graph && opts.graph !== 'default') p.set('graph', opts.graph);
+  if (opts.reasoning) p.set('reasoning', 'true');
+  for (const c of opts.classes ?? []) p.append('class', c);
+  const s = p.toString();
+  return `/$/schema/${enc(ds)}/shapes${s ? `?${s}` : ''}`;
+}
+
+export const draftShapes = (ds: string, opts: DraftOptions = {}) =>
+  json<ShapesDraft>(draftShapesPath(ds, opts), { signal: opts.signal, cache: 'no-store' });
+
+// ------------------------------------------------------------ stored queries ------
+
+export type StoredParamType =
+  | 'iri'
+  | 'string'
+  | 'integer'
+  | 'decimal'
+  | 'double'
+  | 'boolean'
+  | 'date'
+  | 'dateTime'
+  | 'literal'
+  | 'term';
+
+export type StoredParam = {
+  type: StoredParamType;
+  description?: string;
+  default?: string | number | boolean;
+  required?: boolean;
+  datatype?: string;
+  language?: string;
+  enum?: (string | number | boolean)[];
+};
+
+/** The definition a client stores (`PUT /$/queries/{ds}/{name}`). */
+export type StoredDefinition = {
+  query: string;
+  description?: string;
+  parameters?: Record<string, StoredParam>;
+  results?: string;
+  mcp?: boolean;
+};
+
+export type StoredVersion = {
+  version: number;
+  parent?: number;
+  created: string;
+  author?: string;
+  message?: string;
+  datasetCommit?: number;
+  digest: string;
+};
+
+/** A stored query as `GET /$/queries/{ds}/{name}` answers (listings leave out `query`). */
+export type StoredQuery = Omit<StoredDefinition, 'query'> & {
+  query?: string;
+  name: string;
+  kind?: QueryType;
+  mcp: boolean;
+  version: StoredVersion;
+};
+
+export async function storedQueries(ds: string, signal?: AbortSignal): Promise<StoredQuery[]> {
+  const body = await json<{ queries: StoredQuery[] }>(`/$/queries/${enc(ds)}`, {
+    signal,
+    cache: 'no-store',
+  });
+  return body?.queries ?? [];
+}
+
+export const storedQuery = (ds: string, name: string) =>
+  json<StoredQuery>(`/$/queries/${enc(ds)}/${enc(name)}`, { cache: 'no-store' });
+
+export const putStoredQuery = (ds: string, name: string, def: StoredDefinition) =>
+  json<StoredQuery & { changed: boolean }>(`/$/queries/${enc(ds)}/${enc(name)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(def),
+  });
+
+export async function deleteStoredQuery(ds: string, name: string): Promise<void> {
+  await request(`/$/queries/${enc(ds)}/${enc(name)}`, { method: 'DELETE' });
+}
+
+/**
+ * Run a stored query with parameter values (a form body) and get the rich UI result
+ * format, as `query` does.
+ */
+export async function runStoredQuery(
+  ds: string,
+  name: string,
+  values: Record<string, string>,
+  opts: QueryOptions = {},
+): Promise<SparklesResult> {
+  const res = await request(`/${enc(ds)}/queries/${enc(name)}${queryParams(opts)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: SPARKLES_JSON },
+    body: new URLSearchParams(values).toString(),
+    signal: opts.signal,
+  });
+  const body = (await res.json()) as SparklesResult;
+  const inferences = parseInferencesHeader(res.headers.get('Sparkles-Inferences'));
+  if (inferences) body.inferences = inferences;
+  const at = atInfo(res.headers);
+  if (at) body.at = at;
+  return normalizeResult(body);
+}

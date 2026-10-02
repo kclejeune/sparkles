@@ -23,6 +23,7 @@ mod mcp;
 mod obs;
 mod otel;
 mod outbound;
+mod queries_cmd;
 mod quota_cmd;
 mod ratelimit;
 mod reasoning;
@@ -1078,6 +1079,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SnapshotCmd,
     },
+    /// Stored, parameterized queries of a database: list, get, put, delete and run them
+    Queries {
+        #[command(subcommand)]
+        cmd: queries_cmd::QueriesCmd,
+    },
     /// Merge updates into a freshly built index generation
     Compact {
         #[arg(long)]
@@ -1261,6 +1267,33 @@ enum Cmd {
         /// Largest number of classes, and of predicates
         #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
         max_entries: usize,
+        /// Draft SHACL shapes (or, with --format shexc, a ShEx schema) from the data
+        /// instead of printing the schema; --format is then turtle, shexc or json
+        #[arg(long)]
+        draft_shapes: bool,
+        /// Draft a constraint when at least this share of the instances it applies to
+        /// satisfy it, in (0, 1]
+        #[arg(long, default_value_t = 1.0, requires = "draft_shapes")]
+        support: f64,
+        /// Draft closed shapes
+        #[arg(long, requires = "draft_shapes")]
+        closed: bool,
+        /// Largest sh:in list (0: none)
+        #[arg(long, default_value_t = sparkles::schema::draft::DEFAULT_MAX_IN, requires = "draft_shapes")]
+        max_in: usize,
+        /// Largest sh:maxCount drafted (0: none)
+        #[arg(long, default_value_t = sparkles::schema::draft::DEFAULT_MAX_COUNT, requires = "draft_shapes")]
+        max_count: u64,
+        /// Draft only this class (IRI; repeatable)
+        #[arg(long, value_name = "IRI", requires = "draft_shapes")]
+        class: Vec<String>,
+        /// Skip classes with fewer instances
+        #[arg(long, default_value_t = 1, requires = "draft_shapes")]
+        min_instances: u64,
+        /// Draft from the data with its materialized inferences (drafts leave them out
+        /// by default, as write-time validation does)
+        #[arg(long, requires = "draft_shapes", conflicts_with = "no_inferences")]
+        with_inferences: bool,
     },
     /// Validate a database (or data files) against a SHACL shapes graph; exits with
     /// status 1 when the data does not conform
@@ -2402,6 +2435,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
+        Cmd::Queries { cmd } => queries_cmd::run(cmd, opts),
         Cmd::Diff {
             loc,
             from,
@@ -2713,9 +2747,37 @@ fn run() -> Result<()> {
             format,
             timeout,
             max_entries,
+            draft_shapes,
+            support,
+            closed,
+            max_in,
+            max_count,
+            class,
+            min_instances,
+            with_inferences,
         } => {
             use sparkles::index::Perm;
             use sparkles::schema::{GraphSelection, Page, SchemaError, SchemaOptions};
+            if draft_shapes {
+                return schema_draft(
+                    loc,
+                    &data,
+                    opts,
+                    SchemaDraftArgs {
+                        graph,
+                        format,
+                        timeout,
+                        max_entries,
+                        support,
+                        closed,
+                        max_in,
+                        max_count,
+                        classes: class,
+                        min_instances,
+                        with_inferences,
+                    },
+                );
+            }
             // `void` is the VoID description, `turtle` the description and the declarations
             let (json, void) = match format.as_str() {
                 "json" => (true, None),
@@ -3083,6 +3145,114 @@ fn open_or_load(loc: Option<PathBuf>, data: &[PathBuf], opts: StoreOptions) -> R
             s
         }
     })
+}
+
+/// `sparkles schema --draft-shapes` arguments.
+struct SchemaDraftArgs {
+    graph: String,
+    format: String,
+    timeout: Option<f64>,
+    max_entries: usize,
+    support: f64,
+    closed: bool,
+    max_in: usize,
+    max_count: u64,
+    classes: Vec<String>,
+    min_instances: u64,
+    with_inferences: bool,
+}
+
+/// `sparkles schema --draft-shapes`: SHACL shapes, a ShEx schema or the JSON draft.
+fn schema_draft(
+    loc: Option<PathBuf>,
+    data: &[PathBuf],
+    opts: StoreOptions,
+    a: SchemaDraftArgs,
+) -> Result<()> {
+    use sparkles::schema::draft::{DraftOptions, TRACKED_VALUES, default_base};
+    use sparkles::schema::{GraphSelection, SchemaError, SchemaOptions};
+    #[derive(PartialEq)]
+    enum Out {
+        Turtle,
+        ShexC,
+        Json,
+    }
+    let out = match a.format.as_str() {
+        "turtle" | "text" => Out::Turtle,
+        "shexc" => Out::ShexC,
+        "json" => Out::Json,
+        f => bail!("unknown format '{f}' with --draft-shapes (turtle, shexc or json)"),
+    };
+    if !(a.support > 0.0 && a.support <= 1.0) {
+        bail!("--support must be in (0, 1]");
+    }
+    if a.max_in > TRACKED_VALUES {
+        bail!("--max-in must be at most {TRACKED_VALUES}");
+    }
+    let name = loc
+        .as_deref()
+        .and_then(|l| l.file_name())
+        .map_or_else(|| "data".to_string(), |f| f.to_string_lossy().into_owned());
+    let store = open_or_load(loc, data, opts)?;
+    let mut prefixes = sparkles::io::standard_prefixes();
+    prefixes.extend(store.prefixes());
+    let classes = a
+        .classes
+        .iter()
+        .map(|c| {
+            let iri = c.trim().trim_start_matches('<').trim_end_matches('>');
+            oxrdf::NamedNode::new(iri)
+                .map(|n| n.into_string())
+                .map_err(|e| anyhow::anyhow!("--class {c}: {e}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let dopts = DraftOptions {
+        schema: SchemaOptions {
+            graph: GraphSelection::parse(&a.graph).map_err(anyhow::Error::msg)?,
+            inferred_graph: Some(http::INFERRED_GRAPH.to_string()),
+            include_inferred: a.with_inferences,
+            deadline: a
+                .timeout
+                .map(|t| Instant::now() + Duration::from_secs_f64(t)),
+            max_entries: a.max_entries,
+            ..Default::default()
+        },
+        base: default_base(&name),
+        dataset: name,
+        support: a.support,
+        classes,
+        min_instances: a.min_instances,
+        max_in: a.max_in,
+        max_count: a.max_count,
+        closed: a.closed,
+        prefixes: prefixes.into_iter().collect(),
+    };
+    let draft = match sparkles::schema::draft_shapes(&store.snapshot(), &dopts) {
+        Ok(d) => d,
+        Err(e @ (SchemaError::Timeout { .. } | SchemaError::TooManyEntries { .. })) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mut w = std::io::stdout().lock();
+    match out {
+        Out::Turtle => w.write_all(draft.shacl.as_bytes())?,
+        Out::ShexC => {
+            w.write_all(draft.shex.as_bytes())?;
+            writeln!(
+                w,
+                "\n# Shape map:\n# {}",
+                draft.shape_map.replace('\n', "\n# ")
+            )?;
+        }
+        Out::Json => {
+            serde_json::to_writer_pretty(&mut w, &draft)?;
+            writeln!(w)?;
+        }
+    }
+    w.flush()?;
+    Ok(())
 }
 
 #[cfg(feature = "shacl")]

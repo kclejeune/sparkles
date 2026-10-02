@@ -47,6 +47,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/schema/{ds}", &["GET"]),
     ("/$/schema/{ds}/classes", &["GET"]),
     ("/$/schema/{ds}/predicates", &["GET"]),
+    ("/$/schema/{ds}/shapes", &["GET"]),
     ("/$/compact/{ds}", &["POST"]),
     ("/$/backup/{ds}", &["POST"]),
     ("/$/reason/{ds}", &["GET", "POST", "DELETE"]),
@@ -62,6 +63,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/geo/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/geo/{ds}/rebuild", &["POST"]),
     ("/$/geo/convert", &["POST"]),
+    ("/$/queries/{ds}", &["GET"]),
+    ("/$/queries/{ds}/{name}", &["GET", "PUT", "DELETE"]),
+    ("/$/queries/{ds}/{name}/versions", &["GET"]),
+    ("/{ds}/queries/{name}", &["GET", "POST"]),
     ("/$/commits/{ds}", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
     ("/$/vector/{ds}", &["GET"]),
@@ -189,10 +194,14 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/schema/{ds}"
         | "/$/schema/{ds}/classes"
         | "/$/schema/{ds}/predicates"
+        | "/$/schema/{ds}/shapes"
         | "/$/reason/{ds}/diagnostics"
         | "/$/prefixes/{ds}"
         | "/$/commits/{ds}"
         | "/$/commits/{ds}/{reference}"
+        | "/$/queries/{ds}"
+        | "/$/queries/{ds}/{name}/versions"
+        | "/{ds}/queries/{name}"
         | "/$/vector/{ds}"
         | "/$/vector/{ds}/{name}/recall"
         | "/{ds}/sparql"
@@ -209,6 +218,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/text/{ds}"
         | "/$/geo/{ds}"
         | "/$/vector/{ds}/{name}"
+        | "/$/queries/{ds}/{name}"
         | "/$/snapshots/{ds}"
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
@@ -238,6 +248,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/snapshots/{ds}"
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
+        | "/$/queries/{ds}/{name}"
         | "/$/validation/{ds}" => Dataset(Admin),
         // backups: the listing is filtered by the handler (names and types for dataset
         // admins); a backup's handlers also check that it belongs to `{ds}`, and a
@@ -290,9 +301,12 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
 pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<Endpoint> {
     let get = matches!(*method, Method::GET | Method::HEAD);
     Some(match route {
-        "/{ds}/sparql" | "/{ds}/query" | "/{ds}/explain" | "/{ds}/text" | "/{ds}/geo" => {
-            Endpoint::Query
-        }
+        "/{ds}/sparql"
+        | "/{ds}/query"
+        | "/{ds}/explain"
+        | "/{ds}/text"
+        | "/{ds}/geo"
+        | "/{ds}/queries/{name}" => Endpoint::Query,
         "/{ds}/update" => Endpoint::Update,
         "/{ds}/get" => Endpoint::GspR,
         "/{ds}/data" if get => Endpoint::GspR,

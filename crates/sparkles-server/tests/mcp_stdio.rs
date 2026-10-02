@@ -69,8 +69,13 @@ fn stdio_session() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     assert_eq!(
-        names[..3],
-        ["list_datasets", "describe_schema", "sparql_query"]
+        names[..4],
+        [
+            "list_datasets",
+            "describe_schema",
+            "draft_shapes",
+            "sparql_query"
+        ]
     );
 
     let r = exchange(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {

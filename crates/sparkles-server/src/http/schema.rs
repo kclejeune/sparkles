@@ -392,5 +392,8 @@ pub(super) async fn predicates(
     serve(st, name, uri, p, What::Predicates).await
 }
 
+mod shapes;
+pub(super) use shapes::shapes;
+
 #[cfg(test)]
 mod tests;

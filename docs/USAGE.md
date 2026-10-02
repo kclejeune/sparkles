@@ -362,6 +362,7 @@ The other commands are:
 
 * `schema`, `shacl` and `shex validate|parse`;
 * `validation`, for write-time validation ([API](API.md#write-time-validation));
+* `queries`, for stored queries ([below](#stored-queries));
 * `snapshot`, for named snapshots and history retention;
 * `quota`, for the storage quota of a dataset, locally or on a `--server`;
 * `repo` and `backup create|list|show|restore|verify|delete|policy`
@@ -377,6 +378,62 @@ The other commands are:
 in Turtle, and `--format turtle` adds the declared RDFS/OWL schema. The server answers
 `GET /$/schema/{ds}` the same way when the request asks for Turtle or another RDF syntax
 ([API.md](API.md#schema-discovery)).
+
+### Drafting shapes from the data
+
+`sparkles schema --draft-shapes` writes SHACL shapes for the classes of a database, with
+the cardinalities, node kinds, datatypes, classes, small value sets and languages that
+its instances have. Review the draft, then use it for write-time validation:
+
+```sh
+sparkles schema --loc db --draft-shapes > shapes.ttl                 # the data conforms
+sparkles schema --loc db --draft-shapes --support 0.95 --closed      # rules most instances follow
+sparkles schema --loc db --draft-shapes --format shexc               # a ShEx schema and its shape map
+sparkles validation --loc db --mode warn --shapes shapes.ttl
+```
+
+With the default support of 1, every constraint holds for every instance, so the current
+data conforms. With `--support 0.95`, a constraint is drafted when 95% of the instances
+it applies to satisfy it. The comments in the output say how many instances each
+constraint would exclude, and list the candidates that missed the threshold. Turning the
+guard on in `warn` mode first shows what later writes would break before anything is
+rejected. The server offers the same as `GET /$/schema/{ds}/shapes`, and the UI's schema
+browser has a **Draft shapes** action that opens the draft in the dataset page's shapes
+editor or installs it as a guard in `warn` mode ([API](API.md#drafted-shapes)).
+
+### Stored queries
+
+A database can keep named queries with typed parameters. Applications and agents then
+run them by name instead of building query text, and the values can never change the
+query, because each one is bound to its variable as a term.
+
+```sh
+cat > adults.rq <<'EOF'
+PREFIX ex: <http://ex.org/>
+SELECT ?name WHERE { ?p ex:age ?age ; ex:name ?name FILTER(?age >= ?minAge) }
+EOF
+sparkles queries put --loc db adults --query adults.rq --param minAge:integer=18 \
+    --description "People at least minAge years old" --message "first version"
+sparkles queries run --loc db adults --set minAge=40
+sparkles queries list --loc db
+sparkles queries versions --loc db adults
+```
+
+On a server, `PUT /$/queries/{ds}/{name}` stores a definition (it needs `admin`), and
+`GET /{ds}/queries/{name}?minAge=40` runs it with the caller's permissions, budgets and
+rate limits:
+
+```sh
+curl -X PUT localhost:3030/$/queries/books/adults -H 'Content-Type: application/json' \
+  -d '{"query": "PREFIX ex: <http://ex.org/> SELECT ?name WHERE { ?p ex:age ?age ; ex:name ?name FILTER(?age >= ?minAge) }",
+       "parameters": {"minAge": {"type": "integer", "default": 18}}}'
+curl 'localhost:3030/books/queries/adults?minAge=40' -H 'Accept: text/csv'
+```
+
+Each change is a new version with its time, author and message. The MCP server offers
+every stored query as a tool named `<dataset>__<query>`, and the UI's query page lists
+them with a form for their parameters. [API.md](API.md#stored-queries) describes the
+definitions, the parameter types and the versions.
 
 ## Formatting
 
@@ -697,6 +754,11 @@ The tools are read-only unless the operator turns on the write tool:
 
 * `list_datasets`, `describe_schema`, `sparql_query`, `explain_query`,
   `describe_resource` and `list_commits`.
+* `draft_shapes` drafts SHACL shapes or a ShEx schema from the data, with the number of
+  instances each constraint would exclude.
+* Each stored query of a dataset is a tool of its own, `<dataset>__<query>`, whose
+  arguments are the query's parameters ([below](#stored-queries)). `--no-stored-queries`
+  (or `serve --mcp-no-stored-queries`) leaves them out.
 * `search_text` runs BM25 search over a full-text index. `--text` indexes `--data` files.
 * `similar_entities` runs exact search over stored `spk:vector` embeddings. It never
   computes embeddings.

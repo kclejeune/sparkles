@@ -21,6 +21,7 @@ pub mod querybuilder;
 pub mod schema;
 pub mod sparql;
 pub mod store;
+pub mod stored;
 pub mod text;
 pub mod validation;
 pub mod vector;

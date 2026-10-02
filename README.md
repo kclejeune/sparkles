@@ -76,6 +76,8 @@ running queries.
 **Server and CLI**
 * Fuseki's endpoints, Graph Store Protocol, upload and `/$/` admin API. Sparkles adds
   endpoints for commits, schema discovery, clones, reasoning and validation ([API](docs/API.md)).
+* Stored queries with typed parameters, which clients and MCP agents run by name. Values
+  are bound as terms and never spliced into the text ([API](docs/API.md#stored-queries)).
 * A Jena-style CLI with `tdb2.*` and `arq` equivalents. The commands work on a database
   directory or on a remote server ([usage](docs/USAGE.md#command-line-tools)).
 
@@ -94,6 +96,9 @@ running queries.
 * Write-time guards validate each commit with SHACL or ShEx before it is written. A
   write re-validates only the focus nodes it can affect
   ([API](docs/API.md#write-time-validation)).
+* Shapes drafted from the data give a guard a starting point. Each constraint has a
+  support threshold and a count of the instances it would exclude
+  ([API](docs/API.md#drafted-shapes)).
 
 **Search**
 * Full-text search through Jena's `text:query`, ranked by BM25 with Tantivy and stemmed per
@@ -121,8 +126,8 @@ running queries.
 * Storage quotas per dataset, and a shutdown that lets requests in flight finish within
   a grace period ([API](docs/API.md#storage-quotas)).
 * An MCP server for LLM agents, over stdio or at `/$/mcp` on the server. Each call runs as
-  its caller, within query budgets, and the write tool is opt-in
-  ([usage](docs/USAGE.md#mcp-server-llm-agents)).
+  its caller, within query budgets, and the write tool is opt-in. Each stored query is a
+  tool of its own ([usage](docs/USAGE.md#mcp-server-llm-agents)).
 
 [docs/FEATURES.md](docs/FEATURES.md) lists every feature and what is not there yet.
 
@@ -225,7 +230,8 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `backup`, `repo` | Write N-Quads dumps, and manage backup repositories on a file system or S3, restores and policies. |
 | `infer` | Materialize RDFS, OWL 2 RL or Jena rules. Report staleness and check for inconsistencies. |
 | `shacl`, `shex`, `validation` | Validate with SHACL or ShEx, and configure write-time guards. |
-| `schema` | List classes and predicates with exact counts and their declarations. |
+| `schema` | List classes and predicates with exact counts and their declarations, or draft shapes from the data. |
+| `queries` | Store, list and run parameterized queries. |
 | `text-index`, `geo-index` | Manage the full-text and spatial indexes. |
 | `auth` | Hash passwords, manage API tokens and sign in for remote commands (`auth login`). |
 | `mcp` | Run the MCP server for LLM agents over stdio. `serve --mcp` serves it over HTTP. |

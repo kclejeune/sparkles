@@ -31,6 +31,7 @@ mod dry_run;
 mod format;
 pub(crate) mod history;
 mod inline;
+mod queries;
 mod schema;
 mod sd;
 mod shex;
@@ -59,6 +60,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static("sparkles-diff-added"),
         header::HeaderName::from_static("sparkles-diff-removed"),
         header::HeaderName::from_static(changes::SPARKLES_CHANGES_NEXT),
+        header::HeaderName::from_static(queries::SPARKLES_QUERY_VERSION),
         header::CONTENT_LOCATION,
         header::VARY,
         header::LINK,
@@ -92,6 +94,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}", get(schema::summary))
         .route("/$/schema/{ds}/classes", get(schema::classes))
         .route("/$/schema/{ds}/predicates", get(schema::predicates))
+        .route("/$/schema/{ds}/shapes", get(schema::shapes))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route(
@@ -118,6 +121,15 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .put(budgets::put_quota)
                 .delete(budgets::delete_quota),
         )
+        .route("/$/queries/{ds}", get(queries::list))
+        .route(
+            "/$/queries/{ds}/{name}",
+            get(queries::get_query)
+                .put(queries::put_query)
+                .delete(queries::delete_query),
+        )
+        .route("/$/queries/{ds}/{name}/versions", get(queries::versions))
+        .route("/{ds}/queries/{name}", get(queries::run).post(queries::run))
         .route("/$/commits/{ds}", get(list_commits))
         .route("/$/commits/{ds}/{reference}", get(get_commit))
         .route("/{ds}", any(dataset_root))
@@ -523,7 +535,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
 // ------------------------------------------------------------------ params ------
 
 #[derive(Default, Debug)]
-struct Params(Vec<(String, String)>);
+pub(crate) struct Params(Vec<(String, String)>);
 
 impl Params {
     fn from_query(uri: &Uri) -> Params {
@@ -882,6 +894,22 @@ async fn query_endpoint(
         return Err(err(StatusCode::BAD_REQUEST, "missing 'query' parameter"));
     }
     crate::obs::log_query_text(&query);
+    run_query(st, ds, p, uri, headers, params, query, Vec::new()).await
+}
+
+/// Run a query as `/{ds}/sparql` does: the request's budgets, graph view, result format
+/// and history parameters, with `bindings` as initial bindings (stored queries).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_query(
+    st: Arc<AppState>,
+    ds: Arc<Dataset>,
+    p: Principal,
+    uri: Uri,
+    headers: HeaderMap,
+    params: Params,
+    query: String,
+    bindings: Vec<(String, oxrdf::Term)>,
+) -> ApiResult {
     let mut opts = query_options(&st, &ds, &params);
     // budgets the request asked for, never above the server's
     let asked = budgets::Overrides::parse(&params)?;
@@ -901,7 +929,13 @@ async fn query_endpoint(
     let timeout = opts.timeout;
     // a query that was quick last time runs in place (see `inline`); past states are
     // resolved on the blocking pool, since opening one may read from disk
-    let quick_key = inline::QuickQueries::key(&ds.name, &query);
+    let quick_key = if bindings.is_empty() {
+        inline::QuickQueries::key(&ds.name, &query)
+    } else {
+        let values: Vec<String> = bindings.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        inline::QuickQueries::key(&ds.name, &format!("{query}\n{}", values.join("\n")))
+    };
+    opts.initial_bindings = bindings;
     let in_place = at.is_none() && inline::available() && QUICK.is_quick(quick_key);
     let run = {
         let ds = ds.clone();
@@ -1339,8 +1373,8 @@ fn with_commit(mut r: Response, ds: &Dataset, seq: u64) -> Response {
 
 /// The client asked for a commit receipt: `receipt=true`, or an `Accept` that names the
 /// Sparkles media type (`*/*` does not count).
-/// The `Sparkles-Commit-Message` of a request, or why it is invalid (MCP writes).
-#[cfg(feature = "mcp")]
+/// The `Sparkles-Commit-Message` of a request, or why it is invalid (MCP writes and
+/// stored-query versions).
 pub(crate) fn commit_message_header(h: &HeaderMap) -> Result<Option<Arc<str>>, String> {
     conditional::commit_message(h).map_err(|e| {
         e.1["error"]

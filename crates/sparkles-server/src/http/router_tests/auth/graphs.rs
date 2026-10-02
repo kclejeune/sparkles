@@ -568,6 +568,98 @@ async fn schema_explain_text_and_diff_cover_the_view() {
 }
 
 #[tokio::test]
+async fn drafted_shapes_cover_the_view() {
+    let s = server();
+    let ds = s.state.datasets.read().get("graphs").cloned().unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            br#"@prefix ex: <http://ex/> .
+<http://ex/a/1> { ex:a1 a ex:T . }
+<http://ex/b/1> { ex:b1 a ex:T ; ex:hidden "secret" . }"#
+                .to_vec(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let get = |u: &'static str, user: &'static str| {
+        let app = s.app.clone();
+        async move { call(&app, "GET", u, &[("authorization", &b(user))], "").await }
+    };
+    let r = get("/$/schema/graphs/shapes?graph=union", "gra").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["shapes"][0]["instances"], 1, "{j}");
+    assert!(!j.to_string().contains("hidden"), "{j}");
+    let j = get("/$/schema/graphs/shapes?graph=union", "gfull")
+        .await
+        .json();
+    assert_eq!(j["shapes"][0]["instances"], 2, "{j}");
+    assert!(j.to_string().contains("hidden"), "{j}");
+    let r = get(
+        "/$/schema/graphs/shapes?graph=http%3A%2F%2Fex%2Fb%2F1",
+        "gra",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // a grant limited to the Graph Store reads does not reach the info endpoint
+    let r = get("/$/schema/graphs/shapes", "gep").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn stored_queries_run_on_the_view() {
+    let s = server();
+    let ds = s.state.datasets.read().get("graphs").cloned().unwrap();
+    let def: sparkles::stored::Definition = serde_json::from_value(serde_json::json!({
+        "query": "SELECT ?s WHERE { GRAPH ?g { ?s <http://ex/p> ?o FILTER(CONTAINS(?o, ?word)) } } ORDER BY ?s",
+        "parameters": { "word": { "type": "string", "default": "fox" } }
+    }))
+    .unwrap();
+    ds.queries
+        .put("foxes", def.clone(), sparkles::stored::Change::default())
+        .unwrap();
+    let get = |u: &'static str, user: &'static str| {
+        let app = s.app.clone();
+        async move {
+            call(
+                &app,
+                "GET",
+                u,
+                &[("authorization", &b(user)), ("accept", "text/csv")],
+                "",
+            )
+            .await
+        }
+    };
+    let rows = |r: &R| -> Vec<String> { r.text().lines().skip(1).map(str::to_string).collect() };
+    let r = get("/graphs/queries/foxes", "gfull").await;
+    assert_eq!(rows(&r), ["http://ex/a1", "http://ex/b1"], "{}", r.text());
+    // a reader of http://ex/a/* sees the foxes of those graphs only
+    let r = get("/graphs/queries/foxes", "gra").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(rows(&r), ["http://ex/a1"]);
+    // the definitions are dataset settings that a limited reader may list
+    let r = get("/$/queries/graphs", "gra").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // a grant limited to the Graph Store reads reaches no query
+    let r = get("/graphs/queries/foxes", "gep").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    // changing a definition needs admin
+    let r = call(
+        &s.app,
+        "PUT",
+        "/$/queries/graphs/foxes",
+        &[
+            ("authorization", &b("gfull")),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::to_string(&def).unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+}
+
+#[tokio::test]
 async fn endpoint_permissions() {
     let s = server();
     let get = |u: &'static str, user: &'static str| {

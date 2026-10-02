@@ -1460,5 +1460,8 @@ fn strongly_connected(adj: &[Vec<usize>]) -> Vec<usize> {
 mod void;
 pub use void::{VOID_NS, VoidOptions, description_iri, void_text, void_triples};
 
+pub mod draft;
+pub use draft::{DraftOptions, ShapesDraft, draft_shapes};
+
 #[cfg(test)]
 mod tests;
