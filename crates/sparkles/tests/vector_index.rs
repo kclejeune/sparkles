@@ -176,6 +176,9 @@ fn recall_against_the_exact_oracle() {
 fn the_delta_is_overlaid_exactly() {
     let vs = clustered(5_000, 3);
     let s = store_with(Store::in_memory(StoreOptions::default()), &vs);
+    // the graph searches below are compared with exact ones, so the graph must not depend
+    // on thread timing
+    s.sequential_vector_builds(true);
     s.create_vector_index("emb", config(0)).unwrap();
     s.wait_vector_index("emb").unwrap();
     let q = vs[42].clone();
@@ -254,6 +257,10 @@ fn many_random_changes_match_the_oracle() {
     let all = clustered(3_400, 11);
     let (vs, extra) = all.split_at(3_000);
     let s = store_with(Store::in_memory(StoreOptions::default()), vs);
+    // A parallel build's graph depends on how its threads interleave, so on the machine's
+    // load, and one query's recall@10 then varies between 0.8 and 1 from run to run. The
+    // graph is built one node at a time instead, so every run checks the same graph.
+    s.sequential_vector_builds(true);
     s.create_vector_index("emb", config(0)).unwrap();
     s.wait_vector_index("emb").unwrap();
     let mut z = 5u64;
@@ -293,13 +300,20 @@ fn many_random_changes_match_the_oracle() {
             },
         );
         assert_eq!(info.method, "hnsw");
-        // nothing deleted ever appears, and with a wide search the result is exact
+        // nothing deleted ever appears
         for (i, p) in present.iter().enumerate() {
             if !p {
                 let id = snap.lookup_iri(&format!("urn:n{i}")).unwrap().0;
                 assert!(ann.iter().all(|h| h.0 != id));
             }
         }
+        // a row's score does not depend on the path
+        for a in &ann {
+            if let Some(e) = exact.iter().find(|e| e.0 == a.0) {
+                assert_eq!(a.1.to_bits(), e.1.to_bits());
+            }
+        }
+        // a wide search finds nearly all of the exact result
         assert!(recall(&ann, &exact) >= 0.9, "round {round}");
         // inserted rows are scored exactly: the new one is found for itself
         let (own, _) = search(&snap, e, 1, SearchMode::default());

@@ -33,6 +33,8 @@ pub(crate) struct VectorRegistry {
     indexes: RwLock<BTreeMap<String, Arc<IndexEntry>>>,
     /// test hook: background builds wait before they publish
     paused: AtomicBool,
+    /// test hook: builds insert graph nodes one at a time, so graphs are reproducible
+    sequential: AtomicBool,
 }
 
 /// One configured index and the state of its builds.
@@ -352,6 +354,14 @@ impl Store {
         self.vector.paused.store(on, Ordering::SeqCst);
     }
 
+    /// Test hook: build the HNSW graphs of later builds one node at a time. A parallel
+    /// build's graph depends on the order in which its threads insert nodes, and so on
+    /// the machine's load; a sequential one is the same every time.
+    #[doc(hidden)]
+    pub fn sequential_vector_builds(&self, on: bool) {
+        self.vector.sequential.store(on, Ordering::SeqCst);
+    }
+
     fn entry_status(&self, e: &IndexEntry, snap: &Snapshot) -> VectorIndexStatus {
         let built = snap.generation.vectors.built(&e.name);
         let info = e.info.lock();
@@ -526,6 +536,7 @@ impl Store {
             None
         };
         let write = self.opts.vector_files;
+        let sequential = self.vector.sequential.load(Ordering::SeqCst);
         let current = Arc::downgrade(&self.current);
         let registry = Arc::downgrade(&self.vector);
         let uid = snap.generation.uid;
@@ -548,6 +559,7 @@ impl Store {
                     files,
                     load,
                     write,
+                    sequential,
                 };
                 let gv = &snap.generation.vectors;
                 let install = |b: Arc<Built>| {
