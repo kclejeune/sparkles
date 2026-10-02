@@ -238,3 +238,49 @@ fn schema_graph_follows_commits() {
     insert("ex:Kitten rdfs:subClassOf ex:Cat");
     assert_eq!(animals(&store), 2);
 }
+
+/// A class with many subclasses: its instances come from one scan joined with a table of
+/// the subclasses instead of a union of scans, with the same answers.
+#[test]
+fn many_subclasses() {
+    let ex = "http://example.org/";
+    let sub = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+    let ty = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    let mut schema = Vec::new();
+    let mut data = String::new();
+    for i in 0..40 {
+        schema.push(oxrdf::Triple::new(
+            oxrdf::NamedNode::new_unchecked(format!("{ex}C{i}")),
+            oxrdf::NamedNode::new_unchecked(sub),
+            oxrdf::NamedNode::new_unchecked(format!("{ex}Top")),
+        ));
+        // every other class has an instance, and C0 has a stored Top instance too
+        if i % 2 == 0 {
+            data.push_str(&format!("<{ex}i{i}> <{ty}> <{ex}C{i}> .\n"));
+        }
+    }
+    data.push_str(&format!("<{ex}i0> <{ty}> <{ex}Top> .\n"));
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let opts = QueryOptions {
+        rdfs: Some(Arc::new(RdfsOnRead::fixed(RdfsSchema::from_triples(
+            &schema,
+        )))),
+        ..Default::default()
+    };
+    let count = |q: &str| {
+        query(s.snapshot(), &format!("{PREFIXES}{q}"), &opts)
+            .unwrap()
+            .rows()
+            .len()
+    };
+    assert_eq!(count("SELECT ?x { ?x a ex:Top }"), 20);
+    assert_eq!(count("SELECT ?x { GRAPH ?g { ?x a ex:Top } }"), 0);
+    // each instance: its stored class and ex:Top, once for i0
+    assert_eq!(count("SELECT ?x ?t { ?x a ?t }"), 40);
+}

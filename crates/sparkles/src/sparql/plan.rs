@@ -743,20 +743,22 @@ impl<'a> Planner<'a> {
             } => {
                 let vars: Vec<VarId> = variables.iter().map(|v| self.ctx.var(v.as_str())).collect();
                 let mut t = Table::new(vars.clone());
+                // a term repeated in the table is looked up once
+                let mut seen: FxHashMap<&GroundTerm, Id> = FxHashMap::default();
                 for row in bindings {
                     let ids: Vec<Id> = row
                         .iter()
                         .map(|t| match t {
                             None => Id::UNDEF,
-                            Some(GroundTerm::NamedNode(n)) => {
-                                self.ctx.intern_term(&Term::NamedNode(n.clone()))
-                            }
-                            Some(GroundTerm::Literal(l)) => {
-                                self.ctx.intern_term(&Term::Literal(l.clone()))
-                            }
-                            Some(t @ GroundTerm::Triple(_)) => {
-                                self.ctx.intern_term(&ground_term(t))
-                            }
+                            Some(t) => *seen.entry(t).or_insert_with(|| match t {
+                                GroundTerm::NamedNode(n) => {
+                                    self.ctx.intern_term(&Term::NamedNode(n.clone()))
+                                }
+                                GroundTerm::Literal(l) => {
+                                    self.ctx.intern_term(&Term::Literal(l.clone()))
+                                }
+                                GroundTerm::Triple(_) => self.ctx.intern_term(&ground_term(t)),
+                            }),
                         })
                         .collect();
                     t.push_row(&ids);

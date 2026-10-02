@@ -334,6 +334,10 @@ pub fn rewrite(gp: &GraphPattern, schema: &RdfsSchema) -> GraphPattern {
 
 const TYPE: NamedNodeRef<'static> = rdf::TYPE;
 
+/// The most constants a pattern is expanded into as a union of patterns; more are joined
+/// as a table.
+const MAX_UNION: usize = 16;
+
 struct Rewriter<'a> {
     s: &'a RdfsSchema,
     n: Cell<u32>,
@@ -608,14 +612,21 @@ impl Rewriter<'_> {
         }
         // superclasses of stored types
         match o {
-            TermPattern::NamedNode(t) => {
-                for c in RdfsSchema::get(&self.s.sub_class, t.as_ref())
-                    .into_iter()
-                    .flatten()
-                {
-                    b.push(tp(s, &ty, &TermPattern::NamedNode(c.clone())));
+            TermPattern::NamedNode(t) => match RdfsSchema::get(&self.s.sub_class, t.as_ref()) {
+                // many subclasses: one scan joined with a table of them
+                Some(subs) if subs.len() > MAX_UNION => {
+                    let c = TermPattern::Variable(self.fresh());
+                    let rows = subs.iter().map(|c| vec![c.clone()]);
+                    if let Some(g) = with_table(tp(s, &ty, &c), &[&c], rows) {
+                        b.push(g);
+                    }
                 }
-            }
+                subs => {
+                    for c in subs.into_iter().flatten() {
+                        b.push(tp(s, &ty, &TermPattern::NamedNode(c.clone())));
+                    }
+                }
+            },
             TermPattern::Variable(_) => {
                 let c = TermPattern::Variable(self.fresh());
                 let rows = self.s.class_pairs();
