@@ -182,7 +182,9 @@ authentication.
   memory budget.
 * **Immutable base plus delta.** Updates are layered on the immutable index, in the style
   of QLever's `DeltaTriples`. Snapshots are versioned, and caches are keyed by snapshot
-  version.
+  version. A scan merges the delta into the blocks it changes. It finds the base rows
+  between two delta keys by binary search, and only those blocks have every column
+  decoded.
 * **Columnar execution and planning.** Execution is column-major. The planner is a DP over
   interesting sort orders with a greedy fallback, and merge joins run on sorted scans.
 * **Decoded-block cache.** A shared cache of decoded blocks, weighted by bytes.
