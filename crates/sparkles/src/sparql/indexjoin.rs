@@ -1222,14 +1222,13 @@ fn spans(col: &[Id], keys: &[u64], gallop: bool) -> Vec<(u32, u32)> {
     let mut out = Vec::with_capacity(keys.len());
     let mut i = 0;
     for &k in keys {
-        let e;
-        if gallop {
+        let e = if gallop {
             i = gallop_to(i, col.len(), |x| col[x].0 < k);
-            e = gallop_to(i, col.len(), |x| col[x].0 == k);
+            gallop_to(i, col.len(), |x| col[x].0 == k)
         } else {
             i += col[i..].partition_point(|x| x.0 < k);
-            e = i + col[i..].partition_point(|x| x.0 == k);
-        }
+            i + col[i..].partition_point(|x| x.0 == k)
+        };
         out.push((i as u32, e as u32));
         i = e;
     }

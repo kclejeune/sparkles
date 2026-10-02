@@ -1790,14 +1790,13 @@ fn gallop(col: &[Id], from: usize, target: Id) -> usize {
     lo.min(hi) + col[lo.min(hi)..hi].partition_point(|x| *x < target)
 }
 
-/// The rows of a hash join's build side grouped by key, in partitions of about
-/// [`PART_ROWS`] rows chosen by bits of a hash of the key, so that each partition's table
-/// stays in the CPU caches while it is built. Within a partition the rows of the `g`-th
-/// key, in row order, are `rows[start[g]..start[g + 1]]`, and `map` finds `g` from the
-/// key (the id of a single key column, or a hash of several). A partition is laid out by
-/// counting each key's rows and then placing every row, so the build allocates a few
-/// arrays per partition instead of a list per key, and the partitions are built in
-/// parallel.
+/// The rows of a hash join's build side grouped by key. Within a partition, `map` finds
+/// the span of `rows` that holds a key's rows in row order (the key is the id of a single
+/// key column, or a hash of several). A partition is laid out by counting each key's rows
+/// and then placing every row, so the build allocates a few arrays instead of a list per
+/// key. A build side of [`PART_MIN`] rows or more is split by bits of a hash of the key
+/// into partitions of about [`PART_ROWS`] rows, whose tables stay in the CPU caches while
+/// they are built, in parallel.
 struct KeyGroups {
     /// the partition of a key is its mixed hash shifted right by this (64: one)
     shift: u32,
@@ -1805,8 +1804,7 @@ struct KeyGroups {
 }
 
 struct KeyPart {
-    map: FxHashMap<u64, u32>,
-    start: Vec<u32>,
+    map: FxHashMap<u64, (u32, u32)>,
     rows: Vec<u32>,
 }
 
@@ -1814,18 +1812,22 @@ struct KeyPart {
 /// per row fits in the per-core cache.
 const PART_ROWS: usize = 8192;
 
+/// Build sides with fewer rows have one partition, built on one thread: their table fits
+/// in the caches anyway, and handing pieces to other threads costs more than it saves.
+const PART_MIN: usize = 1 << 16;
+
 /// Probe rows per parallel piece of a hash join.
 const PROBE_PIECE: usize = 1 << 15;
 
 impl KeyGroups {
     fn build(ctx: &Ctx, t: &Table, cols: &[usize]) -> Result<KeyGroups> {
         let n = t.len();
-        let keys: Vec<u64> = map_rows(ctx, n, n >= PAR_MIN_LEN, |i| Self::key_of(t, cols, i))?;
-        let bits = (n / PART_ROWS)
-            .max(1)
-            .next_power_of_two()
-            .trailing_zeros()
-            .min(12);
+        let keys: Vec<u64> = map_rows(ctx, n, n >= PART_MIN, |i| Self::key_of(t, cols, i))?;
+        let bits = if n < PART_MIN {
+            0
+        } else {
+            (n / PART_ROWS).next_power_of_two().trailing_zeros().min(12)
+        };
         let shift = 64 - bits;
         if bits == 0 {
             let part = KeyPart::build(&keys, (0..n as u32).collect());
@@ -1887,10 +1889,7 @@ impl KeyGroups {
             &self.parts[(mix(k) >> self.shift) as usize]
         };
         match part.map.get(&k) {
-            Some(&g) => {
-                let g = g as usize;
-                &part.rows[part.start[g] as usize..part.start[g + 1] as usize]
-            }
+            Some(&(s, e)) => &part.rows[s as usize..e as usize],
             None => &[],
         }
     }
@@ -1903,26 +1902,30 @@ impl KeyGroups {
 impl KeyPart {
     /// The groups of the rows `rows` (in row order) of the keys `keys`.
     fn build(keys: &[u64], rows: Vec<u32>) -> KeyPart {
-        let mut map: FxHashMap<u64, u32> = FxHashMap::default();
-        map.reserve(rows.len().min(PART_ROWS * 2));
+        // each key's number while counting, then the span of its rows
+        let mut map: FxHashMap<u64, (u32, u32)> = FxHashMap::default();
+        map.reserve(rows.len().min(PART_MIN));
         let mut group: Vec<u32> = Vec::with_capacity(rows.len());
         let mut count: Vec<u32> = Vec::new();
         for &i in &rows {
             let next = count.len() as u32;
-            let g = *map.entry(keys[i as usize]).or_insert(next);
+            let g = map.entry(keys[i as usize]).or_insert((next, 0)).0;
             if g == next {
                 count.push(0);
             }
             count[g as usize] += 1;
             group.push(g);
         }
-        // `start[g]` is where the next row of key `g` goes, then the end of its rows
-        let mut start: Vec<u32> = Vec::with_capacity(count.len() + 1);
-        start.push(0);
+        // `start[g]`: where the rows of key `g` begin
+        let mut start: Vec<u32> = Vec::with_capacity(count.len());
         let mut at = 0u32;
         for c in &count {
-            at += c;
             start.push(at);
+            at += c;
+        }
+        for v in map.values_mut() {
+            let g = v.0 as usize;
+            *v = (start[g], start[g] + count[g]);
         }
         let mut placed = vec![0u32; rows.len()];
         for (&i, &g) in rows.iter().zip(&group) {
@@ -1930,14 +1933,7 @@ impl KeyPart {
             placed[*p as usize] = i;
             *p += 1;
         }
-        // placing the rows moved each start to the next key's start
-        start.rotate_right(1);
-        start[0] = 0;
-        KeyPart {
-            map,
-            start,
-            rows: placed,
-        }
+        KeyPart { map, rows: placed }
     }
 }
 
@@ -2077,6 +2073,7 @@ fn join_pairs(
         // the pairs of the probe rows `[s, e)`, in probe order; `total` counts the pairs
         // of all pieces for the output limits
         let total = AtomicUsize::new(0);
+        let pcol = single.then(|| &pt.cols[pcols[0]]);
         let piece = |s: usize, e: usize| -> Result<Vec<(u32, u32)>> {
             let mut out = Vec::new();
             let mut counted = 0;
@@ -2088,7 +2085,11 @@ fn join_pairs(
                     ctx.check()?;
                     ctx.check_output(all, w)?;
                 }
-                let m = groups.rows(KeyGroups::key_of(pt, &pcols, pi));
+                let k = match pcol {
+                    Some(c) => c[pi].0,
+                    None => KeyGroups::key_of(pt, &pcols, pi),
+                };
+                let m = groups.rows(k);
                 if m.len() > 1024 {
                     let all = total.load(AtomicOrdering::Relaxed);
                     ctx.check_output(all.saturating_add(out.len() - counted + m.len()), w)?;

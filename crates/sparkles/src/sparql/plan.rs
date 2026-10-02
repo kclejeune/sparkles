@@ -2365,11 +2365,12 @@ pub(super) fn join_est_from(a_est: f64, b_est: f64, denom: f64) -> f64 {
 /// probes it with each row of the larger one. With a list allocated per key, inserting a
 /// row takes 40 to 100 ns, about as long as scanning 48 rows.
 const HASH_BUILD_COST: f64 = 48.0;
-/// Inserting a row into the flat table, which is built in partitions that stay in the
-/// CPU caches, in parallel: about 21 ns a row where a scan reads a row in 2.2 ns (and the
-/// lists took 62), measured on generated tables by `costcal_tests::cal_tables`. A probe
-/// takes about as long as reading a row, in parallel pieces of the larger input.
-const FLAT_HASH_BUILD_COST: f64 = 12.0;
+/// Inserting a row into the flat table takes 10 to 15 ns on one thread while the table
+/// fits in the CPU caches, and 3 to 7 ns for a million rows built in partitions in
+/// parallel, where a scan reads a row in 2.2 ns and the lists took 18 to 62 ns (measured
+/// on generated tables by `costcal_tests::cal_tables`). A probe takes about 1.2 ns, in
+/// parallel pieces of the larger input, and is counted as one row.
+const FLAT_HASH_BUILD_COST: f64 = 8.0;
 
 /// What the join costs depend on besides the inputs: whether index joins are offered and
 /// what inserting a row into a hash table costs.
