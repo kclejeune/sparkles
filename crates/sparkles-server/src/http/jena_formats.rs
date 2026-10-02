@@ -1343,7 +1343,7 @@ mod tests {
         let b = BlankNode::new("b0").unwrap();
         let t = Triple {
             subject: ex("s").into(),
-            predicate: ex("p").into(),
+            predicate: ex("p"),
             object: Literal::new_simple_literal("x").into(),
         };
         vec![

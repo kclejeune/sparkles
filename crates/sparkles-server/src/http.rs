@@ -2175,7 +2175,7 @@ async fn spool_after(
 
 /// A serializer of a Graph Store GET body: oxrdfio's, or one of Jena's syntaxes.
 enum GraphOut<W: std::io::Write> {
-    Rdf(oxrdfio::WriterQuadSerializer<W>),
+    Rdf(Box<oxrdfio::WriterQuadSerializer<W>>),
     Jena(jena_formats::RdfWriter<W>),
     /// a writer that has finished
     Done,
@@ -2184,9 +2184,9 @@ enum GraphOut<W: std::io::Write> {
 impl<W: std::io::Write> GraphOut<W> {
     fn new(fmt: OutFormat, prefixes: std::collections::BTreeMap<String, String>, w: W) -> Self {
         match fmt {
-            OutFormat::Rdf(f) => GraphOut::Rdf(
+            OutFormat::Rdf(f) => GraphOut::Rdf(Box::new(
                 sparkles::io::with_prefixes(RdfSerializer::from_format(f), prefixes).for_writer(w),
-            ),
+            )),
             OutFormat::Jena(j) => GraphOut::Jena(jena_formats::RdfWriter::new(j, w)),
         }
     }

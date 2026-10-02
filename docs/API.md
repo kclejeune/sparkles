@@ -605,35 +605,46 @@ type Task = {
 };
 ```
 
-Request counters (`FusekiCounters`, and Prometheus' `fuseki_requests*` families with
-`--metrics-fuseki-names`) are kept while metrics are on, and are empty with
-`--no-metrics`. `GET /$/server` also has Fuseki's `startDateTime` and `uptime` (seconds).
+**Task slots.** At most `sparkles serve --max-tasks` background tasks run at once (default
+4, `0` for no limit). Background tasks are compaction, clones, reasoning, full-text and
+spatial index builds, and N-Quads backups. The others wait as `queued`, in start order,
+and can be cancelled while they wait. Backup repository tasks (`backup-*` kinds) wait for
+their own `--backup-max-tasks` slots instead. Starting a task while 1000 already wait
+returns `503`. The task list keeps every queued and running task and the 200 most recent
+finished ones.
+
+The request counters behind `FusekiCounters`, which also feed the `fuseki_requests*`
+families of `--metrics-fuseki-names`, are kept while metrics are on. With `--no-metrics`
+they stay empty. `GET /$/server` also has Fuseki's `startDateTime`, and `uptime` in
+seconds.
 
 ### Assembler bodies
 
-`POST /$/datasets` with a body in an RDF syntax (`text/turtle`, `application/trig`,
-`application/n-triples`, `application/n-quads`, `application/rdf+xml` or
-`application/ld+json`) reads a Fuseki service description, as older Fuseki versions did
-(Fuseki 6 refuses them). It takes the part of a `config.ttl` that maps to a Sparkles
-dataset:
+`POST /$/datasets` with a body in an RDF syntax reads a Fuseki service description, the
+way older Fuseki versions did. Fuseki 6 itself refuses such bodies. The syntaxes are
+`text/turtle`, `application/trig`, `application/n-triples`, `application/n-quads`,
+`application/rdf+xml` and `application/ld+json`. Sparkles reads the part of a
+`config.ttl` that maps to one of its datasets.
 
-* one `fuseki:Service` with a `fuseki:name` and a `fuseki:dataset`;
-* endpoints (`fuseki:endpoint [ fuseki:operation …; fuseki:name … ]`, or the older
-  `fuseki:serviceQuery` and similar properties) for operations Sparkles serves, at the
-  names it serves them at: `query` at the dataset URL, `sparql` or `query`, `update` at
-  the dataset URL or `update`, `gsp-rw` and `gsp-r` at the dataset URL, `data` or `get`,
-  `upload`, `shacl` and `prefixes-r` or `prefixes-rw` at `prefixes`, and
-  `gsp-direct-rw` or `gsp-direct-r` when the server runs with `--gsp-direct-naming`;
-* a dataset of type `tdb2:DatasetTDB2` or `tdb:DatasetTDB`, which becomes a persistent
-  dataset (or an in-memory one at `tdb2:location "--mem--"`), or `ja:MemoryDataset`,
-  `ja:DatasetTxnMem` or `ja:RDFDataset`, which become in-memory datasets.
+* The description has one `fuseki:Service` with a `fuseki:name` and a `fuseki:dataset`.
+* Its endpoints, given as `fuseki:endpoint` or with older properties such as
+  `fuseki:serviceQuery`, name operations that Sparkles serves, at the names it serves
+  them at. Queries are served at the dataset URL, `sparql` and `query`. Updates are
+  served at the dataset URL and `update`, and `gsp-rw` and `gsp-r` at the dataset URL,
+  `data` and `get`. `upload` and `shacl` keep their names, and `prefixes-r` and
+  `prefixes-rw` are served at `prefixes`. `gsp-direct-rw` and `gsp-direct-r` need a
+  server started with `--gsp-direct-naming`.
+* A dataset of type `tdb2:DatasetTDB2` or `tdb:DatasetTDB` becomes a persistent dataset,
+  unless its location is `--mem--`. A `ja:MemoryDataset`, `ja:DatasetTxnMem` or
+  `ja:RDFDataset` becomes an in-memory dataset.
 
-`tdb2:location` is ignored, as Sparkles keeps its databases under its data directory, and
-`tdb2:unionDefaultGraph` must match `--union-default-graph`. Everything else is a `400`
-that names it: other dataset types (text indexes, inference, GeoSPARQL), data to load
-(`ja:data`), contexts, access control in the description, RDF Patch, custom endpoint names,
-and a service with no write endpoint, since Sparkles serves every endpoint of a dataset.
-The error says what to do instead where Sparkles has it, such as `PUT /$/text/{ds}` for a
+`tdb2:location` is otherwise ignored, because Sparkles keeps its databases under its data
+directory. `tdb2:unionDefaultGraph` must match `--union-default-graph`. Everything else
+is refused with a `400` that names it. That covers other dataset types such as text
+indexes, inference and GeoSPARQL, data to load with `ja:data`, contexts, access control in
+the description, RDF Patch and custom endpoint names. A service without a write endpoint
+is refused too, since Sparkles serves every endpoint of a dataset. Where Sparkles has
+another way to get the same result, the error names it, such as `PUT /$/text/{ds}` for a
 text index or `--auth-config` for access control.
 
 ### Validators
@@ -655,14 +666,6 @@ number}]`, as in Fuseki. `formatted` is the formatter's output (the parser's ser
 in a build without the `fmt` feature), and `algebra` is the SPARQL algebra in SSE. Fuseki
 also gives the algebra in quad form and optimized, which Sparkles does not. Fuseki's
 language tag validator answers in HTML only. A missing parameter is a `400`.
-
-**Task slots.** At most `sparkles serve --max-tasks` background tasks run at once (default
-4, `0` for no limit). Background tasks are compaction, clones, reasoning, full-text and
-spatial index builds, and N-Quads backups. The others wait as `queued`, in start order,
-and can be cancelled while they wait. Backup repository tasks (`backup-*` kinds) wait for
-their own `--backup-max-tasks` slots instead. Starting a task while 1000 already wait
-returns `503`. The task list keeps every queued and running task and the 200 most recent
-finished ones.
 
 ## Schema discovery
 
