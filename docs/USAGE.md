@@ -165,6 +165,7 @@ sparkles backup  --loc db --out backups/      # zstd; --compress gzip --level 9,
 sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
 sparkles stats   --loc db
 sparkles log     --loc db                     # commit history (works next to a running server)
+sparkles diff    --loc db 41 42               # what commit 42 changed, as + and - N-Quads lines
 sparkles check   --loc db                     # verify the files, read-only (--quick, --format json)
 sparkles infer   --loc db --profile owl-rl    # materialize inferences
 sparkles infer   --loc db --status            # are the inferences up to date?
@@ -186,6 +187,28 @@ sparkles update --loc db --message 'Fix the labels of ex:alice' 'DELETE … INSE
 sparkles load   --server http://localhost:3030 --dataset ds --message 'Nightly import' data.ttl
 sparkles log    --loc db                      # the message follows each commit's columns
 ```
+
+Past states are read with `--at`, which takes a commit number, `commit:N`,
+`time:<RFC 3339>` or `snapshot:NAME`. Every commit since the last compaction or bulk
+commit can be read, and `sparkles log` marks them with `*`. A named snapshot or the
+retention window keeps older ones. `sparkles diff` shows the quads added and removed
+between two states, and `--format json` or `--format count` change its output.
+
+```sh
+sparkles query    --loc db --at snapshot:release-1 'SELECT ...'
+sparkles dump     --loc db --at time:2026-09-30T14:00:00Z > then.nq
+sparkles clone    --loc db --to sandbox --at commit:40
+sparkles diff     --loc db snapshot:release-1 head --graph http://ex.org/g
+sparkles snapshot create   --loc db release-1 --note 'before the migration'
+sparkles snapshot create   --loc db tmp --expires 7d
+sparkles snapshot retain   --loc db --keep-age 7d --max-bytes 20GiB
+sparkles snapshot schedule --loc db --prefix daily- --every 1d --keep-last 7
+sparkles snapshot gc       --loc db        # expire pins, make scheduled ones, collect
+```
+
+A running server does the work of `snapshot gc` every minute. Over HTTP the same
+features are `?at=`, `GET /{ds}/diff`, `/$/snapshots/{ds}` and `/$/history/{ds}`
+([API: Point-in-time reads and snapshots](API.md#point-in-time-reads-and-snapshots)).
 
 The global flag `--commit-digests` makes a command record a change digest with every
 commit of the databases it opens. A database keeps the setting once it is on, so later

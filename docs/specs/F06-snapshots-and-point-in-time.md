@@ -4,9 +4,11 @@
 >
 > **Phases:** Phase 1 shipped. It covers point-in-time reads with `?at=`, named
 > snapshots, the `keepCommits`/`keepAge` retention window, `/$/snapshots`, `/$/history`,
-> the `sparkles snapshot` CLI, `query --at` and `dump --at`. Phase 2 and Phase 3 are not
-> built. Phase 2 covers diffs, `Accept-Datetime`, `maxBytes` retention and scheduled
-> pins, history for in-memory datasets, and the UI's snapshot panel and `at` selector.
+> the `sparkles snapshot` CLI, `query --at` and `dump --at`. Phase 2 shipped except the
+> replay speedups and warm pins. It covers diffs, `Accept-Datetime`, `maxBytes`
+> retention, pin expiry and schedules, history for in-memory datasets, `at` on more
+> endpoints, history metrics, and the UI's snapshot panel and `at` selector. Phase 3 is
+> not built.
 >
 > **User docs:** [API: Point-in-time reads and snapshots](../API.md#point-in-time-reads-and-snapshots) ·
 > [Features](../FEATURES.md#storage-tdb2-equivalent) ·
@@ -1121,8 +1123,114 @@ part keeps the tags of different serializations apart. `Cache-Control: immutable
 sent. A dataset deleted and re-created under the same name starts its commits again at 0,
 so the URL of `at=commit:N` can later name a different state.
 
-**Not built.** The rest of Phase 2 is not built: diffs, `Accept-Datetime`, `maxBytes`
-retention, per-pin expiry and scheduled pins, history for in-memory datasets, `at` on
-schema, stats, SHACL, clone and backup, history metrics, and the UI's snapshot panel and
-`at` selector. Nor is Phase 3: a generation-independent change log, full-text search at
-pins, history queries and pin rebasing.
+### Phase 2
+
+Phase 2 landed on 2026-10-02 in four commits. `8ec0c57` changed the engine, `601c2cf`
+added the diff endpoint, `Accept-Datetime` and the history settings to the server and
+CLI, `b09f623` added `at` to more endpoints, and `6282681` changed the UI.
+
+**Diffs.** `Store::diff`, `GET /{ds}/diff?from=&to=` and `sparkles diff` return the net
+quads added and removed between two readable commits, in either order. The design rests
+on one property of the write-ahead log: every change it records took effect. An insert
+is logged only for an absent quad and a delete only for a present one. The net
+difference between two commits is then the symmetric difference of the changes between
+them. Each change toggles its quad in a map, and a quad changed back cancels out. A
+quad's first change tells its state at `from`, and its last change tells its state at
+`to`, so no base index is probed.
+
+A diff plans its way from the older commit to the newer one through the retained
+generations. Where a generation's base is at or before the current position, its log
+covers the next stretch, and the planner takes the log that reaches furthest. A
+compaction does not change the data, so the walk continues in the next generation's log
+from its base. A bulk commit has no log records, and a collected generation leaves a gap.
+Those stretches compare the two states. The older state's quads are translated into the
+newer generation's ids through the vocabulary, sorted, and merged with a sorted GSPO scan
+of the newer state. A quad with a term the newer generation lacks is removed outright.
+Two states of one generation, which is the in-memory case, differ only in their deltas,
+so only the delta keys are compared. Generation ids are local to a generation, so each
+stretch's changes are turned into vocabulary keys before they are combined.
+
+The JSON format has counts, `method` (`log`, `compare` or `same`) and, with `quads=true`,
+the changes as `{op, subject, predicate, object, graph}`. The diff format
+(`text/x-sparkles-diff`) has one N-Quads line per change, marked `+ ` or `- `. Removals
+come first, then additions, each ordered by graph, subject, predicate and object. `to`
+defaults to the head and `from` to the commit before `to`. `graph=` limits a diff to one
+graph. Large bodies stream. A diff between two `commit:` selectors gets a weak entity tag.
+
+**Diff performance.** A release build measured these times on one run, with other builds
+running on the machine. The dataset had a bulk-built base of 1,000,000 quads, then 20,000
+commits of 5 inserts each (`diff_performance` in `crates/sparkles/tests/diff.rs`).
+
+| Diff | Path | Time |
+|---|---|---|
+| All 20,000 commits (100,000 changes) | log | 84–152 ms |
+| The last 100 commits | log | 2.0–2.3 ms |
+| One commit | log | 1.6–1.8 ms |
+| 1,003 commits across a compaction | log | 22–41 ms |
+| A bulk commit of 50,000 quads, two states of 1.1 M quads | compare | 0.75 s |
+
+A diff of one commit at the end of a long log spends most of its time finding the commit,
+because the walk reads the log from the generation's base. The sparse offset index of §5.3
+would remove that cost.
+
+**Memento.** A Graph Store `GET` or `HEAD` without `at` is its own TimeGate, with
+200-style negotiation. `Accept-Datetime` selects the last readable commit at or before
+the end of that second, clamped to the oldest readable commit. The response carries
+`Memento-Datetime`, `Content-Location` with the memento's `at=commit:N` URL,
+`Link: <…>; rel="original timegate"` and `Vary: accept-datetime`. Graph Store reads
+without the header send `Vary: accept-datetime` as well.
+
+**Retention and pins.** `Retention.maxBytes` caps the disk of the generations that only
+the window keeps, removing the oldest first. Pins take an `expires` time. Schedules
+(`{prefix, every, keepLast}`, stored in `history.json`) pin the head as
+`<prefix><UTC time>`, skip a pin when the newest one already holds the head, and rotate
+the oldest out. `Store::history_tick` expires pins, runs the schedules and collects, and
+a server runs it every minute. `sparkles snapshot schedule` and `snapshot gc` are the
+CLI for them.
+
+**In-memory datasets.** Pins and the retention window keep `Arc<Snapshot>`s, which share
+their structure with the live state. A commit that no pin or window holds is `410
+history-gone`. Diffs between them compare snapshots.
+
+**Other endpoints.** `at` works on `/$/stats`, `/$/schema`, `/{ds}/shacl`,
+`/$/datasets/{ds}/clone` (recorded as `forkedFrom.seq`) and `/$/backup` (named after the
+commit). Stats report `commit`, `at` and the `history` summary of §2.5. `sparkles clone`
+takes `--at`. `sparkles log` marks the readable commits with `*`. `/$/metrics` reports
+`sparkles_history_bytes`, `sparkles_history_snapshots`, `sparkles_history_cache_entries`,
+the cache hit and miss counters, and `sparkles_history_materialize_seconds_count` and
+`_sum`.
+
+**UI.** The dataset page has a Snapshots panel with the readable ranges and retention,
+creation (with an expiry) and deletion. Its figures can show a past state. The commit
+history marks unreadable commits and snapshot pins, opens the query page at a commit, and
+shows the changes of a commit, or between any two, as signed N-Quads lines. The query page
+has an At field, offers the dataset's snapshots in it, and labels a result read at a past
+state with "at commit 42 · 3 h ago".
+
+**Phase 2 deviations.**
+
+- There is no `--diff-max-quads`. The change set and the sort buffer of a comparison
+  count against the existing rows budget (`--max-rows`), and the body against
+  `--max-export-mb`.
+- The log walk is not limited to one generation. It crosses compactions, and only bulk
+  commits and gaps are compared, as §6 asked.
+- RDF Patch output is not offered, the default of open question 3.
+- History upkeep runs every minute, not every hour, so that schedules shorter than an
+  hour keep time.
+- An in-memory dataset answers `410` for a commit it does not keep, where Phase 1 answered
+  `501`. `maxBytes` does not apply to it, and its history status lists no generations.
+- The Graph Store sends no `Cache-Control: immutable`, as in Phase 1.
+
+**Phase 2 tests.** `crates/sparkles/tests/diff.rs` checks diffs against the two
+materialized states for random commit sequences with deletes and re-inserts, across
+compactions, bulk commits and a collected generation, for one graph and all, in
+persistent and in-memory stores. It also covers the rows budget, pin expiry, schedules
+and `maxBytes`. `http/diff_tests.rs` covers both diff formats, defaults, errors, entity
+tags, the budget, `Accept-Datetime`, the history settings and metrics, in-memory history,
+and `at` on stats, schema, SHACL, clone and backup. `ui/src/lib/history.test.ts` covers
+selector parsing, the result label and diff formatting.
+
+**Not built.** The replay speedups of §5.3 (reusing a cached delta, replaying backwards
+and the sparse offset index), `warm` pins, and clones into an in-memory dataset are not
+built. Nor is Phase 3: a generation-independent change log, full-text search at pins,
+history queries and pin rebasing.

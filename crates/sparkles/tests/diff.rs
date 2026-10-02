@@ -527,3 +527,102 @@ fn max_bytes_trims_the_window() {
     assert_eq!(kept, ["gen-0003"]);
     assert!(st.bytes <= newest + 1);
 }
+
+/// Timings of the two diff paths: `cargo test --release -p sparkles --test diff --
+/// --ignored --nocapture`. `DIFF_BASE` quads (default 1,000,000) in a bulk-built base,
+/// then 20,000 commits of 5 inserts each, then a compaction and a bulk commit.
+#[test]
+#[ignore = "a benchmark"]
+fn diff_performance() {
+    use oxrdf::{Literal, Term};
+    use sparkles::id::Id;
+    use std::time::Instant;
+    let base: usize = std::env::var("DIFF_BASE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(
+        &dir.path().join("db"),
+        StoreOptions {
+            bulk_threshold: 10_000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    s.set_retention(keep_all()).unwrap();
+    let nt: String = (0..base)
+        .map(|i| format!("<urn:s{}> <urn:p{}> \"v{i}\" .\n", i / 10, i % 7))
+        .collect();
+    let t = Instant::now();
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    eprintln!("load {base} quads: {:.2?}", t.elapsed());
+    let first = s.head_commit().seq;
+    let t = Instant::now();
+    let mut r = Rng(5);
+    for c in 0..20_000u64 {
+        let mut w = s.write();
+        for k in 0..5u64 {
+            let subj = w
+                .intern(&Term::NamedNode(NamedNode::new_unchecked(format!(
+                    "urn:s{}",
+                    r.below(base as u64 / 10)
+                ))))
+                .unwrap();
+            let pred = w
+                .intern(&Term::NamedNode(NamedNode::new_unchecked("urn:p0")))
+                .unwrap();
+            let obj = w
+                .intern(&Term::Literal(Literal::new_simple_literal(format!(
+                    "n{c}-{k}"
+                ))))
+                .unwrap();
+            w.insert([subj, pred, obj, Id::DEFAULT_GRAPH]).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    eprintln!("20,000 commits of 5 inserts: {:.2?}", t.elapsed());
+    let head = s.head_commit().seq;
+    let time = |what: &str, a: u64, b: u64| {
+        let t = Instant::now();
+        let d = s
+            .diff(&At::Commit(a), &At::Commit(b), &Default::default())
+            .unwrap();
+        eprintln!(
+            "{what}: commits {a}..{b}: +{} -{} by {} in {:.2?} ({} log changes, {} quads compared)",
+            d.added,
+            d.removed,
+            d.method.as_str(),
+            t.elapsed(),
+            d.log_changes,
+            d.compared
+        );
+    };
+    time("log, every commit", first, head);
+    time("log, the last 100 commits", head - 100, head);
+    time("log, one commit", head - 1, head);
+    s.compact().unwrap();
+    for i in 0..3 {
+        let q = format!("INSERT DATA {{ <urn:after{i}> <urn:p> {i} }}");
+        update(&s, &q, &QueryOptions::default()).unwrap();
+    }
+    time("log across a compaction", head - 1_000, s.head_commit().seq);
+    let before = s.head_commit().seq;
+    // over the bulk threshold by the size estimate (80 bytes a quad)
+    let nt: String = (0..50_000)
+        .map(|i| format!("<urn:bulk{i}> <urn:p> \"b{i}\" .\n"))
+        .collect();
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    assert!(s.head_commit().bulk);
+    time("compare across a bulk commit", before, s.head_commit().seq);
+}
