@@ -26,6 +26,7 @@
   import TaskList from '$components/TaskList.svelte';
   import TermView from '$components/TermView.svelte';
   import TurtleEditor from '$components/TurtleEditor.svelte';
+  import WriteValidationPanel from '$components/WriteValidationPanel.svelte';
 
   const name = $derived(page.params.name ?? '');
   const info = $derived(app.datasets.find((d) => d.name === name));
@@ -795,6 +796,9 @@ ex:PersonShape a sh:NodeShape ;
             </div>
           {/if}
         </section>
+
+        <!-- write-time validation -->
+        <WriteValidationPanel {name} {prefixes} refreshKey={refreshKick} />
 
         <!-- predicates -->
         <section class="panel">

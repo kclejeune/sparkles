@@ -171,6 +171,16 @@ async fn reject_mode_over_http() {
     .await
     .json();
     assert!(s["status"]["counters"]["rejected"].as_u64().unwrap() >= 2);
+    // the last write and the last rejections, for the dataset page
+    let st = &s["status"];
+    assert_eq!(st["lastCheck"]["status"], "rejected");
+    assert_eq!(st["recentRejections"][0]["kind"], "gsp-put");
+    assert_eq!(
+        st["recentRejections"][1]["first"]["focusNode"]["value"],
+        "http://ex.org/b"
+    );
+    assert_eq!(st["incremental"]["localShapes"], 1);
+    assert_eq!(st["baseline"]["bySeverity"]["violation"], 0);
 }
 
 #[tokio::test]

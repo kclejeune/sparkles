@@ -107,6 +107,57 @@ pub fn validate_node(
     engine.run(Some(focus))
 }
 
+/// The focus nodes a shape is validated on (see [`validate_selected`]).
+#[derive(Clone, Debug)]
+pub(crate) enum Sel {
+    /// none: the shape is not validated
+    Skip,
+    /// every focus node of its targets
+    All,
+    /// those of these nodes that its targets select
+    Nodes(Vec<Id>),
+}
+
+/// The outcome of one shape of [`validate_selected`].
+#[derive(Debug, Default)]
+pub(crate) struct ShapeRun {
+    pub results: Vec<ValidationResult>,
+    /// the focus nodes validated
+    pub focus: usize,
+}
+
+/// Validate each shape (by [`ShapeId`]) on the focus nodes `sel` picks for it, over
+/// `data` (with `ids`, the ids of the shapes' terms in it). Ids in `sel` may be ids of
+/// `ids_of`, a later state of the same store than `data` (the post-state of a write
+/// whose pre-state `data` reads): an id of a term `data` does not have is resolved by
+/// its term, so a `sh:targetNode` the write added still matches.
+pub(crate) fn validate_selected(
+    data: &mut DataGraph,
+    ids: &[Id],
+    shapes: &Shapes,
+    opts: &ValidateOptions,
+    sel: &[Sel],
+    ids_of: Option<&Snapshot>,
+) -> Result<Vec<ShapeRun>> {
+    let mut sel = sel.to_vec();
+    if let Some(after) = ids_of {
+        let known = data.snap.dvocab_len;
+        for s in &mut sel {
+            if let Sel::Nodes(nodes) = s {
+                for n in nodes.iter_mut() {
+                    // a delta id past the snapshot's vocabulary: a term it does not have
+                    let unknown = n.tag() == sparkles::id::Tag::Delta && n.payload() >= known;
+                    if unknown && let Some(t) = after.term(*n) {
+                        *n = data.resolve(&t, shapes.bnodes_in_store);
+                    }
+                }
+            }
+        }
+    }
+    let engine = Engine::new(shapes, data, ids.to_vec(), opts)?;
+    engine.run_shapes(&sel)
+}
+
 /// Result path of a raw result.
 pub(crate) enum RPath {
     None,
@@ -242,22 +293,52 @@ impl<'a> Engine<'a> {
     }
 
     fn run(&self, only: Option<Id>) -> Result<ValidationReport> {
-        let mut results = Vec::new();
+        let sel: Vec<Sel> = (0..self.shapes.shapes.len())
+            .map(|_| match only {
+                None => Sel::All,
+                Some(f) => Sel::Nodes(vec![f]),
+            })
+            .collect();
+        let results: Vec<ValidationResult> = self
+            .run_shapes(&sel)?
+            .into_iter()
+            .flat_map(|r| r.results)
+            .collect();
+        Ok(ValidationReport {
+            conforms: results.is_empty(),
+            results,
+        })
+    }
+
+    /// Validate each shape with targets on the focus nodes `sel` picks for it, in shape
+    /// order: the results and the number of focus nodes of every shape.
+    fn run_shapes(&self, sel: &[Sel]) -> Result<Vec<ShapeRun>> {
+        let mut runs = Vec::with_capacity(self.shapes.shapes.len());
         for (si, shape) in self.shapes.shapes.iter().enumerate() {
+            let mut run = ShapeRun::default();
             if shape.targets.is_empty() || shape.deactivated {
+                runs.push(run);
                 continue;
             }
             self.check_limits()?;
-            let focus = match only {
-                None => self.focus_nodes(si)?,
-                Some(f) => {
-                    if self.is_target(si, f)? {
-                        vec![f]
-                    } else {
-                        continue;
+            let focus = match &sel[si] {
+                Sel::Skip => {
+                    runs.push(run);
+                    continue;
+                }
+                Sel::All => self.focus_nodes(si)?,
+                Sel::Nodes(nodes) => {
+                    let mut seen = FxHashSet::default();
+                    let mut out = Vec::new();
+                    for &f in nodes {
+                        if seen.insert(f) && self.is_target(si, f)? {
+                            out.push(f);
+                        }
                     }
+                    out
                 }
             };
+            run.focus = focus.len();
             let chunk = |nodes: &[Id]| -> Result<Vec<ValidationResult>> {
                 let mut out = Out::collect();
                 let mut cx = Cx::default();
@@ -272,24 +353,22 @@ impl<'a> Engine<'a> {
                 Ok(out.results)
             };
             if self.parallel && focus.len() >= 512 {
-                let run = || -> Vec<Result<Vec<ValidationResult>>> {
+                let run_par = || -> Vec<Result<Vec<ValidationResult>>> {
                     focus.par_chunks(256).map(chunk).collect()
                 };
                 let parts = match &self.pool {
-                    Some(pool) => pool.install(run),
-                    None => run(),
+                    Some(pool) => pool.install(run_par),
+                    None => run_par(),
                 };
                 for p in parts {
-                    results.extend(p?);
+                    run.results.extend(p?);
                 }
             } else {
-                results.extend(chunk(&focus)?);
+                run.results = chunk(&focus)?;
             }
+            runs.push(run);
         }
-        Ok(ValidationReport {
-            conforms: results.is_empty(),
-            results,
-        })
+        Ok(runs)
     }
 
     /// Focus nodes of a shape's targets (distinct, in target order).

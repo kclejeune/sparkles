@@ -815,13 +815,18 @@ async fn validation_metrics_count_writes_by_status_and_severity() {
             r#"sparkles_validation_total{dataset="ds",language="shacl",status="timeout"}"#,
             0.0,
         ),
+        // the head's state is known once validation is on: writes are incremental
         (
-            r#"sparkles_validation_duration_seconds_count{dataset="ds",language="shacl",strategy="full"}"#,
+            r#"sparkles_validation_duration_seconds_count{dataset="ds",language="shacl",strategy="incremental"}"#,
             2.0,
         ),
         (
-            r#"sparkles_validation_duration_seconds_bucket{dataset="ds",language="shacl",strategy="full",le="+Inf"}"#,
+            r#"sparkles_validation_duration_seconds_bucket{dataset="ds",language="shacl",strategy="incremental",le="+Inf"}"#,
             2.0,
+        ),
+        (
+            r#"sparkles_validation_fallbacks_total{dataset="ds",language="shacl",reason="baseline"}"#,
+            0.0,
         ),
         (
             r#"sparkles_validation_results_total{dataset="ds",language="shacl",severity="violation"}"#,
@@ -844,7 +849,7 @@ async fn validation_metrics_count_writes_by_status_and_severity() {
         assert_eq!(sample(&m, series), Some(v), "{series}\n{m}");
     }
     // no strategy without validations
-    assert!(!m.contains(r#"strategy="incremental""#), "{m}");
+    assert!(!m.contains(r#"strategy="full""#), "{m}");
 
     // datasets beyond the label cap share `$other`
     let s = server_with(|st| st.metrics = crate::obs::Metrics::new(true, 0));

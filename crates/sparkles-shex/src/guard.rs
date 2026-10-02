@@ -34,7 +34,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use sparkles::commit::CommitKind;
 use sparkles::guard::config::{
-    Baseline, CONFIG_FILE, Counters, DataGraphSel, DecisionCounts, sha256_hex, write_atomic,
+    Baseline, CONFIG_FILE, CheckHistory, CheckRecord, Counters, DataGraphSel, DecisionCounts,
+    sha256_hex, write_atomic,
 };
 use sparkles::guard::{
     Candidate, Changes, CommitGuard, GuardLanguage, GuardMode, GuardStatus, Severity,
@@ -167,6 +168,10 @@ pub struct ShexValidationStatus {
     pub last_full_millis: Option<u64>,
     pub counters: Counters,
     pub warnings: Vec<String>,
+    /// the last validated write
+    pub last_check: Option<CheckRecord>,
+    /// the last rejected writes, newest first
+    pub recent_rejections: Vec<CheckRecord>,
 }
 
 /// Write-time ShEx validation of one store.
@@ -185,6 +190,7 @@ pub struct ShexGuard {
     associations: AtomicU64,
     /// the last validation's warnings (semantic actions not run, …)
     warnings: Mutex<Vec<String>>,
+    history: CheckHistory,
 }
 
 impl ShexGuard {
@@ -201,6 +207,7 @@ impl ShexGuard {
             last_full: AtomicU64::new(u64::MAX),
             associations: AtomicU64::new(u64::MAX),
             warnings: Mutex::new(Vec::new()),
+            history: CheckHistory::default(),
         }
     }
 
@@ -228,6 +235,8 @@ impl ShexGuard {
             last_full_millis: (last != u64::MAX).then_some(last),
             counters: self.counters.get(),
             warnings,
+            last_check: self.history.last(),
+            recent_rejections: self.history.rejected(),
         }
     }
 
@@ -314,6 +323,9 @@ impl ShexGuard {
             millis,
             results,
             shapes_error: None,
+            introduced: None,
+            focus_nodes: None,
+            fallback: None,
             report_turtle: None,
         }
     }
@@ -402,6 +414,7 @@ impl CommitGuard for ShexGuard {
         }
         let summary = self.validate_state(&c.view, c.opts)?;
         self.counters.count(summary.status);
+        self.history.record(c.kind, &summary);
         if summary.status != GuardStatus::Rejected {
             *self.pending.lock() = Some((seq, baseline_of(&summary, seq)));
         }
@@ -451,6 +464,7 @@ fn baseline_of(s: &ValidationSummary, commit: u64) -> Baseline {
         conforms: Some(s.blocking == 0),
         blocking: s.blocking,
         total: s.total,
+        by_severity: s.by_severity,
         millis: s.millis,
     }
 }
