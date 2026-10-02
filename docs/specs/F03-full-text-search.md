@@ -6,8 +6,11 @@
 > documents kept current in the commit path, catch-up or rebuild at open,
 > `sparkles text-index` and `/$/text/{ds}`. Two Phase 2 items shipped with it:
 > `PUT`/`DELETE /$/text/{ds}` and the UI (an index admin panel and ranked search in
-> Explore). Snippets, highlighting, stemming, the Sparkles query grammar and the Phase 3
-> items are not built.
+> Explore). Later, Lucene's query syntax replaced the planned Sparkles grammar, and
+> highlighting with snippets and stemming per language shipped. Of Phase 3, the fast
+> fields shipped with index format 2, and hybrid retrieval with vector search shipped as
+> `spk:hybridSearch` ([F04](F04-vector-search.md#outcome)). Online rebuilds, `text` on
+> dataset creation and the other Phase 3 items are not built.
 >
 > **User docs:** [API: Full-text search](../API.md#full-text-search) · [Features](../FEATURES.md#sparql-arq-equivalent) · [Benchmarks: Full-text index and observability](../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
 >
@@ -744,5 +747,54 @@ Sparkles always keeps it. `GET /{ds}/text` from §2.2 returns ranked hits with H
 snippets, escaped by Sparkles with the matches in `<mark>`. The full-text benchmark has a
 sixth query for highlighting, on which Fuseki also runs.
 
-**Not built.** Stemming, online rebuilds with a journal, `text` on dataset creation, and
-the rest of Phase 3.
+**Stemming per language (2026-10-02).** Phase 2 planned stemmed fields per language. They
+follow jena-text's `text:multilingualSupport` with a `text:langField`, where a tagged
+literal is indexed a second time with its language's analyzer and a search with
+`lang:xx` searches that field.
+
+- *Configuration.* `languages` in `text.json` is `"all"`, a list of primary language
+  tags, or a map from a tag to an analyzer name. `sparkles text-index --language`
+  sets it. Each language gets a field `text_<tag>`, and the schema depends on the
+  configuration. An index without languages keeps its schema and its configuration
+  hash, so it is not rebuilt and no format change was needed. A change of languages
+  changes the hash and rebuilds the index on open, as other configuration changes do.
+- *Analyzers.* Tantivy's Snowball stemmers (the `stemmer` feature, `rust-stemmers`) and
+  its stop word lists (the `stopwords` feature, which adds no crate) cover 18 languages.
+  An analyzer lowercases, drops stop words and stems. Its stems are not folded to ASCII,
+  as in Lucene. A first version folded them like the standard text, and the comparison
+  below showed that folding merged words Lucene keeps apart, such as Swedish `städer`
+  and `stad`. Removed stop words leave gaps in the positions, so phrases match as in
+  Lucene.
+- *Queries.* `lang:` and a tagged query string choose the field by the primary subtag,
+  so `en-GB` literals are stemmed as English. Jena matches the tag exactly. The query
+  parser of the Lucene syntax analyzes words with the field's analyzer and searches the
+  field's terms. Prefixes, wildcards, fuzzy words, regular expressions and range bounds
+  are lowercased but not stemmed, as Lucene's `QueryParser` normalizes multi-term
+  queries. German ones also lose umlauts and ß, as Lucene's German normalization and
+  the Snowball German stems do. Highlighting uses the same analyzer, so stemmed matches
+  are marked.
+- *Comparison with Jena.* A corpus of 2,700 literals in nine languages (English, French,
+  German, Spanish, Italian, Portuguese, Dutch, Russian and Swedish), with inflected forms
+  and stop words, was loaded into Sparkles and into Fuseki 5.1.0 with jena-text
+  configured the same way. Of 1,590 stemmed queries (words, conjunctions, stop words,
+  prefixes, fuzzy words, wildcards and phrases), 1,235 matched the same literals. German,
+  Dutch, Russian and Swedish, where Lucene also uses Snowball, agreed on 662 of 671. The
+  rest differ by Lucene's Dutch stem dictionary and by `ё` in Russian stems. English
+  agreed on 172 of 191, because Lucene uses the original Porter stemmer and Tantivy the
+  Snowball English stemmer (`relativity` is `rel` in one and `relat` in the other).
+  French, Spanish, Italian and Portuguese agreed on 401 of 728, because Lucene uses light
+  stemmers for them that merge fewer forms than Snowball does. A query of stop words only
+  gives `400` in Sparkles, and Jena then returns every literal of the language.
+- *Benchmark.* `scripts/bench-text.sh` indexes the English titles stemmed in both engines
+  and has a seventh query, `"+theories +42"` with `lang:en`. On 210,509 triples Sparkles
+  and Jena returned the same 10 literals, and every other query kept its answer.
+
+**Rank output.** `text:query` has a sixth subject slot after Jena's five, the hit's rank
+in the score order. It is one more than the number of hits with a higher score, so equal
+scores share a rank. The rank exists for `spk:hybridSearch`
+([F04](F04-vector-search.md#outcome)), which fuses a text ranking with a vector ranking,
+and is not produced when the query does not use it.
+
+**Not built.** Online rebuilds with a journal, `text` on dataset creation, analyzers other
+than Tantivy's (Lucene's Porter and light stemmers, CJK segmentation), and the rest of
+Phase 3 apart from hybrid retrieval.

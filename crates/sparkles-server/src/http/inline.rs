@@ -33,10 +33,14 @@ pub const QUICK_UPDATE_BYTES: usize = 64 << 10;
 const REMEMBERED: usize = 4096;
 
 /// Whether this thread can run blocking work in place: a worker of a multi-threaded
-/// runtime (a current-thread runtime has no other thread to hand its tasks to).
+/// runtime (a current-thread runtime has no other thread to hand its tasks to). Setting
+/// `SPARKLES_NO_IN_PLACE` in the server's environment sends every request to the blocking
+/// pool, for comparing the two paths.
 pub fn available() -> bool {
-    tokio::runtime::Handle::try_current()
-        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| std::env::var_os("SPARKLES_NO_IN_PLACE").is_some())
+        && tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
 }
 
 /// Requests run in place so far (for tests).

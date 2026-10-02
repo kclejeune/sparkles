@@ -109,6 +109,210 @@ pub struct TextConfig {
     /// `lz4` or `none`; changing it rebuilds the index
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docstore_compression: Option<DocstoreCompression>,
+    /// per-language analyzers: a literal whose language tag has one is also indexed
+    /// stemmed, and a search with that language searches the stemmed text
+    #[serde(default, skip_serializing_if = "Languages::is_none")]
+    pub languages: Languages,
+}
+
+/// A language analyzer: Tantivy's Snowball stemmer for the language, after the stop
+/// words of the language are removed (where Tantivy has a list for it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Analyzer {
+    Arabic,
+    Danish,
+    Dutch,
+    English,
+    Finnish,
+    French,
+    German,
+    Greek,
+    Hungarian,
+    Italian,
+    Norwegian,
+    Portuguese,
+    Romanian,
+    Russian,
+    Spanish,
+    Swedish,
+    Tamil,
+    Turkish,
+}
+
+impl Analyzer {
+    /// Every analyzer with the language tag it is used for by default.
+    pub const ALL: [(&'static str, Analyzer); 18] = [
+        ("ar", Analyzer::Arabic),
+        ("da", Analyzer::Danish),
+        ("de", Analyzer::German),
+        ("el", Analyzer::Greek),
+        ("en", Analyzer::English),
+        ("es", Analyzer::Spanish),
+        ("fi", Analyzer::Finnish),
+        ("fr", Analyzer::French),
+        ("hu", Analyzer::Hungarian),
+        ("it", Analyzer::Italian),
+        ("nl", Analyzer::Dutch),
+        ("no", Analyzer::Norwegian),
+        ("pt", Analyzer::Portuguese),
+        ("ro", Analyzer::Romanian),
+        ("ru", Analyzer::Russian),
+        ("sv", Analyzer::Swedish),
+        ("ta", Analyzer::Tamil),
+        ("tr", Analyzer::Turkish),
+    ];
+
+    /// The analyzer of a primary language tag, if there is one (`nb` and `nn` are
+    /// Norwegian too).
+    pub fn for_tag(tag: &str) -> Option<Analyzer> {
+        let tag = match tag {
+            "nb" | "nn" => "no",
+            t => t,
+        };
+        Self::ALL.iter().find(|(t, _)| *t == tag).map(|(_, a)| *a)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Analyzer::Arabic => "arabic",
+            Analyzer::Danish => "danish",
+            Analyzer::Dutch => "dutch",
+            Analyzer::English => "english",
+            Analyzer::Finnish => "finnish",
+            Analyzer::French => "french",
+            Analyzer::German => "german",
+            Analyzer::Greek => "greek",
+            Analyzer::Hungarian => "hungarian",
+            Analyzer::Italian => "italian",
+            Analyzer::Norwegian => "norwegian",
+            Analyzer::Portuguese => "portuguese",
+            Analyzer::Romanian => "romanian",
+            Analyzer::Russian => "russian",
+            Analyzer::Spanish => "spanish",
+            Analyzer::Swedish => "swedish",
+            Analyzer::Tamil => "tamil",
+            Analyzer::Turkish => "turkish",
+        }
+    }
+}
+
+/// The per-language analyzers of an index (`languages` in `text.json`): none, `"all"`
+/// (every language Tantivy has a stemmer for, by its tag), a list of language tags, or
+/// a map from a language tag to an analyzer name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Languages {
+    #[default]
+    None,
+    All,
+    /// primary language tag (lowercase) → analyzer
+    Only(std::collections::BTreeMap<String, Analyzer>),
+}
+
+impl Languages {
+    pub fn is_none(&self) -> bool {
+        match self {
+            Languages::None => true,
+            Languages::All => false,
+            Languages::Only(m) => m.is_empty(),
+        }
+    }
+
+    /// The analyzed languages: each primary tag with its analyzer, by tag.
+    pub fn resolve(&self) -> Vec<(String, Analyzer)> {
+        match self {
+            Languages::None => Vec::new(),
+            Languages::All => {
+                let mut v: Vec<(String, Analyzer)> = Analyzer::ALL
+                    .iter()
+                    .map(|(t, a)| (t.to_string(), *a))
+                    .collect();
+                v.extend(["nb", "nn"].map(|t| (t.to_string(), Analyzer::Norwegian)));
+                v.sort();
+                v
+            }
+            Languages::Only(m) => m.iter().map(|(t, a)| (t.clone(), *a)).collect(),
+        }
+    }
+
+    /// Languages from tags (`all`, or tags each with its default analyzer).
+    pub fn from_tags<S: AsRef<str>>(tags: &[S]) -> std::result::Result<Languages, String> {
+        if tags.iter().any(|t| t.as_ref().eq_ignore_ascii_case("all")) {
+            return Ok(Languages::All);
+        }
+        let mut m = std::collections::BTreeMap::new();
+        for t in tags {
+            let tag = primary_tag(t.as_ref())?;
+            let a = Analyzer::for_tag(&tag).ok_or_else(|| {
+                format!(
+                    "languages: no analyzer for {tag:?}; name one, as in {{\"{tag}\": \"english\"}}"
+                )
+            })?;
+            m.insert(tag, a);
+        }
+        Ok(Languages::Only(m))
+    }
+}
+
+/// A primary language subtag, lowercased: 2 to 8 ASCII letters.
+fn primary_tag(t: &str) -> std::result::Result<String, String> {
+    let tag = t.trim().to_ascii_lowercase();
+    if (2..=8).contains(&tag.len()) && tag.bytes().all(|b| b.is_ascii_lowercase()) {
+        Ok(tag)
+    } else {
+        Err(format!(
+            "languages: {t:?} is not a primary language tag such as \"en\" (2 to 8 letters)"
+        ))
+    }
+}
+
+impl Serialize for Languages {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Languages::None => s.serialize_none(),
+            Languages::All => s.serialize_str("all"),
+            Languages::Only(m) => m.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Languages {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Word(String),
+            List(Vec<String>),
+            Map(std::collections::BTreeMap<String, String>),
+        }
+        let err = serde::de::Error::custom;
+        match Option::<Repr>::deserialize(d)? {
+            None => Ok(Languages::None),
+            Some(Repr::Word(w)) if w == "all" => Ok(Languages::All),
+            Some(Repr::Word(w)) => Err(err(format!(
+                "languages: expected \"all\", a list of language tags or a map of tags to analyzers, got {w:?}"
+            ))),
+            Some(Repr::List(v)) => Languages::from_tags(&v).map_err(err),
+            Some(Repr::Map(m)) => {
+                let mut out = std::collections::BTreeMap::new();
+                for (t, a) in m {
+                    let tag = primary_tag(&t).map_err(err)?;
+                    let a = Analyzer::ALL
+                        .iter()
+                        .map(|(_, a)| *a)
+                        .find(|x| x.name() == a.to_ascii_lowercase())
+                        .ok_or_else(|| {
+                            err(format!(
+                                "languages: unknown analyzer {a:?} (one of {})",
+                                Analyzer::ALL.map(|(_, a)| a.name()).join(", ")
+                            ))
+                        })?;
+                    out.insert(tag, a);
+                }
+                Ok(Languages::Only(out))
+            }
+        }
+    }
 }
 
 /// Compression of the full-text index's document store.
@@ -146,6 +350,7 @@ impl Default for TextConfig {
             max_text_bytes: default_max_text_bytes(),
             max_hits: default_max_hits(),
             docstore_compression: None,
+            languages: Languages::None,
         }
     }
 }
@@ -389,7 +594,7 @@ mod imp {
     const FORMAT: u32 = 2;
     const TOKENIZER: &str = "sparkles_standard";
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     pub(crate) struct Fields {
         key: Field,
         pub(super) s: Field,
@@ -398,16 +603,41 @@ mod imp {
         pub(super) g: Field,
         pub(super) lang: Field,
         pub(super) text: Field,
+        /// the stemmed text of each analyzed language (`text_<tag>`), by primary tag
+        stemmed: Vec<(String, Field, Analyzer)>,
     }
 
-    fn schema() -> (Schema, Fields) {
+    impl Fields {
+        /// The stemmed field of a language tag's primary subtag and its analyzer, if it
+        /// has one.
+        fn stemmed_for(&self, tag: &str) -> Option<(Field, Analyzer)> {
+            let primary = tag.split('-').next().unwrap_or(tag);
+            self.stemmed
+                .binary_search_by(|(t, ..)| t.as_str().cmp(primary))
+                .ok()
+                .map(|i| (self.stemmed[i].1, self.stemmed[i].2))
+        }
+
+        /// The field a search with language `lang` searches: the language's stemmed
+        /// text when it has an analyzer, else the standard text (`None`).
+        pub(super) fn text_for(&self, lang: Option<&str>) -> (Field, Option<Analyzer>) {
+            match lang.and_then(|l| self.stemmed_for(l)) {
+                Some((f, a)) => (f, Some(a)),
+                None => (self.text, None),
+            }
+        }
+    }
+
+    fn schema(config: &TextConfig) -> (Schema, Fields) {
         let mut b = Schema::builder();
         let bytes_indexed = BytesOptions::default().set_indexed();
-        let text = TextOptions::default().set_indexing_options(
-            TextFieldIndexing::default()
-                .set_tokenizer(TOKENIZER)
-                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-        );
+        let text = |tokenizer: &str| {
+            TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer(tokenizer)
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            )
+        };
         // A hit's terms are read from columns (fast fields), not from stored documents:
         // a column read costs far less than decompressing a doc store block.
         let fields = Fields {
@@ -417,13 +647,26 @@ mod imp {
             o: b.add_bytes_field("o", BytesOptions::default().set_fast()),
             g: b.add_text_field("g", STRING | FAST),
             lang: b.add_text_field("lang", STRING),
-            text: b.add_text_field("text", text),
+            text: b.add_text_field("text", text(TOKENIZER)),
+            stemmed: config
+                .languages
+                .resolve()
+                .into_iter()
+                .map(|(tag, a)| {
+                    let f = b.add_text_field(&format!("text_{tag}"), text(&tokenizer_name(a)));
+                    (tag, f, a)
+                })
+                .collect(),
         };
         (b.build(), fields)
     }
 
     /// The longest token the text field indexes, in bytes.
     pub(super) const MAX_TOKEN: usize = 40;
+
+    fn tokenizer_name(a: Analyzer) -> String {
+        format!("sparkles_{}", a.name())
+    }
 
     fn register_tokenizer(index: &Index) {
         index.tokenizers().register(
@@ -434,16 +677,63 @@ mod imp {
                 .filter(AsciiFoldingFilter)
                 .build(),
         );
+        for (_, a) in Analyzer::ALL {
+            index
+                .tokenizers()
+                .register(&tokenizer_name(a), language_analyzer(a));
+        }
     }
 
-    /// The text field's analysis without its tokenizer: a prefix, wildcard, fuzzy or
-    /// regular expression term is normalized as the indexed tokens are (lowercased and
-    /// ASCII-folded), but not split.
-    pub(super) fn normalizer() -> TextAnalyzer {
-        TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
+    /// A language's analyzer: the standard tokens, lowercased, without the language's
+    /// stop words, and stemmed. As in Lucene's language analyzers, the stems are not
+    /// ASCII-folded: folding would merge words the language keeps apart, such as
+    /// Swedish `städer` and `stad` or Spanish `año` and `ano`. Removed stop words leave
+    /// gaps in the positions, as in Lucene, so a phrase across one still needs the gap.
+    pub(super) fn language_analyzer(a: Analyzer) -> TextAnalyzer {
+        use tantivy::tokenizer::{Language as L, Stemmer, StopWordFilter};
+        let lang = match a {
+            Analyzer::Arabic => L::Arabic,
+            Analyzer::Danish => L::Danish,
+            Analyzer::Dutch => L::Dutch,
+            Analyzer::English => L::English,
+            Analyzer::Finnish => L::Finnish,
+            Analyzer::French => L::French,
+            Analyzer::German => L::German,
+            Analyzer::Greek => L::Greek,
+            Analyzer::Hungarian => L::Hungarian,
+            Analyzer::Italian => L::Italian,
+            Analyzer::Norwegian => L::Norwegian,
+            Analyzer::Portuguese => L::Portuguese,
+            Analyzer::Romanian => L::Romanian,
+            Analyzer::Russian => L::Russian,
+            Analyzer::Spanish => L::Spanish,
+            Analyzer::Swedish => L::Swedish,
+            Analyzer::Tamil => L::Tamil,
+            Analyzer::Turkish => L::Turkish,
+        };
+        let b = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(MAX_TOKEN))
             .filter(LowerCaser)
-            .filter(AsciiFoldingFilter)
-            .build()
+            .dynamic();
+        let b = match StopWordFilter::new(lang) {
+            Some(stop) => b.filter_dynamic(stop),
+            None => b,
+        };
+        b.filter_dynamic(Stemmer::new(lang)).build()
+    }
+
+    /// A text field's analysis without its tokenizer: a prefix, wildcard, fuzzy or
+    /// regular expression term is normalized as the indexed tokens are, but not split or
+    /// stemmed. Terms of the standard text (`None`) are lowercased and ASCII-folded, and
+    /// those of a language only lowercased, as Lucene's analyzers normalize them.
+    pub(super) fn normalizer(analyzer: Option<Analyzer>) -> TextAnalyzer {
+        let b = TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
+            .filter(LowerCaser)
+            .dynamic();
+        match analyzer {
+            None => b.filter_dynamic(AsciiFoldingFilter).build(),
+            Some(_) => b.build(),
+        }
     }
 
     /// What every view of one index generation shares.
@@ -601,7 +891,7 @@ mod imp {
 
     /// A new, empty index (in `dir`, replacing anything there, or in memory).
     fn new_index(dir: Option<&Path>, config: &TextConfig) -> Result<(Index, Fields)> {
-        let (schema, fields) = schema();
+        let (schema, fields) = schema(config);
         let docstore_compression = match DocstoreCompression::effective(config.docstore_compression)
         {
             #[cfg(feature = "zstd")]
@@ -645,12 +935,12 @@ mod imp {
     }
 
     /// Open the index in `<root>/text/` for maintenance without per-commit fsync.
-    fn open_index(root: &Path) -> Result<(Index, Fields, LazySyncDir)> {
+    fn open_index(root: &Path, config: &TextConfig) -> Result<(Index, Fields, LazySyncDir)> {
         let dir = LazySyncDir::open(&root.join("text"), marker(root))?;
         let index = Index::open(dir.clone()).map_err(text_err)?;
         register_tokenizer(&index);
-        let (_, fields) = schema();
-        if index.schema() != schema().0 {
+        let (expected, fields) = schema(config);
+        if index.schema() != expected {
             return Err(text_err("unexpected index schema"));
         }
         Ok((index, fields, dir))
@@ -708,7 +998,7 @@ mod imp {
                     return p;
                 }
             };
-            if index.schema() != schema().0 {
+            if index.schema() != schema(&config).0 {
                 p.open_error = Some("unexpected index schema".into());
                 return p;
             }
@@ -964,6 +1254,10 @@ mod imp {
                 end -= 1;
             }
             d.add_text(f.text, &lex[..end]);
+            // a language with an analyzer: the stemmed text too
+            if let Some((field, _)) = lang.and_then(|t| f.stemmed_for(&t.to_ascii_lowercase())) {
+                d.add_text(field, &lex[..end]);
+            }
             Some(Doc {
                 key,
                 hash,
@@ -1004,7 +1298,7 @@ mod imp {
                 })
             };
             let reusable = root.filter(|r| r.join("text").exists()).and_then(|r| {
-                let (index, fields, dir) = open_index(r)
+                let (index, fields, dir) = open_index(r, &config)
                     .inspect_err(|e| tracing::warn!("{e}; rebuilding"))
                     .ok()?;
                 if dir.is_marked()
@@ -1207,7 +1501,8 @@ mod imp {
         ) -> Result<Arc<TextView>> {
             let mut live = self.live.lock();
             let live = &mut *live;
-            let fields = live.shared.fields;
+            let shared = live.shared.clone();
+            let fields = &shared.fields;
             let mut terms = Terms::default();
             let mut changed = false;
             let mut seen = FxHashSet::default();
@@ -1220,7 +1515,7 @@ mod imp {
                     key,
                     hash,
                     doc: Some(doc),
-                }) = terms.document(snap, &fields, &self.config, q)
+                }) = terms.document(snap, fields, &self.config, q)
                 else {
                     continue;
                 };
@@ -1466,7 +1761,7 @@ mod imp {
                         _ => {}
                     }
                     crate::store::sync_dir(root)?;
-                    let (index, fields, dir) = open_index(root)?;
+                    let (index, fields, dir) = open_index(root, &self.config)?;
                     *live = live_of(index, fields, &self.config, Some(dir), snap.commit)?;
                     Some(old)
                 }
@@ -1558,6 +1853,44 @@ mod imp {
             if let Err(e) = self.inner.close() {
                 tracing::warn!("full-text index checkpoint on close: {e}");
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn tokens(a: Analyzer, text: &str) -> Vec<(usize, String)> {
+            let mut an = language_analyzer(a);
+            let mut st = an.token_stream(text);
+            let mut out = Vec::new();
+            while let Some(t) = st.next() {
+                out.push((t.position, t.text.clone()));
+            }
+            out
+        }
+
+        #[test]
+        fn language_analyzers_stem_and_drop_stop_words() {
+            let words =
+                |a, t| -> Vec<String> { tokens(a, t).into_iter().map(|(_, w)| w).collect() };
+            assert_eq!(
+                words(Analyzer::English, "The theories of running foxes"),
+                ["theori", "run", "fox"]
+            );
+            // stop words leave gaps in the positions, as in Lucene
+            assert_eq!(
+                tokens(Analyzer::English, "Ada and the fox"),
+                [(0, "ada".to_string()), (3, "fox".to_string())]
+            );
+            assert_eq!(words(Analyzer::French, "Les chevaux"), ["cheval"]);
+            // the German stemmer removes the umlaut itself
+            assert_eq!(words(Analyzer::German, "die Häuser"), ["haus"]);
+            // stems are not folded: Swedish keeps städer (städ) apart from stad
+            assert_eq!(words(Analyzer::Swedish, "städer stad"), ["städ", "stad"]);
+            assert_eq!(words(Analyzer::Spanish, "las canciones"), ["cancion"]);
+            // a language without a stop word list in Tantivy still stems
+            assert_eq!(words(Analyzer::Turkish, "kitaplar"), ["kitap"]);
         }
     }
 }

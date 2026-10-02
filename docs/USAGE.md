@@ -187,7 +187,8 @@ sparkles infer   --loc db --profile owl-rl    # materialize inferences
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
-sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --rebuild, --status, --disable
+sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,
+                                              #   --rebuild, --status, --disable
 sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph, --wgs84,
                                               #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable
 sparkles vector create --loc db --name emb --predicate http://example.org/emb --dim 384
@@ -202,6 +203,13 @@ sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server
 build. Later openings of the database map the built index from its file. Every
 `sparkles vector` command also works against a server with `--server URL --dataset NAME`
 in place of `--loc` ([API](API.md#vector-indexes)).
+
+The web UI manages the same indexes. The dataset page has a card for each index, and an
+admin of the dataset can create, edit, rebuild and drop indexes there. Anyone who can
+read the dataset can measure an index's recall from its card. The **Similar** page
+(`/ui/similar`) searches an index from an entity's vector or from a pasted vector, with
+controls for k, the metric, `ef` and exact search, and it shows how the server ran each
+search.
 
 `sparkles update` and `sparkles load` take `--message TEXT`, which is stored with the
 commit they make and shown by `sparkles log` and `/$/commits`. With `--server`, the

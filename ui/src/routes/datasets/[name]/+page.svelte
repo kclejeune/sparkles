@@ -28,6 +28,7 @@
   import TaskList from '$components/TaskList.svelte';
   import TermView from '$components/TermView.svelte';
   import TurtleEditor from '$components/TurtleEditor.svelte';
+  import VectorIndexPanel from '$components/VectorIndexPanel.svelte';
   import WriteValidationPanel from '$components/WriteValidationPanel.svelte';
 
   const name = $derived(page.params.name ?? '');
@@ -1078,6 +1079,20 @@ ex:PersonShape a sh:NodeShape ;
           onchanged={refreshAll}
         />
 
+        <!-- vector indexes -->
+        <VectorIndexPanel
+          {name}
+          {prefixes}
+          predicates={stats.predicates.map((p) => p.iri)}
+          canAdmin={auth.can(name, 'admin')}
+          {readOnly}
+          busy={acting != null}
+          refreshKey={refreshKick}
+          onstart={startTask}
+          onstarted={() => taskKick++}
+          onchanged={refreshAll}
+        />
+
         <!-- backups in repositories -->
         <BackupsPanel
           {name}
@@ -1129,6 +1144,8 @@ ex:PersonShape a sh:NodeShape ;
                   toasts.push('success', 'Full-text index built', t.message);
                 else if (t.kind === 'geo-index')
                   toasts.push('success', 'Spatial index built', t.message);
+                else if (t.kind === 'vector-index')
+                  toasts.push('success', 'Vector index built', t.message);
                 else toasts.push('success', `${t.kind} finished`, t.message);
                 refreshAll();
               }}

@@ -85,7 +85,10 @@ running queries.
   ([API](docs/API.md#write-time-validation)).
 
 **Search**
-* Full-text search through Jena's `text:query`, ranked by BM25 with Tantivy ([API](docs/API.md#full-text-search)).
+* Full-text search through Jena's `text:query`, ranked by BM25 with Tantivy and stemmed per
+  language ([API](docs/API.md#full-text-search)).
+* Hybrid search that fuses a full-text and a vector ranking by reciprocal rank fusion
+  ([API](docs/API.md#hybrid-text-and-vector-search)).
 * Vector similarity search over `spk:vector` literals, exact or through an HNSW index that
   sees every write at once ([API](docs/API.md#vector-similarity)).
 * GeoSPARQL 1.1 with a spatial index per dataset, Jena's `spatial:` and `spatialF:`
@@ -98,8 +101,8 @@ running queries.
 
 **Operations**
 * A SvelteKit web UI, embedded in the binary. It has a query editor, results as a table,
-  graph, plan or map, a resource explorer, a schema browser, validation and backups
-  ([screenshots](#web-ui)).
+  graph, plan or map, a resource explorer, a schema browser, vector similarity search and
+  index management, validation and backups ([screenshots](#web-ui)).
 * Authentication with Basic, API tokens, OIDC or trusted proxies, per-dataset access
   control, and rate limiting ([API](docs/API.md#authentication-and-access-control)).
 * Access logs, Prometheus metrics, a readiness endpoint and OpenTelemetry traces
