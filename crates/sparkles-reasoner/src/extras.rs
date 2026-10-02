@@ -9,13 +9,15 @@ use std::str::FromStr;
 /// A vocabulary built into the reasoner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Vocabulary {
-    /// the GeoSPARQL 1.1 classes and properties with the Simple Features geometry types:
-    /// their subclass, subproperty, domain and range axioms
+    /// the GeoSPARQL 1.1 classes and properties with the Simple Features and GML geometry
+    /// types: their subclass, subproperty, domain and range axioms, and rules that type a
+    /// geometry from its serialization literals
     GeoSparql,
 }
 
 /// The GeoSPARQL axioms (`vocab/geosparql.rules`): written from the standard's class and
-/// property definitions, as rules without premises.
+/// property definitions, as rules without premises, and the rules that type geometries
+/// from their serializations.
 pub const GEOSPARQL_RULES: &str = include_str!("../vocab/geosparql.rules");
 
 impl Vocabulary {
@@ -121,6 +123,7 @@ mod tests {
     fn the_geosparql_axioms_parse() {
         let rules = Vocabulary::GeoSparql.rules().unwrap();
         assert!(rules.len() > 100, "{}", rules.len());
-        assert!(rules.iter().all(|r| r.body.is_empty()));
+        // the axioms, then the geometry-type rules
+        assert_eq!(rules.iter().filter(|r| !r.body.is_empty()).count(), 7);
     }
 }

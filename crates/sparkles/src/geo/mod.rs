@@ -12,6 +12,7 @@
 
 pub mod config;
 pub mod crs;
+pub mod types;
 pub mod units;
 mod validate;
 pub mod vocab;

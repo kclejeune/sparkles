@@ -155,3 +155,52 @@ fn rewrite_sees_materialized_default_geometries() {
     assert_eq!(select(&s, q, true), ["A", "g1", "gA", "p1"]);
     assert_eq!(select(&s, q, false), ["A"]);
 }
+
+const TYPED: &str = r#"
+@prefix ex: <http://example.org/> .
+@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+ex:w geo:asWKT "<http://www.opengis.net/def/crs/OGC/1.3/CRS84> Polygon((0 0, 1 0, 1 1, 0 0))"^^geo:wktLiteral .
+ex:l geo:asWKT "LINESTRING Z (0 0 1, 1 1 1)"^^geo:wktLiteral .
+ex:j geo:asGeoJSON "{\"type\":\"MultiPoint\",\"coordinates\":[[0,0]]}"^^geo:geoJSONLiteral .
+ex:m geo:asGML "<gml:Polygon xmlns:gml=\"http://www.opengis.net/gml/3.2\"><gml:exterior><gml:LinearRing><gml:posList>0 0 1 0 1 1 0 0</gml:posList></gml:LinearRing></gml:exterior></gml:Polygon>"^^geo:gmlLiteral .
+ex:k geo:asKML "<Point><coordinates>1,2</coordinates></Point>"^^geo:kmlLiteral .
+ex:s geo:hasSerialization "POINT(1 2)"^^geo:wktLiteral .
+ex:e geo:asWKT ""^^geo:wktLiteral .
+ex:x geo:asWKT "POINT(1 2)" .
+"#;
+
+#[test]
+fn geometries_are_typed_from_their_serializations() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        TYPED.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    run(&s, &["geosparql"], false);
+    let typed = |c: &str| select(&s, &format!("SELECT ?x {{ ?x a {c} }}"), true);
+    assert_eq!(typed("sf:Polygon"), ["m", "w"]);
+    assert_eq!(typed("sf:Surface"), ["m", "w"]);
+    assert_eq!(typed("sf:Curve"), ["l"]);
+    assert_eq!(typed("sf:MultiPoint"), ["j"]);
+    assert_eq!(typed("sf:Point"), ["k", "s"]);
+    // the GML type of a GML literal, with GML's hierarchy
+    assert_eq!(
+        typed("<http://www.opengis.net/ont/gml#AbstractSurface>"),
+        ["m"]
+    );
+    // an empty WKT literal declares no type, and a plain string is no serialization
+    assert_eq!(typed("sf:Geometry"), ["j", "k", "l", "m", "s", "w"]);
+    assert!(!typed("sf:Geometry").contains(&"x".to_string()));
+    // without the vocabulary, nothing is typed
+    let s2 = Store::in_memory(StoreOptions::default());
+    s2.load(&[Source::from_bytes(
+        TYPED.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    run(&s2, &[], false);
+    assert!(select(&s2, "SELECT ?x { ?x a sf:Point }", true).is_empty());
+}

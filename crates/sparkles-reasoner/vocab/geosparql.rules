@@ -15,6 +15,7 @@
 
 @prefix geo: <http://www.opengis.net/ont/geosparql#> .
 @prefix sf:  <http://www.opengis.net/ont/sf#> .
+@prefix gml: <http://www.opengis.net/ont/gml#> .
 
 #------------------------------------------------------------------
 # Classes
@@ -45,6 +46,33 @@
 -> (sf:MultiLineString rdfs:subClassOf sf:MultiCurve).
 -> (sf:MultiSurface rdfs:subClassOf sf:GeometryCollection).
 -> (sf:MultiPolygon rdfs:subClassOf sf:MultiSurface).
+
+# GML geometry types, after the substitution groups of the GML 3.2
+# geometry schemas (an element that substitutes for another is a
+# subclass of it)
+-> (gml:AbstractGeometry rdfs:subClassOf geo:Geometry).
+-> (gml:AbstractGeometricPrimitive rdfs:subClassOf gml:AbstractGeometry).
+-> (gml:AbstractGeometricAggregate rdfs:subClassOf gml:AbstractGeometry).
+-> (gml:Point rdfs:subClassOf gml:AbstractGeometricPrimitive).
+-> (gml:AbstractCurve rdfs:subClassOf gml:AbstractGeometricPrimitive).
+-> (gml:LineString rdfs:subClassOf gml:AbstractCurve).
+-> (gml:Curve rdfs:subClassOf gml:AbstractCurve).
+-> (gml:OrientableCurve rdfs:subClassOf gml:AbstractCurve).
+-> (gml:CompositeCurve rdfs:subClassOf gml:AbstractCurve).
+-> (gml:AbstractSurface rdfs:subClassOf gml:AbstractGeometricPrimitive).
+-> (gml:Polygon rdfs:subClassOf gml:AbstractSurface).
+-> (gml:Surface rdfs:subClassOf gml:AbstractSurface).
+-> (gml:OrientableSurface rdfs:subClassOf gml:AbstractSurface).
+-> (gml:CompositeSurface rdfs:subClassOf gml:AbstractSurface).
+-> (gml:PolyhedralSurface rdfs:subClassOf gml:Surface).
+-> (gml:TriangulatedSurface rdfs:subClassOf gml:Surface).
+-> (gml:Tin rdfs:subClassOf gml:TriangulatedSurface).
+-> (gml:MultiPoint rdfs:subClassOf gml:AbstractGeometricAggregate).
+-> (gml:MultiCurve rdfs:subClassOf gml:AbstractGeometricAggregate).
+-> (gml:MultiSurface rdfs:subClassOf gml:AbstractGeometricAggregate).
+-> (gml:MultiGeometry rdfs:subClassOf gml:AbstractGeometricAggregate).
+-> (gml:LinearRing rdfs:subClassOf gml:AbstractRing).
+-> (gml:Ring rdfs:subClassOf gml:AbstractRing).
 
 # geometry literal datatypes
 -> (geo:wktLiteral rdf:type rdfs:Datatype).
@@ -159,3 +187,22 @@
 -> (geo:rcc8ntpp rdfs:range geo:SpatialObject).
 -> (geo:rcc8ntppi rdfs:domain geo:SpatialObject).
 -> (geo:rcc8ntppi rdfs:range geo:SpatialObject).
+
+#------------------------------------------------------------------
+# Geometry types from serializations
+#
+# A geometry has the type its serialization declares: sf:Polygon for
+# a WKT POLYGON, a GeoJSON "Polygon", a GML gml:Polygon or a KML
+# <Polygon>, and the GML type as well for a GML literal. The Sparkles
+# builtins geoSfType and geoGmlType read the type from the literal's
+# keyword, "type" member or root element, without checking its
+# coordinates.
+#------------------------------------------------------------------
+
+[geoTypeWkt: (?g geo:asWKT ?l) geoSfType(?l, ?t) -> (?g rdf:type ?t)]
+[geoTypeGeoJson: (?g geo:asGeoJSON ?l) geoSfType(?l, ?t) -> (?g rdf:type ?t)]
+[geoTypeGml: (?g geo:asGML ?l) geoSfType(?l, ?t) -> (?g rdf:type ?t)]
+[geoTypeKml: (?g geo:asKML ?l) geoSfType(?l, ?t) -> (?g rdf:type ?t)]
+[geoTypeSerialization: (?g geo:hasSerialization ?l) geoSfType(?l, ?t) -> (?g rdf:type ?t)]
+[geoGmlTypeGml: (?g geo:asGML ?l) geoGmlType(?l, ?t) -> (?g rdf:type ?t)]
+[geoGmlTypeSerialization: (?g geo:hasSerialization ?l) geoGmlType(?l, ?t) -> (?g rdf:type ?t)]
