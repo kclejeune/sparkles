@@ -345,6 +345,10 @@ impl Models {
         a: I,
         b: I,
     ) -> Option<JoinModel> {
+        let first = self.probed && super::keyprobe::first(ctx, v);
+        if first && let Some(m) = self.probe(ctx, v, j, a.clone(), b.clone()) {
+            return Some(m);
+        }
         if self.starred {
             let mask = |ins: I| {
                 let mut m = 0;
@@ -365,6 +369,21 @@ impl Models {
                 return Some(JoinModel::Star { rr, rd });
             }
         }
+        if first {
+            return None;
+        }
+        self.probe(ctx, v, j, a, b)
+    }
+
+    /// The estimate of the join from probed values, if one applies.
+    fn probe<I: Iterator<Item = usize> + Clone>(
+        &self,
+        ctx: &Ctx,
+        v: VarId,
+        j: u32,
+        a: I,
+        b: I,
+    ) -> Option<JoinModel> {
         if !self.probed {
             return None;
         }

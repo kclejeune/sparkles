@@ -11,30 +11,33 @@
 //! The statistics count the characteristic sets of the subjects (Neumann and Moerkotte,
 //! "Characteristic Sets: Accurate Cardinality Estimation for RDF Queries with Multiple
 //! Joins", ICDE 2011): each set of predicates that some subject has exactly, with its
-//! subjects and the triples of each predicate over them. The subjects that have every
-//! predicate of `Q` are those of the sets that hold `Q`, and the rows of the star of `Q`
-//! (one pattern `?s p ?o` per predicate) are, per set, its subjects times the average
-//! triples per subject of each predicate. Both count over every graph.
+//! subjects and the triples of each predicate over them. The classes a subject has by
+//! `rdf:type` count as predicates of their own, since a class usually decides which
+//! predicates its instances have. The subjects that have every item of `Q` are those of
+//! the sets that hold `Q`, and the rows of the star of `Q` (one pattern `?s p ?o` per
+//! predicate, `?s rdf:type <class>` per class) are, per set, its subjects times the
+//! average triples per subject of each item. Both count over every graph.
 //!
-//! A join on a subject variable `?s` whose inputs hold patterns `?s p o` with constant
-//! predicates, `Qa` on one side and `Qb` on the other, then keeps of the product of the
-//! inputs' rows the share `rows(Qa ∪ Qb) / (rows(Qa) · rows(Qb))`, and of the product of
-//! their distinct subjects the share `subjects(Qa ∪ Qb) / (subjects(Qa) · subjects(Qb))`.
-//! For inputs that are exactly the stars this is the estimate from the sets. Whatever
-//! else restricts an input (constant objects, filters, other joins) is taken to be
-//! independent of the predicates its subjects have.
+//! A join on a subject variable `?s` whose inputs hold such patterns, `Qa` on one side and
+//! `Qb` on the other, then keeps of the product of the inputs' rows the share
+//! `rows(Qa ∪ Qb) / (rows(Qa) · rows(Qb))`, and of the product of their distinct subjects
+//! the share `subjects(Qa ∪ Qb) / (subjects(Qa) · subjects(Qb))`. For inputs that are
+//! exactly the stars this is the estimate from the sets. Whatever else restricts an input
+//! (constant objects other than classes, filters, other joins) is taken to be independent
+//! of the items its subjects have.
 //!
-//! The predicates of a query's stars are registered per subject variable before its
-//! groups are ordered, and the sets are summed once per combination of them that some set
-//! holds. A predicate is used only when the sets kept in the statistics hold nearly all of
-//! its triples. Otherwise, and when a predicate occurs twice among the inputs, the join
-//! keeps the estimate from distinct values.
+//! The items of a query's stars are registered per subject variable before its groups are
+//! ordered, and the sets are summed once per combination of them that some set holds; the
+//! sums are kept with the generation for later queries. An item is used only when the
+//! sets kept in the statistics hold nearly all of its triples. Otherwise, and when an
+//! item occurs twice among the inputs, the join keeps the estimate from distinct
+//! values.
 
 use super::ctx::Ctx;
 use super::plan::{Kind, Node, ScanSpec};
 use super::table::VarId;
-use crate::builder::Stats;
 use crate::index::{O, P, S};
+use crate::store::Generation;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -51,6 +54,8 @@ const COVERAGE: f64 = 0.95;
 
 /// The characteristic sets of a generation's statistics by predicate.
 pub struct CharIndex {
+    /// the base id of `rdf:type`
+    rdf_type: Option<u64>,
     /// the subjects of each set kept
     subjects: Vec<f64>,
     /// predicate → the sets holding it, by index into the statistics' list, with its
@@ -67,7 +72,13 @@ impl CharIndex {
     /// Lists of predicates whose sums are kept before the cache starts over.
     const KEPT: usize = 1024;
 
-    fn new(stats: &Stats) -> CharIndex {
+    fn new(generation: &Generation) -> CharIndex {
+        let stats = &generation.stats;
+        let rdf_type = generation
+            .vocab
+            .find(&crate::id::iri_key(oxrdf::vocab::rdf::TYPE.as_str()))
+            .ok()
+            .map(|i| crate::id::Id::vocab(i).0);
         let mut by_pred: FxHashMap<u64, Vec<(u32, f64)>> = FxHashMap::default();
         let mut covered: FxHashMap<u64, u64> = FxHashMap::default();
         for (i, c) in stats.charsets.iter().enumerate() {
@@ -77,6 +88,7 @@ impl CharIndex {
             }
         }
         CharIndex {
+            rdf_type,
             subjects: stats.charsets.iter().map(|c| c.subjects as f64).collect(),
             by_pred,
             covered,
@@ -193,25 +205,43 @@ impl StarVar {
     }
 }
 
-/// Register the star patterns `(subject variable, predicate)` of a group about to be
-/// ordered, so that joins on those variables can be estimated from the sets.
-pub(super) fn register(ctx: &Ctx, stars: &[(VarId, u64)]) {
+/// The item a pattern with predicate `p` and object `o` (when constant) stands for in a
+/// characteristic set: the predicate, or the class of `?s rdf:type <class>`.
+fn item(p: u64, o: Option<u64>, rdf_type: Option<u64>) -> Option<u64> {
+    match o {
+        None => Some(p),
+        Some(o) if Some(p) == rdf_type => crate::builder::class_item(o),
+        Some(_) => None,
+    }
+}
+
+/// Register the star patterns `(subject variable, predicate, constant object)` of a group
+/// about to be ordered, so that joins on those variables can be estimated from the sets.
+pub(super) fn register(ctx: &Ctx, stars: &[(VarId, u64, Option<u64>)]) {
     let generation = &ctx.snap.generation;
     let stats = &generation.stats;
     if stats.charsets.is_empty() || stars.is_empty() {
         return;
     }
-    let idx = generation.charsets.get_or_init(|| CharIndex::new(stats));
+    let idx = generation
+        .charsets
+        .get_or_init(|| CharIndex::new(generation));
     let mut reg = ctx.stars.lock();
     let mut changed: Vec<VarId> = Vec::new();
-    for &(v, p) in stars {
+    for &(v, p, o) in stars {
+        let Some(p) = item(p, o, idx.rdf_type) else {
+            continue;
+        };
         let sv = reg.entry(v).or_default();
         if sv.preds.contains(&p) || sv.preds.len() >= MAX_PREDS {
             continue;
         }
         let bit = sv.preds.len();
         sv.preds.push(p);
-        let count = stats.predicate(p).map_or(0, |s| s.count);
+        let count = match crate::builder::item_class(p) {
+            Some(c) => stats.classes.iter().find(|x| x.0 == c).map_or(0, |x| x.1),
+            None => stats.predicate(p).map_or(0, |s| s.count),
+        };
         let covered = idx.covered.get(&p).copied().unwrap_or(0);
         if count > 0 && covered as f64 >= COVERAGE * count as f64 {
             sv.usable |= 1 << bit;
@@ -239,20 +269,26 @@ pub(super) fn merge(a: u64, b: u64) -> u64 {
     }
 }
 
-/// The variable and predicate of a scan of a pattern `?s p o` with a constant predicate.
-fn star_of(spec: &ScanSpec) -> Option<(VarId, u64)> {
+/// The variable and item (see [`item`]) of a scan of a pattern `?s p ?o` with a constant
+/// predicate, or `?s rdf:type <class>`.
+fn star_of(spec: &ScanSpec, rdf_type: Option<u64>) -> Option<(VarId, u64)> {
     let order = spec.perm.order();
-    if (0..spec.prefix.len()).any(|i| order[i] == O) {
-        return None;
-    }
-    let p = spec
-        .prefix
-        .iter()
-        .enumerate()
-        .find(|&(i, _)| order[i] == P)
-        .map(|(_, &p)| p)?;
+    let at = |c: usize| {
+        spec.prefix
+            .iter()
+            .enumerate()
+            .find(|&(i, _)| order[i] == c)
+            .map(|(_, &x)| x)
+    };
+    let p = at(P)?;
     let &(_, v) = spec.cols.iter().find(|&&(kc, _)| order[kc] == S)?;
-    Some((v, p))
+    Some((v, item(p, at(O), rdf_type)?))
+}
+
+/// Whether the scan `spec` is a star pattern on `v` the sets could count.
+pub(super) fn is_star(ctx: &Ctx, spec: &ScanSpec, v: VarId) -> bool {
+    let rdf_type = ctx.snap.generation.charsets.get().and_then(|i| i.rdf_type);
+    star_of(spec, rdf_type).is_some_and(|(x, _)| x == v)
 }
 
 /// The star masks per subject variable of the patterns in plan `n`, merged into `out`.
@@ -261,12 +297,18 @@ pub(super) fn of_node(ctx: &Ctx, n: &Node, out: &mut Vec<(VarId, u64)>) {
     if reg.is_empty() {
         return;
     }
-    walk(&reg, n, out);
+    let rdf_type = ctx.snap.generation.charsets.get().and_then(|i| i.rdf_type);
+    walk(&reg, n, rdf_type, out);
 }
 
-fn walk(reg: &FxHashMap<VarId, StarVar>, n: &Node, out: &mut Vec<(VarId, u64)>) {
+fn walk(
+    reg: &FxHashMap<VarId, StarVar>,
+    n: &Node,
+    rdf_type: Option<u64>,
+    out: &mut Vec<(VarId, u64)>,
+) {
     let mut add = |spec: &ScanSpec| {
-        if let Some((v, p)) = star_of(spec) {
+        if let Some((v, p)) = star_of(spec, rdf_type) {
             let bit = reg
                 .get(&v)
                 .and_then(|sv| sv.preds.iter().position(|&x| x == p))
@@ -284,11 +326,11 @@ fn walk(reg: &FxHashMap<VarId, StarVar>, n: &Node, out: &mut Vec<(VarId, u64)>) 
             for p in &j.probes {
                 add(&p.scan);
             }
-            walk(reg, &n.children[0], out);
+            walk(reg, &n.children[0], rdf_type, out);
         }
         Kind::Join { .. } | Kind::Filter(_) | Kind::Sort(_) => {
             for c in &n.children {
-                walk(reg, c, out);
+                walk(reg, c, rdf_type, out);
             }
         }
         _ => {}

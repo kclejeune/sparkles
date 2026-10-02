@@ -1837,10 +1837,11 @@ impl<'a> Planner<'a> {
             super::sample::prepare(self.ctx, &leaves, &filters);
         }
         if self.ctx.opt.characteristic_sets {
-            let stars: Vec<(VarId, u64)> = triples
+            let stars: Vec<(VarId, u64, Option<u64>)> = triples
                 .iter()
                 .filter_map(|t| match (t.t[0], t.t[1], t.t[2]) {
-                    (PT::V(v), PT::C(p), PT::V(_)) => Some((v, p.0)),
+                    (PT::V(v), PT::C(p), PT::V(_)) => Some((v, p.0, None)),
+                    (PT::V(v), PT::C(p), PT::C(o)) => Some((v, p.0, Some(o.0))),
                     _ => None,
                 })
                 .collect();
@@ -2418,17 +2419,33 @@ pub(super) fn join_est(a: &Node, b: &Node, keys: &[VarId]) -> f64 {
 
 /// The estimated rows of joining `a` and `b` on `keys`, and, when the join is on one
 /// variable and estimated from characteristic sets or probed values, the variable with
-/// how it was estimated. The sets come first: they hold how the predicates of a star
-/// occur together, where probes see only the small input and one pattern.
+/// how it was estimated. The sets come first, since they hold how the predicates of a
+/// star occur together where probes see only the small input and one pattern, unless the
+/// small input is a subset of values the sets know nothing of (see
+/// [`super::keyprobe::first`]).
 pub(super) fn join_est_with(
     a: &Node,
     b: &Node,
     keys: &[VarId],
     ctx: &Ctx,
 ) -> (f64, Option<(VarId, JoinModel)>) {
-    if let [v] = keys
-        && ctx.opt.characteristic_sets
-    {
+    let [v] = keys else {
+        return (join_est(a, b, keys), None);
+    };
+    let probe = || {
+        if !ctx.opt.probed_keys {
+            return None;
+        }
+        let (sa, sb) = (
+            super::keyprobe::side(ctx, a, *v)?,
+            super::keyprobe::side(ctx, b, *v)?,
+        );
+        super::keyprobe::applies(ctx, *v, sa, sb).map(|(m, a_src)| JoinModel::Probe { m, a_src })
+    };
+    let star = || {
+        if !ctx.opt.characteristic_sets {
+            return None;
+        }
         let (mut qa, mut qb) = (Vec::new(), Vec::new());
         super::charsets::of_node(ctx, a, &mut qa);
         super::charsets::of_node(ctx, b, &mut qb);
@@ -2436,23 +2453,17 @@ pub(super) fn join_est_with(
             super::charsets::mask_of(&qa, *v),
             super::charsets::mask_of(&qb, *v),
         );
-        if let Some((rr, rd)) = super::charsets::factor(ctx, *v, qa, qb) {
-            let model = JoinModel::Star { rr, rd };
-            return (model.est(a.est, b.est), Some((*v, model)));
-        }
+        super::charsets::factor(ctx, *v, qa, qb).map(|(rr, rd)| JoinModel::Star { rr, rd })
+    };
+    let model = if ctx.opt.probed_keys && super::keyprobe::first(ctx, *v) {
+        probe().or_else(star)
+    } else {
+        star().or_else(probe)
+    };
+    match model {
+        Some(m) => (m.est(a.est, b.est), Some((*v, m))),
+        None => (join_est(a, b, keys), None),
     }
-    if let [v] = keys
-        && ctx.opt.probed_keys
-        && let (Some(sa), Some(sb)) = (
-            super::keyprobe::side(ctx, a, *v),
-            super::keyprobe::side(ctx, b, *v),
-        )
-        && let Some((m, a_src)) = super::keyprobe::applies(ctx, *v, sa, sb)
-    {
-        let model = JoinModel::Probe { m, a_src };
-        return (model.est(a.est, b.est), Some((*v, model)));
-    }
-    (join_est(a, b, keys), None)
 }
 
 /// The estimated rows of joining `a_est` and `b_est` rows that keeps the share `rr` of

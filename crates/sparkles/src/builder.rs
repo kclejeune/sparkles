@@ -88,10 +88,12 @@ pub struct Stats {
 
 /// A characteristic set (Neumann and Moerkotte, ICDE 2011): a set of predicates, the
 /// number of subjects whose predicates are exactly these, and the number of triples each
-/// predicate has over those subjects.
+/// predicate has over those subjects. The classes a subject has by `rdf:type` count as
+/// predicates of their own (see [`class_item`]), so that a set tells which predicates the
+/// instances of a class have.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CharSet {
-    /// sorted
+    /// sorted: the predicates, then the classes
     pub preds: Vec<u64>,
     pub subjects: u64,
     /// per predicate of `preds`
@@ -100,6 +102,17 @@ pub struct CharSet {
 
 /// Characteristic sets kept in the statistics at most, those of the most subjects.
 pub const MAX_CHARSETS: usize = 10_000;
+
+/// The item standing for class `class` (a base vocabulary id) in a characteristic set: its
+/// payload under a tag no term has, so that it sorts after every predicate.
+pub fn class_item(class: u64) -> Option<u64> {
+    (Id(class).tag() == Tag::Vocab).then(|| 0xF << id::PAYLOAD_BITS | (class & id::PAYLOAD_MASK))
+}
+
+/// The class a characteristic set item stands for, if it is one.
+pub fn item_class(item: u64) -> Option<u64> {
+    (item >> id::PAYLOAD_BITS == 0xF).then(|| Id::new(Tag::Vocab, item & id::PAYLOAD_MASK).0)
+}
 
 /// Distinct characteristic sets counted while a build streams SPO at most; the subjects
 /// of sets found after that are counted as others.
@@ -689,6 +702,7 @@ struct StatsCollector {
     // characteristic sets in SPO: the current subject's (predicate, triples), and per
     // set of predicates (subjects, triples per predicate)
     cs_cur: Vec<(u64, u64)>,
+    cs_classes: Vec<(u64, u64)>,
     cs_preds: Vec<u64>,
     charsets: FxHashMap<Box<[u64]>, (u64, Vec<u64>)>,
     cs_others: u64,
@@ -707,6 +721,7 @@ impl StatsCollector {
             classes: Vec::new(),
             class_cur: None,
             cs_cur: Vec::new(),
+            cs_classes: Vec::new(),
             cs_preds: Vec::new(),
             charsets: FxHashMap::default(),
             cs_others: 0,
@@ -718,6 +733,8 @@ impl StatsCollector {
         if self.cs_cur.is_empty() {
             return;
         }
+        // class items sort after every predicate
+        self.cs_cur.append(&mut self.cs_classes);
         self.cs_preds.clear();
         self.cs_preds.extend(self.cs_cur.iter().map(|&(p, _)| p));
         let room = self.charsets.len() < MAX_CHARSETS_SEEN;
@@ -762,6 +779,14 @@ impl StatsCollector {
             match self.cs_cur.last_mut() {
                 Some((p, c)) if *p == k[1] => *c += 1,
                 _ => self.cs_cur.push((k[1], 1)),
+            }
+            if Some(k[1]) == self.rdf_type
+                && let Some(item) = class_item(k[2])
+            {
+                match self.cs_classes.last_mut() {
+                    Some((x, c)) if *x == item => *c += 1,
+                    _ => self.cs_classes.push((item, 1)),
+                }
             }
         }
         if self.perm == Perm::Pos && Some(k[0]) == self.rdf_type {

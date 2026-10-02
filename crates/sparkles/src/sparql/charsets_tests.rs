@@ -138,8 +138,35 @@ fn stars_of_independent_predicates_are_estimated_exactly() {
     }
 }
 
-/// Patterns with a constant object, or a predicate that occurs twice, keep the estimate
-/// from distinct values.
+/// Classes count as items of the sets: the instances of `ex:C1` all have `ex:p`, those
+/// of `ex:C2` none, and other subjects have `ex:p` without a class.
+#[test]
+fn classes_are_items_of_the_sets() {
+    let mut t = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..600 {
+        match i % 3 {
+            0 => t.push_str(&format!("ex:s{i} a ex:C1 ; ex:p {i} .\n")),
+            1 => t.push_str(&format!("ex:s{i} a ex:C2 .\n")),
+            _ => t.push_str(&format!("ex:s{i} ex:p {i} .\n")),
+        }
+    }
+    let s = load(t);
+    let snap = s.snapshot();
+    for (q, rows) in [
+        ("SELECT * WHERE { ?s a ex:C1 ; ex:p ?o }", 200.0),
+        ("SELECT * WHERE { ?s a ex:C2 ; ex:p ?o }", 0.0),
+    ] {
+        assert_eq!(answer(&snap, q, sets()).len() as f64, rows, "{q}");
+        let est = root_est(&snap, q, sets());
+        assert!(
+            (est - rows.max(1.0)).abs() < 0.5,
+            "{q}: estimated {est} for {rows}"
+        );
+    }
+}
+
+/// Patterns with a constant object other than a class, or a predicate that occurs twice,
+/// keep the estimate from distinct values.
 #[test]
 fn other_patterns_keep_the_estimate_from_distinct_values() {
     let s = load(subjects(300));

@@ -17,8 +17,11 @@
 //! pattern on the variable that was probed is estimated as the rows of the first, times
 //! the mean count, times the share of the probed pattern's rows that the second plan
 //! keeps. Whatever else restricts either plan is taken to be independent of the values
-//! the small input holds. Other joins keep the estimates from characteristic sets or from
-//! distinct values.
+//! the small input holds. When the small input is itself a pattern the characteristic
+//! sets count, a join that the sets estimate keeps their estimate, since they hold how
+//! the predicates of a star occur together where a probe sees one pattern. Otherwise the
+//! small input's values are a subset the sets know nothing of, and the probes come
+//! first. Other joins keep the estimate from distinct values.
 //!
 //! A count reads at most two blocks of the pattern. A probe of a value whose blocks are
 //! not in the block cache counts against a budget per pattern, so that planning decodes
@@ -33,6 +36,7 @@ use crate::error::Result;
 use crate::id::Id;
 use crate::index::{Key, Perm, bound_cols, pad};
 use crate::store::Chunk;
+use std::hash::{Hash, Hasher};
 
 /// A triple pattern of at most this many rows is a small input.
 const SOURCE_ROWS: f64 = 1024.0;
@@ -86,6 +90,9 @@ fn values_sig(t: &Table, v: VarId) -> Option<(usize, [u64; 3])> {
 /// The small input of one variable and the patterns probed with its values.
 pub(super) struct VarProbe {
     source: Sig,
+    /// the small input is not a star pattern on the variable, so its values are a subset
+    /// the characteristic sets know nothing of, and probes come before the sets
+    first: bool,
     /// the probed patterns, by their access paths
     targets: Vec<(Vec<ScanSig>, Measure)>,
 }
@@ -250,7 +257,7 @@ fn probe_var(ctx: &Ctx, leaves: &[Vec<Node>], v: VarId) -> Result<Option<VarProb
         }) else {
             continue;
         };
-        if let Some(m) = measure(ctx, spec, &keys, &source, v)? {
+        if let Some(m) = measure(ctx, spec, &keys)? {
             let sigs = opts
                 .iter()
                 .filter_map(|o| match &o.kind {
@@ -272,24 +279,27 @@ fn probe_var(ctx: &Ctx, leaves: &[Vec<Node>], v: VarId) -> Result<Option<VarProb
     if targets.is_empty() {
         return Ok(None);
     }
-    Ok(Some(VarProbe { source, targets }))
+    let first = !matches!(&src.kind, Kind::Scan(s) if super::charsets::is_star(ctx, s, v));
+    Ok(Some(VarProbe {
+        source,
+        first,
+        targets,
+    }))
 }
 
 /// Count the rows of the pattern `spec` (sorted on `v`) for each of `keys`, within the
 /// budget of blocks to decode.
-fn measure(
-    ctx: &Ctx,
-    spec: &ScanSpec,
-    keys: &[Id],
-    source: &Sig,
-    v: VarId,
-) -> Result<Option<Measure>> {
+fn measure(ctx: &Ctx, spec: &ScanSpec, keys: &[Id]) -> Result<Option<Measure>> {
+    // the pattern's range and the values probed decide the measure
+    let mut h = rustc_hash::FxHasher::default();
+    keys.hash(&mut h);
     let key = format!(
-        "probe|{source:?}|{}|{:?}|{:?}|{:?}|{v}",
+        "probe|{}|{:?}|{:?}|{}|{:x}",
         spec.perm.name(),
         spec.prefix,
         spec.graph,
-        keys.len()
+        keys.len(),
+        h.finish()
     );
     if let Some(m) = ctx.snap.counts.probed(&key) {
         return Ok(m);
@@ -380,6 +390,13 @@ fn side_of(p: &VarProbe, n: &Node, v: VarId, out: &mut Side) {
             }
         }
     }
+}
+
+/// Whether joins on `v` are estimated from probes before characteristic sets: when its
+/// small input is a VALUES table or a pattern that the sets do not count (a constant
+/// object, or `v` not its subject).
+pub(super) fn first(ctx: &Ctx, v: VarId) -> bool {
+    ctx.probes.lock().get(&v).is_some_and(|p| p.first)
 }
 
 /// How plan `n` holds the leaves on `v`, when `v` was probed.
