@@ -3259,10 +3259,27 @@ async fn reason(
     }
     let ds = dataset(&st, &name)?;
     let query = Params::from_query(&uri);
+    let bad = |m: String| err(StatusCode::BAD_REQUEST, m);
+    // the input graphs the request names, if any
+    let mut asked_inputs: Option<sparkles_reasoner::Inputs> = None;
+    let mut refresh = query.get("refreshImports").is_some_and(truthy);
     let (profile_name, rules, rerun, vocabularies, geo_default_geometry, full) =
         if content_type(&headers) == "application/json" && !body.is_empty() {
             let v: J = serde_json::from_slice(&body)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            let mut i = serde_json::Map::new();
+            for k in ["dataGraphs", "ontologyGraphs", "imports", "locationMapping"] {
+                if !v[k].is_null() {
+                    i.insert(k.into(), v[k].clone());
+                }
+            }
+            if !i.is_empty() {
+                asked_inputs = Some(
+                    serde_json::from_value(J::Object(i))
+                        .map_err(|e| bad(format!("input graphs: {e}")))?,
+                );
+            }
+            refresh |= v["refreshImports"].as_bool().unwrap_or(false);
             let vocabularies = match &v["vocabularies"] {
                 J::Null => Vec::new(),
                 J::Array(a) => a
@@ -3293,6 +3310,24 @@ async fn reason(
         } else {
             let mut p = Params::default();
             p.extend_form(&body);
+            let (data, onto) = (p.all("dataGraph"), p.all("ontologyGraph"));
+            if !data.is_empty() || !onto.is_empty() || p.get("imports").is_some() {
+                let graphs = |v: Vec<String>| {
+                    v.iter()
+                        .map(|g| sparkles_reasoner::GraphRef::parse(g))
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let mut i = sparkles_reasoner::Inputs::default();
+                if !data.is_empty() {
+                    i.data_graphs = graphs(data).map_err(bad)?;
+                }
+                i.ontology_graphs = graphs(onto).map_err(bad)?;
+                if let Some(m) = p.get("imports") {
+                    i.imports = m.parse().map_err(bad)?;
+                }
+                asked_inputs = Some(i);
+            }
+            refresh |= p.get("refreshImports").is_some_and(truthy);
             (
                 p.get("profile").unwrap_or("rdfs").to_string(),
                 p.get("rules").map(str::to_string),
@@ -3305,7 +3340,7 @@ async fn reason(
     let rerun = rerun || query.get("rerun").is_some_and(truthy);
     let full = full || query.get("full").is_some_and(truthy);
     let recorded = if rerun {
-        // the recorded profile, including its custom rules and extras
+        // the recorded profile, including its custom rules, extras and input graphs
         let info = ds
             .reasoning
             .read()
@@ -3315,19 +3350,26 @@ async fn reason(
         Some((
             crate::reasoning::recorded_profile(&info).map_err(conflict)?,
             crate::reasoning::recorded_extras(&info).map_err(conflict)?,
+            crate::reasoning::recorded_inputs(&info).map_err(conflict)?,
         ))
     } else {
         None
     };
+    let inputs = match (&recorded, asked_inputs) {
+        (Some((_, _, i)), None) => i.clone(),
+        (_, Some(i)) => i,
+        (None, None) => Default::default(),
+    };
+    inputs.validate().map_err(|e| bad(format!("{e:#}")))?;
     let extras = match &recorded {
-        Some((_, e)) => e.clone(),
+        Some((_, e, _)) => e.clone(),
         None => sparkles_reasoner::Extras::parse(&vocabularies, geo_default_geometry)
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?,
     };
     extras
         .validate()
         .map_err(|e| err(StatusCode::NOT_IMPLEMENTED, format!("{e:#}")))?;
-    let profile: sparkles_reasoner::Profile = if let Some((p, _)) = recorded {
+    let profile: sparkles_reasoner::Profile = if let Some((p, _, _)) = recorded {
         p
     } else if profile_name == "rules" {
         sparkles_reasoner::Profile::Rules(rules.unwrap_or_default())
@@ -3345,8 +3387,10 @@ async fn reason(
         ds,
         profile,
         extras,
+        inputs,
         crate::reasoning::Trigger::Request,
         !full,
+        refresh,
     );
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }

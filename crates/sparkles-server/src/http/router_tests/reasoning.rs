@@ -442,6 +442,178 @@ async fn incremental_runs() {
     );
 }
 
+/// An ontology in a named graph and an import: what the status records, which commits
+/// make the inferences stale, and re-runs over the recorded graphs.
+#[tokio::test]
+async fn input_graphs_and_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let auto = || Some(AutoReason::per_dataset());
+    let st = open(dir.path(), auto(), false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "<urn:o> owl:imports ex:extra . ex:x a ex:C .");
+    let app = router(st.clone());
+    update(
+        &app,
+        "t",
+        "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         INSERT DATA { GRAPH ex:onto { ex:C rdfs:subClassOf ex:A } }",
+    )
+    .await;
+    let r = post_json(
+        &app,
+        "/$/reason/t",
+        r#"{"profile":"rdfs","ontologyGraphs":["http://ex.org/onto"]}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(
+        s["inputGraphs"],
+        serde_json::json!(["default", "http://ex.org/onto"]),
+        "{s}"
+    );
+    // the import that did not resolve is watched
+    assert_eq!(
+        s["watchedGraphs"],
+        serde_json::json!(["default", "http://ex.org/extra", "http://ex.org/onto"]),
+        "{s}"
+    );
+    assert_eq!(s["imports"][0]["iri"], "http://ex.org/extra");
+    assert_eq!(s["inputs"]["ontologyGraphs"][0], "http://ex.org/onto");
+    assert!(
+        s["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("did not resolve")),
+        "{s}"
+    );
+
+    // a graph the run does not read: still fresh
+    update(&app, "t", "INSERT DATA { GRAPH ex:other { ex:y a ex:C } }").await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(
+        (&s["stale"], &s["commitsSince"]),
+        (&J::Bool(false), &J::from(1))
+    );
+    // the ontology graph: stale, and a re-run reads the recorded graphs incrementally
+    update(
+        &app,
+        "t",
+        "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         INSERT DATA { GRAPH ex:onto { ex:A rdfs:subClassOf ex:B } }",
+    )
+    .await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["stale"], true, "{s}");
+    let (_, hdr) = b_instances(&app, "t").await;
+    assert_eq!(hdr.as_deref(), Some("stale; commits-since=2"));
+    post_json(&app, "/$/reason/t", r#"{"rerun":true}"#).await;
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["stale"], false, "{s}");
+    assert_eq!(s["run"]["method"], "incremental", "{s}");
+    let (rows, hdr) = b_instances(&app, "t").await;
+    assert_eq!((rows, hdr), (vec!["http://ex.org/x".to_string()], None));
+
+    // the missing import appears: stale, and the re-run reads it, in full
+    update(&app, "t", "INSERT DATA { GRAPH ex:extra { ex:z a ex:C } }").await;
+    assert_eq!(get_json(&app, "/$/reason/t").await["stale"], true);
+    // after a restart, the staleness of named graphs comes from the commit diff
+    drop(app);
+    drop(st);
+    let st = open(dir.path(), auto(), false);
+    let app = router(st.clone());
+    assert_eq!(get_json(&app, "/$/reason/t").await["stale"], true);
+    post_json(&app, "/$/reason/t", r#"{"rerun":true}"#).await;
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(
+        s["run"]["fallback"], "the input graphs changed since the previous run",
+        "{s}"
+    );
+    assert_eq!(s["imports"][0]["graph"], "http://ex.org/extra", "{s}");
+    let (rows, _) = b_instances(&app, "t").await;
+    assert_eq!(rows, ["http://ex.org/x", "http://ex.org/z"]);
+
+    // bad input graphs
+    let r = post_json(
+        &app,
+        "/$/reason/t",
+        r#"{"profile":"rdfs","dataGraphs":["urn:x-sparkles:inferred"]}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = post_json(&app, "/$/reason/t", r#"{"imports":"sometimes"}"#).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+/// Imports fetched from files under `--load-dir`, kept in the dataset, and refreshed.
+#[tokio::test]
+async fn fetched_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let docs = tempfile::tempdir().unwrap();
+    std::fs::write(
+        docs.path().join("onto.ttl"),
+        "<http://ex.org/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/B> .",
+    )
+    .unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.file_loads = sparkles::sparql::FileLoads::under(docs.path()).unwrap();
+    let st = Arc::new(st);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "<urn:o> owl:imports ex:onto . ex:x a ex:C .");
+    let app = router(st.clone());
+    let body = serde_json::json!({
+        "profile": "rdfs",
+        "imports": "fetch",
+        "locationMapping": [{
+            "name": "http://ex.org/onto",
+            "altName": format!("file://{}/onto.ttl", docs.path().canonicalize().unwrap().display()),
+        }],
+    });
+    let r = post_json(&app, "/$/reason/t", &body.to_string()).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(
+        s["fetchedImports"],
+        serde_json::json!(["http://ex.org/onto"]),
+        "{s}"
+    );
+    let (rows, _) = b_instances(&app, "t").await;
+    assert_eq!(rows, ["http://ex.org/x"]);
+    // the copy is a graph of the dataset
+    let r = send(
+        &app,
+        Request::get("/t/data?graph=http%3A%2F%2Fex.org%2Fonto")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert!(r.text().contains("subClassOf"), "{}", r.text());
+
+    // a refresh loads the changed document again
+    std::fs::write(
+        docs.path().join("onto.ttl"),
+        "<http://ex.org/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/D> .",
+    )
+    .unwrap();
+    post_json(&app, "/$/reason/t", r#"{"rerun":true}"#).await;
+    wait_tasks(&st).await;
+    assert_eq!(b_instances(&app, "t").await.0, ["http://ex.org/x"]);
+    post_json(
+        &app,
+        "/$/reason/t",
+        r#"{"rerun":true,"refreshImports":true}"#,
+    )
+    .await;
+    wait_tasks(&st).await;
+    assert!(b_instances(&app, "t").await.0.is_empty());
+}
+
 #[tokio::test]
 async fn no_automatic_runs_on_a_read_only_server() {
     let dir = tempfile::tempdir().unwrap();

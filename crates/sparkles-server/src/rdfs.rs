@@ -247,6 +247,23 @@ pub fn routes() -> Router<Arc<crate::state::AppState>> {
     )
 }
 
+/// `serve --rdfs NAME=FILE`: the dataset's schema from a file.
+pub fn configure(st: &crate::state::AppState, spec: &str) -> Result<()> {
+    let (name, file) = spec
+        .split_once('=')
+        .with_context(|| format!("--rdfs {spec}: expected NAME=FILE"))?;
+    let ds = st
+        .datasets
+        .read()
+        .get(name)
+        .cloned()
+        .with_context(|| format!("--rdfs {spec}: no dataset /{name}"))?;
+    let triples =
+        read_file(std::path::Path::new(file)).with_context(|| format!("--rdfs {spec}"))?;
+    set(&ds, Some(NewSchema::Triples(triples)))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::state::{AppState, DbType};
@@ -389,21 +406,4 @@ ex:owns rdfs:range ex:Pet .
         assert_eq!(rows(&j), 0);
         assert!(!root.join(super::SETTING_FILE).exists());
     }
-}
-
-/// `serve --rdfs NAME=FILE`: the dataset's schema from a file.
-pub fn configure(st: &crate::state::AppState, spec: &str) -> Result<()> {
-    let (name, file) = spec
-        .split_once('=')
-        .with_context(|| format!("--rdfs {spec}: expected NAME=FILE"))?;
-    let ds = st
-        .datasets
-        .read()
-        .get(name)
-        .cloned()
-        .with_context(|| format!("--rdfs {spec}: no dataset /{name}"))?;
-    let triples =
-        read_file(std::path::Path::new(file)).with_context(|| format!("--rdfs {spec}"))?;
-    set(&ds, Some(NewSchema::Triples(triples)))?;
-    Ok(())
 }

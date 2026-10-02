@@ -1242,6 +1242,28 @@ enum Cmd {
         /// Timeout of the checks in seconds
         #[arg(long, requires = "check")]
         timeout: Option<f64>,
+        /// A graph whose triples the rules read: `default` or a graph IRI (repeatable;
+        /// default: the default graph). Without input options, a run reads the graphs
+        /// the recorded status names
+        #[arg(long = "data-graph", value_name = "GRAPH")]
+        data_graphs: Vec<String>,
+        /// A graph that holds the ontology, read like the data graphs (repeatable)
+        #[arg(long = "ontology-graph", value_name = "GRAPH")]
+        ontology_graphs: Vec<String>,
+        /// What to do with owl:imports: `none`, `dataset` (follow them to graphs of the
+        /// database, the default) or `fetch` (also load the missing ones, as LOAD does)
+        #[arg(long, value_name = "MODE")]
+        imports: Option<String>,
+        /// A Jena location-mapping file (lm:name/lm:altName, lm:prefix/lm:altPrefix) for
+        /// the imports
+        #[arg(long, value_name = "FILE")]
+        location_mapping: Option<PathBuf>,
+        /// Load again the imports that earlier runs fetched
+        #[arg(long)]
+        refresh_imports: bool,
+        // where fetched imports may come from
+        #[command(flatten)]
+        outbound: outbound::OutboundArgs,
     },
     /// Print the schema of a database (or data files): classes and predicates with exact
     /// counts and their RDFS/OWL declarations; exits with status 2 when a budget is exceeded
@@ -2594,6 +2616,12 @@ fn run() -> Result<()> {
             closure,
             format,
             timeout,
+            data_graphs,
+            ontology_graphs,
+            imports,
+            location_mapping,
+            refresh_imports,
+            outbound,
         } => {
             use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions};
             // bad check options exit with 2, before any work
@@ -2653,16 +2681,80 @@ fn run() -> Result<()> {
                 } else {
                     reasoning::incremental_since(previous.as_ref(), &store)
                 };
+                // the input graphs: as given, else as recorded
+                let given = !data_graphs.is_empty()
+                    || !ontology_graphs.is_empty()
+                    || imports.is_some()
+                    || location_mapping.is_some();
+                let inputs = if given {
+                    let graphs = |v: &[String]| {
+                        v.iter()
+                            .map(|g| sparkles_reasoner::GraphRef::parse(g))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| anyhow::anyhow!(e))
+                    };
+                    let mut i = sparkles_reasoner::Inputs::default();
+                    if !data_graphs.is_empty() {
+                        i.data_graphs = graphs(&data_graphs)?;
+                    }
+                    i.ontology_graphs = graphs(&ontology_graphs)?;
+                    if let Some(m) = &imports {
+                        i.imports = m.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+                    }
+                    if let Some(f) = &location_mapping {
+                        let (format, _) = sparkles::io::format_for_path(f)
+                            .with_context(|| format!("{}: unknown RDF format", f.display()))?;
+                        i.location_mapping = sparkles_reasoner::LocationMapping::from_jena(
+                            &std::fs::read(f)?,
+                            format,
+                        )?;
+                    }
+                    i
+                } else {
+                    match &previous {
+                        Some(p) => reasoning::recorded_inputs(p)?,
+                        None => Default::default(),
+                    }
+                };
+                inputs.validate()?;
+                let fetched_before: Vec<String> = previous
+                    .as_ref()
+                    .map(|p| p.fetched_imports.clone())
+                    .unwrap_or_default();
+                let mut fetched = fetched_before.clone();
+                if inputs.imports == sparkles_reasoner::ImportMode::Fetch || refresh_imports {
+                    let qopts = QueryOptions {
+                        outbound: outbound.local_policy()?,
+                        ..Default::default()
+                    };
+                    let refresh = if refresh_imports {
+                        fetched_before
+                    } else {
+                        Vec::new()
+                    };
+                    let f = sparkles_reasoner::fetch_imports(&store, &inputs, &refresh, &qopts)?;
+                    for i in &f.fetched {
+                        eprintln!("fetched owl:imports <{i}>");
+                    }
+                    for w in &f.warnings {
+                        eprintln!("warning: {w}");
+                    }
+                    fetched.extend(f.fetched);
+                }
                 let r = sparkles_reasoner::materialize_incremental(
                     &store,
                     &profile,
                     &extras,
                     sparkles_reasoner::Incremental { since, cache: None },
-                    &Default::default(),
+                    &sparkles_reasoner::ReasonOptions {
+                        inputs: inputs.clone(),
+                        ..Default::default()
+                    },
                 )?;
                 // lets `sparkles serve` pick the inferences up for this database, with
                 // the database's automatic re-run setting kept
                 let mut info = reasoning::recorded(&profile, &extras, &r, &store);
+                reasoning::record_inputs(&mut info, &inputs, &r, fetched);
                 info.auto = previous.and_then(|i| i.auto);
                 state::write_reasoning_file(&loc, Some(&info))?;
                 eprintln!(

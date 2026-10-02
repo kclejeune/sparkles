@@ -2,10 +2,11 @@
 //! inconsistency diagnostics.
 //!
 //! A materialization records the commit (`seq`) it wrote, or the unchanged head it read
-//! when it changed nothing, together with the dataset id. The inferences are fresh while
-//! no later commit changed the default graph, which is all the reasoner reads. Commits
-//! to named graphs, the inferred graph included, leave them fresh; `commitsSince` still
-//! counts every commit.
+//! when it changed nothing, together with the dataset id and the graphs it read. The
+//! inferences are fresh while no later commit changed one of those graphs (the default
+//! graph alone, unless the run read others or followed imports). Commits to other
+//! graphs, the inferred graph included, leave them fresh; `commitsSince` still counts
+//! every commit.
 
 use crate::state::{AppState, Dataset, ReasoningInfo};
 #[cfg(feature = "reasoning")]
@@ -64,22 +65,32 @@ pub fn freshness(info: &ReasoningInfo, store: &Store, at: u64) -> Freshness {
         },
         std::cmp::Ordering::Greater => {
             let n = at - commit;
-            // the reasoner reads the default graph alone: commits to named graphs,
-            // the inferred graph included, leave the inferences fresh
-            if !store.default_graph_changed(commit, at) {
-                return Freshness {
+            // commits to graphs the run did not read, the inferred graph included,
+            // leave the inferences fresh
+            match inputs_changed(info, store, commit, at) {
+                Ok(false) => Freshness {
                     stale: Some(false),
                     commits_since: Some(n),
                     reason: None,
-                };
-            }
-            Freshness {
-                stale: Some(true),
-                commits_since: Some(n),
-                reason: Some(format!(
-                    "{n} commit{} since materialization",
-                    if n == 1 { "" } else { "s" }
-                )),
+                },
+                Ok(true) => Freshness {
+                    stale: Some(true),
+                    commits_since: Some(n),
+                    reason: Some(format!(
+                        "{n} commit{} since materialization",
+                        if n == 1 { "" } else { "s" }
+                    )),
+                },
+                Err(e) => {
+                    tracing::debug!("reading the changes since commit {commit}: {e}");
+                    Freshness {
+                        stale: Some(true),
+                        commits_since: Some(n),
+                        reason: Some(
+                            "the changes since the materialization can no longer be read".into(),
+                        ),
+                    }
+                }
             }
         }
         std::cmp::Ordering::Less => Freshness {
@@ -88,6 +99,73 @@ pub fn freshness(info: &ReasoningInfo, store: &Store, at: u64) -> Freshness {
             reason: Some("store position moved backwards".into()),
         },
     }
+}
+
+/// The graphs whose changes make `info`'s inferences stale: `default` or IRIs.
+pub fn watched_graphs(info: &ReasoningInfo) -> Vec<String> {
+    info.watched_graphs
+        .clone()
+        .unwrap_or_else(|| vec!["default".to_string()])
+}
+
+/// Whether a commit after `commit`, up to `at`, changed a graph the run read. The commit
+/// flag answers for the default graph. For named graphs, the commit diff restricted to
+/// each graph answers, and the answer is remembered by dataset and recorded commit, so
+/// that each new head reads the commits since the last one asked about.
+fn inputs_changed(
+    info: &ReasoningInfo,
+    store: &Store,
+    commit: u64,
+    at: u64,
+) -> Result<bool, String> {
+    let watched = watched_graphs(info);
+    if watched.iter().any(|g| g == "default") && store.default_graph_changed(commit, at) {
+        return Ok(true);
+    }
+    let named: Vec<&str> = watched
+        .iter()
+        .map(String::as_str)
+        .filter(|g| *g != "default")
+        .collect();
+    if named.is_empty() {
+        return Ok(false);
+    }
+    type Memo = HashMap<(String, u64, String), (u64, bool)>;
+    static MEMO: std::sync::OnceLock<Mutex<Memo>> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    let key = (store.dataset_id().to_string(), commit, named.join("\n"));
+    // the commits from `start` on still need reading
+    let start = match memo.lock().get(&key).copied() {
+        Some((to, changed)) if to == at || (changed && to <= at) => return Ok(changed),
+        Some((to, false)) if to < at => to,
+        _ => commit,
+    };
+    let mut changed = false;
+    for g in &named {
+        let o = sparkles::store::DiffOptions {
+            graph: Some(oxrdf::GraphName::NamedNode(
+                oxrdf::NamedNode::new_unchecked(*g),
+            )),
+            ..Default::default()
+        };
+        use sparkles::history::At;
+        let d = store
+            .diff(&At::Commit(start), &At::Commit(at), &o)
+            .map_err(|e| e.to_string())?;
+        if !d.is_empty() {
+            changed = true;
+            break;
+        }
+    }
+    let mut m = memo.lock();
+    if m.len() > 4096 {
+        m.clear();
+    }
+    let later = m.get(&key).is_some_and(|(to, _)| *to > at);
+    if !later {
+        m.insert(key, (at, changed));
+    }
+    Ok(changed)
 }
 
 /// `DatasetInfo.reasoning`: the recorded summary plus freshness at the head.
@@ -164,6 +242,21 @@ pub fn status_value(info: &ReasoningInfo, store: &Store, auto: J) -> J {
     if info.geo_default_geometry {
         j["geoDefaultGeometry"] = true.into();
     }
+    if let Some(i) = &info.inputs {
+        j["inputs"] = i.clone();
+    }
+    if let Some(g) = &info.input_graphs {
+        j["inputGraphs"] = g.clone().into();
+    }
+    if let Some(g) = &info.watched_graphs {
+        j["watchedGraphs"] = g.clone().into();
+    }
+    if !info.imports.is_empty() {
+        j["imports"] = info.imports.clone().into();
+    }
+    if !info.fetched_imports.is_empty() {
+        j["fetchedImports"] = info.fetched_imports.clone().into();
+    }
     j
 }
 
@@ -180,11 +273,11 @@ fn profile_text(info: &ReasoningInfo) -> String {
     s
 }
 
-/// "up to date", noting the later commits that left the default graph unchanged.
+/// "up to date", noting the later commits that left the input graphs unchanged.
 pub fn up_to_date(commits_since: Option<u64>) -> String {
     match commits_since {
         Some(n) if n > 0 => format!(
-            "up to date; {n} later commit{} left the default graph unchanged",
+            "up to date; {n} later commit{} left the input graphs unchanged",
             if n == 1 { "" } else { "s" }
         ),
         _ => "up to date".to_string(),
@@ -262,6 +355,54 @@ pub fn recorded(
         inherited_stale: false,
         auto: None,
         run: Some(run_info(report)),
+        ..Default::default()
+    }
+}
+
+/// Record a run's input graphs in its status: the configuration (unless it is the
+/// default), the graphs read and watched and the imports (unless the run read the
+/// default graph alone), and the imports fetched by it or by earlier runs that it still
+/// imports.
+#[cfg(feature = "reasoning")]
+pub fn record_inputs(
+    info: &mut ReasoningInfo,
+    inputs: &sparkles_reasoner::Inputs,
+    report: &sparkles_reasoner::ReasonReport,
+    fetched: Vec<String>,
+) {
+    if *inputs != sparkles_reasoner::Inputs::default() {
+        info.inputs = serde_json::to_value(inputs).ok();
+    }
+    let Some(r) = &report.inputs else {
+        return;
+    };
+    let names = |g: Vec<sparkles_reasoner::GraphRef>| -> Vec<String> {
+        g.iter().map(|g| g.as_str().to_string()).collect()
+    };
+    if !r.default_only() || !r.imports.is_empty() {
+        info.input_graphs = Some(names(r.graphs.clone()));
+        info.watched_graphs = Some(names(r.watched()));
+        info.imports = r
+            .imports
+            .iter()
+            .filter_map(|i| serde_json::to_value(i).ok())
+            .collect();
+    }
+    let mut f: Vec<String> = fetched
+        .into_iter()
+        .filter(|iri| r.imports.iter().any(|i| &i.iri == iri && i.graph.is_some()))
+        .collect();
+    f.sort();
+    f.dedup();
+    info.fetched_imports = f;
+}
+
+/// The input configuration a recorded status re-runs.
+#[cfg(feature = "reasoning")]
+pub fn recorded_inputs(info: &ReasoningInfo) -> anyhow::Result<sparkles_reasoner::Inputs> {
+    match &info.inputs {
+        None => Ok(Default::default()),
+        Some(j) => Ok(serde_json::from_value(j.clone())?),
     }
 }
 
@@ -356,14 +497,21 @@ pub enum Trigger {
 /// With `incremental`, the run updates the recorded materialization when it can (see
 /// [`sparkles_reasoner::materialize_incremental`]), with the closure the dataset keeps
 /// in memory or, after a restart, the one saved with it.
+///
+/// The run reads the graphs of `inputs`. With imports fetched, it first loads the
+/// missing ones under the server's `LOAD` rules, and with `refresh` loads again those
+/// that earlier runs fetched.
 #[cfg(feature = "reasoning")]
+#[allow(clippy::too_many_arguments)]
 pub fn start_reason(
     st: &Arc<AppState>,
     ds: Arc<Dataset>,
     profile: sparkles_reasoner::Profile,
     extras: sparkles_reasoner::Extras,
+    inputs: sparkles_reasoner::Inputs,
     trigger: Trigger,
     incremental: bool,
+    refresh: bool,
 ) -> crate::state::Task {
     let st2 = st.clone();
     let name = ds.name.clone();
@@ -382,11 +530,35 @@ pub fn start_reason(
             locked2.store(true, Ordering::Relaxed);
             h2.progress(p, &format!("{prefix}{msg}"));
         });
-        h.progress(0.05, &format!("{prefix}loading triples"));
         let cancel = h.cancel_flag();
+        let fetched_before: Vec<String> = ds
+            .reasoning
+            .read()
+            .as_ref()
+            .map(|i| i.fetched_imports.clone())
+            .unwrap_or_default();
+        let mut fetched = fetched_before.clone();
+        let mut fetch_warnings = Vec::new();
+        if inputs.imports == sparkles_reasoner::ImportMode::Fetch || refresh {
+            h.progress(0.02, &format!("{prefix}fetching imports"));
+            // the rules of the server's LOAD
+            let qopts = sparkles::sparql::QueryOptions {
+                outbound: st2.outbound.clone(),
+                file_loads: st2.file_loads.clone(),
+                cancel: Some(cancel.clone()),
+                ..Default::default()
+            };
+            let refresh_list = if refresh { fetched_before } else { Vec::new() };
+            let f = sparkles_reasoner::fetch_imports(&ds.store, &inputs, &refresh_list, &qopts)
+                .map_err(|e| e.context(format!("{prefix}fetching imports")))?;
+            fetched.extend(f.fetched);
+            fetch_warnings = f.warnings;
+        }
+        h.progress(0.05, &format!("{prefix}loading triples"));
         let opts = sparkles_reasoner::ReasonOptions {
             progress: Some(progress),
             cancel: Some(cancel.clone()),
+            inputs: inputs.clone(),
             ..Default::default()
         };
         let superseded = AtomicBool::new(false);
@@ -442,6 +614,8 @@ pub fn start_reason(
             }
         };
         let mut info = recorded(&profile, &extras, &report, &ds.store);
+        record_inputs(&mut info, &inputs, &report, fetched);
+        info.warnings.splice(0..0, fetch_warnings);
         // a run keeps the dataset's automatic re-run setting
         info.auto = ds.reasoning.read().as_ref().and_then(|i| i.auto.clone());
         ds.set_reasoning(Some(info))?;
@@ -674,10 +848,14 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
         if !quiet && !forced {
             continue;
         }
-        let run = info
-            .as_ref()
-            .map(|i| Ok::<_, anyhow::Error>((recorded_profile(i)?, recorded_extras(i)?)));
-        let (profile, extras) = match run {
+        let run = info.as_ref().map(|i| {
+            Ok::<_, anyhow::Error>((
+                recorded_profile(i)?,
+                recorded_extras(i)?,
+                recorded_inputs(i)?,
+            ))
+        });
+        let (profile, extras, inputs) = match run {
             Some(Ok(p)) => p,
             Some(Err(e)) => {
                 tracing::warn!("auto-reason /{}: {e:#}", ds.name);
@@ -690,7 +868,16 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
         let trigger = Trigger::Auto {
             superseded_by_writes: !forced,
         };
-        let task = start_reason(st, ds.clone(), profile, extras, trigger, true);
+        let task = start_reason(
+            st,
+            ds.clone(),
+            profile,
+            extras,
+            inputs,
+            trigger,
+            true,
+            false,
+        );
         p.task = Some((task.id, head));
         p.since = now;
     }
