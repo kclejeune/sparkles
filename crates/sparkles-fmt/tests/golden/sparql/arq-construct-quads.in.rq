@@ -1,0 +1,2 @@
+PREFIX ex: <http://example.org/>
+construct { ?s ex:p ?o . graph ?g { ?s ex:p ?o } . { ?s ex:q ?o } graph _:b { ?s ex:r ?o } graph <urn:x-arq:DefaultGraphNode> {?s ex:t ?o} } where { graph ?g { ?s ex:p ?o } }

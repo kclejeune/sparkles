@@ -53,6 +53,8 @@ keywords! {
     // graph patterns
     Optional => "OPTIONAL",
     Minus => "MINUS",
+    // Jena ARQ's lateral join
+    Lateral => "LATERAL",
     Union => "UNION",
     Graph => "GRAPH",
     Service => "SERVICE",
@@ -219,7 +221,8 @@ mod tests {
             Some("hasLANGDIR")
         );
         assert_eq!(Kw::from_word("TRUE").map(Kw::canonical), Some("true"));
-        assert_eq!(Kw::from_word("LATERAL"), None);
+        assert_eq!(Kw::from_word("lateral"), Some(Kw::Lateral));
+        assert_eq!(Kw::from_word("UNFOLD"), None);
         assert!(Kw::Str.is_builtin() && Kw::GroupConcat.is_builtin());
         assert!(!Kw::A.is_builtin() && !Kw::Select.is_builtin());
         assert!(Kw::Count.is_aggregate() && !Kw::Object.is_aggregate());

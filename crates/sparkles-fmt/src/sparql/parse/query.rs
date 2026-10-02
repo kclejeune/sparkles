@@ -92,7 +92,7 @@ fn construct_query(p: &mut Parser<'_>) {
         p.expect_kw(Kw::Where);
         let g = p.start(NodeKind::GroupGraphPattern);
         p.expect(TokenKind::LBrace);
-        triples_template(p);
+        construct_quads(p);
         p.expect(TokenKind::RBrace);
         g.complete(p);
         w.complete(p);
@@ -102,16 +102,46 @@ fn construct_query(p: &mut Parser<'_>) {
     m.complete(p);
 }
 
-/// `ConstructTemplate ::= '{' ConstructTriples? '}'`. A lone `.` is accepted, as the
-/// reference parser does.
+/// `ConstructTemplate ::= '{' ConstructTriples? '}'`, or Jena ARQ's TriG-like template
+/// (`ConstructQuads`). A lone `.` is accepted, as the reference parser does.
 fn construct_template(p: &mut Parser<'_>) {
     let m = p.start(NodeKind::ConstructTemplate);
     p.expect(TokenKind::LBrace);
     if !p.eat(TokenKind::Dot) {
-        triples_template(p);
+        construct_quads(p);
     }
     p.expect(TokenKind::RBrace);
     m.complete(p);
+}
+
+/// ARQ's `ConstructQuads`: triples statements, `GRAPH g { … }` blocks (`g` an IRI, a
+/// variable or a blank node) and bare `{ … }` blocks for the default graph, up to a
+/// `}`. Each block is a `QuadsGraph`, the `.` after it a token of the template.
+fn construct_quads(p: &mut Parser<'_>) {
+    while !p.at(TokenKind::RBrace) && !p.has_error() {
+        if p.at_kw(Kw::Graph) || p.at(TokenKind::LBrace) {
+            let g = p.start(NodeKind::QuadsGraph);
+            if p.at_kw(Kw::Graph) {
+                p.bump_as(TokenKind::Kw(Kw::Graph));
+                if term::at_blank_node(p) {
+                    p.bump();
+                } else {
+                    term::var_or_iri(p);
+                }
+            }
+            p.expect(TokenKind::LBrace);
+            triples_template(p);
+            p.expect(TokenKind::RBrace);
+            g.complete(p);
+            p.eat(TokenKind::Dot);
+        } else if !triples::triples_stmt(p, Mode::Template)
+            && !p.at(TokenKind::RBrace)
+            && !p.at_kw(Kw::Graph)
+            && !p.at(TokenKind::LBrace)
+        {
+            p.error("expected . or }");
+        }
+    }
 }
 
 /// `TriplesTemplate`: statements separated by `.`, up to a `}`.
