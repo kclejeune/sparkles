@@ -28,6 +28,7 @@ mod diff;
 #[cfg(feature = "fmt")]
 mod format;
 pub(crate) mod history;
+mod inline;
 mod schema;
 mod shex;
 mod stream;
@@ -872,7 +873,11 @@ async fn query_endpoint(
     let with_extra = !opts.default_graph_extra.is_empty();
     let at = history::at_param(&params)?;
     let timeout = opts.timeout;
-    let (r, seq, resolved, t0) = blocking({
+    // a query that was quick last time runs in place (see `inline`); past states are
+    // resolved on the blocking pool, since opening one may read from disk
+    let quick_key = inline::QuickQueries::key(&ds.name, &query);
+    let in_place = at.is_none() && inline::available() && QUICK.is_quick(quick_key);
+    let run = {
         let ds = ds.clone();
         move || {
             let t = std::time::Instant::now();
@@ -883,9 +888,19 @@ async fn query_endpoint(
             tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
             Ok((r, seq, resolved, t0))
         }
-    })
-    .await
-    .map_err(|e| with_timeout(e, timeout))?;
+    };
+    let ran = if in_place {
+        inline::run(run)
+    } else {
+        blocking(run).await
+    };
+    if ran.is_err() {
+        // a query that failed (a timeout, say) is not known to be quick any more
+        QUICK.record(quick_key, f64::INFINITY);
+    }
+    let (r, seq, resolved, t0) = ran.map_err(|e| with_timeout(e, timeout))?;
+    let query_ms = r.timing.total_ms;
+    let cells = r.len().saturating_mul(r.vars.len().max(3));
     let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
     let sparkles_doc =
         sfmt == SolutionsFormat::Sparkles && (!is_graph || params_wants_sparkles(&headers));
@@ -941,16 +956,22 @@ async fn query_endpoint(
     // weak: the serializer thread must not keep the server state (and its stores' locks)
     // alive after the response
     let (metrics_st, name) = (Arc::downgrade(&st), ds.name.clone());
-    let body = stream::serialize(limit, write, move |end| {
-        if let Some(st) = metrics_st.upgrade() {
-            st.metrics
-                .add_response_bytes(Some(&name), Op::Query, end.bytes);
-        }
-        stream_end_log("query", &end);
-    })
-    .await?;
+    // a small result of a query run in place is serialized in place too
+    let body = if in_place && cells <= inline::QUICK_RESULT_CELLS {
+        stream::serialize_now(limit, write)?
+    } else {
+        stream::serialize(limit, write, move |end| {
+            if let Some(st) = metrics_st.upgrade() {
+                st.metrics
+                    .add_response_bytes(Some(&name), Op::Query, end.bytes);
+            }
+            stream_end_log("query", &end);
+        })
+        .await?
+    };
     let (body, report) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
+            QUICK.record(quick_key, query_ms + serialize_ms);
             let report = RequestReport {
                 response_bytes: Some(body.len() as u64),
                 serialize_ms: Some(serialize_ms),
@@ -958,7 +979,10 @@ async fn query_endpoint(
             };
             (axum::body::Body::from(body), report)
         }
-        stream::Serialized::Streamed(body) => (body, report),
+        stream::Serialized::Streamed(body) => {
+            QUICK.record(quick_key, f64::INFINITY);
+            (body, report)
+        }
     };
     let resp = with_commit(
         ([(header::CONTENT_TYPE, ct)], body).into_response(),
@@ -973,6 +997,10 @@ async fn query_endpoint(
     };
     Ok(report.attach(resp))
 }
+
+/// Query texts whose last run was quick (see `inline`).
+static QUICK: std::sync::LazyLock<inline::QuickQueries> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Serialize a query result: the Sparkles JSON document, an RDF graph or solutions.
 #[allow(clippy::too_many_arguments)]
@@ -1504,33 +1532,65 @@ async fn update_endpoint(
     opts.write.cancel = Some(cancel);
     let wanted = receipt_wanted(&params, &headers);
     let timeout = opts.timeout;
-    blocking(move || {
+    let run = |ds: &Dataset, update: &str, opts: &QueryOptions| {
         let t0 = crate::otel::start();
         let stats = sparkles::sparql::update::update_as(
             &ds.store,
-            &update,
-            &opts,
+            update,
+            opts,
             sparkles::commit::CommitKind::Update,
         )?;
         crate::otel::update_done(t0, &stats);
-        let receipt = stats.commit.clone().expect("update receipts");
-        let report = RequestReport {
-            operation: Some(Op::Update),
-            rows: Some(stats.inserted + stats.deleted),
-            mem_peak_bytes: Some(stats.mem_peak_bytes),
-            ..Default::default()
-        };
-        let body = serde_json::to_value(&stats).unwrap();
-        Ok(report.attach(write_response(
-            &ds,
-            StatusCode::OK,
-            Some(body),
-            &receipt,
-            wanted,
-        )))
+        Ok(stats)
+    };
+    // a small update that only inserts or deletes data runs in place (see `inline`),
+    // unless it would wait for another write or for write-time validation
+    if update.len() <= inline::QUICK_UPDATE_BYTES
+        && inline::available()
+        && ds.store.guard().is_none()
+        && sparkles::sparql::update::data_only(&update, &opts)
+    {
+        let mut now = opts.clone();
+        now.write.no_wait = true;
+        match inline::run(|| run(&ds, &update, &now)) {
+            Err(Error::WriterBusy) => {}
+            r => {
+                return r
+                    .map_err(ApiError::from)
+                    .map(|stats| update_response(&ds, stats, wanted))
+                    .map_err(|e| with_timeout(e, timeout));
+            }
+        }
+    }
+    blocking(move || {
+        let stats = run(&ds, &update, &opts)?;
+        Ok(update_response(&ds, stats, wanted))
     })
     .await
     .map_err(|e| with_timeout(e, timeout))
+}
+
+/// The response to a SPARQL Update: its statistics, and the receipt when `wanted`.
+fn update_response(
+    ds: &Dataset,
+    stats: sparkles::sparql::update::UpdateStats,
+    wanted: bool,
+) -> Response {
+    let receipt = stats.commit.clone().expect("update receipts");
+    let report = RequestReport {
+        operation: Some(Op::Update),
+        rows: Some(stats.inserted + stats.deleted),
+        mem_peak_bytes: Some(stats.mem_peak_bytes),
+        ..Default::default()
+    };
+    let body = serde_json::to_value(&stats).unwrap();
+    report.attach(write_response(
+        ds,
+        StatusCode::OK,
+        Some(body),
+        &receipt,
+        wanted,
+    ))
 }
 
 async fn explain(
