@@ -178,6 +178,10 @@ pub struct SchemaCacheEntry {
     /// hash of the selection parameters
     pub selection: u64,
     pub report: Arc<sparkles::schema::SchemaReport>,
+    /// the state the report was computed at, for an in-memory dataset, whose past states
+    /// a later report cannot otherwise be compared with (see
+    /// `http::schema::maintained`)
+    pub mark: Option<sparkles::store::StateMark>,
 }
 
 #[derive(Serialize, Deserialize, Default)]

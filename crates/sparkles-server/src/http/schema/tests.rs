@@ -872,3 +872,66 @@ async fn constraints_layer() {
     let j = ok(&s.app, "/$/schema/t?shapes=none").await;
     assert!(j.get("constraints").is_none(), "{j}");
 }
+
+/// A summary, and how its report came about (`Sparkles-Schema-Report`).
+async fn summary_with_header(app: &Router, path: &str) -> (J, String) {
+    let res = app
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let how = res
+        .headers()
+        .get("sparkles-schema-report")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let mut j: J = serde_json::from_slice(&body).unwrap();
+    j["snapshot"].as_object_mut().unwrap().remove("computedAt");
+    (j, how)
+}
+
+#[tokio::test]
+async fn reports_are_updated_from_changes() {
+    for kind in [DbType::Mem, DbType::Persistent] {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        let ds = state.attach("t", kind, None).unwrap();
+        let app = router(state.clone());
+        update(
+            &app,
+            "INSERT DATA { ex:a a ex:C ; ex:p 1, \"x\"@en . ex:C <http://www.w3.org/2000/01/rdf-schema#label> \"C\" }",
+        )
+        .await;
+        for path in ["/$/schema/t", "/$/schema/t?graph=union&reasoning=false"] {
+            let (_, how) = summary_with_header(&app, path).await;
+            assert_eq!(how, "full", "{kind:?} {path}");
+            let (_, how) = summary_with_header(&app, path).await;
+            assert_eq!(how, "cached");
+            update(
+                &app,
+                "DELETE DATA { ex:a ex:p 1 } ; INSERT DATA { ex:b a ex:C, ex:D ; ex:p 2 . GRAPH ex:g { ex:b ex:q ex:a } }",
+            )
+            .await;
+            let (updated, how) = summary_with_header(&app, path).await;
+            assert_eq!(how, "updated; changes=5", "{kind:?} {path}");
+            // the same report computed from scratch
+            *ds.schema_cache.lock() = None;
+            let (full, how) = summary_with_header(&app, path).await;
+            assert_eq!(how, "full");
+            assert_eq!(updated, full, "{kind:?} {path}");
+            assert!(full["snapshot"]["commit"].as_u64().unwrap() >= 2);
+            // undo, so the next selection starts from the same data
+            update(
+                &app,
+                "INSERT DATA { ex:a ex:p 1 } ; DELETE DATA { ex:b a ex:C, ex:D ; ex:p 2 . GRAPH ex:g { ex:b ex:q ex:a } }",
+            )
+            .await;
+        }
+    }
+}

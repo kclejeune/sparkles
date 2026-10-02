@@ -142,6 +142,13 @@ impl Diff {
             .filter_map(|(k, op)| key_quad(k).map(|q| (*op, q)))
     }
 
+    /// The changes as the vocabulary keys of their graph, subject, predicate and object
+    /// (the default graph's key is empty), in order. Keys are the same in every
+    /// generation; [`key_id`] finds a key's id in a snapshot.
+    pub fn keys(&self) -> impl Iterator<Item = (DiffOp, &[Arc<[u8]>; 4])> + '_ {
+        self.changes.iter().map(|(k, op)| (*op, k))
+    }
+
     /// The changes from position `start`, at most `n` of them.
     pub fn slice(&self, start: usize, n: usize) -> impl Iterator<Item = (DiffOp, Quad)> + '_ {
         self.changes
@@ -149,6 +156,23 @@ impl Diff {
             .skip(start)
             .take(n)
             .filter_map(|(k, op)| key_quad(k).map(|q| (*op, q)))
+    }
+}
+
+/// The id of a term (or graph) key of a [`Diff`] in `snap`, if the snapshot has it. The
+/// empty key is the default graph.
+pub fn key_id(snap: &Snapshot, key: &[u8]) -> Option<Id> {
+    match key.first() {
+        None => Some(Id::DEFAULT_GRAPH),
+        Some(b'_') => {
+            let b: [u8; 8] = key.get(1..9)?.try_into().ok()?;
+            Some(Id::new(Tag::BNode, u64::from_be_bytes(b)))
+        }
+        Some(b'"') => match crate::id::key_to_term(key) {
+            t @ Term::Literal(_) => crate::id::inline_id(&t).or_else(|| snap.lookup_key(key)),
+            _ => None,
+        },
+        Some(_) => snap.lookup_key(key),
     }
 }
 
@@ -599,7 +623,93 @@ fn compare_deltas(a: &Snapshot, b: &Snapshot, net: &mut Net<'_>) -> Result<u64> 
     Ok(read)
 }
 
+/// A light record of one state: its delta and commit, without holding its generation.
+/// A later state of the same generation can be compared with it
+/// ([`Store::diff_since`]), which an in-memory store, whose past states are not kept
+/// without a retention window, cannot do by commit.
+#[derive(Clone)]
+pub struct StateMark {
+    generation: std::sync::Weak<Generation>,
+    delta: Delta,
+    dvocab_len: u64,
+    commit: u64,
+}
+
+impl StateMark {
+    /// The commit of the marked state.
+    pub fn commit(&self) -> u64 {
+        self.commit
+    }
+}
+
+impl Snapshot {
+    /// Mark this state for [`Store::diff_since`].
+    pub fn mark(&self) -> StateMark {
+        StateMark {
+            generation: Arc::downgrade(&self.generation),
+            delta: self.delta.clone(),
+            dvocab_len: self.dvocab_len,
+            commit: self.commit,
+        }
+    }
+}
+
 impl Store {
+    /// The net difference from a marked state to `to`, from their deltas, when both
+    /// are states of one generation (`None` otherwise, or when either commit's metadata
+    /// is gone). The cost is proportional to the two deltas.
+    pub fn diff_since(
+        &self,
+        mark: &StateMark,
+        to: &Snapshot,
+        o: &DiffOptions,
+    ) -> Result<Option<Diff>> {
+        let Some(generation) = mark.generation.upgrade() else {
+            return Ok(None);
+        };
+        if !Arc::ptr_eq(&generation, &to.generation) || mark.commit > to.commit {
+            return Ok(None);
+        }
+        let head = self.head_commit();
+        let (Ok(rf), Ok(rt)) = (
+            self.resolve_with(&At::Commit(mark.commit), head),
+            self.resolve_with(&At::Commit(to.commit), head),
+        ) else {
+            return Ok(None);
+        };
+        let from = Snapshot {
+            delta: mark.delta.clone(),
+            dvocab_len: mark.dvocab_len,
+            commit: mark.commit,
+            ..to.clone()
+        };
+        let mut net = Net {
+            map: FxHashMap::default(),
+            opts: o,
+            readable: FxHashMap::default(),
+        };
+        let compared = compare_deltas(&from, to, &mut net)?;
+        o.over(net.map.len() as u64)?;
+        let mut changes: Vec<(QuadKey, DiffOp)> = net
+            .map
+            .into_iter()
+            .map(|(k, added)| (k, if added { DiffOp::Add } else { DiffOp::Remove }))
+            .collect();
+        changes
+            .sort_unstable_by(|x, y| (x.1 == DiffOp::Add, &x.0).cmp(&(y.1 == DiffOp::Add, &y.0)));
+        let added = changes.iter().filter(|c| c.1 == DiffOp::Add).count() as u64;
+        Ok(Some(Diff {
+            removed: changes.len() as u64 - added,
+            added,
+            from: rf,
+            to: rt,
+            method: DiffMethod::Compare,
+            log_changes: 0,
+            compared,
+            changes,
+        }))
+    }
+
     /// The net difference between the states at `from` and `to`, two readable commits
     /// in either order. Within the retained generations' logs it reads only the changes
     /// between the two commits; across a bulk commit, a gap in the retained history, or

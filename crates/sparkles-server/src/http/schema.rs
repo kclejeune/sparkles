@@ -179,12 +179,81 @@ fn schema_error(e: SchemaError, timeout: Duration) -> ApiError {
     }
 }
 
+/// How the report a request was answered from came about (the `Sparkles-Schema-Report`
+/// header).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Computed {
+    /// the dataset's cached report
+    Cached,
+    /// computed from the indexes
+    Full,
+    /// the cached report of an earlier commit, brought up to date from this many changes
+    Updated(usize),
+}
+
+impl Computed {
+    pub(crate) fn header(self) -> String {
+        match self {
+            Computed::Cached => "cached".into(),
+            Computed::Full => "full".into(),
+            Computed::Updated(n) => format!("updated; changes={n}"),
+        }
+    }
+}
+
+/// The header that says how a report came about.
+pub(crate) const COMPUTED_HEADER: &str = "sparkles-schema-report";
+
+/// The dataset's cached report brought up to date at `snap`, when the cache holds a
+/// report of the same selection at an earlier commit, the changes since then are in the
+/// write-ahead logs and number at most [`schema::max_changes`], and the request is one
+/// a report can be maintained for. `None` otherwise: the caller computes a new report.
+pub(crate) fn maintained(
+    ds: &Dataset,
+    snap: &Arc<sparkles::store::Snapshot>,
+    selection: u64,
+    opts: &SchemaOptions,
+) -> Result<Option<(SchemaReport, usize)>, SchemaError> {
+    let (old, mark) = match ds.schema_cache.lock().as_ref() {
+        Some(e) if e.selection == selection => (e.report.clone(), e.mark.clone()),
+        _ => return Ok(None),
+    };
+    if old.maintenance.is_none() || old.snapshot.commit > snap.commit {
+        return Ok(None);
+    }
+    let o = sparkles::store::DiffOptions {
+        max_quads: schema::max_changes(&old),
+        deadline: opts.deadline,
+        cancel: opts.cancel.clone(),
+        ..Default::default()
+    };
+    // a persistent dataset reads the changes from its write-ahead logs; an in-memory one
+    // compares the deltas of two states of one generation
+    let diff = match &mark {
+        Some(m) => ds.store.diff_since(m, snap, &o).ok().flatten(),
+        None => {
+            let at = sparkles::history::At::Commit;
+            ds.store
+                .diff(&at(old.snapshot.commit), &at(snap.commit), &o)
+                .ok()
+                // a state comparison reads the whole store: a new report costs as much
+                .filter(|d| d.method != sparkles::store::DiffMethod::Compare)
+        }
+    };
+    // history that is gone, or more changes than an update is worth, is a new report
+    let Some(diff) = diff else {
+        return Ok(None);
+    };
+    Ok(schema::update(&old, snap, &diff, opts)?.map(|r| (r, diff.len())))
+}
+
 /// The report the request is answered from: the cached one when it matches the cursor
-/// or the current snapshot, otherwise a fresh one (which replaces the cache).
+/// or the current snapshot, the cached one brought up to date when it can be, otherwise
+/// a fresh one (which replaces the cache).
 fn report(
     ds: &Dataset,
     req: &mut Request,
-) -> ApiResult<(Arc<SchemaReport>, Arc<sparkles::store::Snapshot>)> {
+) -> ApiResult<(Arc<SchemaReport>, Arc<sparkles::store::Snapshot>, Computed)> {
     let (snap, current) = match &req.at {
         None => {
             let snap = ds.store.snapshot();
@@ -221,7 +290,7 @@ fn report(
         && e.selection == req.selection
         && (e.report.term_totals.is_some() || !req.opts.term_totals)
     {
-        return Ok((e.report.clone(), snap));
+        return Ok((e.report.clone(), snap, Computed::Cached));
     }
     if wanted != current {
         return Err(err(
@@ -233,11 +302,22 @@ fn report(
     }
     req.opts.deadline = Some(Instant::now() + req.timeout);
     let started = Instant::now();
-    let report =
-        Arc::new(schema::discover(&snap, &req.opts).map_err(|e| schema_error(e, req.timeout))?);
+    let updated = if req.at.is_none() && req.opts.graphs.is_none() {
+        maintained(ds, &snap, req.selection, &req.opts).map_err(|e| schema_error(e, req.timeout))?
+    } else {
+        None
+    };
+    let (report, how) = match updated {
+        Some((r, n)) => (Arc::new(r), Computed::Updated(n)),
+        None => (
+            Arc::new(schema::discover(&snap, &req.opts).map_err(|e| schema_error(e, req.timeout))?),
+            Computed::Full,
+        ),
+    };
     tracing::debug!(
-        "schema of /{} at version {current} in {:?}: {} classes, {} predicates",
+        "schema of /{} at version {current} ({}) in {:?}: {} classes, {} predicates",
         ds.name,
+        how.header(),
         started.elapsed(),
         report.classes.len(),
         report.predicates.len()
@@ -248,9 +328,10 @@ fn report(
             identity: current,
             selection: req.selection,
             report: report.clone(),
+            mark: (!ds.store.is_persistent()).then(|| snap.mark()),
         });
     }
-    Ok((report, snap))
+    Ok((report, snap, how))
 }
 
 /// One page of `items` after the request's cursor.
@@ -341,9 +422,9 @@ async fn serve(st: St, name: String, uri: Uri, p: Principal, what: What) -> ApiR
         req.cursor = None;
     }
     blocking(move || {
-        let (report, snap) = report(&ds, &mut req)?;
+        let (report, snap, how) = report(&ds, &mut req)?;
         let r = &*report;
-        Ok(match what {
+        let mut resp = match what {
             What::Void(format, declarations) => {
                 let mut prefixes = sparkles::io::standard_prefixes();
                 prefixes.extend(ds.store.prefixes());
@@ -376,7 +457,11 @@ async fn serve(st: St, name: String, uri: Uri, p: Principal, what: What) -> ApiR
             }
             What::Classes => Json(page(r, &r.classes, &req, true)).into_response(),
             What::Predicates => Json(page(r, &r.predicates, &req, true)).into_response(),
-        })
+        };
+        if let Ok(v) = header::HeaderValue::from_str(&how.header()) {
+            resp.headers_mut().insert(COMPUTED_HEADER, v);
+        }
+        Ok(resp)
     })
     .await
 }

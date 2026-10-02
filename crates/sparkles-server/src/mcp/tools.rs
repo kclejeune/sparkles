@@ -828,12 +828,21 @@ impl Tools<'_> {
             graphs: graphs.clone(),
             subject_classes,
         };
-        let report = Arc::new(schema::discover(snap, &opts).map_err(|e| ctx.schema(e))?);
+        let updated = match graphs {
+            None => crate::http::schema::maintained(ds, snap, selection, &opts)
+                .map_err(|e| ctx.schema(e))?,
+            Some(_) => None,
+        };
+        let report = Arc::new(match updated {
+            Some((r, _)) => r,
+            None => schema::discover(snap, &opts).map_err(|e| ctx.schema(e))?,
+        });
         if graphs.is_none() {
             *ds.schema_cache.lock() = Some(SchemaCacheEntry {
                 identity,
                 selection,
                 report: report.clone(),
+                mark: (!ds.store.is_persistent()).then(|| snap.mark()),
             });
         }
         Ok(report)
