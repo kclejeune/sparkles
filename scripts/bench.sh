@@ -364,8 +364,11 @@ cold() {
       evict "$e"
       start "$e"
       ready+=("${READY_S[$e]}")
-      t=$(curl -sf --max-time "${MAX_TIME:-300}" -o /dev/null -w '%{time_total}' -H 'Accept: text/tab-separated-values' \
-        --data-urlencode "query@queries/$n.rq" "${URL[$e]}" || echo error)
+      # curl prints the time even when the request fails, so a failure replaces it
+      if ! t=$(curl -sf --max-time "${MAX_TIME:-300}" -o /dev/null -w '%{time_total}' -H 'Accept: text/tab-separated-values' \
+        --data-urlencode "query@queries/$n.rq" "${URL[$e]}"); then
+        t=error
+      fi
       times+=("$t")
       log "cold $e $n run $i: ready ${READY_S[$e]} s, query $t s"
     done
