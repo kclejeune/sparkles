@@ -1241,6 +1241,7 @@ fn enable_text_for(_: &state::AppState, _: &str) -> Result<()> {
 
 /// `sparkles text-index`
 #[cfg(feature = "text")]
+#[allow(clippy::too_many_arguments)]
 fn text_index(
     loc: &std::path::Path,
     opts: StoreOptions,
@@ -1299,6 +1300,7 @@ fn text_index(
 }
 
 #[cfg(not(feature = "text"))]
+#[allow(clippy::too_many_arguments)]
 fn text_index(
     _: &std::path::Path,
     _: StoreOptions,
