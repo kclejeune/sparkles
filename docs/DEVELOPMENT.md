@@ -132,6 +132,55 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 [BENCHMARKS.md](BENCHMARKS.md) has the results and describes how each run was set up.
 
 * `scripts/bench.sh` (`mise run bench [people] [workdir]`) runs the engine comparison.
+  It compares Sparkles, Jena/Fuseki, QLever, Fluree and Oxigraph over HTTP. Its
+  `--mode` flag, or the `MODE` variable, chooses what it measures.
+
+  ```sh
+  mise run bench 100000 target/bench                   # load, queries and memory
+  mise run bench 100000 target/bench --mode updates    # the queries after 5,000 commits
+  mise run bench 100000 target/bench --mode mixed      # readers and a writer at once
+  mise run bench 100000 target/bench --mode cold       # a restart with a cold page cache per query
+  ```
+
+  The default mode loads every engine, checks the answers and times each query, a
+  single-triple update and the throughput of 16 concurrent clients. Each load runs under
+  GNU `time`, which records its peak RSS, and the index size is the disk space the store
+  takes. The harness reads each server's RSS 2 seconds after it starts, after every query
+  has run once, and after the run. It also records the peak RSS during the throughput
+  run. While it checks the answers, it resets each server's peak RSS before every query
+  (through `/proc/<pid>/clear_refs`) and records how far the peak rose. For Sparkles it
+  also reads the size of the decoded-block cache from `/$/stats`, so the summary can show
+  the RSS without it. These readings go to `results/mem.json` and the memory tables of
+  `results/summary.md`.
+
+  The `updates` mode measures a store that has taken writes. It copies every engine's
+  store into `scratch/` in the workdir and serves the copies. Then it sends each engine
+  the same 5,000 commits (`--churn`), one request each. About 70% insert new
+  `foaf:knows` edges, types and tags, and the rest delete existing `foaf:knows`,
+  `foaf:name` and `rdf:type` triples. `scripts/bench-writes.py` generates these commits
+  once per workdir from `data.nt` with a fixed seed, so every engine gets the same input
+  and the answers stay comparable. The commit rate and latency go to `churn.json`. The
+  queries, the answer check and the memory readings then run on the changed stores, and
+  all results go to `results-updates/`. The harness never compacts the Sparkles copy,
+  and Sparkles does not compact on its own, so its queries read the base index merged
+  with the delta of the commits.
+
+  The `mixed` mode runs each engine alone on a fresh copy of its store. For 30 seconds
+  (`--mixed-seconds`), 16 clients run `star-join` through `oha` while one writer commits
+  single-triple inserts as fast as the engine answers, or at `--write-rate` commits per
+  second. It reports the reads and writes per second and their latency percentiles.
+  Every request opens a new connection, as the curl requests of the other measurements
+  do, because on a reused connection QLever's answers wait about 40 ms for a delayed TCP
+  acknowledgement.
+
+  The `cold` mode stops each engine before every query and evicts its files from the
+  page cache. Then it starts the engine, records the time until it answers, and times one
+  query. It repeats this 3 times (`--cold-runs`) and keeps the median.
+
+  The copies of the `updates` and `mixed` modes are removed at the end of the run unless
+  `KEEP_SCRATCH=1` is set. The servers listen on five ports from `--port-base` (default
+  3931), so runs with different bases can share a machine. Results merge per engine, so
+  `--engines qlever` measures QLever again and keeps the other engines' numbers.
 * `scripts/bench-billion.sh` (`mise run bench:billion [scale]`) runs a comparison on real
   data: English DBpedia, release 2022.12.01 (every English file of its generic, mappings
   and text groups, and the DBpedia ontology), 1.24 billion triples in all. The files, their
