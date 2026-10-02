@@ -115,6 +115,8 @@ impl ErrorContext<'_> {
                     }
                     BudgetKind::OutboundBytes => ("budget-outbound-bytes", "outbound-bytes"),
                     BudgetKind::ValidationWork => ("budget-validation-work", "validation-work"),
+                    BudgetKind::RowsProduced => ("budget-rows-produced", "rows-produced"),
+                    BudgetKind::DatasetBytes => ("budget-dataset-bytes", "dataset-bytes"),
                 };
                 let mut t = ToolError::new(code, 507, b.to_string()).hint(BUDGET_HINT);
                 t.budget = Some(budget);

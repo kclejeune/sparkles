@@ -12,7 +12,9 @@
 
 mod backup;
 mod geo;
+mod quota;
 pub use backup::{BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard};
+pub use quota::{QUOTA_FILE, QuotaSource, QuotaStatus};
 
 use crate::builder::{BuildOptions, Builder, IndexMeta, Slot, Stats};
 use crate::codec::{Codec, Level};
@@ -674,6 +676,11 @@ pub struct StoreOptions {
     /// In-memory stores: refuse a commit that would make the data larger than this
     /// (estimated: index files plus the in-memory delta and vocabulary).
     pub max_memory_bytes: Option<u64>,
+    /// Persistent stores: the default storage quota on the on-disk bytes of the dataset
+    /// directory (`None`: unlimited); a dataset's `quota.json` overrides it (see
+    /// [`Store::set_quota`]). A commit that adds quads past it fails with
+    /// [`Error::BudgetExceeded`] before anything is written.
+    pub max_disk_bytes: Option<u64>,
     /// Prefixes per dataset (0: unlimited): [`Store::set_prefix`] refuses a new one
     /// past it, and the prefixes of loaded data stop being added.
     pub max_prefixes: usize,
@@ -714,6 +721,7 @@ impl Default for StoreOptions {
             unvalidated_writes: false,
             min_free_disk_bytes: None,
             max_memory_bytes: None,
+            max_disk_bytes: None,
             max_prefixes: DEFAULT_MAX_PREFIXES,
             geo_budget_bytes: 4 << 30,
             geo_op_vertices: 2_000_000,
@@ -773,6 +781,8 @@ pub struct Store {
     guard_observer: parking_lot::RwLock<Option<Arc<dyn crate::guard::GuardObserver>>>,
     /// `validation.json` asks for a guard: commits fail without one (fail closed)
     guard_required: AtomicBool,
+    /// the storage quota and the measured size of the directory
+    quota: quota::Quota,
     /// test hooks by failpoint name
     #[cfg(any(test, feature = "failpoints"))]
     failpoints: Mutex<BTreeMap<&'static str, backup::Failpoint>>,
@@ -870,6 +880,7 @@ impl Store {
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(false),
+            quota: quota::Quota::open(None, None).expect("no file to read in memory"),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,
@@ -1077,6 +1088,7 @@ impl Store {
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(guard_required_by(root)),
+            quota: quota::Quota::open(Some(root), opts.max_disk_bytes)?,
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,
@@ -2383,6 +2395,7 @@ impl Store {
             }
             if bulk.is_some() {
                 self.check_memory(dir_size(&dir))?;
+                self.quota.check_rebuild(snap.generation.dir.as_deref())?;
             }
             Ok(meta)
         })();
@@ -2542,6 +2555,8 @@ impl Store {
         if validation.is_some() && bulk.is_some() {
             self.guard_committed(head.seq);
         }
+        // a new generation (and maybe one fewer old one): measure the directory again
+        self.quota.invalidate();
         let receipt = Receipt {
             dataset_id: self.dataset_id,
             committed: bulk.is_some(),
@@ -3271,9 +3286,13 @@ impl WriteTxn<'_> {
                 validation: None,
             });
         }
-        // nothing is written when the disk (or an in-memory store's limit) has no room
-        self.store
-            .check_disk((self.log.len() as u64 + 1) * WAL_REC as u64)?;
+        // nothing is written when the disk (or an in-memory store's limit, or a
+        // persistent one's quota) has no room
+        let wal_bytes = (self.log.len() as u64 + 1) * WAL_REC as u64;
+        self.store.check_disk(wal_bytes)?;
+        if self.net_ins > 0 {
+            self.store.quota.check_commit(wal_bytes)?;
+        }
         if self.net_ins > 0
             && self.store.root.is_none()
             && self.store.opts.max_memory_bytes.is_some()
@@ -3321,6 +3340,7 @@ impl WriteTxn<'_> {
                 self.guard.poisoned = true;
                 return Err(e.into());
             }
+            self.store.quota.add(data.len() as u64);
         }
         self.guard.head = c;
         self.store.catalog.lock().append(c);

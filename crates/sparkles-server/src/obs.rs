@@ -591,6 +591,8 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::DecompressedBytes => 3,
         BudgetKind::OutboundBytes => 4,
         BudgetKind::ValidationWork => 5,
+        BudgetKind::RowsProduced => 6,
+        BudgetKind::DatasetBytes => 7,
     }
 }
 
