@@ -481,6 +481,20 @@ pub fn metrics(st: &AppState, out: &mut String) {
     }
 }
 
+/// `--geo-crs FILE`: register the projected CRSs of a `crs.json` file before any
+/// database opens, so their literals parse and index.
+pub fn register_crs_file(path: &std::path::Path) -> Result<()> {
+    if !cfg!(feature = "geo") {
+        bail!("--geo-crs: built without GeoSPARQL (cargo feature \"geo\")");
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("--geo-crs: reading {}", path.display()))?;
+    let n = sparkles::geo::crs::register_file(&text)
+        .with_context(|| format!("--geo-crs: {}", path.display()))?;
+    tracing::info!("GeoSPARQL: {n} CRSs registered from {}", path.display());
+    Ok(())
+}
+
 /// `serve --geo NAME[=geo.json]`
 pub fn enable_for(st: &AppState, spec: &str) -> Result<()> {
     if !cfg!(feature = "geo") {

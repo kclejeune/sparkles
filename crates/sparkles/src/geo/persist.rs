@@ -172,20 +172,24 @@ pub fn crc32(parts: &[&[u8]]) -> u32 {
     c.sum()
 }
 
-/// The hash of how this build reads literals into the index (its version and CRS table):
-/// files written by another build are rebuilt, since it may classify literals
-/// differently.
+/// The hash of how this build reads literals into the index (its version, CRS table and
+/// the CRSs registered in this process): files written by another build, or with other
+/// registered CRSs, are rebuilt, since it may classify literals differently.
 pub fn engine_hash() -> u64 {
     static HASH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *HASH.get_or_init(|| {
-        let mut h = super::Fnv::new();
-        h.field(env!("CARGO_PKG_VERSION").as_bytes());
-        h.field(&FILE_VERSION.to_le_bytes());
-        for id in super::crs::CrsId::all() {
-            h.field(id.iri().as_bytes());
-        }
-        h.finish()
-    })
+    let registered = super::crs::registry_fingerprint();
+    registered.rotate_left(17)
+        ^ *HASH.get_or_init(|| {
+            let mut h = super::Fnv::new();
+            h.field(env!("CARGO_PKG_VERSION").as_bytes());
+            h.field(&FILE_VERSION.to_le_bytes());
+            for id in super::crs::CrsId::all() {
+                h.field(id.iri().as_bytes());
+            }
+            // the EPSG table resolves more CRSs
+            h.field(&[u8::from(cfg!(feature = "geo-epsg"))]);
+            h.finish()
+        })
 }
 
 /// What the files of a generation must match: the configuration's [`index_hash`], the

@@ -18,6 +18,7 @@ server=(
   shex
   text
   geo
+  geo-epsg
   otel
   auth
   mcp

@@ -106,8 +106,12 @@ shacl = ["dep:sparkles-shacl"]
 shex = ["dep:sparkles-shex"]
 # full-text search (`text:query`, `/$/text`, `sparkles text-index`)
 text = ["sparkles/text"]
-# GeoSPARQL (`geof:` functions, `spatial:` property functions, `/$/geo`, `sparkles geo-index`)
-geo = ["sparkles/geo"]
+# GeoSPARQL (`geof:` functions, `spatial:` property functions, `/$/geo`, `sparkles geo-index`),
+# with projected CRSs an operator defines by proj4 strings (`--geo-crs`)
+geo = ["sparkles/geo", "sparkles/geo-proj4"]
+# GeoSPARQL: resolve EPSG codes through the EPSG-derived proj4 table of crs-definitions
+# (not in the default build: the EPSG terms of use)
+geo-epsg = ["geo", "sparkles/geo-epsg"]
 # authentication and dataset-level authorization (`serve --auth-config`, `sparkles auth`)
 auth = [
     "dep:subtle",

@@ -563,6 +563,47 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
         );
     }
 
+    /// A CRS registered from a proj4 definition works in literals: relations with
+    /// CRS84 geometries, transforms and metric functions.
+    #[cfg(feature = "geo-proj4")]
+    #[test]
+    fn registered_crs_literals() {
+        let iri = "http://example.org/crs/test-fn-utm31";
+        crate::geo::crs::register(
+            iri,
+            "+proj=utm +zone=31 +datum=WGS84 +units=m +no_defs",
+            false,
+        )
+        .unwrap();
+        let s = store();
+        let p = format!("\"<{iri}> POINT(500000 0)\"^^geo:wktLiteral");
+        let t = lit(
+            &s,
+            &format!("geof:transform({p}, <http://www.opengis.net/def/crs/OGC/1.3/CRS84>)"),
+        )
+        .0;
+        let x: f64 = t
+            .trim_start_matches("POINT(")
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((x - 3.0).abs() < 1e-9 && t.ends_with(" 0)"), "{t}");
+        assert!(truth(
+            &s,
+            &format!(
+                "geof:sfWithin({p}, \"POLYGON((2 -1, 4 -1, 4 1, 2 1, 2 -1))\"^^geo:wktLiteral)"
+            )
+        ));
+        let d = num(
+            &s,
+            &format!("geof:metricDistance({p}, \"<{iri}> POINT(501000 0)\"^^geo:wktLiteral)"),
+        );
+        assert!((d - 1000.0).abs() < 2.0, "{d}");
+        assert_eq!(lit(&s, &format!("geof:getSRID({p})")).0, iri);
+    }
+
     #[test]
     fn relations() {
         let s = store();
