@@ -147,6 +147,8 @@ pub struct Dataset {
     pub closure: sparkles_reasoner::Cache,
     /// RDFS on read, when set (see [`crate::rdfs`])
     pub rdfs: RwLock<Option<Arc<sparkles::sparql::rdfs::RdfsOnRead>>>,
+    /// the origin of an in-memory clone (a persistent clone keeps it in `origin.json`)
+    pub mem_origin: Option<serde_json::Value>,
 }
 
 pub use crate::write_validation::Validation;
@@ -736,6 +738,20 @@ impl AppState {
             }
         };
         let reasoning = store.root().and_then(read_reasoning_file);
+        Ok(self.dataset_of(name, kind, store, reasoning, loc.is_some(), None))
+    }
+
+    /// The dataset `name` around `store`, with its validation, RDFS-on-read setting
+    /// and stored queries read from the store's directory.
+    fn dataset_of(
+        &self,
+        name: &str,
+        kind: DbType,
+        store: Store,
+        reasoning: Option<ReasoningInfo>,
+        ephemeral: bool,
+        mem_origin: Option<serde_json::Value>,
+    ) -> Arc<Dataset> {
         let validation = install_validation(&store);
         let rdfs = crate::rdfs::load(&store);
         let validation_metrics = Arc::new(crate::obs::ValidationMetrics::new(name));
@@ -746,12 +762,12 @@ impl AppState {
                 "stored queries of /{name}: {e}; they cannot be changed until it is fixed"
             );
         }
-        Ok(Arc::new(Dataset {
+        Arc::new(Dataset {
             name: name.to_string(),
             kind,
             store,
             reasoning: RwLock::new(reasoning),
-            ephemeral: loc.is_some(),
+            ephemeral,
             schema_cache: Mutex::new(None),
             validation: RwLock::new(validation),
             validation_metrics,
@@ -760,7 +776,8 @@ impl AppState {
             #[cfg(feature = "reasoning")]
             closure: sparkles_reasoner::Cache::new(self.reason_cache_triples),
             rdfs: RwLock::new(rdfs),
-        }))
+            mem_origin,
+        })
     }
 
     #[cfg(any(feature = "reasoning", feature = "backup"))]
@@ -967,6 +984,28 @@ impl AppState {
         Ok(ds)
     }
 
+    /// Register the in-memory store `store` (a clone) under a reserved name, with its
+    /// reasoning status and origin, and persist the registry. Like every in-memory
+    /// dataset, it is registered again after a restart, empty.
+    pub fn adopt_memory(
+        &self,
+        reservation: Reservation,
+        store: Store,
+        reasoning: Option<ReasoningInfo>,
+        origin: serde_json::Value,
+    ) -> Result<Arc<Dataset>> {
+        let name = reservation.name.clone();
+        let _guard = self.manage.lock();
+        let ds = self.dataset_of(&name, DbType::Mem, store, reasoning, false, Some(origin));
+        self.datasets.write().insert(name.clone(), ds.clone());
+        if let Err(e) = self.save_registry_locked() {
+            self.datasets.write().remove(&name);
+            return Err(e);
+        }
+        drop(reservation);
+        Ok(ds)
+    }
+
     // ----------------------------------------------------------------- tasks ------
 
     /// A new task id (for a task started with [`start_task_as`](Self::start_task_as)).
@@ -1034,6 +1073,7 @@ impl AppState {
         let span = crate::otel::task_span(kind, &id, dataset);
         let run = {
             let id = id.clone();
+            let kind = kind.to_string();
             move |waited: bool| {
                 std::thread::spawn(move || {
                     let handle = TaskHandle {
@@ -1061,7 +1101,7 @@ impl AppState {
                     };
                     finish(&state.tasks, &id, r);
                     if counted {
-                        state.task_queue.done();
+                        state.task_queue.done(&kind);
                     }
                 });
             }
@@ -1074,21 +1114,27 @@ impl AppState {
         // decided and listed under the queue's lock, so the task is listed before a
         // finishing task can start it
         let mut q = self.task_queue.inner.lock();
-        let now_running = q.running < self.task_queue.max();
-        if now_running {
-            q.running += 1;
+        let slot = q.running < self.task_queue.max();
+        let kind_slot = self.task_queue.kind_free(&q, kind);
+        if slot && kind_slot {
+            q.start(kind);
         } else {
             // a task that has not started may always be cancelled
             task.state = task_state::QUEUED.into();
             task.cancellable = true;
-            task.message = Some("waiting for a free task slot (--max-tasks)".into());
+            task.message = Some(if slot {
+                format!("waiting for a free {kind} slot (--max-{kind}s)")
+            } else {
+                "waiting for a free task slot (--max-tasks)".into()
+            });
         }
         self.push_task(task.clone());
-        if now_running {
+        if slot && kind_slot {
             drop(q);
             run(false);
         } else {
-            q.queued.push_back((id, Box::new(move || run(true))));
+            q.queued
+                .push_back((id, kind.to_string(), Box::new(move || run(true))));
         }
         task
     }
@@ -1189,27 +1235,45 @@ pub const MAX_QUEUED_TASKS: usize = 1000;
 /// Background tasks running at once by default (`serve --max-tasks`).
 pub const DEFAULT_MAX_TASKS: usize = 4;
 
+/// Clones running at once by default (`serve --max-clones`), within `--max-tasks`.
+pub const DEFAULT_MAX_CLONES: usize = 2;
+
 /// The background task slots: at most `max` tasks run at once (each on its own
-/// thread); the others wait, `queued`, in start order. Backup tasks are not counted
-/// here: they wait for the slots of `--backup-max-tasks`.
+/// thread), and at most the limit of their kind for the kinds that have one (clones:
+/// `--max-clones`). The others wait, `queued`, in start order, and a freed slot goes
+/// to the first waiting task that may run. Backup tasks are not counted here: they
+/// wait for the slots of `--backup-max-tasks`.
 pub struct TaskQueue {
     max: std::sync::atomic::AtomicUsize,
+    /// tasks of a kind that may run at once, for the kinds that have a limit
+    kind_max: Mutex<BTreeMap<String, usize>>,
     inner: Mutex<QueueState>,
 }
 
-/// A queued task: its id and what starts it.
-type Queued = (String, Box<dyn FnOnce() + Send>);
+/// A queued task: its id, its kind and what starts it.
+type Queued = (String, String, Box<dyn FnOnce() + Send>);
 
 #[derive(Default)]
 struct QueueState {
     running: usize,
+    /// running tasks by kind
+    kinds: BTreeMap<String, usize>,
     queued: std::collections::VecDeque<Queued>,
+}
+
+impl QueueState {
+    /// A task of `kind` takes a slot.
+    fn start(&mut self, kind: &str) {
+        self.running += 1;
+        *self.kinds.entry(kind.to_string()).or_default() += 1;
+    }
 }
 
 impl TaskQueue {
     pub fn new(max: usize) -> TaskQueue {
         TaskQueue {
             max: std::sync::atomic::AtomicUsize::new(max),
+            kind_max: Mutex::new(BTreeMap::from([("clone".to_string(), DEFAULT_MAX_CLONES)])),
             inner: Mutex::new(QueueState::default()),
         }
     }
@@ -1219,6 +1283,16 @@ impl TaskQueue {
         self.max.store(max, Ordering::Relaxed);
     }
 
+    /// Tasks of `kind` that may run at once (0: only the overall limit applies).
+    pub fn set_kind_max(&self, kind: &str, max: usize) {
+        let mut m = self.kind_max.lock();
+        if max == 0 {
+            m.remove(kind);
+        } else {
+            m.insert(kind.to_string(), max);
+        }
+    }
+
     fn max(&self) -> usize {
         match self.max.load(Ordering::Relaxed) {
             0 => usize::MAX,
@@ -1226,10 +1300,20 @@ impl TaskQueue {
         }
     }
 
-    /// Whether a task started now would run at once rather than wait.
+    /// Whether one more task of `kind` stays within its kind's limit.
+    fn kind_free(&self, q: &QueueState, kind: &str) -> bool {
+        match self.kind_max.lock().get(kind) {
+            Some(&max) => q.kinds.get(kind).copied().unwrap_or(0) < max,
+            None => true,
+        }
+    }
+
+    /// Whether a task without a kind limit started now would run at once rather than
+    /// wait. A waiting task that may run takes the first free slot, so the only tasks
+    /// that wait next to a free slot are held back by their kind's limit.
     pub fn has_free_slot(&self) -> bool {
         let q = self.inner.lock();
-        q.queued.is_empty() && q.running < self.max()
+        q.running < self.max()
     }
 
     /// Tasks running now and waiting.
@@ -1239,22 +1323,32 @@ impl TaskQueue {
         (q.running, q.queued.len())
     }
 
-    /// A counted task ended: start the next one in its slot.
-    fn done(&self) {
+    /// A counted task of `kind` ended: the first waiting task that may run now takes
+    /// its slot.
+    fn done(&self, kind: &str) {
         let mut q = self.inner.lock();
-        match q.queued.pop_front() {
-            Some((_, start)) => {
-                drop(q);
-                start();
+        if let Some(n) = q.kinds.get_mut(kind) {
+            *n -= 1;
+            if *n == 0 {
+                q.kinds.remove(kind);
             }
-            None => q.running -= 1,
+        }
+        q.running -= 1;
+        let next = (0..q.queued.len()).find(|&i| self.kind_free(&q, &q.queued[i].1));
+        if let Some(i) = next
+            && q.running < self.max()
+        {
+            let (_, k, start) = q.queued.remove(i).expect("in range");
+            q.start(&k);
+            drop(q);
+            start();
         }
     }
 
     /// Take a queued task out; whether it was queued.
     fn remove(&self, id: &str) -> bool {
         let mut q = self.inner.lock();
-        let Some(i) = q.queued.iter().position(|(t, _)| t == id) else {
+        let Some(i) = q.queued.iter().position(|(t, _, _)| t == id) else {
             return false;
         };
         let entry = q.queued.remove(i);

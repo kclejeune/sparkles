@@ -254,6 +254,8 @@ pub enum Hold {
     Retention,
     /// a backup reading the generation (a lease, by backup name)
     Lease(String),
+    /// a clone copying the generation's files (a lease, by the clone's name)
+    Clone(String),
 }
 
 impl std::fmt::Display for Hold {
@@ -263,6 +265,7 @@ impl std::fmt::Display for Hold {
             Hold::Snapshot(n) => write!(f, "snapshot:{n}"),
             Hold::Retention => write!(f, "retention"),
             Hold::Lease(n) => write!(f, "backup:{n}"),
+            Hold::Clone(n) => write!(f, "clone:{n}"),
         }
     }
 }
@@ -487,12 +490,15 @@ pub(crate) struct GenEntry {
     pub bytes: u64,
 }
 
-/// A backup's hold on a generation directory: kept, whatever else needs it, until the
-/// backup has read it. In memory only (never in `history.json`).
+/// A backup's or a clone's hold on a generation directory: kept, whatever else needs
+/// it, until the backup has read it or the clone has copied it. In memory only (never
+/// in `history.json`).
 #[derive(Clone, Debug)]
 pub(crate) struct Lease {
     pub generation: u32,
     pub label: String,
+    /// held by a clone rather than a backup
+    pub clone: bool,
 }
 
 /// A materialized past state in the history cache.
@@ -625,6 +631,12 @@ impl HistoryState {
 
     /// Add a lease on generation `generation`; returns its id.
     pub fn lease(&mut self, generation: u32, label: &str) -> u64 {
+        self.lease_for(generation, label, false)
+    }
+
+    /// Add a lease on generation `generation` for a backup, or for a clone (`clone`);
+    /// returns its id.
+    pub(crate) fn lease_for(&mut self, generation: u32, label: &str, clone: bool) -> u64 {
         let id = self.next_lease;
         self.next_lease += 1;
         self.leases.insert(
@@ -632,6 +644,7 @@ impl HistoryState {
             Lease {
                 generation,
                 label: label.to_string(),
+                clone,
             },
         );
         id
@@ -642,7 +655,13 @@ impl HistoryState {
         self.leases
             .values()
             .filter(move |l| l.generation == no)
-            .map(|l| Hold::Lease(l.label.clone()))
+            .map(|l| {
+                if l.clone {
+                    Hold::Clone(l.label.clone())
+                } else {
+                    Hold::Lease(l.label.clone())
+                }
+            })
     }
 
     /// The non-current generations to keep, with what holds each: a generation is

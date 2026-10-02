@@ -239,6 +239,7 @@ pub fn clone_to<'py>(
     d.set_item("quads", r.quads)?;
     d.set_item("graphs", r.graphs)?;
     d.set_item("millis", r.millis)?;
+    d.set_item("method", r.method.name())?;
     Ok(d)
 }
 

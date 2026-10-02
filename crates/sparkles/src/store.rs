@@ -12,6 +12,7 @@
 
 mod backup;
 mod changes;
+mod clone;
 mod compaction;
 #[cfg(test)]
 mod compaction_tests;
@@ -28,6 +29,7 @@ pub use backup::{
     MemoryCaptureOptions,
 };
 pub use changes::{ChangePage, ChangesOptions, CommitChanges};
+pub use clone::{CloneMethod, CloneMode, CloneOptions, CloneReport};
 pub use compaction::{
     Blocker, COMPACTION_FILE, CompactOptions, CompactReport, CompactionMeasures, CompactionPolicy,
     CompactionSettings, SETTING_NAMES, Trigger, TriggerKind,
@@ -726,8 +728,18 @@ impl Snapshot {
     }
 
     /// Stream every quad as terms (dump / backup / compaction).
-    pub fn for_each_quad(&self, mut f: impl FnMut(&[Id; 4]) -> Result<()>) -> Result<()> {
-        self.scan(Perm::Gspo, &[], |c| {
+    pub fn for_each_quad(&self, f: impl FnMut(&[Id; 4]) -> Result<()>) -> Result<()> {
+        self.for_each_quad_in(&[], f)
+    }
+
+    /// Stream the quads whose GSPO key starts with `prefix` (`[g]`: the quads of graph
+    /// `g`), in GSPO order.
+    pub fn for_each_quad_in(
+        &self,
+        prefix: &[u64],
+        mut f: impl FnMut(&[Id; 4]) -> Result<()>,
+    ) -> Result<()> {
+        self.scan(Perm::Gspo, prefix, |c| {
             match c {
                 Chunk::Block(b, s, e) => {
                     for i in s..e {
@@ -939,6 +951,8 @@ pub struct Store {
     /// exclusive OS lock on `<root>/sparkles.lock` (TDB2 `tdb.lock`), held while open
     _lock: Option<File>,
     dataset_id: uuid::Uuid,
+    /// `forkedFrom` of an in-memory clone (a persistent one keeps it in `dataset.json`)
+    forked_mem: Option<ForkedFrom>,
     catalog: Arc<Mutex<Catalog>>,
     /// commit messages and change digests (lock order: writer, then annotations)
     annotations: Mutex<crate::annotations::Annotations>,
@@ -1009,13 +1023,6 @@ pub(crate) const WAL_REC: usize = 1 + 32;
 impl Store {
     /// A fresh in-memory store (Jena `DatasetGraphFactory.createTxnMem()` equivalent).
     pub fn in_memory(opts: StoreOptions) -> Store {
-        let cache = Arc::new(BlockCache::new(opts.cache_bytes));
-        let results = Arc::new(crate::sparql::cache::ResultCache::new(
-            opts.result_cache_bytes,
-            opts.result_cache_min_ms,
-        ));
-        let gen_ = Arc::new(Generation::empty(DeltaVocab::in_memory()));
-        let dataset_id = uuid::Uuid::new_v4();
         let root = CommitInfo {
             seq: 0,
             timestamp_ms: commit::now_ms(),
@@ -1030,6 +1037,35 @@ impl Store {
             default_graph: true,
             unvalidated: false,
         };
+        let gen_ = Arc::new(Generation::empty(DeltaVocab::in_memory()));
+        Self::in_memory_from(
+            opts,
+            gen_,
+            0,
+            BTreeMap::new(),
+            root,
+            uuid::Uuid::new_v4(),
+            None,
+        )
+    }
+
+    /// An in-memory store whose base is the generation `gen_` (built in a temporary
+    /// directory it owns), with root commit `root`: a new store, or an in-memory clone.
+    pub(crate) fn in_memory_from(
+        opts: StoreOptions,
+        gen_: Arc<Generation>,
+        next_bnode: u64,
+        prefixes: BTreeMap<String, String>,
+        root: CommitInfo,
+        dataset_id: uuid::Uuid,
+        forked_from: Option<ForkedFrom>,
+    ) -> Store {
+        let cache = Arc::new(BlockCache::new(opts.cache_bytes));
+        let results = Arc::new(crate::sparql::cache::ResultCache::new(
+            opts.result_cache_bytes,
+            opts.result_cache_min_ms,
+        ));
+        let dvocab_len = gen_.dvocab.len();
         let store = Store {
             root: None,
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
@@ -1038,7 +1074,7 @@ impl Store {
                 version: 0,
                 cache: cache.clone(),
                 results: results.clone(),
-                dvocab_len: 0,
+                dvocab_len,
                 commit: 0,
                 text: None,
                 geo: None,
@@ -1051,7 +1087,7 @@ impl Store {
             writer: Arc::new(Mutex::new(WriterState {
                 wal: None,
                 wal_len: 0,
-                next_bnode: 0,
+                next_bnode,
                 head: root,
                 poisoned: false,
                 closed: false,
@@ -1059,9 +1095,10 @@ impl Store {
             })),
             cache,
             results,
-            prefixes: Mutex::new(BTreeMap::new()),
+            prefixes: Mutex::new(prefixes),
             _lock: None,
             dataset_id,
+            forked_mem: forked_from,
             catalog: Arc::new(Mutex::new(Catalog::memory(root, opts.memory_commit_ring))),
             annotations: Mutex::new(crate::annotations::Annotations::memory(opts.commit_digests)),
             clock: Arc::new(Mutex::new(None)),
@@ -1296,6 +1333,7 @@ impl Store {
             prefixes: Mutex::new(prefixes),
             _lock: Some(lock),
             dataset_id,
+            forked_mem: None,
             catalog: Arc::new(Mutex::new(catalog)),
             annotations: Mutex::new(annotations),
             clock: Arc::new(Mutex::new(None)),
@@ -3109,6 +3147,7 @@ impl Store {
             write_snapshot(
                 &builder,
                 snap,
+                None,
                 |q| Ok(!drop_graphs.contains(&q[3])),
                 extra_quads,
             )?;
@@ -3363,176 +3402,17 @@ impl Store {
         Ok((meta.quads.saturating_sub(before), receipt))
     }
 
-    /// Build a new, independent database in `dir` (absent or empty) from one consistent
-    /// snapshot of this store: every quad (except those in `opts.exclude_graphs`) in a
-    /// freshly built generation `gen-0001` with an empty delta, the prefixes, and a new
-    /// dataset id whose root commit records this store's id and the snapshot's commit as
-    /// `forkedFrom`. Blank nodes keep their ids (`_:b<hex>` labels), and the blank-node
-    /// counter is carried over, so new blank nodes never collide with copied ones.
-    ///
-    /// The writer lock is held only to capture the snapshot; this store is never written.
-    /// On any error `dir` is left as it was found (removed, or emptied).
-    pub fn clone_to(&self, dir: &Path, opts: &CloneOptions) -> Result<CloneReport> {
-        let t0 = std::time::Instant::now();
-        let existed = dir.exists();
-        if existed && std::fs::read_dir(dir)?.next().is_some() {
-            return Err(Error::Invalid(format!(
-                "{} exists and is not empty",
-                dir.display()
-            )));
-        }
-        // the snapshot and the blank-node counter together: no commit falls in between
-        let (snap, next_bnode) = {
-            let w = self.writer.lock();
-            (self.snapshot(), w.next_bnode)
-        };
-        // a past state: its blank nodes are older than the counter, which never decreases
-        let snap = match &opts.at {
-            Some(at) => {
-                let o = crate::history::HistoryOptions {
-                    cancel: opts.cancel.clone(),
-                    deadline: None,
-                };
-                self.snapshot_at(at, &o)?.0
-            }
-            None => snap,
-        };
-        std::fs::create_dir_all(dir)?;
-        let mut guard = CleanDir {
-            dir,
-            remove: !existed,
-            armed: true,
-        };
-        let excluded: std::collections::HashSet<u64> = opts
-            .exclude_graphs
-            .iter()
-            .filter_map(|g| snap.lookup_iri(g.as_str()))
-            .map(|g| g.0)
-            .collect();
-        let report = |f: f32, msg: &str| {
-            if let Some(p) = &opts.progress {
-                p(f, msg);
-            }
-        };
-        let name = "gen-0001";
-        let gdir = dir.join(name);
-        let total = snap.len().max(1);
-        let (mut seen, mut graphs, mut last_graph) = (0u64, 0u64, None);
-        report(0.0, "copying quads");
-        let prefixes = self.prefixes();
-        // the clone's file system keeps the same free space as this store's
-        let meta = self.build_from_snapshot(
-            &gdir,
-            &snap,
-            next_bnode,
-            self.opts.min_free_disk_bytes,
-            prefixes.clone(),
-            |q| {
-                seen += 1;
-                if seen % 65_536 == 0 {
-                    if opts
-                        .cancel
-                        .as_ref()
-                        .is_some_and(|c| c.load(Ordering::Relaxed))
-                    {
-                        return Err(Error::Cancelled);
-                    }
-                    report(0.7 * seen as f32 / total as f32, "copying quads");
-                }
-                if excluded.contains(&q[3].0) {
-                    return Ok(false);
-                }
-                if last_graph != Some(q[3]) {
-                    graphs += 1;
-                    last_graph = Some(q[3]);
-                }
-                Ok(true)
-            },
-            || report(0.7, "building indexes"),
-        )?;
-        // a new lineage: its own id and root commit, forked from the snapshot
-        let id = uuid::Uuid::new_v4();
-        let now = commit::now_ms();
-        let root = CommitInfo {
-            seq: 0,
-            timestamp_ms: now,
-            kind: CommitKind::Create,
-            inserted: meta.quads,
-            deleted: 0,
-            quads: meta.quads,
-            generation: 1,
-            bulk: true,
-            exact: true,
-            reconstructed: false,
-            default_graph: true,
-            unvalidated: false,
-        };
-        let forked_from = ForkedFrom {
-            id: self.dataset_id,
-            seq: snap.commit,
-        };
-        write_synced(
-            &gdir.join("commit.json"),
-            &commit::gen_commit_bytes(id, "clone", &root),
-        )?;
-        File::create(gdir.join("wal.log"))?.sync_all()?;
-        sync_dir(&gdir)?;
-        write_atomic(
-            &dir.join("dataset.json"),
-            &commit::clone_dataset_file_bytes(id, now, forked_from),
-        )?;
-        Catalog::create(&dir.join("commits.bin"), id, root)?;
-        if !prefixes.is_empty() {
-            write_atomic(
-                &dir.join("prefixes.json"),
-                &serde_json::to_vec_pretty(&prefixes).unwrap(),
-            )?;
-        }
-        // full-text search, the spatial index and the vector indexes stay on: the clone
-        // rebuilds them when opened
-        for (file, cfg) in self.index_config_files()? {
-            write_atomic(&dir.join(file), &cfg)?;
-        }
-        // write-time validation stays configured (the clone judges its first write in
-        // full), and the stored queries come along
-        if let Some(root) = &self.root {
-            for f in crate::guard::config::FILES
-                .iter()
-                .chain([&crate::stored::FILE])
-            {
-                match std::fs::read(root.join(f)) {
-                    Ok(b) => write_atomic(&dir.join(f), &b)?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
-        // CURRENT last: the commit point of the new database
-        write_atomic(&dir.join("CURRENT"), name.as_bytes())?;
-        sync_dir(dir)?;
-        guard.armed = false;
-        report(1.0, "done");
-        Ok(CloneReport {
-            dataset_id: id,
-            forked_from,
-            version: snap.version,
-            generation: snap.generation.name.clone(),
-            source_quads: snap.len(),
-            quads: meta.quads,
-            graphs,
-            millis: t0.elapsed().as_millis() as u64,
-        })
-    }
-
-    /// Build the generation directory `gdir` from `snap`: every quad `keep` accepts, the
-    /// `prefixes`, and new blank nodes numbered from `next_bnode` on. Building stops
-    /// with `507` once the file system would keep less than `reserve` bytes free.
-    /// `indexing` is called between writing the quads and building the indexes.
+    /// Build the generation directory `gdir` from `snap`: every quad `keep` accepts (of
+    /// the graphs `graphs` only, when given), the `prefixes`, and new blank nodes
+    /// numbered from `next_bnode` on. Building stops with `507` once the file system
+    /// would keep less than `reserve` bytes free. `indexing` is called between writing
+    /// the quads and building the indexes.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_from_snapshot(
         &self,
         gdir: &Path,
         snap: &Snapshot,
+        graphs: Option<&[u64]>,
         next_bnode: u64,
         reserve: Option<u64>,
         prefixes: BTreeMap<String, String>,
@@ -3548,7 +3428,7 @@ impl Store {
                 crate::disk::check_reserve(&gdir, reserve, 0, false)
             }));
         }
-        write_snapshot(&builder, snap, keep, &[])?;
+        write_snapshot(&builder, snap, graphs, keep, &[])?;
         indexing();
         builder.add_prefixes(prefixes);
         builder.finish()
@@ -3607,6 +3487,9 @@ impl Store {
     /// `forkedFrom` of a database made by [`clone_to`](Self::clone_to) (or restored
     /// from a backup under a new identity).
     pub fn forked_from(&self) -> Option<ForkedFrom> {
+        if let Some(f) = self.forked_mem {
+            return Some(f);
+        }
         let root = self.root.as_ref()?;
         commit::read_forked_from(root).ok().flatten()
     }
@@ -3668,13 +3551,15 @@ impl Store {
     }
 }
 
-/// Push the quads of `snap` for which `keep` returns true, then `extra` (store ids of
-/// `snap`), into `builder`. Vocabulary ids are passed as their keys; inline and
-/// blank-node ids pass through unchanged, which keeps blank-node identity. Triple-term
-/// keys embed their blank-node payloads, so blank nodes inside them keep it too.
+/// Push the quads of `snap` (of the graphs `graphs` only, when given) for which `keep`
+/// returns true, then `extra` (store ids of `snap`), into `builder`. Vocabulary ids are
+/// passed as their keys; inline and blank-node ids pass through unchanged, which keeps
+/// blank-node identity. Triple-term keys embed their blank-node payloads, so blank
+/// nodes inside them keep it too.
 fn write_snapshot(
     builder: &Builder,
     snap: &Snapshot,
+    graphs: Option<&[u64]>,
     mut keep: impl FnMut(&[Id; 4]) -> Result<bool>,
     extra: &[[Id; 4]],
 ) -> Result<()> {
@@ -3704,74 +3589,23 @@ fn write_snapshot(
         };
         enc.push_slots([slot(0), slot(1), slot(2), slot(3)])
     };
-    snap.for_each_quad(|q| if keep(q)? { push(q) } else { Ok(()) })?;
+    let mut each = |q: &[Id; 4]| if keep(q)? { push(q) } else { Ok(()) };
+    match graphs {
+        None => snap.for_each_quad(&mut each)?,
+        Some(gs) => {
+            for &g in gs {
+                snap.for_each_quad_in(&[g], &mut each)?;
+            }
+        }
+    }
     for q in extra {
         push(q)?;
     }
     enc.flush()
 }
 
-/// What [`Store::clone_to`] leaves out, and how it reports progress.
-#[derive(Clone, Default)]
-pub struct CloneOptions {
-    /// graphs to leave out (e.g. the materialized inferences)
-    pub exclude_graphs: Vec<NamedNode>,
-    /// set to `true` to cancel (checked every 65536 quads)
-    pub cancel: Option<Arc<AtomicBool>>,
-    pub progress: Option<ProgressFn>,
-    /// clone the state at this commit instead of the head (it must be readable)
-    pub at: Option<crate::history::At>,
-}
-
 /// Progress callback: (fraction done in `[0, 1]`, message).
 pub type ProgressFn = Arc<dyn Fn(f32, &str) + Send + Sync>;
-
-/// Outcome of [`Store::clone_to`].
-#[derive(Clone, Debug)]
-pub struct CloneReport {
-    /// the new database's dataset id
-    pub dataset_id: uuid::Uuid,
-    /// this store's id and the commit of the copied snapshot
-    pub forked_from: ForkedFrom,
-    /// snapshot version and generation of the source
-    pub version: u64,
-    pub generation: String,
-    /// quads in the source snapshot
-    pub source_quads: u64,
-    /// quads in the clone (fewer when graphs were excluded)
-    pub quads: u64,
-    /// graphs in the clone, the default graph included when it has quads
-    pub graphs: u64,
-    pub millis: u64,
-}
-
-/// Removes (or empties) a directory on drop unless disarmed.
-struct CleanDir<'a> {
-    dir: &'a Path,
-    /// remove the directory itself (it did not exist before)
-    remove: bool,
-    armed: bool,
-}
-
-impl Drop for CleanDir<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if self.remove {
-            let _ = std::fs::remove_dir_all(self.dir);
-        } else if let Ok(rd) = std::fs::read_dir(self.dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                let _ = if p.is_dir() {
-                    std::fs::remove_dir_all(&p)
-                } else {
-                    std::fs::remove_file(&p)
-                };
-            }
-        }
-    }
-}
 
 pub(crate) fn dir_size(p: &Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(p) else {
