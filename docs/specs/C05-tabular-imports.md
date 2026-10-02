@@ -1,12 +1,14 @@
 # C05: CSV and TSV imports
 
-> **Status:** designed, not built
+> **Status:** implemented
 >
-> **Phases:** Phase 1 is designed here: the `sparkles::tabular` converter, a default
-> mapping, CSVW metadata mappings, CONSTRUCT templates, `sparkles load` and
+> **Phases:** Shipped on 2026-10-02 as one phase: the `sparkles::tabular` converter, a
+> default mapping, CSVW metadata mappings, CONSTRUCT templates, `sparkles load` and
 > `sparkles csv`, and CSV files in `POST /{ds}/upload`.
 >
-> **User docs:** none yet.
+> **User docs:** [Usage: Loading CSV and TSV](../USAGE.md#loading-csv-and-tsv) ·
+> [API: CSV and TSV uploads](../API.md#csv-and-tsv-uploads) ·
+> [Features](../FEATURES.md#storage-tdb2-equivalent)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -484,4 +486,85 @@ parameter, are a non-goal for this phase.
 
 ## Outcome
 
-Not built yet.
+**Delivered on 2026-10-02**, as designed in one phase.
+
+- `sparkles::tabular` holds the converter. `csvw` reads the metadata subset of §3,
+  `datatype` parses cells by datatype and format, `uritemplate` expands RFC 6570
+  templates, and `template` runs CONSTRUCT templates. `convert` streams a table to a
+  triple sink, `write` serializes the triples, and `to_ntriples_file` writes the
+  temporary N-Triples file that `source` turns into a loader `Source`. The `csv` crate
+  reads the records, and a guard on its input stops a record that grows past the limit
+  before it is read whole.
+- `sparkles load` takes `--mapping`, `--template`, `--base` and `--key`, and
+  `sparkles csv` has `convert` and `mapping`. Both live in the server crate's `csv_cmd`
+  module. A later `riot`-style converter can call `tabular::write` directly.
+- `POST /{ds}/upload` converts tables in `http::tabular`, after the Jena binary formats
+  are transcoded and before the sources are built, so dry runs, timeouts, grants and
+  write-time validation apply unchanged.
+
+**Deviations and additions.**
+
+- The parser projects a CONSTRUCT's WHERE clause onto its variables. The `VALUES` block
+  therefore goes inside that projection, and the table's variables are added to it, so
+  a template can use a column variable that its WHERE clause never names.
+- Comment lines are not records, as in the `csv` crate, so `_sourceRow` and the row
+  numbers of messages do not count them. Messages add the line number when it differs
+  from the row number.
+- `notes`, `@id`, `@type`, `primaryKey`, `foreignKeys`, `rowTitles` and common
+  properties such as `dc:title` are accepted without a warning, because they describe
+  the table and do not change the triples. `transformations` and properties outside the
+  vocabulary are ignored with a warning.
+- Turtle output declares `rdf`, `xsd`, the CSVW prefixes that the mapping's
+  `propertyUrl` and `valueUrl` use, and the template's `PREFIX` declarations. The prefixes
+  of the output cannot be known before it is streamed, so this replaced the design's
+  "prefixes that the output uses".
+- Two header cells with the same title get the names `title` and `title_2`. Template
+  variables are made unique the same way, and a column named `ROWNUM` becomes
+  `?ROWNUM_2`.
+- `.tab` files are TSV too, and `application/csv` is a CSV media type.
+- `--compression` applies to the RDF files of a load. Tables are detected by their magic
+  bytes and file names. The decompressed-size limit applies to compressed tables only,
+  since a plain upload is already bounded by `--max-upload-mb`.
+- The upload's answer lists each table with its `file`, `rows`, `triples` and
+  `warnings` under `tables`.
+- Under the record limit, an unclosed quote ends at the end of the file and the rest of
+  the file becomes one cell, as the `csv` crate reads it. Past the limit it fails with
+  the row where the record started.
+
+**Tests at landing.**
+
+- `sparkles::tabular::tests` covers the acceptance examples T1 to T6 and T10, the default
+  metadata that `sparkles csv mapping` prints, dialects (skipped rows and columns, two
+  header rows, comments, other delimiters, no trimming, blank rows), lists and ordered
+  lists, defaults, `_row` and `_column` in templates, suppressed columns, table groups,
+  bad metadata, relative IRIs without a table URL, the output limit, compressed tables
+  and the decompressed-size limit, a 200,000-row generated table that is never held in
+  memory, and a load through the temporary file that leaves the store unchanged when the
+  table fails. The `datatype`, `uritemplate` and `template` modules test number, boolean,
+  string and date formats, the examples of RFC 6570 §3.2, variable names and the refused
+  templates. The W3C CSVW test suite was not available offline, so these cases follow
+  the spec's examples instead.
+- `csv_cmd::tests` checks the conversion of a load's files, the metadata file found next
+  to a table, and the tables of a mapping loaded from their `url`.
+- `http::router_tests::tabular` uploads `text/csv` and TSV bodies, multipart uploads with
+  a mapping or a template next to an RDF file, the refusals of a key with a mapping, a
+  mapping without a table and a template with `SERVICE`, a bad cell that commits nothing,
+  and the decompressed-size limit (`413`).
+
+**Cost.** Measured with the release build on a machine with a load average of about 55,
+so the times are rough. A 3,000,000-row table of 112 MiB with four columns converted to
+12,000,000 triples (551 MiB of N-Triples) in 8.8 s with the default mapping, in 13.3 s
+with CSVW metadata that types three columns, and in 31.4 s with a CONSTRUCT template that
+casts the same three. The conversion stayed at 30 MiB of resident memory, or 114 MiB with
+the template's batches, independent of the number of rows (T8). `sparkles load` of the
+table took 64 s in all, against 47 s for loading the converted N-Triples file directly,
+so the conversion and the temporary file cost about a quarter of the load. The temporary
+file takes about five times the table's size on disk until the load ends.
+
+**Not built.** RML, R2RML and YARRRML mappings, CSVW's standard mode, primary-key and
+foreign-key checks, templates over the target dataset, Tarql's extension functions, CSV
+in the Graph Store protocol, mappings stored on the server, and CSV loading in the Python
+package (`Dataset.load`) were not built. Python was left out because it needs a new
+method, its type stubs and tests, and the CLI covers the use until then. The UI's upload
+form was not changed. It sends no `base`, `mapping` or `template`, so a CSV file uploaded
+from it is refused with `400`.
