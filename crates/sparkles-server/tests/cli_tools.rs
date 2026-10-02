@@ -140,6 +140,46 @@ fn convert_counts_and_validates() {
     assert_eq!(out(&o), "");
 }
 
+/// Jena's syntaxes in `convert` and `load`: TriG to TriX and back, TriX to RDF Thrift
+/// and back, standard input, and a load of a compressed TriX file.
+#[test]
+fn convert_and_load_take_jena_syntaxes() {
+    let d = setup();
+    let dir = d.path();
+    let o = run(dir, &["convert", "g.trig", "--output", "trix"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let trix = out(&o);
+    assert!(
+        trix.starts_with("<trix xmlns=\"http://www.w3.org/2004/03/trix/trix-1/\">"),
+        "{trix}"
+    );
+    std::fs::write(dir.join("g.trix"), &trix).unwrap();
+    let o = run(dir, &["compare", "g.trig", "g.trix"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let o = run(dir, &["convert", "g.trix", "--output", "rt"]);
+    assert!(o.status.success(), "{}", err(&o));
+    std::fs::write(dir.join("g.rt"), &o.stdout).unwrap();
+    let o = run(dir, &["compare", "g.rt", "g.trig"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let o = run_stdin(
+        dir,
+        &["convert", "--syntax", "trix", "--count"],
+        trix.as_bytes(),
+    );
+    assert_eq!(out(&o), "stdin: 2 quads\n", "{}", err(&o));
+    // a broken document is an error with the reader's message
+    let o = run_stdin(dir, &["convert", "--syntax", "trix"], b"<trix><graph>");
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("TriX:"), "{}", err(&o));
+
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(trix.as_bytes()).unwrap();
+    std::fs::write(dir.join("g.trix.gz"), gz.finish().unwrap()).unwrap();
+    let o = run(dir, &["load", "--loc", "db", "g.trix.gz"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(err(&o).contains("loaded 2 quads"), "{}", err(&o));
+}
+
 #[test]
 fn load_checks_terms_first() {
     let d = setup();

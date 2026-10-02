@@ -753,7 +753,7 @@ page. They read no dataset.
 | `/$/validate/query` | `query`, `languageSyntax` (`SPARQL`, the default, or `ARQ`) | `{input, formatted, algebra}`, or `{input, errors}` |
 | `/$/validate/update` | `update`, `languageSyntax` | `{input, formatted}`, or `{input, errors}` |
 | `/$/validate/iri` | `iri` (repeatable) | `{iris: [{iri, errors: string[], warning: string[]}]}`. A relative IRI gets a warning. |
-| `/$/validate/data` | `data`, `languageSyntax` (Jena's names: `N-Quads`, the default, `Turtle`, `N-Triples`, `TriG`, `RDF/XML`, `JSON-LD`, `N3`, `RDF/JSON`) | `{input}`, or `{input, errors}` with the first syntax error |
+| `/$/validate/data` | `data`, `languageSyntax` (Jena's names: `N-Quads`, the default, `Turtle`, `N-Triples`, `TriG`, `RDF/XML`, `JSON-LD`, `N3`, `RDF/JSON`, `TriX`) | `{input}`, or `{input, errors}` with the first syntax error |
 | `/$/validate/langtag` | `langtag` or `lang` (repeatable) | `{langtags: [{input, errors, formatted, language, script?, region?, variant?, extension?, privateuse?}]}` |
 
 `errors` is `[{"parse-error": string, "parse-error-line"?: number, "parse-error-column"?:
@@ -1172,7 +1172,7 @@ must not exist or must be empty. `SRC` must be a database that no server has ope
 Results are negotiated with `Accept` or, Fuseki style, the `format=` parameter. Fuseki's
 `output=` and `results=` are the same parameter, and its short names work: `json`, `xml`,
 `sparql`, `csv`, `tsv` and `thrift` for results, and `json` (JSON-LD), `json-rdf`, `xml`,
-`text` (Turtle), `ttl`, `nt`, `n-quads` and `trig` for graphs. `force-accept` labels the
+`text` (Turtle), `ttl`, `nt`, `n-quads`, `trig` and `trix` for graphs. `force-accept` labels the
 response `text/plain`, so that a browser shows it.
 
 * SELECT/ASK: `application/sparql-results+json` (default), `application/sparql-results+xml`,
@@ -1183,13 +1183,25 @@ response `text/plain`, so that a browser shows it.
 * CONSTRUCT/DESCRIBE/GSP GET: `text/turtle` (default), `application/n-triples`,
   `application/n-quads`, `application/trig`, `application/ld+json`, `application/rdf+xml`,
   and Jena's RDF Thrift (`application/rdf+thrift`), RDF Protobuf
-  (`application/rdf+protobuf`) and RDF/JSON (`application/rdf+json`, graphs only).
+  (`application/rdf+protobuf`), RDF/JSON (`application/rdf+json`, graphs only) and TriX
+  (`application/trix+xml`, or Jena's `application/trix`).
 
 Graph Store writes and uploads read the same syntaxes, and Jena's N3 media types
 (`text/rdf+n3`, `text/n3`, `application/n3`) as Turtle. RDF Thrift and RDF Protobuf bodies
 may use prefix names, values (`valInteger`, `valDecimal`, `valDouble`) and triple terms,
 as Jena writes them. An upload takes them by the file name extensions `.rt`, `.trdf`,
-`.rpb`, `.pbrdf` and `.rj`. The JSONP `callback` and XSLT `stylesheet` parameters of
+`.rpb`, `.pbrdf`, `.rj` and `.trix`, compressed or not (`data.trix.gz`).
+
+TriX follows Jena's reader and writer. A `<graph>` without a name holds triples of the
+default graph, and a named one holds a named graph, so a TriX body sent to one graph
+(`?default` or `?graph=`) must not name its graphs. Plain literals are simple and
+language-tagged strings, and every other literal is a `<typedLiteral>`. The content of an
+`rdf:XMLLiteral` is kept as the XML it was written as. A directional language string is
+written with its direction after `--` in `xml:lang` (`en--ltr`), which Jena's reader
+understands. Triple terms are nested `<triple>` elements, and `<qname>` is read against
+the XML namespaces in scope. The writer writes full IRIs and no XML declaration, as Jena
+does. SPARQL Update's `LOAD` reads TriX too, by the response's media type or the `.trix`
+extension. The JSONP `callback` and XSLT `stylesheet` parameters of
 Fuseki are not supported.
 
 Query parameters beyond the standard protocol:

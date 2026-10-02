@@ -349,6 +349,13 @@ normalization, shared with `langtag`. The text table of `query` moved to
 `tools/table.rs` and is shared with `rsparql` and `rset`. The core crate's only change is
 that `sparql::update::parse_update` became public.
 
+Later, `convert` and `load` took Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON, by
+file extension (also behind a compression extension) or by `--syntax` and `--output`
+names. `convert` transcodes such an input to N-Quads on a second thread while it streams,
+and `load` transcodes each file into a temporary N-Quads file before the load, as the
+server does with request bodies. The reader and writer are the server's
+(`http/jena_formats.rs`), and TriX's live in the core crate (`sparkles::trix`).
+
 **Deviations and decisions.**
 - `qparse` and `uparse` print the input formatted by `sparkles fmt` rather than
   spargebra's rendering of the parse. The rendering moves aggregates into a subquery and

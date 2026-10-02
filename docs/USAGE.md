@@ -302,6 +302,7 @@ directly. A running server locks the databases it holds, so use the HTTP API ins
 
 ```sh
 sparkles load    --loc db data/*.ttl.gz       # parallel bulk load (tdb2.tdbloader)
+sparkles load    --loc db data.trix data.rt   # TriX and Jena's binary syntaxes, read into N-Quads first
 sparkles load    --loc db people.csv --base http://ex.org/p/ --key id   # CSV and TSV tables, see below
 sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv, --explain, --time
 sparkles query   --data file.ttl --query q.rq # query files in memory (arq --data)
@@ -492,6 +493,7 @@ sparkles convert big.nt --output nq --compress zstd > big.nq.zst   # --compress 
 sparkles convert --count *.ttl                # triples (or quads) per file and a total
 sparkles convert --validate data.ttl          # syntax errors and term warnings, exit 1 on any
 sparkles convert --check data.ttl > out.nq    # convert, and warn about IRIs and language tags
+sparkles convert data.trix --output ttl       # Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON too
 sparkles load --loc db --check --strict data.ttl   # the same checks before a load
 sparkles qparse 'SELECT ...'                  # the query, formatted
 sparkles qparse --print algebra,plan --query q.rq  # SPARQL algebra (SSE) and the physical plan
@@ -506,7 +508,8 @@ sparkles rset results.srj --results text      # JSON, XML or TSV results to anot
 
 `convert` reads files, or standard input when no file is given or a file is `-`. It takes
 the syntax from `--syntax`, then from the file extension, and reads standard input as
-N-Quads by default. Compressed inputs are detected as `load` detects them. The output
+N-Quads by default. Besides the W3C syntaxes it reads and writes Jena's TriX (`trix`), RDF
+Thrift (`rt`), RDF Protobuf (`rpb`) and RDF/JSON (`rj`), which `load` takes as well. Compressed inputs are detected as `load` detects them. The output
 streams, so a file larger than memory converts in bounded memory. Turtle, TriG and
 RDF/XML output declare the prefixes that the input declared before its first statement.
 A quad in a named graph cannot be written in a triple syntax, so `convert` drops it with
