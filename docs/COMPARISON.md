@@ -187,8 +187,10 @@ authentication.
   decoded.
 * **Columnar execution and planning.** Execution is column-major. The planner orders joins
   with QLever's dynamic program, which keeps the cheapest plan per subset of patterns and
-  sort order, and merge joins run on sorted scans. Groups too large for the program are
-  planned in rounds or greedily, as described under join ordering on cost summaries below.
+  sort order, and merge joins run on sorted scans. A hash join's output keeps the order of
+  the input it probes, so a merge join above it reads it as sorted. Groups too large for
+  the program are planned in rounds or greedily, as described under join ordering on cost
+  summaries below.
 * **Decoded-block cache.** A shared cache of decoded blocks, weighted by bytes.
 * **Result cache.** Executed subtrees are cached under a canonical plan key and the
   snapshot version, so updates invalidate entries without extra work. Results with
