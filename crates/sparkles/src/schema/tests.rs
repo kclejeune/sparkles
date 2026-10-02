@@ -522,3 +522,207 @@ fn empty_store() {
     assert!(r.classes.is_empty() && r.predicates.is_empty());
     assert!(r.hierarchy.roots.is_empty());
 }
+
+/// The objects of `(s, p)`, with `p` a VoID local name or a full IRI.
+fn objects(g: &[oxrdf::Triple], s: &oxrdf::NamedOrBlankNode, p: &str) -> Vec<Term> {
+    let p = if p.contains(':') {
+        p.to_string()
+    } else {
+        format!("{VOID_NS}{p}")
+    };
+    g.iter()
+        .filter(|t| &t.subject == s && t.predicate.as_str() == p)
+        .map(|t| t.object.clone())
+        .collect()
+}
+
+/// The single integer object of `(s, p)`.
+fn number(g: &[oxrdf::Triple], s: &oxrdf::NamedOrBlankNode, p: &str) -> u64 {
+    match objects(g, s, p).as_slice() {
+        [Term::Literal(l)] => {
+            assert_eq!(l.datatype().as_str(), format!("{XSD_NS}integer"));
+            l.value().parse().unwrap()
+        }
+        o => panic!("{p}: {o:?}"),
+    }
+}
+
+fn iri_term(iri: &str) -> Term {
+    Term::NamedNode(NamedNode::new_unchecked(iri))
+}
+
+fn iri_subject(iri: &str) -> oxrdf::NamedOrBlankNode {
+    NamedNode::new_unchecked(iri).into()
+}
+
+/// The partition node whose `key` (`class` or `property`) is `iri`.
+fn partition(g: &[oxrdf::Triple], key: &str, iri: &str) -> oxrdf::NamedOrBlankNode {
+    let key = format!("{VOID_NS}{key}");
+    g.iter()
+        .find(|t| t.predicate.as_str() == key && t.object == iri_term(iri))
+        .unwrap_or_else(|| panic!("no partition of {iri}"))
+        .subject
+        .clone()
+}
+
+fn parse_rdf(text: &str, format: RdfFormat) -> Vec<oxrdf::Triple> {
+    oxrdfio::RdfParser::from_format(format)
+        .for_slice(text.as_bytes())
+        .map(|q| oxrdf::Triple::from(q.unwrap()))
+        .collect()
+}
+
+#[test]
+fn void_description() {
+    let s = store_with(
+        r#"ex:Person a owl:Class ; rdfs:label "Person"@en .
+           ex:Student rdfs:subClassOf ex:Person .
+           ex:alice a ex:Student ; ex:knows ex:bob, _:x ; ex:name "Alice" .
+           ex:bob a ex:Person ; ex:name "Bob" .
+           _:x a ex:Person .
+           ex:knows rdfs:domain ex:Person .
+           ex:g1 { ex:carol a ex:Person ; ex:name "Carol" . }"#,
+    );
+    let r = report(
+        &s,
+        &SchemaOptions {
+            term_totals: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        r.term_totals,
+        Some(TermTotals {
+            distinct_subjects: 6,
+            distinct_objects: 8,
+            entities: 5,
+        })
+    );
+    // the JSON document does not change
+    assert!(
+        serde_json::to_value(&r)
+            .unwrap()
+            .get("termTotals")
+            .is_none()
+    );
+    let opts = VoidOptions {
+        dataset: "my ds",
+        declarations: false,
+        prefixes: vec![("ex".into(), "http://ex.org/".into())],
+    };
+    let text = void_text(&r, &opts, RdfFormat::Turtle);
+    assert!(
+        text.contains("@prefix void: <http://rdfs.org/ns/void#>"),
+        "{text}"
+    );
+    assert!(text.contains("ex:Person"), "{text}");
+    let g = parse_rdf(&text, RdfFormat::Turtle);
+    let iri = description_iri("my ds", r.snapshot.version);
+    assert!(iri.starts_with("urn:x-sparkles:schema:my%20ds:"), "{iri}");
+    let d = iri_subject(&iri);
+    assert_eq!(
+        objects(&g, &d, RDF_TYPE),
+        [iri_term(&format!("{VOID_NS}Dataset"))]
+    );
+    for (p, n) in [
+        ("triples", 11),
+        ("entities", 5),
+        ("classes", 3),
+        ("properties", 6),
+        ("distinctSubjects", 6),
+        ("distinctObjects", 8),
+    ] {
+        assert_eq!(number(&g, &d, p), n, "{p}\n{text}");
+    }
+    assert_eq!(objects(&g, &d, "classPartition").len(), 3);
+    assert_eq!(objects(&g, &d, "propertyPartition").len(), 6);
+    let person = partition(&g, "class", &ex("Person"));
+    assert_eq!(number(&g, &person, "entities"), 2);
+    assert!(objects(&g, &d, "classPartition").contains(&Term::from(person)));
+    let ty = partition(&g, "property", RDF_TYPE);
+    assert_eq!(
+        (
+            number(&g, &ty, "triples"),
+            number(&g, &ty, "distinctSubjects"),
+            number(&g, &ty, "distinctObjects")
+        ),
+        (4, 4, 3)
+    );
+    assert_eq!(
+        number(&g, &partition(&g, "property", &ex("name")), "triples"),
+        2
+    );
+    // statistics only: no declaration
+    let sub = format!("{RDFS}subClassOf");
+    assert!(!g.iter().any(|t| t.predicate.as_str() == sub));
+
+    // with the declarations, and in the other syntaxes
+    let opts = VoidOptions {
+        declarations: true,
+        ..opts
+    };
+    let all = void_triples(&r, &opts);
+    let person_iri = iri_term(&ex("Person"));
+    assert_eq!(
+        objects(&all, &iri_subject(&ex("Student")), &sub),
+        std::slice::from_ref(&person_iri)
+    );
+    assert_eq!(
+        objects(&all, &iri_subject(&ex("knows")), &format!("{RDFS}domain")),
+        [person_iri]
+    );
+    assert_eq!(
+        objects(&all, &iri_subject(&ex("Person")), RDFS_LABEL),
+        [Term::Literal(
+            oxrdf::Literal::new_language_tagged_literal("Person", "en").unwrap()
+        )]
+    );
+    for format in [
+        RdfFormat::NTriples,
+        RdfFormat::RdfXml,
+        RdfFormat::NQuads,
+        RdfFormat::TriG,
+    ] {
+        let g = parse_rdf(&void_text(&r, &opts, format), format);
+        assert_eq!(g.len(), all.len(), "{format:?}");
+        assert_eq!(number(&g, &d, "triples"), 11, "{format:?}");
+    }
+
+    // without term totals, the description leaves out what was not counted
+    let r = report(&s, &SchemaOptions::default());
+    assert_eq!(r.term_totals, None);
+    let g = void_triples(&r, &VoidOptions::default());
+    let d = iri_subject(&description_iri("", r.snapshot.version));
+    assert_eq!(number(&g, &d, "triples"), 11);
+    for p in ["entities", "distinctSubjects", "distinctObjects"] {
+        assert!(objects(&g, &d, p).is_empty(), "{p}");
+    }
+}
+
+#[test]
+fn term_totals_follow_the_selection() {
+    let s = store_with(
+        "ex:a ex:p ex:b . ex:g1 { ex:a ex:p ex:b . ex:c ex:p \"x\" . } ex:g2 { _:z ex:p ex:b . }",
+    );
+    let totals = |graph: &str| {
+        report(
+            &s,
+            &SchemaOptions {
+                graph: GraphSelection::parse(graph).unwrap(),
+                term_totals: true,
+                ..Default::default()
+            },
+        )
+        .term_totals
+        .unwrap()
+    };
+    let t = |s, o, e| TermTotals {
+        distinct_subjects: s,
+        distinct_objects: o,
+        entities: e,
+    };
+    assert_eq!(totals("default"), t(1, 1, 1));
+    assert_eq!(totals(&ex("g1")), t(2, 2, 2));
+    // a triple in several graphs counts once; a blank subject is no entity
+    assert_eq!(totals("union"), t(3, 2, 2));
+}

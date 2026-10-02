@@ -423,6 +423,15 @@ enum Cmd {
         /// Datasets with their own metric labels; the others share `$other`
         #[arg(long, default_value_t = 100)]
         metrics_max_datasets: usize,
+        /// Also expose Fuseki's metric names (fuseki_requests, fuseki_requests_good,
+        /// fuseki_requests_bad, ...) on /$/metrics, for dashboards built for Fuseki
+        #[arg(long, conflicts_with = "no_metrics")]
+        metrics_fuseki_names: bool,
+        /// Also serve /$/metrics on this address (HOST:PORT), under the same
+        /// authentication; a non-loopback address without --auth-config needs
+        /// --allow-open-network
+        #[arg(long, value_name = "HOST:PORT", conflicts_with = "no_metrics")]
+        metrics_addr: Option<String>,
         /// Budget for the estimated memory of a query's intermediate results, in MiB
         /// (0: unlimited)
         #[arg(long, default_value_t = 8192)]
@@ -909,7 +918,8 @@ enum Cmd {
         /// Declarations to read: `asserted`, or `all` (including inferred ones)
         #[arg(long, default_value = "asserted")]
         declared: String,
-        /// Output format: text or json
+        /// Output format: text, json, void (the VoID description in Turtle) or turtle
+        /// (the VoID description and the declarations in Turtle)
         #[arg(long, default_value = "text")]
         format: String,
         /// Timeout in seconds
@@ -1305,6 +1315,8 @@ fn run() -> Result<()> {
             no_access_log,
             no_metrics,
             metrics_max_datasets,
+            metrics_fuseki_names,
+            metrics_addr,
             query_memory_mb,
             max_result_mb,
             max_export_mb,
@@ -1354,6 +1366,9 @@ fn run() -> Result<()> {
                 auth_config.is_some(),
                 allow_open_network,
             )?;
+            if let Some(addr) = &metrics_addr {
+                exposure::check_metrics_addr(addr, auth_config.is_some(), allow_open_network)?;
+            }
             // one server per data directory (held until the process exits)
             #[cfg(feature = "backup")]
             let _data_lock = backup::lock_data_dir(&data)?;
@@ -1409,6 +1424,7 @@ fn run() -> Result<()> {
             sparkles::vector::set_budget(vector_memory_mb << 20);
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
+            st.metrics.fuseki_names = metrics_fuseki_names;
             st.task_queue.set_max(max_tasks);
             let mib = |m: u64| (m > 0).then_some(m << 20);
             st.limits = state::Limits {
@@ -1541,6 +1557,20 @@ fn run() -> Result<()> {
                     ),
                     Some(_) => None,
                 };
+                // the metrics listener ends with the runtime, after the main one
+                if let Some(maddr) = &metrics_addr {
+                    let l = tokio::net::TcpListener::bind(maddr)
+                        .await
+                        .with_context(|| format!("binding --metrics-addr {maddr}"))?;
+                    tracing::info!("metrics at http://{maddr}/$/metrics");
+                    let service = obs::metrics_router(st.clone())
+                        .into_make_service_with_connect_info::<auth::Peer>();
+                    tokio::spawn(async move {
+                        if let Err(e) = axum::serve(l, service).await {
+                            tracing::error!("metrics listener failed: {e}");
+                        }
+                    });
+                }
                 #[cfg(unix)]
                 let unix = match &unix_socket {
                     Some(path) => Some(bind_unix(path)?),
@@ -2171,10 +2201,13 @@ fn run() -> Result<()> {
         } => {
             use sparkles::index::Perm;
             use sparkles::schema::{GraphSelection, Page, SchemaError, SchemaOptions};
-            let json = match format.as_str() {
-                "json" => true,
-                "text" => false,
-                f => bail!("unknown format '{f}' (text or json)"),
+            // `void` is the VoID description, `turtle` the description and the declarations
+            let (json, void) = match format.as_str() {
+                "json" => (true, None),
+                "text" => (false, None),
+                "void" => (false, Some(false)),
+                "turtle" => (false, Some(true)),
+                f => bail!("unknown format '{f}' (text, json, void or turtle)"),
             };
             let declared_from_inferred = match declared.as_str() {
                 "asserted" => false,
@@ -2203,6 +2236,7 @@ fn run() -> Result<()> {
                 deadline: timeout.map(|t| Instant::now() + Duration::from_secs_f64(t)),
                 cancel: None,
                 max_entries,
+                term_totals: void.is_some(),
             };
             let report = match sparkles::schema::discover(&snap, &sopts) {
                 Ok(r) => r,
@@ -2213,7 +2247,18 @@ fn run() -> Result<()> {
                 Err(e) => return Err(e.into()),
             };
             let mut out = std::io::stdout().lock();
-            if json {
+            if let Some(declarations) = void {
+                let mut prefixes = sparkles::io::standard_prefixes();
+                prefixes.extend(store.prefixes());
+                let vopts = sparkles::schema::VoidOptions {
+                    dataset: &name,
+                    declarations,
+                    prefixes: prefixes.into_iter().collect(),
+                };
+                let turtle = oxrdfio::RdfFormat::Turtle;
+                let text = sparkles::schema::void_text(&report, &vopts, turtle);
+                out.write_all(text.as_bytes())?;
+            } else if json {
                 // every item on one page
                 let summary = report.summary(
                     &name,

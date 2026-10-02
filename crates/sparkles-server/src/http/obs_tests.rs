@@ -334,6 +334,145 @@ async fn metrics_json_snapshot_and_disabled_metrics() {
     );
 }
 
+/// A Fuseki series of dataset `ds`.
+fn fuseki(name: &str, endpoint: &str, operation: &str, description: &str) -> String {
+    format!(
+        r#"{name}{{application="fuseki",dataset="/ds",description="{description}",endpoint="{endpoint}",operation="{operation}"}}"#
+    )
+}
+
+#[tokio::test]
+async fn fuseki_metric_names_are_opt_in() {
+    let s = server();
+    get(&s.app, ALL).await;
+    let m = metrics(&s.app).await;
+    assert!(!m.contains("fuseki"), "{m}");
+
+    let s = server_with(|st| st.metrics.fuseki_names = true);
+    let m = metrics(&s.app).await;
+    // no series before the first request, but the process gauges at once
+    assert!(!m.lines().any(|l| l.starts_with("fuseki_requests")), "{m}");
+    assert!(m.contains("# TYPE fuseki_requests_good gauge"), "{m}");
+    assert!(sample(&m, r#"system_cpu_count{application="fuseki"}"#).unwrap() >= 1.0);
+    assert!(sample(&m, r#"process_uptime_seconds{application="fuseki"}"#).is_some());
+    assert!(sample(&m, r#"process_start_time_seconds{application="fuseki"}"#).unwrap() > 1e9);
+
+    assert_eq!(get(&s.app, ALL).await.status, StatusCode::OK);
+    assert_eq!(get(&s.app, ALL).await.status, StatusCode::OK);
+    assert_eq!(
+        get(&s.app, "/ds/sparql?query=SELEKT").await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        get(&s.app, "/ds?query=ASK%7B%7D").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(get(&s.app, "/ds/get?default").await.status, StatusCode::OK);
+    let update = Request::post("/ds/update")
+        .header("content-type", "application/sparql-update")
+        .body(Body::from("INSERT DATA { <urn:a> <urn:b> <urn:c> }"))
+        .unwrap();
+    assert_eq!(send(&s.app, update).await.status, StatusCode::OK);
+    // requests that name no dataset, and routes Fuseki has no endpoint for, are left out
+    get(&s.app, "/nope/sparql?query=ASK%7B%7D").await;
+    get(&s.app, "/$/server").await;
+
+    let m = metrics(&s.app).await;
+    let query = |n| fuseki(n, "sparql", "query", "SPARQL Query");
+    for (series, v) in [
+        (query("fuseki_requests"), 3.0),
+        (query("fuseki_requests_good"), 2.0),
+        (query("fuseki_requests_bad"), 1.0),
+        (
+            fuseki("fuseki_requests_good", "", "query", "SPARQL Query"),
+            1.0,
+        ),
+        (
+            fuseki(
+                "fuseki_requests_good",
+                "get",
+                "gsp-r",
+                "Graph Store Protocol (Read)",
+            ),
+            1.0,
+        ),
+        (
+            fuseki("fuseki_requests", "update", "update", "SPARQL Update"),
+            1.0,
+        ),
+        (
+            fuseki("fuseki_requests_bad", "update", "update", "SPARQL Update"),
+            0.0,
+        ),
+    ] {
+        assert_eq!(sample(&m, &series), Some(v), "{series}\n{m}");
+    }
+    let fuseki_lines: Vec<&str> = m
+        .lines()
+        .filter(|l| l.starts_with("fuseki_requests"))
+        .collect();
+    // three families of four endpoints, all of dataset /ds
+    assert_eq!(fuseki_lines.len(), 12, "{m}");
+    assert!(
+        fuseki_lines.iter().all(|l| l.contains("dataset=\"/ds\"")),
+        "{m}"
+    );
+    // the Sparkles names are still there
+    assert_eq!(
+        sample(
+            &m,
+            r#"sparkles_requests_total{dataset="ds",operation="query",outcome="ok"}"#
+        ),
+        Some(3.0),
+        "{m}"
+    );
+}
+
+#[tokio::test]
+async fn read_only_graph_store_counts_as_fuseki_gsp_r() {
+    let s = server_with(|st| {
+        st.metrics.fuseki_names = true;
+        st.read_only = true;
+    });
+    assert_eq!(get(&s.app, "/ds/data?default").await.status, StatusCode::OK);
+    let m = metrics(&s.app).await;
+    let series = fuseki(
+        "fuseki_requests_good",
+        "data",
+        "gsp-r",
+        "Graph Store Protocol (Read)",
+    );
+    assert_eq!(sample(&m, &series), Some(1.0), "{m}");
+}
+
+#[tokio::test]
+async fn metrics_listener_serves_only_metrics() {
+    let s = server();
+    get(&s.app, ALL).await;
+    let app = crate::obs::metrics_router(s.state.clone());
+    let r = get(&app, "/$/metrics").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(
+        sample(
+            &r.text(),
+            r#"sparkles_requests_total{dataset="ds",operation="query",outcome="ok"}"#
+        ),
+        Some(1.0)
+    );
+    assert_eq!(get(&app, ALL).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(get(&app, "/$/ping").await.status, StatusCode::NOT_FOUND);
+    // a page that rebinds its DNS name to the listener is refused, as on the main one
+    let r = get_with(&app, "/$/metrics", "host", "evil.example").await;
+    assert_eq!(r.status, StatusCode::MISDIRECTED_REQUEST);
+    // scrapes are not counted on either listener
+    let m = metrics(&s.app).await;
+    assert!(
+        !m.lines()
+            .any(|l| l.starts_with("sparkles_requests_total") && l.contains("operation=\"admin\"")),
+        "{m}"
+    );
+}
+
 #[tokio::test]
 async fn deleted_datasets_lose_their_series() {
     let s = server();

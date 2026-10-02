@@ -54,12 +54,12 @@ not built; the status block says which. *Designed, not built* means there is no 
 |---|---|---|
 | [CI](CI-commit-identity.md) | Durable dataset ids, a gap-free commit sequence, commit receipts and headers, `/$/commits` and `sparkles log` | implemented in part (Phases 1–2) |
 | [C01](C01-observability-and-budgets.md) | Request ids, access log, Prometheus metrics, readiness, OpenTelemetry, memory and result-size budgets, cancellation on disconnect | implemented in part |
-| [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, `sparkles schema`, and the UI's schema browser | implemented in part (Phase 1) |
+| [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, `sparkles schema`, and the UI's schema browser | implemented in part (Phase 1, VoID export) |
 | [C06](C06-clone-to-sandbox.md) | Cloning a consistent snapshot of a dataset into a new, independent dataset | implemented in part (Phase 1) |
 | [C08](C08-inference-freshness.md) | Whether materialized inferences are current, re-running them, and inconsistency diagnostics | implemented in part (Phase 1) |
 | [C09](C09-dataset-access-control.md) | Authentication (Basic, API tokens, OIDC, trusted proxies, CLI logins) and per-dataset permissions | implemented in part (Phase 1, part of Phase 2) |
 | [C10](C10-write-time-validation.md) | A per-dataset SHACL guard that validates the state after each write before the write commits | implemented in part (Phase 1) |
-| [C11](C11-mcp-server.md) | `sparkles mcp`, a Model Context Protocol server with read-only query, schema, search and validation tools | implemented in part (Phase 1, part of Phase 2) |
+| [C11](C11-mcp-server.md) | `sparkles mcp`, a Model Context Protocol server with read-only query, schema, search, validation and formatting tools | implemented in part (Phase 1, part of Phase 2) |
 | [F03](F03-full-text-search.md) | BM25 full-text search over literals with Tantivy, through Jena's `text:query` | implemented in part (Phase 1, part of Phase 2) |
 | [F04](F04-vector-search.md) | `spk:vector` literals, similarity functions and exact top-k `spk:vectorSearch` | implemented in part (Phase 1) |
 | [F05](F05-snapshot-repositories.md) | Incremental, deduplicated backups to a file system or S3, restore, verification, policies and GC | implemented in part (Phase 1, most of Phase 2) |

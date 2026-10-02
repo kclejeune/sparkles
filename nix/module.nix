@@ -135,6 +135,11 @@ let
   ++ lib.optional cfg.otel.logs "--otel-logs"
   ++ lib.optional cfg.otel.queryText "--otel-query-text"
   ++ lib.optional cfg.otel.planSpans "--otel-plan-spans"
+  ++ lib.optional cfg.metrics.fusekiNames "--metrics-fuseki-names"
+  ++ lib.optionals (cfg.metrics.listenAddress != null) [
+    "--metrics-addr"
+    cfg.metrics.listenAddress
+  ]
   ++ lib.optionals (rateLimits != null) [
     "--rate-limit-config"
     rateLimitsFile
@@ -397,6 +402,21 @@ in
       type = types.str;
       default = "sparkles=info,sparkles_server=info,tower_http=warn";
       description = "`RUST_LOG` filter for the service.";
+    };
+
+    metrics = {
+      fusekiNames = mkEnableOption "Fuseki's Prometheus metric names on `/$/metrics`, next to the Sparkles names";
+
+      listenAddress = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "127.0.0.1:9464";
+        description = ''
+          Also serve `/$/metrics` on this `HOST:PORT`, with the same authentication as the
+          main listener. Without {option}`auth.configFile`, an address that is not
+          loopback needs {option}`allowOpenNetwork`. The firewall is not opened for it.
+        '';
+      };
     };
 
     otel = {

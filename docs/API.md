@@ -23,7 +23,7 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 | GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }`. When auth is on, anonymous callers get no `version` or `limits`. |
 | GET    | `/$/whoami`   | The caller and its permissions. See [whoami](#whoami). |
 | POST   | `/$/format`   | Formats a SPARQL query or update. See [Formatting](#formatting). |
-| GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. |
+| GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. `--metrics-addr` serves it on a second address too. |
 
 ```ts
 type ReadyInfo = {
@@ -126,6 +126,56 @@ server ignores those headers.
 
 Backup repositories add the `sparkles_backup_*` families listed under
 [Backup repositories](#backup-metrics).
+
+#### Fuseki metric names
+
+`serve --metrics-fuseki-names` adds the gauges that Fuseki exports, so that dashboards
+built for Fuseki keep working. The Sparkles families stay as they are.
+
+| Name | Type | Labels | Value |
+|------|------|--------|-------|
+| `fuseki_requests` | gauge | `application="fuseki"`, `dataset`, `description`, `endpoint`, `operation` | Finished requests to the endpoint. |
+| `fuseki_requests_good` | gauge | the same | Requests with the `ok` outcome. |
+| `fuseki_requests_bad` | gauge | the same | Requests with any other outcome. |
+| `process_uptime_seconds`, `process_start_time_seconds` | gauge | `application="fuseki"` | The time since the server started, and the start time. |
+| `system_cpu_count` | gauge | `application="fuseki"` | Processors available to the server. |
+
+`dataset` is the dataset path as Fuseki writes it, such as `/ds`. The datasets past
+`--metrics-max-datasets` share `/$other`. Requests that name no existing dataset are not
+counted.
+`endpoint`, `operation` and `description` are Fuseki's names for the dataset's services.
+
+| Request | `endpoint` | `operation` | `description` |
+|---------|------------|-------------|---------------|
+| `/{ds}/sparql`, `/{ds}/query` | `sparql`, `query` | `query` | `SPARQL Query` |
+| `/{ds}/update` | `update` | `update` | `SPARQL Update` |
+| `/{ds}/data` | `data` | `gsp-rw`, or `gsp-r` on a read-only server | `Graph Store Protocol`, or `Graph Store Protocol (Read)` |
+| `/{ds}/get` | `get` | `gsp-r` | `Graph Store Protocol (Read)` |
+| `/{ds}/upload` | `upload` | `upload` | `File Upload` |
+| `/{ds}/shacl` | `shacl` | `SHACL` | `SHACL Validation` |
+| `/{ds}` | empty | `query`, `update`, `gsp-rw` or `gsp-r`, by the request | As above. |
+
+The good and bad counts split `sparkles_requests_total` for the same dataset and route.
+`good` is `outcome="ok"`, and `bad` is the sum of the other outcomes. Fuseki counts a
+request when it starts and its outcome when it ends, while Sparkles counts both when the
+request ends, so `fuseki_requests` always equals good plus bad. An endpoint's series
+appear after its first request, like the Sparkles series. Fuseki lists every configured
+endpoint from the start with zeros.
+
+Fuseki's other meters come from Micrometer's JVM and system binders, and Sparkles has no
+equivalent for them. They are the `jvm_*` memory, garbage collector, thread and class
+loader gauges, `process_files_*`, `process_cpu_usage`, `system_cpu_usage`,
+`system_load_average_1m`, `disk_free_bytes` and `disk_total_bytes`. `/{ds}/shex`,
+`/{ds}/explain`, `/{ds}/prefixes` and the `/$/` routes have no Fuseki endpoint, so only
+the Sparkles names count them.
+
+#### Metrics listener
+
+`serve --metrics-addr HOST:PORT` also serves `/$/metrics` on a second address, such as a
+port that only the Prometheus server can reach. That listener serves nothing else. It
+applies the same authentication, `metrics` permission and `Host` check as the main
+listener. The main listener keeps `/$/metrics`, because the UI's Server page reads it.
+Without `--auth-config`, an address that is not loopback needs `--allow-open-network`.
 
 ```ts
 type MetricsSnapshot = {
@@ -428,7 +478,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset into a new persistent dataset. Returns `202` with a `Task`. See [Clone](#clone). |
 | GET    | `/$/stats/{ds}`              | `DatasetStats` |
-| GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. See [Schema discovery](#schema-discovery). |
+| GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. An RDF `Accept` gets the same report as a VoID description. See [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Returns a `Task`. `409` while a compaction of the dataset is queued or running. |
@@ -621,13 +671,54 @@ A report is never returned partially.
 The counts come from one ordered pass over the PSO index and one over the POS index per
 predicate, so a report costs about two sequential reads of the selected triples.
 
+**VoID export.** The summary is also served as RDF, as a description in the
+[VoID](https://www.w3.org/TR/void/) vocabulary. Ask for it with an RDF media type in
+`Accept`, or with the `format` parameter. The media types are `text/turtle`,
+`application/n-triples`, `application/ld+json`, `application/rdf+xml`,
+`application/trig` and `application/n-quads`. The `format` values are `turtle`,
+`ntriples`, `jsonld`, `rdfxml`, `trig` and `nquads`, and `format=json` asks for the JSON
+document, which stays the default. The selection parameters apply as above. `limit` and
+`cursor` do not, because the description is always complete.
+
+```turtle
+<urn:x-sparkles:schema:wiki:42> a void:Dataset ;
+    dcterms:title "wiki" ;
+    dcterms:created "2026-10-02T12:04:00Z"^^xsd:dateTime ;
+    void:triples 5 ;                # distinct triples in the selection
+    void:entities 3 ;               # distinct IRI subjects
+    void:classes 2 ;                # distinct rdf:type objects
+    void:properties 3 ;             # predicates with triples
+    void:distinctSubjects 3 ;
+    void:distinctObjects 4 ;
+    void:classPartition _:c1 , _:c2 ;
+    void:propertyPartition _:p1 , _:p2 , _:p3 .
+_:c1 void:class ex:Person ; void:entities 2 .   # instances
+_:c2 void:class owl:Class ; void:entities 1 .
+_:p1 void:property ex:knows ; void:triples 1 ; void:distinctSubjects 1 ; void:distinctObjects 1 .
+_:p2 void:property rdf:type ; void:triples 3 ; void:distinctSubjects 3 ; void:distinctObjects 2 .
+_:p3 void:property rdfs:label ; void:triples 1 ; void:distinctSubjects 1 ; void:distinctObjects 1 .
+```
+
+The node's IRI is `urn:x-sparkles:schema:<dataset>:<snapshot version>`. Every class with
+instances gets a class partition, and every predicate with triples a property
+partition. The partitions reuse the report's exact counts. `void:entities`,
+`void:distinctSubjects` and `void:distinctObjects` of the whole selection are not part of
+the JSON report. They cost one more pass over the SPO and OSP indexes, which only RDF
+requests make. The declarations follow the description as the triples that assert them:
+`rdf:type`, `rdfs:subClassOf`, `owl:equivalentClass`, `owl:disjointWith`, `rdfs:domain`,
+`rdfs:range`, `rdfs:subPropertyOf`, `owl:inverseOf`, labels, comments and the
+`owl:Ontology` headers. `declarations=false` leaves them out. Labels keep their language
+tags.
+
 The CLI equivalent prints the complete report without pagination:
 `sparkles schema --loc DB [--graph default|union|IRI] [--declared-graph G]
-[--no-inferences] [--declared asserted|all] [--format text|json] [--timeout S]
-[--max-entries N]`, or `--data FILE…` in place of `--loc`. `json` is the `SchemaSummary`
-with every item and `next: null`. `text` prints one line per class and per predicate. The
-command exits with status 2 when the timeout or the entry cap is exceeded. The Rust API is
-`sparkles::schema::discover`.
+[--no-inferences] [--declared asserted|all] [--format text|json|void|turtle]
+[--timeout S] [--max-entries N]`, or `--data FILE…` in place of `--loc`. `json` is the
+`SchemaSummary` with every item and `next: null`. `text` prints one line per class and per
+predicate. `void` prints the VoID description in Turtle, and `turtle` prints it with the
+declarations. The command exits with status 2 when the timeout or the entry cap is
+exceeded. The Rust API is `sparkles::schema::discover`, and
+`sparkles::schema::void_text` renders a report as VoID.
 
 ### Clone
 
@@ -2477,6 +2568,9 @@ module takes this endpoint's JSON and answers in the same shape. The UI calls
 load or run. `--format-endpoint authenticated` or `off` therefore does not stop such a UI
 from formatting. It limits only the endpoint.
 
+The MCP server offers the same formatter as its `format` tool, with the same options
+(see [MCP server](#mcp-server)).
+
 **JSON body.** The UI sends `Content-Type: application/json` with this body:
 
 ```ts
@@ -3305,6 +3399,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: an exact `spk:vectorSearch` over the stored `spk:vector` literals. The tool never computes embeddings. `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
+| `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
 
 Every tool except `sparql_query` declares an `outputSchema` and returns
 `structuredContent` plus the same object as one compact JSON text block. `tools/list`

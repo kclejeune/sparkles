@@ -51,6 +51,8 @@ pub fn run(
         "validate_shacl" => t.validate_shacl(args),
         #[cfg(feature = "shex")]
         "validate_shex" => t.validate_shex(args),
+        #[cfg(feature = "fmt")]
+        "format" => t.format(args),
         _ => Err(ToolError::internal(&call.request_id)),
     }
 }
@@ -715,6 +717,7 @@ impl Tools<'_> {
             deadline: Some(deadline),
             cancel: Some(self.call.cancel.clone()),
             max_entries: self.server.state.schema_max_entries,
+            term_totals: false,
         };
         let report = Arc::new(schema::discover(snap, &opts).map_err(|e| ctx.schema(e))?);
         *ds.schema_cache.lock() = Some(SchemaCacheEntry {
