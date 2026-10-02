@@ -1041,6 +1041,41 @@ implementation landed.
   - Bolt in the first phase;
   - a parser generated from the ANTLR grammar.
 
+## Encryption at rest and encrypted backups
+
+- **Spec:** [`F07-encryption-at-rest.md`](F07-encryption-at-rest.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code, the file layout of a database built with the release binary, and
+    the [F05](F05-snapshot-repositories.md), [C13](C13-automatic-compaction.md) and
+    [X01](X01-compression-codecs.md) specs;
+  - NIST SP 800-38D, draft-irtf-cfrg-xchacha-03 and the FastCDC paper (USENIX ATC 2016);
+  - the public documentation of restic and borg (BSD-licensed), CockroachDB, MongoDB,
+    SQLCipher, AWS KMS, Google Cloud KMS, HashiCorp Vault Transit, OpenZFS and Linux
+    fscrypt, the PostgreSQL wiki page on transparent data encryption, and RocksDB's
+    public `env_encryption.h` header, all read for design ideas only. No source code of
+    these projects was read;
+  - RFCs 2104, 5869, 8439, 8452 and 9106, NIST SP 800-108, the age format and the PADMÉ
+    padding paper, cited from general knowledge.
+
+  Fluree was not consulted.
+- **Planned dependencies:** none new for Phases 1 and 3 beyond moving existing crates.
+  `aws-lc-rs` 1.18 (ISC AND Apache-2.0-or-ISC) is already in the tree through `rustls`.
+  It becomes a direct dependency of `sparkles-backup`, and of `sparkles` behind a `crypt`
+  feature, for AES-256-GCM, HKDF and HMAC. `argon2` 0.6 (MIT/Apache-2.0) and `zeroize` 1.x
+  (MIT/Apache-2.0) are already dependencies. Phase 2 adds the `age` crate
+  (MIT/Apache-2.0). The AWS and Google Cloud KMS clients would come behind cargo features
+  (spec open question 11). FastCDC is to be written from the paper, because it needs a
+  keyed gear table.
+- **Rejected** (spec §13):
+  - unauthenticated CTR or XTS modes at the file layer;
+  - decrypting whole indexes into memory at open;
+  - SQLCipher-style fixed pages for the permutation files;
+  - random 96-bit GCM nonces, XChaCha20-Poly1305 as the only cipher, and AES-GCM-SIV;
+  - convergent encryption for backups;
+  - backing up sealed files instead of their logical plaintext;
+  - encrypting only the vocabulary;
+  - a 7-day default rotation of data keys.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):

@@ -1856,6 +1856,17 @@ languages, and policy runs.
 
 **Not built:** the items listed under Phases at the top.
 
+**Follow-up: Phase 3 encryption and chunking are specified in F07.** Client-side
+encryption and content-defined chunking now have their own design in
+[F07](F07-encryption-at-rest.md), which replaces the sketch in §7 Phase 3. Its Phase 1
+is the encrypted repository of [F07 §5](F07-encryption-at-rest.md#5-encrypted-backup-repositories-phase-1).
+Blob ids become HMAC-SHA256 under a repository key, blobs and manifests are sealed with
+AES-256-GCM, and key slots wrap a repository master key. That answers open question 11.
+Its Phase 2 adds FastCDC for `vocab.dat` behind the 30% gate of §5.4, which answers open
+question 3, and write-only repositories with age recipients. A backup of a dataset that
+is encrypted at rest carries the logical plaintext of each file, so the byte-identical
+restore of §1 becomes a logically identical one for such datasets.
+
 **Follow-up: Fuseki's `/$/backups` alias.** Fuseki routes `POST /$/backups/{ds}` to the
 same action as `POST /$/backup/{ds}`, an N-Quads dump, and its clients send no body. Such a
 request reached the repository API and failed with `404 no-such-repository`. Now
