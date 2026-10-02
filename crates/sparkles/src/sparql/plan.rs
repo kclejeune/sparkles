@@ -2469,21 +2469,48 @@ pub(super) fn join_est_from(a_est: f64, b_est: f64, denom: f64) -> f64 {
 }
 
 /// A hash join builds a table of the smaller input, keyed on the join variables, and
-/// probes it with each row of the larger one. Inserting a row takes 40 to 100 ns (a list
-/// is allocated per key), about as long as scanning 48 rows; a probe takes about one.
+/// probes it with each row of the larger one. With a list allocated per key, inserting a
+/// row takes 40 to 100 ns, about as long as scanning 48 rows.
 const HASH_BUILD_COST: f64 = 48.0;
+/// Inserting a row into the flat table takes 10 to 15 ns on one thread while the table
+/// fits in the CPU caches, and 3 to 7 ns for a million rows built in partitions in
+/// parallel, where a scan reads a row in 2.2 ns and the lists took 18 to 62 ns (measured
+/// on generated tables by `costcal_tests::cal_tables`). A probe takes about 1.2 ns, in
+/// parallel pieces of the larger input, and is counted as one row.
+const FLAT_HASH_BUILD_COST: f64 = 8.0;
 
-/// The cost of hash joining inputs of `a_est` and `b_est` rows, besides the inputs and
-/// the output rows.
-pub(super) fn hash_base(a_est: f64, b_est: f64) -> f64 {
-    HASH_BUILD_COST * a_est.min(b_est) + a_est.max(b_est)
+/// What the join costs depend on besides the inputs: whether index joins are offered and
+/// what inserting a row into a hash table costs.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Costing {
+    pub index_joins: bool,
+    pub hash_build: f64,
+}
+
+impl Costing {
+    pub fn of(ctx: &Ctx) -> Costing {
+        Costing {
+            index_joins: ctx.opt.batched_join,
+            hash_build: if ctx.opt.flat_hash_join {
+                FLAT_HASH_BUILD_COST
+            } else {
+                HASH_BUILD_COST
+            },
+        }
+    }
+}
+
+/// The cost of hash joining inputs of `a_est` and `b_est` rows, at `build` per row of the
+/// smaller one, besides the inputs and the output rows.
+pub(super) fn hash_base(build: f64, a_est: f64, b_est: f64) -> f64 {
+    build * a_est.min(b_est) + a_est.max(b_est)
 }
 
 pub(super) fn sort_cost(n: f64) -> f64 {
     n * n.max(2.0).log2() * 0.25
 }
 
-fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, extra_cost: f64, ctx: &Ctx) -> Node {
+fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, ctx: &Ctx) -> Node {
     let (est, star) = join_est_with(&a, &b, &keys, ctx);
     let mut vars = a.vars.clone();
     for v in &b.vars {
@@ -2511,10 +2538,10 @@ fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, extra_cost: f64, 
     };
     let base = match algo {
         JoinAlgo::Merge => a.est + b.est,
-        JoinAlgo::Hash => hash_base(a.est, b.est),
+        JoinAlgo::Hash => hash_base(Costing::of(ctx).hash_build, a.est, b.est),
         JoinAlgo::Cross => a.est * b.est,
     };
-    let cost = a.cost + b.cost + base + est + extra_cost;
+    let cost = a.cost + b.cost + base + est;
     let dist = merge_dist(&a, &b, est, star);
     let desc = format!(
         "on {}",
@@ -2592,7 +2619,7 @@ pub(super) fn merge_join(a: Node, b: Node, v: VarId, keys: &[VarId], ctx: &Ctx) 
     let (x, y) = (sort_node(a, v), sort_node(b, v));
     let mut k = vec![v];
     k.extend(keys.iter().filter(|x| **x != v));
-    let mut j = mk_join(x, y, JoinAlgo::Merge, k, 0.0, ctx);
+    let mut j = mk_join(x, y, JoinAlgo::Merge, k, ctx);
     j.desc = format!("on ?{}", ctx.var_name(v));
     j
 }
@@ -2606,7 +2633,7 @@ pub(super) fn hash_join(a: Node, b: Node, keys: Vec<VarId>, ctx: &Ctx) -> Node {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let mut h = mk_join(a, b, JoinAlgo::Hash, keys, 0.0, ctx);
+    let mut h = mk_join(a, b, JoinAlgo::Hash, keys, ctx);
     h.desc = desc;
     h
 }
@@ -2625,7 +2652,7 @@ pub fn join(a: Node, b: Node, ctx: &Ctx) -> Node {
         return a;
     }
     if !a.vars.iter().any(|v| b.vars.contains(v)) {
-        let mut j = mk_join(a, b, JoinAlgo::Cross, Vec::new(), 0.0, ctx);
+        let mut j = mk_join(a, b, JoinAlgo::Cross, Vec::new(), ctx);
         j.desc = "cross product".into();
         return j;
     }
@@ -2659,13 +2686,30 @@ fn left_join(l: Node, r: Node, expr: Option<Expr>, ctx: &Ctx) -> Node {
         ),
     };
     let dist = merge_dist(&l, &r, est, None);
+    // both sides sorted on the one variable they share, which both always bind: a merge
+    // that keeps the left side's order (the executor checks the order of the rows)
+    let merge = ctx.opt.merge_left_join
+        && matches!(&keys[..], [k] if l.sorted.first() == Some(k)
+            && r.sorted.first() == Some(k)
+            && l.certain.contains(k)
+            && r.certain.contains(k));
+    let (sorted, base) = if merge {
+        (l.sorted.clone(), l.est + r.est)
+    } else if ctx.opt.merge_left_join {
+        (
+            Vec::new(),
+            hash_base(Costing::of(ctx).hash_build, l.est, r.est),
+        )
+    } else {
+        (Vec::new(), 2.0 * r.est + l.est)
+    };
     Node {
         kind: Kind::LeftJoin { expr },
         vars,
         certain: l.certain.clone(),
-        sorted: Vec::new(),
+        sorted,
         est,
-        cost: l.cost + r.cost + 2.0 * r.est + l.est + est,
+        cost: l.cost + r.cost + base + est,
         dist,
         desc,
         children: vec![l, r],

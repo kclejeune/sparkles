@@ -73,6 +73,14 @@ const KEY_COST: f64 = 140.0;
 /// Added to a key's cost for each doubling of the pattern's rows per input key: keys far
 /// apart search farther and miss the CPU caches more often.
 const KEY_GAP_COST: f64 = 6.0;
+/// The same with the galloping reader, which finds a key from the one before in the
+/// block it already holds: 25 to 40 ns per key plus 3.5 to 11.5 ns per doubling of the
+/// rows per key, where a scan reads a row in 2.2 ns (and the binary searches took 200 to
+/// 280 ns per key), fitted on keys spread at random over patterns of 40k to 2.5M rows.
+/// Keys close together cost less (35 to 90 ns at any count), which the estimate, knowing
+/// only how many keys there are, does not see.
+const GALLOP_KEY_COST: f64 = 15.0;
+const GALLOP_KEY_GAP_COST: f64 = 3.5;
 /// A block the keys touch: fetching it from the block cache and finding the first key.
 const BLOCK_COST: f64 = 256.0;
 /// A row read: copied out of its block, then joined with the input rows of its key, 25 to
@@ -112,14 +120,18 @@ fn forced_walk() -> Option<bool> {
 
 /// Estimated cost of probing a pattern of `rows` rows for `keys` distinct keys with
 /// `per_key` rows each, and the share of the pattern's rows it reads.
-fn probe_cost(keys: f64, rows: f64, per_key: f64) -> (f64, f64) {
+fn probe_cost(keys: f64, rows: f64, per_key: f64, gallop: bool) -> (f64, f64) {
     let blocks = (rows / BLOCK_ROWS as f64).ceil().max(1.0);
     // blocks holding at least one of `keys` keys spread over the pattern
     let touched = blocks * (1.0 - (1.0 - 1.0 / blocks).powf(keys));
     let read = (keys * per_key).min(rows);
     let gap = (rows / keys).max(1.0);
-    let probe =
-        keys * (KEY_COST + KEY_GAP_COST * gap.log2()) + touched * BLOCK_COST + read * ROW_COST;
+    let (key, key_gap) = if gallop {
+        (GALLOP_KEY_COST, GALLOP_KEY_GAP_COST)
+    } else {
+        (KEY_COST, KEY_GAP_COST)
+    };
+    let probe = keys * (key + key_gap * gap.log2()) + touched * BLOCK_COST + read * ROW_COST;
     (probe, if rows > 0.0 { read / rows } else { 0.0 })
 }
 
@@ -203,6 +215,8 @@ pub(super) struct ProbeSide {
     pub key: VarId,
     rows: f64,
     per_key: f64,
+    /// the keys are found by the galloping reader
+    gallop: bool,
     /// a star pattern on the key, which a fused star reads with the index joins on the
     /// key below it (when fused stars are costed so)
     pub star: bool,
@@ -219,6 +233,7 @@ pub(super) fn probe_side(probe: &Node, ctx: &Ctx) -> Option<ProbeSide> {
         key,
         rows: ctx.snap.estimate(spec.perm, &spec.prefix) as f64,
         per_key: scan.est / scan.d(key),
+        gallop: ctx.opt.gallop_index_join,
         star: ctx.opt.fused_star_costs && ctx.opt.star_fusion && star_pattern(spec, key).is_some(),
     })
 }
@@ -261,7 +276,7 @@ impl ProbeSide {
     /// with its filters, for `keys_in` distinct keys, if probing is worth offering: the
     /// probes, and the filters on the rows read.
     pub(super) fn cost(&self, keys_in: f64, pat_cost: f64) -> Option<f64> {
-        let (probe, share) = probe_cost(keys_in, self.rows, self.per_key);
+        let (probe, share) = probe_cost(keys_in, self.rows, self.per_key, self.gallop);
         if !(probe < PROBE_LIMIT * self.rows || forced()) {
             return None;
         }
@@ -669,6 +684,16 @@ impl Ranges<'_> {
         (pad(&b[..n], 0), pad(&b[..n], u64::MAX))
     }
 
+    /// The number of leading key columns that range `i` fixes: its rows are those whose
+    /// first `depth` columns equal its lower end's.
+    fn depth(&self, i: usize) -> usize {
+        match self {
+            Ranges::Keys { prefix, .. } => prefix.len() + 1,
+            Ranges::Star { pats, .. } => 2 + pats[i % pats.len()].1.is_some() as usize,
+            Ranges::All(prefix) => prefix.len(),
+        }
+    }
+
     /// The pattern a range belongs to (its position in the star's `(p, o)` order).
     fn part(&self, i: usize) -> usize {
         match self {
@@ -710,6 +735,65 @@ impl Ranges<'_> {
     }
 }
 
+/// The first index in `[from, n)` for which `before` is false, or `n`, where `before`
+/// holds for a prefix of the indices: steps of doubling length from `from`, then a
+/// binary search in the last step. Finding a position `d` places on costs about
+/// `2 log2 d` tests, so a sorted batch of keys searched from each previous position
+/// costs little per key when the keys are close.
+#[inline]
+pub(super) fn gallop_to(from: usize, n: usize, before: impl Fn(usize) -> bool) -> usize {
+    if from >= n || !before(from) {
+        return from;
+    }
+    // `before(lo)` holds; the answer is in `(lo, hi]`
+    let (mut lo, mut step) = (from, 1);
+    let hi = loop {
+        let hi = lo + step;
+        if hi >= n {
+            break n;
+        }
+        if !before(hi) {
+            break hi;
+        }
+        lo = hi;
+        step *= 2;
+    };
+    search(lo + 1, hi, before)
+}
+
+/// The first index in `[lo, hi)` for which `before` is false, or `hi`, by binary search.
+#[inline]
+fn search(mut lo: usize, mut hi: usize, before: impl Fn(usize) -> bool) -> usize {
+    while lo < hi {
+        let m = lo + (hi - lo) / 2;
+        if before(m) {
+            lo = m + 1;
+        } else {
+            hi = m;
+        }
+    }
+    lo
+}
+
+/// The blocks `[b0, b1)` of `idx` that can hold keys in `[lo, hi]`, searched from the
+/// blocks of the range before (`from`) when `gallop`, else in all blocks.
+#[inline]
+fn block_range(
+    idx: &crate::index::PermIndex,
+    lo: &Key,
+    hi: &Key,
+    from: (usize, usize),
+    gallop: bool,
+) -> (usize, usize) {
+    if !gallop {
+        return idx.key_block_range(lo, hi);
+    }
+    let m = &idx.blocks;
+    let b0 = gallop_to(from.0, m.len(), |b| m[b].last < *lo);
+    let b1 = gallop_to(from.1.max(b0), m.len(), |b| m[b].first <= *hi);
+    (b0, b1)
+}
+
 /// Clusters of consecutive ranges read by one scan each: a range joins the cluster when
 /// its first block is no further than just past the cluster's blocks, and no delta
 /// change lies between it and the cluster (the scan would merge those row by row).
@@ -719,13 +803,16 @@ fn clusters(ctx: &Ctx, perm: Perm, ranges: &Ranges) -> (Vec<(usize, usize)>, usi
     let pi = perm.index();
     let (ins, del) = (&ctx.snap.delta.ins[pi], &ctx.snap.delta.del[pi]);
     let delta = !ins.is_empty() || !del.is_empty();
+    let gallop = ctx.opt.gallop_index_join;
     let mut out = Vec::new();
     let mut blocks = 0;
     // (first range, first block, end block, upper end of the last range)
     let mut cur: Option<(usize, usize, usize, Key)> = None;
+    let mut at = (0, 0);
     for i in 0..ranges.len() {
         let (lo, hi) = ranges.get(i);
-        let (b0, b1) = idx.key_block_range(&lo, &hi);
+        let (b0, b1) = block_range(idx, &lo, &hi, at, gallop);
+        at = (b0, b1);
         let join = cur.is_some_and(|(_, _, c1, prev)| {
             b0 <= c1
                 && !(delta && {
@@ -807,28 +894,8 @@ fn read_ranges(
     }
     let width: usize = cols.iter().map(Vec::len).sum::<usize>().max(1);
     let total = |out: &[Table]| out.iter().map(Table::len).sum::<usize>();
-    // the row passes the rule: append it to its pattern's table
     let push = |k: &Key, r: usize, last: &mut Option<(usize, Key)>, out: &mut [Table]| {
-        if !rule.graph.accepts(k[rule.graph_col]) || rule.eqs.iter().any(|&(a, b)| k[a] != k[b]) {
-            return;
-        }
-        let t = ranges.part(r);
-        let cs = &cols[t];
-        if rule.dedup {
-            let mut proj = [0u64; 4];
-            for (i, &c) in cs.iter().enumerate() {
-                proj[i] = k[c];
-            }
-            if *last == Some((r, proj)) {
-                return;
-            }
-            *last = Some((r, proj));
-        }
-        let tab = &mut out[t];
-        for (i, &c) in cs.iter().enumerate() {
-            tab.cols[i].push(Id(k[c]));
-        }
-        tab.len += 1;
+        push_row(rule, ranges, cols, k, r, last, out)
     };
     for &(c0, c1) in clusters {
         ctx.check()?;
@@ -902,6 +969,168 @@ fn read_ranges(
     Ok(())
 }
 
+/// How row `i` of a block compares with the first `d` columns of `k`.
+#[inline]
+fn lead_cmp(b: &Block, i: usize, k: &Key, d: usize) -> std::cmp::Ordering {
+    for (c, x) in k.iter().enumerate().take(d) {
+        match b.cols[c][i].cmp(x) {
+            std::cmp::Ordering::Equal => {}
+            o => return o,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Append the rows of `ranges` in `perm` to `out[part(r)]`, like [`read_ranges`], with
+/// one cursor over the permutation instead of a scan per cluster. Each range finds its
+/// first block by galloping over the blocks' first and last keys from the range before,
+/// and its rows by galloping in the block from where the range before ended, so keys
+/// that lie close together cost a few comparisons each. The cursor keeps the block it
+/// is in. A range with delta changes in it is read by a scan that merges them.
+#[allow(clippy::too_many_arguments)]
+fn read_ranges_gallop(
+    ctx: &Ctx,
+    perm: Perm,
+    ranges: &Ranges,
+    cols: &[Vec<usize>],
+    rule: &RowRule,
+    out: &mut [Table],
+    stats: &mut Stats,
+) -> Result<()> {
+    let mut mask = ranges.bound_mask();
+    for cs in cols {
+        for &c in cs {
+            mask |= 1 << c;
+        }
+    }
+    if !matches!(rule.graph, GraphFilter::All) {
+        mask |= 1 << rule.graph_col;
+    }
+    for &(a, b) in rule.eqs {
+        mask |= (1 << a) | (1 << b);
+    }
+    if !ctx.opt.selective_columns {
+        mask = ALL_COLS;
+    }
+    let idx = ctx.snap.perm(perm);
+    let metas = &idx.blocks;
+    let pi = perm.index();
+    let (ins, del) = (&ctx.snap.delta.ins[pi], &ctx.snap.delta.del[pi]);
+    let delta = !ins.is_empty() || !del.is_empty();
+    let width: usize = cols.iter().map(Vec::len).sum::<usize>().max(1);
+    let total = |out: &[Table]| out.iter().map(Table::len).sum::<usize>();
+    let plain_rule = !rule.dedup && rule.eqs.is_empty();
+    // the first block that can hold the next range, the block the cursor holds, and the
+    // row of that block where the range before ended
+    let mut b = 0usize;
+    let mut cur: Option<(usize, Block)> = None;
+    let mut row = 0usize;
+    let mut seen = 0usize;
+    for r in 0..ranges.len() {
+        if r % 1024 == 1023 || seen > 1 << 16 {
+            seen = 0;
+            ctx.check()?;
+            ctx.check_output(total(out), width)?;
+        }
+        let (lo, hi) = ranges.get(r);
+        if delta && {
+            let rng = (Bound::Included(lo), Bound::Included(hi));
+            ins.range(rng).next().is_some() || del.range(rng).next().is_some()
+        } {
+            read_ranges(ctx, perm, ranges, &[(r, r + 1)], cols, rule, out, stats)?;
+            continue;
+        }
+        b = gallop_to(b, metas.len(), |x| metas[x].last < lo);
+        let d = ranges.depth(r);
+        let t = ranges.part(r);
+        let mut last: Option<(usize, Key)> = None;
+        let mut x = b;
+        while x < metas.len() && metas[x].first <= hi {
+            let from = match &cur {
+                Some((cb, _)) if *cb == x => Some(row),
+                _ => {
+                    // a block other than the next one is found by a search
+                    if !cur.as_ref().is_some_and(|(cb, _)| cb + 1 == x) {
+                        stats.seeks += 1;
+                    }
+                    cur = Some((x, ctx.snap.cache.get_cols(idx, x, mask)?));
+                    stats.blocks += 1;
+                    None
+                }
+            };
+            let blk = &cur.as_ref().expect("the cursor holds a block").1;
+            let n = blk.len();
+            let before = |i: usize| lead_cmp(blk, i, &lo, d).is_lt();
+            // in a new block, with no position to start from, a binary search
+            let i = match from {
+                Some(from) => gallop_to(from, n, before),
+                None => search(0, n, before),
+            };
+            let j = gallop_to(i, n, |i| lead_cmp(blk, i, &lo, d).is_le());
+            stats.rows += j - i;
+            seen += j - i;
+            let plain = plain_rule
+                && (matches!(rule.graph, GraphFilter::All)
+                    || blk.cols[rule.graph_col][i..j]
+                        .iter()
+                        .all(|&g| rule.graph.accepts(g)));
+            if plain {
+                let tab = &mut out[t];
+                for (k, &c) in cols[t].iter().enumerate() {
+                    tab.cols[k].extend(blk.cols[c][i..j].iter().map(|&v| Id(v)));
+                }
+                tab.len += j - i;
+            } else {
+                for y in i..j {
+                    push_row(rule, ranges, cols, &blk.key(y), r, &mut last, out);
+                }
+            }
+            row = j;
+            if j < n {
+                break;
+            }
+            // the range may go on in the next block
+            x += 1;
+        }
+    }
+    ctx.check_output(total(out), width)?;
+    Ok(())
+}
+
+/// Append row `k` of range `r` to its pattern's table if it passes `rule` (see
+/// [`read_ranges`]); `last` holds the range's last row for dropping merged-graph
+/// duplicates.
+fn push_row(
+    rule: &RowRule,
+    ranges: &Ranges,
+    cols: &[Vec<usize>],
+    k: &Key,
+    r: usize,
+    last: &mut Option<(usize, Key)>,
+    out: &mut [Table],
+) {
+    if !rule.graph.accepts(k[rule.graph_col]) || rule.eqs.iter().any(|&(a, b)| k[a] != k[b]) {
+        return;
+    }
+    let t = ranges.part(r);
+    let cs = &cols[t];
+    if rule.dedup {
+        let mut proj = [0u64; 4];
+        for (i, &c) in cs.iter().enumerate() {
+            proj[i] = k[c];
+        }
+        if *last == Some((r, proj)) {
+            return;
+        }
+        *last = Some((r, proj));
+    }
+    let tab = &mut out[t];
+    for (i, &c) in cs.iter().enumerate() {
+        tab.cols[i].push(Id(k[c]));
+    }
+    tab.len += 1;
+}
+
 /// The ranges of one pattern with their clusters and the base blocks those read.
 type Plan<'a> = (Ranges<'a>, Vec<(usize, usize)>, usize);
 
@@ -919,6 +1148,8 @@ fn read_probes(
         .iter()
         .map(|p| Table::new(p.scan.cols.iter().map(|c| c.1).collect()))
         .collect();
+    let gallop = ctx.opt.gallop_index_join;
+    let star = spec.probes.len() > 1 && !all;
     let per_pattern: Vec<Plan> = spec
         .probes
         .iter()
@@ -931,14 +1162,19 @@ fn read_probes(
                     keys,
                 }
             };
-            let (cl, blocks) = clusters(ctx, p.scan.perm, &ranges);
+            // the galloping reader needs no clusters, except to choose how a star is read
+            let (cl, blocks) = if gallop && !star {
+                (Vec::new(), 0)
+            } else {
+                clusters(ctx, p.scan.perm, &ranges)
+            };
             (ranges, cl, blocks)
         })
         .collect();
     let cost =
         |seeks: usize, blocks: usize| seeks as f64 * SEEK_COST + blocks as f64 * BLOCK_DECODE;
     // a fused star: one walk over the subjects' runs when it reads less
-    if spec.probes.len() > 1 && !all {
+    if star {
         let stars: Vec<&StarPattern> = spec
             .probes
             .iter()
@@ -957,7 +1193,6 @@ fn read_probes(
         let take_walk = forced_walk().unwrap_or(cost(wcl.len(), wblocks) < per_cost);
         if take_walk {
             stats.mode = "subject runs";
-            stats.blocks += wblocks;
             let (sc, oc) = (Perm::Spo.col_of(S), Perm::Spo.col_of(O));
             let cols: Vec<Vec<usize>> = order
                 .iter()
@@ -977,7 +1212,12 @@ fn read_probes(
             };
             // tables in the walk's pattern order, then back in the probes' order
             let mut parts: Vec<Table> = order.iter().map(|&i| out[i].clone()).collect();
-            read_ranges(ctx, Perm::Spo, &walk, &wcl, &cols, &rule, &mut parts, stats)?;
+            if gallop {
+                read_ranges_gallop(ctx, Perm::Spo, &walk, &cols, &rule, &mut parts, stats)?;
+            } else {
+                stats.blocks += wblocks;
+                read_ranges(ctx, Perm::Spo, &walk, &wcl, &cols, &rule, &mut parts, stats)?;
+            }
             for (t, &i) in parts.into_iter().zip(&order) {
                 out[i] = t;
             }
@@ -990,7 +1230,6 @@ fn read_probes(
         .iter()
         .zip(spec.probes.iter().zip(out.iter_mut()))
     {
-        stats.blocks += blocks;
         let rule = RowRule {
             graph: &p.scan.graph,
             graph_col: p.scan.graph_col,
@@ -998,16 +1237,13 @@ fn read_probes(
             dedup: p.scan.dedup,
         };
         let cols = vec![p.scan.cols.iter().map(|c| c.0).collect::<Vec<_>>()];
-        read_ranges(
-            ctx,
-            p.scan.perm,
-            ranges,
-            cl,
-            &cols,
-            &rule,
-            std::slice::from_mut(t),
-            stats,
-        )?;
+        let out = std::slice::from_mut(t);
+        if gallop {
+            read_ranges_gallop(ctx, p.scan.perm, ranges, &cols, &rule, out, stats)?;
+        } else {
+            stats.blocks += blocks;
+            read_ranges(ctx, p.scan.perm, ranges, cl, &cols, &rule, out, stats)?;
+        }
     }
     filter_probes(ctx, spec, &mut out)?;
     Ok(out)
@@ -1022,13 +1258,20 @@ fn filter_probes(ctx: &Ctx, spec: &IndexJoinSpec, out: &mut [Table]) -> Result<(
     Ok(())
 }
 
-/// Row spans of each key of `keys` (sorted, distinct) in a column sorted on the key.
-fn spans(col: &[Id], keys: &[u64]) -> Vec<(u32, u32)> {
+/// Row spans of each key of `keys` (sorted, distinct) in a column sorted on the key,
+/// each searched from the end of the one before by galloping when `gallop`, else by a
+/// binary search over the rest of the column.
+fn spans(col: &[Id], keys: &[u64], gallop: bool) -> Vec<(u32, u32)> {
     let mut out = Vec::with_capacity(keys.len());
     let mut i = 0;
     for &k in keys {
-        i += col[i..].partition_point(|x| x.0 < k);
-        let e = i + col[i..].partition_point(|x| x.0 == k);
+        let e = if gallop {
+            i = gallop_to(i, col.len(), |x| col[x].0 < k);
+            gallop_to(i, col.len(), |x| col[x].0 == k)
+        } else {
+            i += col[i..].partition_point(|x| x.0 < k);
+            i + col[i..].partition_point(|x| x.0 == k)
+        };
         out.push((i as u32, e as u32));
         i = e;
     }
@@ -1104,9 +1347,11 @@ fn combine(
         }
     }
     let width = left.width() + new.len() + 1;
+    let gallop = ctx.opt.gallop_index_join;
     // the spans of each key in every pattern, a row of `m` per key
     let rows_of = |keys: &[u64]| -> Vec<(u32, u32)> {
-        let per: Vec<Vec<(u32, u32)>> = rs.iter().map(|t| spans(&t.cols[0], keys)).collect();
+        let per: Vec<Vec<(u32, u32)>> =
+            rs.iter().map(|t| spans(&t.cols[0], keys, gallop)).collect();
         (0..keys.len())
             .flat_map(|x| per.iter().map(move |p| p[x]))
             .collect()
@@ -1172,7 +1417,10 @@ fn combine(
             }
         }
     };
-    let sorted_key = left.sorted.first() == Some(&spec.key);
+    // an input whose key column is in order, flagged so or not, finds each key from the
+    // one before
+    let sorted_key = left.sorted.first() == Some(&spec.key)
+        || (gallop && !unbound && left.cols[kc].windows(2).all(|w| w[0] <= w[1]));
     let mut x = 0usize;
     for i in 0..left.len() {
         if i % 4096 == 0 {
@@ -1186,7 +1434,9 @@ fn combine(
             }
             continue;
         }
-        x = if sorted_key {
+        x = if sorted_key && gallop {
+            gallop_to(x, keys.len(), |k| keys[k] < v.0)
+        } else if sorted_key {
             x + keys[x..].partition_point(|k| *k < v.0)
         } else {
             keys.partition_point(|k| *k < v.0)

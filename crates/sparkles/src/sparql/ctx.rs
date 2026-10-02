@@ -98,6 +98,15 @@ pub struct Optimizations {
     /// those two read only the key ranges of the values whose string starts as a
     /// `STRSTARTS` or a `REGEX` anchored on a literal start requires
     pub filter_key_ranges: bool,
+    /// hash joins group the build side's rows by key in one flat array instead of a list
+    /// per key
+    pub flat_hash_join: bool,
+    /// index joins find each key's rows by galloping from the previous key's position
+    /// and keep the current block, instead of a binary search and a scan per cluster
+    pub gallop_index_join: bool,
+    /// OPTIONAL on one variable, with both sides sorted on it and always binding it,
+    /// runs as a merge in the left side's order
+    pub merge_left_join: bool,
     /// a FILTER conjunct over the variables of one triple pattern is tested on a sample
     /// of the pattern's rows, whose share that passes is the planner's estimate of the
     /// share of its input it keeps (instead of 30%)
@@ -114,7 +123,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 26] = [
+    pub const NAMES: [&str; 29] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -137,6 +146,9 @@ impl Optimizations {
         "count_filter_runs",
         "filter_scan_runs",
         "filter_key_ranges",
+        "flat_hash_join",
+        "gallop_index_join",
+        "merge_left_join",
         "sampled_filters",
         "characteristic_sets",
         "probed_keys",
@@ -167,6 +179,9 @@ impl Optimizations {
         count_filter_runs: true,
         filter_scan_runs: true,
         filter_key_ranges: true,
+        flat_hash_join: true,
+        gallop_index_join: true,
+        merge_left_join: true,
         sampled_filters: true,
         characteristic_sets: true,
         probed_keys: true,
@@ -197,6 +212,9 @@ impl Optimizations {
         count_filter_runs: false,
         filter_scan_runs: false,
         filter_key_ranges: false,
+        flat_hash_join: false,
+        gallop_index_join: false,
+        merge_left_join: false,
         sampled_filters: false,
         characteristic_sets: false,
         probed_keys: false,
@@ -227,6 +245,9 @@ impl Optimizations {
             "count_filter_runs" => &mut self.count_filter_runs,
             "filter_scan_runs" => &mut self.filter_scan_runs,
             "filter_key_ranges" => &mut self.filter_key_ranges,
+            "flat_hash_join" => &mut self.flat_hash_join,
+            "gallop_index_join" => &mut self.gallop_index_join,
+            "merge_left_join" => &mut self.merge_left_join,
             "sampled_filters" => &mut self.sampled_filters,
             "characteristic_sets" => &mut self.characteristic_sets,
             "probed_keys" => &mut self.probed_keys,

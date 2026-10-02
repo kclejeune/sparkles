@@ -1,0 +1,2 @@
+# follow `# shellcheck source=` directives even when the sourced file is not staged
+external-sources=true

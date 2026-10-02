@@ -202,9 +202,12 @@ authentication.
   are exact from block metadata (at most two block decodes). Join estimates use
   per-predicate distinct subject and object counts with QLever's 0.7 correction factor. A
   pattern with a single free subject, predicate or object has a distinct value of it per
-  row. Costs are counted in rows read by a scan. A hash join costs 48 of them for each row
-  of its smaller input, which goes into a hash table at 40 to 100 ns a row, and one for
-  each row of the larger input that probes it. Merge joins gallop through skewed inputs. `COUNT(*)` over one pattern comes from index
+  row. Costs are counted in rows read by a scan. A hash join costs 8 of them for each row
+  of its smaller input, which goes into the hash table at 3 to 15 ns a row, and one for
+  each row of the larger input that probes it. A scan reads a row in 1.3 to 2.2 ns. With
+  the flat table switched off (`flat_hash_join`), a row of the smaller input costs 48,
+  since the lists per key take 18 to 100 ns a row. Merge joins gallop through skewed
+  inputs. `COUNT(*)` over one pattern comes from index
   metadata. Transitive paths traverse from the bound side, with index lookups per
   frontier node, instead of materializing the closure.
 * **Executed-plan feedback.** Every query returns a runtime-information tree (estimated
@@ -363,21 +366,48 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   sides sorted on the variable give a merge; otherwise the right side's values go into a
   set of ids that the left rows probe. EXPLAIN notes `[anti-join on ?p by merge]`. Other
   MINUS shapes keep the generic compatibility test.
+* **Merge left joins** (`merge_left_join`). An OPTIONAL whose two sides share one
+  variable, are both sorted on it and both always bind it runs as a merge. A branch-free
+  zipper like the anti-join's finds where each left row's key starts on the right, and
+  each left row is then written with the right rows of its key, or alone. The output keeps
+  the left side's order, and the planner treats it as sorted that way. A FILTER inside
+  the OPTIONAL is tested on the matched rows, and a left row none of whose matches pass
+  is kept alone. At 10.5M triples, `optional-count` runs in 6 ms instead of 15 ms on a
+  warm store. EXPLAIN notes `[merge on ?p]`. Other OPTIONALs keep the hash join, which
+  puts the unmatched left rows last.
+* **Flat hash joins** (`flat_hash_join`). A hash join groups the rows of its smaller input
+  by key in flat arrays instead of a list per key. It counts each key's rows and then
+  places every row, so the rows of a key are one span of an array, in row order. An input
+  of 64K rows or more is first split into partitions of about 8K rows by bits of a hash
+  of the key, so that each partition's table stays in the CPU caches while it is built,
+  and the partitions are built in parallel. The larger input probes the table in pieces
+  of 32K rows in parallel, and the pieces' pairs are joined in its order, so the output
+  keeps the probing side's order. Joining a million rows with a million takes 16 to 21
+  ms instead of 62 to 69 ms, and joins of inputs that fit in the caches take as long as
+  before. EXPLAIN notes `[flat hash table: N keys in M parts]`.
 * **Batched index joins.** When a join's input always binds a variable that a triple
   pattern can be read sorted on, and has few distinct values of it for the pattern's size,
   the pattern is read only for those values (`IndexJoin`). The sorted distinct keys become
   key ranges, and ranges in adjacent blocks are read in one scan: scattered keys cost a
   seek per region, dense keys one sweep. Each input row then joins its key's rows, so the
   input's order and duplicates are kept. The planner offers this next to merge and hash
-  joins. A probe takes 160 to 270 ns per key where a scan reads a row in 1.3 to 1.6 ns,
-  so each key costs 140 scanned rows, plus 6 for each doubling of the pattern's rows per
-  key. Each block the keys touch costs 256 and each row read 8. These figures were
-  measured on stores of 1.05M and 10.5M triples by the ignored tests in
-  `sparql/costcal_tests.rs`. Probing then wins when the input has up to about 1 or 2% as
-  many keys as the pattern has rows, against a merge join, and more against a hash join
-  with a large input to build. It is not offered when it would cost more than twice the
-  scan of the pattern. EXPLAIN counts the keys, seeks, blocks and rows read
-  (`batched_join`).
+  joins. The keys are read with one cursor over the permutation (`gallop_index_join`).
+  Each key finds its first block by galloping over the blocks' first and last keys from
+  the block of the key before. It finds its rows by galloping in the block the cursor
+  holds, from where the key before ended, and the spans of the keys in the rows read are
+  found the same way. A range with changes from updates in it is read by a scan that
+  merges them. A key then takes 35 to 90 ns when the keys lie close together and 50 to
+  630 ns when they are spread over the pattern, where binary searches and a scan per
+  cluster of keys took 120 to 490 ns and 250 to 1250 ns. A scan reads a row in 2.2 ns on
+  the same machine. The planner counts 15 scanned rows per key, plus 3.5 for each
+  doubling of the pattern's rows per key, as fitted on keys spread at random. Each block
+  the keys touch costs 256 and each row read 8. These figures were measured on stores of
+  1.05M and 10.5M triples by the ignored tests in `sparql/costcal_tests.rs`. Probing then
+  wins when the input has up to about 5% as many keys as the pattern has rows, against a
+  merge join, and more against a hash join with a large input to build. With the cursor
+  switched off, a key costs 140 rows plus 6 per doubling, and probing wins up to about 1
+  or 2%. Probing is not offered when it would cost more than twice the scan of the
+  pattern. EXPLAIN counts the keys, seeks, blocks and rows read (`batched_join`).
 * **Fused stars.** Index joins on one subject over constant predicates (`?p ex:worksFor
   ex:org7 ; foaf:name ?n ; foaf:age ?a`) run as one operator (`StarJoin`). It walks each
   subject's SPO run once and picks out the star's predicates, or probes each pattern's own
