@@ -338,12 +338,14 @@ export async function handleVector(req, res, url, seg, ctx) {
       if (Number.isNaN(v)) return fail(400, `${key}: 1 to ${max}`);
     const rows = e.baseRows;
     if (!rows) return fail(400, 'the index is empty, or samples or k is 0');
-    // a small graph finds everything; a low ef on a large k misses a little
-    const recall = Math.min(1, 0.9 + (0.1 * ef) / Math.max(ef, 4 * k));
+    // under the exact threshold the searches skip the graph, and the server reports ef 0;
+    // otherwise a low ef on a large k misses a little
+    const exact = rows <= e.config.exactThreshold;
+    const recall = exact ? 1 : Math.min(1, 0.9 + (0.1 * ef) / Math.max(ef, 4 * k));
     ctx.send(res, 200, {
       k,
       samples: Math.min(samples, rows),
-      ef: Math.max(ef, k),
+      ef: exact ? 0 : Math.max(ef, k),
       recall: Math.round(recall * 10000) / 10000,
       hnswMs: 0.04 + ef / 20000,
       exactMs: 0.09 + rows / 50000,

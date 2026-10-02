@@ -417,8 +417,8 @@
               </span>
               <span class="faint">Size</span>
               <span>
-                vectors {fmtBytes(ix.memory.segmentBytes)}{#if ix.hnsw}
-                  · graph {fmtBytes(ix.memory.hnswBytes)}{/if}
+                vectors {fmtBytes(ix.memory.segmentBytes)}
+                {ix.hnsw ? `· graph ${fmtBytes(ix.memory.hnswBytes)}` : ''}
                 <span class="faint"
                   >· {ix.memory.residency === 'mmap' ? 'mapped from the file' : 'in memory'}</span
                 >
@@ -460,9 +460,12 @@
                 {#if recall}
                   <strong>{fmtRecall(recall.recall)}</strong>
                   <span class="faint"
-                    >recall@{recall.k} at ef {recall.ef}, {fmtInt(recall.samples)} samples · graph {fmtMs(
-                      recall.hnswMs,
-                    )}, exact {fmtMs(recall.exactMs)} per search ·
+                    >recall@{recall.k}{recall.ef
+                      ? ` at ef ${recall.ef}`
+                      : ', searched exactly because of the exact threshold'}, {fmtInt(
+                      recall.samples,
+                    )} samples · graph {fmtMs(recall.hnswMs)}, exact {fmtMs(recall.exactMs)} per search
+                    ·
                     <span title={fmtTime(recall.at)}>{fmtRelative(recall.at, now)}</span></span
                   >
                 {:else}
