@@ -113,6 +113,10 @@ impl<'a> Worker<'a> {
 /// How evaluation reads the typing: the pair (node, kind).
 pub type Read<'r> = dyn Fn(Id, PairKind) -> Tri + 'r;
 
+/// Values known from outside a typing (an earlier typing of pairs a write cannot have
+/// changed): a pair it answers is read as that value and never discovered.
+pub type Fixed<'f> = dyn Fn(Id, PairKind) -> Option<bool> + Sync + 'f;
+
 impl<'a> Env<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -384,14 +388,30 @@ impl Typing {
     /// The typing as evaluation reads it: decided and alive pairs, `Unknown` for the
     /// rest.
     pub fn read(&self, node: Id, kind: PairKind) -> Tri {
+        self.read_with(node, kind, None)
+    }
+
+    /// [`Typing::read`], with the pairs it has not discovered read from `fixed`.
+    pub fn read_with(&self, node: Id, kind: PairKind, fixed: Option<&Fixed<'_>>) -> Tri {
         match self.get(node, kind) {
             Some(i) => match self.state[i as usize].load(Ordering::Relaxed) {
                 ALIVE | TRUE => Tri::True,
                 FALSE => Tri::False,
                 _ => Tri::Unknown,
             },
-            None => Tri::Unknown,
+            None => match fixed.and_then(|f| f(node, kind)) {
+                Some(b) => Tri::from(b),
+                None => Tri::Unknown,
+            },
         }
+    }
+
+    /// Every discovered pair and its final value.
+    pub fn values(&self) -> impl Iterator<Item = ((Id, PairKind), bool)> + '_ {
+        self.pairs
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (p, self.value(i as u32)))
     }
 
     /// The value of a pair decided for good, if it is.
@@ -427,6 +447,16 @@ impl Typing {
 
 /// Compute the typing of the pairs reachable from `seeds`.
 pub fn run(env: &Env<'_>, seeds: &[(Id, PairKind)]) -> anyhow::Result<Typing> {
+    run_fixed(env, seeds, None)
+}
+
+/// [`run`], with the pairs `fixed` answers read as its values: they are not discovered,
+/// so the typing reaches only the pairs it does not know.
+pub fn run_fixed(
+    env: &Env<'_>,
+    seeds: &[(Id, PairKind)],
+    fixed: Option<&Fixed<'_>>,
+) -> anyhow::Result<Typing> {
     let mut t = Typing {
         index: FxHashMap::default(),
         pairs: Vec::new(),
@@ -439,13 +469,13 @@ pub fn run(env: &Env<'_>, seeds: &[(Id, PairKind)]) -> anyhow::Result<Typing> {
     for &s in seeds {
         t.intern(s, env.max_pairs)?;
     }
-    discover(env, &mut t)?;
-    refine(env, &mut t)?;
+    discover(env, &mut t, fixed)?;
+    refine(env, &mut t, fixed)?;
     Ok(t)
 }
 
 /// Breadth-first discovery with the three-valued pre-check.
-fn discover(env: &Env<'_>, t: &mut Typing) -> anyhow::Result<()> {
+fn discover(env: &Env<'_>, t: &mut Typing, fixed: Option<&Fixed<'_>>) -> anyhow::Result<()> {
     let mut lo = 0usize;
     while lo < t.pairs.len() {
         env.limits.check()?;
@@ -459,10 +489,16 @@ fn discover(env: &Env<'_>, t: &mut Typing) -> anyhow::Result<()> {
             // decided pairs are final; the others are unknown and become edges
             let read = |n: Id, k: PairKind| match tr.decided(n, k) {
                 Some(b) => Tri::from(b),
-                None => {
-                    reads.borrow_mut().push((n, k));
-                    Tri::Unknown
-                }
+                None => match fixed
+                    .filter(|_| tr.get(n, k).is_none())
+                    .and_then(|f| f(n, k))
+                {
+                    Some(b) => Tri::from(b),
+                    None => {
+                        reads.borrow_mut().push((n, k));
+                        Tri::Unknown
+                    }
+                },
             };
             let r = env.eval(env.ir.pairs[kind.index()].se, node, &read, w)?;
             let mut reads = reads.into_inner();
@@ -492,7 +528,7 @@ fn discover(env: &Env<'_>, t: &mut Typing) -> anyhow::Result<()> {
 }
 
 /// Per stratum, the greatest fixed point in waves.
-fn refine(env: &Env<'_>, t: &mut Typing) -> anyhow::Result<()> {
+fn refine(env: &Env<'_>, t: &mut Typing, fixed: Option<&Fixed<'_>>) -> anyhow::Result<()> {
     let n = t.pairs.len();
     // reverse edges
     let mut rstarts = vec![0u32; n + 1];
@@ -532,7 +568,7 @@ fn refine(env: &Env<'_>, t: &mut Typing) -> anyhow::Result<()> {
             let tr: &Typing = t;
             let failed = env.par_map(&env.registry, &dirty, |w, i| {
                 let (node, kind) = tr.pairs[i as usize];
-                let read = |n: Id, k: PairKind| tr.read(n, k);
+                let read = |n: Id, k: PairKind| tr.read_with(n, k, fixed);
                 match env.eval(env.ir.pairs[kind.index()].se, node, &read, w)? {
                     Tri::Unknown => anyhow::bail!("internal: a pair read an undiscovered pair"),
                     r => Ok(r == Tri::False),

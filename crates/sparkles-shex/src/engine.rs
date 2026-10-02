@@ -29,6 +29,22 @@ pub fn validate(
     map: &ShapeMap,
     opts: &ValidateOptions,
 ) -> anyhow::Result<ResultMap> {
+    Ok(validate_typed(snap, schema, map, opts, None, &[])?.0)
+}
+
+/// The pairs of a typing and their values, of store nodes only.
+pub(crate) type PairValues = Vec<((Id, PairKind), bool)>;
+
+/// [`validate`], with the pairs `fixed` answers read as its values, the pairs `extra`
+/// typed too, and the typing's pairs of store nodes returned with their values.
+pub(crate) fn validate_typed(
+    snap: &Arc<Snapshot>,
+    schema: &CompiledSchema,
+    map: &ShapeMap,
+    opts: &ValidateOptions,
+    fixed: Option<&typing::Fixed<'_>>,
+    extra: &[(Id, PairKind)],
+) -> anyhow::Result<(ResultMap, PairValues)> {
     let started = Instant::now();
     let data = DataGraph::new(
         snap.clone(),
@@ -77,6 +93,8 @@ pub fn validate(
         .zip(&entries)
         .map(|(&n, e)| (n, e.kind))
         .collect();
+    let mut all_seeds = seeds.clone();
+    all_seeds.extend_from_slice(extra);
 
     // start actions, once per validation
     let tracing = Registry::new(opts.semact_trace);
@@ -90,13 +108,13 @@ pub fn validate(
         }
     });
 
-    let t = typing::run(&env, &seeds)?;
+    let t = typing::run_fixed(&env, &all_seeds, fixed)?;
     tracing::debug!(pairs = t.len(), waves = ?t.waves, "shex typing");
 
     // per result: the verdict, then the prints and the reasons
     let acts = has_acts(schema);
     let items: Vec<u32> = (0..entries.len() as u32).collect();
-    let read = |n: Id, k: PairKind| t.read(n, k);
+    let read = |n: Id, k: PairKind| t.read_with(n, k, fixed);
     let prefixes = schema.prefixes();
     let outcomes = env.par_map(&tracing, &items, |w: &mut Worker<'_>, i| {
         let (node, kind) = seeds[i as usize];
@@ -183,7 +201,11 @@ pub fn validate(
         evaluations: t.evaluations,
         waves: t.waves.clone(),
     };
-    Ok(out)
+    let values = t
+        .values()
+        .filter(|((n, _), _)| n.tag() != sparkles::id::Tag::Local)
+        .collect();
+    Ok((out, values))
 }
 
 /// See [`crate::validate_node`].

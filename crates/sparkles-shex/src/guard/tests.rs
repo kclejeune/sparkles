@@ -777,7 +777,10 @@ fn nonconformant(v: &[(Term, crate::ShapeLabel, Status)]) -> Vec<String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    // `SPARKLES_SHEX_CASES=n` runs n cases
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("SPARKLES_SHEX_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(128)
+    ))]
 
     /// Every write's counts are those of a full validation, and every association the
     /// write makes nonconformant is listed, whether the guard validated incrementally
@@ -913,6 +916,59 @@ fn grandfather_mode_blocks_only_new_associations() {
     assert_eq!(
         (v.strategy, v.fallback.as_deref(), v.introduced),
         (Strategy::Full, Some("baseline"), Some(0))
+    );
+}
+
+/// A recursive reference over a connected graph (a ring of people who know the next
+/// one): a write that changes no typing validates only the node it touches, and one
+/// that does validates the nodes the change reaches.
+#[test]
+fn typing_changes_propagate_along_references() {
+    let s = Store::in_memory(StoreOptions::default());
+    let n = 300;
+    let mut data = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix foaf: <http://xmlns.com/foaf/0.1/> .\n",
+    );
+    for i in 0..n {
+        data.push_str(&format!(
+            "ex:p{i} a ex:Person ; foaf:name \"P{i}\" ; foaf:knows ex:p{} .\n",
+            (i + 1) % n
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let (_, sum) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+    assert_eq!((sum.blocking, sum.total), (0, n));
+    // every person reaches p0, but p0's typing does not change
+    let v = summary(&upd(&s, "INSERT DATA { ex:p0 foaf:knows ex:p7 }").unwrap());
+    assert_eq!(
+        (v.strategy, v.focus_nodes, v.blocking),
+        (Strategy::Incremental, Some(1), 0)
+    );
+    // a nameless person p3 knows: everyone reaches p3, and no one conforms
+    let v = summary(
+        &upd(
+            &s,
+            "INSERT DATA { ex:bad a ex:Person . ex:p3 foaf:knows ex:bad }",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        (v.strategy, v.focus_nodes, v.blocking, v.total),
+        (Strategy::Incremental, Some(n + 1), n + 1, n + 1)
+    );
+    // a write between nonconformant people changes nothing either
+    let v = summary(&upd(&s, "INSERT DATA { ex:p9 foaf:knows ex:p20 }").unwrap());
+    assert_eq!((v.focus_nodes, v.blocking), (Some(1), n + 1));
+    // naming bad fixes everyone
+    let v = summary(&upd(&s, "INSERT DATA { ex:bad foaf:name \"B\" }").unwrap());
+    assert_eq!(
+        (v.strategy, v.focus_nodes, v.blocking),
+        (Strategy::Incremental, Some(n + 1), 0)
     );
 }
 
