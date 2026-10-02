@@ -38,6 +38,7 @@ behaviour, and the Outcome explains the difference.
 | `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, cloning, inference freshness, access control, write-time validation and the MCP server. |
 | `F` | Larger data features: full-text and vector search, backups to object storage, retained history and point-in-time reads. |
 | `G` | Gaps against Apache Jena that were out of scope for the first version: GeoSPARQL and ShEx. |
+| `P` | Bindings that embed the engine in other languages: Python. |
 | `X` | Internal engineering that does not derive from any other database product: compression codecs and the formatter. |
 
 Numbers are stable. Gaps in the numbering are roadmap items without a spec: a Cypher
@@ -66,6 +67,7 @@ not built; the status block says which. *Designed, not built* means there is no 
 | [F06](F06-snapshots-and-point-in-time.md) | Point-in-time reads with `?at=`, named snapshots, a retention window and diffs between commits | implemented in part (Phases 1 and 2) |
 | [G01](G01-geosparql.md) | GeoSPARQL 1.1 functions, Jena's spatial extensions, a spatial index, spatial joins and the UI's maps | implemented in part (Phases 1–2) |
 | [G02](G02-shex.md) | ShEx 2.1 validation: ShExC, ShExJ and ShExR, shape maps, `POST /{ds}/shex` and write-time ShEx | implemented in part (Phases 1–2) |
+| [P01](P01-python-bindings.md) | The `sparkles` Python package: datasets, SPARQL, terms, quads, transactions, dumps, reasoning and validation, built with PyO3 and maturin as abi3 wheels | designed, not built |
 | [X01](X01-compression-codecs.md) | zstd and brotli next to gzip and LZ4 for inputs, responses, dumps, backups and the UI's assets | implemented in part (Phase 1) |
 | [X02](X02-formatter.md) | `sparkles fmt`, `POST /$/format`, `sparkles lsp` and the UI's Format button for SPARQL and RDF | implemented |
 
