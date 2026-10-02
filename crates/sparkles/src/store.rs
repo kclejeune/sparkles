@@ -3026,7 +3026,8 @@ impl Store {
             }
             if bulk.is_some() {
                 self.check_memory(dir_size(&dir))?;
-                self.quota.check_rebuild(snap.generation.dir.as_deref())?;
+                self.quota
+                    .check_rebuild(snap.generation.dir.as_deref(), &dir)?;
             }
             Ok(meta)
         })();
