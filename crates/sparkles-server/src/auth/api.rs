@@ -199,10 +199,13 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
 /// expired sessions hourly while running.
 pub fn flush(st: &AppState) {
     #[cfg(feature = "auth")]
-    if let Some(a) = &st.auth
-        && let Err(e) = a.tokens.flush()
-    {
-        tracing::warn!("cannot write the token store: {e:#}");
+    if let Some(a) = &st.auth {
+        if let Err(e) = a.tokens.flush() {
+            tracing::warn!("cannot write the token store: {e:#}");
+        }
+        if let Err(e) = a.sessions.flush() {
+            tracing::warn!("cannot write the session store: {e:#}");
+        }
     }
     let _ = st;
 }
@@ -224,7 +227,8 @@ pub fn spawn_reload_on_sighup(st: &Arc<AppState>) {
                 loop {
                     t.tick().await;
                     let now = prune_auth.now();
-                    if let Err(e) = prune_auth.sessions.prune(now) {
+                    let idle = prune_auth.policy().session_idle;
+                    if let Err(e) = prune_auth.sessions.prune(now, idle) {
                         tracing::warn!("cannot prune sessions: {e:#}");
                     }
                 }

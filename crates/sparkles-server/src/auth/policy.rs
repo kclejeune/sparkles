@@ -1,6 +1,7 @@
 //! The loaded policy, the auth state of the server, and authentication of requests.
 
 use super::config::{self, FileConfig};
+use super::jwt::{self, CloudflareAccess, JwtError};
 use super::proxy::{Peer, ProxySettings};
 use super::session::{CookieMode, Keys, Method, SessionStore};
 use super::tokens::{TokenRecord, TokenStore};
@@ -113,8 +114,11 @@ pub struct Policy {
     /// tokens an owner may mint
     pub mint_rate: crate::ratelimit::Limit,
     pub session_ttl: i64,
+    /// a session unused for this long ends
+    pub session_idle: Option<i64>,
     pub oidc: Option<config::OidcCfg>,
     pub proxy: Option<ProxySettings>,
+    pub cloudflare: Option<config::CloudflareAccessCfg>,
     pub cors_origins: Vec<String>,
     /// verified in place of the hash of an unknown user, so timing reveals no names
     dummy_hash: String,
@@ -248,8 +252,15 @@ impl Policy {
             max_tokens_per_owner: cfg.tokens_policy.max_active_per_owner,
             mint_rate: config::parse_mint_rate(&cfg.tokens_policy.mint_rate)?,
             session_ttl: config::parse_duration(&cfg.session.ttl)?,
+            session_idle: cfg
+                .session
+                .idle_timeout
+                .as_deref()
+                .map(config::parse_duration)
+                .transpose()?,
             oidc: cfg.oidc.clone(),
             proxy: cfg.proxy.as_ref().map(ProxySettings::from_config),
+            cloudflare: cfg.cloudflare_access.clone(),
             cors_origins: cfg.cors.origins.clone(),
             dummy_hash,
             counts: (cfg.users.len(), cfg.tokens.len(), cfg.roles.len()),
@@ -508,6 +519,12 @@ pub struct Auth {
     pub sessions: SessionStore,
     pub keys: Keys,
     pub oidc: super::oidc::OidcState,
+    /// the Cloudflare Access verifier of the current policy, and the settings it was
+    /// built from
+    cloudflare: parking_lot::RwLock<Option<(String, Arc<CloudflareAccess>)>>,
+    /// the groups last recorded for each OIDC or proxy owner, so that an unchanged list
+    /// costs no store lookup (bounded; cleared when full)
+    refreshed: Mutex<HashMap<String, Vec<String>>>,
     pub cli: super::grants::CliGrants,
     pub metrics: AuthMetrics,
     /// seconds added to the clock (tests)
@@ -542,6 +559,8 @@ impl Auth {
         let oidc = super::oidc::OidcState::new(&policy)?;
         let throttle = crate::ratelimit::RateLimiter::new(&throttle_config(&policy))
             .map_err(anyhow::Error::msg)?;
+        let cloudflare = parking_lot::RwLock::new(None);
+        rebuild_cloudflare(&cloudflare, &policy)?;
         Ok(Auth {
             path: None,
             policy: ArcSwap::from_pointee(policy),
@@ -559,7 +578,9 @@ impl Auth {
             sessions: SessionStore::open(dir.join("sessions.json"), now)?,
             keys: Keys::load_or_create(&key_file)?,
             oidc,
-            cli: super::grants::CliGrants::default(),
+            cloudflare,
+            refreshed: Mutex::new(HashMap::new()),
+            cli: super::grants::CliGrants::open(dir.join("device-grants.json"), now)?,
             metrics: AuthMetrics::default(),
             clock_offset: AtomicI64::new(0),
             untrusted_warned: Mutex::new(None),
@@ -619,6 +640,7 @@ impl Auth {
             let (cfg, warnings) = FileConfig::load(path)?;
             let p = Policy::build(&cfg)?;
             self.oidc.reconfigure(&p)?;
+            rebuild_cloudflare(&self.cloudflare, &p)?;
             // the throttle keeps its clients' state
             self.throttle
                 .reload(&throttle_config(&p))
@@ -719,11 +741,38 @@ impl Auth {
                 None => clear_cookie = true,
             }
         }
+        // Cloudflare Access's signed assertion: honored from any peer, since its
+        // signature is checked; an invalid one is refused like a bad Authorization
+        if let Some(v) = h.get(jwt::CF_ASSERTION)
+            && let Some(cf) = self.cloudflare_client()
+        {
+            return self
+                .cloudflare_principal(&policy, &cf, v)
+                .await
+                .map(|principal| Authenticated {
+                    principal,
+                    clear_cookie,
+                });
+        }
         if let Some(px) = &policy.proxy
             && px.has_headers(h)
         {
             if px.trusted.trusts(peer) {
                 if let Some((name, groups)) = px.identity(h) {
+                    // a request without the groups header asserts no groups
+                    let asserted = px
+                        .groups_header
+                        .as_ref()
+                        .is_some_and(|g| h.contains_key(g.as_str()));
+                    let who = Identity {
+                        kind: Kind::Proxy,
+                        name: name.clone(),
+                        groups: groups.clone(),
+                        display_name: None,
+                    };
+                    if asserted {
+                        self.refresh_owner(&who);
+                    }
                     return match self.proxy_principal(&policy, &name, groups) {
                         Some(p) => Ok(Authenticated {
                             principal: p,
@@ -774,6 +823,14 @@ impl Auth {
         if scheme.eq_ignore_ascii_case("bearer") {
             if rest.is_empty() {
                 return Err(malformed("bearer"));
+            }
+            // an access token of the OIDC provider (a JWT), else a Sparkles token
+            if !rest.starts_with("spk_")
+                && jwt::looks_like_jwt(rest)
+                && let Some(oidc) = self.oidc.client()
+                && oidc.accepts_access_tokens()
+            {
+                return self.access_token_principal(policy, &oidc, rest).await;
             }
             return self.token_principal(policy, rest, Scheme::Bearer);
         }
@@ -892,16 +949,179 @@ impl Auth {
         )
     }
 
+    /// The Cloudflare Access verifier of the current policy.
+    fn cloudflare_client(&self) -> Option<Arc<CloudflareAccess>> {
+        self.cloudflare.read().as_ref().map(|(_, c)| c.clone())
+    }
+
+    /// Record `who`'s current groups in the tokens and sessions it owns (open question
+    /// 10 of the spec: token permissions follow the provider's groups). Called whenever
+    /// the provider or proxy asserts the groups, admitted or not, so that an identity
+    /// removed from a group loses what its tokens got through it.
+    pub fn refresh_owner(&self, who: &Identity) {
+        let key = who.log_name();
+        {
+            let mut seen = self.refreshed.lock();
+            if seen.get(&key) == Some(&who.groups) {
+                return;
+            }
+            if seen.len() >= CACHE_MAX {
+                seen.clear();
+            }
+            seen.insert(key.clone(), who.groups.clone());
+        }
+        let tokens = self.tokens.refresh_groups(who);
+        let sessions = self.sessions.refresh_groups(who);
+        match (tokens, sessions) {
+            (Ok(0), Ok(0)) => {}
+            (Ok(t), Ok(s)) => tracing::info!(
+                target: "sparkles::audit",
+                event = "groups_refreshed",
+                owner = key.as_str(),
+                tokens = t,
+                sessions = s,
+            ),
+            (Err(e), _) | (_, Err(e)) => {
+                // retried at the next request that asserts the groups
+                self.refreshed.lock().remove(&key);
+                tracing::error!("cannot record the groups of {key}: {e:#}");
+            }
+        }
+    }
+
+    /// An access token of the OIDC provider on the API: an `oidc:` principal with the
+    /// token's groups, admitted and mapped to roles like a UI login.
+    async fn access_token_principal(
+        &self,
+        policy: &Policy,
+        oidc: &super::oidc::Oidc,
+        token: &str,
+    ) -> Result<Principal, AuthError> {
+        let err = |failure| AuthError {
+            scheme: "bearer",
+            failure,
+        };
+        let claims = match oidc.verify_access_token(token).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("access token refused: {e}");
+                return Err(err(jwt_failure(&e)));
+            }
+        };
+        let Some(cfg) = &policy.oidc else {
+            return Err(err(Failure::Invalid));
+        };
+        let Some(name) = jwt::name_claim(&claims, cfg.api_name_claim()) else {
+            tracing::debug!(
+                "access token refused: it has no {} claim",
+                cfg.api_name_claim()
+            );
+            return Err(err(Failure::Invalid));
+        };
+        let groups_claim = claims.get(&cfg.groups_claim);
+        let who = Identity {
+            kind: Kind::Oidc,
+            name: name.clone(),
+            groups: jwt::strings(groups_claim),
+            display_name: claims
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        };
+        if groups_claim.is_some() {
+            self.refresh_owner(&who);
+        }
+        let grants = policy
+            .identity_grants(&who)
+            .ok_or(err(Failure::NotAllowed))?;
+        let expires = claims
+            .get("exp")
+            .and_then(serde_json::Value::as_f64)
+            .map(|e| e as i64);
+        Ok(
+            Principal::new(Kind::Oidc, &name, Scheme::Bearer, Access::of(grants)).with_info(
+                PrincipalInfo {
+                    owner: Some(who),
+                    expires,
+                    idp_token: true,
+                    ..Default::default()
+                },
+            ),
+        )
+    }
+
+    /// A Cloudflare Access assertion: a `proxy:` principal named by the user's email
+    /// (ambient, like trusted headers, so the CSRF rules apply), or by a service token's
+    /// client id (not ambient: browsers do not hold service tokens).
+    async fn cloudflare_principal(
+        &self,
+        policy: &Policy,
+        cf: &CloudflareAccess,
+        v: &axum::http::HeaderValue,
+    ) -> Result<Principal, AuthError> {
+        let err = |failure| AuthError {
+            scheme: "proxy",
+            failure,
+        };
+        let token = v.to_str().map_err(|_| err(Failure::Malformed))?;
+        let claims = match cf.verify(token.trim()).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("Cloudflare Access assertion refused: {e}");
+                return Err(err(jwt_failure(&e)));
+            }
+        };
+        let Some((name, service)) = CloudflareAccess::account(&claims) else {
+            return Err(err(Failure::Invalid));
+        };
+        let groups_claim = cf.groups_claim.as_ref().and_then(|g| claims.get(g));
+        let who = Identity {
+            kind: Kind::Proxy,
+            name: name.clone(),
+            groups: jwt::strings(groups_claim),
+            display_name: None,
+        };
+        if groups_claim.is_some() {
+            self.refresh_owner(&who);
+        }
+        let grants = policy
+            .identity_grants(&who)
+            .ok_or(err(Failure::NotAllowed))?;
+        let expires = claims
+            .get("exp")
+            .and_then(serde_json::Value::as_f64)
+            .map(|e| e as i64);
+        let (scheme, csrf) = if service {
+            (Scheme::Bearer, None)
+        } else {
+            (
+                Scheme::Proxy,
+                Some(self.keys.csrf(&format!("proxy:{name}"))),
+            )
+        };
+        Ok(
+            Principal::new(Kind::Proxy, &name, scheme, Access::of(grants)).with_info(
+                PrincipalInfo {
+                    owner: Some(who),
+                    expires,
+                    csrf,
+                    idp_token: service,
+                    ..Default::default()
+                },
+            ),
+        )
+    }
+
     /// The principal of a signed session cookie; `None` for a bad signature, an
     /// unknown or expired session, or an identity that lost its access.
     fn session_principal(&self, policy: &Policy, signed: &str) -> Option<Principal> {
         let raw = self.keys.verify(super::SESSION_COOKIE, signed)?;
         let digest = crypto::sha256(raw.as_bytes());
         let now = self.now();
-        let s = self.sessions.get(&digest, now)?;
+        let s = self.sessions.get(&digest, now, policy.session_idle)?;
         let mut info = PrincipalInfo {
             owner: Some(s.principal.clone()),
-            expires: Some(s.expires_at()),
+            expires: Some(s.ends_at(policy.session_idle)),
             csrf: Some(self.keys.csrf(raw)),
             session: Some(digest),
             ..Default::default()
@@ -912,7 +1132,7 @@ impl Auth {
                 let access = self.token_access(policy, &rec, now, 0)?;
                 info.owner = Some(rec.owner.clone());
                 info.token_id = Some(rec.id.clone());
-                info.expires = Some(s.expires_at().min(rec.expires_at()));
+                info.expires = Some(s.ends_at(policy.session_idle).min(rec.expires_at()));
                 (Kind::Token, rec.id, access)
             }
             Method::Password | Method::Oidc => (
@@ -1238,6 +1458,45 @@ impl Auth {
             );
         }
     }
+}
+
+/// The failure a refused JWT counts as: a provider whose keys cannot be fetched is not
+/// the client's fault.
+fn jwt_failure(e: &JwtError) -> Failure {
+    match e {
+        JwtError::Malformed => Failure::Malformed,
+        JwtError::Invalid(_) => Failure::Invalid,
+        JwtError::Expired => Failure::Expired,
+        JwtError::Unavailable(_) => Failure::Idp,
+    }
+}
+
+/// Build the Cloudflare Access verifier of `policy` when its settings changed (its key
+/// cache survives a reload that leaves them alone).
+fn rebuild_cloudflare(
+    slot: &parking_lot::RwLock<Option<(String, Arc<CloudflareAccess>)>>,
+    policy: &Policy,
+) -> Result<()> {
+    let key = policy
+        .cloudflare
+        .as_ref()
+        .map(|c| format!("{}|{:?}|{:?}", c.team_domain, c.audience, c.groups_claim));
+    let mut slot = slot.write();
+    if slot.as_ref().map(|(k, _)| k) == key.as_ref() {
+        return Ok(());
+    }
+    *slot = match (&policy.cloudflare, key) {
+        (Some(c), Some(k)) => Some((
+            k,
+            Arc::new(CloudflareAccess::new(
+                &c.team_domain,
+                c.audience.clone(),
+                c.groups_claim.clone(),
+            )?),
+        )),
+        _ => None,
+    };
+    Ok(())
 }
 
 /// The principal of a minted token.

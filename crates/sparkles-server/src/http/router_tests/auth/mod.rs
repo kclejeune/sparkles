@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod cli_grants;
 pub(super) mod graphs;
+mod idp;
 mod limits;
 mod oidc;
 mod proxy;

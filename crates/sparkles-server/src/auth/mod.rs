@@ -31,6 +31,8 @@ mod grants;
 #[cfg(feature = "auth")]
 mod handlers;
 #[cfg(feature = "auth")]
+pub mod jwt;
+#[cfg(feature = "auth")]
 pub mod oidc;
 #[cfg(feature = "auth")]
 mod policy;
@@ -492,6 +494,9 @@ pub struct PrincipalInfo {
     pub token_id: Option<String>,
     /// a static token from the configuration (cannot mint)
     pub static_token: bool,
+    /// an access token or assertion of the identity provider (cannot mint: it is the
+    /// provider's short-lived credential, not a person at the UI)
+    pub idp_token: bool,
     /// Unix seconds at which the credential (token or session) expires
     pub expires: Option<i64>,
     /// the CSRF token an ambient principal (session or proxy) must send
