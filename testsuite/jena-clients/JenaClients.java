@@ -498,7 +498,7 @@ public class JenaClients {
             expectStatus(200, r, "ASK as TSV");
             expectEq("?_askResult\ntrue\n", r.body(), "TSV body");
         });
-        Lang[] graphLangs = { Lang.TURTLE, Lang.NTRIPLES, Lang.RDFXML, Lang.JSONLD, Lang.RDFTHRIFT, Lang.RDFPROTO, Lang.TRIG, Lang.NQUADS, Lang.RDFJSON };
+        Lang[] graphLangs = { Lang.TURTLE, Lang.NTRIPLES, Lang.RDFXML, Lang.JSONLD, Lang.RDFTHRIFT, Lang.RDFPROTO, Lang.TRIG, Lang.NQUADS, Lang.RDFJSON, Lang.TRIX };
         for ( Lang lang : graphLangs ) {
             check("query: CONSTRUCT, " + lang.getName(), () -> {
                 try ( QueryExec qe = QueryExecHTTP.service(ds + "/sparql")
@@ -516,7 +516,7 @@ public class JenaClients {
             }
         });
         check("query: CONSTRUCT quads (TriG and N-Quads)", () -> {
-            for ( Lang lang : new Lang[] { Lang.TRIG, Lang.NQUADS } ) {
+            for ( Lang lang : new Lang[] { Lang.TRIG, Lang.NQUADS, Lang.TRIX } ) {
                 try ( QueryExec qe = QueryExecHTTP.service(ds + "/sparql")
                         .query("CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ?g { ?s ?p ?o } }")
                         .acceptHeader(lang.getHeaderString()).build() ) {
@@ -638,7 +638,7 @@ public class JenaClients {
     static final RDFFormat[] TRIPLE_FORMATS = {
         RDFFormat.TURTLE, RDFFormat.NTRIPLES, RDFFormat.RDFXML, RDFFormat.JSONLD,
         RDFFormat.RDF_THRIFT, RDFFormat.RDF_THRIFT_VALUES, RDFFormat.RDF_PROTO, RDFFormat.RDFJSON,
-        RDFFormat.TRIG, RDFFormat.NQUADS,
+        RDFFormat.TRIG, RDFFormat.NQUADS, RDFFormat.TRIX,
     };
 
     static void gsp(String ds) {
@@ -674,7 +674,7 @@ public class JenaClients {
         }
         check("gsp: files with every extension (GSP.PUT(file))", () -> {
             Path dir = Files.createTempDirectory("jena-clients");
-            for ( Lang lang : new Lang[] { Lang.TURTLE, Lang.NTRIPLES, Lang.RDFXML, Lang.JSONLD, Lang.RDFTHRIFT, Lang.N3 } ) {
+            for ( Lang lang : new Lang[] { Lang.TURTLE, Lang.NTRIPLES, Lang.RDFXML, Lang.JSONLD, Lang.RDFTHRIFT, Lang.N3, Lang.TRIX } ) {
                 Path file = dir.resolve("data." + lang.getFileExtensions().get(0));
                 RDFDataMgr.write(Files.newOutputStream(file), graph(TRIPLES), lang);
                 GSP.service(gsp).graphName("http://example.org/file").PUT(file.toString());
@@ -716,7 +716,7 @@ public class JenaClients {
 
     static void datasetProtocol(String ds) {
         String gsp = ds + "/data";
-        RDFFormat[] quadFormats = { RDFFormat.TRIG, RDFFormat.NQUADS, RDFFormat.JSONLD, RDFFormat.RDF_THRIFT, RDFFormat.RDF_PROTO };
+        RDFFormat[] quadFormats = { RDFFormat.TRIG, RDFFormat.NQUADS, RDFFormat.JSONLD, RDFFormat.RDF_THRIFT, RDFFormat.RDF_PROTO, RDFFormat.TRIX };
         for ( RDFFormat fmt : quadFormats ) {
             check("dsp: PUT/GET/POST/clear as " + fmt, () -> {
                 DSP.service(gsp).contentType(fmt).PUT(dataset(QUADS));

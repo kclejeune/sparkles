@@ -44,6 +44,8 @@ flate2.workspace = true
 zstd = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 quick_cache = "0.7.0"
+# TriX (the version oxrdfxml and sparesults already use)
+quick-xml = "0.37"
 tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "stemmer", "stopwords", "lz4-compression"], optional = true }
 # the term automata of fuzzy `text:query` terms (the versions Tantivy uses)
 levenshtein_automata = { version = "0.2.1", optional = true }

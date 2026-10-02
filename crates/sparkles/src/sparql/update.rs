@@ -840,9 +840,17 @@ fn load(
             ));
         }
         let path = opts.file_loads.check(url)?;
-        let (format, _) = crate::io::format_for_path(&path).ok_or_else(|| {
-            Error::invalid(format!("cannot determine RDF format of {}", path.display()))
-        })?;
+        let format = if crate::trix::is_path(&path) {
+            LoadSyntax::TriX
+        } else {
+            LoadSyntax::Rdf(
+                crate::io::format_for_path(&path)
+                    .ok_or_else(|| {
+                        Error::invalid(format!("cannot determine RDF format of {}", path.display()))
+                    })?
+                    .0,
+            )
+        };
         let mut f = std::fs::File::open(&path)?;
         let name = path.display().to_string();
         let (codec, head) = crate::io::sniff_codec(&mut f, Some(&path), &name)?;
@@ -864,7 +872,7 @@ fn load(
             client.get(u).header(
                 "Accept",
                 "text/turtle, application/n-triples, application/n-quads, application/trig, \
-                 application/rdf+xml, application/ld+json;q=0.9",
+                 application/rdf+xml, application/ld+json;q=0.9, application/trix+xml;q=0.8",
             )
         })
         .map_err(|f| {
@@ -877,9 +885,19 @@ fn load(
     }
     let ct = resp.content_type;
     let url_path = std::path::Path::new(url);
-    let format = crate::io::format_for_media_type(&ct)
-        .or_else(|| crate::io::format_for_path(url_path).map(|f| f.0))
-        .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))?;
+    let format = if crate::trix::is_media_type(&ct) {
+        LoadSyntax::TriX
+    } else if let Some(f) = crate::io::format_for_media_type(&ct) {
+        LoadSyntax::Rdf(f)
+    } else if crate::trix::is_path(url_path) {
+        LoadSyntax::TriX
+    } else {
+        LoadSyntax::Rdf(
+            crate::io::format_for_path(url_path)
+                .map(|f| f.0)
+                .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))?,
+        )
+    };
     let mut body = resp.body;
     let (codec, head) =
         crate::io::sniff_codec(&mut body, Some(url_path), url).map_err(|e| read_error(url, e))?;
@@ -902,6 +920,13 @@ fn load(
     insert_parsed(txn, r, format, url, &into, stats, req).map_err(|e| read_error(url, e))
 }
 
+/// The syntax of a `LOAD`ed document: one oxrdfio reads, or TriX.
+#[derive(Clone, Copy)]
+enum LoadSyntax {
+    Rdf(RdfFormat),
+    TriX,
+}
+
 /// Where the quads of a `LOAD` go.
 struct Into<'a> {
     graph: Option<NamedNode>,
@@ -915,34 +940,56 @@ struct Into<'a> {
 fn insert_parsed(
     txn: &mut WriteTxn<'_>,
     r: impl Read,
-    format: RdfFormat,
+    syntax: LoadSyntax,
     name: &str,
     into: &Into<'_>,
     stats: &mut UpdateStats,
     req: &Request<'_>,
 ) -> Result<()> {
-    let mut parser = RdfParser::from_format(format)
-        .with_base_iri(into.base)
-        .map_err(|e| Error::invalid(e.to_string()))?;
-    if let Some(g) = &into.graph {
-        parser = parser.with_default_graph(oxrdf::GraphName::NamedNode(g.clone()));
-    }
     let mut labels = std::collections::HashMap::new();
     let mut held = Vec::new();
-    let r = crate::nesting::Guarded::rdf(r, format, name);
-    for (i, q) in parser.for_reader(r).enumerate() {
+    let mut i = 0usize;
+    let mut insert = |q: oxrdf::Quad| -> Result<()> {
         if i % 4096 == 4095 {
             req.check()?;
         }
-        let q = q.map_err(|e| match e {
-            RdfParseError::Io(e) => crate::codec::io_error(e),
-            RdfParseError::Syntax(e) => Error::RdfParse(format!("{name}: {e}")),
-        })?;
+        i += 1;
         let ids = txn.encode_quad(&q, &mut labels)?;
         if into.silent {
             held.push(ids);
         } else if txn.insert(ids)? {
             stats.inserted += 1;
+        }
+        Ok(())
+    };
+    match syntax {
+        LoadSyntax::Rdf(format) => {
+            let mut parser = RdfParser::from_format(format)
+                .with_base_iri(into.base)
+                .map_err(|e| Error::invalid(e.to_string()))?;
+            if let Some(g) = &into.graph {
+                parser = parser.with_default_graph(oxrdf::GraphName::NamedNode(g.clone()));
+            }
+            let r = crate::nesting::Guarded::rdf(r, format, name);
+            for q in parser.for_reader(r) {
+                insert(q.map_err(|e| match e {
+                    RdfParseError::Io(e) => crate::codec::io_error(e),
+                    RdfParseError::Syntax(e) => Error::RdfParse(format!("{name}: {e}")),
+                })?)?;
+            }
+        }
+        LoadSyntax::TriX => {
+            let r = std::io::BufReader::new(r);
+            crate::trix::parse(r, Some(into.base), |mut q| -> Result<()> {
+                if let (Some(g), oxrdf::GraphName::DefaultGraph) = (&into.graph, &q.graph_name) {
+                    q.graph_name = oxrdf::GraphName::NamedNode(g.clone());
+                }
+                insert(q)
+            })
+            .map_err(|e| match e {
+                Error::RdfParse(m) => Error::RdfParse(format!("{name}: {m}")),
+                e => e,
+            })?;
         }
     }
     for ids in held {

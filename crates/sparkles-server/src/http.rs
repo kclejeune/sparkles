@@ -32,7 +32,7 @@ mod format;
 mod fuseki;
 pub(crate) mod history;
 mod inline;
-mod jena_formats;
+pub(crate) mod jena_formats;
 mod queries;
 mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
@@ -756,6 +756,7 @@ fn rdf_format(params: &Params, headers: &HeaderMap, quads: bool) -> OutFormat {
             "json-rdf" | "rdfjson" | "rdf-json" if !quads => {
                 return OutFormat::Jena(JenaFormat::RdfJson);
             }
+            "trix" => return OutFormat::Jena(JenaFormat::TriX),
             _ => {}
         }
     }
@@ -767,6 +768,8 @@ fn rdf_format(params: &Params, headers: &HeaderMap, quads: bool) -> OutFormat {
             "text/plain",
             "application/rdf+thrift",
             "application/rdf+protobuf",
+            "application/trix+xml",
+            "application/trix",
         ]
     } else {
         &[
@@ -780,6 +783,8 @@ fn rdf_format(params: &Params, headers: &HeaderMap, quads: bool) -> OutFormat {
             "application/rdf+thrift",
             "application/rdf+protobuf",
             "application/rdf+json",
+            "application/trix+xml",
+            "application/trix",
         ]
     };
     let picked = negotiate(accept_header(headers), offers).map(|i| offers[i]);
@@ -2590,8 +2595,8 @@ async fn gsp_on(
             }
             history::reject_at(&params)?;
             let ct = content_type(&headers);
-            // Jena's RDF Thrift, RDF Protobuf and RDF/JSON are read into N-Quads or
-            // N-Triples first
+            // Jena's RDF Thrift, RDF Protobuf, RDF/JSON and TriX are read into N-Quads
+            // or N-Triples first
             let jena = jena_formats::JenaFormat::from_media_type(&ct);
             let quads = matches!(target, Target::Dataset);
             let format = match jena {
@@ -2850,9 +2855,7 @@ async fn upload(
         let ext = match (jena, format) {
             _ if table == Some(sparkles::tabular::TabularKind::Csv) => "csv",
             _ if table == Some(sparkles::tabular::TabularKind::Tsv) => "tsv",
-            (Some(jena_formats::JenaFormat::Thrift), _) => "rt",
-            (Some(jena_formats::JenaFormat::Protobuf), _) => "rpb",
-            (Some(jena_formats::JenaFormat::RdfJson), _) => "rj",
+            (Some(j), _) => j.file_extension(),
             (None, Some(RdfFormat::NTriples)) => "nt",
             (None, Some(RdfFormat::NQuads)) => "nq",
             (None, Some(RdfFormat::TriG)) => "trig",
@@ -2882,19 +2885,21 @@ async fn upload(
             ),
             None => None,
         };
-        // files in Jena's RDF Thrift, RDF Protobuf or RDF/JSON (by extension) are read
-        // into N-Quads, or N-Triples for a graph
+        // files in Jena's RDF Thrift, RDF Protobuf, RDF/JSON or TriX (by extension) are
+        // read into N-Quads, or N-Triples for a graph
         let mut files = files;
         for f in files.iter_mut() {
             let name = f
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if let Some(j) = jena_formats::JenaFormat::from_file_name(&name) {
+            if let Some(j) = jena_formats::JenaFormat::from_path(f) {
                 let quads = g.is_none();
                 let out = f.with_extension(if quads { "nq" } else { "nt" });
                 let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-                let src = std::fs::File::open(&*f).map_err(io)?;
+                // compressed files (`data.trix.gz`) are decompressed on the way
+                let src = sparkles::tabular::open(f, st.limits.max_decompressed_bytes)
+                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{name}: {e}")))?;
                 let mut w = std::io::BufWriter::new(std::fs::File::create(&out).map_err(io)?);
                 jena_formats::transcode(j, src, quads, &mut w)
                     .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{name}: {e}")))?;

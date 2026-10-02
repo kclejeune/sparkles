@@ -196,7 +196,7 @@ pub(super) async fn data(uri: Uri, headers: HeaderMap, AdminBody(body): AdminBod
 
 enum DataSyntax {
     Rdf(oxrdfio::RdfFormat),
-    RdfJson,
+    Jena(super::super::jena_formats::JenaFormat),
 }
 
 fn data_syntax(name: &str) -> Option<DataSyntax> {
@@ -212,7 +212,16 @@ fn data_syntax(name: &str) -> Option<DataSyntax> {
             profile: oxrdfio::JsonLdProfileSet::empty(),
         },
         "n3" => RdfFormat::N3,
-        "rdf/json" | "rdfjson" | "rj" => return Some(DataSyntax::RdfJson),
+        "rdf/json" | "rdfjson" | "rj" => {
+            return Some(DataSyntax::Jena(
+                super::super::jena_formats::JenaFormat::RdfJson,
+            ));
+        }
+        "trix" => {
+            return Some(DataSyntax::Jena(
+                super::super::jena_formats::JenaFormat::TriX,
+            ));
+        }
         _ => return None,
     }))
 }
@@ -236,14 +245,11 @@ fn parse_data(format: DataSyntax, data: &str) -> Option<J> {
             }
             None
         }
-        DataSyntax::RdfJson => super::super::jena_formats::transcode(
-            super::super::jena_formats::JenaFormat::RdfJson,
-            data.as_bytes(),
-            true,
-            std::io::sink(),
-        )
-        .err()
-        .map(|e| parse_errors(&e.to_string(), None, None)),
+        DataSyntax::Jena(j) => {
+            super::super::jena_formats::transcode(j, data.as_bytes(), true, std::io::sink())
+                .err()
+                .map(|e| parse_errors(&e.to_string(), None, None))
+        }
     }
 }
 
