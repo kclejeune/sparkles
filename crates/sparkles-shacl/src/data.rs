@@ -24,6 +24,10 @@ pub(crate) struct DataGraph {
     local_index: FxHashMap<Term, Id>,
     pub rdf_type: Id,
     pub sub_class_of: Id,
+    /// `rdf:first`, `rdf:rest` and `rdf:nil` (local ids when the store lacks them)
+    pub rdf_first: Id,
+    pub rdf_rest: Id,
+    pub rdf_nil: Id,
     /// class → the class and all its subclasses (data graph)
     subclasses: RwLock<FxHashMap<Id, Arc<FxHashSet<Id>>>>,
 }
@@ -47,6 +51,9 @@ impl DataGraph {
         let mut d = DataGraph {
             rdf_type: Id::UNDEF,
             sub_class_of: Id::UNDEF,
+            rdf_first: Id::UNDEF,
+            rdf_rest: Id::UNDEF,
+            rdf_nil: Id::UNDEF,
             graph,
             locals: Vec::new(),
             local_index: FxHashMap::default(),
@@ -54,6 +61,9 @@ impl DataGraph {
         };
         d.rdf_type = d.resolve(&rdf::TYPE.into_owned().into(), false);
         d.sub_class_of = d.resolve(&rdfs::SUB_CLASS_OF.into_owned().into(), false);
+        d.rdf_first = d.resolve(&rdf::FIRST.into_owned().into(), false);
+        d.rdf_rest = d.resolve(&rdf::REST.into_owned().into(), false);
+        d.rdf_nil = d.resolve(&rdf::NIL.into_owned().into(), false);
         let ids = shapes
             .terms
             .iter()

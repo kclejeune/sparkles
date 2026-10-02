@@ -14,6 +14,14 @@
   import { compactionSummary, lastCompaction } from '$lib/compaction';
   import { fmtBytes, fmtCompact, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
   import { displayIri, localName, WELL_KNOWN } from '$lib/rdf';
+  import {
+    DEFAULT_SHACLC,
+    readShaclSyntax,
+    shaclSyntaxKey,
+    shapesLabel,
+    shapesPrefixes,
+    type ShaclSyntax,
+  } from '$lib/shacl';
   import { readLang, validateLangKey, type ValidateLang } from '$lib/shex';
   import { load, save } from '$lib/storage';
   import BackupsPanel from '$components/BackupsPanel.svelte';
@@ -245,6 +253,8 @@ ex:PersonShape a sh:NodeShape ;
   ] .`;
   const shapesKey = $derived(`sparkles.shacl.${name}`);
   let shapes = $state(DEFAULT_SHAPES);
+  // the shapes editor's syntax: Turtle or SHACLC (per dataset)
+  let shapesSyntax = $state<ShaclSyntax>('turtle');
   let shaclGraph = $state('default');
   let useInferences = $state(true);
   let validating = $state(false);
@@ -257,7 +267,8 @@ ex:PersonShape a sh:NodeShape ;
 
   $effect(() => {
     // per-dataset shapes draft
-    shapes = load(shapesKey, DEFAULT_SHAPES);
+    shapesSyntax = readShaclSyntax(load<unknown>(shaclSyntaxKey(name), null));
+    shapes = load(shapesKey, shapesSyntax === 'shaclc' ? DEFAULT_SHACLC : DEFAULT_SHAPES);
     shaclGraph = 'default';
     report = null;
     shaclError = null;
@@ -266,8 +277,7 @@ ex:PersonShape a sh:NodeShape ;
   // dataset prefixes plus those declared in the shapes graph, for the results table
   const reportPrefixes = $derived.by(() => {
     const p: Record<string, string> = { ...prefixes };
-    for (const m of shapes.matchAll(/@prefix\s+([A-Za-z][\w.-]*|):\s*<([^>\s]*)>/gi))
-      p[m[1]] ??= m[2];
+    for (const [k, ns] of Object.entries(shapesPrefixes(shapes, shapesSyntax))) p[k] ??= ns;
     return p;
   });
   // Focus nodes: prefixed name if possible, else namespace + rest (e.g. "ex:person/7"),
@@ -289,7 +299,16 @@ ex:PersonShape a sh:NodeShape ;
   const shaclOpts = () => ({
     graph: shaclGraph,
     reasoning: info?.reasoning ? useInferences : undefined,
+    syntax: shapesSyntax,
   });
+
+  /** Switch the editor's syntax; an untouched example becomes the other syntax's example. */
+  function setShapesSyntax(s: ShaclSyntax) {
+    const untouched = !shapes.trim() || shapes === DEFAULT_SHAPES || shapes === DEFAULT_SHACLC;
+    shapesSyntax = s;
+    save(shaclSyntaxKey(name), s);
+    if (untouched) shapes = s === 'shaclc' ? DEFAULT_SHACLC : DEFAULT_SHAPES;
+  }
 
   async function validate() {
     shaclCtl?.abort();
@@ -319,7 +338,8 @@ ex:PersonShape a sh:NodeShape ;
   /** Format the shapes graph, in the browser or on the server (Format and Shift+Alt+F). */
   async function formatShapes() {
     const ed = shapesEditor;
-    if (!ed || formattingShapes || !ed.snapshot().text.trim()) return;
+    // the formatter has no SHACLC
+    if (!ed || formattingShapes || shapesSyntax !== 'turtle' || !ed.snapshot().text.trim()) return;
     formattingShapes = true;
     try {
       await formatEditor(ed, (req) => formatAny({ ...req, language: 'turtle' }));
@@ -772,14 +792,28 @@ ex:PersonShape a sh:NodeShape ;
               value={shapes}
               onchange={(v) => (shapes = v)}
               onformat={() => void formatShapes()}
-              label="Shapes graph (Turtle)"
+              label={shapesLabel(shapesSyntax)}
             />
             <div class="row shacl-opts">
+              <label class="inline">
+                <span class="faint">Syntax</span>
+                <select
+                  class="select"
+                  value={shapesSyntax}
+                  onchange={(e) => setShapesSyntax(readShaclSyntax(e.currentTarget.value))}
+                  aria-label="Shapes syntax"
+                >
+                  <option value="turtle">Turtle</option>
+                  <option value="shaclc">SHACLC</option>
+                </select>
+              </label>
               <button
                 class="btn"
                 onclick={() => formatShapes()}
-                disabled={formattingShapes || !shapes.trim()}
-                title="Format (Shift+Alt+F)"
+                disabled={formattingShapes || !shapes.trim() || shapesSyntax !== 'turtle'}
+                title={shapesSyntax === 'turtle'
+                  ? 'Format (Shift+Alt+F)'
+                  : 'The formatter handles Turtle shapes, not SHACLC'}
               >
                 {#if formattingShapes}<span class="spinner"></span>{:else}<Icon
                     name="wand"

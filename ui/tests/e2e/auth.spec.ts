@@ -38,7 +38,7 @@ anonymous('API tokens authenticate SPARQL requests', async ({ request }) => {
   expect((await r.json()).boolean).toBe(true);
 });
 
-test('a token minted on the tokens page signs in to the UI and calls the API', async ({
+test('a token minted on the tokens page calls the API but does not sign in to the UI', async ({
   page,
   browser,
 }) => {
@@ -71,12 +71,15 @@ test('a token minted on the tokens page signs in to the UI and calls the API', a
   try {
     const other = await ctx.newPage();
     await other.goto('/ui/login');
-    await other.getByLabel('API token').fill(token);
-    await other.getByRole('button', { name: 'Sign in with token' }).click();
-    // the home page forwards to the query page
-    await expect(other).toHaveURL(/\/ui\/(query)?$/);
-    await expect(other.locator('.user .who')).toContainText(USER);
-    await expect(other.locator('.user .who')).toContainText('token');
+    // signing in with an API token is off unless `[session] token_login` turns it on
+    await expect(other.getByRole('button', { name: 'Sign in' })).toBeVisible();
+    await expect(other.getByLabel('API token')).toHaveCount(0);
+    const refused = await ctx.request.post('/$/auth/login', {
+      data: { token },
+      headers: { Origin: server.url },
+    });
+    expect(refused.status()).toBe(403);
+    expect((await refused.json()).error).toContain('token_login');
   } finally {
     await ctx.close();
   }

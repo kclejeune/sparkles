@@ -67,17 +67,31 @@ fn object(r: &mut Rng) -> String {
     }
 }
 
-/// A random data triple (N-Triples, without the final dot).
-fn triple(r: &mut Rng) -> String {
+/// A random data triple (N-Triples, without the final dot); with `lists`, some are list
+/// cells.
+fn triple(r: &mut Rng, lists: bool) -> String {
     let s = if r.chance(3) {
         format!("<{EX}ghost>")
     } else {
         node(r.below(NODES))
     };
-    match r.below(10) {
+    match r.below(if lists { 12 } else { 10 }) {
         0 | 1 => format!(
             "{s} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> {}",
             class(r.below(CLASSES))
+        ),
+        // list cells, for the list constraints: well formed or not
+        10 => format!(
+            "{s} <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> {}",
+            node(r.below(NODES))
+        ),
+        11 => format!(
+            "{s} <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> {}",
+            if r.chance(40) {
+                "<http://www.w3.org/1999/02/22-rdf-syntax-ns#nil>".to_string()
+            } else {
+                node(r.below(NODES))
+            }
         ),
         _ => {
             let o = match object(r) {
@@ -109,6 +123,8 @@ struct ShapeGen<'r> {
     out: String,
     n: usize,
     helpers: usize,
+    /// also the SHACL 1.2 list constraints
+    lists: bool,
 }
 
 impl ShapeGen<'_> {
@@ -145,7 +161,7 @@ impl ShapeGen<'_> {
         let mut cs = Vec::new();
         let mut qualified = false;
         for _ in 0..1 + self.r.below(3) {
-            let c = match self.r.below(24) {
+            let c = match self.r.below(if self.lists { 28 } else { 24 }) {
                 0 => format!("sh:minCount {}", self.r.below(3)),
                 1 => format!("sh:maxCount {}", 1 + self.r.below(2)),
                 2 | 3 => format!("sh:class {}", class(self.r.below(CLASSES))),
@@ -198,6 +214,11 @@ impl ShapeGen<'_> {
                     )
                 }
                 22 if depth > 0 => format!("sh:property {}", self.property(depth - 1, from)),
+                // SHACL 1.2 list constraints
+                24 => format!("sh:minListLength {}", 1 + self.r.below(2)),
+                25 => format!("sh:maxListLength {}", self.r.below(3)),
+                26 => format!("sh:uniqueMembers {}", self.r.pick(&["true", "false"])),
+                27 if from <= self.helpers => format!("sh:memberShape {}", self.helper(from)),
                 _ => format!("sh:maxCount {}", 2 + self.r.below(2)),
             };
             cs.push(c);
@@ -390,13 +411,14 @@ impl ShapeGen<'_> {
     }
 }
 
-fn shapes_text(r: &mut Rng, sparql: bool, recursive: bool) -> String {
+fn shapes_text(r: &mut Rng, sparql: bool, recursive: bool, lists: bool) -> String {
     let helpers = 1 + r.below(3);
     ShapeGen {
         r,
         out: String::new(),
         n: 0,
         helpers,
+        lists,
     }
     .generate(sparql, recursive)
 }
@@ -435,10 +457,12 @@ fn sorted(rs: &[ValidationResult]) -> Vec<String> {
 }
 
 /// A result without its messages (they may list a shape's predicates in another
-/// order after another parse of the same shapes).
+/// order after another parse of the same shapes) and details, as the guard matches
+/// results.
 fn identity(r: &J) -> String {
     let mut r = r.clone();
     r.as_object_mut().unwrap().remove("messages");
+    r.as_object_mut().unwrap().remove("details");
     r.to_string()
 }
 
@@ -498,11 +522,11 @@ struct Tally {
 }
 
 /// Run one random scenario; returns what it saw.
-fn scenario(seed: u64, mode: GuardMode, policy: BaselinePolicy, tally: &mut Tally) {
+fn scenario(seed: u64, mode: GuardMode, policy: BaselinePolicy, lists: bool, tally: &mut Tally) {
     let mut r = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let sparql = r.chance(30);
     let recursive = r.chance(20);
-    let text = shapes_text(&mut r, sparql, recursive);
+    let text = shapes_text(&mut r, sparql, recursive, lists);
     let shapes = Shapes::parse(&text, RdfFormat::Turtle, None)
         .unwrap_or_else(|e| panic!("seed {seed}: {e:#}\n{text}"));
     let store = Store::in_memory(StoreOptions::default());
@@ -511,7 +535,7 @@ fn scenario(seed: u64, mode: GuardMode, policy: BaselinePolicy, tally: &mut Tall
     // a value); the others from random data
     if !(mode == GuardMode::Reject && policy == BaselinePolicy::Strict) {
         for _ in 0..40 + r.below(40) {
-            data.insert(triple(&mut r));
+            data.insert(triple(&mut r, lists));
         }
         if r.chance(60) {
             data.insert(subclass(&mut r));
@@ -551,7 +575,7 @@ fn scenario(seed: u64, mode: GuardMode, policy: BaselinePolicy, tally: &mut Tall
             } else if r.chance(4) {
                 ins.push(subclass(&mut r));
             } else {
-                ins.push(triple(&mut r));
+                ins.push(triple(&mut r, lists));
             }
         }
         let bypass = r.chance(2);
@@ -711,6 +735,10 @@ fn steps() -> usize {
 }
 
 fn run(mode: GuardMode, policy: BaselinePolicy, first: u64) -> Tally {
+    run_with(mode, policy, first, false)
+}
+
+fn run_with(mode: GuardMode, policy: BaselinePolicy, first: u64, lists: bool) -> Tally {
     let mut t = Tally::default();
     // `SPARKLES_DIFF_SEED=n` runs one scenario of every test
     let only: Option<u64> = std::env::var("SPARKLES_DIFF_SEED")
@@ -721,7 +749,7 @@ fn run(mode: GuardMode, policy: BaselinePolicy, first: u64) -> Tally {
         None => first..first + seeds(),
     };
     for seed in range {
-        scenario(seed, mode, policy, &mut t);
+        scenario(seed, mode, policy, lists, &mut t);
     }
     eprintln!("{mode:?} {policy:?}: {t:?}");
     t
@@ -758,4 +786,17 @@ fn grandfather_rejects_only_new_blocking_results() {
         t.strategies.get("Incremental").copied().unwrap_or(0) > t.writes / 4,
         "{t:?}"
     );
+}
+
+/// Shapes with the SHACL 1.2 list constraints over data with list cells, well formed or
+/// not: the incremental results equal full validation's.
+#[test]
+fn list_constraints_equal_full_validation() {
+    let t = run_with(GuardMode::Warn, BaselinePolicy::Strict, 300, true);
+    assert!(
+        t.strategies.get("Incremental").copied().unwrap_or(0) > t.writes / 4,
+        "{t:?}"
+    );
+    let t = run_with(GuardMode::Reject, BaselinePolicy::Grandfather, 400, true);
+    assert!(t.rejected > 0, "{t:?}");
 }

@@ -217,6 +217,48 @@ async fn shacl_conforming_and_json_report() {
     assert!(!v["messages"].as_array().unwrap().is_empty());
 }
 
+/// `PERSON_SHAPES` in the SHACL Compact Syntax.
+#[cfg(feature = "shacl")]
+const PERSON_SHAPES_SHACLC: &str = r#"
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX ex: <http://example.org/>
+shape ex:PersonShape -> ex:Person {
+    foaf:name xsd:string [1..1] .
+    foaf:age xsd:integer [0..1] minInclusive=0 maxInclusive=150 .
+}
+"#;
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_compact_syntax_body() {
+    let s = server();
+    let shaclc = |body: &str| {
+        Request::post("/ds/shacl")
+            .header(header::CONTENT_TYPE, "text/shaclc; charset=utf-8")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let r = send(&s.app, shaclc(PERSON_SHAPES_SHACLC)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let compact = r.json();
+    let turtle = validate_json(&s.app, "", PERSON_SHAPES).await;
+    assert_eq!(compact["conforms"], false);
+    assert_eq!(focus_nodes(&compact), focus_nodes(&turtle));
+    assert_eq!(
+        compact["results"].as_array().unwrap().len(),
+        turtle["results"].as_array().unwrap().len()
+    );
+    // a SHACLC syntax error is a 400 with its position
+    let r = send(&s.app, shaclc("shape ex:S {")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(
+        r.text().contains("SHACLC syntax error at line 1"),
+        "{}",
+        r.text()
+    );
+}
+
 #[cfg(feature = "shacl")]
 #[tokio::test]
 async fn shacl_rdf_reports() {

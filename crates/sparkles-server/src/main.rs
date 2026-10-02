@@ -37,6 +37,9 @@ mod shacl;
 mod shex_cmd;
 mod shutdown;
 mod state;
+#[cfg(feature = "tls")]
+mod tls;
+mod tools;
 mod ui;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validation_cmd;
@@ -854,6 +857,15 @@ enum Cmd {
         #[cfg(feature = "backup")]
         #[arg(long, default_value_t = 2)]
         backup_max_tasks: usize,
+        /// Serve HTTPS with this PEM certificate chain (the server's certificate first;
+        /// with --tls-key). HTTP/2 and HTTP/1.1 are negotiated through ALPN, and the files
+        /// are read again on SIGHUP and when they change. Most deployments terminate TLS
+        /// at a reverse proxy instead
+        #[arg(long, value_name = "FILE", requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// The PEM private key of --tls-cert (PKCS#8, PKCS#1 or SEC1)
+        #[arg(long, value_name = "FILE", requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
         /// Listen on this Unix socket (mode 0660) instead of TCP; with auth, trusted
         /// proxy headers can then be limited to the socket (`proxy.trusted = ["unix"]`)
         #[arg(long, value_name = "PATH")]
@@ -990,6 +1002,13 @@ enum Cmd {
         /// valid (DBpedia's, for one); syntax errors still fail the load
         #[arg(long)]
         lenient: bool,
+        /// Warn about suspicious IRIs and language tags before loading (scheme rules,
+        /// percent-encoding, extlang, …), at the cost of a second parse of the files
+        #[arg(long)]
+        check: bool,
+        /// With --check: load nothing when any IRI or language tag has a warning
+        #[arg(long, requires = "check")]
+        strict: bool,
         /// A message recorded with the commit (shown by `log` and in /$/commits)
         #[arg(long)]
         message: Option<String>,
@@ -1318,8 +1337,17 @@ enum Cmd {
         /// Largest number of classes, and of predicates
         #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
         max_entries: usize,
+        /// List, for each predicate, the classes of its subjects with their triples
+        #[arg(long, conflicts_with = "draft_shapes")]
+        subject_classes: bool,
+        /// SHACL shapes for the constraints layer: `guard` (the database's write-time
+        /// validation), `default`, a graph IRI, or `none` (repeatable; default: the
+        /// write-time validation's shapes, if it has SHACL validation)
+        #[arg(long, value_name = "SOURCE", conflicts_with = "draft_shapes")]
+        shapes: Vec<String>,
         /// Draft SHACL shapes (or, with --format shexc, a ShEx schema) from the data
-        /// instead of printing the schema; --format is then turtle, shexc or json
+        /// instead of printing the schema; --format is then turtle, shaclc (the SHACL
+        /// Compact Syntax), shexc or json
         #[arg(long)]
         draft_shapes: bool,
         /// Draft a constraint when at least this share of the instances it applies to
@@ -1355,7 +1383,8 @@ enum Cmd {
         /// Data files to validate (loaded into memory)
         #[arg(long)]
         data: Vec<PathBuf>,
-        /// Shapes graph file (Turtle, N-Triples, RDF/XML, JSON-LD, ...; `.gz` allowed)
+        /// Shapes graph file (Turtle, N-Triples, RDF/XML, JSON-LD, ..., or SHACLC as
+        /// `.shaclc` or `.shc`; `.gz` allowed)
         #[arg(long)]
         shapes: PathBuf,
         /// Data graph: `default`, `union` (all graphs) or a graph IRI
@@ -1374,6 +1403,10 @@ enum Cmd {
     /// ShEx: validate a database (or data files) against a schema and a shape map
     /// (exits with status 1 when an association does not conform), or print schemas
     Shex(shex_cmd::ShexArgs),
+    // convert (riot), qparse, uparse, compare (rdfdiff), iri, langtag, rsparql, rupdate,
+    // rset
+    #[command(flatten)]
+    Tools(tools::ToolCmd),
 }
 
 fn store_opts(cli: &Cli) -> StoreOptions {
@@ -1814,6 +1847,8 @@ fn run() -> Result<()> {
             #[cfg(feature = "backup")]
             backup_max_tasks,
             unix_socket,
+            tls_cert,
+            tls_key,
             allow_open_network,
             cors_origin,
             public_host,
@@ -1842,11 +1877,24 @@ fn run() -> Result<()> {
             if let Some(addr) = &metrics_addr {
                 exposure::check_metrics_addr(addr, auth_config.is_some(), allow_open_network)?;
             }
+            if tls_cert.is_some() && unix_socket.is_some() {
+                bail!("--tls-cert applies to the TCP listener, not to --unix-socket");
+            }
+            // a certificate that does not load stops the server before it binds
+            #[cfg(feature = "tls")]
+            let certs = match (&tls_cert, &tls_key) {
+                (Some(c), Some(k)) => Some(tls::Certs::open(c, k)?),
+                _ => None,
+            };
+            #[cfg(not(feature = "tls"))]
+            if tls_cert.is_some() || tls_key.is_some() {
+                bail!("--tls-cert: built without native TLS (cargo feature \"tls\")");
+            }
             // one server per data directory (held until the process exits)
             #[cfg(feature = "backup")]
             let _data_lock = backup::lock_data_dir(&data)?;
             let bound = if unix_socket.is_some() { "unix" } else { &host };
-            let auth = auth::load(auth_config.as_deref(), &data, bound)?;
+            let auth = auth::load(auth_config.as_deref(), &data, bound, tls_cert.is_some())?;
             // an in-place restore interrupted between its renames is undone before the
             // registry's datasets are opened
             #[cfg(feature = "backup")]
@@ -2085,9 +2133,10 @@ fn run() -> Result<()> {
                 if unix_socket.is_some() {
                     bail!("--unix-socket needs a Unix platform");
                 }
+                let scheme = if tls_cert.is_some() { "https" } else { "http" };
                 let listening = match &unix_socket {
                     Some(p) => format!("unix:{}", p.display()),
-                    None => format!("http://{addr}/"),
+                    None => format!("{scheme}://{addr}/"),
                 };
                 tracing::info!(
                     "Sparkles {} listening on {listening} (UI at /ui/)",
@@ -2126,6 +2175,33 @@ fn run() -> Result<()> {
                     tracing::info!("shutting down: finishing requests in flight (up to {grace:?})");
                     let _ = draining_tx.send(());
                 };
+                // over TLS the connection's handshakes run beside the accept loop, and
+                // requests say they came over https
+                #[cfg(feature = "tls")]
+                let (tls, tcp) = match (certs, tcp) {
+                    (Some(c), Some(l)) => {
+                        tls::spawn_reload(c.clone());
+                        (
+                            Some(tls::TlsListener::new(l, tls::server_config(c)?)?),
+                            None,
+                        )
+                    }
+                    (_, l) => (None, l),
+                };
+                #[cfg(feature = "tls")]
+                if let Some(l) = tls {
+                    let app = app.layer(axum::middleware::map_request(tls::mark_https));
+                    let service = app.into_make_service_with_connect_info::<auth::Peer>();
+                    use std::future::IntoFuture;
+                    let serve = axum::serve(l, service).with_graceful_shutdown(shutdown);
+                    let drained = shutdown::drain(serve.into_future(), draining, grace).await?;
+                    if drained == shutdown::Drained::GraceElapsed {
+                        tracing::warn!(
+                            "shutdown grace of {grace:?} elapsed: cancelling the requests still in flight"
+                        );
+                    }
+                    return anyhow::Ok(());
+                }
                 // the peer address feeds trusted-proxy checks
                 let service = app.into_make_service_with_connect_info::<auth::Peer>();
                 use std::future::IntoFuture;
@@ -2177,12 +2253,15 @@ fn run() -> Result<()> {
         #[cfg(feature = "fmt")]
         Cmd::Lsp(args) => lsp::run(args),
         Cmd::Shex(args) => shex_cmd::run(args, opts),
+        Cmd::Tools(cmd) => tools::run(cmd, opts),
         Cmd::Load {
             loc,
             graph,
             files,
             compression,
             lenient,
+            check,
+            strict,
             message,
             server,
             dataset,
@@ -2193,6 +2272,14 @@ fn run() -> Result<()> {
                 .map(sparkles::annotations::validate_message)
                 .transpose()?
                 .flatten();
+            // the term checks read the files once before anything is written
+            if check {
+                let explicit = match compression.as_str() {
+                    "auto" => None,
+                    c => Some(sparkles::codec::Codec::parse(c)?),
+                };
+                tools::convert::precheck(&files, explicit, lenient, strict)?;
+            }
             let Some(loc) = loc else {
                 if lenient {
                     bail!("--lenient applies to a local database (--loc) only");
@@ -2908,6 +2995,8 @@ fn run() -> Result<()> {
             format,
             timeout,
             max_entries,
+            subject_classes,
+            shapes,
             draft_shapes,
             support,
             closed,
@@ -2976,6 +3065,7 @@ fn run() -> Result<()> {
                 max_entries,
                 term_totals: void.is_some(),
                 graphs: None,
+                subject_classes,
             };
             let report = match sparkles::schema::discover(&snap, &sopts) {
                 Ok(r) => r,
@@ -2984,6 +3074,11 @@ fn run() -> Result<()> {
                     std::process::exit(2);
                 }
                 Err(e) => return Err(e.into()),
+            };
+            // the constraints layer, for the JSON and text reports
+            let constraints = match void {
+                None => schema_constraints(&store, &snap, &shapes)?,
+                Some(_) => None,
             };
             let mut out = std::io::stdout().lock();
             if let Some(declarations) = void {
@@ -3012,10 +3107,14 @@ fn run() -> Result<()> {
                         next: None,
                     },
                 );
+                let summary = summary.with_constraints(constraints.as_ref());
                 serde_json::to_writer_pretty(&mut out, &summary)?;
                 writeln!(out)?;
             } else {
                 print_schema(&mut out, &report)?;
+                if let Some(c) = &constraints {
+                    print_constraints(&mut out, c)?;
+                }
             }
             out.flush()?;
             Ok(())
@@ -3060,6 +3159,120 @@ fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The constraints layer of `sparkles schema`: the sources of `--shapes`, or else the
+/// shapes of the database's write-time SHACL validation, if any.
+fn schema_constraints(
+    store: &sparkles::store::Store,
+    snap: &sparkles::store::Snapshot,
+    shapes: &[String],
+) -> Result<Option<sparkles::schema::ConstraintsLayer>> {
+    let req = http::ShapesRequest::from_values(shapes).map_err(anyhow::Error::msg)?;
+    #[cfg(feature = "shacl")]
+    {
+        use sparkles_shacl::constraints::{configured_source, graphs_source};
+        let mut layer = sparkles::schema::ConstraintsLayer::default();
+        if req.guard != Some(false) {
+            match sparkles_shacl::guard::configured_shapes(store)? {
+                Some((cfg, s)) => layer.sources.push(configured_source(&cfg, &s)),
+                None if req.guard == Some(true) => {
+                    bail!("the database has no write-time SHACL validation")
+                }
+                None => {}
+            }
+        }
+        for g in req.graphs.iter().filter(|g| *g != "default") {
+            if !validation_common::graph_exists(snap, g) {
+                bail!("no such graph: <{g}>");
+            }
+        }
+        if !req.graphs.is_empty() {
+            layer.sources.push(graphs_source(snap, &req.graphs)?);
+        }
+        Ok((!layer.is_empty()).then_some(layer))
+    }
+    #[cfg(not(feature = "shacl"))]
+    {
+        let _ = (store, snap);
+        if req.guard == Some(true) || !req.graphs.is_empty() {
+            bail!("built without the `shacl` feature");
+        }
+        Ok(None)
+    }
+}
+
+/// `sparkles schema --format text`: the constraints layer, one line per property shape.
+fn print_constraints(
+    out: &mut impl Write,
+    layer: &sparkles::schema::ConstraintsLayer,
+) -> Result<()> {
+    use sparkles::schema::constraints::SourceKind;
+    let short = |i: &str| {
+        let xsd = "http://www.w3.org/2001/XMLSchema#";
+        let sh = "http://www.w3.org/ns/shacl#";
+        match (i.strip_prefix(xsd), i.strip_prefix(sh)) {
+            (Some(l), _) => format!("xsd:{l}"),
+            (_, Some(l)) => format!("sh:{l}"),
+            _ => format!("<{i}>"),
+        }
+    };
+    for src in &layer.sources {
+        let mut from: Vec<String> = src
+            .graphs
+            .iter()
+            .map(|g| match g.as_str() {
+                "default" => "the default graph".to_string(),
+                g => format!("<{g}>"),
+            })
+            .collect();
+        if src.file {
+            from.push("a shapes file".into());
+        }
+        let what = match src.kind {
+            SourceKind::Guard => format!(
+                "write-time validation ({}, threshold {})",
+                src.mode.as_deref().unwrap_or("?"),
+                src.threshold.as_deref().unwrap_or("?")
+            ),
+            SourceKind::Graphs => "shapes graphs, validated on request".to_string(),
+        };
+        writeln!(
+            out,
+            "
+constraints from {what}: {} · {} shapes · {} classes",
+            from.join(", "),
+            src.shapes,
+            src.classes.len()
+        )?;
+        for c in &src.classes {
+            write!(out, "  <{}>", c.class)?;
+            if c.closed {
+                write!(out, "  closed")?;
+            }
+            if c.other_paths > 0 {
+                write!(out, "  (+{} other paths)", c.other_paths)?;
+            }
+            writeln!(out)?;
+            for p in &c.properties {
+                writeln!(
+                    out,
+                    "    <{}>  {}  [{}]",
+                    p.path,
+                    p.summary(short),
+                    p.enforcement.name()
+                )?;
+            }
+        }
+        if src.other_targets > 0 {
+            writeln!(
+                out,
+                "  {} shapes with other targets are not listed",
+                src.other_targets
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// `sparkles schema --format text`: one line per class and per predicate.
@@ -3133,6 +3346,16 @@ fn print_schema(out: &mut impl Write, r: &sparkles::schema::SchemaReport) -> Res
                 format!("  [{}]", kinds.join(", "))
             }
         )?;
+        if let Some(classes) = &o.subject_classes {
+            let mut parts: Vec<String> = classes
+                .iter()
+                .map(|c| format!("<{}> {}", c.class, c.triples))
+                .collect();
+            if let Some(u) = o.untyped_subjects.filter(|u| u.triples > 0) {
+                parts.push(format!("untyped {}", u.triples));
+            }
+            writeln!(out, "    subjects: {}", parts.join(", "))?;
+        }
     }
     Ok(())
 }
@@ -3335,14 +3558,16 @@ fn schema_draft(
     #[derive(PartialEq)]
     enum Out {
         Turtle,
+        Shaclc,
         ShexC,
         Json,
     }
     let out = match a.format.as_str() {
         "turtle" | "text" => Out::Turtle,
+        "shaclc" => Out::Shaclc,
         "shexc" => Out::ShexC,
         "json" => Out::Json,
-        f => bail!("unknown format '{f}' with --draft-shapes (turtle, shexc or json)"),
+        f => bail!("unknown format '{f}' with --draft-shapes (turtle, shaclc, shexc or json)"),
     };
     if !(a.support > 0.0 && a.support <= 1.0) {
         bail!("--support must be in (0, 1]");
@@ -3399,6 +3624,7 @@ fn schema_draft(
     let mut w = std::io::stdout().lock();
     match out {
         Out::Turtle => w.write_all(draft.shacl.as_bytes())?,
+        Out::Shaclc => w.write_all(draft.shaclc.as_bytes())?,
         Out::ShexC => {
             w.write_all(draft.shex.as_bytes())?;
             writeln!(
@@ -3419,8 +3645,8 @@ fn schema_draft(
 #[cfg(feature = "shacl")]
 fn read_shapes(path: &std::path::Path) -> Result<sparkles_shacl::Shapes> {
     use std::io::Read;
-    let (format, _) =
-        sparkles::io::format_for_path(path).unwrap_or((oxrdfio::RdfFormat::Turtle, None));
+    // `.shaclc` and `.shc` are SHACLC; other names as for RDF files, Turtle by default
+    let (format, _) = sparkles_shacl::ShapesSyntax::from_path(path).unwrap_or_default();
     let codec = Source::from_path(path, None)
         .and_then(|s| s.codec())
         .unwrap_or_default();
@@ -3473,60 +3699,9 @@ fn print_table(
     out: &mut impl Write,
 ) -> Result<()> {
     if r.kind == QueryKind::Ask {
-        writeln!(out, "{}", if r.boolean { "yes" } else { "no" })?;
+        tools::table::write_boolean(r.boolean, out)?;
         return Ok(());
     }
-    let prefixes = store.prefixes();
-    let show = |t: Option<oxrdf::Term>| -> String {
-        match t {
-            None => String::new(),
-            Some(oxrdf::Term::NamedNode(n)) => {
-                for (p, ns) in &prefixes {
-                    if let Some(l) = n.as_str().strip_prefix(ns.as_str())
-                        && l.chars()
-                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-                    {
-                        return format!("{p}:{l}");
-                    }
-                }
-                format!("<{}>", n.as_str())
-            }
-            Some(t) => t.to_string(),
-        }
-    };
-    let rows: Vec<Vec<String>> = r
-        .rows()
-        .into_iter()
-        .map(|row| row.into_iter().map(show).collect())
-        .collect();
-    let mut widths: Vec<usize> = r.vars.iter().map(|v| v.chars().count() + 1).collect();
-    for row in &rows {
-        for (i, c) in row.iter().enumerate() {
-            widths[i] = widths[i].max(c.chars().count());
-        }
-    }
-    let line: String = widths
-        .iter()
-        .map(|w| "-".repeat(w + 2))
-        .collect::<Vec<_>>()
-        .join("-");
-    writeln!(out, "-{line}-")?;
-    let hdr: Vec<String> = r
-        .vars
-        .iter()
-        .enumerate()
-        .map(|(i, v)| format!(" {:w$} ", format!("?{v}"), w = widths[i]))
-        .collect();
-    writeln!(out, "|{}|", hdr.join("|"))?;
-    writeln!(out, "={}=", "=".repeat(line.chars().count()))?;
-    for row in &rows {
-        let cells: Vec<String> = row
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!(" {:w$} ", c, w = widths[i]))
-            .collect();
-        writeln!(out, "|{}|", cells.join("|"))?;
-    }
-    writeln!(out, "-{line}-")?;
+    tools::table::write_table(&r.vars, &r.rows(), &store.prefixes(), out)?;
     Ok(())
 }

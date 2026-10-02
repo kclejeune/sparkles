@@ -41,6 +41,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/auth/oidc/login", get(oidc_login))
         .route("/$/auth/oidc/callback", get(oidc_callback))
         .route(
+            "/$/auth/oidc/backchannel-logout",
+            post(oidc_backchannel_logout),
+        )
+        .route(
             "/$/auth/tokens",
             get(list_tokens).post(mint_token).delete(revoke_by_owner),
         )
@@ -153,7 +157,9 @@ async fn config(State(st): St) -> Response {
         methods.push("oidc");
         doc["oidc"] = json!({ "loginUrl": "/$/auth/oidc/login", "displayName": o.display_name });
     }
-    methods.push("token");
+    if p.token_login {
+        methods.push("token");
+    }
     if p.has_users() {
         methods.push("password");
     }
@@ -193,13 +199,10 @@ pub fn whoami_details(auth: &Auth, p: &Principal, doc: &mut J) {
     if let Some(id) = &p.info.token_id {
         doc["tokenId"] = id.clone().into();
     }
-    doc["canMintTokens"] = (!p.is_anonymous() && !p.info.static_token).into();
+    doc["canMintTokens"] = (!p.is_anonymous() && !p.info.static_token && !p.info.idp_token).into();
     let logout = match p.scheme {
         Scheme::Session => true,
-        Scheme::Proxy => policy
-            .proxy
-            .as_ref()
-            .is_some_and(|x| x.logout_url.is_some()),
+        Scheme::Proxy => proxy_logout_url(&policy).is_some(),
         _ => false,
     };
     doc["logout"] = logout.into();
@@ -300,6 +303,13 @@ async fn login(
                 return r;
             }
         },
+        (None, None, Some(_)) if !policy.token_login => {
+            // refused before the token is looked at, so the answer says nothing about it
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "signing in with an API token is turned off ([session] token_login)",
+            );
+        }
         (None, None, Some(t)) => {
             let rec = match auth.token_principal(&policy, &t, Scheme::Bearer) {
                 Ok(p) if !p.info.static_token => p
@@ -388,7 +398,7 @@ async fn logout(State(st): St, Extension(p): Extension<Principal>, headers: Head
         }
         tracing::info!(target: "sparkles::audit", event = "logout", principal = p.id().as_str());
     } else if p.scheme == Scheme::Proxy
-        && let Some(u) = policy.proxy.as_ref().and_then(|x| x.logout_url.clone())
+        && let Some(u) = proxy_logout_url(&policy)
     {
         redirect = J::String(u);
     }
@@ -397,6 +407,18 @@ async fn logout(State(st): St, Extension(p): Extension<Principal>, headers: Head
         r.headers_mut().append(header::SET_COOKIE, h);
     }
     no_store(r)
+}
+
+/// Where a proxy principal signs out: `proxy.logout_url`, else Cloudflare Access's own
+/// logout path when `[cloudflare_access]` is set.
+fn proxy_logout_url(policy: &Policy) -> Option<String> {
+    match policy.proxy.as_ref().and_then(|x| x.logout_url.clone()) {
+        Some(u) => Some(u),
+        None => policy
+            .cloudflare
+            .as_ref()
+            .map(|_| "/cdn-cgi/access/logout".to_string()),
+    }
 }
 
 // ------------------------------------------------------------------------- OIDC ------
@@ -545,19 +567,39 @@ async fn oidc_callback(
         );
         return fail(Failure::Idp, "idp");
     };
-    let groups = strings(claims.get(&ocfg.groups_claim));
-    if !policy.admitted(&name, &groups) {
-        return fail(Failure::NotAllowed, "not_allowed");
-    }
+    let groups_claim = claims.get(&ocfg.groups_claim);
     let who = Identity {
         kind: Kind::Oidc,
         name,
-        groups,
+        groups: strings(groups_claim),
         display_name: claims.get("name").and_then(J::as_str).map(str::to_string),
     };
+    // the tokens and sessions of this account follow the groups the provider asserts
+    // now, also when they no longer admit it
+    if groups_claim.is_some() {
+        auth.refresh_owner(&who);
+    }
+    if !policy.admitted(&who.name, &who.groups) {
+        return fail(Failure::NotAllowed, "not_allowed");
+    }
     let log = who.log_name();
     let expires = now + policy.session_ttl;
-    let (raw, digest) = match auth.sessions.create(Method::Oidc, who, None, now, expires) {
+    let text = |k: &str| {
+        claims
+            .get(k)
+            .and_then(J::as_str)
+            .filter(|v| v.len() <= 256)
+            .map(str::to_string)
+    };
+    let (raw, digest) = match auth.sessions.create_oidc(
+        Method::Oidc,
+        who,
+        None,
+        now,
+        expires,
+        text("sid"),
+        text("sub"),
+    ) {
         Ok(x) => x,
         Err(e) => {
             tracing::error!("cannot store the session: {e:#}");
@@ -578,6 +620,60 @@ async fn oidc_callback(
     r.headers_mut()
         .append(header::SET_COOKIE, mode.set(OIDC_COOKIE, "", 0));
     no_store(r)
+}
+
+/// `POST /$/auth/oidc/backchannel-logout` with a form field `logout_token` (OpenID
+/// Connect Back-Channel Logout 1.0): the provider ends sessions it names by `sid` or
+/// `sub`. Tokens minted from those sessions are not revoked; they belong to the account.
+async fn oidc_backchannel_logout(State(st): St, headers: HeaderMap, body: Bytes) -> Response {
+    let auth = match auth_of(&st) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let Some(client) = auth.oidc.client() else {
+        return not_found();
+    };
+    let refused = |desc: &str| {
+        let mut r = oauth_error("invalid_request", desc);
+        r.extensions_mut().insert(AuthFailed);
+        r
+    };
+    let form = body_map(&headers, &body).unwrap_or_default();
+    let Some(token) = form.get("logout_token").and_then(J::as_str) else {
+        return refused("missing logout_token");
+    };
+    let (sid, sub) = match client.verify_logout_token(token, auth.now()).await {
+        Ok(x) => x,
+        Err(super::jwt::JwtError::Unavailable(e)) => {
+            tracing::warn!("back-channel logout: {e}");
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "identity provider unavailable",
+            );
+        }
+        Err(e) => {
+            tracing::info!("back-channel logout refused: {e}");
+            auth.count_failure(super::policy::AuthError {
+                scheme: "oidc",
+                failure: Failure::Invalid,
+            });
+            return refused("invalid logout_token");
+        }
+    };
+    match auth.sessions.end_oidc(sid.as_deref(), sub.as_deref()) {
+        Ok(n) => {
+            tracing::info!(
+                target: "sparkles::audit",
+                event = "backchannel_logout",
+                sessions = n,
+            );
+            no_store(StatusCode::OK.into_response())
+        }
+        Err(e) => {
+            tracing::error!("cannot store the logout: {e:#}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "cannot store the logout")
+        }
+    }
 }
 
 // ------------------------------------------------------------------------- tokens ------
@@ -613,6 +709,12 @@ fn mint(
         return Err(json_error(
             StatusCode::FORBIDDEN,
             "static tokens cannot mint tokens",
+        ));
+    }
+    if p.info.idp_token {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "access tokens of the identity provider cannot mint tokens: sign in to the web UI or use sparkles auth login",
         ));
     }
     let Some(owner) = p.info.owner.clone() else {
@@ -991,12 +1093,12 @@ async fn device_info(
     }
 }
 
-fn issued(token: &Zeroizing<String>, rec: &TokenRecord, p: &Principal, now: i64) -> Issued {
+fn issued(token: &Zeroizing<String>, rec: &TokenRecord, p: &Principal) -> Issued {
     Issued {
         token: token.clone(),
         token_id: rec.id.clone(),
         principal: p.id(),
-        expires_in: rec.expires_at() - now,
+        expires_at: rec.expires_at(),
     }
 }
 
@@ -1044,10 +1146,7 @@ async fn device_approve(
         Ok(x) => x,
         Err(r) => return r,
     };
-    if !auth
-        .cli
-        .decide(&code, Some(issued(&token, &rec, &p, now)), now)
-    {
+    if !auth.cli.decide(&code, Some(issued(&token, &rec, &p)), now) {
         let _ = auth.tokens.remove(std::slice::from_ref(&rec.id));
         return json_error(StatusCode::NOT_FOUND, "no such code, or it expired");
     }
@@ -1146,7 +1245,7 @@ async fn cli_authorize(State(st): St, Extension(p): Extension<Principal>, body: 
     let code = auth.cli.loopback_insert(
         &b.code_challenge,
         b.port as u16,
-        issued(&token, &rec, &p, now),
+        issued(&token, &rec, &p),
         now,
     );
     let state: String = form_urlencoded::byte_serialize(b.state.as_bytes()).collect();
@@ -1170,12 +1269,12 @@ fn oauth_error(code: &str, desc: &str) -> Response {
     )
 }
 
-fn token_response(i: Issued) -> Response {
+fn token_response(i: Issued, now: i64) -> Response {
     no_store(
         axum::Json(json!({
             "access_token": i.token.as_str(),
             "token_type": "Bearer",
-            "expires_in": i.expires_in,
+            "expires_in": i.expires_at - now,
             "token_id": i.token_id,
             "principal": i.principal,
         }))
@@ -1211,7 +1310,20 @@ async fn token_endpoint(State(st): St, headers: HeaderMap, body: Bytes) -> Respo
                 Poll::SlowDown => oauth_error("slow_down", "polling too fast"),
                 Poll::Denied => oauth_error("access_denied", "the login was denied"),
                 Poll::Expired => oauth_error("expired_token", "the device code expired"),
-                Poll::Token(i) => token_response(i),
+                Poll::Token(i) => token_response(i, now),
+                // approved before a restart, which lost the secret: a new one for the
+                // same token
+                Poll::Reissue(i) => match auth.tokens.reissue(&i.token_id, now) {
+                    Ok(Some(token)) => {
+                        tracing::info!(target: "sparkles::audit", event = "token_reissued", id = i.token_id.as_str());
+                        token_response(Issued { token, ..i }, now)
+                    }
+                    Ok(None) => oauth_error("expired_token", "the approved token is gone"),
+                    Err(e) => {
+                        tracing::error!("cannot store the token: {e:#}");
+                        json_error(StatusCode::INTERNAL_SERVER_ERROR, "cannot store the token")
+                    }
+                },
             }
         }
         "authorization_code" => {
@@ -1227,7 +1339,7 @@ async fn token_endpoint(State(st): St, headers: HeaderMap, body: Bytes) -> Respo
                 },
             };
             match auth.cli.loopback_redeem(code, verifier, port, now) {
-                Some(i) => token_response(i),
+                Some(i) => token_response(i, now),
                 None => failed(oauth_error(
                     "invalid_grant",
                     "invalid, used or expired code",

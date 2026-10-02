@@ -26,9 +26,27 @@ pub fn draft(s: &Store, support: f64, closed: bool, classes: &[&str]) -> ShapesD
     draft_shapes(&s.snapshot(), &o).unwrap_or_else(|e| panic!("{e}"))
 }
 
+fn canonical(mut g: oxrdf::Graph) -> oxrdf::Graph {
+    use oxrdf::dataset::{CanonicalizationAlgorithm, CanonicalizationHashAlgorithm};
+    g.canonicalize(CanonicalizationAlgorithm::Rdfc10 {
+        hash_algorithm: CanonicalizationHashAlgorithm::Sha256,
+    });
+    g
+}
+
 fn check(s: &Store, d: &ShapesDraft) -> ValidationReport {
     let shapes = Shapes::parse(&d.shacl, RdfFormat::Turtle, None)
         .unwrap_or_else(|e| panic!("{e:#}\n{}", d.shacl));
+    // the SHACLC draft is the same shapes graph
+    let turtle = Shapes::read_graph(&d.shacl, RdfFormat::Turtle, None).unwrap();
+    let compact = sparkles_shacl::compact::parse(&d.shaclc, None)
+        .unwrap_or_else(|e| panic!("{e}\n{}", d.shaclc));
+    assert!(
+        canonical(turtle) == canonical(compact.graph),
+        "the SHACLC draft differs from the Turtle draft\n{}\n{}",
+        d.shacl,
+        d.shaclc
+    );
     validate(&s.snapshot(), &shapes, &ValidateOptions::default()).unwrap()
 }
 
@@ -216,7 +234,7 @@ fn graph_views_limit_the_draft() {
 fn print_draft() {
     let s = store(&fixture());
     let d = draft(&s, 0.9, true, &[]);
-    println!("{}\n{}\n{}", d.shacl, d.shex, d.shape_map);
+    println!("{}\n{}\n{}\n{}", d.shacl, d.shaclc, d.shex, d.shape_map);
 }
 
 /// Distinct focus nodes per (path, component) of a report, and the exclusions a draft

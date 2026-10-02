@@ -273,12 +273,14 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
             "describe_schema",
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds,
-                "section": {"enum":["summary","classes","predicates"],"default":"summary"},
+                "section": {"enum":["summary","classes","predicates","constraints"],"default":"summary"},
                 "graph": {"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"},
                 "reasoning": rs,
                 "includeBuiltin": {"type":"boolean","default":false,"description":"Also list rdf:, rdfs:, owl:, xsd:, sh: classes"},
                 "limit": {"type":"integer","minimum":1,"maximum":500,"description":"Entries per list (default 25 for summary, 100 otherwise)"},
                 "cursor": {"type":"string","description":"`next` from the previous page"},
+                "subjectClasses": {"type":"boolean","default":false,"description":"List the classes of each predicate's subjects with their triple counts"},
+                "shapes": {"type":"array","items":{"type":"string"},"description":"section=constraints: `guard` (the write-time validation, the default), `default`, `none` or shapes graph IRIs"},
                 "atCommit": at}}),
         ),
         (
@@ -366,7 +368,8 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
             "validate_shacl",
             json!({"type":"object","additionalProperties":false,"required":["shapes"],"properties":{
                 "dataset": ds,
-                "shapes": {"type":"string","minLength":1,"maxLength":1048576,"description":"The shapes graph in Turtle"},
+                "shapes": {"type":"string","minLength":1,"maxLength":1048576,"description":"The shapes graph in Turtle, or in SHACLC with shapesFormat"},
+                "shapesFormat": {"enum":["turtle","shaclc"],"default":"turtle","description":"The syntax of `shapes`: Turtle, or the SHACL Compact Syntax"},
                 "graph": {"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"},
                 "reasoning": rs,
                 "maxResults": {"type":"integer","minimum":1,"maximum":1000,"default":20},
@@ -653,6 +656,73 @@ fn stored_tool_names_fit_clients() {
         long.bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
     );
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test(flavor = "multi_thread")]
+async fn describe_schema_constraints_and_subject_classes() {
+    let server = fixture_server();
+    let ds = server.state.datasets.read()["t"].clone();
+    ds.store
+        .load(&[Source::from_bytes(
+            br#"@prefix ex: <http://ex.org/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+                @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+                ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+                  sh:property [ sh:path ex:age ; sh:maxCount 1 ; sh:datatype xsd:integer ] ."#
+                .to_vec(),
+            RdfFormat::Turtle,
+            Some(oxrdf::NamedNode::new("http://ex.org/shapes").unwrap()),
+        )])
+        .unwrap();
+    let mut c = Client::start(server);
+    let s = c
+        .structured(
+            "describe_schema",
+            json!({"section": "predicates", "subjectClasses": true}),
+        )
+        .await;
+    let age = s["predicates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["iri"] == "ex:age")
+        .unwrap();
+    assert_eq!(age["subjectClasses"], json!(["ex:Person 2"]), "{s}");
+    // no write-time validation: no constraints unless shapes graphs are named
+    let s = c
+        .structured("describe_schema", json!({"section": "constraints"}))
+        .await;
+    assert_eq!(s["constraints"], json!([]));
+    let s = c
+        .structured(
+            "describe_schema",
+            json!({"section": "constraints", "shapes": ["ex:shapes"]}),
+        )
+        .await;
+    let src = &s["constraints"][0];
+    assert_eq!(src["source"], "graphs");
+    assert_eq!(src["classes"][0]["class"], "ex:Person");
+    let p = &src["classes"][0]["properties"][0];
+    assert_eq!(p["path"], "ex:age");
+    assert!(
+        p["constraints"]
+            .as_str()
+            .unwrap()
+            .starts_with("max 1 · datatype "),
+        "{p}"
+    );
+    assert_eq!(p["enforcement"], "validated-on-request");
+    let (_, e) = c
+        .error("describe_schema", json!({"shapes": ["ex:shapes"]}))
+        .await;
+    assert_eq!(e["code"], "bad-argument");
+    let (_, e) = c
+        .error(
+            "describe_schema",
+            json!({"section": "constraints", "shapes": ["ex:missing"]}),
+        )
+        .await;
+    assert_eq!(e["code"], "unknown-graph");
 }
 
 #[tokio::test(flavor = "multi_thread")]

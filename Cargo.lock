@@ -3757,10 +3757,12 @@ dependencies = [
  "rmcp",
  "rpassword",
  "rust-embed",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
  "similar",
+ "sparesults",
  "spargebra",
  "sparkles",
  "sparkles-backup",
@@ -3771,6 +3773,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml",
  "tower",
@@ -3787,6 +3790,7 @@ name = "sparkles-shacl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "oxiri",
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",

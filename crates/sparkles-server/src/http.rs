@@ -35,6 +35,9 @@ mod inline;
 mod jena_formats;
 mod queries;
 mod schema;
+pub(crate) use schema::constraints::ShapesRequest;
+#[cfg(feature = "mcp")]
+pub(crate) use schema::constraints::build as constraints_layer;
 mod sd;
 mod shex;
 mod stream;
@@ -102,6 +105,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}/classes", get(schema::classes))
         .route("/$/schema/{ds}/predicates", get(schema::predicates))
         .route("/$/schema/{ds}/shapes", get(schema::shapes))
+        .route("/$/schema/{ds}/constraints", get(schema::constraints))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route(
@@ -257,7 +261,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         crate::obs::observe,
     ))
     .layer(axum::middleware::from_fn(crate::alloc::track))
+    .layer(axum::middleware::map_request(authority_host))
     .with_state(state)
+}
+
+/// HTTP/2 requests carry their host as the `:authority` pseudo-header, not `Host`: it is
+/// copied into `Host` when that is absent, so that the checks that read `Host` (the
+/// server's own origin, the names an open server answers) see it for both versions.
+async fn authority_host(mut req: axum::extract::Request) -> axum::extract::Request {
+    if !req.headers().contains_key(header::HOST)
+        && let Some(v) = req
+            .uri()
+            .authority()
+            .and_then(|a| header::HeaderValue::from_str(a.as_str()).ok())
+    {
+        req.headers_mut().insert(header::HOST, v);
+    }
+    req
 }
 
 // ------------------------------------------------------------------ errors ------
@@ -4270,12 +4290,12 @@ async fn shacl(
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let ct = content_type(&headers);
-    // Turtle unless the content type names another RDF syntax (curl's default
-    // `application/x-www-form-urlencoded` included; `text/plain` too, as Turtle is a
-    // superset of N-Triples)
+    // Turtle unless the content type names another RDF syntax or SHACLC
+    // (`text/shaclc`); curl's default `application/x-www-form-urlencoded` is Turtle, and
+    // so is `text/plain`, as Turtle is a superset of N-Triples
     let format = match ct.as_str() {
-        "text/plain" => RdfFormat::Turtle,
-        ct => sparkles::io::format_for_media_type(ct).unwrap_or(RdfFormat::Turtle),
+        "text/plain" => sparkles_shacl::ShapesSyntax::default(),
+        ct => sparkles_shacl::ShapesSyntax::from_media_type(ct).unwrap_or_default(),
     };
     let graph = GraphParam::parse(params.get("graph").unwrap_or("default"))
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;

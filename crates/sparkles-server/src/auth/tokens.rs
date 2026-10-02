@@ -213,6 +213,43 @@ impl TokenStore {
         Ok(n)
     }
 
+    /// Give an unexpired token a new secret (its record, scope and expiry stay); the old
+    /// secret stops working. `None` when the token is gone or expired.
+    pub fn reissue(&self, id: &str, now: i64) -> Result<Option<zeroize::Zeroizing<String>>> {
+        let token = zeroize::Zeroizing::new(super::policy::new_token());
+        let hash = super::policy::token_hash(&token);
+        let digest = super::config::parse_token_hash(&hash).context("token hash")?;
+        let mut inner = self.inner.lock();
+        let Some(rec) = inner.by_id.get_mut(id).filter(|r| r.expires_at() > now) else {
+            return Ok(None);
+        };
+        let old = std::mem::replace(&mut rec.hash, hash);
+        if let Some(d) = super::config::parse_token_hash(&old) {
+            inner.by_digest.remove(&d);
+        }
+        inner.by_digest.insert(digest, id.to_string());
+        self.save(&mut inner)?;
+        Ok(Some(token))
+    }
+
+    /// Record the groups an OIDC or proxy identity has now in the tokens it owns, so that
+    /// their permissions follow the provider. Returns how many tokens changed.
+    pub fn refresh_groups(&self, who: &Identity) -> Result<usize> {
+        let mut inner = self.inner.lock();
+        let mut n = 0;
+        for t in inner.by_id.values_mut() {
+            if t.owner.kind == who.kind && t.owner.name == who.name && t.owner.groups != who.groups
+            {
+                t.owner.groups = who.groups.clone();
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.save(&mut inner)?;
+        }
+        Ok(n)
+    }
+
     /// Records matching `f`, ordered by id.
     pub fn list(&self, f: impl Fn(&TokenRecord) -> bool) -> Vec<TokenRecord> {
         self.inner

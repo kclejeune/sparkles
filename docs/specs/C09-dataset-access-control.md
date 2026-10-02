@@ -1,12 +1,14 @@
 # C09: Authentication and dataset-level access control
 
-> **Status:** implemented in part
+> **Status:** implemented
 >
 > **Phases:** Phase 1 is complete: Basic users, API tokens, OIDC sign-in for the UI,
 > trusted proxy headers, CLI logins, remote `query`/`update`/`load`, and the UI pages.
-> Phase 2 is built in part: rate limiting of failed logins and a Content Security Policy
-> for the UI. Phase 3, graph-level ACLs and endpoint permissions, shipped as
-> [C12](C12-graph-access-control.md).
+> Phase 2 is complete: rate limiting of failed logins, a Content Security Policy for the
+> UI, native TLS, the OIDC provider's access tokens on the API, Cloudflare Access
+> assertions, idle timeouts for sessions and back-channel logout (§12.5). Open questions
+> 9 and 10 were decided with it. Phase 3, graph-level ACLs and endpoint permissions,
+> shipped as [C12](C12-graph-access-control.md).
 >
 > **User docs:** [API: Authentication and access control](../API.md#authentication-and-access-control) · [API: Rate limiting](../API.md#rate-limiting) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
@@ -1522,6 +1524,141 @@ a JWT, and one with the `spk_` prefix is a Sparkles token.
 - The crate would be `jsonwebtoken` (MIT), whose recent majors need an explicit
   crypto-backend feature, or `openidconnect`'s verifier types.
 
+### 12.5 Decisions for the rest of Phase 2
+
+These decisions were made when the remaining items of §12.2 were built, together with
+open questions 9 and 10. They keep to the authentication layer: identities, credentials,
+TLS and sessions. Grants and their evaluation are unchanged.
+
+**Native TLS.**
+
+- `serve --tls-cert FILE --tls-key FILE` takes a PEM chain and a PEM private key. The
+  server uses rustls with the aws-lc-rs provider, which reqwest already linked, and the
+  safe default protocol versions, TLS 1.2 and 1.3. ALPN offers `h2` and then
+  `http/1.1`. axum gains its `http2` feature, so the plain listener also accepts HTTP/2
+  with prior knowledge. There is no new licence in the binary.
+- The key must fit the certificate. A pair that does not load stops the server before
+  it binds, and on reload it keeps the pair in use.
+- The pair is read again on SIGHUP and when either file's modification time changes,
+  which a task checks once a minute. That is cheaper than a file-watching dependency and
+  fast enough for ACME renewals, which happen days before expiry. Each new connection
+  gets the current pair through a certificate resolver, and open connections keep theirs.
+- The accept loop never waits for a handshake. Each handshake runs in its own task, at
+  most 1024 at once and for at most 10 seconds, and finished connections reach axum
+  through a channel. A client that opens connections and never sends a ClientHello
+  therefore delays nobody.
+- Code that derives the scheme reads `X-Forwarded-Proto`. Over TLS the server sets that
+  header to `https` when it is absent, so cookies get `Secure` and `__Host-`, and the
+  server's own origin is `https`. HTTP/2 requests carry their host as `:authority`, so the
+  router copies it into `Host` when `Host` is absent, and the origin and host checks see
+  it for both versions.
+- `--unix-socket` and `--metrics-addr` stay plain HTTP, and `--tls-cert` with
+  `--unix-socket` is an error. Client certificates and OCSP stapling are not offered.
+- The documentation says that most deployments terminate TLS at a proxy. The NixOS
+  module gains `tls.certFile` and `tls.keyFile`, reloads on `systemctl reload`, and
+  lets nginx connect over https when both are on.
+
+**The OIDC provider's access tokens (§12.4).**
+
+- They are off until `oidc.api_audience` (a string or a list) is set. `api_scopes` lists
+  scopes that must all be in `scope` or `scp`, and `api_name_claim` names the account.
+  It defaults to `name_claim` and may also be `client_id` or `azp`, for client
+  credentials grants.
+- `Bearer` values that start with `spk_` are Sparkles tokens. Any other value shaped
+  like a JWS (three base64url segments, at most 16 KiB) is checked as an access token
+  when the API accepts them, and is otherwise an unknown token.
+- One module checks every JWT the server meets: ID tokens, access tokens, logout tokens
+  and Cloudflare Access assertions. It refuses an algorithm outside the configured
+  asymmetric allow-list, which excludes `none` and HMAC. It refuses `crit` and `enc`
+  headers, and it takes keys only from the provider's set, never from `jwk`, `jku`,
+  `x5u` or `x5c` in the token. A key whose `use` is not `sig`, or whose `alg` differs
+  from the header's, is not used. `iss` must equal the issuer as a string, because
+  `jsonwebtoken` would accept a list that contains it. `exp`, `nbf` and `iat` allow 60
+  seconds of skew.
+- The key set is cached for an hour. A token whose key id the cache lacks makes the
+  server fetch the set again, but only once per 5 minutes, so rotation works and random
+  key ids do not turn the server into a request amplifier. Fetches are single-flight.
+  When a refresh fails, the cached set keeps verifying. Without any keys the answer is
+  `503 identity provider unavailable`, which is counted as `reason="idp"` and not charged
+  to the client's failure budget.
+- The principal is `oidc:{name}` with the token's groups, and §2.7 admits it and maps it
+  to roles, as for a UI login. Its scheme is `bearer`, so it is not ambient and needs no
+  CSRF token.
+- **It cannot mint Sparkles tokens.** An access token is a short-lived credential that
+  the provider issued to a client. Letting it mint 30-day Sparkles tokens would turn a
+  leaked five-minute token into a long-lived one. Such callers get `403`, and
+  `canMintTokens` is false.
+- The server warns when `api_audience` contains the `client_id`, because then the UI's ID
+  tokens would also pass as access tokens.
+- The `nonce` claim is not used to tell ID tokens apart. Some providers put it into
+  access tokens too, so audience separation does that job.
+
+**Cloudflare Access.**
+
+- `[cloudflare_access]` has `team_domain`, `audience` (the application's AUD tags) and an
+  optional `groups_claim`. Assertions in `Cf-Access-Jwt-Assertion` must be RS256, signed
+  by a key of `{team_domain}/cdn-cgi/access/certs`, with `iss` = `team_domain`, an
+  `aud` from the list, and an unexpired `exp`.
+- The assertion comes after the session cookie and before trusted headers in §2.1. It is
+  honored from any peer because its signature is checked, and an invalid one is a `401`,
+  as for a bad `Authorization`.
+- A user's assertion (`email`) gives `proxy:{email}` with the `proxy` scheme. The edge
+  adds it to every browser request, so it is ambient and the CSRF rules apply. A service
+  token's assertion (`common_name`) gives `proxy:{client id}` with the `bearer` scheme,
+  which needs no CSRF token and cannot mint tokens.
+- The section cannot be combined with the `cloudflare-access` preset, which trusts the
+  unsigned email header. Logout redirects to `/cdn-cgi/access/logout` unless
+  `proxy.logout_url` is set.
+- Groups come only from the configured claim. Access's identity endpoint, which needs the
+  user's cookie, is not called.
+
+**Idle sessions.** `session.idle_timeout`, which must not exceed `session.ttl`, ends a
+session that has not been used for that long. `ttl` stays the absolute limit. The time
+of last use is kept in memory and written with the next write of the store, at the
+hourly prune and at graceful shutdown, so a busy server does not write per request.
+After a crash a session may lose up to an hour of recorded use and end early, which
+errs on the safe side. The cookie keeps `Max-Age = ttl`, since the server decides.
+
+**Back-channel logout (OpenID Connect Back-Channel Logout 1.0).**
+
+- `POST /$/auth/oidc/backchannel-logout` is public, like the callback, and exists with
+  `[oidc]`. OIDC sessions now record the ID token's `sid` and `sub`.
+- The logout token is checked by the shared module, with `aud` = `client_id`. On top of
+  that, `iat` must be at most 10 minutes old, the `events` claim must hold the
+  back-channel logout event, `sid` or `sub` must be present, and `nonce` must be absent,
+  so an ID token cannot pass. `jti` is required and remembered for 20 minutes, which
+  refuses replays. At most 10 000 are remembered.
+- A token with `sid` ends that session, and one with only `sub` ends every OIDC session
+  of the subject. Minted API tokens stay, because §2.3.1 binds them to the account and
+  not to a session. Admins revoke them by owner.
+- Answers are `200` with `Cache-Control: no-store`, or `400 invalid_request`, which is
+  charged to the caller's failure budget. A provider whose keys cannot be fetched gives
+  `503`.
+
+**Open question 9: device grants persist.** `<data>/auth/device-grants.json` (0600)
+keeps each grant with the SHA-256 of its device code, the user code, the client label
+and hostname, the expiry, the interval and the decision. Neither the device code nor a
+token is written. The plaintext of a token approved before a restart is lost, so the
+grant keeps the minted token's id, and the next poll gives the token a new secret
+(`token_reissued`). Its record, scope and expiry stay the same. A token revoked or
+expired in the meantime gives `expired_token`. The store is written when a grant starts,
+is decided or ends. Starts are already limited per network, and at most 1 000 grants are
+pending. A corrupt file stops startup, like the other stores. Loopback codes stay in
+memory, because they live 120 seconds.
+
+**Open question 10: groups refresh.** Whenever the provider or proxy asserts an
+identity's groups, the server records them in that identity's minted tokens and sessions.
+That happens at an OIDC login, with an access token or Access assertion that carries the
+groups claim, and with a proxy request that carries the groups header. It also happens
+when the new groups no longer admit the identity. Then its tokens stop working instead of
+keeping access the provider has withdrawn. This changes token permissions retroactively
+in both directions, and the scope still bounds them. Tokens follow the provider, which is
+the authority on groups, rather than a snapshot whose staleness only the TTL bounded. A
+request that does not assert groups, such as a proxy request without the groups header
+or a token without the claim, leaves them alone. A small in-memory cache of the last
+groups per owner keeps an unchanged list from costing a store lookup. Each change is
+written once and audited as `groups_refreshed`.
+
 ## 13. Acceptance examples
 
 **Fixture.** `router_tests::auth` builds `AppState` with in-memory datasets `wiki`,
@@ -1862,10 +1999,11 @@ These tests run against a real listener on 127.0.0.1, with `HOME` and
    `--allow-file-load` flag that defaults to off on non-loopback hosts.
 8. Should the CLI default `--host` become `127.0.0.1`?
 9. Should device grants persist across restarts? Currently they live only in memory,
-   and they expire within 10 min anyway.
+   and they expire within 10 min anyway. Decided: they persist (§12.5).
 10. Should oidc and proxy token owners' groups refresh on each UI login, updating their
     tokens' recorded groups? That would be friendlier, but changes token permissions
-    retroactively.
+    retroactively. Decided: they refresh whenever the provider or proxy asserts them
+    (§12.5).
 11. Should credentialed CORS be allowed for listed origins, so that a separate web app
     can use session cookies?
 
@@ -2010,7 +2148,39 @@ sessions, OIDC against an in-process mock provider, proxy headers, CLI grants an
 limits. The NixOS VM test gained an authentication node later (`b149524`).
 
 
-**Not built.** Native TLS, IdP JWT access tokens on the API and Cloudflare Access JWTs,
-sliding sessions and back-channel logout. Endpoint-level permissions and graph-level ACLs
-(Phase 3) were built later, as [C12](C12-graph-access-control.md) describes. Device grants stay in memory (open question 9), and the groups recorded for
-OIDC and proxy token owners are not refreshed (open question 10).
+**The rest of Phase 2** landed on 2026-10-02 as §12.5 describes:
+
+- native TLS (`--tls-cert`, `--tls-key`), with the NixOS options `tls.certFile` and
+  `tls.keyFile`;
+- the OIDC provider's access tokens on the API (`oidc.api_audience`) and Cloudflare
+  Access assertions (`[cloudflare_access]`), on a JWT module that the ID token check now
+  shares;
+- idle timeouts for sessions (`session.idle_timeout`) and back-channel logout;
+- persistent device grants (open question 9) and groups that refresh in tokens and
+  sessions (open question 10).
+
+The new principals are documented in
+[API: Authentication](../API.md#authentication-and-access-control), and TLS in
+[Usage: TLS](../USAGE.md#tls). Router tests in
+`crates/sparkles-server/src/http/router_tests/auth/idp.rs` run them against the
+in-process mock provider. They cover tokens with a bad signature, another issuer or
+audience, an issuer list, no or an expired `exp`, a future `nbf` or `iat`, a missing
+scope or account claim, an unknown key id, `alg: none` with and without a signature,
+HMAC keyed with the public key, a `crit` header and an embedded key. They also cover key
+rotation, a provider without keys, the same refusals for Access assertions and logout
+tokens, a replayed logout token, idle sessions, device grants across two restarts, and
+groups refreshed by OIDC logins and proxy headers. TLS tests serve HTTP/1.1 and HTTP/2
+with a test CA, reload a renewed pair, keep the old one when the new key does not fit,
+and show that idle connections do not stall handshakes. The NixOS VM test's
+authenticated node serves TLS behind nginx.
+
+**Deviations.** Phase 2 named sliding sessions. They landed as an idle timeout within
+the absolute `ttl`, because a session that slides without limit would never end for an
+active stolen cookie. Access tokens cannot mint Sparkles tokens, which §12.4 did not
+settle. Device grants approved before a restart reissue the token's secret instead of
+storing it, because a token at rest would violate §1.1.
+
+**Not built.** Client certificates (mutual TLS), OCSP stapling, token introspection
+(RFC 7662) for opaque access tokens, front-channel logout, and Access's identity endpoint
+for groups. Endpoint-level permissions and graph-level ACLs (Phase 3) were built later,
+as [C12](C12-graph-access-control.md) describes.

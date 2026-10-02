@@ -541,3 +541,103 @@ fn parallel_matches_sequential() {
     assert_eq!(par, seq);
     assert_eq!(par.results.len(), (0..3000).filter(|i| i % 7 > 4).count());
 }
+
+// ------------------------------------------------------- SHACL 1.2 list constraints
+
+#[test]
+fn unique_members_reports_each_duplicate_as_a_detail() {
+    let r = run(
+        "ex:l rdf:first 1 ; rdf:rest (2 1 2 2) .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:l ; sh:uniqueMembers true .",
+    );
+    assert_eq!(summary(&r), ["UniqueMembers l l"], "\n{r}");
+    let details: Vec<String> = r.results[0]
+        .details
+        .iter()
+        .map(|d| {
+            format!(
+                "{} {}",
+                short(&d.focus_node),
+                short(d.value.as_ref().unwrap())
+            )
+        })
+        .collect();
+    assert_eq!(details, ["l 1", "l 2"]);
+    // the details are in the RDF report and read back from it
+    let back = ValidationReport::from_rdf(&r.to_graph(), None).unwrap();
+    assert_eq!(back.results[0].details.len(), 2);
+    let json = sparkles_shacl::report::to_json(&r);
+    assert_eq!(json["results"][0]["details"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn member_shape_details_are_the_member_results() {
+    let r = run(
+        "ex:a ex:speakers ( ex:Alice \"Bob\" \"Carol\" ) .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+             sh:property [ sh:path ex:speakers ; sh:memberShape ex:IRIShape ] .
+         ex:IRIShape a sh:NodeShape ; sh:nodeKind sh:IRI .",
+    );
+    assert_eq!(r.results.len(), 1, "\n{r}");
+    let res = &r.results[0];
+    assert!(
+        res.source_constraint_component
+            .as_str()
+            .ends_with("MemberShapeConstraintComponent")
+    );
+    assert_eq!(short(&res.focus_node), "a");
+    assert!(res.result_path.is_some());
+    let details: Vec<String> = res.details.iter().map(|d| short(&d.focus_node)).collect();
+    assert_eq!(details, ["Bob", "Carol"]);
+    assert!(res.details.iter().all(|d| {
+        d.source_constraint_component
+            .as_str()
+            .ends_with("NodeKindConstraintComponent")
+    }));
+}
+
+#[test]
+fn list_lengths_and_ill_formed_lists() {
+    let shapes_ttl = "ex:S a sh:NodeShape ; sh:targetClass ex:T ;
+        sh:property [ sh:path ex:l ; sh:minListLength 1 ; sh:maxListLength 2 ] .";
+    assert_results(
+        "ex:ok a ex:T ; ex:l (1 2) .
+         ex:empty a ex:T ; ex:l () .
+         ex:long a ex:T ; ex:l (1 2 3) .
+         ex:lit a ex:T ; ex:l \"x\" .
+         ex:two a ex:T ; ex:l ex:c1 . ex:c1 rdf:first 1, 2 ; rdf:rest rdf:nil .
+         ex:open a ex:T ; ex:l ex:c2 . ex:c2 rdf:first 1 ; rdf:rest ex:c3 .
+         ex:loop a ex:T ; ex:l ex:c4 . ex:c4 rdf:first 1 ; rdf:rest ex:c4 .",
+        shapes_ttl,
+        &[
+            "MinListLength empty nil",
+            "MaxListLength long _",
+            "MinListLength lit x",
+            "MaxListLength lit x",
+            "MinListLength two c1",
+            "MaxListLength two c1",
+            "MinListLength open c2",
+            "MaxListLength open c2",
+            "MinListLength loop c4",
+            "MaxListLength loop c4",
+        ],
+    );
+}
+
+#[test]
+fn unique_members_false_still_requires_lists() {
+    assert_results(
+        "ex:a ex:l (1 1) . ex:b ex:l ex:notAList .",
+        "ex:S a sh:NodeShape ; sh:targetSubjectsOf ex:l ;
+             sh:property [ sh:path ex:l ; sh:uniqueMembers false ] .",
+        &["UniqueMembers b notAList"],
+    );
+    assert!(
+        Shapes::parse(
+            &format!("{PREFIXES}ex:S sh:targetNode ex:a ; sh:uniqueMembers 1 ."),
+            RdfFormat::Turtle,
+            None
+        )
+        .is_err()
+    );
+}

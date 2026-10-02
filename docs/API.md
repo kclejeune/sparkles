@@ -507,6 +507,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. An RDF `Accept` gets the same report as a VoID description. See [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
+| GET    | `/$/schema/{ds}/constraints` | *Extension.* The SHACL constraints layer of the report alone. See [Constraints layer](#constraints-layer). |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Writes go on during the build, and the writer lock is held only for the switch. Returns a cancellable `Task`. `409` while a compaction of the dataset is queued or running. The old generation is removed once no reader or retained history needs it, which is what Fuseki's `?deleteOld=true` asks for. `deleteOld` with no value or `true` is accepted, and `deleteOld=false` is a `400`. |
 | GET    | `/$/compaction/{ds}`         | *Extension.* `CompactionStatus`: the dataset's automatic compaction, its settings and what it sees. See [Automatic compaction](#automatic-compaction). |
 | PUT    | `/$/compaction/{ds}`         | *Extension.* Replaces the dataset's own compaction settings with the JSON object's. Returns `CompactionStatus`. |
@@ -765,7 +766,7 @@ language tag validator answers in HTML only. A missing parameter is a `400`.
 
 The design and its rationale are in [C02 Schema discovery](specs/C02-schema-discovery.md).
 
-`GET /$/schema/{ds}` reports the classes and predicates of a dataset in two separate
+`GET /$/schema/{ds}` reports the classes and predicates of a dataset in three separate
 layers:
 
 * **observed** holds exact counts over the selected graphs at one snapshot. A triple
@@ -775,6 +776,10 @@ layers:
   `owl:Class`, `rdfs:subClassOf`, `rdfs:domain`, `owl:FunctionalProperty` and labels. Only
   IRI objects are listed. Blank-node class expressions such as `owl:Restriction` are
   counted in `totals.anonymousClassExpressions`.
+* **constraints** holds what the dataset's SHACL shapes require of the instances of each
+  class, and what enforces each constraint. It is described under
+  [Constraints layer](#constraints-layer). It is read from the shapes alone and never
+  from the counts.
 
 A class is listed if any of these hold:
 
@@ -796,6 +801,8 @@ All parameters are optional, and the read-only server accepts them:
 | `declaredGraph` | same | same as `graph` | Graphs read for declarations, for example an ontology in its own named graph. |
 | `reasoning` | `true`, `false` | `true` if the dataset has materialized inferences | Counts `urn:x-sparkles:inferred` as part of `default` / `union`. |
 | `declared` | `asserted`, `all` | `asserted` | `all` also reads declarations from the inferred graph. That graph holds the transitive closure of `rdfs:subClassOf`, the `rdfs:Resource` superclasses, and similar inferences. |
+| `detail` | `subjectClasses` | none | Each predicate also lists the classes of its subjects. See [Subject classes](#subject-classes). |
+| `shapes` | `guard`, `default`, a graph IRI, `none` (repeatable) | `guard` when the dataset has write-time SHACL validation | The sources of the constraints layer. Only the summary and `/constraints` read it. |
 | `limit` | 1–10000 | 1000 | Page size. The summary uses it for both first pages. |
 | `cursor` | opaque | — | The `next` of the previous page. Send the same selection parameters with it. |
 | `timeout` | seconds | server query timeout | Time budget for computing the report. |
@@ -818,6 +825,7 @@ type SchemaSummary = {
                cycles: string[][] };// subClassOf cycles with more than one member (A ⊑ A is not a cycle)
   classes: Page<ClassEntry>;
   predicates: Page<PredicateEntry>;
+  constraints?: ConstraintsLayer;  // left out when no source has shapes
 };
 type Page<T> = { items: T[]; total: number; next: string | null };  // items in IRI order
 type Lit = { value: string; lang?: string };
@@ -843,6 +851,8 @@ type PredicateEntry = {
                   triples: number; distinct: number;  // distinct terms: "01"^^xsd:integer ≠ "1"^^xsd:integer
                   languages?: { lang: string; direction?: "ltr" | "rtl"; triples: number }[] }[];
     };
+    subjectClasses?: { class: string; triples: number; subjects: number }[];  // detail=subjectClasses
+    untypedSubjects?: { triples: number; subjects: number };                  // detail=subjectClasses
   };
   declared: { types: string[];     // rdf:Property, owl:ObjectProperty, owl:FunctionalProperty, …
               domains: string[]; ranges: string[]; superProperties: string[]; inverseOf: string[];
@@ -916,13 +926,103 @@ tags.
 
 The CLI equivalent prints the complete report without pagination:
 `sparkles schema --loc DB [--graph default|union|IRI] [--declared-graph G]
-[--no-inferences] [--declared asserted|all] [--format text|json|void|turtle]
-[--timeout S] [--max-entries N]`, or `--data FILE…` in place of `--loc`. `json` is the
-`SchemaSummary` with every item and `next: null`. `text` prints one line per class and per
-predicate. `void` prints the VoID description in Turtle, and `turtle` prints it with the
-declarations. The command exits with status 2 when the timeout or the entry cap is
-exceeded. The Rust API is `sparkles::schema::discover`, and
-`sparkles::schema::void_text` renders a report as VoID.
+[--no-inferences] [--declared asserted|all] [--subject-classes] [--shapes SOURCE]…
+[--format text|json|void|turtle] [--timeout S] [--max-entries N]`, or `--data FILE…` in
+place of `--loc`. `json` is the `SchemaSummary` with every item and `next: null`. `text`
+prints one line per class and per predicate, a line of subject classes under each
+predicate with `--subject-classes`, and then the constraints layer. `--shapes` takes the
+values of `shapes`, and without it the layer holds the database's write-time SHACL
+validation, if any. `void` prints the VoID description in Turtle, and `turtle` prints it
+with the declarations. The command exits with status 2 when the timeout or the entry cap
+is exceeded. The Rust API is `sparkles::schema::discover`, with
+`SchemaOptions::subject_classes`, and `sparkles::schema::void_text` renders a report as
+VoID. `sparkles_shacl::constraints` builds the constraints layer from parsed shapes with
+`class_constraints`, `graphs_source` and `guard_source`, and
+`SchemaSummary::with_constraints` adds it to a summary.
+
+### Subject classes
+
+The design is in [C02 §6, Phase 2](specs/C02-schema-discovery.md#6-phasing).
+
+With `detail=subjectClasses`, each predicate's `observed` also lists the classes of its
+subjects. For each class, `triples` counts the predicate's triples whose subject has that
+class in the selection, and `subjects` counts those subjects. A subject with several
+classes counts under each of them. `untypedSubjects` counts the triples and subjects
+whose subject has no `rdf:type` with an IRI object in the selection. Classes are listed
+in IRI order, and only direct types count, unless `reasoning` includes materialized
+ones. The detail costs one more pass over the selection's `rdf:type` triples and memory
+for them, so it is computed only on request. It is part of the report's selection, so a
+cursor issued with it does not continue a listing without it.
+
+### Constraints layer
+
+The design is in [C02 §6, Phase 2](specs/C02-schema-discovery.md#6-phasing), and the
+decisions taken for it are in its Outcome.
+
+The constraints layer lists, for each class that SHACL shapes target, the property shapes
+whose path is a single predicate, with their `sh:minCount`, `sh:maxCount`, `sh:datatype`,
+`sh:class` and `sh:nodeKind`. A class's property shapes are those of the shapes that
+target it with `sh:targetClass` or an implicit class target, and those reached from them
+through `sh:node` and `sh:and`. Shapes under `sh:or`, `sh:xone` and `sh:not` are left out,
+and so are deactivated shapes. Other constraints of a property shape are named by their
+component in `other`. Property shapes with other paths are counted in `otherPaths`, and
+shapes with other targets in `otherTargets`.
+
+The layer has one source per origin of shapes, and the `shapes` parameter picks them.
+
+* `guard` gives the shapes of the dataset's write-time SHACL validation, read from its
+  shapes graphs and its shapes file. Without `shapes`, the summary includes this source
+  when the dataset has SHACL validation, and leaves `constraints` out otherwise.
+* `default` and graph IRIs read shapes graphs of the dataset. Several graphs make one
+  source.
+* `none` leaves the layer out.
+
+Each property shape says what checks it in `enforcement`:
+
+| Value | When |
+|---|---|
+| `reject-on-write` | The shape belongs to write-time validation in `reject` mode, and its severity is at or above the configuration's threshold. A write that breaks it is refused. |
+| `warn-on-write` | The shape belongs to write-time validation in `warn` mode, or its severity is below the threshold. A write that breaks it is committed and reported. |
+| `validated-on-request` | The shape comes from a shapes graph named by `shapes`. Nothing checks it until the data is validated, for example with `POST /{ds}/shacl`. |
+
+```ts
+type ConstraintsLayer = { sources: ConstraintSource[] };
+type ConstraintSource = {
+  kind: "guard" | "graphs";
+  graphs: string[];               // shapes graphs read; "default" for the default graph
+  file?: true;                    // the guard also has shapes from a file or given inline
+  mode?: "reject" | "warn";       // guard only
+  threshold?: "violation" | "warning" | "info";  // guard only
+  shapes: number;                 // node and property shapes of the source
+  otherTargets: number;           // active shapes whose targets are not classes
+  classes: { class: string;
+             shapes: string[];    // IRIs of the shapes that target the class
+             closed: boolean;     // a shape of the class has sh:closed true
+             properties: PropertyConstraint[];  // sorted by path
+             otherPaths: number }[];
+};
+type PropertyConstraint = {
+  path: string; shape?: string;   // the property shape's IRI, if it has one
+  severity: string;               // sh:Violation unless the shape says otherwise
+  enforcement: "reject-on-write" | "warn-on-write" | "validated-on-request";
+  minCount?: number; maxCount?: number; datatype?: string; class?: string[]; nodeKind?: string;
+  other?: string[];               // components of the other constraints, such as sh:PatternConstraintComponent
+};
+```
+
+`GET /$/schema/{ds}/constraints` answers `{schemaFormat, dataset, snapshot: {version,
+generation}, constraints}` with the layer alone, without counting anything. It takes
+`shapes` and `at`. The layer is built for every request and is not cached with the
+report. With `at`, shapes graphs are read at that state, and the guard's shapes are
+always those installed now.
+
+A caller limited to some graphs reads only the shapes graphs it may read. It sees the
+guard's shapes only when it may read every shapes graph of the guard. Otherwise the
+summary leaves the guard source out, and `shapes=guard` answers `404`. `shapes=guard`
+also answers `404` when the dataset has no write-time SHACL validation. A ShEx guard is
+not summarized. A shapes graph with no quads answers `404`, `shapes=union` and a malformed
+IRI answer `400`, and a build without the `shacl` feature answers `501` when shapes are
+named.
 
 ### Drafted shapes
 
@@ -964,7 +1064,7 @@ the threshold is listed as rejected with the same counts.
 | `maxCount` | `1` | The largest `sh:maxCount` drafted. `0` drafts none. |
 | `closed` | `false` | Draft closed shapes, with `sh:ignoredProperties ( rdf:type )`. |
 | `base` | `urn:x-sparkles:shape:<ds>:` | The namespace of the shape IRIs. |
-| `format` | `json` | `json`, `turtle` (the SHACL shapes) or `shexc` (the ShEx schema). `Accept: text/turtle` and `Accept: text/shex` choose them too. |
+| `format` | `json` | `json`, `turtle` (the SHACL shapes), `shaclc` (the SHACL shapes in the compact syntax) or `shexc` (the ShEx schema). `Accept: text/turtle`, `Accept: text/shaclc` and `Accept: text/shex` choose them too. |
 | `timeout`, `at` | | As for queries. |
 
 ```ts
@@ -980,6 +1080,7 @@ type ShapesDraft = {
             properties: { path: string; instances: number; maxValues: number;
                           constraints: Constraint[]; rejected: Constraint[] }[] }[];
   shacl: string;      // the shapes graph in Turtle, with the counts as comments
+  shaclc: string;     // the same shapes in SHACLC, with the counts as comments
   shex: string;       // the ShEx schema in ShExC
   shapeMap: string;   // {FOCUS rdf:type <C>}@<shape>, … for the ShEx schema
 };
@@ -3678,7 +3779,7 @@ versions, format 1 without `language`, are still read:
 |---|---|---|---|
 | `language` | `shacl`, `shex` | `shacl` | The shape language. It is always written, and a `PUT` without it means SHACL. |
 | `mode` | `reject`, `warn`, `off` | — | With `reject`, a write that leaves results at or above the threshold is not committed (`422`). With `warn`, the write commits, and the receipt and header report the findings. |
-| `shapes` (SHACL) | `{ "graphs"?: [iri, …], "inline"?: "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, shapes given inline, or both. Named graphs are read from the state being validated, so changes to them are validated too and must parse. Inline shapes are copied to `validation-shapes.ttl`. With both, the file's shapes are merged with the graphs into one shapes graph, and a write to a shapes graph is validated against the merged shapes. |
+| `shapes` (SHACL) | `{ "graphs"?: [iri, …], "inline"?: "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, shapes given inline, or both. Named graphs are read from the state being validated, so changes to them are validated too and must parse. Inline shapes are copied to `validation-shapes.ttl`. They may be in any RDF syntax or in SHACLC (`text/shaclc`), and shapes in another syntax than Turtle are stored as Turtle. An unknown `format` is a `400`. With both, the file's shapes are merged with the graphs into one shapes graph, and a write to a shapes graph is validated against the merged shapes. |
 | `dataGraph` | `"default"`, `"union"`, `[iri, …]` | `"default"` | The data graph. It never includes the shapes graphs, and includes the inferred graph only with `includeInferences`. |
 | `threshold` (SHACL) | `violation`, `warning`, `info` | `violation` | Results at or above it block. |
 | `baseline` | `strict`, `grandfather` | `strict` | With `strict`, any blocking result in the state after a write decides. With `grandfather`, only the blocking results the write introduces decide, so results the data already has do not block unrelated writes, and `reject` can be enabled on data that does not conform. Results are matched as a multiset: SHACL results by focus node, path, value, source shape, component and constraint, ShEx associations by node and shape. When a write changes a SHACL shapes graph, its results are compared with those the old shapes gave. |
@@ -3858,6 +3959,7 @@ the shapes graph in the request body, with Fuseki's semantics:
 * **Body.** The body is the shapes graph. `Content-Type` selects the syntax:
   `application/n-triples`, `application/rdf+xml`, `application/ld+json`,
   `application/trig` or `application/n-quads`. All graphs of a quad format are merged.
+  `text/shaclc` is the SHACL Compact Syntax (see [SHACLC](#shacl-compact-syntax-shaclc)).
   Turtle is used for `text/turtle` and for any other or absent content type, such as
   curl's default `application/x-www-form-urlencoded`.
 * **`graph`.** `default` is the default and means the dataset's default graph. With
@@ -3873,11 +3975,18 @@ the shapes graph in the request body, with Fuseki's semantics:
 * **`timeout=<seconds>`.** Works as for queries, with the server default otherwise. A
   timeout returns `408`.
 * SHACL Core and SHACL-SPARQL are supported. A parse error in the shapes graph is a `400`.
+  A SHACLC error gives the line and column.
 * **`sh:targetWhere`** (SHACL 1.2 Core) is supported: the focus nodes are the nodes of the
   data graph, its subjects and objects, that conform to the given shape. When that shape
   has `sh:class`, `sh:hasValue` or `sh:in`, or a property shape on a predicate or an
   inverse predicate with `sh:minCount` of at least 1, only the nodes those allow are
   tested. Otherwise every node of the data graph is.
+* **List constraints** (SHACL 1.2 Core) are supported: `sh:memberShape`,
+  `sh:minListLength`, `sh:maxListLength` and `sh:uniqueMembers`. Each value node must be a
+  well-formed RDF list, or it gets a result with the value node as `sh:value`. A
+  `sh:memberShape` result has one `sh:detail` per member that does not conform, holding
+  that member's results against the member shape. A `sh:uniqueMembers true` result has one
+  `sh:detail` per repeated member, with the member as `sh:value`.
 * **Budgets.** The report is bounded like a query result. It fails with `507` and
   `budget: "result-bytes"` once it holds more results than fit in `--max-result-mb` at 48
   bytes each, or in `--query-memory-mb` at an estimated 512 bytes each. It also fails once
@@ -3895,25 +4004,70 @@ negotiated with `Accept` or `format=`:
 | `format=text` | human-readable summary (one line per result) |
 
 ```ts
-type ShaclReport = {
-  conforms: boolean;
-  results: {
-    focusNode: Term;
-    resultPath: Term | { type: "path"; value: string /* SPARQL property path */ } | null;
-    value: Term | null;
-    sourceShape: Term;
-    sourceConstraintComponent: Term;   // e.g. { type: "uri", value: "http://www.w3.org/ns/shacl#MinCountConstraintComponent" }
-    sourceConstraint?: Term;           // SHACL-SPARQL constraints
-    severity: Term;                    // sh:Violation | sh:Warning | sh:Info
-    messages: string[];                // sh:resultMessage texts
-  }[];
+type ShaclReport = { conforms: boolean; results: ShaclResult[] };
+type ShaclResult = {
+  focusNode: Term;
+  resultPath: Term | { type: "path"; value: string /* SPARQL property path */ } | null;
+  value: Term | null;
+  sourceShape: Term;
+  sourceConstraintComponent: Term;   // e.g. { type: "uri", value: "http://www.w3.org/ns/shacl#MinCountConstraintComponent" }
+  sourceConstraint?: Term;           // SHACL-SPARQL constraints
+  severity: Term;                    // sh:Violation | sh:Warning | sh:Info
+  messages: string[];                // sh:resultMessage texts
+  details?: ShaclResult[];           // sh:detail results, only when there are some
 };
 ```
 
 The CLI equivalent is `sparkles shacl --loc DB --shapes shapes.ttl [--graph default|union|IRI]
 [--format ttl|json|text|nt|jsonld|rdfxml] [--no-inferences]`, or `--data FILE…` in place
-of `--loc` to validate files in memory. Like Jena's `shacl validate`, it exits with status
+of `--loc` to validate files in memory. The shapes file's syntax comes from its name, and
+`.shaclc` and `.shc` files are SHACLC. Like Jena's `shacl validate`, it exits with status
 1 when the data does not conform.
+
+### SHACL Compact Syntax (SHACLC)
+
+The design and its rationale are in
+[G03 SHACL Compact Syntax and list constraints](specs/G03-shaclc.md).
+
+SHACLC is the compact syntax for shapes of the SHACL 1.2 Compact Syntax draft and the
+SHACL 1.0 Working Group Note, with the media type `text/shaclc` and the file extensions
+`.shaclc` and `.shc`. Sparkles reads it wherever shapes are given and writes it where
+drafted shapes are shown:
+
+| Place | SHACLC |
+|---|---|
+| `POST /{ds}/shacl` | `Content-Type: text/shaclc` |
+| `PUT /$/validation/{ds}` | `"shapes": { "inline": "…", "format": "text/shaclc" }` |
+| `GET /$/schema/{ds}/shapes` | `format=shaclc` or `Accept: text/shaclc` |
+| `sparkles shacl`, `sparkles validation` | `--shapes FILE.shaclc` or `FILE.shc` |
+| `sparkles schema --draft-shapes` | `--format shaclc` |
+| MCP `validate_shacl` | `shapesFormat: "shaclc"` |
+| Python `Dataset.validate_shacl` | `format="shaclc"` |
+
+```
+PREFIX ex: <http://example.com/ns#>
+
+shape ex:PersonShape -> ex:Person {
+    closed=true ignoredProperties=[rdf:type] .
+    ex:ssn       xsd:string [0..1] pattern="^\\d{3}-\\d{2}-\\d{4}$" .
+    ex:worksFor  IRI ex:Company [0..*] .
+    ex:speakers  IRI [1..1] memberShape=ex:Speaker maxListLength=10 .
+}
+```
+
+The prefixes `rdf`, `rdfs`, `sh` and `xsd` are bound without a `PREFIX` line. Keywords
+ignore case, as in Jena. Sparkles reads what Jena reads beyond the grammar: a shape
+reference alone in a node shape body (`@ex:S .`), `targetClass=` as a node parameter, and
+`group`, `order`, `name`, `description` and `defaultValue` as property parameters. It also
+reads the SHACL 1.2 list parameters `memberShape`, `minListLength`, `maxListLength` and
+`uniqueMembers` as node and property parameters. A document with a `BASE` (or read with a
+base, as the CLI reads files) produces `<base> a owl:Ontology` and an `owl:imports` triple
+per `IMPORTS`, as the production rules say.
+
+Shapes written as SHACLC read back to the same graph. A shapes graph with triples that
+SHACLC cannot express, such as a named property shape, `sh:minCount 0` or a label on a
+shape, is not written at all, and the error names those triples. The Rust API is
+`sparkles_shacl::compact::{parse, write}` and `sparkles_shacl::ShapesSyntax`.
 
 ## ShEx validation
 
@@ -4563,25 +4717,29 @@ pass. So does the server's own UI.
 
 Each request resolves to one principal. The first applicable source wins:
 
-1. **`Authorization`.** `Bearer spk_…` with an API token, or `Basic` with a configured
-   user and password. `Basic` also accepts a token as the password, with any user name,
-   for Basic-only clients such as Jena. Invalid credentials are `401`, never treated as
-   anonymous.
+1. **`Authorization`.** `Bearer spk_…` with an API token, `Bearer` with an access token
+   (a JWT) of the OIDC provider when `oidc.api_audience` is set, or `Basic` with a
+   configured user and password. `Basic` also accepts a token as the password, with any
+   user name, for Basic-only clients such as Jena. Invalid credentials are `401`, never
+   treated as anonymous.
 2. **The session cookie** of the web UI, `__Host-sparkles_session` over https or
-   `sparkles_session` on http://localhost. A bad, expired or revoked cookie is ignored and
-   cleared.
-3. **Trusted proxy headers** (`Remote-User`, `X-Forwarded-User`, …), only from a peer in
+   `sparkles_session` on http://localhost. A bad, expired, idle or revoked cookie is
+   ignored and cleared.
+3. **Cloudflare Access's assertion** (`Cf-Access-Jwt-Assertion`) when
+   `[cloudflare_access]` is set. Its signature is checked, so it is honored from any
+   peer, and an invalid one is `401`.
+4. **Trusted proxy headers** (`Remote-User`, `X-Forwarded-User`, …), only from a peer in
    `proxy.trusted`. An entry there is a CIDR, or `unix` for `--unix-socket`. From any
    other peer the headers are ignored and counted in
    `sparkles_auth_untrusted_proxy_headers_total`.
-4. **Anonymous**, with the grants of `[anonymous]` (none by default).
+5. **Anonymous**, with the grants of `[anonymous]` (none by default).
 
 | Principal | Log name | From |
 |---|---|---|
 | user | `user:bob` | `[[users]]` (argon2id password) |
 | token | `token:tok_…`, `token:cfg-NAME` | minted tokens, and static `[[tokens]]` |
-| oidc | `oidc:alice@example.org` | a web UI login through the OIDC provider |
-| proxy | `proxy:dave` | trusted headers of a forward-auth proxy |
+| oidc | `oidc:alice@example.org` | a web UI login through the OIDC provider, or the provider's access token |
+| proxy | `proxy:dave` | trusted headers of a forward-auth proxy, or a Cloudflare Access assertion |
 | anonymous | `anonymous` | nothing else applied |
 
 ### Permissions
@@ -4619,6 +4777,16 @@ intersected with its owner's current grants, or with its parent token's grants f
 token minted by a token. Removing a grant or a role mapping shrinks every token at its
 next request.
 
+The owner of a token minted by an OIDC or proxy identity is recorded with its groups.
+Whenever the provider or proxy asserts that identity's groups again, at a web UI login,
+with an access token or Cloudflare Access assertion that carries the groups claim, or in
+the proxy's groups header, the server records the new groups in the identity's tokens
+and sessions. A token therefore loses what a group gave it once its owner leaves the
+group and signs in again, and it stops working when the owner is no longer admitted.
+It also gains what a new group gives, within its scope. A proxy request without the
+groups header leaves the recorded groups alone. The audit event `groups_refreshed` names
+the owner and the number of tokens and sessions that changed.
+
 ### Status codes
 
 | Caller's level on `{ds}` | Caller | Dataset exists | Answer |
@@ -4630,7 +4798,9 @@ next request.
 | too low | signed in | yes | `403 {"error":"write access to /ds required"}` |
 
 Invalid credentials get `401 {"error":"invalid credentials"}`, or `token expired`, with
-`WWW-Authenticate: Bearer realm="sparkles", error="invalid_token"`. Browser navigations,
+`WWW-Authenticate: Bearer realm="sparkles", error="invalid_token"`. When the identity
+provider's keys cannot be fetched to check a JWT, the answer is
+`503 {"error":"identity provider unavailable"}` with `Retry-After`. Browser navigations,
 and non-browser clients when users are configured, also get a `Basic` challenge. Missing
 server permissions give `401` to anonymous callers and `403`
 (`{"error":"metrics permission required"}`) to others. A clone needs `admin` on the source
@@ -4643,7 +4813,7 @@ without the permission is a `403` before any connection or file is opened, even 
 | Route | Method | Needs |
 |---|---|---|
 | `/ui/*`, `/$/ping`, `/$/ready` | GET | Nothing. Without `metrics`, `/$/ready` lists only readable datasets. |
-| `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*`, `/$/auth/device`, `/$/auth/token` | | Nothing. Invalid credentials are still `401`. |
+| `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*` (including the back-channel logout), `/$/auth/device`, `/$/auth/token` | | Nothing. Invalid credentials are still `401`. |
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | Any caller. `/$/format` admits nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. Cancelling a task (DELETE) needs `admin` on its dataset. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
@@ -4989,7 +5159,7 @@ type Whoami = {
   datasets: Record<string, "read" | "write" | "admin">;   // existing datasets only
   // datasets where the caller's grants cover only some graphs, endpoints or triples
   restricted: Record<string, { graphs: boolean; triples?: true; endpoints?: string[] }>;
-  canMintTokens: boolean;
+  canMintTokens: boolean;  // false for static tokens and the provider's access tokens
   logout: boolean;
   tokensPolicy?: { defaultTtlSeconds: number; maxTtlSeconds: number };
 };
@@ -5002,7 +5172,7 @@ Without auth, the response is `{"authEnabled": false, "principal": {"kind": "loc
 `{"enabled": true, "methods": ["oidc", "token", "password", "proxy"], "oidc": {"loginUrl",
 "displayName"}, "cli": {"authorizeUrl", "deviceAuthorizationEndpoint", "tokenEndpoint",
 "deviceVerificationUri"}}`, or `{"enabled": false}`. Without auth, the other `/$/auth/*`
-routes return `404`.
+routes return `404`. `token` is listed only when `session.token_login` is on.
 
 ### Web UI sign-in and sessions
 
@@ -5010,6 +5180,11 @@ routes return `404`.
   and a session cookie. The cookie is `HttpOnly`, `SameSite=Lax` and `Secure` over https,
   with `Max-Age` = `session.ttl` (default 12 h). A token session ends with its token.
   Wrong credentials get `401`.
+* Signing in to the UI with an API token is off by default, so that a token copied into
+  a script or a CI secret cannot also open a browser session. With
+  `[session] token_login = true` the login page offers it. Otherwise `{"token"}` gets
+  `403` before the token is looked up, and API tokens keep working as `Bearer`
+  credentials.
 * `GET /$/auth/oidc/login?return_to=/ui/…` redirects (`302`) to the provider. It uses the
   authorization code flow with PKCE `S256`, a `state` bound to the browser by a login
   cookie, and a `nonce`. The callback `GET /$/auth/oidc/callback` checks the state and
@@ -5019,7 +5194,27 @@ routes return `404`.
   to `return_to` with a session cookie. Failures go to
   `/ui/login?error=state|idp|idp_unavailable|not_allowed`.
 * `POST /$/auth/logout` returns `{"redirect": url | null}`. The URL is the provider's
-  end-session URL for OIDC sessions, and `proxy.logout_url` for proxy users.
+  end-session URL for OIDC sessions, and `proxy.logout_url` for proxy users, or
+  `/cdn-cgi/access/logout` with `[cloudflare_access]`.
+* `POST /$/auth/oidc/backchannel-logout` takes the provider's logout token as the form
+  field `logout_token` (OpenID Connect Back-Channel Logout 1.0). Register
+  `{public_url}/$/auth/oidc/backchannel-logout` at the provider. The token must be
+  signed with a key of the provider and name the provider as `iss` and `client_id` in
+  `aud`. Its `iat` must be at most 10 minutes old, and it must carry the back-channel
+  logout event, a `jti` not seen before, `sid` or `sub`, and no `nonce`. A token with
+  `sid` ends the session the provider opened under that id. A token with only `sub` ends
+  every session of that subject. The answer is `200` with `Cache-Control: no-store`, or
+  `400 {"error":"invalid_request"}`. API tokens minted from those sessions stay valid,
+  because they belong to the account rather than the session. Sessions opened by an
+  older version of the server recorded no `sid` or `sub`, so the provider cannot end
+  them.
+
+A session lasts `session.ttl` (12 h by default) after the login. With
+`session.idle_timeout`, it also ends once it has not been used for that long, and each
+request moves that deadline. `whoami`'s `expires` is the earlier of the two. The time of
+last use is kept in memory and written to the session store with its next write, hourly
+and at shutdown, so after a crash a session may end up to an hour of use earlier than it
+would have.
 
 Sessions are kept in `<data>/auth/sessions.json`, with hashed ids and mode 0600, and
 survive restarts. Replacing `<data>/auth/session.key` signs everyone out. An owner keeps
@@ -5027,6 +5222,61 @@ at most 50 sessions, and a new session ends the owner's oldest. An owner is a us
 OIDC or proxy identity. A token login counts for the token's owner. The server keeps at
 most 10,000 sessions. When it is full, the owner that holds the most loses its oldest
 session, so that no one can sign the others out by opening sessions.
+
+### Access tokens of the identity provider
+
+With `oidc.api_audience` set, an API client may send an access token issued by the OIDC
+provider as `Authorization: Bearer <JWT>`. A client credentials grant of a CI job and a
+token a single-page app obtained for its user both work. The server checks the token
+against RFC 7519:
+
+* The signature must verify with a key of the provider's JWKS, found by `kid`, under
+  one of `oidc.algorithms`. `none`, HMAC algorithms, a key embedded in the token
+  (`jwk`, `jku`, `x5u`, `x5c`), a `crit` header and an encrypted token are refused.
+* `iss` must be the provider's issuer, and `aud` must contain one of `api_audience`.
+* `exp` is required. `exp`, `nbf` and `iat` allow 60 seconds of clock skew.
+* Every scope of `api_scopes` must be in `scope` (space-separated) or `scp`.
+
+The account comes from `api_name_claim`, which defaults to `name_claim`. `client_id` or
+`azp` name the client of a client credentials grant. The principal is
+`oidc:{name}` with the groups of `groups_claim`. It is admitted and mapped to roles by
+`[external]` exactly like a web UI login, so the provider must put the groups claim into
+access tokens as well as ID tokens. A token that does not identify a person at the UI
+cannot mint Sparkles tokens, and `POST /$/auth/tokens` answers `403`.
+
+The JWKS is fetched on first use and kept for an hour. When a token names a key id that
+the cached set lacks, the set is fetched again, at most once every five minutes, so
+rotated keys are picked up and random key ids cause no extra requests. Concurrent
+requests share one fetch. While the provider is unreachable, the keys fetched before
+keep verifying. Without any keys the answer is `503`.
+
+Choose an `api_audience` that names the API, not the web UI's `client_id`, so that an
+ID token cannot stand in for an access token. The server warns when the list contains
+the `client_id`.
+
+### Cloudflare Access
+
+Behind [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/), the
+`[cloudflare_access]` section verifies the `Cf-Access-Jwt-Assertion` header that Access
+adds to every request it lets through. This replaces the `cloudflare-access` proxy
+preset, which trusts the unsigned `Cf-Access-Authenticated-User-Email` header, and the
+two cannot be combined.
+
+```toml
+[cloudflare_access]
+team_domain = "https://example.cloudflareaccess.com"
+audience = "<the AUD tag of the Access application>"   # a string or a list
+# groups_claim = "groups"   # a claim of the assertion with the user's groups
+```
+
+The assertion must be signed with RS256 by a key of `{team_domain}/cdn-cgi/access/certs`,
+name `team_domain` as `iss` and one of `audience` in `aud`, and be unexpired. A user's
+assertion names the account by `email`, and the principal is `proxy:{email}`. The edge
+attaches the assertion to every request of the browser, so the CSRF rules of proxy
+principals apply. A service token's assertion names the account by `common_name`, the
+token's client id. Such a principal acts like a bearer token, needs no CSRF token and
+cannot mint tokens. Both are admitted and mapped to roles by `[external]`. Since the
+signature is checked, the assertion is honored from any peer.
 
 ### API tokens
 
@@ -5066,6 +5316,13 @@ their SHA-256, in `<data>/auth/tokens.json` with mode 0600.
   `{access_token, token_type: "Bearer", expires_in, token_id, principal}` once. At most
   1000 logins can be pending. A session may fail 20 code lookups per 10 minutes, and then
   gets `429`.
+
+Device logins survive a restart of the server. `<data>/auth/device-grants.json` (mode
+0600) keeps each pending or decided login with the SHA-256 of its device code, never the
+code itself or a token. When a login was approved before a restart and the CLI had not
+yet fetched its token, the next poll gets a new secret for the token minted at approval.
+That token keeps its id, scope and expiry, and the audit log records `token_reissued`.
+Loopback codes of the browser flow live in memory and last two minutes.
 
 Approval needs a web UI session or proxy identity. Bearer and Basic callers get
 `403 this action requires signing in to the web UI`.
@@ -5119,6 +5376,10 @@ name_claim = "email"                         # or preferred_username, sub
 groups_claim = "groups"
 display_name = "Example SSO"
 algorithms = ["RS256", "ES256"]
+# the provider's access tokens on the API (Authorization: Bearer <JWT>)
+# api_audience = "https://sparql.example.org"   # a string or a list
+# api_scopes = ["sparkles"]                     # all required
+# api_name_claim = "email"                      # default: name_claim; or client_id, azp
 
 [external]                                   # OIDC and proxy identities
 allowed_groups = ["sparkles"]                # empty lists admit everyone
@@ -5131,7 +5392,9 @@ default_roles = []
 "alice@example.org" = ["admins"]
 
 [session]
-ttl = "12h"
+ttl = "12h"                                  # the longest a session lasts
+# idle_timeout = "30m"                       # a session unused this long ends
+# token_login = false                        # true: the login page accepts API tokens
 # key_file = "/var/lib/sparkles/auth/session.key"
 
 [proxy]                                      # off unless present
@@ -5142,12 +5405,17 @@ groups_separator = ","
 name_from = "user"                           # or "email"
 logout_url = "https://auth.example.org/logout"
 
+# [cloudflare_access]                        # instead of the cloudflare-access preset
+# team_domain = "https://example.cloudflareaccess.com"
+# audience = "<the application's AUD tag>"
+
 [cors]
 origins = ["https://yasgui.example.org"]     # default: none
 ```
 
 The OIDC redirect URI to register at the provider is
-`{public_url}/$/auth/oidc/callback`.
+`{public_url}/$/auth/oidc/callback`, and the back-channel logout URI is
+`{public_url}/$/auth/oidc/backchannel-logout`.
 
 **Forward-auth proxies.** The proxy must overwrite or strip client-supplied identity
 headers on every route, including routes it lets through without authentication. Trust
@@ -5168,8 +5436,10 @@ clients use to reach the proxy with `--public-host` or `server.public_url`. The 
 warns at startup when it knows no such name, and the NixOS module passes its virtual
 host.
 
-Credentials travel as bearer secrets, so terminate TLS in front of the server. The server
-warns when auth is on and it listens beyond loopback.
+Credentials travel as bearer secrets, so terminate TLS in front of the server, or let it
+serve HTTPS itself with `--tls-cert` and `--tls-key` (see
+[TLS](USAGE.md#tls)). The server warns when auth is on and it listens beyond loopback
+without TLS.
 
 **Command line.** These commands handle authentication:
 
@@ -5222,8 +5492,9 @@ keeps a single network from filling the queue for everyone.
 `sparkles_auth_password_verifications_running`, `sparkles_auth_password_verifications_waiting`,
 `sparkles_auth_untrusted_proxy_headers_total`, `sparkles_auth_reloads_total{result}`, and
 the policy sizes `sparkles_auth_policy_{users,tokens,roles}`. Audit events are logged at
-INFO under `sparkles::audit`. They cover logins, logouts, minted and revoked tokens,
-device approvals and reloads.
+INFO under `sparkles::audit`. They cover logins, logouts, back-channel logouts, minted,
+reissued and revoked tokens, refreshed groups, device approvals and reloads. A failure to
+fetch the identity provider's keys counts as `reason="idp"`.
 
 ## MCP server
 
@@ -5292,7 +5563,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | Tool | Arguments (besides the common ones) | Result |
 |---|---|---|
 | `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}` |
-| `describe_schema` | `section` (`summary`\|`classes`\|`predicates`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor` | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?}], next, prefixes}`. The summary lists the largest classes and predicates. `classes` and `predicates` page through all entries in IRI order. |
+| `describe_schema` | `section` (`summary`\|`classes`\|`predicates`\|`constraints`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor`, `subjectClasses`, `shapes` | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?, subjectClasses?: ["ex:Person 120", …, "untyped 3"]}], constraints?: [{source, graphs, mode?, threshold?, classes: [{class, closed?, properties: [{path, constraints: "min 1 · max 1 · datatype xsd:string", enforcement}]}]}], next, prefixes}`. The summary lists the largest classes and predicates. `classes` and `predicates` page through all entries in IRI order. `subjectClasses: true` adds the ten classes of each predicate's subjects with the most triples. `constraints` lists the [constraints layer](#constraints-layer), from the write-time SHACL validation or from the sources in `shapes`. |
 | `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, in SHACL Turtle or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
 | `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | One text block: a table or a JSON document (below). No `structuredContent`. |
 | `explain_query` | `query` (required), `includeAlgebra` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. |
@@ -5300,7 +5571,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null}` |
 | `search_text` | `query` (required, ≤ 1000 characters: terms, `"phrases"`, AND/OR, `+required`, `-excluded`), `predicates` (≤ 20 IRIs), `lang`, `limit` (20, ≤ 200), `withTypes` (true) | `{dataset, commit, hits: [{s, score, text, p, label?, types?}], limited, prefixes}`: BM25-ranked matches of `text:query`. `text` is the matched literal, escaped and at most 300 characters long, and `types` has at most 3 entries. Only in builds with the `text` feature. A dataset without an index (`textSearch: false`) gives `text-disabled`. |
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: an exact `spk:vectorSearch` over the stored `spk:vector` literals. The tool never computes embeddings. `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector. |
-| `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
+| `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `shapesFormat` (`turtle` or `shaclc`), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
 | `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
 | `sparql_update` | `update` (required, ≤ 1 Mi characters), `message` (the commit message), `dryRun` (preview instead of committing), `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | `{dataset, committed, commit, inserted, deleted, message?, validation?, elapsedMs}`: the receipt of the write. A dry run adds `dryRun`, `wouldCommit`, `outcome`, `head`, `graphs`, `changes?`, `storage` and `error?` (below). Listed only when the server allows updates and the caller may write to a dataset (below). |

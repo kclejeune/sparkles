@@ -105,8 +105,9 @@ pub fn update_in(txn: &mut WriteTxn<'_>, u: &str, opts: &QueryOptions) -> Result
     })
 }
 
-/// Parse an update request with the base IRI and prefixes of `opts`.
-fn parse_update(u: &str, opts: &QueryOptions) -> Result<spargebra::Update> {
+/// Parse an update request with the base IRI and prefixes of `opts`, and the protocol's
+/// `using-graph-uri` and `using-named-graph-uri` from `opts`.
+pub fn parse_update(u: &str, opts: &QueryOptions) -> Result<spargebra::Update> {
     let mut p = super::aggext::register(SparqlParser::new());
     if let Some(b) = &opts.base_iri {
         p = p

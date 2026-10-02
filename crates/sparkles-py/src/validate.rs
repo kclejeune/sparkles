@@ -206,11 +206,17 @@ pub fn shacl(
     ds: sparkles::Dataset,
     shapes: Option<String>,
     format: Option<RdfFormat>,
+    compact: bool,
     shapes_graph: Option<String>,
     data_graph: Option<String>,
     include_inferred: bool,
 ) -> PyResult<PyShaclReport> {
-    use sparkles_shacl::{Shapes, ValidateOptions};
+    use sparkles_shacl::{Shapes, ShapesSyntax, ValidateOptions};
+    let syntax = if compact {
+        ShapesSyntax::Compact
+    } else {
+        format.unwrap_or(RdfFormat::Turtle).into()
+    };
     let snap = ds.snapshot();
     let shapes = match (shapes, shapes_graph) {
         (Some(_), Some(_)) => {
@@ -218,7 +224,7 @@ pub fn shacl(
         }
         (None, None) => return Err(errors::invalid(py, "give shapes or shapes_graph")),
         (Some(text), None) => py
-            .detach(|| Shapes::parse(&text, format.unwrap_or(RdfFormat::Turtle), None))
+            .detach(|| Shapes::parse(&text, syntax, None))
             .map_err(|e| errors::syntax(py, format!("{e:#}")))?,
         (None, Some(g)) => py
             .detach(|| Shapes::from_store(&snap, Some(&g)))
@@ -274,6 +280,7 @@ pub fn shacl(
     _ds: sparkles::Dataset,
     _shapes: Option<String>,
     _format: Option<RdfFormat>,
+    _compact: bool,
     _shapes_graph: Option<String>,
     _data_graph: Option<String>,
     _include_inferred: bool,

@@ -113,11 +113,13 @@ pub fn server_json(st: &AppState) -> J {
 }
 
 /// `serve --auth-config`: load and validate the configuration (an error stops the
-/// server before it binds) and log its warnings.
+/// server before it binds) and log its warnings. `tls`: the server terminates TLS itself
+/// (`--tls-cert`).
 pub fn load(
     path: Option<&std::path::Path>,
     data_dir: &std::path::Path,
     host: &str,
+    tls: bool,
 ) -> anyhow::Result<Option<Arc<super::Auth>>> {
     let Some(path) = path else {
         return Ok(None);
@@ -129,9 +131,11 @@ pub fn load(
             tracing::warn!("auth configuration: {w}");
         }
         if !crate::exposure::local_listener(host) {
-            tracing::warn!(
-                "credentials are accepted over plain HTTP on {host}; terminate TLS in front of the server"
-            );
+            if !tls {
+                tracing::warn!(
+                    "credentials are accepted over plain HTTP on {host}; terminate TLS in front of the server or pass --tls-cert and --tls-key"
+                );
+            }
             if auth.policy().proxy.is_some() {
                 tracing::warn!(
                     "trusted-header auth is enabled and the server listens on {host}: any host in proxy.trusted can impersonate any user; make sure only the proxy can reach this port"
@@ -143,7 +147,7 @@ pub fn load(
     }
     #[cfg(not(feature = "auth"))]
     {
-        let _ = (host, data_dir);
+        let _ = (host, data_dir, tls);
         anyhow::bail!(
             "--auth-config {}: built without authentication (cargo feature \"auth\")",
             path.display()
@@ -195,10 +199,13 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
 /// expired sessions hourly while running.
 pub fn flush(st: &AppState) {
     #[cfg(feature = "auth")]
-    if let Some(a) = &st.auth
-        && let Err(e) = a.tokens.flush()
-    {
-        tracing::warn!("cannot write the token store: {e:#}");
+    if let Some(a) = &st.auth {
+        if let Err(e) = a.tokens.flush() {
+            tracing::warn!("cannot write the token store: {e:#}");
+        }
+        if let Err(e) = a.sessions.flush() {
+            tracing::warn!("cannot write the session store: {e:#}");
+        }
     }
     let _ = st;
 }
@@ -220,7 +227,8 @@ pub fn spawn_reload_on_sighup(st: &Arc<AppState>) {
                 loop {
                     t.tick().await;
                     let now = prune_auth.now();
-                    if let Err(e) = prune_auth.sessions.prune(now) {
+                    let idle = prune_auth.policy().session_idle;
+                    if let Err(e) = prune_auth.sessions.prune(now, idle) {
                         tracing::warn!("cannot prune sessions: {e:#}");
                     }
                 }

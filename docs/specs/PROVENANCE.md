@@ -748,6 +748,42 @@ implementation landed.
   - a `peg` grammar;
   - treating budget overruns as nonconformant.
 
+## SHACL Compact Syntax and list constraints
+
+- **Spec:** [`G03-shaclc.md`](G03-shaclc.md), written on 2026-10-02 independently from:
+  - the Sparkles code and specs C02, C10 and C11;
+  - the SHACL 1.2 Core and SHACL 1.2 Compact Syntax editor's drafts and the SHACL 1.0
+    Compact Syntax Working Group Note, fetched from the Working Group's pages. They are
+    under the W3C Software and Document License;
+  - the SHACL Compact Syntax test pairs, as copied into Apache Jena, and the SHACL 1.2
+    list constraint tests of the Working Group's test suite;
+  - Apache Jena's `jena-shacl` sources (Apache-2.0): the SHACLC grammar, reader, writer,
+    list constraints and tests, read for behaviour. No code was copied.
+
+  Fluree was not consulted.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. Fluree was not
+  consulted.
+  - The lexer and parser (`compact/lex.rs`, `compact/read.rs`) are hand-written from the
+    grammar and production rules of the Compact Syntax drafts. Jena's JavaCC grammar and
+    `ShaclCompactParser.java` were read for the extensions and the datatype rule. No
+    code was copied.
+  - The writer (`compact/write.rs`) is written from spec §5. It does not follow Jena's
+    writer, which works from the parsed shapes.
+  - The list constraints follow the SHACL 1.2 Core draft's textual definitions and its
+    definition of a SHACL list. Jena's `List*` constraint classes were read for behaviour.
+  - **Dependencies:** none new. `sparkles-shacl` now uses `oxiri`, already in the
+    workspace.
+  - **Test data:** the eight SHACL 1.2 list tests are vendored in
+    `crates/sparkles-shacl/tests/shacl12/` under the W3C Software and Document License,
+    with a README. The SHACLC test pairs and Jena's syntax tests are read from the Jena
+    checkout, not vendored.
+- **Rejected** (spec §10):
+  - writing SHACLC from the parsed shapes model;
+  - skipping what cannot be written;
+  - storing inline SHACLC as written;
+  - a parser generator;
+  - SHACLC as a general RDF syntax.
+
 ## Python bindings
 
 - **Spec:** [`P01-python-bindings.md`](P01-python-bindings.md), written on 2026-10-02
@@ -813,6 +849,31 @@ implementation landed.
   - refusing writes during a build;
   - a size-only or ratio-only trigger;
   - compacting every idle period whatever the delta's size.
+
+## Command-line tools and IRI and language-tag checks
+
+- **Spec:** [`G05-command-line-tools.md`](G05-command-line-tools.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code;
+  - Apache Jena's `jena-cmds` (`riot`, `CmdLangParse`, `ModLangParse`, `ModLangOutput`,
+    `qparse`, `uparse`, `rdfdiff`, `rdfcompare`, `iri`, `rsparql`, `rupdate`, `rset`),
+    `jena-langtag` (`CmdLangTag`) and `jena-iri3986` (`Issue`) sources (Apache-2.0),
+    read for behaviour, flags, output and the list of IRI issues. No code was copied;
+  - RFC 3986, RFC 3987, RFC 9110 §4.2, RFC 8141, RFC 9562, RFC 3061, RFC 8089, W3C DID
+    Core 1.0 §3.1, the IANA URI scheme registry, BCP 47 (RFC 5646), RDF 1.1 and 1.2
+    Concepts, RDFC-1.0, the SPARQL 1.1 Protocol and the SPARQL result formats.
+
+  Fluree was not consulted.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. The IRI and
+  language-tag rules, dot-segment removal and the per-group isomorphism check are written
+  from the RFCs. **Dependencies:** none new. `sparesults` 0.3 (MIT OR Apache-2.0), already
+  a dependency of `sparkles`, became a direct dependency of `sparkles-server`.
+- **Rejected** (spec §8):
+  - a plain endpoint URL in `query --server`, which would send saved tokens to other
+    servers;
+  - canonicalizing whole datasets for the diff of `compare`;
+  - checking terms inside the loader;
+  - a subtag registry for `langtag`.
 
 ## Development tools (not linked into Sparkles)
 

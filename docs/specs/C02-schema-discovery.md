@@ -4,14 +4,18 @@
 >
 > **Phases:** Phase 1 shipped: the `sparkles::schema` library, `GET /$/schema/{ds}` with
 > paginated class and predicate listings, `sparkles schema`, and the UI schema browser.
-> From Phase 2, the VoID/Turtle export shipped. Phase 4 shipped on 2026-10-02: shapes
-> drafted from the data, as `GET /$/schema/{ds}/shapes`, `sparkles schema
-> --draft-shapes`, the MCP tool `draft_shapes` and the schema browser's Draft shapes
-> dialog. The SHACL constraints layer, subject classes per predicate and Phase 3 are not
-> built.
+> Most of Phase 2 shipped: the VoID/Turtle export, the SHACL constraints layer with
+> `GET /$/schema/{ds}/constraints`, and `detail=subjectClasses`. The GSPO-driven scan for
+> small named graphs and the `/$/stats` class counts of Phase 2 are not built. Phase 4
+> shipped on 2026-10-02: shapes drafted from the data, as `GET /$/schema/{ds}/shapes`,
+> `sparkles schema --draft-shapes`, the MCP tool `draft_shapes` and the schema browser's
+> Draft shapes dialog. Phase 3 is not built.
 >
 > **User docs:** [API: Schema discovery](../API.md#schema-discovery) ·
+> [API: Constraints layer](../API.md#constraints-layer) ·
+> [API: Subject classes](../API.md#subject-classes) ·
 > [API: Drafted shapes](../API.md#drafted-shapes) ·
+> [Usage: Constraints next to the counts](../USAGE.md#constraints-next-to-the-counts) ·
 > [Usage: Drafting shapes](../USAGE.md#drafting-shapes-from-the-data) ·
 > [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
@@ -582,6 +586,33 @@ removed, `maxPerSubject = 1`, and no field anywhere changes its name or meaning.
    answer after one. With CI, cursors bind to `commit` and survive both restarts and
    compaction, as long as the cached report or an identical recomputation is available.
 
+The constraints layer of Phase 2 raised four more questions. They were settled when it
+was built, on 2026-10-02.
+
+6. *Which shapes does the layer read when the request names none?* Phase 2 named only
+   `shapes=<graph IRI>`. Write-time validation ([C10](C10-write-time-validation.md)) now
+   gives each dataset a set of shapes it actually uses, read from the shapes graphs its
+   configuration designates and from its shapes file. The summary includes those shapes
+   by default, and `shapes=` names the sources explicitly: `guard`, `default`, graph
+   IRIs, or `none`. Requests that name no shapes and target a dataset without SHACL
+   validation get no layer, so their JSON is unchanged.
+7. *What does `enforcement` say now that C10 exists?* Each property shape carries its own
+   label. A shape of a guard in `reject` mode whose severity is at or above the guard's
+   threshold is `reject-on-write`. A shape of a guard in `warn` mode, or one below the
+   threshold, is `warn-on-write`. Shapes read from graphs named by the request are
+   `validated-on-request`. The layer never derives a constraint from the counts, and the
+   observed layer never reads the shapes.
+8. *Which property shapes belong to a class?* The shapes that target it with
+   `sh:targetClass` or an implicit class target, and the shapes reached from them through
+   `sh:node` and `sh:and`, which apply to the same focus nodes. `sh:or`, `sh:xone` and
+   `sh:not` impose nothing on their own, so their shapes are left out, and so are
+   deactivated shapes. Paths other than a single predicate are counted, not listed, and
+   so are shapes whose targets are not classes.
+9. *Is the layer cached with the report?* No. It is built from the shapes for every
+   summary request, which costs a parse of the shapes graphs or nothing for the guard,
+   whose shapes are already parsed. The report's cache and its cursors are unchanged.
+   `detail=subjectClasses` changes the counts, so it is part of the selection hash.
+
 ## 10. Sources
 
 - The Sparkles repository, the only implementation source:
@@ -870,11 +901,12 @@ may revisit them.
 - The description also carries `dcterms:title` (the dataset name) and `dcterms:created`
   (the time the report was computed). Labels and comments keep their language tags.
 
-**Not built.** The rest of Phase 2 was not built: the SHACL constraints layer,
-`detail=subjectClasses`, the GSPO-driven scan for small named graphs, and `/$/stats` class
-counts from the same pass. Phase 3 was not built either: per-class property profiles
-as a listing, anonymous class expressions, schema diffs and incremental maintenance.
-Phase 4 computes per-class profiles for its drafts, but no endpoint lists them.
+**Not built.** The GSPO-driven scan for small named graphs and the `/$/stats` class
+counts from the same pass were not built, so open question 3 stays open for
+`/$/stats`. Phase 3 was not built either: per-class property profiles as a listing,
+anonymous class expressions, schema diffs and incremental maintenance. Phase 4 computes
+per-class profiles for its drafts, but no endpoint lists them. The constraints layer and
+subject classes landed later, as described at the end of this section.
 
 **Phase 4 landed on 2026-10-02**, as §11 designed it.
 
@@ -929,3 +961,63 @@ draft took 0.45 s (minimum 0.24 s). A closed ShEx draft at support 0.95 took 0.3
 A draft costs about five schema reports, mostly for the per-subject summaries and the
 map of typed subjects.
 
+**The constraints layer and subject classes of Phase 2 landed on 2026-10-02.** Open
+questions 6 to 9 record the decisions taken for them.
+
+- `sparkles::schema::constraints` holds the types of the layer, and
+  `sparkles_shacl::constraints` builds it from parsed shapes. For each class that shapes
+  target, it lists the property shapes with a predicate path and their `sh:minCount`,
+  `sh:maxCount`, `sh:datatype`, `sh:class` and `sh:nodeKind`, the components of their
+  other constraints, their severity and their enforcement. `ShaclGuard::shapes` exposes
+  the shapes an installed guard validates against, and `configured_shapes` reads those
+  of a database's `validation.json` without installing a guard, for the CLI.
+- `GET /$/schema/{ds}` carries the layer in `constraints`, and the new
+  `GET /$/schema/{ds}/constraints` answers with the layer alone, without counting
+  anything. A caller limited to some graphs reads only shapes graphs it may read, and
+  sees the guard's shapes only when it may read every shapes graph of the guard.
+- `SchemaOptions::subject_classes` and `detail=subjectClasses` add the classes of each
+  predicate's subjects, with triple and subject counts, and the triples whose subjects
+  have no IRI class. As §6 proposed, they come from a merge join of the predicate's
+  subjects in PSO order with the selection's `(subject, class)` pairs of `rdf:type`, both
+  sorted by subject. The pairs are read once per report, so the detail costs one pass
+  over `rdf:type` and 16 bytes of memory per typed pair.
+- `sparkles schema` gained `--subject-classes` and `--shapes`. The text report prints a
+  line of subject classes under each predicate and then the constraints, one line per
+  property shape with its enforcement.
+- The MCP tool `describe_schema` gained `section: "constraints"`, with a `shapes`
+  argument, and `subjectClasses`, which adds the ten classes with the most triples to
+  each predicate.
+- The UI's schema browser shows a SHACL chip next to the observed and declared chips of
+  each constrained property, and the class panel lists the class's constraints with
+  their enforcement. The chips are styled apart from the observed ones and never merged
+  with them.
+
+**Choices made during implementation.**
+
+- A ShEx guard is not summarized. The layer is defined in SHACL terms, and a ShEx
+  schema's triple constraints would need a mapping of their own.
+- With `at=`, shapes graphs are read at that state, but the guard's shapes are always
+  those installed now, because the configuration has no history.
+- Several shapes graphs named by one request form one source, merged as write-time
+  validation merges its shapes graphs, so that shapes may refer to each other across
+  them.
+- When a property shape repeats `sh:minCount` or `sh:maxCount`, the layer reports the
+  strictest value. A second `sh:datatype` or `sh:nodeKind` is reported only as its
+  component in `other`.
+
+**Tests at landing.** `sparkles-shacl/tests/constraints.rs` covers targets, implicit
+class targets, `sh:node`, `sh:or`, deactivated shapes, inverse paths, other targets and
+the enforcement of each guard mode and threshold. `schema::tests::subject_classes_of_predicates`
+checks the counts per graph selection, after a delta and after compaction.
+`http::schema::tests::constraints_layer` and `subject_classes_on_request` cover the
+parameters, both sources, the errors and the cursor rule.
+`router_tests::auth::graphs::constraints_cover_the_view` checks the rules for callers
+limited to some graphs, `mcp::tests::describe_schema_constraints_and_subject_classes`
+covers the tool, `tests/cli_schema.rs` runs the CLI, and Vitest covers the UI helpers.
+
+**SHACLC drafts (2026-10-02, with [G03](G03-shaclc.md)).** The draft is also rendered in
+the SHACL Compact Syntax, with the same counts as comments. The JSON gains a `shaclc`
+field, `format=shaclc` and `Accept: text/shaclc` select it, `sparkles schema
+--draft-shapes --format shaclc` prints it, and the UI's dialog has a SHACLC tab.
+`tests/draft.rs` of `sparkles-shacl` checks that every drafted SHACLC reads to the same
+graph as the drafted Turtle.

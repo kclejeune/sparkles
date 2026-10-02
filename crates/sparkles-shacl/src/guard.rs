@@ -24,8 +24,10 @@
 use crate::data::DataGraph;
 use crate::incremental::{Fallback, Model, Tuning};
 use crate::validate::{Sel, ShapeRun, validate_selected};
-use crate::{PropertyPath, Shapes, ValidateOptions, ValidationReport, ValidationResult};
-use anyhow::{Context, Result, bail};
+use crate::{
+    PropertyPath, Shapes, ShapesSyntax, ValidateOptions, ValidationReport, ValidationResult,
+};
+use anyhow::{Context, Result, anyhow, bail};
 use oxrdf::{NamedNode, Term};
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -113,7 +115,8 @@ pub struct ShapesSource {
     /// shapes text given when setting the configuration (not stored in the file)
     #[serde(default, skip_serializing)]
     pub inline: Option<String>,
-    /// media type of `inline` (default Turtle)
+    /// media type of `inline` (default Turtle): an RDF syntax or `text/shaclc`. Shapes
+    /// in another syntax than Turtle are stored as Turtle.
     #[serde(default, skip_serializing)]
     pub format: Option<String>,
 }
@@ -336,6 +339,12 @@ impl ShaclGuard {
 
     pub fn config(&self) -> &ValidationConfig {
         &self.cfg
+    }
+
+    /// The shapes every write is validated against now. They are read again when a
+    /// write changes a shapes graph.
+    pub fn shapes(&self) -> Arc<Shapes> {
+        self.loaded.read().shapes.clone()
     }
 
     /// The limits past which a write is validated in full.
@@ -802,7 +811,9 @@ fn engine_error(e: anyhow::Error) -> sparkles::Error {
     }
 }
 
-fn severity_of(iri: &str) -> Severity {
+/// The rank of a `sh:severity` IRI. An IRI outside SHACL's severities ranks as a
+/// violation, so that it fails closed.
+pub fn severity_of(iri: &str) -> Severity {
     match iri {
         "http://www.w3.org/ns/shacl#Warning" => Severity::Warning,
         "http://www.w3.org/ns/shacl#Info" => Severity::Info,
@@ -1144,13 +1155,8 @@ pub fn read_config(root: &Path) -> Result<Option<ValidationConfig>> {
 fn shapes_text(
     cfg: &ValidationConfig,
     root: Option<&Path>,
-) -> Result<Option<(String, crate::RdfFormat)>> {
-    let format = cfg
-        .shapes
-        .format
-        .as_deref()
-        .and_then(sparkles::io::format_for_media_type)
-        .unwrap_or(crate::RdfFormat::Turtle);
+) -> Result<Option<(String, ShapesSyntax)>> {
+    let format = inline_syntax(cfg)?;
     let text = match (&cfg.shapes.inline, &cfg.shapes.file, root) {
         (Some(t), _, _) => t.clone(),
         (None, None, _) if cfg.shapes.graphs.is_some() => return Ok(None),
@@ -1159,6 +1165,16 @@ fn shapes_text(
         (None, _, None) => bail!("no shapes given"),
     };
     Ok(Some((text, format)))
+}
+
+/// The syntax of a configuration's inline shapes (Turtle without a format).
+fn inline_syntax(cfg: &ValidationConfig) -> Result<ShapesSyntax> {
+    match cfg.shapes.format.as_deref() {
+        None => Ok(ShapesSyntax::default()),
+        Some(mt) => ShapesSyntax::from_media_type(mt).ok_or_else(|| {
+            anyhow!("shapes: unknown format {mt:?} (an RDF media type or text/shaclc)")
+        }),
+    }
 }
 
 /// The shapes of a configuration over `snap`, and the graph of its shapes file when it
@@ -1179,6 +1195,26 @@ fn load_shapes(
         (None, Some((text, format))) => Ok((Shapes::parse(&text, format, None)?, None)),
         (None, None) => bail!("no shapes given"),
     }
+}
+
+/// The SHACL shapes of the write-time validation configured for a persistent store, read
+/// without installing a guard: its shapes graphs in the store's current state and its
+/// shapes file. `None` when the store has no SHACL configuration or validation is off.
+pub fn configured_shapes(store: &Store) -> Result<Option<(ValidationConfig, Shapes)>> {
+    let Some(root) = store.root() else {
+        return Ok(None);
+    };
+    if sparkles::guard::config::config_language(root)? != Some(GuardLanguage::Shacl) {
+        return Ok(None);
+    }
+    let Some(cfg) = read_config(root)? else {
+        return Ok(None);
+    };
+    if cfg.mode == GuardMode::Off {
+        return Ok(None);
+    }
+    let (shapes, _) = load_shapes(&cfg, Some(root), &store.snapshot())?;
+    Ok(Some((cfg, shapes)))
 }
 
 /// Install the guard of a persistent store from its `validation.json` (after
@@ -1269,6 +1305,13 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
         sparkles::guard::config::remove_files(r, &[CONFIG_FILE, SHAPES_FILE])?;
         StatusFile::remove(r)?;
         if let Some(text) = cfg.shapes.inline.take() {
+            // the shapes file is Turtle, whatever the syntax given
+            let syntax = inline_syntax(&cfg)?;
+            let text = if syntax == ShapesSyntax::default() {
+                text
+            } else {
+                crate::syntax::convert(&text, syntax, ShapesSyntax::default(), None)?
+            };
             write_atomic(&r.join(SHAPES_FILE), text.as_bytes())?;
             cfg.shapes.file = Some(SHAPES_FILE.into());
             cfg.shapes.sha256 = Some(sha256_hex(text.as_bytes()));

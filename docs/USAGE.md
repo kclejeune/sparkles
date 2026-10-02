@@ -73,6 +73,35 @@ only from the UI itself, with its inline start-up scripts allowed by hash. Their
 WebAssembly module. That permits WebAssembly compilation only, not JavaScript's `eval`.
 API responses have `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`.
 
+### TLS
+
+Most deployments terminate TLS at a reverse proxy, such as the nginx virtual host of the
+NixOS module, and keep the server on loopback or a Unix socket. When nothing sits in
+front of it, the server can serve HTTPS itself:
+
+```sh
+sparkles serve --host 0.0.0.0 --port 443 --auth-config /etc/sparkles/auth.toml \
+  --tls-cert /etc/sparkles/fullchain.pem --tls-key /etc/sparkles/key.pem --loc wiki=db/wiki
+```
+
+`--tls-cert` is a PEM file with the server's certificate first and its intermediates
+after it. `--tls-key` is its PEM private key (PKCS#8, PKCS#1 or SEC1). The server checks
+that the key fits the certificate before it binds. It speaks TLS 1.2 and 1.3 through
+rustls, and clients choose HTTP/2 or HTTP/1.1 through ALPN. Plain HTTP on the same port
+gets no answer.
+
+The server reads both files again on SIGHUP and when either file changes, which it
+checks once a minute. A certificate renewed by an ACME client is therefore picked up
+without a restart. A pair that does not load, such as a new certificate next to the old
+key, is logged as an error, and the server keeps the pair it has. Connections that are
+open keep their certificate. Handshakes run beside the accept loop, at most 1024 at once
+and each for at most 10 seconds, so slow clients cannot hold up others.
+
+Over TLS, the server sets `X-Forwarded-Proto: https` on requests that do not carry the
+header, so session cookies get `Secure` and the `__Host-` prefix, and origin checks see
+`https`. The `--metrics-addr` listener and `--unix-socket` stay plain HTTP, and
+`--tls-cert` cannot be combined with `--unix-socket`.
+
 ### Endpoints and operations
 
 A dataset `ds` has the Fuseki-style endpoints `/ds/sparql`, `/ds/update`, `/ds/data`
@@ -228,6 +257,7 @@ happens to materialized inferences, and the limits.
 | `--host ADDR` | `127.0.0.1` | Listen address. A non-loopback address needs `--auth-config` or `--allow-open-network`. |
 | `--allow-open-network` | off | Serve without `--auth-config` on a non-loopback address, and log a warning. Also `SPARKLES_ALLOW_OPEN_NETWORK=1`. |
 | `--public-host NAME` | | A host name that clients use to reach the server, such as a reverse proxy's. Repeatable. Without `--auth-config`, names other than IP addresses, `localhost` and `--host` are refused with `421`. With `--auth-config`, the same applies to requests that carry trusted proxy headers from loopback or the Unix socket. |
+| `--tls-cert FILE`, `--tls-key FILE` | | Serve HTTPS with this PEM certificate chain and key (see [TLS](#tls)). Both are re-read on SIGHUP and when they change. |
 | `--cors-origin ORIGIN` | none | A browser origin, such as `https://yasgui.example`, whose pages may call the API cross-origin without credentials. Repeatable. With `--auth-config`, it is added to `cors.origins`. Without auth, such a page may do everything the server allows. |
 | `--timeout S` | `60` | Default query timeout in seconds. `timeout=` sets it per request. |
 | `--update-timeout S` | `0` | Default SPARQL update timeout in seconds; `0` means none. `timeout=` sets it per request. An update that times out changes nothing. |
@@ -452,7 +482,10 @@ The other commands are:
 * `auth`, for password hashes, tokens, and `auth login` for remote `query`, `update` and
   `load --server`;
 * `mcp` ([below](#mcp-server-llm-agents));
-* `fmt` and `lsp` ([below](#formatting)).
+* `fmt` and `lsp` ([below](#formatting));
+* `convert` (`riot`), `qparse`, `uparse`, `compare` (`rdfcompare`, `rdfdiff`), `iri`,
+  `langtag`, `rsparql`, `rupdate` and `rset`, for files and endpoints
+  ([below](#file-tools)).
 
 `sparkles help COMMAND` describes each one.
 
@@ -460,6 +493,105 @@ The other commands are:
 in Turtle, and `--format turtle` adds the declared RDFS/OWL schema. The server answers
 `GET /$/schema/{ds}` the same way when the request asks for Turtle or another RDF syntax
 ([API.md](API.md#schema-discovery)).
+
+### Constraints next to the counts
+
+The schema report keeps what the data shows apart from what its SHACL shapes require.
+When a database has write-time SHACL validation, `sparkles schema` ends with the
+constraints of its shapes per class, and each line says whether a write that breaks the
+constraint is refused, committed with a warning, or not checked at all. `--shapes` names
+other shapes graphs to read, and `--shapes none` leaves the constraints out.
+`--subject-classes` adds, under each predicate, the classes of its subjects with their
+triple counts:
+
+```sh
+sparkles schema --loc db                                     # counts, then the guard's constraints
+sparkles schema --loc db --shapes http://example.org/shapes  # constraints of a shapes graph
+sparkles schema --loc db --subject-classes                   # which classes use each predicate
+```
+
+An observed `max/subject 1` only describes the current data. A constraint such as
+`max 1  [reject-on-write]` is what stops the next write from adding a second value. The
+server gives the same layer in `GET /$/schema/{ds}` and `GET /$/schema/{ds}/constraints`,
+and the UI's schema browser shows it as SHACL chips next to the observed counts
+([API](API.md#constraints-layer)).
+
+### File tools
+
+These commands work on files and endpoints rather than databases. They match Jena's
+`riot`, `qparse`, `uparse`, `rdfdiff`, `rdfcompare`, `iri`, `langtag`, `rsparql`,
+`rupdate` and `rset`, and `convert` and `compare` answer to Jena's names as aliases. The
+design is in [spec G05](specs/G05-command-line-tools.md).
+
+```sh
+sparkles convert data.ttl.gz --output nt      # stream to N-Triples (default output: N-Quads)
+sparkles riot --syntax ttl --output trig < in # standard input needs --syntax, else N-Quads
+sparkles convert data.trig --output ttl --merge   # named graphs into the default graph
+sparkles convert big.nt --output nq --compress zstd > big.nq.zst   # --compress alone is gzip
+sparkles convert --count *.ttl                # triples (or quads) per file and a total
+sparkles convert --validate data.ttl          # syntax errors and term warnings, exit 1 on any
+sparkles convert --check data.ttl > out.nq    # convert, and warn about IRIs and language tags
+sparkles load --loc db --check --strict data.ttl   # the same checks before a load
+sparkles qparse 'SELECT ...'                  # the query, formatted
+sparkles qparse --print algebra,plan --query q.rq  # SPARQL algebra (SSE) and the physical plan
+sparkles uparse --print algebra 'DELETE ...'  # the update as SPARQL algebra
+sparkles compare a.ttl b.nt                   # exit 0 when isomorphic, 1 with a diff, 2 on errors
+sparkles iri '<http://Example.org:80/a/../b>' # components, normal form, warnings
+sparkles langtag en-us zh-yue-HK en--ltr      # subtags, canonical case, warnings
+sparkles rsparql --service https://query.wikidata.org/sparql --query q.rq --results csv
+sparkles rupdate --service http://localhost:3030/ds/update 'INSERT DATA {...}'
+sparkles rset results.srj --results text      # JSON, XML or TSV results to another format
+```
+
+`convert` reads files, or standard input when no file is given or a file is `-`. It takes
+the syntax from `--syntax`, then from the file extension, and reads standard input as
+N-Quads by default. Compressed inputs are detected as `load` detects them. The output
+streams, so a file larger than memory converts in bounded memory. Turtle, TriG and
+RDF/XML output declare the prefixes that the input declared before its first statement.
+A quad in a named graph cannot be written in a triple syntax, so `convert` drops it with
+a warning, or with `--merge` writes it into the default graph.
+
+`--count`, `--sink` and `--validate` write no data. Files are then parsed in parallel, as
+`load` parses them. When a file has a syntax error, it is parsed again in order so that
+up to 20 errors are reported with their exact line and column. `--validate` is `--sink
+--check --strict`, as in Jena. The exit status is 1 when an input had errors, or warnings
+under `--strict`.
+
+`--check` reports suspicious IRIs and language tags that the parsers accept. The IRI
+rules cover upper-case schemes and hosts, lower-case or needless percent-encodings, user
+information, dot segments, empty and default ports, `http` IRIs without a host, and the
+syntax of `urn:` (with `uuid` and `oid`), `file:` and `did:` IRIs. The language-tag rules
+flag grandfathered tags, extended language subtags and unusual primary languages. Each
+distinct value is reported once per file. `load --check` runs the same checks as a
+separate pass before the load, and `--strict` then loads nothing when a value has a
+warning. `iri` and `langtag` show the rules for one value at a time, with the
+components, the RFC 3986 normal form or the canonical case, and `--format json`.
+`/$/validate/iri` returns the same warnings.
+
+`qparse` uses the engine's own parser. Its default output is the query formatted by
+`sparkles fmt`. `--print algebra` prints the SPARQL algebra in SSE, the form of Jena's
+`qparse --print=op`. The operators are spargebra's, which are close to Jena's but not
+the same, and made-up names of aggregates and blank nodes print as `?.0` and `_:b0`.
+`--print plan` prints the physical plan of `query --explain`. It is planned against an
+empty database unless `--loc` or `--data` gives one with real statistics. A syntax
+error exits with status 1.
+
+`compare` reads both files into memory and compares them as RDF datasets up to
+blank-node isomorphism. The diff lists quads only in the first file with `<` and quads
+only in the second with `>`. Blank nodes are labeled by RDFC-1.0 canonicalization, one
+group of connected blank nodes at a time, so a change shows only the group it touches.
+`--merge` ignores graph names, and `-q` prints nothing.
+
+`rsparql` and `rupdate` take any SPARQL 1.1 Protocol endpoint as a full URL, such as a
+Fuseki, QLever or Wikidata endpoint. `query --server` is different, because it names a
+Sparkles server and a dataset and sends the token of `sparkles auth login`. `rsparql`
+sends a query by GET, or as a POST form when it is long or `--post` is given. With
+`--results text`, the default, it prints result sets as a table and graphs as Turtle.
+The other formats are `json`, `xml`, `csv`, `tsv`, and for graphs `ttl`, `nt`, `nq`,
+`trig`, `jsonld` and `rdfxml`. `--header 'Name: value'` and `--user NAME[:PASSWORD]` add
+credentials, which are refused over plain http to a host other than localhost unless
+`--insecure-http` is given. `--default-graph-uri`, `--named-graph-uri` and, for
+`rupdate`, `--using-graph-uri` and `--using-named-graph-uri` set the protocol's dataset.
 
 ### Drafting shapes from the data
 
@@ -470,9 +602,15 @@ its instances have. Review the draft, then use it for write-time validation:
 ```sh
 sparkles schema --loc db --draft-shapes > shapes.ttl                 # the data conforms
 sparkles schema --loc db --draft-shapes --support 0.95 --closed      # rules most instances follow
+sparkles schema --loc db --draft-shapes --format shaclc > shapes.shaclc  # the SHACL Compact Syntax
 sparkles schema --loc db --draft-shapes --format shexc               # a ShEx schema and its shape map
 sparkles validation --loc db --mode warn --shapes shapes.ttl
 ```
+
+Shapes files may be in any RDF syntax or in the SHACL Compact Syntax. `sparkles shacl`
+and `sparkles validation` read a file ending in `.shaclc` or `.shc` as SHACLC, and the
+database keeps write-time shapes as Turtle whatever syntax they came in
+([API.md](API.md#shacl-compact-syntax-shaclc)).
 
 With the default support of 1, every constraint holds for every instance, so the current
 data conforms. With `--support 0.95`, a constraint is drafted when 95% of the instances
@@ -880,7 +1018,9 @@ does the same:
 The tools are read-only unless the operator turns on the write tool:
 
 * `list_datasets`, `describe_schema`, `sparql_query`, `explain_query`,
-  `describe_resource` and `list_commits`.
+  `describe_resource` and `list_commits`. `describe_schema` with
+  `section: "constraints"` lists the SHACL constraints per class, and with
+  `subjectClasses: true` it names the classes that use each predicate.
 * `draft_shapes` drafts SHACL shapes or a ShEx schema from the data, with the number of
   instances each constraint would exclude.
 * Each stored query of a dataset is a tool of its own, `<dataset>__<query>`, whose
@@ -891,7 +1031,8 @@ The tools are read-only unless the operator turns on the write tool:
   computes embeddings.
 * `validate_shacl` and `validate_shex` check a shapes graph, or a ShEx schema with a
   shape map, against a snapshot. They return counts and the first 20 results with node,
-  shape and reason. They do not follow imports.
+  shape and reason. They do not follow imports. `validate_shacl` takes the shapes in
+  Turtle, or in SHACLC with `shapesFormat: "shaclc"`.
 * `format` formats a SPARQL query or update, Turtle, TriG, N-Triples, N-Quads or JSON-LD
   the way `sparkles fmt` does, and returns the text with any warnings. It reads no
   dataset.
@@ -1385,6 +1526,13 @@ store (agenix, sops-nix), owned by the `sparkles` user. Do not also set nginx
 `basicAuthFile`. nginx would forward its own `Authorization` header, which Sparkles
 would then reject. `unixSocket` makes the server listen on a Unix socket that nginx
 proxies to, so trusted proxy headers can be limited to it (`proxy.trusted = ["unix"]`).
+
+`tls.certFile` and `tls.keyFile` pass `--tls-cert` and `--tls-key` for a server that
+serves HTTPS itself. `systemctl reload sparkles` re-reads them, and the server also
+notices when they change. The service user must be able to read both files. For a
+certificate from `security.acme`, add the user to the certificate's group, for example
+`users.users.sparkles.extraGroups = [ "acme" ]`. With `nginx.enable` as well, nginx
+connects to the server over https. The key file must lie outside the Nix store.
 
 For backup repositories, `backup.configFile` passes `--backup-config`. Like
 `auth.configFile`, it stays out of the Nix store, and `systemctl reload sparkles`

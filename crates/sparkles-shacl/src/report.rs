@@ -21,6 +21,9 @@ pub struct ValidationResult {
     pub severity: NamedNode,
     /// `sh:resultMessage` values (from `sh:message`, or a generated message)
     pub messages: Vec<Literal>,
+    /// `sh:detail`: the results that explain this one (the members of a list that do not
+    /// conform to `sh:memberShape`, the duplicates of `sh:uniqueMembers`)
+    pub details: Vec<ValidationResult>,
 }
 
 impl ValidationResult {
@@ -61,58 +64,8 @@ impl ValidationReport {
             Literal::new_typed_literal(self.conforms.to_string(), xsd::BOOLEAN),
         ));
         for r in &self.results {
-            let n = BlankNode::default();
-            out.push(Triple::new(
-                report.clone(),
-                sh::RESULT.into_owned(),
-                n.clone(),
-            ));
-            out.push(Triple::new(
-                n.clone(),
-                rdf::TYPE.into_owned(),
-                sh::VALIDATION_RESULT.into_owned(),
-            ));
-            out.push(Triple::new(
-                n.clone(),
-                sh::FOCUS_NODE.into_owned(),
-                r.focus_node.clone(),
-            ));
-            if let Some(p) = &r.result_path {
-                let pn = p.to_rdf(&mut out);
-                out.push(Triple::new(n.clone(), sh::RESULT_PATH.into_owned(), pn));
-            }
-            if let Some(v) = &r.value {
-                out.push(Triple::new(n.clone(), sh::VALUE.into_owned(), v.clone()));
-            }
-            out.push(Triple::new(
-                n.clone(),
-                sh::SOURCE_SHAPE.into_owned(),
-                r.source_shape.clone(),
-            ));
-            out.push(Triple::new(
-                n.clone(),
-                sh::SOURCE_CONSTRAINT_COMPONENT.into_owned(),
-                r.source_constraint_component.clone(),
-            ));
-            if let Some(c) = &r.source_constraint {
-                out.push(Triple::new(
-                    n.clone(),
-                    sh::SOURCE_CONSTRAINT.into_owned(),
-                    c.clone(),
-                ));
-            }
-            out.push(Triple::new(
-                n.clone(),
-                sh::RESULT_SEVERITY.into_owned(),
-                r.severity.clone(),
-            ));
-            for m in &r.messages {
-                out.push(Triple::new(
-                    n.clone(),
-                    sh::RESULT_MESSAGE.into_owned(),
-                    m.clone(),
-                ));
-            }
+            let n = result_rdf(r, &mut out);
+            out.push(Triple::new(report.clone(), sh::RESULT.into_owned(), n));
         }
         out
     }
@@ -162,38 +115,109 @@ impl ValidationReport {
         };
         let mut results = Vec::new();
         for r in g.objects(&report, sh::RESULT) {
-            let named = |p| match g.object(&r, p) {
-                Some(Term::NamedNode(n)) => Some(n),
-                _ => None,
-            };
-            results.push(ValidationResult {
-                focus_node: g
-                    .object(&r, sh::FOCUS_NODE)
-                    .ok_or_else(|| anyhow!("result {r} has no sh:focusNode"))?,
-                result_path: g
-                    .object(&r, sh::RESULT_PATH)
-                    .map(|p| PropertyPath::from_rdf(graph, &p))
-                    .transpose()?,
-                value: g.object(&r, sh::VALUE),
-                source_shape: g
-                    .object(&r, sh::SOURCE_SHAPE)
-                    .ok_or_else(|| anyhow!("result {r} has no sh:sourceShape"))?,
-                source_constraint_component: named(sh::SOURCE_CONSTRAINT_COMPONENT)
-                    .ok_or_else(|| anyhow!("result {r} has no sh:sourceConstraintComponent"))?,
-                source_constraint: g.object(&r, sh::SOURCE_CONSTRAINT),
-                severity: named(sh::RESULT_SEVERITY).unwrap_or(sh::VIOLATION.into_owned()),
-                messages: g
-                    .objects(&r, sh::RESULT_MESSAGE)
-                    .into_iter()
-                    .filter_map(|t| match t {
-                        Term::Literal(l) => Some(l),
-                        _ => None,
-                    })
-                    .collect(),
-            });
+            results.push(result_from_rdf(graph, &r, 0)?);
         }
         Ok(ValidationReport { conforms, results })
     }
+}
+
+/// Read one result node (and its `sh:detail` results, to a bounded depth).
+fn result_from_rdf(graph: &Graph, r: &Term, depth: usize) -> Result<ValidationResult> {
+    let g = crate::shapes::G { g: graph };
+    let named = |p| match g.object(r, p) {
+        Some(Term::NamedNode(n)) => Some(n),
+        _ => None,
+    };
+    let details = if depth < 8 {
+        g.objects(r, sh::DETAIL)
+            .iter()
+            .map(|d| result_from_rdf(graph, d, depth + 1))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    Ok(ValidationResult {
+        focus_node: g
+            .object(r, sh::FOCUS_NODE)
+            .ok_or_else(|| anyhow!("result {r} has no sh:focusNode"))?,
+        result_path: g
+            .object(r, sh::RESULT_PATH)
+            .map(|p| PropertyPath::from_rdf(graph, &p))
+            .transpose()?,
+        value: g.object(r, sh::VALUE),
+        source_shape: g
+            .object(r, sh::SOURCE_SHAPE)
+            .ok_or_else(|| anyhow!("result {r} has no sh:sourceShape"))?,
+        source_constraint_component: named(sh::SOURCE_CONSTRAINT_COMPONENT)
+            .ok_or_else(|| anyhow!("result {r} has no sh:sourceConstraintComponent"))?,
+        source_constraint: g.object(r, sh::SOURCE_CONSTRAINT),
+        severity: named(sh::RESULT_SEVERITY).unwrap_or(sh::VIOLATION.into_owned()),
+        messages: g
+            .objects(r, sh::RESULT_MESSAGE)
+            .into_iter()
+            .filter_map(|t| match t {
+                Term::Literal(l) => Some(l),
+                _ => None,
+            })
+            .collect(),
+        details,
+    })
+}
+
+/// Push the triples of one result (and its details) and return its node.
+fn result_rdf(r: &ValidationResult, out: &mut Vec<Triple>) -> BlankNode {
+    let n = BlankNode::default();
+    out.push(Triple::new(
+        n.clone(),
+        rdf::TYPE.into_owned(),
+        sh::VALIDATION_RESULT.into_owned(),
+    ));
+    out.push(Triple::new(
+        n.clone(),
+        sh::FOCUS_NODE.into_owned(),
+        r.focus_node.clone(),
+    ));
+    if let Some(p) = &r.result_path {
+        let pn = p.to_rdf(out);
+        out.push(Triple::new(n.clone(), sh::RESULT_PATH.into_owned(), pn));
+    }
+    if let Some(v) = &r.value {
+        out.push(Triple::new(n.clone(), sh::VALUE.into_owned(), v.clone()));
+    }
+    out.push(Triple::new(
+        n.clone(),
+        sh::SOURCE_SHAPE.into_owned(),
+        r.source_shape.clone(),
+    ));
+    out.push(Triple::new(
+        n.clone(),
+        sh::SOURCE_CONSTRAINT_COMPONENT.into_owned(),
+        r.source_constraint_component.clone(),
+    ));
+    if let Some(c) = &r.source_constraint {
+        out.push(Triple::new(
+            n.clone(),
+            sh::SOURCE_CONSTRAINT.into_owned(),
+            c.clone(),
+        ));
+    }
+    out.push(Triple::new(
+        n.clone(),
+        sh::RESULT_SEVERITY.into_owned(),
+        r.severity.clone(),
+    ));
+    for m in &r.messages {
+        out.push(Triple::new(
+            n.clone(),
+            sh::RESULT_MESSAGE.into_owned(),
+            m.clone(),
+        ));
+    }
+    for d in &r.details {
+        let dn = result_rdf(d, out);
+        out.push(Triple::new(n.clone(), sh::DETAIL.into_owned(), dn));
+    }
+    n
 }
 
 impl fmt::Display for ValidationReport {
@@ -253,6 +277,9 @@ pub fn result_json(r: &ValidationResult) -> serde_json::Value {
     });
     if let Some(c) = &r.source_constraint {
         o["sourceConstraint"] = term_json(c);
+    }
+    if !r.details.is_empty() {
+        o["details"] = r.details.iter().map(result_json).collect();
     }
     o
 }

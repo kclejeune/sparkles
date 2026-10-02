@@ -463,7 +463,13 @@ async fn exhaust(s: &AuthServer, ip: &str) {
 
 #[tokio::test]
 async fn an_exhausted_address_keeps_valid_credentials_and_health_checks() {
-    let s = limited(Fixture::default(), &["preauth=3/min"]);
+    let s = limited(
+        Fixture {
+            extra: "[session]\ntoken_login = true\n".into(),
+            ..Default::default()
+        },
+        &["preauth=3/min"],
+    );
     let (cookie, _) = password_session(&s, "bob").await;
     let ip = "192.0.2.1";
     exhaust(&s, ip).await;

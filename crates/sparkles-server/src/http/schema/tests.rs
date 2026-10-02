@@ -588,8 +588,20 @@ async fn drafted_shapes() {
     );
     assert!(j["shacl"].as_str().unwrap().contains("sh:closed true"));
 
-    // Turtle and ShExC by format= or Accept
+    // Turtle, SHACLC and ShExC by format= or Accept
     for (path, accept, ct, needle) in [
+        (
+            "/$/schema/t/shapes?format=shaclc",
+            "*/*",
+            "text/shaclc",
+            "shape shape:",
+        ),
+        (
+            "/$/schema/t/shapes",
+            "text/shaclc",
+            "text/shaclc",
+            "shape shape:",
+        ),
         (
             "/$/schema/t/shapes?format=turtle",
             "*/*",
@@ -645,6 +657,36 @@ async fn drafted_shapes() {
     let j: J = serde_json::from_str(&text).unwrap();
     assert_eq!(j["status"]["baseline"]["conforms"], true, "{j}");
 
+    // and so does the SHACLC draft
+    let (_, _, compact) = get_accept(&s.app, "/$/schema/t/shapes?format=shaclc", "*/*").await;
+    let (status, _, report) = send(
+        &s.app,
+        Request::post("/t/shacl")
+            .header(header::CONTENT_TYPE, "text/shaclc")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::from(compact.clone()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let report: J = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["conforms"], true, "{report}");
+    let body = serde_json::json!({
+        "language": "shacl", "mode": "warn",
+        "shapes": { "inline": compact, "format": "text/shaclc" }
+    });
+    let (status, _, text) = send(
+        &s.app,
+        Request::put("/$/validation/t")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let j: J = serde_json::from_str(&text).unwrap();
+    assert_eq!(j["status"]["baseline"]["conforms"], true, "{j}");
+
     // the union graph includes the named graph's person
     let j = ok(&s.app, "/$/schema/t/shapes?graph=union").await;
     assert_eq!(j["shapes"][2]["instances"], 5);
@@ -675,4 +717,158 @@ async fn drafted_shapes() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn subject_classes_on_request() {
+    let s = server(
+        r#"ex:a a ex:Person ; ex:name "A" . ex:b a ex:Person, ex:Agent ; ex:name "B", "B2" .
+           ex:o a ex:Org ; ex:name "O" . ex:u ex:name "U" ."#,
+    );
+    let j = ok(&s.app, "/$/schema/t/predicates?detail=subjectClasses").await;
+    let name = &find(&j, "http://ex.org/name")["observed"];
+    assert_eq!(
+        name["subjectClasses"],
+        serde_json::json!([
+            {"class": "http://ex.org/Agent", "triples": 2, "subjects": 1},
+            {"class": "http://ex.org/Org", "triples": 1, "subjects": 1},
+            {"class": "http://ex.org/Person", "triples": 3, "subjects": 2},
+        ])
+    );
+    assert_eq!(
+        name["untypedSubjects"],
+        serde_json::json!({"triples": 1, "subjects": 1})
+    );
+    let j = ok(&s.app, "/$/schema/t?detail=subjectClasses").await;
+    assert!(find(&j["predicates"], "http://ex.org/name")["observed"]["subjectClasses"].is_array());
+    // without the detail, the report has no subject classes, even right after one with
+    let j = ok(&s.app, "/$/schema/t/predicates").await;
+    assert!(
+        find(&j, "http://ex.org/name")["observed"]
+            .get("subjectClasses")
+            .is_none()
+    );
+    // a cursor of a listing with the detail does not continue one without
+    let j = ok(
+        &s.app,
+        "/$/schema/t/predicates?detail=subjectClasses&limit=1",
+    )
+    .await;
+    let next = j["next"].as_str().unwrap();
+    let (status, _) = get(
+        &s.app,
+        &format!("/$/schema/t/predicates?limit=1&cursor={next}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = get(&s.app, "/$/schema/t?detail=everything").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "shacl")]
+const SHAPES_DATA: &str = r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+ex:a a ex:Person ; ex:name "A" .
+ex:b a ex:Person ; ex:name "B" .
+ex:shapes {
+  ex:PersonShape a sh:NodeShape ;
+    sh:targetClass ex:Person ;
+    sh:property [ sh:path ex:name ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ] ,
+                [ sh:path ex:nick ; sh:maxCount 1 ; sh:severity sh:Warning ] .
+}
+"#;
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn constraints_layer() {
+    let s = server(SHAPES_DATA);
+    let shapes = enc("http://ex.org/shapes");
+    // no guard and no shapes= : no layer
+    let j = ok(&s.app, "/$/schema/t").await;
+    assert!(j.get("constraints").is_none(), "{j}");
+
+    // a shapes graph, validated on request only
+    let j = ok(&s.app, &format!("/$/schema/t?shapes={shapes}")).await;
+    let src = &j["constraints"]["sources"][0];
+    assert_eq!(src["kind"], "graphs");
+    assert_eq!(src["graphs"], serde_json::json!(["http://ex.org/shapes"]));
+    let person = &src["classes"][0];
+    assert_eq!(person["class"], "http://ex.org/Person");
+    assert_eq!(
+        person["shapes"],
+        serde_json::json!(["http://ex.org/PersonShape"])
+    );
+    let name = &person["properties"][0];
+    assert_eq!(name["path"], "http://ex.org/name");
+    assert_eq!(name["minCount"], 1);
+    assert_eq!(name["maxCount"], 1);
+    assert_eq!(name["datatype"], "http://www.w3.org/2001/XMLSchema#string");
+    assert_eq!(name["enforcement"], "validated-on-request");
+    // the observed layer is unchanged by it
+    let observed = &find(&j["predicates"], "http://ex.org/name")["observed"];
+    assert_eq!(observed["maxPerSubject"], 1);
+    assert!(observed.get("minCount").is_none());
+    // the layer alone
+    let c = ok(&s.app, &format!("/$/schema/t/constraints?shapes={shapes}")).await;
+    assert_eq!(c["constraints"], j["constraints"]);
+    assert_eq!(c["dataset"], "t");
+    let c = ok(&s.app, "/$/schema/t/constraints").await;
+    assert_eq!(c["constraints"]["sources"], serde_json::json!([]));
+
+    for (path, want) in [
+        ("/$/schema/t?shapes=guard", StatusCode::NOT_FOUND),
+        (
+            "/$/schema/t/constraints?shapes=guard",
+            StatusCode::NOT_FOUND,
+        ),
+        ("/$/schema/t?shapes=union", StatusCode::BAD_REQUEST),
+        (
+            "/$/schema/t?shapes=none&shapes=guard",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/$/schema/t?shapes=not%20an%20iri", StatusCode::BAD_REQUEST),
+        (
+            "/$/schema/t?shapes=http%3A%2F%2Fex.org%2Fmissing",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (status, j) = get(&s.app, path).await;
+        assert_eq!(status, want, "{path}: {j}");
+    }
+
+    // the write-time guard's shapes are the layer by default
+    let body = serde_json::json!({
+        "language": "shacl", "mode": "reject",
+        "shapes": { "graphs": ["http://ex.org/shapes"] }
+    });
+    let (status, _, text) = send(
+        &s.app,
+        Request::put("/$/validation/t")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let j = ok(&s.app, "/$/schema/t").await;
+    let src = &j["constraints"]["sources"][0];
+    assert_eq!(src["kind"], "guard");
+    assert_eq!(src["mode"], "reject");
+    assert_eq!(src["threshold"], "violation");
+    let props = &src["classes"][0]["properties"];
+    assert_eq!(props[0]["enforcement"], "reject-on-write");
+    // a warning does not block a write at the default threshold
+    assert_eq!(props[1]["path"], "http://ex.org/nick");
+    assert_eq!(props[1]["enforcement"], "warn-on-write");
+    // both sources, and none
+    let j = ok(&s.app, &format!("/$/schema/t?shapes=guard&shapes={shapes}")).await;
+    let kinds: Vec<&str> = j["constraints"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["guard", "graphs"]);
+    let j = ok(&s.app, "/$/schema/t?shapes=none").await;
+    assert!(j.get("constraints").is_none(), "{j}");
 }

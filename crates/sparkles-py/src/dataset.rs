@@ -883,7 +883,20 @@ impl PyDataset {
         let ds = self.ds(py)?;
         let shapes_graph = opt(shapes_graph, iri_from_py)?.map(|n| n.into_string());
         let data_graph = opt(data_graph, iri_from_py)?.map(|n| n.into_string());
-        let format = format_from_py(format)?;
+        // "shaclc" (or `text/shaclc`) is the SHACL Compact Syntax; other names are RDF
+        // formats
+        let compact = match format.and_then(|f| f.cast::<PyString>().ok()) {
+            Some(s) => matches!(
+                s.to_str()?.trim().to_ascii_lowercase().as_str(),
+                "shaclc" | "shc" | "text/shaclc"
+            ),
+            None => false,
+        };
+        let format = if compact {
+            None
+        } else {
+            format_from_py(format)?
+        };
         let shapes = match shapes.filter(|s| !s.is_none()) {
             None => None,
             Some(s) => Some(if let Ok(b) = s.cast::<PyBytes>() {
@@ -898,6 +911,7 @@ impl PyDataset {
             ds,
             shapes,
             format,
+            compact,
             shapes_graph,
             data_graph,
             include_inferred,

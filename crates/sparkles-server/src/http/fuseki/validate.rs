@@ -144,7 +144,8 @@ pub(super) async fn update(uri: Uri, headers: HeaderMap, AdminBody(body): AdminB
 }
 
 /// `/$/validate/iri?iri=…` (repeatable): errors for an invalid IRI, a warning for a
-/// relative one.
+/// relative one, and the scheme and normalization warnings of `sparkles iri` (spec G05
+/// §4.1).
 pub(super) async fn iri(uri: Uri, headers: HeaderMap, AdminBody(body): AdminBody) -> ApiResult {
     let r = request(&uri, &headers, &body);
     let iris = r.params.all("iri");
@@ -161,6 +162,11 @@ pub(super) async fn iri(uri: Uri, headers: HeaderMap, AdminBody(body): AdminBody
                     Ok(_) => warnings.push(format!("Relative IRI: {s}")),
                     Err(_) => errors.push(format!("Bad IRI: {e}")),
                 },
+            }
+            if errors.is_empty() {
+                let mut issues = Vec::new();
+                crate::tools::terms::iri_warnings(s, &mut issues);
+                warnings.extend(issues.into_iter().map(|i| i.message));
             }
             json!({ "iri": s, "errors": errors, "warning": warnings })
         })
@@ -277,7 +283,12 @@ fn langtag_report(t: &str) -> J {
         None => {
             let tag = oxilangtag::LanguageTag::parse(t.to_string()).expect("checked");
             o.insert("errors".into(), json!([]));
-            o.insert("formatted".into(), canonical_case(t).into());
+            o.insert(
+                "formatted".into(),
+                crate::tools::terms::canonical_case(t)
+                    .unwrap_or_else(|| t.to_string())
+                    .into(),
+            );
             o.insert("language".into(), tag.primary_language().into());
             let mut put = |k: &str, v: Option<&str>| {
                 if let Some(v) = v.filter(|v| !v.is_empty()) {
@@ -292,30 +303,6 @@ fn langtag_report(t: &str) -> J {
         }
     }
     J::Object(o)
-}
-
-/// BCP 47's case conventions: the language and most subtags in lower case, a script in
-/// title case, a region in upper case.
-fn canonical_case(tag: &str) -> String {
-    let mut out = Vec::new();
-    let mut singleton = false;
-    for (i, sub) in tag.split('-').enumerate() {
-        let s = if i == 0 || singleton {
-            sub.to_ascii_lowercase()
-        } else if sub.len() == 4 && sub.chars().all(|c| c.is_ascii_alphabetic()) {
-            let mut c = sub.to_ascii_lowercase();
-            c[..1].make_ascii_uppercase();
-            c
-        } else if sub.len() == 2 && sub.chars().all(|c| c.is_ascii_alphabetic()) {
-            sub.to_ascii_uppercase()
-        } else {
-            sub.to_ascii_lowercase()
-        };
-        // after a singleton (`x-`, `u-`, …) every subtag stays in lower case
-        singleton = singleton || (i > 0 && sub.len() == 1);
-        out.push(s);
-    }
-    out.join("-")
 }
 
 /// The report as JSON, or as Fuseki's plain HTML page.
@@ -361,6 +348,7 @@ mod tests {
 
     #[test]
     fn language_tags() {
+        let canonical_case = |t: &str| crate::tools::terms::canonical_case(t).unwrap();
         assert_eq!(canonical_case("EN-us"), "en-US");
         assert_eq!(canonical_case("zh-hant-tw"), "zh-Hant-TW");
         assert_eq!(canonical_case("en-x-AB-CD"), "en-x-ab-cd");

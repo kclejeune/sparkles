@@ -113,6 +113,12 @@ let
     "--unix-socket"
     cfg.unixSocket
   ]
+  ++ lib.optionals tls [
+    "--tls-cert"
+    cfg.tls.certFile
+    "--tls-key"
+    cfg.tls.keyFile
+  ]
   ++ lib.optional cfg.allowOpenNetwork "--allow-open-network"
   ++ lib.optionals (cfg.loadDir != null) [
     "--load-dir"
@@ -177,6 +183,8 @@ let
     ++ fsRoots
   );
 
+  tls = cfg.tls.certFile != null;
+
   upstream =
     if cfg.unixSocket != null then
       "http://unix:${cfg.unixSocket}"
@@ -192,7 +200,7 @@ let
           else
             cfg.listenAddress;
       in
-      "http://${host}:${toString cfg.port}";
+      "${if tls then "https" else "http"}://${host}:${toString cfg.port}";
 in
 {
   options.services.sparkles = {
@@ -447,6 +455,35 @@ in
       '';
     };
 
+    tls = {
+      certFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/var/lib/acme/sparql.example.org/fullchain.pem";
+        description = ''
+          Serve HTTPS natively with this PEM certificate chain (`--tls-cert`; with
+          {option}`tls.keyFile`). HTTP/2 and HTTP/1.1 are negotiated through ALPN.
+          `systemctl reload sparkles` re-reads the files, and the server also notices
+          when they change, so a certificate renewed by `security.acme` needs no
+          restart. The service user must be able to read both files: for an ACME
+          certificate, add it to the certificate's group, e.g.
+          `users.users.sparkles.extraGroups = [ "acme" ]`. Most deployments let a
+          reverse proxy terminate TLS instead (see {option}`nginx.enable`). With both,
+          nginx connects to the server over https.
+        '';
+      };
+
+      keyFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/var/lib/acme/sparql.example.org/key.pem";
+        description = ''
+          The PEM private key of {option}`tls.certFile` (`--tls-key`). It must not be in
+          the Nix store.
+        '';
+      };
+    };
+
     logLevel = mkOption {
       type = types.str;
       default = "sparkles=info,sparkles_server=info,tower_http=warn";
@@ -603,6 +640,20 @@ in
         message = "services.sparkles.auth.configFile must be an absolute path outside the Nix store (it holds secrets).";
       }
       {
+        assertion = (cfg.tls.certFile == null) == (cfg.tls.keyFile == null);
+        message = "services.sparkles: set both tls.certFile and tls.keyFile, or neither.";
+      }
+      {
+        assertion = !tls || cfg.unixSocket == null;
+        message = "services.sparkles: tls applies to the TCP listener, not to unixSocket.";
+      }
+      {
+        assertion =
+          cfg.tls.keyFile == null
+          || (lib.hasPrefix "/" cfg.tls.keyFile && !lib.hasPrefix "/nix/store" cfg.tls.keyFile);
+        message = "services.sparkles.tls.keyFile must be an absolute path outside the Nix store (it is a secret).";
+      }
+      {
         assertion =
           loadDir == null
           || (
@@ -702,10 +753,10 @@ in
         rateLimits != null
       ) config.environment.etc."sparkles/rate-limits.json".source;
       serviceConfig = {
-        # re-reads the rate-limit, auth and backup configurations (without any, SIGHUP
-        # would stop the server)
+        # re-reads the rate-limit, auth and backup configurations and the TLS certificate
+        # (without any, SIGHUP would stop the server)
         ExecReload = mkIf (
-          rateLimits != null || cfg.auth.configFile != null || cfg.backup.configFile != null
+          rateLimits != null || cfg.auth.configFile != null || cfg.backup.configFile != null || tls
         ) "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
         ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ args);
         RuntimeDirectory = mkIf (
