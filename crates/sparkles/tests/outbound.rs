@@ -780,3 +780,84 @@ fn fetch_text_through_the_policy() {
     let r = fetch_text(&private_ok(), &budget, "ftp://example.org/s.shex", "*/*");
     assert!(failure(r).contains("only http and https"));
 }
+
+/// SPARQL JSON results binding `?x` to a triple term nested `n` levels.
+fn nested_results(n: usize) -> String {
+    let uri = |v: &str| format!(r#"{{"type":"uri","value":"{v}"}}"#);
+    let level = format!(
+        r#"{{"type":"triple","value":{{"subject":{},"predicate":{},"object":"#,
+        uri("urn:s"),
+        uri("urn:p")
+    );
+    format!(
+        r#"{{"head":{{"vars":["x"]}},"results":{{"bindings":[{{"x":{}{}{}}}]}}}}"#,
+        level.repeat(n),
+        uri("urn:o"),
+        "}}".repeat(n)
+    )
+}
+
+/// SPARQL XML results binding `?x` to a triple term nested `n` levels.
+fn nested_xml_results(n: usize) -> String {
+    let level = "<triple><subject><uri>urn:s</uri></subject>\
+                 <predicate><uri>urn:p</uri></predicate><object>";
+    format!(
+        r#"<?xml version="1.0"?><sparql xmlns="http://www.w3.org/2005/sparql-results#"><head><variable name="x"/></head><results><result><binding name="x">{}<uri>urn:o</uri>{}</binding></result></results></sparql>"#,
+        level.repeat(n),
+        "</object></triple>".repeat(n)
+    )
+}
+
+#[test]
+fn nested_responses_are_refused() {
+    // on a thread with a 2 MiB stack, the default of spawned, tokio and rayon threads: a
+    // response nested too deeply fails, never overflows the stack
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            let s = Server::start(|path| {
+                let (kind, n) = path[1..].split_once('/').unwrap();
+                let n: usize = n.parse().unwrap();
+                let (ct, body) = match kind {
+                    "json" => ("application/sparql-results+json", nested_results(n)),
+                    "xml" => ("application/sparql-results+xml", nested_xml_results(n)),
+                    _ => (
+                        "text/turtle",
+                        format!(
+                            "<urn:s> <urn:p> {}<urn:o>{} .",
+                            "<<( <urn:s> <urn:p> ".repeat(n),
+                            " )>>".repeat(n)
+                        ),
+                    ),
+                };
+                reply("200 OK", &[("content-type", ct)], body.as_bytes())
+            });
+            for kind in ["json", "xml"] {
+                let url = s.url(&format!("/{kind}/100"));
+                assert_eq!(service(&url, false, private_ok()).unwrap(), 1);
+                for n in [1_000, 100_000] {
+                    let url = s.url(&format!("/{kind}/{n}"));
+                    let m = failure(service(&url, false, private_ok()));
+                    assert!(
+                        m.contains("nested deeper than 1024 levels"),
+                        "{kind} {n}: {m}"
+                    );
+                }
+            }
+            let (r, n) = load(&s.url("/turtle/100"), private_ok());
+            r.unwrap();
+            assert_eq!(n, 1);
+            for depth in [257, 100_000] {
+                let (r, n) = load(&s.url(&format!("/turtle/{depth}")), private_ok());
+                let m = r.unwrap_err().to_string();
+                assert!(
+                    m.contains("triple terms nested deeper than 256 levels"),
+                    "{m}"
+                );
+                assert_eq!(n, 0);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

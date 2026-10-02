@@ -18,7 +18,7 @@ use spargebra::algebra::GraphPattern;
 use sparkles::id::{Id, Tag};
 use sparkles::sparql::plan::{ActiveGraph, Planner};
 use sparkles::sparql::table::Table;
-use sparkles::sparql::{Ctx, exec, parse_query};
+use sparkles::sparql::{Ctx, depth, exec, parse_query};
 use std::sync::Arc;
 
 /// Variables that may be pre-bound (and so must not be assigned by the query).
@@ -429,6 +429,11 @@ fn display(t: &Term) -> String {
 impl Engine<'_> {
     /// Execute a parsed query with pre-bound variables.
     fn run_query(&self, q: &Query, binds: &[(&str, Term)]) -> Result<(Table, Ctx)> {
+        let depth = depth::check_query(q).map_err(|e| anyhow!("{e}"))?;
+        depth::with_stack(depth, || self.run_query_on(q, binds))
+    }
+
+    fn run_query_on(&self, q: &Query, binds: &[(&str, Term)]) -> Result<(Table, Ctx)> {
         let mut ctx = Ctx::new(self.data.snap.clone());
         ctx.use_cache = false;
         ctx.deadline = self.deadline;

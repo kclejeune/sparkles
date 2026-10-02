@@ -282,6 +282,7 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
     }
     let bytes = load_bytes(src)?;
     let slice = bytes.as_ref();
+    crate::nesting::check(src.format, slice, &src.name)?;
     let prefixes = Mutex::new(BTreeMap::new());
     let splittable = matches!(
         src.format,
@@ -351,6 +352,8 @@ fn parse_stream<S: QuadSink, F: Fn() -> S + Sync>(
         });
         for msg in rx {
             let (start, bytes) = msg?;
+            // a block ends at a line break, and no triple term spans lines
+            crate::nesting::check(src.format, &bytes, &src.name)?;
             let n = (bytes.len() / min_chunk).clamp(1, parallelism);
             let parsers = parser.clone().split_slice_for_parallel_parsing(&bytes, n);
             while sinks.len() < parsers.len() {

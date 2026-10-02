@@ -2712,7 +2712,8 @@ Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, 
 `requestId` is the response's `X-Request-Id`, for finding the request in the logs. The
 statuses are:
 
-* `400` for parse errors
+* `400` for parse errors, and for queries, updates and RDF bodies nested too deeply (see
+  [Nesting limits](#nesting-limits))
 * `401`/`403` for authentication and permissions
 * `404` for an unknown dataset
 * `405` for an update sent with GET
@@ -2730,6 +2731,49 @@ statuses are:
 
 The backup routes add a machine-readable `code` (see
 [Backup repositories](#backup-errors)).
+
+### Nesting limits
+
+The SPARQL parser recurses once for each level of nesting, and so do the planner, the
+evaluator and the code that frees a parsed query. A query nested a few thousand levels
+deep would overflow a thread's stack, and a stack overflow ends the whole server process.
+The server refuses such requests with `400` before it parses them. The limits are fixed:
+
+* A query or update nests at most 256 brackets deep. Every `(`, `[`, `{`, `<<`, `<<(` and
+  `{|` counts, including the parentheses of a function call or a property path, and so
+  does each unary `!`. The error reads `nested deeper than 256 levels`, with the line and
+  column where the limit was passed.
+* A query or update nests at most 1024 levels in its algebra. A chain is flat in the text
+  but nested in the algebra, so each element of a chain counts as a level, added to the
+  brackets around it. Chains are the operators of an expression such as
+  `?a || ?b || …` or `1 + 2 + …`, the steps and operators of a property path, and the
+  elements of a group: OPTIONAL, MINUS, UNION, FILTER, BIND, VALUES, a nested group, or a
+  triple with a property path. The count is made on the text and errs on the high side,
+  so a chain of a little under 1024 elements can already be refused. The error reads
+  `nested deeper than 1024 levels, counting each operator of an expression, step of a
+  property path and element of a group as a level`.
+* RDF read from a request body, an upload, a `LOAD` or the shapes of `/{ds}/shacl` nests
+  at most 256 triple terms (`<<( … )>>` or `<< … >>`) in Turtle, TriG, N-Triples, N-Quads
+  and N3. A JSON-LD document nests at most 256 arrays and objects, and an RDF/XML
+  document at most 1024 elements. Blank nodes (`[ … ]`) and collections (`( … )`) have no
+  limit. The error names the limit that was passed.
+* An update cannot store a triple term nested deeper than 256 levels. Without this check,
+  an update such as `INSERT { ?s ?p <<( ?s ?p ?o )>> } WHERE { ?s ?p ?o }`, run again and
+  again, would add a level each time.
+* The results of a `SERVICE` call nest at most 1024 JSON arrays and objects, or XML
+  elements. A triple term takes two levels. Deeper results fail the query as any other
+  SERVICE error does.
+
+Real queries stay far below these limits. In the W3C SPARQL test suites, no query nests
+more than 5 brackets deep, and the deepest algebra count is 29. Parsing a query at the
+bracket limit takes up to 1.5 MiB of stack, which fits the 2 MiB that Rust, tokio and
+rayon give the threads they start. The server runs requests on threads with 8 MiB
+stacks. The planner and the evaluator size their stack from the parsed query and grow it
+when the thread's stack is too small, so a long chain runs on any thread.
+
+The same limits apply to the MCP tools, SHACL-SPARQL constraints, ShEx SPARQL selectors,
+the formatter, and the `sparkles` library (`Dataset::query`, `Dataset::update`,
+`Dataset::load_str`).
 
 ### Budgets
 

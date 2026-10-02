@@ -3001,6 +3001,7 @@ impl WriteTxn<'_> {
 
     /// Get or create the id for a term (new terms go to the delta vocabulary).
     pub fn intern(&mut self, t: &Term) -> Result<Id> {
+        crate::nesting::check_triple_term(t)?;
         if let Some(id) = id::inline_id(t) {
             return Ok(id);
         }
@@ -3029,6 +3030,7 @@ impl WriteTxn<'_> {
                 Ok(id)
             }
             Term::Triple(_) => {
+                crate::nesting::check_triple_term(t)?;
                 let mut next = self.guard.next_bnode;
                 let mut key = Vec::new();
                 id::write_term_key_with(t, &mut key, &mut |b| {

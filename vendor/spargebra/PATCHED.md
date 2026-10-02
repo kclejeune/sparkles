@@ -68,6 +68,19 @@ The changes, all in `src/parser.rs` unless noted:
   `Aggregate` rule's custom `DISTINCT` form (registered with
   `with_custom_aggregate_function`) could never match and the query was a syntax error.
 
+- **A nesting limit.** `SparqlParser::parse_query` and `parse_update` first scan the text
+  once, without recursion (`src/nesting.rs`, called from `too_deep`). They refuse a text
+  whose brackets nest deeper than `nesting::MAX_NESTING` (256) or whose algebra could
+  nest deeper than `nesting::MAX_DEPTH` (1024), with an error written like peg's,
+  `error at LINE:COLUMN: nested deeper than 256 levels`. The parser recurses once per
+  bracket and overflows a 2 MiB thread stack at a few hundred to a few thousand levels.
+  The chains it builds in loops (`a || b || …`, the OPTIONALs of a group, the steps of a
+  path) nest in the algebra, and walking or dropping a chain tens of thousands long
+  overflows the stack too. A stack overflow aborts the process, and every caller in
+  Sparkles, the formatter included, parses untrusted text. This is not a fix for upstream
+  but a guard Sparkles needs: when this copy is dropped, the check must move to the
+  callers.
+
 Upstream Oxigraph (the development version after 0.4.7) has a rewritten parser that
 follows the SPARQL 1.2 grammar rules [123] and [138] and moves an OPTIONAL group's own
 FILTERs into the `LeftJoin`; the changes here are written against 0.4.7's rust-peg

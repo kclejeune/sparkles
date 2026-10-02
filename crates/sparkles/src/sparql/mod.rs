@@ -3,6 +3,7 @@
 pub mod aggext;
 pub mod cache;
 pub mod ctx;
+pub mod depth;
 pub mod exec;
 mod exists;
 pub mod expr;
@@ -228,8 +229,9 @@ pub fn parse_query(q: &str, base: Option<&str>, prefixes: &[(String, String)]) -
             .map_err(|e| Error::invalid(e.to_string()))?;
     }
     let query = p.parse_query(q)?;
+    let depth = depth::check_query(&query)?;
     let (pattern, _, _) = split(&query);
-    validate_scoping(pattern)?;
+    depth::with_stack(depth, || validate_scoping(pattern))?;
     Ok(query)
 }
 
@@ -436,6 +438,16 @@ pub fn execute_query(
     opts: &QueryOptions,
     parse_ms: f64,
 ) -> Result<QueryResult> {
+    let depth = depth::check_query(parsed)?;
+    depth::with_stack(depth, || execute_parsed(snap, parsed, opts, parse_ms))
+}
+
+fn execute_parsed(
+    snap: Arc<Snapshot>,
+    parsed: &Query,
+    opts: &QueryOptions,
+    parse_ms: f64,
+) -> Result<QueryResult> {
     let t1 = Instant::now();
     let (pattern, dataset, base) = split(parsed);
     let ctx = Arc::new(make_ctx(snap, opts, dataset, base));
@@ -533,13 +545,16 @@ fn project_vars(gp: &GraphPattern, ctx: &Ctx) -> Option<Vec<table::VarId>> {
 /// EXPLAIN: algebra (SSE) and the plan without executing it.
 pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(String, PlanInfo)> {
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
-    let (pattern, dataset, base) = split(&parsed);
-    let ctx = make_ctx(snap, opts, dataset, base);
-    crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
-    let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;
-    let mut info = exec::describe(&ctx, &node);
-    info.warnings = ctx.warnings();
-    Ok((parsed.to_sse(), info))
+    let depth = depth::check_query(&parsed)?;
+    depth::with_stack(depth, || {
+        let (pattern, dataset, base) = split(&parsed);
+        let ctx = make_ctx(snap, opts, dataset, base);
+        crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
+        let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;
+        let mut info = exec::describe(&ctx, &node);
+        info.warnings = ctx.warnings();
+        Ok((parsed.to_sse(), info))
+    })
 }
 
 /// Instantiate a template term (CONSTRUCT / INSERT), recursing into RDF 1.2 triple

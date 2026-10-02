@@ -1133,6 +1133,13 @@ fn print_log(
     Ok(())
 }
 
+/// The stack of the threads that parse and run requests (the async runtime's workers and
+/// blocking pool, the validation and formatting pools): 8 MiB, as a process's main thread
+/// has, rather than the 2 MiB tokio and rayon give theirs. The SPARQL parser takes up to
+/// about 1.5 MiB at the deepest nesting it accepts; the planner and the evaluator size
+/// their own stack (`sparkles::sparql::depth::with_stack`).
+pub(crate) const THREAD_STACK: usize = 8 << 20;
+
 fn main() -> Result<()> {
     run().map_err(rejected_exit)
 }
@@ -1518,6 +1525,7 @@ fn run() -> Result<()> {
             }
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()
+                .thread_stack_size(THREAD_STACK)
                 .enable_all()
                 .build()?;
             // backup tasks drive the repository engine on this runtime

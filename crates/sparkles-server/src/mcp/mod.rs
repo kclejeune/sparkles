@@ -366,6 +366,7 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
     };
     let server = McpServer::new(st, cfg);
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(crate::THREAD_STACK)
         .enable_all()
         .build()?;
     rt.block_on(adapter::serve_stdio(server))

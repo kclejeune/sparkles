@@ -3234,6 +3234,8 @@ mod history_tests;
 #[cfg(test)]
 mod limits_tests;
 #[cfg(test)]
+mod nesting_tests;
+#[cfg(test)]
 mod obs_tests;
 #[cfg(test)]
 mod router_tests;

@@ -74,6 +74,11 @@ impl ExistsSpec {
     }
 }
 
+/// The deepest expression evaluated on rayon's threads (see [`Expr::parallel`]): their
+/// stack is 2 MiB unless the application sets another, and a debug build's evaluator
+/// takes up to 30 KiB a level.
+const PARALLEL_DEPTH: usize = 32;
+
 #[derive(Clone)]
 pub enum Expr {
     Const(Id),
@@ -190,6 +195,38 @@ impl Expr {
             Expr::In(a, l) => a.has_exists() || l.iter().any(|e| e.has_exists()),
             Expr::If(a, b, c) => a.has_exists() || b.has_exists() || c.has_exists(),
             Expr::Coalesce(l) | Expr::Call(_, l) => l.iter().any(|e| e.has_exists()),
+        }
+    }
+
+    /// Whether rows may evaluate this expression on rayon's threads: it holds no EXISTS
+    /// (whose pattern is planned and run on the query's thread) and nests at most
+    /// [`PARALLEL_DEPTH`] levels, so the evaluator's recursion fits a rayon thread's stack.
+    /// Deeper expressions are evaluated on the query's thread, whose stack
+    /// [`super::depth::with_stack`] sized for the whole algebra.
+    pub fn parallel(&self) -> bool {
+        !self.has_exists() && self.within(PARALLEL_DEPTH)
+    }
+
+    /// Whether this expression nests at most `levels` levels (recursing no deeper).
+    fn within(&self, levels: usize) -> bool {
+        if levels == 0 {
+            return false;
+        }
+        let n = levels - 1;
+        match self {
+            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) | Expr::Exists(_) => {
+                true
+            }
+            Expr::Or(a, b)
+            | Expr::And(a, b)
+            | Expr::Eq(a, b)
+            | Expr::SameTerm(a, b)
+            | Expr::Cmp(a, b, _)
+            | Expr::Arith(a, b, _) => a.within(n) && b.within(n),
+            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => a.within(n),
+            Expr::In(a, l) => a.within(n) && l.iter().all(|e| e.within(n)),
+            Expr::If(a, b, c) => a.within(n) && b.within(n) && c.within(n),
+            Expr::Coalesce(l) | Expr::Call(_, l) => l.iter().all(|e| e.within(n)),
         }
     }
 

@@ -117,6 +117,7 @@ pub fn validation_pool() -> Option<std::sync::Arc<rayon::ThreadPool>> {
         rayon::ThreadPoolBuilder::new()
             .num_threads((n / 2).max(1))
             .thread_name(|i| format!("validate-{i}"))
+            .stack_size(crate::THREAD_STACK)
             .build()
             .map(std::sync::Arc::new)
             .ok()

@@ -5,6 +5,7 @@
 #![doc(html_logo_url = "https://raw.githubusercontent.com/oxigraph/oxigraph/main/logo.svg")]
 
 pub mod algebra;
+pub mod nesting;
 mod parser;
 mod query;
 pub mod term;

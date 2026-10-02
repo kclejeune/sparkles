@@ -1792,7 +1792,7 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
         };
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };
-    let par = t.len() > PAR_THRESHOLD && !exprs.iter().any(|e| e.has_exists());
+    let par = t.len() > PAR_THRESHOLD && exprs.iter().all(Expr::parallel);
     let keep = map_rows(ctx, t.len(), par, test)?;
     tracing::debug!("filter evaluated {} rows in {:?}", t.len(), t0.elapsed());
     Ok(keep)
@@ -1827,7 +1827,7 @@ fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
         Ok(v) => v.into_id(ctx),
         Err(_) => Id::UNDEF,
     };
-    map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && !e.has_exists(), f)
+    map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && e.parallel(), f)
 }
 
 /// Candidate rows for `ORDER BY ?v LIMIT k` when every `?v` is a number other than NaN:
@@ -1970,7 +1970,7 @@ fn key_rows(
             Val::V(v) | Val::Dec(_, v) => Some(v),
         })
     };
-    map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD, f)
+    map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && e.parallel(), f)
 }
 
 /// The value of an ORDER BY key once per distinct input value, where the key is pure
@@ -2178,7 +2178,7 @@ fn group(
                         };
                         eval(e, &row, ctx).ok().map(|x| x.into_id(ctx))
                     };
-                    map_rows(ctx, v.len(), v.len() > PAR_THRESHOLD && !e.has_exists(), f)
+                    map_rows(ctx, v.len(), v.len() > PAR_THRESHOLD && e.parallel(), f)
                 })?
             }
             _ => None,
@@ -3114,11 +3114,25 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
             resp.status
         )));
     }
-    let fmt = if resp.content_type.contains("xml") {
-        sparesults::QueryResultsFormat::Xml
+    let (fmt, syntax) = if resp.content_type.contains("xml") {
+        (
+            sparesults::QueryResultsFormat::Xml,
+            crate::nesting::Syntax::Xml,
+        )
     } else {
-        sparesults::QueryResultsFormat::Json
+        (
+            sparesults::QueryResultsFormat::Json,
+            crate::nesting::Syntax::Json,
+        )
     };
+    // the results parsers read a nested triple term by recursion
+    let body = crate::nesting::Guarded::new(
+        resp.body,
+        syntax,
+        crate::nesting::MAX_ELEMENTS,
+        &format!("<{}>", url.as_str()),
+        Error::Service,
+    );
     // parsed as it streams in, under the policy's byte ceiling and deadline
     let parser = sparesults::QueryResultsParser::from_format(fmt);
     let mut t = Table::new(vars.to_vec());
@@ -3130,7 +3144,7 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
         },
         e => Error::Service(format!("<{}>: {e}", url.as_str())),
     };
-    match parser.for_reader(resp.body).map_err(failed)? {
+    match parser.for_reader(body).map_err(failed)? {
         sparesults::ReaderQueryResultsParserOutput::Solutions(sols) => {
             for sol in sols {
                 let sol = sol.map_err(failed)?;

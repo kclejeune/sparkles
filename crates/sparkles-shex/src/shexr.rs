@@ -51,6 +51,8 @@ pub fn from_graph(graph: &Graph, base: Option<&str>) -> Result<Schema, ParseErro
 /// the RDF carry their line and column. The triples of every graph of a dataset syntax
 /// are read as one graph. The document's prefixes (but `sx:`) become the schema's.
 pub fn from_text(text: &str, format: RdfFormat, base: Option<&str>) -> Result<Schema, ParseError> {
+    sparkles::nesting::check(format, text.as_bytes(), "the schema")
+        .map_err(|e| ParseError::new(e.to_string(), 0, 0))?;
     let mut parser = oxrdfio::RdfParser::from_format(format);
     if let Some(b) = base {
         parser = parser

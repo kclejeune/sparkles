@@ -126,6 +126,7 @@ impl SparqlParser {
         );
         #[cfg(feature = "standard-unicode-escaping")]
         let query = unescape_unicode_codepoints(query);
+        too_deep(&query)?;
         Ok(parser::QueryUnit(&query, &mut state).map_err(SparqlSyntaxErrorKind::Syntax)?)
     }
 
@@ -151,6 +152,7 @@ impl SparqlParser {
         );
         #[cfg(feature = "standard-unicode-escaping")]
         let update = unescape_unicode_codepoints(update);
+        too_deep(&update)?;
         let operations =
             parser::UpdateInit(&update, &mut state).map_err(SparqlSyntaxErrorKind::Syntax)?;
         check_if_insert_data_are_sharing_blank_nodes(&operations)?;
@@ -183,6 +185,26 @@ enum SparqlSyntaxErrorKind {
     Syntax(#[from] peg::error::ParseError<LineCol>),
     #[error("The blank node {0} cannot be shared by multiple blocks")]
     SharedBlankNode(BlankNode),
+    /// Refused before parsing (see [`crate::nesting`]); written as peg writes its errors.
+    #[error("error at {line}:{column}: {message}")]
+    TooDeep {
+        line: usize,
+        column: usize,
+        message: String,
+    },
+}
+
+/// Refuse a text that nests too deeply for the parser and the algebra it builds.
+fn too_deep(text: &str) -> Result<(), SparqlSyntaxError> {
+    crate::nesting::check(text).map_err(|e| {
+        let before = &text[..e.offset];
+        SparqlSyntaxErrorKind::TooDeep {
+            line: before.matches('\n').count() + 1,
+            column: before.chars().rev().take_while(|&c| c != '\n').count() + 1,
+            message: e.message,
+        }
+        .into()
+    })
 }
 
 #[cfg(feature = "standard-unicode-escaping")]

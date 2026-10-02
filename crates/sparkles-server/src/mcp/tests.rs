@@ -869,6 +869,32 @@ async fn a10_syntax_error() {
     assert_eq!(e, json!({"code": "syntax", "status": 400}));
 }
 
+/// Deep nesting is a syntax error (the tools' threads have tokio's default 2 MiB stack
+/// here, a quarter of what `sparkles mcp` gives them).
+#[tokio::test(flavor = "multi_thread")]
+async fn deep_nesting_is_a_syntax_error() {
+    let mut c = Client::start(fixture_server());
+    let groups = |n: usize| {
+        format!(
+            "SELECT * WHERE {} ?s ?p ?o {}",
+            "{".repeat(n),
+            "}".repeat(n)
+        )
+    };
+    let t = c.text("sparql_query", json!({"query": groups(100)})).await;
+    assert!(t.starts_with("# SELECT"), "{t}");
+    let r = c.call("explain_query", json!({"query": groups(100)})).await;
+    assert_eq!(r["isError"], false, "{r}");
+    // (a query is at most 65536 characters)
+    for n in [257, 10_000, 30_000] {
+        for tool in ["sparql_query", "explain_query"] {
+            let (t, e) = c.error(tool, json!({"query": groups(n)})).await;
+            assert!(t.contains("nested deeper than 256 levels"), "{tool}: {t}");
+            assert_eq!(e, json!({"code": "syntax", "status": 400}));
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a11_timeout() {
     let mut c = Client::start(server_with(

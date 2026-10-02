@@ -450,6 +450,7 @@ fn run_inner(args: &FmtArgs) -> Result<i32> {
     let outcomes: Vec<Option<Outcome>> = if jobs.len() > 1 {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(args.threads.unwrap_or(0))
+            .stack_size(crate::THREAD_STACK)
             .build()
             .context("starting the formatting threads")?;
         pool.install(|| jobs.par_iter().map(run).collect())

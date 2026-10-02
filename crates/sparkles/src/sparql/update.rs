@@ -63,6 +63,17 @@ pub fn update_as(
             .map_err(|e| Error::invalid(e.to_string()))?;
     }
     let parsed = p.parse_update(u)?;
+    let depth = super::depth::check_update(&parsed)?;
+    super::depth::with_stack(depth, || run_update(store, &parsed, opts, kind, t0))
+}
+
+fn run_update(
+    store: &Store,
+    parsed: &spargebra::Update,
+    opts: &QueryOptions,
+    kind: crate::commit::CommitKind,
+    t0: Instant,
+) -> Result<UpdateStats> {
     // malformed geometry constants fail before the writer lock is taken
     for op in &parsed.operations {
         if let GraphUpdateOperation::DeleteInsert { pattern, .. } = op {
@@ -599,6 +610,7 @@ fn insert_parsed(
     }
     let mut labels = std::collections::HashMap::new();
     let mut held = Vec::new();
+    let r = crate::nesting::Guarded::rdf(r, format, name);
     for (i, q) in parser.for_reader(r).enumerate() {
         if i % 4096 == 4095 {
             req.check()?;
