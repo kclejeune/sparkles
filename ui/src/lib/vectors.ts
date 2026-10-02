@@ -361,6 +361,8 @@ export type IndexForm = {
   efConstruction: string;
   efSearch: string;
   exactThreshold: string;
+  /** The `embedding` object as JSON text; empty for an index of stored vectors. */
+  embedding: string;
 };
 
 /** The form for a new index, or for editing `s`. */
@@ -380,7 +382,61 @@ export function indexForm(
     efConstruction: String(h.efConstruction),
     efSearch: String(h.efSearch),
     exactThreshold: String(s?.exactThreshold ?? EXACT_THRESHOLD_DEFAULT),
+    embedding: s?.embedding ? JSON.stringify(s.embedding.config, null, 2) : '',
   };
+}
+
+/** A starting point for the `embedding` object of a new index (Ollama on this machine). */
+export const EMBEDDING_EXAMPLE = JSON.stringify(
+  {
+    url: 'http://127.0.0.1:11434/v1/embeddings',
+    model: 'nomic-embed-text',
+    predicates: ['http://www.w3.org/2000/01/rdf-schema#label'],
+  },
+  null,
+  2,
+);
+
+/** The `embedding` object typed in the dialog, or why it is not one. */
+export function parseEmbedding(
+  text: string,
+): { config: api.EmbeddingConfig | null; error: null } | { config: null; error: string } {
+  if (!text.trim()) return { config: null, error: null };
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch (e) {
+    return { config: null, error: `Not JSON: ${(e as Error).message}` };
+  }
+  if (!v || typeof v !== 'object' || Array.isArray(v))
+    return { config: null, error: 'A JSON object with url, model and predicates or query' };
+  const o = v as Record<string, unknown>;
+  if (typeof o.url !== 'string' || !/^https?:\/\/\S+$/.test(o.url))
+    return { config: null, error: 'url: an http(s) URL' };
+  if (typeof o.model !== 'string' || !o.model) return { config: null, error: 'model: required' };
+  if (o.predicates == null && o.query == null)
+    return { config: null, error: 'predicates or query: name the text to embed' };
+  if (o.apiKey != null && (typeof o.apiKey !== 'object' || !('secret' in o.apiKey)))
+    return {
+      config: null,
+      error: 'apiKey: {"secret": NAME}, a secret the server defines with --embedding-secret',
+    };
+  return { config: o as api.EmbeddingConfig, error: null };
+}
+
+/** The badge class of an embedding state. */
+export function embeddingStateClass(s: api.EmbeddingState): string {
+  return s === 'idle' ? 'ok' : s === 'backoff' || s === 'disabled' ? 'danger' : 'warn';
+}
+
+/** "3 waiting · applied to commit 41 of 42", or "caught up". */
+export function embeddingProgress(e: api.EmbeddingStatus): string {
+  if (e.appliedSeq >= e.headSeq && !e.backlog && !e.scan) return 'caught up with every commit';
+  const parts: string[] = [];
+  if (e.scan) parts.push(`scanning ${e.scan.done} of ${e.scan.total} subjects`);
+  if (e.backlog) parts.push(`${e.backlog} waiting`);
+  parts.push(`embedded up to commit ${e.appliedSeq} of ${e.headSeq}`);
+  return parts.join(' · ');
 }
 
 /** The IRI of a predicate typed as an IRI, `<IRI>` or a prefixed name, or null. */
@@ -425,6 +481,8 @@ export function indexConfig(
   }
   const exactThreshold = int(f.exactThreshold, 0, Number.MAX_SAFE_INTEGER);
   if (exactThreshold == null) errors.exactThreshold = 'A whole number of rows';
+  const embedding = parseEmbedding(f.embedding ?? '');
+  if (embedding.error) errors.embedding = embedding.error;
   if (Object.keys(errors).length) return { config: null, errors };
   return {
     config: {
@@ -434,6 +492,7 @@ export function indexConfig(
       ...(f.model.trim() ? { model: f.model.trim() } : {}),
       hnsw: f.hnsw ? { m: m!, efConstruction: efConstruction!, efSearch: efSearch! } : false,
       exactThreshold: exactThreshold!,
+      ...(embedding.config ? { embedding: embedding.config } : {}),
     },
     errors: null,
   };

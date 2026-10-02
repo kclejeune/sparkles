@@ -131,6 +131,59 @@ def test_vector_index() -> None:
     assert ds.vector_index("emb") is None
 
 
+def test_embeddings_on_write() -> None:
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    received: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            received.extend(body["input"])
+            data = [
+                {"index": i, "embedding": [float(len(t)), 1.0, 0.0]}
+                for i, t in enumerate(body["input"])
+            ]
+            out = json.dumps({"data": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        ds = Dataset()
+        ds.extend(
+            [
+                Triple(ex("a"), ex("label"), Literal("ab")),
+                Triple(ex("b"), ex("label"), Literal("abcd")),
+            ]
+        )
+        url = f"http://127.0.0.1:{server.server_address[1]}/v1/embeddings"
+        embedding = {"url": url, "model": "m", "predicates": ["http://ex.org/label"]}
+        ds.create_vector_index("names", ex("emb"), 3, options={"embedding": embedding})
+        ds.embed(timeout=30)
+        assert sorted(received) == ["ab", "abcd"]
+        status = ds.vector_index("names")
+        assert status is not None and status["embedding"]["embedded"] == 2
+        q = """PREFIX spk: <urn:x-sparkles:>
+        SELECT ?s WHERE { (?s ?score) spk:vectorSearch (<http://ex.org/emb> "abcd" 1) }"""
+        assert [r["s"] for r in ds.query(q)] == [ex("b")]
+        ds.reembed_vector_index("names")
+        ds.embed(timeout=30)
+        # the query text equals a stored input, so it came from the cache
+        assert len(received) == 4
+    finally:
+        server.shutdown()
+
+
 # ------------------------------------------------------------ write validation ----
 
 SHAPES = """

@@ -126,6 +126,9 @@ running queries.
   ([API](docs/API.md#hybrid-text-and-vector-search)).
 * Vector similarity search over `spk:vector` literals, exact or through an HNSW index that
   sees every write at once ([API](docs/API.md#vector-similarity)).
+* Embeddings computed on write. A vector index can embed selected literals through an
+  OpenAI-compatible endpoint, such as OpenAI, Ollama or vLLM, in the background after
+  each commit, and searches can pass text ([API](docs/API.md#embeddings-on-write)).
 * GeoSPARQL 1.1 with a spatial index per dataset, Jena's `spatial:` and `spatialF:`
   functions, spatial joins and nearest-neighbour search ([API](docs/API.md#geosparql)).
 

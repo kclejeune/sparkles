@@ -18,6 +18,7 @@ mod auth;
 mod backup;
 mod clone;
 mod cost;
+mod embeddings;
 #[cfg(feature = "fmt")]
 mod format;
 mod fuseki;

@@ -1,9 +1,10 @@
 <script lang="ts">
   // The dataset page's vector indexes (`/$/vector/{ds}`): a card per index with its
   // predicate, dimension, metric, model, HNSW settings, build state, sizes and exact
-  // threshold, a recall measurement, and the packed predicates that have no index.
-  // Admins of the dataset create, edit, rebuild and drop indexes (builds are
-  // `vector-index` tasks); the others see the cards without those actions.
+  // threshold, a recall measurement, the embedding worker of an index that computes its
+  // vectors, and the packed predicates that have no index. Admins of the dataset
+  // create, edit, rebuild, re-embed and drop indexes (builds are `vector-index` tasks);
+  // the others see the cards without those actions.
   import { onMount } from 'svelte';
   import { resolve } from '$app/paths';
   import * as api from '$lib/api';
@@ -14,6 +15,9 @@
   import { load as loadStored, save as saveStored } from '$lib/storage';
   import { LatestRun } from '$lib/supersede';
   import {
+    EMBEDDING_EXAMPLE,
+    embeddingProgress,
+    embeddingStateClass,
     fmtRecall,
     indexConfig,
     indexForm,
@@ -94,7 +98,13 @@
 
   const status = $derived(loaded?.kind === 'ok' ? loaded.status : null);
   const indexes = $derived(status?.indexes ?? []);
-  const building = $derived(indexes.some((i) => i.state === 'building'));
+  const building = $derived(
+    indexes.some(
+      (i) =>
+        i.state === 'building' ||
+        (i.embedding != null && i.embedding.state !== 'idle' && i.embedding.state !== 'disabled'),
+    ),
+  );
 
   let panel = $state<HTMLElement>();
 
@@ -165,6 +175,24 @@
   async function rebuild(ix: api.VectorIndexStatus) {
     await onstart(`Vector index ${ix.name} rebuild`, () => api.rebuildVectorIndex(name, ix.name));
     void load();
+  }
+
+  let reembedding = $state<Record<string, boolean>>({});
+  async function reembed(ix: api.VectorIndexStatus) {
+    reembedding[ix.name] = true;
+    try {
+      await api.reembedVectorIndex(name, ix.name);
+      toasts.push(
+        'info',
+        `Re-embedding vector index ${ix.name}`,
+        'Every selected text is sent to the provider again.',
+      );
+      void load();
+    } catch (e) {
+      toasts.error('Could not re-embed the vector index', e);
+    } finally {
+      reembedding[ix.name] = false;
+    }
   }
 
   let dropTarget = $state<api.VectorIndexStatus | null>(null);
@@ -385,6 +413,11 @@
                 >{ix.metric}</span
               >
               {#if ix.model}<span class="chip model" title="Embedding model">{ix.model}</span>{/if}
+              {#if ix.embedding}<span
+                  class="chip model"
+                  title="The vectors are computed by {ix.embedding.endpoint}"
+                  >embeds with {ix.embedding.model}</span
+                >{/if}
             </div>
             {#if ix.state === 'building'}
               <div
@@ -465,6 +498,43 @@
                   <span class="faint">—</span>
                 {/if}
               </span>
+              {#if ix.embedding}
+                {@const em = ix.embedding}
+                <span class="faint">Embeddings</span>
+                <span class="embedding">
+                  <span class="badge {embeddingStateClass(em.state)}">{em.state}</span>
+                  <span class="mono small" title="The provider's endpoint">{em.endpoint}</span>
+                  <span class="faint">· {embeddingProgress(em)}</span>
+                  {#if em.scan}
+                    <span
+                      class="progress"
+                      role="progressbar"
+                      aria-label="Embedding pass"
+                      aria-valuenow={Math.round((em.scan.done / Math.max(1, em.scan.total)) * 100)}
+                      ><span style:width="{(em.scan.done / Math.max(1, em.scan.total)) * 100}%"
+                      ></span></span
+                    >
+                  {/if}
+                  <span class="faint"
+                    >{fmtInt(em.embedded)} vectors written, {fmtInt(em.requests)} requests{em.failed
+                      ? `, ${fmtInt(em.failed)} inputs failed`
+                      : ''}{em.lastBatch
+                      ? ` · last batch of ${fmtInt(em.lastBatch.inputs)} in ${fmtMs(em.lastBatch.ms)}`
+                      : ''}</span
+                  >
+                  {#if em.retryAt}<span class="warn small"
+                      >Retrying {fmtRelative(em.retryAt, now)}</span
+                    >{/if}
+                  {#if em.state === 'paused'}<span class="faint small"
+                      >No worker runs here: a read-only server, or a store opened without one.</span
+                    >{/if}
+                  {#if em.lastError}<span class="error-text small" title={fmtTime(em.lastError.at)}
+                      >{em.lastError.message}{em.lastError.subject
+                        ? ` (${em.lastError.subject})`
+                        : ''}</span
+                    >{/if}
+                </span>
+              {/if}
               <span class="faint">Recall</span>
               <span class="recall">
                 {#if recall}
@@ -549,6 +619,16 @@
                   title={offTitle ?? 'Build the index again from the data'}
                   ><Icon name="refresh" size={13} /> Rebuild</button
                 >
+                {#if ix.embedding}
+                  <button
+                    class="btn sm"
+                    onclick={() => reembed(ix)}
+                    disabled={actionsOff || reembedding[ix.name]}
+                    title={offTitle ??
+                      'Send every selected text to the provider again, as after a model change'}
+                    ><Icon name="refresh" size={13} /> Re-embed</button
+                  >
+                {/if}
               {/if}
             </div>
           </article>
@@ -710,6 +790,24 @@
         aria-invalid={!!errors.exactThreshold}
       />
       {#if errors.exactThreshold}<span class="bad">{errors.exactThreshold}</span>{/if}
+    </label>
+    <label class="field">
+      Embedding <span class="faint"
+        >(optional JSON: compute the vectors from the dataset's text with an OpenAI-compatible
+        endpoint)</span
+      >
+      <textarea
+        class="input mono embedding-json"
+        rows="6"
+        bind:value={form.embedding}
+        placeholder={EMBEDDING_EXAMPLE}
+        spellcheck="false"
+        aria-invalid={!!errors.embedding}></textarea>
+      {#if errors.embedding}<span class="bad">{errors.embedding}</span>{/if}
+      <span class="faint small"
+        >The text of the selected literals is sent to this endpoint after each commit. Leave it
+        empty when you load the vectors yourself.</span
+      >
     </label>
     <p class="faint small">
       {#if !editing}
@@ -879,6 +977,25 @@
   }
   .warn {
     color: var(--warn);
+  }
+  .embedding {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 8px;
+  }
+  .embedding .progress {
+    flex: 1 1 100%;
+  }
+  .error-text {
+    color: var(--danger);
+    flex: 1 1 100%;
+  }
+  .embedding-json {
+    height: auto;
+    min-height: 96px;
+    font-size: var(--fs-sm);
+    resize: vertical;
   }
   .measure {
     display: flex;

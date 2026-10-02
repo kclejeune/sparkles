@@ -656,6 +656,15 @@ enum Cmd {
         no_service: bool,
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
+        /// A secret vector indexes may name as their embedding API key, read from an
+        /// environment variable or a file when a request is made: NAME=env:VARIABLE or
+        /// NAME=file:PATH (repeatable)
+        #[arg(long, value_name = "NAME=SOURCE")]
+        embedding_secret: Vec<String>,
+        /// Compute no embeddings: no worker sends text to a provider, and searches
+        /// cannot pass text (the configurations are kept)
+        #[arg(long)]
+        no_embedding: bool,
         /// Let `LOAD <file:…>` read the files under this directory (and nothing else);
         /// without it, the server refuses file loads
         #[arg(long, value_name = "DIR")]
@@ -1808,6 +1817,8 @@ fn run() -> Result<()> {
             max_timeout,
             read_only,
             no_service,
+            embedding_secret,
+            no_embedding,
             outbound,
             load_dir,
             idle_release_ms,
@@ -1948,6 +1959,12 @@ fn run() -> Result<()> {
             st.read_only = read_only;
             st.allow_service = !no_service;
             st.outbound = outbound.policy()?;
+            // embedding requests go through the same outbound policy
+            sparkles::vector::embed::set_environment(sparkles::vector::embed::Environment {
+                enabled: !no_embedding,
+                outbound: st.outbound.clone(),
+                secrets: vector::parse_secrets(&embedding_secret)?,
+            });
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
             st.schema_max_entries = schema_max_entries;
             st.gsp_direct_naming = gsp_direct_naming;
@@ -2071,6 +2088,8 @@ fn run() -> Result<()> {
             }
             if !st.read_only {
                 compaction::spawn(st.clone());
+                // the embedding workers of datasets whose vector indexes compute vectors
+                vector::spawn_embedders(st.clone());
             }
             for m in mem {
                 st.attach(m.trim_start_matches('/'), state::DbType::Mem, None)?;

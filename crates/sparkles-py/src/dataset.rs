@@ -1084,7 +1084,8 @@ impl PyDataset {
 
     /// Create or replace a vector index over the embeddings of `predicate`, and start
     /// building it in the background; true when it was created. `options` holds more of
-    /// the configuration (`metric`, `model`, `hnsw`, `exactThreshold`).
+    /// the configuration (`metric`, `model`, `hnsw`, `exactThreshold`, and `embedding` for
+    /// an index that computes its vectors with an embeddings endpoint).
     #[pyo3(signature = (name, predicate, dimension, *, options = None))]
     fn create_vector_index(
         &self,
@@ -1109,6 +1110,52 @@ impl PyDataset {
     fn rebuild_vector_index(&self, py: Python<'_>, name: &str) -> PyResult<()> {
         let ds = self.ds_for_write(py)?;
         py.detach(|| ds.store().rebuild_vector_index(name)).py(py)
+    }
+
+    /// Embed every selected text of a vector index again, the next time `embed` runs.
+    fn reembed_vector_index(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        let ds = self.ds_for_write(py)?;
+        py.detach(|| ds.store().reembed(name)).py(py)
+    }
+
+    /// Embed the text waiting for the vector indexes that compute their vectors, on this
+    /// thread, and return when nothing is left. Requests may reach private addresses
+    /// (a local Ollama) unless `allow_private` is false. `secrets` maps the names an
+    /// `apiKey` may give to `env:VARIABLE` or `file:PATH`. Raises `QueryTimeoutError`
+    /// when `timeout` seconds pass with work left, as when the provider keeps failing.
+    #[pyo3(signature = (*, timeout = 3600.0, allow_private = true, secrets = None))]
+    fn embed(
+        &self,
+        py: Python<'_>,
+        timeout: f64,
+        allow_private: bool,
+        secrets: Option<std::collections::BTreeMap<String, String>>,
+    ) -> PyResult<()> {
+        if !(timeout.is_finite() && timeout > 0.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "timeout must be a positive number of seconds",
+            ));
+        }
+        let mut env = sparkles::vector::embed::Environment {
+            outbound: sparkles::outbound::OutboundPolicy {
+                allow_private,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for (name, src) in secrets.unwrap_or_default() {
+            let src = src
+                .parse()
+                .map_err(|e: String| pyo3::exceptions::PyValueError::new_err(e))?;
+            env.secrets.insert(name, src);
+        }
+        let ds = self.ds_for_write(py)?;
+        ds.store().set_embedding_environment(Some(env));
+        py.detach(|| {
+            ds.store()
+                .embed_until_idle(std::time::Duration::from_secs_f64(timeout))
+        })
+        .py(py)
     }
 
     /// The status of a vector index, or `None`; with `wait`, once its build is done.

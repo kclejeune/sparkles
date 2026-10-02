@@ -135,7 +135,7 @@ A commit gains three fields in JSON:
 branch started from. A merge commit's first parent is the previous commit of the target,
 and `mergedFrom` is its second parent.
 
-A new commit kind, `merge` with the next free code (12, after the `patch` kind of [F10](F10-replication.md)), marks merge commits. Creating or deleting a
+A new commit kind, `merge` with the next free code (13, after the `embed` kind of [F08](F08-embeddings-on-write.md) and the `patch` kind of [F10](F10-replication.md)), marks merge commits. Creating or deleting a
 branch makes no commit, just as creating a snapshot makes none.
 
 The commit IRI that RDF Patch output uses becomes `urn:uuid:<branch id>#commit:<seq>`.
@@ -400,7 +400,7 @@ Error::BranchConflict(String, code)  // 409 branch-exists, branch-limit, unmerge
 Error::MergeConflict(ConflictReport) // 409 merge-conflict
 Error::BranchProtected(String)       // 403
 // commit.rs
-CommitKind::Merge                    // code 12, JSON "merge"
+CommitKind::Merge                    // code 13, JSON "merge"
 ```
 
 The branch methods are reachable from any branch's store. They act on the dataset's

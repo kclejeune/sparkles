@@ -1070,6 +1070,11 @@ fusion against hand-computed scores, subjects missing from one list, ties in eac
 ranking and in the fused score, depths, limits and options, euclidean ranking, constant
 subjects, `GRAPH ?g`, subjects with several hits, the `maxHits` budget and every error.
 
+**Embeddings.** Computing embeddings, a non-goal of this spec, became
+[F08](F08-embeddings-on-write.md): an index can name an OpenAI-compatible endpoint that
+computes its vectors after each commit, and `spk:vectorSearch` and `spk:hybridSearch`
+then accept a text as their query.
+
 **Not built.** Quantization, and the rest of Phase 3: background catch-up of the graph with
 overlay inserts, keeping the graph across compactions, rewriting `ORDER BY spk:cosine(…)
 LIMIT k`, and a compact datatype. A hybrid call with a variable vector query or with
