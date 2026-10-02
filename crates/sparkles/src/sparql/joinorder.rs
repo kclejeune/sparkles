@@ -229,11 +229,10 @@ fn probe(
     Some((cost, sorted))
 }
 
-/// The cost and rows of a plan of `cost` and `est` rows under a FILTER of `count`
-/// conjuncts, one of which sorts its input when `unsorted` (see [`plan::filter`]).
-fn filtered(cost: f64, est: f64, count: u32, unsorted: bool) -> (f64, f64) {
+/// The cost and rows of a plan of `cost` and `est` rows under a FILTER of selectivity
+/// `sel`, one of whose conjuncts sorts its input when `unsorted` (see [`plan::filter`]).
+fn filtered(cost: f64, est: f64, sel: f64, unsorted: bool) -> (f64, f64) {
     let cost = cost + est + if unsorted { est * 0.5 } else { 0.0 };
-    let sel = plan::FILTER_SELECTIVITY.powi(count as i32);
     (cost, (est * sel).max(if est > 0.0 { 1.0 } else { 0.0 }))
 }
 
@@ -275,6 +274,8 @@ struct FilterInfo {
     /// the variable an expression cache would read, as a local index, if the inputs
     /// bind it
     cached: Option<u32>,
+    /// its selectivity measured on a sample (see [`super::sample`])
+    sel: Option<f64>,
 }
 
 /// The inputs' variables and the filters, indexed for the ordering.
@@ -294,7 +295,7 @@ struct Group {
 }
 
 impl Group {
-    fn new(items: &[Vec<Node>], filters: &[Expr]) -> Group {
+    fn new(items: &[Vec<Node>], filters: &[Expr], ctx: &Ctx) -> Group {
         let mut idx: FxHashMap<VarId, u32> = FxHashMap::default();
         let mut vars = Vec::new();
         let mut count: Vec<u32> = Vec::new();
@@ -337,6 +338,7 @@ impl Group {
                     placeable,
                     vars: local.into_iter().flatten().collect(),
                     cached,
+                    sel: ctx.sampled(&f.display(ctx)).map(|s| s.sel),
                 }
             })
             .collect();
@@ -360,7 +362,7 @@ pub(super) fn order(
     items: Vec<Vec<Node>>,
     filters: &mut Vec<Expr>,
 ) -> Result<std::result::Result<Node, Vec<Vec<Node>>>> {
-    let g = Group::new(&items, filters);
+    let g = Group::new(&items, filters, pl.ctx);
     let dp = Dp::prepare(&g, &items);
     if dp.is_none() && items.len() <= 12 {
         return Ok(Err(items));
@@ -700,7 +702,8 @@ impl Greedy {
                     .cached
                     .is_some_and(|l| has.get(l) && sum.sorted != Some(g.vars[l as usize]))
             });
-            let (cost, est) = filtered(sum.cost, sum.est, now.len() as u32, unsorted);
+            let sel = super::sample::combine(now.iter().map(|&f| g.filters[f].sel));
+            let (cost, est) = filtered(sum.cost, sum.est, sel, unsorted);
             sum = Sum::new(cost, est, sum.sorted);
             for x in &mut d {
                 x.1 = x.1.min(sum.est.max(1.0));
@@ -838,6 +841,8 @@ struct Dp {
     /// filter (the first 64) → the variable an expression cache reads and the inputs
     /// binding it
     cached: Vec<Option<(VarId, u32)>>,
+    /// filter (the first 64) → its selectivity measured on a sample
+    fsel: Vec<Option<f64>>,
     ents: Vec<Ent>,
     dval: Vec<f64>,
 }
@@ -932,6 +937,7 @@ impl Dp {
             .enumerate()
             .map(|(j, &v)| (v, j as u32))
             .collect();
+        let fsel = fl.iter().map(|fi| fi.sel).collect();
         Some(Dp {
             n,
             jm,
@@ -940,6 +946,7 @@ impl Dp {
             jvar,
             jidx,
             cached,
+            fsel,
             ents: Vec::new(),
             dval: Vec::new(),
         })
@@ -1234,6 +1241,14 @@ impl Dp {
         }
         let newf = self.fcov[im as usize] & !(self.fcov[ia as usize] | self.fcov[ib as usize]);
         let nf = newf.count_ones();
+        let mut bits = newf;
+        let sel = super::sample::combine(std::iter::from_fn(|| {
+            (bits != 0).then(|| {
+                let f = bits.trailing_zeros();
+                bits &= bits - 1;
+                self.fsel[f as usize]
+            })
+        }));
         sc.cached.clear();
         let mut fb = newf;
         while fb != 0 {
@@ -1272,7 +1287,7 @@ impl Dp {
                 let unsorted = |key: Option<VarId>| cached.iter().any(|&v| key != Some(v));
                 let after = |cost: f64, key: Option<VarId>| {
                     if nf > 0 {
-                        filtered(cost, est, nf, unsorted(key))
+                        filtered(cost, est, sel, unsorted(key))
                     } else {
                         (cost, est)
                     }

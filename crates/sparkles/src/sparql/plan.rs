@@ -1833,6 +1833,9 @@ impl<'a> Planner<'a> {
         for t in &triples {
             leaves.push(self.scan_options(t)?);
         }
+        if self.ctx.opt.sampled_filters && !filters.is_empty() {
+            super::sample::prepare(self.ctx, &leaves, &filters);
+        }
         // searches that read the rest of the group are attached to it at the end
         let (dependent, nodes): (Vec<Node>, Vec<Node>) = nodes
             .into_iter()
@@ -2606,12 +2609,14 @@ pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
     if exprs.is_empty() {
         return n;
     }
-    let desc = exprs
-        .iter()
-        .map(|e| e.display(ctx))
-        .collect::<Vec<_>>()
-        .join(" && ");
-    let sel = FILTER_SELECTIVITY.powi(exprs.len() as i32);
+    let texts: Vec<String> = exprs.iter().map(|e| e.display(ctx)).collect();
+    let sampled: Vec<Option<super::sample::Sampled>> =
+        texts.iter().map(|t| ctx.sampled(t)).collect();
+    let sel = super::sample::combine(sampled.iter().map(|s| s.map(|s| s.sel)));
+    let mut desc = texts.join(" && ");
+    if let Some(note) = super::sample::note(&sampled) {
+        desc = format!("{desc} {note}");
+    }
     // a conjunct evaluated once per distinct value sorts its input column, unless the
     // input is sorted on it already (an index scan can be read in that order instead).
     // Costed whether or not the expression cache is on, so that switching it off does

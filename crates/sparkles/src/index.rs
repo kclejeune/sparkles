@@ -607,6 +607,14 @@ impl BlockCache {
         })
     }
 
+    /// Whether the columns in `mask` of block `b` are decoded in the cache, without
+    /// decoding them or counting a hit or miss.
+    pub fn has_cols(&self, idx: &PermIndex, b: usize, mask: ColMask) -> bool {
+        (0..4).all(|c| {
+            mask & (1 << c) == 0 || self.cache.peek(&(idx.uid, b as u32, c as u8)).is_some()
+        })
+    }
+
     pub fn bytes(&self) -> u64 {
         self.cache.weight()
     }

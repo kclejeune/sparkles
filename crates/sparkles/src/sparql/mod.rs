@@ -16,6 +16,7 @@ mod joinorder;
 mod keyfilter;
 pub mod plan;
 pub mod results;
+mod sample;
 pub mod stats;
 pub mod table;
 pub mod textpf;
@@ -726,6 +727,8 @@ mod indexjoin_tests;
 mod joinorder_tests;
 #[cfg(test)]
 mod opt_tests;
+#[cfg(test)]
+mod sample_tests;
 #[cfg(test)]
 mod stats_tests;
 #[cfg(test)]

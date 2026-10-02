@@ -98,10 +98,14 @@ pub struct Optimizations {
     /// those two read only the key ranges of the values whose string starts as a
     /// `STRSTARTS` or a `REGEX` anchored on a literal start requires
     pub filter_key_ranges: bool,
+    /// a FILTER conjunct over the variables of one triple pattern is tested on a sample
+    /// of the pattern's rows, whose share that passes is the planner's estimate of the
+    /// share of its input it keeps (instead of 30%)
+    pub sampled_filters: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 22] = [
+    pub const NAMES: [&str; 23] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -124,6 +128,7 @@ impl Optimizations {
         "count_filter_runs",
         "filter_scan_runs",
         "filter_key_ranges",
+        "sampled_filters",
     ];
 
     /// Everything on.
@@ -150,6 +155,7 @@ impl Optimizations {
         count_filter_runs: true,
         filter_scan_runs: true,
         filter_key_ranges: true,
+        sampled_filters: true,
     };
 
     /// Everything off: the generic operators only.
@@ -176,6 +182,7 @@ impl Optimizations {
         count_filter_runs: false,
         filter_scan_runs: false,
         filter_key_ranges: false,
+        sampled_filters: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -202,6 +209,7 @@ impl Optimizations {
             "count_filter_runs" => &mut self.count_filter_runs,
             "filter_scan_runs" => &mut self.filter_scan_runs,
             "filter_key_ranges" => &mut self.filter_key_ranges,
+            "sampled_filters" => &mut self.sampled_filters,
             _ => return None,
         })
     }
@@ -291,6 +299,8 @@ pub struct Ctx {
     pub geo: crate::geo::memo::GeoMemo,
     /// notes for the plan's reader, without duplicates (see [`Ctx::warn`])
     warnings: parking_lot::Mutex<Vec<PlanWarning>>,
+    /// FILTER selectivities measured on samples for this query, by conjunct text
+    sampled: parking_lot::Mutex<FxHashMap<String, super::sample::Sampled>>,
 }
 
 impl Ctx {
@@ -323,6 +333,7 @@ impl Ctx {
             opt: Optimizations::default(),
             geo: Default::default(),
             warnings: Default::default(),
+            sampled: Default::default(),
         }
     }
 
@@ -337,6 +348,22 @@ impl Ctx {
     /// The warnings recorded so far.
     pub fn warnings(&self) -> Vec<PlanWarning> {
         self.warnings.lock().clone()
+    }
+
+    /// The selectivity measured on a sample for the FILTER conjunct shown as `text`, if
+    /// one was measured while planning this query.
+    pub(super) fn sampled(&self, text: &str) -> Option<super::sample::Sampled> {
+        let m = self.sampled.lock();
+        if m.is_empty() {
+            return None;
+        }
+        m.get(text).copied()
+    }
+
+    /// Keep the selectivity measured for the conjunct shown as `text` (the first one
+    /// measured stays, so that every plan compared sees the same).
+    pub(super) fn set_sampled(&self, text: String, s: super::sample::Sampled) {
+        self.sampled.lock().entry(text).or_insert(s);
     }
 
     #[inline]

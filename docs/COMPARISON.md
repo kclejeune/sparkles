@@ -247,6 +247,24 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   `[runs of ?v: N values tested on vocabulary keys, M passed]`. Union-graph dedup, which
   compares neighbouring rows, and a delta with keys in the scan's range keep the generic
   scan and filter.
+* **Filter selectivity from samples** (`sampled_filters`). Without other knowledge the
+  planner assumes that a FILTER conjunct keeps 30% of its input. A conjunct whose
+  variables are all bound by one triple pattern is instead tested on a sample of that
+  pattern's rows, and the share of the sample it keeps becomes its estimate. The sample
+  comes from the sorted index. The first and last keys of the pattern's blocks are held in
+  memory by the block metadata and cost nothing to read. When they are too few, one or
+  two blocks are decoded as well, preferably blocks the cache already holds, and give 128
+  rows each. A pattern of at most a few thousand rows is read whole, with the delta. The
+  pattern is read sorted on another variable when it has one, so that a decoded block
+  holds values from all over the filtered variable's range. Selectivities are kept with
+  the snapshot, and later queries at the same commit reuse them. A conjunct over several
+  patterns keeps the fixed estimate. EXPLAIN notes `[selectivity 0.0650 of 187 sampled
+  rows]` on the filter. At 10.5M triples, `?p foaf:name ?n ; foaf:age ?a
+  FILTER(CONTAINS(?n, "Ada"))` keeps 5% of the names. With an estimate of 6.5% instead
+  of 30%, the planner tests each distinct name once in a scan sorted on the name, sorts
+  the 50,000 rows that pass and merges them with the ages. The query runs in 12 ms
+  instead of 21 ms. Sampling adds 0.02 to 0.08 ms to planning a filter when the blocks are
+  cached, and 0.3 to 0.6 ms when one has to be decoded.
 * **Key ranges for a fixed start** (`filter_key_ranges`). Under a `STRSTARTS`, or a
   `REGEX` anchored on a literal start (`^abc` with no flag other than `s` and no
   alternation), the two operators above read only the base-vocabulary ids of the keys

@@ -115,24 +115,41 @@ impl Counts {
 }
 
 /// Counts already worked out, kept with a generation (the part that depends only on the
-/// base) or with a snapshot (the final answers).
+/// base) or with a snapshot (the final answers), and the FILTER selectivities measured on
+/// samples of a snapshot (see [`super::sample`]).
 #[derive(Default)]
-pub struct CountCache(Mutex<FxHashMap<CountKey, Arc<Counts>>>);
+pub struct CountCache {
+    counts: Mutex<FxHashMap<CountKey, Arc<Counts>>>,
+    sampled: Mutex<FxHashMap<String, super::sample::Sampled>>,
+}
 
 impl CountCache {
     /// Entries kept before the cache starts over.
     const ENTRIES: usize = 1024;
 
     fn get(&self, k: &CountKey) -> Option<Arc<Counts>> {
-        self.0.lock().get(k).cloned()
+        self.counts.lock().get(k).cloned()
     }
 
     fn put(&self, k: &CountKey, c: Arc<Counts>) {
-        let mut m = self.0.lock();
+        let mut m = self.counts.lock();
         if m.len() >= Self::ENTRIES {
             m.clear();
         }
         m.insert(k.clone(), c);
+    }
+
+    /// A selectivity measured on a sample, by the pattern and conjunct it was measured for.
+    pub(super) fn sampled(&self, k: &str) -> Option<super::sample::Sampled> {
+        self.sampled.lock().get(k).copied()
+    }
+
+    pub(super) fn set_sampled(&self, k: String, s: super::sample::Sampled) {
+        let mut m = self.sampled.lock();
+        if m.len() >= Self::ENTRIES {
+            m.clear();
+        }
+        m.insert(k, s);
     }
 }
 

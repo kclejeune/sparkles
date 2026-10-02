@@ -13,8 +13,11 @@
 //! pattern. `cal_drives` joins selective patterns, sorted on their subject, with one
 //! more pattern each. All three also run the plan the planner chooses (`auto`).
 //! `cal_tables` times hash joins, merge joins and sorts of generated tables.
-//! `SPARKLES_CAL_MODES` limits the modes that run, and `SPARKLES_CAL_RUNS` sets the timed
-//! runs (default 7) after one warm-up.
+//! `cal_plan` times the planning of every query of `SPARKLES_CAL_QUERIES` with the
+//! estimates measured on samples on and off.
+//! `SPARKLES_CAL_MODES` limits the modes that run, `SPARKLES_CAL_RUNS` sets the timed
+//! runs (default 7) after one warm-up, and `SPARKLES_CAL_DISABLE` switches off
+//! optimizations by name, as `SPARKLES_DISABLE_OPTIMIZATIONS` does for the server.
 //!
 //! The server allocates with mimalloc, and test binaries with the system allocator. Run
 //! them with mimalloc preloaded (`LD_PRELOAD=…/libmimalloc.so`) to time what the server
@@ -41,11 +44,21 @@ fn runs() -> usize {
         .unwrap_or(7)
 }
 
+/// The optimizations of a run: all but those `SPARKLES_CAL_DISABLE` names.
+fn optimizations() -> Optimizations {
+    match std::env::var("SPARKLES_CAL_DISABLE") {
+        Ok(names) => Optimizations::ALL
+            .disable(&names)
+            .expect("SPARKLES_CAL_DISABLE names optimizations"),
+        Err(_) => Optimizations::ALL,
+    }
+}
+
 fn opts(batched: bool) -> QueryOptions {
     QueryOptions {
         optimizations: Some(Optimizations {
             batched_join: batched,
-            ..Optimizations::ALL
+            ..optimizations()
         }),
         no_cache: true,
         ..Default::default()
@@ -433,6 +446,70 @@ fn cal_tables() {
             println!("T\thash\t{b}\t{p}\t{out}\t{hash:.4}");
             println!("T\tmerge\t{b}\t{p}\t{out}\t{merge:.4}");
             println!("T\tsort\t{b}\t0\t0\t{:.4}", (sort - copy).max(0.0));
+        }
+    }
+}
+
+/// Planning time of every `.rq` file of `SPARKLES_CAL_QUERIES` (or `SPARKLES_CAL_ONLY`),
+/// with the estimates measured on samples on and off. Each run plans on a copy of the
+/// snapshot without the estimates kept from earlier runs, with the block cache kept
+/// (`warm`) or empty (`cold`, the decoded blocks are read again from the page cache).
+#[test]
+#[ignore]
+fn cal_plan() {
+    let s = store();
+    let snap = s.snapshot();
+    let dir =
+        std::env::var("SPARKLES_CAL_QUERIES").expect("SPARKLES_CAL_QUERIES names a directory");
+    let only = std::env::var("SPARKLES_CAL_ONLY").ok();
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "rq"))
+        .collect();
+    files.sort();
+    for f in files {
+        let name = f.file_stem().unwrap().to_string_lossy().to_string();
+        if only
+            .as_ref()
+            .is_some_and(|o| !o.split(',').any(|x| x == name))
+        {
+            continue;
+        }
+        let q = std::fs::read_to_string(&f).unwrap();
+        for (mode, sampled) in [("on", true), ("off", false)] {
+            if !runs_mode(mode) {
+                continue;
+            }
+            let o = QueryOptions {
+                optimizations: Some(Optimizations {
+                    sampled_filters: sampled,
+                    ..Optimizations::ALL
+                }),
+                no_cache: true,
+                ..Default::default()
+            };
+            for cold in [false, true] {
+                let ts: Vec<f64> = (0..=runs())
+                    .map(|_| {
+                        let mut fresh = (*snap).clone();
+                        fresh.counts = Default::default();
+                        if cold {
+                            fresh.cache = Arc::new(crate::index::BlockCache::new(1 << 30));
+                        }
+                        let fresh = Arc::new(fresh);
+                        let t0 = std::time::Instant::now();
+                        explain(fresh, &q, &o).unwrap_or_else(|e| panic!("{name}: {e}"));
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    })
+                    .skip(1)
+                    .collect();
+                println!(
+                    "PLAN\t{name}\t{mode}\t{}\t{:.3}",
+                    if cold { "cold" } else { "warm" },
+                    median(ts)
+                );
+            }
         }
     }
 }
