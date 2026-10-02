@@ -783,6 +783,41 @@ implementation landed.
   - a size-only or ratio-only trigger;
   - compacting every idle period whatever the delta's size.
 
+## Branches and merges
+
+- **Spec:** [`F09-branches-and-merges.md`](F09-branches-and-merges.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the [C06](C06-clone-to-sandbox.md),
+    [F06](F06-snapshots-and-point-in-time.md), [CI](CI-commit-identity.md),
+    [C13](C13-automatic-compaction.md), [F05](F05-snapshot-repositories.md) and
+    [C12](C12-graph-access-control.md) specs;
+  - Git's model of branches, merge bases, three-way merges and two-parent merge commits,
+    from its documentation, cited from general knowledge;
+  - the public documentation of Dolt (merges and conflict tables) and Project Nessie
+    (expected hashes), both fetched, and of lakeFS (merge strategies) and TerminusDB
+    (delta layers and rebase merges), read through searches;
+  - Datomic's documentation of `with`, cited from general knowledge;
+  - the literature on three-way merges (diff3), replicated sets and version vectors, and
+    the Quit Store and R43ples papers on versioned RDF, cited from general knowledge;
+  - RDF 1.2 Concepts, RDFC-1.0 as a test oracle, the SPARQL 1.1 Protocol and Jena's RDF
+    Patch documentation.
+
+  Fluree was not consulted, and the project's notes that describe Fluree's features were
+  not used. Jena and Oxigraph have no branches, so neither was a source.
+- **Implementation:** not started. **Dependencies:** none planned.
+- **Rejected** (spec §8):
+  - a branch as a full clone;
+  - branches inside one store with one tagged log;
+  - a content-addressed index;
+  - rebase as the merge model;
+  - quad-level conflicts as the default, and conflicts from the ontology alone;
+  - conflicts kept on the server until resolved;
+  - relabelling blank nodes at merge time, and merging isomorphic blank-node structures;
+  - hard links or reflinks to share generation files;
+  - branches as separate datasets in the registry;
+  - moving refs on fast-forward;
+  - a branch syntax inside `at`.
+
 ## Command-line tools and IRI and language-tag checks
 
 - **Spec:** [`G05-command-line-tools.md`](G05-command-line-tools.md), written on
