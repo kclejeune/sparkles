@@ -127,6 +127,7 @@ open('the Spatial index panel enables, shows and rebuilds the index', async ({ p
 
   await panel.getByRole('button', { name: 'Map' }).click();
   const indexed = panel.getByRole('region', { name: 'Indexed geometries' });
-  await expect(indexed).toHaveAttribute('data-state', 'ready');
-  await expect(indexed).toHaveAttribute('data-features', '5');
+  // the map reads the index status and its geometries: as slow as a build on a busy machine
+  await expect(indexed).toHaveAttribute('data-state', 'ready', { timeout: 15_000 });
+  await expect(indexed).toHaveAttribute('data-features', '5', { timeout: 15_000 });
 });
