@@ -6,12 +6,15 @@
 Reads the files scripts/bench.sh and scripts/bench-billion.sh write into <results-dir>:
 hyperfine JSON per query (`<name>.json`), `load.json`, `update-latency.json`,
 `throughput.json` (star-join) or `throughput-<query>.json`, the answer fingerprints
-(`answers.json`, see bench-answers.py), `rss.json` and `rss-probe.json`, and from
-bench-billion.sh `load-details.json` (peak RSS and index size of each load) and
-`cold.json` (one run per query after a restart with the engine's files evicted from the
-page cache). Engines whose answer differs from the majority are footnoted and not ranked.
+(`answers.json`, see bench-answers.py), `rss.json`, `rss-probe.json`, `mem.json` (server
+RSS at start, after a warm-up and at the throughput peak, each query's peak RSS, and the
+Sparkles block cache), `load-details.json` (peak RSS and index size of each load),
+`cold.json` and `cold-runs.json` (queries after a restart with the engine's files evicted
+from the page cache, and the time to ready), `churn.json` (the commits of the updates
+mode) and `mixed.json` (reads and writes of the mixed mode). Engines whose answer differs
+from the majority are footnoted and not ranked. The best value of each row is bold.
 """
-import json, sys, os
+import json, os, statistics, sys
 d, names = sys.argv[1], sys.argv[2:]
 ORDER = ["sparkles", "jena-fuseki", "qlever", "fluree", "oxigraph"]
 LOADNAME = {"jena-fuseki": "jena-tdb2"}
@@ -25,9 +28,14 @@ for n in names + ["update-latency"] + THROUGHPUT:
 if os.path.exists(f"{d}/answers.json"):
     seen |= {e for v in json.load(open(f"{d}/answers.json")).values() for e in v}
 seen |= {next((c for c, l in LOADNAME.items() if l == e), e) for e in load(f"{d}/load.json")}
-cmds =[c for c in ORDER if c in seen] + sorted(seen - set(ORDER))
+for f in ("mem.json", "churn.json", "mixed.json", "cold.json", "rss.json"):
+    if os.path.exists(f"{d}/{f}"):
+        j = json.load(open(f"{d}/{f}"))
+        seen |= {e for e in j if e in ORDER} | {e for v in j.values() if isinstance(v, dict) for e in v if e in ORDER}
+cmds = [c for c in ORDER if c in seen] + sorted(seen - set(ORDER))
 out = ["| query | " + " | ".join(f"{c} (ms)" for c in cmds) + " |", "|---|" + "---:|" * len(cmds)]
-def fmt(r): return f"{r['mean']*1000:.1f} ± {r['stddev']*1000:.1f}"
+# hyperfine has no standard deviation for a single run (null)
+def fmt(r): return f"{r['mean']*1000:.1f} ± {(r['stddev'] or 0)*1000:.1f}"
 def nfailed(r): return sum(1 for e in r.get("exit_codes", []) if e != 0)
 def row(label, rs, bad=frozenset(), f=fmt, better=min, key=lambda r: r["mean"], err="error",
         mark=None, unranked=frozenset()):
@@ -97,22 +105,99 @@ for t in THROUGHPUT:
     if rs:
         row(f"**throughput** {q}, {conc} clients (queries/s)", rs, f=lambda r: ("%.0f" if nreq / r["mean"] >= 10 else "%.1f") % (nreq / r["mean"]),
             better=max, key=lambda r: nreq / r["mean"], err="timeout/error")
-if os.path.exists(f"{d}/rss.json"):
-    rss = json.load(open(f"{d}/rss.json"))
-    out.append("| **server RSS** after the run (MiB) | " + " | ".join(str(rss.get(c, "—")) for c in cmds) + " |")
-if os.path.exists(f"{d}/rss-probe.json"):
-    pr = json.load(open(f"{d}/rss-probe.json"))
-    cell = lambda c, k: str(pr[c][k]) if c in pr and k in pr[c] else "—"
-    out.append("| **RSS probe**, fresh server: after the queries / after 3×160 star-join (MiB) | "
-               + " | ".join(f"{cell(c, 'after_queries_mib')} / {cell(c, 'after_round3_mib')}" if c in pr else "—" for c in cmds) + " |")
-if os.path.exists(f"{d}/load-details.json"):
-    ld = json.load(open(f"{d}/load-details.json"))
-    cell = lambda c, k, f: f(ld[LOADNAME.get(c, c)][k]) if k in ld.get(LOADNAME.get(c, c), {}) else "—"
-    out.append("| **load** peak RSS (MiB) | " + " | ".join(cell(c, "max_rss_kib", lambda v: "%.0f" % (v / 1024)) for c in cmds) + " |")
-    out.append("| **index size** (GiB) | " + " | ".join(cell(c, "index_bytes", lambda v: "%.1f" % (v / 2**30)) for c in cmds) + " |")
+# ------------------------------------------------------------------------ memory
+def jload(name):
+    f = f"{d}/{name}"
+    return json.load(open(f)) if os.path.exists(f) else {}
+def isnum(v): return isinstance(v, (int, float)) and not isinstance(v, bool)
+def table(caption, first):
+    """the caption and head of a Markdown table with one column per engine"""
+    return ["", caption, "", f"| {first} | " + " | ".join(cmds) + " |", "|---|" + "---:|" * len(cmds)]
+def vrow(label, vals, f=lambda v: "%.0f" % v, better=min):
+    """one row of per-engine values (numbers, or strings such as "?"); the best number is bold"""
+    if not any(c in vals for c in cmds): return None
+    nums = {c: vals[c] for c in cmds if isnum(vals.get(c))}
+    best = better(nums, key=nums.get) if better and len(nums) > 1 else None
+    cells = ["—" if c not in vals else ("**%s**" if c == best else "%s") % f(vals[c]) if isnum(vals[c]) else str(vals[c])
+             for c in cmds]
+    return f"| {label} | " + " | ".join(cells) + " |"
+def size(v): return "%.1f GiB" % (v / 2**30) if v >= 2**30 else "%.0f MiB" % (v / 2**20) if v >= 10 * 2**20 else "%.1f MiB" % (v / 2**20)
+mem = jload("mem.json")
+rss = {c: int(v) if str(v).isdigit() else v for c, v in jload("rss.json").items()}
+probe = jload("rss-probe.json")
+ld = jload("load-details.json")
+lde = {c: ld[LOADNAME.get(c, c)] for c in cmds if LOADNAME.get(c, c) in ld}
+mrows = [
+    vrow("server RSS 2 s after start, before any query (MiB)", mem.get("idle", {})),
+    vrow("server RSS after every query ran once (MiB)", mem.get("warm", {})),
+    vrow("server RSS after the run (MiB)", rss),
+    vrow("peak RSS during the throughput run (MiB)", mem.get("throughput_peak", {})),
+]
+bc = mem.get("block_cache", {})
+if isnum(bc.get("sparkles")) and isnum(rss.get("sparkles")):
+    mrows.append(vrow(f"server RSS after the run less Sparkles' decoded-block cache of {bc['sparkles']} MiB (MiB)",
+                      {"sparkles": rss["sparkles"] - bc["sparkles"]}, better=None))
+if probe:
+    cell = lambda c, k: str(probe[c][k]) if c in probe and k in probe[c] else "—"
+    mrows.append("| RSS probe, fresh server: after the queries / after 3×160 star-join (MiB) | "
+                 + " | ".join(f"{cell(c, 'after_queries_mib')} / {cell(c, 'after_round3_mib')}" if c in probe else "—" for c in cmds) + " |")
+mrows += [
+    vrow("load peak RSS (MiB)", {c: v["max_rss_kib"] / 1024 for c, v in lde.items() if "max_rss_kib" in v}),
+    vrow("index size on disk", {c: v["index_bytes"] for c, v in lde.items() if "index_bytes" in v}, f=size),
+]
+mrows = [r for r in mrows if r]
+if mrows:
+    out += table("Memory: the servers' resident set (VmRSS, and VmHWM for peaks) and each load's peak RSS (GNU time). "
+                 "Lower is better.", "memory") + mrows
+mq = mem.get("queries", {})
+if any(n in mq for n in names):
+    out += table("Memory per query: how far the server's peak RSS rose over its RSS before the request, then the peak, "
+                 "in MiB. The peak is reset (clear_refs) before each request of the answer check.", "query (rise / peak)")
+    for n in names:
+        if n not in mq: continue
+        v = mq[n]
+        rise = {c: v[c]["delta"] for c in cmds if c in v and isnum(v[c].get("delta"))}
+        best = min(rise, key=rise.get) if len(rise) > 1 else None
+        cells = ["—" if c not in v else (("**+%s**" if c == best else "+%s") % v[c]["delta"] + f" / {v[c]['peak']}"
+                 if c in rise else f"? / {v[c].get('peak', '?')}") for c in cmds]
+        out.append(f"| {n} | " + " | ".join(cells) + " |")
+
+# ------------------------------------------------------------------------ writes
+churn = jload("churn.json")
+if churn:
+    total = max((v.get("commits", 0) + v.get("errors", 0) for v in churn.values()), default=0)
+    ms = lambda v: "%.2f" % v
+    out += table(f"Churn before the queries: {total} single-triple commits, one request each and the same for every "
+                 "engine. They are INSERT DATA and DELETE DATA in the default graph.", "commits")
+    out += [r for r in [
+        vrow("commits/s", {c: v["per_s"] for c, v in churn.items()}, better=max),
+        vrow("latency p50 (ms)", {c: v["p50_ms"] for c, v in churn.items()}, f=ms),
+        vrow("latency p99 (ms)", {c: v["p99_ms"] for c, v in churn.items()}, f=ms),
+        vrow("failed commits", {c: v["errors"] for c, v in churn.items()}, better=None),
+    ] if r]
+mixed = jload("mixed.json")
+if mixed:
+    ms = lambda v: "%.1f" % v
+    out += table("Mixed load: concurrent star-join readers (oha) and one writer of single-triple INSERT DATA commits. "
+                 "Each engine runs alone on a copy of its store.", "mixed")
+    out += [r for r in [
+        vrow("reads/s", {c: v["read_qps"] for c, v in mixed.items()}, f=ms, better=max),
+        vrow("read p50 (ms)", {c: v["read_p50_ms"] for c, v in mixed.items()}, f=ms),
+        vrow("read p99 (ms)", {c: v["read_p99_ms"] for c, v in mixed.items()}, f=ms),
+        vrow("writes/s", {c: v["writes_per_s"] for c, v in mixed.items()}, f=ms, better=max),
+        vrow("write p50 (ms)", {c: v["write_p50_ms"] for c, v in mixed.items()}, f=ms),
+        vrow("write p99 (ms)", {c: v["write_p99_ms"] for c, v in mixed.items()}, f=ms),
+        vrow("failed reads / writes", {c: f"{v['read_errors']} / {v['write_errors']}" for c, v in mixed.items()}, better=None),
+    ] if r]
+
+# ------------------------------------------------------------------------- cold
 if os.path.exists(f"{d}/cold.json"):
     cold = json.load(open(f"{d}/cold.json"))
-    out += ["", "Cold runs: the first run of each query after a server restart with the engine's files evicted from the page cache.", "",
+    runs = jload("cold-runs.json")
+    k = max((len(r["times"]) for e in runs.values() for r in e.values()), default=1)
+    what = f"The median of {k} runs" if k > 1 else "One run"
+    out += ["", f"Cold runs: {what.lower()} of each query after a server restart with the engine's files evicted from "
+            "the page cache.", "",
             "| query (cold) | " + " | ".join(f"{c} (ms)" for c in cmds) + " |", "|---|" + "---:|" * len(cmds)]
     for n in names:
         vals = {c: cold.get(c, {}).get(n) for c in cmds}
@@ -122,6 +207,9 @@ if os.path.exists(f"{d}/cold.json"):
                  else ("**%.1f**" if c == best else "%.1f") % (v * 1000) for c, v in vals.items()]
         if any(v is not None for v in vals.values()):
             out.append(f"| {n} | " + " | ".join(cells) + " |")
+    ready = {c: statistics.median([t for r in runs[c].values() for t in r["ready"]]) for c in cmds if c in runs}
+    r = vrow("**time to ready** after the restart (median, s)", ready, f=lambda v: "%.2f" % v)
+    if r: out.append(r)
 if notes:
     out += [""] + notes
 open(f"{d}/summary.md", "w").write("\n".join(out) + "\n")

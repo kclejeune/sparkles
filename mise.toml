@@ -253,7 +253,7 @@ run = ["cargo clean", "rm -rf ui/build ui/.svelte-kit"]
 # ---------------------------------------------------------------------------- benchmarks ----
 
 [tasks.bench]
-description = "Sparkles vs Jena/Fuseki vs QLever vs Fluree (hyperfine over HTTP; results merge per engine)"
+description = "Sparkles vs Jena/Fuseki, QLever, Fluree and Oxigraph over HTTP: load, queries, memory, updates, mixed load and cold starts (results merge per engine)"
 depends = ["build"]
 usage = '''
 arg "[people]" default="100000" help="dataset size in people (~10.5 triples each)"
@@ -264,12 +264,20 @@ flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
 flag "--skip-queries" help="reuse per-query results; re-run updates / throughput / memory"
 flag "--answers-only" help="only re-check answers across engines and rebuild the summary"
 flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to (re-)measure; others' results are kept"
-flag "--queries <list>" help="only these queries (default: all 20)"
+flag "--queries <list>" help="only these queries (default: all 28)"
+flag "--mode <mode>" default="default" help="default (load and queries), updates (queries after a churn of commits, into results-updates/), mixed (readers and a writer at once) or cold (a restart with evicted page cache per query)"
+flag "--churn <n>" default="5000" help="updates mode: single-triple commits before the queries"
+flag "--mixed-seconds <s>" default="30" help="mixed mode: seconds per engine"
+flag "--write-rate <n>" default="0" help="mixed mode: commits per second (0: as fast as the engine answers)"
+flag "--cold-runs <n>" default="3" help="cold mode: restarts per query"
+flag "--port-base <port>" default="3931" help="the first of the five server ports"
 '''
 run = '''
 RUNS="$usage_runs" WARMUP="$usage_warmup" ENGINES="$usage_engines" QUERIES="${usage_queries:-}" \
 SKIP_LOAD="${usage_skip_load:+1}" SKIP_QUERIES="${usage_skip_queries:+1}" \
-ANSWERS_ONLY="${usage_answers_only:+1}" scripts/bench.sh "$usage_people" "$(realpath -m "$usage_workdir")"
+ANSWERS_ONLY="${usage_answers_only:+1}" MODE="$usage_mode" CHURN="$usage_churn" \
+MIXED_SECONDS="$usage_mixed_seconds" WRITE_RATE="$usage_write_rate" COLD_RUNS="$usage_cold_runs" \
+PORT_BASE="$usage_port_base" scripts/bench.sh "$usage_people" "$(realpath -m "$usage_workdir")"
 '''
 
 [tasks."bench:billion"]
