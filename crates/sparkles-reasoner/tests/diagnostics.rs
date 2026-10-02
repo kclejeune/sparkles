@@ -304,6 +304,62 @@ fn check_selection_and_timeouts() {
     assert_eq!(check(&clean, &opts()).status, ReportStatus::NoneFound);
 }
 
+#[test]
+fn turtle_rendering_uses_shacl_result_properties() {
+    use sparkles_reasoner::diagnostics::ReportContext;
+    let s = store(
+        "ex:Cat owl:disjointWith ex:Dog . ex:tom a ex:Cat, ex:Dog .
+         owl:Thing rdfs:subClassOf owl:Nothing .",
+    );
+    let r = check(&s, &opts());
+    let prefixes = vec![("ex".to_string(), "http://ex.org/".to_string())];
+    let ttl = r.to_turtle(&ReportContext {
+        dataset: Some("t"),
+        prefixes: &prefixes,
+        ..Default::default()
+    });
+    assert!(ttl.contains("@prefix spx: <urn:x-sparkles:>"), "{ttl}");
+    assert!(ttl.contains("sh:focusNode ex:tom"), "{ttl}");
+    assert!(!ttl.contains("conforms"), "never claims conformance: {ttl}");
+    // it parses, and the evidence lists keep their order
+    let triples: Vec<oxrdf::Triple> = oxttl::TurtleParser::new()
+        .for_slice(ttl.as_bytes())
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|e| panic!("{e}\n{ttl}"));
+    let has = |p: &str, o: &str| {
+        triples
+            .iter()
+            .any(|t| t.predicate.as_str() == p && t.object.to_string() == o)
+    };
+    assert!(has("urn:x-sparkles:dataset", "\"t\""));
+    assert!(has(
+        "http://www.w3.org/ns/shacl#sourceConstraintComponent",
+        "<urn:x-sparkles:check:disjoint-classes>"
+    ));
+    assert!(has(
+        "http://www.w3.org/ns/shacl#resultSeverity",
+        "<http://www.w3.org/ns/shacl#Violation>"
+    ));
+    assert!(has("urn:x-sparkles:rule", "\"cax-dw\""));
+    assert!(has(
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#first",
+        "<http://ex.org/Cat>"
+    ));
+    // the thing-empty axiom is a triple term
+    assert!(
+        triples
+            .iter()
+            .any(|t| t.predicate.as_str() == "urn:x-sparkles:axiom"
+                && matches!(t.object, oxrdf::Term::Triple(_))),
+        "{ttl}"
+    );
+    let reports = triples
+        .iter()
+        .filter(|t| t.object.to_string() == "<urn:x-sparkles:DiagnosticsReport>")
+        .count();
+    assert_eq!(reports, 1);
+}
+
 // ------------------------------------------------- OWL 2 RL rules, one by one ------
 
 /// The findings of one check on `ttl`, which must be the only check with findings.

@@ -2880,10 +2880,34 @@ async fn reason_status(State(st): St, Path(name): Path<String>) -> ApiResult<Jso
 
 /// `GET /$/reason/{ds}/diagnostics`: inconsistency checks over data (and inferences).
 #[cfg(feature = "reasoning")]
-async fn reason_diagnostics(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
-    use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions};
+async fn reason_diagnostics(
+    State(st): St,
+    Path(name): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions, ReportContext};
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
+    // JSON unless `format=turtle` or an Accept header that prefers Turtle
+    const OFFERS: [&str; 2] = ["application/json", "text/turtle"];
+    let turtle = match params.get("format") {
+        Some("json") => false,
+        Some("turtle" | "ttl") => true,
+        Some(f) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown report format '{f}' (expected json or turtle)"),
+            ));
+        }
+        None => {
+            let accept = headers
+                .get(header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("*/*");
+            negotiate(accept, &OFFERS) == Some(1)
+        }
+    };
     let checks: Vec<String> = params
         .get("checks")
         .unwrap_or_default()
@@ -2933,12 +2957,23 @@ async fn reason_diagnostics(State(st): St, Path(name): Path<String>, uri: Uri) -
         prefixes,
     };
     blocking(move || {
-        let (_, j) = crate::reasoning::diagnostics_json(&ds.name, &ds.store, info.as_ref(), &opts)?;
-        Ok(with_commit(
-            Json(j.clone()).into_response(),
-            &ds,
-            j["commit"].as_u64().unwrap_or(0),
-        ))
+        let (report, j) =
+            crate::reasoning::diagnostics_json(&ds.name, &ds.store, info.as_ref(), &opts)?;
+        let seq = j["commit"].as_u64().unwrap_or(0);
+        let r = if turtle {
+            let inf = &j["scope"]["inferences"];
+            let ttl = report.to_turtle(&ReportContext {
+                dataset: Some(&ds.name),
+                profile: inf["profile"].as_str(),
+                stale: inf["stale"].as_bool(),
+                commits_since: inf["commitsSince"].as_u64(),
+                prefixes: &opts.prefixes,
+            });
+            ([(header::CONTENT_TYPE, "text/turtle; charset=utf-8")], ttl).into_response()
+        } else {
+            Json(j).into_response()
+        };
+        Ok(with_commit(r, &ds, seq))
     })
     .await
 }

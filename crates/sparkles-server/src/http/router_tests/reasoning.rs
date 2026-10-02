@@ -413,6 +413,25 @@ async fn diagnostics_endpoint() {
         f["message"],
         "ex:tom is an instance of the disjoint classes ex:Cat and ex:Dog"
     );
+    // Turtle, by Accept or by format
+    for (path, accept) in [
+        ("/$/reason/t/diagnostics", "text/turtle"),
+        ("/$/reason/t/diagnostics?format=turtle", "*/*"),
+    ] {
+        let r = send(
+            &app,
+            Request::get(path)
+                .header(header::ACCEPT, accept)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let ttl = r.text();
+        assert!(ttl.contains("spx:DiagnosticsReport"), "{ttl}");
+        assert!(ttl.contains("sh:focusNode ex:tom"), "{ttl}");
+        assert!(ttl.contains("spx:dataset \"t\""), "{ttl}");
+    }
     let r = get_json(&app, "/$/reason/t/diagnostics?closure=none").await;
     assert_eq!(r["status"], "none-found");
     let r = get_json(
@@ -441,6 +460,7 @@ async fn diagnostics_endpoint() {
         "limit=10001",
         "limit=x",
         "closure=full",
+        "format=xml",
     ] {
         let r = send(
             &app,

@@ -3684,6 +3684,7 @@ dependencies = [
  "anyhow",
  "oxrdf",
  "oxsdatatypes",
+ "oxttl",
  "rayon",
  "regex",
  "rustc-hash",

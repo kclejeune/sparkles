@@ -11,7 +11,8 @@
 //! marked [`Basis::UsesInferences`].
 
 use crate::INFERRED_GRAPH;
-use oxrdf::{NamedNode, Term, Triple};
+use oxrdf::vocab::{rdf, xsd};
+use oxrdf::{BlankNode, Literal, NamedNode, Term, Triple};
 use serde_json::{Value as J, json};
 use sparkles::Error;
 use sparkles::sparql::QueryOptions;
@@ -391,6 +392,166 @@ impl DiagnosticsReport {
             "findings": findings,
         })
     }
+
+    /// The report as RDF: one `spx:DiagnosticsReport` (`spx:` is `urn:x-sparkles:`)
+    /// whose findings use the SHACL result properties (`sh:focusNode`,
+    /// `sh:resultSeverity`, `sh:resultMessage`, `sh:sourceConstraintComponent`). There is
+    /// no `sh:conforms`: finding nothing does not establish consistency.
+    pub fn to_rdf(&self, ctx: &ReportContext<'_>) -> Vec<Triple> {
+        let mut out = Vec::new();
+        let mut add = |s: &BlankNode, p: NamedNode, o: Term| out.push(Triple::new(s.clone(), p, o));
+        let report = BlankNode::default();
+        let s = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+        let int = |v: u64| Term::Literal(Literal::new_typed_literal(v.to_string(), xsd::INTEGER));
+        let bool_ = |v: bool| Term::Literal(Literal::from(v));
+        add(
+            &report,
+            rdf::TYPE.into_owned(),
+            spx("DiagnosticsReport").into(),
+        );
+        if let Some(d) = ctx.dataset {
+            add(&report, spx("dataset"), s(d));
+        }
+        add(&report, spx("commit"), int(self.commit));
+        add(
+            &report,
+            spx("computedAt"),
+            Literal::new_typed_literal(&self.computed_at, xsd::DATE_TIME).into(),
+        );
+        add(&report, spx("status"), s(self.status.name()));
+        add(&report, spx("note"), s(NOTE));
+        add(&report, spx("closure"), s(self.closure.name()));
+        add(&report, spx("inferencesIncluded"), bool_(self.inferences));
+        if self.inferences {
+            if let Some(p) = ctx.profile {
+                add(&report, spx("inferencesProfile"), s(p));
+            }
+            if let Some(stale) = ctx.stale {
+                add(&report, spx("inferencesStale"), bool_(stale));
+            }
+            if let Some(n) = ctx.commits_since {
+                add(&report, spx("commitsSince"), int(n));
+            }
+        }
+        for c in &self.checks {
+            let node = BlankNode::default();
+            add(&report, spx("check"), node.clone().into());
+            add(&node, spx("id"), s(c.id));
+            for r in c.rules {
+                add(&node, spx("rule"), s(r));
+            }
+            add(&node, spx("severity"), s(c.severity.name()));
+            add(&node, spx("status"), s(c.status.name()));
+            add(&node, spx("findings"), int(c.findings as u64));
+            add(&node, spx("millis"), int(c.millis));
+            if let Some(e) = &c.error {
+                add(&node, spx("error"), s(e));
+            }
+        }
+        let mut lists = Vec::new();
+        for f in &self.findings {
+            let node = BlankNode::default();
+            add(&report, sh("result"), node.clone().into());
+            add(&node, rdf::TYPE.into_owned(), spx("Finding").into());
+            add(&node, sh("focusNode"), f.focus.clone());
+            let severity = match f.severity {
+                Severity::Inconsistency => "Violation",
+                Severity::Warning => "Warning",
+            };
+            add(&node, sh("resultSeverity"), sh(severity).into());
+            add(&node, sh("resultMessage"), s(&f.message));
+            add(
+                &node,
+                sh("sourceConstraintComponent"),
+                spx(&format!("check:{}", f.check)).into(),
+            );
+            add(&node, spx("rule"), s(f.rule));
+            add(&node, spx("basis"), s(f.basis.name()));
+            for (k, v) in &f.evidence {
+                let o = match v {
+                    Evidence::One(t) => t.clone(),
+                    Evidence::Many(ts) if ts.is_empty() => rdf::NIL.into_owned().into(),
+                    Evidence::Many(ts) => {
+                        let head = BlankNode::default();
+                        lists.push((head.clone(), ts.clone()));
+                        head.into()
+                    }
+                };
+                add(&node, spx(k), o);
+            }
+        }
+        // the evidence lists, as RDF collections
+        for (head, items) in lists {
+            let mut cur = head;
+            for (i, t) in items.iter().enumerate() {
+                add(&cur, rdf::FIRST.into_owned(), t.clone());
+                if i + 1 == items.len() {
+                    add(&cur, rdf::REST.into_owned(), rdf::NIL.into_owned().into());
+                } else {
+                    let next = BlankNode::default();
+                    add(&cur, rdf::REST.into_owned(), next.clone().into());
+                    cur = next;
+                }
+            }
+        }
+        out
+    }
+
+    /// Turtle serialization of [`to_rdf`](Self::to_rdf), with the `sh:`, `spx:`, `rdf:`
+    /// and `xsd:` prefixes and the context's prefixes.
+    pub fn to_turtle(&self, ctx: &ReportContext<'_>) -> String {
+        let mut ser = oxttl::TurtleSerializer::new();
+        let fixed = [
+            ("sh", SH),
+            ("spx", SPX),
+            ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+            ("xsd", "http://www.w3.org/2001/XMLSchema#"),
+        ];
+        for (p, ns) in fixed {
+            ser = ser.with_prefix(p, ns).expect("valid prefix");
+        }
+        for (p, ns) in ctx.prefixes {
+            if fixed.iter().any(|(f, _)| f == p) {
+                continue;
+            }
+            // a prefix the serializer rejects is left out
+            if let Ok(s) = ser.clone().with_prefix(p, ns) {
+                ser = s;
+            }
+        }
+        let mut w = ser.for_writer(Vec::new());
+        for t in self.to_rdf(ctx) {
+            w.serialize_triple(&t)
+                .expect("writing to a Vec cannot fail");
+        }
+        String::from_utf8(w.finish().expect("writing to a Vec cannot fail"))
+            .expect("Turtle is UTF-8")
+    }
+}
+
+/// What the caller knows beyond the report itself, for its RDF form.
+#[derive(Clone, Debug, Default)]
+pub struct ReportContext<'a> {
+    pub dataset: Option<&'a str>,
+    /// the profile of the included inferences
+    pub profile: Option<&'a str>,
+    /// their freshness (`None` when unknown)
+    pub stale: Option<bool>,
+    pub commits_since: Option<u64>,
+    /// prefixes for the Turtle output
+    pub prefixes: &'a [(String, String)],
+}
+
+/// Namespace of the report vocabulary.
+pub const SPX: &str = "urn:x-sparkles:";
+const SH: &str = "http://www.w3.org/ns/shacl#";
+
+fn spx(local: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("{SPX}{local}"))
+}
+
+fn sh(local: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("{SH}{local}"))
 }
 
 /// Run the checks on one snapshot. Unknown check ids are an error; a failing or timed

@@ -881,7 +881,7 @@ enum Cmd {
         /// `subclass` (type tests follow rdfs:subClassOf*) or `none`
         #[arg(long, default_value = "subclass", requires = "check")]
         closure: String,
-        /// text or json
+        /// text or json (with --check also turtle)
         #[arg(long, default_value = "text")]
         format: String,
         /// Timeout of the checks in seconds
@@ -2149,6 +2149,18 @@ fn run() -> Result<()> {
                 };
             if format == "json" {
                 println!("{}", serde_json::to_string_pretty(&j)?);
+            } else if format == "turtle" {
+                let inf = &j["scope"]["inferences"];
+                print!(
+                    "{}",
+                    report.to_turtle(&sparkles_reasoner::diagnostics::ReportContext {
+                        dataset: Some(&name),
+                        profile: inf["profile"].as_str(),
+                        stale: inf["stale"].as_bool(),
+                        commits_since: inf["commitsSince"].as_u64(),
+                        prefixes: &dopts.prefixes,
+                    })
+                );
             } else {
                 print_diagnostics(&report, &j);
             }
