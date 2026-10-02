@@ -54,7 +54,10 @@ mise run ui:mock      # mock API server for UI work without the Rust backend
 mise run ui:test      # UI unit tests (Vitest)
 mise run ui:e2e       # UI end-to-end tests (Playwright; Chromium from `nix develop`, see below)
 mise run ui:e2e:mock  # UI end-to-end tests against the mock backend
-mise run ci           # fmt:check + lint + lint:features + fmt:wasm + test + ui:test + licenses:check
+mise run py:build     # the Python wheel (crates/sparkles-py) into target/wheels, with maturin
+mise run py:test      # build the Python extension and run its pytest suite (in ci, with py:lint)
+mise run py:lock      # refresh crates/sparkles-py/Cargo.lock from Cargo.lock
+mise run ci           # fmt:check + lint + lint:features + fmt:wasm + test + ui:test + py:lint + py:test + licenses:check
 mise run doc          # API docs of the library crates
 mise run docs:screenshots # the README's screenshots (docs/images) from the demo dataset in docs/demo
 mise run gen-data 1000000 target/bench-data/10m.nt
@@ -83,7 +86,7 @@ runs every hook over the whole tree.
 ## Testing
 
 ```sh
-mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, license notices
+mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, Python binding tests, license notices
 mise run lint:features # clippy over feature combinations (in ci)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
@@ -116,6 +119,26 @@ Code that only some features use is gated on those features, and this task catch
 code and missing gates. Every combination shares the workspace target directory. The
 first run builds the dependencies once per feature set. After that, a change costs a
 minute or two.
+
+### Python bindings
+
+`crates/sparkles-py` builds the `sparkles` Python package
+([USAGE](USAGE.md#python), [spec P01](specs/P01-python-bindings.md)). The crate is its
+own cargo workspace, excluded from the root one, so `cargo build`, `mise run lint` and
+`mise run test` neither compile PyO3 nor need Python. It has its own `Cargo.lock`, which
+`mise run py:lock` refreshes from the root lock after the workspace's dependencies
+change. The flake's check fails while the two disagree on what the crate needs.
+
+`mise run py:test` (`scripts/py-test.sh`) builds the extension with cargo in the root
+`target` directory, so it reuses the workspace's compiled dependencies. It assembles the
+package in `target/py` and runs `crates/sparkles-py/tests` with pytest. The tests include
+mypy's `stubtest`, which checks the `.pyi` stubs against the compiled module, and rdflib
+interoperability tests. Both skip when mypy or rdflib is missing. The dev shell's
+`python3` has pytest, mypy and rdflib. With another `python3`, the script installs pytest
+into a virtual environment in `target/py-venv`. Extra arguments go to pytest, as in
+`mise run py:test -- -k transaction`. `mise run py:lint` runs clippy on the crate with its
+default features and with none. Both tasks are part of `mise run ci`. The first run
+compiles the crate and the engine for the Python build, and later runs take seconds.
 
 `mise run ui:e2e` builds the UI and a debug server. It starts `sparkles serve` on a free
 port of 127.0.0.1 with a temporary data directory, a small dataset, and an auth
@@ -313,11 +336,15 @@ The flake is built on flake-parts and rust-overlay, with the toolchain from
   * `sparkles-cli`: the same binary without the UI, so the build needs no Node.js.
   * `sparkles-ui`: the static UI build.
   * `sparkles-fmt-wasm`: the formatter's WebAssembly module, which `sparkles-ui` builds in.
+  * `sparkles-py`: the Python package for nixpkgs' `python3`, built into an abi3 wheel by
+    maturin. The wheel is in its `dist` output.
 * **Other outputs:**
   * `overlays.default`;
   * a dev shell;
   * `checks`:
     * the packages;
+    * `python-bindings`, which builds `sparkles-py` and runs the pytest suite on the
+      installed package;
     * `ui-licenses`, which checks that `THIRD_PARTY_LICENSES-UI.md` matches the UI build;
     * on Linux, a NixOS VM test of the module behind nginx;
     * on Linux, `ui-e2e`, which runs the Playwright UI tests against the release binary
@@ -339,6 +366,11 @@ Crates that ship no license file get their license's standard text.
 `scripts/third-party-licenses.py` generates the file from `cargo metadata`, so it changes
 only when `Cargo.lock` does. Ship it with binaries. The Nix packages install it as
 `share/doc/sparkles/THIRD_PARTY_LICENSES.md`.
+
+The script also writes `crates/sparkles-py/THIRD_PARTY_LICENSES.md` for the Python wheel
+from that crate's own lock. It lists the crates the extension module links, which are the
+engine's and PyO3's. maturin puts it in the wheel's `licenses/` directory with the
+project's `LICENSE`, as `pyproject.toml` declares. `licenses:check` checks both files.
 
 [`THIRD_PARTY_LICENSES-UI.md`](../THIRD_PARTY_LICENSES-UI.md) does the same for the npm
 packages whose code or fonts end up in the embedded web UI. These are CodeMirror,

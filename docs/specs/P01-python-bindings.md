@@ -1,14 +1,17 @@
 # P01: Python bindings
 
-> **Status:** designed, not built
+> **Status:** implemented in part (Phase 1)
 >
-> **Phases:** Phase 1 is the `sparkles-py` crate and the `sparkles` Python package. It
-> covers datasets, loading, SPARQL, terms, quad access, transactions, dumps, compaction,
-> reasoning and SHACL and ShEx validation, with type stubs, a pytest suite, `mise run
-> py:test` and `py:build`, and a flake check. Phase 2 is listed in §9.
+> **Phases:** Phase 1 shipped. It is the `sparkles-py` crate and the `sparkles` Python
+> package. It covers datasets, loading, SPARQL, terms, quad access, transactions, dumps,
+> compaction, reasoning and SHACL and ShEx validation, with type stubs, a pytest suite,
+> `mise run py:test` and `py:build`, and a flake check. Phase 2, listed in §9, is not
+> built.
 >
 > **User docs:** [Usage: Python](../USAGE.md#python) ·
-> [Features](../FEATURES.md#known-gaps) · [Comparison](../COMPARISON.md)
+> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) ·
+> [Known gaps](../FEATURES.md#known-gaps) · [Comparison](../COMPARISON.md#vs-oxigraph) ·
+> [Development](../DEVELOPMENT.md#python-bindings)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -604,3 +607,77 @@ passed to a term constructor raises `ValueError`, and a wrong argument type rais
 * Sparkles code: `dataset.rs`, `sparql/mod.rs`, `io.rs`, `codec.rs`, `error.rs`,
   `store.rs` (`WriteTxn`, scans), and the entry points of the reasoner, SHACL and ShEx
   crates.
+
+## Outcome
+
+**Delivered.** Phase 1 landed on 2026-10-02 (`fa56e12`) as specified in §2 to §8:
+
+* `crates/sparkles-py`, a cdylib crate in its own cargo workspace, excluded from the root
+  workspace for the reasons of §2.2, with its own `Cargo.lock`, the spargebra patch and
+  the root's profiles;
+* the `sparkles` package, with the API of §3, the type mapping of §4, the exception
+  hierarchy of §5 in `sparkles/_errors.py`, `.pyi` stubs, `py.typed` and
+  `sparkles.rdflib`;
+* `Dataset::quads` and `QuadIter` in `crates/sparkles` (`70aa0c9`), the additive API for
+  the streaming `quads_for_pattern` of §7. They read 4096 keys per batch with
+  `Snapshot::scan_between`, and a Rust test compares them with `Dataset::find` across
+  batches, before and after compaction;
+* transactions on a worker thread that owns the writer lock's guard (§6), with the
+  `ConflictError` guard for writes from the transaction's own thread;
+* the cargo features `reasoning`, `shacl`, `shex`, `text` and `geo`, all on by default,
+  with zstd and brotli always on;
+* `mise run py:build`, `py:test`, `py:lint` and `py:lock`, the flake's
+  `packages.sparkles-py` and `checks.python-bindings`, and maturin, pytest, mypy and
+  rdflib in the dev shell;
+* `crates/sparkles-py/THIRD_PARTY_LICENSES.md`, written by
+  `scripts/third-party-licenses.py` and shipped in the wheel with the project's license.
+
+**Deviations and decisions.**
+
+* `py:test` and `py:lint` are part of `mise run ci`. The first run compiles the
+  extension and the engine with the Python crate's settings, about 4.5 minutes on the
+  development machine once the workspace's dependencies are built. Later runs rebuild in
+  seconds, and the 56 tests take 7 to 12 seconds on an idle machine. The tests are
+  deterministic. The one timing-sensitive assertion, that another thread runs during a
+  query, applies only when the query takes over 50 ms.
+* `Literal` from a `float` uses Python's `repr`, such as `"1.5"^^xsd:double`, with `INF`,
+  `-INF` and `NaN` for the special values. §4.2 asked for the canonical form `1.0E0`.
+  Both are valid lexical forms of `xsd:double`, and the value round-trips.
+* Terms pickle. `Literal` pickles through a private constructor, `_literal`, which the
+  stubs leave out. §9 listed pickling for Phase 2.
+* `validate_shacl` takes `format=None`, which means Turtle, rather than
+  `format="turtle"`. The parameter takes the same values as every other `format`.
+* Predicates must be `NamedNode` or an rdflib `URIRef`. A plain `str` is accepted only
+  where §4.1 allows it, for graph names, `to_graph` and the query's graph lists.
+* `Transaction.quads_for_pattern` returns a list, because the transaction's own view is
+  read in one request to its worker thread.
+* `QuerySolution` also has `get`, `keys` and `in` (a bound variable), and `Dataset` has
+  `closed`.
+* A database directory that is already open, in this process or another, raises
+  `DatasetLockedError`. The binding recognizes it by the store's message, because the
+  engine reports it as `Error::Invalid`.
+* The wheels are tagged for the machine that builds them. `py:build` on the development
+  machine writes `cp310-abi3-manylinux_2_38_x86_64`, from the host's glibc, and the
+  flake's maturin hook writes `cp310-abi3-linux_x86_64` without a manylinux check. The
+  manylinux 2.28 and macOS wheels of §2.4 need builds on those images, which is Phase 2
+  with the release workflow.
+* The module declares that it needs the GIL (`gil_used = true`), as §6 says. PyO3 0.28
+  made free-threading support the default for modules.
+
+**Test results at landing.** All 56 tests pass in `mise run py:test` with CPython 3.14
+and in the flake check on the installed wheel. They include mypy's `stubtest` against
+the compiled module and the rdflib tests. The extension also loads and runs in CPython
+3.11. nixpkgs no longer has CPython 3.10, so the abi3-py310 floor was compiled against
+but not run. `cargo clippy` passes on the crate with its default features and with none,
+and `cargo test -p sparkles` covers the new `Dataset::quads`.
+
+**Measurements.** The release wheel is 10.5 MB, and its extension module, with its
+symbols stripped, is 25 MB unpacked. `py:build` takes 4.5 minutes from a cold release
+build of the crate, with thin LTO.
+
+**Not built.** Everything in the Phase 2 list of §9 except pickling: PyPI publishing and
+manylinux, Windows, PyPy and free-threaded wheels, interrupting queries, an rdflib
+`Store` plugin, results serialization, streaming `parse` and file-object loads, `update`
+inside a transaction, history, snapshots and cloning, the text and vector index
+administration, write-time validation, the query builder and query budgets, and async
+wrappers.

@@ -614,6 +614,48 @@ implementation landed.
   - a `peg` grammar;
   - treating budget overruns as nonconformant.
 
+## Python bindings
+
+- **Spec:** [`P01-python-bindings.md`](P01-python-bindings.md), written on 2026-10-02
+  independently from:
+  - the Sparkles code;
+  - the PyO3 0.29 user guide and API documentation, and the maturin 1.x user guide;
+  - PEPs 384, 517, 561, 599, 600 and 639, and the CPython release schedule;
+  - pyoxigraph's documentation (MIT OR Apache-2.0), read for the names and signatures of
+    its store, term, `parse`, `serialize` and `RdfFormat` API. Its source was not read;
+  - rdflib's documentation (BSD-3-Clause), read for `rdflib.term` and
+    `Literal.toPython`.
+
+  Fluree was not consulted.
+- **Implementation, Phase 1** (2026-10-02): from the spec and the Sparkles code. No code
+  was copied from pyoxigraph or rdflib.
+  - `crates/sparkles-py` is a cdylib crate in its own cargo workspace. The term classes,
+    result iterators, transactions and error mapping are written against PyO3's class and
+    function macros. The Python exceptions are defined in `sparkles/_errors.py`.
+  - Transactions run the engine's closure-based `Dataset::transaction` on a worker
+    thread, which owns the writer lock's guard, and receive operations over a channel.
+  - `Dataset::quads` and `QuadIter` were added to `crates/sparkles` for the streaming
+    `quads_for_pattern`. They read the index in batches with the existing
+    `Snapshot::scan_between`.
+  - **Dependencies:** `pyo3` 0.29.3 (MIT OR Apache-2.0) with the `abi3-py310` feature,
+    with `pyo3-ffi`, `pyo3-macros` and `pyo3-macros-backend` 0.29.3 (MIT OR Apache-2.0)
+    linked or expanded into the extension, and `pyo3-build-config` 0.29.3 (MIT OR
+    Apache-2.0), `target-lexicon` 0.13.5 (Apache-2.0 WITH LLVM-exception) and `heck`
+    0.5.0 (MIT OR Apache-2.0) at build time only. None of them is linked into the
+    `sparkles` binary. `crates/sparkles-py/THIRD_PARTY_LICENSES.md` lists the crates the
+    wheel links.
+  - **Build and test tools, not shipped:** maturin 1.15.0 (MIT OR Apache-2.0), pinned in
+    `mise.toml` for `py:build` and taken from nixpkgs in the flake; pytest (MIT), mypy and
+    its `stubtest` (MIT) and rdflib (BSD-3-Clause) for the test suite, from the dev shell
+    or nixpkgs.
+- **Rejected** (spec §2.2 and §11):
+  - a workspace member left out of `default-members`, which would make every workspace
+    lint and test build compile PyO3;
+  - an rdflib `Store` plugin in Phase 1;
+  - a binding-side table that keeps blank-node labels across writes;
+  - holding the store's write transaction in the Python object, which needs its guard on
+    one thread.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):
