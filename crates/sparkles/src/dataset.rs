@@ -35,7 +35,7 @@
 use crate::commit::{CommitInfo, CommitKind, CommitPage, CommitRange, Receipt};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{G, O, P, Perm, S};
+use crate::index::{G, Key, O, P, Perm, S};
 use crate::io::{RdfFormat, Source};
 use crate::sparql::update::UpdateStats;
 use crate::sparql::{QueryKind, QueryOptions, QueryResult};
@@ -265,6 +265,27 @@ impl Dataset {
             Some(GraphNameRef::BlankNode(b)) => GraphSel::Blank(b.into_owned()),
         };
         find_quads(&snap, &sel, subject, predicate, object)
+    }
+
+    /// The quads of [`find`](Self::find), read from the current snapshot in batches of
+    /// keys and decoded as the iterator advances, so a large match is never collected.
+    /// Later commits are not seen.
+    pub fn quads(
+        &self,
+        graph: Option<GraphNameRef<'_>>,
+        subject: Option<&NamedOrBlankNode>,
+        predicate: Option<&NamedNode>,
+        object: Option<&Term>,
+    ) -> QuadIter {
+        let snap = self.store.snapshot();
+        let sel = match graph {
+            None => GraphSel::Any,
+            Some(GraphNameRef::DefaultGraph) => GraphSel::Default,
+            Some(GraphNameRef::NamedNode(n)) => GraphSel::Named(n.into_owned()),
+            Some(GraphNameRef::BlankNode(b)) => GraphSel::Blank(b.into_owned()),
+        };
+        let plan = scan_plan(&snap, &sel, subject, predicate, object);
+        QuadIter::new(snap, plan)
     }
 
     pub fn contains(&self, quad: QuadRef<'_>) -> Result<bool> {
@@ -659,45 +680,48 @@ fn quad_ids(snap: &Snapshot, q: QuadRef<'_>) -> Option<[Id; 4]> {
     ])
 }
 
-/// Index-backed pattern matching: picks the permutation with the longest bound prefix.
-fn find_quads(
+/// How to read the quads of a pattern: the permutation with the longest bound prefix,
+/// the prefix, the bound components to check past it, and whether only named graphs
+/// count (the union graph, whose triples are deduplicated).
+struct ScanPlan {
+    perm: Perm,
+    prefix: Vec<u64>,
+    bound: [Option<u64>; 4],
+    named_only: bool,
+}
+
+impl ScanPlan {
+    /// Whether a quad of the scan matches the components past the prefix.
+    fn matches(&self, q: &[Id; 4]) -> bool {
+        !(0..4).any(|c| self.bound[c].is_some_and(|b| b != q[c].0))
+            && !(self.named_only && q[3] == Id::DEFAULT_GRAPH)
+    }
+}
+
+/// The scan of a pattern, or `None` when a bound term is not in the store (no match).
+fn scan_plan(
     snap: &Snapshot,
     graph: &GraphSel,
     subject: Option<&NamedOrBlankNode>,
     predicate: Option<&NamedNode>,
     object: Option<&Term>,
-) -> Result<Vec<Quad>> {
+) -> Option<ScanPlan> {
     let mut bound: [Option<u64>; 4] = [None; 4];
     if let Some(s) = subject {
-        let Some(id) = subject_id(snap, s) else {
-            return Ok(Vec::new());
-        };
-        bound[S] = Some(id.0);
+        bound[S] = Some(subject_id(snap, s)?.0);
     }
     if let Some(p) = predicate {
-        let Some(id) = snap.lookup_iri(p.as_str()) else {
-            return Ok(Vec::new());
-        };
-        bound[P] = Some(id.0);
+        bound[P] = Some(snap.lookup_iri(p.as_str())?.0);
     }
     if let Some(o) = object {
-        let Some(id) = snap.lookup_term(o) else {
-            return Ok(Vec::new());
-        };
-        bound[O] = Some(id.0);
+        bound[O] = Some(snap.lookup_term(o)?.0);
     }
     let default_is_union = snap.union_default_graph;
     let (graph_eq, named_only) = match graph {
         GraphSel::Default if default_is_union => (None, true),
         GraphSel::Default => (Some(Id::DEFAULT_GRAPH.0), false),
-        GraphSel::Named(n) => match snap.lookup_iri(n.as_str()) {
-            Some(g) => (Some(g.0), false),
-            None => return Ok(Vec::new()),
-        },
-        GraphSel::Blank(b) => match crate::store::parse_bnode_label(b.as_str()) {
-            Some(g) => (Some(g.0), false),
-            None => return Ok(Vec::new()),
-        },
+        GraphSel::Named(n) => (Some(snap.lookup_iri(n.as_str())?.0), false),
+        GraphSel::Blank(b) => (Some(crate::store::parse_bnode_label(b.as_str())?.0), false),
         GraphSel::Union => (None, true),
         GraphSel::Any => (None, false),
     };
@@ -718,17 +742,33 @@ fn find_quads(
         .unwrap();
     let order = perm.order();
     let prefix: Vec<u64> = order[..plen].iter().map(|c| bound[*c].unwrap()).collect();
+    Some(ScanPlan {
+        perm,
+        prefix,
+        bound,
+        named_only,
+    })
+}
+
+/// Index-backed pattern matching: picks the permutation with the longest bound prefix.
+fn find_quads(
+    snap: &Snapshot,
+    graph: &GraphSel,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+) -> Result<Vec<Quad>> {
+    let Some(plan) = scan_plan(snap, graph, subject, predicate, object) else {
+        return Ok(Vec::new());
+    };
     let mut out = Vec::new();
     let mut seen = FxHashSet::default();
-    for k in snap.scan_keys(perm, &prefix)? {
-        let q = perm.to_quad(&k);
-        if (0..4).any(|c| bound[c].is_some_and(|b| b != q[c].0)) {
+    for k in snap.scan_keys(plan.perm, &plan.prefix)? {
+        let q = plan.perm.to_quad(&k);
+        if !plan.matches(&q) {
             continue;
         }
-        if named_only && q[3] == Id::DEFAULT_GRAPH {
-            continue;
-        }
-        if named_only && !seen.insert([q[0], q[1], q[2]]) {
+        if plan.named_only && !seen.insert([q[0], q[1], q[2]]) {
             continue;
         }
         if let Some(quad) = snap.quad_to_terms(&q) {
@@ -736,6 +776,118 @@ fn find_quads(
         }
     }
     Ok(out)
+}
+
+/// Keys read per batch by [`QuadIter`].
+const QUAD_BATCH: usize = 4096;
+
+/// The quads of a pattern on one snapshot, from [`Dataset::quads`]. It reads up to 4096
+/// keys at a time and decodes each quad when it is returned. An error ends the
+/// iteration after it is returned.
+pub struct QuadIter {
+    snap: Arc<Snapshot>,
+    plan: Option<ScanPlan>,
+    /// where the next batch starts; `None` once the scan is done
+    next: Option<Key>,
+    hi: Key,
+    batch: std::vec::IntoIter<Key>,
+    /// triples already returned (union graph only)
+    seen: FxHashSet<[Id; 3]>,
+}
+
+impl QuadIter {
+    fn new(snap: Arc<Snapshot>, plan: Option<ScanPlan>) -> QuadIter {
+        let pad = |v: u64| -> Key {
+            let mut k = [v; 4];
+            if let Some(p) = &plan {
+                k[..p.prefix.len()].copy_from_slice(&p.prefix);
+            }
+            k
+        };
+        QuadIter {
+            next: plan.as_ref().map(|_| pad(0)),
+            hi: pad(u64::MAX),
+            snap,
+            plan,
+            batch: Vec::new().into_iter(),
+            seen: FxHashSet::default(),
+        }
+    }
+
+    /// The snapshot the quads are read from.
+    pub fn snapshot(&self) -> &Arc<Snapshot> {
+        &self.snap
+    }
+
+    /// Read the next batch of keys; false when the scan is done.
+    fn fill(&mut self) -> Result<bool> {
+        let (Some(plan), Some(lo)) = (&self.plan, self.next) else {
+            return Ok(false);
+        };
+        let mut keys = Vec::with_capacity(QUAD_BATCH);
+        self.snap.scan_between(plan.perm, lo, self.hi, |c| {
+            match c {
+                crate::store::Chunk::Block(b, s, e) => {
+                    let e = e.min(s + (QUAD_BATCH - keys.len()));
+                    keys.extend((s..e).map(|i| b.key(i)));
+                }
+                crate::store::Chunk::Row(k) => keys.push(k),
+            }
+            Ok(keys.len() < QUAD_BATCH)
+        })?;
+        // a full batch continues after its last key
+        self.next = if keys.len() < QUAD_BATCH {
+            None
+        } else {
+            keys.last().and_then(successor)
+        };
+        let more = !keys.is_empty();
+        self.batch = keys.into_iter();
+        Ok(more)
+    }
+}
+
+/// The key right after `k` in key order, if any.
+fn successor(k: &Key) -> Option<Key> {
+    let mut n = *k;
+    for c in (0..4).rev() {
+        if n[c] < u64::MAX {
+            n[c] += 1;
+            return Some(n);
+        }
+        n[c] = 0;
+    }
+    None
+}
+
+impl Iterator for QuadIter {
+    type Item = Result<Quad>;
+
+    fn next(&mut self) -> Option<Result<Quad>> {
+        loop {
+            let Some(k) = self.batch.next() else {
+                match self.fill() {
+                    Ok(true) => continue,
+                    Ok(false) => return None,
+                    Err(e) => {
+                        self.next = None;
+                        return Some(Err(e));
+                    }
+                }
+            };
+            let plan = self.plan.as_ref()?;
+            let q = plan.perm.to_quad(&k);
+            if !plan.matches(&q) {
+                continue;
+            }
+            if plan.named_only && !self.seen.insert([q[0], q[1], q[2]]) {
+                continue;
+            }
+            if let Some(quad) = self.snap.quad_to_terms(&q) {
+                return Some(Ok(quad));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -850,5 +1002,64 @@ mod tests {
             );
             let _ = NamedNodeRef::new_unchecked("x");
         }
+    }
+
+    #[test]
+    fn quads_iterator_matches_find_across_batches() {
+        let ds = Dataset::memory();
+        // more quads than one batch, spread over two graphs and two predicates
+        let mut nt = String::new();
+        for i in 0..(QUAD_BATCH * 2 + 17) {
+            let p = if i % 3 == 0 { "q" } else { "p" };
+            let g = if i % 5 == 0 { " <http://ex.org/g>" } else { "" };
+            nt.push_str(&format!(
+                "<http://ex.org/s{}> <http://ex.org/{p}> \"{i}\"{g} .\n",
+                i % 50
+            ));
+        }
+        ds.load_str(&nt, RdfFormat::NQuads).unwrap();
+        let g = n("g");
+        let check = |ds: &Dataset| {
+            let patterns: Vec<(
+                Option<GraphNameRef<'_>>,
+                Option<NamedOrBlankNode>,
+                Option<NamedNode>,
+            )> = vec![
+                (None, None, None),
+                (Some(GraphNameRef::DefaultGraph), None, None),
+                (Some(g.as_ref().into()), None, None),
+                (None, Some(n("s7").into()), None),
+                (None, None, Some(n("q"))),
+                (
+                    Some(GraphNameRef::DefaultGraph),
+                    Some(n("s3").into()),
+                    Some(n("p")),
+                ),
+                (None, Some(n("missing").into()), None),
+            ];
+            for (graph, s, p) in patterns {
+                let want = ds.find(graph, s.as_ref(), p.as_ref(), None).unwrap();
+                let got: Vec<Quad> = ds
+                    .quads(graph, s.as_ref(), p.as_ref(), None)
+                    .collect::<Result<_>>()
+                    .unwrap();
+                assert_eq!(got, want, "pattern {graph:?} {s:?} {p:?}");
+            }
+            assert_eq!(ds.quads(None, None, None, None).count() as u64, ds.len());
+        };
+        check(&ds);
+        // the same after the pending changes are merged into a generation
+        ds.compact().unwrap();
+        check(&ds);
+        // a later commit is not seen by an iterator made before it
+        let it = ds.quads(None, None, None, None);
+        ds.insert(QuadRef::new(
+            &n("new"),
+            &n("p"),
+            &n("o"),
+            GraphNameRef::DefaultGraph,
+        ))
+        .unwrap();
+        assert_eq!(it.count() as u64, ds.len() - 1);
     }
 }

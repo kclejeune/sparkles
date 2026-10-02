@@ -1,6 +1,7 @@
 //! Incremental write-time validation equals full validation (C10 A15): random shapes
-//! over the core constraint components and every path form, random data and random
-//! writes. After every write the guard's decision, counts and listed results are checked
+//! over the core constraint components, every path form, `sh:targetWhere` targets and
+//! SHACL-SPARQL constraints and components (anchored at the focus node or not), random
+//! data and random writes. After every write the guard's decision, counts and listed results are checked
 //! against full validations of the states before and after it.
 
 use serde_json::Value as J;
@@ -142,6 +143,7 @@ impl ShapeGen<'_> {
     /// Constraints of a property shape (or the value constraints of a node shape).
     fn constraints(&mut self, depth: usize, from: usize) -> String {
         let mut cs = Vec::new();
+        let mut qualified = false;
         for _ in 0..1 + self.r.below(3) {
             let c = match self.r.below(24) {
                 0 => format!("sh:minCount {}", self.r.below(3)),
@@ -185,12 +187,16 @@ impl ShapeGen<'_> {
                     self.helper(from),
                     self.helper(from)
                 ),
-                21 if from <= self.helpers => format!(
-                    "sh:qualifiedValueShape {} ; sh:{} {}",
-                    self.helper(from),
-                    self.r.pick(&["qualifiedMinCount", "qualifiedMaxCount"]),
-                    self.r.below(2)
-                ),
+                // a shape has at most one qualified value shape (SHACL §4.7.3)
+                21 if from <= self.helpers && !qualified => {
+                    qualified = true;
+                    format!(
+                        "sh:qualifiedValueShape {} ; sh:{} {}",
+                        self.helper(from),
+                        self.r.pick(&["qualifiedMinCount", "qualifiedMaxCount"]),
+                        self.r.below(2)
+                    )
+                }
                 22 if depth > 0 => format!("sh:property {}", self.property(depth - 1, from)),
                 _ => format!("sh:maxCount {}", 2 + self.r.below(2)),
             };
@@ -213,9 +219,34 @@ impl ShapeGen<'_> {
         iri
     }
 
+    /// A shape for `sh:targetWhere`: a helper, or one that narrows the nodes that may
+    /// conform (by class, value or a required property) or does not (`sh:not`).
+    fn where_shape(&mut self) -> String {
+        match self.r.below(6) {
+            0 => format!("[ sh:class {} ]", class(self.r.below(CLASSES))),
+            1 => format!(
+                "[ sh:property [ sh:path {} ; sh:minCount 1 ; sh:maxCount {} ] ]",
+                pred(self.r.below(PREDS)),
+                1 + self.r.below(2)
+            ),
+            2 => format!("[ sh:not [ sh:class {} ] ]", class(self.r.below(CLASSES))),
+            3 => format!("[ sh:hasValue {} ]", node(self.r.below(NODES))),
+            4 => format!(
+                "[ sh:property [ sh:path [ sh:inversePath {} ] ; sh:minCount 1 ] ; sh:nodeKind sh:IRI ]",
+                pred(self.r.below(PREDS))
+            ),
+            _ => self.helper(0),
+        }
+    }
+
     fn targets(&mut self) -> String {
         let mut ts = Vec::new();
         for _ in 0..1 + self.r.below(2) {
+            if self.r.chance(15) {
+                let w = self.where_shape();
+                ts.push(format!("sh:targetWhere {w}"));
+                continue;
+            }
             ts.push(match self.r.below(5) {
                 0 | 1 => format!("sh:targetClass {}", class(self.r.below(CLASSES))),
                 2 => format!("sh:targetSubjectsOf {}", pred(self.r.below(PREDS))),
@@ -279,12 +310,32 @@ impl ShapeGen<'_> {
             ));
         }
         if sparql {
-            let c = self.fresh("sparql");
             self.out.push_str(&format!(
-                "<{EX}Q> a sh:NodeShape ; sh:targetClass {} ; sh:sparql {c} .\n\
-                 {c} sh:select \"SELECT $this ?value WHERE {{ $this <{EX}p0> ?value . FILTER NOT EXISTS {{ ?value <{EX}p1> ?x }} }}\" .\n",
-                class(0)
+                "<{EX}HasType> a sh:ConstraintComponent ;\n\
+                   sh:parameter [ sh:path <{EX}requiredType> ] ;\n\
+                   sh:validator [ a sh:SPARQLAskValidator ;\n\
+                     sh:ask \"ASK {{ $value a $requiredType }}\" ] .\n"
             ));
+            for _ in 0..1 + self.r.below(2) {
+                let iri = self.fresh("Q");
+                let t = self.targets();
+                let c = self.fresh("sparql");
+                let q = self.query();
+                self.out.push_str(&format!(
+                    "{iri} a sh:NodeShape ; {t} ; sh:sparql {c} .\n{c} sh:select \"{q}\" .\n"
+                ));
+            }
+            if self.r.chance(50) {
+                let iri = self.fresh("Q");
+                let t = self.targets();
+                let path = self.path(1);
+                let k = class(self.r.below(CLASSES));
+                let ps = self.fresh("ps");
+                self.out.push_str(&format!(
+                    "{iri} a sh:NodeShape ; {t} ; sh:property {ps} .\n\
+                     {ps} sh:path {path} ; <{EX}requiredType> {k} .\n"
+                ));
+            }
         }
         if recursive {
             self.out.push_str(&format!(
@@ -295,6 +346,47 @@ impl ShapeGen<'_> {
             ));
         }
         self.out
+    }
+}
+
+impl ShapeGen<'_> {
+    /// A SHACL-SPARQL query: most are anchored at `$this`, some are not.
+    fn query(&mut self) -> String {
+        let a = pred(self.r.below(PREDS));
+        let b = pred(self.r.below(PREDS));
+        let c = pred(self.r.below(PREDS));
+        let k = class(self.r.below(CLASSES));
+        match self.r.below(9) {
+            0 => format!(
+                "SELECT $this ?value WHERE {{ $this {a} ?value . FILTER NOT EXISTS {{ ?value {b} ?x }} }}"
+            ),
+            // uniqueness: another node with the same value
+            1 => format!(
+                "SELECT $this ?value WHERE {{ $this {a} ?value . ?other {a} ?value . FILTER(?other != $this) }}"
+            ),
+            2 => format!(
+                "SELECT $this WHERE {{ $this {a} ?x OPTIONAL {{ ?x {b} ?y }} FILTER(!BOUND(?y)) }}"
+            ),
+            3 => format!(
+                "SELECT $this ?value WHERE {{ {{ $this {a} ?value }} UNION {{ ?value {b} $this }} FILTER NOT EXISTS {{ ?value a {k} }} }}"
+            ),
+            4 => format!(
+                "SELECT $this WHERE {{ $this {a}/{b}* ?v . ?v {c} ?w . FILTER(isLiteral(?w)) }}"
+            ),
+            5 => format!(
+                "SELECT $this ?value WHERE {{ $this ?p ?value . FILTER(?p = {a} && isIRI(?value)) FILTER EXISTS {{ ?value ?q $this }} }}"
+            ),
+            6 => format!(
+                "SELECT $this WHERE {{ $this {a} ?x }} GROUP BY $this HAVING (COUNT(?x) > 1)"
+            ),
+            // not anchored: these read the whole data graph
+            7 => {
+                format!("SELECT $this WHERE {{ $this {a} ?x . FILTER NOT EXISTS {{ ?y a {k} }} }}")
+            }
+            _ => format!(
+                "SELECT $this WHERE {{ ?x {a} $this . ?y {b} ?x . FILTER EXISTS {{ ?z {c} ?y }} FILTER NOT EXISTS {{ ?q {c} ?q }} }}"
+            ),
+        }
     }
 }
 
@@ -397,6 +489,8 @@ fn config(mode: GuardMode, baseline: BaselinePolicy, shapes: &str) -> Validation
 
 #[derive(Default, Debug)]
 struct Tally {
+    /// validated incrementally though they changed `rdfs:subClassOf`
+    subclass_incremental: usize,
     strategies: BTreeMap<String, usize>,
     fallbacks: BTreeMap<String, usize>,
     rejected: usize,
@@ -481,7 +575,10 @@ fn scenario(seed: u64, mode: GuardMode, policy: BaselinePolicy, tally: &mut Tall
             ..Default::default()
         };
         let (after, after_c) = full(&after_data, &shapes);
-        let ctx = || format!("seed {seed} step {step} {mode:?} {policy:?}\n{u}\n{text}");
+        let data_text = data.iter().cloned().collect::<Vec<_>>().join(" .\n");
+        let ctx = || {
+            format!("seed {seed} step {step} {mode:?} {policy:?}\n{u}\n{text}\nDATA\n{data_text}")
+        };
         let res = update(&store, &u, &opts);
         tally.writes += 1;
         let introduced = minus(&after, &before);
@@ -525,6 +622,11 @@ fn scenario(seed: u64, mode: GuardMode, policy: BaselinePolicy, tally: &mut Tall
             if let Some(f) = &s.fallback {
                 *tally.fallbacks.entry(f.clone()).or_default() += 1;
             }
+            if s.strategy == Strategy::Incremental
+                && ins.iter().chain(&del).any(|t| t.contains("subClassOf"))
+            {
+                tally.subclass_incremental += 1;
+            }
             match s.status {
                 GuardStatus::Bypassed => {}
                 GuardStatus::Skipped => {
@@ -537,7 +639,17 @@ fn scenario(seed: u64, mode: GuardMode, policy: BaselinePolicy, tally: &mut Tall
                     );
                 }
                 _ => {
-                    assert_eq!(s.by_severity, after_c, "counts: {}", ctx());
+                    assert_eq!(
+                        s.by_severity,
+                        after_c,
+                        "counts ({:?} {:?} focus {:?}, new {:?}, gone {:?}): {}",
+                        s.strategy,
+                        s.fallback,
+                        s.focus_nodes,
+                        introduced,
+                        minus(&before, &after),
+                        ctx()
+                    );
                     assert_eq!(s.total as usize, after.len(), "total: {}", ctx());
                     assert_eq!(s.blocking, blocking(&after_c), "blocking: {}", ctx());
                     let listed: Vec<String> = {
@@ -600,7 +712,15 @@ fn steps() -> usize {
 
 fn run(mode: GuardMode, policy: BaselinePolicy, first: u64) -> Tally {
     let mut t = Tally::default();
-    for seed in first..first + seeds() {
+    // `SPARKLES_DIFF_SEED=n` runs one scenario of every test
+    let only: Option<u64> = std::env::var("SPARKLES_DIFF_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let range = match only {
+        Some(n) => n..n + 1,
+        None => first..first + seeds(),
+    };
+    for seed in range {
         scenario(seed, mode, policy, &mut t);
     }
     eprintln!("{mode:?} {policy:?}: {t:?}");
@@ -614,9 +734,10 @@ fn warn_mode_counts_and_results_equal_full_validation() {
         t.strategies.get("Incremental").copied().unwrap_or(0) > t.writes / 4,
         "{t:?}"
     );
-    for f in ["baseline", "subclass", "sparql", "recursive", "budget"] {
+    for f in ["baseline", "sparql", "recursive", "budget"] {
         assert!(t.fallbacks.contains_key(f), "fallback {f} not hit: {t:?}");
     }
+    assert!(t.subclass_incremental > 0, "{t:?}");
 }
 
 #[test]

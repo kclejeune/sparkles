@@ -924,6 +924,7 @@ type Commit = {
   generation: string;                   // index generation it was made in
   bulk: boolean;                        // made by rebuilding the index
   exact: boolean;                       // false: a bulk commit that also deleted
+  unvalidated?: true;                   // the write bypassed write-time validation
   message?: string;                     // the writer's commit message
   digest?: string;                      // change digest (hex SHA-256), when enabled
 };
@@ -1020,7 +1021,10 @@ longer kept is `410 history-gone`, and the body lists the readable ranges:
 
 Materializing a past state is bounded by `--history-cache-mb` (default 1024, `507`
 beyond it) and by the request timeout. Results are cached, and one materialization runs
-at a time.
+at a time. A state starts from the nearest known state of its generation in the
+write-ahead log: the generation's base, a cached past state before or after it, or the
+live state. Later states replay the log forward, and earlier ones undo it backward, so a
+read near the head or near a cached commit replays only the commits in between.
 
 ### Diffs between commits
 
@@ -1035,6 +1039,8 @@ the selectors of `at`. `to` defaults to the head and `from` to the commit before
 |---|---|---|
 | JSON (default) | `Accept: application/json` or `format=json` | Counts, and the quads with `quads=true`. |
 | Diff lines | `Accept: text/x-sparkles-diff` or `format=diff` | One N-Quads line per change, marked `+ ` or `- `. |
+| RDF Patch | `Accept: application/rdf-patch` (or `text/rdf-patch`) or `format=patch` | A patch that turns the state at `from` into the state at `to`. |
+| RDF Patch, binary | `Accept: application/rdf-patch+thrift` or `format=patch-binary` | The same patch as RDF Thrift rows. |
 
 ```json
 { "dataset": "ds", "datasetId": "3f1c9a2e-…",
@@ -1064,25 +1070,113 @@ between two `commit:` selectors never changes, so it gets a weak entity tag and 
 effect, so the net change is the symmetric difference of the changes between the two
 commits. Within the retained generations Sparkles reads only those log records,
 compactions included, and its memory grows with the quads that changed. That is
-`"log"`. A bulk commit has no log records, and a collected generation leaves a gap. Those
-stretches are compared state against state with a sorted merge, which reads both states
-in full. That is `"compare"`, and in-memory datasets always use it.
+`"log"`. A sparse index of each log says where every 1,024th commit ends, so a diff
+starts reading near its first commit. A bulk commit has no log records, and a collected
+generation leaves a gap. Those stretches are compared state against state with a sorted
+merge, which reads both states in full. That is `"compare"`, and in-memory datasets
+always use it.
+
+**RDF Patch.** The patch formats follow Apache Jena's RDF Patch, which Jena's
+`jena-rdfpatch` module, Fuseki's patch endpoint and RDF Delta read. A patch names the
+two states in its header, deletes with `D` rows and adds with `A` rows inside one
+transaction:
+
+```
+H id <urn:uuid:3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa#commit:4> .
+H prev <urn:uuid:3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa#commit:1> .
+TX .
+D <urn:a> <urn:p> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+A <urn:c> <urn:p> "three" .
+A <urn:b> <urn:p> "2"^^<http://www.w3.org/2001/XMLSchema#integer> <urn:g1> .
+TC .
+```
+
+`id` is the IRI of the `to` commit and `prev` that of the `from` commit. A commit's IRI is
+`urn:uuid:` with the dataset id, then `#commit:` and its number. A quad in the default
+graph has three terms. Blank nodes are written `<_:label>`, the form Jena's reader keeps
+labels in. The binary form is a sequence of `RDF_Patch_Row` structs of Jena's RDF Thrift
+schema in the Thrift compact protocol. Its literals carry the base direction of
+directional language strings, which Jena's binary reader ignores. A patch always lists
+every change, so `limit` with a patch format is `400`.
+
+### Change feed
+
+`GET /{ds}/changes?after=SEL` lists the commits after a commit, oldest first, each with
+the quads it added and removed relative to its parent. It needs read permission on the
+dataset. `after` takes the selectors of `at` and defaults to the head, so a request
+without it waits for the next commit. Resuming is simple: a client that applied commit
+`n` asks for the commits after `n`. That works from any readable commit, as for diffs.
+
+| Parameter | Meaning |
+|---|---|
+| `after` | The commit to start after (`N`, `commit:N`, `time:…`, `snapshot:NAME`, `head`). |
+| `limit` | The most commits listed, 1 to 1,000 (default 100). |
+| `wait` | Seconds to wait for a commit when there is none after `after`, at most 60 (default 0). |
+| `format` | `json` (default), `patch` or `patch-binary`, in place of `Accept`. |
+
+The JSON body lists the commits with their changes. `next` and the `Sparkles-Changes-Next`
+header name the commit to ask after next, and `Sparkles-Head` carries the head:
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…", "after": 2, "next": 4, "head": { "seq": 4, … },
+  "commits": [
+    { "commit": { "seq": 3, "message": "…", … }, "added": 0, "removed": 1, "complete": true,
+      "changes": [ { "op": "-", "subject": "<urn:a>", "predicate": "<urn:p>",
+                     "object": "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>", "graph": null } ] },
+    … ] }
+```
+
+With `Accept: application/rdf-patch` or `application/rdf-patch+thrift` the body is one
+patch per commit, one after another. Each patch's `id` names its commit and its `prev`
+names the parent, so the patches chain.
+
+A page lists at most `--max-rows` changes, all its commits together. It ends before the
+commit that would pass that, and the next page starts with it. A commit whose changes
+alone pass the budget is listed with its counts and `"complete": false`, without
+`changes`, and a client reads the state at that commit instead. A patch cannot leave
+changes out, so a patch page that would start with such a commit is `507` with
+`code: "changes-too-large"` and the commit's number. A body over `--max-export-mb` is cut
+off as for other streamed bodies.
+
+A commit past the head is `404`. A commit whose state is no longer kept is
+`410 history-gone`, and so is the first commit after a gap in the readable history: its
+changes need the state before it. A page ends where the readable history does, so the
+next request reports the commit that cannot be read.
+
+**Long polling.** With `wait=N`, a request that finds no commit after `after` waits up to
+N seconds for one and then answers, with an empty list if none came. The server wakes
+waiting requests as soon as a commit is published, and ends the wait when it begins to
+shut down.
+
+**Server-sent events.** With `Accept: text/event-stream` the response is an event stream.
+Each commit is a `commit` event whose `id` is the commit's number and whose data is the
+commit's JSON object, or its text patch with `format=patch`. The stream sends the commits
+after `after`, then new commits as they are made, with a comment every 15 seconds to keep
+the connection open. It ends after five minutes and when the server shuts down. A client
+that reconnects sends `Last-Event-ID`, as browsers' `EventSource` does, and the stream
+resumes after that commit. An error ends the stream with an `error` event that carries
+the error's JSON body.
+
+```sh
+curl -N -H 'Accept: text/event-stream' 'http://localhost:3030/ds/changes?after=41'
+```
 
 ### Named snapshots and retention
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/$/snapshots/{ds}` | `{ dataset, datasetId, head, snapshots: NamedSnapshot[] }` |
-| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note?, expires? }`, as JSON, a form or the query string. `expires` is an RFC 3339 time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). Returns `201` and `Location`, or `200` if the name already pins that commit. `409` if the name pins another commit. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
+| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note?, expires?, warm? }`, as JSON, a form or the query string. `expires` is an RFC 3339 time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). `warm: true` keeps the pinned state materialized (see below). Returns `201` and `Location`, or `200` if the name already pins that commit. `409` if the name pins another commit. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
 | GET | `/$/snapshots/{ds}/{name}` | `NamedSnapshot` |
 | DELETE | `/$/snapshots/{ds}/{name}` | `204`. Generations that only this snapshot kept are removed. |
 | GET | `/$/history/{ds}` | `HistoryStatus` |
-| PUT | `/$/history/{ds}` | Sets the retention window and returns `HistoryStatus`. The body is `{ keepCommits?, keepAge?, maxBytes?, schedules? }`. `schedules` replaces the pin schedules when it is present. |
+| PUT | `/$/history/{ds}` | Sets the retention window and returns `HistoryStatus`. The body is `{ keepCommits?, keepAge?, maxBytes?, schedules?, catalog? }`. `schedules` replaces the pin schedules when it is present, and `catalog` replaces the catalog horizon (`null` turns it off). |
 
 ```ts
 type NamedSnapshot = { name: string; ref: string; seq: number; commit: Commit | null;
   created: string; expires: string | null; note: string | null;
-  generation: string | null; reconstructable: boolean };
+  generation: string | null; reconstructable: boolean;
+  warm: boolean };                                   // kept materialized
 type Retention = { keepCommits: number | null;      // the last N commits
   keepAge: string | null;                            // "7d", or seconds
   maxBytes: number | null };                         // a number, or "10GiB" in a PUT
@@ -1093,6 +1187,8 @@ type HistoryStatus = { dataset: string; datasetId: string; head: number;
   generations: { name: string; baseSeq: number; endSeq: number; bytes: number;
                  current: boolean; heldBy: string[] }[];   // "head", "snapshot:NAME", "retention"
   retention: Retention; schedules: Schedule[]; snapshots: number;
+  catalog: { keepCommits: number | null; keepAge: string | null;   // the catalog horizon
+             firstRetained: number };                              // the oldest commit listed
   cache: { entries: number; bytes: number; hits: number; misses: number; materializations: number } };
 ```
 
@@ -1105,6 +1201,24 @@ is finished at the next open. `GET /$/commits/{ds}` adds `oldestReconstructable`
 `maxBytes` caps the disk used by generations that only the retention window keeps. When
 the kept generations together exceed it, the oldest window-only generations are removed
 first. Pins and backups in progress always keep their generations.
+
+A **warm** pin keeps its state materialized. The state is built when the pin is made and
+by the history upkeep, so it is ready again within a minute of a restart. The history
+cache evicts warm states last, only when they alone pass `--history-cache-mb`, so a read
+at a warm pin costs no replay. A pin at the head needs no warming, and an in-memory
+dataset keeps every pinned state in memory anyway.
+
+The **catalog horizon** bounds the commit catalog. Without one, `/$/commits` and
+`sparkles log` keep every commit's metadata forever, at 64 bytes a commit. With
+`catalog: { keepCommits: 100000, keepAge: "90d" }`, the catalog drops the records, messages
+and digests of commits that are older than both the oldest readable commit and the
+horizon. A commit is kept if either limit keeps it. The history upkeep prunes once at
+least 1,024 records, and an eighth of the catalog, can go. Setting the horizon prunes at
+once, and so does `sparkles snapshot gc`. Commit numbers never repeat, because the head is
+never pruned. A pruned commit answers `410` in `/$/commits/{ds}/{ref}`, and
+`firstRetained` moves up. Pruning writes a new `commits.bin` and `annotations.bin` that
+replace the old files atomically. Backups, restores, `sparkles check` and the dataset
+quota handle the shorter files like any others.
 
 A **schedule** pins the head every `every` (at least a minute) as `PREFIX` followed by the
 UTC time, for example `daily-20261002T140311Z`. It skips a pin when its newest one
@@ -1129,14 +1243,17 @@ and `sparkles_history_cache_entries` per dataset. It also reports the counters
 
 **CLI.** The history commands are these:
 
-* `sparkles snapshot create --loc DB NAME [--at SEL] [--note TEXT] [--expires 7d]`
+* `sparkles snapshot create --loc DB NAME [--at SEL] [--note TEXT] [--expires 7d] [--warm]`
 * `sparkles snapshot list|history --loc DB [--format json]`
 * `sparkles snapshot delete --loc DB NAME`
 * `sparkles snapshot retain --loc DB [--keep-commits N] [--keep-age 7d] [--max-bytes 10GiB] [--off]`
 * `sparkles snapshot schedule --loc DB --prefix daily- --every 1d [--keep-last 7]`, or
   `--remove PREFIX`, or no options to list the schedules
-* `sparkles snapshot gc --loc DB`, which runs the history upkeep once
-* `sparkles diff --loc DB FROM [TO] [--graph IRI|default] [--format diff|json|count]`
+* `sparkles snapshot gc --loc DB`, which runs the history upkeep once and prunes the
+  commit catalog
+* `sparkles snapshot catalog --loc DB [--keep-commits N] [--keep-age 90d] [--off]`, which
+  sets the catalog horizon and prunes
+* `sparkles diff --loc DB FROM [TO] [--graph IRI|default] [--format diff|json|count|patch|patch-binary]`
 * `sparkles query --loc DB --at SEL …`, `sparkles dump --loc DB --at SEL` and
   `sparkles clone --loc DB --to DIR --at SEL`
 
@@ -1793,8 +1910,11 @@ SELECT ?s ?score ?label WHERE {
 } ORDER BY DESC(?score)
 ```
 
-* **Subject list.** `(?s ?score ?literal ?graph ?predicate)`. Every slot after the
-  subject is optional. A constant subject restricts the search to that subject.
+* **Subject list.** `(?s ?score ?literal ?graph ?predicate ?rank)`. Every slot after the
+  subject is optional. A constant subject restricts the search to that subject. The
+  sixth slot is a Sparkles extension. It binds the hit's rank as an `xsd:integer`, one
+  more than the number of hits with a higher score, so hits with equal scores share a
+  rank. Unused slots can be blank nodes, as in `(?s ?score [] [] [] ?rank)`.
 * **Object.** A query string, or `(predicate* "query" limit "lang:xx" "highlight:…")`.
   The limit, `lang:` and `highlight:` arguments are each optional. A language tag on the
   query string acts as `lang:`.
@@ -1847,6 +1967,32 @@ SELECT ?s ?score ?label WHERE {
   before any join.
 * **Analyzer.** Tokens are split on non-alphanumeric characters, lowercased and
   ASCII-folded, so `café` matches `cafe`.
+* **Languages.** An index can also stem the literals of chosen languages, as jena-text
+  does with `text:multilingualSupport`. `languages` in the configuration names them. A
+  literal whose language tag has an analyzer is indexed twice, once as above and once
+  stemmed. A search with `lang:` or a language-tagged query string searches the stemmed
+  text of that language, so `"runs"@en` matches `Running quickly`@en. The analyzer of a
+  language lowercases, removes the language's stop words (where Tantivy has a list for
+  it) and applies Tantivy's Snowball stemmer. It is applied to the query in the same way.
+  As in Lucene, stemmed terms are not folded to ASCII, so Swedish `städer` and `stad`
+  stay apart.
+  * The language of a literal and of a search is its primary subtag, so `en-GB` literals
+    are stemmed as English and `lang:en-gb` searches the English text and keeps only
+    `en-GB` literals.
+  * As in Lucene, prefixes, wildcards, fuzzy words, regular expressions and ranges are
+    not stemmed. They match the stemmed terms, so `runn*` finds `runner` but not
+    `running`, which was indexed as `run`. They are lowercased, and for German the
+    umlauts and ß are replaced as the German stemmer replaces them, so `häu*` finds
+    `Häuser`.
+  * A removed stop word leaves a gap in the positions, as in Lucene. The phrase
+    `"ada and the fox"` matches `Ada and the fox`, and `"ada fox"` does not.
+  * A search without a language searches the unstemmed text, as in Jena. A language
+    without an analyzer in the index is searched unstemmed and filtered by its tag.
+  * The analyzers are `arabic`, `danish`, `dutch`, `english`, `finnish`, `french`,
+    `german`, `greek`, `hungarian`, `italian`, `norwegian`, `portuguese`, `romanian`,
+    `russian`, `spanish`, `swedish`, `tamil` and `turkish`. Their default tags are `ar`,
+    `da`, `nl`, `en`, `fi`, `fr`, `de`, `el`, `hu`, `it`, `no` (and `nb` and `nn`), `pt`,
+    `ro`, `ru`, `es`, `sv`, `ta` and `tr`.
 * **Consistency.** Indexes are updated in the same commit as the data, so a query sees
   the text of its own snapshot, including the writes just before it. A write only stages
   its documents. The index commit, which writes a new segment, happens at the next text
@@ -1885,6 +2031,7 @@ type TextConfig = {
   maxTextBytes?: number;                                // default 262144 (longer text is indexed truncated)
   maxHits?: number;                                     // default 1000000 hits without a limit or above one (then 507)
   docstoreCompression?: "zstd" | "lz4" | "none";         // default zstd; a change rebuilds
+  languages?: "all" | string[] | { [tag: string]: string };  // stemmed languages; a change rebuilds
 };
 type TextStatus = {
   enabled: true; state: "ready" | "stale"; docs: number;
@@ -1904,10 +2051,16 @@ type TextHits = {
 };
 ```
 
+`languages` is `"all"` for every analyzer under its default tags, a list of tags with
+their default analyzers, such as `["en", "fr"]`, or a map from a primary language tag to
+an analyzer name, such as `{"en": "english", "gl": "portuguese"}`. `--language all` and
+`--language en` set it from the CLI. An index without `languages` keeps the schema and
+configuration it had before languages existed and is not rebuilt.
+
 Dataset info (`/$/datasets`) has `text: null | { state, docs }`. The configuration lives
 in the database directory, in `text.json`, with the index in `text/`. The CLI commands
 are
-`sparkles text-index --loc DB [--predicate IRI…] [--exclude-graph IRI…] [--rebuild | --status | --disable]`
+`sparkles text-index --loc DB [--predicate IRI…] [--exclude-graph IRI…] [--language TAG…] [--rebuild | --status | --disable]`
 and `sparkles serve --text NAME[=config.json]`.
 
 ## Vector similarity
@@ -2043,6 +2196,45 @@ sparkles vector status  --loc DB [--name NAME]
 
 Each command takes `--server URL --dataset NAME` instead of `--loc`. `create` and
 `rebuild` wait for the build.
+
+### Hybrid text and vector search
+
+`spk:hybridSearch` runs a full-text search and a vector search and fuses their rankings
+by reciprocal rank fusion (Cormack, Clarke and Büttcher, SIGIR 2009). The design is in
+[F04](specs/F04-vector-search.md#outcome).
+
+```sparql
+PREFIX spk: <urn:x-sparkles:>
+SELECT ?s ?score ?textRank ?vectorRank WHERE {
+  (?s ?score ?textRank ?vectorRank) spk:hybridSearch (
+      (rdfs:label "brown fox" 100 "lang:en")
+      (ex:emb "[0.1, -0.2, 0.3]"^^spk:vector 100)
+      10 "rrf:60" "weights:1,0.5") .
+} ORDER BY DESC(?score)
+```
+
+* **Arguments.** The first element is the object list of `text:query`, or a bare query
+  string. The second is the object list of `spk:vectorSearch`. An optional limit follows,
+  1 to 10,000 subjects with 10 by default, and then the options. `rrf:k` sets the
+  constant of the fusion (60 by default). `weights:wt,wv` weights the text and the vector
+  ranking (1 and 1 by default).
+* **Subject list.** `(?s ?score ?textRank ?vectorRank)`. Every slot after the subject is
+  optional. `?score` is the fused score as an `xsd:double`. A rank is unbound when its
+  list does not hold the subject. A constant subject returns that subject's row of the
+  fused ranking.
+* **Rankings.** Each list runs as its own property function would, within the active
+  graph and with its own options, budgets and errors. The text list's limit and the
+  vector list's `k` set how deep each ranking goes, 100 when they are absent. Each
+  ranking keeps one entry per subject, its best hit, or per subject and graph under
+  `GRAPH ?g`. A subject's rank is one more than the number of subjects in that list with
+  a better score, so ties share a rank. For the euclidean metric a lower distance is
+  better.
+* **Fusion.** A subject's score is the sum of `weight / (k + rank)` over the lists that
+  hold it. The best `limit` subjects are returned, and ties break by term id.
+* **Restrictions.** The text list takes no `highlight:` option. The vector query must be
+  a vector literal or an entity, and `candidates:join` is refused. Errors follow the two
+  searches, and malformed calls and options give `400`. The call needs the `text`
+  feature and a full-text index.
 
 ## GeoSPARQL
 
@@ -2665,10 +2857,10 @@ versions, format 1 without `language`, are still read:
 |---|---|---|---|
 | `language` | `shacl`, `shex` | `shacl` | The shape language. It is always written, and a `PUT` without it means SHACL. |
 | `mode` | `reject`, `warn`, `off` | — | With `reject`, a write that leaves results at or above the threshold is not committed (`422`). With `warn`, the write commits, and the receipt and header report the findings. |
-| `shapes` (SHACL) | `{ "graphs": [iri, …] }` or `{ "inline": "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, or shapes given inline. Named graphs are read from the state being validated, so changes to them are validated too and must parse. Inline shapes are copied to `validation-shapes.ttl`. |
+| `shapes` (SHACL) | `{ "graphs"?: [iri, …], "inline"?: "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, shapes given inline, or both. Named graphs are read from the state being validated, so changes to them are validated too and must parse. Inline shapes are copied to `validation-shapes.ttl`. With both, the file's shapes are merged with the graphs into one shapes graph, and a write to a shapes graph is validated against the merged shapes. |
 | `dataGraph` | `"default"`, `"union"`, `[iri, …]` | `"default"` | The data graph. It never includes the shapes graphs, and includes the inferred graph only with `includeInferences`. |
 | `threshold` (SHACL) | `violation`, `warning`, `info` | `violation` | Results at or above it block. |
-| `baseline` (SHACL) | `strict`, `grandfather` | `strict` | With `strict`, any blocking result in the state after a write decides. With `grandfather`, only the blocking results the write introduces decide, so results the data already has do not block unrelated writes, and `reject` can be enabled on data that does not conform. |
+| `baseline` | `strict`, `grandfather` | `strict` | With `strict`, any blocking result in the state after a write decides. With `grandfather`, only the blocking results the write introduces decide, so results the data already has do not block unrelated writes, and `reject` can be enabled on data that does not conform. Results are matched as a multiset: SHACL results by focus node, path, value, source shape, component and constraint, ShEx associations by node and shape. When a write changes a SHACL shapes graph, its results are compared with those the old shapes gave. |
 | `timeoutSeconds`, `reportLimit` | number, 1–10000 | 10, 100 | `timeoutSeconds` is the time budget per write. Exceeding it fails the write with `408`. `reportLimit` is the number of results a report carries. |
 
 **ShEx.** A ShEx configuration names a schema and a query shape map instead of shapes:
@@ -2685,6 +2877,7 @@ versions, format 1 without `language`, are still read:
 | `schema` | `PUT`: `{ "inline": "<schema>", "format"?: "shexc" \| "shexj" \| "shexr", "base"?: iri, "source"?: text }` | The schema text, and the base its relative IRIs resolve against. The text is ShExC, ShExJ, or ShExR in Turtle. Without `format` the language is sniffed, and text that starts with `{` is ShExJ. The schema is copied into the database. Without imports, it is stored verbatim as `validation-schema.shex` (ShExC) or `validation-schema.json` (ShExJ). With imports, the imports are resolved during the `PUT` and the merged schema is written as ShExJ to `validation-schema.json`. The schema's prefixes are then kept in `schema.prefixes` for the shape map. The stored configuration names the copy (`file`, `format`), keeps `base` and `source`, and records the SHA-256 of the text given. A later write never fetches anything. To change the other fields, a `PUT` may send the stored `schema` back, with its `file` and without `inline`. |
 | `shapeMap` | compact string, or the JSON form `[{ "node", "shape" }]` | A query map. It is expanded again on every validated state, so new focus nodes are picked up. Prefixed names use the schema's prefixes unless the map has its own `PREFIX`es. |
 | `threshold` | — | Not accepted. Every nonconformant association blocks. |
+| `baseline` | `strict`, `grandfather` | As for SHACL. In grandfather mode a write is blocked only by the nonconformant associations it introduces. A ShEx schema changes only through a new configuration, so no write compares two schemas. |
 
 Imports resolve as for `POST /{ds}/shex`. `file:` IRIs and relative IRIs must be inside
 `--load-dir`, and http(s) imports go through the outbound policy. A `PUT` takes no inline
@@ -2706,8 +2899,10 @@ it changes. For SHACL the predicates read are those of paths, targets, `sh:equal
 its siblings, and `rdf:type` and `rdfs:subClassOf` for classes. SHACL needs the state of
 the head to be known for this skip. For ShEx they are the predicates of triple
 constraints and `{FOCUS p …}` selectors, because a neighbourhood holds only the arcs of
-the predicates its shape mentions. A closed shape reads every predicate, and so does a
-SHACL-SPARQL constraint, so neither language skips writes then. Responses carry
+the predicates its shape mentions. A SHACL-SPARQL constraint reads the predicates of its
+query when the query is anchored at the focus node (see below). A closed shape reads
+every predicate, and so does a query with a variable predicate or one that is not
+anchored, so neither language skips writes then. Responses carry
 `Sparkles-Validation: status=passed|warned|rejected|skipped|bypassed, mode=…, strategy=full|incremental|none, blocking=N, total=N, violations=N, warnings=N, infos=N, ms=N`.
 ShEx adds `lang=shex` after `strategy`. In grandfather mode `introduced=N` follows
 `blocking`. Receipts (`receipt=true`) include a `validation` object with its `language`.
@@ -2738,9 +2933,13 @@ rejection is JSON whatever the `Accept`:
 A rejected write uses no commit number. `?validationLimit=N` bounds the results of one
 request. `?validate=false`, or the header `Sparkles-Validate: off`, skips validation, but
 only on a server started with `--allow-unvalidated-writes`. On other servers it gets
-`403`. The CLI has `--no-validate`. A dataset whose `validation.json` cannot be loaded
-refuses writes with `501` rather than accepting them unvalidated. This happens, for
-example, when a binary built without `shex` opens a ShEx configuration.
+`403`. The CLI has `--no-validate`. A commit made this way is flagged `unvalidated` in
+`/$/commits`, in receipts and in `sparkles log`. The flag is kept in the write-ahead log
+and the commit catalog, so it survives restarts. A library program that opens a validated
+database with `StoreOptions::unvalidated_writes` and installs no guard makes such commits
+too. A dataset whose `validation.json` cannot be loaded refuses writes with `501` rather
+than accepting them unvalidated. This happens, for example, when a binary built without
+`shex` opens a ShEx configuration.
 
 **Incremental validation.** The guard knows the exact result counts of the head. A full
 validation sets them when validation is turned on, and every validated write keeps them
@@ -2762,26 +2961,59 @@ A write is validated in full in these cases, and `fallback` names the reason:
 |---|---|
 | `baseline` | The state of the head is unknown, for example after a bypassed write. In strict `reject` mode, the head also has blocking results. |
 | `shapes` | The write changed a shapes graph. |
-| `subclass` | The write changed `rdfs:subClassOf` and a shape reads classes. |
+| `subclass` | The write changed `rdfs:subClassOf`, a shape reads classes, and the classes it changes have more than 100,000 instances. With fewer, those instances are validated incrementally. |
 | `bulk` | The write was a bulk load, which renumbers terms. |
 | `budget` | The write affects more than 50,000 focus nodes, or more than 512 of one shape's focus nodes when that is over a quarter of them. The search for affected nodes may also visit at most 100,000 nodes. |
-| `sparql`, `recursive` | Some shapes are validated in full on every write, because they have SHACL-SPARQL constraints or refer to themselves. The other shapes stay incremental. |
+| `sparql`, `recursive` | Some shapes are validated in full on every write, because they have a SHACL-SPARQL constraint whose query is not anchored at the focus node, or refer to themselves. The other shapes stay incremental. |
+
+**SHACL-SPARQL and `sh:targetWhere`.** A SHACL-SPARQL constraint or SPARQL-based
+component is validated incrementally when its query is anchored at the focus node. Every
+triple pattern must then connect to `$this`, or to `$value` for an ASK validator, through
+the patterns before it. Constants and variables may sit in between, and paths may have
+any form except a negated property set inside a longer path. `FILTER NOT EXISTS`,
+`OPTIONAL`, `UNION`, `BIND`, aggregates and `GROUP BY` are allowed when their patterns
+are anchored in the same way. A variable bound only in one branch of a `UNION`, or only
+inside an `OPTIONAL`, anchors nothing after it. A query with a subquery, `GRAPH`,
+`SERVICE`, `VALUES` or `MINUS`, or with a pattern that is not anchored, keeps its shape
+validated in full. For example, the uniqueness constraint
+`SELECT $this WHERE { $this ex:key ?k . ?other ex:key ?k . FILTER (?other != $this) }`
+validates the nodes that share a changed key. The `incremental` member of the status
+lists the shapes still validated in full and why. A shape with an `sh:targetWhere`
+target (SHACL 1.2) is incremental when its where shape is. A node's membership then
+depends on what conformance to the where shape reads at the node. When the where shape
+does not narrow the candidates by `sh:class`, `sh:hasValue`, `sh:in` or a required
+property, every edge of the node counts.
 
 ShEx works the same way on the associations of the shape map. A node is affected when a
-changed triple is an arc its shape reads, or an arc a reference from it reaches. With a
-recursive reference such as `foaf:knows @ex:Person *`, every node that reaches the changed
-one over `foaf:knows` is affected, so on a large connected graph such writes are
-validated in full. ShEx falls back for `baseline`, `bulk`, `budget` (more than 50,000
-affected nodes), and `sparql` for a map with a SPARQL selector. ShEx has no grandfather
-mode.
+changed triple is an arc its shape reads, or an arc a reference from it reaches. The
+guard also keeps the typing of the head in memory for schemas whose references follow
+arcs. With it, a write validates only where typings change. It types the pairs of the
+nodes it touched, reads from the head's typing the other pairs that conformed and those
+that fail whatever they refer to, and goes on to the nodes that refer to a pair whose
+value changed. With a recursive reference such as `foaf:knows @ex:Person *`, a new
+`foaf:knows` arc between two people who conform validates one node. A write that makes a
+person nonconformant validates every person who reaches them, and falls back to a full
+validation past 50,000 nodes. A restart, a compaction or a write the guard did not
+validate leaves the typing unknown until the next full validation, and writes until then
+are validated over every node that reaches a changed one. ShEx falls back for `baseline`,
+`bulk`, `budget` (more than 50,000 affected nodes), and `sparql` for a map with a SPARQL
+selector.
 
 In the CLI, `sparkles validation` sets the configuration. For SHACL it is
-`sparkles validation --loc DB --mode reject|warn (--shapes-graph IRI … | --shapes FILE) [--data-graph …] [--threshold …] [--grandfather]`.
+`sparkles validation --loc DB --mode reject|warn [--shapes-graph IRI …] [--shapes FILE] [--data-graph …] [--threshold …] [--grandfather]`,
+with at least one shapes graph or a shapes file.
 For ShEx it is
-`sparkles validation --loc DB [--lang shex] --schema FILE [--schema-format shexc|shexj|shexr] --shape-map MAP --mode reject|warn [--data-graph …]`.
+`sparkles validation --loc DB [--lang shex] --schema FILE [--schema-format shexc|shexj|shexr] --shape-map MAP --mode reject|warn [--data-graph …] [--grandfather]`.
 `--schema` and `--shape-map` imply `--lang shex`, and imports resolve against the schema's
 directory. `--status [--format json]` shows the configuration, and `--off` turns
-validation off.
+validation off. `sparkles serve --validate NAME=CONFIG.json` sets a dataset's
+configuration when the server starts, from a file holding a `PUT` body. In that file,
+shapes or a schema without `inline` text are read from the path in `source`, relative to
+the file. `--validate NAME` validates a dataset with the configuration it has. Either way
+the data is validated in full before the server listens, the result is logged, and the
+state of the head, with the typing a ShEx guard keeps, is known for the writes that
+follow. A configuration file whose `reject` mode the data does not pass stops the server
+from starting.
 
 A write rejected in the CLI exits with status 3, and ShEx lists
 `  <node> @ <shape>: <reason>`. `load`, `update` and `infer` end their summary line with
@@ -2818,6 +3050,11 @@ the shapes graph in the request body, with Fuseki's semantics:
 * **`timeout=<seconds>`.** Works as for queries, with the server default otherwise. A
   timeout returns `408`.
 * SHACL Core and SHACL-SPARQL are supported. A parse error in the shapes graph is a `400`.
+* **`sh:targetWhere`** (SHACL 1.2 Core) is supported: the focus nodes are the nodes of the
+  data graph, its subjects and objects, that conform to the given shape. When that shape
+  has `sh:class`, `sh:hasValue` or `sh:in`, or a property shape on a predicate or an
+  inverse predicate with `sh:minCount` of at least 1, only the nodes those allow are
+  tested. Otherwise every node of the data graph is.
 * **Budgets.** The report is bounded like a query result. It fails with `507` and
   `budget: "result-bytes"` once it holds more results than fit in `--max-result-mb` at 48
   bytes each, or in `--query-memory-mb` at an estimated 512 bytes each. It also fails once
@@ -3656,7 +3893,7 @@ granted only under `datasets`.
 | `gsp-rw` | Graph Store reads and writes |
 | `upload` | `/{ds}/upload` |
 | `shacl`, `shex` | `/{ds}/shacl`, `/{ds}/shex`, and the MCP validation tools |
-| `diff` | `/{ds}/diff` |
+| `diff` | `/{ds}/diff` and the change feed `/{ds}/changes` |
 | `info` | The dataset's other routes that need `read` or `write`: its description, schema, prefixes, commits, index and reasoning status, snapshots, history and validation settings, and backups. MCP's `list_commits`, `describe_schema` and resources count as `info`. |
 
 A request through an endpoint that no grant names gets
@@ -3680,7 +3917,13 @@ one that does not exist:
 * Graph Store `GET ?graph=` of a hidden graph answers `404 no such graph`, exactly as for
   a missing graph. `GET` without a target returns the quads of the visible graphs.
 * `/$/schema/{ds}` counts the visible graphs, and `graph=` of a hidden graph is `404`.
-* `/{ds}/diff` lists, and counts, the changes of the visible graphs only.
+* `/{ds}/diff` lists, and counts, the changes of the visible graphs only, as JSON, diff
+  lines or RDF Patch.
+* The change feed `/{ds}/changes` lists every commit, each with its changes in the
+  visible graphs only, in JSON, RDF Patch and server-sent events. A commit that changed
+  only hidden graphs appears with no changes. A commit too large to list has no change
+  counts, and its commit has no quad counts.
+* `spk:hybridSearch` fuses a text and a vector ranking of the visible graphs.
 
 The engine applies the view to every scan, path, count, search and statistic, so counts
 answered from index statistics are exact for the view. Plans shown to a limited caller,

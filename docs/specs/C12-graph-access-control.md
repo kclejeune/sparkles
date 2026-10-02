@@ -707,6 +707,21 @@ scans of every named graph, where each row's graph is looked up in the visible s
 filters, paths and lookups show no difference. A view whose patterns cover every existing
 graph measured the same as a full grant once the change above was made.
 
+**Read paths merged later.** The change feed (`/{ds}/changes`, in JSON, RDF Patch and
+server-sent events), RDF Patch diffs, warm snapshot pins and `spk:hybridSearch` arrived on
+`main` while this was built. They follow the view as well:
+
+- `store::ChangesOptions::graphs` filters each commit's changes in the log walk and in
+  state comparisons, before they count against the page's limit. The feed belongs to the
+  `diff` endpoint. Every commit is still listed, so a commit of hidden graphs only shows
+  no changes, and a commit too large to list has no change or quad counts.
+- RDF Patch diffs are written from the filtered diff, so a patch leads from one state of
+  the view to the next.
+- Warm pins only keep a pinned state materialized; reads at a pinned snapshot are queries,
+  which take the view.
+- `spk:hybridSearch` plans its text and vector searches with the active graph's filter,
+  so the fusion ranks visible hits only. The differential test includes it.
+
 **Not built.** Graph restrictions on token scopes, validation of a view (§5.5), and a
 `/$/stats` answer for the visible graphs remain open questions 1–3. Full-text scores
 still use the statistics of the whole index.

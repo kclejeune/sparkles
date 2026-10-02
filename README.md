@@ -47,8 +47,10 @@ running queries.
 * MVCC snapshots with a single writer and a crash-safe WAL. Compaction writes immutable
   generations of 7 sorted, compressed permutations ([features](docs/FEATURES.md#storage-tdb2-equivalent)).
 * Durable commit ids, point-in-time reads by commit (`?at=commit:N`), time or named
-  snapshot, and diffs between any two readable commits
+  snapshot, and diffs between any two readable commits, as JSON or RDF Patch
   ([API](docs/API.md#point-in-time-reads-and-snapshots)).
+* A change feed of commits and their changes, resumable from any readable commit, with
+  long polling and server-sent events ([API](docs/API.md#change-feed)).
 * Commit messages, optional change digests, and Graph Store entity tags with `If-Match`
   writes checked under the writer lock ([API](docs/API.md#entity-tags-and-conditional-requests)).
 * A read-only integrity check ([usage](docs/USAGE.md#checking-a-database)).
@@ -85,7 +87,10 @@ running queries.
   ([API](docs/API.md#write-time-validation)).
 
 **Search**
-* Full-text search through Jena's `text:query`, ranked by BM25 with Tantivy ([API](docs/API.md#full-text-search)).
+* Full-text search through Jena's `text:query`, ranked by BM25 with Tantivy and stemmed per
+  language ([API](docs/API.md#full-text-search)).
+* Hybrid search that fuses a full-text and a vector ranking by reciprocal rank fusion
+  ([API](docs/API.md#hybrid-text-and-vector-search)).
 * Vector similarity search over `spk:vector` literals, exact or through an HNSW index that
   sees every write at once ([API](docs/API.md#vector-similarity)).
 * GeoSPARQL 1.1 with a spatial index per dataset, Jena's `spatial:` and `spatialF:`
@@ -98,8 +103,8 @@ running queries.
 
 **Operations**
 * A SvelteKit web UI, embedded in the binary. It has a query editor, results as a table,
-  graph, plan or map, a resource explorer, a schema browser, validation and backups
-  ([screenshots](#web-ui)).
+  graph, plan or map, a resource explorer, a schema browser, vector similarity search and
+  index management, validation and backups ([screenshots](#web-ui)).
 * Authentication with Basic, API tokens, OIDC or trusted proxies, access control per
   dataset, named graph and endpoint, and rate limiting ([API](docs/API.md#authentication-and-access-control)).
 * Access logs, Prometheus metrics, a readiness endpoint and OpenTelemetry traces
@@ -118,7 +123,7 @@ running queries.
 |---|---|---|
 | [Apache Jena / Fuseki](https://jena.apache.org/) | The reference Java stack. It has ARQ, TDB2 on B+trees, Fuseki, on-the-fly inference, jena-text and GeoSPARQL. | Sparkles has the same protocols, endpoints, admin API and CLI model, on sorted columnar indexes. It is 1.8–580× faster at 10.5M triples. Reasoning is materialized only, and there are no ARQ extensions, RDF Patch or ontology API. |
 | [QLever](https://github.com/ad-freiburg/qlever) | A C++ engine for billions of triples, with lazy, streaming execution. | Sparkles uses the same index and execution architecture and adds exact term identity, MVCC updates, the Graph Store Protocol, reasoning and SHACL. It wins 19 of 20 queries at 10.5M triples and ties the other. It has been measured only up to 10.5M triples, and it materializes intermediate results. |
-| [Oxigraph](https://github.com/oxigraph/oxigraph) | A Rust database and toolkit on RocksDB, with Python and WebAssembly packages. | Sparkles uses Oxigraph's parsers, SPARQL parser and datatypes, with its own storage and planner. It is 1.5–465× faster at 10.5M triples and fsyncs its writes. It adds reasoning, validation, search, authentication and a UI, but has Rust bindings only. |
+| [Oxigraph](https://github.com/oxigraph/oxigraph) | A Rust database and toolkit on RocksDB, with Python and WebAssembly packages. | Sparkles uses Oxigraph's parsers, SPARQL parser and datatypes, with its own storage and planner. It is 1.5–465× faster at 10.5M triples and fsyncs its writes. It adds reasoning, validation, search, authentication and a UI. It has Rust and Python APIs and no WebAssembly build. |
 | [Fluree](https://github.com/fluree/db) | A versioned, permissioned ledger with clustering, licensed under BUSL-1.1. JSON-LD is its main interface. | Sparkles passes the W3C SPARQL suites in full and is compatible with Fuseki. It has point-in-time reads, snapshots and diffs, but no branches, history queries, policy language or clustering. It is faster on most queries and slower on a few single-pattern scans. |
 
 [docs/COMPARISON.md](docs/COMPARISON.md) lists the feature gaps per engine, the places
@@ -207,7 +212,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `serve` | Run the SPARQL server with the web UI. |
 | `load`, `query`, `update`, `dump` | Bulk load, query and update, locally or on a `--server`. `dump` exports N-Quads. |
 | `compact`, `clone`, `stats`, `log`, `check` | Merge updates, copy a dataset, show statistics or the commit history, and verify a database. |
-| `snapshot`, `diff` | Manage named snapshots, pin schedules and history retention for point-in-time reads, and show the quads added and removed between two commits. |
+| `snapshot`, `diff` | Manage named snapshots, pin schedules, history retention and the commit catalog's horizon, and show the quads added and removed between two commits, also as RDF Patch. |
 | `backup`, `repo` | Write N-Quads dumps, and manage backup repositories on a file system or S3, restores and policies. |
 | `infer` | Materialize RDFS, OWL 2 RL or Jena rules. Report staleness and check for inconsistencies. |
 | `shacl`, `shex`, `validation` | Validate with SHACL or ShEx, and configure write-time guards. |
@@ -241,6 +246,20 @@ Besides `Dataset`, the library has a fluent query builder (`sparkles::querybuild
 term-level graph access and transactions. The reasoner and the SHACL and ShEx validators
 are separate crates. [docs/USAGE.md](docs/USAGE.md#embedding-the-library) maps each of
 them to its Jena equivalent.
+
+The same engine is a Python package, built from `crates/sparkles-py` with
+`mise run py:build`. Its API follows pyoxigraph's and accepts rdflib terms.
+
+```python
+from sparkles import Dataset
+
+with Dataset("mydb") as ds:                      # or Dataset() in memory
+    ds.load(path="data.ttl.gz")
+    for row in ds.query("SELECT ?s ?name WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?name }"):
+        print(row["s"], row["name"].value)
+```
+
+[docs/USAGE.md](docs/USAGE.md#python) covers the Python API.
 
 ## Web UI
 
@@ -276,7 +295,7 @@ them to its Jena equivalent.
 | Document | Contents |
 |---|---|
 | [docs/FEATURES.md](docs/FEATURES.md) | Every feature with its status, and the known gaps. |
-| [docs/USAGE.md](docs/USAGE.md) | Running the server and CLI, with options, formatting, backups, outbound requests, integrity checks, MCP, embedding and NixOS. |
+| [docs/USAGE.md](docs/USAGE.md) | Running the server and CLI, with options, formatting, backups, outbound requests, integrity checks, MCP, embedding, the Python package and NixOS. |
 | [docs/API.md](docs/API.md) | The HTTP API: Fuseki's endpoints and the `/$/` extensions. |
 | [docs/COMPARISON.md](docs/COMPARISON.md) | How Sparkles compares with Jena/Fuseki, QLever, Fluree and Oxigraph, where it departs from Jena and QLever on purpose, and the optimizations it adopted from QLever. |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Measured performance, against the other engines and on its own. |

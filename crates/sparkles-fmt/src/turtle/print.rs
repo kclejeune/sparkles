@@ -48,6 +48,9 @@ pub struct Tx<'a, 's> {
     /// With `sort`: a second printer over the same tree without comments, which builds
     /// the printed forms sorting compares ([`sort::printed`]).
     pub keys: Option<Box<Tx<'a, 's>>>,
+    /// the prefix declarations `prune-prefixes` drops, worked out by the first directive
+    /// block that needs them ([`prune::pruned`])
+    pub dropped_prefixes: Option<std::collections::HashSet<NodeId>>,
 }
 
 impl<'a, 's> Deref for Tx<'a, 's> {
@@ -75,6 +78,7 @@ impl<'a, 's> Tx<'a, 's> {
             cx: Ctx::new(tree, comments, opts),
             trig,
             keys: None,
+            dropped_prefixes: None,
         }
     }
 
@@ -252,7 +256,7 @@ fn document(tx: &mut Tx<'_, '_>, n: NodeId) -> DocId {
         match part {
             Part::Statement(s) => statements.push(*s),
             Part::Directives(ds) => {
-                let pruned = prune::pruned(tx, ds, i == 0);
+                let pruned = prune::pruned(tx, ds);
                 if pruned.prints_nothing(ds) {
                     continue;
                 }

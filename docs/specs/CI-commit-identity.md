@@ -868,3 +868,31 @@ Graph Store writes and uploads, their rejection, and CORS.
 **Not built.** Catalog pruning and the long-poll change feed remain later work. The UI
 does not show messages. `/{ds}/update` takes no `If-Match`, because a tag names a
 representation of a graph and an update has none.
+
+**Pruning and the change feed** landed on 2026-10-02, after Phase 3. This answers open
+question 5.
+
+* **Catalog horizon.** `history.json` holds an optional horizon,
+  `catalog: {keepCommits, keepAgeMs}`, which is off by default. The catalog then drops
+  the records, messages and digests of commits that are older than both the oldest
+  readable commit and the horizon. A commit is kept if either limit keeps it, and pins
+  keep their commits because they keep them readable. Pruning holds the writer lock. It
+  writes a new `commits.bin` whose header names the new first commit, and a new
+  `annotations.bin`, and each replaces the old file with `write_atomic`. Readers without
+  the lock, such as `sparkles log`, see either file whole. The head is never pruned, so
+  commit numbers stay monotonic, and the next digest chains from the head's. The history
+  upkeep prunes once at least 1,024 records, and an eighth of the catalog, can go, so
+  the file is not rewritten every minute. Setting the horizon, `Store::prune_commits` and
+  `sparkles snapshot gc` prune at once. A backup opens `commits.bin` under the writer
+  lock, so a rewrite cannot change the file between capture and upload. A pruned
+  catalog is not append-only, so the next backup stores it whole. `sparkles check`
+  accepts a catalog that starts after commit 0, and the quota measures the directory
+  again after a prune.
+* **Change feed.** `Store::changes` and `GET /{ds}/changes` list the commits after a
+  commit with their changes, and `Store::subscribe_commits` announces each published
+  commit. See [F06 Outcome](F06-snapshots-and-point-in-time.md#outcome) for the feed,
+  its formats and its budgets.
+
+**Tests.** `crates/sparkles/tests/annotations.rs` prunes a catalog with messages and
+digests on, through a pin, a reopen, an offline read, `sparkles check` and a backup
+restore. `http/diff_tests.rs` covers the horizon over HTTP.

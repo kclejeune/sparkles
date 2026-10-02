@@ -2,8 +2,9 @@
 
 This guide covers operating the `sparkles` binary: running the server, the command-line
 tools, the formatter, backups, outbound requests, integrity checks, the MCP server,
-embedding the library and deploying on NixOS. [API.md](API.md) specifies the HTTP API.
-[DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
+embedding the library, the Python package and deploying on NixOS. [API.md](API.md)
+specifies the HTTP API. [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and
+testing.
 
 Sparkles is experimental. The on-disk format, HTTP API and CLI may change between commits
 without a migration path, so keep backups of anything you cannot regenerate.
@@ -19,6 +20,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Checking a database](#checking-a-database)
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
 * [Embedding the library](#embedding-the-library)
+* [Python](#python)
 * [Deploying on NixOS](#deploying-on-nixos)
 
 ## Running the server
@@ -153,6 +155,7 @@ Fuseki's `access:entry` and `fuseki:allowedUsers` settings onto grants.
 | `--format-timeout S` | `10` | Seconds a `POST /$/format` request may take, including the wait for a free slot (one per core). A slower request gets `408`. |
 | `--vector-memory-mb N` | `4096` | Memory for packed vectors and HNSW graphs (`spk:vectorSearch` and vector indexes), per index generation. A build past it leaves the index `over-budget`, and a search past it gets `507`. A global flag. |
 | `--text NAME[=FILE]` | | Enable full-text search for a dataset. `FILE` is a `text.json`-shaped configuration file. |
+| `--validate NAME[=FILE]` | | Set a dataset's write-time validation from `FILE`, a `PUT /$/validation/{ds}` body, or with `NAME` alone validate the dataset with the configuration it has. Shapes and schemas without inline text are read from the path in `source`, relative to `FILE`. The data is validated in full before the server listens, and the result is logged. A `reject` configuration the data does not pass stops the start ([API](API.md#write-time-validation)). |
 | `--geo NAME[=FILE]` | | Enable the spatial index for a dataset. `FILE` is a `geo.json`-shaped configuration file. The build runs before the server starts listening. |
 | `--geo-mb N` | `4096` | Memory for each dataset's spatial index (geometry column and trees). A build that would exceed it is refused, the status says `over-budget`, and queries run without the index. |
 | `--geo-op-vertices N` | `2000000` | Largest total of input vertices for one geometry operation (overlay, buffer, hull, relate). A larger operation is a type error. |
@@ -223,7 +226,8 @@ sparkles infer   --loc db --profile owl-rl    # materialize inferences
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
-sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --rebuild, --status, --disable
+sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,
+                                              #   --rebuild, --status, --disable
 sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph, --wgs84,
                                               #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable
 sparkles vector create --loc db --name emb --predicate http://example.org/emb --dim 384
@@ -239,6 +243,13 @@ build. Later openings of the database map the built index from its file. Every
 `sparkles vector` command also works against a server with `--server URL --dataset NAME`
 in place of `--loc` ([API](API.md#vector-indexes)).
 
+The web UI manages the same indexes. The dataset page has a card for each index, and an
+admin of the dataset can create, edit, rebuild and drop indexes there. Anyone who can
+read the dataset can measure an index's recall from its card. The **Similar** page
+(`/ui/similar`) searches an index from an entity's vector or from a pasted vector, with
+controls for k, the metric, `ef` and exact search, and it shows how the server ran each
+search.
+
 `sparkles update` and `sparkles load` take `--message TEXT`, which is stored with the
 commit they make and shown by `sparkles log` and `/$/commits`. With `--server`, the
 message travels in the `Sparkles-Commit-Message` header, and each file that `load` sends
@@ -251,27 +262,49 @@ sparkles load   --server http://localhost:3030 --dataset ds --message 'Nightly i
 sparkles log    --loc db                      # the message follows each commit's columns
 ```
 
+A commit that skipped the dataset's write-time validation, through `--no-validate` or an
+HTTP bypass, shows `[unvalidated]` before its message in `sparkles log`.
+
 Past states are read with `--at`, which takes a commit number, `commit:N`,
 `time:<RFC 3339>` or `snapshot:NAME`. Every commit since the last compaction or bulk
 commit can be read, and `sparkles log` marks them with `*`. A named snapshot or the
 retention window keeps older ones. `sparkles diff` shows the quads added and removed
-between two states, and `--format json` or `--format count` change its output.
+between two states, and `--format json`, `--format count` or `--format patch` change its
+output. `patch` writes an RDF Patch that Jena's tools read, and `patch-binary` writes it
+as RDF Thrift.
 
 ```sh
 sparkles query    --loc db --at snapshot:release-1 'SELECT ...'
 sparkles dump     --loc db --at time:2026-09-30T14:00:00Z > then.nq
 sparkles clone    --loc db --to sandbox --at commit:40
 sparkles diff     --loc db snapshot:release-1 head --graph http://ex.org/g
+sparkles diff     --loc db 40 head --format patch > changes.rdfp
 sparkles snapshot create   --loc db release-1 --note 'before the migration'
 sparkles snapshot create   --loc db tmp --expires 7d
+sparkles snapshot create   --loc db hot --at commit:40 --warm   # kept materialized
 sparkles snapshot retain   --loc db --keep-age 7d --max-bytes 20GiB
 sparkles snapshot schedule --loc db --prefix daily- --every 1d --keep-last 7
-sparkles snapshot gc       --loc db        # expire pins, make scheduled ones, collect
+sparkles snapshot catalog  --loc db --keep-commits 100000 --keep-age 90d
+sparkles snapshot gc       --loc db        # expire pins, make scheduled ones, collect, prune
 ```
 
-A running server does the work of `snapshot gc` every minute. Over HTTP the same
-features are `?at=`, `GET /{ds}/diff`, `/$/snapshots/{ds}` and `/$/history/{ds}`
+A running server does the work of `snapshot gc` every minute. `snapshot catalog` sets how
+long the commit catalog keeps the metadata of commits that can no longer be read. Without
+it, every commit stays listed. Over HTTP the same features are `?at=`, `GET /{ds}/diff`,
+`/$/snapshots/{ds}` and `/$/history/{ds}`
 ([API: Point-in-time reads and snapshots](API.md#point-in-time-reads-and-snapshots)).
+
+A server also offers a change feed, `GET /{ds}/changes?after=N`. It lists the commits after
+commit N with their changes, as JSON or as one RDF Patch per commit. With `wait=30` a
+request waits for the next commit, and with `Accept: text/event-stream` the commits arrive
+as server-sent events that resume after the last one a client saw
+([API: Change feed](API.md#change-feed)).
+
+```sh
+curl 'http://localhost:3030/ds/changes?after=41&wait=30'
+curl -H 'Accept: application/rdf-patch' 'http://localhost:3030/ds/changes?after=41'
+curl -N -H 'Accept: text/event-stream' 'http://localhost:3030/ds/changes?after=41'
+```
 
 The global flag `--commit-digests` makes a command record a change digest with every
 commit of the databases it opens. A database keeps the setting once it is on, so later
@@ -768,6 +801,164 @@ ds.dump(std::io::stdout(), RdfFormat::TriG)?;
 `Dataset::store()` and the `store`, `index` and `builder` modules give lower-level
 access: ids, snapshots, raw index scans and the bulk `Builder`. `mise run doc` builds
 the API documentation of the library crates.
+
+## Python
+
+The `sparkles` Python package embeds the same engine. It is built from
+`crates/sparkles-py` with PyO3 and maturin into an abi3 wheel, which works on CPython
+3.10 and later on Linux and macOS. The package is not on PyPI. Build and install it from
+the repository:
+
+```sh
+mise run py:build                                  # target/wheels/sparkles_rdf-*.whl
+pip install target/wheels/sparkles_rdf-*.whl
+pip install ./crates/sparkles-py                   # or build from source with pip (needs Rust)
+nix build .#sparkles-py                            # or the flake's package for nixpkgs' Python
+```
+
+[Spec P01](specs/P01-python-bindings.md) is the design. The stubs in
+`crates/sparkles-py/python/sparkles/_sparkles.pyi` are the API reference, and editors
+and type checkers read them.
+
+### Datasets, loading and queries
+
+```python
+from sparkles import Dataset, Literal, NamedNode, Quad, Triple, Variable
+
+ds = Dataset()                                     # in memory
+ds = Dataset("mydb")                               # a database directory, locked while open
+ds.load(path="data.ttl.gz")                        # format and compression from the name
+ds.load(text, "turtle", to_graph="http://ex.org/g")
+ds.load(open("data.nq.zst", "rb"), "nq")           # compressed data is recognized by its bytes
+
+rows = ds.query("""
+    PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+    SELECT ?person ?name WHERE { ?person foaf:name ?name } ORDER BY ?name""")
+print(rows.variables)                              # [Variable('person'), Variable('name')]
+for row in rows:
+    print(row["name"], row[0], row.as_dict())      # by name, by position, as a dict
+    person, name = row                             # a row is also a tuple of terms
+
+ds.ask("ASK { ?s ?p ?o }")                         # True or False
+for t in ds.construct("CONSTRUCT WHERE { ?s ?p ?o }"):
+    print(t.subject, t.predicate, t.object)
+ds.update("INSERT DATA { <http://ex.org/a> <http://ex.org/p> 1 }").inserted   # 1
+```
+
+`query` returns a `QuerySolutions` for SELECT, a `bool` for ASK and a `QueryTriples` for
+CONSTRUCT and DESCRIBE. `select`, `ask` and `construct` check the query form and raise
+`InvalidInputError` on another one. The query methods take these keyword arguments:
+
+* `bindings` pre-binds variables, as in `bindings={"s": NamedNode("http://ex.org/a")}`.
+* `default_graph` and `named_graphs` replace the query's dataset, like the SPARQL
+  protocol's `default-graph-uri` and `named-graph-uri`.
+* `include_inferred=True` adds the reasoner's inferences to the default graph.
+* `prefixes` declares prefixes, `base_iri` sets the base, and `timeout` is in seconds.
+
+A row is `None` at an unbound variable. `row.get("name", default)` returns the default
+instead.
+
+### Terms
+
+`NamedNode`, `BlankNode`, `Literal`, `Triple`, `Quad`, `DefaultGraph` and `Variable` are
+immutable and hashable, and they compare as RDF terms. `str()` gives their N-Triples
+form. A `Literal` is made from a string with a `language` or a `datatype`, or from a
+Python value:
+
+```python
+Literal("chat", language="fr")
+Literal("مرحبا", language="ar", direction="rtl")   # an RDF 1.2 directional string
+Literal("42", datatype=NamedNode("http://www.w3.org/2001/XMLSchema#integer"))
+Literal(42), Literal(1.5), Literal(True), Literal(Decimal("9.99"))
+Literal(datetime.date(2024, 1, 2)), Literal(b"bytes")   # xsd:date, xsd:base64Binary
+Literal(42).to_python()                            # 42
+```
+
+`to_python()` returns a `bool`, `int`, `float`, `Decimal`, `datetime`, `date`, `time` or
+`bytes` for the matching XSD datatypes, and the lexical form for anything else. A
+`Triple` can be the object of another triple, as an RDF 1.2 triple term.
+
+Every argument that takes a term also accepts rdflib's `URIRef`, `BNode` and `Literal`.
+The package recognizes them without importing rdflib. `sparkles.rdflib.to_rdflib` and
+`from_rdflib` convert explicitly.
+
+### Quads and transactions
+
+```python
+alice = NamedNode("http://ex.org/alice")
+ds.add(Quad(alice, NamedNode("http://ex.org/p"), Literal(1)))   # a commit; True if new
+ds.extend(triples_or_quads)                       # many quads in one commit
+ds.remove(quad)
+quad in ds; len(ds); ds.named_graphs()
+
+for q in ds.quads_for_pattern(alice, None, None):  # None matches anything
+    print(q.predicate, q.object, q.graph_name)
+
+with ds.transaction() as tx:                       # commits at the end of the block
+    tx.add(quad)
+    tx.remove(other)
+    tx.quads_for_pattern(alice)                    # sees the transaction's own changes
+```
+
+`graph_name=None` matches every graph, and `DefaultGraph()` matches only the default
+graph. `quads_for_pattern` reads the snapshot it started on, in batches, so a large match
+is never held in memory at once. A transaction rolls back when its block raises, or when
+it is garbage-collected without `commit()`. Queries on the dataset read the last commit,
+not the open transaction. A write on the dataset from the thread that holds the
+transaction raises `ConflictError` instead of waiting for itself. Writes from other
+threads wait.
+
+A blank node read from the dataset has a label like `_:b1f` that names the stored node,
+so it works in later patterns, removals and bindings. Any other label, such as
+`BlankNode("x")`, names a new node in each write. The same label within one `extend` or
+transaction names one node. pyoxigraph keeps a label's node across writes.
+
+### Output, maintenance, reasoning and validation
+
+```python
+data = ds.dump(format="nq")                        # bytes of every graph
+ds.dump("out.ttl.zst")                             # Turtle of the default graph, zstd
+ds.dump("g.nt", from_graph="http://ex.org/g")
+ds.compact(); ds.backup("backups/")
+
+ds.reason("owl-rl")                                # rdfs, rdfs-simple, owl-rl, or rules="…"
+ds.ask("ASK { ?x a <http://ex.org/Animal> }", include_inferred=True)
+ds.clear_inferences()
+
+report = ds.validate_shacl(shapes_turtle)          # or shapes_graph="http://ex.org/shapes"
+for r in report.results:
+    print(r.focus_node, r.path, r.message)
+result = ds.validate_shex(shexc, "{FOCUS a ex:Person}@ex:PersonShape")
+print(result.conforms, [(r.node, r.conformant) for r in result.results])
+```
+
+`parse` and `serialize` work without a dataset, and `RdfFormat` names the formats. Every
+`format` argument also takes a name, extension or media type, such as `"ttl"` or
+`"application/n-quads"`. `sparkles.FEATURES` lists the cargo features of the build.
+Without `reasoning`, `shacl` or `shex`, the matching methods raise `UnsupportedError`.
+
+### Errors and threads
+
+Every engine error is a `sparkles.SparklesError`. Most classes also derive from the
+built-in exception Python code expects:
+
+| Exception | Also a | Raised for |
+|---|---|---|
+| `SparqlSyntaxError`, `RdfSyntaxError` | `SyntaxError` (through `ParseError`) | queries, data, rules, shapes or ShEx text that does not parse |
+| `InvalidInputError` | `ValueError` | refused arguments, a closed dataset, the wrong query form |
+| `UnsupportedError` | `NotImplementedError` | a feature the engine or the build lacks |
+| `QueryTimeoutError` | `TimeoutError` | a query past its `timeout` |
+| `StorageError`, `DatasetLockedError` | `OSError` | corruption, a full disk, a directory that another process or `Dataset` holds |
+| `ConflictError` | | write conflicts, and a write that would wait for its own thread's transaction |
+| `BudgetExceededError` | | a request past a budget, with `kind`, `limit` and `requested` |
+
+I/O failures raise the built-in `OSError` subclasses, such as `FileNotFoundError`. The
+other classes are `CancelledError`, `NotFoundError`, `PermissionDeniedError`,
+`ServiceError` and `WriteRejectedError`.
+
+Queries, updates, loads, dumps, reasoning and validation release the GIL, so other
+Python threads keep running and several threads can query one dataset at once. A running
+query cannot be interrupted with Ctrl-C, so give long queries a `timeout`.
 
 ## Deploying on NixOS
 

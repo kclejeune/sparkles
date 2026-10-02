@@ -227,6 +227,11 @@ const QUERIES: &[&str] = &[
     "SELECT ?s ?lit { GRAPH ?g { (?s ?sc ?lit) text:query \"fox\" } }",
     #[cfg(feature = "text")]
     "SELECT ?s ?lit { (?s ?sc ?lit) text:query \"fox\" }",
+    // text and vector rankings fused: the subjects found, not their fused scores
+    #[cfg(feature = "text")]
+    "SELECT DISTINCT ?s { GRAPH ?g { (?s ?score) spk:hybridSearch ((rdfs:label \"fox\") (ex:emb \"[1,0,0]\"^^spk:vector)) } }",
+    #[cfg(feature = "text")]
+    "SELECT DISTINCT ?s { (?s ?score) spk:hybridSearch ((rdfs:label \"fox\") (ex:emb \"[1,0,0]\"^^spk:vector)) }",
     #[cfg(feature = "geo")]
     "SELECT ?f { GRAPH ?g { ?f geo:asWKT ?w } \
        FILTER(geof:sfWithin(?w, \"POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))\"^^geo:wktLiteral)) }",
@@ -374,6 +379,26 @@ fn a_view_of_every_existing_graph_answers_like_no_view() {
             );
         }
     }
+}
+
+/// Hybrid search through a view finds the subjects of the visible graphs only.
+#[cfg(feature = "text")]
+#[test]
+fn hybrid_search_through_a_view() {
+    let full = store(&|_| true, false);
+    let q = "SELECT DISTINCT ?s { GRAPH ?g { (?s ?score) spk:hybridSearch \
+             ((rdfs:label \"fox\") (ex:emb \"[1,0,0]\"^^spk:vector)) } }";
+    let all = answer(&full, q, &QueryOptions::default());
+    assert!(all.contains(&"<http://ex/s4>".to_string()), "{all:?}");
+    let a = answer(
+        &full,
+        q,
+        &QueryOptions {
+            graphs: Some(view(&["http://ex/a/*"])),
+            ..Default::default()
+        },
+    );
+    assert_eq!(a, ["<http://ex/s1>", "<http://ex/s2>"]);
 }
 
 #[test]
@@ -710,6 +735,34 @@ fn diffs_show_only_the_view() {
         "{graphs:?}"
     );
     assert_eq!((d.added + d.removed) as usize, graphs.len());
+    // the change feed: each commit lists the changes of the view's graphs only
+    let feed = |graphs| {
+        s.changes(
+            from,
+            &sparkles::store::ChangesOptions {
+                graphs,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let full = feed(None);
+    let page = feed(Some(view(&["http://ex/a/*"])));
+    assert_eq!(page.commits.len(), full.commits.len());
+    let seen: Vec<String> = page
+        .commits
+        .iter()
+        .flat_map(|c| c.iter().map(|(_, q)| q.graph_name.to_string()))
+        .collect();
+    let all: usize = full.commits.iter().map(|c| c.iter().count()).sum();
+    assert!(!seen.is_empty() && seen.len() < all, "{seen:?}");
+    assert!(
+        seen.iter().all(|g| g.starts_with("<http://ex/a/")),
+        "{seen:?}"
+    );
+    for c in &page.commits {
+        assert_eq!((c.added + c.removed) as usize, c.iter().count());
+    }
 }
 
 #[test]

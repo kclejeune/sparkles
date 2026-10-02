@@ -533,6 +533,8 @@ impl Store {
         };
         let dvocab_len = snap.generation.dvocab.flush()?;
         let catalog_len = self.catalog.lock().flushed_len()?;
+        // opened under the lock: pruning replaces the file, and holds the lock to do it
+        let catalog = File::open(root.join("commits.bin"))?;
         let prefixes = self.prefixes.lock().clone();
         self.failpoint("backup-capture-locked");
         let lease_id = hist.lock().lease(gen_no, label);
@@ -566,7 +568,6 @@ impl Store {
             };
             gen_files.push((name, f, len));
         }
-        let catalog = File::open(root.join("commits.bin"))?;
         self.failpoint("backup-capture-unlocked");
 
         let current = std::fs::read(root.join("CURRENT"))?;

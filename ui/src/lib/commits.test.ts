@@ -50,6 +50,8 @@ describe('commit formatting', () => {
     const flags = commitFlags(commit(1, { bulk: true, exact: false, reconstructed: true }));
     expect(flags.map((f) => f.label)).toEqual(['bulk', 'inexact', 'reconstructed']);
     expect(flags.find((f) => f.label === 'inexact')?.warn).toBe(true);
+    const bypassed = commitFlags(commit(2, { unvalidated: true }));
+    expect(bypassed.map((f) => [f.label, f.warn])).toEqual([['unvalidated', true]]);
   });
 });
 

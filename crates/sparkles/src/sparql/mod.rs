@@ -12,6 +12,7 @@ mod exprcache;
 pub mod geojoin;
 pub mod geopf;
 pub mod georewrite;
+pub mod hybrid;
 pub mod indexjoin;
 mod joinorder;
 mod keyfilter;

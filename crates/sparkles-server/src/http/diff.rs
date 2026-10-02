@@ -5,10 +5,11 @@
 //! commit before `to`, so `?to=commit:42` shows what commit 42 changed. `graph=IRI` or
 //! `default` limits the diff to one graph.
 //!
-//! The body is JSON (`application/json`, counts, and the quads with `quads=true`) or
-//! N-Quads lines marked `+ ` or `- ` (`text/x-sparkles-diff`), removals first. Either is
-//! streamed once it is large. A diff between two `commit:` selectors never changes, so
-//! it gets a weak entity tag.
+//! The body is JSON (`application/json`, counts, and the quads with `quads=true`),
+//! N-Quads lines marked `+ ` or `- ` (`text/x-sparkles-diff`), removals first, or an RDF
+//! Patch (`application/rdf-patch`, or `application/rdf-patch+thrift` in binary) whose
+//! `id` and `prev` headers name the two commits. Each is streamed once it is large. A
+//! diff between two `commit:` selectors never changes, so it gets a weak entity tag.
 
 use super::*;
 use sparkles::history::At;
@@ -25,13 +26,76 @@ fn fnv(s: &str) -> u64 {
     })
 }
 
+/// The body formats of a diff.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DiffFormat {
+    Json,
+    Lines,
+    /// RDF Patch text, under the media type asked for
+    Patch(&'static str),
+    PatchBinary,
+}
+
+impl DiffFormat {
+    /// From `format=` (json, diff, patch, patch-binary), else from `Accept`.
+    pub(super) fn of(params: &Params, headers: &HeaderMap) -> ApiResult<DiffFormat> {
+        match params.get("format") {
+            Some("diff" | "text") => Ok(DiffFormat::Lines),
+            Some("json") => Ok(DiffFormat::Json),
+            Some("patch") => Ok(DiffFormat::Patch(sparkles::patch::MEDIA_TYPE)),
+            Some("patch-binary") => Ok(DiffFormat::PatchBinary),
+            Some(f) => Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown format '{f}': use json, diff, patch or patch-binary"),
+            )),
+            None => Ok(headers
+                .get(header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|a| {
+                    negotiate(
+                        a,
+                        &[
+                            "application/json",
+                            DIFF_MEDIA_TYPE,
+                            "text/plain",
+                            sparkles::patch::MEDIA_TYPE,
+                            "text/rdf-patch",
+                            sparkles::patch::MEDIA_TYPE_BINARY,
+                        ],
+                    )
+                })
+                .map_or(DiffFormat::Json, |i| match i {
+                    1 | 2 => DiffFormat::Lines,
+                    3 => DiffFormat::Patch(sparkles::patch::MEDIA_TYPE),
+                    4 => DiffFormat::Patch("text/rdf-patch"),
+                    5 => DiffFormat::PatchBinary,
+                    _ => DiffFormat::Json,
+                })),
+        }
+    }
+
+    /// The `Content-Type` of the body.
+    pub(super) fn content_type(self) -> String {
+        match self {
+            DiffFormat::Json => "application/json".into(),
+            DiffFormat::Lines => format!("{DIFF_MEDIA_TYPE}; charset=utf-8"),
+            DiffFormat::Patch(t) => format!("{t}; charset=utf-8"),
+            DiffFormat::PatchBinary => sparkles::patch::MEDIA_TYPE_BINARY.into(),
+        }
+    }
+
+    pub(super) fn is_patch(self) -> bool {
+        matches!(self, DiffFormat::Patch(_) | DiffFormat::PatchBinary)
+    }
+}
+
 fn code_err(status: StatusCode, code: &str, msg: impl Into<String>) -> ApiError {
     ApiError(status, json!({ "error": msg.into(), "code": code }))
 }
 
 /// One selector parameter (`None` when absent); given twice with different values is an
 /// error.
-fn selector(params: &Params, key: &str) -> ApiResult<Option<At>> {
+pub(super) fn selector(params: &Params, key: &str) -> ApiResult<Option<At>> {
     let vals = params.all(key);
     let Some(first) = vals.first() else {
         return Ok(None);
@@ -73,7 +137,7 @@ fn side(r: &sparkles::history::Resolved, restricted: bool) -> J {
     })
 }
 
-fn quad_json(op: DiffOp, q: &oxrdf::Quad) -> J {
+pub(super) fn quad_json(op: DiffOp, q: &oxrdf::Quad) -> J {
     let graph = match &q.graph_name {
         oxrdf::GraphName::DefaultGraph => J::Null,
         g => json!(g.to_string()),
@@ -123,22 +187,16 @@ pub(super) async fn diff(
     let to = selector(&params, "to")?.unwrap_or(At::Head);
     let from = selector(&params, "from")?;
     let graph = graph_param(&params)?;
-    let text = match params.get("format") {
-        Some("diff" | "text") => true,
-        Some("json") => false,
-        Some(f) => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                format!("unknown diff format '{f}': use json or diff"),
-            ));
-        }
-        None => headers
-            .get(header::ACCEPT)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|a| negotiate(a, &["application/json", DIFF_MEDIA_TYPE, "text/plain"]))
-            .is_some_and(|i| i > 0),
-    };
-    let with_quads = text || params.get("quads").is_some_and(truthy);
+    let fmt = DiffFormat::of(&params, &headers)?;
+    let text = fmt == DiffFormat::Lines;
+    if fmt.is_patch() && params.get("limit").is_some() {
+        // a patch without some of its changes would apply to a wrong state
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "limit does not apply to RDF Patch: a patch lists every change",
+        ));
+    }
+    let with_quads = fmt != DiffFormat::Json || params.get("quads").is_some_and(truthy);
     let limit = match params.get("limit") {
         None => usize::MAX,
         Some(v) => v.parse().map_err(|_| {
@@ -179,10 +237,12 @@ pub(super) async fn diff(
         "W/\"{id}:{}..{}:{}{}{}\"",
         d.from.commit.seq,
         d.to.commit.seq,
-        match (text, with_quads) {
-            (true, _) => "diff",
-            (false, true) => "json+quads",
-            (false, false) => "json",
+        match (fmt, with_quads) {
+            (DiffFormat::Lines, _) => "diff",
+            (DiffFormat::Patch(_), _) => "patch",
+            (DiffFormat::PatchBinary, _) => "patch-binary",
+            (DiffFormat::Json, true) => "json+quads",
+            (DiffFormat::Json, false) => "json",
         },
         match params.get("limit") {
             Some(_) if with_quads => format!(":limit={limit}"),
@@ -226,7 +286,22 @@ pub(super) async fn diff(
         return Ok(r);
     }
     let d = Arc::new(d);
+    let patch_ids = (
+        sparkles::patch::commit_iri(id, d.to.commit.seq),
+        sparkles::patch::commit_iri(id, d.from.commit.seq),
+    );
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
+        if fmt.is_patch() {
+            let mut pw = sparkles::patch::PatchWriter::new(w, fmt == DiffFormat::PatchBinary);
+            pw.header("id", &patch_ids.0)?;
+            pw.header("prev", &patch_ids.1)?;
+            pw.begin()?;
+            for (op, q) in d.iter() {
+                pw.change(op, &q)?;
+            }
+            pw.commit()?;
+            return Ok(());
+        }
         if text {
             for (op, q) in d.slice(0, limit) {
                 writeln!(
@@ -270,12 +345,7 @@ pub(super) async fn diff(
         stream::Serialized::Whole { body, .. } => axum::body::Body::from(body),
         stream::Serialized::Streamed(b) => b,
     };
-    let ct = if text {
-        "text/x-sparkles-diff; charset=utf-8"
-    } else {
-        "application/json"
-    };
-    let mut resp = ([(header::CONTENT_TYPE, ct)], body).into_response();
+    let mut resp = ([(header::CONTENT_TYPE, fmt.content_type())], body).into_response();
     let h = resp.headers_mut();
     for (k, v) in counts {
         h.insert(k, v.into());

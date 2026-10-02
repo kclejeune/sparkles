@@ -126,12 +126,16 @@ run = "prek run --all-files"
 [tasks.fmt]
 description = "Format Rust and UI code"
 depends = ["ui:fmt"]
-run = "cargo fmt --all"
+# crates/sparkles-py is its own workspace, outside `--all`
+run = ["cargo fmt --all", "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml"]
 
 [tasks."fmt:check"]
 description = "Check formatting (CI)"
 depends = ["ui:fmt:check"]
-run = "cargo fmt --all --check"
+run = [
+  "cargo fmt --all --check",
+  "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml --check",
+]
 
 [tasks."fmt:jsonld-compare"]
 description = "Compare the JSON-LD formatter's golden outputs with oxfmt (Prettier's JSON conventions) and show the differences; not part of ci"
@@ -189,8 +193,35 @@ description = "shexTest conformance (syntax, negative syntax and structure, repr
 run = "cargo test -p sparkles-shex --test shextest -- --nocapture"
 
 [tasks.ci]
-description = "Everything CI should run: formatting, lints, the formatter's browser build, Rust and UI tests, third-party license notices up to date"
-depends = ["fmt:check", "lint", "lint:features", "fmt:wasm", "test", "ui:test", "licenses:check"]
+description = "Everything CI should run: formatting, lints, the formatter's browser build, Rust, UI and Python binding tests, third-party license notices up to date"
+depends = ["fmt:check", "lint", "lint:features", "fmt:wasm", "test", "ui:test", "py:lint", "py:test", "licenses:check"]
+
+# ------------------------------------------------------------------- Python bindings ----
+# crates/sparkles-py is its own cargo workspace (see its Cargo.toml). These tasks build it
+# in the root target directory, so it reuses the workspace's compiled dependencies.
+
+[tasks."py:build"]
+description = "Build the Python bindings' release wheel (abi3, CPython 3.10+) with maturin into target/wheels; extra args go to `maturin build`"
+tools = { "github:PyO3/maturin" = "1.15.0" }
+run = "maturin build --release --locked --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --out target/wheels"
+
+[tasks."py:test"]
+description = "Build the Python extension and run its pytest suite (python3 from PATH, with pytest from the dev shell or a venv in target/py-venv); extra args go to pytest"
+run = "scripts/py-test.sh"
+
+[tasks."py:lint"]
+description = "Clippy (warnings are errors) on the Python bindings, with their default features and with none"
+run = [
+  "cargo clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets -- -D warnings",
+  "cargo clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
+]
+
+[tasks."py:lock"]
+description = "Refresh crates/sparkles-py/Cargo.lock from the root Cargo.lock, after the workspace's dependencies change"
+run = [
+  "cp Cargo.lock crates/sparkles-py/Cargo.lock",
+  "cargo metadata --manifest-path crates/sparkles-py/Cargo.toml --format-version 1 > /dev/null",
+]
 
 # -------------------------------------------------------------------------- build / run ----
 

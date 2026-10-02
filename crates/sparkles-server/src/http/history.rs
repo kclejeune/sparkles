@@ -1,7 +1,9 @@
 //! Point-in-time reads (`?at=`) and the named snapshot and history endpoints.
 
 use super::*;
-use sparkles::history::{At, HistoryOptions, NamedSnapshot, Resolved, Retention, Schedule};
+use sparkles::history::{
+    At, CatalogHorizon, HistoryOptions, NamedSnapshot, Resolved, Retention, Schedule,
+};
 use sparkles::store::Snapshot;
 
 pub(super) const SPARKLES_AT: &str = "sparkles-at";
@@ -145,6 +147,7 @@ fn snapshot_json(s: &NamedSnapshot) -> J {
         "note": s.note,
         "generation": s.generation,
         "reconstructable": s.reconstructable,
+        "warm": s.warm,
     })
 }
 
@@ -166,6 +169,11 @@ fn history_json(name: &str, ds: &Dataset, h: &sparkles::history::HistoryStatus) 
         })).collect::<Vec<_>>(),
         "retention": retention_json(h.retention),
         "schedules": ds.store.schedules().iter().map(schedule_json).collect::<Vec<_>>(),
+        "catalog": {
+            "keepCommits": h.catalog.keep_commits,
+            "keepAge": h.catalog.keep_age_ms.map(|ms| format!("{}s", ms / 1000)),
+            "firstRetained": h.first_commit,
+        },
         "snapshots": h.snapshots,
         "cache": {
             "entries": h.cache_entries,
@@ -274,10 +282,11 @@ pub(super) async fn create_snapshot(
         "application/json" => {
             let j: J = serde_json::from_slice(&body)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
-            for k in ["name", "at", "note", "expires"] {
+            for k in ["name", "at", "note", "expires", "warm"] {
                 match j.get(k) {
                     Some(J::String(v)) => params.0.push((k.to_string(), v.clone())),
                     Some(J::Number(n)) => params.0.push((k.to_string(), n.to_string())),
+                    Some(J::Bool(b)) => params.0.push((k.to_string(), b.to_string())),
                     _ => {}
                 }
             }
@@ -311,10 +320,17 @@ pub(super) async fn create_snapshot(
             })?,
         ),
     };
+    let warm = params.get("warm").is_some_and(truthy);
     blocking(move || {
-        let (snap, created) = ds
-            .store
-            .create_snapshot_with(&snap_name, &at, note, expires)?;
+        let (snap, created) = ds.store.create_snapshot_opts(
+            &snap_name,
+            &at,
+            &sparkles::history::SnapshotOptions {
+                note,
+                expires_ms: expires,
+                warm,
+            },
+        )?;
         let status = if created {
             StatusCode::CREATED
         } else {
@@ -435,9 +451,43 @@ pub(super) async fn put_history(
             ));
         }
     };
+    // `catalog` replaces the catalog horizon when present
+    let catalog = match j.get("catalog") {
+        None => None,
+        Some(J::Null) => Some(CatalogHorizon::default()),
+        Some(J::Object(o)) => {
+            let bad = || {
+                err(
+                    StatusCode::BAD_REQUEST,
+                    "catalog is {\"keepCommits\": number, \"keepAge\": duration}",
+                )
+            };
+            let keep_commits = match o.get("keepCommits") {
+                None | Some(J::Null) => None,
+                Some(v) => Some(v.as_u64().ok_or_else(bad)?),
+            };
+            let keep_age_ms = match o.get("keepAge") {
+                None | Some(J::Null) => None,
+                Some(v) => Some(parse_age(v).ok_or_else(bad)?),
+            };
+            Some(CatalogHorizon {
+                keep_commits,
+                keep_age_ms,
+            })
+        }
+        Some(_) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "catalog must be an object or null",
+            ));
+        }
+    };
     blocking(move || {
         if let Some(s) = schedules {
             ds.store.set_schedules(s)?;
+        }
+        if let Some(c) = catalog {
+            ds.store.set_catalog_horizon(c)?;
         }
         let h = ds.store.set_retention(r)?;
         Ok(Json(history_json(&ds.name, &ds, &h)))

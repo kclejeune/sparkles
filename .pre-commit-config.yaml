@@ -8,8 +8,9 @@ repos:
     hooks:
       - id: cargo-fmt
         name: cargo fmt
-        # formats the whole workspace (a second or so); vendor/ is outside it
-        entry: cargo fmt --all
+        # formats the whole workspace (a second or so) and the Python bindings, which are
+        # their own workspace; vendor/ is outside both
+        entry: sh -c 'cargo fmt --all && cargo fmt --manifest-path crates/sparkles-py/Cargo.toml'
         language: system
         types: [rust]
         exclude: ^vendor/

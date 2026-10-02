@@ -32,7 +32,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use sparkles::commit::CommitKind;
 pub use sparkles::guard::config::{
-    Baseline, CONFIG_FILE, CheckRecord, Counters, DataGraphSel, STATUS_FILE,
+    Baseline, BaselinePolicy, CONFIG_FILE, CheckRecord, Counters, DataGraphSel, STATUS_FILE,
 };
 use sparkles::guard::config::{
     CheckHistory, DecisionCounts, INFERRED_GRAPH as INFERRED, StatusFile, sha256_hex, write_atomic,
@@ -51,25 +51,6 @@ use std::time::{Duration, Instant};
 
 /// A shapes file copied into the database directory.
 pub const SHAPES_FILE: &str = sparkles::guard::config::SHACL_SHAPES_FILE;
-
-/// How a write is judged against the results the data already has.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BaselinePolicy {
-    /// on the state after the write: any blocking result counts (`reject` can only be
-    /// enabled on data without blocking results)
-    #[default]
-    Strict,
-    /// on the blocking results the write introduces: results the state before the write
-    /// had do not block it
-    Grandfather,
-}
-
-impl BaselinePolicy {
-    fn is_strict(&self) -> bool {
-        *self == BaselinePolicy::Strict
-    }
-}
 
 /// Write-time SHACL validation of one dataset (`validation.json`, format 2 with
 /// `"language": "shacl"`; format 1 files, without `language`, are read too).
@@ -114,7 +95,8 @@ fn hundred() -> usize {
 }
 
 /// Where the shapes come from: named graphs of the dataset (read from the state being
-/// validated, so changes to them are validated too), or a file copied into the database.
+/// validated, so changes to them are validated too), a file copied into the database, or
+/// both, merged into one shapes graph.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShapesSource {
@@ -163,10 +145,12 @@ impl ValidationConfig {
             bail!("dataGraph must be \"default\", \"union\" or a list of graph IRIs");
         }
         let s = &self.shapes;
-        let sources =
-            usize::from(s.graphs.is_some()) + usize::from(s.file.is_some() || s.inline.is_some());
-        if self.mode != GuardMode::Off && sources != 1 {
-            bail!("shapes: give either graphs or a file (inline shapes)");
+        if self.mode != GuardMode::Off
+            && s.graphs.is_none()
+            && s.file.is_none()
+            && s.inline.is_none()
+        {
+            bail!("shapes: give graphs, a file (inline shapes), or both");
         }
         for g in s.graphs.iter().flatten() {
             oxrdf::NamedNode::new(g.as_str()).with_context(|| format!("shapes graph <{g}>"))?;
@@ -321,6 +305,9 @@ pub struct ShaclGuard {
     /// the database directory and the SHA-256 of its `validation.json`, where the state
     /// of each validated commit is kept
     persist: Option<(PathBuf, String)>,
+    /// the shapes file's triples, when the shapes are graphs and a file: they are merged
+    /// with the graphs whenever a write changes them
+    file_shapes: Option<Arc<oxrdf::Graph>>,
 }
 
 /// The data graph of one state, ready to validate.
@@ -343,6 +330,7 @@ impl ShaclGuard {
             tuning: RwLock::new(Tuning::default()),
             history: CheckHistory::default(),
             persist,
+            file_shapes: None,
         }
     }
 
@@ -564,6 +552,19 @@ impl ShaclGuard {
         let mut post = self.state(&c.view, shapes, c.opts)?;
         let mut pre = self.state(&base, shapes, c.opts)?;
         let tuning = self.tuning();
+        let mut extra;
+        let mut changes = changes;
+        if model.uses_classes() {
+            match class_changes(&c.view, [post.as_ref(), pre.as_ref()], changes, &tuning)? {
+                Some(more) if !more.is_empty() => {
+                    extra = changes.to_vec();
+                    extra.extend(more);
+                    changes = &extra;
+                }
+                Some(_) => {}
+                None => return Ok(Err(Fallback::Subclass)),
+            }
+        }
         let affected = model
             .affected(
                 &c.view,
@@ -719,14 +720,6 @@ impl ShaclGuard {
                 changes.push([q[0], q[1], q[2]]);
             }
         }
-        let preds: FxHashSet<Id> = changes.iter().map(|t| t[1]).collect();
-        if loaded.model.uses_classes()
-            && c.view
-                .lookup_iri(crate::vocab::rdfs::SUB_CLASS_OF.as_str())
-                .is_some_and(|p| preds.contains(&p))
-        {
-            return full(Fallback::Subclass);
-        }
         match self.incremental(c, loaded, &exact, &changes)? {
             Ok(checked) => Ok(checked),
             Err(f) => full(f),
@@ -750,6 +743,43 @@ impl ShaclGuard {
             .collect();
         loaded.model.reads_any(&c.view, &preds)
     }
+}
+
+/// A changed `rdfs:subClassOf` edge `(s, rdfs:subClassOf, o)` changes which classes
+/// have the instances of `s` (and of its subclasses) as instances, and nothing else that
+/// `sh:class` and class targets read. Those instances, in the states before and after
+/// the write, are returned as changed `rdf:type` edges, so the shapes that read their
+/// types validate them; `None` when there are more than the tuning's `max_visit`.
+fn class_changes(
+    view: &Snapshot,
+    states: [Option<&State>; 2],
+    changes: &[[Id; 3]],
+    tuning: &Tuning,
+) -> sparkles::Result<Option<Vec<[Id; 3]>>> {
+    let Some(sub) = view.lookup_iri(crate::vocab::rdfs::SUB_CLASS_OF.as_str()) else {
+        return Ok(Some(Vec::new()));
+    };
+    let ty = view
+        .lookup_iri(crate::vocab::rdf::TYPE.as_str())
+        .unwrap_or(Id::UNDEF);
+    let mut out = Vec::new();
+    let mut seen = FxHashSet::default();
+    for &[s, p, _] in changes {
+        if p != sub {
+            continue;
+        }
+        for st in states.iter().flatten() {
+            for x in st.data.instances(s).map_err(engine_error)? {
+                if seen.insert(x) {
+                    out.push([x, ty, s]);
+                    if out.len() > tuning.max_visit {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(out))
 }
 
 /// An error of the validation engine as a store error.
@@ -966,7 +996,11 @@ impl CommitGuard for ShaclGuard {
         let loaded = self.loaded.read().clone();
         let (checked, new_loaded) = if shapes_changed {
             // changed shapes are read from the new state, and must parse
-            let new = match Shapes::from_store_graphs(&c.view, self.cfg.shapes_graphs()) {
+            let new = match Shapes::from_store_graphs_with(
+                &c.view,
+                self.cfg.shapes_graphs(),
+                self.file_shapes.as_deref(),
+            ) {
                 Ok(s) => Loaded::new(s),
                 Err(e) => {
                     self.count(GuardStatus::Rejected);
@@ -1088,23 +1122,46 @@ pub fn read_config(root: &Path) -> Result<Option<ValidationConfig>> {
     Ok(read_config_hashed(root)?.map(|(c, _)| c))
 }
 
-fn load_shapes(cfg: &ValidationConfig, root: Option<&Path>, snap: &Snapshot) -> Result<Shapes> {
-    if let Some(graphs) = &cfg.shapes.graphs {
-        return Shapes::from_store_graphs(snap, graphs);
-    }
+/// The text and format of a configuration's shapes file (given inline, or the copy in
+/// the database); `None` when its shapes are graphs alone.
+fn shapes_text(
+    cfg: &ValidationConfig,
+    root: Option<&Path>,
+) -> Result<Option<(String, crate::RdfFormat)>> {
     let format = cfg
         .shapes
         .format
         .as_deref()
         .and_then(sparkles::io::format_for_media_type)
         .unwrap_or(crate::RdfFormat::Turtle);
-    let text = match (&cfg.shapes.inline, root) {
-        (Some(t), _) => t.clone(),
-        (None, Some(r)) => std::fs::read_to_string(r.join(SHAPES_FILE))
+    let text = match (&cfg.shapes.inline, &cfg.shapes.file, root) {
+        (Some(t), _, _) => t.clone(),
+        (None, None, _) if cfg.shapes.graphs.is_some() => return Ok(None),
+        (None, _, Some(r)) => std::fs::read_to_string(r.join(SHAPES_FILE))
             .with_context(|| format!("reading {SHAPES_FILE}"))?,
-        (None, None) => bail!("no shapes given"),
+        (None, _, None) => bail!("no shapes given"),
     };
-    Shapes::parse(&text, format, None)
+    Ok(Some((text, format)))
+}
+
+/// The shapes of a configuration over `snap`, and the graph of its shapes file when it
+/// also has shapes graphs (merged with them whenever they are read again).
+fn load_shapes(
+    cfg: &ValidationConfig,
+    root: Option<&Path>,
+    snap: &Snapshot,
+) -> Result<(Shapes, Option<Arc<oxrdf::Graph>>)> {
+    let text = shapes_text(cfg, root)?;
+    match (&cfg.shapes.graphs, text) {
+        (Some(graphs), None) => Ok((Shapes::from_store_graphs(snap, graphs)?, None)),
+        (Some(graphs), Some((text, format))) => {
+            let file = Arc::new(Shapes::read_graph(&text, format, None)?);
+            let shapes = Shapes::from_store_graphs_with(snap, graphs, Some(&file))?;
+            Ok((shapes, Some(file)))
+        }
+        (None, Some((text, format))) => Ok((Shapes::parse(&text, format, None)?, None)),
+        (None, None) => bail!("no shapes given"),
+    }
 }
 
 /// Install the guard of a persistent store from its `validation.json` (after
@@ -1123,14 +1180,12 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShaclGuard>>> {
         store.set_guard_required(false);
         return Ok(None);
     }
-    let shapes = load_shapes(&cfg, Some(root), &store.snapshot())?;
+    let (shapes, file_shapes) = load_shapes(&cfg, Some(root), &store.snapshot())?;
     let loaded = Loaded::new(shapes);
     let n = loaded.shapes.len();
-    let g = Arc::new(ShaclGuard::new(
-        cfg,
-        loaded,
-        Some((root.to_path_buf(), hash.clone())),
-    ));
+    let mut g = ShaclGuard::new(cfg, loaded, Some((root.to_path_buf(), hash.clone())));
+    g.file_shapes = file_shapes;
+    let g = Arc::new(g);
     let head = store.head_commit().seq;
     if let Some(b) = StatusFile::read(root, head, &hash) {
         *g.exact.lock() = Some(Exact {
@@ -1176,7 +1231,8 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
     cfg.check()?;
     let view = Arc::new(txn.view());
     let head = txn.base().commit;
-    let loaded = Loaded::new(load_shapes(&cfg, root.as_deref(), &view)?);
+    let (shapes, file_shapes) = load_shapes(&cfg, root.as_deref(), &view)?;
+    let loaded = Loaded::new(shapes);
     let probe = ShaclGuard::new(cfg.clone(), loaded.clone(), None);
     let checked = probe.full(&view, &loaded, None, &WriteOptions::default(), None, head)?;
     let summary = checked.summary;
@@ -1200,14 +1256,16 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
             cfg.shapes.file = Some(SHAPES_FILE.into());
             cfg.shapes.sha256 = Some(sha256_hex(text.as_bytes()));
             cfg.shapes.format = None;
-        } else if cfg.shapes.graphs.is_some() {
+        } else if cfg.shapes.file.is_none() {
             let _ = std::fs::remove_file(r.join(SHAPES_FILE));
         }
         let bytes = serde_json::to_vec_pretty(&cfg)?;
         write_atomic(&r.join(CONFIG_FILE), &bytes)?;
         persist = Some((r.clone(), sha256_hex(&bytes)));
     }
-    let guard = Arc::new(ShaclGuard::new(cfg, loaded, persist));
+    let mut guard = ShaclGuard::new(cfg, loaded, persist);
+    guard.file_shapes = file_shapes;
+    let guard = Arc::new(guard);
     let baseline = baseline_of(&summary, head);
     if let Some((r, hash)) = &guard.persist {
         StatusFile::of(&baseline, hash).write(r)?;

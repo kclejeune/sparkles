@@ -520,6 +520,51 @@ async fn schema_explain_text_and_diff_cover_the_view() {
     assert!(d["to"]["commit"].get("quads").is_none(), "{d}");
     let d = get("/graphs/diff?quads=true".into(), "gfull").await.json();
     assert_eq!(d["added"], 2, "{d}");
+    // the same diff as RDF Patch
+    let patch = get("/graphs/diff?format=patch".into(), "gra").await;
+    assert_eq!(patch.status, StatusCode::OK, "{}", patch.text());
+    let text = patch.text();
+    assert!(
+        text.contains("<http://ex/a/2>") && !text.contains("<http://ex/b/1>"),
+        "{text}"
+    );
+    assert!(
+        get("/graphs/diff?format=patch".into(), "gfull")
+            .await
+            .text()
+            .contains("<http://ex/b/1>")
+    );
+    // the change feed after the load: the visible changes, without the commits' counts
+    let feed = get("/graphs/changes?after=1".into(), "gra").await;
+    assert_eq!(feed.status, StatusCode::OK, "{}", feed.text());
+    let f = feed.json();
+    let c = &f["commits"][0];
+    assert_eq!(c["added"], 1, "{f}");
+    assert!(c["commit"].get("quads").is_none(), "{f}");
+    let changes = c["changes"].to_string();
+    assert!(
+        changes.contains("ex/a/2") && !changes.contains("ex/b/1"),
+        "{f}"
+    );
+    let f = get("/graphs/changes?after=1".into(), "gfull").await.json();
+    assert_eq!(f["commits"][0]["added"], 2, "{f}");
+    assert!(f["commits"][0]["commit"]["quads"].is_u64(), "{f}");
+    let patch = get("/graphs/changes?after=1&format=patch".into(), "gra")
+        .await
+        .text();
+    assert!(
+        patch.contains("<http://ex/a/2>") && !patch.contains("<http://ex/b/1>"),
+        "{patch}"
+    );
+    // a commit of hidden graphs only is listed, with no changes
+    let up = "INSERT DATA { GRAPH <http://ex/b/1> { <http://ex/y> <http://ex/p> 3 } }";
+    assert_eq!(
+        update_as(&s.app, "graphs", &b("gfull"), up).await.status,
+        StatusCode::OK
+    );
+    let f = get("/graphs/changes?after=2".into(), "gra").await.json();
+    assert_eq!(f["commits"][0]["added"], 0, "{f}");
+    assert_eq!(f["commits"][0]["changes"], serde_json::json!([]), "{f}");
 }
 
 #[tokio::test]
@@ -537,6 +582,7 @@ async fn endpoint_permissions() {
         "/graphs/sparql?query=ASK%7B%7D",
         "/$/schema/graphs",
         "/graphs/diff",
+        "/graphs/changes",
     ] {
         let r = get(u, "gep").await;
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{u}");

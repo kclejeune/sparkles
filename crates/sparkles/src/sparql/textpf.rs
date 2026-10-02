@@ -3,7 +3,7 @@
 //!
 //! ```sparql
 //! ?s text:query "query"                          # or "query"@lang
-//! (?s ?score ?literal ?g ?prop) text:query (pred* "query" limit "lang:xx")
+//! (?s ?score ?literal ?g ?prop ?rank) text:query (pred* "query" limit "lang:xx")
 //! ```
 //!
 //! SPARQL parses `( … )` into `rdf:first` / `rdf:rest` chains of blank nodes. This module
@@ -28,6 +28,8 @@ pub struct TextCall {
     pub literal: Option<TermPattern>,
     pub graph: Option<TermPattern>,
     pub prop: Option<TermPattern>,
+    /// the hit's rank in the score order (a Sparkles extension after Jena's slots)
+    pub rank: Option<TermPattern>,
     /// predicates to search (empty: every indexed predicate)
     pub predicates: Vec<NamedNode>,
     pub query: String,
@@ -153,8 +155,61 @@ pub fn take_calls_where(
     Ok((calls, rest))
 }
 
-fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<TextCall> {
-    if subjects.is_empty() || subjects.len() > 5 {
+/// The elements of the list headed by `head`, taking its `rdf:first`/`rdf:rest` triples
+/// out of `patterns`; `None` when `head` heads no list (it is then left as it is). A
+/// nested list argument of a property function stays in the patterns until taken so.
+pub fn take_list(
+    patterns: &mut Vec<TriplePattern>,
+    head: &TermPattern,
+    name: &str,
+) -> Result<Option<Vec<TermPattern>>> {
+    let TermPattern::BlankNode(b) = head else {
+        return Ok(None);
+    };
+    let link = |patterns: &[TriplePattern], b: &BlankNode, p: oxrdf::NamedNodeRef<'_>| {
+        patterns
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                matches!(&t.subject, TermPattern::BlankNode(x) if x == b)
+                    && matches!(&t.predicate, NamedNodePattern::NamedNode(x) if *x == p)
+            })
+            .map(|(i, _)| i)
+            .collect::<Vec<usize>>()
+    };
+    if link(patterns, b, rdf::FIRST).is_empty() {
+        return Ok(None);
+    }
+    let bad = || Error::invalid(format!("{name}: malformed argument list"));
+    let mut used = Vec::new();
+    let mut items = Vec::new();
+    let mut b = b.clone();
+    loop {
+        let (first, rest) = (
+            link(patterns, &b, rdf::FIRST),
+            link(patterns, &b, rdf::REST),
+        );
+        let ([f], [r]) = (first.as_slice(), rest.as_slice()) else {
+            return Err(bad());
+        };
+        used.extend([*f, *r]);
+        items.push(patterns[*f].object.clone());
+        match &patterns[*r].object {
+            TermPattern::NamedNode(n) if *n == rdf::NIL => break,
+            TermPattern::BlankNode(next) if items.len() < 64 => b = next.clone(),
+            _ => return Err(bad()),
+        }
+    }
+    used.sort_unstable();
+    for i in used.into_iter().rev() {
+        patterns.remove(i);
+    }
+    Ok(Some(items))
+}
+
+/// Decode a `text:query` call from its subject and object list elements.
+pub fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<TextCall> {
+    if subjects.is_empty() || subjects.len() > 6 {
         return Err(bad("malformed argument list"));
     }
     let mut slots = subjects.into_iter();
@@ -170,6 +225,7 @@ fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<TextCall
     let literal = var_slot("the literal")?;
     let graph = var_slot("the graph")?;
     let prop = var_slot("the property")?;
+    let rank = var_slot("the rank")?;
 
     let mut predicates = Vec::new();
     let mut args = args.into_iter().peekable();
@@ -242,6 +298,7 @@ fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<TextCall
         literal,
         graph,
         prop,
+        rank,
         predicates,
         query,
         lang,

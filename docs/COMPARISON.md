@@ -25,7 +25,7 @@ full feature list is in [FEATURES.md](FEATURES.md).
 
 | Area | Jena / Fuseki | Sparkles |
 |---|---|---|
-| Full-text search | jena-text (Lucene), `text:query` | `text:query` with Lucene's query syntax and Jena's highlighting over string literals (Tantivy, BM25), updated on commit. No per-language stemming or multi-field entity documents. |
+| Full-text search | jena-text (Lucene), `text:query` | `text:query` with Lucene's query syntax, Jena's highlighting and stemming per language over string literals (Tantivy, BM25), updated on commit. No multi-field entity documents. |
 | Spatial | GeoSPARQL 1.0/1.1: `geof:` and `spatialF:` functions, `spatial:` property functions over a spatial index, query rewrite of the topological properties, RDFS entailment of the geometry hierarchy, GML and KML literals, EPSG CRSs through Apache SIS | The GeoSPARQL 1.1 `geof:` functions over WKT and GeoJSON literals in the built-in CRSs and the 120 UTM zones; Jena's `spatial:` property functions and `spatialF:` filter functions; a per-dataset spatial index used by FILTERs, property functions, spatial joins and nearest-neighbour ORDER BY; query rewrite (off by default) and RDFS entailment of the geometry hierarchy (`--vocab geosparql`). No geometry-type entailment, GML/KML literals or EPSG database ([AUDIT.md](AUDIT.md#5-explicit-non-goals-for-v1) §5). |
 | Shape languages | ShEx (jena-shex) | SHACL, and ShEx 2.1 (ShExC, ShExJ, ShExR, SPARQL selectors). No ShEx 2.2. |
 | Inference | On-the-fly `InfModel`, backward and hybrid rules (LP engine), OWL Micro/Mini/Full | Forward materialization only (RDFS, an OWL 2 RL subset, Jena forward rules). Not incremental: after an update to the default graph the inferences are marked stale and recomputed in full, on request or automatically. Inconsistency checks cover the OWL 2 RL `false` rules except `dt-not-type`, which is not full consistency checking. |
@@ -33,7 +33,7 @@ full feature list is in [FEATURES.md](FEATURES.md).
 | SPARQL extensions | Property functions (`list:member`, `apf:*`), `LET`, custom aggregates (`MEDIAN`, `MODE`, `FOLD`), `cdt:` list/map literals, JavaScript functions, the full `afn:`/`fn:` library | ✗ (the common `fn:`, `afn:` and `math:` functions only) |
 | SPARQL parser | JavaCC grammar | `spargebra` 0.4.7, vendored with fixes for the W3C tests it failed ([`vendor/spargebra/PATCHED.md`](../vendor/spargebra/PATCHED.md)) |
 | RDF formats | RDF Thrift, RDF Protobuf, TriX, RDF/JSON | ✗ (Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD only) |
-| Change logs | RDF Patch (jena-rdfpatch), Fuseki `/patch` | ✗ |
+| Change logs | RDF Patch (jena-rdfpatch), Fuseki `/patch` | RDF Patch output, as text and as RDF Thrift, for diffs between commits and for a change feed with long polling and server-sent events. Sparkles writes patches but does not apply them, so it has no `/patch` endpoint. |
 | Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix endpoints | Basic and Bearer tokens, OIDC sign-in for the UI and trusted proxy headers, with per-dataset access levels. Grants can be limited to some named graphs, for reading and writing, and to some endpoints, which covers fuseki-access and endpoint `allowedUsers`. Prometheus `/$/metrics` with Sparkles metric names, plus Fuseki's `fuseki_requests*` names with `--metrics-fuseki-names`, and no JVM metrics. Datasets are configured by CLI flags and the admin API. Prefixes through `/{ds}/prefixes`. |
 | SERVICE | Bulk, batched and cached SERVICE (serviceenhancer) | Plain SERVICE only |
 | Transactions over HTTP | — | — (as in Fuseki, one request is one transaction) |
@@ -68,7 +68,7 @@ time, and this comparison draws on its public documentation.
 
 | Area | Fluree | Sparkles |
 |---|---|---|
-| History | An immutable, content-addressed commit chain; time travel (`@t:`, `@iso:`, `@commit:`); history queries; branches, merge and revert | Durable, ordered commit ids and a commit catalog. Point-in-time reads of every commit since the last compaction, and of older commits kept by named snapshots or a retention window. Diffs between any two readable commits. No history queries across commits, branches or merges. |
+| History | An immutable, content-addressed commit chain; time travel (`@t:`, `@iso:`, `@commit:`); history queries; branches, merge and revert | Durable, ordered commit ids and a commit catalog that can be pruned past a horizon. Point-in-time reads of every commit since the last compaction, and of older commits kept by named snapshots or a retention window. Diffs between any two readable commits, as JSON or RDF Patch, and a change feed that resumes from any readable commit. No history queries across commits, branches or merges. |
 | Security | Access policies stored in the ledger, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | Per-dataset access levels with Basic, API tokens, OIDC sign-in for the UI and trusted proxy headers. Grants can be limited to some named graphs and endpoints. No policy language, rules on data, signed requests or encryption at rest. |
 | Interfaces | JSON-LD transactions and queries (FQL), openCypher with Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, an MCP server | SPARQL, the Rust API and an MCP server over stdio and HTTP. JSON-LD is an RDF format only. |
 | Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`), vector search (`spk:vectorSearch`) with an HNSW index or exactly, and GeoSPARQL with a spatial index. Vector indexes have no quantization. |
@@ -99,7 +99,7 @@ Sparkles' own.
 
 | Area | Oxigraph | Sparkles |
 |---|---|---|
-| Embedding | A Rust library, Python (`pyoxigraph`) and JavaScript/WebAssembly packages, an in-memory store | A Rust library, persistent or in-memory. No Python or WebAssembly bindings. |
+| Embedding | A Rust library, Python (`pyoxigraph`) and JavaScript/WebAssembly packages, an in-memory store | A Rust library and a Python package (`sparkles`, abi3 wheels built from the repository, not on PyPI), persistent or in-memory. The Python API follows pyoxigraph's names for terms, `query`, `load`, `dump` and `quads_for_pattern`, and adds transactions as context managers, reasoning and validation. No WebAssembly build. |
 | Storage | RocksDB (a C++ LSM tree) with 9 index orders (6 for named graphs, 3 for the default graph) and a string dictionary; updates in place; online backups as RocksDB checkpoints (a complete copy in a new local directory, hard-linked on the same file system) | Immutable sorted blocks in 7 orders, plus an in-memory delta logged to a WAL and merged by compaction. Online backups to repositories on a file system or S3, incremental and deduplicated across backups and datasets, with restore, verification, schedules and retention. |
 | Spatial | GeoSPARQL functions (`spargeo`, on by default in the CLI); no spatial index | GeoSPARQL 1.1 functions (geodesic measures, EPSG:4326 axis order, metric buffers) and a per-dataset spatial index |
 | Write durability | One RocksDB transaction per request, written to RocksDB's WAL without an fsync (RocksDB's default) | The WAL is fsynced before a write is acknowledged: one `fdatasync` per commit, or two when the commit adds terms the dataset has not seen before (they go to a separate file first) and one more for a commit message or change digest |
@@ -135,6 +135,8 @@ or web UI.
 | The effective boolean value of an ill-typed boolean or numeric literal is an error | SPARQL 1.2 §17.2.2. SPARQL 1.1 said `false`. |
 | Reasoning is materialized (forward chaining into `urn:x-sparkles:inferred`, queried as default ∪ inferred), not computed on the fly like Jena's `InfGraph` | Queries run at the speed of the plain index. The cost is re-running `/$/reason` after updates. The reasoning status records the commit it ran at, so stale inferences are reported, and `serve --auto-reason` re-runs them automatically. Backward (LP) rules are not supported. |
 | An `AS ?v` target already in scope is rejected (SPARQL §18.2.1) | `spargebra` does not check this, so Sparkles does, matching Jena and QLever. |
+| Stemming uses Tantivy's Snowball stemmers and stop word lists, not Lucene's language analyzers | Lucene uses the same Snowball stemmers for Danish, Dutch, Finnish, Hungarian, Norwegian, Romanian, Russian, Swedish and Turkish. Its English analyzer uses the original Porter stemmer, French, German, Spanish, Italian and Portuguese use light stemmers, and Greek and Arabic use stemmers of their own. A stemmed search can therefore find different literals than in Jena. On a test corpus in nine languages, 1,235 of 1,590 stemmed queries matched the same literals in both. The Snowball languages agreed on 662 of 671 queries, and English on 172 of 191. |
+| A literal's language is its primary subtag: `en-GB` literals are stemmed as English, and `lang:en` finds them | Jena matches the language tag exactly, so `lang:en` leaves `en-GB` literals out. |
 | The full-text index commits lazily: a write stages its documents, and the next text query that needs them, or a tick about once a second, commits them | A Tantivy commit flushes a segment and costs more than the indexing, so a burst of writes shares one commit. Each snapshot still searches exactly its own documents: later ones are filtered out, and removed ones are kept until their batch commits. After a crash the WAL restores what was only staged. Jena's text index commits with each transaction. |
 | N-Quads backups (`/$/backup/{ds}`, `sparkles backup`) are zstd (level 3, `.nq.zst`) by default; Fuseki writes gzip (`.nq.gz`). `?compression=gzip` or `--compress gzip` writes Fuseki's format | At 10.5M triples, zstd took 8.2 s for 81.5 MB and gzip (level 6) 41 s for 74.9 MB: five times faster for a file 9% larger. `sparkles load` and uploads read both. |
 
@@ -164,8 +166,8 @@ or web UI.
 
 JavaScript functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's
 Lucene index format and assembler configuration (Sparkles implements `text:query` itself),
-SHACL-AF rules (also absent from Jena), RDF Patch, backward-chaining (LP) rules and Shiro
-authentication.
+SHACL-AF rules (also absent from Jena), applying RDF Patch, backward-chaining (LP) rules
+and Shiro authentication.
 
 ## Optimizations adopted from QLever
 

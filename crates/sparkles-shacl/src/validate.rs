@@ -3,7 +3,7 @@
 use crate::data::DataGraph;
 use crate::path::{CPath, PropertyPath};
 use crate::report::{ValidationReport, ValidationResult};
-use crate::shapes::{Constraint, Qualified, ShapeId, Shapes, Target};
+use crate::shapes::{Candidates, Constraint, Qualified, ShapeId, Shapes, Target};
 use anyhow::{Result, bail};
 use oxrdf::{Literal, NamedNode, Term};
 use rayon::prelude::*;
@@ -381,6 +381,19 @@ impl<'a> Engine<'a> {
                 Target::Class(c) => self.data.instances(self.id(c))?,
                 Target::SubjectsOf(p) => self.data.subjects_of(self.id(p))?,
                 Target::ObjectsOf(p) => self.data.objects_of(self.id(p))?,
+                Target::Where(w) => {
+                    let mut cx = Cx::default();
+                    let mut out = Vec::new();
+                    for (i, n) in self.candidates(w)?.into_iter().enumerate() {
+                        if i % 256 == 0 {
+                            self.check_limits()?;
+                        }
+                        if self.conforms(w, n, &mut cx)? {
+                            out.push(n);
+                        }
+                    }
+                    out
+                }
             };
             for n in nodes {
                 if seen.insert(n) {
@@ -398,12 +411,63 @@ impl<'a> Engine<'a> {
                 Target::Class(c) => self.data.is_instance(f, self.id(c))?,
                 Target::SubjectsOf(p) => !self.data.objects(f, self.id(p))?.is_empty(),
                 Target::ObjectsOf(p) => !self.data.subjects(self.id(p), f)?.is_empty(),
+                // a node that conforms is one of the candidates; those of a narrowed
+                // set are nodes of the data graph
+                Target::Where(w) => {
+                    let narrowed = !matches!(
+                        self.shapes.candidates(w),
+                        Candidates::All | Candidates::Terms(_)
+                    );
+                    (narrowed || self.is_node(f)?) && self.conforms(w, f, &mut Cx::default())?
+                }
             };
             if hit {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// The nodes that may conform to shape `si` (see [`Shapes::candidates`]).
+    fn candidates(&self, si: ShapeId) -> Result<Vec<Id>> {
+        let pred = |p: &NamedNode| {
+            self.data
+                .snap
+                .lookup_iri(p.as_str())
+                .unwrap_or(Id::local(u64::MAX >> 8))
+        };
+        Ok(match self.shapes.candidates(si) {
+            Candidates::All => self.data.nodes()?,
+            Candidates::Instances(c) => self.data.instances(self.id(c))?,
+            Candidates::Terms(ts) => {
+                let mut out = Vec::new();
+                for t in ts {
+                    let id = self.id(t);
+                    if self.is_node(id)? && !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+                out
+            }
+            Candidates::SubjectsOf(p) => self.data.subjects_of(pred(&p))?,
+            Candidates::ObjectsOf(p) => self.data.objects_of(pred(&p))?,
+        })
+    }
+
+    /// Whether `n` is a node of the data graph (the subject or object of a triple).
+    fn is_node(&self, n: Id) -> Result<bool> {
+        if matches!(n.tag(), sparkles::id::Tag::Local | sparkles::id::Tag::Undef) {
+            return Ok(false);
+        }
+        let mut found = false;
+        self.data.scan_out_edges(n, |_, _| {
+            found = true;
+            false
+        })?;
+        if !found {
+            found = self.data.has_in_edge(n)?;
+        }
+        Ok(found)
     }
 
     /// Value nodes of a shape for a focus node.

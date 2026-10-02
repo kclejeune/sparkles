@@ -21,7 +21,6 @@ use super::*;
 use crate::history::{At, Resolved};
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
-use std::io::BufReader;
 use std::time::Instant;
 
 /// A quad as the vocabulary keys of its graph, subject, predicate and object (the
@@ -85,7 +84,7 @@ pub struct DiffOptions {
 }
 
 impl DiffOptions {
-    fn check(&self) -> Result<()> {
+    pub(super) fn check(&self) -> Result<()> {
         if self
             .cancel
             .as_ref()
@@ -124,7 +123,7 @@ pub struct Diff {
     pub log_changes: u64,
     /// quads read by state comparisons
     pub compared: u64,
-    changes: Vec<(QuadKey, DiffOp)>,
+    pub(super) changes: Vec<(QuadKey, DiffOp)>,
 }
 
 impl Diff {
@@ -154,7 +153,7 @@ impl Diff {
 }
 
 /// The quad of a key (`None` for keys that no quad can have).
-fn key_quad(k: &QuadKey) -> Option<Quad> {
+pub(super) fn key_quad(k: &QuadKey) -> Option<Quad> {
     let s = match crate::id::key_to_term(&k[1]) {
         Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
         Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
@@ -202,13 +201,13 @@ fn graph_id(g: &Generation, name: &GraphName) -> Option<Id> {
 }
 
 /// Turns one generation's ids into vocabulary keys, remembering the ones it has seen.
-struct Keys<'a> {
+pub(super) struct Keys<'a> {
     generation: &'a Generation,
     seen: FxHashMap<Id, Arc<[u8]>>,
 }
 
 impl<'a> Keys<'a> {
-    fn new(generation: &'a Generation) -> Keys<'a> {
+    pub(super) fn new(generation: &'a Generation) -> Keys<'a> {
         Keys {
             generation,
             seen: FxHashMap::default(),
@@ -246,7 +245,7 @@ impl<'a> Keys<'a> {
     }
 
     /// The key of a quad (`[s, p, o, g]` ids).
-    fn quad(&mut self, q: &[Id; 4]) -> Result<QuadKey> {
+    pub(super) fn quad(&mut self, q: &[Id; 4]) -> Result<QuadKey> {
         Ok([
             self.key(q[3])?,
             self.key(q[0])?,
@@ -268,24 +267,31 @@ struct Net<'o> {
     readable: FxHashMap<Arc<[u8]>, bool>,
 }
 
+/// Whether the graph of a quad key may be read under `access`, remembered per graph in
+/// `memo`.
+pub(crate) fn readable_key(
+    access: &crate::access::GraphAccess,
+    memo: &mut FxHashMap<Arc<[u8]>, bool>,
+    k: &QuadKey,
+) -> bool {
+    if let Some(ok) = memo.get(&k[0]) {
+        return *ok;
+    }
+    let ok = if k[0].is_empty() {
+        access.read.default_graph()
+    } else {
+        access.readable(Some(&crate::id::key_to_term(&k[0])))
+    };
+    memo.insert(k[0].clone(), ok);
+    ok
+}
+
 impl Net<'_> {
     fn toggle(&mut self, k: QuadKey, added: bool) -> Result<()> {
-        if let Some(a) = self.opts.graphs.as_ref().filter(|a| !a.reads_all()) {
-            let ok = match self.readable.get(&k[0]) {
-                Some(ok) => *ok,
-                None => {
-                    let ok = if k[0].is_empty() {
-                        a.read.default_graph()
-                    } else {
-                        a.readable(Some(&crate::id::key_to_term(&k[0])))
-                    };
-                    self.readable.insert(k[0].clone(), ok);
-                    ok
-                }
-            };
-            if !ok {
-                return Ok(());
-            }
+        if let Some(a) = self.opts.graphs.as_ref().filter(|a| !a.reads_all())
+            && !readable_key(a, &mut self.readable, &k)
+        {
+            return Ok(());
         }
         match self.map.entry(k) {
             Entry::Occupied(e) => {
@@ -307,7 +313,7 @@ impl Net<'_> {
 
 /// One stretch of a range of commits.
 #[derive(Debug, PartialEq, Eq)]
-enum Step {
+pub(super) enum Step {
     /// walk generation `generation`'s log from after commit `after` through `through`
     Log {
         generation: u32,
@@ -358,84 +364,38 @@ fn plan(gens: &[(u32, u64, u64)], lo: u64, hi: u64) -> Vec<Step> {
 }
 
 /// Read the changes of the commits after `after` through `through` from a generation's
-/// WAL (`base`: the commit its base index holds), streaming. The commits are numbered as
-/// [`replay_wal`] numbers them. A checksum mismatch, or a log that ends before
-/// `through`, is [`Error::Corrupt`].
-#[allow(clippy::too_many_arguments)]
+/// WAL, streaming from the cursor (at or before the end of `after`). The commits are
+/// numbered as [`replay_wal`] numbers them. A checksum mismatch, or a log that ends
+/// before `through`, is [`Error::Corrupt`].
 fn walk_wal(
-    file: File,
-    path: &Path,
-    base: CommitInfo,
-    fold_legacy: bool,
+    c: &mut super::wal::WalCursor,
     after: u64,
     through: u64,
     o: &DiffOptions,
     f: &mut dyn FnMut(u8, [Id; 4]) -> Result<()>,
 ) -> Result<u64> {
-    let mut r = BufReader::with_capacity(1 << 20, file);
-    let mut rec = [0u8; WAL_REC];
-    let mut txn: Vec<u8> = Vec::new();
-    let (mut prev, mut seen_v2, mut offset, mut changes) = (base.seq, false, 0u64, 0u64);
     if after >= through {
         return Ok(0);
     }
+    let mut changes = 0u64;
     loop {
-        match r.read_exact(&mut rec) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(Error::Corrupt(format!(
-                    "{}: the log ends before commit {through}",
-                    path.display()
-                )));
+        let Some((seq, txn)) = c.next()? else {
+            return Err(Error::Corrupt(format!(
+                "{}: the log ends before commit {through}",
+                c.path().display()
+            )));
+        };
+        if seq > after && seq <= through {
+            for d in txn.as_chunks::<WAL_REC>().0 {
+                f(d[0], super::wal::record_quad(d))?;
+                changes += 1;
+                if changes & 0xFFFF == 0 {
+                    o.check()?;
+                }
             }
-            Err(e) => return Err(e.into()),
         }
-        offset += WAL_REC as u64;
-        match rec[0] {
-            WAL_INSERT | WAL_DELETE => txn.extend_from_slice(&rec),
-            WAL_COMMIT => {
-                let seq = match commit::open_wal_commit(&rec, &txn) {
-                    Some(Ok((seq, _, _))) => {
-                        seen_v2 = true;
-                        seq
-                    }
-                    Some(Err(())) => {
-                        return Err(Error::Corrupt(format!(
-                            "{}: checksum mismatch in the transaction ending at byte {offset}",
-                            path.display()
-                        )));
-                    }
-                    // legacy records before the first with metadata fold into the base
-                    None if fold_legacy && !seen_v2 => prev,
-                    None => prev + 1,
-                };
-                if seq > after && seq <= through {
-                    for d in txn.as_chunks::<WAL_REC>().0 {
-                        let q: [Id; 4] = std::array::from_fn(|j| {
-                            Id(u64::from_le_bytes(
-                                d[1 + j * 8..9 + j * 8].try_into().unwrap(),
-                            ))
-                        });
-                        f(d[0], q)?;
-                        changes += 1;
-                        if changes & 0xFFFF == 0 {
-                            o.check()?;
-                        }
-                    }
-                }
-                txn.clear();
-                prev = seq;
-                if seq >= through {
-                    return Ok(changes);
-                }
-            }
-            op => {
-                return Err(Error::Corrupt(format!(
-                    "{}: unknown record type {op} at byte {}",
-                    path.display(),
-                    offset - WAL_REC as u64
-                )));
-            }
+        if seq >= through {
+            return Ok(changes);
         }
     }
 }
@@ -716,7 +676,7 @@ impl Store {
         Ok(())
     }
 
-    fn diff_plan(&self, lo: u64, hi: u64) -> Result<Vec<Step>> {
+    pub(super) fn diff_plan(&self, lo: u64, hi: u64) -> Result<Vec<Step>> {
         let Some(hist) = &self.history else {
             return Ok(vec![Step::Compare { a: lo, b: hi }]);
         };
@@ -732,6 +692,45 @@ impl Store {
         Ok(plan(&gens, lo, hi))
     }
 
+    /// Open generation `no`'s log to read the commits after `after`: the generation, and
+    /// a cursor at the nearest indexed position at or before the end of `after`. The
+    /// generation and its log are opened under the history lock: collection takes the
+    /// same lock, and an open file outlives an unlink.
+    pub(super) fn open_log(
+        &self,
+        no: u32,
+        after: u64,
+    ) -> Result<(Arc<Generation>, super::wal::WalCursor)> {
+        let hist = self.history.as_ref().expect("a persistent store");
+        let (generation, entry, file) = {
+            let live = self.snapshot();
+            let current = commit::generation_number(&live.generation.name);
+            let mut h = hist.lock();
+            let Some(entry) = h.gens.get(&no).cloned() else {
+                return Err(Error::Corrupt(format!(
+                    "generation {no} was collected while it was read; retry"
+                )));
+            };
+            let generation = self.history_generation(&mut h, no, current, &live, &entry)?;
+            let file = File::open(entry.dir.join("wal.log"))?;
+            (generation, entry, file)
+        };
+        let path = entry.dir.join("wal.log");
+        let from = {
+            let mut ix = generation.wal_index.lock();
+            if ix.is_none() {
+                *ix = Some(super::wal::WalIndex::scan(
+                    &path,
+                    entry.base.seq,
+                    entry.fold_legacy,
+                )?);
+            }
+            ix.as_ref().map(|ix| ix.floor(after)).expect("built above")
+        };
+        let cursor = super::wal::WalCursor::new(file, &path, from)?;
+        Ok((generation, cursor))
+    }
+
     /// Walk generation `no`'s log from after `after` through `through` into `net`.
     fn diff_log(
         &self,
@@ -741,34 +740,7 @@ impl Store {
         o: &DiffOptions,
         net: &mut Net<'_>,
     ) -> Result<u64> {
-        let hist = self.history.as_ref().expect("a persistent store");
-        // open the generation and its log under the history lock: collection takes the
-        // same lock, and an open file outlives an unlink
-        let (generation, entry, file) = {
-            let live = self.snapshot();
-            let current = commit::generation_number(&live.generation.name);
-            let mut h = hist.lock();
-            let Some(entry) = h.gens.get(&no).cloned() else {
-                return Err(Error::Corrupt(format!(
-                    "generation {no} was collected during a diff; retry"
-                )));
-            };
-            let generation = if no == current {
-                live.generation.clone()
-            } else if let Some(i) = h.open.iter().position(|(n, _)| *n == no) {
-                let e = h.open.remove(i);
-                let g = e.1.clone();
-                h.open.insert(0, e);
-                g
-            } else {
-                let g = Arc::new(Generation::open_sealed(&entry.dir, &entry.name)?);
-                h.open.insert(0, (no, g.clone()));
-                h.open.truncate(2);
-                g
-            };
-            let file = File::open(entry.dir.join("wal.log"))?;
-            (generation, entry, file)
-        };
+        let (generation, mut cursor) = self.open_log(no, after)?;
         let gid = match &o.graph {
             Some(g) => match graph_id(&generation, g) {
                 Some(i) => Some(i),
@@ -778,34 +750,24 @@ impl Store {
             None => None,
         };
         let mut local: FxHashMap<[Id; 4], bool> = FxHashMap::default();
-        let path = entry.dir.join("wal.log");
-        let changes = walk_wal(
-            file,
-            &path,
-            entry.base,
-            entry.fold_legacy,
-            after,
-            through,
-            o,
-            &mut |op, q| {
-                if gid.is_some_and(|g| q[3] != g) {
-                    return Ok(());
+        let changes = walk_wal(&mut cursor, after, through, o, &mut |op, q| {
+            if gid.is_some_and(|g| q[3] != g) {
+                return Ok(());
+            }
+            let added = op == WAL_INSERT;
+            match local.entry(q) {
+                Entry::Occupied(e) => {
+                    e.remove();
                 }
-                let added = op == WAL_INSERT;
-                match local.entry(q) {
-                    Entry::Occupied(e) => {
-                        e.remove();
-                    }
-                    Entry::Vacant(e) => {
-                        e.insert(added);
-                        if local.len() & 0xFFFF == 0 {
-                            o.over(local.len() as u64)?;
-                        }
+                Entry::Vacant(e) => {
+                    e.insert(added);
+                    if local.len() & 0xFFFF == 0 {
+                        o.over(local.len() as u64)?;
                     }
                 }
-                Ok(())
-            },
-        )?;
+            }
+            Ok(())
+        })?;
         let mut keys = Keys::new(&generation);
         for (q, added) in local {
             net.toggle(keys.quad(&q)?, added)?;

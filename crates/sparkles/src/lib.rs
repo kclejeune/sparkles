@@ -15,6 +15,7 @@ pub mod index;
 pub mod io;
 pub mod nesting;
 pub mod outbound;
+pub mod patch;
 pub mod querybuilder;
 pub mod schema;
 pub mod sparql;
@@ -25,5 +26,5 @@ pub mod vector;
 pub mod vocab;
 pub mod xsd;
 
-pub use dataset::{Dataset, GraphView, Solution, Solutions, Transaction};
+pub use dataset::{Dataset, GraphView, QuadIter, Solution, Solutions, Transaction};
 pub use error::{Budget, BudgetKind, Error, Result};

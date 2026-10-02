@@ -16,13 +16,19 @@
 //! every result the write can add or remove; the results at every other focus node are
 //! the same before and after.
 //!
+//! A SHACL-SPARQL constraint or component reads what its query's patterns match from the
+//! focus node, when every pattern is anchored there ([`crate::localize`]). A
+//! `sh:targetWhere` target reads what conformance to its shape reads at the focus node,
+//! and every edge of the node when the shape does not narrow the nodes that may conform
+//! (membership in the data graph's nodes then decides).
+//!
 //! Shapes this cannot localize are validated in full: shapes with SHACL-SPARQL
-//! constraints or components (they may read anything), and shapes that reach a
+//! constraints or components whose queries may read anything, and shapes that reach a
 //! reference cycle (recursive shapes).
 
 use crate::data::DataGraph;
 use crate::path::{CPath, PropertyPath};
-use crate::shapes::{Constraint, ShapeId, Shapes, Target};
+use crate::shapes::{Candidates, Constraint, ShapeId, Shapes, Target};
 use crate::vocab::{rdf, rdfs};
 use oxrdf::{NamedNode, Term};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -37,9 +43,11 @@ pub enum Fallback {
     Baseline,
     /// the shapes changed
     Shapes,
-    /// `rdfs:subClassOf` changed while a shape reads classes
+    /// `rdfs:subClassOf` changed while a shape reads classes, and the classes it changes
+    /// have too many instances
     Subclass,
-    /// a shape has a SHACL-SPARQL constraint or component
+    /// a shape has a SHACL-SPARQL constraint or component whose query is not anchored at
+    /// the focus node
     Sparql,
     /// a shape reaches a reference cycle
     Recursive,
@@ -100,7 +108,7 @@ impl Default for Tuning {
 
 /// Which side of a changed edge a dependency reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Dir {
+pub(crate) enum Dir {
     Out,
     In,
 }
@@ -113,6 +121,16 @@ struct Dep {
     /// `None`: every predicate
     pred: Option<NamedNode>,
     dir: Dir,
+}
+
+impl From<crate::localize::Read> for Dep {
+    fn from(r: crate::localize::Read) -> Dep {
+        Dep {
+            prefix: r.prefix,
+            pred: r.pred,
+            dir: if r.out { Dir::Out } else { Dir::In },
+        }
+    }
 }
 
 /// Predicates a group of dependencies reads.
@@ -236,7 +254,22 @@ impl Analyzer<'_> {
                     nested.push(q.shape);
                     nested.extend(&q.siblings);
                 }
-                Constraint::Sparql(_) | Constraint::Component(_) => return Err(Fallback::Sparql),
+                // a query anchored at the focus node reads its neighbourhood
+                Constraint::Sparql(c) => {
+                    let reads = crate::localize::reads(&c.parsed, &[("this", Vec::new())])
+                        .ok_or(Fallback::Sparql)?;
+                    out.extend(reads.into_iter().map(Dep::from));
+                }
+                Constraint::Component(c) => {
+                    let mut anchors = vec![("this", Vec::new())];
+                    if c.ask {
+                        // `$value` is each value node
+                        anchors.push(("value", path.clone()));
+                    }
+                    let reads =
+                        crate::localize::reads(&c.parsed, &anchors).ok_or(Fallback::Sparql)?;
+                    out.extend(reads.into_iter().map(Dep::from));
+                }
                 // these depend on the value nodes alone
                 Constraint::Datatype(_)
                 | Constraint::NodeKind(_)
@@ -273,7 +306,7 @@ impl Analyzer<'_> {
 }
 
 /// Push inverses down to the predicates (`^(a/b)` is `^b/^a`).
-fn nnf(p: &PropertyPath, inv: bool) -> PropertyPath {
+pub(crate) fn nnf(p: &PropertyPath, inv: bool) -> PropertyPath {
     use PropertyPath as P;
     let b = |x: &PropertyPath| Box::new(nnf(x, inv));
     match p {
@@ -296,7 +329,7 @@ fn nnf(p: &PropertyPath, inv: bool) -> PropertyPath {
 
 /// The edges evaluating a path (in negation normal form) reads: `(prefix, p, dir)` for
 /// each predicate step, where `prefix` reaches the node whose `p` edges it follows.
-fn steps(p: &PropertyPath) -> Vec<(Vec<PropertyPath>, NamedNode, Dir)> {
+pub(crate) fn steps(p: &PropertyPath) -> Vec<(Vec<PropertyPath>, NamedNode, Dir)> {
     use PropertyPath as P;
     match p {
         P::Predicate(n) => vec![(Vec::new(), n.clone(), Dir::Out)],
@@ -349,9 +382,34 @@ impl Model {
             let plan = match a.deps(si) {
                 Ok(mut deps) => {
                     // the targets read the focus node's own edges
+                    let mut global = None;
                     for t in &shape.targets {
                         let (pred, dir) = match *t {
                             Target::Node(_) => continue,
+                            // membership reads what conformance to the shape reads, and
+                            // being a node of the data graph reads every edge of the node
+                            Target::Where(w) => {
+                                match a.deps(w) {
+                                    Ok(d) => deps.extend(d),
+                                    Err(f) => {
+                                        global = Some(f);
+                                        break;
+                                    }
+                                }
+                                if matches!(
+                                    shapes.candidates(w),
+                                    Candidates::All | Candidates::Terms(_)
+                                ) {
+                                    for dir in [Dir::Out, Dir::In] {
+                                        deps.push(Dep {
+                                            prefix: Vec::new(),
+                                            pred: None,
+                                            dir,
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
                             Target::Class(_) => {
                                 a.uses_classes = true;
                                 (Some(rdf::TYPE.into_owned()), Dir::Out)
@@ -368,7 +426,13 @@ impl Model {
                             });
                         }
                     }
-                    Plan::Local(group(deps, &mut reads))
+                    match global {
+                        Some(f) => {
+                            reads = None;
+                            Plan::Global(f)
+                        }
+                        None => Plan::Local(group(deps, &mut reads)),
+                    }
                 }
                 Err(f) => {
                     reads = None;
@@ -402,8 +466,8 @@ impl Model {
         self.plans.get(si).is_some_and(Option::is_some)
     }
 
-    /// Some localized shape reads classes (a change to `rdfs:subClassOf` is then
-    /// validated in full).
+    /// Some localized shape reads classes: a change to `rdfs:subClassOf` then affects
+    /// the instances of the classes whose subclasses it changes.
     pub fn uses_classes(&self) -> bool {
         self.uses_classes
     }
@@ -618,9 +682,23 @@ mod tests {
         let (s, m) = model(
             "ex:R a sh:NodeShape ; sh:targetNode ex:x ; sh:property [ sh:path ex:p ; sh:node ex:R ] .
              ex:Q a sh:NodeShape ; sh:targetNode ex:y ;
-               sh:sparql [ sh:select \"SELECT $this WHERE { }\" ] .
+               sh:sparql [ sh:select \"SELECT $this WHERE { ?x <http://ex.org/p> ?y }\" ] .
+             ex:L a sh:NodeShape ; sh:targetNode ex:y ;
+               sh:sparql [ sh:select \"SELECT $this WHERE { $this <http://ex.org/k> ?k . ?o <http://ex.org/k> ?k }\" ] .
+             ex:W a sh:NodeShape ;
+               sh:targetWhere [ sh:property [ sh:path ex:age ; sh:minCount 1 ] ] .
              ex:Z a sh:NodeShape ; sh:targetNode ex:z ; sh:closed true .",
         );
+        // an anchored query reads ex:k at the focus node and at its ex:k values
+        let Plan::Local(groups) = plan_of(&s, &m, "http://ex.org/L") else {
+            panic!("local")
+        };
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        // a where target reads what the where shape reads
+        let Plan::Local(groups) = plan_of(&s, &m, "http://ex.org/W") else {
+            panic!("local")
+        };
+        assert_eq!(groups[0].out.set.len(), 1, "{groups:?}");
         assert!(matches!(
             plan_of(&s, &m, "http://ex.org/R"),
             Plan::Global(Fallback::Recursive)

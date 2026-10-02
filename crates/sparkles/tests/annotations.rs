@@ -372,3 +372,107 @@ fn concurrent_writers_with_the_same_precondition_commit_once() {
     assert_eq!((ok, failed), (1, 7));
     assert_eq!(s.head_commit().seq, 1);
 }
+
+/// The catalog horizon prunes the records and annotations of commits older than both
+/// the readable history and the horizon; numbers stay monotonic, digests keep chaining,
+/// and the pruned files survive a reopen, a check and a backup.
+#[test]
+fn the_catalog_horizon_prunes_old_commits() {
+    use sparkles::history::{At, CatalogHorizon};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let opts = StoreOptions {
+        commit_digests: true,
+        ..Default::default()
+    };
+    let s = Store::open(&root, opts.clone()).unwrap();
+    for i in 1..=30 {
+        upd_with(
+            &s,
+            &format!("INSERT DATA {{ <urn:s{i}> <urn:p> {i} }}"),
+            with_message(&format!("write {i}")),
+        )
+        .unwrap();
+    }
+    // every commit is readable: the horizon prunes nothing
+    let h = s
+        .set_catalog_horizon(CatalogHorizon {
+            keep_commits: Some(5),
+            keep_age_ms: None,
+        })
+        .unwrap();
+    assert_eq!(h.first_commit, 0);
+    // a pin keeps its generation, so every commit of it, readable through a compaction
+    s.create_snapshot("keep", &At::Commit(20), None).unwrap();
+    s.compact().unwrap();
+    assert_eq!(s.prune_commits().unwrap(), 0);
+    assert_eq!(s.history().reconstructable, [(0, 30)]);
+    // without the pin only the head is readable, and the horizon of five commits decides
+    assert!(s.delete_snapshot("keep").unwrap());
+    assert_eq!(s.history().reconstructable, [(30, 30)]);
+    assert_eq!(s.prune_commits().unwrap(), 26);
+    assert_eq!(s.history().first_commit, 26);
+    assert!(s.commit(25).is_none() && s.commit(26).is_some());
+    assert_eq!(message(&s, 25), None);
+    assert_eq!(message(&s, 26).as_deref(), Some("write 26"));
+    assert!(matches!(
+        s.snapshot_at(&At::Commit(3), &Default::default()),
+        Err(Error::HistoryGone(_))
+    ));
+    let page = s.commits(sparkles::commit::CommitRange::After(0), 100);
+    assert_eq!(page.first_retained, 26);
+    assert_eq!(page.commits.first().map(|c| c.seq), Some(26));
+    // the history tick waits for more to prune
+    let parent = s.annotation(30).unwrap().digest.unwrap();
+    let r = upd_with(
+        &s,
+        "INSERT DATA { <urn:t> <urn:p> 1 }",
+        with_message("after"),
+    )
+    .unwrap();
+    assert_eq!(r.commit.seq, 31);
+    assert!(r.annotation.digest.is_some());
+    assert_eq!(s.history_tick().unwrap().pruned, 0);
+    drop(s);
+    // offline readers and a reopen see the pruned files
+    let (_, recs) = sparkles::commit::read_catalog(&root.join("commits.bin"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(recs.first().map(|c| c.seq), Some(26));
+    assert_eq!(annotations::read(&root).unwrap().keys().next(), Some(&26));
+    let report = sparkles::check::check(&root, &Default::default()).unwrap();
+    assert_eq!(report.errors, 0, "{:?}", report.checks);
+    let s = Store::open(&root, opts.clone()).unwrap();
+    assert_eq!(s.history().first_commit, 26);
+    assert_eq!(
+        s.history().catalog,
+        CatalogHorizon {
+            keep_commits: Some(5),
+            keep_age_ms: None
+        }
+    );
+    assert_eq!(message(&s, 31).as_deref(), Some("after"));
+    assert_eq!(s.annotation(30).unwrap().digest, Some(parent));
+    let r = upd_with(&s, "INSERT DATA { <urn:u> <urn:p> 1 }", Default::default()).unwrap();
+    assert_eq!(r.commit.seq, 32);
+    // a backup of a pruned catalog restores
+    let c = s.backup_capture("b").unwrap();
+    let out = dir.path().join("restored");
+    c.write_to(&out).unwrap();
+    drop(c);
+    let r = Store::open(&out, opts).unwrap();
+    assert_eq!(r.head_commit().seq, 32);
+    assert_eq!(r.history().first_commit, 26);
+    // off: nothing more is pruned
+    s.set_catalog_horizon(CatalogHorizon::default()).unwrap();
+    for i in 0..10 {
+        upd_with(
+            &s,
+            &format!("INSERT DATA {{ <urn:v{i}> <urn:p> 1 }}"),
+            Default::default(),
+        )
+        .unwrap();
+    }
+    s.compact().unwrap();
+    assert_eq!(s.prune_commits().unwrap(), 0);
+}

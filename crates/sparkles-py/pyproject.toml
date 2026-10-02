@@ -1,0 +1,34 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "sparkles-rdf"
+description = "An embedded RDF database with SPARQL 1.2, reasoning and SHACL and ShEx validation (Python bindings for Sparkles)"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES.md"]
+keywords = ["rdf", "sparql", "database", "linked-data", "shacl", "shex"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/kclejeune/sparkles"
+Documentation = "https://github.com/kclejeune/sparkles/blob/main/docs/USAGE.md#python"
+
+[tool.maturin]
+python-source = "python"
+module-name = "sparkles._sparkles"
+# the extension module links libpython's symbols at load time (abi3, PEP 384)
+bindings = "pyo3"
+strip = true

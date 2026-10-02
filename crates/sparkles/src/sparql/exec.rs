@@ -436,6 +436,11 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             counters = Some(c);
             t
         }
+        Kind::HybridSearch(spec) => {
+            let (t, c) = super::hybrid::search(ctx, spec, &n.vars)?;
+            counters = Some(c);
+            t
+        }
         Kind::SpatialScan(spec) => {
             let (t, c) = spatial_scan(ctx, spec, &n.vars)?;
             counters = Some(c);
@@ -3973,7 +3978,7 @@ const MAX_QUERY_VECTORS: usize = 1000;
 /// Top-k vector search (`spk:vectorSearch`). With `input` (a variable query or
 /// `candidates:join`), the search runs once per distinct query and joins with the input
 /// rows; else it is a leaf.
-fn vector_search(
+pub(super) fn vector_search(
     ctx: &Ctx,
     spec: &super::plan::VectorSpec,
     input: Option<Table>,
