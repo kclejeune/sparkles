@@ -11,7 +11,8 @@
 //! marked [`Basis::UsesInferences`].
 
 use crate::INFERRED_GRAPH;
-use oxrdf::{NamedNode, Term, Triple};
+use oxrdf::vocab::{rdf, xsd};
+use oxrdf::{BlankNode, Literal, NamedNode, Term, Triple};
 use serde_json::{Value as J, json};
 use sparkles::Error;
 use sparkles::sparql::QueryOptions;
@@ -23,6 +24,8 @@ use std::time::{Duration, Instant};
 
 const OWL_NOTHING: &str = "http://www.w3.org/2002/07/owl#Nothing";
 const OWL_THING: &str = "http://www.w3.org/2002/07/owl#Thing";
+const OWL_MEMBERS: &str = "http://www.w3.org/2002/07/owl#members";
+const OWL_TARGET_INDIVIDUAL: &str = "http://www.w3.org/2002/07/owl#targetIndividual";
 
 /// The note every report carries.
 pub const NOTE: &str = "Checks a fixed subset of OWL 2 RL inconsistency rules; 'none-found' does not establish OWL consistency.";
@@ -106,16 +109,70 @@ pub const CHECKS: &[Check] = &[
         query: include_str!("../diagnostics/all-disjoint-classes.rq"),
     },
     Check {
+        id: "complement-classes",
+        rules: &["cls-com", "cax-sco"],
+        severity: Severity::Inconsistency,
+        query: include_str!("../diagnostics/complement-classes.rq"),
+    },
+    Check {
+        id: "max-cardinality-zero",
+        rules: &["cls-maxc1", "cax-sco"],
+        severity: Severity::Inconsistency,
+        query: include_str!("../diagnostics/max-cardinality-zero.rq"),
+    },
+    Check {
+        id: "max-qualified-cardinality-zero",
+        rules: &["cls-maxqc1", "cls-maxqc2", "cax-sco"],
+        severity: Severity::Inconsistency,
+        query: include_str!("../diagnostics/max-qualified-cardinality-zero.rq"),
+    },
+    Check {
         id: "same-different",
         rules: &["eq-diff1", "eq-ref", "eq-sym", "eq-trans"],
         severity: Severity::Inconsistency,
         query: include_str!("../diagnostics/same-different.rq"),
     },
     Check {
+        id: "all-different",
+        rules: &["eq-diff2", "eq-diff3", "eq-ref", "eq-sym", "eq-trans"],
+        severity: Severity::Inconsistency,
+        query: include_str!("../diagnostics/all-different.rq"),
+    },
+    Check {
         id: "functional-literal-conflict",
         rules: &["prp-fp", "dt-diff", "eq-diff1"],
         severity: Severity::Inconsistency,
         query: include_str!("../diagnostics/functional-literal-conflict.rq"),
+    },
+    Check {
+        id: "irreflexive-property",
+        rules: &["prp-irp"],
+        severity: Severity::Inconsistency,
+        query: include_str!("../diagnostics/irreflexive-property.rq"),
+    },
+    Check {
+        id: "asymmetric-property",
+        rules: &["prp-asyp"],
+        severity: Severity::Inconsistency,
+        query: include_str!("../diagnostics/asymmetric-property.rq"),
+    },
+    Check {
+        id: "disjoint-properties",
+        rules: &["prp-pdw"],
+        severity: Severity::Inconsistency,
+        query: include_str!("../diagnostics/disjoint-properties.rq"),
+    },
+    Check {
+        id: "all-disjoint-properties",
+        rules: &["prp-adp"],
+        severity: Severity::Inconsistency,
+        query: include_str!("../diagnostics/all-disjoint-properties.rq"),
+    },
+    Check {
+        id: "negative-property-assertion",
+        rules: &["prp-npa1", "prp-npa2"],
+        severity: Severity::Inconsistency,
+        query: include_str!("../diagnostics/negative-property-assertion.rq"),
     },
     Check {
         id: "thing-empty",
@@ -335,6 +392,166 @@ impl DiagnosticsReport {
             "findings": findings,
         })
     }
+
+    /// The report as RDF: one `spk:DiagnosticsReport` (`spk:` is `urn:x-sparkles:`)
+    /// whose findings use the SHACL result properties (`sh:focusNode`,
+    /// `sh:resultSeverity`, `sh:resultMessage`, `sh:sourceConstraintComponent`). There is
+    /// no `sh:conforms`: finding nothing does not establish consistency.
+    pub fn to_rdf(&self, ctx: &ReportContext<'_>) -> Vec<Triple> {
+        let mut out = Vec::new();
+        let mut add = |s: &BlankNode, p: NamedNode, o: Term| out.push(Triple::new(s.clone(), p, o));
+        let report = BlankNode::default();
+        let s = |v: &str| Term::Literal(Literal::new_simple_literal(v));
+        let int = |v: u64| Term::Literal(Literal::new_typed_literal(v.to_string(), xsd::INTEGER));
+        let bool_ = |v: bool| Term::Literal(Literal::from(v));
+        add(
+            &report,
+            rdf::TYPE.into_owned(),
+            spk("DiagnosticsReport").into(),
+        );
+        if let Some(d) = ctx.dataset {
+            add(&report, spk("dataset"), s(d));
+        }
+        add(&report, spk("commit"), int(self.commit));
+        add(
+            &report,
+            spk("computedAt"),
+            Literal::new_typed_literal(&self.computed_at, xsd::DATE_TIME).into(),
+        );
+        add(&report, spk("status"), s(self.status.name()));
+        add(&report, spk("note"), s(NOTE));
+        add(&report, spk("closure"), s(self.closure.name()));
+        add(&report, spk("inferencesIncluded"), bool_(self.inferences));
+        if self.inferences {
+            if let Some(p) = ctx.profile {
+                add(&report, spk("inferencesProfile"), s(p));
+            }
+            if let Some(stale) = ctx.stale {
+                add(&report, spk("inferencesStale"), bool_(stale));
+            }
+            if let Some(n) = ctx.commits_since {
+                add(&report, spk("commitsSince"), int(n));
+            }
+        }
+        for c in &self.checks {
+            let node = BlankNode::default();
+            add(&report, spk("check"), node.clone().into());
+            add(&node, spk("id"), s(c.id));
+            for r in c.rules {
+                add(&node, spk("rule"), s(r));
+            }
+            add(&node, spk("severity"), s(c.severity.name()));
+            add(&node, spk("status"), s(c.status.name()));
+            add(&node, spk("findings"), int(c.findings as u64));
+            add(&node, spk("millis"), int(c.millis));
+            if let Some(e) = &c.error {
+                add(&node, spk("error"), s(e));
+            }
+        }
+        let mut lists = Vec::new();
+        for f in &self.findings {
+            let node = BlankNode::default();
+            add(&report, sh("result"), node.clone().into());
+            add(&node, rdf::TYPE.into_owned(), spk("Finding").into());
+            add(&node, sh("focusNode"), f.focus.clone());
+            let severity = match f.severity {
+                Severity::Inconsistency => "Violation",
+                Severity::Warning => "Warning",
+            };
+            add(&node, sh("resultSeverity"), sh(severity).into());
+            add(&node, sh("resultMessage"), s(&f.message));
+            add(
+                &node,
+                sh("sourceConstraintComponent"),
+                spk(&format!("check:{}", f.check)).into(),
+            );
+            add(&node, spk("rule"), s(f.rule));
+            add(&node, spk("basis"), s(f.basis.name()));
+            for (k, v) in &f.evidence {
+                let o = match v {
+                    Evidence::One(t) => t.clone(),
+                    Evidence::Many(ts) if ts.is_empty() => rdf::NIL.into_owned().into(),
+                    Evidence::Many(ts) => {
+                        let head = BlankNode::default();
+                        lists.push((head.clone(), ts.clone()));
+                        head.into()
+                    }
+                };
+                add(&node, spk(k), o);
+            }
+        }
+        // the evidence lists, as RDF collections
+        for (head, items) in lists {
+            let mut cur = head;
+            for (i, t) in items.iter().enumerate() {
+                add(&cur, rdf::FIRST.into_owned(), t.clone());
+                if i + 1 == items.len() {
+                    add(&cur, rdf::REST.into_owned(), rdf::NIL.into_owned().into());
+                } else {
+                    let next = BlankNode::default();
+                    add(&cur, rdf::REST.into_owned(), next.clone().into());
+                    cur = next;
+                }
+            }
+        }
+        out
+    }
+
+    /// Turtle serialization of [`to_rdf`](Self::to_rdf), with the `sh:`, `spk:`, `rdf:`
+    /// and `xsd:` prefixes and the context's prefixes.
+    pub fn to_turtle(&self, ctx: &ReportContext<'_>) -> String {
+        let mut ser = oxttl::TurtleSerializer::new();
+        let fixed = [
+            ("sh", SH),
+            ("spk", SPK),
+            ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+            ("xsd", "http://www.w3.org/2001/XMLSchema#"),
+        ];
+        for (p, ns) in fixed {
+            ser = ser.with_prefix(p, ns).expect("valid prefix");
+        }
+        for (p, ns) in ctx.prefixes {
+            if fixed.iter().any(|(f, _)| f == p) {
+                continue;
+            }
+            // a prefix the serializer rejects is left out
+            if let Ok(s) = ser.clone().with_prefix(p, ns) {
+                ser = s;
+            }
+        }
+        let mut w = ser.for_writer(Vec::new());
+        for t in self.to_rdf(ctx) {
+            w.serialize_triple(&t)
+                .expect("writing to a Vec cannot fail");
+        }
+        String::from_utf8(w.finish().expect("writing to a Vec cannot fail"))
+            .expect("Turtle is UTF-8")
+    }
+}
+
+/// What the caller knows beyond the report itself, for its RDF form.
+#[derive(Clone, Debug, Default)]
+pub struct ReportContext<'a> {
+    pub dataset: Option<&'a str>,
+    /// the profile of the included inferences
+    pub profile: Option<&'a str>,
+    /// their freshness (`None` when unknown)
+    pub stale: Option<bool>,
+    pub commits_since: Option<u64>,
+    /// prefixes for the Turtle output
+    pub prefixes: &'a [(String, String)],
+}
+
+/// Namespace of the report vocabulary.
+pub const SPK: &str = "urn:x-sparkles:";
+const SH: &str = "http://www.w3.org/ns/shacl#";
+
+fn spk(local: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("{SPK}{local}"))
+}
+
+fn sh(local: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("{SH}{local}"))
 }
 
 /// Run the checks on one snapshot. Unknown check ids are an error; a failing or timed
@@ -541,6 +758,20 @@ impl Run<'_> {
             }
             "thing-empty" => format!("{} {} {}", t("s")?, t("p")?, t("o")?),
             "unsatisfiable-class" => t("c")?,
+            "complement-classes" => format!("{} {}", t("x")?, pair("c1", "c2")?),
+            "max-cardinality-zero" | "max-qualified-cardinality-zero" => {
+                format!("{} {}", t("r")?, t("x")?)
+            }
+            "all-different" => format!("{} {}", t("d")?, pair("x", "y")?),
+            "irreflexive-property" => format!("{} {}", t("x")?, t("p")?),
+            "asymmetric-property" => format!("{} {}", t("p")?, pair("x", "y")?),
+            "disjoint-properties" => {
+                format!("{} {} {}", t("x")?, t("y")?, pair("p1", "p2")?)
+            }
+            "all-disjoint-properties" => {
+                format!("{} {} {} {}", t("d")?, t("x")?, t("y")?, pair("p1", "p2")?)
+            }
+            "negative-property-assertion" => t("a")?,
             _ => return None,
         })
     }
@@ -556,6 +787,8 @@ impl Run<'_> {
             }
         };
         let n = |t: &Term| self.names.show(t);
+        let is = |t: &Term, iri: &str| matches!(t, Term::NamedNode(x) if x.as_str() == iri);
+        let mut rule = self.check.rules[0];
         let (focus, evidence, message) = match self.check.id {
             "nothing-member" => {
                 let (Some(x), Some(_)) = (get("x"), get("type")) else {
@@ -695,11 +928,206 @@ impl Run<'_> {
                 );
                 (c, vec![("path", Evidence::Many(path))], msg)
             }
+            "complement-classes" => {
+                let (Some(x), Some(c1), Some(c2)) = (get("x"), get("c1"), get("c2")) else {
+                    return Ok(None);
+                };
+                let msg = if c1 == c2 {
+                    format!(
+                        "{} is an instance of {}, which is declared the complement of itself",
+                        n(&x),
+                        n(&c1)
+                    )
+                } else {
+                    format!(
+                        "{} is an instance of both {} and its complement {}",
+                        n(&x),
+                        n(&c1),
+                        n(&c2)
+                    )
+                };
+                (x, vec![("classes", Evidence::Many(sorted(c1, c2)))], msg)
+            }
+            "max-cardinality-zero" | "max-qualified-cardinality-zero" => {
+                let (Some(r), Some(x), Some(p), Some(y)) = (get("r"), get("x"), get("p"), get("y"))
+                else {
+                    return Ok(None);
+                };
+                let mut evidence = vec![
+                    ("restriction", Evidence::One(r.clone())),
+                    ("property", Evidence::One(p.clone())),
+                ];
+                let msg = match get("c") {
+                    Some(c) => {
+                        let thing = is(&c, OWL_THING);
+                        if thing {
+                            rule = "cls-maxqc2";
+                        }
+                        let what = if thing {
+                            String::new()
+                        } else {
+                            format!(" of class {}", n(&c))
+                        };
+                        evidence.push(("class", Evidence::One(c)));
+                        format!(
+                            "{} has the value {}{what} for {}, but its type {} allows none (owl:maxQualifiedCardinality 0)",
+                            n(&x),
+                            n(&y),
+                            n(&p),
+                            n(&r)
+                        )
+                    }
+                    None => format!(
+                        "{} has the value {} for {}, but its type {} allows none (owl:maxCardinality 0)",
+                        n(&x),
+                        n(&y),
+                        n(&p),
+                        n(&r)
+                    ),
+                };
+                evidence.push(("value", Evidence::One(y)));
+                (x, evidence, msg)
+            }
+            "all-different" => {
+                let (Some(d), Some(m), Some(x), Some(y)) = (get("d"), get("m"), get("x"), get("y"))
+                else {
+                    return Ok(None);
+                };
+                if !is(&m, OWL_MEMBERS) {
+                    rule = "eq-diff3";
+                }
+                let msg = if x == y {
+                    format!(
+                        "{} is listed twice in the owl:AllDifferent axiom {}",
+                        n(&x),
+                        n(&d)
+                    )
+                } else {
+                    format!(
+                        "{} and {} are declared different by {} but are the same individual (owl:sameAs)",
+                        n(&x),
+                        n(&y),
+                        n(&d)
+                    )
+                };
+                let both = sorted(x, y);
+                (
+                    both[0].clone(),
+                    vec![
+                        ("axiom", Evidence::One(d)),
+                        ("individuals", Evidence::Many(both)),
+                    ],
+                    msg,
+                )
+            }
+            "irreflexive-property" => {
+                let (Some(x), Some(p)) = (get("x"), get("p")) else {
+                    return Ok(None);
+                };
+                let msg = format!(
+                    "{} is related to itself by the irreflexive property {}",
+                    n(&x),
+                    n(&p)
+                );
+                (x, vec![("property", Evidence::One(p))], msg)
+            }
+            "asymmetric-property" => {
+                let (Some(x), Some(p), Some(y)) = (get("x"), get("p"), get("y")) else {
+                    return Ok(None);
+                };
+                let both = sorted(x, y);
+                let (x, y) = (both[0].clone(), both[1].clone());
+                let msg = if x == y {
+                    format!(
+                        "{} is related to itself by the asymmetric property {}",
+                        n(&x),
+                        n(&p)
+                    )
+                } else {
+                    format!(
+                        "{} and {} are related in both directions by the asymmetric property {}",
+                        n(&x),
+                        n(&y),
+                        n(&p)
+                    )
+                };
+                (
+                    x,
+                    vec![("property", Evidence::One(p)), ("other", Evidence::One(y))],
+                    msg,
+                )
+            }
+            "disjoint-properties" | "all-disjoint-properties" => {
+                let (Some(x), Some(y), Some(p1), Some(p2)) =
+                    (get("x"), get("y"), get("p1"), get("p2"))
+                else {
+                    return Ok(None);
+                };
+                let axiom = get("d");
+                let declared = match &axiom {
+                    Some(d) => format!("{} declares pairwise disjoint", n(d)),
+                    None => "are declared disjoint".to_string(),
+                };
+                let msg = if p1 == p2 {
+                    let why = match &axiom {
+                        Some(d) => format!("{} lists twice as pairwise disjoint", n(d)),
+                        None => "is declared disjoint with itself".to_string(),
+                    };
+                    format!(
+                        "{} is related to {} by {}, which {why}",
+                        n(&x),
+                        n(&y),
+                        n(&p1)
+                    )
+                } else {
+                    let p = sorted(p1.clone(), p2.clone());
+                    format!(
+                        "{} is related to {} by both {} and {}, which {declared}",
+                        n(&x),
+                        n(&y),
+                        n(&p[0]),
+                        n(&p[1])
+                    )
+                };
+                let mut evidence = Vec::new();
+                if let Some(d) = axiom {
+                    evidence.push(("axiom", Evidence::One(d)));
+                }
+                evidence.push(("properties", Evidence::Many(sorted(p1, p2))));
+                evidence.push(("value", Evidence::One(y)));
+                (x, evidence, msg)
+            }
+            "negative-property-assertion" => {
+                let (Some(a), Some(x), Some(p), Some(t), Some(y)) =
+                    (get("a"), get("x"), get("p"), get("t"), get("y"))
+                else {
+                    return Ok(None);
+                };
+                if !is(&t, OWL_TARGET_INDIVIDUAL) {
+                    rule = "prp-npa2";
+                }
+                let msg = format!(
+                    "{} {} {} is stated, but the negative property assertion {} denies it",
+                    n(&x),
+                    n(&p),
+                    n(&y),
+                    n(&a)
+                );
+                (
+                    x,
+                    vec![
+                        ("axiom", Evidence::One(a)),
+                        ("property", Evidence::One(p)),
+                        ("target", Evidence::One(y)),
+                    ],
+                    msg,
+                )
+            }
             _ => return Ok(None),
         };
         Ok(Some(Finding {
             check: self.check.id,
-            rule: self.check.rules[0],
+            rule,
             severity: self.check.severity,
             focus,
             evidence,

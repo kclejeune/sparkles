@@ -195,6 +195,63 @@ async fn inference_freshness_lifecycle() {
 }
 
 #[tokio::test]
+async fn only_default_graph_commits_make_inferences_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let auto = || Some(AutoReason::new(Duration::ZERO, None));
+    let st = open(dir.path(), auto(), false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "ex:C rdfs:subClassOf ex:B . ex:x a ex:C .");
+    let app = router(st.clone());
+    post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+    wait_tasks(&st).await;
+    let c = get_json(&app, "/$/reason/t").await["commit"]
+        .as_u64()
+        .unwrap();
+
+    // a named graph, and the inferred graph itself: still fresh
+    update(&app, "t", "INSERT DATA { GRAPH ex:g { ex:y a ex:C } }").await;
+    update(
+        &app,
+        "t",
+        "INSERT DATA { GRAPH <urn:x-sparkles:inferred> { ex:z a ex:B } }",
+    )
+    .await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["stale"], false, "{s}");
+    assert_eq!(s["commitsSince"], 2);
+    assert_eq!(s["head"], c + 2);
+    assert!(s.get("staleReason").is_none());
+    let (_, hdr) = b_instances(&app, "t").await;
+    assert_eq!(hdr, None);
+    assert_eq!(
+        get_json(&app, "/$/datasets/t").await["reasoning"]["stale"],
+        false
+    );
+    // so automatic mode has nothing to do
+    crate::reasoning::auto_reason_tick(&st, Instant::now() + Duration::from_secs(60));
+    assert_eq!(st.tasks.lock().len(), 1);
+
+    // the same after a restart, when the flags come from the WAL and the catalog
+    drop(app);
+    drop(st);
+    let st = open(dir.path(), auto(), false);
+    let app = router(st.clone());
+    assert_eq!(get_json(&app, "/$/reason/t").await["stale"], false);
+
+    // a change to the default graph makes them stale, counting every commit since
+    update(&app, "t", "INSERT DATA { ex:w a ex:C }").await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["stale"], true);
+    assert_eq!(s["commitsSince"], 3);
+    let (_, hdr) = b_instances(&app, "t").await;
+    assert_eq!(hdr.as_deref(), Some("stale; commits-since=3"));
+    crate::reasoning::auto_reason_tick(&st, Instant::now() + Duration::from_secs(60));
+    wait_tasks(&st).await;
+    assert_eq!(st.tasks.lock().len(), 1, "an automatic run");
+    assert_eq!(get_json(&app, "/$/reason/t").await["stale"], false);
+}
+
+#[tokio::test]
 async fn legacy_or_foreign_status_is_unknown() {
     let dir = tempfile::tempdir().unwrap();
     {
@@ -346,7 +403,7 @@ async fn diagnostics_endpoint() {
     assert_eq!(r["dataset"], "t");
     assert_eq!(r["status"], "violations-found");
     assert_eq!(r["scope"]["inferences"]["included"], false);
-    assert_eq!(r["checks"].as_array().unwrap().len(), 7);
+    assert_eq!(r["checks"].as_array().unwrap().len(), 16);
     assert_eq!(r["findings"].as_array().unwrap().len(), 1);
     let f = &r["findings"][0];
     assert_eq!(f["check"], "disjoint-classes");
@@ -356,6 +413,25 @@ async fn diagnostics_endpoint() {
         f["message"],
         "ex:tom is an instance of the disjoint classes ex:Cat and ex:Dog"
     );
+    // Turtle, by Accept or by format
+    for (path, accept) in [
+        ("/$/reason/t/diagnostics", "text/turtle"),
+        ("/$/reason/t/diagnostics?format=turtle", "*/*"),
+    ] {
+        let r = send(
+            &app,
+            Request::get(path)
+                .header(header::ACCEPT, accept)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let ttl = r.text();
+        assert!(ttl.contains("spk:DiagnosticsReport"), "{ttl}");
+        assert!(ttl.contains("sh:focusNode ex:tom"), "{ttl}");
+        assert!(ttl.contains("spk:dataset \"t\""), "{ttl}");
+    }
     let r = get_json(&app, "/$/reason/t/diagnostics?closure=none").await;
     assert_eq!(r["status"], "none-found");
     let r = get_json(
@@ -384,6 +460,7 @@ async fn diagnostics_endpoint() {
         "limit=10001",
         "limit=x",
         "closure=full",
+        "format=xml",
     ] {
         let r = send(
             &app,
@@ -520,4 +597,191 @@ async fn geosparql_vocabulary_and_default_geometries() {
     let s = get_json(&app, "/$/reason/t").await;
     assert!(s.get("vocabularies").is_none() && s.get("geoDefaultGeometry").is_none());
     assert_eq!(geometries(&app, "t").await, Vec::<String>::new());
+}
+
+async fn put_auto(app: &Router, ds: &str, body: &str) -> Resp {
+    send(
+        app,
+        Request::put(format!("/$/reason/{ds}/auto"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn per_dataset_automatic_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), Some(AutoReason::per_dataset()), false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "ex:C rdfs:subClassOf ex:B . ex:x a ex:C .");
+    let app = router(st.clone());
+    // the setting lives with a recorded status
+    let r = put_auto(&app, "t", r#"{"enabled":true}"#).await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(
+        s["auto"],
+        serde_json::json!({"enabled": false, "source": "server"})
+    );
+
+    // off without a server-wide setting: a stale dataset waits
+    update(&app, "t", "INSERT DATA { ex:y a ex:C }").await;
+    crate::reasoning::auto_reason_tick(&st, Instant::now() + Duration::from_secs(60));
+    assert_eq!(st.tasks.lock().len(), 1);
+
+    for bad in [
+        r#"{"enabled":"yes"}"#,
+        r#"{"enabled":true,"debounceSeconds":-1}"#,
+        r#"{"enabled":true,"maxDelaySeconds":"soon"}"#,
+        "nope",
+    ] {
+        assert_eq!(
+            put_auto(&app, "t", bad).await.status,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    let r = put_auto(&app, "t", r#"{"enabled":true,"debounceSeconds":2}"#).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let auto = &r.json()["auto"];
+    assert_eq!(auto["enabled"], true);
+    assert_eq!(auto["source"], "dataset");
+    assert_eq!(auto["debounceSeconds"], 2.0);
+    assert_eq!(auto["maxDelaySeconds"], 24.0);
+    let file: J = serde_json::from_slice(
+        &std::fs::read(dir.path().join("databases/t/reasoning.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        file["auto"],
+        serde_json::json!({"enabled": true, "debounceSeconds": 2.0})
+    );
+
+    // the dataset's debounce applies, and the run keeps the setting
+    let t0 = Instant::now();
+    crate::reasoning::auto_reason_tick(&st, t0);
+    crate::reasoning::auto_reason_tick(&st, t0 + Duration::from_secs(1));
+    assert_eq!(st.tasks.lock().len(), 1, "within the dataset's debounce");
+    crate::reasoning::auto_reason_tick(&st, t0 + Duration::from_secs(3));
+    wait_tasks(&st).await;
+    assert_eq!(st.tasks.lock().len(), 2);
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["stale"], false);
+    assert_eq!(s["auto"]["source"], "dataset");
+
+    // the setting survives a restart; switched off, it overrides the server's
+    drop(app);
+    drop(st);
+    let st = open(
+        dir.path(),
+        Some(AutoReason::new(Duration::ZERO, None)),
+        false,
+    );
+    let app = router(st.clone());
+    assert_eq!(
+        get_json(&app, "/$/reason/t").await["auto"]["debounceSeconds"],
+        2.0
+    );
+    let r = put_auto(&app, "t", r#"{"enabled":false}"#).await;
+    assert_eq!(
+        r.json()["auto"],
+        serde_json::json!({"enabled": false, "source": "dataset"})
+    );
+    update(&app, "t", "INSERT DATA { ex:z a ex:C }").await;
+    crate::reasoning::auto_reason_tick(&st, Instant::now() + Duration::from_secs(60));
+    assert!(st.tasks.lock().is_empty());
+    // removed, the server's setting applies again
+    let r = send(
+        &app,
+        Request::delete("/$/reason/t/auto")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["auto"]["source"], "server");
+    assert_eq!(r.json()["auto"]["enabled"], true);
+    crate::reasoning::auto_reason_tick(&st, Instant::now() + Duration::from_secs(60));
+    wait_tasks(&st).await;
+    assert_eq!(st.tasks.lock().len(), 1);
+
+    // never on a read-only server
+    drop(app);
+    drop(st);
+    let st = open(dir.path(), Some(AutoReason::per_dataset()), true);
+    let r = put_auto(&router(st), "t", r#"{"enabled":true}"#).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_waiting_write_supersedes_an_automatic_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(
+        dir.path(),
+        Some(AutoReason::new(Duration::ZERO, None)),
+        false,
+    );
+    let ds = st.attach("t", DbType::Mem, None).unwrap();
+    load(&st, "t", "ex:C0 rdfs:subClassOf ex:C1 .");
+    let app = router(st.clone());
+    post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+    wait_tasks(&st).await;
+    // enough data that a run takes a while: a long subclass chain with many members
+    let mut ttl = String::new();
+    for i in 1..100 {
+        ttl.push_str(&format!("ex:C{i} rdfs:subClassOf ex:C{} .\n", i + 1));
+    }
+    for i in 0..1000 {
+        ttl.push_str(&format!("ex:i{i} a ex:C0 .\n"));
+    }
+    load(&st, "t", &ttl);
+    crate::reasoning::auto_reason_tick(&st, Instant::now());
+    let id = st.tasks.lock()[1].id.clone();
+    let task = |st: &AppState| {
+        st.tasks
+            .lock()
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+            .unwrap()
+    };
+    // once the run holds the writer lock, a write comes in
+    let t0 = Instant::now();
+    while !task(&st)
+        .message
+        .is_some_and(|m| m != "auto: loading triples")
+    {
+        assert!(t0.elapsed() < Duration::from_secs(30), "{:?}", task(&st));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let store_ds = ds.clone();
+    let writer = std::thread::spawn(move || {
+        let t = Instant::now();
+        let r = sparkles::sparql::update::update(
+            &store_ds.store,
+            "INSERT DATA { <http://ex.org/w> a <http://ex.org/C0> }",
+            &Default::default(),
+        )
+        .unwrap();
+        (r.commit.unwrap().committed, t.elapsed())
+    });
+    let (committed, waited) = tokio::task::spawn_blocking(move || writer.join().unwrap())
+        .await
+        .unwrap();
+    assert!(committed);
+    while task(&st).active() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let t = task(&st);
+    assert_eq!(t.state, "cancelled", "{t:?} (the write waited {waited:?})");
+    // still stale: the next pass starts a new run
+    assert_eq!(get_json(&app, "/$/reason/t").await["stale"], true);
+    crate::reasoning::auto_reason_tick(&st, Instant::now());
+    assert_eq!(st.tasks.lock().len(), 3);
+    let id = st.tasks.lock()[2].id.clone();
+    let _ = st.cancel_task(&id);
 }

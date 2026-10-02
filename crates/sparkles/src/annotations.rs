@@ -513,6 +513,7 @@ mod tests {
             bulk: false,
             exact: true,
             reconstructed: false,
+            default_graph: true,
         };
         let id = uuid::Uuid::nil();
         let l = |s: &str| s.to_string();

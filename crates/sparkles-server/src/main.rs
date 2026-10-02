@@ -900,7 +900,7 @@ enum Cmd {
         /// `subclass` (type tests follow rdfs:subClassOf*) or `none`
         #[arg(long, default_value = "subclass", requires = "check")]
         closure: String,
-        /// text or json
+        /// text or json (with --check also turtle)
         #[arg(long, default_value = "text")]
         format: String,
         /// Timeout of the checks in seconds
@@ -1501,6 +1501,8 @@ fn run() -> Result<()> {
                     Duration::from_secs_f64(secs),
                     max,
                 ));
+            } else if cfg!(feature = "reasoning") {
+                st.auto_reason = Some(reasoning::AutoReason::per_dataset());
             }
             let limit_sources = ratelimit::Sources {
                 file: rate_limit_config,
@@ -1539,12 +1541,13 @@ fn run() -> Result<()> {
             let st = Arc::new(st);
             otel::register_metrics(&st);
             #[cfg(feature = "reasoning")]
-            if st.auto_reason.is_some() {
-                if st.read_only {
+            if st.read_only {
+                if st.auto_reason.is_some() {
                     tracing::warn!("--auto-reason has no effect on a read-only server");
-                } else {
-                    reasoning::spawn_auto_reason(st.clone());
                 }
+            } else {
+                // the loop also serves datasets that enable automatic runs themselves
+                reasoning::spawn_auto_reason(st.clone());
             }
             for m in mem {
                 st.attach(m.trim_start_matches('/'), state::DbType::Mem, None)?;
@@ -2181,11 +2184,11 @@ fn run() -> Result<()> {
                     &extras,
                     &Default::default(),
                 )?;
-                // lets `sparkles serve` pick the inferences up for this database
-                state::write_reasoning_file(
-                    &loc,
-                    Some(&reasoning::recorded(&profile, &extras, &r, &store)),
-                )?;
+                // lets `sparkles serve` pick the inferences up for this database, with
+                // the database's automatic re-run setting kept
+                let mut info = reasoning::recorded(&profile, &extras, &r, &store);
+                info.auto = state::read_reasoning_file(&loc).and_then(|i| i.auto);
+                state::write_reasoning_file(&loc, Some(&info))?;
                 eprintln!(
                     "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>{}",
                     r.inferred,
@@ -2230,6 +2233,18 @@ fn run() -> Result<()> {
                 };
             if format == "json" {
                 println!("{}", serde_json::to_string_pretty(&j)?);
+            } else if format == "turtle" {
+                let inf = &j["scope"]["inferences"];
+                print!(
+                    "{}",
+                    report.to_turtle(&sparkles_reasoner::diagnostics::ReportContext {
+                        dataset: Some(&name),
+                        profile: inf["profile"].as_str(),
+                        stale: inf["stale"].as_bool(),
+                        commits_since: inf["commitsSince"].as_u64(),
+                        prefixes: &dopts.prefixes,
+                    })
+                );
             } else {
                 print_diagnostics(&report, &j);
             }
@@ -2476,7 +2491,7 @@ fn print_reasoning_status(loc: &std::path::Path, store: &Store, format: &str) ->
     );
     println!("head            {head}");
     let state = match (f.stale, f.commits_since) {
-        (Some(false), _) => "up to date".to_string(),
+        (Some(false), n) => reasoning::up_to_date(n),
         (Some(true), Some(n)) => {
             format!("STALE ({n} commit{} since)", if n == 1 { "" } else { "s" })
         }

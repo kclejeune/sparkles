@@ -483,13 +483,15 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Returns a `Task`. `409` while a compaction of the dataset is queued or running. |
 | POST   | `/$/backup/{ds}`             | Writes an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` with zstd level 3. A build without zstd writes gzip (`.nq.gz`). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec. The extension follows the codec, so `compression=gzip` gives Fuseki's `.nq.gz`. Levels are 0–9 for gzip, 1–19 for zstd and 0–11 for brotli. lz4 and none take no level. Any other level is a `400`. Returns a cancellable `Task` whose message gives the size and time. `409` while a backup of the dataset is queued or running. `507` when the data directory's file system has less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are described under [Backup repositories](#backup-repositories). |
-| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. `400` for an unknown profile or vocabulary. Returns a `Task`. |
+| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. `400` for an unknown profile or vocabulary. Returns a cancellable `Task`. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
+| PUT    | `/$/reason/{ds}/auto`        | *Extension.* Sets the dataset's own automatic re-runs with `{ "enabled": boolean, "debounceSeconds"?: number, "maxDelaySeconds"?: number }`. Returns the `ReasoningStatus`. `409` when nothing is recorded, `403` on a read-only server. |
+| DELETE | `/$/reason/{ds}/auto`        | *Extension.* Removes the dataset's own setting, so the server's `--auto-reason` applies again. Returns the `ReasoningStatus`. |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | DELETE | `/$/reason/{ds}`             | Drops materialized inferences. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
-| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, or an N-Quads backup. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results. Returns `{ "cleared": number /* entries */, "bytes": number }`. |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's prefixes plus well-known ones. |
 | GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. |
@@ -2211,10 +2213,14 @@ The design and its rationale are in [C08 Inference freshness and diagnostics](sp
 
 Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally. A
 materialization records the dataset id and the commit it wrote. When it changed nothing,
-it records the head it read instead. Any later commit makes the inferences **stale**,
-including commits that only touch named graphs the reasoner does not read. Compaction and
-restarts do not. A status written by an older version, or recorded for another dataset
-id, has unknown freshness (`stale: null`).
+it records the head it read instead. A later commit that changes the default graph makes
+the inferences **stale**, because the default graph is all the reasoner reads. Commits
+that change only named graphs leave them fresh, and so do changes to the inferred graph
+itself. `commitsSince` still counts every commit. Compaction and restarts change nothing.
+Each commit records whether it may have changed the default graph. A commit recorded by
+an older version, or one whose record is no longer kept, counts as a change. A status
+written by an older version, or recorded for another dataset id, has unknown freshness
+(`stale: null`).
 
 ```ts
 type ReasoningStatus = {
@@ -2224,9 +2230,12 @@ type ReasoningStatus = {
   commit: number | null;       // commit the inferences were materialized at; null = unknown
   head: number;                // current head commit
   stale: boolean | null;       // null = unknown
-  commitsSince: number | null; // head − commit; null when unknown or not comparable
+  commitsSince: number | null; // head − commit, counting every commit; null when unknown
   staleReason?: string;        // "3 commits since materialization", "store position moved backwards", …
-  auto: { enabled: boolean; debounceSeconds?: number; scheduledAt?: string /* next planned run */ };
+  auto: { enabled: boolean;
+          source: "server" | "dataset"; // --auto-reason, or the dataset's own setting
+          debounceSeconds?: number; maxDelaySeconds?: number;
+          scheduledAt?: string /* next planned run */ };
   warnings: string[];          // the last run's warnings
   vocabularies?: string[];     // built-in vocabularies added to the profile ("geosparql")
   geoDefaultGeometry?: true;   // default geometries were materialized
@@ -2248,6 +2257,20 @@ attempt waits for the next commit. Runs never start for unknown freshness, nor o
 `--read-only` servers. Each run is a full recomputation that holds the dataset's writer
 lock, so updates wait while it runs.
 
+A dataset can have its own setting, which takes precedence over the server's.
+`PUT /$/reason/{ds}/auto` with `{"enabled": true}` turns automatic runs on for that
+dataset even without `--auto-reason`, and `{"enabled": false}` turns them off. Without
+`debounceSeconds`, the dataset uses the server's debounce, or 5 seconds when the server
+has none. The maximum delay defaults to 12 × the debounce. The setting is stored in the
+dataset's `reasoning.json`, survives re-runs and restarts, and goes away with
+`DELETE /$/reason/{ds}`. `sparkles infer` keeps it too.
+
+A write that waits for the writer lock supersedes an automatic run that started after
+the debounce. The run is cancelled at its next check, the task ends `cancelled`, and the
+write goes ahead. The next run starts after the next debounce. A run forced by the
+maximum delay is never superseded, so continuous writes cannot postpone it forever. A
+`DELETE /$/tasks/{id}` cancels any reasoning run, and a cancelled run changes nothing.
+
 **Diagnostics.** `GET /$/reason/{ds}/diagnostics` runs a fixed set of checks taken from
 the OWL 2 RL rules whose conclusion is `false` (OWL 2 Profiles §4.3). Each check is one
 SPARQL query over the default graph, plus the inferences when they are included. Those
@@ -2261,19 +2284,35 @@ establish OWL consistency.
 | `reasoning` | `true` if inferences exist | Includes `urn:x-sparkles:inferred`. |
 | `closure` | `subclass` | `subclass` makes type tests follow `rdfs:subClassOf*`. `none` uses stated types only. |
 | `timeout` | server query timeout | Time budget for the whole report. |
+| `format` | `json` | `json` or `turtle`. Without it, an `Accept: text/turtle` header selects Turtle. |
 
 | Check | Rules | Severity | Query |
 |---|---|---|---|
 | `nothing-member` | `cls-nothing2` (+`cax-sco`) | inconsistency | [nothing-member.rq](../crates/sparkles-reasoner/diagnostics/nothing-member.rq) |
 | `disjoint-classes` | `cax-dw` | inconsistency | [disjoint-classes.rq](../crates/sparkles-reasoner/diagnostics/disjoint-classes.rq) |
 | `all-disjoint-classes` | `cax-adc` | inconsistency | [all-disjoint-classes.rq](../crates/sparkles-reasoner/diagnostics/all-disjoint-classes.rq) |
+| `complement-classes` | `cls-com` (+`cax-sco`) | inconsistency | [complement-classes.rq](../crates/sparkles-reasoner/diagnostics/complement-classes.rq) |
+| `max-cardinality-zero` | `cls-maxc1` (+`cax-sco`) | inconsistency | [max-cardinality-zero.rq](../crates/sparkles-reasoner/diagnostics/max-cardinality-zero.rq) |
+| `max-qualified-cardinality-zero` | `cls-maxqc1`, `cls-maxqc2` (+`cax-sco`) | inconsistency | [max-qualified-cardinality-zero.rq](../crates/sparkles-reasoner/diagnostics/max-qualified-cardinality-zero.rq) |
 | `same-different` | `eq-diff1` (+`eq-ref`, `eq-sym`, `eq-trans`) | inconsistency | [same-different.rq](../crates/sparkles-reasoner/diagnostics/same-different.rq) |
+| `all-different` | `eq-diff2`, `eq-diff3` (+`eq-ref`, `eq-sym`, `eq-trans`) | inconsistency | [all-different.rq](../crates/sparkles-reasoner/diagnostics/all-different.rq) |
 | `functional-literal-conflict` | `prp-fp`, `dt-diff`, `eq-diff1` | inconsistency | [functional-literal-conflict.rq](../crates/sparkles-reasoner/diagnostics/functional-literal-conflict.rq) |
+| `irreflexive-property` | `prp-irp` | inconsistency | [irreflexive-property.rq](../crates/sparkles-reasoner/diagnostics/irreflexive-property.rq) |
+| `asymmetric-property` | `prp-asyp` | inconsistency | [asymmetric-property.rq](../crates/sparkles-reasoner/diagnostics/asymmetric-property.rq) |
+| `disjoint-properties` | `prp-pdw` | inconsistency | [disjoint-properties.rq](../crates/sparkles-reasoner/diagnostics/disjoint-properties.rq) |
+| `all-disjoint-properties` | `prp-adp` | inconsistency | [all-disjoint-properties.rq](../crates/sparkles-reasoner/diagnostics/all-disjoint-properties.rq) |
+| `negative-property-assertion` | `prp-npa1`, `prp-npa2` | inconsistency | [negative-property-assertion.rq](../crates/sparkles-reasoner/diagnostics/negative-property-assertion.rq) |
 | `thing-empty` | `thing-nonempty`: the domain is never empty | inconsistency | [thing-empty.rq](../crates/sparkles-reasoner/diagnostics/thing-empty.rq) |
 | `unsatisfiable-class` | `lint`: a class below `owl:Nothing` without members | warning | [unsatisfiable-class.rq](../crates/sparkles-reasoner/diagnostics/unsatisfiable-class.rq) |
 
+A check that implements two rules reports the one that matched in each finding's `rule`.
+For example, `all-different` reports `eq-diff2` for `owl:members` and `eq-diff3` for
+`owl:distinctMembers`. Property assertions are matched as stated. A subproperty or
+inverse assertion counts only when the inferences are included and contain it.
+Cardinality restrictions match the value 0 of any numeric datatype.
+
 There is no unique name assumption. Two IRIs count as different individuals only through
-`owl:differentFrom`. Literal values of a functional property are compared with SPARQL
+`owl:differentFrom` or `owl:AllDifferent`. Literal values of a functional property are compared with SPARQL
 `!=`, restricted to numbers, strings, language-tagged strings and booleans, so a pair it
 cannot compare is never reported. With inferences included, each finding is re-checked
 with the same bindings over the asserted data alone. `basis` is `asserted` when the
@@ -2301,12 +2340,27 @@ type DiagnosticsReport = {
 `status` is `violations-found` when an inconsistency check has findings. Otherwise it is
 `incomplete` when a check timed out or failed, and `none-found` when none did. Warnings
 never count. A timeout marks the remaining checks `timeout`, and the request does not
-fail with `408`. Errors are `400` for an unknown check id or a bad `limit` or `closure`,
-`404` for an unknown dataset, and `501` without the `reasoning` feature. Diagnostics are
-read-only and also work on `--read-only` servers.
+fail with `408`. Errors are `400` for an unknown check id or a bad `limit`, `closure` or
+`format`, `404` for an unknown dataset, and `501` without the `reasoning` feature.
+Diagnostics are read-only and also work on `--read-only` servers.
+
+The Turtle form describes one `spk:DiagnosticsReport`, where `spk:` is `urn:x-sparkles:`.
+Each finding is an `sh:result` with the SHACL result properties `sh:focusNode`,
+`sh:resultSeverity`, `sh:resultMessage` and `sh:sourceConstraintComponent`. The last one
+names the check, as in `spk:check:disjoint-classes`. The rule, the basis and the evidence
+are `spk:` properties, and evidence with several terms is an RDF list. The report has no
+`sh:conforms`, because finding nothing does not establish consistency.
+
+```turtle
+[] a spk:DiagnosticsReport ; spk:dataset "t" ; spk:status "violations-found" ;
+   sh:result [ a spk:Finding ; sh:focusNode ex:tom ; sh:resultSeverity sh:Violation ;
+               sh:sourceConstraintComponent <urn:x-sparkles:check:disjoint-classes> ;
+               spk:rule "cax-dw" ; spk:basis "asserted" ; spk:classes ( ex:Cat ex:Dog ) ;
+               sh:resultMessage "ex:tom is an instance of the disjoint classes ex:Cat and ex:Dog" ] .
+```
 
 In the CLI, `sparkles infer --loc DB --status` prints the status.
-`sparkles infer --loc DB --check [--checks a,b] [--limit N] [--no-inferences] [--closure subclass|none] [--format text|json]`
+`sparkles infer --loc DB --check [--checks a,b] [--limit N] [--no-inferences] [--closure subclass|none] [--format text|json|turtle]`
 runs the checks, after materializing when `--profile` or `--rules` is given. It exits
 with 0 (`none-found`), 1 (`violations-found`) or 2 (`incomplete` or an error).
 `sparkles stats` shows a `reasoning` line.

@@ -1,0 +1,13 @@
+# complement-classes: an instance of a class and of its complement (OWL 2 RL cls-com).
+#
+# {TYPE} is replaced by `rdf:type` (closure=none) or `rdf:type/rdfs:subClassOf*`
+# (closure=subclass); the checker appends a LIMIT.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?x ?c1 ?c2 WHERE {
+  ?c1 owl:complementOf ?c2 .
+  ?x {TYPE} ?c1 .
+  ?x {TYPE} ?c2 .
+}

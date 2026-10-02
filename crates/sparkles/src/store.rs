@@ -38,7 +38,7 @@ use std::io::{BufWriter, Read, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Immutable base index generation.
 pub struct Generation {
@@ -789,6 +789,32 @@ struct BulkCommit {
     net_del: u64,
     /// quads in the committed snapshot the transaction started from
     start_len: u64,
+    /// the commit may change the default graph
+    default_graph: bool,
+}
+
+/// Counts a writer waiting for the writer lock while it lives.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn new(n: &'a AtomicUsize) -> Waiting<'a> {
+        n.fetch_add(1, Ordering::Relaxed);
+        Waiting(n)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether loading `sources` may write to the default graph: a quad format may hold
+/// default-graph quads, a triple format writes there unless a target graph is set.
+fn sources_reach_default_graph(sources: &[Source]) -> bool {
+    sources
+        .iter()
+        .any(|s| s.graph.is_none() || s.format.supports_datasets())
 }
 
 type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -823,6 +849,8 @@ pub struct Store {
     guard_observer: parking_lot::RwLock<Option<Arc<dyn crate::guard::GuardObserver>>>,
     /// `validation.json` asks for a guard: commits fail without one (fail closed)
     guard_required: AtomicBool,
+    /// write transactions waiting for the writer lock
+    writers_waiting: AtomicUsize,
     /// test hooks by failpoint name
     #[cfg(any(test, feature = "failpoints"))]
     failpoints: Mutex<BTreeMap<&'static str, backup::Failpoint>>,
@@ -882,6 +910,7 @@ impl Store {
             bulk: false,
             exact: true,
             reconstructed: false,
+            default_graph: true,
         };
         let store = Store {
             root: None,
@@ -922,6 +951,7 @@ impl Store {
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(false),
+            writers_waiting: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,
@@ -962,6 +992,7 @@ impl Store {
                 bulk: false,
                 exact: true,
                 reconstructed: false,
+                default_graph: true,
             };
             write_synced(
                 &dir.join("commit.json"),
@@ -1027,6 +1058,7 @@ impl Store {
                     // counts relative to an earlier commit are unknown
                     exact: prev.is_none(),
                     reconstructed: false,
+                    default_graph: true,
                 };
                 (c, true)
             }
@@ -1134,6 +1166,7 @@ impl Store {
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(guard_required_by(root)),
+            writers_waiting: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,
@@ -1731,6 +1764,14 @@ impl Store {
         self.catalog.lock().get(seq)
     }
 
+    /// Whether a commit after `after`, up to and including `at`, may have changed the
+    /// default graph. Commits that changed named graphs alone do not count. A commit
+    /// whose record is no longer retained, or was written before the flag existed,
+    /// counts as a change.
+    pub fn default_graph_changed(&self, after: u64, at: u64) -> bool {
+        self.catalog.lock().default_graph_changed(after, at)
+    }
+
     /// A page of the commit catalog.
     pub fn commits(&self, range: CommitRange, limit: usize) -> CommitPage {
         self.catalog.lock().page(range, limit)
@@ -2038,8 +2079,16 @@ impl Store {
 
     /// [`write_as`](Self::write_as) with options for the write guard.
     pub fn write_with(&self, kind: CommitKind, opts: crate::guard::WriteOptions) -> WriteTxn<'_> {
+        let waiting = Waiting::new(&self.writers_waiting);
         let guard = self.writer.lock();
+        drop(waiting);
         self.begin(guard, kind, opts)
+    }
+
+    /// Write transactions waiting for the writer lock right now. A long holder of the
+    /// lock, such as an automatic reasoning run, can give way to them.
+    pub fn writers_waiting(&self) -> usize {
+        self.writers_waiting.load(Ordering::Relaxed)
     }
 
     /// [`write_with`](Self::write_with), but a write whose `opts` are cancelled or past
@@ -2057,16 +2106,20 @@ impl Store {
     /// The writer lock, waited for in slices while `o` can be cancelled or time out.
     /// Then the write's precondition, if it has one, is checked on the head snapshot.
     fn lock_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
-        let w = if o.cancel.is_none() && o.deadline.is_none() {
-            self.writer.lock()
-        } else {
-            loop {
-                o.check()?;
-                if let Some(w) = self
-                    .writer
-                    .try_lock_for(std::time::Duration::from_millis(20))
-                {
-                    break w;
+        let w = {
+            // counted while it waits, so a long holder of the lock can give way
+            let _waiting = Waiting::new(&self.writers_waiting);
+            if o.cancel.is_none() && o.deadline.is_none() {
+                self.writer.lock()
+            } else {
+                loop {
+                    o.check()?;
+                    if let Some(w) = self
+                        .writer
+                        .try_lock_for(std::time::Duration::from_millis(20))
+                    {
+                        break w;
+                    }
                 }
             }
         };
@@ -2290,6 +2343,7 @@ impl Store {
                 kind,
                 net_del: 0,
                 start_len: snap.len(),
+                default_graph: sources_reach_default_graph(sources),
             };
             let check = Some((crate::guard::Changes::Unknown, o));
             Ok(self
@@ -2427,6 +2481,8 @@ impl Store {
             kind,
             net_del: dropped,
             start_len,
+            default_graph: graphs.contains(&Id::DEFAULT_GRAPH)
+                || sources_reach_default_graph(sources),
         };
         let check = Some((crate::guard::Changes::Unknown, o));
         let (_, r) =
@@ -2585,6 +2641,7 @@ impl Store {
                 bulk: true,
                 exact: b.net_del == 0,
                 reconstructed: false,
+                default_graph: b.default_graph,
             },
             None => w.head,
         };
@@ -2800,6 +2857,7 @@ impl Store {
             bulk: true,
             exact: true,
             reconstructed: false,
+            default_graph: true,
         };
         let forked_from = ForkedFrom {
             id: self.dataset_id,
@@ -3426,6 +3484,8 @@ impl WriteTxn<'_> {
             kind: self.kind,
             net_del: self.net_del,
             start_len: self.base.len(),
+            default_graph: self.log.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH)
+                || bulk.iter().any(|q| q[3] == Id::DEFAULT_GRAPH),
         };
         let log = std::mem::take(&mut self.log);
         let check = Some((
@@ -3491,6 +3551,7 @@ impl WriteTxn<'_> {
             bulk: false,
             exact: true,
             reconstructed: false,
+            default_graph: self.log.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH),
         };
         // the message and digest are durable before the commit is (see `annotations`)
         let annotation = self
@@ -3948,6 +4009,7 @@ pub(crate) fn replay_wal(
                     Vec::new()
                 };
                 let before = out.commits.len();
+                let default_graph = pending.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH);
                 for (op, q) in pending.drain(..) {
                     let k = Perm::Spo.to_key(&q);
                     let in_base = probe.perm(Perm::Spo).contains(cache, &k)?;
@@ -3989,6 +4051,7 @@ pub(crate) fn replay_wal(
                             bulk: false,
                             exact: true,
                             reconstructed: false,
+                            default_graph,
                         });
                     }
                     // a legacy commit record: folded into the baseline when the
@@ -4005,6 +4068,7 @@ pub(crate) fn replay_wal(
                         bulk: false,
                         exact: true,
                         reconstructed: true,
+                        default_graph,
                     }),
                 }
                 if from.keep_touched && out.commits.len() > before {

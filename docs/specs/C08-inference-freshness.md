@@ -5,8 +5,10 @@
 > **Phases:** Phase 1 shipped. It covers commit-based freshness, `GET /$/reason/{ds}`,
 > the `Sparkles-Inferences` header, re-runs, opt-in automatic re-materialization, the
 > seven diagnostics checks, `sparkles infer --status/--check` and the UI panel. It is
-> built on durable commit identity, so the §5.1 stopgap was never needed. Phase 2 and
-> Phase 3 are not built.
+> built on durable commit identity, so the §5.1 stopgap was never needed. Phase 2
+> shipped as well: staleness limited to default-graph commits, the remaining OWL 2 RL
+> checks, the Turtle report, a per-dataset auto setting and superseded automatic runs.
+> Phase 3 is not built.
 >
 > **User docs:** [API: Reasoning status and diagnostics](../API.md#reasoning-status-and-diagnostics) ·
 > [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
@@ -670,10 +672,43 @@ GeoSPARQL added the optional `vocabularies` and `geoDefaultGeometry` fields to t
 ([G01](G01-geosparql.md)). Write-time validation can refuse a reasoning run's commit and
 puts the reason in the task's error ([C10](C10-write-time-validation.md)).
 
-**Not built.** Phase 2 is not built. Staleness does not look at the graphs a commit
-touched, so any commit still makes the inferences stale. The further OWL 2 RL checks are
-missing (`prp-irp`, `prp-asyp`, `prp-pdw`, `prp-adp`, `cls-com`, `cls-maxc1`,
-`cls-maxqc1`/`2`, `eq-diff2`/`3`, `prp-npa1`/`2`). So are the Turtle rendering of the
-report, a per-dataset auto setting and superseding a running automatic run. Phase 3,
-incremental DRed-style materialization and diagnostics over chosen named graphs, is not
-built either.
+**Phase 2.** Phase 2 landed on 2026-10-02 with these parts:
+
+- **Precise staleness.** Each commit records one bit that says whether it may have
+  changed the default graph. The catalog keeps it in flag bit 3 of byte 45, set when
+  the default graph is known to be unchanged, so older records read as changed. A bulk
+  commit keeps it in `commit.json`, and replay recomputes it from the WAL's data
+  records. The WAL commit record therefore stays as CI defines it. The status is fresh
+  while no commit after the recorded one has the bit, and `commitsSince` still counts
+  every commit. Automatic runs follow the same rule.
+- **More checks.** Nine checks cover the twelve rules of §4.3's candidate list. Rules
+  that differ only in their vocabulary share a check: `all-different` reports `eq-diff2`
+  or `eq-diff3`, `max-qualified-cardinality-zero` reports `cls-maxqc1` or `cls-maxqc2`,
+  and `negative-property-assertion` reports `prp-npa1` or `prp-npa2`. List members are
+  matched by position, so a member listed twice counts as two members, as the rules
+  say. Cardinalities match the value 0 of any numeric datatype.
+- **Turtle rendering.** `format=turtle`, or an `Accept` header that prefers Turtle,
+  returns a `spk:DiagnosticsReport`. The prefix is `spk:` instead of `spx:`, because
+  `urn:x-sparkles:` already has that prefix for the vector terms ([F04](F04-vector-search.md)).
+  Findings use the SHACL result properties, and
+  `sh:sourceConstraintComponent` names the check. There is no `sh:conforms`.
+  `sparkles infer --check --format turtle` prints the same.
+- **Per-dataset auto setting.** `PUT /$/reason/{ds}/auto` stores
+  `{enabled, debounceSeconds?, maxDelaySeconds?}` in `reasoning.json`, and `DELETE`
+  removes it. It takes precedence over `--auto-reason` and also works without it, so
+  `serve` always runs the loop unless the server is read-only. Re-runs and
+  `sparkles infer` keep the setting.
+- **Superseding automatic runs.** A run holds the writer lock for its whole duration,
+  so a newer commit cannot arrive while it runs. A write that waits for the lock
+  supersedes it instead. The store counts the write transactions waiting for the lock,
+  and the task cancels the run when one waits. Only runs started after the debounce
+  yield, and a run forced by the maximum delay always finishes. Reasoning tasks also
+  accept `DELETE /$/tasks/{id}`.
+
+**Phase 2 decisions.** §6 counted commits to the inferred graph as input changes. The
+reasoner never reads that graph, and every run rewrites it, so changes to it leave the
+inferences fresh. The status does not expose an `inputCommit` field. The UI gained a
+button that turns the dataset's own automatic re-runs on or off.
+
+**Not built.** Phase 3, incremental DRed-style materialization and diagnostics over
+chosen named graphs, is not built. `dt-not-type` is still never checked.

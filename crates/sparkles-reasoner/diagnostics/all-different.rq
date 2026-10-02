@@ -1,0 +1,19 @@
+# all-different: two members of an owl:AllDifferent axiom that are the same individual
+# through owl:sameAs (OWL 2 RL eq-diff2 for owl:members, eq-diff3 for
+# owl:distinctMembers, with eq-ref, eq-sym and eq-trans).
+#
+# The members are matched by list position, so an individual listed twice is reported.
+# The checker appends a LIMIT.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?d ?m ?x ?y WHERE {
+  VALUES ?m { owl:members owl:distinctMembers }
+  ?d rdf:type owl:AllDifferent ;
+     ?m ?list .
+  ?list rdf:rest* ?n1 .
+  ?n1 rdf:first ?x ;
+      rdf:rest+ ?n2 .
+  ?n2 rdf:first ?y .
+  ?x (owl:sameAs|^owl:sameAs)* ?y .
+}
