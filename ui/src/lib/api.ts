@@ -809,10 +809,19 @@ export type ConstraintSource = {
 /** The SHACL constraints layer of the schema report: declared, never observed. */
 export type ConstraintsLayer = { sources: ConstraintSource[] };
 
+/** The state a schema report was computed at. */
+export type SchemaSnapshot = {
+  version: number;
+  /** The commit (reports since per-commit maintenance). */
+  commit?: number;
+  generation: string;
+  computedAt: string;
+};
+
 export type SchemaSummary = {
   schemaFormat: 1;
   dataset: string;
-  snapshot: { version: number; generation: string; computedAt: string };
+  snapshot: SchemaSnapshot;
   selection: {
     graph: string;
     declaredGraph: string;
@@ -2210,6 +2219,117 @@ export function draftShapesPath(ds: string, opts: DraftOptions = {}): string {
 
 export const draftShapes = (ds: string, opts: DraftOptions = {}) =>
   json<ShapesDraft>(draftShapesPath(ds, opts), { signal: opts.signal, cache: 'no-store' });
+
+// ------------------------------------------------- class profiles, schema diffs ------
+
+/** One predicate the instances of a class use. */
+export type ProfileProperty = {
+  predicate: string;
+  /** Instances with at least one value. */
+  instances: number;
+  triples: number;
+  minPerInstance: number;
+  maxPerInstance: number;
+  objects: {
+    iri?: number;
+    blank?: number;
+    tripleTerm?: number;
+    literals?: { datatype: string; triples: number }[];
+  };
+  /** The classes of the IRI and blank-node values, most triples first. */
+  objectClasses: { class: string; triples: number }[];
+};
+
+/** The profile of one class: the predicates its instances use, and those that point at them. */
+export type ClassProfile = {
+  class: string;
+  builtin: boolean;
+  instances: number;
+  properties: ProfileProperty[];
+  incoming: { predicate: string; triples: number; instances: number }[];
+};
+
+/** `GET /$/schema/{ds}/profiles`. */
+export type ClassProfiles = {
+  profileFormat: number;
+  snapshot: SchemaSnapshot;
+  selection: { graph: string; reasoning: boolean };
+  classes: ClassProfile[];
+};
+
+export type ProfileOptions = {
+  graph?: string;
+  reasoning?: boolean;
+  classes?: string[];
+  signal?: AbortSignal;
+};
+
+/** The URL of a profiles request. */
+export function schemaProfilesPath(ds: string, opts: ProfileOptions = {}): string {
+  const p = new URLSearchParams();
+  if (opts.graph && opts.graph !== 'default') p.set('graph', opts.graph);
+  if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
+  for (const c of opts.classes ?? []) p.append('class', c);
+  const s = p.toString();
+  return `/$/schema/${enc(ds)}/profiles${s ? `?${s}` : ''}`;
+}
+
+export const schemaProfiles = (ds: string, opts: ProfileOptions = {}) =>
+  json<ClassProfiles>(schemaProfilesPath(ds, opts), { signal: opts.signal, cache: 'no-store' });
+
+/** One difference of a field between two reports: a value, or members of a list. */
+export type SchemaChange =
+  | { path: string; from: unknown; to: unknown }
+  | { path: string; added: unknown[]; removed: unknown[] };
+
+export type SchemaEntryChanges<T> = {
+  added: T[];
+  removed: T[];
+  changed: { iri: string; changes: SchemaChange[] }[];
+};
+
+/** `GET /$/schema/{ds}/diff`: what changed from the report of one state to another's. */
+export type SchemaDiff = {
+  diffFormat: number;
+  from: SchemaSnapshot;
+  to: SchemaSnapshot;
+  selection: SchemaSummary['selection'];
+  counts: {
+    classesAdded: number;
+    classesRemoved: number;
+    classesChanged: number;
+    predicatesAdded: number;
+    predicatesRemoved: number;
+    predicatesChanged: number;
+  };
+  /** Changes of the totals, the hierarchy and the ontology headers. */
+  report: SchemaChange[];
+  classes: SchemaEntryChanges<SchemaClass>;
+  predicates: SchemaEntryChanges<SchemaPredicate>;
+};
+
+export type SchemaDiffOptions = {
+  /** The earlier state: `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+  from: string;
+  /** The later state (default: the head). */
+  to?: string;
+  graph?: string;
+  reasoning?: boolean;
+  signal?: AbortSignal;
+};
+
+/** The URL of a schema diff request. */
+export function schemaDiffPath(ds: string, opts: SchemaDiffOptions): string {
+  const p = new URLSearchParams();
+  p.set('from', opts.from);
+  if (opts.to) p.set('to', opts.to);
+  if (opts.graph && opts.graph !== 'default') p.set('graph', opts.graph);
+  if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
+  return `/$/schema/${enc(ds)}/diff?${p.toString()}`;
+}
+
+export const schemaDiff = (ds: string, opts: SchemaDiffOptions) =>
+  json<SchemaDiff>(schemaDiffPath(ds, opts), { signal: opts.signal, cache: 'no-store' });
 
 // ------------------------------------------------------------ stored queries ------
 

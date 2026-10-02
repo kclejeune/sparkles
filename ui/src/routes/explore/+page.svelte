@@ -15,7 +15,9 @@
   import GeoMapCard from '$components/GeoMapCard.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
   import Icon from '$components/Icon.svelte';
+  import SchemaDiffDialog from '$components/SchemaDiffDialog.svelte';
   import ShapesDraftDialog from '$components/ShapesDraftDialog.svelte';
+  import { coverage, objectKinds, valuesRange } from '$lib/schema-history';
   import SimilarPanel from '$components/SimilarPanel.svelte';
   import TermView from '$components/TermView.svelte';
   import TextSearchView from '$components/TextSearchView.svelte';
@@ -392,6 +394,13 @@
   let schemaInferences = $state(true);
   /** The "Draft shapes" dialog. */
   let draftOpen = $state(false);
+  /** The "Compare" dialog (schema diffs). */
+  let diffOpen = $state(false);
+  /** The observed profile of the selected class. */
+  let profile = $state<api.ClassProfile | null>(null);
+  let profileFor = $state<string | null>(null);
+  let profileErr = $state<string | null>(null);
+  const profileRuns = new LatestRun();
   let showBuiltinProps = $state(false);
   const hasInferences = $derived(!!app.datasets.find((d) => d.name === ds)?.reasoning);
   // A newer load (reload, other graph, dataset switch) supersedes an older one.
@@ -476,6 +485,32 @@
       range: schema.properties.filter((p) => p.ranges.includes(cls.iri)),
     };
   });
+  // the profile of the selected class, read again when the class or the selection changes
+  $effect(() => {
+    const iri = selectedClass;
+    const name = ds;
+    const key = `${name} ${schemaGraph} ${schemaInferences} ${schemaFor} ${iri}`;
+    if (!iri || !name || !schema || profileFor === key) return;
+    untrack(() => {
+      const owns = profileRuns.claim('profile');
+      profileFor = key;
+      profile = null;
+      profileErr = null;
+      api
+        .schemaProfiles(name, {
+          graph: schemaGraph,
+          reasoning: hasInferences ? schemaInferences : undefined,
+          classes: [iri],
+        })
+        .then((p) => {
+          if (owns()) profile = p.classes.find((c) => c.class === iri) ?? null;
+        })
+        .catch((e) => {
+          if (owns()) profileErr = api.errorMessage(e);
+        });
+    });
+  });
+
   const clsConstraints = $derived(
     cls && schema ? schema.constraints.filter((l) => l.class === cls.iri) : [],
   );
@@ -897,6 +932,14 @@
           >
             <Icon name="wand" size={13} /> Draft shapes
           </button>
+          <button
+            class="btn sm"
+            onclick={() => (diffOpen = true)}
+            disabled={!ds}
+            title="What changed in the schema since an earlier commit or snapshot"
+          >
+            <Icon name="clock" size={13} /> Compare
+          </button>
         </div>
         <div class="schema-tools">
           <div class="tabs" role="tablist">
@@ -1148,6 +1191,48 @@
                   >{classLabel(s)}</button
                 >{:else}<span class="faint">None</span>{/each}
             </div>
+            <h3 class="sub">
+              Used properties <span class="faint small">observed</span>
+            </h3>
+            {#if profileErr}
+              <p class="error small">{profileErr}</p>
+            {:else if !profile}
+              <p class="faint small">{cls.instances ? 'Counting…' : 'No instances.'}</p>
+            {:else}
+              {#each profile.properties as p (p.predicate)}
+                <div class="profile-line">
+                  <div class="row">
+                    <span class="t-iri mono">{displayIri(p.predicate, prefixes)}</span>
+                    <span class="faint small" title="Instances with a value"
+                      >{coverage(p, profile.instances)}</span
+                    >
+                  </div>
+                  <div class="faint small">
+                    {valuesRange(p)} per instance · {objectKinds(
+                      p,
+                      short,
+                    )}{#if p.objectClasses.length}
+                      · → {p.objectClasses
+                        .slice(0, 3)
+                        .map((k) => classLabel(k.class))
+                        .join(', ')}{/if}
+                  </div>
+                </div>
+              {:else}<p class="faint small">
+                  Its instances have no properties besides rdf:type.
+                </p>{/each}
+              {#if profile.incoming.length}
+                <h3 class="sub">Pointed at by <span class="faint small">observed</span></h3>
+                {#each profile.incoming as i (i.predicate)}
+                  <div class="prop-line">
+                    <span class="t-iri mono">{displayIri(i.predicate, prefixes)}</span>
+                    <span class="faint small"
+                      >{fmtInt(i.triples)} triples · {fmtInt(i.instances)} instances</span
+                    >
+                  </div>
+                {/each}
+              {/if}
+            {/if}
             {#if clsConstraints.length}
               <h3 class="sub">
                 Constraints <span class="faint small">declared by SHACL shapes</span>
@@ -1203,6 +1288,13 @@
     {ds}
     graph={schemaGraph}
     reasoning={hasInferences && schemaInferences}
+    {prefixes}
+  />
+  <SchemaDiffDialog
+    bind:open={diffOpen}
+    {ds}
+    graph={schemaGraph}
+    reasoning={hasInferences ? schemaInferences : undefined}
     {prefixes}
   />
 {/if}
@@ -1661,6 +1753,16 @@
   .facts dd {
     margin: 0;
     font-weight: 600;
+  }
+  .profile-line {
+    padding: 3px 0;
+    border-bottom: 1px solid var(--border);
+    overflow-wrap: anywhere;
+  }
+  .profile-line .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
   }
   .prop-line {
     display: flex;
