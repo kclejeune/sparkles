@@ -1,10 +1,14 @@
 # C13: Automatic compaction
 
-> **Status:** designed, not built
+> **Status:** implemented
+>
+> **Phases:** Phase 1 shipped: the background build with catch-up, the policy, the
+> scheduler, the settings, the status, the metrics, the CLI and the UI.
 >
 > **User docs:** [API: Automatic compaction](../API.md#automatic-compaction) ·
 > [Usage: Automatic compaction](../USAGE.md#automatic-compaction) ·
-> [Features](../FEATURES.md#storage-tdb2-equivalent)
+> [Features](../FEATURES.md#storage-tdb2-equivalent) ·
+> [Benchmarks: Automatic compaction](../BENCHMARKS.md#automatic-compaction-105m-triples)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end records how it landed.
@@ -556,4 +560,76 @@ corrections.
 
 ## Outcome
 
-Not built yet.
+**Delivered.** Phase 1 landed on 2026-10-02 in five commits: the engine (`e757d9c`), the
+server, CLI and UI (`beed225`), the docs (`7aab6ea`), and the deletion of the replaced
+generation after the lock is released (`9de1492`).
+
+* **Engine.** `store/compaction.rs` holds the policy (`CompactionPolicy`,
+  `CompactionSettings`, `CompactionMeasures`, `Trigger`), `compaction.json`, the blockers
+  the store can see, and `Store::compact_with`. `Store::compact` uses the same background
+  path, so manual compactions no longer stop writes either. `CompactOptions` sets the
+  thread count, nice 10 on Linux, an average write rate and a cancel flag, and
+  `CompactReport` gives the generation, the commits carried over, and the build, lock and
+  total times.
+* **Server.** `compaction.rs` holds the scheduler, which runs once a second, the
+  `--auto-compact-*` flags, `GET`, `PUT` and `DELETE /$/compaction/{ds}`, `compaction` in
+  `/$/stats`, and the metrics. `POST /$/compact/{ds}` starts the same task, which is now
+  cancellable. An in-place restore cancels a running compaction of its dataset.
+* **CLI.** `sparkles compaction` shows and changes a dataset's settings, locally or on a
+  `--server`, and `sparkles compact --if-due` compacts only when the policy says so.
+* **UI.** The dataset page's Storage panel shows the state, the trigger or the reason for
+  waiting, and the last compaction, with a button to turn the dataset's automatic
+  compaction off or on.
+
+The defaults are those of §2.1 and §2.3.
+
+**Deviations.**
+* The full-text index is checkpointed under a brief writer lock when the build starts,
+  not at the switch. Its position is then the build's base commit, and the new
+  generation's log holds every later commit, so the switch does not pay for a Tantivy
+  commit.
+* An unfinished build holds a `compacting` file with the dataset id. A build interrupted
+  before `commit.json` was written would otherwise be a directory that the open cannot
+  attribute and leaves alone. The open removes a `gen-N` above the current one that
+  holds this dataset's marker.
+* After a reopen, the head commit keeps the generation the catalog recorded for it,
+  which is the generation it was made in, rather than the one whose log replayed it.
+  [F06's Outcome](F06-snapshots-and-point-in-time.md#compaction-during-writes) describes
+  the overlapping generation ranges.
+* The duration metrics are summaries (`_sum`, `_count`) plus a gauge of the longest
+  switch, not histograms. `sparkles_compaction_running` and `sparkles_compaction_due` are
+  summed over the datasets that share the `$other` label.
+* `clone` is one more reason to wait. A due compaction waits while a clone of its
+  dataset runs, because both read the whole index.
+* The write rate is enforced where the builder already calls its interrupt hook, every
+  65,536 quads while it encodes and between its phases. It is an average over the build,
+  and a single permutation can be written faster than the rate.
+* There are no NixOS module options for the flags. `extraArgs` passes them.
+
+**Tests.** `crates/sparkles/src/store/compaction_tests.rs` covers commits during the
+build in persistent and in-memory stores (300 commits of inserts, deletes, blank nodes,
+named graphs and multi-quad changes, compared with a store that never compacted, with
+past states read from the new log), a reopen that replays them with `sparkles check`
+clean, writers and readers running through a compaction, query answers before and after,
+a crash at each of five points, a bulk commit during the build, cancellation, one
+compaction at a time, named snapshots made before and during the build, the retention
+window's `history` wait, backup leases, too little disk, the quota leaving the building
+generation out, `compaction.json`, the measures and their triggers, the write rate and,
+with the `text` feature, full-text search across the switch. The server's
+`compaction_tests.rs` covers the scheduler firing and not firing, the waits for the
+minimum interval, a restore, a load task and a full task slot, both switches, the
+settings over HTTP and across a restart, a read-only server, cancellation for a restore,
+the flags, the stats and the metrics. `compaction_cmd.rs` and `ui/src/lib/compaction.test.ts`
+cover the CLI and the UI's wording. The W3C SPARQL suites pass unchanged.
+
+**Performance.** [Benchmarks: Automatic compaction](../BENCHMARKS.md#automatic-compaction-105m-triples)
+has the measurements at 1.05M triples with 50,000 single-triple commits, taken on a busy
+shared machine. After an automatic compaction, `types-grouped` went from 5.8 ms to 1.9 ms
+and `distinct-obj` from 7.8 ms to 2.2 ms, and `predicate-counts` stayed at 1.9–2.0 ms.
+The compactions took 1.3–2.0 s and held the writer lock for 3.3–5.7 ms, against the
+50 ms of A14. The 860 commits made during two compactions had a p50 of 2.0 ms and a p99
+of 15 ms, the same as the rest of the run.
+
+**Not built.** Partial compaction, delta quads located per block, adaptive thresholds and
+compaction in embedded use without a server remain later work. The spatial index's base
+is still built under the writer lock at the switch.

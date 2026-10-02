@@ -62,7 +62,7 @@ not built; the status block says which. *Designed, not built* means there is no 
 | [C10](C10-write-time-validation.md) | A per-dataset SHACL guard that validates the state after each write before the write commits | implemented in part (Phases 1–3) |
 | [C11](C11-mcp-server.md) | `sparkles mcp`, a Model Context Protocol server with read-only query, schema, search, validation and formatting tools | implemented in part (Phase 1, part of Phase 2) |
 | [C12](C12-graph-access-control.md) | Grants limited to some named graphs or endpoints of a dataset, enforced by a filtered dataset view in the engine | implemented |
-| [C13](C13-automatic-compaction.md) | Background compaction triggered by the delta's size, the log's size, age and idle time, with writes continuing during the build | designed, not built |
+| [C13](C13-automatic-compaction.md) | Background compaction triggered by the delta's size, the log's size, age and idle time, with writes continuing during the build | implemented |
 | [F03](F03-full-text-search.md) | BM25 full-text search over literals with Tantivy, through Jena's `text:query` | implemented in part (Phase 1, part of Phase 2) |
 | [F04](F04-vector-search.md) | `spk:vector` literals, similarity functions and exact top-k `spk:vectorSearch` | implemented in part (Phase 1) |
 | [F05](F05-snapshot-repositories.md) | Incremental, deduplicated backups to a file system or S3, restore, verification, policies and GC | implemented in part (Phase 1, most of Phase 2) |
