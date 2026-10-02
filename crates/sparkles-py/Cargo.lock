@@ -2401,13 +2401,16 @@ dependencies = [
  "oxrdf",
  "oxsdatatypes",
  "oxttl",
+ "parking_lot",
  "rayon",
  "regex",
  "rustc-hash",
+ "serde",
  "serde_json",
  "sparkles",
  "thiserror 2.0.21",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
