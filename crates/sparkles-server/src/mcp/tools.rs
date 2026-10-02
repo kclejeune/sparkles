@@ -494,8 +494,11 @@ impl Tools<'_> {
                     let f = crate::reasoning::freshness(info, &ds.store, snap.commit);
                     json!({ "profile": info.profile, "stale": f.stale })
                 });
-                // quads count every graph: left out for a caller limited to some
-                let quads = (!p.restricted(&ds.name)).then(|| snap.len());
+                // the quads the caller can read
+                let quads = match p.view(&ds.name, crate::auth::Endpoint::Info) {
+                    Some(v) => v.visible_quads(&snap).ok(),
+                    None => Some(snap.len()),
+                };
                 json!({
                     "name": ds.name,
                     "quads": quads,

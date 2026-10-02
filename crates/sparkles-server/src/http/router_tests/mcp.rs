@@ -1160,7 +1160,7 @@ mod auth {
             .find(|d| d["name"] == "graphs")
             .unwrap()
             .clone();
-        assert!(d["quads"].is_null(), "{d}");
+        assert_eq!(d["quads"], 3, "{d}");
         let r = tool(
             &s.app,
             "describe_schema",

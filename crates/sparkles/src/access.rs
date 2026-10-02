@@ -266,6 +266,22 @@ impl GraphAccess {
         Ok(v)
     }
 
+    /// The quads of `snap` in the graphs this view reads (from the index counts of each
+    /// graph).
+    pub fn visible_quads(&self, snap: &Snapshot) -> Result<u64> {
+        if self.read.is_all() {
+            return Ok(snap.len());
+        }
+        let mut n = 0;
+        if self.read.default_graph() {
+            n += snap.count(crate::index::Perm::Gspo, &[Id::DEFAULT_GRAPH.0])?;
+        }
+        for g in self.visible_named(snap)?.iter() {
+            n += snap.count(crate::index::Perm::Gspo, &[g.0])?;
+        }
+        Ok(n)
+    }
+
     /// Whether the graph id `g` of `snap` is readable.
     pub fn readable_id(&self, snap: &Snapshot, g: Id) -> bool {
         if self.read.is_all() {

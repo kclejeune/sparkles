@@ -341,6 +341,7 @@ pub fn whole_dataset(route: &str, method: &Method) -> bool {
         | "/$/vector/{ds}/{name}"
         | "/$/backups/{ds}"
         | "/$/backups/{ds}/{repo}/{backup}"
+        | "/$/history/{ds}"
         | "/$/quota/{ds}" => get,
         "/{ds}/prefixes" => !get,
         _ => false,

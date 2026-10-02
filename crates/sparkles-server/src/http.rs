@@ -2569,15 +2569,19 @@ fn dataset_info_for(d: &Dataset, p: &Principal) -> J {
     if let Some(a) = p.access(&d.name) {
         info["access"] = a.as_str().into();
     }
-    if p.restricted(&d.name) {
+    if let Some(v) = p.view(&d.name, crate::auth::Endpoint::Info) {
         redact_dataset_info(&mut info);
+        // the quads the caller can read
+        if let Ok(n) = v.visible_quads(&d.store.snapshot()) {
+            info["quads"] = n.into();
+        }
     }
     info
 }
 
 /// Leave out of a `DatasetInfo` the figures that count every graph (quads, index
 /// entries, inferences), for a caller whose grants cover only some graphs; `graphs:
-/// "limited"` says so.
+/// "limited"` says so. The caller fills in the quads it can read.
 pub(crate) fn redact_dataset_info(info: &mut J) {
     if let Some(m) = info.as_object_mut() {
         m.remove("quads");

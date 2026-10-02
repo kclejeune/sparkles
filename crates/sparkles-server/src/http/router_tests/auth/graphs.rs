@@ -398,7 +398,12 @@ async fn routes_that_cover_every_graph_refuse_a_limited_view() {
         let app = s.app.clone();
         async move { call(&app, "GET", u, &[("authorization", &b(user))], "").await }
     };
-    for u in ["/$/stats/graphs", "/$/text/graphs", "/$/reason/graphs"] {
+    for u in [
+        "/$/stats/graphs",
+        "/$/text/graphs",
+        "/$/reason/graphs",
+        "/$/history/graphs",
+    ] {
         let r = get(u, "gra").await;
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{u}: {}", r.text());
         assert!(
@@ -423,7 +428,7 @@ async fn routes_that_cover_every_graph_refuse_a_limited_view() {
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     // the dataset's description leaves out its size
     let r = get("/$/datasets/graphs", "gra").await.json();
-    assert!(r.get("quads").is_none(), "{r}");
+    assert_eq!(r["quads"], 3, "{r}");
     assert_eq!(r["graphs"], "limited");
     let r = get("/$/datasets/graphs", "gfull").await.json();
     assert!(r["quads"].is_u64(), "{r}");

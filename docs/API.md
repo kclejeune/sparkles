@@ -3463,7 +3463,8 @@ commands such as `sparkles load --loc` too. Backups leave it out.
 
 ## Authentication and access control
 
-The design and its rationale are in [C09 Authentication and dataset-level access control](specs/C09-dataset-access-control.md).
+The design and its rationale are in [C09 Authentication and dataset-level access control](specs/C09-dataset-access-control.md),
+and graph-level grants are in [C12](specs/C12-graph-access-control.md).
 
 `sparkles serve --auth-config FILE` turns authentication on. Without it there are no
 credentials, and every request may do everything as the local principal. With it the
@@ -3537,7 +3538,8 @@ There are three server permissions:
   files under it.
 
 A principal's grants are the union of its own grants and its roles' grants. There are no
-deny rules. `--read-only` still applies to everyone, after authorization. `federate` does
+deny rules. A grant can be limited to some graphs or endpoints of a dataset (see
+[Graph-level access control](#graph-level-access-control)). `--read-only` still applies to everyone, after authorization. `federate` does
 not open every URL. `SERVICE` and `LOAD <http…>` also follow the server's outbound
 policy, which allows only public addresses unless `--outbound-allow-private` or
 `--outbound-allow` is set (see
@@ -3601,6 +3603,145 @@ datasets, up to `--metrics-max-datasets`, whatever the holder's dataset grants.
 Prometheus scrapes it with a static token (`Authorization: Bearer spk_…`), for example
 through `bearer_token_file` in the scrape config.
 
+### Graph-level access control
+
+The design is in [C12 Graph-level access control and endpoint permissions](specs/C12-graph-access-control.md).
+
+A grant can be limited to some named graphs of a dataset, to some of its endpoints, or to
+both. Limited grants are listed under `grants` for anonymous callers, roles, users and
+static tokens. An entry of `datasets` is a grant without limits.
+
+```toml
+[[users]]
+name = "carol"
+password = "$argon2id$…"
+datasets = { catalog = "read" }
+
+[[users.grants]]
+dataset = "wiki"                                  # a dataset name or * pattern
+level = "read"                                    # read or write, never admin
+graphs = ["urn:x-arq:DefaultGraph", "http://example.org/wiki/public/*"]
+
+[[users.grants]]
+dataset = "wiki"
+level = "write"
+graphs = ["http://example.org/wiki/carol/*"]
+
+[[roles.dashboards.grants]]
+dataset = "metrics-*"
+level = "read"
+endpoints = ["query", "info"]
+```
+
+An entry of `graphs` is `urn:x-arq:DefaultGraph` (or `default`) for the default graph,
+a graph IRI, or an IRI with `*` wildcards. A lone `*` covers every named graph but not the
+default graph. Wildcards never cover blank-node graph names or the graph of materialized
+inferences, `urn:x-sparkles:inferred`, which holds facts derived from every graph. Name
+the inferred graph exactly to grant it. `urn:x-arq:UnionGraph` is refused, because it is
+not a graph.
+
+Grants form a union, as dataset grants do. A principal reads the graphs of all its
+grants that apply, and writes the graphs of those at `write`. One grant without `graphs`
+covers every graph at its level. A `write` grant also gives `read` on its graphs, so a
+principal never writes a graph it cannot read. `admin` covers the whole dataset and is
+granted only under `datasets`.
+
+`endpoints` lists the services a grant applies to:
+
+| Endpoint | Requests |
+|---|---|
+| `query` | SPARQL queries on `/{ds}/sparql`, `/{ds}/query` and `/{ds}`, `/{ds}/explain`, `/{ds}/text`, `/{ds}/geo`, and the MCP tools that query |
+| `update` | SPARQL Update on `/{ds}/update` and `/{ds}`, and the MCP tool `sparql_update` |
+| `gsp-r` | Graph Store reads (`GET` and `HEAD` on `/{ds}/data`, `/{ds}/get` and `/{ds}`) |
+| `gsp-rw` | Graph Store reads and writes |
+| `upload` | `/{ds}/upload` |
+| `shacl`, `shex` | `/{ds}/shacl`, `/{ds}/shex`, and the MCP validation tools |
+| `diff` | `/{ds}/diff` |
+| `info` | The dataset's other routes that need `read` or `write`: its description, schema, prefixes, commits, index and reasoning status, snapshots, history and validation settings, and backups. MCP's `list_commits`, `describe_schema` and resources count as `info`. |
+
+A request through an endpoint that no grant names gets
+`403 {"error":"the query endpoint of /wiki is not allowed"}`. The dataset stays visible to
+a caller that can reach it through another endpoint.
+
+#### What a limited caller sees
+
+A caller whose grants cover only some graphs sees the dataset through a filtered view.
+Queries, explain, the Graph Store, full-text, vector and spatial search, schema
+discovery, diffs and point-in-time reads all read the view. A hidden graph behaves like
+one that does not exist:
+
+* `FROM` and `FROM NAMED` of a hidden graph add nothing, and `GRAPH ?g` never binds it.
+* `GRAPH <hidden> { … }` matches nothing, and `ASK { GRAPH <hidden> {} }` is false.
+* The default graph is empty when the view does not cover it. With
+  `--union-default-graph`, and for `GRAPH <urn:x-arq:UnionGraph>`, the default graph is
+  the union of the visible named graphs.
+* The inference overlay (`reasoning=true`) adds the inferred graph only when a grant names
+  it.
+* Graph Store `GET ?graph=` of a hidden graph answers `404 no such graph`, exactly as for
+  a missing graph. `GET` without a target returns the quads of the visible graphs.
+* `/$/schema/{ds}` counts the visible graphs, and `graph=` of a hidden graph is `404`.
+* `/{ds}/diff` lists, and counts, the changes of the visible graphs only.
+
+The engine applies the view to every scan, path, count, search and statistic, so counts
+answered from index statistics are exact for the view. Plans shown to a limited caller,
+by `/explain` or in the Sparkles result format, have `estimatedRows` and `estimatedCost`
+of `-1`, statistics notes reduced to `[from statistics]`, and no operator counters,
+because those come from statistics of every graph.
+
+Routes that report on the whole dataset answer `403` with
+`"… covers every graph of /wiki, and your access is limited to some graphs"`. These are
+`/$/stats/{ds}`, `/$/reason/{ds}` (GET) and its diagnostics, `/$/text/{ds}`,
+`/$/geo/{ds}` and `/$/vector/{ds}…` status and recall, `/$/backups/{ds}…` (GET),
+`/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/{ds}/shacl`, `/{ds}/shex` and changes
+to `/{ds}/prefixes`. Other
+responses leave out figures that count every graph:
+
+* `DatasetInfo` counts in `quads` only the quads of the visible graphs, has no index or
+  inference counts, and has `graphs: "limited"`;
+* commits (`/$/commits`, snapshots, diffs, write receipts and MCP's `list_commits`) have
+  no `inserted`, `deleted`, `quads`, `exact` or `digest`;
+* `/$/ready` has no `walBytes` or `deltaQuads` for the dataset;
+* `/$/tasks` leaves out the dataset's tasks.
+
+Commit numbers, entity tags and `Sparkles-Commit` headers are the same for every caller.
+They show that a commit happened, not what it changed. Full-text scores use the term
+statistics of the whole index.
+
+#### Writes of a limited caller
+
+Each quad a write asks to insert or delete must be in a graph the caller writes. The check
+looks at the requested quads before anything is looked up, so the answer does not depend
+on whether a quad or a hidden graph exists. A refused write changes nothing and answers
+`403 {"error":"write access to graph <http://example.org/g> required"}`.
+
+* `INSERT DATA` and `DELETE DATA` check every quad, and templates check their graphs, also
+  those bound by the `WHERE` clause.
+* `CLEAR`, `DROP` and `CREATE` of a named graph, and `LOAD … INTO GRAPH`, check the graph
+  first. `CLEAR ALL`, `CLEAR NAMED` and `DROP ALL` act on the visible graphs, and each of
+  them must be writable. Hidden graphs are left alone.
+* The `WHERE` clause reads the view, after `WITH` and `USING` are applied.
+* Graph Store `PUT`, `POST` and `DELETE` check `?graph=` or `?default` before the body is
+  read. A `POST` of quads without a target checks each quad. `PUT` and `DELETE` without a
+  target are refused, because they replace or clear the whole dataset.
+* Uploads check each quad.
+* A write that the dataset's validation guard rejects answers `422` without the guard's
+  results, which can quote any graph.
+
+#### Mapping Fuseki's configuration
+
+| Fuseki | Sparkles |
+|---|---|
+| `access:entry ("user1" <g1> <g2>)` in the registry of dataset `ds` | `[[users.grants]]` with `dataset = "ds"`, `level = "read"`, `graphs = ["g1", "g2"]` |
+| `<urn:x-arq:DefaultGraph>` in an entry | `"urn:x-arq:DefaultGraph"` in `graphs` |
+| a user without an entry | no grant: the dataset is hidden |
+| `fuseki:allowedUsers` on the dataset | `datasets = { ds = "read" }` (or `write`) |
+| `fuseki:allowedUsers` on an endpoint | a grant with `endpoints = ["query"]`, `["update"]`, `["gsp-r"]` … |
+| `fuseki:allowedUsers "*"` | a role that every user holds, or `[external] default_roles` |
+
+Fuseki applies graph access control to read-only datasets only. Sparkles grants `write`
+on graphs too. Fuseki's levels intersect, while Sparkles grants form a union, so a grant
+names the endpoints it allows rather than the ones it removes.
+
 ### CSRF and CORS
 
 With auth, the server refuses unsafe requests, and any request that needs `write`,
@@ -3633,6 +3774,8 @@ type Whoami = {
   tokenId?: string;       // token principals
   server: ("metrics" | "federate" | "server-admin")[];
   datasets: Record<string, "read" | "write" | "admin">;   // existing datasets only
+  // datasets where the caller's grants cover only some graphs or endpoints
+  restricted: Record<string, { graphs: boolean; endpoints?: string[] }>;
   canMintTokens: boolean;
   logout: boolean;
   tokensPolicy?: { defaultTtlSeconds: number; maxTtlSeconds: number };
