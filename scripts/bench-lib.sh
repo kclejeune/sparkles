@@ -111,6 +111,34 @@ if [ -n "${SERVER_MEM_MAX:-}" ]; then
   CAP=(systemd-run --user --scope --quiet -p "MemoryMax=$SERVER_MEM_MAX" -p MemorySwapMax=0 --)
 fi
 
+# The latency runs start one curl process per request, and starting curl takes 3 to 10 ms
+# of CPU, more than most of the queries. Left to the scheduler, each process lands on
+# whichever core is idle, often one clocked down or an efficiency core, and the start-up
+# time then changes from run to run and in streaks: on an idle hybrid machine the same
+# request against the same server took 3.3 ms or 10 ms. So hyperfine and its curl
+# processes run on one CPU, a performance core when the machine has two kinds, which
+# stays warm because it runs them back to back. The servers are not pinned.
+# CLIENT_CPU picks another CPU, and CLIENT_CPU=none turns pinning off.
+client_cpu() {
+  if [ -n "${CLIENT_CPU:-}" ]; then
+    [ "$CLIENT_CPU" != none ] && echo "$CLIENT_CPU"
+    return 0
+  fi
+  command -v taskset > /dev/null || return 0
+  local list
+  if [ -r /sys/devices/cpu_core/cpus ]; then
+    list=$(cat /sys/devices/cpu_core/cpus)
+  elif [ -r /sys/devices/system/cpu/online ]; then
+    list=$(cat /sys/devices/system/cpu/online)
+  else
+    return 0
+  fi
+  # the last CPU of a list like 0-11 or 0,2-5
+  echo "${list##*[,-]}"
+}
+CLIENT=()
+if cpu=$(client_cpu) && [ -n "$cpu" ]; then CLIENT=(taskset -c "$cpu"); fi
+
 pid_on() { ss -ltnp 2> /dev/null | grep ":$1 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1 || true; }
 
 # start <engine>: start its server on STORE and wait until it answers; READY_S gets the
