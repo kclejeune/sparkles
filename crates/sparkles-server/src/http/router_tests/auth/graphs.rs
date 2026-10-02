@@ -568,6 +568,45 @@ async fn schema_explain_text_and_diff_cover_the_view() {
 }
 
 #[tokio::test]
+async fn drafted_shapes_cover_the_view() {
+    let s = server();
+    let ds = s.state.datasets.read().get("graphs").cloned().unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            br#"@prefix ex: <http://ex/> .
+<http://ex/a/1> { ex:a1 a ex:T . }
+<http://ex/b/1> { ex:b1 a ex:T ; ex:hidden "secret" . }"#
+                .to_vec(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let get = |u: &'static str, user: &'static str| {
+        let app = s.app.clone();
+        async move { call(&app, "GET", u, &[("authorization", &b(user))], "").await }
+    };
+    let r = get("/$/schema/graphs/shapes?graph=union", "gra").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["shapes"][0]["instances"], 1, "{j}");
+    assert!(!j.to_string().contains("hidden"), "{j}");
+    let j = get("/$/schema/graphs/shapes?graph=union", "gfull")
+        .await
+        .json();
+    assert_eq!(j["shapes"][0]["instances"], 2, "{j}");
+    assert!(j.to_string().contains("hidden"), "{j}");
+    let r = get(
+        "/$/schema/graphs/shapes?graph=http%3A%2F%2Fex%2Fb%2F1",
+        "gra",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // a grant limited to the Graph Store reads does not reach the info endpoint
+    let r = get("/$/schema/graphs/shapes", "gep").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn endpoint_permissions() {
     let s = server();
     let get = |u: &'static str, user: &'static str| {

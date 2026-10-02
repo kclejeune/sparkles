@@ -11,6 +11,7 @@
 
 mod adapter;
 mod context;
+mod draft;
 mod errors;
 #[cfg(feature = "fmt")]
 mod format;

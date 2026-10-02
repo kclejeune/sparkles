@@ -508,3 +508,171 @@ async fn void_by_content_negotiation() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {text}");
     }
 }
+
+const DRAFT_DATA: &str = r#"ex:Employee rdfs:subClassOf ex:Person .
+    ex:a a ex:Person ; ex:name "A" ; ex:status "active" ; ex:knows ex:b .
+    ex:b a ex:Person ; ex:name "B" ; ex:status "active" ; ex:knows ex:c .
+    ex:c a ex:Employee ; ex:name "C", "Cee" ; ex:status "inactive" ; ex:knows ex:a .
+    ex:d a ex:Person ; ex:name "D" ; ex:status "inactive" .
+    ex:o a ex:Org ; ex:member ex:a, ex:c .
+    GRAPH ex:g { ex:z a ex:Person ; ex:secret "s" }"#;
+
+async fn send(app: &Router, req: Request<Body>) -> (StatusCode, String, String) {
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let ct = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, ct, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn drafted_shapes() {
+    let s = server(DRAFT_DATA);
+    let j = ok(&s.app, "/$/schema/t/shapes").await;
+    assert_eq!(j["draftFormat"], 1);
+    assert_eq!(j["selection"]["graph"], "default");
+    assert_eq!(j["options"]["support"], 1.0);
+    let classes: Vec<&str> = j["shapes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["class"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        classes,
+        [
+            "http://ex.org/Employee",
+            "http://ex.org/Org",
+            "http://ex.org/Person"
+        ]
+    );
+    let person = &j["shapes"][2];
+    assert_eq!(person["instances"], 4);
+    assert_eq!(person["shape"], "urn:x-sparkles:shape:t:PersonShape");
+    assert!(
+        j["shacl"]
+            .as_str()
+            .unwrap()
+            .contains("sh:targetClass ex:Person")
+    );
+    assert!(j["shex"].as_str().unwrap().contains("shape:PersonShape {"));
+    assert!(!j["shacl"].as_str().unwrap().contains("secret"));
+    // ex:c has two names: sh:maxCount 1 is rejected at support 1, drafted at 0.75
+    let name = person["properties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["path"] == "http://ex.org/name")
+        .unwrap();
+    let max = name["rejected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["component"] == "maxCount")
+        .unwrap();
+    assert_eq!(max["excluded"], 1);
+    let j = ok(&s.app, "/$/schema/t/shapes?support=0.75&closed=true").await;
+    assert!(
+        j["shacl"]
+            .as_str()
+            .unwrap()
+            .contains("sh:maxCount 1 ;  # 3 of 4 instances, excludes 1"),
+        "{}",
+        j["shacl"]
+    );
+    assert!(j["shacl"].as_str().unwrap().contains("sh:closed true"));
+
+    // Turtle and ShExC by format= or Accept
+    for (path, accept, ct, needle) in [
+        (
+            "/$/schema/t/shapes?format=turtle",
+            "*/*",
+            "text/turtle",
+            "a sh:NodeShape",
+        ),
+        (
+            "/$/schema/t/shapes",
+            "text/turtle",
+            "text/turtle",
+            "a sh:NodeShape",
+        ),
+        ("/$/schema/t/shapes", "text/shex", "text/shex", "PREFIX ex:"),
+        (
+            "/$/schema/t/shapes?format=shexc",
+            "*/*",
+            "text/shex",
+            "PREFIX ex:",
+        ),
+    ] {
+        let (status, got, text) = get_accept(&s.app, path, accept).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(got.starts_with(ct), "{got}");
+        assert!(text.contains(needle), "{text}");
+    }
+
+    // the draft validates the data, and installs as a guard in warn mode
+    let (_, _, turtle) = get_accept(&s.app, "/$/schema/t/shapes?format=turtle", "*/*").await;
+    let (status, _, report) = send(
+        &s.app,
+        Request::post("/t/shacl")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::from(turtle.clone()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let report: J = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["conforms"], true, "{report}");
+    let body = serde_json::json!({
+        "language": "shacl", "mode": "warn", "shapes": { "inline": turtle }
+    });
+    let (status, _, text) = send(
+        &s.app,
+        Request::put("/$/validation/t")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let j: J = serde_json::from_str(&text).unwrap();
+    assert_eq!(j["status"]["baseline"]["conforms"], true, "{j}");
+
+    // the union graph includes the named graph's person
+    let j = ok(&s.app, "/$/schema/t/shapes?graph=union").await;
+    assert_eq!(j["shapes"][2]["instances"], 5);
+    let j = ok(
+        &s.app,
+        &format!("/$/schema/t/shapes?class={}", enc("http://ex.org/Org")),
+    )
+    .await;
+    assert_eq!(j["shapes"].as_array().unwrap().len(), 1);
+
+    for path in [
+        "/$/schema/t/shapes?support=0",
+        "/$/schema/t/shapes?support=1.5",
+        "/$/schema/t/shapes?support=x",
+        "/$/schema/t/shapes?maxIn=x",
+        "/$/schema/t/shapes?maxIn=65",
+        "/$/schema/t/shapes?closed=maybe",
+        "/$/schema/t/shapes?format=csv",
+        "/$/schema/t/shapes?class=not%20an%20iri",
+    ] {
+        let (status, _, text) = get_accept(&s.app, path, "*/*").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {text}");
+    }
+    let (status, _, _) = get_accept(
+        &s.app,
+        &format!("/$/schema/t/shapes?graph={}", enc("http://ex.org/missing")),
+        "*/*",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

@@ -282,6 +282,22 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "atCommit": at}}),
         ),
         (
+            "draft_shapes",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "dataset": ds,
+                "graph": {"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"},
+                "reasoning": {"type":"boolean","default":false,"description":"Include materialized inferences (write-time validation leaves them out by default)"},
+                "language": {"enum":["shacl","shex"],"default":"shacl"},
+                "support": {"type":"number","exclusiveMinimum":0,"maximum":1,"default":1},
+                "classes": {"type":"array","items":{"type":"string"},"description":"Draft only these classes (IRIs or prefixed names)"},
+                "minInstances": {"type":"integer","minimum":1,"default":1},
+                "maxIn": {"type":"integer","minimum":0,"maximum":64,"default":10,"description":"Largest sh:in list (0: none)"},
+                "maxCount": {"type":"integer","minimum":0,"default":1,"description":"Largest sh:maxCount drafted (0: none)"},
+                "closed": {"type":"boolean","default":false},
+                "atCommit": at,
+                "timeoutSeconds": to}}),
+        ),
+        (
             "sparql_query",
             json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
                 "dataset": ds,
@@ -398,6 +414,7 @@ async fn a03_tool_list() {
         [
             "list_datasets",
             "describe_schema",
+            "draft_shapes",
             "sparql_query",
             "explain_query",
             "describe_resource",
@@ -507,6 +524,44 @@ async fn a05_describe_schema_summary() {
         .await;
     assert_eq!(s["builtinClassesHidden"], 0);
     assert_eq!(s["classes"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn draft_shapes_tool() {
+    let mut c = Client::start(fixture_server());
+    let s = c.structured("draft_shapes", json!({})).await;
+    assert_eq!(s["dataset"], "t");
+    assert_eq!(s["language"], "shacl");
+    assert_eq!(s["shapes"][0]["class"], "http://ex.org/Person");
+    assert_eq!(s["shapes"][0]["instances"], 2);
+    assert_eq!(s["shapes"][0]["excluding"], json!([]));
+    let shacl = s["shacl"].as_str().unwrap();
+    assert!(shacl.contains("sh:targetClass ex:Person"), "{shacl}");
+    assert!(s.get("shex").is_none());
+    let s = c
+        .structured(
+            "draft_shapes",
+            json!({"language": "shex", "classes": ["ex:Person"], "support": 0.5}),
+        )
+        .await;
+    assert!(s["shex"].as_str().unwrap().contains("shape:PersonShape {"));
+    assert!(
+        s["shapeMap"]
+            .as_str()
+            .unwrap()
+            .contains("@<urn:x-sparkles:shape:t:PersonShape>")
+    );
+    // at support 0.5, ex:bob's plain label and his missing ex:knows are excluded
+    assert_eq!(
+        s["shapes"][0]["excluding"],
+        json!([
+            {"path": "http://www.w3.org/2000/01/rdf-schema#label", "component": "datatype", "excluded": 1},
+            {"path": "http://www.w3.org/2000/01/rdf-schema#label", "component": "languageIn", "excluded": 1},
+            {"path": "http://ex.org/knows", "component": "minCount", "excluded": 1}])
+    );
+    let (text, meta) = c.error("draft_shapes", json!({"support": 2})).await;
+    assert!(text.contains("support"), "{text}");
+    assert_eq!(meta["code"], "bad-argument");
 }
 
 #[tokio::test(flavor = "multi_thread")]

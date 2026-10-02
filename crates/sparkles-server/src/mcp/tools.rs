@@ -40,6 +40,7 @@ pub fn run(
     match name {
         "list_datasets" => t.list_datasets(args),
         "describe_schema" => t.describe_schema(args),
+        "draft_shapes" => t.draft_shapes(args),
         "sparql_query" => t.sparql_query(args),
         "explain_query" => t.explain_query(args),
         "describe_resource" => t.describe_resource(args),

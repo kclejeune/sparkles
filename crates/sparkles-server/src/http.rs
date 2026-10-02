@@ -88,6 +88,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}", get(schema::summary))
         .route("/$/schema/{ds}/classes", get(schema::classes))
         .route("/$/schema/{ds}/predicates", get(schema::predicates))
+        .route("/$/schema/{ds}/shapes", get(schema::shapes))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route(
