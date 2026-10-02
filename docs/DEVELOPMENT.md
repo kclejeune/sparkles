@@ -183,6 +183,12 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
   `KEEP_SCRATCH=1` is set. The servers listen on five ports from `--port-base` (default
   3931), so runs with different bases can share a machine. Results merge per engine, so
   `--engines qlever` measures QLever again and keeps the other engines' numbers.
+
+  On a machine with less memory than the engines can use, set `SERVER_MEM_MAX` (for
+  example `SERVER_MEM_MAX=12G`). Each server then runs in a systemd scope with that memory
+  limit and no swap. An engine that exceeds it is killed on its own, and its remaining
+  queries are reported as errors. Without the limit, an engine that grows past the
+  machine's memory can make the whole machine stop responding.
 * `scripts/bench-text.sh` (`mise run bench:text [people] [workdir]`) compares full-text
   search on the same generated data. Sparkles and Jena Fuseki both answer `text:query`.
   Fuseki serves a TDB2 store wrapped in a jena-text dataset with a Lucene index, and QLever

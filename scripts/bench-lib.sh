@@ -102,6 +102,15 @@ copy_stores() {
   rm -rf "$STORE/sparkles-server"
 }
 
+# Servers run inside a transient systemd scope limited to SERVER_MEM_MAX (for example 12G)
+# when it is set, so an engine that runs out of memory is killed alone and its queries
+# are reported as errors, instead of the machine swapping until it stops responding.
+CAP=()
+if [ -n "${SERVER_MEM_MAX:-}" ]; then
+  command -v systemd-run > /dev/null || die "SERVER_MEM_MAX needs systemd-run"
+  CAP=(systemd-run --user --scope --quiet -p "MemoryMax=$SERVER_MEM_MAX" -p MemorySwapMax=0 --)
+fi
+
 pid_on() { ss -ltnp 2> /dev/null | grep ":$1 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1 || true; }
 
 # start <engine>: start its server on STORE and wait until it answers; READY_S gets the
@@ -113,20 +122,20 @@ start() {
   case $e in
     sparkles)
       # shellcheck disable=SC2086 # SPARKLES_ARGS is a list of flags
-      "$SPARKLES" --result-cache-mb 0 serve --data "$STORE/sparkles-server" --loc bench="$(store_of sparkles)" \
+      "${CAP[@]}" "$SPARKLES" --result-cache-mb 0 serve --data "$STORE/sparkles-server" --loc bench="$(store_of sparkles)" \
         --port "$p" --timeout 600 ${SPARKLES_ARGS:-} > "$STORE/sparkles.log" 2>&1 &
       URL[$e]=localhost:$p/bench/sparql
       UPDURL[$e]=localhost:$p/bench/update
       ready="localhost:$p/\$/ping"
       ;;
     jena)
-      JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "$FUSEKI" --update --port "$p" --loc "$(store_of jena)" /bench > "$STORE/fuseki.log" 2>&1 &
+      JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "${CAP[@]}" "$FUSEKI" --update --port "$p" --loc "$(store_of jena)" /bench > "$STORE/fuseki.log" 2>&1 &
       URL[$e]=localhost:$p/bench/sparql
       UPDURL[$e]=localhost:$p/bench/update
       ready="localhost:$p/\$/ping"
       ;;
     qlever)
-      (cd "$(store_of qlever)" && exec "$QSERVER" -i bench -p "$p" -m 8G -c 2G -e 0B -s 600s -a bench -j 16 > server.log 2>&1) &
+      (cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m 8G -c 2G -e 0B -s 600s -a bench -j 16 > server.log 2>&1) &
       URL[$e]=localhost:$p/
       UPDURL[$e]=localhost:$p/
       UPDFIELD[$e]=access-token=bench
@@ -135,14 +144,14 @@ start() {
     fluree)
       # property-path traversal is capped at 1M visited nodes by default (knows-reach at 10M)
       (cd "$(store_of fluree)" && FLUREE_CACHE_MAX_MB=4096 FLUREE_PATH_MAX_VISITED=20000000 FLUREE_QUERY_TIMEOUT_MS=600000 \
-        exec "$FLUREE" server run --listen-addr "127.0.0.1:$p" --storage-path "$(store_of fluree)/.fluree/storage" \
+        exec "${CAP[@]}" "$FLUREE" server run --listen-addr "127.0.0.1:$p" --storage-path "$(store_of fluree)/.fluree/storage" \
         --log-level warn > "$STORE/fluree.log" 2>&1) &
       URL[$e]=localhost:$p/v1/fluree/query/bench:main
       UPDURL[$e]=localhost:$p/v1/fluree/update/bench:main
       ready="localhost:$p/health"
       ;;
     oxigraph)
-      "$OXIGRAPH" serve --location "$(store_of oxigraph)" --bind "127.0.0.1:$p" --timeout-s 600 > "$STORE/oxigraph.log" 2>&1 &
+      "${CAP[@]}" "$OXIGRAPH" serve --location "$(store_of oxigraph)" --bind "127.0.0.1:$p" --timeout-s 600 > "$STORE/oxigraph.log" 2>&1 &
       URL[$e]=localhost:$p/query
       UPDURL[$e]=localhost:$p/update
       ready="localhost:$p/query?query=ASK%7B%7D"
