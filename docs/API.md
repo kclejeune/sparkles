@@ -2821,9 +2821,9 @@ only on a server started with `--allow-unvalidated-writes`. On other servers it 
 `/$/commits`, in receipts and in `sparkles log`. The flag is kept in the write-ahead log
 and the commit catalog, so it survives restarts. A library program that opens a validated
 database with `StoreOptions::unvalidated_writes` and installs no guard makes such commits
-too. A dataset whose `validation.json` cannot be loaded
-refuses writes with `501` rather than accepting them unvalidated. This happens, for
-example, when a binary built without `shex` opens a ShEx configuration.
+too. A dataset whose `validation.json` cannot be loaded refuses writes with `501` rather
+than accepting them unvalidated. This happens, for example, when a binary built without
+`shex` opens a ShEx configuration.
 
 **Incremental validation.** The guard knows the exact result counts of the head. A full
 validation sets them when validation is turned on, and every validated write keeps them
@@ -2874,14 +2874,14 @@ guard also keeps the typing of the head in memory for schemas whose references f
 arcs. With it, a write validates only where typings change. It types the pairs of the
 nodes it touched, reads from the head's typing the other pairs that conformed and those
 that fail whatever they refer to, and goes on to the nodes that refer to a pair whose
-value changed. With a recursive reference
-such as `foaf:knows @ex:Person *`, a new `foaf:knows` arc between two people who
-conform validates one node. A write that makes a person nonconformant validates every
-person who reaches them, and falls back to a full validation past 50,000 nodes. A
-restart, a compaction or a write the guard did not validate leaves the typing unknown
-until the next full validation, and writes until then are validated over every node that
-reaches a changed one. ShEx falls back for `baseline`, `bulk`, `budget` (more than 50,000
-affected nodes), and `sparql` for a map with a SPARQL selector.
+value changed. With a recursive reference such as `foaf:knows @ex:Person *`, a new
+`foaf:knows` arc between two people who conform validates one node. A write that makes a
+person nonconformant validates every person who reaches them, and falls back to a full
+validation past 50,000 nodes. A restart, a compaction or a write the guard did not
+validate leaves the typing unknown until the next full validation, and writes until then
+are validated over every node that reaches a changed one. ShEx falls back for `baseline`,
+`bulk`, `budget` (more than 50,000 affected nodes), and `sparql` for a map with a SPARQL
+selector.
 
 In the CLI, `sparkles validation` sets the configuration. For SHACL it is
 `sparkles validation --loc DB --mode reject|warn [--shapes-graph IRI …] [--shapes FILE] [--data-graph …] [--threshold …] [--grandfather]`,
@@ -2896,8 +2896,8 @@ shapes or a schema without `inline` text are read from the path in `source`, rel
 the file. `--validate NAME` validates a dataset with the configuration it has. Either way
 the data is validated in full before the server listens, the result is logged, and the
 state of the head, with the typing a ShEx guard keeps, is known for the writes that
-follow. A configuration file whose
-`reject` mode the data does not pass stops the server from starting.
+follow. A configuration file whose `reject` mode the data does not pass stops the server
+from starting.
 
 A write rejected in the CLI exits with status 3, and ShEx lists
 `  <node> @ <shape>: <reason>`. `load`, `update` and `infer` end their summary line with
