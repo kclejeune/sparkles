@@ -717,6 +717,26 @@ implementation landed.
   - a `peg` grammar;
   - treating budget overruns as nonconformant.
 
+## SHACL Compact Syntax and list constraints
+
+- **Spec:** [`G03-shaclc.md`](G03-shaclc.md), written on 2026-10-02 independently from:
+  - the Sparkles code and specs C02, C10 and C11;
+  - the SHACL 1.2 Core and SHACL 1.2 Compact Syntax editor's drafts and the SHACL 1.0
+    Compact Syntax Working Group Note, fetched from the Working Group's pages. They are
+    under the W3C Software and Document License;
+  - the SHACL Compact Syntax test pairs, as copied into Apache Jena, and the SHACL 1.2
+    list constraint tests of the Working Group's test suite;
+  - Apache Jena's `jena-shacl` sources (Apache-2.0): the SHACLC grammar, reader, writer,
+    list constraints and tests, read for behaviour. No code was copied.
+
+  Fluree was not consulted.
+- **Rejected** (spec §10):
+  - writing SHACLC from the parsed shapes model;
+  - skipping what cannot be written;
+  - storing inline SHACLC as written;
+  - a parser generator;
+  - SHACLC as a general RDF syntax.
+
 ## Python bindings
 
 - **Spec:** [`P01-python-bindings.md`](P01-python-bindings.md), written on 2026-10-02
