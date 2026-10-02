@@ -40,6 +40,16 @@
 # share/watdiv, instead of the nix build), SPARKLES (the binary, default
 # target/release/sparkles), FLUREE and FLUREE_VERSION as in scripts/bench.sh.
 set -euo pipefail
+# Servers run inside a transient systemd scope limited to SERVER_MEM_MAX (for example 12G)
+# when it is set, so an engine that runs out of memory is killed alone (as in bench.sh).
+CAP=()
+if [ -n "${SERVER_MEM_MAX:-}" ]; then
+  command -v systemd-run > /dev/null || {
+    echo "SERVER_MEM_MAX needs systemd-run" >&2
+    exit 1
+  }
+  CAP=(systemd-run --user --scope --quiet -p "MemoryMax=$SERVER_MEM_MAX" -p MemorySwapMax=0 --)
+fi
 
 SCALE=${1:-100}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -233,7 +243,7 @@ for p in $SPORT $QPORT $JPORT $FPORT $OPORT; do
   if ss -ltn 2> /dev/null | grep -q ":$p "; then die "port $p is in use (set PORT_BASE)"; fi
 done
 if has sparkles; then
-  "$SPARKLES" --result-cache-mb 0 serve --data sparkles-server --loc bench="$WORK/sparkles.db" --port $SPORT --timeout 600 > sparkles.log 2>&1 &
+  "${CAP[@]}" "$SPARKLES" --result-cache-mb 0 serve --data sparkles-server --loc bench="$WORK/sparkles.db" --port $SPORT --timeout 600 > sparkles.log 2>&1 &
   PIDS+=($!)
   PORT[sparkles]=$SPORT
   wait_for "localhost:$SPORT/\$/ping"
@@ -241,7 +251,7 @@ if has sparkles; then
   URL[sparkles]=localhost:$SPORT/bench/sparql
 fi
 if has jena; then
-  JVM_ARGS="-Xmx8G" "$FUSEKI" --update --port $JPORT --loc "$WORK/jena.db" /bench > fuseki.log 2>&1 &
+  JVM_ARGS="-Xmx8G" "${CAP[@]}" "$FUSEKI" --update --port $JPORT --loc "$WORK/jena.db" /bench > fuseki.log 2>&1 &
   PIDS+=($!)
   PORT[jena]=$JPORT
   wait_for "localhost:$JPORT/\$/ping"
@@ -249,7 +259,7 @@ if has jena; then
   URL[jena]=localhost:$JPORT/bench/sparql
 fi
 if has qlever; then
-  (cd qlever-index && exec "$QSERVER" -i bench -p $QPORT -m 8G -c 2G -e 0B -s 600s -a bench -j 16 > server.log 2>&1) &
+  (cd qlever-index && exec "${CAP[@]}" "$QSERVER" -i bench -p $QPORT -m 8G -c 2G -e 0B -s 600s -a bench -j 16 > server.log 2>&1) &
   PIDS+=($!)
   PORT[qlever]=$QPORT
   wait_for "localhost:$QPORT/?cmd=stats"
@@ -258,7 +268,7 @@ if has qlever; then
 fi
 if has fluree; then
   (cd fluree && FLUREE_CACHE_MAX_MB=4096 FLUREE_PATH_MAX_VISITED=20000000 FLUREE_QUERY_TIMEOUT_MS=600000 \
-    exec "$FLUREE" server run --listen-addr 127.0.0.1:$FPORT --storage-path "$WORK/fluree/.fluree/storage" --log-level warn > ../fluree.log 2>&1) &
+    exec "${CAP[@]}" "$FLUREE" server run --listen-addr 127.0.0.1:$FPORT --storage-path "$WORK/fluree/.fluree/storage" --log-level warn > ../fluree.log 2>&1) &
   PIDS+=($!)
   PORT[fluree]=$FPORT
   wait_for "localhost:$FPORT/health"
@@ -266,7 +276,7 @@ if has fluree; then
   URL[fluree]=localhost:$FPORT/v1/fluree/query/bench:main
 fi
 if has oxigraph; then
-  "$OXIGRAPH" serve --location "$WORK/oxigraph.db" --bind 127.0.0.1:$OPORT --timeout-s 600 > oxigraph.log 2>&1 &
+  "${CAP[@]}" "$OXIGRAPH" serve --location "$WORK/oxigraph.db" --bind 127.0.0.1:$OPORT --timeout-s 600 > oxigraph.log 2>&1 &
   PIDS+=($!)
   PORT[oxigraph]=$OPORT
   wait_for "localhost:$OPORT/query?query=ASK%7B%7D"

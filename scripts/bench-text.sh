@@ -27,6 +27,16 @@
 # timing queries, DATA=path/to/data.nt to reuse a generated dataset (for example
 # scripts/bench.sh's), PORT_BASE (default 3940; the servers listen on PORT_BASE+1..+3).
 set -euo pipefail
+# Servers run inside a transient systemd scope limited to SERVER_MEM_MAX (for example 12G)
+# when it is set, so an engine that runs out of memory is killed alone (as in bench.sh).
+CAP=()
+if [ -n "${SERVER_MEM_MAX:-}" ]; then
+  command -v systemd-run > /dev/null || {
+    echo "SERVER_MEM_MAX needs systemd-run" >&2
+    exit 1
+  }
+  CAP=(systemd-run --user --scope --quiet -p "MemoryMax=$SERVER_MEM_MAX" -p MemorySwapMax=0 --)
+fi
 
 N=${1:-100000}
 WORK=${2:-/tmp/sparkles-bench-text}
@@ -207,7 +217,7 @@ wait_for() {
 }
 if has sparkles; then
   PORT[sparkles]=$SPORT
-  "$SPARKLES" --result-cache-mb 0 serve --loc bench="$WORK/sparkles.db" --port "$SPORT" --timeout 600 > sparkles.log 2>&1 &
+  "${CAP[@]}" "$SPARKLES" --result-cache-mb 0 serve --loc bench="$WORK/sparkles.db" --port "$SPORT" --timeout 600 > sparkles.log 2>&1 &
   PIDS+=($!)
   wait_for "localhost:$SPORT/\$/ping"
   NAME[sparkles]=sparkles
@@ -215,7 +225,7 @@ if has sparkles; then
 fi
 if has jena; then
   PORT[jena]=$JPORT
-  JVM_ARGS="-Xmx8G" "$FUSEKI" --config="$WORK/fuseki-text.ttl" --port "$JPORT" > fuseki.log 2>&1 &
+  JVM_ARGS="-Xmx8G" "${CAP[@]}" "$FUSEKI" --config="$WORK/fuseki-text.ttl" --port "$JPORT" > fuseki.log 2>&1 &
   PIDS+=($!)
   wait_for "localhost:$JPORT/\$/ping"
   NAME[jena]=jena-fuseki
@@ -223,7 +233,7 @@ if has jena; then
 fi
 if has qlever; then
   PORT[qlever]=$QPORT
-  (cd qlever-index && exec "$QSERVER" -i bench -t -p "$QPORT" -m 8G -c 2G -e 0B -s 600s -a bench -j 16 > server.log 2>&1) &
+  (cd qlever-index && exec "${CAP[@]}" "$QSERVER" -i bench -t -p "$QPORT" -m 8G -c 2G -e 0B -s 600s -a bench -j 16 > server.log 2>&1) &
   PIDS+=($!)
   wait_for "localhost:$QPORT/?cmd=stats"
   NAME[qlever]=qlever
