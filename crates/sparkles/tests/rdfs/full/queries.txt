@@ -1,0 +1,42 @@
+# Queries over full/schema.ttl and ../data.trig: one per line, a name, a tab and the
+# query. The prefixes ex:, rdf: and rdfs: are added to each.
+type-const-object	SELECT ?x { ?x a ex:Animal }
+type-const-object-mammal	SELECT ?x { ?x a ex:Mammal }
+type-const-subject	SELECT ?t { ex:tom a ?t }
+type-const-subject-domain	SELECT ?t { ex:ann a ?t }
+type-const-subject-range	SELECT ?t { ex:beth a ?t }
+type-both-const	ASK { ex:tom a ex:Animal }
+type-both-const-false	ASK { ex:tom a ex:Dog }
+type-any	SELECT ?x ?t { ?x a ?t }
+type-literal-range	SELECT ?x { ?x a ex:Number }
+type-literal-range-pet	SELECT ?x { ?x a ex:Thing }
+type-cycle	SELECT ?x { ?x a ex:Loop1 }
+type-agent	SELECT ?x { ?x a ex:Agent }
+type-count	SELECT (COUNT(*) AS ?n) { ?x a ex:Animal }
+type-data-subclass	SELECT ?x { ?x a ex:Animal FILTER(?x = ex:w) }
+type-same-var	SELECT ?x { ?x a ?x }
+subproperty	SELECT ?x ?y { ?x ex:hasParent ?y }
+subproperty-two-steps	SELECT ?x ?y { ?x ex:hasRelative ?y }
+property-no-subproperties	SELECT ?x ?y { ?x ex:hasMother ?y }
+subclassof-stored	SELECT ?a ?b { ?a rdfs:subClassOf ?b }
+subpropertyof-stored	SELECT ?a ?b { ?a rdfs:subPropertyOf ?b }
+any-const-subject	SELECT ?p ?o { ex:ann ?p ?o }
+any-const-subject-object	SELECT ?p { ex:ann ?p ex:beth }
+any-const-subject-z	SELECT ?p ?o { ex:z ?p ?o }
+any-const-object	SELECT ?s ?p { ?s ?p ex:tom }
+any-const-object-class	SELECT ?s ?p { ?s ?p ex:Mammal }
+any	SELECT ?s ?p ?o { ?s ?p ?o }
+graph-var	SELECT ?g ?x { GRAPH ?g { ?x a ex:Animal } }
+graph-named	SELECT ?x { GRAPH ex:g1 { ?x a ex:Agent } }
+graph-named-subproperty	SELECT ?x ?y { GRAPH ex:g2 { ?x ex:hasRelative ?y } }
+graph-any	SELECT ?g ?s ?p ?o { GRAPH ?g { ?s ?p ?o } }
+graph-union	SELECT ?x { GRAPH <urn:x-arq:UnionGraph> { ?x a ex:Animal } }
+join	SELECT ?x ?y { ?x ex:owns ?y . ?y a ex:Pet }
+exists	SELECT ?x { ?x a ex:Agent FILTER EXISTS { ?x ex:hasParent ?m } }
+optional	SELECT ?x ?t { ?x ex:owns ?y OPTIONAL { ?x a ?t } }
+bnode	SELECT ?x { ?x a _:t . _:t rdfs:subClassOf ex:Animal }
+path-plus	SELECT ?x ?y { ?x ex:hasRelative+ ?y }
+path-sequence-type	SELECT ?x ?c { ?x a/rdfs:subClassOf ?c }
+path-inverse	SELECT ?x ?y { ?y ^ex:hasParent ?x }
+path-alternative	SELECT ?x ?y { ?x ex:hasParent|ex:owns ?y }
+path-negated	SELECT ?s ?o { ?s !rdf:type ?o }

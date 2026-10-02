@@ -18,6 +18,7 @@ mod joinorder;
 mod keyfilter;
 mod keyprobe;
 pub mod plan;
+pub mod rdfs;
 pub mod results;
 mod sample;
 pub mod stats;
@@ -95,6 +96,12 @@ pub struct QueryOptions {
     /// The graphs the request may read (and, in an update, write); `None` is every
     /// graph. See [`crate::access`].
     pub graphs: Option<Arc<crate::access::GraphAccess>>,
+    /// RDFS on read: patterns match the RDFS closure of each graph with respect to this
+    /// schema (see [`rdfs`]).
+    pub rdfs: Option<Arc<rdfs::RdfsSchema>>,
+    /// The outbound budget the request spends (`None`: a new one from
+    /// [`outbound`](Self::outbound)), shared by several requests that count as one.
+    pub outbound_budget: Option<Arc<crate::outbound::RequestBudget>>,
 }
 
 /// Which files `LOAD <file:…>` may read.
@@ -321,7 +328,11 @@ fn make_ctx(
     ctx.allow_service = opts.allow_service;
     ctx.forbid_service = opts.forbid_service;
     ctx.outbound = opts.outbound.clone();
-    ctx.outbound_budget = crate::outbound::RequestBudget::new(&opts.outbound);
+    ctx.outbound_budget = opts
+        .outbound_budget
+        .clone()
+        .unwrap_or_else(|| crate::outbound::RequestBudget::new(&opts.outbound));
+    ctx.rdfs = opts.rdfs.clone();
     ctx.use_cache = !opts.no_cache;
     if let Some(o) = opts.optimizations {
         ctx.opt = o;
@@ -511,7 +522,8 @@ fn execute_parsed(
         Query::Construct { .. } => (QueryKind::Construct, pattern.clone()),
         Query::Describe { .. } => (QueryKind::Describe, pattern.clone()),
     };
-    let node = planner.plan(&pattern, &ActiveGraph::Default, Vec::new())?;
+    let planned = rdfs::apply(&ctx, &pattern);
+    let node = planner.plan(&planned, &ActiveGraph::Default, Vec::new())?;
     let plan_ms = t1.elapsed().as_secs_f64() * 1000.0;
     let t2 = Instant::now();
     let (table, mut plan) = exec::execute(&ctx, &node)?;
@@ -595,7 +607,8 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
         let mut planner = Planner::new(&ctx);
         planner.source = Some(&parsed);
-        let node = planner.plan(pattern, &ActiveGraph::Default, Vec::new())?;
+        let pattern = rdfs::apply(&ctx, pattern);
+        let node = planner.plan(&pattern, &ActiveGraph::Default, Vec::new())?;
         let mut info = exec::describe(&ctx, &node);
         info.warnings = ctx.warnings();
         if ctx.graphs.is_some() {

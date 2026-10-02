@@ -1,0 +1,10 @@
+# A schema with property declarations and a domain, but no class hierarchy: Jena then
+# applies no superproperty to the triples of a constant subject.
+@prefix ex:   <http://example.org/> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+ex:hasMother rdfs:subPropertyOf ex:hasParent .
+ex:hasParent rdfs:subPropertyOf ex:hasRelative .
+ex:kind      rdfs:subPropertyOf rdf:type .
+ex:owns      rdfs:domain ex:Person .

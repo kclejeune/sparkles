@@ -1,0 +1,2715 @@
+{
+  "full": {
+    "any": {
+      "head": {
+        "vars": [
+          "s",
+          "p",
+          "o"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/kind"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/z"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/z"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/c"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasMother"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasParent"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasRelative"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "literal",
+              "value": "a toy"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+              "type": "literal",
+              "value": "42"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/age"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Loop1"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/x1"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Loop2"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/x1"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Loop1"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/x1"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/z"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Kitten"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Mammal"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Pet"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Thing"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/c"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/w"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Dog"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Mammal"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          }
+        ]
+      }
+    },
+    "any-const-object": {
+      "head": {
+        "vars": [
+          "s",
+          "p"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          }
+        ]
+      }
+    },
+    "any-const-object-class": {
+      "head": {
+        "vars": [
+          "s",
+          "p"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          },
+          {
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          }
+        ]
+      }
+    },
+    "any-const-subject": {
+      "head": {
+        "vars": [
+          "p",
+          "o"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasMother"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasParent"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasRelative"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            }
+          },
+          {
+            "o": {
+              "type": "literal",
+              "value": "a toy"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            }
+          },
+          {
+            "o": {
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+              "type": "literal",
+              "value": "42"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/age"
+            }
+          }
+        ]
+      }
+    },
+    "any-const-subject-object": {
+      "head": {
+        "vars": [
+          "p"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasMother"
+            }
+          },
+          {
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasParent"
+            }
+          },
+          {
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasRelative"
+            }
+          }
+        ]
+      }
+    },
+    "any-const-subject-z": {
+      "head": {
+        "vars": [
+          "p",
+          "o"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/kind"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            }
+          }
+        ]
+      }
+    },
+    "bnode": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/w"
+            }
+          }
+        ]
+      }
+    },
+    "exists": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          }
+        ]
+      }
+    },
+    "graph-any": {
+      "head": {
+        "vars": [
+          "g",
+          "s",
+          "p",
+          "o"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g1"
+            },
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/bob"
+            }
+          },
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g1"
+            },
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            }
+          },
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g1"
+            },
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            }
+          },
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g1"
+            },
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Mammal"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            }
+          },
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g1"
+            },
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/bob"
+            }
+          },
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g1"
+            },
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/bob"
+            }
+          },
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g1"
+            },
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Pet"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            }
+          },
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g1"
+            },
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Thing"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            }
+          },
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g2"
+            },
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/mia"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasMother"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            }
+          },
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g2"
+            },
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/mia"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasParent"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            }
+          },
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g2"
+            },
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/mia"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasRelative"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            }
+          }
+        ]
+      }
+    },
+    "graph-named": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/bob"
+            }
+          }
+        ]
+      }
+    },
+    "graph-named-subproperty": {
+      "head": {
+        "vars": [
+          "x",
+          "y"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            },
+            "y": {
+              "type": "uri",
+              "value": "http://example.org/mia"
+            }
+          }
+        ]
+      }
+    },
+    "graph-union": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            }
+          }
+        ]
+      }
+    },
+    "graph-var": {
+      "head": {
+        "vars": [
+          "g",
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "g": {
+              "type": "uri",
+              "value": "http://example.org/g1"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/felix"
+            }
+          }
+        ]
+      }
+    },
+    "join": {
+      "head": {
+        "vars": [
+          "x",
+          "y"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "literal",
+              "value": "a toy"
+            }
+          }
+        ]
+      }
+    },
+    "optional": {
+      "head": {
+        "vars": [
+          "x",
+          "t"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          }
+        ]
+      }
+    },
+    "path-alternative": {
+      "head": {
+        "vars": [
+          "x",
+          "y"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          },
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "literal",
+              "value": "a toy"
+            }
+          }
+        ]
+      }
+    },
+    "path-inverse": {
+      "head": {
+        "vars": [
+          "x",
+          "y"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          }
+        ]
+      }
+    },
+    "path-negated": {
+      "head": {
+        "vars": [
+          "s",
+          "o"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/z"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/c"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "literal",
+              "value": "a toy"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+              "type": "literal",
+              "value": "42"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          }
+        ]
+      }
+    },
+    "path-plus": {
+      "head": {
+        "vars": [
+          "x",
+          "y"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          }
+        ]
+      }
+    },
+    "path-sequence-type": {
+      "head": {
+        "vars": [
+          "x",
+          "c"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "c": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/w"
+            }
+          }
+        ]
+      }
+    },
+    "property-no-subproperties": {
+      "head": {
+        "vars": [
+          "x",
+          "y"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          }
+        ]
+      }
+    },
+    "subclassof-stored": {
+      "head": {
+        "vars": [
+          "a",
+          "b"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "a": {
+              "type": "uri",
+              "value": "http://example.org/c"
+            },
+            "b": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            }
+          }
+        ]
+      }
+    },
+    "subproperty": {
+      "head": {
+        "vars": [
+          "x",
+          "y"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          }
+        ]
+      }
+    },
+    "subproperty-two-steps": {
+      "head": {
+        "vars": [
+          "x",
+          "y"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          }
+        ]
+      }
+    },
+    "subpropertyof-stored": {
+      "head": {
+        "vars": [
+          "a",
+          "b"
+        ]
+      },
+      "results": {
+        "bindings": []
+      }
+    },
+    "type-agent": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          }
+        ]
+      }
+    },
+    "type-any": {
+      "head": {
+        "vars": [
+          "x",
+          "t"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Loop1"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/x1"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Loop2"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/x1"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Loop1"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/x1"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/z"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Kitten"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Mammal"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Pet"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Thing"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/c"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/w"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Dog"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Mammal"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          }
+        ]
+      }
+    },
+    "type-both-const": {
+      "boolean": true,
+      "head": {}
+    },
+    "type-both-const-false": {
+      "boolean": false,
+      "head": {}
+    },
+    "type-const-object": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          }
+        ]
+      }
+    },
+    "type-const-object-mammal": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          },
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          }
+        ]
+      }
+    },
+    "type-const-subject": {
+      "head": {
+        "vars": [
+          "t"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Thing"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Pet"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Kitten"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Mammal"
+            }
+          }
+        ]
+      }
+    },
+    "type-const-subject-domain": {
+      "head": {
+        "vars": [
+          "t"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            }
+          }
+        ]
+      }
+    },
+    "type-const-subject-range": {
+      "head": {
+        "vars": [
+          "t"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Agent"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            }
+          }
+        ]
+      }
+    },
+    "type-count": {
+      "head": {
+        "vars": [
+          "n"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "n": {
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+              "type": "literal",
+              "value": "2"
+            }
+          }
+        ]
+      }
+    },
+    "type-cycle": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/x1"
+            }
+          }
+        ]
+      }
+    },
+    "type-data-subclass": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": []
+      }
+    },
+    "type-literal-range": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+              "type": "literal",
+              "value": "42"
+            }
+          }
+        ]
+      }
+    },
+    "type-literal-range-pet": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "x": {
+              "type": "literal",
+              "value": "a toy"
+            }
+          }
+        ]
+      }
+    },
+    "type-same-var": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": []
+      }
+    }
+  },
+  "properties": {
+    "any": {
+      "head": {
+        "vars": [
+          "s",
+          "p",
+          "o"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/kind"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/z"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/z"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/c"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasMother"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasParent"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasRelative"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "literal",
+              "value": "a toy"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+              "type": "literal",
+              "value": "42"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/age"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Loop1"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/x1"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Kitten"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/c"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/w"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Dog"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          }
+        ]
+      }
+    },
+    "any-const-object": {
+      "head": {
+        "vars": [
+          "s",
+          "p"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasMother"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasParent"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasRelative"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          }
+        ]
+      }
+    },
+    "any-const-subject": {
+      "head": {
+        "vars": [
+          "p",
+          "o"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasMother"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            }
+          },
+          {
+            "o": {
+              "type": "literal",
+              "value": "a toy"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            }
+          },
+          {
+            "o": {
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+              "type": "literal",
+              "value": "42"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/age"
+            }
+          }
+        ]
+      }
+    },
+    "any-const-subject-z": {
+      "head": {
+        "vars": [
+          "p",
+          "o"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/kind"
+            }
+          }
+        ]
+      }
+    },
+    "subproperty": {
+      "head": {
+        "vars": [
+          "x",
+          "y"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          }
+        ]
+      }
+    },
+    "type-any": {
+      "head": {
+        "vars": [
+          "x",
+          "t"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Loop1"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/x1"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Kitten"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/c"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/w"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Dog"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          }
+        ]
+      }
+    },
+    "type-const-object": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          }
+        ]
+      }
+    },
+    "type-const-subject": {
+      "head": {
+        "vars": [
+          "t"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "subproperties": {
+    "any": {
+      "head": {
+        "vars": [
+          "s",
+          "p",
+          "o"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/kind"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/z"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/z"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Animal"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/c"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasMother"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/hasParent"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "literal",
+              "value": "a toy"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/owns"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+              "type": "literal",
+              "value": "42"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/age"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Kitten"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Loop1"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/x1"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Dog"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          },
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/c"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/w"
+            }
+          }
+        ]
+      }
+    },
+    "any-const-object": {
+      "head": {
+        "vars": [
+          "s",
+          "p"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/kind"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/z"
+            }
+          },
+          {
+            "p": {
+              "type": "uri",
+              "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            },
+            "s": {
+              "type": "uri",
+              "value": "http://example.org/z"
+            }
+          }
+        ]
+      }
+    },
+    "any-const-subject": {
+      "head": {
+        "vars": [
+          "p",
+          "o"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "o": {
+              "type": "uri",
+              "value": "http://example.org/Cat"
+            },
+            "p": {
+              "type": "uri",
+              "value": "http://example.org/kind"
+            }
+          }
+        ]
+      }
+    },
+    "subproperty": {
+      "head": {
+        "vars": [
+          "x",
+          "y"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/ann"
+            },
+            "y": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          }
+        ]
+      }
+    },
+    "type-any": {
+      "head": {
+        "vars": [
+          "x",
+          "t"
+        ]
+      },
+      "results": {
+        "bindings": [
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Person"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/beth"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Kitten"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/tom"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Loop1"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/x1"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/Dog"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/rex"
+            }
+          },
+          {
+            "t": {
+              "type": "uri",
+              "value": "http://example.org/c"
+            },
+            "x": {
+              "type": "uri",
+              "value": "http://example.org/w"
+            }
+          }
+        ]
+      }
+    },
+    "type-const-object": {
+      "head": {
+        "vars": [
+          "x"
+        ]
+      },
+      "results": {
+        "bindings": []
+      }
+    },
+    "type-const-subject": {
+      "head": {
+        "vars": [
+          "t"
+        ]
+      },
+      "results": {
+        "bindings": []
+      }
+    }
+  }
+}
