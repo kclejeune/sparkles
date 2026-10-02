@@ -88,6 +88,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui/", get(crate::ui::serve_index))
         .route("/ui/{*path}", get(crate::ui::serve))
         .route("/$/ping", get(ping).post(ping))
+        .route("/$/openapi.json", get(crate::openapi::serve_json))
+        .route("/$/openapi.yaml", get(crate::openapi::serve_yaml))
         .merge(crate::auth::routes())
         .route("/$/server", get(server_info).post(server_info))
         .route("/$/metrics", get(crate::obs::metrics_endpoint))

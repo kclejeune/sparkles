@@ -28,6 +28,9 @@ tokio.workspace = true
 axum = { workspace = true, features = ["http2"] }
 tower-http.workspace = true
 clap = { workspace = true, features = ["env"] }
+# `sparkles completions` and `sparkles man`, generated from the clap definition
+clap_complete = "4"
+clap_mangen = "0.2"
 rust-embed.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

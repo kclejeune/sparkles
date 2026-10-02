@@ -9,6 +9,7 @@ mod auth;
 #[cfg(feature = "backup")]
 mod backup;
 mod check_cmd;
+mod cli_docs;
 mod clone;
 mod compaction;
 mod compaction_cmd;
@@ -24,6 +25,7 @@ mod lsp;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod obs;
+mod openapi;
 mod otel;
 mod outbound;
 mod queries_cmd;
@@ -1162,6 +1164,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: backup::cli::RepoCmd,
     },
+    /// Print the OpenAPI 3.1 description of the HTTP API (also served at
+    /// /$/openapi.json and /$/openapi.yaml)
+    Openapi {
+        /// json or yaml
+        #[arg(long, value_enum, default_value_t = openapi::OutputFormat::Json)]
+        format: openapi::OutputFormat,
+    },
+    /// Print a shell completion script: bash, zsh, fish, elvish or powershell
+    Completions(cli_docs::CompletionsArgs),
+    /// Write man pages for sparkles and each of its subcommands
+    Man(cli_docs::ManArgs),
     /// Copy a database into a new, independent one (same data and blank nodes, new
     /// dataset id)
     Clone {
@@ -2259,6 +2272,11 @@ fn run() -> Result<()> {
         Cmd::Fmt(args) => fmt::run(args),
         #[cfg(feature = "fmt")]
         Cmd::Lsp(args) => lsp::run(args),
+        Cmd::Openapi { format } => openapi::print(format),
+        Cmd::Completions(args) => {
+            cli_docs::completions(args, <Cli as clap::CommandFactory>::command())
+        }
+        Cmd::Man(args) => cli_docs::man(args, <Cli as clap::CommandFactory>::command()),
         Cmd::Shex(args) => shex_cmd::run(args, opts),
         Cmd::Tools(cmd) => tools::run(cmd, opts),
         Cmd::Csv(args) => csv_cmd::run(args),

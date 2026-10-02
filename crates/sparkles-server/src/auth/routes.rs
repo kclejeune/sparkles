@@ -36,6 +36,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/ui/{*path}", &["GET"]),
     ("/$/ping", &["GET", "POST"]),
     ("/$/whoami", &["GET"]),
+    // the OpenAPI description (`openapi`)
+    ("/$/openapi.json", &["GET"]),
+    ("/$/openapi.yaml", &["GET"]),
     ("/$/server", &["GET", "POST"]),
     ("/$/metrics", &["GET"]),
     ("/$/ready", &["GET"]),
@@ -179,6 +182,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
     let get = matches!(*method, Method::GET | Method::HEAD);
     Some(match route {
         "/" | "/ui" | "/ui/" | "/ui/{*path}" | "/$/ping" | "/$/ready" | "/$/whoami" => Public,
+        // describes the binary's API, not its data or configuration
+        "/$/openapi.json" | "/$/openapi.yaml" => Public,
         "/$/auth/config"
         | "/$/auth/login"
         | "/$/auth/oidc/login"
