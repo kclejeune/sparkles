@@ -593,3 +593,30 @@ fn loads_into_a_store() {
     assert!(e.to_string().contains("row 3"), "{e}");
     assert_eq!(store.snapshot().len(), 4);
 }
+
+/// Compressed tables are decompressed as a stream, within the decompressed-size limit.
+#[test]
+fn compressed_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("t.csv.gz");
+    let mut w = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut csv = String::from("id,name\n");
+    for i in 0..1000 {
+        csv.push_str(&format!("{i},name {i}\n"));
+    }
+    std::io::Write::write_all(&mut w, csv.as_bytes()).unwrap();
+    std::fs::write(&p, w.finish().unwrap()).unwrap();
+    assert_eq!(tabular_kind(&p), Some(TabularKind::Csv));
+    let o = default_opts(Some("id"), "http://e/");
+    let s = convert(open(&p, None).unwrap(), &o, &mut |_| Ok(())).unwrap();
+    assert_eq!(s.triples, 2000);
+    let e = convert(open(&p, Some(1000)).unwrap(), &o, &mut |_| Ok(())).unwrap_err();
+    assert!(
+        matches!(e, Error::BudgetExceeded(b) if b.kind == BudgetKind::DecompressedBytes),
+        "{e}"
+    );
+    // the limit is on decompression: a plain file is read whole
+    let plain = dir.path().join("t.csv");
+    std::fs::write(&plain, &csv).unwrap();
+    assert!(convert(open(&plain, Some(1000)).unwrap(), &o, &mut |_| Ok(())).is_ok());
+}

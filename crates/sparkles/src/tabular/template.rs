@@ -112,10 +112,11 @@ pub(crate) struct Runner<'a> {
     snap: Arc<Snapshot>,
     opts: QueryOptions,
     batch: u64,
+    part: usize,
 }
 
 impl<'a> Runner<'a> {
-    pub fn new(template: &'a Template, opts: &QueryOptions) -> Runner<'a> {
+    pub fn new(template: &'a Template, opts: &QueryOptions, part: usize) -> Runner<'a> {
         let mut opts = opts.clone();
         opts.allow_service = false;
         opts.forbid_service = true;
@@ -126,6 +127,7 @@ impl<'a> Runner<'a> {
             snap: Store::in_memory(Default::default()).snapshot(),
             opts,
             batch: 0,
+            part,
         }
     }
 
@@ -143,8 +145,8 @@ impl<'a> Runner<'a> {
             bindings: rows,
         });
         let r = crate::sparql::execute_query(self.snap.clone(), &q, &self.opts, 0.0)?;
-        let b = self.batch;
-        let relabel = |n: &BlankNode| BlankNode::new_unchecked(format!("t{b}x{}", n.as_str()));
+        let (p, b) = (self.part, self.batch);
+        let relabel = |n: &BlankNode| BlankNode::new_unchecked(format!("t{p}b{b}x{}", n.as_str()));
         let mut n = 0;
         for t in r.triples {
             sink(relabel_triple(t, &relabel))?;

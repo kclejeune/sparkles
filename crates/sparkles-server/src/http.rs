@@ -38,6 +38,7 @@ mod schema;
 mod sd;
 mod shex;
 mod stream;
+mod tabular;
 mod validation;
 
 pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
@@ -2756,6 +2757,8 @@ async fn upload(
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     let mut graph: Option<String> = params.get("graph").map(str::to_string);
     let mut budget = BodyBudget::new(&st.limits);
+    // a CSVW mapping or CONSTRUCT template for the upload's CSV and TSV files
+    let mut mappings = tabular::Mappings::default();
     if ct == "multipart/form-data" {
         use axum::extract::FromRequest;
         // the route's body limit (`--max-upload-mb`) applies to the whole stream too
@@ -2779,6 +2782,14 @@ async fn upload(
                     if !g.trim().is_empty() {
                         graph = Some(g.trim().to_string());
                     }
+                }
+                Some("mapping") => {
+                    mappings.mapping =
+                        Some(tabular::read_part(&mut field, &mut budget, "mapping").await?);
+                }
+                Some("template") => {
+                    mappings.template =
+                        Some(tabular::read_part(&mut field, &mut budget, "template").await?);
                 }
                 _ => {
                     let fname = field.file_name().unwrap_or("upload.ttl").to_string();
@@ -2805,9 +2816,10 @@ async fn upload(
     } else {
         // plain body: format from content type
         let jena = jena_formats::JenaFormat::from_media_type(&ct);
-        let format = match jena {
-            Some(_) => None,
-            None => Some(sparkles::io::format_for_media_type(&ct).ok_or_else(|| {
+        let table = sparkles::tabular::tabular_media_type(&ct);
+        let format = match (jena, table) {
+            (Some(_), _) | (_, Some(_)) => None,
+            (None, None) => Some(sparkles::io::format_for_media_type(&ct).ok_or_else(|| {
                 err(
                     StatusCode::UNSUPPORTED_MEDIA_TYPE,
                     format!("unsupported content type '{ct}'"),
@@ -2816,6 +2828,8 @@ async fn upload(
         };
         let body = spool_after(request.into_body(), 0, &mut budget).await?;
         let ext = match (jena, format) {
+            _ if table == Some(sparkles::tabular::TabularKind::Csv) => "csv",
+            _ if table == Some(sparkles::tabular::TabularKind::Tsv) => "tsv",
             (Some(jena_formats::JenaFormat::Thrift), _) => "rt",
             (Some(jena_formats::JenaFormat::Protobuf), _) => "rpb",
             (Some(jena_formats::JenaFormat::RdfJson), _) => "rj",
@@ -2868,6 +2882,8 @@ async fn upload(
                 *f = out;
             }
         }
+        // CSV and TSV files are converted into N-Triples
+        let tables = tabular::convert(&mut files, &mappings, &params, &st, &wopts)?;
         let sources = files
             .iter()
             .map(|p| {
@@ -2891,7 +2907,10 @@ async fn upload(
             0
         };
         drop(tmp);
-        let body = json!({ "count": count, "tripleCount": count, "quadCount": count });
+        let mut body = json!({ "count": count, "tripleCount": count, "quadCount": count });
+        if !tables.is_empty() {
+            body["tables"] = tables.into();
+        }
         Ok(write_report(Op::Upload, count).attach(write_response(
             &ds,
             StatusCode::OK,

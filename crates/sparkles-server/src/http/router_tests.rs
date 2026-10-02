@@ -33,6 +33,7 @@ mod open;
 #[cfg(feature = "reasoning")]
 mod reasoning;
 mod sd;
+mod tabular;
 mod tasks;
 
 const DATA: &str = r#"

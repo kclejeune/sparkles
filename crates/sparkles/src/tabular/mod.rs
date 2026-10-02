@@ -88,6 +88,9 @@ pub struct Options {
     pub tsv: bool,
     /// The table of the mapping to use (otherwise matched by file name).
     pub table: Option<usize>,
+    /// Tells apart the blank nodes of tables written into one document: they are
+    /// labelled `t{part}…`.
+    pub part: usize,
     pub limits: Limits,
     /// Budgets and timeout of template evaluation.
     pub query: QueryOptions,
@@ -103,6 +106,7 @@ impl Options {
             name: name.into(),
             tsv: false,
             table: None,
+            part: 0,
             limits: Limits::default(),
             query: QueryOptions::default(),
             check: None,
@@ -194,7 +198,9 @@ pub fn open(path: &Path, max_decompressed: Option<u64>) -> Result<Box<dyn Read +
     })?;
     let (codec, head) = crate::io::sniff_codec(&mut f, Some(path), &path.display().to_string())?;
     let r = std::io::Cursor::new(head).chain(f);
-    codec.reader_send(r, max_decompressed)
+    // an uncompressed file is as large as it is: the limit is on decompression
+    let limit = max_decompressed.filter(|_| codec != crate::codec::Codec::None);
+    codec.reader_send(r, limit)
 }
 
 /// Read a mapping file: CSVW metadata located at `path`.
@@ -374,18 +380,23 @@ impl<R: Read> Records<R> {
                     return Err(self.too_long());
                 }
                 let row = self.count + 1;
-                Err(match e.kind() {
+                let msg = e.to_string();
+                Err(match e.into_kind() {
                     csv::ErrorKind::Utf8 { pos, err } => Error::invalid(format!(
                         "{}: row {row}{}, field {}: the table is not UTF-8",
                         self.name,
                         line_note(row, pos.as_ref().map(|p| p.line())),
                         err.field() + 1
                     )),
-                    csv::ErrorKind::Io(io) => Error::invalid(format!(
-                        "{}: row {row}: cannot read the table: {io}",
-                        self.name
-                    )),
-                    _ => Error::invalid(format!("{}: row {row}: {e}", self.name)),
+                    // a budget of the decompressing reader stays a budget error
+                    csv::ErrorKind::Io(io) => match crate::codec::io_error(io) {
+                        Error::Io(io) => Error::invalid(format!(
+                            "{}: row {row}: cannot read the table: {io}",
+                            self.name
+                        )),
+                        e => e,
+                    },
+                    _ => Error::invalid(format!("{}: row {row}: {msg}", self.name)),
                 })
             }
         }
@@ -869,12 +880,12 @@ pub fn convert(
     let table = Table {
         columns: cols,
         url: table_url,
-        index: opts.table.unwrap_or(0),
+        index: opts.part,
         skip_columns: dialect.skip_columns,
     };
     let mut runner = template
         .as_ref()
-        .map(|t| template::Runner::new(t, &opts.query));
+        .map(|t| template::Runner::new(t, &opts.query, opts.part));
     let vars: Vec<Variable> = table
         .columns
         .iter()
