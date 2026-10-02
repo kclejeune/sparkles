@@ -539,6 +539,68 @@ impl Snapshot {
         Ok(())
     }
 
+    /// The base blocks holding keys in the ranges `[lo, hi]` (sorted and disjoint),
+    /// visited in parallel: `f(block, s, e)` for the rows `[s, e)` of a block in a range,
+    /// at most `piece` rows at a time (the columns in `mask` are decoded), with the
+    /// results in key order. `None` when the delta inserts or deletes a key in a range,
+    /// whose merge with the blocks is sequential
+    /// ([`scan_between_cols`](Self::scan_between_cols) reads those).
+    pub fn par_blocks_in_ranges<T: Send>(
+        &self,
+        perm: Perm,
+        ranges: &[(Key, Key)],
+        mask: crate::index::ColMask,
+        piece: usize,
+        f: impl Fn(&Block, usize, usize) -> Result<T> + Sync + Send,
+    ) -> Result<Option<Vec<T>>> {
+        use rayon::prelude::*;
+        let pi = perm.index();
+        let touched = |&(lo, hi): &(Key, Key)| {
+            Delta::key_range(&self.delta.ins[pi], lo, hi)
+                .next()
+                .is_some()
+                || Delta::key_range(&self.delta.del[pi], lo, hi)
+                    .next()
+                    .is_some()
+        };
+        if ranges.iter().any(touched) {
+            return Ok(None);
+        }
+        let base = self.perm(perm);
+        let visits: Vec<(usize, usize)> = ranges
+            .iter()
+            .enumerate()
+            .flat_map(|(r, (lo, hi))| {
+                let (b0, b1) = base.key_block_range(lo, hi);
+                (b0..b1).map(move |b| (r, b))
+            })
+            .collect();
+        visits
+            .into_par_iter()
+            .map(|(r, b)| {
+                let (lo, hi) = &ranges[r];
+                let m = &base.blocks[b];
+                let whole = m.first >= *lo && m.last <= *hi;
+                let bounds = crate::index::bound_cols(lo, hi);
+                let blk = self
+                    .cache
+                    .get_cols(base, b, if whole { mask } else { mask | bounds })?;
+                let (s, e) = if whole {
+                    (0, blk.len())
+                } else {
+                    blk.key_range(lo, hi)
+                };
+                let piece = piece.max(1);
+                let starts: Vec<usize> = (s..e.max(s + 1)).step_by(piece).collect();
+                starts
+                    .into_par_iter()
+                    .map(|a| f(&blk, a.min(e), (a + piece).min(e)))
+                    .collect::<Result<Vec<T>>>()
+            })
+            .collect::<Result<Vec<Vec<T>>>>()
+            .map(|parts| Some(parts.into_iter().flatten().collect()))
+    }
+
     /// Collect full keys for a prefix (convenience; engine uses [`scan`](Self::scan)).
     pub fn scan_keys(&self, perm: Perm, prefix: &[u64]) -> Result<Vec<Key>> {
         let mut out = Vec::new();

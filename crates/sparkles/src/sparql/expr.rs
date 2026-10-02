@@ -815,8 +815,10 @@ pub fn lang_matches(tag: &str, range: &str) -> bool {
     if range == "*" {
         return !tag.is_empty();
     }
-    let (t, r) = (tag.to_ascii_lowercase(), range.to_ascii_lowercase());
-    t == r || (t.starts_with(&r) && t.as_bytes().get(r.len()) == Some(&b'-'))
+    let (t, r) = (tag.as_bytes(), range.as_bytes());
+    t.len() >= r.len()
+        && t[..r.len()].eq_ignore_ascii_case(r)
+        && (t.len() == r.len() || t[r.len()] == b'-')
 }
 
 fn round_half_up_double(d: f64) -> f64 {

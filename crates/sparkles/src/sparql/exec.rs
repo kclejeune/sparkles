@@ -10,7 +10,7 @@ use super::table::{Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{Block, O, P, Perm, S, pad};
+use crate::index::{Block, Key, O, P, Perm, S, pad};
 use crate::store::Chunk;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -257,6 +257,19 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
             t
         }
+        Kind::CountFilterScan {
+            spec,
+            key,
+            filter,
+            var,
+            distinct,
+        } => {
+            let (c, why) = count_filter_scan(ctx, spec, *key, filter, *distinct)?;
+            note = Some(why);
+            let mut t = Table::new(vec![*var]);
+            t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
+            t
+        }
         Kind::CountJoin { algo, var } => {
             let l = child(0, &mut infos)?;
             let r = if l.is_empty() {
@@ -304,9 +317,30 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             out
         }
         Kind::Filter(es) => {
-            let mut t = child(0, &mut infos)?;
-            expr_report = apply_filter(ctx, &mut t, es)?;
+            let runs = match &n.children[0].kind {
+                Kind::Scan(spec) if ctx.opt.filter_scan_runs => {
+                    filter_scan_runs(ctx, spec, &n.children[0], es)?
+                }
+                _ => None,
+            };
+            let (mut t, rest, runs_note) = match runs {
+                Some(r) => {
+                    let mut info = describe(ctx, &n.children[0]);
+                    info.actual_rows = r.read as i64;
+                    infos.push(info);
+                    held.add(r.table.mem_bytes())?;
+                    (r.table, r.rest, Some(r.note))
+                }
+                None => (child(0, &mut infos)?, es.clone(), None),
+            };
+            expr_report = apply_filter(ctx, &mut t, &rest)?;
             (note, counters) = super::exists::explain(ctx, es);
+            if let Some(r) = runs_note {
+                note = Some(match note {
+                    Some(n) => format!("{r} {n}"),
+                    None => r,
+                });
+            }
             t
         }
         Kind::Extend(v, e) => {
@@ -582,9 +616,461 @@ fn run_end(col: &[Id], i: usize) -> usize {
     }
 }
 
+/// Key columns read for the runs of a scan's first free column: that column and the
+/// columns of the graph filter and repeated-variable checks, or every variable column
+/// when duplicates across graphs are dropped (rows are compared on all of them).
+fn run_mask(ctx: &Ctx, spec: &ScanSpec) -> crate::index::ColMask {
+    let all = scan_mask(ctx, spec);
+    if spec.dedup || all == crate::index::ALL_COLS {
+        return all;
+    }
+    let mut m: crate::index::ColMask = 1 << spec.cols[0].0;
+    if !matches!(spec.graph, GraphFilter::All) {
+        m |= 1 << spec.graph_col;
+    }
+    for &(a, b) in &spec.eqs {
+        m |= (1 << a) | (1 << b);
+    }
+    m
+}
+
+/// COUNT over a FILTER on the first free key column of a scan: the filter is tested
+/// once per distinct value of the column (on vocabulary keys when it can be), and the
+/// rows of the values that pass are counted from the runs, or the values themselves for
+/// `COUNT(DISTINCT)`. Also returns the EXPLAIN note.
+fn count_filter_scan(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    key: VarId,
+    filter: &[Expr],
+    distinct: bool,
+) -> Result<(u64, String)> {
+    let kf = super::keyfilter::KeyFilter::new(filter, key);
+    if let Some(kf) = &kf
+        && let Some(c) = par_count_on_keys(ctx, spec, kf, &key_ranges(ctx, spec, Some(kf)))?
+    {
+        // the other values: inline literals and blank nodes
+        let ids: Vec<Id> = c.other.iter().map(|r| r.0).collect();
+        let (hit, _) = super::exprcache::filter_values(ctx, &ids, key, filter)?;
+        let (mut rows, mut passed) = (c.rows, c.passed);
+        for (h, (_, n)) in hit.iter().zip(&c.other) {
+            if *h {
+                rows += n;
+                passed += 1;
+            }
+        }
+        let tested = c.tested + ids.len() as u64;
+        let n = if distinct { passed } else { rows };
+        return Ok((
+            n,
+            format!(
+                "[{tested} values{} tested on vocabulary keys, {passed} passed]",
+                ranges_note(c.ranges)
+            ),
+        ));
+    }
+    let (keys, counts) = key_runs(ctx, spec)?;
+    ctx.check()?;
+    let (hit, on_keys) = super::exprcache::filter_values(ctx, &keys, key, filter)?;
+    let passed = hit.iter().filter(|h| **h).count();
+    let n = if distinct {
+        passed as u64
+    } else {
+        hit.iter()
+            .zip(&counts)
+            .filter(|(h, _)| **h)
+            .map(|(_, c)| *c)
+            .sum()
+    };
+    let note = format!(
+        "[{} values tested{}, {passed} passed]",
+        keys.len(),
+        if on_keys { " on vocabulary keys" } else { "" }
+    );
+    Ok((n, note))
+}
+
+/// Rows of an index block read by one parallel task of the filters on runs.
+const PIECE: usize = 8192;
+
+/// All keys of a scan.
+fn whole_range(spec: &ScanSpec) -> (Key, Key) {
+    (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX))
+}
+
+/// Key ranges of a scan that hold every row whose first free column can pass a key
+/// filter: when the filter fixes the start of the string (`STRSTARTS`, `REGEX("^…")`),
+/// the base-vocabulary ids of the keys with that start, and every id outside the base
+/// vocabulary (inline values, terms added by updates), which are tested as usual.
+/// Otherwise the whole scan.
+fn key_ranges(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    kf: Option<&super::keyfilter::KeyFilter>,
+) -> Vec<(Key, Key)> {
+    let c = spec.prefix.len();
+    let Some(prefixes) = kf.and_then(|k| k.key_prefixes()) else {
+        return vec![whole_range(spec)];
+    };
+    if !ctx.opt.filter_key_ranges || spec.cols.first().map(|x| x.0) != Some(c) || c >= 4 {
+        return vec![whole_range(spec)];
+    }
+    let vocab = &ctx.snap.generation.vocab;
+    let at = |v: u64, fill: u64| {
+        let mut k = pad(&spec.prefix, fill);
+        k[c] = v;
+        k
+    };
+    // ids sort by tag first: the base vocabulary is one block of ids
+    let mut ranges = vec![(at(0, 0), at(Id::vocab(0).0 - 1, u64::MAX))];
+    for p in prefixes {
+        let (a, b) = vocab.prefix_range(&p);
+        if a < b {
+            ranges.push((at(Id::vocab(a).0, 0), at(Id::vocab(b - 1).0, u64::MAX)));
+        }
+    }
+    ranges.push((at(Id::vocab(vocab.len()).0, 0), at(u64::MAX, u64::MAX)));
+    ranges
+}
+
+/// EXPLAIN text for a read restricted to key ranges.
+fn ranges_note(n: usize) -> String {
+    if n > 1 {
+        format!(" in {n} key ranges")
+    } else {
+        String::new()
+    }
+}
+
+/// What the index blocks of a scan contribute to a count on vocabulary keys.
+#[derive(Default)]
+struct KeyCount {
+    /// rows of the vocabulary values that passed
+    rows: u64,
+    /// distinct vocabulary values tested, and those that passed
+    tested: u64,
+    passed: u64,
+    /// the block's first and last vocabulary value and whether it passed (a run that
+    /// continues into the next block is tested in both)
+    first: Option<(u64, bool)>,
+    last: Option<(u64, bool)>,
+    /// the runs of the other values (inline literals, blank nodes), in order
+    other: Vec<(Id, u64)>,
+    /// key ranges read
+    ranges: usize,
+}
+
+/// The rows of a scan whose first free key column passes a key filter, counted per
+/// index block in parallel: each block's runs of vocabulary ids are tested on their keys
+/// as the front-coded vocabulary blocks are decoded, without collecting the runs of the
+/// whole scan. The runs of other ids are returned for the general evaluator. `None`
+/// when the blocks cannot be read in parallel (see [`par_key_runs`]).
+fn par_count_on_keys(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    kf: &super::keyfilter::KeyFilter,
+    ranges: &[(Key, Key)],
+) -> Result<Option<KeyCount>> {
+    if spec.dedup {
+        return Ok(None);
+    }
+    let vocab = &ctx.snap.generation.vocab;
+    let parts = ctx.snap.par_blocks_in_ranges(
+        spec.perm,
+        ranges,
+        run_mask(ctx, spec),
+        PIECE,
+        |b, s, e| {
+            // threads sharing a regular expression contend for its match caches
+            let kf = kf.clone();
+            let mut out = KeyCount::default();
+            let (mut ids, mut counts): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
+            block_runs(spec, b, s, e, |k, n| {
+                if Id(k).tag() == crate::id::Tag::Vocab {
+                    ids.push(Id(k).payload());
+                    counts.push(n);
+                } else {
+                    out.other.push((Id(k), n));
+                }
+            });
+            let mut pass = vec![false; ids.len()];
+            let mut j = 0;
+            vocab.get_sorted(&ids, |p, key| {
+                while ids[j] != p {
+                    j += 1;
+                }
+                pass[j] = kf.test(key);
+            });
+            for (h, n) in pass.iter().zip(&counts) {
+                if *h {
+                    out.rows += n;
+                    out.passed += 1;
+                }
+            }
+            out.tested = ids.len() as u64;
+            let raw = |i: usize| Id::vocab(ids[i]).0;
+            if !ids.is_empty() {
+                out.first = Some((raw(0), pass[0]));
+                out.last = Some((raw(ids.len() - 1), pass[ids.len() - 1]));
+            }
+            ctx.check()?;
+            Ok(out)
+        },
+    )?;
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
+    let mut all = KeyCount {
+        ranges: ranges.len(),
+        ..Default::default()
+    };
+    let mut last: Option<(u64, bool)> = None;
+    for p in parts {
+        all.rows += p.rows;
+        all.tested += p.tested;
+        all.passed += p.passed;
+        // a value whose run continues from the block before was tested twice
+        if let (Some((a, passed)), Some((b, _))) = (last, p.first)
+            && a == b
+        {
+            all.tested -= 1;
+            all.passed -= passed as u64;
+        }
+        if p.last.is_some() {
+            last = p.last;
+        }
+        for (id, n) in p.other {
+            match all.other.last_mut() {
+                Some((x, m)) if *x == id => *m += n,
+                _ => all.other.push((id, n)),
+            }
+        }
+    }
+    ctx.check_output(all.other.len(), 2)?;
+    Ok(Some(all))
+}
+
+/// The runs of the first free key column in rows `[s, e)` of an index block that pass
+/// the scan's graph filter and repeated-variable checks: `f(id, rows)` per run, in
+/// order (the first and last may continue in the neighbouring blocks).
+fn block_runs(spec: &ScanSpec, b: &Block, s: usize, e: usize, mut f: impl FnMut(u64, u64)) {
+    let kc = spec.cols[0].0;
+    if block_passes(spec, b, s, e) {
+        let col = &b.cols[kc][s..e];
+        let mut i = 0;
+        while i < col.len() {
+            let run = run_len(&col[i..], col[i]);
+            f(col[i], run as u64);
+            i += run;
+        }
+        return;
+    }
+    let mut cur: Option<(u64, u64)> = None;
+    for i in s..e {
+        let k = b.key(i);
+        if !spec.graph.accepts(k[spec.graph_col]) || spec.eqs.iter().any(|&(a, b)| k[a] != k[b]) {
+            continue;
+        }
+        match &mut cur {
+            Some((v, n)) if *v == k[kc] => *n += 1,
+            _ => {
+                if let Some((v, n)) = cur {
+                    f(v, n);
+                }
+                cur = Some((k[kc], 1));
+            }
+        }
+    }
+    if let Some((v, n)) = cur {
+        f(v, n);
+    }
+}
+
+/// A scan filtered on its first free key column by [`filter_scan_runs`].
+struct FilteredScan {
+    /// the rows whose value passed, in scan order
+    table: Table,
+    /// conjuncts that read other variables, still to be applied
+    rest: Vec<Expr>,
+    /// rows of the scan, passed or not
+    read: u64,
+    note: String,
+}
+
+/// A FILTER over a scan sorted on a variable it tests: the conjuncts that read only that
+/// variable are tested once per run of its values (on vocabulary keys when they can be),
+/// and only the rows of the values that pass are copied out of the index blocks, in
+/// parallel. `None` when no conjunct reads only the sort variable, when union-graph dedup
+/// compares neighbouring rows, or when the delta has keys in the scan's range.
+fn filter_scan_runs(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    scan: &Node,
+    exprs: &[Expr],
+) -> Result<Option<FilteredScan>> {
+    let Some(&(kc, key)) = spec.cols.first() else {
+        return Ok(None);
+    };
+    if spec.dedup || exprs.is_empty() {
+        return Ok(None);
+    }
+    let (on_key, rest): (Vec<Expr>, Vec<Expr>) = exprs
+        .iter()
+        .cloned()
+        .partition(|e| super::exprcache::input(&[e]) == Ok(Some(key)));
+    if on_key.is_empty() {
+        return Ok(None);
+    }
+    let kf = super::keyfilter::KeyFilter::new(&on_key, key);
+    let ranges = key_ranges(ctx, spec, kf.as_ref());
+    let Some((keys, counts)) = par_key_runs(ctx, spec, &ranges)? else {
+        return Ok(None);
+    };
+    let read: u64 = counts.iter().sum();
+    let (hit, on_keys) = super::exprcache::filter_values(ctx, &keys, key, &on_key)?;
+    drop(counts);
+    let passed = hit.iter().filter(|h| **h).count();
+    let width = spec.cols.len();
+    let parts = ctx.snap.par_blocks_in_ranges(
+        spec.perm,
+        &ranges,
+        scan_mask(ctx, spec),
+        PIECE,
+        |b, s, e| {
+            let mut cols: Vec<Vec<Id>> = vec![Vec::new(); width];
+            if s >= e {
+                return Ok(cols);
+            }
+            let col = &b.cols[kc];
+            // the block's values among the runs, and whether any of them passed
+            let j0 = keys.partition_point(|k| k.0 < col[s]);
+            let j1 = keys.partition_point(|k| k.0 <= col[e - 1]);
+            if !hit[j0..j1].iter().any(|h| *h) {
+                return Ok(cols);
+            }
+            let mut j = j0;
+            if block_passes(spec, b, s, e) {
+                let mut i = s;
+                while i < e {
+                    let run = run_len(&col[i..e], col[i]);
+                    while keys[j].0 < col[i] {
+                        j += 1;
+                    }
+                    if hit[j] {
+                        for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+                            cols[c].extend(b.cols[kc][i..i + run].iter().map(|&x| Id(x)));
+                        }
+                    }
+                    i += run;
+                }
+            } else {
+                for i in s..e {
+                    let k = b.key(i);
+                    if !spec.graph.accepts(k[spec.graph_col])
+                        || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
+                    {
+                        continue;
+                    }
+                    while keys[j].0 < k[kc] {
+                        j += 1;
+                    }
+                    if hit[j] {
+                        for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+                            cols[c].push(Id(k[kc]));
+                        }
+                    }
+                }
+            }
+            ctx.check()?;
+            Ok(cols)
+        },
+    )?;
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
+    let rows: usize = parts.iter().map(|p| p[0].len()).sum();
+    ctx.check_output(rows, width)?;
+    let mut table = Table::new(scan.vars.clone());
+    for c in &mut table.cols {
+        c.reserve_exact(rows);
+    }
+    for p in parts {
+        for (c, part) in p.into_iter().enumerate() {
+            table.cols[c].extend(part);
+        }
+    }
+    table.len = rows;
+    table.sorted = scan.sorted.clone();
+    let note = format!(
+        "[runs of ?{}: {} values{} tested{}, {passed} passed]",
+        ctx.var_name(key),
+        keys.len(),
+        ranges_note(ranges.len()),
+        if on_keys { " on vocabulary keys" } else { "" }
+    );
+    Ok(Some(FilteredScan {
+        table,
+        rest,
+        read,
+        note,
+    }))
+}
+
+/// [`key_runs`] with the index blocks read in parallel, when the snapshot's delta has no
+/// key in the scan's range and rows need no comparison with their neighbours (no
+/// union-graph dedup); `None` otherwise.
+fn par_key_runs(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    ranges: &[(Key, Key)],
+) -> Result<Option<(Vec<Id>, Vec<u64>)>> {
+    if spec.dedup {
+        return Ok(None);
+    }
+    let parts = ctx.snap.par_blocks_in_ranges(
+        spec.perm,
+        ranges,
+        run_mask(ctx, spec),
+        PIECE,
+        |b, s, e| {
+            let mut keys: Vec<Id> = Vec::new();
+            let mut counts: Vec<u64> = Vec::new();
+            block_runs(spec, b, s, e, |k, n| {
+                keys.push(Id(k));
+                counts.push(n);
+            });
+            ctx.check()?;
+            Ok((keys, counts))
+        },
+    )?;
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
+    let total: usize = parts.iter().map(|p| p.0.len()).sum();
+    // a key and a count per run
+    ctx.check_output(total, 2)?;
+    let (mut keys, mut counts) = (Vec::with_capacity(total), Vec::with_capacity(total));
+    for (k, c) in parts {
+        // a run that continues from the block before
+        let skip = match (keys.last(), k.first()) {
+            (Some(a), Some(b)) if a == b => {
+                *counts.last_mut().unwrap() += c[0];
+                1
+            }
+            _ => 0,
+        };
+        keys.extend_from_slice(&k[skip..]);
+        counts.extend_from_slice(&c[skip..]);
+    }
+    Ok(Some((keys, counts)))
+}
+
 /// The distinct values of a scan's first free key column with the number of rows of each,
 /// in key order.
 fn key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<(Vec<Id>, Vec<u64>)> {
+    if let Some(runs) = par_key_runs(ctx, spec, &[whole_range(spec)])? {
+        return Ok(runs);
+    }
     let kc = spec.cols[0].0;
     let kcs: Vec<usize> = spec.cols.iter().map(|(k, _)| *k).collect();
     let mut keys: Vec<Id> = Vec::new();
@@ -602,7 +1088,7 @@ fn key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<(Vec<Id>, Vec<u64>)> {
     let mut last: Option<[u64; 4]> = None;
     let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
     ctx.snap
-        .scan_between_cols(spec.perm, lo, hi, scan_mask(ctx, spec), |chunk| {
+        .scan_between_cols(spec.perm, lo, hi, run_mask(ctx, spec), |chunk| {
             let mut row = |k: &[u64; 4]| {
                 if !spec.graph.accepts(k[spec.graph_col])
                     || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
@@ -663,7 +1149,7 @@ fn count_distinct_scan(ctx: &Ctx, spec: &ScanSpec) -> Result<u64> {
     let mut last: Option<u64> = None;
     let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
     ctx.snap
-        .scan_between_cols(spec.perm, lo, hi, scan_mask(ctx, spec), |chunk| {
+        .scan_between_cols(spec.perm, lo, hi, run_mask(ctx, spec), |chunk| {
             let mut row = |k: &[u64; 4]| {
                 if spec.graph.accepts(k[spec.graph_col])
                     && spec.eqs.iter().all(|&(a, b)| k[a] == k[b])

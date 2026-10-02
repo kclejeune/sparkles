@@ -321,6 +321,17 @@ pub enum Kind {
         /// the count read from the index statistics (exact for this snapshot)
         metadata: Option<u64>,
     },
+    /// `COUNT(*)` over a FILTER on one variable of a single scan: the scan is read as
+    /// runs of a permutation sorted on the variable, the filter is tested once per run
+    /// and the lengths of the runs that pass are summed
+    CountFilterScan {
+        spec: ScanSpec,
+        key: VarId,
+        filter: Vec<Expr>,
+        var: VarId,
+        /// `COUNT(DISTINCT ?key)`: the number of runs that pass
+        distinct: bool,
+    },
     /// decompose the triple term in `t` into `parts` (RDF 1.2)
     Unpack {
         t: VarId,
@@ -459,6 +470,7 @@ impl Node {
                 metadata: Some(_), ..
             } => "CountDistinctFromMetadata",
             Kind::CountDistinctScan { .. } => "CountDistinctFromIndex",
+            Kind::CountFilterScan { .. } => "CountFilterFromRuns",
             Kind::GroupCountScan {
                 metadata: Some(_), ..
             } => "GroupCountFromMetadata",
@@ -3156,6 +3168,52 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
             desc,
         );
         n.cost = cost;
+        return n;
+    }
+    // COUNT(*) over a FILTER that reads one variable of a single scan: the filter is
+    // tested once per run of the variable's values, without materializing the rows
+    if keys.is_empty()
+        && ctx.opt.count_filter_runs
+        && aggs.len() == 1
+        && matches!(aggs[0].1.func, AggregateFunction::Count)
+        && let Kind::Filter(filter) = &child.kind
+        && let Kind::Scan(spec) = &child.children[0].kind
+        && let Ok(Some(k)) = super::exprcache::input(&filter.iter().collect::<Vec<_>>())
+        && child.children[0].vars.contains(&k)
+        && match (&aggs[0].1.expr, aggs[0].1.distinct) {
+            (None, false) => true,
+            // every variable of a scan is bound on every row
+            (Some(Expr::Var(x)), false) => child.children[0].vars.contains(x),
+            (Some(Expr::Var(x)), true) => *x == k,
+            _ => false,
+        }
+        && let Some(spec) = reorder_scan(spec, k)
+    {
+        let scan = &child.children[0];
+        let var = aggs[0].0;
+        let desc = format!(
+            "{} filter {}{}",
+            retarget_desc(&scan.desc, &spec),
+            child.desc,
+            if aggs[0].1.distinct {
+                format!(" distinct ?{}", ctx.var_name(k))
+            } else {
+                String::new()
+            }
+        );
+        let mut n = Node::leaf(
+            Kind::CountFilterScan {
+                spec,
+                key: k,
+                filter: filter.clone(),
+                var,
+                distinct: aggs[0].1.distinct,
+            },
+            vec![var],
+            1.0,
+            desc,
+        );
+        n.cost = scan.est;
         return n;
     }
     // COUNT(*) over a join of two scans on one variable: per-key run lengths

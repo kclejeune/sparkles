@@ -89,10 +89,19 @@ pub struct Optimizations {
     /// by shared variables, and drops partial plans dearer than a greedy plan; off: the
     /// program builds every candidate plan tree for every split
     pub pruned_join_order: bool,
+    /// COUNT(*) over a FILTER on one variable of a single scan tests the filter once per
+    /// run of the variable in a permutation sorted on it and sums the run lengths
+    pub count_filter_runs: bool,
+    /// a FILTER over a scan sorted on a variable it tests reads the runs of that
+    /// variable, tests each value once and copies only the rows of the values that pass
+    pub filter_scan_runs: bool,
+    /// those two read only the key ranges of the values whose string starts as a
+    /// `STRSTARTS` or a `REGEX` anchored on a literal start requires
+    pub filter_key_ranges: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 19] = [
+    pub const NAMES: [&str; 22] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -112,6 +121,9 @@ impl Optimizations {
         "topk_first_key",
         "delta_statistics",
         "pruned_join_order",
+        "count_filter_runs",
+        "filter_scan_runs",
+        "filter_key_ranges",
     ];
 
     /// Everything on.
@@ -135,6 +147,9 @@ impl Optimizations {
         topk_first_key: true,
         delta_statistics: true,
         pruned_join_order: true,
+        count_filter_runs: true,
+        filter_scan_runs: true,
+        filter_key_ranges: true,
     };
 
     /// Everything off: the generic operators only.
@@ -158,6 +173,9 @@ impl Optimizations {
         topk_first_key: false,
         delta_statistics: false,
         pruned_join_order: false,
+        count_filter_runs: false,
+        filter_scan_runs: false,
+        filter_key_ranges: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -181,6 +199,9 @@ impl Optimizations {
             "topk_first_key" => &mut self.topk_first_key,
             "delta_statistics" => &mut self.delta_statistics,
             "pruned_join_order" => &mut self.pruned_join_order,
+            "count_filter_runs" => &mut self.count_filter_runs,
+            "filter_scan_runs" => &mut self.filter_scan_runs,
+            "filter_key_ranges" => &mut self.filter_key_ranges,
             _ => return None,
         })
     }
