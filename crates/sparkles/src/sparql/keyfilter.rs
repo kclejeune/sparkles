@@ -7,7 +7,7 @@
 //! straight off the key are compiled; ids that are not stored terms (inline numbers and
 //! dates, blank nodes, unbound) are left to the general evaluator.
 
-use super::expr::{Expr, Func, compatible, compile_regex, lang_matches};
+use super::expr::{Expr, Func, compile_regex, lang_matches};
 use super::table::VarId;
 use super::value::Value;
 use crate::id::KEY_SEP;
@@ -23,12 +23,15 @@ enum Arg {
     Str,
 }
 
+#[derive(Clone)]
 enum Test {
     /// `CONTAINS` / `STRSTARTS` / `STRENDS` with a constant second argument
     Str {
         f: Function,
         arg: Arg,
         needle: Arc<str>,
+        /// substring search for `CONTAINS`, built once for the needle
+        finder: memchr::memmem::Finder<'static>,
         lang: Option<Arc<str>>,
     },
     Regex {
@@ -40,31 +43,32 @@ enum Test {
 }
 
 /// A conjunction of key tests over one variable.
+#[derive(Clone)]
 pub struct KeyFilter(Vec<Test>);
 
-/// A stored term key, borrowed.
+/// A stored term key split into its parts, borrowed. The parts are not checked to be
+/// UTF-8 up front: the byte tests give the answer of the string tests on UTF-8, and a
+/// key that passes them all is checked before it counts as a match.
 enum Key<'a> {
-    Iri(&'a str),
+    Iri(&'a [u8]),
     Literal {
-        lex: &'a str,
+        lex: &'a [u8],
         /// language tag without the base direction
-        lang: Option<&'a str>,
+        lang: Option<&'a [u8]>,
         /// datatype other than `xsd:string` / `rdf:langString`
         typed: bool,
     },
-    /// blank node, triple term or undecodable bytes
+    /// blank node or triple term
     Other,
 }
 
-fn parse(key: &[u8]) -> Key<'_> {
-    let utf8 = |b| std::str::from_utf8(b).ok();
+fn split(key: &[u8]) -> Key<'_> {
     match key.first() {
-        Some(b'<') => utf8(&key[1..]).map_or(Key::Other, Key::Iri),
+        Some(b'<') => Key::Iri(&key[1..]),
         Some(b'"') => {
-            let sep = key.iter().rposition(|&b| b == KEY_SEP).unwrap_or(key.len());
-            let Some(lex) = utf8(&key[1..sep]) else {
-                return Key::Other;
-            };
+            // the separator byte never occurs in UTF-8, so the last one ends the lexical form
+            let sep = memchr::memrchr(KEY_SEP, key).unwrap_or(key.len());
+            let lex = &key[1..sep];
             let suffix = key.get(sep + 1..).unwrap_or(&[]);
             match suffix.first() {
                 None => Key::Literal {
@@ -73,11 +77,9 @@ fn parse(key: &[u8]) -> Key<'_> {
                     typed: false,
                 },
                 Some(b'@') => {
-                    let Some(tag) = utf8(&suffix[1..]) else {
-                        return Key::Other;
-                    };
-                    let lang = match tag.rsplit_once("--") {
-                        Some((l, "ltr" | "rtl")) => l,
+                    let tag = &suffix[1..];
+                    let lang = match tag.len().checked_sub(5) {
+                        Some(i) if tag[i..] == *b"--ltr" || tag[i..] == *b"--rtl" => &tag[..i],
                         _ => tag,
                     };
                     Key::Literal {
@@ -97,6 +99,18 @@ fn parse(key: &[u8]) -> Key<'_> {
     }
 }
 
+impl Key<'_> {
+    /// Whether the parts the tests read are UTF-8 (a key that is not is no string).
+    fn valid(&self) -> bool {
+        let ok = |b: &[u8]| std::str::from_utf8(b).is_ok();
+        match self {
+            Key::Iri(i) => ok(i),
+            Key::Literal { lex, lang, .. } => ok(lex) && lang.is_none_or(ok),
+            Key::Other => false,
+        }
+    }
+}
+
 impl Arg {
     fn of(e: &Expr, v: VarId) -> Option<Arg> {
         match e {
@@ -109,7 +123,7 @@ impl Arg {
     }
 
     /// The string and language tag the function sees; `None` on a type error.
-    fn read<'a>(self, key: &Key<'a>) -> Option<(&'a str, Option<&'a str>)> {
+    fn read<'a>(self, key: &Key<'a>) -> Option<(&'a [u8], Option<&'a [u8]>)> {
         match (self, key) {
             (
                 Arg::Term,
@@ -158,6 +172,7 @@ impl KeyFilter {
                     Test::Str {
                         f: f.clone(),
                         arg: Arg::of(a, v)?,
+                        finder: memchr::memmem::Finder::new(needle.as_bytes()).into_owned(),
                         needle,
                         lang,
                     }
@@ -190,27 +205,46 @@ impl KeyFilter {
 
     /// Whether the term with this key passes (type errors fail the filter).
     pub fn test(&self, key: &[u8]) -> bool {
-        let key = parse(key);
+        let key = split(key);
+        // UTF-8 is self-synchronizing: a byte match of a UTF-8 needle in a UTF-8 string
+        // is a match of the strings
         self.0.iter().all(|t| match t {
             Test::Str {
                 f,
                 arg,
                 needle,
+                finder,
                 lang,
             } => arg.read(&key).is_some_and(|(s, l)| {
-                compatible(l, lang.as_deref())
+                compatible_bytes(l, lang.as_deref())
                     && match f {
-                        Function::Contains => s.contains(&**needle),
-                        Function::StrStarts => s.starts_with(&**needle),
-                        _ => s.ends_with(&**needle),
+                        Function::Contains => finder.find(s).is_some(),
+                        Function::StrStarts => s.starts_with(needle.as_bytes()),
+                        _ => s.ends_with(needle.as_bytes()),
                     }
             }),
-            Test::Regex { arg, re } => arg.read(&key).is_some_and(|(s, _)| re.is_match(s)),
+            Test::Regex { arg, re } => arg
+                .read(&key)
+                .and_then(|(s, _)| std::str::from_utf8(s).ok())
+                .is_some_and(|s| re.is_match(s)),
             Test::LangMatches(range) => match &key {
-                Key::Literal { lang, .. } => lang_matches(lang.unwrap_or(""), range),
+                Key::Literal { lang: None, .. } => lang_matches("", range),
+                Key::Literal { lang: Some(l), .. } => {
+                    std::str::from_utf8(l).is_ok_and(|l| lang_matches(l, range))
+                }
                 _ => false,
             },
-        })
+        }) && key.valid()
+    }
+}
+
+/// [`super::expr::compatible`] on the bytes of a language tag: the needle's tag, if it
+/// has one, must equal the string's ignoring ASCII case.
+fn compatible_bytes(a: Option<&[u8]>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (_, None) => true,
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y.as_bytes()),
+        (None, Some(_)) => false,
     }
 }
 

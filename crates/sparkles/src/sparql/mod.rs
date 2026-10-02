@@ -727,4 +727,6 @@ mod opt_tests;
 #[cfg(test)]
 mod stats_tests;
 #[cfg(test)]
+mod strfilter_tests;
+#[cfg(test)]
 mod tests;
