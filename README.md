@@ -60,6 +60,8 @@ running queries.
   ([API](docs/API.md#write-previews)).
 * A read-only integrity check ([usage](docs/USAGE.md#checking-a-database)).
 * Parallel bulk loading with external sort.
+* CSV and TSV imports with a default mapping, W3C CSVW metadata or Tarql-style CONSTRUCT
+  templates ([usage](docs/USAGE.md#loading-csv-and-tsv)).
 * N-Quads dumps, and incremental, deduplicated backups of persistent and in-memory
   datasets to a file system or S3 ([usage](docs/USAGE.md#backup-repositories)).
 
@@ -234,6 +236,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 |---|---|
 | `serve` | Run the SPARQL server with the web UI. |
 | `load`, `query`, `update`, `dump` | Bulk load, query and update, locally or on a `--server`. `dump` exports N-Quads. |
+| `csv` | Convert CSV and TSV tables to RDF, or print the CSVW metadata of the default mapping. `load` maps and loads them directly. |
 | `compact`, `compaction`, `clone`, `stats`, `log`, `check` | Merge updates, set a dataset's automatic compaction, copy a dataset, show statistics or the commit history, and verify a database. |
 | `snapshot`, `diff` | Manage named snapshots, pin schedules, history retention and the commit catalog's horizon, and show the quads added and removed between two commits, also as RDF Patch. |
 | `backup`, `repo` | Write N-Quads dumps, and manage backup repositories on a file system or S3, restores and policies. |

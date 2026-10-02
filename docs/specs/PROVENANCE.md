@@ -783,6 +783,43 @@ implementation landed.
   - a size-only or ratio-only trigger;
   - compacting every idle period whatever the delta's size.
 
+## CSV and TSV imports
+
+- **Spec:** [`C05-tabular-imports.md`](C05-tabular-imports.md), written on 2026-10-02
+  independently from:
+  - the W3C Recommendations "Model for Tabular Data and Metadata on the Web", "Metadata
+    Vocabulary for Tabular Data" and "Generating RDF from Tabular Data on the Web", cited
+    from working knowledge;
+  - RFC 4180, RFC 6570, RFC 7111 and the IANA registration of
+    `text/tab-separated-values`;
+  - Tarql's public documentation (Apache-2.0), for CONSTRUCT templates over rows. Its
+    source was not read;
+  - the W3C R2RML Recommendation and the RML and YARRRML specifications, at the level of
+    their overviews, for the rejected alternative;
+  - the Sparkles code and specs C01 and C15.
+
+  Fluree was not consulted.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02). No CSVW
+  processor's or Tarql's code was read or copied. The W3C CSVW test suite was not
+  available offline, so the tests were written from the spec's examples.
+  - `sparkles::tabular` holds the converter: the dialect and the record reader on the
+    `csv` crate, the CSVW metadata subset, the datatypes and their formats, an RFC 6570
+    URI template expander, the minimal-mode triples and the CONSTRUCT templates, which
+    run on the engine's `sparql::execute_query` with a `VALUES` block placed at the start
+    of the WHERE clause.
+  - `sparkles-server` has the `load` options and `sparkles csv` in `csv_cmd`, and the
+    upload's conversion in `http::tabular`.
+  - **Dependencies:** `csv` 1.4.0 and `csv-core` 0.1.13 (Unlicense OR MIT), linked into
+    the `sparkles` binary and the Python wheel.
+- **Rejected** (spec §8):
+  - RML, R2RML and YARRRML mappings, deferred until users bring existing mappings;
+  - CSVW's standard mode;
+  - type inference for the default mapping;
+  - a loader `Source` that holds the converter instead of a temporary N-Triples file;
+  - a SPARQL evaluation per row for templates;
+  - templates that read the target dataset;
+  - CSV bodies in the Graph Store protocol.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):

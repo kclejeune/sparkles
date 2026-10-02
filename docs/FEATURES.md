@@ -24,6 +24,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | 7 permutations (SPO, SOP, PSO, POS, OSP, OPS, GSPO) in compressed blocks of 32k rows. | ✅ |
 | A parallel bulk loader for Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD. Input can be compressed with gzip, zstd, brotli or LZ4. | ✅ |
 | External sort for inputs larger than the memory budget. | ✅ |
+| CSV and TSV imports ([C05](specs/C05-tabular-imports.md)). `sparkles load`, `sparkles csv` and `POST /{ds}/upload` map tables to triples with a default mapping (a key column or the row number names each row), with W3C CSVW metadata (datatypes and formats, null values, defaults, lists, virtual columns and RFC 6570 URI templates), or with Tarql-style CONSTRUCT templates run in batches by the SPARQL engine. Tables stream, compressed or not, and an invalid cell stops the load with its row and column ([USAGE.md](USAGE.md#loading-csv-and-tsv)). | ✅ |
 | Planner statistics for predicates (counts, distinct subjects and objects), classes and graphs. | ✅ |
 | MVCC snapshots with a single writer (MR+SW), and a WAL with crash-safe replay. | ✅ |
 | Durable commit ids. Each dataset has a UUID and a gap-free commit sequence with timestamps and net counts. Writes return receipts and `Sparkles-Commit` headers, and the commit catalog is available through `/$/commits` and `sparkles log`. | ✅ |
@@ -159,6 +160,11 @@ These are features other RDF stores have and Sparkles does not have yet.
   by the server only, not by the CLI or the library, and there is no TriX. RDF Patch is
   written for diffs, the change feed and write previews, but Sparkles cannot apply
   a patch.
+* **Tabular imports.** CSV and TSV tables are mapped by CSVW metadata in its minimal
+  mode or by CONSTRUCT templates. There are no RML or R2RML mappings, no CSVW standard
+  mode, and no primary-key or foreign-key checks, and a template cannot read the target
+  dataset. Tables are imported, not queried in place. The Graph Store endpoint and the
+  Python package do not read CSV.
 * **Stored queries.** There are no stored updates, no parameters bound to several values
   at once, and no private queries per user.
 * **Operations.** There are no triple-level or data-dependent access rules, no JVM
