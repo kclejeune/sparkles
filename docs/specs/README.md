@@ -35,27 +35,29 @@ behaviour, and the Outcome explains the difference.
 | Prefix | Group |
 |---|---|
 | `CI` | Durable commit identity. The commit sequence, dataset ids and receipts that most later features build on. |
-| `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, cloning, inference freshness, access control, write-time validation, the MCP server, automatic compaction, write previews and stored queries. |
+| `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, a GraphQL read adapter, cloning, inference freshness, access control, write-time validation, the MCP server, automatic compaction, write previews and stored queries. |
 | `F` | Larger data features: full-text and vector search, backups to object storage, retained history and point-in-time reads. |
 | `G` | Gaps against Apache Jena that were out of scope for the first version: GeoSPARQL, ShEx and the command-line tools. |
 | `P` | Bindings that embed the engine in other languages: Python. |
 | `X` | Internal engineering that does not derive from any other database product: compression codecs and the formatter. |
 
 Numbers are stable. Gaps in the numbering are roadmap items without a spec: a Cypher
-frontend and property-graph view, a GraphQL adapter, tabular imports and a Datalog
-frontend. G01 replaced the narrower geospatial item on that list.
+frontend and property-graph view, tabular imports and a Datalog frontend. G01 replaced
+the narrower geospatial item on that list.
 
 ## Specs
 
 A spec's status is one of three values. *Implemented* means every phase shipped.
 *Implemented in part* means the first phase shipped and some later phases or items were
-not built; the status block says which. *Designed, not built* means there is no code yet.
+not built; the status block says which. *Specified* means the design is written and
+there is no code yet.
 
 | Spec | Summary | Status |
 |---|---|---|
 | [CI](CI-commit-identity.md) | Durable dataset ids, a gap-free commit sequence, commit receipts and headers, `/$/commits` and `sparkles log` | implemented in part (Phases 1–2) |
 | [C01](C01-observability-and-budgets.md) | Request ids, access log, Prometheus metrics, readiness, OpenTelemetry, memory and result-size budgets, cancellation on disconnect | implemented in part |
 | [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented in part (Phase 1, VoID export, Phase 4) |
+| [C03](C03-graphql.md) | A read-only GraphQL endpoint per dataset, with a schema mapped to classes and predicates by `@rdf` directives and drafted from SHACL shapes or the data, compiled to batched SPARQL algebra under the caller's view and budgets | specified |
 | [C06](C06-clone-to-sandbox.md) | Cloning a consistent snapshot of a dataset into a new, independent dataset | implemented in part (Phase 1) |
 | [C08](C08-inference-freshness.md) | Whether materialized inferences are current, re-running them incrementally, and inconsistency diagnostics | implemented (Phases 1–3) |
 | [C09](C09-dataset-access-control.md) | Authentication (Basic, API tokens, OIDC, trusted proxies, CLI logins) and per-dataset permissions | implemented in part (Phase 1, part of Phase 2, Phase 3 as C12) |
