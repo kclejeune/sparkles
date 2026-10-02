@@ -722,9 +722,11 @@ problems, which this change fixed.
   The planner drops a score or literal output that the query uses nowhere else, so a
   `COUNT` or a subject join reads no literal. A search without a limit collects its hits
   without a top-k heap. On 1.05M triples, counting the 4,937 hits of a common word went from
-  about 22 ms to about 5 ms per HTTP request, and joining them with a structural pattern
-  from about 30 ms to about 9 ms. The `docstoreCompression` setting is still accepted, but
-  it no longer changes the index size.
+  about 20 ms to about 2 ms per HTTP request, and joining them with a structural pattern
+  went from about 20 ms to about 3 ms. These are medians of 40 requests on a busy machine,
+  with the id cache warm. Without the cache, each distinct term costs a dictionary lookup
+  of about half a microsecond. The `docstoreCompression` setting is still accepted, but it
+  no longer changes the index size.
 
 **Highlighting (2026-10-02).** Jena's `highlight:` argument works, with Jena's options
 and defaults (`m:`, `z:`, `s:`, `e:`, `f:`, `jh:` and `jf:`). Sparkles does not use
