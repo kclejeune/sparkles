@@ -185,7 +185,7 @@ description = "W3C SPARQL 1.0/1.1/1.2 conformance with per-suite summaries"
 run = "cargo test -p sparkles --test w3c -- --nocapture --test-threads=1"
 
 [tasks."test:shacl"]
-description = "W3C SHACL Core + SHACL-SPARQL conformance"
+description = "W3C SHACL Core + SHACL-SPARQL conformance, the SHACL 1.2 list tests and the SHACLC test pairs"
 run = "cargo test -p sparkles-shacl --test w3c_shacl -- --nocapture"
 
 [tasks."test:shex"]

@@ -1,6 +1,6 @@
 # G03: SHACL Compact Syntax and SHACL 1.2 list constraints
 
-> **Status:** implemented (Phase 1)
+> **Status:** implemented in part (Phase 1)
 >
 > **Phases:** Phase 1 is the SHACLC reader and writer in `sparkles-shacl`, SHACLC wherever
 > shapes are read or shown, and the four SHACL 1.2 list constraint components. The later
