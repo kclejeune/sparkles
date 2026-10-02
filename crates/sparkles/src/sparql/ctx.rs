@@ -45,7 +45,7 @@ impl DatasetSpec {
         if access.reads_all() {
             return Ok(());
         }
-        let visible = access.visible_named(snap)?;
+        let (visible, every) = access.visible_named_all(snap)?;
         let allowed = |g: &Id| {
             if *g == Id::DEFAULT_GRAPH {
                 access.read.default_graph()
@@ -61,6 +61,8 @@ impl DatasetSpec {
         };
         let union = || visible.to_vec();
         self.default = match self.default.take() {
+            // every named graph is visible: the union of them all, with its fast paths
+            None if every && (self.union_default || snap.union_default_graph) => None,
             _ if self.union_default => Some(union()),
             None if snap.union_default_graph => Some(union()),
             // the store's default graph, as before (which keeps its fast paths)
@@ -68,11 +70,14 @@ impl DatasetSpec {
             None => Some(Vec::new()),
             Some(l) => Some(l.into_iter().filter(allowed).collect()),
         };
-        self.union_default = false;
-        self.named = Some(match self.named.take() {
-            None => union(),
-            Some(l) => l.into_iter().filter(allowed).collect(),
-        });
+        if self.default.is_some() {
+            self.union_default = false;
+        }
+        self.named = match self.named.take() {
+            None if every => None,
+            None => Some(union()),
+            Some(l) => Some(l.into_iter().filter(allowed).collect()),
+        };
         Ok(())
     }
 }

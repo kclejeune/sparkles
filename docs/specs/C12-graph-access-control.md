@@ -1,10 +1,10 @@
 # C12: Graph-level access control and endpoint permissions
 
-> **Status:** designed, not built
+> **Status:** implemented
 >
-> **Phases:** Phase 1 covers graph grants for reads and writes, endpoint permissions,
-> every read and write path of the server and the MCP server, and the engine's filtered
-> dataset view.
+> **Phases:** Phase 1 shipped on 2026-10-02: graph grants for reads and writes, endpoint
+> permissions, every read and write path of the server and the MCP server, and the
+> engine's filtered dataset view.
 >
 > **User docs:** [API: Graph-level access control](../API.md#graph-level-access-control) ·
 > [Usage: Restricting users to some graphs](../USAGE.md#restricting-users-to-some-graphs) ·
@@ -627,3 +627,86 @@ predicates, plus a full-text index and vectors. The users are:
   Protocol: cited from working knowledge.
 - **Not consulted:** anything from Fluree, including its policy language, source,
   documentation and design notes.
+
+## Outcome
+
+**Delivered on 2026-10-02**, as one phase.
+
+- The engine's `sparkles::access` module holds `GraphRule`, `Graphs` and `GraphAccess`.
+  `QueryOptions::graphs`, `WriteOptions::graphs`, `SchemaOptions::graphs` and
+  `DiffOptions::graphs` carry a view. `DatasetSpec::restrict` intersects a query's dataset
+  with it after `FROM`, the protocol dataset, the inference overlay and `USING` are
+  applied, and the planner's graph filter does the rest. The visible named graphs are
+  kept per snapshot and rule in the snapshot's count cache.
+- The server's grants gained the `grants` lists of §3.1, `Endpoint`, and
+  `Principal::level_at`, `view` and `limits`. The middleware computes each route's
+  endpoint next to its need, and refuses the whole-dataset routes of §5.4 for a limited
+  view. `auth::restrict` sets the view on query, update, explain, text and MCP options.
+  The Graph Store, uploads, schema, diffs, commits, snapshots, readiness, tasks,
+  `/{ds}/geo` and the MCP tools apply it themselves.
+
+**Deviations from the design.**
+
+- `DatasetInfo` keeps `quads` for a limited caller, counting the quads of the visible
+  graphs, so that listings keep their shape. MCP's `list_datasets` does the same.
+- `/$/history/{ds}` (GET) is refused like the other whole-dataset routes, because it
+  reports the size of the retained history. Snapshot listings leave out the pinned
+  commit's counts.
+- A caller that some endpoint does not admit gets an empty view there, so the redactions
+  of §5.4 and §5.6 apply to every caller whose grants limit graphs or endpoints.
+- When a view's patterns cover every named graph the snapshot has, the query keeps the
+  store's own named graphs and union instead of an explicit list, so it runs the plans of
+  the full dataset. The answers are the same, since no graph is hidden.
+- In a store with `--union-default-graph`, `DESCRIBE` without a view reads the stored
+  default graph as well as the named graphs, while a view's union holds the visible named
+  graphs only. That older difference between `DESCRIBE` and the other query forms was
+  left as it was.
+- `/{ds}/text` without `graph=` searches the default graph, as before, so a caller who
+  cannot see the default graph gets no hits there.
+
+**Tests at landing.**
+
+- `crates/sparkles/tests/graph_access.rs` checks that 47 queries through five views give
+  exactly the answers of a store that holds only the view's graphs. The queries cover
+  `GRAPH ?g`, `FROM` and `FROM NAMED` of hidden graphs, the union graph, property paths,
+  counts with and without patterns, grouped counts, `DESCRIBE`, `CONSTRUCT`, `EXISTS`,
+  `MINUS`, `OPTIONAL`, subqueries, string filters, `spk:vectorSearch`, `text:query` and
+  `geof:sfWithin`. The stores hold a compacted base with a delta on top, with and without
+  a union default graph, and an unrestricted run fills the result cache first. The same file
+  covers protocol datasets, the inference overlay, plan redaction, views that leave plans
+  unchanged, the write rules of §6, loads and replaces, diffs and schema reports.
+- `sparql::access_tests` runs class, predicate and distinct counts through views with the
+  statistics' work limit lifted, so that the statistics shortcuts and their correction for
+  graphs not read answer them, and compares them with a store of the view's graphs.
+- `router_tests::auth::graphs` is a matrix of five users (full, graph-limited reader,
+  graph-limited writer, endpoint-limited, and mixed) against queries, the Graph Store,
+  updates, schema, explain, full-text search, diffs, commits, listings, whoami and the
+  refused routes, and validates configurations. `router_tests::mcp` adds the MCP tools.
+- Crate and server tests, Clippy over all targets, `mise run lint:features`, the W3C
+  suites (SPARQL 1.0 482/482, 1.1 query 328/328, 1.1 update 157/157, 1.2 269/269) and the
+  SHACL suites pass. `mise run ci` passes.
+
+**Performance.** Measured over HTTP on 1M quads, with 100k in the default graph and 45k
+in each of 20 named graphs, as medians of 21 runs that alternate between callers. The
+machine was shared with other builds, so differences under about 10% are noise.
+
+| Query | `main`, full grant | This change, full grant | View of the default graph and 18 named graphs |
+|---|---|---|---|
+| `COUNT(*)` of the default graph | 0.59 ms | 0.60 ms | 0.62 ms |
+| `COUNT(*)` over `GRAPH ?g` | 12.4 ms | 12.3 ms | 15.4 ms |
+| class counts over `GRAPH ?g` | 5.4 ms | 5.4 ms | 5.5 ms |
+| counts per graph | 23.3 ms | 22.6 ms | 24.4 ms |
+| a star join in `GRAPH ?g` | 2.0 ms | 2.0 ms | 2.0 ms |
+| a `STRSTARTS` filter in `GRAPH ?g` | 1.0 ms | 1.1 ms | 1.1 ms |
+| a property path | 1.0 ms | 0.9 ms | 0.9 ms |
+| one subject in `GRAPH ?g` | 0.8 ms | 0.8 ms | 0.8 ms |
+
+A caller with a full grant runs exactly as before: its options carry no view, and the
+tests check that its plans do not change. A limited view costs up to a quarter more on
+scans of every named graph, where each row's graph is looked up in the visible set. Joins,
+filters, paths and lookups show no difference. A view whose patterns cover every existing
+graph measured the same as a full grant once the change above was made.
+
+**Not built.** Graph restrictions on token scopes, validation of a view (§5.5), and a
+`/$/stats` answer for the visible graphs remain open questions 1–3. Full-text scores
+still use the statistics of the whole index.

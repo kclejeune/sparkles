@@ -124,7 +124,7 @@ pub struct CountCache {
     probed: Mutex<FxHashMap<String, Option<super::keyprobe::Measure>>>,
     /// the named graphs each read rule of a graph view sees (see
     /// [`crate::access::GraphAccess::visible_named`])
-    views: Mutex<FxHashMap<String, Arc<Vec<crate::id::Id>>>>,
+    views: Mutex<FxHashMap<String, (Arc<Vec<crate::id::Id>>, bool)>>,
 }
 
 impl CountCache {
@@ -171,11 +171,11 @@ impl CountCache {
     }
 
     /// The visible named graphs of a graph view's read rule, by the rule's key.
-    pub(crate) fn view(&self, k: &str) -> Option<Arc<Vec<crate::id::Id>>> {
+    pub(crate) fn view(&self, k: &str) -> Option<(Arc<Vec<crate::id::Id>>, bool)> {
         self.views.lock().get(k).cloned()
     }
 
-    pub(crate) fn put_view(&self, k: String, v: Arc<Vec<crate::id::Id>>) {
+    pub(crate) fn put_view(&self, k: String, v: (Arc<Vec<crate::id::Id>>, bool)) {
         let mut m = self.views.lock();
         if m.len() >= Self::ENTRIES {
             m.clear();

@@ -356,6 +356,26 @@ fn protocol_datasets_and_the_inference_overlay_are_limited_to_the_view() {
     assert_eq!(r, ["\"inferred\""]);
 }
 
+/// A view by patterns that happen to cover every graph of the store keeps the plans of
+/// the full dataset (its named graphs are not listed), and the same answers.
+#[test]
+fn a_view_of_every_existing_graph_answers_like_no_view() {
+    for union in [false, true] {
+        let s = store(&|g| !g.starts_with("_:"), union);
+        let every = QueryOptions {
+            graphs: Some(view(&["default", "*", INFERRED])),
+            ..Default::default()
+        };
+        for q in QUERIES {
+            assert_eq!(
+                answer(&s, q, &every),
+                answer(&s, q, &QueryOptions::default()),
+                "union {union}: {q}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_full_view_changes_nothing() {
     let full = store(&|_| true, false);

@@ -251,17 +251,25 @@ impl GraphAccess {
     /// The named graphs of `snap` that are readable, sorted by id. Kept with the
     /// snapshot per rule, so repeated queries at one commit list them once.
     pub fn visible_named(&self, snap: &Snapshot) -> Result<Arc<Vec<Id>>> {
+        Ok(self.visible_named_all(snap)?.0)
+    }
+
+    /// [`visible_named`](Self::visible_named), and whether those are all the named graphs
+    /// of `snap`.
+    pub fn visible_named_all(&self, snap: &Snapshot) -> Result<(Arc<Vec<Id>>, bool)> {
         let key = self.read_key();
         if let Some(v) = snap.counts.view(&key) {
             return Ok(v);
         }
-        let mut v: Vec<Id> = snap
-            .graph_ids()?
+        let all = snap.graph_ids()?;
+        let n = all.len();
+        let mut v: Vec<Id> = all
             .into_iter()
             .filter(|&g| self.readable_id(snap, g))
             .collect();
         v.sort_unstable();
-        let v = Arc::new(v);
+        let v = (Arc::new(v), false);
+        let v = (v.0.clone(), v.0.len() == n);
         snap.counts.put_view(key, v.clone());
         Ok(v)
     }

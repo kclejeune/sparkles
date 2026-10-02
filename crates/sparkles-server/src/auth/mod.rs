@@ -381,9 +381,16 @@ impl Access {
     }
 
     /// The graph view of `ds` through endpoint `e`: `None` when it covers every graph
-    /// the level allows (or nothing is allowed).
+    /// the level allows (or the dataset is not granted at all), and no graph when other
+    /// endpoints are granted but not `e`.
     pub fn view(&self, ds: &str, e: Endpoint) -> Option<sparkles::access::GraphAccess> {
-        let l = self.level_for(ds, Some(e))?;
+        let Some(l) = self.level_for(ds, Some(e)) else {
+            self.level_for(ds, None)?;
+            return Some(sparkles::access::GraphAccess {
+                read: sparkles::access::Graphs::none(),
+                write: sparkles::access::Graphs::none(),
+            });
+        };
         let read = self.grants.graphs(ds, e, Level::Read);
         let write = if l >= Level::Write {
             self.grants.graphs(ds, e, Level::Write)
