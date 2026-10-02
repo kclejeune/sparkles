@@ -265,7 +265,7 @@ pub fn configured_source(cfg: &ValidationConfig, shapes: &Shapes) -> ConstraintS
         mode: cfg.mode,
         threshold: cfg.threshold,
     };
-    let (classes, other_targets) = class_constraints(&shapes, checked);
+    let (classes, other_targets) = class_constraints(shapes, checked);
     ConstraintSource {
         kind: SourceKind::Guard,
         graphs: cfg.shapes.graphs.clone().unwrap_or_default(),

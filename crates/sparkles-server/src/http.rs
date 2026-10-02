@@ -35,7 +35,9 @@ mod inline;
 mod jena_formats;
 mod queries;
 mod schema;
-pub(crate) use schema::constraints::{ShapesRequest, build as constraints_layer};
+pub(crate) use schema::constraints::ShapesRequest;
+#[cfg(feature = "mcp")]
+pub(crate) use schema::constraints::build as constraints_layer;
 mod sd;
 mod shex;
 mod stream;
