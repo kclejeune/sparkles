@@ -1003,3 +1003,43 @@ fn invalid_values_rows_are_errors_not_panics() {
         .unwrap();
     assert!(ok.contains("VALUES ?x { 1 UNDEF }"), "{ok}");
 }
+
+#[test]
+fn exec_lateral_and_path_ranges() {
+    let ds = dataset();
+    // the friend of a friend through a range, and through LATERAL the first person each
+    // person reaches by foaf:knows (Jena ARQ's syntax)
+    let q = people()
+        .select("?p")
+        .select("?ff")
+        .where_("?p", "foaf:knows{2}", "?ff");
+    assert!(q.build().unwrap().contains("foaf:knows{2}"));
+    let rows = q.execute(&ds).unwrap();
+    assert_eq!(col(&rows, "p"), [ex("alice")]);
+    assert_eq!(col(&rows, "ff"), [ex("carol")]);
+    let q = people()
+        .select("?p")
+        .select("?f")
+        .where_("?p", "a", "foaf:Person")
+        .lateral(|w| {
+            w.sub_select(
+                people()
+                    .select("?p")
+                    .select("?f")
+                    .where_("?p", "foaf:knows{1,}", "?f")
+                    .order_by("?f")
+                    .limit(1),
+            )
+        })
+        .order_by("?p");
+    assert!(q.build().unwrap().contains("LATERAL {"));
+    let rows = q.execute(&ds).unwrap();
+    assert_eq!(col(&rows, "p"), [ex("alice"), ex("bob")]);
+    assert_eq!(col(&rows, "f"), [ex("bob"), ex("carol")]);
+    assert!(
+        people()
+            .where_("?p", "foaf:knows{1,", "?f")
+            .build()
+            .is_err()
+    );
+}

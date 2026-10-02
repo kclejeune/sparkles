@@ -189,13 +189,29 @@ impl Dataset {
         Ok(r.boolean)
     }
 
-    /// Run a CONSTRUCT or DESCRIBE query.
+    /// Run a CONSTRUCT or DESCRIBE query: the triples of the default graph.
     pub fn construct(&self, query: &str) -> Result<Vec<Triple>> {
         let r = self.query(query)?;
         if !matches!(r.kind, QueryKind::Construct | QueryKind::Describe) {
             return Err(Error::invalid("not a CONSTRUCT or DESCRIBE query"));
         }
         Ok(r.triples)
+    }
+
+    /// Run a CONSTRUCT or DESCRIBE query as quads: the default graph's triples, then the
+    /// quads of a CONSTRUCT template's `GRAPH` blocks (Jena ARQ's quad templates).
+    pub fn construct_quads(&self, query: &str) -> Result<Vec<oxrdf::Quad>> {
+        let r = self.query(query)?;
+        if !matches!(r.kind, QueryKind::Construct | QueryKind::Describe) {
+            return Err(Error::invalid("not a CONSTRUCT or DESCRIBE query"));
+        }
+        let mut out: Vec<oxrdf::Quad> = r
+            .triples
+            .into_iter()
+            .map(|t| t.in_graph(oxrdf::GraphName::DefaultGraph))
+            .collect();
+        out.extend(r.quads);
+        Ok(out)
     }
 
     /// Run a SPARQL Update request (all operations in one transaction).

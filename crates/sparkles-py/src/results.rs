@@ -346,12 +346,15 @@ impl PyQuerySolution {
 #[pyclass(module = "sparkles", name = "QueryTriples")]
 pub struct PyQueryTriples {
     triples: Mutex<std::vec::IntoIter<Triple>>,
+    /// the quads of a CONSTRUCT's `GRAPH` blocks (Jena ARQ)
+    quads: Vec<Quad>,
 }
 
 impl PyQueryTriples {
-    pub fn new(triples: Vec<Triple>) -> PyQueryTriples {
+    pub fn new(triples: Vec<Triple>, quads: Vec<Quad>) -> PyQueryTriples {
         PyQueryTriples {
             triples: Mutex::new(triples.into_iter()),
+            quads,
         }
     }
 }
@@ -367,9 +370,20 @@ impl PyQueryTriples {
         next.map(|t| triple_to_py(py, t)).transpose()
     }
 
-    /// Write the triples not yet iterated in an RDF format (Turtle by default). Returns
-    /// bytes when `output` is `None`, writes a file for a path, and writes to a binary
-    /// file object otherwise. It consumes the triples.
+    /// The quads in named graphs of a CONSTRUCT with Jena ARQ's `GRAPH` template blocks
+    /// (the default graph's triples are the iteration).
+    #[getter]
+    fn quads<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+        self.quads
+            .iter()
+            .map(|q| quad_to_py(py, q.clone()))
+            .collect()
+    }
+
+    /// Write the triples not yet iterated in an RDF format (Turtle by default), and in a
+    /// dataset format (TriG, N-Quads) the quads too. Returns bytes when `output` is
+    /// `None`, writes a file for a path, and writes to a binary file object otherwise.
+    /// It consumes the triples.
     #[pyo3(signature = (output = None, format = None, *, prefixes = None))]
     fn serialize<'py>(
         &self,
@@ -383,11 +397,17 @@ impl PyQueryTriples {
             .or_else(|| format_of_output(&out))
             .unwrap_or(oxrdfio::RdfFormat::Turtle);
         let triples: Vec<Triple> = self.triples.lock().unwrap().by_ref().collect();
+        let named = if format.supports_datasets() {
+            self.quads.clone()
+        } else {
+            Vec::new()
+        };
         let prefixes = prefixes.unwrap_or_default();
         write_output(py, out, None, move |w| {
             let quads = triples
                 .into_iter()
-                .map(|t| Ok(t.in_graph(oxrdf::GraphName::DefaultGraph)));
+                .map(|t| Ok(t.in_graph(oxrdf::GraphName::DefaultGraph)))
+                .chain(named.into_iter().map(Ok));
             serialize_quads(w, format, prefixes, quads, false)
         })
     }

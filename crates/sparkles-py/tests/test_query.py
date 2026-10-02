@@ -66,6 +66,21 @@ def test_a5_ask_construct(ds: Dataset) -> None:
     assert sum(1 for _ in ds.select("SELECT * WHERE { ?s ?p ?o }")) == len(ds)
 
 
+def test_construct_quads(ds: Dataset) -> None:
+    # Jena ARQ's GRAPH blocks in a CONSTRUCT template: the named graph's quads beside
+    # the default graph's triples
+    triples = ds.construct(
+        PREFIXES + "CONSTRUCT { ?s foaf:nick ?n GRAPH ex:nicks { ?s foaf:nick ?n } } WHERE { ?s foaf:name ?n }"
+    )
+    quads = triples.quads
+    assert len(quads) == 3
+    assert all(q.graph_name == ex("nicks") for q in quads)
+    nquads = triples.serialize(format="nquads")
+    assert nquads is not None
+    assert nquads.count(b"<http://ex.org/nicks>") == 3
+    assert len(nquads.splitlines()) == 6
+
+
 def test_a6_errors(ds: Dataset) -> None:
     with pytest.raises(SparqlSyntaxError) as e:
         ds.query("SELECT * WHERE {")

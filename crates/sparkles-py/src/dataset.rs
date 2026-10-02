@@ -144,9 +144,9 @@ pub fn result_to_py<'py>(
         QueryKind::Ask => pyo3::types::PyBool::new(py, r.boolean)
             .to_owned()
             .into_any(),
-        QueryKind::Construct | QueryKind::Describe => {
-            PyQueryTriples::new(r.triples).into_pyobject(py)?.into_any()
-        }
+        QueryKind::Construct | QueryKind::Describe => PyQueryTriples::new(r.triples, r.quads)
+            .into_pyobject(py)?
+            .into_any(),
     })
 }
 
