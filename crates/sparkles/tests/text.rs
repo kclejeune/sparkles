@@ -497,6 +497,171 @@ fn crash_images_are_verified_caught_up_or_rebuilt() {
     }
 }
 
+/// The forms of Lucene's query syntax that jena-text accepts.
+#[test]
+fn lucene_query_syntax() {
+    let s = mem();
+    let hits = |q: &str| {
+        sorted(rows(
+            &s,
+            &format!("SELECT ?s ?lit {{ (?s ?sc ?lit) text:query \"{q}\" }}"),
+        ))
+    };
+    let brown = [
+        "b1 The Quick Brown Fox",
+        "b2 A field guide to brown bears",
+        "b2 Brown Bears",
+    ];
+    // a prefix of one word, alone and in boolean queries
+    assert_eq!(hits("fox*"), ["b1 The Quick Brown Fox", "p1 Foxglove"]);
+    assert_eq!(hits("FOX*"), hits("fox*"), "prefixes are lowercased");
+    assert_eq!(hits("+brown +bea*"), &brown[1..]);
+    assert_eq!(hits("+brown -bea*"), &brown[..1]);
+    assert_eq!(hits("\\\"fox\\\"*"), hits("fox*"));
+    // a phrase prefix (the last word)
+    assert_eq!(hits("\\\"quick bro\\\"*"), &brown[..1]);
+    // wildcards, also leading ones
+    assert_eq!(hits("f?x"), ["b1 The Quick Brown Fox"]);
+    assert_eq!(hits("*glove"), ["p1 Foxglove"]);
+    assert_eq!(hits("b*s"), &brown[1..]);
+    assert_eq!(
+        hits("f\\\\*x"),
+        Vec::<String>::new(),
+        "an escaped * is literal"
+    );
+    // fuzzy terms
+    // "brwn" is one edit away from both "brown" and "brun"
+    let brun = [&brown[..], &["b3 Le renard brun"]].concat();
+    assert_eq!(hits("brwn~1"), brun);
+    assert_eq!(hits("brwn~"), brun);
+    assert_eq!(hits("browm~1"), brown);
+    assert!(hits("brwn").is_empty());
+    assert_eq!(
+        hits("bxown~0.6"),
+        brown,
+        "a similarity of 0.6 allows 2 edits of 5"
+    );
+    // boolean operators and grouping
+    assert_eq!(hits("brown AND fox"), &brown[..1]);
+    assert_eq!(hits("brown && NOT fox"), &brown[1..]);
+    assert_eq!(hits("brown -fox"), &brown[1..]);
+    assert_eq!(hits("brown !fox"), &brown[1..]);
+    assert_eq!(hits("(fox OR bears) AND brown"), brown);
+    assert_eq!(hits("fox OR bears AND guide"), &brown[1..2]);
+    assert_eq!(hits("+(fox socks) -quick"), Vec::<String>::new());
+    // phrases with a slop, in either order (as in Lucene)
+    assert_eq!(hits("\\\"quick fox\\\"~1"), &brown[..1]);
+    assert!(hits("\\\"quick fox\\\"").is_empty());
+    assert!(hits("\\\"fox quick\\\"~2").is_empty());
+    assert_eq!(hits("\\\"fox quick\\\"~3"), &brown[..1]);
+    // regular expressions, ranges, boosts, every document
+    assert_eq!(
+        hits("/fox(glove)?/"),
+        ["b1 The Quick Brown Fox", "p1 Foxglove"]
+    );
+    assert_eq!(hits("[foxa TO foxz]"), ["p1 Foxglove"]);
+    assert_eq!(hits("{fox TO foxglove}"), Vec::<String>::new());
+    assert_eq!(hits("fox^2 OR bears"), hits("fox OR bears"));
+    assert_eq!(hits("*").len(), 5, "the default graph's literals");
+    // a word the analyzer splits is an OR of its parts
+    assert_eq!(hits("quick-bears"), hits("quick OR bears"));
+    // forms that are refused instead of finding nothing
+    for (q, needle) in [
+        ("label:fox", "field names"),
+        ("*:*", "* alone"),
+        ("-fox", "not excluded"),
+        ("NOT fox", "not excluded"),
+        ("...", "no word"),
+        ("", "empty query"),
+        ("(fox", "missing ')'"),
+        ("fox AND", "word should follow"),
+        ("/a@b/", "not supported"),
+        ("\\\"a b a\\\"~2", "repeat a word"),
+        ("fox~1.5", "fractional"),
+    ] {
+        let e = err(&s, &format!("SELECT ?s {{ ?s text:query \"{q}\" }}"));
+        assert!(e.contains("text:query") && e.contains(needle), "{q}: {e}");
+    }
+}
+
+/// An explicit limit above `maxHits` is no limit: more hits than `maxHits` are an error,
+/// as without a limit, instead of the first `maxHits` + 1.
+#[test]
+fn limits_above_max_hits_are_refused_like_no_limit() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    s.enable_text(TextConfig {
+        max_hits: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    let count = |limit: &str| {
+        query(
+            s.snapshot(),
+            &format!(
+                "{P}SELECT (COUNT(*) AS ?n) {{ (?s ?sc ?lit) text:query (\"brown\"{limit}) }}"
+            ),
+            &QueryOptions::default(),
+        )
+        .map(|r| r.rows()[0][0].as_ref().unwrap().to_string())
+    };
+    for limit in ["", " 3", " 1000", " 100000000"] {
+        let e = count(limit).expect_err(limit);
+        assert!(
+            matches!(&e, sparkles::Error::BudgetExceeded(b) if b.limit == 2 && b.requested == 3),
+            "limit{limit}: {e}"
+        );
+    }
+    assert!(count(" 2").unwrap().starts_with("\"2\""));
+    assert!(count(" 1").unwrap().starts_with("\"1\""));
+    // within maxHits every hit is returned, whatever the limit
+    assert!(
+        rows(&s, "SELECT ?s { ?s text:query (\"fox\" 1000) }").len() == 1,
+        "one hit"
+    );
+}
+
+/// A score or literal the query does not use is not produced, so the search reads no
+/// literal; one used anywhere else still is.
+#[test]
+fn unused_outputs_are_left_out() {
+    let s = mem();
+    let plan = |q: &str| {
+        let r = query(s.snapshot(), &format!("{P}{q}"), &QueryOptions::default()).unwrap();
+        fn find(p: &sparkles::sparql::PlanInfo) -> Option<String> {
+            if p.operator == "TextSearch" {
+                return Some(p.description.clone());
+            }
+            p.children.iter().find_map(find)
+        }
+        (r.rows().len(), find(&r.plan).unwrap())
+    };
+    let (n, d) = plan("SELECT (COUNT(*) AS ?n) { (?s ?sc ?lit) text:query \"brown\" }");
+    assert_eq!(n, 1);
+    assert!(d.starts_with("?s ←"), "{d}");
+    assert_eq!(
+        rows(
+            &s,
+            "SELECT (COUNT(*) AS ?n) { (?s ?sc ?lit) text:query \"brown\" }"
+        ),
+        ["3"]
+    );
+    let (_, d) = plan("SELECT ?s { (?s ?sc ?lit) text:query \"brown\" } ORDER BY ?lit");
+    assert!(d.contains("?lit") && !d.contains("?sc"), "{d}");
+    let (_, d) = plan("SELECT ?s { (?s ?sc ?lit) text:query \"brown\" FILTER(?sc > 0) }");
+    assert!(d.contains("?sc") && !d.contains("?lit"), "{d}");
+    let (_, d) = plan("SELECT * { (?s ?sc ?lit) text:query \"brown\" }");
+    assert!(d.contains("?sc") && d.contains("?lit"), "{d}");
+    // COUNT(DISTINCT *) depends on every variable
+    assert_eq!(
+        rows(
+            &s,
+            "SELECT (COUNT(DISTINCT *) AS ?n) { (?s ?sc ?lit) text:query \"brown\" }"
+        ),
+        ["3"]
+    );
+}
+
 #[test]
 fn searches_count_toward_the_memory_budget() {
     let s = mem();
