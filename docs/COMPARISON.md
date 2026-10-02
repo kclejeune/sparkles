@@ -199,7 +199,8 @@ authentication.
 * **GROUP BY + COUNT from index runs.** When the group key is a scan's sort column, counts
   come from runs in the blocks; the scan is never materialized.
 * **Planner details.** Filters are placed as soon as their variables are bound. Scan sizes
-  are exact from block metadata (at most two block decodes). Join estimates use
+  are exact from block metadata (at most two block decodes). Joins are estimated from
+  characteristic sets or probed values where those apply (see below), and otherwise from
   per-predicate distinct subject and object counts with QLever's 0.7 correction factor. A
   pattern with a single free subject, predicate or object has a distinct value of it per
   row. Costs are counted in rows read by a scan. A hash join costs 8 of them for each row
@@ -266,7 +267,7 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   FILTER(CONTAINS(?n, "Ada"))` keeps 5% of the names. With an estimate of 6.5% instead
   of 30%, the planner tests each distinct name once in a scan sorted on the name, sorts
   the 50,000 rows that pass and merges them with the ages. The query runs in 12 ms
-  instead of 21 ms. Sampling adds 0.02 to 0.08 ms to planning a filter when the blocks are
+  instead of 20 ms. Sampling adds 0.02 to 0.08 ms to planning a filter when the blocks are
   cached, and 0.3 to 0.6 ms when one has to be decoded.
 * **Star estimates from characteristic sets** (`characteristic_sets`). A join on a
   variable estimated from distinct values assumes that the values of the side with fewer
@@ -275,16 +276,42 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   predicates independently of each other, it overestimated a star of six patterns
   tenfold. A bulk load or compaction now counts the characteristic sets of the subjects,
   after Neumann and Moerkotte: each set of predicates some subject has exactly, with its
-  subjects and the triples of each predicate. The statistics keep the 10,000 sets with
-  the most subjects. A join on a subject variable of patterns `?s p ?o`, with a constant
-  predicate and a variable object, is then estimated from the sets that hold the
-  predicates of both sides, including the number of triples per subject of each
-  predicate within those sets. Whatever else restricts an input is taken to be
-  independent of the predicates. Patterns with a constant object, predicates that the
-  kept sets cover poorly, and stores loaded before this change keep the estimate from
-  distinct values. On WatDiv at 1.1M triples, the joins of the C3 star are estimated
-  exactly, and C3 runs in 0.76 ms instead of 1.5 ms. C2 runs in 0.04 ms instead of
-  0.30 ms.
+  subjects and the triples of each predicate. The classes a subject has by `rdf:type`
+  count as predicates of their own, since a class usually decides which predicates its
+  instances have. The statistics keep the 10,000 sets with the most subjects. A join on a
+  subject variable of patterns `?s p ?o` with a constant predicate, or `?s a <class>`, is
+  then estimated from the sets that hold the predicates of both sides, including the
+  number of triples per subject of each predicate within those sets. Whatever else
+  restricts an input is taken to be independent of the predicates. Patterns with another
+  constant object, predicates that the kept sets cover poorly, and stores loaded before
+  this change keep the estimate from distinct values. The sets holding a predicate are
+  found once per index generation, and the sums for a query's predicates are kept for
+  later queries. On WatDiv at 1.1M triples, the joins of the C3 star are estimated
+  exactly, and C3 runs in 0.65 ms instead of 1.48 ms. C2 runs in 0.03 ms instead of
+  0.21 ms.
+* **Join estimates from probed values** (`probed_keys`). When one input of a group is
+  small, a VALUES table or a pattern of at most 1,024 rows, the planner reads up to 32 of
+  its values, spread over them in order, and counts the rows each has in every other
+  pattern of the group on the same variable, as an index join would look them up. The mean
+  count and the share of values that have rows then estimate a join of the small input
+  with that pattern. They replace the assumption that every value is on the other side
+  with the pattern's average number of rows, less 30%. This is index-based join sampling
+  as Leis et al. describe it, from one small input. When the small input is itself a
+  pattern the characteristic sets count, their estimate comes first, since the sets know
+  how a star's predicates occur together. The counts read each block of a pattern once,
+  and at most two blocks per group that the block cache does not hold. A small pattern
+  whose blocks are not cached is left to a later query, after this one has read them. The
+  counts are kept with the snapshot. At 10.5M triples, a star of three patterns over
+  30,000 VALUES keys is estimated at its 30,000 rows instead of 10,290.
+
+  Joins that neither the characteristic sets nor probed values estimate keep QLever's
+  0.7 correction. Measured over the two-input joins of every plan of `scripts/bench.sh`,
+  the queries for these estimates and WatDiv at 1.1M triples, with the new estimates
+  switched off, the factor makes the median join of the generated data 30% low, since its
+  joins follow references that exist. The median WatDiv join is still 3.4 times too high
+  with it. No single factor fits both. With the new estimates, the median join of both
+  datasets is estimated exactly, and the mean error falls from a factor of 1.37 to 1.04
+  on the generated data and from 4.2 to 1.6 on WatDiv.
 * **Key ranges for a fixed start** (`filter_key_ranges`). Under a `STRSTARTS`, or a
   `REGEX` anchored on a literal start (`^abc` with no flag other than `s` and no
   alternation), the two operators above read only the base-vocabulary ids of the keys
@@ -413,7 +440,10 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   subject's SPO run once and picks out the star's predicates, or probes each pattern's own
   permutation, whichever touches fewer blocks, and builds the output once instead of
   through intermediate tables (`star_fusion`). The planner costs a star as its separate
-  index joins, since a fused star still spends about as long per key and pattern.
+  index joins, since a fused star still spends about as long per key and pattern. A fused
+  star looks up every pattern for every key of its input, so each of those index joins is
+  costed for the keys of the star's input, not for those left after the patterns below
+  it (`fused_star_costs`).
 * **Whole-block scans under graph filters.** A block slice is copied column-wise whenever
   every row passes the graph filter (one pass over the graph column), so default-graph
   queries avoid row-by-row filtering.

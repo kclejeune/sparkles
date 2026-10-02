@@ -47,8 +47,9 @@ pub struct Sampled {
 
 /// Rows a sample of a small pattern tests at most.
 const SAMPLE_ROWS: usize = 256;
-/// Blocks a sample decodes at most. Decoding a column of a block takes 150 to 250 µs
-/// when its pages are in memory, as long as planning a typical query.
+/// Blocks a sample decodes at most, except a sorted pattern read whole (see
+/// [`SORTED_BLOCKS`]). Decoding a column of a block takes 150 to 250 µs when its pages are
+/// in memory, as long as planning a typical query.
 const SAMPLE_BLOCKS: usize = 2;
 /// A pattern sorted on the filtered variable in at most this many blocks is read whole:
 /// its blocks hold narrow slices of the values, which their first and last keys alone
