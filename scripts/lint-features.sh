@@ -25,9 +25,11 @@ server=(
   backup
   fmt
   tls
+  graphql
   "mcp,shacl"
   "mcp,shex"
   "mcp,fmt"
+  "graphql,shacl"
 )
 
 failed=()
