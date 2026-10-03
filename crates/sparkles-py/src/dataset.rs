@@ -6,7 +6,9 @@ use crate::io::{
     Output, codec_from_py, format_from_py, format_of_output, output_from_py, serialize_quads,
     source_from_py, write_output,
 };
-use crate::results::{PyQuadIterator, PyQuerySolutions, PyQueryTriples, PyUpdateStats};
+use crate::results::{
+    PyPatchStats, PyQuadIterator, PyQuerySolutions, PyQueryTriples, PyUpdateStats,
+};
 use crate::terms::{
     PyVariable, graph_from_py, graph_to_py, iri_from_py, named_node_from_py, opt, quad_from_py,
     subject_from_py, term_from_py,
@@ -630,6 +632,46 @@ impl PyDataset {
         let update = update.to_string();
         let s = interrupt::run(py, &flag, move || ds.update_with(&update, &opts))?;
         Ok(PyUpdateStats::from(s))
+    }
+
+    /// Apply an RDF Patch, in the text form or (`binary`) the RDF Thrift form, as one
+    /// commit of kind `patch`. `data` is the patch as `str` or `bytes`. A `TA` row
+    /// aborts the patch and nothing is applied.
+    #[pyo3(signature = (data, binary = false, *, message = None))]
+    fn apply_patch(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        binary: bool,
+        message: Option<String>,
+    ) -> PyResult<PyPatchStats> {
+        let bytes: Vec<u8> = if let Ok(s) = data.cast::<PyString>() {
+            s.to_str()?.as_bytes().to_vec()
+        } else if let Ok(b) = data.cast::<PyBytes>() {
+            b.as_bytes().to_vec()
+        } else {
+            return Err(PyTypeError::new_err("data must be str or bytes"));
+        };
+        let message = match message {
+            Some(m) => sparkles::annotations::validate_message(&m).py(py)?,
+            None => None,
+        };
+        let ds = self.ds_for_write(py)?;
+        let o = py
+            .detach(move || {
+                ds.store().apply_patch(
+                    &bytes[..],
+                    &sparkles::store::PatchOptions {
+                        binary,
+                        write: sparkles::guard::WriteOptions {
+                            message,
+                            ..Default::default()
+                        },
+                    },
+                )
+            })
+            .py(py)?;
+        Ok(PyPatchStats::from(o))
     }
 
     // ------------------------------------------------------------------ quads ----

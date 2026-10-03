@@ -438,6 +438,67 @@ impl From<sparkles::sparql::update::UpdateStats> for PyUpdateStats {
     }
 }
 
+/// What applying an RDF Patch did.
+#[pyclass(frozen, module = "sparkles", name = "PatchStats", skip_from_py_object)]
+pub struct PyPatchStats {
+    /// whether the patch made a commit
+    #[pyo3(get)]
+    pub committed: bool,
+    /// the commit, or the unchanged head
+    #[pyo3(get)]
+    pub commit: u64,
+    /// `A` rows that added a quad
+    #[pyo3(get)]
+    pub inserted: u64,
+    /// `D` rows that removed a quad
+    #[pyo3(get)]
+    pub deleted: u64,
+    /// the rows read
+    #[pyo3(get)]
+    pub rows: u64,
+    /// a `TA` row aborted the patch
+    #[pyo3(get)]
+    pub aborted: bool,
+    /// the patch's `prev` named a commit of this dataset, which was the head
+    #[pyo3(get)]
+    pub prev_checked: bool,
+    #[pyo3(get)]
+    pub prefixes_set: u64,
+    #[pyo3(get)]
+    pub prefixes_removed: u64,
+}
+
+impl From<sparkles::store::PatchOutcome> for PyPatchStats {
+    fn from(o: sparkles::store::PatchOutcome) -> Self {
+        PyPatchStats {
+            committed: o.receipt.committed,
+            commit: o.receipt.commit.seq,
+            inserted: o.inserted,
+            deleted: o.deleted,
+            rows: o.rows,
+            aborted: o.aborted,
+            prev_checked: o.prev_checked,
+            prefixes_set: o.prefixes_set,
+            prefixes_removed: o.prefixes_removed,
+        }
+    }
+}
+
+#[pymethods]
+impl PyPatchStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "PatchStats(committed={}, commit={}, inserted={}, deleted={}, rows={}, aborted={})",
+            if self.committed { "True" } else { "False" },
+            self.commit,
+            self.inserted,
+            self.deleted,
+            self.rows,
+            if self.aborted { "True" } else { "False" },
+        )
+    }
+}
+
 #[pymethods]
 impl PyUpdateStats {
     fn __repr__(&self) -> String {
@@ -454,5 +515,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyQuerySolution>()?;
     m.add_class::<PyQueryTriples>()?;
     m.add_class::<PyUpdateStats>()?;
+    m.add_class::<PyPatchStats>()?;
     Ok(())
 }
