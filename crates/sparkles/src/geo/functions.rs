@@ -296,7 +296,16 @@ impl Call<'_, '_> {
     fn transform(&self) -> EvalResult<Val> {
         self.arity(2)?;
         let g = self.geom(0)?;
-        let to = CrsRef::Known(crs::lookup(&self.iri(1)?).ok_or(TypeError)?);
+        let iri = self.iri(1)?;
+        let to = match crs::lookup(&iri) {
+            Some(id) => CrsRef::Known(id),
+            None => {
+                // an EPSG code the build refused says why
+                memo::note_crs_ref(self.ctx, &CrsRef::Unknown(iri));
+                return Err(TypeError);
+            }
+        };
+        memo::note_crs_ref(self.ctx, &to);
         let out = ops::transform(&g, &to).map_err(op)?;
         self.geometry(&out, self.datatype(0))
     }
@@ -602,6 +611,49 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
         );
         assert!((d - 1000.0).abs() < 2.0, "{d}");
         assert_eq!(lit(&s, &format!("geof:getSRID({p})")).0, iri);
+    }
+
+    /// Queries that use EPSG CRSs with a Helmert shift, or EPSG CRSs that were refused,
+    /// say so in the plan's warnings, once per CRS.
+    #[cfg(feature = "geo-epsg")]
+    #[test]
+    fn epsg_accuracy_warnings() {
+        let s = store();
+        let run = |expr: &str| {
+            let text = format!("{PREFIXES}SELECT ?r {{ BIND({expr} AS ?r) }}");
+            let r = query(s.snapshot(), &text, &QueryOptions::default()).unwrap();
+            r.plan.warnings
+        };
+        let bng = "\"<http://www.opengis.net/def/crs/EPSG/0/27700> POINT(538985 177334)\"^^geo:wktLiteral";
+        let ws = run(&format!(
+            "geof:sfWithin({bng}, geof:buffer({bng}, 10, uom:metre))"
+        ));
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        assert_eq!(ws[0].code, "geo-crs-approximate");
+        assert!(ws[0].message.starts_with("EPSG:27700 (OSGB 1936"), "{ws:?}");
+        let ws = run(
+            "geof:transform(\"POINT(0 51.4779)\"^^geo:wktLiteral, <http://www.opengis.net/def/crs/EPSG/0/27700>)",
+        );
+        assert!(ws.iter().any(|w| w.code == "geo-crs-approximate"), "{ws:?}");
+        // an exact CRS adds nothing
+        let ws = run(
+            "geof:transform(\"POINT(2.35 48.85)\"^^geo:wktLiteral, <http://www.opengis.net/def/crs/EPSG/0/2154>)",
+        );
+        assert!(ws.is_empty(), "{ws:?}");
+        // a refused CRS, as a literal's and as a target
+        let nad27 = "\"<http://www.opengis.net/def/crs/EPSG/0/26717> POINT(500000 4000000)\"^^geo:wktLiteral";
+        for expr in [
+            format!("geof:metricArea({nad27})"),
+            "geof:transform(\"POINT(-81 36)\"^^geo:wktLiteral, <http://www.opengis.net/def/crs/EPSG/0/26717>)".into(),
+        ] {
+            let ws = run(&expr);
+            assert_eq!(ws.len(), 1, "{expr}: {ws:?}");
+            assert_eq!(ws[0].code, "geo-crs-unsupported");
+            assert!(
+                ws[0].message.contains("NAD27 / UTM zone 17N") && ws[0].message.contains("grid"),
+                "{ws:?}"
+            );
+        }
     }
 
     #[test]

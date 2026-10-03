@@ -4218,18 +4218,62 @@ first, the default) or `ne` (northing first), the order of the literal's coordin
 The transforms run in `proj4rs`, a pure-Rust port of proj4js, which covers transverse
 Mercator, Lambert conformal conic, Lambert azimuthal equal-area, Albers, stereographic,
 Mercator, Swiss oblique Mercator, Krovak and other projections, and datum shifts by
-`+towgs84`. Grid shifts (`+nadgrids`) are not available. A registered CRS behaves like a
+`+towgs84`. Sparkles has no grid files, so a definition whose datum shift needs one is
+refused. That covers `+nadgrids` with a grid name and `+datum=NAD27`, which implies the
+NADCON and NTv2 grids. A registered CRS behaves like a
 UTM zone. Its literals are indexed, transformed to and from the other CRSs, and measured
 in metres. Geographic definitions (`+proj=longlat`) are refused, because
 geographic CRSs on datums other than WGS 84 are not supported. A built-in CRS cannot be
 redefined, and a file that the server cannot read stops it from starting. Changing the
 registered CRSs rebuilds a dataset's spatial index files when it opens.
 
-Sparkles ships no EPSG data, and the default build reads no other EPSG codes. A build
-with the `geo-epsg` cargo feature also looks up any projected EPSG code that is neither
-built in nor registered in the proj4 table of `crs-definitions`, which is derived from
-the EPSG dataset. The EPSG terms of use then apply to that binary. The axis order comes
-from the definition's WKT when it has an `AXIS`, and is easting first otherwise.
+#### EPSG codes
+
+The `sparkles` binary also resolves projected EPSG codes that are neither built in nor
+registered. It looks them up in the proj4 table of the `crs-definitions` crate, which its
+authors generated from the EPSG entries of PostGIS's `spatial_ref_sys` table. A code is
+read on first use, and `EPSG:2154`, `urn:ogc:def:crs:EPSG::2154` and the other aliases
+name the same CRS. The axis order comes from the definition's WKT when it has an `AXIS`,
+and is easting first otherwise. Of the table's 6,184 codes, 4,916 projected ones resolve.
+The others are refused. 956 are geographic or geocentric CRSs, 239 need grid files, and
+`proj4rs` cannot read 73.
+
+These definitions are derived from the EPSG Geodetic Parameter Dataset, which IOGP owns
+and publishes at no charge under the [EPSG terms of
+use](https://epsg.org/terms-of-use.html). The terms allow use and redistribution free of
+charge. They forbid distributing the data for profit, ask every distributor to pass the
+terms on to recipients, and forbid attributing modified data to the EPSG Dataset. The
+binary therefore carries the terms in `THIRD_PARTY_LICENSES.md`. The proj4 strings are a
+conversion of the EPSG data, so Sparkles does not present them or the coordinates it
+computes with them as EPSG data.
+
+The `sparkles` library leaves the table out unless an embedder turns on its `geo-epsg`
+cargo feature. To build the server without the table, list its other default features.
+
+```sh
+cargo build --release -p sparkles-server --no-default-features \
+  --features reasoning,shacl,shex,mimalloc,text,geo,otel,auth,mcp,backup,fmt,tls
+```
+
+Such a build resolves only the built-in CRSs and those of `--geo-crs`.
+
+#### Accuracy of datum shifts
+
+Every transform goes through longitude and latitude on WGS 84, so a CRS on another datum
+needs a datum shift. Sparkles sorts the definitions it accepts, from `--geo-crs` or from
+the EPSG table, into three kinds.
+
+| Kind | Definitions | Accuracy |
+|---|---|---|
+| Exact | Definitions on WGS 84 or GRS 80 without a shift, such as `+datum=WGS84`, `+datum=NAD83`, `+ellps=GRS80`, or `+towgs84=0,0,0` on those ellipsoids. ETRS89 CRSs such as Lambert-93 (EPSG:2154) and ETRS89 / UTM 32N (EPSG:25832) are of this kind, and so are 3,095 codes of the table. | Sparkles takes these datums as WGS 84 and ignores the metre-level drift between them. Transforms are then exact up to the projection formulas, and the tests match PROJ 9.9 to the millimetre. |
+| Helmert | A 3- or 7-parameter `+towgs84` shift, or a proj4 datum that implies one (`+datum=OSGB36`, `potsdam`, `ch1903` and others). The British National Grid (EPSG:27700) and RD New (EPSG:28992) are of this kind, and so are 1,543 codes of the table. | A Helmert shift approximates the national transformation. It is typically good to a few metres, and some older shifts only to tens of metres. Against OSTN15, EPSG:27700 is 0.5 m off in Edinburgh, 1.8 m in Greenwich and 4.3 m at Land's End. Against RDNAPTRANS 2018, EPSG:28992 is within 0.1 m in Amsterdam and Eindhoven. |
+| No datum shift | Another ellipsoid without `+towgs84` or `+datum`, such as Anguilla 1957 (EPSG:2000). 278 codes of the table are of this kind. | The CRS's geographic coordinates are taken as WGS 84 ones, so transformed coordinates are off by the datum's offset. That is tens or hundreds of metres. |
+
+A query that reads a geometry in a Helmert or no-shift CRS, or transforms to one, gets a
+`geo-crs-approximate` plan warning that names the CRS and its kind. A literal in an EPSG
+CRS that the build refused is a literal in an unknown CRS, and the query gets a
+`geo-crs-unsupported` warning with the reason. `serve` and the other commands log the
+`--geo-crs` definitions that are approximate when they start.
 
 ### Spatial joins and nearest neighbours
 
@@ -5483,6 +5527,14 @@ something in the query did not run the way it reads, although the answer is the 
 * `geo-not-pushed`: a spatial FILTER is evaluated row by row. The warning says why.
 * `geo-index-building`: the spatial index is being built, and plans run without it.
 * `geo-not-built`: the query uses `geof:` functions in a build without the `geo` feature.
+
+The plan of an executed query, which the `application/x-sparkles+json` result includes,
+also lists the warnings that came up while it ran:
+
+* `geo-crs-approximate`: a geometry in a CRS whose datum shift is approximate. See
+  [Accuracy of datum shifts](#accuracy-of-datum-shifts).
+* `geo-crs-unsupported`: a geometry in an EPSG CRS that the build refused, with the
+  reason.
 
 ## Compression
 

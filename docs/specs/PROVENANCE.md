@@ -861,9 +861,12 @@ implementation landed.
   - **Dependencies:** `proj4rs` 0.2.0 (MIT OR Apache-2.0), with its default features off,
     behind the `geo-proj4` feature that the server's `geo` feature turns on. Its only new
     dependency is `thiserror` 2. `crs-definitions` 0.5.0 (CC0-1.0, derived from the EPSG
-    dataset) is linked only by the opt-in `geo-epsg` feature, because the EPSG terms of
-    use restrict redistribution. Sparkles has no `deny.toml`. The license check is
-    `scripts/third-party-licenses.py`, and both licenses are permissive.
+    dataset) is linked by the `geo-epsg` feature. The maintainer decided on 2026-10-03
+    to turn it on in the server's default features and leave it off in the library's.
+    The EPSG terms of use allow redistribution at no charge with the terms passed on, so
+    `scripts/third-party-licenses.py` writes them into `THIRD_PARTY_LICENSES.md` with
+    an acknowledgement of IOGP's ownership. Sparkles has no `deny.toml`. The license
+    check is `scripts/third-party-licenses.py`, and both licenses are permissive.
 
 ## ShEx validation
 

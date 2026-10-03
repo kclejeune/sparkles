@@ -24,6 +24,8 @@ rustPlatform.buildRustPackage {
       ../crates
       ../vendor
       ../THIRD_PARTY_LICENSES.md
+      # vendored test data the crates' tests read (Jena's TriX files)
+      ../testsuite/trix
     ];
   };
 

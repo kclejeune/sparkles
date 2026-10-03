@@ -44,6 +44,11 @@ pub struct GeoMemo {
     lru: Mutex<Lru>,
     budget: usize,
     op_vertices: AtomicU64,
+    /// the registered CRSs whose geometries this query has seen, by index (see
+    /// [`note_crs`])
+    noted: [AtomicU64; 2],
+    /// the unknown CRS IRIs whose geometries this query has seen
+    noted_unknown: Mutex<Vec<Arc<str>>>,
 }
 
 impl Default for GeoMemo {
@@ -58,6 +63,8 @@ impl GeoMemo {
             lru: Mutex::new(Lru::default()),
             budget: bytes,
             op_vertices: AtomicU64::new(DEFAULT_OP_VERTICES),
+            noted: Default::default(),
+            noted_unknown: Default::default(),
         }
     }
 
@@ -101,6 +108,65 @@ impl GeoMemo {
     pub fn op_vertices(&self) -> u64 {
         self.op_vertices.load(Ordering::Relaxed)
     }
+}
+
+/// Add a warning to the plan, once per query and CRS, when `g` is in a CRS whose
+/// transforms to WGS 84 are approximate (`geo-crs-approximate`), or in an EPSG CRS of the
+/// build's table that was refused (`geo-crs-unsupported`), with the reason.
+pub(crate) fn note_crs(ctx: &Ctx, g: &Geom) {
+    note_crs_ref(ctx, &g.crs);
+}
+
+/// [`note_crs`] for a CRS on its own (the target of `geof:transform`).
+pub(crate) fn note_crs_ref(ctx: &Ctx, crs_ref: &crate::geo::crs::CrsRef) {
+    use crate::geo::crs::{self, CrsRef};
+    use crate::sparql::ctx::PlanWarning;
+    match crs_ref {
+        CrsRef::Known(id) => {
+            let Some(i) = id.registered_index() else {
+                return;
+            };
+            let bit = 1u64 << (i % 64);
+            if ctx.geo.noted[i / 64].fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+                return;
+            }
+            if let Some(message) = crs::approximation(*id) {
+                ctx.warn(PlanWarning {
+                    code: "geo-crs-approximate",
+                    message,
+                });
+            }
+        }
+        CrsRef::Unknown(iri) => {
+            if !cfg!(feature = "geo-epsg") {
+                return;
+            }
+            {
+                let mut seen = ctx.geo.noted_unknown.lock();
+                if seen.iter().any(|s| **s == **iri) {
+                    return;
+                }
+                seen.push(iri.clone());
+            }
+            if let Some(why) = crs::refusal(iri) {
+                ctx.warn(PlanWarning {
+                    code: "geo-crs-unsupported",
+                    message: format!(
+                        "{why}. Its literals are in an unknown CRS, so metric functions and \
+                         mixes with other CRSs are type errors"
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// [`note_crs`] for a geometry that may be missing, passed through.
+pub(crate) fn noted<E>(ctx: &Ctx, g: Result<GeomRef, E>) -> Result<GeomRef, E> {
+    if let Ok(g) = &g {
+        note_crs(ctx, g);
+    }
+    g
 }
 
 const NIL: usize = usize::MAX;
@@ -243,15 +309,19 @@ pub(crate) fn by_id(ctx: &Ctx, id: Id, decoded: Option<&Value>) -> EvalResult<Ge
         return Err(TypeError);
     }
     if let Some(g) = from_column(ctx, id) {
+        note_crs(ctx, &g);
         return Ok(g);
     }
     let max = max_vertices(ctx);
-    ctx.geo
-        .get_or_parse(MemoKey::Id(id), || match decoded {
-            Some(v) => parse_value(v, max),
-            None => parse_value(&ctx.value(id)?, max),
-        })
-        .ok_or(TypeError)
+    noted(
+        ctx,
+        ctx.geo
+            .get_or_parse(MemoKey::Id(id), || match decoded {
+                Some(v) => parse_value(v, max),
+                None => parse_value(&ctx.value(id)?, max),
+            })
+            .ok_or(TypeError),
+    )
 }
 
 /// The geometry column's parse of a stored literal, when the dataset's spatial index
@@ -288,9 +358,12 @@ pub(crate) fn geom_arg(args: &[Expr], i: usize, row: &Row<'_>, ctx: &Ctx) -> Eva
                     return Err(TypeError);
                 };
                 let max = max_vertices(ctx);
-                ctx.geo
-                    .get_or_parse(MemoKey::lex(dt, lex), || parse_value(&v, max))
-                    .ok_or(TypeError)
+                noted(
+                    ctx,
+                    ctx.geo
+                        .get_or_parse(MemoKey::lex(dt, lex), || parse_value(&v, max))
+                        .ok_or(TypeError),
+                )
             }
         },
     }

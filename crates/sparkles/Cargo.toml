@@ -81,8 +81,8 @@ geo = [
 ]
 # GeoSPARQL CRSs defined by proj4 strings in the operator's `crs.json`
 geo-proj4 = ["geo", "dep:proj4rs"]
-# EPSG codes resolved through the EPSG-derived proj4 table of `crs-definitions` (not
-# in the default build: the EPSG terms of use)
+# EPSG codes resolved through the EPSG-derived proj4 table of `crs-definitions`. Off in
+# the library, so an embedder opts in to the EPSG terms of use; the server turns it on
 geo-epsg = ["geo-proj4", "dep:crs-definitions"]
 # zstd inputs, dumps and backups (libzstd, a C build), and zstd for the text doc store
 zstd = ["dep:zstd", "tantivy?/zstd-compression"]
