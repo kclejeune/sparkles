@@ -1350,6 +1350,10 @@ enum Cmd {
         /// the defaults) says a compaction is due
         #[arg(long)]
         if_due: bool,
+        /// Whether to rewrite only the index blocks the delta touches: auto, off or
+        /// always (default: the dataset's partial setting, else auto)
+        #[arg(long, value_name = "MODE")]
+        partial: Option<String>,
     },
     /// Add the sparse vocabulary index (vocab.idx) to a database whose current index was
     /// built before it existed, so that a cold server looks up a term with one read
@@ -3033,7 +3037,18 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::DescribeSettings(args) => describe_cmd::run(args, opts),
-        Cmd::Compact { loc, if_due } => {
+        Cmd::Compact {
+            loc,
+            if_due,
+            partial,
+        } => {
+            let partial = partial
+                .map(|p| {
+                    sparkles::store::PartialMode::parse(&p).with_context(|| {
+                        format!("--partial expects auto, off or always, not {p:?}")
+                    })
+                })
+                .transpose()?;
             let store = Store::open(&loc, opts)?;
             if if_due {
                 let policy =
@@ -3051,11 +3066,18 @@ fn run() -> Result<()> {
                 }
             }
             let t = Instant::now();
-            store.compact()?;
+            let rep = store.compact_with(&sparkles::store::CompactOptions {
+                partial,
+                ..Default::default()
+            })?;
             eprintln!(
-                "compacted into {} in {:.2}s",
+                "compacted into {} in {:.2}s{}",
                 store.snapshot().generation.name,
-                t.elapsed().as_secs_f64()
+                t.elapsed().as_secs_f64(),
+                match &rep.full_reason {
+                    Some(why) if rep.mode == "full" => format!(" (full: {why})"),
+                    _ => compaction::partial_note(&rep),
+                }
             );
             Ok(())
         }

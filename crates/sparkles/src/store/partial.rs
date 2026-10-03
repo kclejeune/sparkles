@@ -23,8 +23,14 @@ use serde::{Deserialize, Serialize};
 /// The block cache of the statistics update.
 const STATS_CACHE_BYTES: u64 = 64 << 20;
 
-/// The share of blocks above which an automatic choice rebuilds everything.
-pub(crate) const MAX_REWRITE_SHARE: f64 = 0.5;
+/// The cost model of the automatic choice, in milliseconds of a compaction's wall time
+/// per unit, measured on the 10.5M-triple benchmark data (the C13 spec, Phase 2): a full
+/// build per quad, a partial compaction per block it rewrites and per block it copies,
+/// and its statistics update per delta quad.
+const FULL_MS_PER_QUAD: f64 = 1.0e-3;
+const REWRITE_MS_PER_BLOCK: f64 = 0.65;
+const COPY_MS_PER_BLOCK: f64 = 0.05;
+const STATS_MS_PER_DELTA_QUAD: f64 = 6.5e-3;
 /// Blocks after a partial compaction, at most, as a multiple of the blocks a full build
 /// would write. Past it the automatic choice rebuilds everything, which packs them again.
 pub(crate) const MAX_FRAGMENTATION: f64 = 1.25;
@@ -83,10 +89,14 @@ pub(crate) struct PartialPlan {
     pub blocks_after: u64,
     /// blocks a full build would write
     pub blocks_full: u64,
+    /// quads the new generation will hold, and quads in the delta
+    pub quads: u64,
+    pub delta_quads: u64,
 }
 
 impl PartialPlan {
-    /// The share of old blocks rewritten.
+    /// The share of old blocks rewritten (for measurements).
+    #[cfg(test)]
     pub fn share(&self) -> f64 {
         self.rewritten as f64 / self.blocks.max(1) as f64
     }
@@ -94,6 +104,32 @@ impl PartialPlan {
     /// Blocks after the compaction as a multiple of a full build's.
     pub fn fragmentation(&self) -> f64 {
         self.blocks_after as f64 / self.blocks_full.max(1) as f64
+    }
+
+    /// The estimated milliseconds of this partial compaction and of a full build.
+    pub fn estimate_ms(&self) -> (f64, f64) {
+        let partial = self.rewritten as f64 * REWRITE_MS_PER_BLOCK
+            + (self.blocks - self.rewritten) as f64 * COPY_MS_PER_BLOCK
+            + self.delta_quads as f64 * STATS_MS_PER_DELTA_QUAD;
+        (partial, self.quads as f64 * FULL_MS_PER_QUAD)
+    }
+
+    /// Why the automatic choice builds in full rather than by this plan (`None`: it
+    /// follows the plan).
+    pub fn auto_refusal(&self) -> Option<String> {
+        let (partial, full) = self.estimate_ms();
+        if partial >= full {
+            return Some(format!(
+                "a full build is estimated to be quicker ({full:.0} ms against {partial:.0} ms)"
+            ));
+        }
+        if self.fragmentation() > MAX_FRAGMENTATION {
+            return Some(format!(
+                "it would leave {} blocks where a full build writes {}",
+                self.blocks_after, self.blocks_full
+            ));
+        }
+        None
     }
 }
 
@@ -112,7 +148,10 @@ pub(crate) fn plan(snap: &Snapshot) -> std::result::Result<PartialPlan, String> 
             "{new_terms} inserted quads use terms that are not in the vocabulary"
         ));
     }
-    let mut plan = PartialPlan::default();
+    let mut plan = PartialPlan {
+        delta_quads: (snap.delta.inserts() + snap.delta.deletes()) as u64,
+        ..Default::default()
+    };
     for p in Perm::ALL {
         let idx = g.perm(p);
         let segs = plan_perm(idx, &snap.delta.ins[p.index()], &snap.delta.del[p.index()]);
@@ -132,6 +171,9 @@ pub(crate) fn plan(snap: &Snapshot) -> std::result::Result<PartialPlan, String> 
         }
         plan.blocks += idx.blocks.len() as u64;
         plan.blocks_full += rows.div_ceil(BLOCK_ROWS as u64);
+        if p == Perm::Spo {
+            plan.quads = rows;
+        }
         plan.perms.push(segs);
     }
     Ok(plan)
@@ -336,9 +378,10 @@ pub(crate) fn write(
     }
     interrupt()?;
     // the permutations and the statistics, which read only the old generation
+    let t0 = std::time::Instant::now();
     let (rows, stats) = rayon::join(
         || -> Result<Vec<u64>> {
-            Perm::ALL
+            let r = Perm::ALL
                 .par_iter()
                 .zip(&plan.perms)
                 .map(|(&p, segs)| {
@@ -351,9 +394,18 @@ pub(crate) fn write(
                         interrupt,
                     )
                 })
-                .collect()
+                .collect();
+            tracing::debug!("partial compaction: blocks written in {:?}", t0.elapsed());
+            r
         },
-        || update_stats(snap),
+        || {
+            let r = update_stats(snap);
+            tracing::debug!(
+                "partial compaction: statistics updated in {:?}",
+                t0.elapsed()
+            );
+            r
+        },
     );
     let (rows, stats) = (rows?, stats?);
     let quads = rows[Perm::Spo.index()];
@@ -605,4 +657,53 @@ fn update_charsets(
     st.charsets = v;
     st.charset_others = others;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(rewritten: u64, blocks: u64, after: u64, quads: u64, delta: u64) -> PartialPlan {
+        PartialPlan {
+            rewritten,
+            blocks,
+            blocks_after: after,
+            blocks_full: quads.div_ceil(BLOCK_ROWS as u64) * 7,
+            quads,
+            delta_quads: delta,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_automatic_choice_weighs_blocks_and_delta_against_quads() {
+        // 10.5M quads, 2254 blocks: a small delta, then one in every block
+        assert_eq!(
+            plan(100, 2254, 2254, 10_500_000, 1_000).auto_refusal(),
+            None
+        );
+        assert_eq!(
+            plan(2254, 2254, 2254, 10_500_000, 100_000).auto_refusal(),
+            None
+        );
+        // a delta as large as the base: the statistics cost more than a rebuild
+        let why = plan(70, 70, 70, 300_000, 300_000).auto_refusal().unwrap();
+        assert!(why.contains("estimated to be quicker"), "{why}");
+        // too many short blocks
+        let why = plan(10, 2254, 3000, 10_500_000, 1_000)
+            .auto_refusal()
+            .unwrap();
+        assert!(why.contains("blocks where a full build writes"), "{why}");
+    }
+
+    #[test]
+    fn runs_split_into_even_blocks() {
+        let n = BLOCK_ROWS as u64 * 2 + 3;
+        let mut c = Cuts::new(n);
+        let ends: Vec<u64> = (1..=n).filter(|_| c.row()).collect();
+        // three blocks, the first one row longer (n is 1 more than a multiple of 3)
+        let base = n / 3;
+        assert_eq!(n % 3, 1);
+        assert_eq!(ends, vec![base + 1, 2 * base + 1, n]);
+    }
 }

@@ -70,6 +70,7 @@ let
     threads = "--auto-compact-threads";
     ioMb = "--auto-compact-io-mb";
     maxRunning = "--auto-compact-max-running";
+    partial = "--auto-compact-partial";
   };
 
   # an optional whole number: `null` keeps the server's default
@@ -559,6 +560,19 @@ in
       maxRunning =
         optionalInt types.ints.positive 2 "1"
           "Automatic compactions that may run on the server at once (`--auto-compact-max-running`).";
+
+      partial = mkOption {
+        type = types.nullOr (
+          types.enum [
+            "auto"
+            "off"
+            "always"
+          ]
+        );
+        default = null;
+        example = "off";
+        description = "Whether a compaction, automatic or not, may rewrite only the index blocks its delta touches (`--auto-compact-partial`). `null`: the server's default, `auto`.";
+      };
     };
 
     unixSocket = mkOption {

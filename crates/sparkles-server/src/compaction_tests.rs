@@ -128,6 +128,12 @@ async fn the_scheduler_compacts_when_due_and_not_before() {
     let msg = t.message.unwrap();
     assert!(msg.starts_with("auto: compacted to gen-0003"), "{msg}");
     assert!(msg.contains("writer lock"), "{msg}");
+    let (_, j) = send(&app, "GET", "/$/compaction/p", "").await;
+    assert_eq!(j["policy"]["partial"], "auto", "{j}");
+    assert!(
+        matches!(j["last"]["mode"].as_str(), Some("full" | "partial")),
+        "{j}"
+    );
     let ds = st.get("p").unwrap();
     assert!(ds.store.snapshot().delta.is_empty());
     tick(&st, Instant::now());
@@ -346,11 +352,15 @@ fn the_flags_make_the_policy() {
         "3",
         "--auto-compact-io-mb",
         "50",
+        "--auto-compact-partial",
+        "off",
     ])
     .a
     .state()
     .unwrap();
     assert!(!c.enabled);
+    assert_eq!(c.policy.partial, sparkles::store::PartialMode::Off);
+    assert!(Cli::try_parse_from(["x", "--auto-compact-partial", "sometimes"]).is_err());
     assert_eq!((c.policy.delta_ratio, c.policy.idle_seconds), (0.2, 0));
     assert_eq!((c.threads, c.io_bytes_per_sec), (3, Some(50 << 20)));
     let bad = Cli::parse_from(["x", "--auto-compact-ratio", "NaN"])

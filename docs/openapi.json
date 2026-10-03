@@ -1292,7 +1292,7 @@
       },
       "CompactionPolicy": {
         "additionalProperties": true,
-        "description": "Compaction settings: `minDeltaQuads`, `deltaRatio`, `maxDeltaQuads`, `maxDeltaMb`, `maxWalMb`, `idleSeconds`, `maxAgeSeconds`, `minIntervalSeconds` and `enabled`.",
+        "description": "Compaction settings: `minDeltaQuads`, `deltaRatio`, `maxDeltaQuads`, `maxDeltaMb`, `maxWalMb`, `idleSeconds`, `maxAgeSeconds`, `minIntervalSeconds`, `enabled` and `partial` (`auto`, `off` or `always`).",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#automatic-compaction"
         },

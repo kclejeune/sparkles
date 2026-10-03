@@ -1122,7 +1122,7 @@ fn the_automatic_choice_and_its_reasons() {
     let r = s.compact_with(&CompactOptions::default()).unwrap();
     assert_eq!(r.mode, "full");
     assert!(r.full_reason.unwrap().contains("not in the vocabulary"));
-    // changes in every block rebuild everything, unless partial is forced
+    // changes spread over most blocks still cost less than a full build
     let mut ins = String::new();
     for i in (0..100_000).step_by(1_000) {
         ins += &format!(
@@ -1133,9 +1133,8 @@ fn the_automatic_choice_and_its_reasons() {
     }
     upd(&s, &format!("INSERT DATA {{ {ins} }}"));
     let r = s.compact_with(&CompactOptions::default()).unwrap();
-    assert_eq!(r.mode, "full");
-    assert!(r.full_reason.unwrap().contains("% of the blocks"));
-    upd(&s, "DELETE DATA { <urn:s0> <urn:q> 500000 }");
+    assert_eq!(r.mode, "partial", "{r:?}");
+    assert!(r.blocks_rewritten > r.blocks_copied, "{r:?}");
     upd(&s, &format!("DELETE DATA {{ {ins} }}"));
     let r = s
         .compact_with(&CompactOptions {
@@ -1257,6 +1256,10 @@ fn partial_compaction_at_scale() {
         "{:<20} {:>7} {:>8} {:>9} {:>9} {:>9} {:>7}  auto",
         "delta", "forced", "mode", "rewritten", "build ms", "total ms", "lock ms"
     );
+    // `SPARKLES_BENCH_CASES` limits the cases to those whose label contains it, and
+    // `SPARKLES_BENCH_MODES` the modes (`always,off`)
+    let cases = std::env::var("SPARKLES_BENCH_CASES").unwrap_or_default();
+    let modes = std::env::var("SPARKLES_BENCH_MODES").unwrap_or_else(|_| "always,off".into());
     for size in [1_000u64, 10_000, 100_000] {
         for concentrated in [true, false] {
             let label = format!(
@@ -1267,10 +1270,23 @@ fn partial_compaction_at_scale() {
                     "spread"
                 }
             );
+            if !label.contains(cases.as_str()) {
+                continue;
+            }
             for mode in [PartialMode::Always, PartialMode::Off] {
+                if !modes.split(',').any(|m| m == mode.as_str()) {
+                    continue;
+                }
                 let run = work.join("run");
                 let _ = std::fs::remove_dir_all(&run);
                 copy_dir(&base, &run);
+                // the copy's dirty pages would otherwise be written back while the
+                // compaction syncs its files
+                // SAFETY: sync has no preconditions
+                #[cfg(unix)]
+                unsafe {
+                    libc::sync()
+                };
                 let s = Store::open(&run, StoreOptions::default()).unwrap();
                 let mut seed = 0x5eed_u64 + size;
                 let mut rnd = |m: u64| {
@@ -1306,18 +1322,19 @@ fn partial_compaction_at_scale() {
                 let snap = s.snapshot();
                 let auto = match crate::store::partial::plan(&snap) {
                     Err(why) => format!("full: {why}"),
-                    Ok(p) => format!(
-                        "{} ({:.1}% of blocks, {:.3}x)",
-                        if p.share() > crate::store::partial::MAX_REWRITE_SHARE
-                            || p.fragmentation() > crate::store::partial::MAX_FRAGMENTATION
-                        {
-                            "full"
-                        } else {
-                            "partial"
-                        },
-                        p.share() * 100.0,
-                        p.fragmentation()
-                    ),
+                    Ok(p) => {
+                        let (pm, fm) = p.estimate_ms();
+                        format!(
+                            "{} ({:.1}% of blocks, {:.3}x, estimated {pm:.0} against {fm:.0} ms)",
+                            if p.auto_refusal().is_some() {
+                                "full"
+                            } else {
+                                "partial"
+                            },
+                            p.share() * 100.0,
+                            p.fragmentation()
+                        )
+                    }
                 };
                 drop(snap);
                 let r = s

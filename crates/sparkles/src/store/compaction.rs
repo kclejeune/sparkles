@@ -1169,22 +1169,11 @@ impl Store {
             _ => match partial::plan(snap) {
                 Err(why) => why,
                 Ok(plan)
-                    if mode == PartialMode::Auto && plan.share() > partial::MAX_REWRITE_SHARE =>
+                    if let Some(why) = (mode == PartialMode::Auto)
+                        .then(|| plan.auto_refusal())
+                        .flatten() =>
                 {
-                    format!(
-                        "it would rewrite {:.0}% of the blocks, more than {:.0}%",
-                        plan.share() * 100.0,
-                        partial::MAX_REWRITE_SHARE * 100.0
-                    )
-                }
-                Ok(plan)
-                    if mode == PartialMode::Auto
-                        && plan.fragmentation() > partial::MAX_FRAGMENTATION =>
-                {
-                    format!(
-                        "it would leave {} blocks where a full build writes {}",
-                        plan.blocks_after, plan.blocks_full
-                    )
+                    why
                 }
                 Ok(plan) => {
                     if let Some(p) = &o.progress {
