@@ -355,9 +355,12 @@ fn parse_stream<S: QuadSink, F: Fn() -> S + Sync>(
         });
         for msg in rx {
             let (start, bytes) = msg?;
-            // a block ends at a line break, and no triple term spans lines
-            crate::nesting::check(src.format, &bytes, &src.name)?;
             let n = (bytes.len() / min_chunk).clamp(1, parallelism);
+            // a block ends at a line break, and no triple term spans lines: its lines
+            // are checked in parallel pieces
+            line_pieces(&bytes, n)
+                .into_par_iter()
+                .try_for_each(|p| crate::nesting::check(src.format, p, &src.name))?;
             let parsers = parser.clone().split_slice_for_parallel_parsing(&bytes, n);
             while sinks.len() < parsers.len() {
                 sinks.push(make_sink());
@@ -383,6 +386,22 @@ fn parse_stream<S: QuadSink, F: Fn() -> S + Sync>(
     sinks.into_par_iter().try_for_each(QuadSink::finish)
 }
 
+/// `bytes` cut into about `n` pieces that end at a line break (the last at the end).
+fn line_pieces(bytes: &[u8], n: usize) -> Vec<&[u8]> {
+    let step = bytes.len().div_ceil(n.max(1)).max(1);
+    let mut out = Vec::with_capacity(n);
+    let mut start = 0;
+    while start < bytes.len() {
+        let end = match memchr::memchr(b'\n', &bytes[(start + step).min(bytes.len())..]) {
+            Some(i) => (start + step).min(bytes.len()) + i + 1,
+            None => bytes.len(),
+        };
+        out.push(&bytes[start..end]);
+        start = end;
+    }
+    out
+}
+
 /// Send `src` decompressed in blocks of at least `block` bytes that end at a line break
 /// (the last one at the end of the data), with their offsets. Stops when the receiver
 /// is gone.
@@ -399,36 +418,40 @@ fn read_blocks(
     let mut r = codec.reader(raw, src.max_decompressed)?;
     let mut offset = 0u64;
     let mut buf: Vec<u8> = Vec::new();
+    // bytes of `buf` read; the rest is zeroed room for the next reads, zeroed once per
+    // block (a decoder fills a few hundred KiB per call)
+    let mut filled = 0;
     let mut target = block;
     let mut eof = false;
     loop {
-        while buf.len() < target && !eof {
-            let have = buf.len();
+        if buf.len() < target {
             buf.resize(target, 0);
-            match r.read(&mut buf[have..]) {
-                Ok(0) => {
-                    buf.truncate(have);
-                    eof = true;
-                }
-                Ok(k) => buf.truncate(have + k),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => buf.truncate(have),
+        }
+        while filled < target && !eof {
+            match r.read(&mut buf[filled..target]) {
+                Ok(0) => eof = true,
+                Ok(k) => filled += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(crate::codec::io_error(e)),
             }
         }
-        let cut = match buf.iter().rposition(|&c| c == b'\n') {
-            _ if eof => buf.len(),
+        let cut = match memchr::memrchr(b'\n', &buf[..filled]) {
+            _ if eof => filled,
             Some(i) => i + 1,
             // a line longer than a block: read on
             None => {
-                target = buf.len() + block;
+                target = filled + block;
                 continue;
             }
         };
-        let rest = buf.split_off(cut);
+        let mut next = Vec::with_capacity(block.max(filled - cut));
+        next.extend_from_slice(&buf[cut..filled]);
+        filled -= cut;
+        buf.truncate(cut);
         let len = buf.len() as u64;
         if len > 0
             && tx
-                .send(Ok((offset, std::mem::replace(&mut buf, rest))))
+                .send(Ok((offset, std::mem::replace(&mut buf, next))))
                 .is_err()
         {
             return Ok(());
@@ -568,6 +591,20 @@ mod tests {
         let (out, finished) = (Mutex::new(Vec::new()), Mutex::new(0));
         let e = parse_source(&bad, 4, || Collect(&out, Vec::new(), &finished)).unwrap_err();
         assert!(e.to_string().contains("offset 0"), "{e}");
+    }
+
+    #[test]
+    fn line_pieces_cover_the_block_at_line_breaks() {
+        let text = b"aa\nbbbb\n\nc\nddddddd\ne";
+        for n in 1..12 {
+            let pieces = line_pieces(text, n);
+            assert_eq!(pieces.concat(), text, "{n}");
+            for p in &pieces[..pieces.len() - 1] {
+                assert_eq!(p.last(), Some(&b'\n'), "{n}");
+            }
+            assert!(pieces.len() <= n, "{n}");
+        }
+        assert!(line_pieces(b"", 4).is_empty());
     }
 
     #[test]
