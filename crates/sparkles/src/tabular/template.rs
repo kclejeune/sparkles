@@ -29,11 +29,20 @@ impl Template {
             )))
         };
         let Query::Construct {
-            dataset, pattern, ..
+            dataset,
+            pattern,
+            graph_templates,
+            ..
         } = &query
         else {
             return Err(Error::invalid("a CSV template must be a CONSTRUCT query"));
         };
+        if !graph_templates.is_empty() {
+            return Err(Error::invalid(
+                "a CSV template cannot use GRAPH in its template: the rows are loaded into the \
+                 graph the load names",
+            ));
+        }
         if dataset.is_some() {
             return Err(Error::invalid(
                 "a CSV template cannot use FROM or FROM NAMED: it reads the table only",
@@ -72,11 +81,13 @@ impl Template {
         match &self.query {
             Query::Construct {
                 template,
+                graph_templates,
                 dataset,
                 pattern,
                 base_iri,
             } => Query::Construct {
                 template: template.clone(),
+                graph_templates: graph_templates.clone(),
                 dataset: dataset.clone(),
                 // the parser projects a CONSTRUCT's pattern onto the WHERE clause's
                 // variables: the values go inside that projection, with their own
@@ -318,5 +329,20 @@ mod tests {
                 (String::new(), "http://d/".to_string())
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod graph_template_tests {
+    #[test]
+    fn graph_blocks_in_the_template_are_refused() {
+        let e = super::Template::parse(
+            "CONSTRUCT { GRAPH <http://ex.org/g> { ?s <http://ex.org/p> ?o } } WHERE {}",
+            None,
+        )
+        .err()
+        .expect("refused")
+        .to_string();
+        assert!(e.contains("GRAPH"), "{e}");
     }
 }
