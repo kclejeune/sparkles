@@ -118,6 +118,9 @@ running queries.
 * The schema report lists a guard's SHACL constraints per class next to the observed
   counts, and says which ones a write cannot break
   ([API](docs/API.md#constraints-layer)).
+* Class profiles list the predicates the instances of each class use, a schema diff
+  shows what changed between two commits, and the server keeps its schema report up to
+  date from each write's changes ([API](docs/API.md#class-profiles)).
 
 **Search**
 * Full-text search through Jena's `text:query`, ranked by BM25 with Tantivy and stemmed per
@@ -259,7 +262,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `backup`, `repo` | Write N-Quads dumps, and manage backup repositories on a file system or S3, restores and policies. |
 | `infer` | Materialize RDFS, OWL 2 RL or Jena rules. Report staleness and check for inconsistencies. |
 | `shacl`, `shex`, `validation` | Validate with SHACL or ShEx, and configure write-time guards. |
-| `schema` | List classes and predicates with exact counts and their declarations, or draft shapes from the data. |
+| `schema` | List classes and predicates with exact counts and their declarations, profile the classes, compare two commits' schemas, or draft shapes from the data. |
 | `queries` | Store, list and run parameterized queries. |
 | `text-index`, `geo-index` | Manage the full-text and spatial indexes. |
 | `auth` | Hash passwords, manage API tokens and sign in for remote commands (`auth login`). |

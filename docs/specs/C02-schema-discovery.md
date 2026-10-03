@@ -1,22 +1,27 @@
 # C02: Schema discovery and export API
 
-> **Status:** implemented in part
+> **Status:** implemented
 >
 > **Phases:** Phase 1 shipped: the `sparkles::schema` library, `GET /$/schema/{ds}` with
 > paginated class and predicate listings, `sparkles schema`, and the UI schema browser.
-> Most of Phase 2 shipped: the VoID/Turtle export, the SHACL constraints layer with
-> `GET /$/schema/{ds}/constraints`, and `detail=subjectClasses`. The GSPO-driven scan for
-> small named graphs and the `/$/stats` class counts of Phase 2 are not built. Phase 4
-> shipped on 2026-10-02: shapes drafted from the data, as `GET /$/schema/{ds}/shapes`,
-> `sparkles schema --draft-shapes`, the MCP tool `draft_shapes` and the schema browser's
-> Draft shapes dialog. Phase 3 is not built.
+> Phase 2 shipped: the VoID/Turtle export, the SHACL constraints layer with
+> `GET /$/schema/{ds}/constraints`, `detail=subjectClasses`, the GSPO-driven scan for
+> small named graphs and the `/$/stats` class counts. Phase 3 shipped on 2026-10-02:
+> per-class property profiles (`GET /$/schema/{ds}/profiles`), anonymous class
+> expressions, schema diffs between two states (`GET /$/schema/{ds}/diff`) and reports
+> kept up to date from the changes. Phase 4 shipped on 2026-10-02: shapes drafted from
+> the data, as `GET /$/schema/{ds}/shapes`, `sparkles schema --draft-shapes`, the MCP tool
+> `draft_shapes` and the schema browser's Draft shapes dialog.
 >
 > **User docs:** [API: Schema discovery](../API.md#schema-discovery) ·
 > [API: Constraints layer](../API.md#constraints-layer) ·
 > [API: Subject classes](../API.md#subject-classes) ·
+> [API: Class profiles](../API.md#class-profiles) ·
+> [API: Schema diffs](../API.md#schema-diffs) ·
 > [API: Drafted shapes](../API.md#drafted-shapes) ·
 > [Usage: Constraints next to the counts](../USAGE.md#constraints-next-to-the-counts) ·
 > [Usage: Drafting shapes](../USAGE.md#drafting-shapes-from-the-data) ·
+> [Usage: What each class uses](../USAGE.md#what-each-class-uses-and-what-changed) ·
 > [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
@@ -579,7 +584,10 @@ removed, `maxPerSubject = 1`, and no field anywhere changes its name or meaning.
    does today.
 3. Should the dataset page's "Top predicates/classes" switch to this API? It would then
    need the scan, and `/$/stats` is cheaper. Phase 1 leaves `/$/stats` alone, and Phase 2
-   fixes its class-count semantics.
+   fixes its class-count semantics. *Settled when Phase 2 finished, on 2026-10-02:*
+   `/$/stats` stays separate, and after updates it counts each class's distinct subjects
+   over all graphs with one ordered pass over `POS[rdf:type]`, as the build statistics
+   count them for the base index.
 4. Is 1,000,000 the right entry cap? Datasets that mint a class per entity would exceed
    it.
 5. `version` is not durable. Cursors do not survive a restart, and 409 is the correct
@@ -901,12 +909,11 @@ may revisit them.
 - The description also carries `dcterms:title` (the dataset name) and `dcterms:created`
   (the time the report was computed). Labels and comments keep their language tags.
 
-**Not built.** The GSPO-driven scan for small named graphs and the `/$/stats` class
-counts from the same pass were not built, so open question 3 stays open for
-`/$/stats`. Phase 3 was not built either: per-class property profiles as a listing,
-anonymous class expressions, schema diffs and incremental maintenance. Phase 4 computes
-per-class profiles for its drafts, but no endpoint lists them. The constraints layer and
-subject classes landed later, as described at the end of this section.
+**Not built with Phase 1.** The rest of Phase 2 and all of Phase 3 came later, as the
+end of this section describes: the constraints layer and subject classes, then the
+GSPO-driven scan for small named graphs, the `/$/stats` class counts, per-class
+property profiles, anonymous class expressions, schema diffs and incremental
+maintenance.
 
 **Phase 4 landed on 2026-10-02**, as §11 designed it.
 
@@ -1021,3 +1028,93 @@ field, `format=shaclc` and `Accept: text/shaclc` select it, `sparkles schema
 --draft-shapes --format shaclc` prints it, and the UI's dialog has a SHACLC tab.
 `tests/draft.rs` of `sparkles-shacl` checks that every drafted SHACLC reads to the same
 graph as the drafted Turtle.
+
+**Phase 3 and the rest of Phase 2 landed on 2026-10-02.**
+
+- When every graph filter of a report, a draft or a profile is a set of graphs that hold
+  at most 2^20 quads and at most an eighth of the store, their quads are read once from
+  GSPO and each permutation the passes need is sorted in memory on first use
+  (`schema::source::Src`). The passes are unchanged, and a test checks that the copied
+  report equals the one the indexes give.
+- After updates, `/$/stats` counts the distinct subjects of each class over all graphs
+  with one ordered pass over `POS[rdf:type]`, so a subject typed in several graphs
+  counts once, as the build statistics count it for the base index. Open question 3
+  records the decision.
+- `sparkles::schema::profiles` builds per-class property profiles. It lists, for each
+  class, the predicates its instances use, with the instances that have a value, the
+  triples, the fewest and most values per instance, the object kinds and literal
+  datatypes, and the classes of the values, and the predicates that point at its
+  instances with their triples and instances. The instances of a class are its direct
+  instances in the selection, as `observed.instances` counts them, so the profile and
+  the class entry agree. One pass over the `rdf:type` pairs and two passes per predicate
+  compute it. `GET /$/schema/{ds}/profiles`, `sparkles schema --profiles`,
+  `describe_schema` with `section: "profiles"` and the UI's class panel show it.
+- The report renders anonymous class expressions. Blank-node superclasses, equivalent
+  classes, domains and ranges appear in the OWL 2 Manchester Syntax, with IRIs in angle
+  brackets, in `superClassExpressions`, `equivalentClassExpressions`,
+  `domainExpressions` and `rangeExpressions`. Restrictions on a property or its inverse,
+  Boolean combinations, enumerations and datatype restrictions are rendered to a depth
+  of eight. Other shapes are rendered as `[…]`.
+- `sparkles::schema::compare` computes schema diffs. It compares two reports of one
+  selection, and lists the classes and predicates one of them lacks with their entries,
+  and for each entry both list, every field that differs with its path. Values give
+  `from` and `to`, lists give the members added and removed, and literal groups,
+  languages, subject classes and ontology headers are compared by key. The endpoint
+  `GET /$/schema/{ds}/diff?from=&to=` reads both states with F06's point-in-time reads. The
+  CLI's `--diff FROM [--to TO]`, the MCP tool `diff_schema` and the schema browser's
+  **Compare** dialog are built on it.
+- `sparkles::schema::update` brings a report up to date from the net changes between
+  its commit and a later one, which F06's `Store::diff` reads. For
+  each triple the changes touch, one SPO lookup in the new state says whether the
+  selection holds it now, and the changes say whether it held it before. Only triples
+  whose presence changed move the counts. A report keeps, per predicate, how many
+  subjects have each number of objects, so `maxPerSubject` and `subjectsWithMultiple`
+  survive deletions. Whether an object was used before needs at most as many subjects of
+  `POS[p, o]` as the change moved. The declared layer is read again, and labels are
+  reread only for subjects whose labels changed. The server's report cache uses it for
+  the next request of the same selection. A persistent dataset reads the changes from
+  its write-ahead logs, and an in-memory one compares the deltas of two states of one
+  generation through a `StateMark` the cache keeps. Requests for subject classes, for a
+  VoID description, or from a caller limited to some graphs are computed in full, and so
+  is any write with more than one change per 500 triples of the report.
+
+**Choices made during implementation.**
+
+- The report gained `snapshot.commit`, which the update and the diff need. Cursors still
+  bind to `snapshot.version`.
+- `Sparkles-Schema-Report: cached | full | updated; changes=N` says how a report came
+  about.
+- Profiles count direct instances, unlike drafts, which count SHACL instances, so that a
+  profile agrees with the class entry next to it.
+- A diff of the head reuses the dataset's kept report, and the older state's report is
+  computed for the request and not cached.
+- The maintenance limit comes from a measurement. An update costs about 30 to 45 µs per
+  changed triple on the 1.05M-triple benchmark dataset, while a full report costs 40 to
+  140 ns per selected triple there, so the two cost about the same near one change per
+  500 triples.
+
+**Tests at landing.** `schema::maintain_tests` runs 230 random writes over a persistent
+store, with compactions, in six selections (default and union graphs with and without
+inferences, a named graph, a separate declared graph) and with a union default graph.
+After every write it compares the updated report with a report computed from scratch, as
+JSON. The writes cover several graphs, `rdf:type` with IRI and blank objects, inline and
+vocabulary literals, language tags, triple terms, fresh blank nodes, labels, comments,
+version info, subclass, domain and ontology declarations, and `DELETE WHERE`. Two
+deliberate mistakes in the update, a missed label change and an off-by-one in object
+usage, each made it fail. `schema::profile_tests`, `schema::compare_tests` and
+`schema::tests::anonymous_class_expressions` cover the other parts.
+`http::schema::tests::reports_are_updated_from_changes` checks the header and that an
+updated report equals a fresh one, for in-memory and persistent datasets.
+`profiles_of_classes`, `diff_between_commits` and
+`stats_count_distinct_instances_after_updates` cover the endpoints,
+`tests/cli_schema.rs` the CLI, `mcp::tests::profiles_and_schema_diffs` the tools, and
+Vitest the UI's helpers.
+
+**Measured.** On the 1.05M-triple benchmark dataset, served by the release build on a
+machine with a load average between 70 and 90 from other builds, the first report took
+0.76 s. Twenty reports updated after writes of four triples took a median of 5.0 ms (1.1
+to 19 ms) by the client's clock, against a median of 136 ms (41 to 550 ms) for forty
+full reports after the same kind of write. After larger writes the update took 4 ms for
+100 changes, 9 ms for 300, 25 ms for 600, 91 to 119 ms for 1,000 to 2,000 and 363 ms for
+10,000, while full reports took 45 to 700 ms, which set the limit of one change per 500
+triples.

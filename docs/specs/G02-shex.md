@@ -1,15 +1,16 @@
 # G02: ShEx 2.1 validation
 
-> **Status:** implemented in part (Phases 1 and 2; Phase 3 in part)
+> **Status:** implemented in part (Phases 1 and 2; Phase 3 except ShEx 2.2)
 >
 > **Phases:** Phase 1 is the `sparkles-shex` crate with ShExC and ShExJ, imports, shape
 > maps and stratified typing, plus `POST /{ds}/shex`, `sparkles shex validate|parse`, the
 > shexTest harness and `bench:shex`. Phase 2 is write-time ShEx validation with
 > `validation.json` format 2, ShExR, `SPARQL """…"""` selectors, the UI's SHACL | ShEx
-> switch and `bench:shex-write`. Three Phase 3 items are also built: the MCP tools
+> switch and `bench:shex-write`. Four Phase 3 items are built: the MCP tools
 > `validate_shacl` and `validate_shex`, the interval matcher, which became the Phase 1
-> matcher, and incremental guard validation, which now propagates typing changes. The
-> guard also has a grandfather mode.
+> matcher, incremental guard validation, which propagates typing changes, and ShExR
+> schemas stored in named graphs for the guard. The guard also has a grandfather mode.
+> ShEx 2.2 (`EXTENDS`, `ABSTRACT`) is not built.
 >
 > **User docs:** [API: ShEx validation](../API.md#shex-validation) ·
 > [API: Write-time validation](../API.md#write-time-validation) ·
@@ -1779,6 +1780,35 @@ With validation off it took 20 ms. The first such write after a restart is still
 validated in full, because the typing is not persisted, unless the server was started
 with `--validate`.
 
-**Deferred or rejected.** ShExR schemas in named graphs for the guard, SHACL and ShEx
-guards on one dataset, a persisted typing, and ShEx 2.2 (`EXTENDS`, `ABSTRACT`) are not
+**ShExR schemas in named graphs** landed on 2026-10-02, as §10's Phase 3 item described
+them. The configuration's `schema.graphs` names graphs of the dataset that hold the
+schema in ShExR, instead of a copied file.
+
+* The schema is read from the state being validated. The union of the named graphs'
+  triples is parsed as ShExR, checked and compiled, and the shape map is parsed against
+  it. A configuration's `schema.prefixes` stand in for the prefixes a graph cannot hold,
+  so the map may use them. Nothing is copied into the database, and imports are refused
+  because a write never fetches anything.
+* The schema graphs are never part of the data graph, and a `dataGraph` list that names
+  one is refused.
+* A write that changes a schema graph reads the schema it leaves and validates the state
+  after it in full, with the fallback reason `schema`. In grandfather mode the state
+  before is judged under the old schema, as SHACL compares a shapes change with the old
+  shapes' results. The new schema, its shape map and what it reads replace the old ones
+  when the write commits, together with the typing of the full validation. A write whose
+  schema does not parse, check or define the map's labels is rejected with the reason
+  in `shapesError`, in `warn` mode too.
+* `sparkles validation` gained `--schema-graph IRI` and `--schema-prefix PREFIX=IRI`, and
+  a restart reads the schema from the graphs again.
+
+To swap a schema at commit time, the guard keeps its compiled schema, map, read
+predicates and incremental plan together behind a lock, and a pending write carries the
+new set. The property test of incremental validation now also runs with the schema in a
+graph, and passed 1,500 cases with the final code. `guard::tests::schemas_in_graphs`
+covers a schema change, a rejected change and a restart,
+`http::validation::shex_tests::schema_in_a_graph` the HTTP side, and
+`tests/cli_validation.rs` the CLI.
+
+**Deferred or rejected.** SHACL and ShEx guards on one dataset, a persisted typing, a
+schema in graphs merged with a file, and ShEx 2.2 (`EXTENDS`, `ABSTRACT`) are not
 built.

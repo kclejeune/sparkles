@@ -56,7 +56,7 @@ there is no code yet.
 |---|---|---|
 | [CI](CI-commit-identity.md) | Durable dataset ids, a gap-free commit sequence, commit receipts and headers, `/$/commits` and `sparkles log` | implemented in part (Phases 1–2) |
 | [C01](C01-observability-and-budgets.md) | Request ids, access log, Prometheus metrics, readiness, OpenTelemetry, memory and result-size budgets, cancellation on disconnect | implemented in part |
-| [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, a SHACL constraints layer, subject classes per predicate, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented in part (Phase 1, most of Phase 2, Phase 4) |
+| [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, a SHACL constraints layer, subject classes per predicate, class profiles, schema diffs between commits, reports kept up to date from the changes, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented |
 | [C03](C03-graphql.md) | A read-only GraphQL endpoint per dataset, with a schema mapped to classes and predicates by `@rdf` directives and drafted from SHACL shapes or the data, compiled to batched SPARQL algebra under the caller's view and budgets | specified |
 | [C05](C05-tabular-imports.md) | CSV and TSV imports with a default mapping, W3C CSVW metadata or Tarql-style CONSTRUCT templates, in `sparkles load`, `sparkles csv` and uploads | implemented |
 | [C06](C06-clone-to-sandbox.md) | Cloning a consistent snapshot of a dataset into a new, independent dataset | implemented in part (Phase 1) |
@@ -77,7 +77,7 @@ there is no code yet.
 | [F10](F10-replication.md) | Applying RDF Patch through Fuseki's `patch` operation, with `H prev` as a concurrency check, then read replicas that pull commits as RDF Patch, keep the primary's commit ids, bootstrap from a generation copy or a backup, and are promoted by hand | specified |
 | [F11](F11-encryption-at-rest.md) | Client-side encrypted backup repositories with keyed blob ids, content-defined chunking, and AES-256-GCM encryption at rest for dataset files under KMS-wrapped per-dataset keys | specified |
 | [G01](G01-geosparql.md) | GeoSPARQL 1.1 functions, Jena's spatial extensions, a spatial index, spatial joins and the UI's maps | implemented in part (Phases 1–2) |
-| [G02](G02-shex.md) | ShEx 2.1 validation: ShExC, ShExJ and ShExR, shape maps, `POST /{ds}/shex` and write-time ShEx | implemented in part (Phases 1–2, Phase 3 in part) |
+| [G02](G02-shex.md) | ShEx 2.1 validation: ShExC, ShExJ and ShExR, shape maps, `POST /{ds}/shex` and write-time ShEx, with schemas in ShExR graphs of the dataset | implemented in part (Phases 1–2, Phase 3 except ShEx 2.2) |
 | [G03](G03-shaclc.md) | The SHACL Compact Syntax (`text/shaclc`) read and written wherever shapes go in or come out, and the SHACL 1.2 list constraints | implemented in part (Phase 1) |
 | [G05](G05-command-line-tools.md) | `convert` (`riot`), `qparse`, `uparse`, `compare` (`rdfdiff`), `iri`, `langtag`, `rsparql`, `rupdate` and `rset`, and IRI and language-tag warnings in `convert --check`, `load --check` and `/$/validate/iri` | implemented |
 | [P01](P01-python-bindings.md) | The `sparkles` Python package: datasets, SPARQL, terms, quads, transactions, dumps, reasoning and validation, built with PyO3 and maturin as abi3 wheels | implemented in part (Phase 1, most of Phase 2) |
