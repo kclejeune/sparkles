@@ -373,16 +373,23 @@ implementation landed.
   - the Sparkles code and specs C01, C02, C09, C10, C11, C12, C16 and F06.
 
   Fluree was not consulted, and no description of Fluree's GraphQL support was used.
-- **Implementation:** not built.
-  - **Planned dependencies:** `apollo-compiler` 1.33 and `apollo-parser` 0.8 (MIT OR
-    Apache-2.0), in a new `sparkles-graphql` crate. They bring crates that `Cargo.lock`
-    does not have yet: `ariadne`, `typed-arena`, `memoffset` and `jsonpath-rust` (MIT),
-    and `rowan`, `serde_json_bytes`, `triomphe`, `countme`, `text-size`, `ahash`,
-    `yansi` and `pest` (MIT OR Apache-2.0). The list will be confirmed from `Cargo.lock`
-    when the crate is added.
-    The repository has no `cargo-deny` configuration, so these were checked against the
-    licenses `THIRD_PARTY_LICENSES.md` already lists, which are all permissive. The UI
-    would add `cm6-graphql` 0.2 and `graphql` 17 (MIT).
+- **Implementation:** Phase 1, from the spec plus Sparkles code only (2026-10-02). The
+  mapping schema, the API schema, the planner, the algebra of the fetch groups, the
+  executor and the drafts are in the new crate `sparkles-graphql`. The routes, the
+  `graphql` endpoint of grants and `sparkles graphql` are in `sparkles-server`, behind its
+  default-on `graphql` feature. The engine gained `QueryOptions::work`, a row count shared
+  by several queries.
+  - **Dependencies:** `apollo-compiler` 1.33.0 and `apollo-parser` 0.8.6 (MIT OR
+    Apache-2.0). The crate also uses `quick_cache` 0.7 and `serde_json_bytes` 0.2, which
+    were already in the tree. `Cargo.lock` gained `ariadne` 0.6, `typed-arena` 2,
+    `jsonpath-rust` 0.3 (MIT, through a license file) and `is-terminal` 0.4 (MIT), and
+    `rowan` 0.16, `serde_json_bytes` 0.2, `triomphe` 0.1, `countme` 3, `text-size` 1,
+    `ahash` 0.8, `yansi` 1, `concolor` 0.1, `concolor-query` 0.3, `pest` 2.9 with its
+    derive, generator and meta crates, `ucd-trie` 0.1, `hashbrown` 0.14, `rustc-hash` 1.1,
+    `hermit-abi` 0.5 and the `windows-sys` 0.45 family (MIT OR Apache-2.0). The license
+    of every crate was read with `scripts/third-party-licenses.py`, and
+    `THIRD_PARTY_LICENSES.md` was regenerated. No UI package was added, since the UI
+    page is Phase 2.
 - **Rejected** (spec §17):
   - one SPARQL query per document with nested `OPTIONAL`s, as GraphQL-LD builds;
   - a resolver per field with `juniper` (BSD-2-Clause) or `async-graphql`'s dynamic
