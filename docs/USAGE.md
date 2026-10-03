@@ -834,6 +834,9 @@ sparkles describe-settings --loc db --default                        # back to t
 sparkles describe-settings --server URL --dataset db --set mode=outgoing
 ```
 
+The dataset page of the web UI shows the setting too. An admin of the dataset can change
+the mode, the labels and reifiers and the two limits there, or go back to the defaults.
+
 A request can choose another mode with `describe=scbd` and lower the limits with
 `describe-max-triples` and `describe-max-depth`. `sparkles query` takes the same options
 as `--describe MODE`, `--describe-labels`, `--describe-reifiers`, `--describe-max-triples
