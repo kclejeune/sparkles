@@ -623,7 +623,7 @@ fn admit(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<Plan, String> {
 
 /// `cert(gp)` for an admitted pattern (see the module documentation); adds the risky
 /// variables of its filters to `risky`.
-fn certain(
+pub(super) fn certain(
     ctx: &Ctx,
     gp: &GraphPattern,
     risky: &mut FxHashSet<VarId>,
@@ -709,6 +709,7 @@ fn construct(gp: &GraphPattern) -> &'static str {
         GP::Values { .. } => "a VALUES block",
         GP::Service { .. } => "a SERVICE call",
         GP::Group { .. } | GP::Project { .. } => "a sub-select",
+        GP::Lateral { .. } => "a LATERAL",
         _ => "an unsupported construct",
     }
 }
@@ -740,6 +741,7 @@ fn zero_length(p: &PropertyPathExpression) -> bool {
         PP::Reverse(a) | PP::OneOrMore(a) => zero_length(a),
         PP::Sequence(a, b) | PP::Alternative(a, b) => zero_length(a) || zero_length(b),
         PP::ZeroOrMore(_) | PP::ZeroOrOne(_) => true,
+        PP::Range { path, min, .. } => *min == 0 || zero_length(path),
     }
 }
 
@@ -773,7 +775,7 @@ fn pure(e: &Expression) -> bool {
     }
 }
 
-fn pure_pattern(gp: &GraphPattern) -> bool {
+pub(super) fn pure_pattern(gp: &GraphPattern) -> bool {
     use GraphPattern as GP;
     match gp {
         GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => true,
@@ -786,9 +788,10 @@ fn pure_pattern(gp: &GraphPattern) -> bool {
             right,
             expression,
         } => expression.as_ref().is_none_or(pure) && pure_pattern(left) && pure_pattern(right),
-        GP::Join { left, right } | GP::Union { left, right } | GP::Minus { left, right } => {
-            pure_pattern(left) && pure_pattern(right)
-        }
+        GP::Join { left, right }
+        | GP::Lateral { left, right }
+        | GP::Union { left, right }
+        | GP::Minus { left, right } => pure_pattern(left) && pure_pattern(right),
         GP::Graph { inner, .. }
         | GP::Distinct { inner }
         | GP::Reduced { inner }

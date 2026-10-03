@@ -59,7 +59,7 @@ fn path_elt_or_inverse(p: &mut Parser<'_>) -> bool {
     }
 }
 
-/// `PathElt ::= PathPrimary PathMod?`
+/// `PathElt ::= PathPrimary PathMod?`, with Jena ARQ's ranges as `PathMod`s.
 fn path_elt(p: &mut Parser<'_>) -> bool {
     let m = p.start(NodeKind::PathElt);
     let plain = path_primary(p);
@@ -70,10 +70,30 @@ fn path_elt(p: &mut Parser<'_>) -> bool {
         p.bump();
         m.complete(p);
         false
+    } else if p.at(TokenKind::LBrace) {
+        path_range(p);
+        m.complete(p);
+        false
     } else {
         m.abandon(p);
         plain
     }
+}
+
+/// ARQ's `PathMod` braces: `{*}`, `{+}`, `{n}`, `{n,m}`, `{n,}` and `{,m}`.
+fn path_range(p: &mut Parser<'_>) {
+    p.expect(TokenKind::LBrace);
+    if !p.eat(TokenKind::Star) && !p.eat(TokenKind::Plus) {
+        let min = p.eat(TokenKind::Integer);
+        if p.eat(TokenKind::Comma) {
+            if !p.eat(TokenKind::Integer) && !min {
+                p.error("expected the most steps of a path range");
+            }
+        } else if !min {
+            p.error("expected a path range");
+        }
+    }
+    p.expect(TokenKind::RBrace);
 }
 
 /// `PathPrimary ::= iri | 'a' | '!' PathNegatedPropertySet | '(' Path ')'`

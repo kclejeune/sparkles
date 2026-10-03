@@ -32,6 +32,7 @@ pub(crate) enum Element {
     Optional(WhereBuilder),
     Union(Vec<WhereBuilder>),
     Minus(WhereBuilder),
+    Lateral(WhereBuilder),
     Graph(Node, WhereBuilder),
     Service(Node, bool, WhereBuilder),
     Filter(Expr),
@@ -99,6 +100,12 @@ impl WhereBuilder {
     /// `MINUS { … }`
     pub fn minus(self, f: impl FnOnce(WhereBuilder) -> WhereBuilder) -> Self {
         self.push(Element::Minus(sub(f)))
+    }
+
+    /// `LATERAL { … }` (Jena ARQ): the group evaluated once per solution of the
+    /// elements before it, with that solution's values substituted.
+    pub fn lateral(self, f: impl FnOnce(WhereBuilder) -> WhereBuilder) -> Self {
+        self.push(Element::Lateral(sub(f)))
     }
 
     /// `GRAPH g { … }` (`g` is an IRI or a variable).

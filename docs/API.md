@@ -1376,6 +1376,100 @@ Some of ARQ's library is not supported. These are `afn:sprintf`, `afn:print`,
 such form, so Sparkles does not accept it. An unknown function is an error, so its
 `BIND` leaves the variable unbound.
 
+### ARQ syntax extensions
+
+Fuseki parses queries with Jena ARQ's syntax, a superset of SPARQL, and so does Sparkles.
+Besides ARQ's aggregates above, it accepts `LATERAL`, property path ranges and CONSTRUCT
+templates with `GRAPH`, with ARQ's results. None of them changes the meaning of a SPARQL
+query. The Rust parser rejects them with `SparqlParser::with_arq_syntax(false)`, and
+`sparkles qparse --syntax sparql` checks a query as strict SPARQL. The design is spec
+[G06](specs/G06-arq-query-extensions.md).
+
+**`LATERAL { … }`** evaluates its group once for each solution of the patterns before it
+in the same group, with that solution's values in place of its variables. The FILTERs,
+sub-selects, aggregates, ORDER BY and LIMIT of the group therefore see the outer values,
+so a lateral sub-select gives the top results per row:
+
+```sparql
+SELECT ?person ?friend WHERE {
+  ?person a foaf:Person .
+  LATERAL {
+    SELECT ?person ?friend { ?person foaf:knows ?friend . ?friend foaf:age ?age }
+    ORDER BY DESC(?age) LIMIT 2
+  }
+}
+```
+
+* A variable is replaced only where the sub-select projects it. In
+  `LATERAL { SELECT ?friend { ?person foaf:knows ?friend } LIMIT 2 }` the inner
+  `?person` is another variable, so every row gets the same two friends, as in ARQ.
+* A variable that the solution leaves unbound, from an OPTIONAL for instance, is not
+  replaced and may be bound by the group.
+* The group must not assign a variable that is in scope before it, with `BIND`,
+  `VALUES` or `SELECT (… AS ?v)`. That is a syntax error, as in ARQ.
+* A `LATERAL` sees only the patterns before it in its own group. Inside an OPTIONAL it
+  sees the OPTIONAL's group, not the patterns outside it.
+
+When the replacement cannot change the group's solutions, the `LATERAL` is planned as an
+ordinary join. That is the case when the group mentions no outer variable, or when it
+holds only triple patterns, paths that cannot match a zero-length path, `GRAPH` and
+FILTERs whose variables the group always binds. Otherwise EXPLAIN shows a `Lateral`
+operator, which groups the outer rows by the values the group uses and plans and runs
+the group once per distinct combination. Its counters report `lateralGroups` and
+`lateralSolutions`.
+
+**Path ranges** repeat a path element a number of times. ARQ evaluates them differently
+from `*`, `+` and `?`. Those three give each pair of connected nodes once, while a range
+counts every way through the graph, as a sequence `p/p` does.
+
+| Form | Steps | Solutions |
+|---|---|---|
+| `p{n}` | exactly `n` | one per walk of `n` steps |
+| `p{n,m}` | `n` to `m` | one per walk of `n` to `m` steps |
+| `p{,m}` | 0 to `m` | as `p{0,m}` |
+| `p{n,}` | `n` or more | one per walk of `n` steps followed by a path that visits no node twice |
+| `p{*}`, `p{0,}` | 0 or more | one per path from the start that visits no node twice |
+| `p{+}` | 1 or more | as `p{1,}` |
+
+With `:a :p :b, :c . :b :p :d . :c :p :d`, `:a :p{2} ?x` gives `:d` twice and
+`:a :p+ ?x` gives `:b`, `:c` and `:d` once each. A walk may visit a node again, so
+`:p{2}` on a cycle returns to its start. The number of solutions is the product of
+path counts and grows quickly on dense graphs. The query's row and memory budgets apply
+to it. Zero-length matches follow SPARQL's rules for `*`. `p{n,m}` with `n` above `m` is a
+syntax error.
+
+Jena 6.2.0 evaluates `p{0,}` as `p{+}`, so it leaves out the zero-length match. Sparkles
+gives `{0,}` the meaning of `{*}`, which is what ARQ's documentation describes.
+
+**CONSTRUCT with `GRAPH`.** A CONSTRUCT template may hold `GRAPH g { … }` blocks beside
+its triples, where `g` is an IRI, a variable or a blank node, and bare `{ … }` blocks for
+the default graph. The short form `CONSTRUCT WHERE { … }` takes `GRAPH` blocks too.
+
+```sparql
+CONSTRUCT { GRAPH ?g { ?s ?p ?o } ?g ex:size ?n }
+WHERE { GRAPH ?g { ?s ?p ?o } }
+```
+
+* A block whose name is unbound, a literal or a triple term gives nothing for that
+  solution. A blank-node name is a fresh graph per solution.
+* `<urn:x-arq:DefaultGraphNode>` and `<urn:x-arq:DefaultGraph>` name the default graph.
+* As in Fuseki, a dataset format (TriG, N-Quads, JSON-LD, RDF Thrift, RDF Protobuf)
+  returns the named graphs' quads with the default graph's triples, and a graph format
+  (Turtle, N-Triples, RDF/XML, RDF/JSON) returns the default graph only. Ask for
+  `Accept: application/trig` or `application/n-quads` to get the quads.
+* The `application/x-sparkles+json` document adds a `quads` array of
+  `[subject, predicate, object, graph]` beside `triples`.
+* `sparkles query --format trig` or `--format nquads` prints the quads. In Rust,
+  `QueryResult::quads` holds them and `Dataset::construct_quads` returns everything as
+  quads. In Python, `construct()` returns the triples and their `quads` attribute holds
+  the named graphs' quads.
+
+The formatter, the editor's highlighting and the query builder know the three forms. The
+builder has `lateral(|w| …)`, and its path syntax accepts ranges (`"foaf:knows{1,3}"`).
+
+ARQ's other path forms (`:p^:q`, `distinct(…)`, `shortest(…)` and `multi(…)`),
+`SEMIJOIN`, `ANTIJOIN`, `LET`, `UNFOLD` and the `JSON` query form are not supported.
+
 ### Blank nodes
 
 A stored blank node has a label made of `b` and its id in lowercase hex, such as `_:b1f`.

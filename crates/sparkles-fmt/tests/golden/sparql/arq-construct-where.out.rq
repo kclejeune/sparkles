@@ -1,0 +1,6 @@
+CONSTRUCT WHERE {
+  ?s ?p ?o .
+  GRAPH ?g {
+    ?s ?p ?o .
+  }
+}

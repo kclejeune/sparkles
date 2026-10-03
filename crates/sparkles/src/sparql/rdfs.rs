@@ -378,7 +378,10 @@ impl Rewriter<'_> {
                     *gp = self.path(subject, path, object);
                 }
             }
-            G::Join { left, right } | G::Union { left, right } | G::Minus { left, right } => {
+            G::Join { left, right }
+            | G::Lateral { left, right }
+            | G::Union { left, right }
+            | G::Minus { left, right } => {
                 self.walk(left);
                 self.walk(right);
             }
@@ -768,12 +771,19 @@ impl Rewriter<'_> {
                 self.path_changes(a, top) || self.path_changes(b, top)
             }
             P::ZeroOrMore(x) | P::OneOrMore(x) | P::ZeroOrOne(x) => self.path_changes(x, false),
+            // a short range is rewritten as its sequences, so its links count as at the top
+            P::Range { path: x, max, .. } => {
+                self.path_changes(x, top && max.is_some_and(|m| m <= RANGE_UNROLL))
+            }
         }
     }
 
     /// A path pattern over stored triples. Sequences, alternatives and inverses are split
     /// into triple patterns; inside `*`, `+` and `?`, a link becomes the alternative of
-    /// it and its subproperties.
+    /// it and its subproperties. An ARQ range of at most [`RANGE_UNROLL`] steps becomes
+    /// the union of its sequences, so that each entailed link counts once; inside a
+    /// longer range, a link that holds through a property and its subproperty counts
+    /// twice.
     fn path(
         &self,
         s: &TermPattern,
@@ -828,11 +838,40 @@ impl Rewriter<'_> {
                     variables: dedup(vars),
                 }
             }
-            P::ZeroOrMore(_) | P::OneOrMore(_) | P::ZeroOrOne(_) => GraphPattern::Path {
-                subject: s.clone(),
-                path: self.links(path),
-                object: o.clone(),
-            },
+            P::Range {
+                path: x,
+                min,
+                max: Some(max),
+            } if *max <= RANGE_UNROLL => {
+                let branches = (*min..=*max)
+                    .map(|k| match k {
+                        0 => GraphPattern::Path {
+                            subject: s.clone(),
+                            path: P::Range {
+                                path: x.clone(),
+                                min: 0,
+                                max: Some(0),
+                            },
+                            object: o.clone(),
+                        },
+                        k => {
+                            let mut seq = (**x).clone();
+                            for _ in 1..k {
+                                seq = P::Sequence(Box::new(seq), x.clone());
+                            }
+                            self.path(s, &seq, o)
+                        }
+                    })
+                    .collect();
+                union(branches)
+            }
+            P::ZeroOrMore(_) | P::OneOrMore(_) | P::ZeroOrOne(_) | P::Range { .. } => {
+                GraphPattern::Path {
+                    subject: s.clone(),
+                    path: self.links(path),
+                    object: o.clone(),
+                }
+            }
         }
     }
 
@@ -864,9 +903,18 @@ impl Rewriter<'_> {
             P::ZeroOrMore(x) => P::ZeroOrMore(b(x)),
             P::OneOrMore(x) => P::OneOrMore(b(x)),
             P::ZeroOrOne(x) => P::ZeroOrOne(b(x)),
+            P::Range { path, min, max } => P::Range {
+                path: b(path),
+                min: *min,
+                max: *max,
+            },
         }
     }
 }
+
+/// The longest ARQ path range rewritten as the union of its sequences (see
+/// [`Rewriter::path`]).
+const RANGE_UNROLL: u64 = 8;
 
 fn is_var(t: &TermPattern) -> bool {
     matches!(t, TermPattern::Variable(_) | TermPattern::BlankNode(_))
@@ -1064,7 +1112,10 @@ fn blank_to_var(gp: &mut GraphPattern) {
             term(subject);
             term(object);
         }
-        G::Join { left, right } | G::Union { left, right } | G::Minus { left, right } => {
+        G::Join { left, right }
+        | G::Lateral { left, right }
+        | G::Union { left, right }
+        | G::Minus { left, right } => {
             blank_to_var(left);
             blank_to_var(right);
         }

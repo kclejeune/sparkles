@@ -42,6 +42,8 @@ export const KEYWORDS = [
   'OFFSET',
   'VALUES',
   'OPTIONAL',
+  // Jena ARQ's lateral join
+  'LATERAL',
   'GRAPH',
   'SERVICE',
   'SILENT',

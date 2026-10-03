@@ -232,6 +232,10 @@ class QueryTriples:
 
     def __iter__(self) -> QueryTriples: ...
     def __next__(self) -> Triple: ...
+    @property
+    def quads(self) -> list[Quad]:
+        """The quads in named graphs of a CONSTRUCT with Jena ARQ's `GRAPH` template
+        blocks. The iteration yields the default graph's triples."""
     def serialize(
         self,
         output: _Output | None = None,
@@ -239,7 +243,8 @@ class QueryTriples:
         *,
         prefixes: Mapping[str, str] | None = None,
     ) -> bytes | None:
-        """Write the remaining triples in an RDF format (Turtle by default)."""
+        """Write the remaining triples in an RDF format (Turtle by default), and the
+        quads too in a dataset format."""
 
 @final
 class UpdateStats:

@@ -1,0 +1,22 @@
+PREFIX ex: <http://example.org/>
+
+CONSTRUCT {
+  ?s ex:p ?o .
+  GRAPH ?g {
+    ?s ex:p ?o .
+  }
+  {
+    ?s ex:q ?o .
+  }
+  GRAPH _:b {
+    ?s ex:r ?o .
+  }
+  GRAPH <urn:x-arq:DefaultGraphNode> {
+    ?s ex:t ?o .
+  }
+}
+WHERE {
+  GRAPH ?g {
+    ?s ex:p ?o .
+  }
+}

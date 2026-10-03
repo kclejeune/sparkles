@@ -852,7 +852,8 @@ fn parse_literal(s: &str) -> Node {
     }
 }
 
-/// Accepts property path syntax: IRIs, prefixed names, `a`, `^ / | ( ) * + ? !`.
+/// Accepts property path syntax: IRIs, prefixed names, `a`, `^ / | ( ) * + ? !`, and
+/// Jena ARQ's ranges (`{2}`, `{1,3}`, `{2,}`, `{,3}`, `{*}`, `{+}`).
 fn parse_path(s: &str) -> Node {
     let bad = || Node::invalid(format!("invalid term or property path {s:?}"));
     let Ok(toks) = tokenize(s) else {
@@ -860,6 +861,7 @@ fn parse_path(s: &str) -> Node {
     };
     let mut depth = 0i32;
     let mut has_op = false;
+    let mut in_range = false;
     for (t, _, _) in &toks {
         match t {
             Tok::Iri | Tok::PName(_) | Tok::Ws => {}
@@ -875,10 +877,16 @@ fn parse_path(s: &str) -> Node {
                 }
             }
             Tok::Punct('^' | '/' | '|' | '*' | '+' | '?' | '!') => has_op = true,
+            Tok::Punct('{') if !in_range => {
+                in_range = true;
+                has_op = true;
+            }
+            Tok::Punct('}') if in_range => in_range = false,
+            Tok::Number | Tok::Punct(',') if in_range => {}
             _ => return bad(),
         }
     }
-    if depth != 0 || !has_op {
+    if depth != 0 || in_range || !has_op {
         return bad();
     }
     Node(N::Path(s.to_string()))

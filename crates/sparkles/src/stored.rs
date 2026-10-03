@@ -234,6 +234,7 @@ fn assigned(p: &GraphPattern, out: &mut Vec<String>) {
     match p {
         G::Bgp { .. } | G::Path { .. } => {}
         G::Join { left, right }
+        | G::Lateral { left, right }
         | G::LeftJoin { left, right, .. }
         | G::Union { left, right }
         | G::Minus { left, right } => {

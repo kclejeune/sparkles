@@ -76,6 +76,8 @@ pub enum NodeKind {
     /// one object with its reifiers and annotations, and its `,`
     Object,
     Optional,
+    /// `LATERAL { … }` (Jena ARQ)
+    Lateral,
     Minus,
     /// a chain of `{…} UNION {…}`
     Union,
@@ -111,7 +113,8 @@ pub enum NodeKind {
     // ---- SPARQL: property paths
     PathAlternative,
     PathSequence,
-    /// a path primary with its `?`, `*` or `+`
+    /// a path primary with its `?`, `*` or `+`, or ARQ's range (`{2}`, `{1,3}`, `{2,}`,
+    /// `{,3}`, `{*}`, `{+}`)
     PathElt,
     /// `^elt`
     PathInverse,

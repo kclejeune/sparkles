@@ -1243,6 +1243,13 @@ fn serialize_result(
                 for t in &r.triples {
                     out.triple(t)?;
                 }
+                // a CONSTRUCT's GRAPH blocks: RDF Thrift and Protobuf carry quads,
+                // RDF/JSON is one graph
+                if j != jena_formats::JenaFormat::RdfJson {
+                    for q in &r.quads {
+                        out.quad(q)?;
+                    }
+                }
                 out.finish()?;
                 Ok(())
             }

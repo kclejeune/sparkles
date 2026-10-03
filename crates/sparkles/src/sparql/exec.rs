@@ -426,6 +426,16 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             }
             t
         }
+        Kind::Lateral(spec) => {
+            let l = child(0, &mut infos)?;
+            let (t, groups, solutions) = super::lateral::run(ctx, spec, &l, &n.vars)?;
+            note = Some(format!("[{groups} groups evaluated]"));
+            let mut c = Counters::new();
+            c.insert("lateralGroups".into(), groups.into());
+            c.insert("lateralSolutions".into(), solutions.into());
+            counters = Some(c);
+            t
+        }
         Kind::TextSearch(spec) => crate::text::search(ctx, spec, &n.vars)?,
         Kind::VectorSearch(spec) => {
             let input = match n.children.len() {
@@ -3666,8 +3676,12 @@ impl Graph<'_> {
             .unwrap_or_default())
     }
 
-    /// Nodes reachable from `start` according to min/max length.
+    /// Nodes reachable from `start` according to min/max length (ARQ ranges: once per
+    /// way).
     fn reach(&self, start: u64, forward: bool) -> Result<Vec<u64>> {
+        if let Some((lo, hi)) = self.spec.count {
+            return self.reach_counted(start, forward, lo, hi);
+        }
         let mut out = Vec::new();
         let mut seen = FxHashSet::default();
         if self.spec.min == 0 {
@@ -3697,6 +3711,147 @@ impl Graph<'_> {
             self.ctx.check_output(out.len(), 1)?;
         }
         Ok(out)
+    }
+
+    /// The ends of an ARQ path range from `start`, once per way (see
+    /// [`PathSpec::count`]): walks of `lo` to `hi` steps, or walks of `lo` steps each
+    /// followed by every simple path from its end. From the object end (`!forward`) the
+    /// simple paths come first, so the counts agree with the forward evaluation.
+    fn reach_counted(
+        &self,
+        start: u64,
+        forward: bool,
+        lo: u64,
+        hi: Option<u64>,
+    ) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        let mut nbrs: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        let emit = |out: &mut Vec<u64>, x: u64, n: u64| -> Result<()> {
+            let n = usize::try_from(n).unwrap_or(usize::MAX);
+            self.ctx.check_output(out.len().saturating_add(n), 1)?;
+            out.extend(std::iter::repeat_n(x, n));
+            Ok(())
+        };
+        let mut level: FxHashMap<u64, u64> = FxHashMap::default();
+        match hi {
+            Some(hi) => {
+                level.insert(start, 1);
+                for k in 0..=hi {
+                    if k >= lo {
+                        let mut ends: Vec<(u64, u64)> =
+                            level.iter().map(|(x, n)| (*x, *n)).collect();
+                        ends.sort_unstable();
+                        for (x, n) in ends {
+                            emit(&mut out, x, n)?;
+                        }
+                    }
+                    if k == hi {
+                        break;
+                    }
+                    level = self.step(&level, forward, &mut nbrs)?;
+                    if level.is_empty() {
+                        break;
+                    }
+                }
+            }
+            None if forward => {
+                level.insert(start, 1);
+                for _ in 0..lo {
+                    level = self.step(&level, forward, &mut nbrs)?;
+                }
+                let mut mids: Vec<(u64, u64)> = level.into_iter().collect();
+                mids.sort_unstable();
+                for (m, n) in mids {
+                    self.simple_paths(m, forward, &mut nbrs, &mut |x| emit(&mut out, x, n))?;
+                }
+            }
+            None => {
+                self.simple_paths(start, forward, &mut nbrs, &mut |x| {
+                    *level.entry(x).or_default() += 1;
+                    Ok(())
+                })?;
+                for _ in 0..lo {
+                    level = self.step(&level, forward, &mut nbrs)?;
+                }
+                let mut ends: Vec<(u64, u64)> = level.into_iter().collect();
+                ends.sort_unstable();
+                for (x, n) in ends {
+                    emit(&mut out, x, n)?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The neighbours of `x`, with one entry per edge, memoized in `nbrs`.
+    fn neighbours_memo<'m>(
+        &self,
+        x: u64,
+        forward: bool,
+        nbrs: &'m mut FxHashMap<u64, Vec<u64>>,
+    ) -> Result<&'m [u64]> {
+        Ok(match nbrs.entry(x) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(self.neighbours(x, forward)?),
+        })
+    }
+
+    /// One step of walks: the number of walks ending at each node.
+    fn step(
+        &self,
+        level: &FxHashMap<u64, u64>,
+        forward: bool,
+        nbrs: &mut FxHashMap<u64, Vec<u64>>,
+    ) -> Result<FxHashMap<u64, u64>> {
+        self.ctx.check()?;
+        let mut next: FxHashMap<u64, u64> = FxHashMap::default();
+        for (&x, &n) in level {
+            for &y in self.neighbours_memo(x, forward, nbrs)? {
+                let c = next.entry(y).or_default();
+                *c = c.saturating_add(n);
+            }
+        }
+        Ok(next)
+    }
+
+    /// Every simple path from `start` (no node twice, the zero-length path included):
+    /// `f` is called with the end of each, depth first. The number of simple paths can
+    /// be exponential in the size of the graph; the deadline and the row budget bound
+    /// the enumeration.
+    fn simple_paths(
+        &self,
+        start: u64,
+        forward: bool,
+        nbrs: &mut FxHashMap<u64, Vec<u64>>,
+        f: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        f(start)?;
+        let mut on_path: FxHashSet<u64> = FxHashSet::default();
+        on_path.insert(start);
+        // (node, index of its next neighbour)
+        let mut stack: Vec<(u64, usize)> = vec![(start, 0)];
+        let mut steps = 0u32;
+        while let Some(&mut (x, ref mut i)) = stack.last_mut() {
+            steps = steps.wrapping_add(1);
+            if steps.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            let ns = self.neighbours_memo(x, forward, nbrs)?;
+            match ns.get(*i).copied() {
+                Some(y) => {
+                    *i += 1;
+                    if on_path.insert(y) {
+                        f(y)?;
+                        stack.push((y, 0));
+                    }
+                }
+                None => {
+                    on_path.remove(&x);
+                    stack.pop();
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Does the term occur as subject or object in the active graph?
@@ -3843,7 +3998,8 @@ fn path(
         };
         match (&spec.subj, &spec.obj) {
             (PathEnd::Const(s), PathEnd::Const(o)) => {
-                if g.reach(s.0, true)?.contains(&o.0) {
+                // once, or once per way for a range
+                for _ in g.reach(s.0, true)?.into_iter().filter(|y| *y == o.0) {
                     push(s.0, o.0, &mut out);
                 }
             }

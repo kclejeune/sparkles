@@ -21,7 +21,7 @@ oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
 oxrdfio = { version = "0.2", features = ["rdf-12"] }
 oxttl = { version = "0.2", features = ["rdf-12"] }
 oxiri = "0.2"
-spargebra = { version = "0.4", features = ["sparql-12"] }
+spargebra = { version = "0.4", features = ["sparql-12", "sep-0006"] }
 sparesults = { version = "0.3", features = ["sparql-12"] }
 oxsdatatypes = "0.2"
 oxilangtag = "0.1"

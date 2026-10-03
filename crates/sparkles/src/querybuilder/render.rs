@@ -358,6 +358,7 @@ impl Renderer {
                     .join(" UNION ")
             }
             Element::Minus(w) => format!("MINUS {}", self.group(w)),
+            Element::Lateral(w) => format!("LATERAL {}", self.group(w)),
             Element::Graph(g, w) => {
                 let g = self.node(g, Pos::Term);
                 format!("GRAPH {g} {}", self.group(w))

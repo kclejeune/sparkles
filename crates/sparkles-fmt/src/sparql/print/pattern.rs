@@ -32,6 +32,11 @@ pub fn optional(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     spaced(cx, n)
 }
 
+/// `Lateral`: `LATERAL {`.
+pub fn lateral(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
+    spaced(cx, n)
+}
+
 /// `Minus`: `MINUS {`.
 pub fn minus(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     spaced(cx, n)

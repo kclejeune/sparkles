@@ -48,6 +48,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | SPARQL 1.1 Query: BGP, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries, GROUP BY and aggregates, ORDER BY, DISTINCT, LIMIT/OFFSET and EXISTS. | ✅ |
 | RDF 1.2 and SPARQL 1.2 in every RDF syntax. This covers triple terms (`<<( s p o )>>`), the reification syntax `<< >>`, annotations, base-direction literals (`"x"@en--rtl`), and the functions `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, `LANGDIR`, `hasLANG`, `hasLANGDIR` and `STRLANGDIR`. | ✅ |
 | Property paths. `p*`, `p+` and `p?` run as a breadth-first search over the index, starting from the side the join input binds. | ✅ |
+| Jena ARQ's syntax extensions, accepted by default as Fuseki accepts them ([API.md](API.md#arq-syntax-extensions), spec [G06](specs/G06-arq-query-extensions.md)). `LATERAL` substitutes each outer solution into its group, respects the scope of sub-selects and runs as a join when substitution cannot change the result. Path ranges (`p{n}`, `p{n,m}`, `p{n,}`, `p{,m}`, `p{*}`, `p{+}`) count each way through the graph, as ARQ does. CONSTRUCT templates with `GRAPH` blocks return quads in TriG, N-Quads and the other dataset formats. ARQ's tests and Jena 6.2.0's answers check them. | ✅ |
 | The function library: the SPARQL 1.1 built-ins, the XSD casts (the derived integer types with their ranges, `anyURI` and the Gregorian types included), and most of ARQ's `fn:`, `afn:` and `math:` functions, such as `fn:round-half-to-even`, `fn:numeric-mod`, the duration accessors, timezone adjustment, `fn:normalize-unicode`, `afn:substr` and `afn:sha1sum` ([API.md](API.md#extension-functions-and-aggregates)). Tests compare them with Jena's answers. | ✅ |
 | Jena ARQ's statistical aggregates `MEDIAN`, `MODE`, `STDEV`, `STDEV_SAMP`, `STDEV_POP`, `VARIANCE`, `VAR_SAMP` and `VAR_POP`, with `DISTINCT`, as keywords, by their `agg:` and `afn:` IRIs and through `AGG <iri>(…)`. Their results, types, empty groups and errors are ARQ's, and tests compare them with Jena's answers on the same data. The variance and deviation aggregates run in the incremental GROUP BY. | ✅ |
 | SPARQL 1.1 Update: INSERT DATA, DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR, DROP, CREATE, ADD, COPY and MOVE. | ✅ |
@@ -144,10 +145,12 @@ These are features other RDF stores have and Sparkles does not have yet.
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the
   first run after a compaction without retained history, compute everything again.
   Inconsistency checks cover a fixed subset of OWL 2 RL.
-* **SPARQL extensions.** Of ARQ's extensions, Sparkles has the statistical aggregates
-  and most of the function library. It has no property-function libraries such as
-  `list:member` and `apf:*`, and no `LET`, `FOLD`, `cdt:` literals, JavaScript functions,
-  `afn:sprintf` or `fn:format-number`. SERVICE is plain, with no batching or caching.
+* **SPARQL extensions.** Of ARQ's extensions, Sparkles has the statistical aggregates,
+  most of the function library, `LATERAL`, path ranges and CONSTRUCT with `GRAPH`. It
+  has no property-function libraries such as `list:member` and `apf:*`, and no `LET`,
+  `FOLD`, `cdt:` literals, JavaScript functions, `afn:sprintf` or `fn:format-number`.
+  ARQ's `:p^:q`, `distinct(…)` and `shortest(…)` paths are missing too. SERVICE is
+  plain, with no batching or caching.
 * **Search.** Full-text search has no multi-field documents, and its stemmers are
   Tantivy's Snowball stemmers rather than Lucene's analyzers. A vector index has no quantization, so its packed vectors take 4 bytes per
   dimension. Its graph is not carried across compactions and is built again for each new

@@ -74,6 +74,8 @@ running queries.
 * Jena ARQ's statistical aggregates (`MEDIAN`, `MODE`, `STDEV`, `VARIANCE` and their
   variants) and most of its `fn:`, `afn:` and `math:` functions, checked against Jena's
   answers ([API](docs/API.md#extension-functions-and-aggregates)).
+* ARQ's `LATERAL`, property path ranges such as `p{1,3}` and CONSTRUCT templates with
+  `GRAPH`, which Fuseki users write ([API](docs/API.md#arq-syntax-extensions)).
 * A SPARQL 1.1 Service Description per dataset ([API](docs/API.md#service-description)).
 * Federated `SERVICE` queries under an outbound network policy ([usage](docs/USAGE.md#outbound-requests-service-and-load)).
 
@@ -160,7 +162,7 @@ running queries.
 
 | Engine | What it is | Where Sparkles stands |
 |---|---|---|
-| [Apache Jena / Fuseki](https://jena.apache.org/) | The reference Java stack. It has ARQ, TDB2 on B+trees, Fuseki, on-the-fly inference, jena-text and GeoSPARQL. | Sparkles has the same protocols, endpoints, admin API and CLI model, on sorted columnar indexes. It is faster on every benchmark query at 10.5M triples, by a median of 78×. Reasoning is materialized, apart from RDFS on read. Sparkles writes RDF Patch but cannot apply it. It has ARQ's statistical aggregates and most of its function library, but not its property-function libraries, `LET` or `FOLD`, and there is no ontology API. |
+| [Apache Jena / Fuseki](https://jena.apache.org/) | The reference Java stack. It has ARQ, TDB2 on B+trees, Fuseki, on-the-fly inference, jena-text and GeoSPARQL. | Sparkles has the same protocols, endpoints, admin API and CLI model, on sorted columnar indexes. It is faster on every benchmark query at 10.5M triples, by a median of 78×. Reasoning is materialized, apart from RDFS on read. Sparkles writes RDF Patch but cannot apply it. It has ARQ's statistical aggregates, `LATERAL`, path ranges, CONSTRUCT with `GRAPH` and most of its function library, but not its property-function libraries, `LET` or `FOLD`, and there is no ontology API. |
 | [QLever](https://github.com/ad-freiburg/qlever) | A C++ engine for billions of triples, with lazy, streaming execution. | Sparkles uses the same index and execution architecture and adds exact term identity, MVCC updates, the Graph Store Protocol, reasoning and SHACL. It is faster on all 28 benchmark queries at 10.5M triples and on all 20 WatDiv templates, and it uses about a third more memory. It has been measured only up to 11M triples, and it materializes intermediate results. |
 | [Oxigraph](https://github.com/oxigraph/oxigraph) | A Rust database and toolkit on RocksDB, with Python and WebAssembly packages. | Sparkles uses Oxigraph's parsers, SPARQL parser and datatypes, with its own storage and planner. It is faster on every benchmark query at 10.5M triples, by a median of 85×. It fsyncs its writes, so Oxigraph's single-triple updates are faster. It adds reasoning, validation, search, authentication and a UI. It has Rust and Python APIs and no WebAssembly build. |
 | [Fluree](https://github.com/fluree/db) | A versioned, permissioned ledger with clustering, licensed under BUSL-1.1. JSON-LD is its main interface. | Sparkles passes the W3C SPARQL suites in full and is compatible with Fuseki. It has point-in-time reads, snapshots, diffs and protections of triples in its configuration, but no branches, history queries, policies stored in the data or clustering. It is faster on every benchmark query that Fluree completes at 10.5M triples, by a median of 9.8×, but only by 1–5% on a few counts and point lookups. |

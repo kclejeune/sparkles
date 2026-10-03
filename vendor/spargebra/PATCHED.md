@@ -85,6 +85,34 @@ The changes, all in `src/parser.rs` unless noted:
   not added, because ARQ parses it only to fail with "not implemented" and SPARQL 1.2 does
   not have it.
 
+- **A switch for ARQ's syntax.** `SparqlParser::with_arq_syntax(bool)` accepts Jena
+  ARQ's syntax extensions (the default, as Fuseki parses with ARQ's syntax) or rejects
+  them. Every ARQ-only rule has the guard rule `arq()`, which fails when they are off,
+  so that the text is a syntax error. The aggregate keywords and `AGG` above are
+  behind it, and so are the three forms below. Spec
+  [G06](../../docs/specs/G06-arq-query-extensions.md) has the design.
+
+- **`LATERAL`.** The workspace turns on spargebra's own `sep-0006` feature, whose
+  `LATERAL { … }` element, `GraphPattern::Lateral` and check that the right side does
+  not assign a variable in scope on the left are 0.4.7's. `LateralGraphPattern` gains
+  the `arq()` guard.
+
+- **Path ranges.** `PathElt_op` accepts ARQ's `PathMod` braces, `p{n}`, `p{n,m}`,
+  `p{n,}`, `p{,m}`, `p{*}` and `p{+}`, as the new path expression
+  `PropertyPathExpression::Range { path, min, max }` (`{,m}` is `min` 0, `{*}` is
+  `{0,}` and `{+}` is `{1,}`). `p{n,m}` with `n > m` is a syntax error. In
+  `src/algebra.rs` the SPARQL form writes `{0,}` as `{*}`, because Jena evaluates
+  `{0,}` as `{+}`, and the SSE form is Jena's `(pathN n p)`, `(pathN* p)` and
+  `(mod min max p)`, with `_` for no maximum.
+
+- **CONSTRUCT templates with `GRAPH`.** `ConstructTemplate` and the body of
+  `CONSTRUCT WHERE` read ARQ's TriG-like `ConstructQuads`: triples, `GRAPH g { … }`
+  blocks (`g` an IRI, a variable or a blank node) and bare `{ … }` blocks, whose triples
+  join the default graph's. `Query::Construct` gains `graph_templates`, a list of
+  `GraphTemplate { name, triples }` (in `src/query.rs`, with its SPARQL and SSE forms).
+  The pattern of `CONSTRUCT WHERE` joins a `GRAPH` group per block, and a blank-node
+  name is an error there.
+
 - **A nesting limit.** `SparqlParser::parse_query` and `parse_update` first scan the text
   once, without recursion (`src/nesting.rs`, called from `too_deep`). They refuse a text
   whose brackets nest deeper than `nesting::MAX_NESTING` (256) or whose algebra could

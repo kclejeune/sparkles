@@ -499,6 +499,7 @@ pub fn node(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
             // group graph patterns
             K::GroupGraphPattern => pattern::group_graph_pattern(cx, n),
             K::Optional => pattern::optional(cx, n),
+            K::Lateral => pattern::lateral(cx, n),
             K::Minus => pattern::minus(cx, n),
             K::Union => pattern::union(cx, n),
             K::UnionBranch => pattern::union_branch(cx, n),
@@ -598,6 +599,7 @@ impl CommentRules for SparqlRules {
                 | K::UsingClause
                 | K::TriplesStmt
                 | K::Optional
+                | K::Lateral
                 | K::Minus
                 | K::UnionBranch
                 | K::GraphPattern

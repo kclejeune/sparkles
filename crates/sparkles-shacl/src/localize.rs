@@ -118,7 +118,7 @@ fn path(p: &PropertyPathExpression) -> R<PropertyPath> {
         E::ZeroOrMore(x) => PropertyPath::ZeroOrMore(b(x)?),
         E::OneOrMore(x) => PropertyPath::OneOrMore(b(x)?),
         E::ZeroOrOne(x) => PropertyPath::ZeroOrOne(b(x)?),
-        E::NegatedPropertySet(_) => return Err(Global),
+        E::NegatedPropertySet(_) | E::Range { .. } => return Err(Global),
     })
 }
 

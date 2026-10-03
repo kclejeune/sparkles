@@ -19,6 +19,7 @@ pub mod indexjoin;
 mod joinorder;
 mod keyfilter;
 mod keyprobe;
+pub mod lateral;
 pub mod plan;
 pub mod rdfs;
 pub mod results;
@@ -35,13 +36,13 @@ use crate::index::Perm;
 use crate::store::{Chunk, Snapshot};
 pub use ctx::{Ctx, DatasetSpec, Optimizations};
 pub use exec::PlanInfo;
-use oxrdf::{BlankNode, NamedOrBlankNode, Term, Triple};
+use oxrdf::{BlankNode, GraphName, NamedOrBlankNode, Quad, Term, Triple};
 use plan::{ActiveGraph, Planner};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use spargebra::algebra::{GraphPattern, QueryDataset};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
-use spargebra::{Query, SparqlParser};
+use spargebra::{GraphTemplate, Query, SparqlParser};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -202,7 +203,11 @@ pub struct QueryResult {
     /// SELECT solutions; columns in `vars` order
     pub table: Table,
     pub boolean: bool,
+    /// CONSTRUCT and DESCRIBE: the triples of the default graph
     pub triples: Vec<Triple>,
+    /// CONSTRUCT with Jena ARQ's `GRAPH` template blocks: the quads in named graphs
+    /// (the default graph's are in `triples`)
+    pub quads: Vec<Quad>,
     pub plan: PlanInfo,
     pub timing: Timing,
     /// Peak estimated memory of intermediate results (see [`QueryOptions::max_memory_bytes`]).
@@ -226,7 +231,7 @@ impl QueryResult {
         match self.kind {
             QueryKind::Select => self.table.len(),
             QueryKind::Ask => 1,
-            _ => self.triples.len(),
+            _ => self.triples.len() + self.quads.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -283,6 +288,7 @@ pub fn validate_scoping(gp: &GraphPattern) -> Result<()> {
             validate_scoping(inner)
         }
         GP::Join { left, right }
+        | GP::Lateral { left, right }
         | GP::Union { left, right }
         | GP::Minus { left, right }
         | GP::LeftJoin { left, right, .. } => {
@@ -547,6 +553,7 @@ fn execute_parsed(
         table: Table::default(),
         boolean: false,
         triples: Vec::new(),
+        quads: Vec::new(),
         plan,
         timing: Timing::default(),
         mem_peak_bytes: 0,
@@ -576,8 +583,12 @@ fn execute_parsed(
             }
         }
         Query::Ask { .. } => result.boolean = !table.is_empty(),
-        Query::Construct { template, .. } => {
-            result.triples = construct(&ctx, &table, template);
+        Query::Construct {
+            template,
+            graph_templates,
+            ..
+        } => {
+            (result.triples, result.quads) = construct(&ctx, &table, template, graph_templates);
         }
         Query::Describe { .. } => {
             result.triples = describe(&ctx, &table)?;
@@ -659,10 +670,22 @@ pub fn instantiate(
     })
 }
 
-fn construct(ctx: &Ctx, t: &Table, template: &[TriplePattern]) -> Vec<Triple> {
+/// Instantiate a CONSTRUCT template per solution: the default graph's triples, and the
+/// quads of Jena ARQ's `GRAPH` blocks. A block whose name is unbound, or not an IRI or a
+/// blank node, gives nothing for that solution; `urn:x-arq:DefaultGraph` and
+/// `urn:x-arq:DefaultGraphNode` name the default graph. Blank nodes, the graph names'
+/// included, are fresh per solution.
+fn construct(
+    ctx: &Ctx,
+    t: &Table,
+    template: &[TriplePattern],
+    graphs: &[GraphTemplate],
+) -> (Vec<Triple>, Vec<Quad>) {
     let map = t.var_map(ctx.nvars());
     let mut seen = FxHashSet::default();
     let mut out = Vec::new();
+    let mut seen_quads = FxHashSet::default();
+    let mut quads = Vec::new();
     for i in 0..t.len() {
         let mut bnodes: FxHashMap<String, BlankNode> = FxHashMap::default();
         let inst = |tp: &TermPattern, bnodes: &mut FxHashMap<String, BlankNode>| -> Option<Term> {
@@ -683,30 +706,60 @@ fn construct(ctx: &Ctx, t: &Table, template: &[TriplePattern]) -> Vec<Triple> {
                 },
             )
         };
-        for tp in template {
-            let s = inst(&tp.subject, &mut bnodes);
+        let triple = |tp: &TriplePattern, bnodes: &mut FxHashMap<String, BlankNode>| {
+            let s = inst(&tp.subject, bnodes);
             let p = match &tp.predicate {
                 NamedNodePattern::NamedNode(n) => Some(Term::NamedNode(n.clone())),
-                NamedNodePattern::Variable(v) => {
-                    inst(&TermPattern::Variable(v.clone()), &mut bnodes)
-                }
+                NamedNodePattern::Variable(v) => inst(&TermPattern::Variable(v.clone()), bnodes),
             };
-            let o = inst(&tp.object, &mut bnodes);
+            let o = inst(&tp.object, bnodes);
             let (Some(s), Some(Term::NamedNode(p)), Some(o)) = (s, p, o) else {
-                continue;
+                return None;
             };
             let s = match s {
                 Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
                 Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
-                _ => continue,
+                _ => return None,
             };
-            let tr = Triple::new(s, p, o);
-            if seen.insert(tr.clone()) {
+            Some(Triple::new(s, p, o))
+        };
+        for tp in template {
+            if let Some(tr) = triple(tp, &mut bnodes)
+                && seen.insert(tr.clone())
+            {
                 out.push(tr);
             }
         }
+        for g in graphs {
+            let name = match inst(&g.name, &mut bnodes) {
+                Some(Term::NamedNode(n))
+                    if n.as_str() == ctx::DEFAULT_GRAPH_IRI
+                        || n.as_str() == ctx::DEFAULT_GRAPH_NODE_IRI =>
+                {
+                    GraphName::DefaultGraph
+                }
+                Some(Term::NamedNode(n)) => GraphName::NamedNode(n),
+                Some(Term::BlankNode(b)) => GraphName::BlankNode(b),
+                _ => continue,
+            };
+            for tp in &g.triples {
+                let Some(tr) = triple(tp, &mut bnodes) else {
+                    continue;
+                };
+                if name == GraphName::DefaultGraph {
+                    if seen.insert(tr.clone()) {
+                        out.push(tr);
+                    }
+                } else {
+                    let q = tr.in_graph(name.clone());
+                    if seen_quads.insert(q.clone()) {
+                        quads.push(q);
+                    }
+                }
+            }
+        }
     }
-    out
+    (out, quads)
 }
 
 /// DESCRIBE: bounded description (outgoing triples + blank node closure), like

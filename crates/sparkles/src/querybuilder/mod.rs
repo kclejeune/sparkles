@@ -193,6 +193,14 @@ macro_rules! where_methods {
             self.map_where(|w| w.minus(f))
         }
 
+        /// `LATERAL { … }` (Jena ARQ)
+        pub fn lateral(
+            self,
+            f: impl FnOnce($crate::querybuilder::WhereBuilder) -> $crate::querybuilder::WhereBuilder,
+        ) -> Self {
+            self.map_where(|w| w.lateral(f))
+        }
+
         /// `GRAPH g { … }`
         pub fn graph(
             self,

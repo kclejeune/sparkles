@@ -724,6 +724,7 @@ fn has_service(p: &GraphPattern) -> bool {
     match p {
         G::Service { .. } => true,
         G::Join { left, right }
+        | G::Lateral { left, right }
         | G::LeftJoin { left, right, .. }
         | G::Union { left, right }
         | G::Minus { left, right } => has_service(left) || has_service(right),

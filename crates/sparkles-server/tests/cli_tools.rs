@@ -187,6 +187,23 @@ fn qparse_and_uparse() {
     assert!(out(&o).contains("(insertData"), "{}", out(&o));
     let o = run(dir, &["uparse", "INSERT { ?s }"]);
     assert_eq!(o.status.code(), Some(1));
+    // Jena ARQ's syntax by default, strict SPARQL with --syntax sparql (spec G06)
+    let arq = "SELECT * { ?s <http://e/p>{2} ?o LATERAL { ?o <http://e/q> ?x } }";
+    let o = run(dir, &["qparse", "--print", "algebra", arq]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("(pathN 2 ") && out(&o).contains("(lateral"),
+        "{}",
+        out(&o)
+    );
+    let o = run(dir, &["qparse", "--syntax", "sparql", arq]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("1:"), "{}", err(&o));
+    let o = run(
+        dir,
+        &["qparse", "--syntax", "SPARQL_11", "SELECT * { ?s ?p ?o }"],
+    );
+    assert!(o.status.success(), "{}", err(&o));
 }
 
 #[test]

@@ -717,7 +717,10 @@ implementation landed.
   - the FILTER scope in OPTIONAL;
   - SELECT expressions see earlier aliases;
   - no nested aggregates;
-  - triple-term subjects restricted per the SPARQL 1.2 grammar rules [123] and [138].
+  - triple-term subjects restricted per the SPARQL 1.2 grammar rules [123] and [138];
+  - Jena ARQ's syntax extensions behind one switch, `with_arq_syntax`: the aggregate
+    keywords, `LATERAL` (spargebra's own `sep-0006` code), path ranges and CONSTRUCT
+    templates with `GRAPH`, written from ARQ's grammar for spec G06.
 - **Notes:** like the published crate, the copy has no `LICENSE` files. The license is
   the `Cargo.toml` field. The copy will be dropped once a spargebra release has these
   fixes.
@@ -1158,6 +1161,36 @@ implementation landed.
   - backing up sealed files instead of their logical plaintext;
   - encrypting only the vocabulary;
   - a 7-day default rotation of data keys.
+
+## ARQ's query language extensions
+
+- **Spec:** [`G06-arq-query-extensions.md`](G06-arq-query-extensions.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the vendored spargebra, whose `sep-0006` feature already
+    parsed `LATERAL`;
+  - Apache Jena's `jena-arq` sources (Apache-2.0): the ARQ grammar `Grammar/main.jj`,
+    `SyntaxVarScope`, `OpLateral` and its executor, the `path` package (`P_Mod`,
+    `P_FixedLength`, `PathFactory`, `PathCompiler`, `PathLib`, `PathEngineSPARQL`,
+    `PathEngineN`), `Template` and `TemplateLib`, and Fuseki's `SPARQLQueryProcessor`
+    and `Responses`, read for syntax and behaviour. No code was copied;
+  - ARQ's test suites `testing/ARQ/Syntax-Lateral`, `testing/ARQ/Lateral` and the
+    `syntax-quad-construct-*` tests of `testing/ARQ/Syntax-ARQ`, and the unit tests
+    `TestPath` and `TestPathQuery`, whose cases are ported with citations to
+    `crates/sparkles/tests/arq_syntax.rs`;
+  - the output of Jena 6.2.0's `arq` command on small graphs;
+  - SPARQL 1.1 and 1.2 Query and the SPARQL 1.2 community proposal SEP-0006.
+
+  Fluree was not consulted.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. The `LATERAL`
+  decorrelation reuses the analysis of the EXISTS decorrelation, and its per-row
+  evaluation the planner's substitution of constants. **Dependencies:** none new.
+- **Rejected** (spec §9):
+  - expanding ranges in the parser;
+  - evaluating every `LATERAL` per row, or decorrelating every one into a join;
+  - renaming hidden sub-select variables in the algebra;
+  - copying Jena's evaluation of `{0,}` as `{+}`;
+  - ARQ's syntax off by default;
+  - returning quads from `Dataset::construct`.
 
 ## Development tools (not linked into Sparkles)
 

@@ -1432,6 +1432,7 @@ fn children(p: &GraphPattern) -> Vec<&GraphPattern> {
     use GraphPattern as G;
     match p {
         G::Join { left, right }
+        | G::Lateral { left, right }
         | G::LeftJoin { left, right, .. }
         | G::Union { left, right }
         | G::Minus { left, right } => vec![left, right],
