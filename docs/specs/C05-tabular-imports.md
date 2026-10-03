@@ -13,7 +13,7 @@
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
 
-This is a clean-room design. It was written from the W3C CSV on the Web recommendations
+This design was written from the W3C CSV on the Web recommendations
 (the Model for Tabular Data and Metadata on the Web, the Metadata Vocabulary for Tabular
 Data, and Generating RDF from Tabular Data on the Web), RFC 4180, RFC 6570, RFC 7111, the
 IANA registration of `text/tab-separated-values`, the public documentation of Tarql, the
@@ -482,7 +482,6 @@ parameter, are a non-goal for this phase.
 - The Sparkles code: `io::Source`, `Store::load_with`, the server's transcoding of
   Jena's binary formats, `upload`, `BodyBudget`, `sparql::execute_query` and `xsd`, and
   the specs C01 and C15.
-- Fluree was not consulted.
 
 ## Outcome
 

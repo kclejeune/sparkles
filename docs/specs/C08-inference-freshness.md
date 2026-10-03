@@ -20,7 +20,7 @@
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
 
-This is a clean-room spec. It builds on the durable commit sequence `seq` from the commit
+This spec builds on the durable commit sequence `seq` from the commit
 identity spec ([CI](CI-commit-identity.md)). It uses `Snapshot::commit`,
 `Store::head_commit()` and the `Receipt` that `WriteTxn::commit()` returns. In case C08 is
 implemented first, §5.1 defines a stopgap counter.
@@ -616,7 +616,7 @@ finding.
 ## 10. Sources
 
 - Sparkles repository:
-  - [CI-commit-identity.md](CI-commit-identity.md), a sibling clean-room spec: `seq`,
+  - [CI-commit-identity.md](CI-commit-identity.md), a sibling spec: `seq`,
     `head`, `Receipt`, `write_as(Reason)`, the dataset id, and the layouts of the WAL
     commit record and the catalog.
   - `crates/sparkles-reasoner/src/lib.rs`: `materialize`, which holds the writer lock
@@ -645,7 +645,6 @@ finding.
   not re-fetched.
 - Apache Jena documentation on `rb:violation`-style validation in rule reasoners. Cited
   from working knowledge, only as a rejected alternative, and not re-fetched.
-- Fluree was not consulted: no code, documentation or product pages.
 
 ## 11. Phase 4: input graphs, imports and RDFS on read
 

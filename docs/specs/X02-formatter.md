@@ -6,8 +6,8 @@
 > config file, `POST /$/format` and the UI Format button. Phase 2 adds JSON-LD, `--sort`,
 > `--prune-prefixes`, `--canonicalize`, the external sort, `sparkles lsp`, the two optional
 > keys `turtle-layout` and `align-values`, and Format in the shapes editor. Phase 3 adds the
-> WebAssembly build that the UI uses and streaming Turtle/TriG. The Phase 3 fuzzing targets
-> had not landed when this record was written.
+> WebAssembly build that the UI uses, streaming Turtle/TriG and the cargo-fuzz targets
+> (`mise run fmt:fuzz`).
 >
 > **User docs:** [API: Formatting](../API.md#formatting) · [Editor integration](../editors.md) · [Features](../FEATURES.md#formatter-and-editor-support)
 >
@@ -2174,8 +2174,17 @@ and N-Triples/N-Quads. The line formats came with streaming, `--sort` with LZ4-f
 spill runs, and `--canonicalize` with RDFC-1.0. That round also added `sparkles lsp` with
 [editor snippets](../editors.md), `align-values`, `prune-prefixes`, Turtle/TriG sorting
 and `turtle-layout = "conventional"`, so neither optional key was dropped. The
-WebAssembly build (`crates/sparkles-fmt-wasm`) and streaming Turtle/TriG came last. The
-Phase 3 fuzzing targets had not landed when this record was written.
+WebAssembly build (`crates/sparkles-fmt-wasm`) and streaming Turtle/TriG came next. The
+Phase 3 fuzzing targets of §9.7 landed on 2026-10-01 in `crates/sparkles-fmt/fuzz`, a
+cargo workspace of its own that `mise run fmt:fuzz` runs and `mise run ci` never builds.
+There is one target each for SPARQL, Turtle and TriG, N-Triples and N-Quads, and JSON-LD.
+Each checks that the formatter never panics, that a refusal is a positioned syntax error,
+and that the output means what the input means, keeps its comments and formats to
+itself. The first campaign found stack overflows on deep nesting, which led to the
+256-level limit, a panic on an undeclared prefix, three outputs that were not
+fixpoints, an unterminated long string that did not lex by the longest match, and a
+cursor mapped inside a character. All of them were fixed, and each is a test in
+`tests/fuzz_regressions.rs`.
 
 **Decided by the maintainer:** the §13.1 style defaults and the twelve configuration keys
 were reviewed item by item before Phase 1. The WebAssembly module is optional. A
@@ -2219,7 +2228,7 @@ the in-memory output. JSON-LD has no local W3C suite. Jena's and Oxigraph's JSON
 and the W3C RDF results written as JSON-LD stand in for one, plus
 `SPARKLES_JSONLD_TESTS` when set.
 
-**Performance:** the §8 targets are not yet recorded in [BENCHMARKS](../BENCHMARKS.md).
+**Performance:** the §8 targets are not recorded in [BENCHMARKS](../BENCHMARKS.md).
 The WebAssembly module is about 250 KB with brotli, well under the 1.5 MB budget of §7.4.
 
 **MCP tool.** The `format` tool of §13.2 Q10 landed on 2026-10-02 in `sparkles mcp`
@@ -2230,7 +2239,7 @@ text changed and the warnings. The text may be up to 1 MiB, and `--mcp-max-bytes
 the result. A call runs within its `timeoutSeconds`. It reads no dataset and no config
 file.
 
-**Deferred:** fuzzing (§9.7). `sparkles lint` landed later as its own spec,
+**Later:** `sparkles lint` landed later as its own spec,
 [X04](X04-linter.md), on the formatter's syntax tree. It adds a `[lint]` table to the
 config file, which the formatter ignores, lint diagnostics and quick fixes to
 `sparkles lsp`, and a `lint` function to the WebAssembly module.

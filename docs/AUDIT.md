@@ -19,7 +19,7 @@ audited (§2b). Each feature Sparkles added beyond this audit has a design spec 
 | jena-shacl / jena-shex | 23K / 18K | SHACL Core and SHACL-SPARQL; ShEx 2 | `sparkles-shacl` implements SHACL Core and SHACL-SPARQL and passes the W3C suites (98/98 and 20/20). `sparkles-shex` implements ShEx 2.1 with ShExC, ShExJ, ShExR and shape maps, and passes 99.9% of the shexTest validation tests. Either can validate writes ([C10](specs/C10-write-time-validation.md), [G02](specs/G02-shex.md)). |
 | jena-text | 7.5K | A Lucene text index | A `text:query` subset over string literals, on Tantivy with BM25. It does not use jena-text's Lucene format or assembler ([F03](specs/F03-full-text-search.md)). |
 | jena-geosparql | 23K | GeoSPARQL 1.0/1.1 on JTS and Apache SIS. It has the `geof:` and `spatialF:` functions, `spatial:` property functions over an STR-tree of feature envelopes, query rewrite, GML, KML, WKT and GeoJSON literals, and EPSG CRSs. | `sparkles::geo` (the `geo` cargo feature), built on the `geo`, `geo-index` and `geographiclib-rs` crates with its own WKT and GeoJSON readers. It has the `geof:` functions over WKT, GeoJSON, GML and KML, a packed R-tree per generation with an overlay of commits, the `spatial:` property functions, Jena's `spatialF:` filter functions, spatial joins, query rewrite, RDFS entailment of the GeoSPARQL vocabulary with geometry types from literals, and projected CRSs from proj4 definitions through `proj4rs`. It follows Jena where GeoSPARQL leaves room, and [COMPARISON.md](COMPARISON.md#geosparql) lists the divergences. The server resolves projected EPSG codes through an EPSG-derived proj4 table, and there are no datum-shift grids (§5). The design is in [G01](specs/G01-geosparql.md). |
-| jena-rdfpatch, rdfconnection, querybuilder, serviceenhancer, cmds | — | Patch logs, client APIs, builders and the CLI | The CLI became the `sparkles` binary. The others do not apply in Rust. |
+| jena-rdfpatch, rdfconnection, querybuilder, serviceenhancer, cmds | — | Patch logs, client APIs, builders and the CLI | The CLI became the `sparkles` binary. Sparkles writes RDF Patch for diffs and the change feed and applies it through Fuseki's `patch` operation, without patch logs ([F10](specs/F10-replication.md)). The remote side of `RDFConnection` became `sparkles-client` ([P02](specs/P02-rust-client.md)), and the query builder became `sparkles::querybuilder`. serviceenhancer has no counterpart. |
 | jena-tdb1, commonsrdf | — | Deprecated | Skipped |
 
 Sparkles preserves these Jena behaviours:
@@ -46,8 +46,12 @@ Sparkles preserves these Jena behaviours:
 * **Reasoning.** RDFS (full, default and simple), the OWL Micro, Mini and Full rule sets,
   and `GenericRuleReasoner` with Jena rule syntax `[name: (?a p ?b) builtin(?x) -> (?a q ?b)]`.
 
-The `sparkles` tests run these conformance suites from the Jena checkout:
-`jena-arq/testing/rdf-tests-cg/sparql/{sparql10,sparql11,sparql12}`, `jena-arq/testing/rdf-tests-cg/rdf/{rdf11,rdf12}`, `jena-arq/testing/ARQ`, `jena-shacl/src/test/files/std`, `jena-core/testing/wg`.
+The tests run these suites from the Jena checkout. The `sparkles` crate runs
+`jena-arq/testing/rdf-tests-cg/sparql/{sparql10,sparql11,sparql12}` and ARQ's `LATERAL`
+tests in `jena-arq/testing/ARQ`. The formatter's tests read the Turtle and TriG suites of
+`jena-arq/testing/rdf-tests-cg/rdf/{rdf11,rdf12}`, `sparkles-shacl` runs
+`jena-shacl/src/test/files/std`, and `sparkles-shex` runs the shexTest copy in
+`jena-shex/src/test/files/spec`.
 
 ## 2. QLever — architecture and performance mechanisms
 
@@ -88,9 +92,8 @@ Oxigraph is one of the engines in the benchmarks (`docs/BENCHMARKS.md`).
 
 ## 2b. Fluree — not audited
 
-[Fluree DB](https://github.com/fluree/db) is licensed under BUSL-1.1. Sparkles neither
-depends on it nor borrows from it, and its source, tests and design documents were not
-read. Some features that other databases offer, Fluree among them, were added to Sparkles:
+[Fluree DB](https://github.com/fluree/db) is licensed under BUSL-1.1, and Sparkles does
+not depend on it. Some features that other databases offer were added to Sparkles:
 durable commit ids, point-in-time reads and named snapshots, full-text and vector search,
 dataset access control, an MCP server, and backups to object storage. Their specs were
 written from the W3C and IETF standards, the documentation of permissively licensed
@@ -123,7 +126,8 @@ make up for re-creating the parser, algebra and datatype stack.
 
 ```
 ui/ (SvelteKit)  ──HTTP──▶  sparkles-server (axum; Fuseki protocol + /$/ admin; auth, rate
-                                   │         limits, observability; CLI; MCP over stdio)
+                                   │         limits, observability; CLI; MCP over stdio and HTTP)
+                                   ├─ sparkles-graphql  (the read-only GraphQL adapter, compiled to SPARQL algebra)
                                    ├─ sparkles-reasoner (RDFS / OWL-RL / Jena rules, semi-naive forward chaining)
                                    ├─ sparkles-shacl    (SHACL Core + SHACL-SPARQL, write-time validation)
                                    ├─ sparkles-shex     (ShEx 2.1, write-time validation)
@@ -141,19 +145,22 @@ sparkles (library)
  ├─ sparql    spargebra → planner (DP + interesting orders) → columnar operators → results
  ├─ text      full-text index (Tantivy)
  ├─ geo       GeoSPARQL: literals, CRSs, units, the geof: functions, the spatial index (geo, geo-index)
- ├─ vector    exact vector similarity
+ ├─ vector    vector similarity, exact or through HNSW indexes, and embeddings computed on write
  ├─ codec     gzip / zstd / brotli / LZ4
  └─ io        RDF & result-format parsing/serialization (Oxigraph crates)
 ```
 
 ## 5. Explicit non-goals for v1
 
-Sparkles v1 leaves out JavaScript scripting functions, RDF Thrift and Protobuf, TriX,
-jena-ontapi's object mapping API, jena-text's Lucene index format and assembler
-configuration, RDF Patch, backward-chaining (LP) rules and Shiro authentication. Sparkles
-implements `text:query` itself and has its own authentication
-([C09](specs/C09-dataset-access-control.md)). These are documented extension points, not
-hidden gaps.
+Sparkles v1 leaves out JavaScript scripting functions, jena-ontapi's object mapping API,
+jena-text's Lucene index format and assembler configuration, backward-chaining (LP) rules
+and Shiro authentication. Sparkles implements `text:query` itself and has its own
+authentication ([C09](specs/C09-dataset-access-control.md)). These are documented
+extension points, not hidden gaps. RDF Thrift, RDF Protobuf, TriX, RDF/JSON and RDF Patch
+were on this list at first. The server, `sparkles load` and `sparkles convert` now read and
+write Jena's formats, and RDF Patch is written and applied
+([F10](specs/F10-replication.md)). The library's loader and the Python package still take
+only the W3C syntaxes.
 
 GeoSPARQL is supported ([G01](specs/G01-geosparql.md)), except for these parts:
 

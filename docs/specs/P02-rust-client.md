@@ -20,7 +20,7 @@ draft on RateLimit header fields. The public documentation of Apache Jena's
 `RDFConnection` and `RDFLink` (Apache-2.0) and of Oxigraph's Rust API and pyoxigraph (MIT
 OR Apache-2.0) served as prior art for the shape of the API. The documentation of
 progenitor and openapi-generator informed the choice in §2. No code was copied from any
-of them. Fluree was not consulted.
+of them.
 
 ## 1. Summary, goals, non-goals
 

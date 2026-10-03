@@ -1,17 +1,16 @@
 # G01: GeoSPARQL (OGC GeoSPARQL 1.1, Jena spatial extensions, spatial index)
 
-> **Status:** Phases 1 and 2 are implemented. Phase 3 is partly implemented. Geometry
-> types from literals, variable `spatial:` arguments, cell prefilters, GML and KML, and
-> CRSs from proj4 definitions are built, and the rest of Phase 3 is not.
+> **Status:** implemented in part (Phases 1–2, part of Phase 3)
 >
 > **Phases:** Phase 1 covers geometry literals, CRSs and units, the `geof:` functions, the
 > spatial index with FILTER pushdown, Jena's `spatial:` property functions, and the server
 > and CLI surfaces. Phase 2 covers spatial joins and k-NN, Query Rewrite, `spatial:equals`,
 > RDFS entailment and default geometries, the aggregates, hulls and `isSimple`,
 > `spatialF:`, UTM zones, persisted index files, W3C Basic Geo points, `GET /{ds}/geo`,
-> `POST /$/geo/convert`, the UI maps and Oxigraph's GeoSPARQL tests. Phase 3 adds GML and
-> KML literals, `geometryTypes` entailment, variable `spatial:` arguments, a cell grid for
-> spatial tests and projected CRSs from proj4 definitions.
+> `POST /$/geo/convert`, the UI maps and Oxigraph's GeoSPARQL tests. Phase 3 shipped GML
+> and KML literals, geometry types from literals, variable `spatial:` arguments, a cell
+> grid for spatial tests, projected CRSs from proj4 definitions and the opt-in `geo-epsg`
+> build feature. The rest of Phase 3 is not built, as the [Outcome](#outcome) lists.
 >
 > **User docs:** [API: GeoSPARQL](../API.md#geosparql) ·
 > [API: hulls, aggregates, `spatialF:`, UTM and conversion](../API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion) ·
@@ -1660,10 +1659,9 @@ list gets updated too, since QLever's libspatialjoin is likely faster on huge se
   * Egenhofer and Franzosa, IJGIS 5(2), 1991, doi:10.1080/02693799108927841.
   * Randell, Cui, Cohn, KR 1992.
   * Clementini, Di Felice, van Oosterom, SSD 1993, doi:10.1007/3-540-56869-7_16.
-* **Not consulted**: Fluree. No Fluree repository, source, tests, documentation, website
-  or other material was opened or used for this spec. No GPL or LGPL source code was
-  read. The GeoSPARQL benchmark was looked at only for its license, size and layout, and
-  GEOS and QLever's `pb_util` were not looked at at all.
+* **Not read**: no GPL or LGPL source code was read. The GeoSPARQL benchmark was looked
+  at only for its license, size and layout, and GEOS and QLever's `pb_util` were not
+  looked at at all.
 
 ## 13. Provenance entry (for `PROVENANCE.md`)
 
@@ -1685,7 +1683,7 @@ that actually shipped.
   Natural Earth and OSM tile-policy pages; and papers (Jovanovik et al. 2021; Bast et al.
   2024/2025; Karney 2011/2013; STR, R*-tree, Egenhofer, RCC8, DE-9IM). The GeoSPARQL
   Compliance Benchmark (GPL-2.0-only) was looked at for its license, size and layout only.
-  No GPL or LGPL source was read. Fluree was not consulted.
+  No GPL or LGPL source was read.
 - **Implementation:** not started.
   - **Planned dependencies** (spec §5.1, all permissive), behind a `geo` feature of
     `sparkles` that the server enables by default: `geo` 0.33 (MIT OR Apache-2.0, with
@@ -1838,6 +1836,6 @@ buffer computed another way, and rewrite answers that DE-9IM does not give.
 
 **Performance.** The index adds no measurable commit latency ([commit
 cost](../BENCHMARKS.md#spatial-index-commit-cost)). The §9 query targets have not been
-measured yet. The cell grid made 200,000 `sfContains` tests against a 1,024-vertex polygon
+measured. The cell grid made 200,000 `sfContains` tests against a 1,024-vertex polygon
 4.3 times faster (60 ms instead of 256 ms) and 5.4 times faster against a 16,384-vertex
 one, for about 16 bytes per region vertex, up to 64 KiB per region.

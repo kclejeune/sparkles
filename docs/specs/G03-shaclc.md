@@ -14,7 +14,7 @@
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
 
-This is a clean-room spec. It depends on the SHACL validator in `crates/sparkles-shacl`,
+This spec depends on the SHACL validator in `crates/sparkles-shacl`,
 on write-time validation ([C10](C10-write-time-validation.md)), on the shapes drafted
 from the data ([C02 §11](C02-schema-discovery.md)) and on the MCP server
 ([C11](C11-mcp-server.md)).

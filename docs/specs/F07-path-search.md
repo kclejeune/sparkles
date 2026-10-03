@@ -1,13 +1,13 @@
 # F07: Path search
 
-> **Status:** implemented
+> **Status:** implemented in part (Phase 1, part of Phase 2)
 >
 > **Phases:** Phase 1 shipped. It covers `SERVICE path:search` with the four modes,
 > predicate sets and directions, ends bound by the query, weights on reifiers, the
 > limits and the masked view. Searches per named graph under `GRAPH ?g`, planned for
 > Phase 2, came with it. The rest of Phase 2 and Phase 3 are not built.
 >
-> **User docs:** [API: Path search](../API.md#path-search) · [Features](../FEATURES.md#sparql-arq-equivalent)
+> **User docs:** [API: Path search](../API.md#path-search) · [Usage: Finding paths](../USAGE.md#finding-paths) · [Features](../FEATURES.md#sparql-arq-equivalent)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -508,5 +508,5 @@ of sweeping whole levels.
 
 **Not built.** Edges from a nested pattern, a direction per predicate, a `path:edge`
 binding of the edge as a triple term, a dedicated MCP tool and the Cypher frontend's
-use of the operator. Zero-weight edges can hide equally cheap paths from
+use of the operator were not built. Zero-weight edges can hide equally cheap paths from
 `path:allShortest`, as §9 says.

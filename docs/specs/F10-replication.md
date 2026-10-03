@@ -11,16 +11,17 @@
 > is done.
 >
 > **User docs:** [Applying RDF Patch](../API.md#applying-rdf-patch) in the API reference,
-> and `sparkles patch` and `sparkles rdfpatch` in [the usage guide](../USAGE.md).
+> and `sparkles patch` and `sparkles rdfpatch` in
+> [the usage guide](../USAGE.md#command-line-tools).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
 
-This is a clean-room spec. It was written from the RDF Patch and RDF Delta documentation,
+This spec was written from the RDF Patch and RDF Delta documentation,
 the Apache Jena sources of the patch reader and of Fuseki's patch service, the PostgreSQL
 documentation of streaming replication and hot standby, the LiteFS and Litestream
 documentation, Oxigraph's API documentation, the Raft paper and the Sparkles code and
-specs. Fluree was not consulted (§12).
+specs. §12 lists the sources.
 
 It builds on durable commit identity ([CI](CI-commit-identity.md)), retained history and
 the change feed ([F06](F06-snapshots-and-point-in-time.md)), background compaction
@@ -1363,9 +1364,6 @@ less time on the replica than making them took on the primary. The numbers go to
   of an Understandable Consensus Algorithm" (USENIX ATC 2014) and the etcd documentation
   on cluster sizes; PostgreSQL's `pg_promote`, timelines and `pg_rewind`; RFC 9110,
   RFC 9530, RFC 9651 and RFC 6648.
-* **Not consulted:** Fluree, in any form. Neither Fluree's source repository nor its
-  documentation, site, tests or talks were opened, searched or fetched, and the
-  descriptions of Fluree in the project's planning notes were not used.
 
 ## Outcome
 
@@ -1462,8 +1460,9 @@ and the Jena client checks.
   157/157, 1.2 269/269) and `mise run ci` pass. Two tests unrelated to patches timed out
   once on a machine with a load average above 60 and passed when run again.
 
-**Not built.** Phases 2 and 3: roles, replicas, the commit stream, captures, holds,
-`minCommit`, promotion and lineages, archiving, synchronous replication and failover.
+**Not built.** Phases 2 and 3 were not built. They cover roles, replicas, the commit
+stream, captures, holds, `minCommit`, promotion and lineages, archiving, synchronous
+replication and failover.
 Open questions 3 (a commit per transaction), 4 (idempotent patches by `H id`), 13 (a
 parameter for the blank-node rule) and 14 (refusing graph terms on prefix rows) keep the
 designed defaults.

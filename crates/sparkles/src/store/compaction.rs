@@ -41,7 +41,8 @@ const NONE: i64 = i64::MIN;
 #[serde(rename_all = "camelCase")]
 pub struct CompactionPolicy {
     pub enabled: bool,
-    /// no quad-count, idle or age trigger fires with a smaller delta
+    /// neither the relative trigger nor the idle trigger fires with a smaller delta (the
+    /// age trigger does)
     pub min_delta_quads: u64,
     /// the relative trigger: `min_delta_quads + delta_ratio × base quads`
     pub delta_ratio: f64,

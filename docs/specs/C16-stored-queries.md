@@ -13,7 +13,7 @@
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
 
-This is a clean-room design. It was written from the SPARQL 1.1 Query and Protocol
+This design was written from the SPARQL 1.1 Query and Protocol
 specifications, Apache Jena's documentation of `ParameterizedSparqlString` and of query
 execution with substitutions, the public documentation of Stardog's stored queries and
 of GraphDB's saved queries, the OpenAPI notion of parameterized operations, and the
@@ -306,7 +306,6 @@ variables.
 - The Sparkles code: `QueryOptions::initial_bindings`, the query endpoint, `auth`,
   `mcp`, `guard::config` and the backup file lists; and the specs CI, C01, C09, C11 and
   C12.
-- Fluree was not consulted.
 
 ## Outcome
 

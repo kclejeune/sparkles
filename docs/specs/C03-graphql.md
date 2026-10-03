@@ -13,7 +13,7 @@
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
 
-This is a clean-room design. It was written from the GraphQL specification (the October
+This design was written from the GraphQL specification (the October
 2021 edition and the current working draft), the GraphQL over HTTP working draft, the
 GraphQL Cursor Connections specification, GraphQL-LD and its `graphql-to-sparql`
 library, HyperGraphQL, the public documentation of Stardog's GraphQL support and of
@@ -27,7 +27,7 @@ access control ([C09](C09-dataset-access-control.md), [C12](C12-graph-access-con
 and the protections of triples that C12's second phase adds), write-time validation
 ([C10](C10-write-time-validation.md)), stored queries ([C16](C16-stored-queries.md)),
 point-in-time reads ([F06](F06-snapshots-and-point-in-time.md)) and the MCP server
-([C11](C11-mcp-server.md)). Fluree was not consulted.
+([C11](C11-mcp-server.md)).
 
 ## 1. Summary
 
@@ -1137,8 +1137,6 @@ French. `ex:Employee rdfs:subClassOf ex:Person`. Some `ex:Org` nodes have `ex:na
 - **The Sparkles code**: `sparql::execute_query` and `QueryOptions`, the vendored
   `spargebra` algebra, `schema::draft`, `stored`, `access`, the server's query, stored
   query and MCP handlers, and the specs C01, C02, C09, C10, C11, C12, C16 and F06.
-- Fluree was not consulted. No Fluree code, documentation, product pages or descriptions
-  of its features were read.
 
 ## Outcome
 
@@ -1246,7 +1244,8 @@ Assembly runs the generic executor once per object and builds a JSON value per f
 and it was not profiled further. The single SPARQL query was slower than the adapter for
 the lookup and the filtered page, and faster for the two pages of 1,000 people.
 
-**Not built.** Phase 2 (the UI's GraphQL page and schema editor, stored GraphQL
-queries, `persistedOnly`, the MCP tools, `QueryOptions::seed` and the per-group top-k)
-and Phase 3 (subscriptions). Nested lists are not connections, and a nested `first`
-limits the response while the engine produces every value of the field.
+**Not built.** Phases 2 and 3 were not built. Phase 2 holds the UI's GraphQL page and
+schema editor, stored GraphQL queries, `persistedOnly`, the MCP tools,
+`QueryOptions::seed` and the per-group top-k, and Phase 3 holds subscriptions. Nested
+lists are not connections, and a nested `first` limits the response while the engine
+produces every value of the field.

@@ -6,16 +6,18 @@
 > catalog, receipts, headers, `/$/commits` and `sparkles log`. Phase 2 added the UI history
 > and receipts, headers on explain and SHACL, `meta.commit`, `id`/`head`/`modified` on
 > datasets, `sparkles log --at` and the in-memory ring. Phase 3 added commit messages,
-> optional change digests, and entity tags with conditional Graph Store requests.
+> optional change digests, and entity tags with conditional Graph Store requests. The
+> catalog horizon and the change feed, which §6 left to later work, landed after Phase 3.
 >
 > **User docs:** [API: Commits](../API.md#commits) ·
 > [API: Entity tags and conditional requests](../API.md#entity-tags-and-conditional-requests) ·
+> [API: Change feed](../API.md#change-feed) ·
 > [Features](../FEATURES.md#storage-tdb2-equivalent)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
 
-This is a clean-room spec. Several later features build on it: full-text and vector search
+Several later features build on this spec: full-text and vector search
 watermarks ([F03](F03-full-text-search.md), [F04](F04-vector-search.md)), point-in-time
 queries (`?at=commit:<n>`, [F06](F06-snapshots-and-point-in-time.md)), change events and
 remote storage ([F05](F05-snapshot-repositories.md)).
@@ -752,8 +754,7 @@ while `sparkles serve` holds the lock → succeeds and lists seqs 1, 0.
 * Cited from general knowledge, not fetched: RFC 3339, RFC 9562 (UUID), RFC 9110 (HTTP
   semantics, ETag), RFC 6648 (`X-` prefix), RFC 9651 (Structured Field Values), RFC 7089
   (Memento), W3C RDF Dataset Canonicalization (RDFC-1.0).
-* **Not consulted**: Fluree in any form, including its code, docs, tests, site and talks.
-  The project's earlier implementation review and feature plan were not read either.
+* The project's earlier implementation review and feature plan were not read.
 
 ## Outcome
 
@@ -865,8 +866,9 @@ commit and format, `304` on `GET` and `HEAD`, tags at `?at=`, `If-Match` on read
 writes, `If-None-Match: *` creation, concurrent `PUT`s with one tag, messages on updates,
 Graph Store writes and uploads, their rejection, and CORS.
 
-**Not built.** Catalog pruning and the long-poll change feed remain later work. The UI
-does not show messages. `/{ds}/update` takes no `If-Match`, because a tag names a
+**Not built in Phase 3.** Catalog pruning and the long-poll change feed were left to
+later work, and both landed afterwards, as the next paragraph describes. The UI does not
+show messages. `/{ds}/update` takes no `If-Match`, because a tag names a
 representation of a graph and an update has none.
 
 **Pruning and the change feed** landed on 2026-10-02, after Phase 3. This answers open

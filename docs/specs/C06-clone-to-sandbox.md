@@ -15,7 +15,7 @@
 > This is the design as written before implementation; the [Outcome](#outcome) section at the end
 > records how it landed.
 
-This is a clean-room spec. It does not depend on commit identity
+This spec does not depend on commit identity
 ([CI](CI-commit-identity.md)), but once CI exists the clone:
 
 - is a **new lineage**, with a fresh dataset id and its own root commit;
@@ -512,7 +512,7 @@ most the final source count. The source ends with all 100 inserts.
 
 - Sparkles repository:
   - [CI-commit-identity.md](CI-commit-identity.md) and [C08-inference-freshness.md](C08-inference-freshness.md),
-    the sibling clean-room specs, for the dataset id, root commit, `forkedFrom` and the
+    the sibling specs, for the dataset id, root commit, `forkedFrom` and the
     reasoning status fields.
   - `crates/sparkles/src/store.rs`: `Store::{open, write, rebuild_locked, dump_nquads,
     backup}`, `bnode_for`/`parse_bnode_label`, `WriteTxn::{intern_scoped, encode_quad}`,
@@ -527,14 +527,13 @@ most the final source count. The source ends with all 100 inserts.
   - `crates/sparkles-server/src/main.rs`: the CLI structure, `dump`/`backup`/`infer`.
   - `ui/src/routes/datasets/[name]/+page.svelte` and `ui/src/lib/api.ts`.
   - `README.md` (the decisions table on blank-node labels and triple terms),
-    `docs/API.md`, and the project's internal planning notes on the clean-room feature
+    `docs/API.md`, and the project's internal planning notes on the feature
     order.
 - W3C RDF 1.1 / RDF 1.2 Concepts, for blank-node scope and triple terms, and RDF Dataset
   Canonicalization (RDFC-1.0) as a test oracle. These are cited from working knowledge
   and were not re-fetched.
 - The Linux `ioctl_ficlone(2)` and `copy_file_range(2)` man pages, for the Phase 2
   reflink fallback. Cited from working knowledge.
-- Fluree was **not** consulted: no code, documentation or product pages.
 
 ## Outcome
 

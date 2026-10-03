@@ -13,7 +13,7 @@
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end will record how it lands.
 
-This spec was written clean-room. Its sources are NIST SP 800-38D, the XChaCha20-Poly1305
+This spec's sources are NIST SP 800-38D, the XChaCha20-Poly1305
 draft, the public documentation of AWS KMS, Google Cloud KMS, HashiCorp Vault Transit,
 CockroachDB, MongoDB, SQLCipher, OpenZFS and Linux fscrypt, the PostgreSQL wiki page on
 transparent data encryption, RocksDB's public `env_encryption.h` header, the design
@@ -23,7 +23,7 @@ builds on backup repositories ([F05](F05-snapshot-repositories.md)), automatic c
 ([F03](F03-full-text-search.md), [F04](F04-vector-search.md),
 [G01](G01-geosparql.md)), the codecs of [X01](X01-compression-codecs.md), durable commit
 identity ([CI](CI-commit-identity.md)) and retained history
-([F06](F06-snapshots-and-point-in-time.md)). Fluree was not consulted.
+([F06](F06-snapshots-and-point-in-time.md)).
 
 ## 1. Summary, goals, non-goals
 
@@ -1466,11 +1466,9 @@ they hold.
   * the `aws-lc-rs` API (`aead`, `hkdf`, `hmac`) and its FIPS feature.
 * **Measured:** `openssl speed -evp aes-256-gcm` and `-evp chacha20-poly1305` on the
   development laptop, for §10.
-* **Not consulted:** Fluree, in any form. Neither Fluree's source repository nor its
-  documentation, site, tests or talks were opened, searched or fetched. No source code
-  of restic, borg, CockroachDB, MongoDB, SQLCipher or PostgreSQL was read. The RocksDB
-  header was read for its interface and comments only.
+* No source code of restic, borg, CockroachDB, MongoDB, SQLCipher or PostgreSQL was
+  read. The RocksDB header was read for its interface and comments only.
 
 ## Outcome
 
-This section stays empty until a phase lands.
+Nothing is built.

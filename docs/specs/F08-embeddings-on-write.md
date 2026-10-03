@@ -492,7 +492,6 @@ text's bytes, with an index `docs` on `ex:emb`, dimension 8, embedding `rdfs:lab
 - crates.io pages of `fastembed` (7.1.0, Apache-2.0, default features `ort` binary
   download and `hf-hub`) and `candle-core`.
 - RFC 9110, RFC 6585, RFC 6750, RFC 4647, SPARQL 1.1 Query.
-- **Not consulted:** anything from Fluree (source, docs, website, blog or talks).
 
 ## Outcome
 
@@ -594,6 +593,7 @@ at zero when the dataset is opened, like those of the status. The store's
 `embedding_metrics` returns them, and the library and router tests check them after an
 outage, a rejected input and a caught-up worker.
 
-**Not built.** Phase 2: chunking and a token-based rate limit. The NixOS module has no vector settings, so it gained no embedding options, and
+**Not built.** Chunking and a token-based rate limit, the rest of Phase 2, were not
+built. The NixOS module has no vector settings, so it gained no embedding options, and
 `--embedding-secret` goes through its `extraArgs`. The Similar page and the MCP tool
 `similar_entities` do not search with text.

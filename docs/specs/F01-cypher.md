@@ -11,7 +11,7 @@
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end will record how it lands.
 
-This is a clean-room design. It was written from the openCypher 9 language reference and
+This design was written from the openCypher 9 language reference and
 its Technology Compatibility Kit (TCK), public summaries of ISO/IEC 39075:2024 (GQL), the
 Neo4j Cypher manual and Query API documentation, Amazon Neptune's documentation and
 published papers on openCypher over RDF, the Kùzu documentation of RDF graphs, the
@@ -1218,8 +1218,7 @@ ex:carol ex:WORKS_FOR ex:acme ~ ex:job2 {| ex:role "Advisor" |} .
 - The Sparkles code: `sparql::QueryOptions`, `execute_query`, `sparql::stats`,
   `sparql::aggext`, the vendored `spargebra` algebra and property paths, the prefixes
   store, and the specs C01, C02, C08, C09, C11, C12, C16 and F06.
-- Fluree was not consulted.
 
 ## Outcome
 
-Not built yet.
+Nothing is built.

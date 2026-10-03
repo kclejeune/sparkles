@@ -27,7 +27,7 @@
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
 
-This is a clean-room spec. It depends only on the engine and storage correctness fixes
+This spec depends only on the engine and storage correctness fixes
 that preceded it. It will use durable commit identity ([CI](CI-commit-identity.md)) once
 that lands.
 
@@ -624,7 +624,7 @@ was built, on 2026-10-02.
 ## 10. Sources
 
 - The Sparkles repository, the only implementation source:
-  - [CI-commit-identity.md](CI-commit-identity.md), a sibling clean-room spec:
+  - [CI-commit-identity.md](CI-commit-identity.md), a sibling spec:
     `Snapshot::commit`, the dataset id and the `Sparkles-Commit` header.
   - `ui/src/lib/explore.ts`: the current queries, LIMITs, `reduceSupers` and cycle
     promotion.
@@ -638,7 +638,7 @@ was built, on 2026-10-02.
     the error format.
   - `crates/sparkles-shacl/src/lib.rs` and `shapes.rs`: `Shapes::from_store` and
     `Constraint`.
-  - `docs/API.md`, `docs/AUDIT.md`, `README.md`, and the project's clean-room feature
+  - `docs/API.md`, `docs/AUDIT.md`, `README.md`, and the project's feature
     order (internal planning notes).
 - W3C RDF 1.1 and RDF 1.2 Concepts, RDF Schema 1.1, OWL 2 Mapping to RDF Graphs, SHACL
   and the SPARQL 1.1 Protocol, for the vocabulary and term kinds. These are cited from
@@ -647,7 +647,6 @@ was built, on 2026-10-02.
   vocabulary of the Phase 2 Turtle export. It is cited from working knowledge.
 - The Apache Jena convention of `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph`, as
   Sparkles' SHACL endpoint already implements it.
-- Fluree was not consulted. No Fluree code, documentation or product pages were read.
 
 ## 11. Phase 4: shapes drafted from the data
 
@@ -879,9 +878,10 @@ modules.
 The open questions were settled as the spec proposed. `graph` defaults to `default`,
 built-in entries are listed with a `builtin` flag, and `/$/stats` was left alone.
 
-**Deviations.** Durable commit identity landed, but the report did not gain
-`snapshot.commit` or `datasetId`. Cursors still bind to the in-memory
-`snapshot.version`, so they do not survive a restart. §4.5 and open question 5 describe
+**Deviations.** Durable commit identity landed, but the Phase 1 report did not gain
+`snapshot.commit` or `datasetId`. Phase 3 later added `snapshot.commit`, as the end of
+this section says. Cursors still bind to the in-memory `snapshot.version`, so they do
+not survive a restart. §4.5 and open question 5 describe
 the commit-bound alternative.
 
 **Later use.** The MCP server's schema tools are built on `sparkles::schema`

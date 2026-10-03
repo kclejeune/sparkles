@@ -16,7 +16,7 @@
 This spec was written from the Sparkles code, from the public documentation of other
 engines and from general knowledge of their published behaviour. The sources are LSM
 compaction in LevelDB and RocksDB, QLever's background index rebuild, PostgreSQL's
-autovacuum thresholds and TDB2's compaction. Fluree was not consulted. It builds on
+autovacuum thresholds and TDB2's compaction. The spec builds on
 durable commit identity ([CI](CI-commit-identity.md)), retained generations and named
 snapshots ([F06](F06-snapshots-and-point-in-time.md)), backup leases
 ([F05](F05-snapshot-repositories.md)), and the storage quotas and budgets of

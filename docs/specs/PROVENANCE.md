@@ -1,9 +1,8 @@
 # Provenance of adopted designs and dependencies
 
-This is the clean-room provenance record of Sparkles. Each entry covers one feature or
+This is the provenance record of Sparkles. Each entry covers one feature or
 dependency. It says where the design came from, what was adopted, with version and
-license, and what was rejected. No entry uses Fluree source, tests or design documents,
-and Fluree was not consulted for any feature. Each feature's spec in this directory (see
+license, and what was rejected. Each feature's spec in this directory (see
 the [index](README.md)) gives the full design, and its Outcome section describes how the
 implementation landed.
 
@@ -25,8 +24,7 @@ implementation landed.
 
 - **Spec:** [`CI-commit-identity.md`](CI-commit-identity.md), written independently from
   the Sparkles code, the Apache Jena Fuseki sources (Apache-2.0), the W3C SPARQL 1.1
-  Protocol and Graph Store Protocol, and RFCs 3339, 9562, 9110, 6648 and 9651. Fluree was
-  not consulted.
+  Protocol and Graph Store Protocol, and RFCs 3339, 9562, 9110, 6648 and 9651.
 - **Implementation:** from the spec plus Sparkles code only.
   - **Dependencies:** `uuid` 1.x (Apache-2.0/MIT), with its `serde` feature now
     enabled, and the CRC-32 from `flate2` (MIT/Apache-2.0). Both were already
@@ -49,8 +47,6 @@ implementation landed.
     syntax compatibility only;
   - the Tantivy docs and spargebra's parser source;
   - the SPARQL 1.1 Query §4.2.3 collections syntax, BCP 47 and RFC 4647.
-
-  Fluree was not consulted.
 - **Adopted:** `tantivy` 0.26.2 (MIT) with default features off, plus `mmap`, `stemmer`,
   `stopwords` and `lz4-compression`. That set avoids zstd's C code. The `stemmer` feature
   links `rust-stemmers` 1.2.0 (MIT OR BSD-3-Clause), the Snowball stemmers that the
@@ -74,8 +70,7 @@ implementation landed.
 
 - **Spec:** [`F04-vector-search.md`](F04-vector-search.md), written independently from
   RDF 1.2 Concepts, SPARQL 1.1 §17.6, RFC 8259, IEEE 754, RFC 8141, the HNSW paper,
-  docs.rs / crates.io pages for the ANN candidates, and the Sparkles code. Fluree was not
-  consulted.
+  docs.rs / crates.io pages for the ANN candidates, and the Sparkles code.
 - **Implementation:** Phase 1 (exact search), from the spec and Sparkles code only.
   There are no new dependencies. The kernel is our own 8-lane loop, and rayon was
   already in use.
@@ -123,8 +118,7 @@ implementation landed.
     and `candle-core`.
 
   The roadmap item that named the feature came from a review of other databases'
-  public descriptions. The spec itself does not use Fluree's documentation, and Fluree
-  was not consulted.
+  public descriptions. The spec itself was written from the sources above.
 - **Implementation** (2026-10-02): from the spec and the Sparkles code. The client, the
   worker, the input record and the mock endpoint are our own code. **Dependencies:**
   none new. Requests use the `reqwest` client and the outbound policy the engine already
@@ -160,8 +154,7 @@ implementation landed.
     behaviour only;
   - Pohl (1971) on bidirectional search, Dijkstra (1959) and Yen (1971).
 
-  Fluree was not consulted, and the review of other databases that named the roadmap
-  item was not used.
+  The review of other databases that named the roadmap item was not used.
 - **Implementation** (2026-10-02): from the spec and the Sparkles code. The searches,
   the adjacency scans and the planner's handling of the service are our own code, and
   the index sweep follows the transitive path operator Sparkles already had.
@@ -185,8 +178,6 @@ implementation landed.
   - RFCs 3339, 8246, 6648 and 9651, cited from general knowledge;
   - Jena's RDF Patch format (Apache-2.0), cited from general knowledge for an open
     question only.
-
-  Fluree was not consulted.
 - **Implementation:** from the spec plus Sparkles code only (2026-09-30).
   - **Dependencies:** `httpdate` 1.0.3 (MIT OR Apache-2.0), new in the server.
 - **Rejected** (spec §8):
@@ -218,8 +209,6 @@ implementation landed.
   - docs.rs pages for `argon2`, `openidconnect`, `axum-extra`, `axum` and `tower-http`,
     and the public docs of oauth2-proxy, Authelia, Tailscale serve and Cloudflare Access
     (header names only).
-
-  Fluree was not consulted.
 - **Implementation:** from the spec plus Sparkles code only (2026-09-30), behind the
   default-on `auth` feature of `sparkles-server`.
   - **Dependencies:**
@@ -263,8 +252,6 @@ implementation landed.
   - W3C Solid Web Access Control and Access Control Policy, the NIST RBAC model and
     SPARQL 1.1 Query, Update, Protocol and Graph Store Protocol, cited from working
     knowledge.
-
-  Fluree was not consulted, including its policy language.
 - **Implementation:** from the spec plus Sparkles code only (2026-10-02). The engine part
   is in `sparkles::access` and the query, update, store, schema and diff modules. The
   server part is in the `auth` module of `sparkles-server` and its handlers.
@@ -290,9 +277,6 @@ implementation landed.
     found 2026-10-02);
   - W3C Solid Web Access Control and Access Control Policy, the W3C ODRL Information
     Model 2.2, OASIS XACML 3.0, SPARQL 1.1 and RDF Schema, cited from working knowledge.
-
-  Fluree was not consulted, including its policy language, source, documentation and
-  design notes.
 - **Implementation:** from the spec plus Sparkles code only (2026-10-02). The engine part
   is in `sparkles::access::triples`, the snapshot's mask, the write transaction's checks
   and the query, update, schema, diff and change-feed modules. The server part is in the
@@ -319,8 +303,6 @@ implementation landed.
   - the RDF4J `RepositoryConnection` Javadoc (`prepare` and `rollback`);
   - SPARQL 1.1 Update and Protocol, RFC 9110, RFC 4918, RFC 6648, RFC 7240 and Apache
     Jena's RDF Patch, cited from working knowledge.
-
-  Fluree was not consulted.
 - **Implementation:** from the spec plus Sparkles code only.
   - **Dependencies:** none added.
 - **Rejected** (spec §8):
@@ -344,8 +326,6 @@ implementation landed.
     for a trust threshold per constraint, and ABSTAT (Spahiu et al., 2016) for type
     patterns with cardinality statistics. No code of these projects was read or used;
   - the Sparkles code and specs C02, C10, C11 and C12.
-
-  Fluree was not consulted.
 - **Implementation:** from the spec plus Sparkles code only (2026-10-02), in
   `sparkles::schema::draft` and the server's schema, MCP and CLI code.
   - **Dependencies:** none added.
@@ -368,8 +348,6 @@ implementation landed.
   - the OpenAPI Specification's typed operation parameters and the MCP specification's
     tool input schemas, cited from working knowledge;
   - the Sparkles code and specs CI, C01, C09, C11 and C12.
-
-  Fluree was not consulted.
 - **Implementation:** from the spec plus Sparkles code only (2026-10-02). The catalog,
   the parameter types and the binding are in `sparkles::stored`. The admin API, runs, MCP
   tools and the `sparkles queries` command are in `sparkles-server`.
@@ -403,8 +381,6 @@ implementation landed.
     `async-graphql` and `juniper`, and the npm records of `cm6-graphql`, `graphql` and
     `graphiql`;
   - the Sparkles code and specs C01, C02, C09, C10, C11, C12, C16 and F06.
-
-  Fluree was not consulted, and no description of Fluree's GraphQL support was used.
 - **Implementation:** Phase 1, from the spec plus Sparkles code only (2026-10-02). The
   mapping schema, the API schema, the planner, the algebra of the fetch groups, the
   executor and the drafts are in the new crate `sparkles-graphql`. The routes, the
@@ -449,7 +425,7 @@ implementation landed.
     knowledge: Nicolas 1982; Blakeley, Larson and Tompa 1986; Gupta and Mumick 1995;
     Corman, Reutter and Savković 2018.
 
-  Fluree and TopBraid documentation were not consulted.
+  TopBraid's documentation was not consulted.
 - **Implementation:** from the spec plus Sparkles code only (2026-09-30). There are no
   new third-party dependencies. `sparkles-shacl` now uses `serde`, `serde_json`,
   `parking_lot`, `sha2` and `tempfile`, which were all already in the workspace.
@@ -478,9 +454,6 @@ implementation landed.
   - the rmcp 3.5.0 crates.io record, its docs.rs pages, READMEs and `LICENSE`;
   - JSON-RPC 2.0 and SPARQL 1.1, cited from working knowledge;
   - the Sparkles code and specs C01, C02 and C06.
-
-  Fluree was not consulted, including any material on a Fluree MCP server or "memory"
-  feature.
 - **Implementation:** from the spec plus Sparkles code only (2026-09-30), behind the
   default-on `mcp` feature of `sparkles-server`.
   - **Dependencies:** `rmcp` 3.5.0 (Apache-2.0), the official Rust SDK
@@ -518,8 +491,7 @@ implementation landed.
     rust-embed 8 and Tantivy 0.26;
   - the Sparkles code.
 
-  It does not derive from any other database product. It has no explicit "Fluree was not
-  consulted" line, and Fluree is not among its sources.
+  It does not derive from any other database product.
 - **Implementation:** Phase 1, from the spec plus Sparkles code only (2026-09-30).
   - **Dependencies:**
     - `zstd` 0.14.0 (BSD-3-Clause), with `zstd-safe` 8.0.0, `zstd-sys`
@@ -561,8 +533,6 @@ implementation landed.
   - `chrono-tz`, `lz4_flex`, `age`, BLAKE3, S3 limits, the borg chunker (BSD-3-Clause),
     `s3s-fs`, the MinIO license, RFCs 9110, 3339 and 9562 and the IANA time zone
     database, cited from general knowledge.
-
-  Fluree was not consulted.
 - **Implementation:** done (2026-09-30/10-01), from the spec, the implementation plan
   and the Sparkles code only. Where the plan and the spec differ, the plan wins. The
   implementation consists of:
@@ -683,11 +653,10 @@ implementation landed.
     RDF 1.2 constructs only);
   - the Sparkles code, spargebra 0.4.7, oxttl 0.2.4 and oxrdf 0.3.4.
 
-  No code was read or copied from any GPL or LGPL project. The spec has no explicit
-  "Fluree was not consulted" line, and Fluree is not among its sources.
+  No code was read or copied from any GPL or LGPL project.
 - **Implementation, slice 1** (2026-09-30): SPARQL queries and updates, `sparkles fmt`,
   `POST /$/format` and the UI's Format button. It was built from the spec, the slice plan
-  and the Sparkles code only. Fluree was not consulted.
+  and the Sparkles code only.
   - **Design sources:**
     - Philip Wadler, "A prettier printer" (1998/2003), for the document algebra (text,
       line, group, nest) and the fits-then-break rule;
@@ -756,7 +725,7 @@ implementation landed.
   - the Sparkles code: the formatter's lexer, syntax tree, prefix scopes, reference
     parses and equivalence checks.
 
-  No code was read or copied from another linter. Fluree was not consulted.
+  No code was read or copied from another linter.
 - **Implementation** (2026-10-02): from the spec and the Sparkles code. **Dependencies:**
   `oxsdatatypes` 0.2 (MIT OR Apache-2.0), already a dependency of `sparkles`, became a
   dependency of `sparkles-fmt` for the XML Schema date, time and duration forms.
@@ -771,7 +740,7 @@ implementation landed.
   the unnamed graph as the default graph, plain and typed literals, `rdf:XMLLiteral`
   content, `<qname>`, triple terms, and the writer's layout. The format itself is
   Carroll and Stickler's "TriX: RDF Triples in XML" (HP Labs, HPL-2004-56). No code was
-  copied, and Fluree was not consulted.
+  copied.
 - **Test files:** Jena's `jena-arq/testing/RIOT/Lang/TriX` directory is copied unchanged
   into `testsuite/trix/jena`, with Jena's `LICENSE` (as `LICENSE-APACHE`) and `NOTICE`, as
   the Apache License 2.0 allows. The unit tests of `sparkles::trix` run Jena's cases
@@ -815,8 +784,6 @@ implementation landed.
   - Oxigraph's `spargeo` (Apache-2.0/MIT) and QLever's spatial support (Apache-2.0),
     both read;
   - the Sparkles code.
-
-  Fluree was not consulted.
 - **Implementation, Phase 1** (2026-10-01): the `geo` feature of `sparkles`, which is on
   in the server. It is built on three crates:
   - `geo` 0.33.1 (MIT OR Apache-2.0), with default features off, renamed `georust`;
@@ -842,7 +809,7 @@ implementation landed.
     and file names were consulted to write the runner. Its code was not.
 - **Phase 2** (2026-10-01): spatial joins, nearest neighbours, query rewrite, hulls and
   aggregates, conversion and the UI's maps. Built from the spec, the Phase 2 plan and the
-  Sparkles code. Fluree was not consulted.
+  Sparkles code.
   - **UI dependencies:** `maplibre-gl` 6.11.2 (BSD-3-Clause) and its `@maplibre/*` packages
     (ISC, MIT, MIT OR Apache-2.0), listed in `THIRD_PARTY_LICENSES-UI.md`.
   - **Data:** the bundled basemap is Natural Earth 1:110m, release 5.1.2 (public domain),
@@ -851,7 +818,7 @@ implementation landed.
     the standard. No OGC files are vendored.
 - **Phase 3** (2026-10-02): geometry types from literals, variable `spatial:` arguments,
   the cell grid for spatial tests, GML and KML literals, and CRSs from proj4 definitions.
-  Built from the spec and the Sparkles code. Fluree was not consulted.
+  Built from the spec and the Sparkles code.
   - The GML and KML readers and writers are written from the GML 3.2 Simple Features
     profile and KML 2.2. They read XML with `quick-xml` 0.37 (MIT), which the RDF/XML
     parser already used. The GML class hierarchy follows the substitution groups of the
@@ -883,10 +850,8 @@ implementation landed.
     and conformance. It is not a dependency;
   - papers by Staworko et al. (ICDT 2015), Boneva, Labra Gayo and Prud'hommeaux (ISWC
     2017) and Labra Gayo et al. (2015, RBE derivatives).
-
-  Fluree was not consulted.
 - **Implementation, Phase 1** (2026-10-01): from the spec, the plan and the Sparkles
-  code. Fluree was not consulted.
+  code.
   - The conformance harness (`crates/sparkles-shex/tests/shextest.rs`) reads the
     shexTest manifests itself, with oxttl for Turtle and serde_json for JSON-LD. Jena's
     `ShexTests.java` and `ShexValidationTest.java` (Apache-2.0) were read to learn how
@@ -944,10 +909,7 @@ implementation landed.
     list constraint tests of the Working Group's test suite;
   - Apache Jena's `jena-shacl` sources (Apache-2.0): the SHACLC grammar, reader, writer,
     list constraints and tests, read for behaviour. No code was copied.
-
-  Fluree was not consulted.
-- **Implementation** (2026-10-02): from the spec and the Sparkles code. Fluree was not
-  consulted.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code.
   - The lexer and parser (`compact/lex.rs`, `compact/read.rs`) are hand-written from the
     grammar and production rules of the Compact Syntax drafts. Jena's JavaCC grammar and
     `ShaclCompactParser.java` were read for the extensions and the datatype rule. No
@@ -980,8 +942,6 @@ implementation landed.
     its store, term, `parse`, `serialize` and `RdfFormat` API. Its source was not read;
   - rdflib's documentation (BSD-3-Clause), read for `rdflib.term` and
     `Literal.toPython`.
-
-  Fluree was not consulted.
 - **Implementation, Phase 1** (2026-10-02): from the spec and the Sparkles code. No code
   was copied from pyoxigraph or rdflib.
   - `crates/sparkles-py` is a cdylib crate in its own cargo workspace. The term classes,
@@ -1026,8 +986,6 @@ implementation landed.
   - the documentation of progenitor (MPL-2.0) and openapi-generator (Apache-2.0), read to
     decide against generating the client;
   - the docs.rs documentation of reqwest, tokio, tokio-util, sparesults and oxrdfio.
-
-  Fluree was not consulted.
 - **Implementation** (2026-10-02): from the spec and the Sparkles code. No code was
   copied from Jena, Oxigraph or a generator. The URL normalization and the credentials
   file moved from the server crate into the client, which the CLI now uses.
@@ -1057,8 +1015,6 @@ implementation landed.
     `IndexRebuilder.h` and `IndexSwap.h` headers (Apache-2.0), read for behaviour;
   - LSM compaction in LevelDB and RocksDB, PostgreSQL's autovacuum thresholds and Jena
     TDB2's compaction, cited from their public documentation and general knowledge.
-
-  Fluree was not consulted.
 - **Implementation** (2026-10-02): from the spec and the Sparkles code. No code was copied
   from QLever. **Dependencies:** none new. `libc`'s `setpriority`, already a dependency of
   the engine on Unix, lowers the build threads' priority.
@@ -1089,8 +1045,7 @@ implementation landed.
   - RDF 1.2 Concepts, RDFC-1.0 as a test oracle, the SPARQL 1.1 Protocol and Jena's RDF
     Patch documentation.
 
-  Fluree was not consulted, and the project's notes that describe Fluree's features were
-  not used. Jena and Oxigraph have no branches, so neither was a source.
+  Jena and Oxigraph have no branches, so neither was a source.
 - **Implementation:** not started. **Dependencies:** none planned.
 - **Rejected** (spec §8):
   - a branch as a full clone;
@@ -1117,8 +1072,6 @@ implementation landed.
   - RFC 3986, RFC 3987, RFC 9110 §4.2, RFC 8141, RFC 9562, RFC 3061, RFC 8089, W3C DID
     Core 1.0 §3.1, the IANA URI scheme registry, BCP 47 (RFC 5646), RDF 1.1 and 1.2
     Concepts, RDFC-1.0, the SPARQL 1.1 Protocol and the SPARQL result formats.
-
-  Fluree was not consulted.
 - **Implementation** (2026-10-02): from the spec and the Sparkles code. The IRI and
   language-tag rules, dot-segment removal and the per-group isomorphism check are written
   from the RFCs. **Dependencies:** none new. `sparesults` 0.3 (MIT OR Apache-2.0), already
@@ -1144,8 +1097,6 @@ implementation landed.
   - the W3C R2RML Recommendation and the RML and YARRRML specifications, at the level of
     their overviews, for the rejected alternative;
   - the Sparkles code and specs C01 and C15.
-
-  Fluree was not consulted.
 - **Implementation:** from the spec plus Sparkles code only (2026-10-02). No CSVW
   processor's or Tarql's code was read or copied. The W3C CSVW test suite was not
   available offline, so the tests were written from the spec's examples.
@@ -1185,9 +1136,6 @@ implementation landed.
     behaviour;
   - Litestream's design, the Raft paper and the etcd documentation, PostgreSQL timelines
     and RFCs 9110, 9530, 9651 and 6648, cited from general knowledge.
-
-  Fluree was not consulted, and the descriptions of Fluree in the project's planning notes
-  and comparison table were not used.
 - **Implementation:** Phase 1 from the spec plus Sparkles code only (2026-10-02), with no
   new dependency. The patch reader was written from the row grammar and the RDF Thrift
   schema (`BinaryRDF.thrift`), not from Jena's reader. The tests port the patches of
@@ -1232,8 +1180,6 @@ implementation landed.
     Databases" (IEEE Access, 2020), Steer et al., "Cytosm" (GRADES 2017), Thakkar et
     al., "Gremlinator" (GRADES-NDA 2018), and Zhao et al., "S2CTrans" (2023);
   - the Sparkles code and specs C01, C02, C08, C09, C11, C12, C16 and F06.
-
-  Fluree was not consulted.
 - **Implementation:** not built. The spec plans no new runtime dependency. The parser is
   written by hand from the openCypher grammar. The TCK's feature files (Apache-2.0)
   would be test data, read from a pinned checkout and never linked into a binary.
@@ -1265,8 +1211,6 @@ implementation landed.
     these projects was read;
   - RFCs 2104, 5869, 8439, 8452 and 9106, NIST SP 800-108, the age format and the PADMÉ
     padding paper, cited from general knowledge.
-
-  Fluree was not consulted.
 - **Planned dependencies:** none new for Phases 1 and 3 beyond moving existing crates.
   `aws-lc-rs` 1.18 (ISC AND Apache-2.0-or-ISC) is already in the tree through `rustls`.
   It becomes a direct dependency of `sparkles-backup`, and of `sparkles` behind a `crypt`
@@ -1302,8 +1246,6 @@ implementation landed.
     `crates/sparkles/tests/arq_syntax.rs`;
   - the output of Jena 6.2.0's `arq` command on small graphs;
   - SPARQL 1.1 and 1.2 Query and the SPARQL 1.2 community proposal SEP-0006.
-
-  Fluree was not consulted.
 - **Implementation** (2026-10-02): from the spec and the Sparkles code. The `LATERAL`
   decorrelation reuses the analysis of the EXISTS decorrelation, and its per-row
   evaluation the planner's substitution of constants. **Dependencies:** none new.
@@ -1326,8 +1268,6 @@ implementation landed.
   - the W3C member submission *CBD - Concise Bounded Description* (2005), for the
     concise bounded description and its symmetric form, and RDF 1.2 Concepts for
     reifiers.
-
-  Fluree was not consulted.
 - **Phase 2 implementation** (2026-10-02): from the spec and the Sparkles code.
   **Dependencies:** none new.
 - **Rejected in Phase 2** (spec §11.8):
@@ -1347,8 +1287,6 @@ implementation landed.
   - the docs.rs documentation of `clap_complete` and `clap_mangen`, and the nixpkgs
     manual on `installShellFiles`;
   - the Sparkles code and `docs/API.md`.
-
-  Fluree was not consulted.
 - **Implementation** (2026-10-02): from the spec and the Sparkles code. The document is
   built by Sparkles' own code, and the YAML emitter is its own. `utoipa` and `schemars`
   were considered and not used (spec §2.1). **Dependencies:**

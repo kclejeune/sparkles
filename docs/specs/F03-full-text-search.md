@@ -1,6 +1,6 @@
 # F03: Full-text search (Tantivy, `text:query`)
 
-> **Status:** implemented in part
+> **Status:** implemented in part (Phase 1, most of Phase 2, part of Phase 3)
 >
 > **Phases:** Phase 1 shipped. It covers the `text` cargo feature, `text:query`, per-quad
 > documents kept current in the commit path, catch-up or rebuild at open,
@@ -650,8 +650,6 @@ ex:g1 { ex:b4 rdfs:label "Fox in Socks" }
 * S. Robertson, H. Zaragoza, "The Probabilistic Relevance Framework: BM25 and Beyond" (2009);
   G. Cormack, C. Clarke, S. Büttcher, "Reciprocal Rank Fusion outperforms Condorcet and
   individual Rank Learning Methods" (SIGIR 2009).
-* **Not consulted:** Fluree. No Fluree source, documentation, website or other material was
-  opened or used for this spec.
 
 ## Outcome
 

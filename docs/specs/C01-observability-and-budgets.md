@@ -855,7 +855,7 @@ Expect `outcome="cancelled"` = 1 and `sparkles_requests_active{operation="query"
   - `docs/API.md`: endpoint and error conventions.
   - `docs/AUDIT.md`: limits row.
   - `docs/BENCHMARKS.md`: result sizes and memory notes.
-  - The project's clean-room process and feature order (internal planning notes).
+  - The project's feature order (internal planning notes).
   - `crates/sparkles-server/src/{main.rs,http.rs,state.rs,http/router_tests.rs}`.
   - `crates/sparkles/src/{error.rs,store.rs,index.rs}`.
   - `crates/sparkles/src/sparql/{ctx.rs,exec.rs,mod.rs,cache.rs,table.rs,results.rs,update.rs}`.
@@ -884,9 +884,7 @@ Expect `outcome="cancelled"` = 1 and `sparkles_requests_active{operation="query"
     and no validation of incoming ids.
   - `tracing-subscriber` 0.3.23 `Cargo.toml`: `json` pulls in `tracing-serde`, `serde`
     and `serde_json`.
-- **Fluree was not consulted.** No Fluree code, tests, documentation, website or other
-  material was opened, searched or relied on. The project's earlier feature-review notes
-  were not read.
+- The project's earlier feature-review notes were not read.
 
 ## Outcome
 

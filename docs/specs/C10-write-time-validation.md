@@ -17,7 +17,7 @@
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
 
-This is a clean-room design. It depends on the existing SHACL validator
+This design depends on the existing SHACL validator
 (`crates/sparkles-shacl`) and on durable commit identity ([CI](CI-commit-identity.md)),
 which provides `Receipt`, `CommitKind`, `Snapshot::commit` and
 `WriteTxn::commit() -> Receipt`.
@@ -1083,8 +1083,7 @@ with strategy `incremental`, in < 5 ms.
     and applications", *IEEE Data Eng. Bull.* 18(2) (1995);
   * J. Corman, J. L. Reutter, O. Savković, "Semantics and validation of recursive SHACL",
     ISWC 2018.
-* **Not consulted:** Fluree in any form, including its code, docs, tests, site and talks.
-  TopBraid documentation was not consulted either.
+* TopBraid documentation was not consulted.
 
 ## Outcome
 
