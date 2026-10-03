@@ -1456,6 +1456,7 @@ export type CommitKind =
   | 'reason'
   | 'reason-clear'
   | 'transaction'
+  | 'embed'
   | 'unknown';
 
 /** One commit: the state after a write that changed data. */
@@ -1753,6 +1754,59 @@ export type VectorIndexConfig = {
   hnsw?: HnswConfig | false;
   /** Searches over at most this many rows are exact; default 10000. */
   exactThreshold?: number;
+  /** Compute the vectors with an OpenAI-compatible embeddings endpoint. */
+  embedding?: EmbeddingConfig;
+};
+
+/** Where an embedding request's bearer token comes from (the API accepts `secret`). */
+export type EmbeddingApiKey = { secret: string } | { env: string } | { file: string };
+
+/** `VectorIndexConfig.embedding`: which literals are embedded, and by which endpoint. */
+export type EmbeddingConfig = {
+  url: string;
+  model: string;
+  apiKey?: EmbeddingApiKey;
+  sendDimensions?: boolean;
+  predicates?: string[];
+  languages?: string[];
+  classes?: string[];
+  query?: string;
+  combine?: boolean;
+  inputPrefix?: string;
+  queryPrefix?: string;
+  queryText?: boolean;
+  batchSize?: number;
+  maxInputChars?: number;
+  requestsPerMinute?: number;
+  maxRetries?: number;
+  timeoutSecs?: number;
+};
+
+export type EmbeddingState = 'idle' | 'scanning' | 'embedding' | 'backoff' | 'paused' | 'disabled';
+
+/** The embedding worker of an index that computes its vectors. */
+export type EmbeddingStatus = {
+  state: EmbeddingState;
+  model: string;
+  /** The endpoint's URL without credentials or query. */
+  endpoint: string;
+  /** Subjects (per graph) waiting to be embedded. */
+  backlog: number;
+  /** A full pass in progress. */
+  scan?: { done: number; total: number };
+  /** Every commit up to this one has its text embedded. */
+  appliedSeq: number;
+  headSeq: number;
+  /** Since the store was opened. */
+  embedded: number;
+  requests: number;
+  failed: number;
+  lastError?: { at: string; message: string; subject?: string };
+  /** When the worker tries again, in backoff. */
+  retryAt?: string;
+  lastBatch?: { at: string; inputs: number; ms: number };
+  /** The index's embedding configuration (it names secrets, never holds keys). */
+  config: EmbeddingConfig;
 };
 
 export type VectorIndexStatus = {
@@ -1786,6 +1840,8 @@ export type VectorIndexStatus = {
   /** The index file of a persistent store; `opened`: read from it, not built. */
   files?: { bytes: number; opened: boolean };
   lastBuild?: { at: string; ms: number; rows: number };
+  /** The embedding worker, for an index that computes its vectors. */
+  embedding?: EmbeddingStatus;
 };
 
 /** `GET /$/vector/{ds}`. */
@@ -1840,6 +1896,10 @@ export const dropVectorIndex = (ds: string, name: string) =>
 /** Build an index again from RDF. */
 export const rebuildVectorIndex = (ds: string, name: string) =>
   json<Task>(`${vectorPath(ds, name)}/rebuild`, { method: 'POST' });
+
+/** Embed every selected text of an index again (after its model changed). */
+export const reembedVectorIndex = (ds: string, name: string) =>
+  json<VectorIndexStatus>(`${vectorPath(ds, name)}/reembed`, { method: 'POST' });
 
 /** Measure recall@k against the exact search, with stored vectors as the queries. */
 export function vectorRecall(

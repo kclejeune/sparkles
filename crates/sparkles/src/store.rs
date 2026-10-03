@@ -16,12 +16,14 @@ mod compaction;
 #[cfg(test)]
 mod compaction_tests;
 mod diff;
+mod embed;
 mod geo;
 mod mem_history;
 mod preview;
 mod quota;
 mod schedule;
 mod vector;
+pub(crate) use embed::embed_query_text;
 pub(crate) mod wal;
 pub use backup::{
     BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard, MEMORY_CAPTURE_PREFIX,
@@ -223,6 +225,9 @@ pub struct Snapshot {
     /// exact counts from the statistics corrected for this snapshot's delta, worked out
     /// once per snapshot
     pub counts: Arc<crate::sparql::stats::CountCache>,
+    /// the quads a triple-level access view hides, when this snapshot is such a view's
+    /// (they are in the delta as deletions; see [`crate::access::triples`])
+    pub mask: Option<Arc<crate::access::Mask>>,
 }
 
 /// The kind of term an id stands for (see [`Snapshot::term_kind`]).
@@ -950,6 +955,8 @@ pub struct Store {
     geo: arc_swap::ArcSwapOption<crate::geo::GeoIndex>,
     /// configured vector indexes (`vector.json`)
     vector: Arc<vector::VectorRegistry>,
+    /// embeddings computed on write: the work of the indexes that name a provider
+    embed: Arc<crate::vector::embed::Embedder>,
     /// pins, retention, generations and materialized past states (persistent stores)
     history: Option<Arc<Mutex<crate::history::HistoryState>>>,
     /// pins and the retention window of an in-memory store, as kept snapshots
@@ -1046,6 +1053,7 @@ impl Store {
                 geo_op_vertices: opts.geo_op_vertices,
                 delta_stats: Default::default(),
                 counts: Default::default(),
+                mask: None,
                 historical: false,
             })),
             writer: Arc::new(Mutex::new(WriterState {
@@ -1068,6 +1076,7 @@ impl Store {
             text: Default::default(),
             geo: Default::default(),
             vector: Default::default(),
+            embed: Default::default(),
             history: None,
             mem_history: Some(Mutex::new(Default::default())),
             guard: parking_lot::RwLock::new(None),
@@ -1280,6 +1289,7 @@ impl Store {
                 geo_op_vertices: opts.geo_op_vertices,
                 delta_stats: Default::default(),
                 counts: Default::default(),
+                mask: None,
                 historical: false,
             })),
             writer: Arc::new(Mutex::new(WriterState {
@@ -1302,6 +1312,7 @@ impl Store {
             text: Default::default(),
             geo: Default::default(),
             vector: Default::default(),
+            embed: Default::default(),
             history: Some(Arc::new(Mutex::new(history))),
             mem_history: None,
             guard: parking_lot::RwLock::new(None),
@@ -1591,6 +1602,7 @@ impl Store {
             geo_op_vertices: self.opts.geo_op_vertices,
             delta_stats: Default::default(),
             counts: Default::default(),
+            mask: None,
             historical: true,
         });
         h.cache.insert(
@@ -2707,6 +2719,13 @@ impl Store {
             kind,
             net_ins: 0,
             net_del: 0,
+            requested: opts
+                .graphs
+                .as_ref()
+                .and_then(|a| a.triples.as_ref())
+                .is_some_and(|t| t.limits_writes())
+                .then(Vec::new),
+            base_check: None,
             opts,
             writable: Default::default(),
         }
@@ -2916,7 +2935,9 @@ impl Store {
                 ReplaceTarget::Named(n) if !a.writable_iri(n.as_str()) => {
                     return Err(crate::access::GraphAccess::refused_iri(n.as_str()));
                 }
-                ReplaceTarget::All if !(a.read.is_all() && a.write.is_all()) => {
+                ReplaceTarget::All
+                    if !(a.read.is_all() && a.write.is_all() && a.triples.is_none()) =>
+                {
                     return Err(Error::NotPermitted(
                         "replacing the whole dataset needs write access to every graph".into(),
                     ));
@@ -2961,8 +2982,10 @@ impl Store {
         // the graph still has changes nothing, so the transaction logs the difference
         // alone. The result is the same as clearing the graphs first.
         let keep: rustc_hash::FxHashSet<[Id; 4]> = ids.iter().copied().collect();
+        // a view that hides triples replaces the ones it sees, and leaves the rest
+        let read = txn.read_view()?;
         for g in graphs {
-            for (i, k) in view.scan_keys(Perm::Gspo, &[g.0])?.into_iter().enumerate() {
+            for (i, k) in read.scan_keys(Perm::Gspo, &[g.0])?.into_iter().enumerate() {
                 if i % 65_536 == 65_535 {
                     o.check()?;
                 }
@@ -3169,6 +3192,7 @@ impl Store {
                 geo_op_vertices: self.opts.geo_op_vertices,
                 delta_stats: Default::default(),
                 counts: Default::default(),
+                mask: None,
                 historical: false,
             })
         };
@@ -3296,6 +3320,7 @@ impl Store {
             geo_op_vertices: self.opts.geo_op_vertices,
             delta_stats: Default::default(),
             counts: Default::default(),
+            mask: None,
             historical: false,
         };
         if bulk.is_some() {
@@ -3310,6 +3335,10 @@ impl Store {
         self.commits.send_replace(head.seq);
         // and its own vector indexes, built in the background
         self.vectors_switched(snap);
+        if bulk.is_some() {
+            // a bulk commit has no log to schedule embeddings from
+            self.embed_bulk(head.seq);
+        }
         // The old generation is kept if history needs it, else removed; open readers
         // keep their mmaps alive.
         if let (Some(root), Some(old)) = (&self.root, old)
@@ -3850,6 +3879,12 @@ pub struct WriteTxn<'s> {
     /// rolls them back to
     mark: crate::vocab::VocabMark,
     start_bnode: u64,
+    /// the quads asked to be inserted or deleted, when the graph view's protections
+    /// limit writes: each is checked before the commit, whether or not it changed
+    /// anything
+    requested: Option<Vec<[Id; 4]>>,
+    /// the protections applied at the state the transaction started from
+    base_check: Option<crate::access::triples::WriteCheck>,
 }
 
 impl Drop for WriteTxn<'_> {
@@ -3892,6 +3927,80 @@ impl WriteTxn<'_> {
         self.opts.graphs.as_ref()
     }
 
+    /// The state the transaction's reads see: [`view`](Self::view), without the triples
+    /// the graph view's protections hide. Before the first change it is the committed
+    /// snapshot's masked view, built once per commit.
+    pub fn read_view(&self) -> Result<Arc<Snapshot>> {
+        match self.opts.graphs.as_ref().filter(|a| a.hides_triples()) {
+            Some(a) if !self.is_dirty() => a.masked(&self.base),
+            Some(a) => a.masked(&Arc::new(self.view())),
+            None => Ok(Arc::new(self.view())),
+        }
+    }
+
+    /// Check a quad asked to be deleted whose terms the store may lack (`Id::UNDEF`
+    /// for a missing one), against the protections at the state the transaction
+    /// started from. A quad of stored terms is checked again at the commit.
+    pub fn check_requested(&mut self, q: [Id; 4], pred: &str, graph: Option<&Term>) -> Result<()> {
+        if self.requested.is_none() {
+            return Ok(());
+        }
+        self.base_check()?;
+        match self.base_check.as_mut() {
+            Some(c) => c.check(q, pred, graph),
+            None => Ok(()),
+        }
+    }
+
+    fn base_check(&mut self) -> Result<()> {
+        if self.base_check.is_none()
+            && let Some(rules) = self.opts.graphs.as_ref().and_then(|a| a.triples.as_ref())
+        {
+            self.base_check = crate::access::triples::WriteCheck::new(rules, self.base.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Every quad asked to be inserted or deleted must be writable both at the state the
+    /// transaction started from and at the state it leaves (where a protection on
+    /// classes or with a pattern may match it differently). The quads asked for are
+    /// checked, not the changes that took effect, so the answer does not depend on
+    /// whether a hidden quad exists.
+    fn check_requested_all(&mut self) -> Result<()> {
+        let Some(mut req) = self.requested.take() else {
+            return Ok(());
+        };
+        req.sort_unstable_by_key(|q| [q[0].0, q[1].0, q[2].0, q[3].0]);
+        req.dedup();
+        self.base_check()?;
+        if let Some(c) = self.base_check.as_mut() {
+            for (i, q) in req.iter().enumerate() {
+                if i % 65_536 == 65_535 {
+                    self.opts.check()?;
+                }
+                c.check_ids(*q)?;
+            }
+        }
+        let rules = self.opts.graphs.as_ref().and_then(|a| a.triples.clone());
+        if let Some(rules) = rules
+            && rules.rules.iter().any(|r| {
+                !r.write.is_all()
+                    && (r.protection.classes.is_some() || r.protection.pattern.is_some())
+            })
+            && let Some(mut c) =
+                crate::access::triples::WriteCheck::new(&rules, Arc::new(self.view()))?
+        {
+            for (i, q) in req.iter().enumerate() {
+                if i % 65_536 == 65_535 {
+                    self.opts.check()?;
+                }
+                c.check_ids(*q)?;
+            }
+        }
+        self.requested = Some(Vec::new());
+        Ok(())
+    }
+
     /// Snapshot view including this transaction's uncommitted changes. It keeps the
     /// committed version number but not its result cache: the data differs from that
     /// version, so cached results must neither be read nor written through this view.
@@ -3911,6 +4020,7 @@ impl WriteTxn<'_> {
             geo_op_vertices: self.base.geo_op_vertices,
             delta_stats: Default::default(),
             counts: Default::default(),
+            mask: None,
             historical: false,
         }
     }
@@ -4066,6 +4176,9 @@ impl WriteTxn<'_> {
             return Err(Error::invalid("cannot store query-local or unbound terms"));
         }
         self.check_graph(q[3])?;
+        if let Some(r) = self.requested.as_mut() {
+            r.push(q);
+        }
         if self.contains(&q)? {
             return Ok(false);
         }
@@ -4084,6 +4197,9 @@ impl WriteTxn<'_> {
     /// Delete a quad; returns true if it was present.
     pub fn delete(&mut self, q: [Id; 4]) -> Result<bool> {
         self.check_graph(q[3])?;
+        if let Some(r) = self.requested.as_mut() {
+            r.push(q);
+        }
         if !self.contains(&q)? {
             return Ok(false);
         }
@@ -4114,7 +4230,9 @@ impl WriteTxn<'_> {
                 self.check_graph(q[3])?;
             }
         }
-        if (quads.len() as u64) < self.store.opts.bulk_threshold {
+        // a write whose quads protections check goes through the delta, so that the
+        // state it leaves can be checked before the commit
+        if (quads.len() as u64) < self.store.opts.bulk_threshold || self.requested.is_some() {
             for q in quads {
                 self.insert(q)?;
             }
@@ -4159,6 +4277,7 @@ impl WriteTxn<'_> {
         if self.guard.poisoned {
             return Err(Error::Poisoned);
         }
+        self.check_requested_all()?;
         // a write cancelled (its client gone) or past its deadline publishes nothing
         self.opts.check()?;
         if self.bulk.is_empty() {
@@ -4318,13 +4437,17 @@ impl WriteTxn<'_> {
             geo_op_vertices: self.base.geo_op_vertices,
             delta_stats: Default::default(),
             counts: Default::default(),
+            mask: None,
             historical: false,
         };
         self.store.maintain_text(&mut snap, &self.log);
         self.store.maintain_geo(&mut snap, &self.log);
         self.store.remember_past(c.seq);
-        self.store.current.store(Arc::new(snap));
+        let snap = Arc::new(snap);
+        self.store.current.store(snap.clone());
         self.store.commits.send_replace(c.seq);
+        // after the publication: a worker that takes these pairs reads this state
+        self.store.embed_noted(&snap, &self.log, c.seq, self.kind);
         if validation.is_some() {
             self.store.guard_committed(c.seq);
         }
@@ -4595,6 +4718,7 @@ impl Drop for Store {
         // a lease guard outliving the store must not collect in a directory that another
         // process (or a restore's swap) may own next
         self.writer.lock().closed = true;
+        self.embed.close();
     }
 }
 
@@ -4820,6 +4944,7 @@ pub(crate) fn replay_wal(
         geo_op_vertices: StoreOptions::default().geo_op_vertices,
         delta_stats: Default::default(),
         counts: Default::default(),
+        mask: None,
         historical: false,
     };
     let mut quads = out.base_quads;

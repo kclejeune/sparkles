@@ -1683,7 +1683,7 @@ type Commit = {
   seq: number; parent: number | null; ref: string;   // "commit:42"
   timestamp: string;             // RFC 3339 UTC with milliseconds, never decreasing
   kind: "create" | "baseline" | "update" | "gsp-put" | "gsp-post" | "gsp-delete"
-      | "upload" | "load" | "reason" | "reason-clear" | "transaction" | "unknown";
+      | "upload" | "load" | "reason" | "reason-clear" | "transaction" | "embed" | "unknown";
   inserted: number; deleted: number;   // net change relative to the parent
   quads: number;                        // dataset size after the commit
   generation: string;                   // index generation it was made in
@@ -2859,7 +2859,9 @@ matched.
 
   * The first argument is the embedding predicate.
   * The query is a vector literal, an entity whose single vector under that predicate is
-    used, or a variable that the rest of the group binds to either.
+    used, or a variable that the rest of the group binds to either. When the predicate's
+    index computes its vectors, the query can also be a text, which is embedded with the
+    same model ([Embeddings on write](#embeddings-on-write)).
   * `k` defaults to 10 (at most 10000).
   * Options are string literals after `k`:
 
@@ -2948,7 +2950,7 @@ exactly.
 | POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. |
 
 A `VectorIndexStatus` is
-`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild? }`.
+`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
 `state` is `ready`, `building`, `failed` or `over-budget`. `rows` counts the packed base
 rows, and `overlay` the changes that searches add exactly. `residency` is `heap` or
 `mmap`. `hnsw` is `null` or `{ m, efConstruction, efSearch, nodes, layers }`, and
@@ -2969,6 +2971,147 @@ sparkles vector status  --loc DB [--name NAME]
 
 Each command takes `--server URL --dataset NAME` instead of `--loc`. `create` and
 `rebuild` wait for the build.
+
+### Embeddings on write
+
+The design and its rationale are in [F08 Embeddings computed on write](specs/F08-embeddings-on-write.md).
+
+A vector index can compute its own vectors. Its configuration then names the literals to
+embed and an embeddings endpoint that speaks OpenAI's `POST /v1/embeddings` protocol.
+OpenAI, Ollama, vLLM, LM Studio, llama.cpp's server, Hugging Face's Text Embeddings
+Inference and most gateways serve that protocol. After each commit, a background worker
+sends the selected text to the endpoint and writes the returned vectors as `spk:vector`
+literals under the index's predicate, in the literal's graph. Everything else in this
+section about searches and indexes then applies to those vectors unchanged.
+
+```json
+PUT /$/vector/ds/docs
+{
+  "predicate": "http://example.org/embedding",
+  "dimension": 768,
+  "embedding": {
+    "url": "http://127.0.0.1:11434/v1/embeddings",
+    "model": "nomic-embed-text",
+    "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"],
+    "languages": ["en", ""],
+    "inputPrefix": "search_document: ",
+    "queryPrefix": "search_query: "
+  }
+}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `url` | required | The endpoint, an `http` or `https` URL without credentials. |
+| `model` | required | The `model` of each request. |
+| `apiKey` | none | `{"secret": NAME}`, a secret the server defines with `--embedding-secret`. The local CLI and the libraries also accept `{"env": VAR}` and `{"file": PATH}`. Without it, requests carry no `Authorization` header. |
+| `sendDimensions` | `false` | Sends the index's dimension as `dimensions`, for models that shorten their output on request. |
+| `predicates` | — | The predicates whose `xsd:string` and language-tagged literals are embedded. One of `predicates` and `query` is required. |
+| `languages` | all | Language ranges a literal's tag must match, by RFC 4647 basic filtering. `""` matches literals without a tag. |
+| `classes` | all | The subject must have one of these types in the literal's graph. |
+| `query` | — | A SELECT that binds `?s` and `?text`, and optionally `?g`, instead of `predicates`. Rows without `?g` write to the default graph. |
+| `combine` | `false` | Embeds a subject's selected texts in one graph as one input, joined by newlines. Without it, each literal gets its own vector. |
+| `inputPrefix`, `queryPrefix` | `""` | Text put before stored inputs and before query texts, for models trained with instructions. |
+| `queryText` | `true` | Whether searches may pass text for this index. |
+| `batchSize` | 64 | Inputs per request, 1 to 2048. |
+| `maxInputChars` | 8000 | Inputs are cut at this many characters. |
+| `requestsPerMinute` | 0 | A ceiling on requests per minute. 0 sets none. |
+| `maxRetries` | 5 | Retries after a network error, a timeout, `429` or `5xx`, with exponential backoff from 1 s to 60 s, or after the provider's `Retry-After`. |
+| `timeoutSecs` | 60 | The time one request may take, within the outbound timeout. |
+
+The index's predicate cannot also be a source predicate. Changing the `embedding` object
+keeps the index's build.
+
+* **What the worker writes.** It owns the index's predicate. After it reconciles a
+  subject in a graph, the subject's vectors there are exactly the vectors of its current
+  inputs. A changed literal gets a new vector, and a deleted one loses its vector. A
+  vector written by hand under the predicate is replaced when the subject's text changes
+  and removed when the subject has no selected text. The worker's commits have the kind
+  `embed` and the message `embeddings of vector index NAME`, and they go through
+  write-time validation, the quota and the disk reserve like any other commit.
+* **Consistency.** Embeddings are eventually consistent, and writes never wait for
+  them. A query sees the vectors committed in its snapshot. A subject whose text is new
+  has no vector until the worker reconciles it, a changed text keeps its old vector until
+  then, and deleted text keeps its vector for that long too. `appliedSeq` in the status
+  is the newest commit whose text has all been embedded or has failed. A client that
+  needs its own write in vector search waits until `appliedSeq` reaches the `seq` of its
+  commit receipt.
+* **Catching up.** A commit notes the subjects whose selected text it touched. A bulk
+  load, the start of a worker, `reembed` and, for a `query` source, any commit run a full
+  pass instead, which compares every subject's inputs with a record of what was embedded
+  and sends only those that differ. The record is kept in `embed/NAME.log` in the
+  database directory, so a restart sends nothing for text that did not change, and
+  commits made while no worker ran (from `sparkles update --loc`, say) are caught up. A
+  new `model`, dimension, `sendDimensions` or `combine` embeds everything again, and a new
+  URL or key does not. Backups and clones do not hold the record, so a restored or cloned
+  dataset embeds its text again when its worker first runs.
+* **Failures.** A provider outage never blocks a write. After its retries the worker
+  keeps the batch, waits a minute (five after `401` or `403`) and tries again while the
+  backlog grows. A batch that gets another `4xx` is split until the inputs at fault fail
+  alone. A failed input, or a vector of the wrong dimension, counts as `failed` and is not
+  sent again until its text changes or a full pass runs.
+* **Searching with text.** `(?s ?score) spk:vectorSearch (ex:embedding "rivers of
+  southern France" 10)` embeds `queryPrefix` and the text with the index's provider and
+  searches with the result. A variable bound to a string works the same way, and so does
+  the vector list of `spk:hybridSearch`. The last 4096 inputs and query texts are cached
+  per dataset. A predicate without an embedding index, or with `queryText: false`, gives
+  `400`, and a provider failure gives `502`, as a failed SERVICE call does.
+* **Memory.** The record takes about 32 bytes per subject and graph, a waiting subject
+  about 100 bytes, and the cache up to 4096 vectors (12 MiB at 768 dimensions). This
+  memory buys restarts and repeated texts that send nothing to the provider.
+
+| Method | Path | Result |
+|---|---|---|
+| POST | `/$/vector/{ds}/{name}/reembed` | Embeds every selected text of the index again, for example after the model behind a name changed. Answers `202` and the index's status. Needs `admin`. |
+
+The status of an index that computes its vectors has an `embedding` object:
+
+```ts
+type EmbeddingStatus = {
+  state: "idle" | "scanning" | "embedding" | "backoff" | "paused" | "disabled";
+  model: string; endpoint: string;          // the URL without query
+  backlog: number;                          // subjects (per graph) waiting
+  scan?: { done: number; total: number };   // a full pass in progress
+  appliedSeq: number; headSeq: number;
+  embedded: number; requests: number; failed: number;   // since the store was opened
+  lastError?: { at: string; message: string; subject?: string };
+  retryAt?: string; lastBatch?: { at: string; inputs: number; ms: number };
+  config: EmbeddingConfig;                  // the embedding object, which holds no keys
+};
+```
+
+`paused` means that no worker runs for the dataset, as on a read-only server or a store
+opened by a local command. `disabled` means the server runs with `--no-embedding`.
+
+**Data egress.** Sparkles sends text to a provider only for an index whose configuration
+names one, and only the selected literals and the texts of searches. Every request goes
+through the server's outbound policy (`--outbound-*`, see
+[USAGE](USAGE.md#outbound-requests-service-and-load)), so a server refuses a provider on a loopback or
+private address unless that policy allows it. `PUT` refuses a URL the policy refuses
+outright. Through the API, an `apiKey` can only name an operator's secret, because a
+dataset administrator could otherwise send any environment variable or file of the server
+to an endpoint of their choice. Keys are read when a request is made, never stored in
+`vector.json`, and never returned.
+
+`PUT` answers `400` for an invalid `embedding` object, an `apiKey` with `env` or `file`,
+an unknown secret name, a URL with credentials, or a URL the outbound policy refuses.
+
+The CLI:
+
+```sh
+sparkles vector create  --loc DB --name NAME --predicate IRI --dim D --embed-url URL --embed-model MODEL
+                        (--embed-from IRI … | --embed-query SPARQL) [--embed-lang RANGE …] [--embed-class IRI …]
+                        [--embed-api-key-env VAR | --embed-api-key-file PATH | --embed-secret NAME]
+                        [--embed-config FILE|JSON]
+sparkles vector embed   --loc DB [--name NAME] [--embed-timeout 3600] [--embedding-secret NAME=env:VAR]
+sparkles vector reembed --loc DB --name NAME     # or --server URL --dataset NAME
+sparkles serve --embedding-secret openai=env:OPENAI_API_KEY [--no-embedding]
+```
+
+`--embed-config` reads the whole `embedding` object, and the other `--embed-*` flags
+override its fields. `vector embed` and a local `vector reembed` run the worker until
+nothing is left and use the local outbound policy, which allows private addresses unless
+`--outbound-block-private`. They exit with an error when the provider keeps failing.
 
 ### Hybrid text and vector search
 
@@ -3005,7 +3148,8 @@ SELECT ?s ?score ?textRank ?vectorRank WHERE {
 * **Fusion.** A subject's score is the sum of `weight / (k + rank)` over the lists that
   hold it. The best `limit` subjects are returned, and ties break by term id.
 * **Restrictions.** The text list takes no `highlight:` option. The vector query must be
-  a vector literal or an entity, and `candidates:join` is refused. Errors follow the two
+  a vector literal, an entity or a text for an index that computes its vectors, and
+  `candidates:join` is refused. Errors follow the two
   searches, and malformed calls and options give `400`. The call needs the `text`
   feature and a full-text index.
 
@@ -4673,8 +4817,12 @@ fails the request with `507 Insufficient Storage` and a body like this:
 * `dataset-bytes` is the storage quota of a persistent dataset (see
   [Storage quotas](#storage-quotas)). A write that would take the dataset over its quota
   fails with this budget before anything is committed.
+* `hidden-quads` (`[protection_limits] max_hidden_quads`, default 5,000,000) is the
+  number of quads one caller's protections may hide at one commit (see
+  [Protections of triples](#protections-of-triples)).
 
-`limit` and `requested` are in bytes, or in rows for `rows` and `rows-produced`. The
+`limit` and `requested` are in bytes, in rows for `rows` and `rows-produced`, and in
+quads for `hidden-quads`. The
 response of `/{ds}/update` includes `memPeakBytes` and `rowsProduced`.
 `meta.memory.peakBytes` and `meta.rowsProduced` in `application/x-sparkles+json` report a
 query's peak memory estimate and the rows its operators produced.
@@ -4995,7 +5143,7 @@ of `-1`, statistics notes reduced to `[from statistics]`, and no operator counte
 because those come from statistics of every graph.
 
 Routes that report on the whole dataset answer `403` with
-`"… covers every graph of /wiki, and your access is limited to some graphs"`. These are
+`"… covers every graph of /wiki, and your access is limited to some graphs or triples"`. These are
 `/$/stats/{ds}`, `/$/reason/{ds}` (GET) and its diagnostics, `/$/text/{ds}`,
 `/$/geo/{ds}` and `/$/vector/{ds}…` status and recall, `/$/backups/{ds}…` (GET),
 `/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/{ds}/shacl`, `/{ds}/shex` and changes
@@ -5048,6 +5196,147 @@ Fuseki applies graph access control to read-only datasets only. Sparkles grants 
 on graphs too. Fuseki's levels intersect, while Sparkles grants form a union, so a grant
 names the endpoints it allows rather than the ones it removes.
 
+### Protections of triples
+
+The design is in [C12b Protections of triples](specs/C12b-triple-access-control.md).
+
+A protection names some triples of a dataset that only some callers may read or write.
+It matches triples by predicate, by the class of their subject, by graph, or by a SPARQL
+pattern with the caller bound. A protected triple is hidden from every caller whose grants
+do not lift the protection.
+
+```toml
+[[protections]]
+name = "salaries"                       # grants lift it by this name
+dataset = "hr"                          # a dataset name or * pattern
+predicates = ["http://example.org/salary", "http://example.org/pay/*"]
+
+[[protections]]
+name = "patients"
+dataset = "clinic"
+classes = ["http://example.org/Patient"]   # and its subclasses
+graphs = ["urn:x-arq:DefaultGraph", "http://example.org/records/*"]
+
+[[protections]]
+name = "own-documents"
+dataset = "docs"
+classes = ["http://example.org/Document"]
+pattern = "?s ex:owner ?user"
+prefixes = { ex = "http://example.org/" }
+
+[[roles.hr.grants]]
+dataset = "hr"
+level = "write"                         # reads and writes salaries
+lifts = ["salaries"]
+
+[[roles.doctors.grants]]
+dataset = "clinic"
+level = "read"                          # reads patients, writes none
+lifts = ["patients"]
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | The name grants lift it by. |
+| `dataset` | A dataset name or `*` pattern. |
+| `predicates` | Predicate IRIs, and IRI patterns with `*`. Absent: every predicate. |
+| `classes` | Subject classes. A subject is an instance when the dataset holds `rdf:type` for the class in any graph. Absent: every subject. |
+| `subclasses` | Whether instances of subclasses count, through `rdfs:subClassOf` in any graph. Default `true`. |
+| `graphs` | The graphs it applies in, written as in grants. Absent: every graph. |
+| `pattern` | A SPARQL group graph pattern that lets a matched triple through (see below). |
+| `prefixes` | Prefixes for the pattern. |
+| `hide_inferences` | Whether callers it hides triples from lose the inferred graph. Default `true`. |
+
+A protection covers a triple when all of its fields match. A grant lifts the protections
+listed in its `lifts`, in the graphs it covers, through the endpoints it applies to, at
+its level. A `read` grant lets its holder read the triples, and a `write` grant lets it
+read and write them. Entries of `datasets` lift nothing. `admin` on the dataset, and
+`server-admin`, lift every protection.
+
+A caller sees a triple when its graph is in the caller's view and every protection that
+covers it is lifted in that graph or passed by its pattern. Several protections that
+cover one triple must all be passed, so a salary of a patient stays hidden from a caller
+who may read salaries but not patients. Neither protections nor grants depend on their
+order.
+
+#### Patterns
+
+A pattern uses `?s` (or `?this`), `?p` and `?o` for the triple, and these variables for
+the caller:
+
+| Variable | Value |
+|---|---|
+| `?user` | The caller's name as a string: the user, the OIDC or proxy account, the owner of a minted token, or a static token's name. Anonymous callers have none. |
+| `?role` | Each role the caller holds. |
+| `?group` | Each group of an OIDC or proxy identity. |
+
+The pattern lets a covered triple through when it has a solution whose `?s`, `?p` and
+`?o` equal the triple's, for those of the three it uses. A pattern that uses none of them
+lets every covered triple through or none. A pattern that uses a caller variable the
+caller lacks matches nothing. It is matched against every graph of the dataset merged
+into the default graph, and `GRAPH` reaches the named graphs.
+
+A pattern is only as safe as the writes of the triples it reads. With
+`?s ex:project ?p . ?p ex:member ?user`, anyone who may add `ex:member` triples can let
+themselves in, so protect those triples for writing as well.
+
+#### What a protected caller sees
+
+Every read path sees the visible triples only: queries of every form, `EXISTS`, paths,
+aggregates and counts answered from index statistics, `DESCRIBE`, the Graph Store and
+exports, full-text, vector, hybrid and spatial search, `/{ds}/explain`, RDFS on read,
+schema reports, VoID, drafted shapes, stored queries, the MCP tools and the dataset's
+`quads` count. `ASK` of a hidden triple answers like a missing one, and a Graph Store
+`GET ?graph=` of a graph whose every triple is hidden answers `404`.
+
+A caller with protections in force is limited, as in
+[Graph-level access control](#graph-level-access-control): plans have no estimates, the
+whole-dataset routes refuse it, the validation endpoints refuse it, and `whoami` lists
+the dataset under `restricted` with `triples: true`. It never names the protections.
+
+`/{ds}/diff` compares the two states as the caller sees them, so a triple that became
+hidden counts as removed. The change feed `/{ds}/changes` filters each change when the
+protections match by predicate and graph only. With a protection by class or pattern it
+answers `403`, since it would need the caller's view of every commit.
+
+While a protection with `hide_inferences` is in force, the caller does not read the
+inferred graph `urn:x-sparkles:inferred`, whose materialized inferences can restate the
+hidden triples in other words.
+
+#### Writes of a protected caller
+
+Each triple a write asks to insert or delete is checked against the protections at the
+state the write starts from and at the state it would leave, before anything is
+committed. The check uses the triples asked for, not the ones that exist, so a delete of a
+protected triple fails the same way whether or not it exists. A refused write changes
+nothing and answers `403 {"error":"write access to the triple <s> <p> <o> required"}`.
+
+* A caller cannot create a protected triple, so a caller without `patients` cannot type a
+  subject `ex:Patient`, and cannot add `rdfs:subClassOf` links below a protected class or
+  remove them.
+* `WHERE` clauses read the visible triples, so `DELETE WHERE` never removes a hidden one.
+* `CLEAR`, `DROP` and Graph Store `PUT` remove the triples the caller sees and keep the
+  hidden ones. Replacing the whole dataset is refused.
+* Dry runs are refused like the writes they preview.
+
+#### Limits
+
+```toml
+[protection_limits]
+max_hidden_quads = 5000000   # quads one caller's protections may hide at one commit
+max_pattern_rows = 1000000   # solutions of one pattern
+```
+
+The quads a caller's protections hide are worked out once per commit, kept with the
+commit, and shared by callers with the same protections, lifts and (for patterns) the
+same attributes. Past a limit, requests fail with `507` and a budget error of kind
+`hidden-quads` or `rows`.
+
+Class and pattern protections depend on data. A caller that knows an IRI can tell that it
+is protected, because the IRI's triples are missing and writes to it are refused. The
+protections hide triples, not IRIs: an IRI that is the object of a visible triple stays
+visible there.
+
 ### CSRF and CORS
 
 With auth, the server refuses unsafe requests, and any request that needs `write`,
@@ -5080,8 +5369,8 @@ type Whoami = {
   tokenId?: string;       // token principals
   server: ("metrics" | "federate" | "server-admin")[];
   datasets: Record<string, "read" | "write" | "admin">;   // existing datasets only
-  // datasets where the caller's grants cover only some graphs or endpoints
-  restricted: Record<string, { graphs: boolean; endpoints?: string[] }>;
+  // datasets where the caller's grants cover only some graphs, endpoints or triples
+  restricted: Record<string, { graphs: boolean; triples?: true; endpoints?: string[] }>;
   canMintTokens: boolean;  // false for static tokens and the provider's access tokens
   logout: boolean;
   tokensPolicy?: { defaultTtlSeconds: number; maxTtlSeconds: number };

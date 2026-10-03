@@ -106,6 +106,43 @@ implementation landed.
   - `rdf:JSON`;
   - maintaining the graph on the commit path.
 
+## Embeddings computed on write
+
+- **Spec:** [`F08-embeddings-on-write.md`](F08-embeddings-on-write.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the [F04](F04-vector-search.md), [CI](CI-commit-identity.md),
+    [C10](C10-write-time-validation.md) and [C13](C13-automatic-compaction.md) specs;
+  - OpenAI's API reference for `POST /v1/embeddings`, and the OpenAI-compatible
+    embeddings endpoints documented by Ollama, vLLM, LM Studio and Hugging Face Text
+    Embeddings Inference;
+  - the public documentation of Timescale pgai (the vectorizer and its worker), Weaviate
+    (the `text2vec-openai` and `text2vec-ollama` modules, `nearText`), Elasticsearch (the
+    inference API, `semantic_text`), Neo4j (the GenAI procedures) and Qdrant (FastEmbed),
+    read for behaviour only;
+  - RFC 9110, RFC 6585, RFC 6750 and RFC 4647, and the crates.io pages of `fastembed`
+    and `candle-core`.
+
+  The roadmap item that named the feature came from a review of other databases'
+  public descriptions. The spec itself does not use Fluree's documentation, and Fluree
+  was not consulted.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. The client, the
+  worker, the input record and the mock endpoint are our own code. **Dependencies:**
+  none new. Requests use the `reqwest` client and the outbound policy the engine already
+  has, and the cache uses `quick_cache`, already a dependency.
+- **Local models.** No model runtime was added. `fastembed` 7.1.0 (Apache-2.0) runs
+  models through ONNX Runtime, a native library its default features download at build
+  time, and fetches models from Hugging Face. Candle (MIT OR Apache-2.0) is pure Rust
+  but would bring model files, a tokenizer and CPU-heavy inference into the server.
+  Local models run behind Ollama or another OpenAI-compatible server instead. The binary
+  size of either option was not measured.
+- **Rejected** (spec §8):
+  - embedding on the commit path;
+  - vectors outside the RDF data;
+  - replaying the change feed to find changed text;
+  - API keys in `vector.json` or in API bodies;
+  - a model runtime in the binary;
+  - always one vector per subject.
+
 ## Named snapshots and point-in-time reads
 
 - **Spec:** [`F06-snapshots-and-point-in-time.md`](F06-snapshots-and-point-in-time.md),
@@ -207,6 +244,37 @@ implementation landed.
   - making `CLEAR ALL` fail for every restricted principal;
   - deny rules, Solid WAC ACL documents, and a parser for Fuseki's `access:` assembler
     vocabulary.
+
+## Protections of triples
+
+- **Spec:** [`C12b-triple-access-control.md`](C12b-triple-access-control.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the specs C09, C12, C15, C16 and F06;
+  - the source and readme of Apache Jena's `jena-permissions` module (Apache-2.0) at
+    the `jena-5.6.0` release, the last before it was retired: `SecurityEvaluator`,
+    `SecuredGraph` and the query rewriter `OpRewriter`;
+  - AllegroGraph's security filters documentation (fetched 2026-10-02) and MarkLogic's
+    element-level security documentation (protected paths and protected path sets,
+    found 2026-10-02);
+  - W3C Solid Web Access Control and Access Control Policy, the W3C ODRL Information
+    Model 2.2, OASIS XACML 3.0, SPARQL 1.1 and RDF Schema, cited from working knowledge.
+
+  Fluree was not consulted, including its policy language, source, documentation and
+  design notes.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02). The engine part
+  is in `sparkles::access::triples`, the snapshot's mask, the write transaction's checks
+  and the query, update, schema, diff and change-feed modules. The server part is in the
+  `auth` module of `sparkles-server` and the Graph Store and listing handlers.
+  - **Dependencies:** none added.
+- **Rejected** (spec §12):
+  - checking each triple during evaluation, as `jena-permissions` does;
+  - rewriting queries with filters;
+  - turning off the fast paths for protected callers;
+  - allow and disallow filters attached to each grant;
+  - lists of readers in the protection;
+  - inference per caller;
+  - exact per-commit masks for the change feed;
+  - hiding IRIs as well as triples.
 
 ## Write previews
 

@@ -14,6 +14,7 @@ const KIND_LABELS: Record<CommitKind, string> = {
   reason: 'reasoning',
   'reason-clear': 'inferences dropped',
   transaction: 'transaction',
+  embed: 'embeddings',
   unknown: 'unknown',
 };
 

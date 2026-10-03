@@ -1,6 +1,7 @@
 // Mock of the vector index endpoints for UI development (docs/API.md, "Vector indexes"):
 // `GET /$/vector/{ds}`, `GET`, `PUT` and `DELETE /$/vector/{ds}/{name}`, `POST …/rebuild`
-// (a `vector-index` task) and `POST …/recall`. `vectorIndexFor` tells the query endpoint's
+// (a `vector-index` task), `POST …/recall` and `POST …/reembed`. An index with an
+// `embedding` object reports an embedding worker that drains a backlog in a few seconds. `vectorIndexFor` tells the query endpoint's
 // `spk:vectorSearch` emulation which index a search goes through and how it would run.
 //
 // Seeded on the first request: `foaf` has the index `embedding` over `ex:embedding`
@@ -119,6 +120,36 @@ function status(ds, name) {
         }
       : {}),
     ...(e.lastBuild ? { lastBuild: e.lastBuild } : {}),
+    ...(cfg.embedding ? { embedding: embeddingStatus(e) } : {}),
+  };
+}
+
+/** The embedding worker of an index: a backlog that drains over a few seconds. */
+function embeddingStatus(e) {
+  const em = (e.embedding ??= { started: Date.now(), total: 6, embedded: 0, requests: 0 });
+  const done = Math.min(em.total, Math.floor((Date.now() - em.started) / 800));
+  const backlog = em.total - done;
+  const head = 40 + em.total;
+  let url;
+  try {
+    const u = new URL(e.config.embedding.url);
+    u.search = '';
+    url = u.toString();
+  } catch {
+    url = e.config.embedding.url;
+  }
+  return {
+    state: backlog ? 'embedding' : 'idle',
+    model: e.config.embedding.model,
+    endpoint: url,
+    backlog,
+    appliedSeq: backlog ? head - backlog : head,
+    headSeq: head,
+    embedded: em.embedded + done,
+    requests: em.requests + Math.ceil(done / 2),
+    failed: 0,
+    ...(done ? { lastBatch: { at: new Date().toISOString(), inputs: 2, ms: 38 } } : {}),
+    config: e.config.embedding,
   };
 }
 
@@ -179,7 +210,15 @@ export function seedVectors(datasets) {
 
 /** A configuration from a `PUT` body, with the defaults filled in, or an error message. */
 function readConfig(body) {
-  const known = ['predicate', 'dimension', 'metric', 'model', 'hnsw', 'exactThreshold'];
+  const known = [
+    'predicate',
+    'dimension',
+    'metric',
+    'model',
+    'hnsw',
+    'exactThreshold',
+    'embedding',
+  ];
   const unknown = Object.keys(body).find((k) => !known.includes(k));
   if (unknown) return `unknown field \`${unknown}\``;
   if (typeof body.predicate !== 'string' || !/^[a-z][a-z0-9+.-]*:\S+$/i.test(body.predicate))
@@ -198,6 +237,16 @@ function readConfig(body) {
     if (!(hnsw.efSearch >= 1 && hnsw.efSearch <= 4096)) return 'hnsw.efSearch: must be 1..=4096';
   }
   if (typeof body.model === 'string' && body.model.length > 256) return 'model: at most 256 bytes';
+  const em = body.embedding;
+  if (em != null) {
+    if (typeof em !== 'object' || typeof em.url !== 'string' || !/^https?:\/\//.test(em.url))
+      return `embedding.url: ${JSON.stringify(em?.url)} is not an http(s) URL`;
+    if (typeof em.model !== 'string' || !em.model) return 'embedding.model: 1 to 256 bytes';
+    if (em.predicates == null && em.query == null)
+      return 'embedding.predicates: name the predicates to embed, or a query';
+    if (em.apiKey && !('secret' in em.apiKey))
+      return 'embedding.apiKey: the API accepts {"secret": NAME}';
+  }
   return {
     predicate: body.predicate,
     dimension: body.dimension,
@@ -205,6 +254,7 @@ function readConfig(body) {
     ...(typeof body.model === 'string' && body.model ? { model: body.model } : {}),
     hnsw,
     exactThreshold: body.exactThreshold ?? 10000,
+    ...(em ? { embedding: em } : {}),
   };
 }
 
@@ -317,6 +367,22 @@ export async function handleVector(req, res, url, seg, ctx) {
     ctx.send(res, 202, build(ds, name, ctx, 'rebuilding the vector index'));
     return true;
   }
+  if (extra === 'reembed') {
+    if (req.method !== 'POST') return fail(405, 'method not allowed');
+    if (!admin()) return fail(403, `requires admin on ${dsName}`);
+    if (!e) return fail(404, `no vector index ${name}`);
+    if (!e.config.embedding)
+      return fail(400, `vector index ${name} has no embedding configuration`);
+    const before = e.embedding ? embeddingStatus(e) : null;
+    e.embedding = {
+      started: Date.now(),
+      total: 6,
+      embedded: before?.embedded ?? 0,
+      requests: before?.requests ?? 0,
+    };
+    ctx.send(res, 202, status(ds, name));
+    return true;
+  }
   if (extra === 'recall') {
     if (req.method !== 'POST') return fail(405, 'method not allowed');
     if (!e) return fail(404, `no vector index ${name}`);
@@ -379,6 +445,8 @@ export async function handleVector(req, res, url, seg, ctx) {
       const entry = keep
         ? { ...e, config: cfg }
         : { config: cfg, building: null, baseRows: 0, lastBuild: null };
+      if (JSON.stringify(e?.config.embedding) !== JSON.stringify(cfg.embedding))
+        entry.embedding = undefined;
       indexes(ds).set(name, entry);
       let task;
       if (keep) {

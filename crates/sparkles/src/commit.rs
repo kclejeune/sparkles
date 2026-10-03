@@ -43,12 +43,14 @@ pub enum CommitKind {
     ReasonClear,
     /// library write transaction
     Transaction,
+    /// vectors written by a vector index's embedding worker
+    Embed,
     /// a WAL commit written by an older version after this one had upgraded the database
     Unknown,
 }
 
 impl CommitKind {
-    const ALL: [CommitKind; 12] = [
+    const ALL: [CommitKind; 13] = [
         CommitKind::Create,
         CommitKind::Baseline,
         CommitKind::Update,
@@ -60,6 +62,7 @@ impl CommitKind {
         CommitKind::Reason,
         CommitKind::ReasonClear,
         CommitKind::Transaction,
+        CommitKind::Embed,
         CommitKind::Unknown,
     ];
 
@@ -77,6 +80,7 @@ impl CommitKind {
             CommitKind::Reason => 8,
             CommitKind::ReasonClear => 9,
             CommitKind::Transaction => 10,
+            CommitKind::Embed => 11,
             CommitKind::Unknown => 255,
         }
     }
@@ -102,6 +106,7 @@ impl CommitKind {
             CommitKind::Reason => "reason",
             CommitKind::ReasonClear => "reason-clear",
             CommitKind::Transaction => "transaction",
+            CommitKind::Embed => "embed",
             CommitKind::Unknown => "unknown",
         }
     }

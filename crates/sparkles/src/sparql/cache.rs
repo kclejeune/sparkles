@@ -239,6 +239,10 @@ fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
         "g{}|c{}|{:?}|{:?}|{}|",
         ctx.snap.generation.uid, ctx.snap.commit, ds.default, ds.named, ds.union_default
     );
+    // a view that hides triples reads other data than the commit holds
+    if let Some(m) = &ctx.snap.mask {
+        let _ = write!(s, "m{}|", m.key);
+    }
     write_node(n, ctx, &mut s).then_some(s)
 }
 

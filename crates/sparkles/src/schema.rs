@@ -1152,7 +1152,12 @@ impl Iris<'_> {
 
 /// Compute the schema report of `snap`.
 pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaReport, SchemaError> {
-    let snap: &Snapshot = snap;
+    // a view that hides triples is reported without them
+    let masked = match &opts.graphs {
+        Some(a) => a.masked(snap)?,
+        None => snap.clone(),
+    };
+    let snap: &Snapshot = &masked;
     let budget = Budget {
         deadline: opts.deadline,
         cancel: opts.cancel.as_deref(),

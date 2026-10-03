@@ -150,7 +150,7 @@ N-Quads loader checks it.
 Fuseki wraps the patch in one transaction of its own and turns `TX` and `TC` into
 counters, so a patch with several transactions commits once, and a `TA` anywhere aborts
 everything. Sparkles does the same. A patch therefore makes at most one commit, of the
-new kind `patch` (the next free code, 11 at the time of writing). Open question 3 asks
+new kind `patch` (the next free code, 12, after the `embed` kind of [F08](F08-embeddings-on-write.md)). Open question 3 asks
 whether to offer one commit per transaction.
 
 Prefixes are not data in Sparkles, and a prefix change makes no commit

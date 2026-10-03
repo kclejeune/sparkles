@@ -193,6 +193,8 @@ pub struct Restricted {
     pub graphs: Option<Vec<String>>,
     /// `None` is every endpoint
     pub endpoints: Option<Vec<Endpoint>>,
+    /// the protections it lifts in its graphs, at its level
+    pub lifts: Vec<String>,
 }
 
 impl Restricted {
@@ -218,13 +220,25 @@ impl Restricted {
 /// The graph of materialized inferences: covered only by grants that name it exactly.
 pub const INFERRED_GRAPH: &str = crate::http::INFERRED_GRAPH;
 
+/// The protections of a policy (`[[protections]]`), by dataset pattern, and the limits
+/// on applying them.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Protections {
+    pub list: Vec<(String, Arc<sparkles::access::Protection>)>,
+    pub limits: sparkles::access::Limits,
+}
+
 /// Dataset grants by pattern and server permissions; roles are already flattened in.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Grants {
     pub datasets: Vec<(String, Level)>,
     pub server: Vec<ServerPerm>,
-    /// grants limited to some graphs or endpoints
+    /// grants limited to some graphs or endpoints, or lifting protections
     pub restricted: Vec<Restricted>,
+    /// the names of the roles flattened in (a protection's pattern may use them)
+    pub roles: Vec<String>,
+    /// the policy's protections (`None`: there are none)
+    pub protections: Option<Arc<Protections>>,
 }
 
 impl Grants {
@@ -278,8 +292,70 @@ impl Grants {
         self.server.contains(&ServerPerm::ServerAdmin) || self.server.contains(&p)
     }
 
+    /// The graphs of `ds` where the grants of at least `min` reach through endpoint `e`
+    /// and lift the protection `name`: a union.
+    fn lifted(&self, ds: &str, e: Endpoint, min: Level, name: &str) -> sparkles::access::Graphs {
+        let mut g = sparkles::access::Graphs::none();
+        for r in &self.restricted {
+            if r.level >= min && r.applies(ds, Some(e)) && r.lifts.iter().any(|x| x == name) {
+                g = g.union(&r.graphs());
+                if g.is_all() {
+                    break;
+                }
+            }
+        }
+        g
+    }
+
+    /// The protections of `ds` as they apply to these grants through endpoint `e` at
+    /// level `l` (`None` when the policy has none for `ds`, or `admin` lifts them all).
+    pub fn triple_rules(
+        &self,
+        ds: &str,
+        e: Endpoint,
+        l: Level,
+        caller: sparkles::access::Caller,
+    ) -> Option<sparkles::access::TripleRules> {
+        let ps = self.protections.as_ref()?;
+        let mine: Vec<&Arc<sparkles::access::Protection>> = ps
+            .list
+            .iter()
+            .filter(|(d, _)| glob(d, ds))
+            .map(|(_, p)| p)
+            .collect();
+        // admin acts on the whole dataset, as it does on every graph
+        if mine.is_empty() || self.level_for(ds, None) == Some(Level::Admin) {
+            return None;
+        }
+        let rules = mine
+            .into_iter()
+            .map(|p| sparkles::access::Rule {
+                protection: p.clone(),
+                read: self.lifted(ds, e, Level::Read, &p.name),
+                write: if l >= Level::Write {
+                    self.lifted(ds, e, Level::Write, &p.name)
+                } else {
+                    sparkles::access::Graphs::none()
+                },
+            })
+            .collect();
+        Some(sparkles::access::TripleRules {
+            rules,
+            caller,
+            limits: ps.limits,
+        })
+    }
+
     /// Add `other`'s grants.
     pub fn extend(&mut self, other: &Grants) {
+        for r in &other.roles {
+            if !self.roles.contains(r) {
+                self.roles.push(r.clone());
+            }
+        }
+        if self.protections.is_none() {
+            self.protections = other.protections.clone();
+        }
         for g in &other.datasets {
             if !self.datasets.contains(g) {
                 self.datasets.push(g.clone());
@@ -386,13 +462,28 @@ impl Access {
     /// The graph view of `ds` through endpoint `e`: `None` when it covers every graph
     /// the level allows (or the dataset is not granted at all), and no graph when other
     /// endpoints are granted but not `e`.
-    pub fn view(&self, ds: &str, e: Endpoint) -> Option<sparkles::access::GraphAccess> {
+    /// Whether the grants show only some graphs of `ds` through endpoint `e` (for
+    /// reading, or for writing at a level that writes).
+    pub fn graphs_limited(&self, ds: &str, e: Endpoint) -> bool {
+        let Some(l) = self.level_for(ds, Some(e)) else {
+            return self.level_for(ds, None).is_some();
+        };
+        !(self.grants.graphs(ds, e, Level::Read).is_all()
+            && (l < Level::Write || self.grants.graphs(ds, e, Level::Write).is_all()))
+    }
+
+    pub fn view(
+        &self,
+        ds: &str,
+        e: Endpoint,
+        caller: sparkles::access::Caller,
+    ) -> Option<sparkles::access::GraphAccess> {
         let Some(l) = self.level_for(ds, Some(e)) else {
             self.level_for(ds, None)?;
-            return Some(sparkles::access::GraphAccess {
-                read: sparkles::access::Graphs::none(),
-                write: sparkles::access::Graphs::none(),
-            });
+            return Some(sparkles::access::GraphAccess::graphs(
+                sparkles::access::Graphs::none(),
+                sparkles::access::Graphs::none(),
+            ));
         };
         let read = self.grants.graphs(ds, e, Level::Read);
         let write = if l >= Level::Write {
@@ -400,10 +491,16 @@ impl Access {
         } else {
             sparkles::access::Graphs::none()
         };
-        if read.is_all() && (l < Level::Write || write.is_all()) {
+        let graphs_all = read.is_all() && (l < Level::Write || write.is_all());
+        let a = match self.grants.triple_rules(ds, e, l, caller) {
+            Some(rules) => sparkles::access::GraphAccess::with_triples(read, write, rules),
+            None if graphs_all => return None,
+            None => sparkles::access::GraphAccess::graphs(read, write),
+        };
+        if graphs_all && a.triples.is_none() {
             return None;
         }
-        Some(sparkles::access::GraphAccess { read, write })
+        Some(a)
     }
 
     pub fn has(&self, p: ServerPerm) -> bool {
@@ -506,6 +603,16 @@ pub struct PrincipalInfo {
     pub session: Option<[u8; 32]>,
 }
 
+/// How a principal's grants limit one dataset (`whoami`).
+pub struct Limits {
+    /// some endpoint sees only some graphs
+    pub graphs: bool,
+    /// protections hide some triples or keep them from being written
+    pub triples: bool,
+    /// the endpoints it may use, when not all of them
+    pub endpoints: Option<Vec<Endpoint>>,
+}
+
 /// The caller of a request, inserted into the request extensions by [`middleware`].
 /// Later layers and handlers read it with `Extension<Principal>`; [`Principal::id`] is a
 /// stable key (never a credential).
@@ -603,7 +710,37 @@ impl Principal {
         if self.is_local() {
             return None;
         }
-        self.access.view(ds, e).map(Arc::new)
+        self.access.view(ds, e, self.caller()).map(Arc::new)
+    }
+
+    /// What a protection's pattern may know of this caller: its name (the owner's for
+    /// a minted token, none when anonymous), its roles and its groups.
+    pub fn caller(&self) -> sparkles::access::Caller {
+        let user = match self.kind {
+            Kind::Local | Kind::Anonymous => None,
+            // a minted token acts for its owner; a static token's id is `cfg-<name>`
+            Kind::Token => Some(match &self.info.owner {
+                Some(o) => o.name.clone(),
+                None => self
+                    .name
+                    .strip_prefix("cfg-")
+                    .unwrap_or(&self.name)
+                    .to_string(),
+            }),
+            _ => Some(self.name.to_string()),
+        };
+        let mut roles = self.access.grants.roles.clone();
+        roles.sort();
+        sparkles::access::Caller {
+            user,
+            roles,
+            groups: self
+                .info
+                .owner
+                .as_ref()
+                .map(|o| o.groups.clone())
+                .unwrap_or_default(),
+        }
     }
 
     /// Whether some endpoint of `ds` shows this principal only some of its graphs.
@@ -617,7 +754,7 @@ impl Principal {
     /// How this principal's grants limit `ds`, for `whoami`: whether some endpoint sees
     /// only some graphs, and the endpoints it may use when not all of them. `None` when
     /// nothing is limited.
-    pub fn limits(&self, ds: &str) -> Option<(bool, Option<Vec<Endpoint>>)> {
+    pub fn limits(&self, ds: &str) -> Option<Limits> {
         if self.is_local() {
             return None;
         }
@@ -625,9 +762,15 @@ impl Principal {
             .into_iter()
             .filter(|e| self.can_at(ds, *e, Level::Read))
             .collect();
-        let graphs = allowed.iter().any(|e| self.view(ds, *e).is_some());
+        let views: Vec<_> = allowed.iter().filter_map(|e| self.view(ds, *e)).collect();
+        let graphs = allowed.iter().any(|e| self.access.graphs_limited(ds, *e));
+        let triples = views.iter().any(|v| v.triples.is_some());
         let endpoints = (allowed.len() < Endpoint::ALL.len()).then_some(allowed);
-        (graphs || endpoints.is_some()).then_some((graphs, endpoints))
+        (graphs || triples || endpoints.is_some()).then_some(Limits {
+            graphs,
+            triples,
+            endpoints,
+        })
     }
 
     /// `server-admin` implies every server permission.

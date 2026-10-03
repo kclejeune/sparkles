@@ -72,3 +72,93 @@ pub fn check_reserve(dir: &Path, reserve: u64, need: u64, cached: bool) -> crate
     }
     Ok(())
 }
+
+/// Make sure the process may hold `need` open files: when the soft limit is lower, raise
+/// it, up to the hard limit. Many systems start processes with a soft limit of 1,024
+/// while the hard limit is far higher, and a bulk load of a billion triples merges more
+/// files than that at once. The error says how to raise the hard limit.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // rlim_t is not u64 on every unix
+pub fn ensure_open_files(need: u64) -> crate::Result<()> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit only read and write the struct passed to them
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Ok(());
+    }
+    let (soft, hard) = (lim.rlim_cur as u64, lim.rlim_max as u64);
+    if soft >= need {
+        return Ok(());
+    }
+    if hard >= need {
+        lim.rlim_cur = need.max(soft) as libc::rlim_t;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } == 0 {
+            return Ok(());
+        }
+    }
+    Err(crate::Error::invalid(format!(
+        "this needs {need} open files, and the limit is {soft} (hard limit {hard}): raise it \
+         with `ulimit -n {need}` or LimitNOFILE= in the service"
+    )))
+}
+
+#[cfg(not(unix))]
+pub fn ensure_open_files(_: u64) -> crate::Result<()> {
+    Ok(())
+}
+
+/// Raise the soft limit on open files to the hard limit, as servers and loaders that
+/// hold many files do. Returns the new soft limit.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+pub fn raise_open_file_limit() -> Option<u64> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: as in ensure_open_files
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return None;
+        }
+        if lim.rlim_cur < lim.rlim_max {
+            let want = libc::rlimit {
+                rlim_cur: lim.rlim_max,
+                rlim_max: lim.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &want) == 0 {
+                return Some(want.rlim_cur as u64);
+            }
+        }
+    }
+    Some(lim.rlim_cur as u64)
+}
+
+#[cfg(not(unix))]
+pub fn raise_open_file_limit() -> Option<u64> {
+    None
+}
+
+#[cfg(all(test, unix))]
+mod open_file_tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn the_soft_limit_rises_up_to_the_hard_limit() {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        let (soft, hard) = (lim.rlim_cur as u64, lim.rlim_max as u64);
+        ensure_open_files(soft).unwrap();
+        if hard < u64::MAX / 2 {
+            let e = ensure_open_files(hard + 1).unwrap_err().to_string();
+            assert!(e.contains("ulimit -n"), "{e}");
+        }
+        assert!(raise_open_file_limit().unwrap() >= soft);
+    }
+}

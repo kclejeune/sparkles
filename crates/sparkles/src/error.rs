@@ -95,10 +95,12 @@ pub enum BudgetKind {
     RowsProduced,
     /// on-disk bytes of a persistent dataset (its storage quota)
     DatasetBytes,
+    /// quads a caller's triple-level access rules hide at one commit
+    HiddenQuads,
 }
 
 impl BudgetKind {
-    pub const ALL: [BudgetKind; 8] = [
+    pub const ALL: [BudgetKind; 9] = [
         BudgetKind::Rows,
         BudgetKind::Memory,
         BudgetKind::ResultBytes,
@@ -107,6 +109,7 @@ impl BudgetKind {
         BudgetKind::ValidationWork,
         BudgetKind::RowsProduced,
         BudgetKind::DatasetBytes,
+        BudgetKind::HiddenQuads,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -119,6 +122,7 @@ impl BudgetKind {
             BudgetKind::ValidationWork => "validation-work",
             BudgetKind::RowsProduced => "rows-produced",
             BudgetKind::DatasetBytes => "dataset-bytes",
+            BudgetKind::HiddenQuads => "hidden-quads",
         }
     }
 }
@@ -175,6 +179,11 @@ impl std::fmt::Display for Budget {
                 "the write would grow the dataset to about {} on disk, over its quota of {}",
                 human_bytes(self.requested),
                 human_bytes(self.limit)
+            ),
+            BudgetKind::HiddenQuads => write!(
+                f,
+                "the access rules of this request hide more than {} quads at this commit",
+                self.limit
             ),
         }
     }

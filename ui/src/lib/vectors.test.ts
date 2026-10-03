@@ -5,6 +5,8 @@ import {
   abbreviateVector,
   buildSimilarQuery,
   buildVectorSearch,
+  embeddingProgress,
+  embeddingStateClass,
   fmtRecall,
   fmtScore,
   indexConfig,
@@ -13,6 +15,7 @@ import {
   metricInfo,
   needsBuild,
   overlayShare,
+  parseEmbedding,
   parseVector,
   parseVectorInput,
   rankedHits,
@@ -294,5 +297,75 @@ describe('vector index cards', () => {
     expect(fmtRecall(1)).toBe('100.0 %');
     expect(fmtRecall(NaN)).toBe('—');
     expect(overlayShare(status)).toBeCloseTo(0.11);
+  });
+});
+
+describe('embedding settings', () => {
+  const status: VectorIndexStatus = {
+    name: 'docs',
+    predicate: 'http://ex/emb',
+    dimension: 8,
+    metric: 'cosine',
+    state: 'ready',
+    generation: 'gen-0001',
+    rows: 0,
+    overlay: { inserts: 0, deletes: 0 },
+    skipped: { malformed: 0, wrongDimension: 0, zeroNorm: 0 },
+    memory: { segmentBytes: 0, hnswBytes: 0, residency: 'heap' },
+    hnsw: null,
+    exactThreshold: 10000,
+    embedding: {
+      state: 'embedding',
+      model: 'nomic-embed-text',
+      endpoint: 'http://127.0.0.1:11434/v1/embeddings',
+      backlog: 3,
+      appliedSeq: 40,
+      headSeq: 42,
+      embedded: 10,
+      requests: 2,
+      failed: 0,
+      config: {
+        url: 'http://127.0.0.1:11434/v1/embeddings',
+        model: 'nomic-embed-text',
+        predicates: ['http://www.w3.org/2000/01/rdf-schema#label'],
+      },
+    },
+  };
+
+  it('keeps the embedding object when an index is edited', () => {
+    const f = indexForm(status, {});
+    expect(JSON.parse(f.embedding).model).toBe('nomic-embed-text');
+    const c = indexConfig(f, {});
+    expect(c.config?.embedding?.predicates).toEqual(['http://www.w3.org/2000/01/rdf-schema#label']);
+    expect(indexConfig({ ...f, embedding: '' }, {}).config?.embedding).toBeUndefined();
+  });
+
+  it('checks the JSON typed in the dialog', () => {
+    expect(parseEmbedding('').config).toBeNull();
+    expect(parseEmbedding('{').error).toMatch(/Not JSON/);
+    expect(parseEmbedding('{"url":"ftp://x","model":"m","predicates":[]}').error).toMatch(/url/);
+    expect(parseEmbedding('{"url":"http://x/","model":"m"}').error).toMatch(/predicates or query/);
+    expect(
+      parseEmbedding(
+        '{"url":"http://x/","model":"m","query":"SELECT ?s ?text {}","apiKey":{"env":"K"}}',
+      ).error,
+    ).toMatch(/secret/);
+    expect(
+      parseEmbedding(
+        '{"url":"http://x/","model":"m","predicates":["http://p"],"apiKey":{"secret":"k"}}',
+      ).config?.apiKey,
+    ).toEqual({ secret: 'k' });
+  });
+
+  it('describes the worker', () => {
+    const e = status.embedding!;
+    expect(embeddingProgress(e)).toBe('3 waiting · embedded up to commit 40 of 42');
+    expect(embeddingProgress({ ...e, backlog: 0, appliedSeq: 42 })).toBe(
+      'caught up with every commit',
+    );
+    expect(embeddingProgress({ ...e, scan: { done: 5, total: 9 } })).toMatch(/^scanning 5 of 9/);
+    expect(embeddingStateClass('idle')).toBe('ok');
+    expect(embeddingStateClass('backoff')).toBe('danger');
+    expect(embeddingStateClass('paused')).toBe('warn');
   });
 });

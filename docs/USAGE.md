@@ -19,6 +19,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Formatting](#formatting)
 * [Backup repositories](#backup-repositories)
 * [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
+* [Embeddings computed on write](#embeddings-computed-on-write)
 * [Checking a database](#checking-a-database)
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
 * [Embedding the library](#embedding-the-library)
@@ -211,6 +212,46 @@ and the other tenants' graphs behave as if they did not exist. Its writes may ch
 grants. [API.md](API.md#graph-level-access-control) describes every rule and maps
 Fuseki's `access:entry` and `fuseki:allowedUsers` settings onto grants.
 
+### Hiding some triples from some users
+
+A protection hides some triples of a dataset from everyone whose grants do not lift it.
+It can match triples by predicate, by the class of their subject, or by a SPARQL pattern
+that sees the caller's name and roles:
+
+```toml
+# only HR reads and writes salaries
+[[protections]]
+name = "salaries"
+dataset = "staff"
+predicates = ["https://example.org/salary"]
+
+[[roles.hr.grants]]
+dataset = "staff"
+level = "write"
+lifts = ["salaries"]
+
+# expense reports are visible to their submitter and to finance
+[[protections]]
+name = "expenses"
+dataset = "staff"
+classes = ["https://example.org/ExpenseReport"]
+pattern = "?s ex:submittedBy ?user"
+prefixes = { ex = "https://example.org/" }
+
+[[roles.finance.grants]]
+dataset = "staff"
+level = "read"
+lifts = ["expenses"]
+```
+
+Everyone with `staff = "read"` reads the dataset without salaries and without other
+people's expense reports. A member of `hr` also reads and writes salaries. The triples
+stay hidden in every answer, including counts, searches, schema pages, exports and diffs,
+and writing a protected triple without the protection lifted fails with `403`.
+`sparkles auth check --config FILE` validates the protections and their patterns.
+[API.md](API.md#protections-of-triples) describes the rules, the caller variables, what
+happens to materialized inferences, and the limits.
+
 ### `serve` options
 
 | Flag | Default | Meaning |
@@ -274,6 +315,8 @@ Fuseki's `access:entry` and `fuseki:allowedUsers` settings onto grants.
 | `--outbound-request-max-mb N` | 4 × `--outbound-max-mb` (`1024`) | Bytes that all the SERVICE calls and LOADs of one query or update may receive together. Past it, the request gets `507`. |
 | `--outbound-request-timeout S` | 4 × `--outbound-timeout` (`240`) | Time that all the SERVICE calls and LOADs of one query or update may take, summed. |
 | `--load-dir DIR` | | Let `LOAD <file:…>` read the regular files under `DIR`, with symbolic links resolved and nothing outside it. Without this flag, the server refuses file loads. |
+| `--embedding-secret NAME=SOURCE` | | A secret that vector indexes may name as their embedding API key: `NAME=env:VARIABLE` or `NAME=file:PATH`, read when a request is made. Repeatable. See [Embeddings computed on write](#embeddings-computed-on-write). |
+| `--no-embedding` | | Compute no embeddings. No worker sends text to a provider, and searches cannot pass text. The configurations are kept. |
 | `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. |
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. A closure takes about 135 bytes per triple. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 
@@ -332,6 +375,11 @@ sparkles vector create --loc db --name emb --predicate http://example.org/emb --
                                               # vector index with an HNSW graph: --metric, --m, --ef-construction,
                                               #   --ef-search, --exact-threshold, --no-hnsw
 sparkles vector list|status|rebuild|drop --loc db [--name emb]   # or --server URL --dataset NAME
+sparkles vector create --loc db --name docs --predicate http://example.org/emb --dim 768 \
+    --embed-url http://127.0.0.1:11434/v1/embeddings --embed-model nomic-embed-text \
+    --embed-from http://www.w3.org/2000/01/rdf-schema#label   # an index that computes its vectors
+sparkles vector embed   --loc db              # embed the text that waits, then exit
+sparkles vector reembed --loc db --name docs  # embed every text again (a new model behind the name)
 sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes it, no flag prints it
 sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
 sparkles compaction --loc db --set deltaRatio=0.02     # automatic compaction settings; --default removes them
@@ -973,7 +1021,9 @@ name that resolves to a private or link-local address, list that address or netw
 well (`--outbound-allow fuseki.internal --outbound-allow 10.20.0.0/16`). A hijacked or
 mistyped DNS record then cannot open the metadata service. `sparkles mcp` takes the same
 flags. Library users set `QueryOptions::outbound`
-(`sparkles::outbound::OutboundPolicy`), which has the same defaults. The default refusal
+(`sparkles::outbound::OutboundPolicy`), which has the same defaults. Embedding requests
+([Embeddings computed on write](#embeddings-computed-on-write)) follow the server's policy
+too, and library users set theirs with `sparkles::vector::embed::set_environment`. The default refusal
 of non-public addresses is the constant `BLOCK_PRIVATE_BY_DEFAULT`.
 
 **Local commands.** `sparkles query` and `sparkles update` without `--server` run on the
@@ -999,6 +1049,71 @@ it. Without the flag, the server refuses file loads with `403`. `DIR` may not ho
 data directory. The local `sparkles update` reads any file its user can read. Library
 users set `QueryOptions::file_loads` to `FileLoads::Anywhere` (the default),
 `FileLoads::under(dir)` or `FileLoads::Disabled`.
+
+## Embeddings computed on write
+
+A vector index can compute its vectors from the dataset's text through an embeddings
+endpoint that speaks OpenAI's `POST /v1/embeddings` protocol. That covers OpenAI and most
+hosted providers, and also local models served by Ollama, vLLM, LM Studio, llama.cpp's
+server or Text Embeddings Inference. Sparkles has no model runtime of its own, so a local
+model runs behind one of those servers. The design is in
+[F08](specs/F08-embeddings-on-write.md), and the fields and endpoints are in
+[API.md](API.md#embeddings-on-write).
+
+With Ollama on the same machine:
+
+```sh
+ollama pull nomic-embed-text
+sparkles serve --data ./data --outbound-allow 127.0.0.1/32 --outbound-allow api.openai.com
+curl -X PUT http://localhost:3030/$/vector/ds/docs -H 'Content-Type: application/json' -d '{
+  "predicate": "http://example.org/embedding", "dimension": 768,
+  "embedding": {
+    "url": "http://127.0.0.1:11434/v1/embeddings", "model": "nomic-embed-text",
+    "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"],
+    "inputPrefix": "search_document: ", "queryPrefix": "search_query: "
+  }
+}'
+```
+
+The server refuses loopback and private destinations by default, also for embeddings,
+so a local provider needs `--outbound-allow` with its address, or
+`--outbound-allow-private`. An allowlist limits SERVICE and `LOAD` to the same
+destinations, which is why the example lists the hosted endpoint too.
+
+With OpenAI, the key comes from a secret the operator defines. The configuration names
+the secret, never the key:
+
+```sh
+OPENAI_API_KEY=sk-… sparkles serve --data ./data --embedding-secret openai=env:OPENAI_API_KEY
+# "embedding": { "url": "https://api.openai.com/v1/embeddings", "model": "text-embedding-3-small",
+#                "apiKey": {"secret": "openai"}, "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"] }
+```
+
+`file:PATH` reads the key from a file, such as a systemd credential, each time a request
+is made, so a rotated key takes effect without a restart.
+
+After that, writes are embedded in the background. A write commits at once and its
+vectors follow in a commit of kind `embed`. The index's card on the dataset page shows
+the worker's state, the backlog and the last error, and has a "Re-embed" action.
+`sparkles vector status` prints the same as JSON. A search can pass text instead of a
+vector:
+
+```sparql
+PREFIX spk: <urn:x-sparkles:>  PREFIX ex: <http://example.org/>
+SELECT ?s ?score WHERE { (?s ?score) spk:vectorSearch (ex:embedding "rivers of southern France" 10) }
+```
+
+**What leaves the machine.** The text of the selected literals, and the texts that
+searches pass, go to the configured endpoint, with the model name and, when set, the API
+key. Nothing else is sent, and nothing is sent for an index without an `embedding`
+object. `--no-embedding` stops all of it on a server. Search texts are sent by any
+caller who may read the dataset, which a `queryText: false` index refuses.
+
+**Local commands.** `sparkles update --loc` and the other local commands do not embed.
+The next server start, or `sparkles vector embed --loc db`, catches their writes up, and
+sends nothing for text that was already embedded. The local commands use the local
+outbound policy, which allows private addresses, and take `--embedding-secret` for keys
+named by a secret. The Python package does the same with `Dataset.embed()`.
 
 ## Checking a database
 
@@ -1380,6 +1495,10 @@ ds.query("""PREFIX text: <http://jena.apache.org/text#>
             SELECT ?s WHERE { ?s text:query 'fox' }""")
 ds.create_vector_index("emb", "http://ex.org/embedding", 384, options={"metric": "cosine"})
 ds.vector_index("emb", wait=True)                  # the status once the build is done
+ds.create_vector_index("docs", "http://ex.org/docEmb", 768, options={"embedding": {
+    "url": "http://127.0.0.1:11434/v1/embeddings", "model": "nomic-embed-text",
+    "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"]}})
+ds.embed(timeout=600)                              # embed the waiting text on this thread
 
 ds.set_write_validation({"mode": "reject", "shapes": {"inline": shapes_turtle}})
 ds.add(quad_that_breaks_the_shapes)                # raises WriteRejectedError
@@ -1394,8 +1513,8 @@ the text index ([API](API.md#full-text-search)), the vector index configuration,
 a `schema` and a `shapeMap`. Opening a database directory installs the write-time
 validation its `validation.json` sets up, as the server does. When the configuration
 cannot be loaded, the package warns and writes stay refused. `text_status`,
-`rebuild_text`, `disable_text`, `drop_vector_index`, `rebuild_vector_index` and
-`vector_indexes` complete the administration.
+`rebuild_text`, `disable_text`, `drop_vector_index`, `rebuild_vector_index`,
+`reembed_vector_index` and `vector_indexes` complete the administration.
 
 ### Query builder
 

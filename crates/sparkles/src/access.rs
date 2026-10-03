@@ -5,6 +5,14 @@
 //! and a write transaction refuses to insert or delete a quad outside
 //! [`GraphAccess::write`]. Rules match graph names, never data, so every decision is
 //! the same whether or not a hidden graph exists or holds a quad.
+//!
+//! A view may also carry [`TripleRules`]: protections that hide some triples of the
+//! graphs it reads (see [`triples`]). Reads then see a masked snapshot, which holds the
+//! hidden quads as extra deletions, so every scan, count and index of the engine sees
+//! only the visible triples.
+
+pub mod triples;
+pub use triples::{Caller, Limits, Mask, Protection, Rule, TripleRules};
 
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
@@ -49,6 +57,9 @@ pub struct GraphRule {
     pub patterns: Vec<String>,
     /// IRIs that patterns never match (the graph of materialized inferences)
     pub protected: Vec<String>,
+    /// blank-node graph names are in the set (only in a rule made by
+    /// [`Graphs::without_iri`] from every graph)
+    pub blank_nodes: bool,
 }
 
 impl GraphRule {
@@ -83,6 +94,7 @@ impl GraphRule {
     /// Add `other`'s graphs.
     pub fn extend(&mut self, other: &GraphRule) {
         self.default_graph |= other.default_graph;
+        self.blank_nodes |= other.blank_nodes;
         self.iris.extend(other.iris.iter().cloned());
         self.patterns.extend(other.patterns.iter().cloned());
         self.protected.extend(other.protected.iter().cloned());
@@ -150,8 +162,26 @@ impl Graphs {
                     n.as_str() != UNION_GRAPH_IRI && r.matches_iri(n.as_str())
                 }
             }
+            (Graphs::Only(r), Some(Term::BlankNode(_))) => r.blank_nodes,
             (Graphs::Only(_), Some(_)) => false,
         }
+    }
+
+    /// The set without the named graph `iri`, which only an exact name may bring back.
+    pub fn without_iri(&self, iri: &str) -> Graphs {
+        let mut r = match self {
+            Graphs::All => GraphRule {
+                default_graph: true,
+                patterns: vec!["*".into()],
+                blank_nodes: true,
+                ..Default::default()
+            },
+            Graphs::Only(r) => r.clone(),
+        };
+        r.iris.retain(|x| x != iri);
+        r.protected.push(iri.to_string());
+        r.normalize();
+        Graphs::Only(r)
     }
 
     /// Whether the graph named by `iri` is in the set (`urn:x-arq:DefaultGraph` is the
@@ -171,6 +201,8 @@ impl Graphs {
 pub struct GraphAccess {
     pub read: Graphs,
     pub write: Graphs,
+    /// protections that hide some triples of the graphs read or written (`None`: none)
+    pub triples: Option<Arc<TripleRules>>,
 }
 
 impl GraphAccess {
@@ -179,7 +211,44 @@ impl GraphAccess {
         GraphAccess {
             read: Graphs::All,
             write: Graphs::All,
+            triples: None,
         }
+    }
+
+    /// Graphs only, without protections of triples.
+    pub fn graphs(read: Graphs, write: Graphs) -> GraphAccess {
+        GraphAccess {
+            read,
+            write,
+            triples: None,
+        }
+    }
+
+    /// A view with protections of triples. Rules the caller's grants lift in every
+    /// graph are left out, and while a rule that hides materialized inferences is in
+    /// force for reads, the read graphs leave out the graph of inferences.
+    pub fn with_triples(read: Graphs, write: Graphs, rules: TripleRules) -> GraphAccess {
+        let rules = rules.in_force();
+        let read = if rules.hides_inferences() {
+            read.without_iri(triples::INFERRED_GRAPH)
+        } else {
+            read
+        };
+        GraphAccess {
+            read,
+            write,
+            triples: (!rules.rules.is_empty()).then(|| Arc::new(rules)),
+        }
+    }
+
+    /// Whether some protection hides triples from reads.
+    pub fn hides_triples(&self) -> bool {
+        self.triples.as_ref().is_some_and(|t| t.hides())
+    }
+
+    /// Whether reads see everything: every graph, and every triple of them.
+    pub fn reads_everything(&self) -> bool {
+        self.read.is_all() && !self.hides_triples()
     }
 
     /// Whether reads see every graph (no filtering is needed).
@@ -205,6 +274,16 @@ impl GraphAccess {
     /// A stable key of the read rule (for caches).
     pub fn read_key(&self) -> String {
         format!("{:?}", self.read)
+    }
+
+    /// The snapshot as this view reads it: `snap` with the quads its protections hide
+    /// taken out (see [`triples`]). Kept with the snapshot per view, so repeated
+    /// requests at one commit build it once. `snap` itself when nothing is hidden.
+    pub fn masked(&self, snap: &Arc<Snapshot>) -> Result<Arc<Snapshot>> {
+        match self.triples.as_ref().filter(|t| t.hides()) {
+            Some(t) if snap.mask.is_none() => triples::masked(self, t, snap),
+            _ => Ok(snap.clone()),
+        }
     }
 
     /// The error of a write outside the write graphs.
@@ -304,7 +383,7 @@ impl GraphAccess {
 
 /// The term naming graph `g` other than the default graph (`None` for ids that name no
 /// term).
-fn graph_term(snap: &Snapshot, g: Id) -> Option<Term> {
+pub(crate) fn graph_term(snap: &Snapshot, g: Id) -> Option<Term> {
     match g.tag() {
         Tag::BNode => Some(Term::BlankNode(crate::store::bnode_for(g))),
         Tag::Undef | Tag::Special => None,
@@ -350,6 +429,7 @@ mod tests {
         let a = GraphAccess {
             read: g.clone(),
             write: Graphs::Only(GraphRule::new(["http://ex/a/1", "http://ex/z"], &[])),
+            triples: None,
         };
         assert!(a.writable(Some(&n("http://ex/a/1"))));
         // writable only when readable too

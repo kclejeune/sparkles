@@ -36,7 +36,7 @@ behaviour, and the Outcome explains the difference.
 |---|---|
 | `CI` | Durable commit identity. The commit sequence, dataset ids and receipts that most later features build on. |
 | `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, a GraphQL adapter, CSV and TSV imports, cloning, inference freshness, access control, write-time validation, the MCP server, automatic compaction, write previews and stored queries. |
-| `F` | Larger data features: a Cypher frontend, full-text and vector search, backups to object storage, retained history and point-in-time reads, branches and merges, replication, and encryption at rest. |
+| `F` | Larger data features: a Cypher frontend, full-text and vector search, embeddings computed on write, backups to object storage, retained history and point-in-time reads, branches and merges, replication, and encryption at rest. |
 | `G` | Gaps against Apache Jena that were out of scope for the first version: GeoSPARQL, ShEx, the SHACL Compact Syntax and the command-line tools. |
 | `P` | Bindings that embed the engine in other languages: Python. |
 | `X` | Internal engineering that does not derive from any other database product: compression codecs, the formatter, and the OpenAPI description with shell completions. |
@@ -65,6 +65,7 @@ there is no code yet.
 | [C10](C10-write-time-validation.md) | A per-dataset SHACL guard that validates the state after each write before the write commits | implemented in part (Phases 1–3) |
 | [C11](C11-mcp-server.md) | `sparkles mcp`, a Model Context Protocol server with read-only query, schema, search, validation and formatting tools | implemented in part (Phase 1, part of Phase 2) |
 | [C12](C12-graph-access-control.md) | Grants limited to some named graphs or endpoints of a dataset, enforced by a filtered dataset view in the engine | implemented |
+| [C12b](C12b-triple-access-control.md) | C12 Phase 2: protections that hide triples by predicate, subject class or a SPARQL pattern with the caller bound, lifted by grants and enforced by a masked snapshot in the engine | implemented |
 | [C13](C13-automatic-compaction.md) | Background compaction triggered by the delta's size, the log's size, age and idle time, with writes continuing during the build | implemented |
 | [C15](C15-write-previews.md) | Dry runs of updates, Graph Store writes, uploads and the MCP write tool, which report the commit, the changes, validation, quota and preconditions and roll back | implemented |
 | [C16](C16-stored-queries.md) | Named queries per dataset with typed parameters bound as terms, versions, runs by name, MCP tools and the UI's saved queries | implemented |
@@ -73,6 +74,7 @@ there is no code yet.
 | [F04](F04-vector-search.md) | `spk:vector` literals, similarity functions and exact top-k `spk:vectorSearch` | implemented in part (Phase 1) |
 | [F05](F05-snapshot-repositories.md) | Incremental, deduplicated backups to a file system or S3, restore, verification, policies and GC | implemented in part (Phase 1, most of Phase 2) |
 | [F06](F06-snapshots-and-point-in-time.md) | Point-in-time reads with `?at=`, named snapshots, a retention window and diffs between commits | implemented in part (Phases 1 and 2) |
+| [F08](F08-embeddings-on-write.md) | Vectors computed from selected literals by an OpenAI-compatible embeddings endpoint after each commit, with catch-up, re-embedding, status and text queries | implemented in part (Phase 1) |
 | [F09](F09-branches-and-merges.md) | Branches that share their parent's index until they compact, `?branch=` and `/{ds}@{branch}`, three-way merges of quad sets with cell conflicts and resolutions, protected branches, and clones of branches | specified |
 | [F10](F10-replication.md) | Applying RDF Patch through Fuseki's `patch` operation, with `H prev` as a concurrency check, then read replicas that pull commits as RDF Patch, keep the primary's commit ids, bootstrap from a generation copy or a backup, and are promoted by hand | specified |
 | [F11](F11-encryption-at-rest.md) | Client-side encrypted backup repositories with keyed blob ids, content-defined chunking, and AES-256-GCM encryption at rest for dataset files under KMS-wrapped per-dataset keys | specified |

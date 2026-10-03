@@ -85,6 +85,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/vector/{ds}", &["GET"]),
     ("/$/vector/{ds}/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/vector/{ds}/{name}/rebuild", &["POST"]),
+    ("/$/vector/{ds}/{name}/reembed", &["POST"]),
     ("/$/vector/{ds}/{name}/recall", &["POST"]),
     ("/$/snapshots/{ds}", &["GET", "POST"]),
     ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
@@ -274,6 +275,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/geo/{ds}/rebuild"
         | "/$/vector/{ds}/{name}"
         | "/$/vector/{ds}/{name}/rebuild"
+        | "/$/vector/{ds}/{name}/reembed"
         | "/$/datasets/{ds}/clone"
         | "/$/compact/{ds}"
         | "/$/compaction/{ds}"
@@ -1022,7 +1024,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             {
                 count(Denied::Forbidden);
                 let msg = format!(
-                    "{} covers every graph of /{ds}, and your access is limited to some graphs",
+                    "{} covers every graph of /{ds}, and your access is limited to some graphs or triples",
                     route.replace("{ds}", &ds)
                 );
                 return finish(forbidden(&p, &msg));

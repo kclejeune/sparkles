@@ -132,6 +132,8 @@ pub struct GenerationVectors {
     overlay: Mutex<OverlayCache>,
     /// the generation was replaced: its index files are written no more
     retired: Mutex<bool>,
+    /// the store's embedding state (environment and cache), for searches with text
+    embedder: RwLock<Option<std::sync::Weak<super::embed::Embedder>>>,
 }
 
 /// Parsed delta vectors by literal id, and their bytes.
@@ -196,6 +198,15 @@ impl GenerationVectors {
 
     pub fn configured(&self) -> Arc<BTreeMap<String, VectorIndexConfig>> {
         self.configured.read().clone()
+    }
+
+    pub(crate) fn set_embedder(&self, e: &Arc<super::embed::Embedder>) {
+        *self.embedder.write() = Some(Arc::downgrade(e));
+    }
+
+    /// The store's embedding state, while the store is open.
+    pub(crate) fn embedder(&self) -> Option<Arc<super::embed::Embedder>> {
+        self.embedder.read().as_ref().and_then(|w| w.upgrade())
     }
 
     /// The configured index of predicate `pred` (an id of `snap`), if any.

@@ -997,6 +997,7 @@ impl Store {
             delta_stats: Default::default(),
             counts: Default::default(),
             historical: false,
+            mask: None,
         };
         self.rebuild_geo_locked(&mut new_snap, &view);
         let quads = new_snap.len();

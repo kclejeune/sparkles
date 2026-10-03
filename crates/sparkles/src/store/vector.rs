@@ -161,6 +161,8 @@ impl Store {
         snap.generation
             .vectors
             .set_configured(Arc::new(self.vector_configs()));
+        snap.generation.vectors.set_embedder(&self.embed);
+        self.embed_configure(name, Some(&cfg));
         // an unchanged build (only efSearch, the threshold or the model differ) is kept
         let gv = &snap.generation.vectors;
         let kept = gv
@@ -212,6 +214,7 @@ impl Store {
         let gv = &snap.generation.vectors;
         gv.set_configured(Arc::new(file.indexes));
         gv.remove_built(name);
+        self.embed_configure(name, None);
         if let Some(dir) = self.vector_dir(&snap) {
             gv.with_files(|| persist::remove(&dir, Some(name)));
         }
@@ -418,6 +421,7 @@ impl Store {
                 opened: b.opened,
             }),
             last_build: info.last_build.clone(),
+            embedding: self.embedding_status(&e.name),
         }
     }
 
@@ -472,6 +476,10 @@ impl Store {
             .map(|e| (e.name.clone(), e.clone()))
             .collect();
         let snap = self.snapshot();
+        snap.generation.vectors.set_embedder(&self.embed);
+        for (n, c) in &file.indexes {
+            self.embed_configure(n, Some(c));
+        }
         snap.generation
             .vectors
             .set_configured(Arc::new(file.indexes));
@@ -492,6 +500,7 @@ impl Store {
         snap.generation
             .vectors
             .set_configured(Arc::new(self.vector_configs()));
+        snap.generation.vectors.set_embedder(&self.embed);
         for e in entries {
             self.spawn_vector_build(e, snap.clone(), true);
         }
