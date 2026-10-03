@@ -3009,7 +3009,12 @@ fn dataset_info(st: &AppState, ds: &Dataset) -> J {
     if let Some(f) = ds.store.forked_from() {
         info["forkedFrom"] = json!(f);
     }
-    if let Some(o) = ds.store.root().and_then(crate::clone::read_origin) {
+    if let Some(o) = ds
+        .store
+        .root()
+        .and_then(crate::clone::read_origin)
+        .or_else(|| ds.mem_origin.clone())
+    {
         info["origin"] = o;
     }
     // a restore: the backup it came from
@@ -3237,7 +3242,7 @@ async fn clone_dataset(
     }
     let src = dataset(&st, &source)?;
     let mut params = Params::from_query(&uri);
-    let (name, inferences, kind) =
+    let (name, inferences, kind, mode, graphs) =
         if content_type(&headers) == "application/json" && !body.is_empty() {
             let v: J = serde_json::from_slice(&body)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -3245,11 +3250,43 @@ async fn clone_dataset(
                 params.0.push(("at".into(), a.to_string()));
             }
             let get = |k: &str| v[k].as_str().or_else(|| params.get(k)).map(str::to_string);
-            (get("name"), get("inferences"), get("type"))
+            let graphs = match &v["graphs"] {
+                J::Null => params.all("graph"),
+                J::Array(a) => a
+                    .iter()
+                    .map(|g| {
+                        g.as_str().map(str::to_string).ok_or_else(|| {
+                            err(
+                                StatusCode::BAD_REQUEST,
+                                "graphs must be an array of strings",
+                            )
+                        })
+                    })
+                    .collect::<ApiResult<Vec<_>>>()?,
+                _ => {
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        "graphs must be an array of strings",
+                    ));
+                }
+            };
+            (
+                get("name"),
+                get("inferences"),
+                get("type"),
+                get("mode"),
+                graphs,
+            )
         } else {
             params.extend_form(&body);
             let get = |k: &str| params.get(k).map(str::to_string);
-            (get("name"), get("inferences"), get("type"))
+            (
+                get("name"),
+                get("inferences"),
+                get("type"),
+                get("mode"),
+                params.all("graph"),
+            )
         };
     // a past state: checked (and materialized) before the task starts
     let at = history::at_param(&params)?;
@@ -3269,12 +3306,16 @@ async fn clone_dataset(
         let msg = format!("no admin access to the target name /{name}");
         return Ok(crate::auth::forbidden(&p, &msg));
     }
-    if kind.as_deref().is_some_and(|k| k == "mem") {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "clone into an in-memory dataset is not supported yet",
-        ));
-    }
+    let in_memory = match kind.as_deref() {
+        None | Some("persistent" | "tdb" | "tdb2") => false,
+        Some("mem") => true,
+        Some(k) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("type must be persistent or mem, not '{k}'"),
+            ));
+        }
+    };
     let inferences = match inferences.as_deref() {
         None => crate::clone::Inferences::Copy,
         Some(i) => crate::clone::Inferences::parse(i).ok_or_else(|| {
@@ -3283,6 +3324,27 @@ async fn clone_dataset(
                 format!("inferences must be copy or drop, not '{i}'"),
             )
         })?,
+    };
+    let mode = match mode.as_deref() {
+        None => sparkles::store::CloneMode::Auto,
+        Some(m) => sparkles::store::CloneMode::parse(m).ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("mode must be auto, link or rebuild, not '{m}'"),
+            )
+        })?,
+    };
+    if let Some(g) = graphs.iter().find(|g| !crate::clone::valid_graph_name(g)) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("graph '{g}' is not default, an absolute IRI or an IRI pattern with *"),
+        ));
+    }
+    let spec = crate::clone::Spec {
+        inferences,
+        graphs: (!graphs.is_empty()).then_some(graphs),
+        mode,
+        at,
     };
     task_start_check(&st, None, &source)?;
     let id = st.next_task_id();
@@ -3299,21 +3361,47 @@ async fn clone_dataset(
         let progress: sparkles::store::ProgressFn =
             Arc::new(move |p, msg: &str| h2.progress(p * 0.95, msg));
         let reasoning = src.reasoning.read().clone();
-        let rep = crate::clone::clone_into_at(
-            &src.store,
-            &src.name,
-            reasoning,
-            &tmp,
-            &dst,
-            inferences,
-            Some(progress),
-            Some(h.cancel_flag()),
-            at,
-        )?;
-        // the clone is in place: registering it is no longer undone by a cancel
-        h.set_cancellable(false);
-        h.progress(0.97, "registering");
-        st2.adopt(reservation)?;
+        let rep = if in_memory {
+            let c = crate::clone::clone_into_memory(
+                &src.store,
+                &src.name,
+                &target,
+                reasoning,
+                &spec,
+                st2.store_opts.clone(),
+                Some(progress),
+                Some(h.cancel_flag()),
+            )?;
+            h.set_cancellable(false);
+            h.progress(0.97, "registering");
+            st2.adopt_memory(reservation, c.store, c.reasoning, c.origin)?;
+            c.report
+        } else {
+            let rep = crate::clone::clone_into(
+                &src.store,
+                &src.name,
+                reasoning,
+                &tmp,
+                &dst,
+                &spec,
+                Some(progress),
+                Some(h.cancel_flag()),
+            )?;
+            // the clone is in place: registering it is no longer undone by a cancel
+            h.set_cancellable(false);
+            h.progress(0.97, "registering");
+            st2.adopt(reservation)?;
+            rep
+        };
+        h.set_detail(json!({
+            "method": rep.method.name(),
+            "rebuildReason": rep.rebuild_reason,
+            "type": if in_memory { "mem" } else { "persistent" },
+            "quads": rep.quads,
+            "graphs": rep.graphs,
+            "bytes": rep.bytes,
+            "millis": rep.millis,
+        }));
         Ok(format!(
             "cloned /{} at commit {} ({} quads) into /{target}",
             src.name, rep.forked_from.seq, rep.quads

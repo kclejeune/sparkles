@@ -827,6 +827,10 @@ enum Cmd {
         /// tasks have their own --backup-max-tasks
         #[arg(long, default_value_t = state::DEFAULT_MAX_TASKS)]
         max_tasks: usize,
+        /// Clones that run at once, within --max-tasks; more wait, queued (0: only
+        /// --max-tasks limits them)
+        #[arg(long, default_value_t = state::DEFAULT_MAX_CLONES)]
+        max_clones: usize,
         #[command(flatten)]
         auto_compact: compaction::AutoCompactArgs,
         /// Limit a request class per client: CLASS[@DATASET]=RATE[,burst=N]
@@ -1191,6 +1195,15 @@ enum Cmd {
         /// clone a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME
         #[arg(long)]
         at: Option<String>,
+        /// Copy only this graph (repeatable): `default`, a graph IRI, or an IRI pattern
+        /// with `*`; the inferred graph is copied only when named
+        #[arg(long = "graph", value_name = "GRAPH")]
+        graphs: Vec<String>,
+        /// `auto` shares the source's index files by reflink or copy when it has no
+        /// changes since its last compaction, `link` uses hard links first, `rebuild`
+        /// always rebuilds
+        #[arg(long, default_value = "auto")]
+        mode: String,
     },
     /// Print database statistics
     Stats {
@@ -1865,6 +1878,7 @@ fn run() -> Result<()> {
             max_upload_mb,
             min_free_disk_mb,
             max_tasks,
+            max_clones,
             auto_compact,
             max_mem_dataset_mb,
             max_dataset_mb,
@@ -1986,6 +2000,7 @@ fn run() -> Result<()> {
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
             st.metrics.fuseki_names = metrics_fuseki_names;
             st.task_queue.set_max(max_tasks);
+            st.task_queue.set_kind_max("clone", max_clones);
             st.compaction = auto_compact.state()?;
             let mib = |m: u64| (m > 0).then_some(m << 20);
             st.limits = state::Limits {
@@ -2711,11 +2726,24 @@ fn run() -> Result<()> {
             to,
             inferences,
             at,
+            graphs,
+            mode,
         } => {
             let at: Option<sparkles::history::At> = at.as_deref().map(str::parse).transpose()?;
             let inferences = clone::Inferences::parse(&inferences).with_context(|| {
                 format!("--inferences must be copy or drop, not '{inferences}'")
             })?;
+            let mode = sparkles::store::CloneMode::parse(&mode)
+                .with_context(|| format!("--mode must be auto, link or rebuild, not '{mode}'"))?;
+            if let Some(g) = graphs.iter().find(|g| !clone::valid_graph_name(g)) {
+                bail!("--graph '{g}' is not default, an absolute IRI or an IRI pattern");
+            }
+            let spec = clone::Spec {
+                inferences,
+                graphs: (!graphs.is_empty()).then_some(graphs),
+                mode,
+                at,
+            };
             if !loc.join("CURRENT").exists() {
                 bail!("{} is not a Sparkles database (no CURRENT)", loc.display());
             }
@@ -2724,27 +2752,28 @@ fn run() -> Result<()> {
             }
             let store = Store::open(&loc, opts)?;
             let t = Instant::now();
+            clone::sweep_cli_leftovers(&to);
             let mut tmp = to.as_os_str().to_owned();
             tmp.push(format!(".clone-tmp-{}", std::process::id()));
-            let r = clone::clone_into_at(
+            let r = clone::clone_into(
                 &store,
                 &loc.display().to_string(),
                 state::read_reasoning_file(&loc),
                 std::path::Path::new(&tmp),
                 &to,
-                inferences,
+                &spec,
                 None,
                 None,
-                at,
             )?;
             eprintln!(
-                "cloned {} (commit {}, {} quads, {} graph{}) to {} in {:.2}s",
+                "cloned {} (commit {}, {} quads, {} graph{}) to {} by {} in {:.2}s",
                 loc.display(),
                 r.forked_from.seq,
                 r.quads,
                 r.graphs,
                 if r.graphs == 1 { "" } else { "s" },
                 to.display(),
+                r.method.name(),
                 t.elapsed().as_secs_f64()
             );
             Ok(())

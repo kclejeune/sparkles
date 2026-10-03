@@ -409,6 +409,7 @@ impl Store {
         let meta = self.build_from_snapshot(
             &gdir,
             &snap,
+            None,
             next_bnode,
             o.min_free_disk_bytes,
             prefixes.clone(),
@@ -654,7 +655,8 @@ impl Store {
     /// Install (`Some`) or remove (`None`) the test hook run at failpoint `name`:
     /// `backup-capture-locked` (writer lock held: the hook must not write) or
     /// `backup-capture-unlocked` (right after the lock is released, before `CURRENT`
-    /// is read).
+    /// is read), or `clone-captured` (a clone took its snapshot and released the lock,
+    /// and has not copied anything yet).
     #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn set_failpoint(&self, name: &'static str, hook: Option<Failpoint>) {

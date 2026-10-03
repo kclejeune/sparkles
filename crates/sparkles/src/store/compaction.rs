@@ -1068,7 +1068,7 @@ impl Store {
             if let Some(p) = &o.progress {
                 builder = builder.with_progress(p.clone());
             }
-            write_snapshot(&builder, snap, |_| Ok(true), &[])?;
+            write_snapshot(&builder, snap, None, |_| Ok(true), &[])?;
             builder.add_prefixes(self.prefixes());
             let meta = builder.finish()?;
             interrupt()?;

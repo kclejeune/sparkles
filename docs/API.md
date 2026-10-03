@@ -498,7 +498,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | POST   | `/$/datasets/{ds}?state=offline\|active` | Fuseki's dataset state. An offline dataset answers `503 {code: "dataset-offline"}` on its own endpoints (`/{ds}/…`) and keeps its admin routes. The state is not persisted, so a restart brings every dataset back. `400` without `state` or for another value. Needs `admin` on the dataset. |
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. |
-| POST   | `/$/datasets/{ds}/clone`     | Copies the dataset into a new persistent dataset. Returns `202` with a `Task`. See [Clone](#clone). |
+| POST   | `/$/datasets/{ds}/clone`     | Copies the dataset, or some of its graphs, into a new persistent or in-memory dataset. Returns `202` with a `Task`. See [Clone](#clone). |
 | GET/POST | `/$/stats/{ds}`            | `DatasetStats`, which includes Fuseki's request counters in `datasets`. |
 | GET/POST | `/$/stats`                 | Fuseki's statistics: `{ "datasets": { "/ds": FusekiCounters } }` for every dataset the caller may read. |
 | GET    | `/$/quota/{ds}`              | *Extension.* `DatasetQuota`: the storage quota in effect and the bytes the dataset uses. See [Storage quotas](#storage-quotas). |
@@ -620,7 +620,9 @@ type Task = {
 **Task slots.** At most `sparkles serve --max-tasks` background tasks run at once (default
 4, `0` for no limit). Background tasks are compaction, clones, reasoning, full-text and
 spatial index builds, and N-Quads backups. The others wait as `queued`, in start order,
-and can be cancelled while they wait. Backup repository tasks (`backup-*` kinds) wait for
+and can be cancelled while they wait. Clones also have a limit of their own,
+`--max-clones` (default 2). A clone held back by it waits, and a freed slot goes to the
+first waiting task that may run. Backup repository tasks (`backup-*` kinds) wait for
 their own `--backup-max-tasks` slots instead. Starting a task while 1000 already wait
 returns `503`. The task list keeps every queued and running task and the 200 most recent
 finished ones. An automatic compaction starts only when a slot is free, and never waits as
@@ -1108,21 +1110,50 @@ it to an agent. The Rust API is `sparkles::schema::draft_shapes`.
 The design and its rationale are in [C06 Clone-to-sandbox](specs/C06-clone-to-sandbox.md).
 
 `POST /$/datasets/{ds}/clone` copies one consistent snapshot of `{ds}` into a new,
-independent persistent dataset. Use it to try updates, reasoning or loads without touching
-the original. Parameters come from the query string, a form body or a JSON body:
+independent dataset. Use it to try updates, reasoning or loads without touching the
+original. Parameters come from the query string, a form body or a JSON body:
 
 | Param | Required | Meaning |
 |---|---|---|
 | `name` | yes | Name of the new dataset. |
+| `type` | no, default `persistent` | `persistent` builds the clone in the data directory. `mem` makes it an in-memory dataset. |
 | `inferences` | no, default `copy` | `copy` copies the inferred graph and the reasoning status. `drop` copies neither. |
+| `graph` | no, repeatable | Copies only the graphs named. A name is `default` (or `urn:x-arq:DefaultGraph`), a graph IRI, or an IRI pattern with `*`, as in a [graph grant](#graph-level-access-control). A JSON body gives them as an array, `"graphs": [...]`. |
+| `mode` | no, default `auto` | `auto` shares the source's index files when it can. `link` does the same with hard links. `rebuild` always rebuilds the index. |
 | `at` | no, default the head | A past state to copy, with the selectors of [point-in-time reads](#point-in-time-reads-and-snapshots). Its commit becomes `forkedFrom.seq`. |
 
-The copy has every quad of every graph, including blank-node graph names and triple
-terms. It keeps the same blank-node ids (`_:b<hex>` labels) and the prefixes, and gets a
-freshly compacted index. The clone starts a new lineage, with a new dataset id and a root
-commit `0`. The source's id and the copied commit are kept as `forkedFrom`. Commit
-history, the WAL and caches are not copied. Full-text search stays enabled with the same
-configuration, and the clone builds its own index when it is first opened.
+The copy has every quad of every selected graph, including triple terms. It keeps the
+same blank-node ids (`_:b<hex>` labels) and the prefixes. The clone starts a new lineage,
+with a new dataset id and a root commit `0`. The source's id and the copied commit are
+kept as `forkedFrom`. The clone carries no history: commit records, named snapshots,
+retention settings, older generations, the WAL and caches stay with the source. Clone at
+`at=` to start from a past state. Full-text search, the spatial index and the vector
+indexes stay enabled with the same configuration, and the clone builds its own indexes.
+
+**How the copy is made.** A source whose quads are all in its current generation has had
+no change since its last compaction or bulk load. A clone of such a source, at the head
+and with every graph, shares that generation's index files instead of rebuilding them.
+With `mode=auto` each file is cloned by reflink where the file system supports it (btrfs,
+XFS, ZFS with block cloning) and copied otherwise. With `mode=link` each file is a hard
+link to the source's when both are on one file system. Index files are never changed once
+written, so later writes and compactions on either side never reach the other. The source
+generation is leased while its files are copied, so a compaction that switches the
+source's generation meanwhile keeps the old one until the clone has its copy. The history
+status shows the lease as `clone:<name>`. Any other clone is rebuilt from the snapshot,
+as a compaction rebuilds a generation, which costs about as much as a compaction of the
+source. The [spec's outcome](specs/C06-clone-to-sandbox.md#outcome) has measured times
+for both.
+
+**Partial clones.** With `graph=`, the clone copies only the named graphs and reads only
+those graphs from the source. Patterns never match the inferred graph, and graphs named
+by blank nodes are never selected. A partial clone copies the reasoning status only when
+it names the inferred graph, and then marks the inferences stale, because they were
+drawn from graphs it may have left out.
+
+**In-memory clones.** With `type=mem`, the clone is a new in-memory dataset. Like every
+in-memory dataset, it stays registered after a restart but starts empty. Write-time
+validation and stored queries are not carried into an in-memory clone. An in-memory
+dataset can be cloned too, into either type.
 
 With `inferences=copy`, inferences that were fresh at the copied commit are fresh in the
 clone. Stale ones stay stale, with `staleReason: "inherited from source at clone time"`,
@@ -1130,10 +1161,25 @@ and unknown ones stay unknown. Updates to the source continue during the clone a
 included.
 
 The endpoint returns `202` with a `Task` (`kind: "clone"`, `target`) and
-`Location: /$/datasets/{name}`. The errors are:
+`Location: /$/datasets/{name}`. When the task is done, its `detail` says how the copy was
+made:
 
-* `400`: a missing or invalid `name`, a bad `inferences`, or `type=mem`. In-memory clones
-  are not supported yet.
+```ts
+type CloneDetail = {
+  method: "link" | "reflink" | "copy" | "rebuild";
+  rebuildReason: string | null;   // why the source's files were not shared
+  type: "persistent" | "mem";
+  quads: number; graphs: number;
+  bytes: number;                  // index bytes shared or written
+  millis: number;
+};
+```
+
+At most `sparkles serve --max-clones` clones run at once (default 2, `0` leaves only the
+limit of `--max-tasks`). Clones also take the task slots of `--max-tasks` (see [Datasets](#datasets-admin)). A clone over the limit
+waits as `queued`, and other tasks still start in free slots. The errors are:
+
+* `400`: a missing or invalid `name`, or a bad `type`, `inferences`, `graph` or `mode`.
 * `403`: the server is read-only.
 * `404`: the source is unknown.
 * `409`: `name` is registered, or another task is creating it, or
@@ -1149,11 +1195,15 @@ type DatasetOrigin = {            // origin.json in the clone's directory
   source: { name: string; path?: string; version: number; generation: string; quads: number };
   forkedFrom: { id: string; seq: number };
   inferences: "copy" | "drop";
+  graphs?: string[];              // a partial clone's selection
+  method?: "link" | "reflink" | "copy" | "rebuild";
 };
 ```
 
-`sparkles clone --loc SRC --to DST [--inferences copy|drop] [--at SEL]` does the same offline. `DST`
-must not exist or must be empty. `SRC` must be a database that no server has open.
+`sparkles clone --loc SRC --to DST [--inferences copy|drop] [--at SEL] [--graph G]…
+[--mode auto|link|rebuild]` does the same offline. `DST` must not exist or must be empty.
+`SRC` must be a database that no server has open. A run that stops before it finishes
+leaves a `DST.clone-tmp-PID` directory, which the next run into `DST` removes.
 
 ## Per-dataset SPARQL protocol (Fuseki compatible)
 
