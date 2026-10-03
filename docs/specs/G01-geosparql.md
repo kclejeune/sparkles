@@ -1549,6 +1549,12 @@ list gets updated too, since QLever's libspatialjoin is likely faster on huge se
     supply `crs.json`. The exception would be bundled UTM-style definitions, if the
     maintainer accepts the EPSG terms or the CC0 label of `crs-definitions`. The built-in
     UTM zones are formulas with zone parameters, not EPSG data.
+    **Decided on 2026-10-03.** The maintainer accepted the EPSG terms for the server. The
+    `geo-epsg` feature is on in the default features of `sparkles-server`, and so in the
+    binary and the Nix package, and off in the `sparkles` library. `THIRD_PARTY_LICENSES.md`
+    carries the terms of use and acknowledges IOGP's ownership. The stripped release
+    binary grows by 5.4 MB, from 64.4 MB to 69.9 MB. The Outcome gives the accuracy
+    policy.
 17. **Query Rewrite on by default.** This matches Jena. It changes the answers of existing
     queries that use `geo:sf*` as plain predicates on data with geometries. They get more
     rows, never fewer. A dataset can turn rewrite off.
@@ -1729,7 +1735,11 @@ approximations, `geo:hasMetricArea` and similar properties by rewrite, QLever's
 * Measures are geodesic on WGS 84 by default, with haversine as a per-dataset option
   (§11 q2).
 * The index is opt-in per dataset (q1).
-* No EPSG data ships (q16).
+* EPSG-derived definitions ship in the server (q16). On 2026-10-03 the maintainer
+  turned the `geo-epsg` feature on in the default features of `sparkles-server`, and so
+  in the `sparkles` binary and the Nix package. It stays off in the library, so an
+  embedder opts in to the EPSG terms of use, as Apache SIS users do. The section on EPSG
+  definitions below gives the accuracy policy and the size.
 * The map uses MapLibre with a bundled Natural Earth basemap (q13).
 * The GPL-2.0 Compliance Benchmark is only fetched at test time, behind
   `SPARKLES_ALLOW_GPL_BENCHMARK=1`, and never vendored (q12).
@@ -1763,8 +1773,8 @@ approximations, `geo:hasMetricArea` and similar properties by rewrite, QLever's
     a `crs.json` per dataset, because a CRS IRI means the same thing in every dataset.
     Only projected definitions are accepted. The registered definitions are part of the
     index files' identity, so changing them rebuilds the index.
-  * No EPSG data ships, as decided (q16). The opt-in `geo-epsg` feature resolves other
-    EPSG codes through `crs-definitions`, which is derived from EPSG.
+  * EPSG codes resolve through the proj4 table of `crs-definitions`, which is derived
+    from EPSG, rather than through the EPSG database. The `geo-epsg` feature links it.
   * A `spatial:` binding that does not make valid arguments matches nothing, while the
     same constant is a `400`. An unbound argument variable is a `400`, no longer `501`.
 * Some choices were made during implementation and are open to revision:
@@ -1775,6 +1785,43 @@ approximations, `geo:hasMetricArea` and similar properties by rewrite, QLever's
     graph.
   * `GET /{ds}/geo` scans when the index is not ready.
   * `POST /$/geo/convert` is open to any caller.
+
+**EPSG definitions and datum accuracy.** The `geo-epsg` feature resolves a projected
+EPSG code on first use from the 6,184 definitions of `crs-definitions` 0.5.0. Every
+transform goes through WGS 84, so a definition's datum shift decides how accurate its
+transforms are. Sparkles sorts the definitions, and those of `--geo-crs`, by that shift.
+* A definition whose shift needs grid files is refused, because Sparkles has no grids.
+  The table has 205 NAD27 definitions, which imply the NADCON and NTv2 grids, and 34
+  NZGD49 ones that name `nzgd2kgrid0005.gsb`. The refusal names the CRS and the grids. A
+  literal in such a CRS is in an unknown CRS, and a query that reads it or transforms to
+  it gets a `geo-crs-unsupported` plan warning with the reason. A `--geo-crs` definition
+  with a grid stops the command with the same reason.
+* A definition with a Helmert shift is accepted, and its transforms are approximate.
+  That covers `+towgs84` with nonzero parameters, zero ones on an ellipsoid other than
+  WGS 84 and GRS 80, and the proj4 datums that imply a shift, such as `OSGB36`. The table
+  has 1,543 of them. A query that reads a geometry in such a CRS or transforms to one gets
+  a `geo-crs-approximate` plan warning that names the CRS, and `--geo-crs` logs such
+  definitions when a command starts. Against PROJ 9.9 with the national grids, EPSG:27700
+  is 0.5 m off OSTN15 in Edinburgh, 1.8 m in Greenwich and 4.3 m at Land's End, and
+  EPSG:28992 is within 0.1 m of RDNAPTRANS 2018 in Amsterdam and Eindhoven.
+* A definition on WGS 84, or on a GRS 80 datum without a shift, is exact up to the
+  projection formulas. The table has 3,095 of them. Lambert-93 (EPSG:2154) and ETRS89 /
+  UTM 32N (EPSG:25832) match PROJ to the millimetre.
+* A definition on another ellipsoid that gives no shift at all takes its coordinates as
+  WGS 84 ones, which can be hundreds of metres off. The table has 278 of them. Refusing
+  them would drop CRSs whose literals still relate correctly to each other, so they are
+  accepted with the `geo-crs-approximate` warning, which states the size of the error.
+* The table's other 1,029 definitions are refused too. 956 are geographic or geocentric
+  CRSs, and `proj4rs` cannot read 73.
+
+The feature is part of the spatial index files' identity, so a server that gains it
+rebuilds its spatial indexes once when the datasets open. The Python bindings do not
+turn on `geo`, so they leave the table out.
+
+The table makes the release binary 5.4 MB larger. On x86_64 Linux the stripped
+`sparkles` binary is 69.9 MB with the feature and 64.4 MB without it, 8.5% more. With the
+release profile's line tables it is 436.9 MB against 431.3 MB. Most of the table is the
+WKT text of each definition, which Sparkles reads only for the axis order and the name.
 
 **Conformance.** The §7 examples and seeded comparisons of the index plan against the plain
 plan run as tests, and so do the GML and KML examples printed in GeoSPARQL 1.1. The W3C

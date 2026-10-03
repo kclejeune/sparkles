@@ -43,6 +43,25 @@ request, so requests that keep arriving, even with short gaps, never meet a rele
 `--no-default-features --features reasoning,shacl` uses the system allocator and
 `malloc_trim` instead.
 
+The binary includes EPSG-derived definitions of projected coordinate reference systems,
+so GeoSPARQL literals can name codes such as `EPSG:27700` without a `--geo-crs` file.
+They come from the `crs-definitions` crate through the `geo-epsg` cargo feature of
+`sparkles-server`, which is on by default. The EPSG Dataset they derive from belongs to
+IOGP and is distributed under the [EPSG terms of use](https://epsg.org/terms-of-use.html).
+The terms allow free use and redistribution but forbid selling the data. They require
+that every recipient gets the terms and that modified data is not presented as EPSG data.
+`THIRD_PARTY_LICENSES.md` carries the terms. A build without the definitions leaves
+`geo-epsg` out of the default features.
+
+```sh
+cargo build --release -p sparkles-server --no-default-features \
+  --features reasoning,shacl,shex,mimalloc,text,geo,otel,auth,mcp,backup,fmt,tls
+```
+
+The `sparkles` library and the Python package do not include the definitions.
+[API.md](API.md#epsg-codes) describes which codes resolve and how accurate their datum
+shifts are.
+
 ### Network exposure
 
 `serve` listens on `127.0.0.1` by default. It refuses to start on a non-loopback `--host`,
@@ -294,7 +313,7 @@ happens to materialized inferences, and the limits.
 | `--geo NAME[=FILE]` | | Enable the spatial index for a dataset. `FILE` is a `geo.json`-shaped configuration file. The build runs before the server starts listening. |
 | `--geo-mb N` | `4096` | Memory for each dataset's spatial index (geometry column and trees). A build that would exceed it is refused, the status says `over-budget`, and queries run without the index. |
 | `--geo-op-vertices N` | `2000000` | Largest total of input vertices for one geometry operation (overlay, buffer, hull, relate). A larger operation is a type error. |
-| `--geo-crs FILE` | | Projected CRSs to support beyond the built-in ones, as a JSON file that maps CRS IRIs to proj4 definitions. A global flag, also read from `SPARKLES_GEO_CRS`. A file that cannot be read stops the command ([API](API.md#crss-from-proj4-definitions)). |
+| `--geo-crs FILE` | | Projected CRSs to support beyond the built-in ones and the EPSG codes the binary resolves, as a JSON file that maps CRS IRIs to proj4 definitions. A global flag, also read from `SPARKLES_GEO_CRS`. A file that cannot be read stops the command ([API](API.md#crss-from-proj4-definitions)). |
 | `--log-format text\|json` | `text` | Log format on stderr. A global flag. `RUST_LOG` filters as usual. |
 | `--no-access-log` | | No per-request log lines. |
 | `--no-metrics` | | `/$/metrics` answers `404`, and no request metrics are kept. |
