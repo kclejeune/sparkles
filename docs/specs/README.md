@@ -4,8 +4,7 @@ These are the design specs for the features Sparkles added beyond its port of Je
 Fuseki and QLever's engine. Each spec was written before the feature was built. The
 sources were public standards, published papers, the Sparkles code, and the documentation
 and permissively licensed code of other projects. [PROVENANCE.md](PROVENANCE.md) records
-the sources of each spec and the dependencies it brought in. Fluree was not consulted for
-any of them.
+the sources of each spec and the dependencies it brought in.
 
 Each spec opens with a status block that gives its status, the phases shipped and links
 to the user docs. It closes with an **Outcome** section, which records what was delivered,
