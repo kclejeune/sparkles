@@ -42,8 +42,10 @@ export const KEYWORDS = [
   'OFFSET',
   'VALUES',
   'OPTIONAL',
-  // Jena ARQ's lateral join
+  // Jena ARQ's lateral join, assignment and UNFOLD
   'LATERAL',
+  'LET',
+  'UNFOLD',
   'GRAPH',
   'SERVICE',
   'SILENT',
@@ -146,6 +148,7 @@ export const FUNCTIONS = [
   'VARIANCE',
   'VAR_SAMP',
   'VAR_POP',
+  'FOLD',
   'TRIPLE',
   'SUBJECT',
   'PREDICATE',
@@ -157,8 +160,9 @@ const KW = new Set(KEYWORDS);
 const FN = new Set(FUNCTIONS);
 
 /**
- * GeoSPARQL and Jena spatial terms, offered after their prefix whatever the dataset
- * holds: namespace → [local name, whether it is a function (inserted with `(`)].
+ * GeoSPARQL and Jena spatial terms, and Jena's composite datatype functions, offered after
+ * their prefix whatever the dataset holds: namespace → [local name, whether it is a
+ * function (inserted with `(`)].
  */
 const RELATIONS = ['Equals', 'Disjoint', 'Intersects', 'Touches', 'Within', 'Contains']
   .concat(['Overlaps', 'Crosses'])
@@ -193,6 +197,11 @@ export const SPATIAL_TERMS: Record<string, [string, boolean][]> = {
   'http://www.opengis.net/def/uom/OGC/1.0/': 'metre kilometre mile nauticalMile foot degree radian'
     .split(' ')
     .map((u) => [u, false]),
+  // Jena's composite datatype functions (cdt:List and cdt:Map)
+  'http://w3id.org/awslabs/neptune/SPARQL-CDTs/':
+    'List Map concat contains containsKey containsTerm get head keys merge put remove reverse size subseq tail'
+      .split(' ')
+      .map((f) => [f, true]),
   'http://www.opengis.net/ont/sf#':
     'Point LineString Polygon MultiPoint MultiLineString MultiPolygon GeometryCollection'
       .split(' ')

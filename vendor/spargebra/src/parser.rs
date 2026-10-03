@@ -112,9 +112,10 @@ impl SparqlParser {
     }
 
     /// Whether Jena ARQ's extensions of the SPARQL syntax are accepted (the default) or
-    /// are syntax errors: `LATERAL`, path ranges (`p{2}`,
+    /// are syntax errors: `LATERAL`, `LET`, `UNFOLD`, path ranges (`p{2}`,
     /// `p{1,3}`, `p{2,}`, `p{,3}`, `p{*}`, `p{+}`), `GRAPH` blocks in CONSTRUCT
-    /// templates and ARQ's aggregates (`MEDIAN`, `MODE`, `STDEV`, …, `AGG <iri>(…)`).
+    /// templates and ARQ's aggregates (`MEDIAN`, `MODE`, `STDEV`, …, `FOLD`,
+    /// `AGG <iri>(…)`).
     ///
     /// ```
     /// use spargebra::SparqlParser;
@@ -595,6 +596,10 @@ enum PartialGraphPattern {
     Lateral(GraphPattern),
     Minus(GraphPattern),
     Bind(Expression, Variable),
+    /// ARQ's `LET (?v := expr)`
+    Assign(Expression, Variable),
+    /// ARQ's `UNFOLD(expr AS ?v1, ?v2)`
+    Unfold(Expression, Variable, Option<Variable>),
     Filter(Expression),
     Other(GraphPattern),
 }
@@ -907,8 +912,23 @@ fn add_defined_variables<'a>(pattern: &'a GraphPattern, set: &mut HashSet<&'a Va
         }
         GraphPattern::Extend {
             inner, variable, ..
+        }
+        | GraphPattern::Assign {
+            inner, variable, ..
         } => {
             set.insert(variable);
+            add_defined_variables(inner, set);
+        }
+        GraphPattern::Unfold {
+            inner,
+            variable,
+            second,
+            ..
+        } => {
+            set.insert(variable);
+            if let Some(second) = second {
+                set.insert(second);
+            }
             add_defined_variables(inner, set);
         }
         GraphPattern::Group {
@@ -1074,13 +1094,25 @@ impl ParserState {
         // contain an aggregate function." An aggregate call parsed inside `expr` has
         // already been replaced by the fresh variable registered for it at this query
         // level, so a nested aggregate shows up as one of those variables.
-        if let AggregateExpression::FunctionCall { expr, .. } = &agg {
-            if aggregates
+        let args: Vec<&Expression> = match &agg {
+            AggregateExpression::CountSolutions { .. } => Vec::new(),
+            AggregateExpression::FunctionCall { expr, .. } => vec![expr],
+            AggregateExpression::Fold {
+                expr, value, order, ..
+            } => [expr]
+                .into_iter()
+                .chain(value)
+                .chain(order.iter().map(|o| match o {
+                    OrderExpression::Asc(e) | OrderExpression::Desc(e) => e,
+                }))
+                .collect(),
+        };
+        if args.iter().any(|expr| {
+            aggregates
                 .iter()
                 .any(|(v, _)| expression_uses_variable(expr, v))
-            {
-                return Err("Aggregate functions cannot be nested");
-            }
+        }) {
+            return Err("Aggregate functions cannot be nested");
         }
         Ok(aggregates
             .iter()
@@ -1636,6 +1668,23 @@ parser! {
                         }
                         g = GraphPattern::Extend { inner: Box::new(g), variable, expression }
                     }
+                    // ARQ's LET may assign a variable that is in scope (`SyntaxVarScope`)
+                    PartialGraphPattern::Assign(expression, variable) => {
+                        g = GraphPattern::Assign { inner: Box::new(g), variable, expression }
+                    }
+                    // ARQ's `checkUNFOLD`: neither variable may be in scope
+                    PartialGraphPattern::Unfold(expression, variable, second) => {
+                        let mut contains = false;
+                        g.on_in_scope_variable(|v| {
+                            if *v == variable || second.as_ref() == Some(v) {
+                                contains = true;
+                            }
+                        });
+                        if contains || second.as_ref() == Some(&variable) {
+                            return Err("UNFOLD is overriding an existing variable")
+                        }
+                        g = GraphPattern::Unfold { inner: Box::new(g), expression, variable, second }
+                    }
                     PartialGraphPattern::Filter(expr) => filter = Some(if let Some(f) = filter {
                         Expression::And(Box::new(f), Box::new(expr))
                     } else {
@@ -1682,7 +1731,18 @@ parser! {
             Ok(patterns)
         }
 
-        rule GraphPatternNotTriples() -> PartialGraphPattern = GroupOrUnionGraphPattern() / OptionalGraphPattern() / LateralGraphPattern() / MinusGraphPattern() / GraphGraphPattern() / ServiceGraphPattern() / Filter() / Bind() / InlineData()
+        rule GraphPatternNotTriples() -> PartialGraphPattern = GroupOrUnionGraphPattern() / OptionalGraphPattern() / LateralGraphPattern() / MinusGraphPattern() / GraphGraphPattern() / ServiceGraphPattern() / Filter() / Bind() / InlineData() / Assignment() / Unfold()
+
+        // ARQ's `LET (?v := expr)` (`Assignment` in ARQ's grammar)
+        rule Assignment() -> PartialGraphPattern = i("LET") _ arq() "(" _ v:Var() _ ":=" _ e:Expression() _ ")" {
+            PartialGraphPattern::Assign(e, v)
+        }
+
+        // ARQ's `UNFOLD(expr AS ?v1)` and `UNFOLD(expr AS ?v1, ?v2)`
+        rule Unfold() -> PartialGraphPattern = i("UNFOLD") _ arq() "(" _ e:Expression() _ i("AS") _ v:Var() _ w:Unfold_second()? ")" {
+            PartialGraphPattern::Unfold(e, v, w)
+        }
+        rule Unfold_second() -> Variable = "," _ v:Var() _ { v }
 
         // SPARQL 1.1 §18.2.2.6: OPTIONAL{P} is LeftJoin(G, A2, F) when Translate(P) is
         // Filter(F, A2), i.e. when P itself has FILTERs (§18.2.2.7). The simplification of
@@ -2538,6 +2598,9 @@ parser! {
             i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: true } } /
             i("GROUP_CONCAT") _ "(" _ expr:Expression() _ ";" _ i("SEPARATOR") _ "=" _ s:String() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: Some(s) }, expr, distinct: false } } /
             i("GROUP_CONCAT") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: false } } /
+            arq() i("FOLD") _ "(" _ d:Fold_distinct()? expr:Expression() _ value:Fold_value()? order:Fold_order()? ")" {
+                AggregateExpression::Fold { expr, value, distinct: d.is_some(), order: order.unwrap_or_default() }
+            } /
             arq() name:ArqAggregateKeyword() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
             arq() name:ArqAggregateKeyword() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
             arq() i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
@@ -2556,6 +2619,11 @@ parser! {
                     Err("This custom function is a regular function and not an aggregate function")
                 }
             }
+
+        // the parts of ARQ's FOLD after `FOLD(`
+        rule Fold_distinct() -> () = i("DISTINCT") _ { }
+        rule Fold_value() -> Expression = "," _ e:Expression() _ { e }
+        rule Fold_order() -> Vec<OrderExpression> = i("ORDER") _ i("BY") _ c:OrderClause_item()+ { c }
 
         // ARQ's aggregate keywords (ARQ_AGGREGATE_KEYWORDS), as the IRIs they stand for
         rule ArqAggregateKeyword() -> NamedNode =

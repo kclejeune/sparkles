@@ -170,4 +170,10 @@ pub enum NodeKind {
     JsonArray,
     /// a string, number, `true`, `false` or `null`
     JsonScalar,
+
+    // ---- SPARQL: Jena ARQ's group elements
+    /// `LET (?v := expr)`
+    Let,
+    /// `UNFOLD(expr AS ?v)` or `UNFOLD(expr AS ?v, ?w)`
+    Unfold,
 }

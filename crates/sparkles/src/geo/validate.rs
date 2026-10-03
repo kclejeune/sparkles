@@ -50,6 +50,12 @@ impl Visitor<'_> {
             }
             GP::Extend {
                 inner, expression, ..
+            }
+            | GP::Assign {
+                inner, expression, ..
+            }
+            | GP::Unfold {
+                inner, expression, ..
             } => {
                 self.expr(expression, false)?;
                 self.pattern(inner)

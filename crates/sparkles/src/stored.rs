@@ -251,8 +251,21 @@ fn assigned(p: &GraphPattern, out: &mut Vec<String>) {
         | G::Service { inner, .. } => assigned(inner, out),
         G::Extend {
             inner, variable, ..
+        }
+        | G::Assign {
+            inner, variable, ..
         } => {
             out.push(variable.as_str().to_string());
+            assigned(inner, out);
+        }
+        G::Unfold {
+            inner,
+            variable,
+            second,
+            ..
+        } => {
+            out.push(variable.as_str().to_string());
+            out.extend(second.iter().map(|v| v.as_str().to_string()));
             assigned(inner, out);
         }
         G::Values { variables, .. } => {

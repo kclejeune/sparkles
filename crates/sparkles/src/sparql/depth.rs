@@ -197,6 +197,12 @@ impl Walk {
             GraphPattern::Filter { expr, inner } => self.expr(expr, n).max(self.pattern(inner, n)),
             GraphPattern::Extend {
                 inner, expression, ..
+            }
+            | GraphPattern::Assign {
+                inner, expression, ..
+            }
+            | GraphPattern::Unfold {
+                inner, expression, ..
             } => self.pattern(inner, n).max(self.expr(expression, n)),
             GraphPattern::Values { bindings, .. } => bindings
                 .iter()
@@ -217,6 +223,15 @@ impl Walk {
                 .map(|(_, a)| match a {
                     AggregateExpression::CountSolutions { .. } => n,
                     AggregateExpression::FunctionCall { expr, .. } => self.expr(expr, n),
+                    AggregateExpression::Fold {
+                        expr, value, order, ..
+                    } => value
+                        .iter()
+                        .chain(order.iter().map(|o| match o {
+                            OrderExpression::Asc(e) | OrderExpression::Desc(e) => e,
+                        }))
+                        .map(|e| self.expr(e, n))
+                        .fold(self.expr(expr, n), usize::max),
                 })
                 .fold(self.pattern(inner, n), usize::max),
             GraphPattern::Graph { inner, .. }

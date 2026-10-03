@@ -1485,12 +1485,13 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
     })
 }
 
-/// Is `iri` a supported extension function (fn:, math:, afn:, and with the `geo`
+/// Is `iri` a supported extension function (fn:, math:, afn:, cdt:, and with the `geo`
 /// feature geof:, spatialF:)?
 pub fn is_extension(iri: &str) -> bool {
     iri.starts_with(FN)
         || iri.starts_with(MATH)
         || iri.starts_with(AFN)
+        || iri.starts_with(super::cdt::NS)
         || iri.starts_with(crate::vector::NS)
         || (cfg!(feature = "geo")
             && (iri.starts_with(crate::geo::vocab::GEOF)
@@ -1501,6 +1502,9 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
     #[cfg(feature = "geo")]
     if let Some(r) = crate::geo::functions::call(iri, args, row, ctx) {
         return r;
+    }
+    if let Some(l) = iri.strip_prefix(super::cdt::NS) {
+        return super::cdt::call(l, args, row, ctx);
     }
     let a = |i: usize| arg(args, i, row, ctx);
     let dbl = |i: usize| -> EvalResult<f64> { Ok(Num::of(&*a(i)?)?.to_double().into()) };

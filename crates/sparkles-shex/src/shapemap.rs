@@ -731,6 +731,8 @@ fn has_service(p: &GraphPattern) -> bool {
         G::Filter { inner, .. }
         | G::Graph { inner, .. }
         | G::Extend { inner, .. }
+        | G::Assign { inner, .. }
+        | G::Unfold { inner, .. }
         | G::OrderBy { inner, .. }
         | G::Project { inner, .. }
         | G::Distinct { inner }

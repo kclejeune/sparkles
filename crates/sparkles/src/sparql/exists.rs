@@ -706,6 +706,8 @@ fn construct(gp: &GraphPattern) -> &'static str {
         GP::Union { .. } => "a UNION",
         GP::Minus { .. } => "a MINUS",
         GP::Extend { .. } => "a BIND",
+        GP::Assign { .. } => "a LET",
+        GP::Unfold { .. } => "an UNFOLD",
         GP::Values { .. } => "a VALUES block",
         GP::Service { .. } => "a SERVICE call",
         GP::Group { .. } | GP::Project { .. } => "a sub-select",
@@ -782,6 +784,12 @@ pub(super) fn pure_pattern(gp: &GraphPattern) -> bool {
         GP::Filter { expr, inner } => pure(expr) && pure_pattern(inner),
         GP::Extend {
             inner, expression, ..
+        }
+        | GP::Assign {
+            inner, expression, ..
+        }
+        | GP::Unfold {
+            inner, expression, ..
         } => pure(expression) && pure_pattern(inner),
         GP::LeftJoin {
             left,
@@ -808,6 +816,15 @@ pub(super) fn pure_pattern(gp: &GraphPattern) -> bool {
             aggregates.iter().all(|(_, a)| match a {
                 AggregateExpression::CountSolutions { .. } => true,
                 AggregateExpression::FunctionCall { expr, .. } => pure(expr),
+                AggregateExpression::Fold {
+                    expr, value, order, ..
+                } => {
+                    pure(expr)
+                        && value.as_ref().is_none_or(pure)
+                        && order.iter().all(|o| match o {
+                            OrderExpression::Asc(e) | OrderExpression::Desc(e) => pure(e),
+                        })
+                }
             }) && pure_pattern(inner)
         }
         // a remote endpoint answers as it likes

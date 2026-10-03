@@ -402,6 +402,12 @@ impl Rewriter<'_> {
             }
             G::Extend {
                 inner, expression, ..
+            }
+            | G::Assign {
+                inner, expression, ..
+            }
+            | G::Unfold {
+                inner, expression, ..
             } => {
                 self.expr(expression);
                 self.walk(inner);
@@ -423,8 +429,24 @@ impl Rewriter<'_> {
                 inner, aggregates, ..
             } => {
                 for (_, a) in aggregates {
-                    if let AggregateExpression::FunctionCall { expr, .. } = a {
-                        self.expr(expr);
+                    match a {
+                        AggregateExpression::CountSolutions { .. } => {}
+                        AggregateExpression::FunctionCall { expr, .. } => self.expr(expr),
+                        AggregateExpression::Fold {
+                            expr, value, order, ..
+                        } => {
+                            self.expr(expr);
+                            if let Some(v) = value {
+                                self.expr(v);
+                            }
+                            for o in order {
+                                match o {
+                                    OrderExpression::Asc(e) | OrderExpression::Desc(e) => {
+                                        self.expr(e)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 self.walk(inner);
@@ -1135,6 +1157,12 @@ fn blank_to_var(gp: &mut GraphPattern) {
             blank_to_var(inner);
         }
         G::Extend {
+            inner, expression, ..
+        }
+        | G::Assign {
+            inner, expression, ..
+        }
+        | G::Unfold {
             inner, expression, ..
         } => {
             expr(expression);

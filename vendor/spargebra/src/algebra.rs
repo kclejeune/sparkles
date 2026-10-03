@@ -657,6 +657,23 @@ pub enum GraphPattern {
     },
     /// [Minus](https://www.w3.org/TR/sparql11-query/#defn_algMinus).
     Minus { left: Box<Self>, right: Box<Self> },
+    /// Jena ARQ's assignment, `LET (?v := expr)`. It extends each solution as `Extend`
+    /// does, but `variable` may already be in scope: a solution that binds it keeps its
+    /// value when the expression's value is the same and is dropped when it differs.
+    Assign {
+        inner: Box<Self>,
+        variable: Variable,
+        expression: Expression,
+    },
+    /// Jena ARQ's `UNFOLD(expr AS ?v1, ?v2)`: one solution per element of the
+    /// `cdt:List` literal, or per entry of the `cdt:Map` literal, that `expression`
+    /// evaluates to. `variable` gets the element or key, `second` the position or value.
+    Unfold {
+        inner: Box<Self>,
+        expression: Expression,
+        variable: Variable,
+        second: Option<Variable>,
+    },
     /// A table used to provide inline values
     Values {
         variables: Vec<Variable>,
@@ -715,6 +732,8 @@ impl fmt::Display for GraphPattern {
                     Self::LeftJoin { .. }
                     | Self::Minus { .. }
                     | Self::Extend { .. }
+                    | Self::Assign { .. }
+                    | Self::Unfold { .. }
                     | Self::Filter { .. } => {
                         // The second block might be considered as a modification of the first one.
                         write!(f, "{left} {{ {right} }}")
@@ -762,6 +781,20 @@ impl fmt::Display for GraphPattern {
                 variable,
                 expression,
             } => write!(f, "{inner} BIND({expression} AS {variable})"),
+            Self::Assign {
+                inner,
+                variable,
+                expression,
+            } => write!(f, "{inner} LET({variable} := {expression})"),
+            Self::Unfold {
+                inner,
+                expression,
+                variable,
+                second,
+            } => match second {
+                Some(second) => write!(f, "{inner} UNFOLD({expression} AS {variable}, {second})"),
+                None => write!(f, "{inner} UNFOLD({expression} AS {variable})"),
+            },
             Self::Minus { left, right } => write!(f, "{left} MINUS {{ {right} }}"),
             Self::Service {
                 name,
@@ -920,6 +953,33 @@ impl GraphPattern {
                 write!(f, "(extend (({variable} ")?;
                 expression.fmt_sse(f)?;
                 f.write_str(")) ")?;
+                inner.fmt_sse(f)?;
+                f.write_str(")")
+            }
+            Self::Assign {
+                inner,
+                variable,
+                expression,
+            } => {
+                write!(f, "(assign (({variable} ")?;
+                expression.fmt_sse(f)?;
+                f.write_str(")) ")?;
+                inner.fmt_sse(f)?;
+                f.write_str(")")
+            }
+            Self::Unfold {
+                inner,
+                expression,
+                variable,
+                second,
+            } => {
+                f.write_str("(unfold (")?;
+                expression.fmt_sse(f)?;
+                write!(f, " {variable}")?;
+                if let Some(second) = second {
+                    write!(f, " {second}")?;
+                }
+                f.write_str(") ")?;
                 inner.fmt_sse(f)?;
                 f.write_str(")")
             }
@@ -1088,8 +1148,23 @@ impl GraphPattern {
             }
             Self::Extend {
                 inner, variable, ..
+            }
+            | Self::Assign {
+                inner, variable, ..
             } => {
                 callback(variable);
+                inner.lookup_in_scope_variables(callback);
+            }
+            Self::Unfold {
+                inner,
+                variable,
+                second,
+                ..
+            } => {
+                callback(variable);
+                if let Some(second) = second {
+                    callback(second);
+                }
                 inner.lookup_in_scope_variables(callback);
             }
             Self::Minus { left, .. } => left.lookup_in_scope_variables(callback),
@@ -1176,8 +1251,26 @@ impl GraphPattern {
                 inner,
                 variable,
                 expression,
+            }
+            | Self::Assign {
+                inner,
+                variable,
+                expression,
             } => {
                 callback(variable);
+                expression.lookup_used_variable(callback);
+                inner.lookup_used_variables(callback);
+            }
+            Self::Unfold {
+                inner,
+                expression,
+                variable,
+                second,
+            } => {
+                callback(variable);
+                if let Some(second) = second {
+                    callback(second);
+                }
                 expression.lookup_used_variable(callback);
                 inner.lookup_used_variables(callback);
             }
@@ -1367,6 +1460,15 @@ pub enum AggregateExpression {
         expr: Expression,
         distinct: bool,
     },
+    /// Jena ARQ's `FOLD(expr ORDER BY …)`, which folds the values into a `cdt:List`
+    /// literal, and `FOLD(key, value ORDER BY …)`, which folds them into a `cdt:Map`
+    /// literal. `order` sorts the group's solutions first.
+    Fold {
+        expr: Expression,
+        value: Option<Expression>,
+        distinct: bool,
+        order: Vec<OrderExpression>,
+    },
 }
 
 impl AggregateExpression {
@@ -1409,12 +1511,49 @@ impl AggregateExpression {
                 expr.fmt_sse(f)?;
                 f.write_str(")")
             }
+            Self::Fold {
+                expr,
+                value,
+                distinct,
+                order,
+            } => {
+                f.write_str("(fold ")?;
+                if *distinct {
+                    f.write_str("distinct ")?;
+                }
+                expr.fmt_sse(f)?;
+                if let Some(value) = value {
+                    f.write_str(" ")?;
+                    value.fmt_sse(f)?;
+                }
+                if !order.is_empty() {
+                    f.write_str(" (order")?;
+                    for c in order {
+                        f.write_str(" ")?;
+                        c.fmt_sse(f)?;
+                    }
+                    f.write_str(")")?;
+                }
+                f.write_str(")")
+            }
         }
     }
 
     fn lookup_used_variables<'a>(&'a self, callback: &mut impl FnMut(&'a Variable)) {
-        if let Self::FunctionCall { expr, .. } = self {
-            expr.lookup_used_variable(callback);
+        match self {
+            Self::CountSolutions { .. } => {}
+            Self::FunctionCall { expr, .. } => expr.lookup_used_variable(callback),
+            Self::Fold {
+                expr, value, order, ..
+            } => {
+                expr.lookup_used_variable(callback);
+                if let Some(value) = value {
+                    value.lookup_used_variable(callback);
+                }
+                for c in order {
+                    c.lookup_used_variables(callback);
+                }
+            }
         }
     }
 }
@@ -1463,6 +1602,28 @@ impl fmt::Display for AggregateExpression {
                 } else {
                     write!(f, "{name}({expr})")
                 }
+            }
+            Self::Fold {
+                expr,
+                value,
+                distinct,
+                order,
+            } => {
+                f.write_str("FOLD(")?;
+                if *distinct {
+                    f.write_str("DISTINCT ")?;
+                }
+                write!(f, "{expr}")?;
+                if let Some(value) = value {
+                    write!(f, ", {value}")?;
+                }
+                if !order.is_empty() {
+                    f.write_str(" ORDER BY")?;
+                    for c in order {
+                        write!(f, " {c}")?;
+                    }
+                }
+                f.write_str(")")
             }
         }
     }

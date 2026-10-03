@@ -3,6 +3,7 @@
 pub mod aggext;
 pub mod cache;
 pub mod catalog;
+pub mod cdt;
 pub mod charsets;
 pub mod ctx;
 pub mod depth;
@@ -312,6 +313,8 @@ pub fn validate_scoping(gp: &GraphPattern) -> Result<()> {
         | GP::Reduced { inner }
         | GP::Slice { inner, .. }
         | GP::Group { inner, .. }
+        | GP::Assign { inner, .. }
+        | GP::Unfold { inner, .. }
         | GP::Service { inner, .. } => validate_scoping(inner),
         _ => Ok(()),
     }

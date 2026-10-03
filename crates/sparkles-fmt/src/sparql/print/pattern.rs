@@ -1,6 +1,6 @@
 //! Group graph patterns: always expanded, one element per line, ` .` after triples
 //! only; `OPTIONAL {`, `MINUS {`, `} UNION {`, `GRAPH g {`, `SERVICE [SILENT] x {`,
-//! `FILTER(…)`, `BIND(… AS ?v)`.
+//! `FILTER(…)`, `BIND(… AS ?v)`, and ARQ's `LET(?v := …)` and `UNFOLD(… AS ?v, ?w)`.
 
 use super::{Ctx, term};
 use crate::doc::DocId;
@@ -107,11 +107,31 @@ pub fn bind(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     for &e in &children[..=open] {
         head.push(term::element(cx, e));
     }
-    let inner: Vec<DocId> = children[open + 1..close]
-        .iter()
-        .map(|&e| term::element(cx, e))
-        .collect();
-    let inner = cx.spaced(inner);
+    // one space between the parts, but `:=` (LET) stays together and `,` (UNFOLD)
+    // follows its variable
+    let mut inner = Vec::new();
+    let kind = |e: Element| match e {
+        Element::Token(t) => Some(cx.tree.token_kind(t)),
+        Element::Node(_) => None,
+    };
+    let parts = &children[open + 1..close];
+    let mut i = 0;
+    while i < parts.len() {
+        let e = parts[i];
+        if i > 0 && kind(e) != Some(TokenKind::Comma) {
+            inner.push(cx.space());
+        }
+        if kind(e) == Some(TokenKind::PnameNs)
+            && parts.get(i + 1).copied().and_then(kind) == Some(TokenKind::Eq)
+        {
+            inner.push(cx.text(":="));
+            i += 2;
+            continue;
+        }
+        inner.push(term::element(cx, e));
+        i += 1;
+    }
+    let inner = cx.concat(inner);
     let sl = cx.soft_line();
     let inner = cx.concat([sl, inner]);
     let inner = cx.indent(inner);
@@ -120,6 +140,16 @@ pub fn bind(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     head.extend([inner, sl, close]);
     let d = cx.concat(head);
     cx.group(d)
+}
+
+/// `Let`: `LET(?v := expr)`, broken as `BIND` is.
+pub fn assign(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
+    bind(cx, n)
+}
+
+/// `Unfold`: `UNFOLD(expr AS ?v, ?w)`, broken as `BIND` is.
+pub fn unfold(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
+    bind(cx, n)
 }
 
 /// The children one space apart: keywords in the grammar's spelling, IRIs compacted.

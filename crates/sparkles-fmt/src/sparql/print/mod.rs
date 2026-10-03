@@ -507,6 +507,8 @@ pub fn node(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
             K::Service => pattern::service(cx, n),
             K::Filter => pattern::filter(cx, n),
             K::Bind => pattern::bind(cx, n),
+            K::Let => pattern::assign(cx, n),
+            K::Unfold => pattern::unfold(cx, n),
             K::InlineValues => values::inline_values(cx, n),
             K::ValuesRow => values::values_row(cx, n),
             K::DataValue => values::data_value(cx, n),
@@ -606,6 +608,8 @@ impl CommentRules for SparqlRules {
                 | K::Service
                 | K::Filter
                 | K::Bind
+                | K::Let
+                | K::Unfold
                 | K::InlineValues
                 | K::SubSelect
                 | K::QuadsGraph

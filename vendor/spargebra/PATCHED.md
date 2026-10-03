@@ -89,7 +89,7 @@ The changes, all in `src/parser.rs` unless noted:
   ARQ's syntax extensions (the default, as Fuseki parses with ARQ's syntax) or rejects
   them. Every ARQ-only rule has the guard rule `arq()`, which fails when they are off,
   so that the text is a syntax error. The aggregate keywords and `AGG` above are
-  behind it, and so are the three forms below. Spec
+  behind it, and so are the forms below. Spec
   [G06](../../docs/specs/G06-arq-query-extensions.md) has the design.
 
 - **`LATERAL`.** The workspace turns on spargebra's own `sep-0006` feature, whose
@@ -112,6 +112,18 @@ The changes, all in `src/parser.rs` unless noted:
   `GraphTemplate { name, triples }` (in `src/query.rs`, with its SPARQL and SSE forms).
   The pattern of `CONSTRUCT WHERE` joins a `GRAPH` group per block, and a blank-node
   name is an error there.
+
+- **`LET`, `UNFOLD` and `FOLD`.** ARQ's `Assignment` element, `LET (?v := expr)`, is
+  the new pattern `GraphPattern::Assign { inner, variable, expression }`. Unlike `BIND`
+  it may assign a variable that is in scope, as ARQ's `SyntaxVarScope` allows. ARQ's
+  `Unfold` element, `UNFOLD(expr AS ?v)` and `UNFOLD(expr AS ?v, ?w)`, is
+  `GraphPattern::Unfold { inner, expression, variable, second }`, and neither variable
+  may be in scope (ARQ's `checkUNFOLD`). The aggregate `FOLD(DISTINCT? expr (, expr)?
+  (ORDER BY OrderCondition+)?)` is `AggregateExpression::Fold { expr, value, distinct,
+  order }`, and the check against nested aggregates covers all its expressions. The
+  three are behind the `arq()` guard. In `src/algebra.rs` their SPARQL forms are
+  `LET(?v := e)`, `UNFOLD(e AS ?v, ?w)` and `FOLD(e, f ORDER BY …)`, and their SSE forms
+  are Jena's `(assign ((?v e)) …)`, `(unfold (e ?v ?w) …)` and `(fold e f (order …))`.
 
 - **A nesting limit.** `SparqlParser::parse_query` and `parse_update` first scan the text
   once, without recursion (`src/nesting.rs`, called from `too_deep`). They refuse a text

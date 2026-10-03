@@ -53,8 +53,10 @@ keywords! {
     // graph patterns
     Optional => "OPTIONAL",
     Minus => "MINUS",
-    // Jena ARQ's lateral join
+    // Jena ARQ's lateral join, assignment and UNFOLD
     Lateral => "LATERAL",
+    Let => "LET",
+    Unfold => "UNFOLD",
     Union => "UNION",
     Graph => "GRAPH",
     Service => "SERVICE",
@@ -167,6 +169,8 @@ keywords! {
     VarPop => "VAR_POP",
     // ARQ's `AGG <iri>(…)`, a custom aggregate by its IRI
     Agg => "AGG",
+    // ARQ's FOLD into a cdt:List or cdt:Map literal
+    Fold => "FOLD",
 }
 
 impl Kw {
@@ -222,7 +226,9 @@ mod tests {
         );
         assert_eq!(Kw::from_word("TRUE").map(Kw::canonical), Some("true"));
         assert_eq!(Kw::from_word("lateral"), Some(Kw::Lateral));
-        assert_eq!(Kw::from_word("UNFOLD"), None);
+        assert_eq!(Kw::from_word("unfold"), Some(Kw::Unfold));
+        assert_eq!(Kw::from_word("UNFOLDS"), None);
+        assert!(Kw::Fold.is_aggregate() && !Kw::Let.is_builtin());
         assert!(Kw::Str.is_builtin() && Kw::GroupConcat.is_builtin());
         assert!(!Kw::A.is_builtin() && !Kw::Select.is_builtin());
         assert!(Kw::Count.is_aggregate() && !Kw::Object.is_aggregate());

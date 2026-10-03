@@ -120,6 +120,7 @@ pub fn extension_functions() -> Vec<String> {
     add(MATH, MATH_FUNCTIONS);
     add(AFN, AFN_FUNCTIONS);
     add(crate::vector::NS, SPK_FUNCTIONS);
+    add(super::cdt::NS, &super::cdt::FUNCTIONS);
     #[cfg(feature = "geo")]
     {
         use crate::geo::vocab::{GEOF, Relation, SPATIALF};
@@ -248,6 +249,15 @@ mod tests {
                 "_ => Err(TypeError),\n        };",
             ),
             "spk:",
+        );
+        listed(
+            &super::super::cdt::FUNCTIONS,
+            arms(
+                include_str!("cdt.rs"),
+                "match local {",
+                "_ => Err(TypeError),\n    }",
+            ),
+            "cdt:",
         );
         #[cfg(feature = "geo")]
         {

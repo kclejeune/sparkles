@@ -356,8 +356,11 @@ fn analyze(gp: &GraphPattern, reach: &Reach) -> R<(Reach, Vec<Read>)> {
         } => {
             let (r, mut d) = analyze(inner, reach)?;
             for (_, a) in aggregates {
-                if let AggregateExpression::FunctionCall { expr, .. } = a {
-                    exists(expr, &r, &mut d)?;
+                match a {
+                    AggregateExpression::CountSolutions { .. } => {}
+                    AggregateExpression::FunctionCall { expr, .. } => exists(expr, &r, &mut d)?,
+                    // ARQ's FOLD reads several expressions in its own order
+                    AggregateExpression::Fold { .. } => return Err(Global),
                 }
             }
             // only the grouping variables stay in scope

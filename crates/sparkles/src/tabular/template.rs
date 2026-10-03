@@ -233,6 +233,8 @@ fn uses_service(p: &GraphPattern) -> bool {
         GraphPattern::Filter { inner, .. }
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Extend { inner, .. }
+        | GraphPattern::Assign { inner, .. }
+        | GraphPattern::Unfold { inner, .. }
         | GraphPattern::OrderBy { inner, .. }
         | GraphPattern::Project { inner, .. }
         | GraphPattern::Distinct { inner }

@@ -233,7 +233,21 @@ pub struct Agg {
     pub func: AggregateFunction,
     pub expr: Option<Expr>,
     pub distinct: bool,
+    /// ARQ's FOLD: `expr` is the list element or the map key
+    pub fold: Option<Box<Fold>>,
 }
+
+/// The parts of ARQ's `FOLD(expr, value ORDER BY …)` besides its first expression.
+#[derive(Clone)]
+pub struct Fold {
+    /// the map value; `None` folds into a `cdt:List`
+    pub value: Option<Expr>,
+    /// sort keys of the group's solutions (ascending when `true`)
+    pub order: Vec<(Expr, bool)>,
+}
+
+/// The IRI that names FOLD in EXPLAIN and in the result cache's keys.
+pub const FOLD: &str = "http://w3id.org/awslabs/neptune/SPARQL-CDTs/fold";
 
 #[derive(Clone, Debug)]
 pub enum PathEnd {
@@ -284,6 +298,16 @@ pub enum Kind {
     Union,
     Filter(Vec<Expr>),
     Extend(VarId, Expr),
+    /// ARQ's `LET` of a variable that the child may bind: where it is bound, a solution
+    /// whose value is not the same value as the expression's is dropped
+    Assign(VarId, Expr),
+    /// ARQ's `UNFOLD`: a solution per element of the `cdt:List` or entry of the
+    /// `cdt:Map` that `expr` gives
+    Unfold {
+        expr: Expr,
+        var: VarId,
+        second: Option<VarId>,
+    },
     Sort(Vec<VarId>),
     OrderBy {
         keys: Vec<(Expr, bool)>,
@@ -475,6 +499,8 @@ impl Node {
             Kind::Union => "Union",
             Kind::Filter(_) => "Filter",
             Kind::Extend(..) => "Bind",
+            Kind::Assign(..) => "Let",
+            Kind::Unfold { .. } => "Unfold",
             Kind::Sort(_) => "Sort",
             Kind::OrderBy { limit: Some(_), .. } => "TopK",
             Kind::OrderBy { .. } => "OrderBy",
@@ -771,6 +797,77 @@ impl<'a> Planner<'a> {
                 n.dist.insert(v, n.est);
                 Ok(self.apply_filters(n, top))
             }
+            GP::Assign {
+                inner,
+                variable,
+                expression,
+            } => {
+                let v = self.ctx.var(variable.as_str());
+                let (push, top) = self.split_filters(filters, |x| *x != v);
+                let child = self.plan(inner, g, push)?;
+                let e = self.compile(expression, g);
+                let desc = format!("?{} := {}", variable.as_str(), e.display(self.ctx));
+                if let Some(&c) = self.subst.get(&v) {
+                    // the outer solution binds ?v (a LATERAL or EXISTS substitution): a
+                    // different value drops the solution, and an error keeps it
+                    let keep = Expr::Coalesce(vec![
+                        Expr::Eq(Box::new(e), Box::new(Expr::Const(c))),
+                        Expr::Const(Id::from_bool(true)),
+                    ]);
+                    return Ok(self.apply_filters(filter(child, vec![keep], self.ctx), top));
+                }
+                let n = if child.vars.contains(&v) {
+                    // LET of a variable the pattern may bind: compared where it is bound
+                    let mut n = Node::unary(Kind::Assign(v, e), child, desc);
+                    n.est *= FILTER_SELECTIVITY.max(0.5);
+                    n
+                } else {
+                    // LET of a new variable is BIND
+                    let mut n = Node::unary(Kind::Extend(v, e), child, desc);
+                    n.vars.push(v);
+                    n.dist.insert(v, n.est);
+                    n
+                };
+                Ok(self.apply_filters(n, top))
+            }
+            GP::Unfold {
+                inner,
+                expression,
+                variable,
+                second,
+            } => {
+                let v = self.ctx.var(variable.as_str());
+                let w = second.as_ref().map(|s| self.ctx.var(s.as_str()));
+                let (push, top) = self.split_filters(filters, |x| *x != v && Some(*x) != w);
+                let child = self.plan(inner, g, push)?;
+                let e = self.compile(expression, g);
+                let desc = match second {
+                    Some(s) => format!(
+                        "{} AS ?{}, ?{}",
+                        e.display(self.ctx),
+                        variable.as_str(),
+                        s.as_str()
+                    ),
+                    None => format!("{} AS ?{}", e.display(self.ctx), variable.as_str()),
+                };
+                let mut n = Node::unary(
+                    Kind::Unfold {
+                        expr: e,
+                        var: v,
+                        second: w,
+                    },
+                    child,
+                    desc,
+                );
+                // a list or map of a few elements per solution
+                n.est *= 4.0;
+                n.cost += n.est;
+                for x in [Some(v), w].into_iter().flatten() {
+                    n.vars.push(x);
+                    n.dist.insert(x, n.est);
+                }
+                Ok(self.apply_filters(n, top))
+            }
             GP::Values {
                 variables,
                 bindings,
@@ -901,6 +998,7 @@ impl<'a> Planner<'a> {
                                 func: AggregateFunction::Count,
                                 expr: None,
                                 distinct: *distinct,
+                                fold: None,
                             },
                             AggregateExpression::FunctionCall {
                                 name,
@@ -910,6 +1008,29 @@ impl<'a> Planner<'a> {
                                 func: name.clone(),
                                 expr: Some(self.compile(expr, g)),
                                 distinct: *distinct,
+                                fold: None,
+                            },
+                            AggregateExpression::Fold {
+                                expr,
+                                value,
+                                distinct,
+                                order,
+                            } => Agg {
+                                func: AggregateFunction::Custom(
+                                    spargebra::term::NamedNode::new_unchecked(FOLD),
+                                ),
+                                expr: Some(self.compile(expr, g)),
+                                distinct: *distinct,
+                                fold: Some(Box::new(Fold {
+                                    value: value.as_ref().map(|e| self.compile(e, g)),
+                                    order: order
+                                        .iter()
+                                        .map(|o| match o {
+                                            OrderExpression::Asc(e) => (self.compile(e, g), true),
+                                            OrderExpression::Desc(e) => (self.compile(e, g), false),
+                                        })
+                                        .collect(),
+                                })),
                             },
                         };
                         (self.ctx.var(v.as_str()), agg)
@@ -4162,7 +4283,10 @@ fn certain_names(gp: &GraphPattern, out: &mut Vec<String>) {
             }
             certain_names(inner, out);
         }
-        GP::Extend { inner, .. } => certain_names(inner, out),
+        // a failed expression or a null element leaves the variable unbound
+        GP::Extend { inner, .. } | GP::Assign { inner, .. } | GP::Unfold { inner, .. } => {
+            certain_names(inner, out)
+        }
         GP::Project { inner, variables } => {
             let mut inner_names = Vec::new();
             certain_names(inner, &mut inner_names);
@@ -4215,6 +4339,12 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
                 walk(right, out);
             }
             GP::Extend {
+                inner, expression, ..
+            }
+            | GP::Assign {
+                inner, expression, ..
+            }
+            | GP::Unfold {
                 inner, expression, ..
             } => {
                 expr_vars(expression, out);
