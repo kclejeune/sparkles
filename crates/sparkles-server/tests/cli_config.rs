@@ -220,7 +220,8 @@ fn a_fuseki_base_directory_with_shiro() {
     }
 }
 
-/// A free port of `range`, within 5540-5559; tests that run at once use separate ranges.
+/// A free port of `range`, within 5580-5599, which no other test uses. Tests that run
+/// at once use separate ranges.
 fn port(range: std::ops::Range<u16>) -> u16 {
     range
         .clone()
@@ -257,7 +258,7 @@ fn serve_from_a_fuseki_configuration() {
            fuseki:dataset [ a ja:MemoryDataset ; ja:data \"data.trig\" ] .\n",
     )
     .unwrap();
-    let port = port(5540..5546);
+    let port = port(5580..5586);
     let mut child = Command::new(BIN)
         .args([
             "serve",
@@ -332,7 +333,7 @@ fn serve_sh_starts() {
             &["config", "import", "fuseki", &config, "--out", "out"],
         );
         assert_eq!(o.status.code(), Some(0), "{}{}", out(&o), err(&o));
-        let port = port(5546..5560);
+        let port = port(5586..5600);
         let mut child = Command::new("sh")
             .arg(d.path().join("out/serve.sh"))
             .args(["--port", &port.to_string(), "--idle-release-ms", "0"])
