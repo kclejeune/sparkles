@@ -46,7 +46,7 @@ extra=("$@")
 for f in "${server[@]}"; do
   run "sparkles-server [${f:-no features}]" -p sparkles-server --all-targets --features "$f"
 done
-run "sparkles [no features]" -p sparkles --all-targets
+run "sparkles-core [no features]" -p sparkles-core --all-targets
 run "sparkles-fmt [no features]" -p sparkles-fmt --all-targets
 # the Rust client without its blocking facade
 run "sparkles-client [no features]" -p sparkles-client --all-targets

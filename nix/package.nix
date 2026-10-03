@@ -63,7 +63,7 @@ let
     // {
       src = depsSrc;
       buildPhaseCargoCommand = "cargoWithProfile build --locked -p sparkles-server";
-      checkPhaseCargoCommand = "cargoWithProfile test --locked -p sparkles --lib --no-run";
+      checkPhaseCargoCommand = "cargoWithProfile test --locked -p sparkles-core --lib --no-run";
     }
   );
 
@@ -72,7 +72,7 @@ let
     commonArgs
     // {
       inherit src cargoArtifacts;
-      cargoTestExtraArgs = "-p sparkles --lib";
+      cargoTestExtraArgs = "-p sparkles-core --lib";
       doInstallCargoArtifacts = false;
     }
   );

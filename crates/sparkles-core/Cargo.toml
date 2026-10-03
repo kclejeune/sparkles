@@ -1,0 +1,92 @@
+[package]
+name = "sparkles-core"
+description = "High-performance RDF/SPARQL database engine (Jena-compatible, QLever-style index)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oxrdf.workspace = true
+oxrdfio.workspace = true
+oxttl.workspace = true
+oxiri.workspace = true
+spargebra.workspace = true
+sparesults.workspace = true
+oxsdatatypes.workspace = true
+imbl.workspace = true
+arc-swap.workspace = true
+parking_lot.workspace = true
+rustc-hash.workspace = true
+memmap2.workspace = true
+lz4_flex.workspace = true
+rayon.workspace = true
+regex.workspace = true
+memchr.workspace = true
+stacker.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+rand.workspace = true
+percent-encoding.workspace = true
+csv.workspace = true
+# fn:normalize-unicode (already built for URL handling)
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
+reqwest.workspace = true
+# the outbound policy: CIDR allowlists, DNS lookups off reqwest's runtime thread
+ipnet = "2"
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
+flate2.workspace = true
+zstd = { workspace = true, optional = true }
+brotli = { workspace = true, optional = true }
+quick_cache = "0.7.0"
+# TriX, and GML and KML geometry literals (the version oxrdfxml and sparesults already use)
+quick-xml = "0.37"
+tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "stemmer", "stopwords", "lz4-compression"], optional = true }
+# the term automata of fuzzy `text:query` terms (the versions Tantivy uses)
+levenshtein_automata = { version = "0.2.1", optional = true }
+tantivy-fst = { version = "0.5", optional = true }
+tempfile = "3"
+# GeoSPARQL (feature `geo`)
+georust = { workspace = true, optional = true }
+geo-index = { workspace = true, optional = true }
+geographiclib-rs = { workspace = true, optional = true }
+# CRSs an operator defines with proj4 strings (feature `geo-proj4`; pure Rust, MIT OR
+# Apache-2.0); `geo-epsg` adds crs-definitions' EPSG-derived table (CC0)
+proj4rs = { version = "0.2", default-features = false, optional = true }
+crs-definitions = { version = "0.5", optional = true }
+
+# statvfs: the free disk space a store keeps
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+oxrdfio.workspace = true
+sparesults.workspace = true
+spargebra.workspace = true
+tempfile.workspace = true
+
+[features]
+# Full-text search over string literals (Tantivy), `text:query` in SPARQL
+text = ["dep:tantivy", "dep:levenshtein_automata", "dep:tantivy-fst"]
+# GeoSPARQL: `geof:` functions, `spatial:` property functions and a spatial index
+geo = [
+    "dep:georust",
+    "dep:geo-index",
+    "dep:geographiclib-rs",
+]
+# GeoSPARQL CRSs defined by proj4 strings in the operator's `crs.json`
+geo-proj4 = ["geo", "dep:proj4rs"]
+# EPSG codes resolved through the EPSG-derived proj4 table of `crs-definitions`. Off in
+# the library, so an embedder opts in to the EPSG terms of use; the server turns it on
+geo-epsg = ["geo-proj4", "dep:crs-definitions"]
+# zstd inputs, dumps and backups (libzstd, a C build), and zstd for the text doc store
+zstd = ["dep:zstd", "tantivy?/zstd-compression"]
+# brotli inputs, dumps and backups (pure Rust)
+brotli = ["dep:brotli"]
+# test hooks at named points of the store (`Store::set_failpoint`), for other crates' tests
+failpoints = []

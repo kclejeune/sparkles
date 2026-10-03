@@ -9,4 +9,4 @@ License, Version 2.0 (LICENSE-APACHE) or the MIT license (LICENSE-MIT), at your 
 both license texts are in this directory.
 
 expected-failures.txt and this NOTICE are Sparkles' own. Sparkles runs the manifest with
-its W3C test harness (crates/sparkles/tests/w3c.rs, test geosparql_oxigraph).
+its W3C test harness (crates/sparkles-core/tests/w3c.rs, test geosparql_oxigraph).

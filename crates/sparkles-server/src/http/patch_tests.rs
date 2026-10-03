@@ -203,7 +203,7 @@ async fn p5_p6_abort_and_prefix_rows() {
 #[tokio::test]
 async fn p9_binary_patches_written_by_jena() {
     let s = server();
-    let trp = include_bytes!("../../../sparkles/tests/patch/jena-1.trp");
+    let trp = include_bytes!("../../../sparkles-core/tests/patch/jena-1.trp");
     let r = call(
         &s.app,
         "PATCH",

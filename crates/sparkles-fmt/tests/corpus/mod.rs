@@ -481,7 +481,7 @@ pub fn arq_only(path: &Path) -> bool {
 /// The engine's `w3c-known-failures.txt`: tests the reference parser itself gets wrong.
 pub fn w3c_known_failures() -> BTreeSet<String> {
     let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../sparkles/tests/w3c-known-failures.txt");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../sparkles-core/tests/w3c-known-failures.txt");
     std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
