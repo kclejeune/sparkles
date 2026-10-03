@@ -1,0 +1,28 @@
+# The Docker build context (Dockerfile, compose.yaml) holds only what the image is built
+# from: everything is ignored except the listed sources, and build outputs inside those
+# are ignored again. A local target/, ui/node_modules or ui/build therefore never reaches
+# the build, and documentation edits do not invalidate its cached layers.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!vendor/
+!ui/
+!scripts/build-fmt-wasm.sh
+!scripts/docker-healthcheck.sh
+!LICENSE
+!THIRD_PARTY_LICENSES.md
+
+**/target
+# the Python bindings are their own workspace, outside the root one
+crates/sparkles-py
+ui/node_modules
+ui/build
+ui/.svelte-kit
+# a local `mise run ui:wasm` build: the image builds its own
+ui/src/lib/wasm
+# the Playwright tests and their output, and the UI's notes, are not part of the build
+ui/tests
+ui/test-results
+ui/playwright-report
+ui/README.md

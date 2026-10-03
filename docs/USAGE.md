@@ -3,7 +3,7 @@
 This guide covers operating the `sparkles` binary: running the server, the command-line
 tools, automatic compaction, the formatter, backups, outbound requests, path search,
 integrity checks, the MCP server, embedding the library, the Python package, the Rust
-client and deploying on NixOS. [API.md](API.md) specifies the HTTP API.
+client, Docker and deploying on NixOS. [API.md](API.md) specifies the HTTP API.
 [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
 
 Sparkles is experimental. The on-disk format, HTTP API and CLI may change between commits
@@ -26,6 +26,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Embedding the library](#embedding-the-library)
 * [Python](#python)
 * [Rust client](#rust-client)
+* [Docker](#docker)
 * [Deploying on NixOS](#deploying-on-nixos)
 
 ## Running the server
@@ -1955,6 +1956,182 @@ for row in client.dataset("ds").select("SELECT * { ?s ?p ?o } LIMIT 10")? {
 The blocking client runs its own tokio runtime with one worker thread, and its results
 are iterators. Like reqwest's blocking client, it must not be called from inside an async
 runtime. Without the default `blocking` feature, the crate has only the async API.
+
+## Docker
+
+The repository's `Dockerfile` builds an image with the server and its web UI, and
+`compose.yaml` runs it with the data in a named volume:
+
+```sh
+docker compose up --build -d     # UI at http://localhost:3030/ui/
+docker compose logs -f sparkles
+docker compose down              # stops and removes the container; the volume stays
+```
+
+The build runs in stages. It first builds the formatter's WebAssembly module with the
+wasm-bindgen CLI of the version that `Cargo.lock` pins, and then the UI with that module,
+as `mise run ui:wasm` and `mise run ui:build` do. Then
+`cargo build --release --locked -p sparkles-server` embeds the UI into the binary with the
+default features. Node and pnpm are the versions that `mise.toml` pins. Rust is a fixed
+stable release named in the `Dockerfile`, because `rust-toolchain.toml` only asks for
+"stable". The runtime image is Debian bookworm slim with CA certificates, for outbound
+HTTPS to SERVICE endpoints, OIDC providers, S3 and embedding providers. The server runs
+in it as the unprivileged user `sparkles` (uid and gid 10001). The image is about 185 MB,
+or 64 MB compressed, of which the binary takes 89 MB. The workspace's release profile
+keeps line tables for profiling, which would make the binary 450 MB, so the image strips
+them and keeps the symbol table that names functions in backtraces.
+`--build-arg KEEP_DEBUGINFO=1` keeps the line tables.
+
+A first build took 17 minutes on a 16-core machine that was busy with other work, with
+8 compile jobs. The server's compilation took 11 of those minutes. BuildKit cache mounts
+keep the cargo registry, the pnpm store and the cargo target directories, so a rebuild
+compiles only the crates that changed. On the same machine, a rebuild without changes
+took 14 seconds, and one after a change to the server crate took 5 minutes.
+`SPARKLES_BUILD_JOBS=4 docker compose build` caps the parallel compile jobs on a busy
+machine, and `mise run docker:build` runs the same build. The cache mounts live in
+Docker's build cache, about 3.5 GB after a build, and `docker builder prune` removes
+them.
+
+### Network exposure in a container
+
+A published port cannot reach a loopback listener inside a container, so the image runs
+`sparkles serve --host 0.0.0.0`. Without `--auth-config`, the server refuses to start on
+that address unless `SPARKLES_ALLOW_OPEN_NETWORK=1` is set, as described in
+[Network exposure](#network-exposure). `compose.yaml` sets the variable and publishes the
+port on the host's loopback address only, as `127.0.0.1:3030:3030`. The server is then
+reachable from the host as a server listening on the host's loopback address would be,
+and not from the network. Other users of the host and other containers on the same
+Docker network can still reach it. `SPARKLES_PORT=8080 docker compose up -d` publishes it
+on another host port.
+
+Browsers reach the server as `localhost` or `127.0.0.1`, which an open server answers,
+so the UI works through the published port without further flags. The host and origin
+checks of an open server stay on. Requests usually arrive from the address of Docker's
+bridge gateway rather than the client's, so limits per client address
+(`--rate-limit`) count every client as one.
+
+Without Compose, the same container runs like this. Without the variable or
+`--auth-config`, it exits at once with the server's explanation.
+
+```sh
+docker build -t sparkles .
+docker run -d --name sparkles -p 127.0.0.1:3030:3030 -v sparkles-data:/data \
+  -e SPARKLES_ALLOW_OPEN_NETWORK=1 --stop-timeout 30 sparkles
+```
+
+### Authentication in a container
+
+Turn on authentication before you publish the port beyond the host's loopback address,
+or when you do not trust every user and container on the host. Write an auth
+configuration as described in [API.md](API.md#configuration). The image hashes passwords
+for it:
+
+```sh
+docker compose run --rm -T sparkles auth hash < password.txt
+```
+
+Then mount the file, pass `--auth-config` and remove `SPARKLES_ALLOW_OPEN_NETWORK`.
+`compose.yaml` has these lines commented out:
+
+```yaml
+    command: [serve, --data, /data, --host, 0.0.0.0, --port, "3030",
+              --auth-config, /etc/sparkles/auth.toml]
+    volumes:
+      - sparkles-data:/data
+      - ./auth.toml:/etc/sparkles/auth.toml:ro
+```
+
+The file must be readable by uid 10001, and it should not be readable by others, so
+`chown 10001:10001 auth.toml && chmod 600 auth.toml` on the host. With authentication on,
+`ports` can publish the port on every interface, as `"3030:3030"` does. Serve it over
+HTTPS, through a reverse proxy in front of the container or with `--tls-cert` and
+`--tls-key` on mounted files ([TLS](#tls)), because plain HTTP sends passwords and tokens
+in the clear. The image's health check speaks plain HTTP, so a server with `--tls-cert`
+needs its own health check in `compose.yaml`.
+
+### Configuring the container
+
+Other `serve` flags go into the `command` list of `compose.yaml`. Files that a flag
+names, such as a `--text` or `--validate` configuration or a `--load-dir` directory, are
+mounted into the container like the auth configuration. The compose file reads a few
+variables from the environment or from an `.env` file next to it:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SPARKLES_PORT` | `3030` | The host port, on `127.0.0.1`. |
+| `RUST_LOG` | the server's default filter | The log filter. |
+| `SPARKLES_LOG_FORMAT` | `text` | `text` or `json`, passed as `--log-format`. |
+| `SPARKLES_BUILD_JOBS` | all cores | Parallel compile jobs of the image build. |
+
+The server logs to stderr, which `docker compose logs` shows. The container's health
+check asks for `GET /$/ready` every 30 seconds, and every 2 seconds during the first five
+minutes until the first success, so that a large database can open first. On
+`docker compose down` or `docker stop`, the server gets SIGTERM and finishes the
+requests in flight within `--shutdown-grace` (20 seconds). `compose.yaml` waits 30
+seconds before it kills the server.
+
+Request bodies are spooled to `/tmp` in the container's writable layer. For uploads of
+several gigabytes, mount a volume at `/tmp`. The commented `deploy.resources` block of
+`compose.yaml` limits CPU and memory. Keep `--query-memory-mb`, `--max-mem-dataset-mb`
+and `--vector-memory-mb` below the memory limit, so that a budget refuses a large request
+before the kernel ends the container.
+
+Commands other than `serve` run in the same image. The CLI can talk to the running
+server from inside its container:
+
+```sh
+docker compose exec sparkles sparkles query --server http://localhost:3030 --dataset films \
+  'SELECT (COUNT(*) AS ?n) { ?s ?p ?o }'
+docker compose run --rm sparkles help    # a new container with the same image and volume
+```
+
+### Upgrading the container
+
+```sh
+git pull
+docker compose up --build -d
+```
+
+Compose rebuilds the image and replaces the container, and the volume keeps the data.
+Sparkles is experimental, and its on-disk format may change between commits without a
+migration path, so take a backup before you upgrade.
+
+### Backing up the container's data
+
+The `sparkles-data` volume holds the dataset registry, the databases and the server's
+own state. Docker names it after the Compose project, such as `sparkles_sparkles-data`.
+Backup repositories ([Backup repositories](#backup-repositories)) work in the container
+as on a host. To back up to a directory of the host, mount it and a backup configuration
+that names it:
+
+```toml
+version = 1
+
+[repositories.local]
+type = "fs"
+path = "/backups"
+```
+
+```yaml
+    environment:
+      SPARKLES_BACKUP_CONFIG: /etc/sparkles/backup.toml
+    volumes:
+      - sparkles-data:/data
+      - ./backups:/backups
+      - ./backup.toml:/etc/sparkles/backup.toml:ro
+```
+
+The host directory must be writable by uid 10001 (`chown 10001:10001 backups`). Backups
+are then taken through the UI, the API or the configuration's policies, and an S3
+repository works the same way without the mount. Copying the volume's files is a
+consistent backup only while the server is stopped:
+
+```sh
+docker compose stop
+docker run --rm -v sparkles_sparkles-data:/data:ro -v "$PWD":/out debian:bookworm-slim \
+  tar -C /data -czf /out/sparkles-data.tar.gz .
+docker compose start
+```
 
 ## Deploying on NixOS
 

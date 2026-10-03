@@ -237,6 +237,14 @@ cargo install --path crates/sparkles-server   # installs the `sparkles` binary
 # or: nix run github:kclejeune/sparkles -- serve --data ./data
 ```
 
+Docker builds the UI and the binary in one step and serves them on the host's
+`127.0.0.1:3030`, with the data in a named volume. [docs/USAGE.md](docs/USAGE.md#docker)
+explains the image, authentication and backups.
+
+```sh
+docker compose up --build -d
+```
+
 Load a file into a new database and serve it on `127.0.0.1:3030`:
 
 ```sh

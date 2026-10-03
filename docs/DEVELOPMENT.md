@@ -30,8 +30,12 @@ cargo build --release
 The formatter's WebAssembly module lets the UI format text in the page. It is optional.
 `mise run ui:wasm` builds `crates/sparkles-fmt-wasm` into `ui/src/lib/wasm/`, which is
 git-ignored, and later UI builds keep it up to date. Without the module, the UI formats
-through `POST /$/format`. The Nix packages always build it in. See
+through `POST /$/format`. The Nix packages and the Docker image always build it in. See
 [ui/README.md](../ui/README.md#formatting-in-the-browser).
+
+The `Dockerfile` builds the module, the UI and the release binary in stages, without
+Node, pnpm or Rust on the host. `mise run docker:build` builds the image of
+`compose.yaml`, and [USAGE.md](USAGE.md#docker) covers running it.
 
 ## mise tasks
 
@@ -62,6 +66,7 @@ mise run ci           # fmt:check + lint + lint:features + fmt:wasm + test + ui:
 mise run doc          # API docs of the library crates
 mise run openapi      # rewrite docs/openapi.json after an API change (a test fails until then)
 mise run docs:screenshots # the README's screenshots (docs/images) from the demo dataset in docs/demo
+mise run docker:build # the Docker image of compose.yaml (not in ci)
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:text   # full-text search: Sparkles vs Fuseki with jena-text vs QLever

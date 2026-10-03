@@ -1,0 +1,73 @@
+# `docker compose up --build -d` builds the image (Dockerfile) and serves Sparkles with its
+# UI at http://localhost:3030/ui/, keeping the data in the named volume `sparkles-data`.
+# docs/USAGE.md#docker covers configuration, authentication, upgrades and backups.
+#
+# Variables, from the environment or an .env file next to this file:
+#   SPARKLES_PORT        host port, on 127.0.0.1 only (default 3030)
+#   RUST_LOG             log filter (default: the server's own, as below)
+#   SPARKLES_LOG_FORMAT  text or json (default text)
+#   SPARKLES_BUILD_JOBS  parallel compile jobs of the image build (default: all cores)
+
+services:
+  sparkles:
+    build:
+      context: .
+      args:
+        BUILD_JOBS: ${SPARKLES_BUILD_JOBS:-}
+    command:
+      - serve
+      - --data
+      - /data
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3030"
+      - --log-format
+      - ${SPARKLES_LOG_FORMAT:-text}
+      # With authentication (mount the file below and drop SPARKLES_ALLOW_OPEN_NETWORK):
+      # - --auth-config
+      # - /etc/sparkles/auth.toml
+      # The names clients use to reach the server when it is published beyond loopback
+      # (without --auth-config, other names than IP addresses and localhost get 421):
+      # - --public-host
+      # - sparql.example.org
+    environment:
+      RUST_LOG: ${RUST_LOG:-sparkles=info,sparkles_server=info,tower_http=warn}
+      # Without --auth-config, every client that reaches the port may read, write and
+      # administer every dataset. The server therefore refuses to listen on 0.0.0.0
+      # unless this says that the port stays private. It does here: `ports` publishes it
+      # on the host's 127.0.0.1 only. Remove this line once you use --auth-config, and
+      # never publish the port more widely without it.
+      SPARKLES_ALLOW_OPEN_NETWORK: "1"
+      # SPARKLES_BACKUP_CONFIG: /etc/sparkles/backup.toml
+    ports:
+      - "127.0.0.1:${SPARKLES_PORT:-3030}:3030"
+    volumes:
+      - sparkles-data:/data
+      # Authentication and per-dataset authorization (docs/API.md#configuration):
+      # - ./auth.toml:/etc/sparkles/auth.toml:ro
+      # A backup repository on the host, and its configuration
+      # (docs/USAGE.md#backup-repositories):
+      # - ./backups:/backups
+      # - ./backup.toml:/etc/sparkles/backup.toml:ro
+    restart: unless-stopped
+    # more than the server's --shutdown-grace (20 s), so requests in flight can finish
+    stop_grace_period: 30s
+    # the image's health check, spelled out: GET /$/ready inside the container
+    healthcheck:
+      test: ["CMD", "sparkles-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5m
+      start_interval: 2s
+      retries: 3
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "4"
+    #       memory: 8g
+    # Keep --query-memory-mb, --max-mem-dataset-mb and --vector-memory-mb below the
+    # memory limit, or the kernel ends the container before a budget refuses a request.
+
+volumes:
+  sparkles-data:
