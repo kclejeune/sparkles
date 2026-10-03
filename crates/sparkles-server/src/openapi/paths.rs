@@ -1430,6 +1430,19 @@ fn search(p: &mut Paths) {
     p.add(
         op(
             POST,
+            "/$/vector/{ds}/{name}/reembed",
+            "reembedVectorIndex",
+            "Search",
+            "Embed an index's texts again",
+        )
+        .doc("Embeds every selected text of the index again, for example after the model behind a name changed.")
+        .see("embeddings-on-write")
+        .json("202", "The index's status.", "VectorIndexStatus")
+        .errors(&[400, 409]),
+    );
+    p.add(
+        op(
+            POST,
             "/$/vector/{ds}/{name}/recall",
             "measureVectorRecall",
             "Search",

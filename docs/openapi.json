@@ -12156,6 +12156,76 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/vector/{ds}/{name}/reembed": {
+      "post": {
+        "description": "Embeds every selected text of the index again, for example after the model behind a name changed.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#embeddings-on-write"
+        },
+        "operationId": "reembedVectorIndex",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VectorIndexStatus"
+                }
+              }
+            },
+            "description": "The index's status."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Embed an index's texts again",
+        "tags": [
+          "Search"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
     "/$/whoami": {
       "get": {
         "description": "Answers `401` only for invalid credentials.",
