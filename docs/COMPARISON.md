@@ -78,8 +78,8 @@ API, materialized reasoning, SHACL validation and an embeddable library.
 a SPARQL 1.1 endpoint, a compressed columnar index and in-memory novelty over immutable
 index files. It is built as a versioned, permissioned ledger with JSON-LD, SPARQL and
 openCypher interfaces. Fluree is licensed under BUSL-1.1 (free except as a hosted
-database service; each release becomes Apache-2.0 after four years). Sparkles neither
-depends on it nor borrows from it. Fluree appears here only as a benchmark target,
+database service; each release becomes Apache-2.0 after four years). Sparkles does not
+depend on it. Fluree appears here only as a benchmark target,
 downloaded at benchmark time, and this comparison draws on its public documentation.
 
 | Area | Fluree | Sparkles |
