@@ -79,6 +79,10 @@ struct Cli {
     /// Query result cache size in MiB (0 disables it)
     #[arg(long, global = true, default_value_t = 512)]
     result_cache_mb: u64,
+    /// Cache of remote SERVICE results (`SERVICE <cache:…>`) per dataset, in MiB (0
+    /// disables it)
+    #[arg(long, global = true, default_value_t = 64)]
+    service_cache_mb: u64,
     /// Treat the default graph as the union of all named graphs
     #[arg(long, global = true)]
     union_default_graph: bool,
@@ -1529,6 +1533,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
     StoreOptions {
         cache_bytes: cli.cache_mb << 20,
         result_cache_bytes: cli.result_cache_mb << 20,
+        service_cache_bytes: cli.service_cache_mb << 20,
         union_default_graph: cli.union_default_graph,
         history_cache_bytes: cli.history_cache_mb << 20,
         history_max_generations: cli.history_max_generations,

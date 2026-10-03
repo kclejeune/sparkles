@@ -378,7 +378,12 @@ pub(super) fn schemas() -> Map<String, J> {
         "CacheCleared",
         obj(
             &["cleared", "bytes"],
-            json!({ "cleared": { "type": "integer" }, "bytes": { "type": "integer" } }),
+            json!({
+                "cleared": { "type": "integer" },
+                "bytes": { "type": "integer" },
+                "serviceCleared": { "type": "integer" },
+                "serviceBytes": { "type": "integer" },
+            }),
         ),
     );
     put(

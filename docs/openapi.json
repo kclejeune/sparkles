@@ -1014,6 +1014,12 @@
           },
           "cleared": {
             "type": "integer"
+          },
+          "serviceBytes": {
+            "type": "integer"
+          },
+          "serviceCleared": {
+            "type": "integer"
           }
         },
         "required": [
@@ -5730,7 +5736,7 @@
             "cloudflareAccess": []
           }
         ],
-        "summary": "Clear the query result cache",
+        "summary": "Clear the query result cache and the cache of remote SERVICE results",
         "tags": [
           "Datasets"
         ],

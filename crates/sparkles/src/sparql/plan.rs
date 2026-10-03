@@ -385,6 +385,8 @@ pub enum Kind {
         endpoint: PathEnd,
         query: String,
         silent: bool,
+        /// the `cache` option of Jena's service enhancer
+        cache: super::enhancer::CacheMode,
     },
     /// full-text search (`text:query`)
     TextSearch(Box<TextSpec>),
@@ -724,6 +726,25 @@ impl<'a> Planner<'a> {
         self.ctx.check()?;
         use GraphPattern as GP;
         match gp {
+            // Jena's `SERVICE <loop:…>`: evaluated per solution of the patterns before it
+            GP::Join { left, right } if super::enhancer::is_loop(right) => {
+                let certain = certain_vars(left, self.ctx);
+                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let l = self.plan(left, g, push)?;
+                let n = super::enhancer::plan_loop(self, l, right, g, None)?;
+                Ok(self.apply_filters(n, top))
+            }
+            GP::LeftJoin {
+                left,
+                right,
+                expression,
+            } if super::enhancer::is_loop(right) => {
+                let certain = certain_vars(left, self.ctx);
+                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let l = self.plan(left, g, push)?;
+                let n = super::enhancer::plan_loop(self, l, right, g, Some(expression.clone()))?;
+                Ok(self.apply_filters(n, top))
+            }
             GP::Bgp { .. } | GP::Path { .. } | GP::Join { .. } | GP::Graph { .. } => {
                 let mut items = Vec::new();
                 self.collect(gp, g, &mut items)?;
@@ -1097,13 +1118,42 @@ impl<'a> Planner<'a> {
                 inner,
                 silent,
             } => {
-                let endpoint = match self.named_pattern(name) {
-                    PT::C(id) => PathEnd::Const(id),
-                    PT::V(v) => PathEnd::Var(v),
-                };
+                // Jena's service enhancer: options in front of the IRI, and the dataset
+                // itself
+                let (inner, silent, cache, endpoint) =
+                    match super::enhancer::effective(name, inner, *silent)? {
+                        Some(e) => match e.target {
+                            super::enhancer::Target::SelfDataset => {
+                                // a separate query on the same dataset and view
+                                return self.plan(e.inner, &ActiveGraph::Default, filters);
+                            }
+                            super::enhancer::Target::Remote(url) => (
+                                e.inner,
+                                e.silent,
+                                e.opts.cache,
+                                PathEnd::Const(self.ctx.intern_term(&Term::NamedNode(url))),
+                            ),
+                        },
+                        None => (
+                            &**inner,
+                            *silent,
+                            super::enhancer::CacheMode::None,
+                            match self.named_pattern(name) {
+                                PT::C(id) => PathEnd::Const(id),
+                                PT::V(v) => PathEnd::Var(v),
+                            },
+                        ),
+                    };
+                // the constants in force (initial bindings, the row of an EXISTS or a
+                // LATERAL) are sent as values
+                let subst = super::enhancer::planner_subst(self, inner);
                 let mut names = Vec::new();
                 collect_pattern_vars(inner, &mut names);
-                let mut vars: Vec<VarId> = names.iter().map(|n| self.ctx.var(n)).collect();
+                let mut vars: Vec<VarId> = names
+                    .iter()
+                    .filter(|n| !subst.map.contains_key(*n))
+                    .map(|n| self.ctx.var(n))
+                    .collect();
                 vars.sort_unstable();
                 vars.dedup();
                 if let PathEnd::Var(v) = endpoint
@@ -1111,12 +1161,17 @@ impl<'a> Planner<'a> {
                 {
                     vars.push(v);
                 }
-                let query = format!("SELECT * WHERE {{ {inner} }}");
+                let query = if subst.map.is_empty() {
+                    super::enhancer::single_request(inner)
+                } else {
+                    super::enhancer::single_request(&super::enhancer::substitute(inner, &subst))
+                };
                 let mut n = Node::leaf(
                     Kind::Service {
                         endpoint,
                         query: query.clone(),
-                        silent: *silent,
+                        silent,
+                        cache,
                     },
                     vars,
                     1000.0,
@@ -1217,7 +1272,7 @@ impl<'a> Planner<'a> {
                 self.collect_path(s, path, o, g, items)?;
                 items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
-            GP::Join { left, right } => {
+            GP::Join { left, right } if !super::enhancer::is_loop(right) => {
                 self.collect(left, g, items)?;
                 self.collect(right, g, items)?;
             }

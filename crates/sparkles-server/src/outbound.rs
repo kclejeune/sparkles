@@ -44,6 +44,13 @@ pub struct OutboundArgs {
     /// seconds [default: 4 × --outbound-timeout]
     #[arg(long, value_name = "SECS")]
     pub outbound_request_timeout: Option<f64>,
+    /// Inputs per request of `SERVICE <loop:bulk:…>` (Jena's serviceBulkBindingCount)
+    #[arg(long, value_name = "N", default_value_t = sparkles::outbound::DEFAULT_SERVICE_BULK_SIZE)]
+    pub service_bulk_size: usize,
+    /// The most inputs per request of a bulk SERVICE; bulk+n is capped to it (Jena's
+    /// serviceBulkMaxBindingCount)
+    #[arg(long, value_name = "N", default_value_t = sparkles::outbound::DEFAULT_SERVICE_BULK_MAX)]
+    pub service_bulk_max: usize,
 }
 
 impl OutboundArgs {
@@ -86,6 +93,9 @@ impl OutboundArgs {
                     .map_err(|e| anyhow::anyhow!("--outbound-allow: {e}"))
             })
             .collect::<Result<Vec<_>>>()?;
+        if self.service_bulk_size == 0 || self.service_bulk_max == 0 {
+            bail!("--service-bulk-size and --service-bulk-max must be at least 1");
+        }
         let timeout = Duration::from_secs_f64(self.outbound_timeout);
         Ok(OutboundPolicy {
             allow_private: (allow_private || self.outbound_allow_private)
@@ -96,6 +106,8 @@ impl OutboundArgs {
             max_response_bytes: self.outbound_max_mb.saturating_mul(1 << 20),
             max_request_bytes: request_mb.saturating_mul(1 << 20),
             request_timeout: Duration::from_secs_f64(request_timeout),
+            service_bulk_size: self.service_bulk_size.min(self.service_bulk_max),
+            service_bulk_max: self.service_bulk_max,
             ..Default::default()
         })
     }

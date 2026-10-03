@@ -441,6 +441,30 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             }
             t
         }
+        Kind::Lateral(spec) if spec.service.is_some() => {
+            let l = child(0, &mut infos)?;
+            let rl = spec.service.as_deref().expect("a remote loop");
+            let (t, st) = super::enhancer::run_remote(ctx, spec, rl, &l, &n.vars)?;
+            note = Some(format!(
+                "[{} inputs, {} requests, {} from the cache{}]",
+                st.inputs,
+                st.requests,
+                st.cache_hits,
+                if st.retried > 0 {
+                    format!(", {} bulk requests cut short and sent again", st.retried)
+                } else {
+                    String::new()
+                }
+            ));
+            let mut c = Counters::new();
+            c.insert("serviceInputs".into(), st.inputs.into());
+            c.insert("serviceRequests".into(), st.requests.into());
+            c.insert("serviceCacheHits".into(), st.cache_hits.into());
+            c.insert("serviceRetried".into(), st.retried.into());
+            c.insert("serviceSolutions".into(), st.solutions.into());
+            counters = Some(c);
+            t
+        }
         Kind::Lateral(spec) => {
             let l = child(0, &mut infos)?;
             let (t, groups, solutions) = super::lateral::run(ctx, spec, &l, &n.vars)?;
@@ -521,7 +545,8 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             endpoint,
             query,
             silent,
-        } => match service(ctx, endpoint, query, &n.vars) {
+            cache,
+        } => match service(ctx, endpoint, query, &n.vars, *cache) {
             Ok(t) => t,
             // SILENT hides failures of the remote service, not a refusal or a spent
             // budget
@@ -4685,21 +4710,85 @@ pub(super) fn vector_search(
 
 // ---------------------------------------------------------------- service ------
 
-fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result<Table> {
-    if !ctx.allow_service {
-        return Err(Error::Service("SERVICE is disabled".into()));
-    }
-    if ctx.forbid_service {
-        return Err(Error::NotPermitted(
-            "SERVICE requires the federate permission".into(),
-        ));
-    }
+fn service(
+    ctx: &Ctx,
+    endpoint: &PathEnd,
+    query: &str,
+    vars: &[VarId],
+    cache: super::enhancer::CacheMode,
+) -> Result<Table> {
+    use super::enhancer::CacheMode;
+    super::enhancer::check_allowed(ctx)?;
     let PathEnd::Const(id) = endpoint else {
         return Err(Error::unsupported("SERVICE with a variable endpoint"));
     };
     let Some(oxrdf::Term::NamedNode(url)) = ctx.term(*id) else {
         return Err(Error::Service("invalid SERVICE endpoint".into()));
     };
+    let store = &ctx.snap.results.service;
+    if matches!(cache, CacheMode::Default | CacheMode::Clear) && ctx.use_cache && store.enabled() {
+        // the whole result under one key: a SERVICE without `loop` has one input
+        let key = super::svccache::key(&ctx.service_scope, url.as_str(), query, &[]);
+        let hit = if cache == CacheMode::Default {
+            store.get(&key)
+        } else {
+            store.remove(&key);
+            None
+        };
+        let rows = match hit {
+            Some(rows) => rows,
+            None => {
+                let rows = std::sync::Arc::new(super::enhancer::fetch_rows(ctx, &url, query)?);
+                store.put(key, rows.clone());
+                rows
+            }
+        };
+        let cols: Vec<Option<usize>> = vars
+            .iter()
+            .map(|v| {
+                let n = ctx.var_name(*v);
+                rows.vars.iter().position(|x| *x == n)
+            })
+            .collect();
+        let mut t = Table::new(vars.to_vec());
+        let mut bnodes = FxHashMap::default();
+        for r in &rows.rows {
+            let row: Vec<Id> = cols
+                .iter()
+                .map(|c| {
+                    c.and_then(|c| r[c].as_ref())
+                        .map_or(Id::UNDEF, |term| ctx.intern_remote_term(term, &mut bnodes))
+                })
+                .collect();
+            t.push_row(&row);
+        }
+        return Ok(t);
+    }
+    let mut t = Table::new(vars.to_vec());
+    // the endpoint's blank nodes are its own: new ones here, one per label of the result
+    let mut bnodes = FxHashMap::default();
+    fetch(ctx, &url, query, &mut |sol| {
+        let row: Vec<Id> = vars
+            .iter()
+            .map(|v| {
+                sol.get(ctx.var_name(*v).as_str())
+                    .map_or(Id::UNDEF, |term| ctx.intern_remote_term(term, &mut bnodes))
+            })
+            .collect();
+        t.push_row(&row);
+        Ok(())
+    })?;
+    Ok(t)
+}
+
+/// Send `query` to the endpoint `url` through the outbound policy and hand each
+/// solution of the response to `on_solution` as it is parsed.
+pub(super) fn fetch(
+    ctx: &Ctx,
+    url: &oxrdf::NamedNode,
+    query: &str,
+    on_solution: &mut dyn FnMut(sparesults::QuerySolution) -> Result<()>,
+) -> Result<()> {
     // the host of the endpoint (no user info, no port)
     let host = oxiri::Iri::parse(url.as_str())
         .ok()
@@ -4770,9 +4859,6 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
     );
     // parsed as it streams in, under the policy's byte ceiling and deadline
     let parser = sparesults::QueryResultsParser::from_format(fmt);
-    let mut t = Table::new(vars.to_vec());
-    // the endpoint's blank nodes are its own: new ones here, one per label of the result
-    let mut bnodes = FxHashMap::default();
     let failed = |e: sparesults::QueryResultsParseError| match e {
         // a spent budget, or the body's own words (timeout, size, connection)
         sparesults::QueryResultsParseError::Io(e) => match crate::codec::io_error(e) {
@@ -4784,18 +4870,10 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
     match parser.for_reader(body).map_err(failed)? {
         sparesults::ReaderQueryResultsParserOutput::Solutions(sols) => {
             for sol in sols {
-                let sol = sol.map_err(failed)?;
-                let row: Vec<Id> = vars
-                    .iter()
-                    .map(|v| {
-                        sol.get(ctx.var_name(*v).as_str())
-                            .map_or(Id::UNDEF, |term| ctx.intern_remote_term(term, &mut bnodes))
-                    })
-                    .collect();
-                t.push_row(&row);
+                on_solution(sol.map_err(failed)?)?;
             }
         }
         sparesults::ReaderQueryResultsParserOutput::Boolean(_) => {}
     }
-    Ok(t)
+    Ok(())
 }

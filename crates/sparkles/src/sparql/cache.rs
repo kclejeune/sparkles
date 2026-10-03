@@ -39,6 +39,8 @@ impl quick_cache::Weighter<String, Arc<Entry>> for Weighter {
 }
 
 pub struct ResultCache {
+    /// the cache of remote SERVICE results, cleared with this one
+    pub service: super::svccache::ServiceCache,
     cache: Option<quick_cache::sync::Cache<String, Arc<Entry>, Weighter>>,
     max_entry_bytes: u64,
     /// minimum computation time (ms) for a result to be worth caching
@@ -49,7 +51,13 @@ pub struct ResultCache {
 
 impl ResultCache {
     pub fn new(bytes: u64, min_ms: f64) -> ResultCache {
+        ResultCache::with_service(bytes, min_ms, 0)
+    }
+
+    /// A result cache with a cache of remote SERVICE results of `service_bytes`.
+    pub fn with_service(bytes: u64, min_ms: f64, service_bytes: u64) -> ResultCache {
         ResultCache {
+            service: super::svccache::ServiceCache::new(service_bytes),
             min_ms,
             cache: (bytes > 0)
                 .then(|| quick_cache::sync::Cache::with_weighter(10_000, bytes, Weighter)),
@@ -371,8 +379,9 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             // and generated names are local to it
             let _ = write!(
                 s,
-                "{}|{:?}|{:?}|{:?}|{:?}",
+                "{}|{}|{:?}|{:?}|{:?}|{:?}",
                 l.pattern,
+                l.unscoped,
                 match &l.graph {
                     super::plan::ActiveGraph::Var(v) => format!("?{}", ctx.var_name(*v)),
                     g => format!("{g:?}"),
@@ -387,7 +396,8 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
                     .map(|v| ctx.var_name(*v))
                     .collect::<Vec<_>>(),
             );
-            super::exists::pure_pattern(&l.pattern)
+            // a remote loop's results are the endpoint's
+            l.service.is_none() && super::exists::pure_pattern(&l.pattern)
         }
         Kind::PropertyFn(spec) => {
             let _ = write!(s, "{:?}", spec);
