@@ -1,9 +1,10 @@
 # Usage
 
-This guide covers operating the `sparkles` binary: running the server, the command-line
-tools, automatic compaction, the formatter, backups, outbound requests, path search,
-integrity checks, the MCP server, embedding the library, the Python package, the Rust
-client, Docker and deploying on NixOS. [API.md](API.md) specifies the HTTP API.
+This guide covers operating the `sparkles` binary. It describes running the server, the
+command-line tools, automatic compaction, the formatter and linter, backups, outbound
+requests, path search, integrity checks, the MCP server, embedding the library, the
+Python package, the Rust client, Docker and deploying on NixOS. [API.md](API.md)
+specifies the HTTP API.
 [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
 
 Sparkles is experimental. The on-disk format, HTTP API and CLI may change between commits
@@ -11,12 +12,27 @@ without a migration path, so keep backups of anything you cannot regenerate.
 
 * [Running the server](#running-the-server)
   * [Network exposure](#network-exposure)
+  * [TLS](#tls)
   * [Endpoints and operations](#endpoints-and-operations)
+  * [Previewing a write](#previewing-a-write)
+  * [Fuseki and Jena clients](#fuseki-and-jena-clients)
+  * [Restricting users to some graphs](#restricting-users-to-some-graphs)
+  * [Hiding some triples from some users](#hiding-some-triples-from-some-users)
   * [`serve` options](#serve-options)
 * [Command-line tools](#command-line-tools)
   * [Shell completions and man pages](#shell-completions-and-man-pages)
+  * [Constraints next to the counts](#constraints-next-to-the-counts)
+  * [What each class uses, and what changed](#what-each-class-uses-and-what-changed)
+  * [File tools](#file-tools)
+  * [Validating with SHACL and ShEx](#validating-with-shacl-and-shex)
+  * [Drafting shapes from the data](#drafting-shapes-from-the-data)
+  * [Stored queries](#stored-queries)
+  * [DESCRIBE modes](#describe-modes)
+  * [GraphQL](#graphql)
+  * [Loading CSV and TSV](#loading-csv-and-tsv)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
+* [Linting](#linting)
 * [Backup repositories](#backup-repositories)
 * [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
 * [Finding paths](#finding-paths)
@@ -338,9 +354,12 @@ happens to materialized inferences, and the limits.
 | `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. |
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. A closure takes about 135 bytes per triple. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 
-`sparkles serve --help` lists the other options, including `--read-only`,
-`--result-cache-mb`, `--auto-reason`, `--auth-config`, `--unix-socket`,
-`--map-style-url`, and the compression and schema limits.
+`sparkles serve --help` lists the other options. They include `--read-only`,
+`--union-default-graph`, the cache sizes (`--cache-mb`, `--result-cache-mb`,
+`--history-cache-mb`), `--auto-reason`, `--auth-config`, `--unix-socket`,
+`--map-style-url`, the GraphQL limits ([GraphQL](#graphql)), the `--mcp-*` options
+([MCP over HTTP](#over-http)), response compression (`--http-compression`) and the
+schema limits.
 
 A request over budget fails with `507` and a JSON body that names the budget. The
 outbound total is named `outbound-bytes`. A query can lower its own budgets with the
@@ -510,9 +529,13 @@ left out of the index and the server rebuilds it when it opens the database.
 
 The other commands are:
 
-* `schema`, `shacl` and `shex validate|parse`;
-* `validation`, for write-time validation ([API](API.md#write-time-validation));
+* `schema` ([below](#constraints-next-to-the-counts));
+* `shacl`, `shex validate|parse` and `validation`, for validation on request and
+  write-time validation ([below](#validating-with-shacl-and-shex));
 * `queries`, for stored queries ([below](#stored-queries));
+* `describe-settings`, for a dataset's DESCRIBE mode ([below](#describe-modes));
+* `graphql`, for a dataset's GraphQL schema and queries ([below](#graphql));
+* `csv`, for CSV and TSV tables ([below](#loading-csv-and-tsv));
 * `snapshot`, for named snapshots and history retention;
 * `quota`, for the storage quota of a dataset, locally or on a `--server`;
 * `compaction`, for a dataset's automatic compaction settings, locally or on a `--server`
@@ -522,10 +545,11 @@ The other commands are:
 * `auth`, for password hashes, tokens, and `auth login` for remote `query`, `update` and
   `load --server`;
 * `mcp` ([below](#mcp-server-llm-agents));
-* `fmt` and `lsp` ([below](#formatting));
+* `fmt` and `lsp` ([below](#formatting)), and `lint` ([below](#linting));
+* `completions`, `man` and `openapi` ([below](#shell-completions-and-man-pages));
 * `convert` (`riot`), `qparse`, `uparse`, `compare` (`rdfcompare`, `rdfdiff`), `iri`,
-  `langtag`, `rsparql`, `rupdate` and `rset`, for files and endpoints
-  ([below](#file-tools)).
+  `langtag`, `rsparql`, `rupdate`, `rset` and `rdfpatch`, for files and endpoints
+  ([below](#file-tools));
 * `vocab-index`, which adds the sparse vocabulary index (`vocab.idx`) to a database
   whose index was built before it existed. Loads and compactions write it. With it, a
   server that starts with a cold page cache looks up a term with one read instead of one
@@ -705,6 +729,30 @@ prints the counts of data rows, prefix rows and transaction rows of each file to
 error. The input form follows the file extension, `.trp` for binary, or `--format`. An
 error exits with status 1 and names the line and column, or the row of a binary patch.
 
+### Validating with SHACL and ShEx
+
+`sparkles shacl` and `sparkles shex validate` validate a database or data files on
+request, and exit with status 1 when the data does not conform. `sparkles validation`
+installs a guard that validates every later write to a database before it commits
+([API](API.md#write-time-validation)):
+
+```sh
+sparkles shacl --loc db --shapes shapes.ttl                  # a Turtle report; --format json|text
+sparkles shacl --data data.ttl --shapes shapes.shaclc --graph union
+sparkles shex validate --loc db --schema people.shex --shape-map '{FOCUS a ex:Person}@ex:PersonShape'
+sparkles shex parse people.shex --out shexr > people.ttl     # ShExC to ShExR, ShExJ or ShExC
+sparkles validation --loc db --mode reject --shapes shapes.ttl
+sparkles validation --loc db --mode warn --schema people.shex --shape-map '{FOCUS a ex:Person}@ex:PersonShape'
+sparkles validation --loc db --status                        # the configuration and its counts
+sparkles validation --loc db --off
+```
+
+Both commands read the default graph unless `--graph` names another, and include the
+materialized inferences unless `--no-inferences` is given. `shex validate` also takes a
+shape map file (`--map`) or a single node (`--node`), and Jena's flag names as aliases.
+`validation --grandfather` blocks only the results a write introduces, so a guard in
+`reject` mode can be installed on data that does not conform.
+
 ### Drafting shapes from the data
 
 `sparkles schema --draft-shapes` writes SHACL shapes for the classes of a database, with
@@ -831,6 +879,9 @@ curl localhost:3030/books/graphql -H 'Content-Type: application/json' \
 
 A request runs as a fixed number of SPARQL queries, one per level of nested objects and
 per group of list fields, whatever the number of nodes, and `explain=true` shows them.
+The server bounds each request with `serve --graphql-max-depth` (default 12),
+`--graphql-max-nodes` (100,000), `--graphql-default-first` (100, the page size of a list
+without `first` or `last`) and `--graphql-max-first` (1,000).
 The caller's graph view, protections of triples, budgets and rate limits apply as on
 `/{ds}/sparql`, and a grant can be limited to the `graphql` endpoint. Pages of a
 connection read the commit of their cursor, so they stay consistent while the data
@@ -2079,10 +2130,12 @@ docker compose run --rm -T sparkles auth hash < password.txt
 ```
 
 Then mount the file, pass `--auth-config` and remove `SPARKLES_ALLOW_OPEN_NETWORK`.
-`compose.yaml` has these lines commented out:
+`compose.yaml` has the lines for both commented out. With them in place, the service
+reads:
 
 ```yaml
     command: [serve, --data, /data, --host, 0.0.0.0, --port, "3030",
+              --log-format, "${SPARKLES_LOG_FORMAT:-text}",
               --auth-config, /etc/sparkles/auth.toml]
     volumes:
       - sparkles-data:/data
