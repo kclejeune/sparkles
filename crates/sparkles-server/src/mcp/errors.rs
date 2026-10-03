@@ -144,6 +144,21 @@ impl ErrorContext<'_> {
             ),
             Error::GuardMissing(m) => ToolError::new("write-failed", 503, m),
             Error::StorageFull(m) => ToolError::new("storage-full", 507, m),
+            Error::PreconditionFailed(m) => ToolError::new("precondition-failed", 412, m).hint(
+                "nothing was written: read the current state again, then retry with the head commit (list_commits) as ifHead",
+            ),
+            Error::Patch(p) => {
+                let status = if p.kind == sparkles::patch::PatchErrorKind::PrevMismatch {
+                    412
+                } else {
+                    400
+                };
+                ToolError::new("patch-error", status, p.to_string())
+                    .hint("nothing was written: fix the patch and send it again")
+            }
+            Error::HistoryGone(g) => ToolError::new("unknown-commit", 410, g.message.clone())
+                .hint("the dataset no longer keeps that state; see list_commits"),
+            Error::HistoryUnsupported(m) => ToolError::new("unknown-commit", 410, m),
             Error::Cancelled => ToolError::new("internal", 500, "call cancelled: server shutting down"),
             e => {
                 tracing::error!(request_id = self.request_id, "MCP tool call failed: {e}");

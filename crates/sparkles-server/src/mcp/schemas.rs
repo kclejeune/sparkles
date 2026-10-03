@@ -51,7 +51,12 @@ fn ds() -> Value {
 }
 
 fn at() -> Value {
-    json!({"type":"integer","minimum":0,"description":"Read the snapshot of this commit (the `commit` of an earlier result) for consistent multi-call reads. Fails once the server no longer holds it; then rerun without atCommit."})
+    json!({"type":"integer","minimum":0,"description":"Read the snapshot of this commit (the `commit` of an earlier result) for consistent multi-call reads. A past commit is readable while the server holds it or the dataset's history keeps it; otherwise the call fails and you rerun without atCommit."})
+}
+
+/// `at`: a past state by commit, time or snapshot name.
+pub(super) fn at_sel() -> Value {
+    json!({"type":["integer","string"],"description":"Read a past state of the dataset: a commit number, `commit:N`, `time:<RFC 3339>` (the last commit at or before that instant), `snapshot:<name>` (a named snapshot) or `head`. The dataset must still keep that state (see list_commits). Not with atCommit."})
 }
 
 fn rs() -> Value {
@@ -145,7 +150,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
             "exactTotal": {"type":"boolean","default":true,"description":"false: stop after offset+maxRows+1 solutions (faster; total becomes null)"},
             "timeoutSeconds": to(cfg),
             "reasoning": rs(),
-            "atCommit": at()}}),
+            "atCommit": at(), "at": at_sel()}}),
         None,
     );
     sparql_query.open_world = cfg.allow_service;
@@ -184,7 +189,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "subjectClasses": {"type":"boolean","default":false,"description":"List the classes of each predicate's subjects with their triple counts"},
                 "shapes": {"type":"array","items":{"type":"string"},"description":"section=constraints: `guard` (the write-time validation, the default), `default`, `none` or shapes graph IRIs"},
                 "classes": {"type":"array","items":{"type":"string"},"description":"section=profiles: profile only these classes (IRIs or prefixed names)"},
-                "atCommit": at()}}),
+                "atCommit": at(), "at": at_sel()}}),
             Some(
                 json!({"type":"object","required":["dataset","commit","graph","reasoning","section","totals","builtinClassesHidden","next","prefixes"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"graph":{"type":"string"},
@@ -216,7 +221,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "maxIn": {"type":"integer","minimum":0,"maximum":64,"default":10,"description":"Largest sh:in list (0: none)"},
                 "maxCount": {"type":"integer","minimum":0,"default":1,"description":"Largest sh:maxCount drafted (0: none)"},
                 "closed": {"type":"boolean","default":false},
-                "atCommit": at(),
+                "atCommit": at(), "at": at_sel(),
                 "timeoutSeconds": to(cfg)}}),
             Some(json!({"type":"object","required":["dataset","commit","graph","support","language","totals","shapes"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"graph":{"type":"string"},
@@ -259,7 +264,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
             json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
                 "dataset": ds(), "query": {"type":"string","minLength":1,"maxLength":65536},
                 "includeAlgebra": {"type":"boolean","default":false},
-                "reasoning": rs(), "atCommit": at()}}),
+                "reasoning": rs(), "atCommit": at(), "at": at_sel()}}),
             Some(
                 json!({"type":"object","required":["dataset","commit","queryType","estimatedRows","plan","warnings"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"queryType":{"type":"string"},
@@ -279,7 +284,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "direction": {"enum":["both","outgoing","incoming"],"default":"both"},
                 "maxTriples": {"type":"integer","minimum":1,"maximum":500,"default":50,"description":"Per direction"},
                 "lang": {"type":"string","default":"en","description":"Preferred label language"},
-                "reasoning": rs(), "atCommit": at()}}),
+                "reasoning": rs(), "atCommit": at(), "at": at_sel()}}),
             Some(
                 json!({"type":"object","required":["dataset","commit","iri","exists","types","prefixes"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"iri":{"type":"string"},
@@ -304,7 +309,9 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "commits":{"type":"array","items":{"type":"object","required":["seq","timestamp","kind","inserted","deleted","quads"],"properties":{
                     "seq":{"type":"integer"},"timestamp":{"type":"string"},"kind":{"type":"string"},
                     "inserted":{"type":"integer"},"deleted":{"type":"integer"},"quads":{"type":"integer"}}}},
-                "next":{"type":["object","null"],"properties":{"before":{"type":"integer"}}}}}),
+                "next":{"type":["object","null"],"properties":{"before":{"type":"integer"}}},
+                "readable":{"type":"array","description":"The commits whose state `at` and `atCommit` can read","items":{"type":"object","required":["from","to"],"properties":{"from":{"type":"integer"},"to":{"type":"integer"}}}},
+                "snapshots":{"type":"array","description":"Named snapshots, newest first (read with at=snapshot:<name>)","items":{"type":"object","required":["name","commit"],"properties":{"name":{"type":"string"},"commit":{"type":"integer"}}}}}}),
             ),
         ),
         read(
@@ -318,7 +325,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "lang": {"type":"string"},
                 "limit": {"type":"integer","minimum":1,"maximum":200,"default":20},
                 "withTypes": {"type":"boolean","default":true},
-                "reasoning": rs(), "atCommit": at()}}),
+                "reasoning": rs(), "atCommit": at(), "at": at_sel()}}),
             Some(json!({"type":"object","required":["dataset","commit","hits","limited","prefixes"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},
                 "hits":{"type":"array","items":{"type":"object","required":["s","score"],"properties":{
@@ -340,7 +347,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "metric": {"enum":["cosine","dot","euclidean"],"default":"cosine"},
                 "excludeSelf": {"type":"boolean","default":true},
                 "withLabels": {"type":"boolean","default":true},
-                "reasoning": rs(), "atCommit": at()}}),
+                "reasoning": rs(), "atCommit": at(), "at": at_sel()}}),
             Some(json!({"type":"object","required":["dataset","commit","metric","higherIsBetter","hits","prefixes"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},
                 "metric":{"enum":["cosine","dot","euclidean"]},"higherIsBetter":{"type":"boolean"},
@@ -360,7 +367,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "reasoning": rs(),
                 "maxResults": max_results(cfg),
                 "timeoutSeconds": to(cfg),
-                "atCommit": at()}}),
+                "atCommit": at(), "at": at_sel()}}),
             Some(json!({"type":"object","required":["dataset","commit","reasoning","conforms","total","bySeverity","results","truncated","prefixes"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"reasoning":{"type":"boolean"},
                 "conforms":{"type":"boolean"},"total":{"type":"integer"},
@@ -386,7 +393,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "onlyNonconformant": {"type":"boolean","default":true,"description":"List only nonconformant results (the counts cover all)"},
                 "maxResults": max_results(cfg),
                 "timeoutSeconds": to(cfg),
-                "atCommit": at()}}),
+                "atCommit": at(), "at": at_sel()}}),
             Some(json!({"type":"object","required":["dataset","commit","reasoning","conforms","counts","results","truncated","warnings","prefixes"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"reasoning":{"type":"boolean"},
                 "conforms":{"type":"boolean"},
@@ -420,11 +427,13 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         ToolDef {
             name: "sparql_update",
             title: "Run a SPARQL update",
-            description: "Run a SPARQL 1.1 Update (INSERT DATA, DELETE DATA, DELETE/INSERT WHERE, CLEAR, DROP, …) on a dataset. The dataset's prefixes are predeclared. LOAD is refused. The write passes the dataset's write-time validation, and message is recorded with the commit. Returns the commit and the quads inserted and deleted. Changes are committed immediately and cannot be undone through this server.",
-            input: json!({"type":"object","additionalProperties":false,"required":["update"],"properties":{
+            description: "Run a SPARQL 1.1 Update (INSERT DATA, DELETE DATA, DELETE/INSERT WHERE, CLEAR, DROP, …) on a dataset, or apply an RDF Patch (text form) with `patch` instead of `update`. The dataset's prefixes are predeclared. LOAD is refused. The write passes the dataset's write-time validation, and message is recorded with the commit. With ifHead the write happens only if that commit is still the dataset's head. Returns the commit and the quads inserted and deleted. Changes are committed immediately and cannot be undone through this server.",
+            input: json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds(),
-                "update": {"type":"string","minLength":1,"maxLength":1_048_576},
+                "update": {"type":"string","minLength":1,"maxLength":1_048_576,"description":"A SPARQL 1.1 Update. Give update or patch"},
+                "patch": {"type":"string","minLength":1,"maxLength":1_048_576,"description":"An RDF Patch in its text form (A and D rows, transactions, prefixes, and a prev header that must name the head). Give update or patch"},
                 "message": {"type":"string","maxLength":1024,"description":"Commit message recorded with the change (one line, at most 1024 bytes)"},
+                "ifHead": {"type":"integer","minimum":0,"description":"Write only if this commit is still the dataset's head (the `commit` of the result you based the change on); otherwise nothing is written and the call fails with precondition-failed"},
                 "dryRun": {"type":"boolean","description":"Preview the update instead of committing it: it runs up to its commit, nothing is written, and the result gives the commit it would make, its counts per graph, the validation it would pass or fail, and whether it fits the storage quota"},
                 "changes": {"type":"integer","minimum":0,"maximum":100,"description":"With dryRun, list up to this many changed quads"},
                 "timeoutSeconds": to(cfg)}}),
@@ -432,6 +441,9 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "dataset":{"type":"string"},"committed":{"type":"boolean"},"commit":{"type":"integer"},
                 "inserted":{"type":"integer"},"deleted":{"type":"integer"},
                 "message":{"type":"string"},
+                "patch":{"type":"object","description":"For a patch: the rows read, whether a TA row aborted it, whether its prev header was checked, and the prefixes it set and removed","properties":{
+                    "rows":{"type":"integer"},"aborted":{"type":"boolean"},"prevChecked":{"type":"boolean"},
+                    "prefixesSet":{"type":"integer"},"prefixesRemoved":{"type":"integer"}}},
                 "validation":{"type":"object"},
                 "dryRun":{"type":"boolean"},"wouldCommit":{"type":"boolean"},
                 "outcome":{"enum":["commit","no-change","precondition-failed","rejected","storage-refused"]},

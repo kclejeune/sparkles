@@ -35,6 +35,7 @@ struct SearchTextArgs {
     with_types: Option<bool>,
     reasoning: Option<bool>,
     at_commit: Option<u64>,
+    at: Option<Value>,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,7 @@ struct SimilarArgs {
     with_labels: Option<bool>,
     reasoning: Option<bool>,
     at_commit: Option<u64>,
+    at: Option<Value>,
 }
 
 /// `[A-Za-z]{1,8}(-[A-Za-z0-9]{1,8})*`
@@ -144,7 +146,7 @@ impl Tools<'_> {
         let names = prefixes.names();
         let timeout = self.cfg().default_timeout();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let snap = self.server.shared.pins.resolve(&ds, a.at_commit)?;
+        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let deadline = self.call.arrived + timeout;
         let opts = self
@@ -270,7 +272,7 @@ impl Tools<'_> {
             ToolError::new("no-vectors", 400, m)
                 .hint("list embedding predicates with describe_schema (vector=true)")
         };
-        let snap = self.server.shared.pins.resolve(&ds, a.at_commit)?;
+        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let deadline = self.call.arrived + timeout;
         let opts = self

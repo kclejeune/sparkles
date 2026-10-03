@@ -131,6 +131,7 @@ impl StoredTool {
                 "atCommit",
                 json!({"type":"integer","minimum":0,"description":"Read the snapshot of this commit (the `commit` of an earlier result)."}),
             ),
+            ("at", super::schemas::at_sel()),
             (
                 "timeoutSeconds",
                 json!({"type":"number","exclusiveMinimum":0,"maximum":timeout.0,"default":timeout.1}),
@@ -227,6 +228,7 @@ impl Tools<'_> {
         let max_rows = paging("maxRows");
         let offset = paging("offset");
         let at_commit = paging("atCommit");
+        let at = paging("at");
         let timeout = paging("timeoutSeconds");
         let mut rest = Map::new();
         for (k, v) in [
@@ -234,6 +236,7 @@ impl Tools<'_> {
             ("maxRows", max_rows),
             ("offset", offset),
             ("atCommit", at_commit),
+            ("at", at),
             ("timeoutSeconds", timeout),
         ] {
             if let Some(v) = v {

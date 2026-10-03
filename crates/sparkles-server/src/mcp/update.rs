@@ -4,16 +4,23 @@
 //! passes the dataset's write-time validation, and the commit carries a message. With
 //! `dryRun` the update is previewed instead: it runs up to its commit, and the result
 //! says what the commit would be (see `docs/specs/C15-write-previews.md`).
+//!
+//! The tool also applies RDF Patch in its text form (`patch` instead of `update`), as
+//! `/{ds}/patch` does, with the caller's write grant on the `patch` endpoint. `ifHead`
+//! makes either write conditional on the dataset's head, checked with the writer lock
+//! held.
 
 use super::Outcome;
 use super::errors::ToolError;
 use super::render::{Prefixes, Terms};
 use super::tools::{Tools, dataset_prefixes, parse};
-use crate::auth::Level;
+use crate::auth::{Endpoint, Level};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use spargebra::{GraphUpdateOperation, SparqlParser};
 use sparkles::commit::CommitKind;
+use sparkles::guard::Precondition;
+use sparkles::store::{PatchOptions, Snapshot};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -27,11 +34,29 @@ const MAX_CHANGES: usize = 100;
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct UpdateArgs {
     dataset: Option<String>,
-    update: String,
+    update: Option<String>,
     message: Option<String>,
     timeout_seconds: Option<f64>,
     dry_run: Option<bool>,
     changes: Option<usize>,
+    if_head: Option<u64>,
+    patch: Option<String>,
+}
+
+/// `ifHead`: the write goes ahead only while commit `expected` is the dataset's head.
+/// The store checks it with the writer lock held, so that no other commit can come
+/// between the check and the write, as for an HTTP `If-Match`.
+fn if_head(expected: u64) -> Precondition {
+    Precondition::new(move |head: &Snapshot| {
+        if head.commit == expected {
+            Ok(())
+        } else {
+            Err(sparkles::Error::PreconditionFailed(format!(
+                "ifHead: the head of the dataset is commit {}, not {expected}",
+                head.commit
+            )))
+        }
+    })
 }
 
 /// What the update parses to, as far as this tool cares.
@@ -78,12 +103,27 @@ fn classify(u: &str, prefixes: &[(String, String)]) -> Parsed {
 impl Tools<'_> {
     pub(super) fn sparql_update(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: UpdateArgs = parse(args)?;
-        if a.update.trim().is_empty() {
-            return Err(ToolError::bad_argument("update must not be empty"));
+        let (text, is_patch) = match (&a.update, &a.patch) {
+            (Some(u), None) => (u.as_str(), false),
+            (None, Some(p)) => (p.as_str(), true),
+            (Some(_), Some(_)) => {
+                return Err(ToolError::bad_argument(
+                    "give update (SPARQL Update) or patch (RDF Patch), not both",
+                ));
+            }
+            (None, None) => {
+                return Err(ToolError::bad_argument(
+                    "update (SPARQL Update) or patch (RDF Patch) is required",
+                ));
+            }
+        };
+        let what = if is_patch { "patch" } else { "update" };
+        if text.trim().is_empty() {
+            return Err(ToolError::bad_argument(format!("{what} must not be empty")));
         }
-        if a.update.chars().count() > MAX_UPDATE_CHARS {
+        if text.chars().count() > MAX_UPDATE_CHARS {
             return Err(ToolError::bad_argument(format!(
-                "update must be at most {MAX_UPDATE_CHARS} characters"
+                "{what} must be at most {MAX_UPDATE_CHARS} characters"
             )));
         }
         let timeout = self.timeout(a.timeout_seconds)?;
@@ -99,11 +139,20 @@ impl Tools<'_> {
         }
         let ds = self.dataset(a.dataset.as_deref())?;
         let p = &self.call.principal;
-        if !p.can(&ds.name, Level::Write) {
+        let endpoint = if is_patch {
+            Endpoint::Patch
+        } else {
+            Endpoint::Update
+        };
+        if !p.can(&ds.name, Level::Write) || !p.can_at(&ds.name, endpoint, Level::Write) {
             return Err(ToolError::new(
                 "forbidden",
                 403,
-                format!("write access to dataset {} required", ds.name),
+                format!(
+                    "write access to the {} endpoint of dataset {} required",
+                    endpoint.as_str(),
+                    ds.name
+                ),
             )
             .hint("this caller may only read the dataset"));
         }
@@ -116,33 +165,29 @@ impl Tools<'_> {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        match classify(&a.update, &pv) {
-            Parsed::Load => {
-                return Err(ToolError::new(
-                    "load-disabled",
-                    403,
-                    "LOAD is disabled for MCP updates",
-                )
-                .hint("insert the data with INSERT DATA, or load files with the HTTP API"));
+        if !is_patch {
+            match classify(text, &pv) {
+                Parsed::Load => {
+                    return Err(ToolError::new(
+                        "load-disabled",
+                        403,
+                        "LOAD is disabled for MCP updates",
+                    )
+                    .hint("insert the data with INSERT DATA, or load files with the HTTP API"));
+                }
+                Parsed::Query => {
+                    return Err(
+                        ToolError::new("not-an-update", 400, "this is a SPARQL query")
+                            .hint("use sparql_query"),
+                    );
+                }
+                Parsed::Update | Parsed::Unknown => {}
             }
-            Parsed::Query => {
-                return Err(
-                    ToolError::new("not-an-update", 400, "this is a SPARQL query")
-                        .hint("use sparql_query"),
-                );
-            }
-            Parsed::Update | Parsed::Unknown => {}
         }
         let t0 = Instant::now();
         let deadline = self.call.arrived + timeout;
         let mut opts = self
-            .query_options(
-                &ds.name,
-                crate::auth::Endpoint::Update,
-                false,
-                deadline,
-                &prefix_map,
-            )
+            .query_options(&ds.name, endpoint, false, deadline, &prefix_map)
             .map_err(|e| ctx.engine(e))?;
         // the engine refuses LOAD too, should the check above not have parsed the update
         opts.forbid_remote_load = true;
@@ -153,7 +198,7 @@ impl Tools<'_> {
             cancel: Some(self.call.cancel.clone()),
             report_limit: None,
             message: message.clone(),
-            precondition: None,
+            precondition: a.if_head.map(if_head),
             no_wait: false,
             graphs: opts.graphs.clone(),
             dry_run: dry_run.then_some(sparkles::preview::DryRun {
@@ -164,34 +209,78 @@ impl Tools<'_> {
         };
         // a caller limited to some graphs learns that the guard refused, not its results
         let restricted = opts.graphs.is_some();
-        let result =
-            sparkles::sparql::update::update_as(&ds.store, &a.update, &opts, CommitKind::Update);
-        if let Err(sparkles::Error::DryRun(p)) = result {
-            let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-            return Ok(Outcome::Structured(preview_json(
-                &ds.name, &p, &prefixes, restricted, changes, elapsed_ms,
-            )));
-        }
-        let stats = result.map_err(|e| match e {
-                    sparkles::Error::Rejected(_) if restricted => ToolError::new(
-                        "validation-failed",
-                        422,
-                        "the update does not conform to the dataset's validation guard; nothing was written",
-                    ),
-                    e => ctx.engine(e),
-                })?;
-        let Some(receipt) = stats.commit else {
-            return Err(ToolError::internal(&self.call.request_id));
+        let refused = |e: sparkles::Error| match e {
+            sparkles::Error::Rejected(_) if restricted => ToolError::new(
+                "validation-failed",
+                422,
+                format!(
+                    "the {what} does not conform to the dataset's validation guard; nothing was written"
+                ),
+            ),
+            e => ctx.engine(e),
         };
-        let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+        let elapsed = || (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+        // (receipt, inserted, deleted, the patch's own counts)
+        let (receipt, inserted, deleted, patch) = if is_patch {
+            let po = PatchOptions {
+                write: opts.write.clone(),
+                binary: false,
+            };
+            match ds.store.apply_patch(text.as_bytes(), &po) {
+                Err(sparkles::Error::DryRun(p)) => {
+                    return Ok(Outcome::Structured(preview_json(
+                        &ds.name,
+                        &p,
+                        &prefixes,
+                        restricted,
+                        changes,
+                        elapsed(),
+                    )));
+                }
+                Err(e) => return Err(refused(e)),
+                Ok(o) => {
+                    let counts = json!({
+                        "rows": o.rows,
+                        "aborted": o.aborted,
+                        "prevChecked": o.prev_checked,
+                        "prefixesSet": o.prefixes_set,
+                        "prefixesRemoved": o.prefixes_removed,
+                    });
+                    (o.receipt, o.inserted, o.deleted, Some(counts))
+                }
+            }
+        } else {
+            match sparkles::sparql::update::update_as(&ds.store, text, &opts, CommitKind::Update) {
+                Err(sparkles::Error::DryRun(p)) => {
+                    return Ok(Outcome::Structured(preview_json(
+                        &ds.name,
+                        &p,
+                        &prefixes,
+                        restricted,
+                        changes,
+                        elapsed(),
+                    )));
+                }
+                Err(e) => return Err(refused(e)),
+                Ok(stats) => {
+                    let Some(receipt) = stats.commit else {
+                        return Err(ToolError::internal(&self.call.request_id));
+                    };
+                    (receipt, stats.inserted, stats.deleted, None)
+                }
+            }
+        };
         let mut out = json!({
             "dataset": ds.name,
             "committed": receipt.committed,
             "commit": receipt.commit.seq,
-            "inserted": stats.inserted,
-            "deleted": stats.deleted,
-            "elapsedMs": elapsed_ms,
+            "inserted": inserted,
+            "deleted": deleted,
+            "elapsedMs": elapsed(),
         });
+        if let Some(counts) = patch {
+            out["patch"] = counts;
+        }
         if let Some(m) = &message {
             out["message"] = json!(m.as_ref());
         }
