@@ -168,7 +168,9 @@ pub struct Group {
     /// a values group's predicates, by field number
     pub vfields: Vec<NamedNode>,
     /// how each field of each concrete type is answered
-    pub fields: HashMap<(String, Key), FieldPlan>,
+    pub fields: HashMap<String, HashMap<Key, FieldPlan>>,
+    /// the declared type is an object type, so every node has it
+    pub concrete: bool,
     /// the declared type of the nodes: an object type, an interface, a union or `Node`
     pub declared: String,
 }
@@ -184,6 +186,7 @@ impl Group {
             values: None,
             vfields: Vec::new(),
             fields: HashMap::new(),
+            concrete: false,
             declared: declared.to_string(),
         }
     }
@@ -588,6 +591,7 @@ impl<'a> Planner<'a> {
         let m = &self.c.mapping;
         let types = m.possible_types(declared);
         let is_object = m.ty(declared).is_some_and(|t| !t.interface);
+        self.plan.groups[g].concrete = is_object;
         if !is_object {
             self.plan.groups[g].flags = types.clone();
         }
@@ -623,7 +627,9 @@ impl<'a> Planner<'a> {
                 if name == "id" {
                     self.plan.groups[g]
                         .fields
-                        .insert((ty.clone(), k), FieldPlan::Id);
+                        .entry(ty.clone())
+                        .or_default()
+                        .insert(k, FieldPlan::Id);
                     continue;
                 }
                 if ty == "Resource" {
@@ -631,7 +637,9 @@ impl<'a> Planner<'a> {
                         let fno = self.value_field(g, &NamedNode::new_unchecked(RDF_TYPE))?;
                         self.plan.groups[g]
                             .fields
-                            .insert((ty.clone(), k), FieldPlan::Types { fno });
+                            .entry(ty.clone())
+                            .or_default()
+                            .insert(k, FieldPlan::Types { fno });
                     }
                     continue;
                 }
@@ -721,7 +729,11 @@ impl<'a> Planner<'a> {
                         }
                     }
                 };
-                self.plan.groups[g].fields.insert((ty.clone(), k), plan);
+                self.plan.groups[g]
+                    .fields
+                    .entry(ty.clone())
+                    .or_default()
+                    .insert(k, plan);
             }
         }
         Ok(())

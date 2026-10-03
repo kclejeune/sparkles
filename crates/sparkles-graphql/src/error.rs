@@ -120,6 +120,8 @@ impl GqlError {
             sparkles::Error::Cancelled => {
                 GqlError::new(Code::Cancelled, "the request was cancelled")
             }
+            // a value the engine refuses, such as a regex pattern
+            sparkles::Error::Invalid(m) => GqlError::new(Code::BadUserInput, m),
             e => GqlError::new(Code::Internal, e.to_string()),
         }
     }

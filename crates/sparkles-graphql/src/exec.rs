@@ -293,7 +293,7 @@ pub struct Cx<'a> {
     pub commit: u64,
 }
 
-impl Cx<'_> {
+impl<'a> Cx<'a> {
     fn fail(&self, e: GqlError) -> FieldError {
         let mut errs = self.errors.borrow_mut();
         errs.push(e);
@@ -316,22 +316,16 @@ impl Cx<'_> {
     }
 
     /// The object type of a record of group `g`.
-    fn type_of(&self, g: usize, rec: &Rec) -> Result<String, GqlError> {
-        let grp = &self.plan.groups[g];
-        if grp.flags.is_empty()
-            && self
-                .c
-                .mapping
-                .ty(&grp.declared)
-                .is_some_and(|t| !t.interface)
-        {
-            return Ok(grp.declared.clone());
+    fn type_of(&self, g: usize, rec: &Rec) -> Result<&'a str, GqlError> {
+        let grp: &'a crate::plan::Group = &self.plan.groups[g];
+        if grp.concrete {
+            return Ok(&grp.declared);
         }
         if let Some(i) = rec.flags.iter().position(|f| *f) {
-            return Ok(grp.flags[i].clone());
+            return Ok(&grp.flags[i]);
         }
         if grp.declared == "Node" {
-            return Ok("Resource".into());
+            return Ok("Resource");
         }
         Err(GqlError::new(
             Code::UnresolvedType,
@@ -540,7 +534,7 @@ struct NodeObj<'a> {
     cx: &'a Cx<'a>,
     group: usize,
     rec: usize,
-    ty: String,
+    ty: &'a str,
 }
 
 /// Values in the first language range that has any (§4.5).
@@ -668,7 +662,7 @@ fn slice<T>(v: Vec<T>, offset: u64, first: u64) -> Vec<T> {
 
 impl ObjectValue for NodeObj<'_> {
     fn type_name(&self) -> &str {
-        &self.ty
+        self.ty
     }
 
     fn resolve_field<'a>(
@@ -677,7 +671,11 @@ impl ObjectValue for NodeObj<'_> {
     ) -> Result<ResolvedValue<'a>, FieldError> {
         let cx = self.cx;
         let k = key(info.field_selections()[0]);
-        let Some(fp) = cx.plan.groups[self.group].fields.get(&(self.ty.clone(), k)) else {
+        let Some(fp) = cx.plan.groups[self.group]
+            .fields
+            .get(self.ty)
+            .and_then(|m| m.get(&k))
+        else {
             if info.field_name() == "id" {
                 return Ok(leaf(id_of(&self.rec().node).unwrap_or_default().into()));
             }

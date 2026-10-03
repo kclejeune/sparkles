@@ -389,7 +389,9 @@ fn run(
     apollo_compiler::introspection::check_max_depth(&doc, op)
         .map_err(|e| GqlError::new(Code::TooComplex, e.message().to_string()))?;
     let limits = opts.limits.with(&c.config.limits);
+    let parsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let plan = plan::Planner::new(c, &doc, &vars, limits).plan(op)?;
+    let planned_ms = started.elapsed().as_secs_f64() * 1000.0;
     // the snapshot: the cursors' commit, which `at` must agree with, or `at`, or the head
     let snap = match plan.commit {
         Some(commit) => match &opts.at {
@@ -423,6 +425,7 @@ fn run(
     qopts.work = Some(Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let deadline = qopts.timeout.map(|t| started + t);
     let data = exec::run_groups(c, &plan, snap.clone(), &qopts, deadline, opts.explain)?;
+    let ran_ms = started.elapsed().as_secs_f64() * 1000.0;
     resp.groups = data.iter().filter(|d| !d.skipped).count();
     let (out, errors, _nodes) = exec::assemble(
         c,
@@ -446,6 +449,14 @@ fn run(
     if opts.explain {
         ext["plan"] = exec::explain(&plan, &data);
         ext["groups"] = resp.groups.into();
+        let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
+        let done = started.elapsed().as_secs_f64() * 1000.0;
+        ext["timing"] = json!({
+            "parseMs": r3(parsed_ms),
+            "planMs": r3(planned_ms - parsed_ms),
+            "groupsMs": r3(ran_ms - planned_ms),
+            "assembleMs": r3(done - ran_ms),
+        });
     }
     body.insert("extensions".into(), json!({ "sparkles": ext }));
     let body = J::Object(body);
