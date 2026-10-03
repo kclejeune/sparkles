@@ -273,7 +273,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
             "describe_schema",
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds,
-                "section": {"enum":["summary","classes","predicates","constraints"],"default":"summary"},
+                "section": {"enum":["summary","classes","predicates","constraints","profiles"],"default":"summary"},
                 "graph": {"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"},
                 "reasoning": rs,
                 "includeBuiltin": {"type":"boolean","default":false,"description":"Also list rdf:, rdfs:, owl:, xsd:, sh: classes"},
@@ -281,6 +281,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "cursor": {"type":"string","description":"`next` from the previous page"},
                 "subjectClasses": {"type":"boolean","default":false,"description":"List the classes of each predicate's subjects with their triple counts"},
                 "shapes": {"type":"array","items":{"type":"string"},"description":"section=constraints: `guard` (the write-time validation, the default), `default`, `none` or shapes graph IRIs"},
+                "classes": {"type":"array","items":{"type":"string"},"description":"section=profiles: profile only these classes (IRIs or prefixed names)"},
                 "atCommit": at}}),
         ),
         (
@@ -297,6 +298,17 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "maxCount": {"type":"integer","minimum":0,"default":1,"description":"Largest sh:maxCount drafted (0: none)"},
                 "closed": {"type":"boolean","default":false},
                 "atCommit": at,
+                "timeoutSeconds": to}}),
+        ),
+        (
+            "diff_schema",
+            json!({"type":"object","additionalProperties":false,"required":["from"],"properties":{
+                "dataset": ds,
+                "from": {"type":["integer","string"],"description":"The earlier state: a commit, `time:<RFC 3339>` or `snapshot:<name>`"},
+                "to": {"type":["integer","string"],"description":"The later state (default: the head)"},
+                "graph": {"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"},
+                "reasoning": rs,
+                "limit": {"type":"integer","minimum":1,"maximum":500,"default":50,"description":"Entries per list"},
                 "timeoutSeconds": to}}),
         ),
         (
@@ -418,6 +430,7 @@ async fn a03_tool_list() {
             "list_datasets",
             "describe_schema",
             "draft_shapes",
+            "diff_schema",
             "sparql_query",
             "explain_query",
             "describe_resource",
@@ -1703,4 +1716,75 @@ async fn update_over_stdio() {
     let ds = c.structured("list_datasets", json!({})).await;
     assert_eq!(ds["datasets"][0]["writable"], true);
     assert_eq!(ds["limits"]["updates"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn profiles_and_schema_diffs() {
+    let server = fixture_server();
+    let ds = server.state.datasets.read()["t"].clone();
+    // an in-memory dataset keeps past states only within a retention window
+    ds.store
+        .set_retention(sparkles::history::Retention {
+            keep_commits: Some(10),
+            ..Default::default()
+        })
+        .unwrap();
+    let first = ds.store.head_commit().seq;
+    sparkles::sparql::update::update(
+        &ds.store,
+        "PREFIX ex: <http://ex.org/> INSERT DATA { ex:carol a ex:Person, ex:Admin ; ex:age 41 }",
+        &sparkles::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let mut c = Client::start(server);
+    let s = c
+        .structured("describe_schema", json!({"section": "profiles"}))
+        .await;
+    let p = &s["profiles"][0];
+    assert_eq!(p["class"], "ex:Person");
+    assert_eq!(p["instances"], 3);
+    let age = p["properties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["predicate"] == "ex:age")
+        .unwrap();
+    assert_eq!(age["instances"], 3);
+    assert_eq!(age["valuesPerInstance"], "1..1");
+    assert_eq!(p["incoming"][0]["predicate"], "ex:knows");
+    let s = c
+        .structured(
+            "describe_schema",
+            json!({"section": "profiles", "classes": ["ex:Admin"]}),
+        )
+        .await;
+    assert_eq!(s["profiles"].as_array().unwrap().len(), 1);
+    assert_eq!(s["profiles"][0]["class"], "ex:Admin");
+    let (text, _) = c
+        .error("describe_schema", json!({"classes": ["ex:Admin"]}))
+        .await;
+    assert!(text.contains("section=profiles"), "{text}");
+
+    let s = c.structured("diff_schema", json!({"from": first})).await;
+    assert_eq!(s["from"], first);
+    assert_eq!(s["to"], first + 1);
+    assert_eq!(s["classes"]["added"], json!(["ex:Admin"]));
+    let person = &s["classes"]["changed"][0];
+    assert_eq!(person["iri"], "ex:Person");
+    assert_eq!(
+        person["changes"][0],
+        json!({"path": "observed.instances", "from": 2, "to": 3})
+    );
+    assert_eq!(s["truncated"], false);
+    let s = c
+        .structured(
+            "diff_schema",
+            json!({"from": format!("commit:{first}"), "to": first}),
+        )
+        .await;
+    assert_eq!(s["counts"]["classesChanged"], 0);
+    let (_, meta) = c.error("diff_schema", json!({"from": first + 5})).await;
+    assert_eq!(meta["status"], 404, "{meta}");
+    let (_, meta) = c.error("diff_schema", json!({"from": true})).await;
+    assert_eq!(meta["code"], "bad-argument");
 }

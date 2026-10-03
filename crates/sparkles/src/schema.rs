@@ -275,6 +275,8 @@ pub struct Lit {
 pub struct SnapshotInfo {
     /// [`snapshot_identity`] of the snapshot the report was computed at.
     pub version: u64,
+    /// The commit the report was computed at.
+    pub commit: u64,
     /// Name of the base index generation.
     pub generation: String,
     /// RFC 3339 time the report was computed.
@@ -348,6 +350,13 @@ pub struct ClassDeclared {
     pub super_classes: Vec<String>,
     pub equivalent_classes: Vec<String>,
     pub disjoint_with: Vec<String>,
+    /// Anonymous superclasses: class expressions in the OWL 2 Manchester Syntax, with
+    /// IRIs in angle brackets.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub super_class_expressions: Vec<String>,
+    /// Anonymous equivalent classes, rendered the same way.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub equivalent_class_expressions: Vec<String>,
     pub labels: Vec<Lit>,
     pub comments: Vec<Lit>,
 }
@@ -446,6 +455,11 @@ pub struct PredicateDeclared {
     pub ranges: Vec<String>,
     pub super_properties: Vec<String>,
     pub inverse_of: Vec<String>,
+    /// Anonymous domains and ranges: class expressions in the OWL 2 Manchester Syntax.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub domain_expressions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub range_expressions: Vec<String>,
     pub labels: Vec<Lit>,
     pub comments: Vec<Lit>,
 }
@@ -476,6 +490,10 @@ pub struct SchemaReport {
     /// computed a cached report.
     #[serde(skip)]
     pub term_totals: Option<TermTotals>,
+    /// What [`update`] needs to bring the report up to date from later changes (not
+    /// kept for reports with subject classes, which it cannot maintain).
+    #[serde(skip)]
+    pub maintenance: Option<Arc<Maintenance>>,
 }
 
 /// One page of a list, in IRI order.
@@ -779,10 +797,15 @@ fn is_blank(snap: &Snapshot, id: u64) -> bool {
     matches!(quick_kind(snap, id), Some(Kind::Blank))
 }
 
-/// Per-predicate accumulator of the two passes.
-#[derive(Default)]
-struct PredAcc {
-    obs: PredicateObserved,
+/// Per-predicate accumulator of the two passes. A report keeps them by predicate (see
+/// [`Maintenance`]), so it can be brought up to date from later changes ([`update`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PredAcc {
+    triples: u64,
+    distinct_subjects: u64,
+    distinct_objects: u64,
+    /// distinct objects of one subject → subjects with that many
+    per_subject: BTreeMap<u64, u64>,
     iri: KindCount,
     blank: KindCount,
     triple: KindCount,
@@ -790,38 +813,67 @@ struct PredAcc {
     lits: FxHashMap<Vec<u8>, (u64, u64)>,
 }
 
-impl PredAcc {
-    fn literal(&mut self, suffix: &[u8], n: u64) {
-        match self.lits.get_mut(suffix) {
-            Some(e) => {
-                e.0 += n;
-                e.1 += 1;
-            }
-            None => {
-                self.lits.insert(suffix.to_vec(), (n, 1));
-            }
-        }
-    }
+/// `x + d`, or `None` below zero.
+fn bumped(x: u64, d: i64) -> Option<u64> {
+    x.checked_add_signed(d)
+}
 
-    fn object(&mut self, kind: Kind, n: u64) {
-        let add = |k: &mut KindCount| {
-            k.triples += n;
-            k.distinct += 1;
+impl PredAcc {
+    /// Add `triples` triples and `distinct` distinct objects of one kind (both may be
+    /// negative when changes are applied); `None` when a count would fall below zero.
+    fn object(&mut self, kind: Kind, triples: i64, distinct: i64) -> Option<()> {
+        let add = |k: &mut KindCount| -> Option<()> {
+            k.triples = bumped(k.triples, triples)?;
+            k.distinct = bumped(k.distinct, distinct)?;
+            Some(())
         };
         match kind {
             Kind::Iri => add(&mut self.iri),
             Kind::Blank => add(&mut self.blank),
             Kind::Triple => add(&mut self.triple),
-            Kind::Literal(s) => self.literal(&s, n),
-            Kind::Other => {}
+            Kind::Literal(s) => {
+                let e = self.lits.entry(s.into_owned()).or_default();
+                e.0 = bumped(e.0, triples)?;
+                e.1 = bumped(e.1, distinct)?;
+                if *e == (0, 0) {
+                    self.lits.retain(|_, v| *v != (0, 0));
+                }
+                Some(())
+            }
+            Kind::Other => Some(()),
         }
     }
 
-    fn finish(mut self) -> PredicateObserved {
+    /// One subject more with `n` distinct objects (`n > 0`), or with `remove`, one less.
+    fn subject_run(&mut self, n: u64, remove: bool) -> Option<()> {
+        if n == 0 {
+            return Some(());
+        }
+        if remove {
+            let e = self.per_subject.get_mut(&n)?;
+            *e = e.checked_sub(1)?;
+            if *e == 0 {
+                self.per_subject.remove(&n);
+            }
+        } else {
+            *self.per_subject.entry(n).or_default() += 1;
+        }
+        Some(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.triples == 0
+            && self.distinct_subjects == 0
+            && self.distinct_objects == 0
+            && self.per_subject.is_empty()
+            && self.iri == KindCount::default()
+            && self.blank == KindCount::default()
+            && self.triple == KindCount::default()
+            && self.lits.is_empty()
+    }
+
+    fn observed(&self) -> PredicateObserved {
         let some = |k: KindCount| (k.distinct > 0).then_some(k);
-        self.obs.objects.iri = some(self.iri);
-        self.obs.objects.blank = some(self.blank);
-        self.obs.objects.triple_term = some(self.triple);
         #[derive(Default)]
         struct Group {
             triples: u64,
@@ -829,7 +881,7 @@ impl PredAcc {
             langs: Option<BTreeMap<(String, Option<String>), u64>>,
         }
         let mut groups: BTreeMap<String, Group> = BTreeMap::new();
-        for (suffix, (t, d)) in self.lits {
+        for (suffix, &(t, d)) in &self.lits {
             let text = String::from_utf8_lossy(suffix.get(1..).unwrap_or(&[])).into_owned();
             let (datatype, lang) = match suffix.first() {
                 None => (XSD_STRING.to_string(), None),
@@ -852,70 +904,89 @@ impl PredAcc {
                     .or_default() += t;
             }
         }
-        self.obs.objects.literals = groups
-            .into_iter()
-            .map(|(datatype, g)| LiteralGroup {
-                datatype,
-                triples: g.triples,
-                distinct: g.distinct,
-                languages: g.langs.map(|m| {
-                    m.into_iter()
-                        .map(|((lang, direction), triples)| LangCount {
-                            lang,
-                            direction,
-                            triples,
-                        })
-                        .collect()
-                }),
-            })
-            .collect();
-        self.obs
+        PredicateObserved {
+            triples: self.triples,
+            distinct_subjects: self.distinct_subjects,
+            distinct_objects: self.distinct_objects,
+            max_per_subject: self.per_subject.keys().next_back().copied().unwrap_or(0),
+            subjects_with_multiple: self.per_subject.range(2..).map(|(_, n)| n).sum(),
+            objects: ObjectKinds {
+                iri: some(self.iri),
+                blank: some(self.blank),
+                triple_term: some(self.triple),
+                literals: groups
+                    .into_iter()
+                    .map(|(datatype, g)| LiteralGroup {
+                        datatype,
+                        triples: g.triples,
+                        distinct: g.distinct,
+                        languages: g.langs.map(|m| {
+                            m.into_iter()
+                                .map(|((lang, direction), triples)| LangCount {
+                                    lang,
+                                    direction,
+                                    triples,
+                                })
+                                .collect()
+                        }),
+                    })
+                    .collect(),
+            },
+            subject_classes: None,
+            untyped_subjects: None,
+        }
     }
+}
+
+/// What a report keeps to be brought up to date from the changes after its commit
+/// ([`update`]): the accumulators of its predicates, by the predicate's vocabulary key,
+/// which every generation shares.
+#[derive(Clone, Debug, Default)]
+pub struct Maintenance {
+    /// the commit the report was computed at
+    pub(crate) commit: u64,
+    pub(crate) preds: FxHashMap<Vec<u8>, PredAcc>,
 }
 
 /// Pass A over `PSO[p]`: triples, distinct subjects, objects per subject, and with
 /// `join`, the classes of the subjects.
 fn subject_pass(
-    snap: &Snapshot,
+    src: &Src,
     p: u64,
     filter: &GraphFilter,
     budget: &Budget,
     acc: &mut PredAcc,
     mut join: Option<&mut ClassJoin>,
 ) -> crate::Result<()> {
-    let o = &mut acc.obs;
     let mut prev: Option<(u64, u64)> = None;
     let mut run = 0u64;
-    let mut end_subject = |o: &mut PredicateObserved, s: Option<u64>, run: u64| {
-        o.max_per_subject = o.max_per_subject.max(run);
-        if run >= 2 {
-            o.subjects_with_multiple += 1;
-        }
+    let mut end_subject = |acc: &mut PredAcc, s: Option<u64>, run: u64| {
+        acc.subject_run(run, false);
         if let (Some(j), Some(s)) = (join.as_deref_mut(), s) {
             j.subject(s, run);
         }
     };
-    for_each_key(snap, Perm::Pso, &[p], budget, |k| {
+    src.for_each_key(Perm::Pso, &[p], budget, |k| {
         if !filter.accepts(k[3]) || prev == Some((k[1], k[2])) {
             return;
         }
-        o.triples += 1;
+        acc.triples += 1;
         if prev.is_none_or(|(s, _)| s != k[1]) {
-            end_subject(o, prev.map(|(s, _)| s), run);
-            o.distinct_subjects += 1;
+            end_subject(acc, prev.map(|(s, _)| s), run);
+            acc.distinct_subjects += 1;
             run = 0;
         }
         run += 1;
         prev = Some((k[1], k[2]));
     })?;
-    end_subject(o, prev.map(|(s, _)| s), run);
+    end_subject(acc, prev.map(|(s, _)| s), run);
     Ok(())
 }
 
 /// The `(subject, class)` pairs of the selection's `rdf:type` triples whose object is
 /// an IRI, sorted by subject and then by class.
 fn subject_types(
-    snap: &Snapshot,
+    src: &Src,
     rdf_type: u64,
     filter: &GraphFilter,
     budget: &Budget,
@@ -923,12 +994,12 @@ fn subject_types(
     let mut iri: FxHashMap<u64, bool> = FxHashMap::default();
     let mut out: Vec<(u64, u64)> = Vec::new();
     let mut prev: Option<(u64, u64)> = None;
-    for_each_key(snap, Perm::Pso, &[rdf_type], budget, |k| {
+    src.for_each_key(Perm::Pso, &[rdf_type], budget, |k| {
         if !filter.accepts(k[3]) || prev == Some((k[1], k[2])) {
             return;
         }
         prev = Some((k[1], k[2]));
-        if *iri.entry(k[2]).or_insert_with(|| is_iri(snap, k[2])) {
+        if *iri.entry(k[2]).or_insert_with(|| is_iri(src, k[2])) {
             out.push((k[1], k[2]));
         }
     })?;
@@ -997,7 +1068,11 @@ impl PendingLiterals {
                 i += 1;
             }
             if i < ids.len() && ids[i] == id {
-                acc.literal(literal_suffix(key), counts[i]);
+                acc.object(
+                    Kind::Literal(literal_suffix(key).into()),
+                    counts[i] as i64,
+                    1,
+                );
                 i += 1;
             }
         });
@@ -1009,44 +1084,35 @@ impl PendingLiterals {
 /// Pass B over `POS[p]`: distinct objects and their kinds. For `rdf:type`, also the
 /// instances of each class.
 fn object_pass(
-    snap: &Snapshot,
+    src: &Src,
     p: u64,
     filter: &GraphFilter,
     budget: &Budget,
     acc: &mut PredAcc,
     mut class_instances: Option<&mut FxHashMap<u64, u64>>,
-    anon_types: &mut FxHashSet<u64>,
 ) -> crate::Result<()> {
     let mut pending = PendingLiterals::default();
     let mut prev: Option<(u64, u64)> = None;
     let mut run: Option<(u64, u64)> = None; // (object, distinct subjects)
     let mut end_object = |acc: &mut PredAcc, pending: &mut PendingLiterals, o: u64, n: u64| {
-        acc.obs.distinct_objects += 1;
-        match quick_kind(snap, o) {
+        acc.distinct_objects += 1;
+        match quick_kind(src, o) {
             Some(kind) => {
-                if let Some(ci) = class_instances.as_deref_mut() {
-                    match kind {
-                        Kind::Iri => {
-                            ci.insert(o, n);
-                        }
-                        Kind::Blank => {
-                            anon_types.insert(o);
-                        }
-                        _ => {}
-                    }
+                if let (Some(ci), Kind::Iri) = (class_instances.as_deref_mut(), &kind) {
+                    ci.insert(o, n);
                 }
-                acc.object(kind, n);
+                acc.object(kind, n as i64, 1);
             }
             None => {
                 pending.ids.push(Id(o).payload());
                 pending.counts.push(n);
                 if pending.ids.len() >= PendingLiterals::BATCH {
-                    pending.flush(snap, acc);
+                    pending.flush(src, acc);
                 }
             }
         }
     };
-    for_each_key(snap, Perm::Pos, &[p], budget, |k| {
+    src.for_each_key(Perm::Pos, &[p], budget, |k| {
         if !filter.accepts(k[3]) || prev == Some((k[1], k[2])) {
             return;
         }
@@ -1064,7 +1130,7 @@ fn object_pass(
     if let Some((o, n)) = run {
         end_object(acc, &mut pending, o, n);
     }
-    pending.flush(snap, acc);
+    pending.flush(src, acc);
     Ok(())
 }
 
@@ -1076,6 +1142,8 @@ struct ClassDecl {
     supers: BTreeSet<u64>,
     equivalents: BTreeSet<u64>,
     disjoint: BTreeSet<u64>,
+    super_exprs: BTreeSet<u64>,
+    equivalent_exprs: BTreeSet<u64>,
 }
 
 #[derive(Default)]
@@ -1086,11 +1154,13 @@ struct PropDecl {
     ranges: BTreeSet<u64>,
     supers: BTreeSet<u64>,
     inverse: BTreeSet<u64>,
+    domain_exprs: BTreeSet<u64>,
+    range_exprs: BTreeSet<u64>,
 }
 
 /// Distinct literal objects of `(s, p)` in the filtered graphs, sorted.
 fn literals_of(
-    snap: &Snapshot,
+    src: &Src,
     s: u64,
     p: Option<Id>,
     filter: &GraphFilter,
@@ -1100,7 +1170,7 @@ fn literals_of(
         return Ok(Vec::new());
     };
     let mut ids = Vec::new();
-    for_each_key(snap, Perm::Spo, &[s, p.0], budget, |k| {
+    src.for_each_key(Perm::Spo, &[s, p.0], budget, |k| {
         if filter.accepts(k[3]) {
             ids.push(k[2]);
         }
@@ -1108,7 +1178,7 @@ fn literals_of(
     ids.dedup();
     let mut out: Vec<Lit> = ids
         .into_iter()
-        .filter_map(|o| match snap.term(Id(o))? {
+        .filter_map(|o| match src.term(Id(o))? {
             Term::Literal(l) => Some(Lit {
                 value: l.value().to_string(),
                 lang: l.language().map(str::to_string),
@@ -1150,6 +1220,59 @@ impl Iris<'_> {
     }
 }
 
+/// The resolved graph filters of a report.
+struct Selected<'o> {
+    observed: GraphFilter,
+    declared: GraphFilter,
+    declared_sel: &'o GraphSelection,
+}
+
+impl<'o> Selected<'o> {
+    fn resolve(snap: &Snapshot, opts: &'o SchemaOptions) -> Result<Selected<'o>, SchemaError> {
+        let inferred = opts
+            .inferred_graph
+            .as_deref()
+            .and_then(|g| snap.lookup_iri(g))
+            .map(|g| g.0);
+        let observed = resolve(snap, &opts.graph, inferred, opts.include_inferred)?;
+        let declared_sel = opts.declared_graph.as_ref().unwrap_or(&opts.graph);
+        let declared = resolve(snap, declared_sel, inferred, opts.declared_from_inferred)?;
+        let (observed, declared) = match opts.graphs.as_ref().filter(|a| !a.reads_all()) {
+            Some(a) => (
+                within_view(snap, observed, &opts.graph, a)?,
+                within_view(snap, declared, declared_sel, a)?,
+            ),
+            None => (observed, declared),
+        };
+        Ok(Selected {
+            observed,
+            declared,
+            declared_sel,
+        })
+    }
+}
+
+/// The subject classes of each predicate, and its untyped subjects, by id.
+type Joins = FxHashMap<u64, (FxHashMap<u64, SubjectCount>, SubjectCount)>;
+
+/// The observed layer of a report, by id: the accumulator of every used predicate and
+/// the instances of every IRI class.
+struct Observed {
+    preds: FxHashMap<u64, PredAcc>,
+    class_instances: FxHashMap<u64, u64>,
+    /// the subject classes of each predicate by class id, named at the end
+    joins: Option<Joins>,
+    term_totals: Option<TermTotals>,
+}
+
+/// Labels a report may take from an earlier report of the same selection: those of
+/// entries whose subjects' labels, comments and version info did not change.
+struct Reuse<'a> {
+    old: &'a SchemaReport,
+    /// ids of the subjects whose labels, comments or version info changed
+    changed: FxHashSet<u64>,
+}
+
 /// Compute the schema report of `snap`.
 pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaReport, SchemaError> {
     // a view that hides triples is reported without them
@@ -1163,72 +1286,97 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
         cancel: opts.cancel.as_deref(),
     };
     in_phase(budget.check(), || "starting".into())?;
-    let inferred = opts
-        .inferred_graph
-        .as_deref()
-        .and_then(|g| snap.lookup_iri(g))
-        .map(|g| g.0);
-    let observed = resolve(snap, &opts.graph, inferred, opts.include_inferred)?;
-    let declared_sel = opts.declared_graph.as_ref().unwrap_or(&opts.graph);
-    let declared = resolve(snap, declared_sel, inferred, opts.declared_from_inferred)?;
-    let (observed, declared) = match opts.graphs.as_ref().filter(|a| !a.reads_all()) {
-        Some(a) => (
-            within_view(snap, observed, &opts.graph, a)?,
-            within_view(snap, declared, declared_sel, a)?,
-        ),
-        None => (observed, declared),
-    };
+    let sel = Selected::resolve(snap, opts)?;
+    let src = in_phase(
+        Src::for_filters(snap, &[&sel.observed, &sel.declared], &budget),
+        || "reading the selected graphs".into(),
+    )?;
+    let observed = &sel.observed;
     let rdf_type = snap.lookup_iri(RDF_TYPE).map(|i| i.0);
 
     // -- observed: two passes per predicate -------------------------------------------
-    let preds = in_phase(snap.distinct_first(Perm::Pso), || {
+    let preds = in_phase(src.distinct_first(Perm::Pso), || {
         "listing predicates".into()
     })?;
-    let mut props: FxHashMap<u64, PropDecl> = FxHashMap::default();
+    let mut accs: FxHashMap<u64, PredAcc> = FxHashMap::default();
     let mut class_instances: FxHashMap<u64, u64> = FxHashMap::default();
-    let mut anon_types: FxHashSet<u64> = FxHashSet::default();
-    let mut total_triples = 0u64;
     let types = match rdf_type.filter(|_| opts.subject_classes) {
-        Some(t) => in_phase(subject_types(snap, t, &observed, &budget), || {
+        Some(t) => in_phase(subject_types(&src, t, observed, &budget), || {
             "reading the classes of subjects".into()
         })?,
         None => Vec::new(),
     };
-    // the subject classes of each predicate by class id, named at the end
-    let mut joins: FxHashMap<u64, (FxHashMap<u64, SubjectCount>, SubjectCount)> =
-        FxHashMap::default();
+    let mut joins: Joins = FxHashMap::default();
     for (i, &p) in preds.iter().enumerate() {
         let phase = || format!("scanning predicates ({}/{})", i + 1, preds.len());
         let mut acc = PredAcc::default();
         let mut join = opts.subject_classes.then(|| ClassJoin::new(&types));
         in_phase(
-            subject_pass(snap, p, &observed, &budget, &mut acc, join.as_mut()),
+            subject_pass(&src, p, observed, &budget, &mut acc, join.as_mut()),
             phase,
         )?;
-        if acc.obs.triples == 0 {
+        if acc.triples == 0 {
             continue;
         }
         if let Some(j) = join {
             joins.insert(p, (j.by_class, j.untyped));
         }
         let ci = (Some(p) == rdf_type).then_some(&mut class_instances);
-        in_phase(
-            object_pass(snap, p, &observed, &budget, &mut acc, ci, &mut anon_types),
-            phase,
-        )?;
-        total_triples += acc.obs.triples;
-        if is_iri(snap, p) {
-            props.entry(p).or_default().observed = Some(acc.finish());
-        }
+        in_phase(object_pass(&src, p, observed, &budget, &mut acc, ci), phase)?;
+        accs.insert(p, acc);
     }
     let term_totals = if opts.term_totals {
-        Some(in_phase(term_totals(snap, &observed, &budget), || {
+        Some(in_phase(term_totals(&src, observed, &budget), || {
             "counting distinct subjects and objects".into()
         })?)
     } else {
         None
     };
-    let mut classes: FxHashMap<u64, ClassDecl> = class_instances
+    let obs = Observed {
+        preds: accs,
+        class_instances,
+        joins: opts.subject_classes.then_some(joins),
+        term_totals,
+    };
+    assemble(&src, opts, &sel, &budget, obs, None)
+}
+
+/// The declared layer and the report: declarations read from the declared graphs,
+/// labels (read, or taken from `reuse`), the hierarchy, and the lists in IRI order.
+fn assemble(
+    src: &Src,
+    opts: &SchemaOptions,
+    sel: &Selected,
+    budget: &Budget,
+    obs: Observed,
+    reuse: Option<&Reuse>,
+) -> Result<SchemaReport, SchemaError> {
+    let snap: &Snapshot = src;
+    let declared = &sel.declared;
+    let rdf_type = snap.lookup_iri(RDF_TYPE).map(|i| i.0);
+    let total_triples: u64 = obs.preds.values().map(|a| a.triples).sum();
+    let anon_types = rdf_type
+        .and_then(|t| obs.preds.get(&t))
+        .map_or(0, |a| a.blank.distinct);
+    let maintenance = (!opts.subject_classes).then(|| {
+        Arc::new(Maintenance {
+            commit: snap.commit,
+            preds: obs
+                .preds
+                .iter()
+                .filter_map(|(p, a)| Some((snap.key(Id(*p))?.into_owned(), a.clone())))
+                .collect(),
+        })
+    });
+    let mut props: FxHashMap<u64, PropDecl> = FxHashMap::default();
+    for (p, acc) in &obs.preds {
+        if is_iri(snap, *p) {
+            props.entry(*p).or_default().observed = Some(acc.observed());
+        }
+    }
+    let mut joins = obs.joins.unwrap_or_default();
+    let mut classes: FxHashMap<u64, ClassDecl> = obs
+        .class_instances
         .into_iter()
         .map(|(c, n)| {
             (
@@ -1250,7 +1398,7 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
         };
         let mut out: Vec<(u64, u64)> = Vec::new();
         in_phase(
-            for_each_key(snap, Perm::Pso, &[p.0], &budget, |k| {
+            src.for_each_key(Perm::Pso, &[p.0], budget, |k| {
                 if declared.accepts(k[3]) && out.last() != Some(&(k[1], k[2])) {
                     out.push((k[1], k[2]));
                 }
@@ -1273,6 +1421,13 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
             }
             let c = classes.entry(s).or_default();
             if !o_iri {
+                if is_blank(snap, o) {
+                    match rel {
+                        ClassRel::SubClassOf => c.super_exprs.insert(o),
+                        ClassRel::EquivalentClass => c.equivalent_exprs.insert(o),
+                        ClassRel::DisjointWith => false,
+                    };
+                }
                 continue;
             }
             match rel {
@@ -1298,7 +1453,14 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
                 anon_exprs.insert(o);
             }
             if !is_iri(snap, o) {
-                props.entry(s).or_default();
+                let e = props.entry(s).or_default();
+                if is_blank(snap, o) {
+                    match rel {
+                        PropRel::Domain => e.domain_exprs.insert(o),
+                        PropRel::Range => e.range_exprs.insert(o),
+                        _ => false,
+                    };
+                }
                 continue;
             }
             if matches!(rel, PropRel::SubPropertyOf | PropRel::InverseOf) {
@@ -1319,7 +1481,7 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
         };
         let mut out: Vec<u64> = Vec::new();
         in_phase(
-            for_each_key(snap, Perm::Pos, &[ty, t.0], &budget, |k| {
+            src.for_each_key(Perm::Pos, &[ty, t.0], budget, |k| {
                 if declared.accepts(k[3]) && out.last() != Some(&k[2]) && is_iri(snap, k[2]) {
                     out.push(k[2]);
                 }
@@ -1357,19 +1519,38 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
     let n_entries = classes.len() + props.len();
     let mut done = 0usize;
     let lits = |s: u64, p: Option<Id>, done: usize| {
-        in_phase(literals_of(snap, s, p, &declared, &budget), || {
+        in_phase(literals_of(src, s, p, declared, budget), || {
             format!("reading labels ({done}/{n_entries})")
         })
     };
+    // an earlier report's entry for `iri`, when its labels can be taken over
+    let kept = |id: u64| reuse.filter(|r| !r.changed.contains(&id)).map(|r| r.old);
     let mut iris = Iris {
         snap,
         cache: FxHashMap::default(),
+    };
+    let mut renderer = expressions::Renderer::new(src, declared, budget);
+    let mut render = |ids: &BTreeSet<u64>| -> Result<Vec<String>, SchemaError> {
+        let mut v = Vec::with_capacity(ids.len());
+        for &id in ids {
+            v.push(in_phase(renderer.render(id), || {
+                "rendering class expressions".into()
+            })?);
+        }
+        v.sort();
+        v.dedup();
+        Ok(v)
     };
 
     let mut class_list = Vec::with_capacity(classes.len());
     for (id, c) in classes {
         done += 1;
         let Some(iri) = iris.get(id) else { continue };
+        let old = kept(id).and_then(|o| find(&o.classes, &iri));
+        let (labels, comments) = match old {
+            Some(o) => (o.declared.labels.clone(), o.declared.comments.clone()),
+            None => (lits(id, label, done)?, lits(id, comment, done)?),
+        };
         class_list.push(ClassEntry {
             builtin: builtin(&iri),
             iri,
@@ -1381,8 +1562,10 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
                 super_classes: iris.all(&c.supers),
                 equivalent_classes: iris.all(&c.equivalents),
                 disjoint_with: iris.all(&c.disjoint),
-                labels: lits(id, label, done)?,
-                comments: lits(id, comment, done)?,
+                super_class_expressions: render(&c.super_exprs)?,
+                equivalent_class_expressions: render(&c.equivalent_exprs)?,
+                labels,
+                comments,
             },
         });
     }
@@ -1409,6 +1592,11 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
             observed.subject_classes = Some(list);
             observed.untyped_subjects = Some(untyped);
         }
+        let old = kept(id).and_then(|o| find(&o.predicates, &iri));
+        let (labels, comments) = match old {
+            Some(o) => (o.declared.labels.clone(), o.declared.comments.clone()),
+            None => (lits(id, label, done)?, lits(id, comment, done)?),
+        };
         pred_list.push(PredicateEntry {
             builtin: builtin(&iri),
             iri,
@@ -1419,8 +1607,10 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
                 ranges: iris.all(&p.ranges),
                 super_properties: iris.all(&p.supers),
                 inverse_of: iris.all(&p.inverse),
-                labels: lits(id, label, done)?,
-                comments: lits(id, comment, done)?,
+                domain_expressions: render(&p.domain_exprs)?,
+                range_expressions: render(&p.range_exprs)?,
+                labels,
+                comments,
             },
         });
     }
@@ -1429,11 +1619,20 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
     let mut ontology = Vec::new();
     for id in ontologies {
         let Some(iri) = iris.get(id) else { continue };
-        ontology.push(OntologyEntry {
-            iri,
-            labels: lits(id, label, done)?,
-            version_info: lits(id, version_info, done)?,
-            comments: lits(id, comment, done)?,
+        let old = kept(id).and_then(|o| {
+            o.ontology
+                .binary_search_by(|e| e.iri.as_str().cmp(&iri))
+                .ok()
+                .map(|i| &o.ontology[i])
+        });
+        ontology.push(match old {
+            Some(o) => OntologyEntry { iri, ..o.clone() },
+            None => OntologyEntry {
+                iri,
+                labels: lits(id, label, done)?,
+                version_info: lits(id, version_info, done)?,
+                comments: lits(id, comment, done)?,
+            },
         });
     }
     ontology.sort_by(|a, b| a.iri.cmp(&b.iri));
@@ -1443,12 +1642,13 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
         schema_format: SCHEMA_FORMAT,
         snapshot: SnapshotInfo {
             version: snapshot_identity(snap),
+            commit: snap.commit,
             generation: snap.generation.name.clone(),
             computed_at: crate::builder::now_rfc3339(),
         },
         selection: Selection {
             graph: opts.graph.name().to_string(),
-            declared_graph: declared_sel.name().to_string(),
+            declared_graph: sel.declared_sel.name().to_string(),
             reasoning: opts.include_inferred,
             declared: if opts.declared_from_inferred {
                 "all"
@@ -1460,38 +1660,43 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
             triples: total_triples,
             classes: class_list.len(),
             predicates: pred_list.len(),
-            anonymous_type_targets: anon_types.len() as u64,
+            anonymous_type_targets: anon_types,
             anonymous_class_expressions: anon_exprs.len() as u64,
         },
         ontology,
         hierarchy,
         classes: class_list,
         predicates: pred_list,
-        term_totals,
+        term_totals: obs.term_totals,
+        maintenance,
     })
+}
+
+/// The entry for `iri` in an IRI-sorted list.
+fn find<'a, T: HasIri>(items: &'a [T], iri: &str) -> Option<&'a T> {
+    items
+        .binary_search_by(|e| e.iri().cmp(iri))
+        .ok()
+        .map(|i| &items[i])
 }
 
 /// Distinct subjects (one SPO pass, also telling IRIs apart) and distinct objects (one
 /// OSP pass) of the selected graphs.
-fn term_totals(
-    snap: &Snapshot,
-    filter: &GraphFilter,
-    budget: &Budget,
-) -> crate::Result<TermTotals> {
+fn term_totals(src: &Src, filter: &GraphFilter, budget: &Budget) -> crate::Result<TermTotals> {
     let mut t = TermTotals::default();
     let mut prev: Option<u64> = None;
-    for_each_key(snap, Perm::Spo, &[], budget, |k| {
+    src.for_each_key(Perm::Spo, &[], budget, |k| {
         if !filter.accepts(k[3]) || prev == Some(k[0]) {
             return;
         }
         prev = Some(k[0]);
         t.distinct_subjects += 1;
-        if is_iri(snap, k[0]) {
+        if is_iri(src, k[0]) {
             t.entities += 1;
         }
     })?;
     prev = None;
-    for_each_key(snap, Perm::Osp, &[], budget, |k| {
+    src.for_each_key(Perm::Osp, &[], budget, |k| {
         if filter.accepts(k[3]) && prev != Some(k[0]) {
             prev = Some(k[0]);
             t.distinct_objects += 1;
@@ -1613,6 +1818,21 @@ fn strongly_connected(adj: &[Vec<usize>]) -> Vec<usize> {
     comp
 }
 
+mod source;
+pub use source::SMALL_SELECTION_MAX;
+use source::Src;
+
+mod expressions;
+
+mod maintain;
+pub use maintain::{max_changes, update};
+
+pub mod profile;
+pub use profile::{ClassProfiles, ProfileOptions, profiles};
+
+pub mod compare;
+pub use compare::{SchemaDiff, compare, diff_text};
+
 mod void;
 pub use void::{VOID_NS, VoidOptions, description_iri, void_text, void_triples};
 
@@ -1624,3 +1844,12 @@ pub use draft::{DraftOptions, ShapesDraft, draft_shapes};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod maintain_tests;
+
+#[cfg(test)]
+mod profile_tests;
+
+#[cfg(test)]
+mod compare_tests;

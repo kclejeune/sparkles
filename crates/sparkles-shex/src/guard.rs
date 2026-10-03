@@ -20,6 +20,12 @@
 //! anything; the shape map is expanded again on every validated state, so new focus
 //! nodes are picked up.
 //!
+//! The schema may instead live in named graphs of the dataset, in ShExR
+//! (`schema.graphs`). It is then read from the state being validated: a write that
+//! changes one of those graphs is validated in full against the schema it leaves, and
+//! rejected when that schema does not parse, check or define the shape map's labels.
+//! The schema graphs are never part of the data graph.
+//!
 //! A write is not validated when it cannot change the result map: when it touches no
 //! graph of the data graph, or when every quad it changes has a predicate that no triple
 //! constraint and no `{FOCUS p …}` selector mentions (a neighbourhood holds only the arcs
@@ -137,6 +143,10 @@ pub struct SchemaSource {
     /// schema text given when setting the configuration (not stored in the file)
     #[serde(default, skip_serializing)]
     pub inline: Option<String>,
+    /// named graphs of the dataset that hold the schema in ShExR, read from the state
+    /// being validated (instead of a copied file)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphs: Option<Vec<String>>,
 }
 
 /// A query shape map: compact syntax, or the JSON form.
@@ -166,13 +176,36 @@ impl ShexValidationConfig {
             bail!("reportLimit must be between 1 and 10000");
         }
         self.data_graph.check()?;
+        let s = &self.schema;
         if self.mode != GuardMode::Off
-            && usize::from(self.schema.file.is_some()) + usize::from(self.schema.inline.is_some())
+            && usize::from(s.file.is_some())
+                + usize::from(s.inline.is_some())
+                + usize::from(s.graphs.is_some())
                 != 1
         {
-            bail!("schema: give the schema inline (or the file it was copied to)");
+            bail!(
+                "schema: give the schema inline, the file it was copied to, or the graphs that hold it in ShExR"
+            );
+        }
+        if let Some(gs) = &s.graphs {
+            if gs.is_empty() {
+                bail!("schema.graphs: name at least one graph");
+            }
+            for g in gs {
+                oxrdf::NamedNode::new(g.as_str()).with_context(|| format!("schema graph <{g}>"))?;
+            }
+            if let DataGraphSel::Graphs(ds) = &self.data_graph
+                && let Some(g) = ds.iter().find(|g| gs.contains(g))
+            {
+                bail!("<{g}> is both a schema graph and a data graph");
+            }
         }
         Ok(())
+    }
+
+    /// The named graphs that hold the schema (none for a copied schema).
+    pub fn schema_graphs(&self) -> &[String] {
+        self.schema.graphs.as_deref().unwrap_or(&[])
     }
 }
 
@@ -227,6 +260,37 @@ struct Pending {
     baseline: Baseline,
     exact: Option<Exact>,
     typing: TypingUpdate,
+    /// the schema a write to the schema graphs leaves
+    model: Option<Arc<Model>>,
+}
+
+/// The schema a guard validates against, with what it reads: replaced when a write
+/// changes the schema graphs.
+pub(crate) struct Model {
+    pub(crate) schema: Arc<CompiledSchema>,
+    pub(crate) map: ShapeMap,
+    shape_count: usize,
+    /// the predicates a validation can read (see [`read_predicates`])
+    pub(crate) reads: Option<Vec<String>>,
+    /// what a write can affect
+    plan: incremental::Plan,
+}
+
+impl Model {
+    fn new(loaded: Loaded, map: ShapeMap) -> Model {
+        Model {
+            reads: read_predicates(loaded.compiled.ir(), &map),
+            plan: incremental::Plan::new(loaded.compiled.ir(), &map),
+            schema: Arc::new(loaded.compiled),
+            map,
+            shape_count: loaded.shape_count,
+        }
+    }
+
+    /// Whether the guard keeps the typing of the head: when references follow arcs.
+    fn keeps_typing(&self) -> bool {
+        self.plan.refers()
+    }
 }
 
 /// The typing of the head: every pair the validations of its shape map discovered,
@@ -278,13 +342,7 @@ enum TypingUpdate {
 /// Write-time ShEx validation of one store.
 pub struct ShexGuard {
     cfg: ShexValidationConfig,
-    schema: Arc<CompiledSchema>,
-    map: ShapeMap,
-    shape_count: usize,
-    /// the predicates a validation can read (see [`read_predicates`])
-    reads: Option<Vec<String>>,
-    /// what a write can affect
-    plan: incremental::Plan,
+    model: parking_lot::RwLock<Arc<Model>>,
     pending: Mutex<Option<Pending>>,
     baseline: Mutex<Option<Baseline>>,
     exact: Mutex<Option<Exact>>,
@@ -312,15 +370,11 @@ impl ShexGuard {
         persist: Option<(PathBuf, String)>,
     ) -> ShexGuard {
         ShexGuard {
-            reads: read_predicates(loaded.compiled.ir(), &map),
-            plan: incremental::Plan::new(loaded.compiled.ir(), &map),
+            model: parking_lot::RwLock::new(Arc::new(Model::new(loaded, map))),
             exact: Mutex::new(None),
             typing: Mutex::new(None),
             persist,
             cfg,
-            schema: Arc::new(loaded.compiled),
-            map,
-            shape_count: loaded.shape_count,
             pending: Mutex::new(None),
             baseline: Mutex::new(None),
             counters: DecisionCounts::default(),
@@ -334,6 +388,11 @@ impl ShexGuard {
 
     pub fn config(&self) -> &ShexValidationConfig {
         &self.cfg
+    }
+
+    /// The schema and shape map every write is validated against now.
+    pub(crate) fn model(&self) -> Arc<Model> {
+        self.model.read().clone()
     }
 
     /// The schema copy of an in-memory dataset: its file name in a database directory
@@ -357,7 +416,7 @@ impl ShexGuard {
         }
         ShexValidationStatus {
             mode: self.cfg.mode,
-            shape_count: self.shape_count,
+            shape_count: self.model().shape_count,
             associations: (associations != u64::MAX).then_some(associations),
             baseline: self.baseline.lock().clone(),
             last_full_millis: (last != u64::MAX).then_some(last),
@@ -378,14 +437,11 @@ impl ShexGuard {
             .clamp(1, 10_000)
     }
 
-    /// Whether the guard keeps the typing of the head: when references follow arcs.
-    fn keeps_typing(&self) -> bool {
-        self.plan.refers()
-    }
-
-    /// The result map of all of `snap`, and its typing when the guard keeps it.
+    /// The result map of all of `snap` under `m`, and its typing when the guard keeps
+    /// it.
     fn validate_map(
         &self,
+        m: &Model,
         snap: &Arc<Snapshot>,
         o: &WriteOptions,
         deadline: Instant,
@@ -393,9 +449,9 @@ impl ShexGuard {
         match self.options(snap, o, deadline) {
             Some(vo) => {
                 let (rm, mut values) =
-                    crate::engine::validate_typed(snap, &self.schema, &self.map, &vo, None, &[])
+                    crate::engine::validate_typed(snap, &m.schema, &m.map, &vo, None, &[])
                         .map_err(engine_error)?;
-                if !self.keeps_typing() {
+                if !m.keeps_typing() {
                     values = Vec::new();
                 }
                 Ok((rm, values))
@@ -411,21 +467,23 @@ impl ShexGuard {
         }
     }
 
-    /// Validate all of `view` and summarize under this configuration. In grandfather
-    /// mode `before` (the state before the write) is validated too, and the
-    /// nonconformant associations `view` adds decide; without it none counts as added.
+    /// Validate all of `view` under `m` and summarize under this configuration. In
+    /// grandfather mode `before` (the state before the write, with the schema it was
+    /// validated against) is validated too, and the nonconformant associations `view`
+    /// adds decide; without it none counts as added.
     fn validate_state(
         &self,
+        m: &Model,
         view: &Arc<Snapshot>,
-        before: Option<&Arc<Snapshot>>,
+        before: Option<(&Arc<Snapshot>, &Model)>,
         o: &WriteOptions,
     ) -> sparkles::Result<(ValidationSummary, PairValues)> {
         let t0 = Instant::now();
         let deadline = self.deadline(t0, o);
-        let (rm, typing) = self.validate_map(view, o, deadline)?;
+        let (rm, typing) = self.validate_map(m, view, o, deadline)?;
         let introduced = match before {
-            Some(base) if self.grandfather() => {
-                let (pre, _) = self.validate_map(base, o, deadline)?;
+            Some((base, bm)) if self.grandfather() => {
+                let (pre, _) = self.validate_map(bm, base, o, deadline)?;
                 Some(new_nonconformant(&rm.results, &pre.results))
             }
             _ if self.grandfather() => Some(vec![false; rm.results.len()]),
@@ -454,10 +512,11 @@ impl ShexGuard {
         o: &WriteOptions,
         deadline: Instant,
     ) -> Option<ValidateOptions> {
-        let graphs = self
-            .cfg
-            .data_graph
-            .graphs(snap, self.cfg.include_inferences, &[])?;
+        let graphs = self.cfg.data_graph.graphs(
+            snap,
+            self.cfg.include_inferences,
+            self.cfg.schema_graphs(),
+        )?;
         Some(ValidateOptions {
             data_graph: graphs.data_graph,
             extra_graphs: graphs.extra_graphs,
@@ -474,10 +533,17 @@ impl ShexGuard {
         })
     }
 
-    /// Validate in full, saying why it is not incremental.
-    fn full(&self, c: &Candidate<'_>, reason: &str) -> sparkles::Result<Checked> {
+    /// Validate in full under `m`, saying why it is not incremental. In grandfather mode
+    /// the state before the write is judged under `before` (the schema it had).
+    fn full(
+        &self,
+        m: &Model,
+        before: &Model,
+        c: &Candidate<'_>,
+        reason: &str,
+    ) -> sparkles::Result<Checked> {
         let base = Arc::new(c.base.clone());
-        let (mut s, typing) = self.validate_state(&c.view, Some(&base), c.opts)?;
+        let (mut s, typing) = self.validate_state(m, &c.view, Some((&base, before)), c.opts)?;
         s.fallback = Some(reason.to_string());
         s.focus_nodes = Some(s.total);
         let exact = Exact {
@@ -485,7 +551,7 @@ impl ShexGuard {
             nonconformant: s.blocking,
             total: s.total,
         };
-        let typing = if self.keeps_typing() {
+        let typing = if m.keeps_typing() {
             TypingUpdate::Replace(c.view.generation.uid, typing)
         } else {
             TypingUpdate::Drop
@@ -504,8 +570,10 @@ impl ShexGuard {
     /// no value outside it changes. The typing of every pair the region does not reach
     /// is then the head's, so the associations of the region's nodes are the only ones
     /// whose results the write can change.
+    #[allow(clippy::too_many_arguments)]
     fn propagated(
         &self,
+        m: &Model,
         c: &Candidate<'_>,
         changes: &[[Id; 3]],
         exact: &Exact,
@@ -523,7 +591,7 @@ impl ShexGuard {
         let (Some((vo, post_data)), Some((_, pre_data))) = (post, pre) else {
             return Ok(Propagation::Unknown);
         };
-        let r = self.plan.resolve(&c.view);
+        let r = m.plan.resolve(&c.view);
         let mut region: FxHashSet<Id> = FxHashSet::default();
         let mut queue: Vec<Id> = Vec::new();
         for x in incremental::Plan::direct(&r, changes) {
@@ -547,7 +615,7 @@ impl ShexGuard {
                 .into_iter()
                 .filter_map(|id| c.view.term(id).map(|term| (id, term)))
                 .collect();
-            let map = incremental::associations(&self.map, &c.view, Some(post_data), &nodes)?;
+            let map = incremental::associations(&m.map, &c.view, Some(post_data), &nodes)?;
             // outside the region: what conformed, and what fails whatever it reads
             let fixed = |n: Id, k: PairKind| -> Option<bool> {
                 if region.contains(&n) {
@@ -559,15 +627,9 @@ impl ShexGuard {
                     Verdict::False => None,
                 }
             };
-            let (after, values) = crate::engine::validate_typed(
-                &c.view,
-                &self.schema,
-                &map,
-                vo,
-                Some(&fixed),
-                &seeds,
-            )
-            .map_err(engine_error)?;
+            let (after, values) =
+                crate::engine::validate_typed(&c.view, &m.schema, &map, vo, Some(&fixed), &seeds)
+                    .map_err(engine_error)?;
             // a changed value is read by the pair's node and the nodes that refer to it;
             // those reached from them backwards join at once, so a change that runs
             // along a chain takes one more typing, not one per link
@@ -602,7 +664,7 @@ impl ShexGuard {
             }
         };
         // the results before the write at the region's nodes, from the head's typing
-        let before_map = incremental::associations(&self.map, &c.view, Some(pre_data), &nodes)?;
+        let before_map = incremental::associations(&m.map, &c.view, Some(pre_data), &nodes)?;
         let mut before: Vec<crate::ShapeResult> = Vec::new();
         let mut before_total = 0usize;
         for a in &before_map.0 {
@@ -611,7 +673,7 @@ impl ShexGuard {
             };
             let (Some(id), Ok(kind)) = (
                 c.view.lookup_term(node),
-                crate::shapemap::label_kind(&self.schema, &a.shape),
+                crate::shapemap::label_kind(&m.schema, &a.shape),
             ) else {
                 return Ok(Propagation::Unknown);
             };
@@ -697,30 +759,33 @@ impl ShexGuard {
 
     /// Validate a write to the data graph: the associations it can affect when the
     /// counts of the head are known, everything otherwise.
-    fn check_data(&self, c: &Candidate<'_>) -> sparkles::Result<Checked> {
+    fn check_data(&self, m: &Model, c: &Candidate<'_>) -> sparkles::Result<Checked> {
         let t0 = Instant::now();
         let Changes::Log(log) = c.changes else {
-            return self.full(c, "bulk");
+            return self.full(m, m, c, "bulk");
         };
-        if self.plan.sparql {
-            return self.full(c, "sparql");
+        if m.plan.sparql {
+            return self.full(m, m, c, "sparql");
         }
         let exact = *self.exact.lock();
         let Some(exact) = exact.filter(|e| e.commit == c.base.commit) else {
-            return self.full(c, "baseline");
+            return self.full(m, m, c, "baseline");
         };
         if self.cfg.mode == GuardMode::Reject && !self.grandfather() && exact.nonconformant > 0 {
             // the report must show the associations that block every write
-            return self.full(c, "baseline");
+            return self.full(m, m, c, "baseline");
         }
         let mut graphs: FxHashMap<u64, bool> = FxHashMap::default();
         let mut seen: FxHashSet<[Id; 3]> = FxHashSet::default();
         let mut changes = Vec::new();
         for (_, q) in log.iter() {
             let data = *graphs.entry(q[3].0).or_insert_with(|| {
-                self.cfg
-                    .data_graph
-                    .touches(&c.view, q[3].0, self.cfg.include_inferences, &[])
+                self.cfg.data_graph.touches(
+                    &c.view,
+                    q[3].0,
+                    self.cfg.include_inferences,
+                    self.cfg.schema_graphs(),
+                )
             });
             if data && seen.insert([q[0], q[1], q[2]]) {
                 changes.push([q[0], q[1], q[2]]);
@@ -743,19 +808,19 @@ impl ShexGuard {
             };
         let post = state(&c.view)?;
         let pre = state(&base)?;
-        match self.propagated(c, &changes, &exact, &post, &pre, t0)? {
+        match self.propagated(m, c, &changes, &exact, &post, &pre, t0)? {
             Propagation::Done(checked) => return Ok(*checked),
-            Propagation::Budget => return self.full(c, "budget"),
+            Propagation::Budget => return self.full(m, m, c, "budget"),
             Propagation::Unknown => {}
         }
-        let affected = self.plan.affected(
+        let affected = m.plan.affected(
             &c.view,
             [post.as_ref().map(|s| &s.1), pre.as_ref().map(|s| &s.1)],
             &changes,
             MAX_FOCUS,
         )?;
         let Some(affected) = affected else {
-            return self.full(c, "budget");
+            return self.full(m, m, c, "budget");
         };
         let nodes: Vec<(Id, oxrdf::Term)> = affected
             .into_iter()
@@ -763,10 +828,10 @@ impl ShexGuard {
             .collect();
         let run = |snap: &Arc<Snapshot>, st: &Option<(ValidateOptions, DataGraph)>| {
             let map =
-                incremental::associations(&self.map, &c.view, st.as_ref().map(|s| &s.1), &nodes)?;
+                incremental::associations(&m.map, &c.view, st.as_ref().map(|s| &s.1), &nodes)?;
             match st {
                 Some((vo, _)) if !map.0.is_empty() => {
-                    crate::validate(snap, &self.schema, &map, vo).map_err(engine_error)
+                    crate::validate(snap, &m.schema, &map, vo).map_err(engine_error)
                 }
                 _ => Ok(ResultMap {
                     conforms: true,
@@ -782,8 +847,55 @@ impl ShexGuard {
         );
         match self.moved(c, &exact, after, &before.results, counts, t0) {
             Some(checked) => Ok(checked),
-            None => self.full(c, "baseline"),
+            None => self.full(m, m, c, "baseline"),
         }
+    }
+
+    /// A write that changes a schema graph: the schema it leaves is read from the state
+    /// after it, and that state is validated in full against it (in grandfather mode the
+    /// state before is judged under the old schema). A schema that does not load, or
+    /// does not define the shape map's labels, rejects the write.
+    fn schema_write(
+        &self,
+        c: &Candidate<'_>,
+        old: &Arc<Model>,
+        seq: u64,
+        live: bool,
+    ) -> sparkles::Result<ValidationSummary> {
+        let new = match load_graph_model(&self.cfg, &c.view) {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                let mut s = ValidationSummary::empty(
+                    GuardStatus::Rejected,
+                    self.cfg.mode,
+                    Severity::Violation,
+                );
+                s.language = GuardLanguage::Shex;
+                s.limit = self.cfg.report_limit;
+                s.shapes_error = Some(format!("{e:#}"));
+                if live {
+                    self.counters.count(GuardStatus::Rejected);
+                    self.history.record(c.kind, &s);
+                }
+                return Ok(s);
+            }
+        };
+        let (summary, exact, typing) = self.full(&new, old, c, "schema")?;
+        if !live {
+            return Ok(summary);
+        }
+        self.counters.count(summary.status);
+        self.history.record(c.kind, &summary);
+        if summary.status != GuardStatus::Rejected {
+            *self.pending.lock() = Some(Pending {
+                seq,
+                baseline: baseline_of(&summary, seq),
+                exact: Some(exact),
+                typing,
+                model: Some(new),
+            });
+        }
+        Ok(summary)
     }
 
     /// Count and bound the results, and decide: every nonconformant association blocks,
@@ -847,32 +959,45 @@ impl ShexGuard {
     }
 
     /// Whether a change can change the result map: a changed quad in a graph of the
-    /// data graph, with a predicate a validation reads (any, when it may read any).
-    fn relevant(&self, view: &Snapshot, changes: &Changes<'_>) -> bool {
+    /// data graph, with a predicate a validation reads (any, when it may read any); and
+    /// whether it changes a schema graph.
+    fn relevant(&self, m: &Model, view: &Snapshot, changes: &Changes<'_>) -> (bool, bool) {
+        let schema_graphs: Vec<u64> = self
+            .cfg
+            .schema_graphs()
+            .iter()
+            .filter_map(|g| view.lookup_iri(g).map(|i| i.0))
+            .collect();
         let (log, bulk) = match changes {
             Changes::Log(log) => (*log, &[][..]),
             Changes::Rebuilt { log, bulk } => (*log, *bulk),
-            Changes::Unknown => return true,
+            Changes::Unknown => return (true, !self.cfg.schema_graphs().is_empty()),
         };
-        let preds: Option<FxHashSet<Id>> = self
+        let preds: Option<FxHashSet<Id>> = m
             .reads
             .as_ref()
             .map(|ps| ps.iter().filter_map(|p| view.lookup_iri(p)).collect());
         let mut graphs: FxHashMap<u64, bool> = FxHashMap::default();
+        let (mut data, mut schema) = (false, false);
         for q in log.iter().map(|(_, q)| q).chain(bulk) {
-            if preds.as_ref().is_some_and(|ps| !ps.contains(&q[1])) {
+            let g = q[3].0;
+            if schema_graphs.contains(&g) {
+                schema = true;
                 continue;
             }
-            let g = q[3].0;
-            if *graphs.entry(g).or_insert_with(|| {
-                self.cfg
-                    .data_graph
-                    .touches(view, g, self.cfg.include_inferences, &[])
-            }) {
-                return true;
+            if data || preds.as_ref().is_some_and(|ps| !ps.contains(&q[1])) {
+                continue;
             }
+            data |= *graphs.entry(g).or_insert_with(|| {
+                self.cfg.data_graph.touches(
+                    view,
+                    g,
+                    self.cfg.include_inferences,
+                    self.cfg.schema_graphs(),
+                )
+            });
         }
-        false
+        (data, schema)
     }
 }
 
@@ -915,7 +1040,12 @@ impl CommitGuard for ShexGuard {
         // a dry run validates like a write and records nothing: no counters, no history,
         // no state for the next commit
         let live = c.opts.dry_run.is_none();
-        if !self.relevant(&c.view, &c.changes) {
+        let model = self.model();
+        let (relevant, schema_changed) = self.relevant(&model, &c.view, &c.changes);
+        if schema_changed {
+            return self.schema_write(c, &model, seq, live);
+        }
+        if !relevant {
             if !live {
                 let mut s = ValidationSummary::empty(
                     GuardStatus::Skipped,
@@ -939,6 +1069,7 @@ impl CommitGuard for ShexGuard {
                     baseline,
                     exact,
                     typing: TypingUpdate::Keep,
+                    model: None,
                 });
             }
             let mut s =
@@ -947,7 +1078,7 @@ impl CommitGuard for ShexGuard {
             s.limit = self.cfg.report_limit;
             return Ok(s);
         }
-        let (summary, exact, typing) = self.check_data(c)?;
+        let (summary, exact, typing) = self.check_data(&model, c)?;
         if !live {
             return Ok(summary);
         }
@@ -959,6 +1090,7 @@ impl CommitGuard for ShexGuard {
                 baseline: baseline_of(&summary, seq),
                 exact: Some(exact),
                 typing,
+                model: None,
             });
         }
         Ok(summary)
@@ -972,6 +1104,9 @@ impl CommitGuard for ShexGuard {
                     && let Err(e) = StatusFile::of(&p.baseline, hash).write(root)
                 {
                     tracing::warn!("cannot write {STATUS_FILE}: {e}");
+                }
+                if let Some(m) = p.model {
+                    *self.model.write() = m;
                 }
                 *self.baseline.lock() = Some(p.baseline);
                 *self.exact.lock() = p.exact;
@@ -1112,20 +1247,7 @@ fn load(
             .map(|(p, ns)| (p.clone(), ns.clone()))
             .collect();
     }
-    let closed = crate::resolve::close(&parsed, resolver).map_err(|e| anyhow!("schema: {e}"))?;
-    if let Some(d) = closed
-        .shapes
-        .iter()
-        .find(|d| matches!(d.expr, crate::ShapeExpr::External))
-    {
-        bail!(
-            "schema: the EXTERNAL shape {} has no definition (write-time validation takes none)",
-            d.label
-        );
-    }
-    let checked = crate::check::check(&closed).map_err(|e| anyhow!("schema: {e}"))?;
-    let compiled =
-        crate::compile::compile(&closed, &checked).map_err(|e| anyhow!("schema: {e}"))?;
+    let (compiled, closed) = compile_schema(&parsed, resolver)?;
     let verbatim = parsed.imports.is_empty() && closed == parsed;
     let (file, format, text) = match format {
         SchemaFormat::ShExC if verbatim => (SHEX_SCHEMA_SHEXC_FILE, "shexc", text),
@@ -1152,6 +1274,99 @@ fn load(
         },
         base: closed.base.clone(),
     })
+}
+
+/// Close a parsed schema over its imports, refuse EXTERNAL shapes without a definition,
+/// and check and compile it.
+fn compile_schema(parsed: &Schema, resolver: &dyn Resolver) -> Result<(CompiledSchema, Schema)> {
+    let closed = crate::resolve::close(parsed, resolver).map_err(|e| anyhow!("schema: {e}"))?;
+    if let Some(d) = closed
+        .shapes
+        .iter()
+        .find(|d| matches!(d.expr, crate::ShapeExpr::External))
+    {
+        bail!(
+            "schema: the EXTERNAL shape {} has no definition (write-time validation takes none)",
+            d.label
+        );
+    }
+    let checked = crate::check::check(&closed).map_err(|e| anyhow!("schema: {e}"))?;
+    let compiled =
+        crate::compile::compile(&closed, &checked).map_err(|e| anyhow!("schema: {e}"))?;
+    Ok((compiled, closed))
+}
+
+/// The triples of the named graphs `graphs` of `snap`, as one graph (graphs the
+/// snapshot does not have add nothing).
+fn graphs_of(snap: &Snapshot, graphs: &[String]) -> sparkles::Result<oxrdf::Graph> {
+    use sparkles::index::Perm;
+    use sparkles::store::Chunk;
+    let mut g = oxrdf::Graph::new();
+    for iri in graphs {
+        let Some(id) = snap.lookup_iri(iri) else {
+            continue;
+        };
+        snap.scan(Perm::Gspo, &[id.0], |c| {
+            let mut add = |k: &sparkles::index::Key| {
+                if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(k)) {
+                    g.insert(&oxrdf::Triple::from(q));
+                }
+            };
+            match c {
+                Chunk::Block(b, s, e) => (s..e).for_each(|i| add(&b.key(i))),
+                Chunk::Row(k) => add(&k),
+            }
+            Ok(true)
+        })?;
+    }
+    Ok(g)
+}
+
+/// The schema a configuration keeps in ShExR graphs, read from `snap`. Imports are not
+/// fetched (a write never fetches anything); the shape map may use the configuration's
+/// `schema.prefixes`, or full IRIs.
+fn load_graphs(cfg: &ShexValidationConfig, snap: &Snapshot) -> Result<Loaded> {
+    let g = graphs_of(snap, cfg.schema_graphs())?;
+    if g.is_empty() {
+        bail!(
+            "schema: the schema graphs {} hold no triples",
+            cfg.schema_graphs()
+                .iter()
+                .map(|g| format!("<{g}>"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let mut parsed = crate::shexr::from_graph(&g, cfg.schema.base.as_deref())
+        .map_err(|e| anyhow!("schema: {e}"))?;
+    if !parsed.imports.is_empty() {
+        bail!("schema: a schema in graphs cannot import other schemas (nothing is fetched)");
+    }
+    if parsed.prefixes.is_empty() {
+        parsed.prefixes = cfg
+            .schema
+            .prefixes
+            .iter()
+            .map(|(p, ns)| (p.clone(), ns.clone()))
+            .collect();
+    }
+    let (compiled, closed) = compile_schema(&parsed, &NoImports)?;
+    Ok(Loaded {
+        compiled,
+        shape_count: closed.shapes.len(),
+        file: "",
+        format: "shexr",
+        text: String::new(),
+        prefixes: Vec::new(),
+        base: closed.base.clone(),
+    })
+}
+
+/// The schema and shape map of a configuration whose schema is in graphs, from `snap`.
+fn load_graph_model(cfg: &ShexValidationConfig, snap: &Snapshot) -> Result<Model> {
+    let loaded = load_graphs(cfg, snap)?;
+    let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
+    Ok(Model::new(loaded, map))
 }
 
 /// Load the copy of the schema a configuration names (nothing is resolved: the copy
@@ -1236,7 +1451,10 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
         store.set_guard_required(false);
         return Ok(None);
     }
-    let loaded = load_copy(&cfg, root)?;
+    let loaded = match &cfg.schema.graphs {
+        Some(_) => load_graphs(&cfg, &store.snapshot())?,
+        None => load_copy(&cfg, root)?,
+    };
     let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
     let g = Arc::new(ShexGuard::new(
         cfg,
@@ -1295,7 +1513,10 @@ pub fn set_config(
         return Ok(SetOutcome::Removed);
     };
     cfg.check()?;
+    let view = Arc::new(txn.view());
+    let in_graphs = cfg.schema.graphs.is_some();
     let mut loaded = match cfg.schema.inline.take() {
+        _ if in_graphs => load_graphs(&cfg, &view)?,
         Some(text) => {
             cfg.schema.sha256 = Some(sha256_hex(text.as_bytes()));
             load(
@@ -1317,21 +1538,23 @@ pub fn set_config(
     // the configuration as written
     cfg.format = CONFIG_FORMAT;
     cfg.updated = Some(sparkles::guard::config::now_rfc3339());
-    cfg.schema.file = Some(loaded.file.to_string());
-    cfg.schema.format = Some(loaded.format.to_string());
-    cfg.schema.prefixes = loaded.prefixes.iter().cloned().collect();
-    if loaded.file == SHEX_SCHEMA_SHEXJ_FILE && cfg.schema.base.is_none() {
-        cfg.schema.base = loaded.base.clone();
+    if !in_graphs {
+        cfg.schema.file = Some(loaded.file.to_string());
+        cfg.schema.format = Some(loaded.format.to_string());
+        cfg.schema.prefixes = loaded.prefixes.iter().cloned().collect();
+        if loaded.file == SHEX_SCHEMA_SHEXJ_FILE && cfg.schema.base.is_none() {
+            cfg.schema.base = loaded.base.clone();
+        }
     }
     let file = loaded.file;
     let text = std::mem::take(&mut loaded.text);
     let mut guard = ShexGuard::new(cfg, loaded, map, None);
-    if root.is_none() {
+    if root.is_none() && !in_graphs {
         guard.copy = Some(text.clone());
     }
 
-    let view = Arc::new(txn.view());
-    let (summary, typing) = guard.validate_state(&view, None, &WriteOptions::default())?;
+    let model = guard.model();
+    let (summary, typing) = guard.validate_state(&model, &view, None, &WriteOptions::default())?;
     if guard.cfg.mode == GuardMode::Reject && !guard.grandfather() && summary.blocking > 0 {
         return Ok(SetOutcome::NotConforming(summary));
     }
@@ -1339,9 +1562,17 @@ pub fn set_config(
     let baseline = baseline_of(&summary, head);
     if let Some(r) = &root {
         // a configuration of either language this one replaces leaves nothing behind
-        sparkles::guard::config::remove_files(r, &[CONFIG_FILE, file])?;
+        // a schema in graphs keeps no copy
+        let keep: &[&str] = if in_graphs {
+            &[CONFIG_FILE]
+        } else {
+            &[CONFIG_FILE, file]
+        };
+        sparkles::guard::config::remove_files(r, keep)?;
         StatusFile::remove(r)?;
-        write_atomic(&r.join(file), text.as_bytes())?;
+        if !in_graphs {
+            write_atomic(&r.join(file), text.as_bytes())?;
+        }
         let bytes = serde_json::to_vec_pretty(&guard.cfg)?;
         write_atomic(&r.join(CONFIG_FILE), &bytes)?;
         let hash = sha256_hex(&bytes);
@@ -1353,7 +1584,7 @@ pub fn set_config(
         nonconformant: summary.blocking,
         total: summary.total,
     });
-    if guard.keeps_typing() {
+    if model.keeps_typing() {
         *guard.typing.lock() = Some(HeadTyping::new(head, view.generation.uid, typing));
     }
     *guard.baseline.lock() = Some(baseline);

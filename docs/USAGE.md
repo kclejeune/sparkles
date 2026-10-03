@@ -554,6 +554,30 @@ server gives the same layer in `GET /$/schema/{ds}` and `GET /$/schema/{ds}/cons
 and the UI's schema browser shows it as SHACL chips next to the observed counts
 ([API](API.md#constraints-layer)).
 
+### What each class uses, and what changed
+
+`--profiles` lists, for each class, the predicates its instances use, and `--diff`
+compares the schema of two states of the database:
+
+```sh
+sparkles schema --loc db --profiles                        # every class
+sparkles schema --loc db --profiles --class http://ex.org/Person --format json
+sparkles schema --loc db --diff 41                         # from commit 41 to the head
+sparkles schema --loc db --diff snapshot:before-import --to commit:57
+```
+
+A profile line such as
+`<http://ex.org/name>  instances 1890/2000  triples 2210  values 1..3  string 2210`
+says that 1,890 of the 2,000 people have a name, and that one person has three. An arrow
+lists the classes of the values, and a line that starts with `←` names a predicate that
+points at the class's instances. A diff prints one line per class or predicate that was
+added or removed, and for a changed one each count, declaration or label that differs,
+such as `~ class http://ex.org/Person: observed.instances 2000 -> 2004`. Both states must
+still be readable, as they must be for `query --at`. The
+server offers the same as `GET /$/schema/{ds}/profiles` and `GET /$/schema/{ds}/diff`,
+and the UI's schema browser shows the profile of the selected class and has a
+**Compare** dialog ([API](API.md#class-profiles)).
+
 ### File tools
 
 These commands work on files and endpoints rather than databases. They match Jena's
@@ -1186,9 +1210,12 @@ The tools are read-only unless the operator turns on the write tool:
 * `list_datasets`, `describe_schema`, `sparql_query`, `explain_query`,
   `describe_resource` and `list_commits`. `describe_schema` with
   `section: "constraints"` lists the SHACL constraints per class, and with
-  `subjectClasses: true` it names the classes that use each predicate.
+  `subjectClasses: true` it names the classes that use each predicate. With
+  `section: "profiles"` it lists the predicates the instances of each class use.
 * `draft_shapes` drafts SHACL shapes or a ShEx schema from the data, with the number of
   instances each constraint would exclude.
+* `diff_schema` lists the classes and predicates that changed between two commits or
+  named snapshots, with each count or declaration before and after.
 * Each stored query of a dataset is a tool of its own, `<dataset>__<query>`, whose
   arguments are the query's parameters ([below](#stored-queries)). `--no-stored-queries`
   (or `serve --mcp-no-stored-queries`) leaves them out.

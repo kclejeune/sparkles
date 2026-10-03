@@ -599,7 +599,8 @@ fn write(s: &Store, changes: &[(bool, Triple)]) -> sparkles::Result<sparkles::co
 
 /// (node, shape, status) of every association.
 fn verdicts(g: &ShexGuard, snap: &Arc<Snapshot>) -> Vec<(Term, crate::ShapeLabel, Status)> {
-    crate::validate(snap, &g.schema, &g.map, &ValidateOptions::default())
+    let m = g.model();
+    crate::validate(snap, &m.schema, &m.map, &ValidateOptions::default())
         .unwrap()
         .results
         .into_iter()
@@ -622,7 +623,7 @@ proptest! {
         let (g, _) = installed(
             set_config(&s, Some(cfg("warn", SKIP_SCHEMA, SKIP_MAP)), &NoImports).unwrap(),
         );
-        prop_assert!(g.reads.is_some());
+        prop_assert!(g.model().reads.is_some());
         let before = verdicts(&g, &s.snapshot());
         let r = write(&s, &changes).unwrap();
         let Some(v) = r.validation else {
@@ -792,6 +793,7 @@ proptest! {
         writes in proptest::collection::vec(proptest::collection::vec(change(), 1..5), 1..8),
         closed in any::<bool>(),
         grandfather in any::<bool>(),
+        in_graph in any::<bool>(),
     ) {
         let s = Store::in_memory(StoreOptions::default());
         write(&s, &base.iter().map(|t| (true, *t)).collect::<Vec<_>>()).unwrap();
@@ -806,6 +808,15 @@ proptest! {
         let mut c = cfg(if grandfather { "reject" } else { "warn" }, &schema, map);
         if grandfather {
             c.baseline = BaselinePolicy::Grandfather;
+        }
+        // the same schema in a ShExR graph of the dataset
+        if in_graph {
+            put_shexr(&s, &schema, SCHEMA_GRAPH);
+            c.schema = SchemaSource {
+                graphs: Some(vec![SCHEMA_GRAPH.into()]),
+                prefixes: [("ex".to_string(), EX.to_string())].into(),
+                ..Default::default()
+            };
         }
         let (g, _) = installed(set_config(&s, Some(c), &NoImports).unwrap());
         for w in &writes {
@@ -1094,4 +1105,152 @@ fn dry_runs_report_the_write_and_leave_the_guard_alone() {
             assert_eq!(status(&guards[0]), status(&guards[1]), "{mode} {w}");
         }
     }
+}
+
+const SCHEMA_GRAPH: &str = "urn:x-test:schema";
+
+/// Write `schema` (ShExC) as ShExR into graph `g`.
+fn put_shexr(s: &Store, schema: &str, g: &str) {
+    let parsed = crate::parse_schema(schema, None, Some(SchemaFormat::ShExC)).unwrap();
+    let graph = parsed.to_shexr();
+    let mut t = s.write();
+    let mut labels = std::collections::HashMap::new();
+    for tr in graph.iter() {
+        let q = oxrdf::Quad::new(
+            tr.subject.into_owned(),
+            tr.predicate.into_owned(),
+            tr.object.into_owned(),
+            NamedNode::new_unchecked(g),
+        );
+        let ids = t.encode_quad(&q, &mut labels).unwrap();
+        t.insert(ids).unwrap();
+    }
+    t.commit().unwrap();
+}
+
+fn graph_cfg(mode: &str, graphs: &[&str]) -> ShexValidationConfig {
+    config(serde_json::json!({"language": "shex", "mode": mode,
+        "schema": {"graphs": graphs, "prefixes": {"ex": "http://ex.org/"}},
+        "shapeMap": MAP}))
+    .unwrap()
+}
+
+/// A schema kept in a ShExR graph: read from the dataset, kept out of the data graph,
+/// read again when a write changes it, and refused when a write breaks it.
+#[test]
+fn schemas_in_graphs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = loaded(&root);
+    put_shexr(&s, SCHEMA, SCHEMA_GRAPH);
+    let (g, sum) =
+        installed(set_config(&s, Some(graph_cfg("warn", &[SCHEMA_GRAPH])), &NoImports).unwrap());
+    // carol has no name; the schema graph's triples are not data
+    assert_eq!((sum.total, sum.blocking), (3, 1));
+    assert_eq!(g.status().shape_count, 2);
+    assert!(!exists(&root, SHEX_SCHEMA_SHEXC_FILE) && !exists(&root, SHEX_SCHEMA_SHEXJ_FILE));
+    let stored = stored_config(&root);
+    assert_eq!(
+        stored["schema"]["graphs"],
+        serde_json::json!([SCHEMA_GRAPH])
+    );
+    assert!(stored["schema"].get("file").is_none(), "{stored}");
+
+    // a data write is validated incrementally
+    let st = upd(
+        &s,
+        "INSERT DATA { ex:dave a ex:Person ; foaf:name \"Dave\" }",
+    )
+    .unwrap();
+    let v = summary(&st);
+    assert_eq!(v.strategy, Strategy::Incremental);
+    assert_eq!((v.total, v.blocking), (4, 1));
+
+    // a write to the schema: people may be up to 250 years old
+    let raise = format!(
+        "PREFIX sx: <http://www.w3.org/ns/shex#>
+         DELETE {{ GRAPH <{SCHEMA_GRAPH}> {{ ?x sx:maxinclusive ?m }} }}
+         INSERT {{ GRAPH <{SCHEMA_GRAPH}> {{ ?x sx:maxinclusive 250 }} }}
+         WHERE {{ GRAPH <{SCHEMA_GRAPH}> {{ ?x sx:maxinclusive ?m }} }}"
+    );
+    let v = summary(&upd(&s, &raise).unwrap());
+    assert_eq!(v.fallback.as_deref(), Some("schema"));
+    assert_eq!((v.total, v.blocking), (4, 1));
+    let v = summary(
+        &upd(
+            &s,
+            "INSERT DATA { ex:erin a ex:Person ; foaf:name \"Erin\" ; foaf:age 220 }",
+        )
+        .unwrap(),
+    );
+    assert_eq!(v.strategy, Strategy::Incremental);
+    assert_eq!((v.total, v.blocking), (5, 1));
+
+    // a write that leaves no schema, or one without the map's shapes, is refused
+    let head = s.head_commit().seq;
+    let r = upd(&s, &format!("DROP GRAPH <{SCHEMA_GRAPH}>"));
+    match r {
+        Err(Error::Rejected(rej)) => {
+            let e = rej.summary.shapes_error.unwrap();
+            assert!(e.contains("hold no triples"), "{e}");
+        }
+        r => panic!("not rejected: {:?}", r.map(|_| ())),
+    }
+    let rename = format!(
+        "DELETE {{ GRAPH <{SCHEMA_GRAPH}> {{ ex:Person ?p ?o }} }}
+         INSERT {{ GRAPH <{SCHEMA_GRAPH}> {{ ex:Human ?p ?o }} }}
+         WHERE {{ GRAPH <{SCHEMA_GRAPH}> {{ ex:Person ?p ?o }} }}"
+    );
+    assert!(matches!(upd(&s, &rename), Err(Error::Rejected(_))));
+    assert_eq!(s.head_commit().seq, head);
+
+    // a restart reads the schema from the graph as it is now
+    drop((g, s));
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(g.status().shape_count, 2);
+    let v = summary(
+        &upd(
+            &s,
+            "INSERT DATA { ex:fay a ex:Person ; foaf:name \"Fay\" ; foaf:age 240 }",
+        )
+        .unwrap(),
+    );
+    assert_eq!(v.blocking, 1);
+    let v = summary(
+        &upd(
+            &s,
+            "INSERT DATA { ex:gus a ex:Person ; foaf:name \"Gus\" ; foaf:age 260 }",
+        )
+        .unwrap(),
+    );
+    assert_eq!(v.blocking, 2);
+}
+
+/// Configurations of schemas in graphs that cannot be used are refused.
+#[test]
+fn unusable_schema_graphs_are_refused() {
+    for j in [
+        serde_json::json!({"language": "shex", "mode": "warn",
+            "schema": {"graphs": []}, "shapeMap": MAP}),
+        serde_json::json!({"language": "shex", "mode": "warn",
+            "schema": {"graphs": [SCHEMA_GRAPH], "inline": SCHEMA}, "shapeMap": MAP}),
+        serde_json::json!({"language": "shex", "mode": "warn",
+            "schema": {"graphs": ["not an iri"]}, "shapeMap": MAP}),
+        serde_json::json!({"language": "shex", "mode": "warn",
+            "schema": {"graphs": [SCHEMA_GRAPH]}, "dataGraph": [SCHEMA_GRAPH], "shapeMap": MAP}),
+    ] {
+        assert!(config(j.clone()).is_err(), "{j}");
+    }
+    let s = Store::in_memory(StoreOptions::default());
+    // no such graph, and a map whose shapes the graph does not define
+    let e = set_config(&s, Some(graph_cfg("warn", &[SCHEMA_GRAPH])), &NoImports)
+        .err()
+        .unwrap();
+    assert!(format!("{e:#}").contains("hold no triples"), "{e:#}");
+    put_shexr(&s, SKIP_SCHEMA, SCHEMA_GRAPH);
+    let e = set_config(&s, Some(graph_cfg("warn", &[SCHEMA_GRAPH])), &NoImports)
+        .err()
+        .unwrap();
+    assert!(format!("{e:#}").contains("shapeMap"), "{e:#}");
 }

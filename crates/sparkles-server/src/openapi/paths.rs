@@ -792,6 +792,54 @@ fn schema(p: &mut Paths) {
         .json("200", "The constraints layer.", "ConstraintsLayer")
         .errors(&[400]),
     );
+    p.add(
+        op(
+            GET,
+            "/$/schema/{ds}/profiles",
+            "getClassProfiles",
+            "Schema",
+            "Class profiles",
+        )
+        .doc("For each class with instances, the predicates its instances use, with counts, cardinalities and object kinds, and the predicates that point to them.")
+        .see("class-profiles")
+        .param("graphSel")
+        .param("reasoning")
+        .param("at")
+        .param("timeout")
+        .query("class", s(), "Profile only this class (repeatable).")
+        .resp(
+            "200",
+            "The class profiles.",
+            Some(json!({ "application/json": { "schema": { "type": "object" } } })),
+        )
+        .errors(&[400, 408, 410]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/schema/{ds}/diff",
+            "getSchemaDiff",
+            "Schema",
+            "Schema diff",
+        )
+        .doc("Compares the schema reports of two states of the dataset, field by field.")
+        .see("schema-diffs")
+        .query_req("from", s(), "The earlier state, in any form `at` takes.")
+        .query(
+            "to",
+            s(),
+            "The later state, in any form `at` takes (default: the head).",
+        )
+        .param("graphSel")
+        .param("reasoning")
+        .param("timeout")
+        .resp(
+            "200",
+            "The changes between the two reports.",
+            Some(json!({ "application/json": { "schema": { "type": "object" } } })),
+        )
+        .errors(&[400, 408, 410]),
+    );
 }
 
 fn admin(p: &mut Paths) {

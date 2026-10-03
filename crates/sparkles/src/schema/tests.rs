@@ -789,3 +789,71 @@ fn subject_classes_of_predicates() {
         s.compact().unwrap();
     }
 }
+
+#[test]
+fn anonymous_class_expressions() {
+    let s = store_with(
+        r#"ex:Parent rdfs:subClassOf ex:Person ,
+             [ a owl:Restriction ; owl:onProperty ex:hasChild ; owl:someValuesFrom ex:Person ] ,
+             [ a owl:Restriction ; owl:onProperty ex:age ;
+               owl:allValuesFrom [ a rdfs:Datatype ; owl:onDatatype xsd:integer ;
+                 owl:withRestrictions ( [ xsd:minInclusive 18 ] ) ] ] .
+           ex:Pet owl:equivalentClass [ owl:unionOf ( ex:Cat ex:Dog
+             [ owl:intersectionOf ( ex:Bird [ owl:complementOf ex:Wild ] ) ] ) ] .
+           ex:Twin rdfs:subClassOf [ a owl:Restriction ; owl:onProperty [ owl:inverseOf ex:hasTwin ] ;
+             owl:qualifiedCardinality "1"^^xsd:nonNegativeInteger ; owl:onClass ex:Person ] ,
+             [ a owl:Restriction ; owl:onProperty ex:colour ; owl:hasValue "red" ] ,
+             [ a owl:Restriction ; owl:onProperty ex:p ; owl:maxCardinality 2 ] ,
+             [ ex:strange 1 ] .
+           ex:owns rdfs:domain [ owl:oneOf ( ex:alice ex:bob ) ] ;
+             rdfs:range [ owl:unionOf ( ex:Thing ex:Item ) ] ."#,
+    );
+    let r = report(&s, &SchemaOptions::default());
+    let ex_ = |l: &str| format!("<http://ex.org/{l}>");
+    let parent = &class(&r, &ex("Parent")).declared;
+    assert_eq!(parent.super_classes, [ex("Person")]);
+    assert_eq!(
+        parent.super_class_expressions,
+        [
+            format!(
+                "{} only <{XSD_NS}integer>[>= \"18\"^^<{XSD_NS}integer>]",
+                ex_("age")
+            ),
+            format!("{} some {}", ex_("hasChild"), ex_("Person")),
+        ]
+    );
+    let pet = &class(&r, &ex("Pet")).declared;
+    assert_eq!(
+        pet.equivalent_class_expressions,
+        [format!(
+            "({} or {} or ({} and (not {})))",
+            ex_("Cat"),
+            ex_("Dog"),
+            ex_("Bird"),
+            ex_("Wild")
+        )]
+    );
+    let twin = &class(&r, &ex("Twin")).declared;
+    assert_eq!(
+        twin.super_class_expressions,
+        [
+            format!("{} value \"red\"", ex_("colour")),
+            format!("{} max 2", ex_("p")),
+            "[…]".to_string(),
+            format!("inverse {} exactly 1 {}", ex_("hasTwin"), ex_("Person")),
+        ]
+    );
+    let owns = &pred(&r, &ex("owns")).declared;
+    assert_eq!(
+        owns.domain_expressions,
+        [format!("{{{}, {}}}", ex_("alice"), ex_("bob"))]
+    );
+    assert_eq!(
+        owns.range_expressions,
+        [format!("({} or {})", ex_("Thing"), ex_("Item"))]
+    );
+    // the JSON leaves out empty lists
+    let j = serde_json::to_value(class(&r, &ex("Person"))).unwrap();
+    assert!(j["declared"].get("superClassExpressions").is_none(), "{j}");
+    assert_eq!(r.totals.anonymous_class_expressions, 9);
+}

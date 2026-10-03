@@ -18,6 +18,7 @@ mod format;
 pub mod http;
 mod pins;
 mod render;
+mod schema_history;
 mod schemas;
 mod search;
 mod stored;

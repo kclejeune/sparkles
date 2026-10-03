@@ -1135,6 +1135,32 @@ fn schema_reports_through_a_view() {
     assert!(format!("{:?}", full.predicates).contains("salary"));
 }
 
+/// Class profiles count the triples the view sees.
+#[test]
+fn class_profiles_through_a_view() {
+    let s = fixture();
+    let none = Graphs::none();
+    let staff = writer(&[(salaries(), none.clone(), none.clone())], "x");
+    let profile = |graphs| {
+        let p = sparkles::schema::profile::profiles(
+            &s.snapshot(),
+            &sparkles::schema::profile::ProfileOptions {
+                schema: sparkles::schema::SchemaOptions {
+                    graph: sparkles::schema::GraphSelection::Union,
+                    graphs,
+                    ..Default::default()
+                },
+                classes: Vec::new(),
+            },
+        )
+        .unwrap();
+        format!("{:?}", serde_json::to_value(&p.classes).unwrap())
+    };
+    let seen = profile(staff.graphs.clone());
+    assert!(!seen.contains("salary"), "{seen}");
+    assert!(profile(None).contains("salary"));
+}
+
 /// A view may hide only so many quads at one commit.
 #[test]
 fn the_hidden_quads_have_a_limit() {

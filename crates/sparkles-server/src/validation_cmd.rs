@@ -36,6 +36,14 @@ pub struct ValidationArgs {
     /// sniffed)
     #[arg(long, value_parser = ["shexc", "shexj", "shexr"], requires = "schema")]
     pub schema_format: Option<String>,
+    /// a named graph of the dataset that holds the schema in ShExR (repeatable; ShEx),
+    /// read from the state each write leaves instead of a copied file
+    #[arg(long, value_name = "IRI", conflicts_with = "schema")]
+    pub schema_graph: Vec<String>,
+    /// a prefix the shape map may use with --schema-graph, as `ex=http://ex.org/`
+    /// (repeatable)
+    #[arg(long, value_name = "PREFIX=IRI", requires = "schema_graph")]
+    pub schema_prefix: Vec<String>,
     /// the query shape map, in compact syntax (ShEx), e.g. '{FOCUS a ex:Person}@ex:Person'
     #[arg(long, value_name = "MAP")]
     pub shape_map: Option<String>,
@@ -67,7 +75,7 @@ pub struct ValidationArgs {
 /// The language a `--mode` asks for (`--lang`, or ShEx when `--schema` or `--shape-map`
 /// is given), and the flags of the other language it may not use.
 fn language(a: &ValidationArgs) -> Result<GuardLanguage> {
-    let shex_flags = a.schema.is_some() || a.shape_map.is_some();
+    let shex_flags = a.schema.is_some() || a.shape_map.is_some() || !a.schema_graph.is_empty();
     let lang = match a.lang.as_deref() {
         Some("shex") => GuardLanguage::Shex,
         Some(_) => GuardLanguage::Shacl,
@@ -77,7 +85,9 @@ fn language(a: &ValidationArgs) -> Result<GuardLanguage> {
     match lang {
         GuardLanguage::Shacl => {
             if shex_flags {
-                bail!("--schema and --shape-map are for ShEx (SHACL takes --shapes)");
+                bail!(
+                    "--schema, --schema-graph and --shape-map are for ShEx (SHACL takes --shapes)"
+                );
             }
         }
         GuardLanguage::Shex => {
@@ -259,8 +269,48 @@ fn set_shex(
     use sparkles_shex::guard::{
         self, CONFIG_FORMAT, MapSource, SchemaSource, SetOutcome, ShexValidationConfig,
     };
-    let (Some(schema), Some(map)) = (&a.schema, &a.shape_map) else {
-        bail!("give --schema FILE and --shape-map MAP");
+    let Some(map) = &a.shape_map else {
+        bail!("give --schema FILE (or --schema-graph IRI) and --shape-map MAP");
+    };
+    if !a.schema_graph.is_empty() {
+        let mut prefixes = std::collections::BTreeMap::new();
+        for p in &a.schema_prefix {
+            let (k, v) = p
+                .split_once('=')
+                .with_context(|| format!("--schema-prefix {p}: expected PREFIX=IRI"))?;
+            prefixes.insert(k.to_string(), v.to_string());
+        }
+        let cfg = ShexValidationConfig {
+            format: CONFIG_FORMAT,
+            language: GuardLanguage::Shex,
+            mode,
+            schema: SchemaSource {
+                graphs: Some(a.schema_graph.clone()),
+                prefixes,
+                ..Default::default()
+            },
+            shape_map: MapSource::Compact(map.clone()),
+            data_graph: data_graph(&a.data_graph),
+            include_inferences: a.include_inferences,
+            baseline: if a.grandfather {
+                guard::BaselinePolicy::Grandfather
+            } else {
+                guard::BaselinePolicy::Strict
+            },
+            timeout_seconds: a.timeout,
+            report_limit: a.report_limit,
+            updated: None,
+        };
+        return Ok(
+            match guard::set_config(store, Some(cfg), &sparkles_shex::NoImports)? {
+                SetOutcome::Installed(_, s) => Ok(s),
+                SetOutcome::NotConforming(s) => Err(s),
+                SetOutcome::Removed => bail!("validation was turned off"),
+            },
+        );
+    }
+    let Some(schema) = &a.schema else {
+        bail!("give --schema FILE (or --schema-graph IRI) and --shape-map MAP");
     };
     let text = std::fs::read_to_string(schema).with_context(|| format!("{}", schema.display()))?;
     let format =

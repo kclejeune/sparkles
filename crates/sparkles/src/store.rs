@@ -36,7 +36,7 @@ pub use compaction::{
     Blocker, COMPACTION_FILE, CompactOptions, CompactReport, CompactionMeasures, CompactionPolicy,
     CompactionSettings, SETTING_NAMES, Trigger, TriggerKind,
 };
-pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions};
+pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
 pub use quota::{QUOTA_FILE, QuotaSource, QuotaStatus};
 
 use crate::builder::{BuildOptions, Builder, IndexMeta, Slot, Stats};

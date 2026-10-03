@@ -1407,8 +1407,8 @@ enum Cmd {
         /// Largest sh:maxCount drafted (0: none)
         #[arg(long, default_value_t = sparkles::schema::draft::DEFAULT_MAX_COUNT, requires = "draft_shapes")]
         max_count: u64,
-        /// Draft only this class (IRI; repeatable)
-        #[arg(long, value_name = "IRI", requires = "draft_shapes")]
+        /// Draft or profile only this class (IRI; repeatable)
+        #[arg(long, value_name = "IRI")]
         class: Vec<String>,
         /// Skip classes with fewer instances
         #[arg(long, default_value_t = 1, requires = "draft_shapes")]
@@ -1417,6 +1417,19 @@ enum Cmd {
         /// by default, as write-time validation does)
         #[arg(long, requires = "draft_shapes", conflicts_with = "no_inferences")]
         with_inferences: bool,
+        /// Print per-class property profiles instead of the schema: the predicates the
+        /// instances of each class (or of each --class) use, and the predicates that point
+        /// at them; --format is text or json
+        #[arg(long, conflicts_with_all = ["draft_shapes", "subject_classes", "diff"])]
+        profiles: bool,
+        /// Print what changed in the schema since this state instead of the schema: a
+        /// commit (`N` or `commit:N`), `time:<RFC 3339>` or `snapshot:<name>`; --format is
+        /// text or json
+        #[arg(long, value_name = "AT", conflicts_with_all = ["draft_shapes", "subject_classes"])]
+        diff: Option<String>,
+        /// The later state of --diff (default: the head)
+        #[arg(long, value_name = "AT", requires = "diff")]
+        to: Option<String>,
     },
     /// Validate a database (or data files) against a SHACL shapes graph; exits with
     /// status 1 when the data does not conform
@@ -3097,8 +3110,14 @@ fn run() -> Result<()> {
             class,
             min_instances,
             with_inferences,
+            profiles,
+            diff,
+            to,
         } => {
             use sparkles::index::Perm;
+            if !class.is_empty() && !draft_shapes && !profiles {
+                bail!("--class goes with --draft-shapes or --profiles");
+            }
             use sparkles::schema::{GraphSelection, Page, SchemaError, SchemaOptions};
             if draft_shapes {
                 return schema_draft(
@@ -3159,6 +3178,12 @@ fn run() -> Result<()> {
                 graphs: None,
                 subject_classes,
             };
+            if profiles {
+                return schema_profiles(&snap, sopts, class, &format);
+            }
+            if let Some(from) = diff {
+                return schema_diff(&store, &sopts, &from, to.as_deref(), &format);
+            }
             let report = match sparkles::schema::discover(&snap, &sopts) {
                 Ok(r) => r,
                 Err(e @ (SchemaError::Timeout { .. } | SchemaError::TooManyEntries { .. })) => {
@@ -3639,6 +3664,147 @@ struct SchemaDraftArgs {
 }
 
 /// `sparkles schema --draft-shapes`: SHACL shapes, a ShEx schema or the JSON draft.
+/// Exit with status 2 on a budget error of the schema API.
+fn schema_budget<T>(r: Result<T, sparkles::schema::SchemaError>) -> Result<T> {
+    use sparkles::schema::SchemaError;
+    match r {
+        Ok(x) => Ok(x),
+        Err(e @ (SchemaError::Timeout { .. } | SchemaError::TooManyEntries { .. })) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `sparkles schema --profiles`.
+fn schema_profiles(
+    snap: &Arc<sparkles::store::Snapshot>,
+    schema: sparkles::schema::SchemaOptions,
+    classes: Vec<String>,
+    format: &str,
+) -> Result<()> {
+    let json = match format {
+        "json" => true,
+        "text" => false,
+        f => bail!("unknown format '{f}' with --profiles (text or json)"),
+    };
+    let mut iris = Vec::new();
+    for c in classes {
+        let iri = c.trim().trim_start_matches('<').trim_end_matches('>');
+        oxrdf::NamedNode::new(iri).with_context(|| format!("--class {iri}"))?;
+        iris.push(iri.to_string());
+    }
+    let opts = sparkles::schema::ProfileOptions {
+        schema,
+        classes: iris,
+    };
+    let p = schema_budget(sparkles::schema::profiles(snap, &opts))?;
+    let mut out = std::io::stdout().lock();
+    if json {
+        serde_json::to_writer_pretty(&mut out, &p)?;
+        writeln!(out)?;
+    } else {
+        let short = |iri: &str| iri.rsplit(['#', '/']).next().unwrap_or(iri).to_string();
+        writeln!(
+            out,
+            "# version {} · commit {} · graph {} · inferences {}",
+            p.snapshot.version,
+            p.snapshot.commit,
+            p.selection.graph,
+            if p.selection.reasoning {
+                "included"
+            } else {
+                "excluded"
+            }
+        )?;
+        for c in &p.classes {
+            writeln!(out, "\n<{}>  instances {}", c.class, c.instances)?;
+            for x in &c.properties {
+                let mut kinds: Vec<String> = Vec::new();
+                for (name, n) in [
+                    ("iri", x.objects.iri),
+                    ("blank", x.objects.blank),
+                    ("triple", x.objects.triple_term),
+                ] {
+                    if n > 0 {
+                        kinds.push(format!("{name} {n}"));
+                    }
+                }
+                for l in &x.objects.literals {
+                    kinds.push(format!("{} {}", short(&l.datatype), l.triples));
+                }
+                let classes: Vec<String> = x
+                    .object_classes
+                    .iter()
+                    .take(5)
+                    .map(|k| format!("{} {}", short(&k.class), k.triples))
+                    .collect();
+                write!(
+                    out,
+                    "  <{}>  instances {}/{}  triples {}  values {}..{}  {}",
+                    x.predicate,
+                    x.instances,
+                    c.instances,
+                    x.triples,
+                    x.min_per_instance,
+                    x.max_per_instance,
+                    kinds.join(", ")
+                )?;
+                if !classes.is_empty() {
+                    write!(out, "  → {}", classes.join(", "))?;
+                }
+                writeln!(out)?;
+            }
+            for i in &c.incoming {
+                writeln!(
+                    out,
+                    "  ← <{}>  triples {}  instances {}",
+                    i.predicate, i.triples, i.instances
+                )?;
+            }
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// `sparkles schema --diff FROM [--to TO]`.
+fn schema_diff(
+    store: &sparkles::store::Store,
+    opts: &sparkles::schema::SchemaOptions,
+    from: &str,
+    to: Option<&str>,
+    format: &str,
+) -> Result<()> {
+    use sparkles::history::{At, HistoryOptions};
+    let json = match format {
+        "json" => true,
+        "text" => false,
+        f => bail!("unknown format '{f}' with --diff (text or json)"),
+    };
+    let at = |s: &str| s.parse::<At>().map_err(anyhow::Error::from);
+    let (from, to) = (at(from)?, to.map(at).transpose()?.unwrap_or(At::Head));
+    let ho = HistoryOptions {
+        cancel: None,
+        deadline: opts.deadline,
+    };
+    let (a, _) = store.snapshot_at(&from, &ho)?;
+    let (b, _) = store.snapshot_at(&to, &ho)?;
+    let ra = schema_budget(sparkles::schema::discover(&a, opts))?;
+    let rb = schema_budget(sparkles::schema::discover(&b, opts))?;
+    let d = sparkles::schema::compare(&ra, &rb);
+    let mut out = std::io::stdout().lock();
+    if json {
+        serde_json::to_writer_pretty(&mut out, &d)?;
+        writeln!(out)?;
+    } else {
+        out.write_all(sparkles::schema::diff_text(&d).as_bytes())?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 fn schema_draft(
     loc: Option<PathBuf>,
     data: &[PathBuf],

@@ -545,6 +545,8 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | GET    | `/$/schema/{ds}/constraints` | *Extension.* The SHACL constraints layer of the report alone. See [Constraints layer](#constraints-layer). |
+| GET    | `/$/schema/{ds}/profiles`    | *Extension.* `ClassProfiles`: the predicates the instances of each class use, and those that point at them. See [Class profiles](#class-profiles). |
+| GET    | `/$/schema/{ds}/diff`        | *Extension.* `SchemaDiff`: the classes and predicates added, removed and changed between two states. See [Schema diffs](#schema-diffs). |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Writes go on during the build, and the writer lock is held only for the switch. Returns a cancellable `Task`. `409` while a compaction of the dataset is queued or running. The old generation is removed once no reader or retained history needs it, which is what Fuseki's `?deleteOld=true` asks for. `deleteOld` with no value or `true` is accepted, and `deleteOld=false` is a `400`. |
 | GET    | `/$/compaction/{ds}`         | *Extension.* `CompactionStatus`: the dataset's automatic compaction, its settings and what it sees. See [Automatic compaction](#automatic-compaction). |
 | PUT    | `/$/compaction/{ds}`         | *Extension.* Replaces the dataset's own compaction settings with the JSON object's. Returns `CompactionStatus`. |
@@ -614,7 +616,7 @@ type DatasetStats = {
   terms: number;           // vocabulary size
   graphs: { name: string | null; quads: number }[];   // null = default graph
   predicates: { iri: string; count: number; distinctSubjects: number; distinctObjects: number }[]; // top 100
-  classes: { iri: string; instances: number }[];      // top 100 by rdf:type
+  classes: { iri: string; instances: number }[];      // top 100: distinct subjects typed with the class in any graph
   diskBytes: number;
   quota: DatasetQuota | null;   // persistent datasets: the storage quota and its usage
   cache: { entries: number; bytes: number; hits: number; misses: number };        // decoded-block cache (--cache-mb)
@@ -813,8 +815,9 @@ layers:
   are not constraints. `maxPerSubject: 1` only says that no subject has two values *now*.
 * **declared** holds what the RDFS/OWL vocabulary in the data asserts, such as `rdf:type`
   `owl:Class`, `rdfs:subClassOf`, `rdfs:domain`, `owl:FunctionalProperty` and labels. Only
-  IRI objects are listed. Blank-node class expressions such as `owl:Restriction` are
-  counted in `totals.anonymousClassExpressions`.
+  IRI objects are listed as IRIs. Blank-node class expressions such as an
+  `owl:Restriction` superclass are rendered as text in the OWL 2 Manchester Syntax, in
+  the `…Expressions` lists, and counted in `totals.anonymousClassExpressions`.
 * **constraints** holds what the dataset's SHACL shapes require of the instances of each
   class, and what enforces each constraint. It is described under
   [Constraints layer](#constraints-layer). It is read from the shapes alone and never
@@ -851,6 +854,7 @@ type SchemaSummary = {
   schemaFormat: 1;                 // version of this JSON shape
   dataset: string;
   snapshot: { version: number;     // changes on every commit and compaction; restarts with the server
+              commit: number;      // the commit the report describes
               generation: string;  // base index generation
               computedAt: string };// RFC 3339
   selection: { graph: string; declaredGraph: string; reasoning: boolean; declared: "asserted" | "all" };
@@ -875,6 +879,8 @@ type ClassEntry = {
   observed: { instances: number }; // distinct subjects with rdf:type C (no subclass roll-up)
   declared: { types: string[];     // subset of rdfs:Class, owl:Class, rdfs:Datatype
               superClasses: string[]; equivalentClasses: string[]; disjointWith: string[];
+              superClassExpressions?: string[];       // anonymous superclasses (see below)
+              equivalentClassExpressions?: string[];  // anonymous equivalent classes
               labels: Lit[]; comments: Lit[] };
 };
 type PredicateEntry = {
@@ -895,9 +901,23 @@ type PredicateEntry = {
   };
   declared: { types: string[];     // rdf:Property, owl:ObjectProperty, owl:FunctionalProperty, …
               domains: string[]; ranges: string[]; superProperties: string[]; inverseOf: string[];
+              domainExpressions?: string[]; rangeExpressions?: string[];  // anonymous ones
               labels: Lit[]; comments: Lit[] };
 };
 type KindCount = { triples: number; distinct: number };
+```
+
+**Anonymous class expressions.** A blank-node object of `rdfs:subClassOf`,
+`owl:equivalentClass`, `rdfs:domain` or `rdfs:range` is read as a class expression of the
+OWL 2 mapping to RDF and rendered in the Manchester Syntax, with IRIs in angle brackets.
+Restrictions (`some`, `only`, `value`, `Self`, `min`, `max` and `exactly`, qualified or
+not, on a property or its `inverse`), `or`, `and`, `not`, enumerations in braces and
+datatype restrictions such as `<http://www.w3.org/2001/XMLSchema#integer>[>= "18"^^…]`
+are rendered, nested up to eight levels. A node of another shape is rendered as `[…]`.
+The lists are sorted and left out of the JSON when empty, for example:
+
+```json
+"superClassExpressions": ["<http://ex.org/hasChild> some (<http://ex.org/A> or <http://ex.org/B>)"]
 ```
 
 **Pagination.** Every page of a listing comes from the report of one snapshot. The
@@ -922,7 +942,28 @@ restarts from the first page. Cursors do not survive a restart.
 A report is never returned partially.
 
 The counts come from one ordered pass over the PSO index and one over the POS index per
-predicate, so a report costs about two sequential reads of the selected triples.
+predicate, so a report costs about two sequential reads of the selected triples. When the
+selection is a set of graphs that hold at most 2^20 quads and at most an eighth of the
+store, such as a small named graph, their quads are read once from the GSPO index and
+sorted in memory instead, so the report does not read the rest of the store.
+
+**Reports kept up to date.** After a write, the next request for the same selection
+brings the kept report up to date from the changes since its commit, instead of reading
+the selection again. Each changed triple moves the counts by what it adds to or removes
+from the selection, the declarations are read again, and labels are reread only for the
+subjects whose labels changed. The result equals a report computed from scratch. A
+persistent dataset reads the changes from its write-ahead logs, and an in-memory one
+compares the deltas of the two states. A new report is computed instead when the changes
+number more than one per 500 triples of the report (at least 256), when the history
+between the two commits is gone, when the request asks for `detail=subjectClasses` or a
+VoID description, and for a caller limited to some graphs. The `Sparkles-Schema-Report`
+header says how a report came about, with the value `cached`, `full` or
+`updated; changes=N`. On the
+1.05M-triple benchmark dataset, on a machine with a load average near 80, a report
+updated after a write of four triples took a median of 5 ms, against a median of 136 ms
+for a full report. An update costs about 30 to 45 µs per changed triple there, so a write
+of 10,000 triples is cheaper to recount, which the limit of one change per 500 triples
+reflects.
 
 **VoID export.** The summary is also served as RDF, as a description in the
 [VoID](https://www.w3.org/TR/void/) vocabulary. Ask for it with an RDF media type in
@@ -967,7 +1008,9 @@ The CLI equivalent prints the complete report without pagination:
 `sparkles schema --loc DB [--graph default|union|IRI] [--declared-graph G]
 [--no-inferences] [--declared asserted|all] [--subject-classes] [--shapes SOURCE]…
 [--format text|json|void|turtle] [--timeout S] [--max-entries N]`, or `--data FILE…` in
-place of `--loc`. `json` is the `SchemaSummary` with every item and `next: null`. `text`
+place of `--loc`. `--profiles [--class IRI]…` prints [class profiles](#class-profiles)
+instead, and `--diff FROM [--to TO]` a [schema diff](#schema-diffs), each as `text` or
+`json`. `json` is the `SchemaSummary` with every item and `next: null`. `text`
 prints one line per class and per predicate, a line of subject classes under each
 predicate with `--subject-classes`, and then the constraints layer. `--shapes` takes the
 values of `shapes`, and without it the layer holds the database's write-time SHACL
@@ -992,6 +1035,84 @@ in IRI order, and only direct types count, unless `reasoning` includes materiali
 ones. The detail costs one more pass over the selection's `rdf:type` triples and memory
 for them, so it is computed only on request. It is part of the report's selection, so a
 cursor issued with it does not continue a listing without it.
+
+### Class profiles
+
+The design is in [C02 §6, Phase 3](specs/C02-schema-discovery.md#6-phasing).
+
+`GET /$/schema/{ds}/profiles` lists, for each class with instances, the predicates its
+instances use and the predicates that point at them. The instances of a class are the
+subjects typed with it in the selection, as the report counts them, so subclass
+instances count under a superclass only when the selection holds materialized
+inferences. A subject with several classes counts under each. The parameters `graph`,
+`reasoning`, `timeout` and `at` are those of `/$/schema/{ds}`, and `class` (repeatable)
+profiles only the classes it names. A named class without instances gets an empty
+profile.
+
+```ts
+type ClassProfiles = {
+  profileFormat: 1;
+  snapshot: { version: number; commit: number; generation: string; computedAt: string };
+  selection: { graph: string; reasoning: boolean };
+  classes: {                        // sorted by class IRI
+    class: string; builtin: boolean;
+    instances: number;              // subjects typed with the class
+    properties: {                   // most instances first, then by IRI
+      predicate: string;
+      instances: number;            // instances with at least one value
+      triples: number;              // distinct triples of those instances
+      minPerInstance: number; maxPerInstance: number;  // among instances with a value
+      objects: { iri?: number; blank?: number; tripleTerm?: number;
+                 literals?: { datatype: string; triples: number }[] };
+      objectClasses: { class: string; triples: number }[];  // classes of IRI and blank values
+    }[];
+    incoming: { predicate: string;  // predicates whose values include instances
+                triples: number; instances: number }[];
+  }[];
+};
+```
+
+The counts are measurements of one snapshot, like the report's. A profile costs one pass
+over the selection's `rdf:type` triples and, per predicate, one pass over `POS[p]` and one
+over `PSO[p]`. Errors are those of `/$/schema/{ds}`, and `400` also covers a malformed
+`class`.
+
+### Schema diffs
+
+The design is in [C02 §6, Phase 3](specs/C02-schema-discovery.md#6-phasing).
+
+`GET /$/schema/{ds}/diff?from=…[&to=…]` compares the reports of two states of the
+dataset. `from` and `to` take the values `at` takes, such as `42`, `commit:42`,
+`time:<RFC 3339>` or `snapshot:<name>`, and `to` defaults to the head. Both states must
+still be readable, as they must be for point-in-time queries. The selection parameters are those of
+`/$/schema/{ds}`. The head's report comes from the dataset's kept report, and an older
+state's report is computed for the request.
+
+```ts
+type SchemaDiff = {
+  diffFormat: 1;
+  from: Snapshot; to: Snapshot;     // as in SchemaSummary
+  selection: Selection;
+  counts: { classesAdded: number; classesRemoved: number; classesChanged: number;
+            predicatesAdded: number; predicatesRemoved: number; predicatesChanged: number };
+  report: Change[];                 // changes of totals, hierarchy and ontology headers
+  classes: { added: ClassEntry[]; removed: ClassEntry[];
+             changed: { iri: string; changes: Change[] }[] };
+  predicates: { added: PredicateEntry[]; removed: PredicateEntry[];
+                changed: { iri: string; changes: Change[] }[] };
+};
+type Change =
+  | { path: string; from: unknown; to: unknown }          // a value; null when absent on one side
+  | { path: string; added: unknown[]; removed: unknown[] }; // members of a list
+```
+
+A path names a field of an entry, such as `observed.instances` or
+`declared.superClasses`. Literal groups are compared by datatype, languages by tag,
+subject classes by class and ontology headers by IRI, and the path names the group, as
+in `observed.objects.literals[datatype=http://www.w3.org/2001/XMLSchema#integer].triples`.
+`format=text` or `Accept: text/plain` answers with one line per added, removed or changed
+entry. A `from` or `to` beyond the head answers `404`, history that is gone `410`, and
+`at`, `cursor` or a missing `from` `400`.
 
 ### Constraints layer
 
@@ -4233,10 +4354,18 @@ versions, format 1 without `language`, are still read:
 
 | Field | Values | Meaning |
 |---|---|---|
-| `schema` | `PUT`: `{ "inline": "<schema>", "format"?: "shexc" \| "shexj" \| "shexr", "base"?: iri, "source"?: text }` | The schema text, and the base its relative IRIs resolve against. The text is ShExC, ShExJ, or ShExR in Turtle. Without `format` the language is sniffed, and text that starts with `{` is ShExJ. The schema is copied into the database. Without imports, it is stored verbatim as `validation-schema.shex` (ShExC) or `validation-schema.json` (ShExJ). With imports, the imports are resolved during the `PUT` and the merged schema is written as ShExJ to `validation-schema.json`. The schema's prefixes are then kept in `schema.prefixes` for the shape map. The stored configuration names the copy (`file`, `format`), keeps `base` and `source`, and records the SHA-256 of the text given. A later write never fetches anything. To change the other fields, a `PUT` may send the stored `schema` back, with its `file` and without `inline`. |
+| `schema` | `PUT`: `{ "inline": "<schema>", "format"?: "shexc" \| "shexj" \| "shexr", "base"?: iri, "source"?: text }` | The schema text, and the base its relative IRIs resolve against. The text is ShExC, ShExJ, or ShExR in Turtle. Without `format` the language is sniffed, and text that starts with `{` is ShExJ. The schema is copied into the database. Without imports, it is stored verbatim as `validation-schema.shex` (ShExC) or `validation-schema.json` (ShExJ). With imports, the imports are resolved during the `PUT` and the merged schema is written as ShExJ to `validation-schema.json`. The schema's prefixes are then kept in `schema.prefixes` for the shape map. The stored configuration names the copy (`file`, `format`), keeps `base` and `source`, and records the SHA-256 of the text given. A later write never fetches anything. To change the other fields, a `PUT` may send the stored `schema` back, with its `file` and without `inline`. The schema may instead live in the dataset: `{ "graphs": [iri, …], "prefixes"?: { prefix: iri }, "base"?: iri }` names named graphs that hold it in ShExR. It is then read from the state each write leaves, nothing is copied, and the shape map may use the prefixes given here or full IRIs. Imports are not fetched for a schema in graphs. |
 | `shapeMap` | compact string, or the JSON form `[{ "node", "shape" }]` | A query map. It is expanded again on every validated state, so new focus nodes are picked up. Prefixed names use the schema's prefixes unless the map has its own `PREFIX`es. |
 | `threshold` | — | Not accepted. Every nonconformant association blocks. |
-| `baseline` | `strict`, `grandfather` | As for SHACL. In grandfather mode a write is blocked only by the nonconformant associations it introduces. A ShEx schema changes only through a new configuration, so no write compares two schemas. |
+| `baseline` | `strict`, `grandfather` | As for SHACL. In grandfather mode a write is blocked only by the nonconformant associations it introduces. When a write changes a schema graph, the state before it is judged under the old schema, so its associations are compared with those the old schema gave. |
+
+A schema in graphs works as SHACL shapes graphs do. The schema graphs are never part of
+the data graph, and a `dataGraph` list that names one is a `400`. A write that changes a
+schema graph is validated in full against the schema it leaves, with the fallback reason
+`schema`, and that schema replaces the old one when the write commits. A write whose
+schema no longer parses, checks or defines the shape map's labels is rejected with `422`
+and the reason in `shapesError`, in `warn` mode too. A restart reads the schema from the
+graphs again.
 
 Imports resolve as for `POST /{ds}/shex`. `file:` IRIs and relative IRIs must be inside
 `--load-dir`, and http(s) imports go through the outbound policy. A `PUT` takes no inline
@@ -4355,16 +4484,19 @@ person nonconformant validates every person who reaches them, and falls back to 
 validation past 50,000 nodes. A restart, a compaction or a write the guard did not
 validate leaves the typing unknown until the next full validation, and writes until then
 are validated over every node that reaches a changed one. ShEx falls back for `baseline`,
-`bulk`, `budget` (more than 50,000 affected nodes), and `sparql` for a map with a SPARQL
+`bulk`, `budget` (more than 50,000 affected nodes), `schema` for a write to a schema
+graph, and `sparql` for a map with a SPARQL
 selector.
 
 In the CLI, `sparkles validation` sets the configuration. For SHACL it is
 `sparkles validation --loc DB --mode reject|warn [--shapes-graph IRI …] [--shapes FILE] [--data-graph …] [--threshold …] [--grandfather]`,
 with at least one shapes graph or a shapes file.
 For ShEx it is
-`sparkles validation --loc DB [--lang shex] --schema FILE [--schema-format shexc|shexj|shexr] --shape-map MAP --mode reject|warn [--data-graph …] [--grandfather]`.
-`--schema` and `--shape-map` imply `--lang shex`, and imports resolve against the schema's
-directory. `--status [--format json]` shows the configuration, and `--off` turns
+`sparkles validation --loc DB [--lang shex] --schema FILE [--schema-format shexc|shexj|shexr] --shape-map MAP --mode reject|warn [--data-graph …] [--grandfather]`,
+or with `--schema-graph IRI …` and `--schema-prefix PREFIX=IRI …` in place of `--schema`
+for a schema kept in ShExR graphs of the dataset.
+`--schema`, `--schema-graph` and `--shape-map` imply `--lang shex`, and imports resolve
+against the schema's directory. `--status [--format json]` shows the configuration, and `--off` turns
 validation off. `sparkles serve --validate NAME=CONFIG.json` sets a dataset's
 configuration when the server starts, from a file holding a `PUT` body. In that file,
 shapes or a schema without `inline` text are read from the path in `source`, relative to
@@ -6000,7 +6132,8 @@ open-world when SERVICE is allowed. The common arguments are:
 | Tool | Arguments (besides the common ones) | Result |
 |---|---|---|
 | `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}` |
-| `describe_schema` | `section` (`summary`\|`classes`\|`predicates`\|`constraints`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor`, `subjectClasses`, `shapes` | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?, subjectClasses?: ["ex:Person 120", …, "untyped 3"]}], constraints?: [{source, graphs, mode?, threshold?, classes: [{class, closed?, properties: [{path, constraints: "min 1 · max 1 · datatype xsd:string", enforcement}]}]}], next, prefixes}`. The summary lists the largest classes and predicates. `classes` and `predicates` page through all entries in IRI order. `subjectClasses: true` adds the ten classes of each predicate's subjects with the most triples. `constraints` lists the [constraints layer](#constraints-layer), from the write-time SHACL validation or from the sources in `shapes`. |
+| `describe_schema` | `section` (`summary`\|`classes`\|`predicates`\|`constraints`\|`profiles`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor`, `subjectClasses`, `shapes`, `classes` (IRIs, with `profiles`) | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?, superClassExpressions?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?, subjectClasses?: ["ex:Person 120", …, "untyped 3"]}], constraints?: [{source, graphs, mode?, threshold?, classes: [{class, closed?, properties: [{path, constraints: "min 1 · max 1 · datatype xsd:string", enforcement}]}]}], next, prefixes}`. The summary lists the largest classes and predicates. `classes` and `predicates` page through all entries in IRI order. `subjectClasses: true` adds the ten classes of each predicate's subjects with the most triples. `constraints` lists the [constraints layer](#constraints-layer), from the write-time SHACL validation or from the sources in `shapes`. `profiles` lists the [class profiles](#class-profiles) of the classes with the most instances, or of those in `classes`: `profiles: [{class, instances, properties: [{predicate, instances, triples, valuesPerInstance: "1..2", objects: {iri?, "xsd:string"?: n, …}, objectClasses?}], incoming}]`, with at most 25 properties and 10 incoming predicates per class. |
+| `diff_schema` | `from` (a commit, or `time:…` / `snapshot:…`), `to` (the head), `graph`, `reasoning`, `limit` (50, at most 500 entries per list), `timeoutSeconds` | `{dataset, from, to, graph, reasoning, counts, report: [Change], classes: {added: [iri], removed: [iri], changed: [{iri, changes: [Change]}]}, predicates: {…}, truncated, prefixes}`: the [schema diff](#schema-diffs) between two readable states. `404` for a commit beyond the head and `410` for one whose history is gone. |
 | `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, in SHACL Turtle or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
 | `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | One text block: a table or a JSON document (below). No `structuredContent`. |
 | `explain_query` | `query` (required), `includeAlgebra` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. |

@@ -11,6 +11,7 @@ pub fn all_tools() -> Vec<&'static str> {
         "list_datasets",
         "describe_schema",
         "draft_shapes",
+        "diff_schema",
         "sparql_query",
         "explain_query",
         "describe_resource",
@@ -98,13 +99,21 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
     };
     let schema_class = json!({"type":"object","required":["iri","instances","declared"],"properties":{
         "iri":{"type":"string"},"label":{"type":"string"},"instances":{"type":"integer"},
-        "declared":strings(),"superClasses":strings()}});
+        "declared":strings(),"superClasses":strings(),"superClassExpressions":strings()}});
     let schema_predicate = json!({"type":"object","required":["iri","triples","distinctSubjects","distinctObjects","maxPerSubject","objects"],"properties":{
         "iri":{"type":"string"},"label":{"type":"string"},"triples":{"type":"integer"},
         "distinctSubjects":{"type":"integer"},"distinctObjects":{"type":"integer"},
         "maxPerSubject":{"type":"integer"},"objects":strings(),
         "domains":strings(),"ranges":strings(),"vector":{"type":"boolean"},
         "subjectClasses":strings()}});
+    let profile_property = json!({"type":"object","required":["predicate","instances","triples","valuesPerInstance","objects"],"properties":{
+        "predicate":{"type":"string"},"instances":{"type":"integer"},"triples":{"type":"integer"},
+        "valuesPerInstance":{"type":"string"},"objects":{"type":"object"},
+        "objectClasses":{"type":"array","items":{"type":"object","properties":{"class":{"type":"string"},"triples":{"type":"integer"}}}}}});
+    let class_profile = json!({"type":"object","required":["class","instances","properties","incoming"],"properties":{
+        "class":{"type":"string"},"instances":{"type":"integer"},
+        "properties":{"type":"array","items":profile_property},
+        "incoming":{"type":"array","items":{"type":"object","properties":{"predicate":{"type":"string"},"triples":{"type":"integer"},"instances":{"type":"integer"}}}}}});
     let constraint_source = json!({"type":"object","required":["source","graphs","classes"],"properties":{
         "source":{"enum":["guard","graphs"]},"graphs":strings(),
         "mode":{"type":"string"},"threshold":{"type":"string"},"otherTargets":{"type":"integer"},
@@ -163,10 +172,10 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         read(
             "describe_schema",
             "Describe schema",
-            "Classes and predicates of a dataset with exact counts, labels and RDFS/OWL declarations. section=summary (default) gives totals and the largest classes and predicates; section=classes|predicates lists all entries in IRI order, page by page with cursor. section=constraints lists the SHACL constraints per class: those of the dataset's write-time validation, or of the shapes graphs named in `shapes`, with what enforces each. Counts are observations of one snapshot, never constraints.",
+            "Classes and predicates of a dataset with exact counts, labels and RDFS/OWL declarations. section=summary (default) gives totals and the largest classes and predicates; section=classes|predicates lists all entries in IRI order, page by page with cursor. section=constraints lists the SHACL constraints per class: those of the dataset's write-time validation, or of the shapes graphs named in `shapes`, with what enforces each. section=profiles lists, per class (the largest, or those in `classes`), the predicates its instances use with value counts, kinds and the classes of the values, and the predicates that point at its instances. Counts are observations of one snapshot, never constraints.",
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds(),
-                "section": {"enum":["summary","classes","predicates","constraints"],"default":"summary"},
+                "section": {"enum":["summary","classes","predicates","constraints","profiles"],"default":"summary"},
                 "graph": graph(),
                 "reasoning": rs(),
                 "includeBuiltin": {"type":"boolean","default":false,"description":"Also list rdf:, rdfs:, owl:, xsd:, sh: classes"},
@@ -174,11 +183,12 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "cursor": {"type":"string","description":"`next` from the previous page"},
                 "subjectClasses": {"type":"boolean","default":false,"description":"List the classes of each predicate's subjects with their triple counts"},
                 "shapes": {"type":"array","items":{"type":"string"},"description":"section=constraints: `guard` (the write-time validation, the default), `default`, `none` or shapes graph IRIs"},
+                "classes": {"type":"array","items":{"type":"string"},"description":"section=profiles: profile only these classes (IRIs or prefixed names)"},
                 "atCommit": at()}}),
             Some(
                 json!({"type":"object","required":["dataset","commit","graph","reasoning","section","totals","builtinClassesHidden","next","prefixes"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"graph":{"type":"string"},
-                "reasoning":{"type":"boolean"},"section":{"enum":["summary","classes","predicates","constraints"]},
+                "reasoning":{"type":"boolean"},"section":{"enum":["summary","classes","predicates","constraints","profiles"]},
                 "totals":{"type":"object","properties":{"triples":{"type":"integer"},"classes":{"type":"integer"},"predicates":{"type":"integer"}}},
                 "builtinClassesHidden":{"type":"integer"},
                 "ontology":{"type":"array","items":{"type":"object","required":["iri"],"properties":{"iri":{"type":"string"},"label":{"type":"string"},"versionInfo":{"type":"string"}}}},
@@ -186,6 +196,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "classes":{"type":"array","items":schema_class},
                 "predicates":{"type":"array","items":schema_predicate},
                 "constraints":{"type":"array","items":constraint_source},
+                "profiles":{"type":"array","items":class_profile},
                 "next":nullable("string"),
                 "prefixes":prefixes()}}),
             ),
@@ -217,6 +228,28 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                     "excluding":{"type":"array","items":{"type":"object","required":["path","component","excluded"],"properties":{
                         "path":{"type":"string"},"component":{"type":"string"},"excluded":{"type":"integer"}}}}}}},
                 "shacl":{"type":"string"},"shex":{"type":"string"},"shapeMap":{"type":"string"}}})),
+        ),
+        read(
+            "diff_schema",
+            "Diff the schema between commits",
+            "What changed in a dataset's schema between two states: the classes and predicates added and removed, and per changed entry each count, declaration or label that differs, with its value before and after. `from` and `to` (default: the head) are commits, or `time:<RFC 3339>` or `snapshot:<name>`. Both states must still be readable (history).",
+            json!({"type":"object","additionalProperties":false,"required":["from"],"properties":{
+                "dataset": ds(),
+                "from": {"type":["integer","string"],"description":"The earlier state: a commit, `time:<RFC 3339>` or `snapshot:<name>`"},
+                "to": {"type":["integer","string"],"description":"The later state (default: the head)"},
+                "graph": graph(),
+                "reasoning": rs(),
+                "limit": {"type":"integer","minimum":1,"maximum":500,"default":50,"description":"Entries per list"},
+                "timeoutSeconds": to(cfg)}}),
+            Some(json!({"type":"object","required":["dataset","from","to","graph","reasoning","counts","report","classes","predicates","truncated","prefixes"],"properties":{
+                "dataset":{"type":"string"},"from":{"type":"integer"},"to":{"type":"integer"},
+                "graph":{"type":"string"},"reasoning":{"type":"boolean"},
+                "counts":{"type":"object"},
+                "report":{"type":"array","items":{"type":"object"}},
+                "classes":{"type":"object","properties":{"added":strings(),"removed":strings(),"changed":{"type":"array","items":{"type":"object"}}}},
+                "predicates":{"type":"object","properties":{"added":strings(),"removed":strings(),"changed":{"type":"array","items":{"type":"object"}}}},
+                "truncated":{"type":"boolean"},
+                "prefixes":prefixes()}})),
         ),
         sparql_query,
         read(

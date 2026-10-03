@@ -69,11 +69,12 @@ fn stdio_session() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     assert_eq!(
-        names[..4],
+        names[..5],
         [
             "list_datasets",
             "describe_schema",
             "draft_shapes",
+            "diff_schema",
             "sparql_query"
         ]
     );

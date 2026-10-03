@@ -15,8 +15,8 @@
 //! `POS[p]` (to classify literal objects in sorted batches) and one over `PSO[p]`.
 
 use super::{
-    Budget, GraphFilter, Iris, SchemaError, SchemaOptions, SnapshotInfo, builtin, for_each_key,
-    in_phase, is_iri, literal_suffix, resolve, snapshot_identity, within_view,
+    Budget, GraphFilter, Iris, SchemaError, SchemaOptions, SnapshotInfo, Src, builtin, in_phase,
+    is_iri, literal_suffix, resolve, snapshot_identity, within_view,
 };
 use crate::id::{Id, Tag};
 use crate::index::Perm;
@@ -441,7 +441,7 @@ impl Types {
 }
 
 fn types(
-    snap: &Snapshot,
+    snap: &Src,
     filter: &GraphFilter,
     budget: &Budget,
     max_entries: usize,
@@ -460,7 +460,7 @@ fn types(
         let mut prev = None;
         let mut edges = Vec::new();
         in_phase(
-            for_each_key(snap, Perm::Pso, &[sub.0], budget, |k| {
+            snap.for_each_key(Perm::Pso, &[sub.0], budget, |k| {
                 if filter.accepts(k[3]) && prev != Some((k[1], k[2])) {
                     prev = Some((k[1], k[2]));
                     edges.push((k[1], k[2]));
@@ -487,7 +487,7 @@ fn types(
         let mut runs: Vec<(u64, Vec<u64>)> = Vec::new();
         let mut prev = None;
         in_phase(
-            for_each_key(snap, Perm::Pso, &[ty.0], budget, |k| {
+            snap.for_each_key(Perm::Pso, &[ty.0], budget, |k| {
                 if !filter.accepts(k[3]) || prev == Some((k[1], k[2])) {
                     return;
                 }
@@ -625,7 +625,7 @@ fn literal_info(key: &[u8], dts: &mut Names, langs: &mut Names) -> ObjInfo {
 /// Classify the objects of `p` that need their vocabulary key (base-vocabulary literals
 /// and delta terms), reading base keys in sorted batches.
 fn object_infos(
-    snap: &Snapshot,
+    snap: &Src,
     p: u64,
     filter: &GraphFilter,
     budget: &Budget,
@@ -636,7 +636,7 @@ fn object_infos(
     let mut delta: Vec<u64> = Vec::new();
     let mut prev = None;
     let v = &snap.generation.vocab;
-    for_each_key(snap, Perm::Pos, &[p], budget, |k| {
+    snap.for_each_key(Perm::Pos, &[p], budget, |k| {
         let o = k[1];
         if !filter.accepts(k[3]) || prev == Some(o) {
             return;
@@ -1037,6 +1037,10 @@ pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesD
     if let Some(a) = so.graphs.as_ref().filter(|a| !a.reads_all()) {
         filter = within_view(snap, filter, &so.graph, a)?;
     }
+    let src = in_phase(Src::for_filters(snap, &[&filter], &budget), || {
+        "reading the selected graphs".into()
+    })?;
+    let snap = &src;
     let types = types(snap, &filter, &budget, so.max_entries)?;
     let mut iris = Iris {
         snap,
@@ -1099,7 +1103,7 @@ pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesD
             };
             let mut prev = None;
             in_phase(
-                for_each_key(snap, Perm::Pso, &[p], &budget, |k| {
+                snap.for_each_key(Perm::Pso, &[p], &budget, |k| {
                     if !filter.accepts(k[3]) || prev == Some((k[1], k[2])) {
                         return;
                     }
@@ -1203,6 +1207,7 @@ pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesD
         dataset: opts.dataset.clone(),
         snapshot: SnapshotInfo {
             version: snapshot_identity(snap),
+            commit: snap.commit,
             generation: snap.generation.name.clone(),
             computed_at: crate::builder::now_rfc3339(),
         },

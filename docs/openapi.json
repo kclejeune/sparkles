@@ -9698,6 +9698,84 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/schema/{ds}/diff": {
+      "get": {
+        "description": "Compares the schema reports of two states of the dataset, field by field.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#schema-diffs"
+        },
+        "operationId": "getSchemaDiff",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The earlier state, in any form `at` takes.",
+            "in": "query",
+            "name": "from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The later state, in any form `at` takes (default: the head).",
+            "in": "query",
+            "name": "to",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/graphSel"
+          },
+          {
+            "$ref": "#/components/parameters/reasoning"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The changes between the two reports."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Schema diff",
+        "tags": [
+          "Schema"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/schema/{ds}/predicates": {
       "get": {
         "externalDocs": {
@@ -9806,6 +9884,78 @@
           ],
           "style": "cursor"
         },
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/schema/{ds}/profiles": {
+      "get": {
+        "description": "For each class with instances, the predicates its instances use, with counts, cardinalities and object kinds, and the predicates that point to them.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#class-profiles"
+        },
+        "operationId": "getClassProfiles",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/graphSel"
+          },
+          {
+            "$ref": "#/components/parameters/reasoning"
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "description": "Profile only this class (repeatable).",
+            "in": "query",
+            "name": "class",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The class profiles."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Class profiles",
+        "tags": [
+          "Schema"
+        ],
         "x-sparkles-permission": "read"
       }
     },
