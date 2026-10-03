@@ -527,7 +527,15 @@ impl OutboundPolicy {
         let failed = Arc::new(Mutex::new(None));
         let client = self
             .client(&failed)
-            .map_err(|e| Failure::Failed(hidden(url, "the request could not be built", &e)))?;
+            // a client that cannot be built is a local configuration error (such as an
+            // `SSL_CERT_FILE` that names no file), so its cause is safe to show
+            .map_err(|e| {
+                Failure::Failed(format!(
+                    "{}: {}",
+                    hidden(url, "the HTTP client could not be built", &e),
+                    chain(&e)
+                ))
+            })?;
         let start = Instant::now();
         let resp = apply(build(&client, u)).timeout(timeout).send();
         let resp = match resp {

@@ -4,6 +4,7 @@
 # installed package (`checks.python-bindings`).
 {
   lib,
+  cacert,
   python3,
   rustPlatform,
 }:
@@ -41,6 +42,12 @@ python3.pkgs.buildPythonPackage {
     python3.pkgs.rdflib
   ];
   enabledTestPaths = [ "crates/sparkles-py/tests" ];
+  # the sandbox points SSL_CERT_FILE at a file that does not exist, and the HTTP client
+  # (rustls with the platform's roots) cannot be built then, even for plain http: give
+  # the tests the CA bundle a normal system has
+  preCheck = ''
+    export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
+  '';
   pythonImportsCheck = [ "sparkles" ];
 
   meta = {
