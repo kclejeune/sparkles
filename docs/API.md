@@ -3743,9 +3743,19 @@ SELECT ?s ?score ?label WHERE {
     without an analyzer in the index is searched unstemmed and filtered by its tag.
   * The analyzers are `arabic`, `danish`, `dutch`, `english`, `finnish`, `french`,
     `german`, `greek`, `hungarian`, `italian`, `norwegian`, `portuguese`, `romanian`,
-    `russian`, `spanish`, `swedish`, `tamil` and `turkish`. Their default tags are `ar`,
-    `da`, `nl`, `en`, `fi`, `fr`, `de`, `el`, `hu`, `it`, `no` (and `nb` and `nn`), `pt`,
-    `ro`, `ru`, `es`, `sv`, `ta` and `tr`.
+    `russian`, `spanish`, `swedish`, `tamil`, `turkish` and `cjk`. Their default tags are
+    `ar`, `da`, `nl`, `en`, `fi`, `fr`, `de`, `el`, `hu`, `it`, `no` (and `nb` and `nn`),
+    `pt`, `ro`, `ru`, `es`, `sv`, `ta` and `tr`, and `zh`, `ja` and `ko` for `cjk`.
+    `"all"` names the 18 stemmed languages, so CJK is listed on its own, as in
+    `["en", "zh", "ja", "ko"]`.
+  * `cjk` segments Chinese, Japanese and Korean text without a dictionary, as Lucene's
+    `CJKAnalyzer` does. A run of Han, Hiragana, Katakana or Hangul characters becomes its
+    overlapping pairs of characters, so `東京都` is indexed as `東京` and `京都`, and a
+    lone character stays a token. Other words are split and lowercased as usual.
+    Full-width letters and digits match their ASCII forms, and half-width Katakana
+    matches full-width. A query word is the OR of its pairs, so `東京都` also finds
+    `京都`, and the phrase `"東京都"` finds the three characters in a row. Without a
+    language, the standard analyzer keeps a run of CJK characters as one word.
 * **Consistency.** Indexes are updated in the same commit as the data, so a query sees
   the text of its own snapshot, including the writes just before it. A write only stages
   its documents. The index commit, which writes a new segment, happens at the next text

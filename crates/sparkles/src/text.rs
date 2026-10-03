@@ -25,6 +25,8 @@
 use crate::error::{Error, Result};
 
 #[cfg(feature = "text")]
+mod cjk;
+#[cfg(feature = "text")]
 mod highlight;
 #[cfg(feature = "text")]
 mod lazydir;
@@ -116,7 +118,8 @@ pub struct TextConfig {
 }
 
 /// A language analyzer: Tantivy's Snowball stemmer for the language, after the stop
-/// words of the language are removed (where Tantivy has a list for it).
+/// words of the language are removed (where Tantivy has a list for it), or `cjk`, the
+/// bigrams of Chinese, Japanese and Korean text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Analyzer {
@@ -138,9 +141,16 @@ pub enum Analyzer {
     Swedish,
     Tamil,
     Turkish,
+    /// overlapping bigrams of Han, Hiragana, Katakana and Hangul, as Lucene's
+    /// `CJKAnalyzer` makes them (no stemmer, no dictionary)
+    Cjk,
 }
 
 impl Analyzer {
+    /// The languages whose default analyzer is `cjk`. `"all"` leaves them out, since it
+    /// names the stemmed languages; an index lists them.
+    pub const CJK: [&'static str; 3] = ["ja", "ko", "zh"];
+
     /// Every analyzer with the language tag it is used for by default.
     pub const ALL: [(&'static str, Analyzer); 18] = [
         ("ar", Analyzer::Arabic),
@@ -170,7 +180,20 @@ impl Analyzer {
             "nb" | "nn" => "no",
             t => t,
         };
+        if Self::CJK.contains(&tag) {
+            return Some(Analyzer::Cjk);
+        }
         Self::ALL.iter().find(|(t, _)| *t == tag).map(|(_, a)| *a)
+    }
+
+    /// The analyzer of a name (`english`, `cjk`, …), in any case.
+    pub fn named(name: &str) -> Option<Analyzer> {
+        let name = name.to_ascii_lowercase();
+        Self::ALL
+            .iter()
+            .map(|(_, a)| *a)
+            .chain([Analyzer::Cjk])
+            .find(|a| a.name() == name)
     }
 
     pub fn name(self) -> &'static str {
@@ -193,6 +216,7 @@ impl Analyzer {
             Analyzer::Swedish => "swedish",
             Analyzer::Tamil => "tamil",
             Analyzer::Turkish => "turkish",
+            Analyzer::Cjk => "cjk",
         }
     }
 }
@@ -297,16 +321,12 @@ impl<'de> Deserialize<'de> for Languages {
                 let mut out = std::collections::BTreeMap::new();
                 for (t, a) in m {
                     let tag = primary_tag(&t).map_err(err)?;
-                    let a = Analyzer::ALL
-                        .iter()
-                        .map(|(_, a)| *a)
-                        .find(|x| x.name() == a.to_ascii_lowercase())
-                        .ok_or_else(|| {
-                            err(format!(
-                                "languages: unknown analyzer {a:?} (one of {})",
-                                Analyzer::ALL.map(|(_, a)| a.name()).join(", ")
-                            ))
-                        })?;
+                    let a = Analyzer::named(&a).ok_or_else(|| {
+                        err(format!(
+                            "languages: unknown analyzer {a:?} (one of {}, cjk)",
+                            Analyzer::ALL.map(|(_, a)| a.name()).join(", ")
+                        ))
+                    })?;
                     out.insert(tag, a);
                 }
                 Ok(Languages::Only(out))
@@ -677,7 +697,11 @@ mod imp {
                 .filter(AsciiFoldingFilter)
                 .build(),
         );
-        for (_, a) in Analyzer::ALL {
+        for a in Analyzer::ALL
+            .map(|(_, a)| a)
+            .into_iter()
+            .chain([Analyzer::Cjk])
+        {
             index
                 .tokenizers()
                 .register(&tokenizer_name(a), language_analyzer(a));
@@ -692,6 +716,12 @@ mod imp {
     pub(super) fn language_analyzer(a: Analyzer) -> TextAnalyzer {
         use tantivy::tokenizer::{Language as L, Stemmer, StopWordFilter};
         let lang = match a {
+            Analyzer::Cjk => {
+                return TextAnalyzer::builder(super::cjk::CjkTokenizer)
+                    .filter(RemoveLongFilter::limit(MAX_TOKEN))
+                    .filter(LowerCaser)
+                    .build();
+            }
             Analyzer::Arabic => L::Arabic,
             Analyzer::Danish => L::Danish,
             Analyzer::Dutch => L::Dutch,

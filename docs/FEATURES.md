@@ -165,7 +165,8 @@ These are features other RDF stores have and Sparkles does not have yet.
   query form and evaluation of `shortest(…)` paths, which ARQ does not evaluate either.
   `afn:collation` orders by code point instead of by locale. SERVICE is plain, with no batching or caching.
 * **Search.** Full-text search has no multi-field documents, and its stemmers are
-  Tantivy's Snowball stemmers rather than Lucene's analyzers, with no CJK segmentation.
+  Tantivy's Snowball stemmers rather than Lucene's analyzers. CJK text is cut into
+  bigrams, with no dictionary-based segmentation.
   A full-text rebuild holds the writer lock until it finishes. A vector index has no quantization,
   so its packed vectors take 4 bytes per dimension. Its graph is not carried across
   compactions and is built again for each new generation. Path search takes its
