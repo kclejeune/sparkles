@@ -8051,7 +8051,7 @@
             }
           },
           {
-            "description": "The tool, resource or prompt name (stateless requests).",
+            "description": "The tool, resource or prompt name, or the task id (stateless requests).",
             "in": "header",
             "name": "Mcp-Name",
             "schema": {
@@ -8084,7 +8084,7 @@
                 }
               }
             },
-            "description": "The JSON-RPC response."
+            "description": "The JSON-RPC response, or an SSE stream for `subscriptions/listen` and the requests of a legacy session."
           },
           "202": {
             "description": "A notification or response was accepted."

@@ -1713,3 +1713,7 @@ caller as the author and needs the `diff` grant.
 **Not built.** Full-text search at pins (§11.6) and pin rebasing remain deferred, as do
 periods per quad, a history query that takes bindings from the rest of its group, and
 point-in-time reads rebuilt from the change log.
+
+**Later additions (2026-10-03).** The MCP read tools take `at` and read past states as
+`?at=` does, and the MCP tool `list_changes` runs the history query of
+`GET /{ds}/history` ([C11](C11-mcp-server.md#outcome)).

@@ -1,14 +1,16 @@
 # C11: MCP server
 
-> **Status:** implemented in part (Phases 1–2)
+> **Status:** implemented (Phases 1–3)
 >
 > **Phases:** Phase 1 shipped: `sparkles mcp` over stdio with six read-only tools,
 > snapshot pins and cancellation. Phase 2's `search_text` and `similar_entities` shipped
 > with it, and `validate_shacl`, `validate_shex` and `format` were added later. The rest
 > of Phase 2 shipped on 2026-10-02: the HTTP transport (`/$/mcp`), `sparql_update`,
 > resources and prompts. The auth integration of §4.9 shipped with it. Of Phase 3,
-> `dryRun` for `sparql_update` came with [C15](C15-write-previews.md). The other Phase 3
-> items were not built.
+> `dryRun` for `sparql_update` came with [C15](C15-write-previews.md), and the rest
+> shipped on 2026-10-03: past states from the dataset's history, `ifHead`, completions,
+> `subscriptions/listen`, the tasks extension and the stdio-to-HTTP bridge, together
+> with tools for path search, history queries, GraphQL, RDF Patch and DESCRIBE modes.
 >
 > **User docs:** [API: MCP server](../API.md#mcp-server) ·
 > [Usage: MCP server](../USAGE.md#mcp-server-llm-agents) ·
@@ -1537,11 +1539,6 @@ revisit them.
 5. There is no `--allow-load`, and the `sparkles_mcp_tool_*` metrics and the access log's
    `mcp_tool` field were not built.
 
-**Not built.** The Phase 3 items other than auth and `dryRun` were not built. These are
-`atCommit` over retained commits, `ifHead` for `sparql_update`, `subscriptions/listen`,
-the tasks extension, completions and the stdio-to-HTTP bridge. MCP has no measurements in
-[BENCHMARKS](../BENCHMARKS.md).
-
 **Later additions (2026-10-02).** Features of other specs added tools.
 
 - `sparql_update` takes `dryRun` and `changes`, which preview an update without
@@ -1554,4 +1551,95 @@ the tasks extension, completions and the stdio-to-HTTP bridge. MCP has no measur
 - Each stored query that a caller may run becomes a tool named `<dataset>__<query>`,
   with a JSON Schema of its parameters ([C16](C16-stored-queries.md)). The tool set is
   therefore no longer fixed, so `tools/list` may be cached for a minute instead of an
-  hour. The server does not send `notifications/tools/list_changed`.
+  hour. Phase 3 added `notifications/tools/list_changed` (below).
+
+**Phase 3 shipped on 2026-10-03.** All of its items are in, and features that landed
+since the design added five tools or arguments.
+
+- **Past states.** The read tools take `at` beside `atCommit`. It is a commit number or a
+  string, `commit:N`, `time:<RFC 3339>`, `snapshot:<name>` or `head`, parsed as the HTTP
+  `?at=` parameter is. A commit that the pin table does not hold is read from the
+  dataset's retained history ([F06](F06-snapshots-and-point-in-time.md)) within the
+  call's deadline, and is then pinned like any other. A commit beyond the head, an
+  unknown snapshot or a time before history is `unknown-commit` with status 404. A state
+  that the dataset no longer keeps is `unknown-commit` with 410, and the hint names the
+  commits it still keeps, or says that it keeps none. `list_commits` adds `readable`, the
+  ranges of commits that `at` can read, and `snapshots`, the 20 newest named snapshots.
+  `describe_schema` cursors still name their commit, and `at` with a cursor is refused.
+- **`ifHead`.** `sparql_update` takes `ifHead: N`. It becomes the write's precondition,
+  which the store checks with the writer lock held, as the Graph Store's `If-Match` is
+  checked. A head other than `N` fails with `precondition-failed` (412) and writes
+  nothing, and a dry run reports it as its outcome.
+- **Completions.** `completion/complete` suggests dataset names (for stored queries, the
+  datasets that have some), stored-query names, the parameter names a stored query's
+  `arguments` lack, named graphs of the caller's view (at most 1000, read by a query
+  under a 5 s deadline) and prefixes. Everything comes from what the caller may see,
+  and a completion takes one of the tool calls' concurrency slots.
+  Completions need prompts and templates to complete, so the prompts `run_stored_query`
+  (`dataset`, `query`, `arguments`) and `explain_term` (`dataset`, `term`) were added,
+  `explore_dataset` and `answer_question` take an optional `graph`, and each stored query
+  offered as a tool is a resource, `sparkles://{ds}/queries/{name}`, with a third
+  template.
+- **Change notifications.** The capabilities declare `tools.listChanged`,
+  `resources.listChanged` and `resources.subscribe`. `subscriptions/listen` delivers
+  tool list changes, resource list changes and updates of the subscribed resources.
+  Every 2 seconds a subscription compares what its caller sees. It compares the tools
+  the caller may call with the versions of their stored queries, the URIs of its
+  resources, and for each subscribed resource the dataset's head commit, prefixes or
+  stored-query version. A session of the
+  `initialize` era gets the two list notifications on its stream from
+  `notifications/initialized` on. At most 64 subscriptions and sessions watch at once.
+- **Tasks.** The server declares the tasks extension (SEP-2663, which rmcp 3.5
+  implements). A call of a client that declares it and runs longer than
+  `--task-after-ms` (`--mcp-task-after-ms`, 2000 by default) returns a task. `tasks/get`
+  returns its state and result, and `tasks/cancel` sets the call's cancel flag. A task
+  answers only its caller, its result is kept for 10 minutes, and at most 64 run at once.
+  Every tool may become a task, since only the time it takes decides.
+- **Bridge.** `sparkles mcp --url URL` forwards each stdin message to `URL/$/mcp` with
+  the transport's headers, and writes each message of a JSON or SSE answer as a line. It
+  signs in with `--token`, `SPARKLES_TOKEN` or the saved `sparkles auth login`, and a
+  `401` becomes an error that names `sparkles auth login`. Requests run concurrently,
+  `notifications/cancelled` drops the HTTP request it names, and a legacy session keeps
+  its id, opens its notification stream and is deleted when stdin closes. The bridge is
+  in builds with both the `mcp` and `auth` features, since it uses the CLI's HTTP client.
+- **New tools.** `find_paths` writes a `SERVICE path:search` block
+  ([F07](F07-path-search.md)) from its arguments, with validated IRIs, and returns each
+  path's ends, length, cost and edges, at most 100 paths and 2000 edges.
+  `graphql_query` runs a GraphQL document ([C03](C03-graphql.md)) as a `GET` would, so
+  mutations are refused, on the call's snapshot. Without `query` it returns the API
+  schema. It is listed only while a dataset that the caller may query through GraphQL
+  has a schema, and `list_datasets` marks such datasets with `graphql: true`.
+  `sparql_update` applies an RDF Patch given as `patch` instead of `update`, with a write
+  grant on the `patch` endpoint. `describe_resource` takes `mode` (`cbd`, `scbd`,
+  `outgoing`) and adds the resource's DESCRIBE in that mode, at most `maxTriples` triples.
+  `list_changes` runs the history query of `GET /{ds}/history`
+  ([F06 §11](F06-snapshots-and-point-in-time.md#11-phase-3-history-queries-and-the-change-log)),
+  which merged while this phase was built. It filters the recorded changes by subjects,
+  predicates, objects, graphs, commit range and kind, needs the grant of the `diff`
+  endpoint, and renders each change as a line of terms with its commit's number, time,
+  kind, author and message.
+
+**Deviations of Phase 3.**
+
+1. Legacy `resources/subscribe` is not served, and the legacy handshake leaves
+   `resources.subscribe` out of its capabilities. Resource updates come only through
+   `subscriptions/listen`.
+2. The protocol acknowledges a subscription before the server takes its first look, so
+   a change in that moment is not reported.
+3. Progress notifications were not built, since the tasks extension covers long calls.
+4. There is no `--watch-interval` flag. The 2-second interval is a constant of the
+   configuration.
+
+**Tests at landing.** Tests over the in-memory stdio transport cover reads of past
+states by commit, time and snapshot name with their errors, `ifHead` and patches,
+`find_paths`, `list_changes`, the DESCRIBE modes, `graphql_query` before and after a
+schema is installed, every completion, `subscriptions/listen` with each notification and
+its cancellation, list changes on a legacy session, and tasks that complete and that are
+cancelled. Router tests over HTTP cover a subscription's SSE stream, completions and
+task ownership for two callers, and `find_paths` and `list_changes` under graph grants.
+An end-to-end test runs the bridge binary against a server with authentication, without
+a login, with `--token` and with the saved login.
+
+**Not built.** OAuth protected-resource metadata, audience validation and scope
+challenges (deviation 3 of Phase 2) are still not built. MCP has no measurements in
+[BENCHMARKS](../BENCHMARKS.md).

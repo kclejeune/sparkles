@@ -10,18 +10,35 @@
 //! off unless allowed, and the default tool set cannot write.
 
 mod adapter;
+#[cfg(feature = "auth")]
+mod bridge;
+mod complete;
 mod context;
 mod draft;
 mod errors;
 #[cfg(feature = "fmt")]
 mod format;
+#[cfg(feature = "graphql")]
+mod graphql;
+#[cfg(feature = "graphql")]
+use graphql::graphql_on;
+
+/// Without GraphQL no dataset has a GraphQL API.
+#[cfg(not(feature = "graphql"))]
+fn graphql_on(_: &Principal, _: &Dataset) -> bool {
+    false
+}
+mod history;
 pub mod http;
+mod notify;
+mod paths;
 mod pins;
 mod render;
 mod schema_history;
 mod schemas;
 mod search;
 mod stored;
+mod tasks;
 mod tools;
 mod update;
 #[cfg(any(feature = "shacl", feature = "shex"))]
@@ -50,16 +67,29 @@ pub struct McpArgs {
     /// Database directory to serve, as [NAME=]PATH (repeatable; the name defaults to the
     /// directory's name). A database held by `sparkles serve` is refused: use that
     /// server instead.
-    #[arg(
-        long,
-        value_name = "[NAME=]PATH",
-        required_unless_present = "data",
-        conflicts_with = "data"
-    )]
+    #[arg(long, value_name = "[NAME=]PATH", conflicts_with = "data")]
+    #[cfg_attr(feature = "auth", arg(required_unless_present_any = ["data", "url"]))]
+    #[cfg_attr(not(feature = "auth"), arg(required_unless_present = "data"))]
     pub loc: Vec<String>,
     /// RDF files loaded into one in-memory dataset
     #[arg(long, value_name = "FILE", num_args = 1..)]
     pub data: Vec<PathBuf>,
+    /// Bridge stdio to the MCP endpoint (/$/mcp) of a running `sparkles serve --mcp` at
+    /// this URL instead of opening databases. The server's tools, limits and permissions
+    /// apply, and the bridge signs in with --token, SPARKLES_TOKEN or the saved
+    /// `sparkles auth login` of that server
+    #[cfg(feature = "auth")]
+    #[arg(long, value_name = "URL", conflicts_with_all = ["loc", "data"])]
+    pub url: Option<String>,
+    /// The API token the bridge sends (instead of SPARKLES_TOKEN or the saved login)
+    #[cfg(feature = "auth")]
+    #[arg(long, value_name = "TOKEN", requires = "url")]
+    pub token: Option<String>,
+    /// Allow --url over plain http to a host other than localhost (the token travels in
+    /// clear text)
+    #[cfg(feature = "auth")]
+    #[arg(long, requires = "url")]
+    pub insecure_http: bool,
     /// Name of the in-memory dataset of --data
     #[arg(long, default_value = "data")]
     pub name: String,
@@ -110,6 +140,10 @@ pub struct McpArgs {
     /// Largest number of classes, and of predicates, a schema report may have
     #[arg(long, value_name = "N", default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
     pub schema_max_entries: usize,
+    /// How long a tool call of a client that supports tasks runs before it becomes a
+    /// task that the client polls, in milliseconds
+    #[arg(long, value_name = "MS", default_value_t = 2000)]
+    pub task_after_ms: u64,
 }
 
 /// Limits and switches of the MCP tools.
@@ -133,6 +167,11 @@ pub struct McpConfig {
     pub datasets: Vec<String>,
     /// offer the stored queries of the datasets as tools (C16)
     pub stored_queries: bool,
+    /// how often a subscription looks for changed tool and resource lists and resources
+    pub watch_interval: Duration,
+    /// how long a tool call of a client that supports tasks may run before it becomes a
+    /// task that the client polls
+    pub task_after: Duration,
 }
 
 impl Default for McpConfig {
@@ -148,6 +187,8 @@ impl Default for McpConfig {
             disabled: BTreeSet::new(),
             datasets: Vec::new(),
             stored_queries: true,
+            watch_interval: Duration::from_secs(2),
+            task_after: Duration::from_secs(2),
         }
     }
 }
@@ -183,6 +224,10 @@ pub struct Shared {
     /// one permit per concurrent tool call
     pub slots: Arc<Semaphore>,
     tools: Vec<schemas::ToolDef>,
+    /// tool calls that became tasks (the tasks extension), with their callers
+    pub tasks: tasks::Tasks,
+    /// one permit per open `subscriptions/listen` stream or legacy session watcher
+    pub subscriptions: Arc<Semaphore>,
 }
 
 /// The transport-neutral MCP server.
@@ -237,6 +282,8 @@ impl McpServer {
                 slots: Arc::new(Semaphore::new(cfg.max_concurrent.max(1))),
                 pins: pins::Pins::default(),
                 tools,
+                tasks: tasks::Tasks::default(),
+                subscriptions: Arc::new(Semaphore::new(notify::MAX_SUBSCRIPTIONS)),
                 cfg,
             }),
         }
@@ -265,13 +312,24 @@ impl McpServer {
                 .any(|ds| p.can(&ds.name, Level::Write))
     }
 
+    /// Whether `p` may call the offered tool `name`: the write tool needs a dataset
+    /// `p` may write to, and `graphql_query` one with a GraphQL schema that `p` may
+    /// query. Tool listings leave out the others.
+    pub fn allows(&self, p: &Principal, name: &str) -> bool {
+        match name {
+            "sparql_update" => self.may_update(p),
+            #[cfg(feature = "graphql")]
+            "graphql_query" => self.graphql_available(p),
+            _ => true,
+        }
+    }
+
     /// The offered tools `p` may call, in `tools/list` order.
     pub fn tools_for(&self, p: &Principal) -> Vec<&schemas::ToolDef> {
-        let update = self.may_update(p);
         self.shared
             .tools
             .iter()
-            .filter(|t| t.name != "sparql_update" || update)
+            .filter(|t| self.allows(p, t.name))
             .collect()
     }
 
@@ -299,10 +357,17 @@ impl McpServer {
         args: Map<String, Value>,
         call: Call,
     ) -> Result<Result<Outcome, ToolError>, UnknownTool> {
-        if !self.offers(name) && self.stored_tool(&call.principal, name).is_none() {
+        if !self.known(&call.principal, name) {
             return Err(UnknownTool(name.to_string()));
         }
         Ok(self.run(name, args, call).await)
+    }
+
+    /// Whether `p` may call the tool `name`: an offered tool (the write tool checks for
+    /// itself which datasets `p` may write to) or one of its stored queries.
+    pub fn known(&self, p: &Principal, name: &str) -> bool {
+        (self.offers(name) && (name == "sparql_update" || self.allows(p, name)))
+            || self.stored_tool(p, name).is_some()
     }
 
     /// [`McpServer::call`] for a tool whether or not it is offered (resources are read
@@ -377,6 +442,10 @@ impl McpServer {
 
 /// `sparkles mcp`: serve the datasets over stdio until stdin closes.
 pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
+    #[cfg(feature = "auth")]
+    if let Some(url) = &args.url {
+        return bridge::run(url, args.token.clone(), args.insecure_http);
+    }
     if !(args.timeout.is_finite() && args.timeout > 0.0) {
         bail!("--timeout expects a positive number of seconds");
     }
@@ -459,6 +528,8 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         disabled: args.disable_tool.into_iter().collect(),
         datasets: Vec::new(),
         stored_queries: !args.no_stored_queries,
+        task_after: Duration::from_millis(args.task_after_ms),
+        ..McpConfig::default()
     };
     let server = McpServer::new(st, cfg);
     let rt = tokio::runtime::Builder::new_multi_thread()

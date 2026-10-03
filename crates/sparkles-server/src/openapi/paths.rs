@@ -1841,11 +1841,11 @@ fn format_and_mcp(p: &mut Paths) {
     p.add(
         mcp(POST, "mcpPost", "Send an MCP message", "One JSON-RPC message of the Model Context Protocol's Streamable HTTP transport. `404` unless the server runs with `--mcp`.")
             .header("Mcp-Method", s(), "The JSON-RPC method (stateless requests).")
-            .header("Mcp-Name", s(), "The tool, resource or prompt name (stateless requests).")
+            .header("Mcp-Name", s(), "The tool, resource or prompt name, or the task id (stateless requests).")
             .body(true, "A JSON-RPC message.", json!({ "application/json": { "schema": { "type": "object" } } }))
             .resp(
                 "200",
-                "The JSON-RPC response.",
+                "The JSON-RPC response, or an SSE stream for `subscriptions/listen` and the requests of a legacy session.",
                 Some(json!({
                     "application/json": { "schema": { "type": "object" } },
                     "text/event-stream": text(),

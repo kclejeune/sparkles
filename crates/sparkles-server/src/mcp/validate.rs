@@ -87,6 +87,7 @@ impl Tools<'_> {
         reasoning: Option<bool>,
         timeout_seconds: Option<f64>,
         at_commit: Option<u64>,
+        at: Option<&Value>,
     ) -> Result<Target, ToolError> {
         let timeout = self.timeout(timeout_seconds)?;
         let ds = self.dataset(dataset)?;
@@ -115,7 +116,7 @@ impl Tools<'_> {
                 }
             },
         };
-        let snap = self.server.shared.pins.resolve(&ds, at_commit)?;
+        let snap = self.snapshot(&ds, at_commit, at, self.call.arrived + timeout)?;
         if let GraphParam::Named(iri) = &graph
             && !validation_common::graph_exists(&snap, iri)
         {
@@ -227,6 +228,7 @@ struct ShaclArgs {
     max_results: Option<u64>,
     timeout_seconds: Option<f64>,
     at_commit: Option<u64>,
+    at: Option<Value>,
 }
 
 /// The syntax of `validate_shacl`'s shapes.
@@ -296,6 +298,7 @@ impl Tools<'_> {
             a.reasoning,
             a.timeout_seconds,
             a.at_commit,
+            a.at.as_ref(),
         )?;
         let prefixes = Prefixes::new(&t.prefixes);
         let names = prefixes.names();
@@ -370,6 +373,7 @@ struct ShexArgs {
     max_results: Option<u64>,
     timeout_seconds: Option<f64>,
     at_commit: Option<u64>,
+    at: Option<Value>,
 }
 
 /// A syntax error with its line and column.
@@ -458,6 +462,7 @@ impl Tools<'_> {
             a.reasoning,
             a.timeout_seconds,
             a.at_commit,
+            a.at.as_ref(),
         )?;
         let names: Vec<String> = t.prefixes.keys().cloned().collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();

@@ -28,6 +28,7 @@ struct DraftArgs {
     max_count: Option<u64>,
     closed: Option<bool>,
     at_commit: Option<u64>,
+    at: Option<Value>,
     timeout_seconds: Option<f64>,
 }
 
@@ -82,7 +83,7 @@ impl Tools<'_> {
                 _ => return Err(ToolError::bad_argument("classes must be IRIs")),
             }
         }
-        let snap = self.server.shared.pins.resolve(&ds, a.at_commit)?;
+        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
         let opts = DraftOptions {
             schema: SchemaOptions {
                 graph,

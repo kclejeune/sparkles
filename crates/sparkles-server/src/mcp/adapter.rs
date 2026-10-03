@@ -11,21 +11,28 @@
 //! rmcp hands over in the request's `http::request::Parts`. Listings and calls follow
 //! that principal's permissions.
 
+use super::complete::{Request as CompleteRequest, Target};
 use super::context::{ContextError, PROMPTS, templates};
 use super::errors::{ERROR_META, ToolError};
+use super::notify::{Change, Watch};
 use super::{Call, McpServer, Outcome, UnknownTool};
 use crate::auth::Principal;
 use parking_lot::Mutex;
 use rmcp::model::{
-    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+    CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock, CreateTaskResult,
     CustomRequest, CustomResult, DiscoverResult, GetPromptRequestParams, GetPromptResponse,
-    GetPromptResult, Implementation, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
+    GetPromptResult, GetTaskParams, GetTaskResult, Implementation, InitializeRequestParams,
+    InitializeResult, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams, Prompt,
     PromptArgument, PromptMessage, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ResourceTemplate, Role,
-    ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
+    ReadResourceResponse, ReadResourceResult, Reference, Resource, ResourceContents,
+    ResourceTemplate, Role, ServerCapabilities, ServerConfig, SubscriptionFilter, Tool,
+    ToolAnnotations, UpdateTaskParams,
 };
-use rmcp::service::{RequestContext, RoleServer, ServerInitializeError};
+use rmcp::service::{
+    NotificationContext, RequestContext, RoleServer, ServerInitializeError, SubscriptionContext,
+};
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -191,15 +198,183 @@ impl ServerHandler for Adapter {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
             ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
+                .enable_completions()
                 .enable_prompts()
+                .enable_resources()
+                .enable_resources_list_changed()
+                .enable_resources_subscribe()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .enable_tasks()
                 .build(),
         )
         .with_server_info(implementation())
         .with_instructions(INSTRUCTIONS)
         // the newest version with an `initialize` handshake
         .with_protocol_version(ProtocolVersion::V_2025_11_25)
+    }
+
+    /// The legacy handshake: as rmcp's, without `resources.subscribe`, which only
+    /// `subscriptions/listen` of revision `2026-07-28` serves.
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        ctx.peer.set_peer_info(request.clone());
+        let mut r = self.negotiate_initialize(&request)?;
+        if let Some(res) = r.capabilities.resources.as_mut() {
+            res.subscribe = None;
+        }
+        Ok(r)
+    }
+
+    /// A session of the `initialize` era gets `notifications/tools/list_changed` and
+    /// `notifications/resources/list_changed` on its stream from now on.
+    async fn on_initialized(&self, ctx: NotificationContext<RoleServer>) {
+        let principal = match self.transport {
+            Transport::Stdio => Some(Principal::local()),
+            Transport::Http => ctx
+                .extensions
+                .get::<axum::http::request::Parts>()
+                .and_then(|parts| parts.extensions.get::<Principal>().cloned()),
+        };
+        let Some(p) = principal else { return };
+        let Ok(permit) = self.server.shared.subscriptions.clone().try_acquire_owned() else {
+            tracing::warn!("MCP: too many subscriptions; a session gets no change notifications");
+            return;
+        };
+        let watch = Watch {
+            tools: true,
+            resources: true,
+            uris: Vec::new(),
+        };
+        let mut watcher = self.server.watcher(p, &watch);
+        let interval = self.server.cfg().watch_interval;
+        let peer = ctx.peer;
+        tokio::spawn(async move {
+            let _permit = permit;
+            let closed = async {
+                while !peer.is_transport_closed() {
+                    tokio::time::sleep(interval).await;
+                }
+            };
+            tokio::pin!(closed);
+            loop {
+                let change = tokio::select! {
+                    c = watcher.next() => c,
+                    () = &mut closed => return,
+                };
+                let sent = match change {
+                    Change::Tools => peer.notify_tool_list_changed().await,
+                    Change::Resources => peer.notify_resource_list_changed().await,
+                    Change::Updated(_) => Ok(()),
+                };
+                if sent.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(requested.supported_by(&self.get_info().capabilities))
+    }
+
+    /// `subscriptions/listen`: the changes the client asked for, as its caller sees them,
+    /// until it cancels the request or the server shuts down.
+    async fn listen(&self, sub: SubscriptionContext) -> Result<(), McpError> {
+        let p = self.principal(sub.request_context())?;
+        let Ok(_permit) = self.server.shared.subscriptions.clone().try_acquire_owned() else {
+            return Err(McpError::internal_error(
+                "too many subscriptions; retry later",
+                None,
+            ));
+        };
+        let accepted = sub.accepted().clone();
+        let watch = Watch {
+            tools: accepted.tools_list_changed == Some(true),
+            resources: accepted.resources_list_changed == Some(true),
+            uris: accepted.resource_subscriptions.unwrap_or_default(),
+        };
+        let sink = sub.sink();
+        let mut watcher = self.server.watcher(p, &watch);
+        loop {
+            let change = tokio::select! {
+                c = watcher.next() => c,
+                () = sub.cancelled() => return Ok(()),
+            };
+            let sent = match change {
+                Change::Tools => sink.notify_tool_list_changed().await,
+                Change::Resources => sink.notify_resource_list_changed().await,
+                Change::Updated(uri) => sink.notify_resource_updated(uri).await,
+            };
+            if sent.is_err() {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, McpError> {
+        let call = self.call(&ctx, Arc::default())?;
+        let target = match request.r#ref {
+            Reference::Prompt(p) => Target::Prompt(p.name),
+            Reference::Resource(r) => Target::Template(r.uri),
+            _ => return Err(McpError::invalid_params("unknown reference", None)),
+        };
+        let req = CompleteRequest {
+            target,
+            argument: request.argument.name,
+            value: request.argument.value,
+            context: request
+                .context
+                .and_then(|c| c.arguments)
+                .unwrap_or_default(),
+        };
+        let c = self
+            .server
+            .complete(req, call)
+            .await
+            .map_err(context_error)?;
+        let more = c.total > c.values.len();
+        let info = CompletionInfo::with_pagination(c.values, Some(c.total as u32), more)
+            .map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CompleteResult::new(info))
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        let p = self.principal(&ctx)?;
+        let task = self.server.shared.tasks.get(&p.id(), &request.task_id)?;
+        Ok(GetTaskResult::new(task))
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        let p = self.principal(&ctx)?;
+        self.server.shared.tasks.cancel(&p.id(), &request.task_id)
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        let p = self.principal(&ctx)?;
+        self.server.shared.tasks.update(&p.id(), &request.task_id)
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -334,10 +509,10 @@ impl ServerHandler for Adapter {
                 let args = p
                     .arguments
                     .iter()
-                    .map(|(name, description)| {
-                        PromptArgument::new(*name)
-                            .with_description(*description)
-                            .with_required(true)
+                    .map(|a| {
+                        PromptArgument::new(a.name)
+                            .with_description(a.description)
+                            .with_required(a.required)
                     })
                     .collect();
                 Prompt::new(p.name, Some(p.description), Some(args)).with_title(p.title)
@@ -377,7 +552,7 @@ impl ServerHandler for Adapter {
         request: CustomRequest,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CustomResult, McpError> {
-        const KNOWN: [&str; 9] = [
+        const KNOWN: [&str; 14] = [
             "initialize",
             "server/discover",
             "tools/list",
@@ -387,6 +562,11 @@ impl ServerHandler for Adapter {
             "resources/read",
             "prompts/list",
             "prompts/get",
+            "completion/complete",
+            "subscriptions/listen",
+            "tasks/get",
+            "tasks/cancel",
+            "tasks/update",
         ];
         if KNOWN.contains(&request.method.as_str()) {
             let hint = if request.method == "tools/call" {
@@ -414,33 +594,80 @@ impl ServerHandler for Adapter {
     ) -> Result<CallToolResponse, McpError> {
         let cancel = Arc::new(AtomicBool::new(false));
         let call = self.call(&ctx, cancel.clone())?;
+        let name = request.name.to_string();
+        if !self.server.known(&call.principal, &name) {
+            return Err(McpError::invalid_params(
+                format!("Unknown tool: {name}"),
+                None,
+            ));
+        }
+        let owner = call.principal.id();
         let args = request.arguments.unwrap_or_default();
-        let work = self.server.call(&request.name, args, call);
-        tokio::pin!(work);
+        let modern = modern(&ctx);
+        let server = self.server.clone();
+        // The call runs on its own task, so that it can outlive this request as a task
+        // of the tasks extension. Until then, dropping this future stops it.
+        let mut stop = StopOnDrop(Some(cancel.clone()));
+        let mut work = tokio::spawn(async move {
+            let outcome = match server.call(&name, args, call).await {
+                Ok(o) => o,
+                Err(UnknownTool(name)) => Err(ToolError::new(
+                    "unknown-tool",
+                    404,
+                    format!("Unknown tool: {name}"),
+                )),
+            };
+            let mut r = result(outcome);
+            if modern {
+                set_server_info(r.meta.get_or_insert_with(MetaObject::default));
+            }
+            r
+        });
+        let joined = |r: Result<CallToolResult, tokio::task::JoinError>| match r {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("MCP tool call failed: {e}");
+                result(Err(ToolError::internal(&ctx.id.to_string())))
+            }
+        };
+        // a client that declared the tasks extension gets a task for a call that runs
+        // longer than `task_after`
+        let tasks = &self.server.shared.tasks;
+        let as_task = ctx
+            .client_capabilities()
+            .is_some_and(|c| c.supports_tasks())
+            && tasks.can_start();
+        let after = tokio::time::sleep(self.server.cfg().task_after);
         // `notifications/cancelled` (stdio, legacy sessions) and a closed connection
         // (stateless HTTP) cancel the request's token: stop the engine at its next
         // check. rmcp sends no response for a cancelled request.
-        let outcome = tokio::select! {
-            r = &mut work => r,
+        tokio::select! {
+            r = &mut work => {
+                stop.0 = None;
+                return Ok(joined(r).into());
+            }
             () = ctx.ct.cancelled() => {
                 cancel.store(true, Ordering::Relaxed);
-                work.await
+                let r = work.await;
+                stop.0 = None;
+                return Ok(joined(r).into());
             }
-        };
-        let outcome = match outcome {
-            Ok(o) => o,
-            Err(UnknownTool(name)) => {
-                return Err(McpError::invalid_params(
-                    format!("Unknown tool: {name}"),
-                    None,
-                ));
-            }
-        };
-        let mut r = result(outcome);
-        if modern(&ctx) {
-            set_server_info(r.meta.get_or_insert_with(MetaObject::default));
+            () = after, if as_task => {}
         }
-        Ok(r.into())
+        stop.0 = None;
+        let task = tasks.start(owner, work, cancel);
+        Ok(CallToolResponse::Task(CreateTaskResult::new(task)))
+    }
+}
+
+/// Sets a call's cancel flag when dropped, unless disarmed (`None`).
+struct StopOnDrop(Option<Arc<AtomicBool>>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if let Some(c) = &self.0 {
+            c.store(true, Ordering::Relaxed);
+        }
     }
 }
 

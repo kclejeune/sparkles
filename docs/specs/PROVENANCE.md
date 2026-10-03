@@ -484,6 +484,12 @@ implementation landed.
     streams at shutdown. It was already in the tree through rmcp. The transport, its
     session rules and the auth integration follow the C11 spec and the C09 permission
     model. No other MCP server was consulted.
+  - **Phase 3** (2026-10-03): completions, `subscriptions/listen` and the tasks extension
+    use rmcp 3.5's own handlers and its `task_manager`, with no new dependency. The
+    stdio-to-HTTP bridge uses the CLI's `reqwest` client and the credentials code of
+    `sparkles-client`. The header rules of the bridge follow the Streamable HTTP
+    transport of the MCP specification as rmcp checks them. No other MCP server or
+    bridge was consulted.
 - **Rejected** (spec §9):
   - a hand-rolled JSON-RPC layer (the fallback, isolated behind `adapter.rs`);
   - rmcp `#[tool]` macros with `schemars`-derived schemas;

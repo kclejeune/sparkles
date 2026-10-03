@@ -168,6 +168,9 @@ mod validate;
 #[path = "format_tests.rs"]
 mod format;
 
+#[path = "phase3_tests.rs"]
+mod phase3;
+
 fn head(s: &McpServer, ds: &str) -> u64 {
     s.state.get(ds).unwrap().store.head_commit().seq
 }
@@ -184,7 +187,7 @@ async fn a01_discover() {
     );
     assert_eq!(
         res["capabilities"],
-        json!({"tools": {}, "resources": {}, "prompts": {}})
+        json!({"completions": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}, "prompts": {}, "resources": {"listChanged": true, "subscribe": true}, "tools": {"listChanged": true}})
     );
     assert!(
         res["instructions"]
@@ -216,7 +219,7 @@ async fn a02_legacy_handshake() {
     assert_eq!(res["protocolVersion"], "2025-11-25");
     assert_eq!(
         res["capabilities"],
-        json!({"tools": {}, "resources": {}, "prompts": {}})
+        json!({"completions": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}, "prompts": {}, "resources": {"listChanged": true}, "tools": {"listChanged": true}})
     );
     assert_eq!(
         res["serverInfo"],
@@ -261,7 +264,8 @@ async fn a02_legacy_handshake() {
 /// The input schemas of §3, with this server's maxima (60 s, 1000 rows, 1 MiB).
 fn expected_input_schemas() -> Vec<(&'static str, Value)> {
     let ds = json!({"type":"string","pattern":"^[A-Za-z0-9_.-]+$","description":"Dataset name from list_datasets. Optional when there is exactly one dataset."});
-    let at = json!({"type":"integer","minimum":0,"description":"Read the snapshot of this commit (the `commit` of an earlier result) for consistent multi-call reads. Fails once the server no longer holds it; then rerun without atCommit."});
+    let at = json!({"type":"integer","minimum":0,"description":"Read the snapshot of this commit (the `commit` of an earlier result) for consistent multi-call reads. A past commit is readable while the server holds it or the dataset's history keeps it; otherwise the call fails and you rerun without atCommit."});
+    let sel = json!({"type":["integer","string"],"description":"Read a past state of the dataset: a commit number, `commit:N`, `time:<RFC 3339>` (the last commit at or before that instant), `snapshot:<name>` (a named snapshot) or `head`. The dataset must still keep that state (see list_commits). Not with atCommit."});
     let rs = json!({"type":"boolean","description":"Include materialized inferences (default: true when the dataset has them)."});
     let to = json!({"type":"number","exclusiveMinimum":0,"maximum":60,"default":30});
     vec![
@@ -282,7 +286,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "subjectClasses": {"type":"boolean","default":false,"description":"List the classes of each predicate's subjects with their triple counts"},
                 "shapes": {"type":"array","items":{"type":"string"},"description":"section=constraints: `guard` (the write-time validation, the default), `default`, `none` or shapes graph IRIs"},
                 "classes": {"type":"array","items":{"type":"string"},"description":"section=profiles: profile only these classes (IRIs or prefixed names)"},
-                "atCommit": at}}),
+                "atCommit": at, "at": sel}}),
         ),
         (
             "draft_shapes",
@@ -297,7 +301,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "maxIn": {"type":"integer","minimum":0,"maximum":64,"default":10,"description":"Largest sh:in list (0: none)"},
                 "maxCount": {"type":"integer","minimum":0,"default":1,"description":"Largest sh:maxCount drafted (0: none)"},
                 "closed": {"type":"boolean","default":false},
-                "atCommit": at,
+                "atCommit": at, "at": sel,
                 "timeoutSeconds": to}}),
         ),
         (
@@ -324,14 +328,14 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "exactTotal": {"type":"boolean","default":true,"description":"false: stop after offset+maxRows+1 solutions (faster; total becomes null)"},
                 "timeoutSeconds": to,
                 "reasoning": rs,
-                "atCommit": at}}),
+                "atCommit": at, "at": sel}}),
         ),
         (
             "explain_query",
             json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
                 "dataset": ds, "query": {"type":"string","minLength":1,"maxLength":65536},
                 "includeAlgebra": {"type":"boolean","default":false},
-                "reasoning": rs, "atCommit": at}}),
+                "reasoning": rs, "atCommit": at, "at": sel}}),
         ),
         (
             "describe_resource",
@@ -341,7 +345,29 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "direction": {"enum":["both","outgoing","incoming"],"default":"both"},
                 "maxTriples": {"type":"integer","minimum":1,"maximum":500,"default":50,"description":"Per direction"},
                 "lang": {"type":"string","default":"en","description":"Preferred label language"},
-                "reasoning": rs, "atCommit": at}}),
+                "mode": {"enum":["cbd","scbd","outgoing"],"description":"Also return the resource's DESCRIBE in this mode as `description`: cbd (the concise bounded description), scbd (with the incoming triples too) or outgoing (its own triples), at most maxTriples triples"},
+                "reasoning": rs, "atCommit": at, "at": sel}}),
+        ),
+        (
+            "find_paths",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "dataset": ds,
+                "source": {"type":"string","description":"The first node: an IRI or prefixed name"},
+                "target": {"type":"string","description":"The last node: an IRI or prefixed name"},
+                "predicates": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"The predicates whose triples are edges (default: all)"},
+                "algorithm": {"enum":["shortest","allShortest","kShortest","all"],"default":"shortest"},
+                "direction": {"enum":["forward","backward","both"],"default":"forward","description":"Follow triples from subject to object, the other way, or both"},
+                "minLength": {"type":"integer","minimum":0,"description":"The fewest edges (default 1; the shortest modes take 0 or 1)"},
+                "maxLength": {"type":"integer","minimum":0,"description":"The most edges (required by algorithm=all)"},
+                "k": {"type":"integer","minimum":1,"maximum":100,"description":"Paths per pair for algorithm=kShortest"},
+                "limit": {"type":"integer","minimum":1,"maximum":100,"default":10,"description":"The most paths returned"},
+                "maxVisited": {"type":"integer","minimum":1,"description":"The most nodes one search may visit (default 10,000,000)"},
+                "weight": {"type":"string","description":"The property of an edge's RDF 1.2 reifier that holds its weight"},
+                "defaultWeight": {"type":"number","minimum":0,"description":"The weight of an edge without one (with weight)"},
+                "graph": {"type":"string","default":"default","description":"`default` or a named graph IRI to search in"},
+                "reasoning": rs,
+                "timeoutSeconds": to,
+                "atCommit": at, "at": sel}}),
         ),
         (
             "list_commits",
@@ -349,6 +375,21 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "dataset": ds,
                 "limit": {"type":"integer","minimum":1,"maximum":100,"default":10},
                 "before": {"type":"integer","minimum":0,"description":"Only commits older than this seq"}}}),
+        ),
+        (
+            "list_changes",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "dataset": ds,
+                "subjects": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"IRIs, prefixed names or blank nodes"},
+                "predicates": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"IRIs or prefixed names"},
+                "objects": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"IRIs, prefixed names, blank nodes, or literals in N-Triples syntax (\"text\"@en, \"42\"^^<http://www.w3.org/2001/XMLSchema#integer>)"},
+                "graphs": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"`default` or graph IRIs (default: every graph you may read)"},
+                "from": {"type":["integer","string"],"description":"The first commit: a number, `commit:N`, `time:<RFC 3339>` or `snapshot:<name>` (default: the first)"},
+                "to": {"type":["integer","string"],"description":"The last commit (default: the head)"},
+                "op": {"enum":["add","remove"],"description":"Only additions or only removals"},
+                "order": {"enum":["asc","desc"],"default":"asc","description":"desc lists the newest commits first"},
+                "limit": {"type":"integer","minimum":1,"maximum":1000,"default":100},
+                "timeoutSeconds": to}}),
         ),
         #[cfg(feature = "text")]
         (
@@ -360,7 +401,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "lang": {"type":"string"},
                 "limit": {"type":"integer","minimum":1,"maximum":200,"default":20},
                 "withTypes": {"type":"boolean","default":true},
-                "reasoning": rs, "atCommit": at}}),
+                "reasoning": rs, "atCommit": at, "at": sel}}),
         ),
         (
             "similar_entities",
@@ -373,7 +414,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "metric": {"enum":["cosine","dot","euclidean"],"default":"cosine"},
                 "excludeSelf": {"type":"boolean","default":true},
                 "withLabels": {"type":"boolean","default":true},
-                "reasoning": rs, "atCommit": at}}),
+                "reasoning": rs, "atCommit": at, "at": sel}}),
         ),
         #[cfg(feature = "shacl")]
         (
@@ -386,7 +427,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "reasoning": rs,
                 "maxResults": {"type":"integer","minimum":1,"maximum":1000,"default":20},
                 "timeoutSeconds": to,
-                "atCommit": at}}),
+                "atCommit": at, "at": sel}}),
         ),
         #[cfg(feature = "shex")]
         (
@@ -400,7 +441,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "onlyNonconformant": {"type":"boolean","default":true,"description":"List only nonconformant results (the counts cover all)"},
                 "maxResults": {"type":"integer","minimum":1,"maximum":1000,"default":20},
                 "timeoutSeconds": to,
-                "atCommit": at}}),
+                "atCommit": at, "at": sel}}),
         ),
         #[cfg(feature = "fmt")]
         (
@@ -434,7 +475,9 @@ async fn a03_tool_list() {
             "sparql_query",
             "explain_query",
             "describe_resource",
+            "find_paths",
             "list_commits",
+            "list_changes",
             #[cfg(feature = "text")]
             "search_text",
             "similar_entities",
@@ -1067,12 +1110,143 @@ async fn a09_at_commit() {
     assert_eq!(r["commit"], 2);
 }
 
+/// [`pins::Pins::resolve`] of commit `at` (`None`: the head).
+fn resolve(
+    pins: &pins::Pins,
+    ds: &Arc<crate::state::Dataset>,
+    at: Option<u64>,
+) -> Result<Arc<sparkles::store::Snapshot>, ToolError> {
+    let at = at.map(sparkles::history::At::Commit);
+    pins.resolve(ds, at.as_ref(), &Default::default(), &|e| {
+        ToolError::new("internal", 500, e.to_string())
+    })
+}
+
+/// Past states the pin table does not hold are read from the dataset's retained
+/// history, by commit, time or snapshot name; states it no longer keeps fail with
+/// `unknown-commit` and name the commits it still keeps.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_reads_retained_history() {
+    let server = fixture_server();
+    let ds = server.state.get("t").unwrap();
+    // keep the last 10 states of the in-memory dataset
+    ds.store
+        .set_retention(sparkles::history::Retention {
+            keep_commits: Some(10),
+            ..Default::default()
+        })
+        .unwrap();
+    let insert = |n: &str| {
+        sparkles::sparql::update::update(
+            &ds.store,
+            &format!("INSERT DATA {{ <http://ex.org/{n}> a <http://ex.org/Person> }}"),
+            &sparkles::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+    };
+    insert("carol");
+    ds.store
+        .create_snapshot("two", &sparkles::history::At::Commit(2), None)
+        .unwrap();
+    insert("dave");
+    assert_eq!(head(&server, "t"), 3);
+    let mut c = Client::start(server.clone());
+    let count = "SELECT (COUNT(*) AS ?n) WHERE { ?p a ex:Person }";
+    let j = |t: String| -> Value { serde_json::from_str(&t).unwrap() };
+    // no call read commit 2, so no pin holds it: the history does
+    assert!(!server.shared.pins.holds(&ds, 2));
+    let r = j(c
+        .text(
+            "sparql_query",
+            json!({"query": count, "format": "json", "atCommit": 2}),
+        )
+        .await);
+    assert_eq!(
+        (r["rows"][0][0].clone(), r["commit"].clone()),
+        (json!("3"), json!(2))
+    );
+    // the state read is pinned for the next call
+    assert!(server.shared.pins.holds(&ds, 2));
+    // by snapshot name and as `commit:N`
+    for at in [json!("snapshot:two"), json!("commit:2"), json!(2)] {
+        let r = j(c
+            .text(
+                "sparql_query",
+                json!({"query": count, "format": "json", "at": at}),
+            )
+            .await);
+        assert_eq!(r["commit"], 2, "{at}");
+    }
+    // by time: an instant after the last commit selects the head
+    let r = j(c
+        .text(
+            "sparql_query",
+            json!({"query": count, "format": "json", "at": "time:2999-01-01T00:00:00Z"}),
+        )
+        .await);
+    assert_eq!(r["commit"], 3);
+    // the other read tools take `at` too
+    let s = c
+        .structured("describe_schema", json!({"at": "snapshot:two"}))
+        .await;
+    assert_eq!(
+        (s["commit"].clone(), s["classes"][0]["instances"].clone()),
+        (json!(2), json!(3))
+    );
+    let s = c
+        .structured("describe_resource", json!({"iri": "ex:Person", "at": 1}))
+        .await;
+    assert_eq!(
+        (s["commit"].clone(), s["incoming"]["total"].clone()),
+        (json!(1), json!(2))
+    );
+    // list_commits names what is readable and the snapshots
+    let s = c.structured("list_commits", json!({})).await;
+    assert_eq!(s["snapshots"], json!([{"name": "two", "commit": 2}]));
+    assert_eq!(s["readable"].as_array().unwrap().last().unwrap()["to"], 3);
+    // errors
+    let (t, e) = c
+        .error(
+            "sparql_query",
+            json!({"query": count, "at": "snapshot:nope"}),
+        )
+        .await;
+    assert!(t.starts_with("no snapshot 'nope' in dataset t"), "{t}");
+    assert_eq!(e, json!({"code": "unknown-commit", "status": 404}));
+    let (t, _) = c
+        .error("sparql_query", json!({"query": count, "at": "yesterday"}))
+        .await;
+    assert!(t.starts_with("invalid at 'yesterday'"), "{t}");
+    let (t, _) = c
+        .error(
+            "sparql_query",
+            json!({"query": count, "at": 1, "atCommit": 1}),
+        )
+        .await;
+    assert_eq!(t, "give at or atCommit, not both");
+    // a dataset that keeps no past states: the hint says so
+    ds.store
+        .set_retention(sparkles::history::Retention::default())
+        .unwrap();
+    ds.store.delete_snapshot("two").unwrap();
+    server.shared.pins.advance(Duration::from_secs(11 * 60));
+    let (t, e) = c
+        .error("sparql_query", json!({"query": count, "atCommit": 1}))
+        .await;
+    assert!(
+        t.starts_with("commit 1 is no longer held (head is 3)"),
+        "{t}"
+    );
+    assert!(t.contains("Hint: this dataset keeps no past states"), "{t}");
+    assert_eq!(e, json!({"code": "unknown-commit", "status": 410}));
+}
+
 #[test]
 fn pin_limits() {
     let server = fixture_server();
     let ds = server.state.get("t").unwrap();
     let pins = &server.shared.pins;
-    pins.resolve(&ds, None).unwrap();
+    resolve(pins, &ds, None).unwrap();
     for i in 0..6 {
         sparkles::sparql::update::update(
             &ds.store,
@@ -1080,20 +1254,20 @@ fn pin_limits() {
             &sparkles::sparql::QueryOptions::default(),
         )
         .unwrap();
-        pins.resolve(&ds, None).unwrap();
+        resolve(pins, &ds, None).unwrap();
     }
     // commits 1..=7 were read; the 4 most recent are held
     let held: Vec<u64> = (1..=7).filter(|&c| pins.holds(&ds, c)).collect();
     assert_eq!(held, [4, 5, 6, 7]);
     // using a pin refreshes it
-    pins.resolve(&ds, Some(4)).unwrap();
+    resolve(pins, &ds, Some(4)).unwrap();
     sparkles::sparql::update::update(
         &ds.store,
         "INSERT DATA { <http://ex.org/n9> a <http://ex.org/N> }",
         &sparkles::sparql::QueryOptions::default(),
     )
     .unwrap();
-    pins.resolve(&ds, None).unwrap();
+    resolve(pins, &ds, None).unwrap();
     let held: Vec<u64> = (1..=8).filter(|&c| pins.holds(&ds, c)).collect();
     assert_eq!(held, [4, 6, 7, 8]);
 }
@@ -1401,7 +1575,7 @@ async fn a18_list_commits() {
         json!({"dataset":"t","head":1,"firstRetained":0,"complete":true,
                "commits":[{"seq":1,"kind":"load","inserted":10,"deleted":0,"quads":10},
                           {"seq":0,"kind":"create","inserted":0,"deleted":0,"quads":0}],
-               "next":null})
+               "next":null,"readable":[{"from":1,"to":1}],"snapshots":[]})
     );
     let s = c.structured("list_commits", json!({"limit": 1})).await;
     assert_eq!(s["commits"].as_array().unwrap().len(), 1);
@@ -1716,6 +1890,71 @@ async fn update_over_stdio() {
     let ds = c.structured("list_datasets", json!({})).await;
     assert_eq!(ds["datasets"][0]["writable"], true);
     assert_eq!(ds["limits"]["updates"], true);
+
+    // ifHead: the write happens only while that commit is the head
+    let (t, e) = c
+        .error(
+            "sparql_update",
+            json!({"update": "INSERT DATA { ex:dave a ex:Person }", "ifHead": 1}),
+        )
+        .await;
+    assert!(
+        t.starts_with("ifHead: the head of the dataset is commit 2, not 1"),
+        "{t}"
+    );
+    assert_eq!(e, json!({"code": "precondition-failed", "status": 412}));
+    assert_eq!(head(&server, "t"), 2);
+    let out = c
+        .structured(
+            "sparql_update",
+            json!({"update": "INSERT DATA { ex:dave a ex:Person }", "ifHead": 2}),
+        )
+        .await;
+    assert_eq!(out["commit"], 3);
+    // a dry run reports the precondition instead of failing
+    let out = c
+        .structured(
+            "sparql_update",
+            json!({"update": "INSERT DATA { ex:erin a ex:Person }", "ifHead": 2, "dryRun": true}),
+        )
+        .await;
+    assert_eq!(out["outcome"], "precondition-failed", "{out}");
+
+    // RDF Patch through the same tool
+    let patch = "TX .\nA <http://ex.org/erin> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/Person> .\nD <http://ex.org/dave> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/Person> .\nTC .\n";
+    let out = c
+        .structured(
+            "sparql_update",
+            json!({"patch": patch, "message": "swap", "ifHead": 3}),
+        )
+        .await;
+    assert_eq!(
+        (
+            out["commit"].clone(),
+            out["inserted"].clone(),
+            out["deleted"].clone()
+        ),
+        (json!(4), json!(1), json!(1)),
+        "{out}"
+    );
+    assert_eq!(out["patch"]["aborted"], false);
+    assert_eq!(out["message"], "swap");
+    let (_, e) = c
+        .error("sparql_update", json!({"patch": "A <http://ex.org/x> <http://ex.org/y> <http://ex.org/z> .\n", "ifHead": 3}))
+        .await;
+    assert_eq!(e["code"], "precondition-failed");
+    let (_, e) = c
+        .error("sparql_update", json!({"patch": "X nonsense\n"}))
+        .await;
+    assert_eq!(e, json!({"code": "patch-error", "status": 400}));
+    let (t, _) = c
+        .error(
+            "sparql_update",
+            json!({"patch": patch, "update": "CLEAR ALL"}),
+        )
+        .await;
+    assert!(t.starts_with("give update"), "{t}");
+    assert_eq!(head(&server, "t"), 4);
 }
 
 #[tokio::test(flavor = "multi_thread")]

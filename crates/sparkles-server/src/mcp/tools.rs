@@ -17,6 +17,7 @@ use spargebra::term::{NamedNodePattern, TermPattern};
 use spargebra::{Query, SparqlParser};
 use sparkles::commit::CommitRange;
 use sparkles::error::Error;
+use sparkles::history::{At, HistoryOptions};
 use sparkles::schema::{
     self, ClassEntry, GraphSelection, PredicateEntry, SchemaOptions, SchemaReport,
 };
@@ -45,7 +46,9 @@ pub fn run(
         "sparql_query" => t.sparql_query(args),
         "explain_query" => t.explain_query(args),
         "describe_resource" => t.describe_resource(args),
+        "find_paths" => t.find_paths(args),
         "list_commits" => t.list_commits(args),
+        "list_changes" => t.list_changes(args),
         #[cfg(feature = "text")]
         "search_text" => t.search_text(args),
         "similar_entities" => t.similar_entities(args),
@@ -55,6 +58,8 @@ pub fn run(
         "validate_shex" => t.validate_shex(args),
         #[cfg(feature = "fmt")]
         "format" => t.format(args),
+        #[cfg(feature = "graphql")]
+        "graphql_query" => t.graphql_query(args),
         "sparql_update" => t.sparql_update(args),
         // a stored query of a dataset (`<dataset>__<query>`)
         name => t.stored_query(name, args),
@@ -100,6 +105,35 @@ fn query_text(q: &str) -> Result<(), ToolError> {
         ));
     }
     Ok(())
+}
+
+/// The most named snapshots `list_commits` lists, newest first.
+const MAX_SNAPSHOTS_LISTED: usize = 20;
+
+/// The state a call selects: `atCommit` (a commit), or `at` (a commit as a number or as
+/// `commit:N`, `time:<RFC 3339>`, `snapshot:<name>` or `head`), but not both. `None`
+/// reads the head.
+pub(super) fn selector(
+    at_commit: Option<u64>,
+    at: Option<&Value>,
+) -> Result<Option<At>, ToolError> {
+    const FORMS: &str =
+        "at is a commit number, or a string: commit:N, time:<RFC 3339>, snapshot:<name> or head";
+    match (at_commit, at) {
+        (Some(_), Some(_)) => Err(ToolError::bad_argument("give at or atCommit, not both")),
+        (Some(c), None) => Ok(Some(At::Commit(c))),
+        (None, None) => Ok(None),
+        (None, Some(Value::Number(n))) => n
+            .as_u64()
+            .map(|c| Some(At::Commit(c)))
+            .ok_or_else(|| ToolError::bad_argument(FORMS)),
+        (None, Some(Value::String(s))) => s
+            .trim()
+            .parse::<At>()
+            .map(Some)
+            .map_err(|e| ToolError::bad_argument(e.to_string())),
+        (None, Some(_)) => Err(ToolError::bad_argument(FORMS)),
+    }
 }
 
 /// The remaining time until `deadline` (`Error::Timeout` once it has passed).
@@ -284,6 +318,7 @@ struct DescribeSchemaArgs {
     limit: Option<u64>,
     cursor: Option<String>,
     at_commit: Option<u64>,
+    at: Option<Value>,
     subject_classes: Option<bool>,
     shapes: Option<Vec<String>>,
     classes: Option<Vec<String>>,
@@ -323,6 +358,7 @@ pub(super) struct SparqlQueryArgs {
     timeout_seconds: Option<f64>,
     reasoning: Option<bool>,
     at_commit: Option<u64>,
+    at: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -333,6 +369,7 @@ struct ExplainArgs {
     include_algebra: Option<bool>,
     reasoning: Option<bool>,
     at_commit: Option<u64>,
+    at: Option<Value>,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +390,8 @@ struct DescribeResourceArgs {
     lang: Option<String>,
     reasoning: Option<bool>,
     at_commit: Option<u64>,
+    at: Option<Value>,
+    mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -388,6 +427,31 @@ impl Tools<'_> {
     /// The dataset the call names, among those its principal may read.
     pub(super) fn dataset(&self, name: Option<&str>) -> Result<Arc<Dataset>, ToolError> {
         self.server.dataset(&self.call.principal, name)
+    }
+
+    /// The snapshot a call reads: the state `atCommit` or `at` selects (see
+    /// [`selector`]), else the head. A past state that the pin table does not hold is
+    /// read from the dataset's retained history, within `deadline`.
+    pub(super) fn snapshot(
+        &self,
+        ds: &Arc<Dataset>,
+        at_commit: Option<u64>,
+        at: Option<&Value>,
+        deadline: Instant,
+    ) -> Result<Arc<Snapshot>, ToolError> {
+        let sel = selector(at_commit, at)?;
+        let ho = HistoryOptions {
+            cancel: Some(self.call.cancel.clone()),
+            deadline: Some(deadline),
+        };
+        let secs = deadline
+            .saturating_duration_since(self.call.arrived)
+            .as_secs_f64();
+        let ctx = self.ctx(&[], secs);
+        self.server
+            .shared
+            .pins
+            .resolve(ds, sel.as_ref(), &ho, &|e| ctx.engine(e))
     }
 
     pub(super) fn ctx<'n>(
@@ -526,7 +590,7 @@ impl Tools<'_> {
                     Some(v) => v.masked(&snap).and_then(|m| v.visible_quads(&m)).ok(),
                     None => Some(snap.len()),
                 };
-                json!({
+                let mut j = json!({
                     "name": ds.name,
                     "quads": quads,
                     "commit": snap.commit,
@@ -534,7 +598,12 @@ impl Tools<'_> {
                     "reasoning": reasoning,
                     "textSearch": ds.store.text_enabled(),
                     "writable": updates && p.can(&ds.name, crate::auth::Level::Write),
-                })
+                });
+                // graphql_query reads this dataset
+                if self.server.offers("graphql_query") && super::graphql_on(p, ds) {
+                    j["graphql"] = true.into();
+                }
+                j
             })
             .collect();
         Ok(Outcome::Structured(json!({
@@ -654,15 +723,20 @@ impl Tools<'_> {
                         "atCommit differs from the cursor's commit",
                     ));
                 }
+                if a.at.is_some() {
+                    return Err(ToolError::bad_argument(
+                        "at does not apply with cursor: the cursor names its commit",
+                    ));
+                }
                 let snap = self
-                    .server
-                    .shared
-                    .pins
-                    .resolve(&ds, Some(cur.c))
+                    .snapshot(&ds, Some(cur.c), None, self.call.arrived + timeout)
                     .map_err(|_| stale(409, "the schema changed since the first page"))?;
                 (snap, Some(cur.a))
             }
-            None => (self.server.shared.pins.resolve(&ds, a.at_commit)?, None),
+            None => (
+                self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?,
+                None,
+            ),
         };
         let report = self.schema_report(
             &ds,
@@ -926,7 +1000,7 @@ impl Tools<'_> {
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let snap = self.server.shared.pins.resolve(&ds, a.at_commit)?;
+        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let t0 = Instant::now();
         let mut parsed = self.parse_query(&a.query, &prefix_map, &ctx)?;
@@ -1016,7 +1090,7 @@ impl Tools<'_> {
         let names = prefixes.names();
         let timeout = self.cfg().default_timeout();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let snap = self.server.shared.pins.resolve(&ds, a.at_commit)?;
+        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let parsed = self.parse_query(&a.query, &prefix_map, &ctx)?;
         let opts = self
@@ -1106,6 +1180,53 @@ impl Tools<'_> {
 
     // --------------------------------------------------------- describe_resource ------
 
+    /// The `DESCRIBE` of the resource in `mode` (`cbd`, `scbd` or `outgoing`, as the
+    /// dataset's DESCRIBE setting and `?describe=` name them), at most `max` triples,
+    /// rendered `s p o` with the compact terms.
+    fn description(
+        &self,
+        q: &Queries,
+        mode: &str,
+        max: usize,
+        terms: &mut Terms,
+        ctx: &ErrorContext,
+    ) -> Result<Value, ToolError> {
+        let mode = sparql::describe::DescribeMode::parse(mode)
+            .map_err(|_| ToolError::bad_argument("mode must be cbd, scbd or outgoing"))?;
+        let mut opts = q.opts.clone();
+        opts.timeout = Some(remaining(q.deadline).map_err(|e| ctx.engine(e))?);
+        opts.initial_bindings = vec![("r".to_string(), q.resource.clone())];
+        // one triple more than shown tells whether the description goes on
+        opts.describe.mode = mode;
+        opts.describe.labels = false;
+        opts.describe.max_triples = Some(max as u64 + 1);
+        // the resource comes in as a binding (a blank node has no syntax in DESCRIBE)
+        let r = sparql::query(
+            q.snap.clone(),
+            "DESCRIBE ?d WHERE { BIND(?r AS ?d) }",
+            &opts,
+        )
+        .map_err(|e| ctx.engine(e))?;
+        let triples: Vec<Value> = r
+            .triples
+            .iter()
+            .take(max)
+            .map(|t| {
+                json!(format!(
+                    "{} {} {}",
+                    terms.term(&t.subject.clone().into()),
+                    terms.term(&Term::NamedNode(t.predicate.clone())),
+                    terms.term(&t.object)
+                ))
+            })
+            .collect();
+        Ok(json!({
+            "mode": mode.name(),
+            "triples": triples,
+            "truncated": r.triples.len() > max,
+        }))
+    }
+
     fn describe_resource(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: DescribeResourceArgs = parse(args)?;
         let max_triples = bounded("maxTriples", a.max_triples, 50, 1, 500)? as usize;
@@ -1118,7 +1239,7 @@ impl Tools<'_> {
         let timeout = self.cfg().default_timeout();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
         let resource = parse_iri(&a.iri, &prefix_map, true)?;
-        let snap = self.server.shared.pins.resolve(&ds, a.at_commit)?;
+        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let deadline = self.call.arrived + timeout;
         let opts = self
@@ -1230,6 +1351,9 @@ impl Tools<'_> {
                 .collect();
             out["incoming"] = side.json(triples, &mut terms);
         }
+        if let Some(mode) = a.mode.as_deref() {
+            out["description"] = self.description(&q, mode, max_triples, &mut terms, &ctx)?;
+        }
         out["prefixes"] = json!(terms.used());
         Ok(Outcome::Structured(out))
     }
@@ -1269,6 +1393,21 @@ impl Tools<'_> {
                 j
             })
             .collect();
+        // the past states `at` and `atCommit` can read beyond the pins of this server
+        let readable: Vec<Value> = ds
+            .store
+            .history()
+            .reconstructable
+            .iter()
+            .map(|&(from, to)| json!({ "from": from, "to": to.min(head) }))
+            .collect();
+        let mut snapshots = ds.store.snapshots();
+        snapshots.sort_by(|a, b| b.seq.cmp(&a.seq).then_with(|| a.name.cmp(&b.name)));
+        let snapshots: Vec<Value> = snapshots
+            .iter()
+            .take(MAX_SNAPSHOTS_LISTED)
+            .map(|s| json!({ "name": s.name, "commit": s.seq }))
+            .collect();
         Ok(Outcome::Structured(json!({
             "dataset": ds.name,
             "head": head,
@@ -1276,6 +1415,8 @@ impl Tools<'_> {
             "complete": page.complete,
             "commits": commits,
             "next": next,
+            "readable": readable,
+            "snapshots": snapshots,
         })))
     }
 }
