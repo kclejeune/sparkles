@@ -618,21 +618,26 @@ impl Client {
         }
     }
 
-    /// Call a Sparkles operation by its `operationId` and return its JSON body (`Null`
-    /// when the body is empty). Only the operations of the client's operation table are
-    /// known; their path parameters are given by name.
+    /// Any other JSON operation of the server's API: the method, the path under the base
+    /// URL with its parameters already filled in and percent-encoded (such as
+    /// `/$/compaction/lib`), the query parameters and an optional JSON body. It returns
+    /// the JSON body, `Null` when the body is empty. Requests sent this way go through the
+    /// same authentication, retries and errors, but the contract test does not cover
+    /// them. A GET, HEAD, PUT or DELETE is retried as a safe request.
     pub async fn call_json(
         &self,
-        operation_id: &str,
-        path_params: &[(&str, &str)],
+        method: Method,
+        path: &str,
         query: &[(&str, &str)],
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let op = crate::routes::ALL
-            .iter()
-            .find(|o| o.id == operation_id)
-            .ok_or_else(|| Error::config(format!("unknown operation {operation_id}")))?;
-        let mut r = self.op_req(op, path_params)?;
+        let base = self.inner.base.as_ref().ok_or_else(|| {
+            Error::config("this client has no server URL (use Client::builder(url))")
+        })?;
+        let url = base
+            .join(path.trim_start_matches('/'))
+            .map_err(|e| Error::config(format!("{path}: {e}")))?;
+        let mut r = Req::new(method, url);
         for (k, v) in query {
             r.query.push((k.to_string(), v.to_string()));
         }

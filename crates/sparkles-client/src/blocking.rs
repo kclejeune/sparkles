@@ -130,12 +130,12 @@ impl Client {
     }
     pub fn call_json(
         &self,
-        operation_id: &str,
-        path_params: &[(&str, &str)],
+        method: reqwest::Method,
+        path: &str,
         query: &[(&str, &str)],
         body: Option<&Value>,
     ) -> Result<Value> {
-        self.wait(self.inner.call_json(operation_id, path_params, query, body))
+        self.wait(self.inner.call_json(method, path, query, body))
     }
 }
 

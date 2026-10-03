@@ -260,7 +260,8 @@ op!(PING, "ping", GET, "/$/ping");
 op!(SERVER, "getServer", GET, "/$/server");
 op!(WHOAMI, "whoami", GET, "/$/whoami");
 
-/// Every operation above, for the contract test and [`crate::Client::call_json`].
+/// Every operation above, for the contract test.
+#[cfg(test)]
 pub const ALL: &[&Op] = &[
     &SPARQL_GET,
     &SPARQL_POST,

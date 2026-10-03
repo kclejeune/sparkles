@@ -335,7 +335,7 @@ async fn async_client_against_a_server() {
     let schema = ds.schema(Some(At::Head)).await.unwrap();
     assert_eq!(schema["dataset"], "lib");
     let c = client
-        .call_json("getCommit", &[("ds", "lib"), ("reference", "1")], &[], None)
+        .call_json(sparkles_client::Method::GET, "/$/commits/lib/1", &[], None)
         .await
         .unwrap();
     assert_eq!(c["commit"]["seq"], 1);

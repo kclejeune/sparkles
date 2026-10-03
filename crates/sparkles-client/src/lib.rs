@@ -75,5 +75,6 @@ pub use types::{
 
 pub use oxrdf;
 pub use oxrdfio::RdfFormat;
+pub use reqwest::Method;
 pub use sparesults::QuerySolution;
 pub use tokio_util::sync::CancellationToken;
