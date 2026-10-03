@@ -481,7 +481,8 @@ impl PyDataset {
                 })
                 .py(py);
         }
-        let src = source_from_py(
+        // the spool of an input in one of Jena's syntaxes lives until the load ends
+        let (src, _spool) = source_from_py(
             py,
             input,
             format,
@@ -519,6 +520,7 @@ impl PyDataset {
                 )
             })
             .collect::<PyResult<Vec<_>>>()?;
+        let (sources, _spools): (Vec<_>, Vec<_>) = sources.into_iter().unzip();
         let ds = self.ds_for_write(py)?;
         py.detach(|| ds.store().load(&sources)).py(py)
     }

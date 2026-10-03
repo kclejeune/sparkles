@@ -1862,9 +1862,12 @@ variable, and `row.get("name", default)` returns the default instead.
 `RdfFormat` names oxrdfio's syntaxes and Jena's TriX (`RdfFormat.TRIX`), RDF Thrift
 (`RDF_THRIFT`), RDF Protobuf (`RDF_PROTOBUF`) and RDF/JSON (`RDF_JSON`). `load`, `dump`,
 `parse` and `serialize` take all of them, by name, extension or media type as well.
-An input in one of Jena's syntaxes is read into memory and converted to N-Quads before
-it is parsed, so it does not stream. RDF/JSON holds one graph, so `dump` writes the
-default graph, or `from_graph`.
+An input in one of Jena's syntaxes streams through the engine's reader on a thread of
+its own. `parse` and a file object's `load` take the quads as the reader finds them.
+`load` from a path or from bytes writes them as N-Quads to a temporary file in the
+system's temporary directory (`TMPDIR`) for the bulk loader and removes the file
+afterwards. The reader of RDF/JSON reads its whole document first. RDF/JSON holds one
+graph, so `dump` writes the default graph, or `from_graph`.
 
 `load` reads a CSV or TSV table when the format is `"csv"` or `"tsv"`, or the path ends
 in `.csv`, `.tsv` or `.tab`, before any compression extension. The table is mapped as
