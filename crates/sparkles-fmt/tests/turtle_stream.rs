@@ -457,6 +457,35 @@ fn unused_redefinitions_stream_like_they_format() {
     }
 }
 
+/// Found by the property test: a directive block whose declarations all go, leaving only
+/// a section header, before a multi-line statement. The output was not a fixpoint
+/// (`Unsafe(Idempotence)`), and a stream with an invalid statement further on (an
+/// undeclared prefix, or a `GRAPH` block in Turtle) failed with that instead of the
+/// syntax error.
+#[test]
+fn a_pruned_block_leaving_a_comment_streams_like_it_formats() {
+    let opts = Options {
+        prune_prefixes: true,
+        ..Options::default()
+    };
+    let head = "PREFIX ex: <http://example.org/>\n ex:s ex:p _:x . PREFIX unused: <http://unused.org/>\n\n# section\n\nPREFIX unused: <http://unused.org/> ex:s ex:p _:x, _:x .";
+    let valid = format!("{head} ex:s ex:p ex:d .\n");
+    let expected = "PREFIX ex: <http://example.org/>\n\nex:s ex:p _:x .\n\n# section\n\nex:s\n  ex:p _:x, _:x ;\n.\n\nex:s ex:p ex:d .\n";
+    let formatted = format(&valid, Language::Turtle, &opts).unwrap().text;
+    assert_eq!(formatted, expected);
+    assert_eq!(
+        format(&formatted, Language::Turtle, &opts).unwrap().text,
+        formatted
+    );
+    agrees(&valid, false, &opts).unwrap();
+    for tail in ["ex:s ex:p o:d .", "GRAPH ex:g { ex:s ex:p ex:o . }"] {
+        let invalid = format!("{head} {tail}\n");
+        let e = format(&invalid, Language::Turtle, &opts).unwrap_err();
+        assert_eq!(e.code(), "syntax", "{e:?}");
+        agrees(&invalid, false, &opts).unwrap();
+    }
+}
+
 // --------------------------------------------------------------- the edges ------
 
 #[test]
