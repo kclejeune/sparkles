@@ -268,6 +268,11 @@ run = "./target/release/sparkles serve --data ./data"
 description = "API docs for the library crates"
 run = "cargo doc --workspace --no-deps --exclude sparkles-server"
 
+[tasks.openapi]
+description = "Rewrite docs/openapi.json, the checked-in copy of the OpenAPI description (a test fails while it is out of date)"
+env = { SPARKLES_UPDATE_OPENAPI = "1" }
+run = "cargo test -p sparkles-server --bin sparkles openapi::tests::checked_in_copy_is_current"
+
 [tasks."docs:screenshots"]
 description = "The README's screenshots (docs/images/*.png): the release build serves the demo dataset of docs/demo on a free port, Playwright drives the UI in dark mode, oxipng shrinks the images (not part of ci)"
 depends = ["build", "ui:e2e:browsers"]

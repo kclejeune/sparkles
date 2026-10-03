@@ -11,6 +11,42 @@ Without `sparkles serve --auth-config` the server is open, as described below. W
 every route needs credentials or a grant to `anonymous`. See
 [Authentication and access control](#authentication-and-access-control).
 
+A machine-readable description of this API is served at `/$/openapi.json`. See
+[OpenAPI description](#openapi-description).
+
+## OpenAPI description
+
+The design and its rationale are in [X03 OpenAPI description, shell completions and man pages](specs/X03-openapi-and-completions.md).
+
+`GET /$/openapi.json` returns an OpenAPI 3.1 description of this API, and
+`GET /$/openapi.yaml` returns the same document as YAML. Both are public and carry an
+`ETag`, so `If-None-Match` revalidates them with `304`. `sparkles openapi [--format yaml]`
+prints the document without a server. [openapi.json](openapi.json) in this directory is a
+copy that a test keeps current, so a change to the API shows up in its diff.
+
+The description lists every route with its methods, parameters, request and response
+media types and error responses. Each operation has an `operationId` and a tag, so client
+generators can work from it. An operation's security requirements and its
+`x-sparkles-permission` extension come from the code that authorizes requests. The
+permission is `public`, `any caller`, `signed in`, `web session`, a dataset level (`read`,
+`write`, `admin`) or a server permission (`metrics`, `federate`, `server-admin`).
+Listings that page carry `x-sparkles-pagination`, which names the parameters that select
+a page and the member that continues the listing.
+
+The common bodies have full schemas. They are the error body, the SPARQL results, dataset
+and server information, readiness, tasks, commits and receipts, whoami, tokens, schema
+pages and the formatter's request and result. Some admin bodies, such as those of
+backups, the search indexes, reasoning, write-time validation and history, are open
+objects that link to their section of this page.
+
+The UI's Server page links both documents. Any OpenAPI viewer can open them, for example
+Swagger UI or Redocly pointed at `http://localhost:3030/$/openapi.json`.
+
+```sh
+curl -s localhost:3030/'$/openapi.json' | jq '.paths | keys | length'
+sparkles openapi --format yaml > sparkles-api.yaml
+```
+
 ## Server
 
 The design and its rationale are in [C01 Observability, readiness and budgets](specs/C01-observability-and-budgets.md).
@@ -22,6 +58,7 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 | GET    | `/$/ready/{ds}` | Readiness of one dataset. `datasets` has one entry. `404` if the dataset is unknown. |
 | GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }`. When auth is on, anonymous callers get no `version` or `limits`. |
 | GET    | `/$/whoami`   | The caller and its permissions. See [whoami](#whoami). |
+| GET    | `/$/openapi.json`, `/$/openapi.yaml` | The OpenAPI 3.1 description of the API. See [OpenAPI description](#openapi-description). |
 | POST   | `/$/format`   | Formats a SPARQL query or update. See [Formatting](#formatting). |
 | GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. `--metrics-addr` serves it on a second address too. |
 
@@ -5212,7 +5249,7 @@ without the permission is a `403` before any connection or file is opened, even 
 
 | Route | Method | Needs |
 |---|---|---|
-| `/ui/*`, `/$/ping`, `/$/ready` | GET | Nothing. Without `metrics`, `/$/ready` lists only readable datasets. |
+| `/ui/*`, `/$/ping`, `/$/ready`, `/$/openapi.json`, `/$/openapi.yaml` | GET | Nothing. Without `metrics`, `/$/ready` lists only readable datasets. |
 | `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*` (including the back-channel logout), `/$/auth/device`, `/$/auth/token` | | Nothing. Invalid credentials are still `401`. |
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | Any caller. `/$/format` admits nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. Cancelling a task (DELETE) needs `admin` on its dataset. |
 | `/$/metrics` | GET | `metrics` |

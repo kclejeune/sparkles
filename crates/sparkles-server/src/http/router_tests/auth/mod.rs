@@ -1649,6 +1649,38 @@ fn route_coverage() {
     );
 }
 
+/// The OpenAPI description is public, in JSON and YAML, and revalidates with its ETag.
+#[tokio::test]
+async fn openapi_is_public() {
+    let s = auth_server();
+    let r = get_as(&s.app, "/$/openapi.json", None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.headers["content-type"], "application/json");
+    let doc = r.json();
+    assert_eq!(doc["openapi"], "3.1.0");
+    assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
+    assert!(doc["paths"]["/{ds}/sparql"]["post"].is_object());
+    let etag = r.headers["etag"].to_str().unwrap().to_string();
+    let again = call(
+        &s.app,
+        "GET",
+        "/$/openapi.json",
+        &[("if-none-match", &etag)],
+        "",
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::NOT_MODIFIED);
+    assert!(again.body.is_empty());
+    let y = get_as(&s.app, "/$/openapi.yaml", None).await;
+    assert_eq!(y.status, StatusCode::OK);
+    assert_eq!(y.headers["content-type"], "application/yaml");
+    assert!(y.text().contains("operationId: sparqlQueryPost\n"));
+    assert_ne!(y.headers["etag"], r.headers["etag"]);
+    // invalid credentials are still refused
+    let bad = get_as(&s.app, "/$/openapi.json", Some(&basic("bob", "x"))).await;
+    assert_eq!(bad.status, StatusCode::UNAUTHORIZED);
+}
+
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

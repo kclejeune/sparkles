@@ -60,6 +60,7 @@ mise run py:test      # build the Python extension and run its pytest suite (in 
 mise run py:lock      # refresh crates/sparkles-py/Cargo.lock from Cargo.lock
 mise run ci           # fmt:check + lint + lint:features + fmt:wasm + test + ui:test + py:lint + py:test + licenses:check
 mise run doc          # API docs of the library crates
+mise run openapi      # rewrite docs/openapi.json after an API change (a test fails until then)
 mise run docs:screenshots # the README's screenshots (docs/images) from the demo dataset in docs/demo
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
@@ -381,7 +382,8 @@ The flake is built on flake-parts and rust-overlay, with the toolchain from
 
 * **Packages:**
   * `sparkles` (default): the binary with the UI and the formatter's WebAssembly module
-    embedded, and the third-party licenses and notices in `share/doc/sparkles/`.
+    embedded, the third-party licenses and notices and the OpenAPI description in
+    `share/doc/sparkles/`, shell completions for bash, zsh and fish, and man pages.
   * `sparkles-cli`: the same binary without the UI, so the build needs no Node.js.
   * `sparkles-ui`: the static UI build.
   * `sparkles-fmt-wasm`: the formatter's WebAssembly module, which `sparkles-ui` builds in.

@@ -48,11 +48,12 @@ pub use api::{
     restrict, routes, server_json, spawn_reload_on_sighup, throttle,
 };
 pub use proxy::Peer;
+#[cfg(test)]
+pub use routes::ROUTES;
 #[cfg(feature = "mcp")]
 pub use routes::authentication_required;
 pub use routes::{AuthReport, Denied, dataset_denial, forbidden, middleware};
-#[cfg(test)]
-pub use routes::{ROUTES, need};
+pub use routes::{Need, need};
 
 #[cfg(all(test, feature = "auth"))]
 pub use handlers::MAX_AUTH_BODY;

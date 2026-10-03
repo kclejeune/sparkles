@@ -394,10 +394,10 @@ impl Store {
             .filter_map(|g| snap.lookup_iri(g.as_str()))
             .map(|g| g.0)
             .collect();
-        let view = opts.graphs.clone().map(|read| GraphAccess {
-            read,
-            write: Graphs::none(),
-        });
+        let view = opts
+            .graphs
+            .clone()
+            .map(|read| GraphAccess::graphs(read, Graphs::none()));
         // the graphs that have quads, and those the clone keeps
         let all = snap.distinct_first(Perm::Gspo)?;
         let kept: Vec<u64> = all
