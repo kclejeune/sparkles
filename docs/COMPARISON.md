@@ -57,7 +57,7 @@ full feature list is in [FEATURES.md](FEATURES.md).
 
 | Area | QLever | Sparkles |
 |---|---|---|
-| Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Measured up to 11M triples (WatDiv at scale 100). The external-sort path has tests but no measurements at 100M+. |
+| Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Measured up to 1.24 billion triples (English DBpedia, [BENCHMARKS.md](BENCHMARKS.md#dbpedia-at-124-billion-triples)). It loads them in 584 s, where QLever takes 1,674 s on the same machine. |
 | Streaming execution | Lazy, block-wise scans, joins, filters and GROUP BY; results streamed to the client | Every operator materializes its result, within row and memory budgets. Responses over 1 MiB are streamed as they are serialized. Materialization and the 1 GiB block cache trade memory for speed. After the 10.5M benchmark, Sparkles' server holds 892 MiB to QLever's 676 MiB, and 513 MiB without its block cache ([BENCHMARKS.md](BENCHMARKS.md#memory-and-the-speed-it-buys)). |
 | Block prefiltering | FILTER ranges and STRSTARTS checked against block min/max to skip blocks | Numeric range FILTERs on a scan's sort column read only the matching id ranges (inline integers and decimals). Non-canonical numerals are tested row by row. `STRSTARTS` and a `REGEX` anchored on a literal start read only the vocabulary ids of the keys with that start. |
 | Pattern trick | `ql:has-predicate`, per-subject predicate patterns | ✗ (predicate counts come from index runs) |
@@ -152,6 +152,7 @@ or web UI.
 | Rust instead of Java or C++ | [AUDIT.md](AUDIT.md#3-language-decision-rust) §3: `spargebra`, `oxttl` and related crates provide the parser and format stack, there is no garbage collector, and performance is predictable. |
 | Sorted-block permutations instead of TDB2's B+trees | Scan-heavy analytics run much faster and the files are smaller. Updates go to a delta that compaction merges, not into the index in place. |
 | Values are inlined only when their lexical form is canonical | QLever inlines lossily: doubles lose 4 bits and the lexical form is dropped. Sparkles keeps exact RDF term identity (`"01"^^xsd:integer` ≠ `"1"^^xsd:integer`), as Jena does. Doubles whose low mantissa bits are set go to the vocabulary. |
+| Literals with different lexical forms are different terms, even when they have the same value | QLever folds `xsd:float` and `xsd:double` literals whose lexical forms parse to the same number into one term. RDF 1.1 identifies a literal by its lexical form and datatype, so Sparkles keeps them apart, as Jena does. On English DBpedia, QLever therefore counts 1,014,683,273 triples and Sparkles 1,014,683,275, because two pairs of triples (in `geo:lat` and `dbo:orbitalPeriod`) differ only in the lexical form of such a literal. |
 | The graph is a 4th key column in every permutation, plus a GSPO permutation | Matches QLever's graph column. GSPO gives TDB2-style graph-scoped access (dumps, enumerating `GRAPH ?g {}`). |
 | Deltas are persistent ordered sets (`imbl`), logged to the WAL | Snapshots publish in O(1) for MVCC. QLever locates delta triples per block instead; Sparkles may adopt that later. |
 | Blank nodes are stored ids and serialize as `_:b<hex>` | A stored node keeps its label across requests, and the dataset APIs and query bindings accept it back. Blank nodes that a query makes are `_:q<hex>` and belong to their result. |
@@ -216,10 +217,14 @@ and Shiro authentication.
 * **Permutation files.** Blocks store each column separately (delta, zig-zag varint,
   LZ4). Each block's first and last key stay in RAM, which allows block skipping on
   bound prefixes and exact counts with at most two block decodes.
-* **Bulk build pipeline.** Parallel chunked parsing produces per-batch vocabularies, which
-  are k-way merged into one. Ids are remapped in parallel, and each permutation is built
-  with a parallel sort, or with sorted runs and a k-way merge when the data exceeds the
-  memory budget.
+* **Bulk build pipeline.** Parallel chunked parsing produces per-batch vocabularies. They
+  are merged into one in parallel, over ranges of keys that sampled keys delimit. The
+  batches are then read once, in chunks that are remapped to global ids in parallel and
+  sorted in place by SPO, OSP and PSO, each order written as a compressed sorted run.
+  The runs of each order are merged in a thread of their own. As in QLever, the
+  permutations are built in pairs: SOP, OPS and POS come from the merged SPO, OSP and PSO
+  streams by sorting each run of the shared first column. Data that fits into the sort
+  budget is sorted in memory the same way.
 * **Immutable base plus delta.** Updates are layered on the immutable index, in the style
   of QLever's `DeltaTriples`. Snapshots are versioned, and caches are keyed by snapshot
   version. A scan merges the delta into the blocks it changes. It finds the base rows
@@ -364,6 +369,15 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   alternation), the two operators above read only the base-vocabulary ids of the keys
   with that start: literals for `?v`, literals and IRIs for `STR(?v)`. Ids outside the
   base vocabulary (inline values and terms added by updates) are still read and tested.
+* **Id ranges for a fixed start** (`filter_id_ranges`). The same starts restrict the other
+  places that test such a filter on vocabulary keys. A FILTER over the rows of a join
+  fails the base-vocabulary ids outside the ranges without reading their keys, and reads
+  only the keys of the ids inside them, which lie together in the vocabulary. The planner
+  costs a filtered scan sorted on the tested variable by the rows of its ranges, counted
+  exactly, instead of by every row of the scan. On English DBpedia, `?s a dbo:Band ;
+  rdfs:label ?l FILTER(REGEX(?l, "^The B"))` then reads the 23,812 labels in the range
+  and merges them with the bands, instead of looking up the label of each of the 36,745
+  bands. It went from 18.8 to 3.8 ms warm and from 1,040 to 90 ms cold.
 * **Pure expressions per distinct value** (`expr_cache`). A FILTER conjunct, BIND, ORDER BY
   key or aggregate argument that reads one variable and gives the same result for the same
   term is evaluated once per distinct id of that variable. Rows look up the result, errors

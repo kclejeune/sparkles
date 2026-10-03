@@ -38,6 +38,12 @@ query templates and on all 88 query instances. Its geometric mean is 4.95 ms, ag
 In the full-text comparison, Sparkles is the fastest on all 7 queries at 1.05M and on 6
 of 7 at 10.5M. At 10.5M, QLever counts the hits of a common word 1.11× faster.
 
+On English DBpedia at 1.24 billion triples, against QLever alone, Sparkles is faster on 28
+of the 29 queries whose answers agree and on both throughput tests, and the last one,
+`geo-box`, is a tie. It loads the data in 584 s against QLever's 1,674 s. Cold, QLever is
+faster on 17 of 31 queries, most of them point lookups and small joins
+([DBpedia at 1.24 billion triples](#dbpedia-at-124-billion-triples)).
+
 Sparkles uses more memory than QLever, and that is a choice. Its defaults spend memory on
 a 1 GiB decoded-block cache per dataset and on materialized intermediate results.
 [Memory and the speed it buys](#memory-and-the-speed-it-buys) shows what each part costs
@@ -509,6 +515,295 @@ queries that read many rows, Sparkles stays ahead when cold. At 10.5M, cold `sta
 took 97 ms against QLever's 366 ms, and cold `order-by-full` 481 ms against QLever's
 1,436 ms.
 
+## DBpedia at 1.24 billion triples
+
+This run compared Sparkles with QLever on real data at full scale, English DBpedia in its
+release of 2022.12.01. The 38 files of `scripts/bench-billion/dbpedia-2022.12.tsv` hold 1,237,418,025
+lines of N-Triples, 16 GB compressed with zstd. Some lines repeat a triple, and
+1,014,683,275 distinct triples remain. Sparkles' vocabulary has 205,941,262 terms.
+
+The run used `scripts/bench-billion.sh` with `SCALE=full`, `RUNS=3`, `TIMEOUT=300` and a
+query memory budget of 8 GB for each engine (`QUERY_MEM_GB=8`). Sparkles was at commit
+`4995963` and QLever was the nixpkgs build of 0.5.48. Each engine ran alone on `forge`, an
+Intel i5-13500 with 15 GiB of RAM and an NVMe disk. Both loads were pinned to the
+P-cores, CPUs 0–11, and ran in a systemd scope capped at 14 GiB with no swap, with an
+open-file limit of 65,536. QLever indexed with 8 GB of sort memory and 5 million triples
+per batch. Each query ran once to warm up and then three times. The cold runs restarted
+the server with the engine's files evicted from the page cache and ran each query once.
+
+| query | sparkles (ms) | qlever (ms) |
+|---|---:|---:|
+| **load** (s) | 2292.41 | **1673.78** |
+| abstract-contains | **36.9 ± 6.2** | 223.9 ± 0.5 |
+| births-by-decade | **51.6 ± 2.2** | 142.6 ± 14.8 |
+| category-people-1 | **11.3 ± 2.5** | 53.0 ± 5.6 |
+| category-people-2 | **9.8 ± 2.8** | 55.7 ± 3.4 |
+| category-tree | **271.8 ± 3.1** | 2048.9 ± 25.9 |
+| class-counts | **5.6 ± 2.9** | 98.2 ± 1.3 |
+| costar-birthplace | **52.1 ± 2.2** | 129.8 ± 14.4 |
+| count-all | 9.8 ± 1.1 † | 2550.2 ± 21.3 † |
+| country-population | **10.3 ± 1.3** | 21.3 ± 2.1 |
+| entity-facts-1 | **8.0 ± 2.0** | 17.5 ± 1.7 |
+| entity-facts-2 | **9.1 ± 2.1** | 14.4 ± 1.4 |
+| entity-summary-1 | **6.0 ± 1.4** | 14.1 ± 2.6 |
+| entity-summary-2 | **7.2 ± 3.7** | 12.8 ± 1.4 |
+| export-1m | **556.6 ± 2.3** | 1445.5 ± 23.9 |
+| film-director-optional | **18.8 ± 1.8** | 40.1 ± 6.6 |
+| geo-box | **147.9 ± 3.0** | 148.2 ± 3.3 |
+| inlinks-count-1 | **9.4 ± 1.8** | 18.2 ± 4.9 |
+| inlinks-count-2 | **7.9 ± 4.0** | 14.2 ± 1.0 |
+| label-regex | 46.1 ± 16.0 | **19.5 ± 5.9** |
+| outlink-classes-1 | **17.9 ± 12.6** | 28.0 ± 0.9 |
+| outlink-classes-2 | **19.4 ± 11.6** | 25.1 ± 3.3 |
+| people-no-birthdate | **55.6 ± 7.8** | 62.9 ± 1.3 |
+| place-births-1 | **13.9 ± 1.5** | 39.6 ± 2.8 |
+| place-births-2 | **12.6 ± 2.5** | 45.7 ± 0.9 |
+| place-union-1 | **11.1 ± 0.4** | 17.5 ± 0.9 |
+| place-union-2 | **10.2 ± 1.4** | 16.5 ± 1.7 |
+| predicate-counts | 25.1 ± 3.0 † | 5680.4 ± 16.4 † |
+| redirect-target-1 | **9.4 ± 1.1** | 23.4 ± 2.1 |
+| redirect-target-2 | **7.9 ± 1.4** | 21.9 ± 1.3 |
+| sameas-subjects | **8.6 ± 0.4** | 22.1 ± 1.3 |
+| top-linked | **602.5 ± 17.3** | 5598.2 ± 41.2 |
+| **throughput** entity-facts-1, 16 clients (queries/s) | **1450** | 1216 |
+| **throughput** place-births-1, 16 clients (queries/s) | **860** | 234 |
+
+† The engines' answers differ, so the query is not ranked. The section after the cold
+runs explains why.
+
+Sparkles was faster on 27 of the 29 ranked queries and on both throughput tests. QLever
+loaded 1.37× faster and was faster on `label-regex`. `geo-box` was a tie. The changes
+described [below](#after-the-build-and-filter-work) have since made the load 2.9× faster
+than QLever's and `label-regex` twice as fast as QLever's.
+
+| memory | sparkles | qlever |
+|---|---:|---:|
+| server RSS after the run (MiB) | 6412 | **1403** |
+| load peak RSS (MiB) | **8408** | 11401 |
+| index size on disk | **28.7 GiB** | 33.4 GiB |
+
+The server RSS figures do not measure the same thing for both engines. Sparkles maps its
+index files into memory, so the pages of the index that a query touched count toward its
+VmRSS, although they are clean file pages that the kernel can drop at any time. QLever
+reads its files with `pread`, so its page cache never shows up in its RSS. Right after
+its start, the Sparkles server's RSS was 72 MiB. After one pass over all the queries it
+was 7.4 GiB. Of that, 4.6 GiB were clean file-backed pages of the index and 2.8 GiB were
+anonymous memory, which includes the 1 GiB decoded-block cache. The memory that Sparkles
+actually allocated was therefore about twice QLever's RSS, and its 1 GiB block cache
+accounts for much of the difference.
+
+| query (cold) | sparkles (ms) | qlever (ms) |
+|---|---:|---:|
+| abstract-contains | **1084.0** | 4290.6 |
+| births-by-decade | **133.6** | 171.9 |
+| category-people-1 | 380.2 | **228.0** |
+| category-people-2 | 254.6 | **169.6** |
+| category-tree | **406.3** | 1889.6 |
+| class-counts | **52.1** | 164.5 |
+| costar-birthplace | 200.7 | **193.9** |
+| count-all | **5.8** | 4580.1 |
+| country-population | 117.9 | **35.9** |
+| entity-facts-1 | 58.8 | **25.3** |
+| entity-facts-2 | 59.7 | **39.1** |
+| entity-summary-1 | 64.1 | **20.2** |
+| entity-summary-2 | 36.3 | **26.8** |
+| export-1m | 11586.7 | **4284.0** |
+| film-director-optional | **59.5** | 63.0 |
+| geo-box | 374.8 | **183.8** |
+| inlinks-count-1 | 42.4 | **23.8** |
+| inlinks-count-2 | 52.6 | **26.0** |
+| label-regex | 988.6 | **69.1** |
+| outlink-classes-1 | 157.3 | **62.2** |
+| outlink-classes-2 | 103.6 | **45.7** |
+| people-no-birthdate | 115.1 | **82.6** |
+| place-births-1 | 271.5 | **268.3** |
+| place-births-2 | **260.5** | 340.9 |
+| place-union-1 | **213.6** | 220.4 |
+| place-union-2 | 246.3 | **217.2** |
+| predicate-counts | **43.1** | 5888.9 |
+| redirect-target-1 | 58.8 | **42.8** |
+| redirect-target-2 | 71.4 | **32.1** |
+| sameas-subjects | **25.2** | 27.2 |
+| top-linked | **986.4** | 6527.1 |
+
+Cold, QLever was faster on 20 of the 31 queries. Most of them are point lookups and small
+joins, where a cold Sparkles server reads and decodes whole index blocks for a few rows.
+Sparkles stayed ahead on the queries that read many rows, such as `abstract-contains`,
+`category-tree` and `top-linked`, and on the counts it answers from statistics.
+
+### Why `count-all` and `predicate-counts` differ
+
+QLever counts 1,014,683,273 triples, and Sparkles counts 1,014,683,275. QLever folds
+`xsd:float` and `xsd:double` literals whose lexical forms parse to the same number into
+one term. DBpedia has such pairs, for example distinct lexical forms of the same value
+in `geo:lat` and in `dbo:orbitalPeriod`, so QLever merges two pairs of triples that differ
+only in that literal. RDF 1.1 identifies a literal by its lexical form and datatype, so
+Sparkles keeps these as distinct terms and distinct triples, as Jena does. The per-predicate
+counts differ for the same reason. [COMPARISON.md](COMPARISON.md#general) lists this
+among the divergences.
+
+### After the build and filter work
+
+These figures are from the same machine and data, with Sparkles at commit `bf279e9`. That
+build also has the work merged into the main branch after `4995963`. Its load was pinned
+to the P-cores and ran under the same 14 GiB cap.
+
+**Bulk load.** The Sparkles load of the full data took 584 s, against 2,292 s before and
+QLever's 1,674 s, with a peak RSS of 6,769 MiB against 8,408 MiB before. The index it
+built is byte-for-byte the same as before. These were the phases:
+
+| phase | Sparkles before (s) | Sparkles after (s) | QLever (s) |
+|---|---:|---:|---:|
+| parse and partial vocabularies | 823 | 295 | 914 |
+| vocabulary merge | 171 | 58 | 183 |
+| remap to global ids | 55 | in the sort | 117 |
+| sorts and permutations | 1,244 | 232 | 459 |
+| total | 2,292 | 584 | 1,674 |
+
+Four changes made the difference:
+
+* The thread that decompresses a zstd file zeroed the rest of its 256 MiB block buffer
+  before each read of the decoder, which delivers a few hundred KiB at a time. That
+  memset took 17% of the load's CPU and held decompression to about 150 MB/s, so the 12
+  parser threads were mostly idle. The buffer is now zeroed once per block.
+* The partial vocabularies are merged in parallel over ranges of keys that sampled keys
+  delimit, and the ranges are appended to the vocabulary in order.
+* The batches of quads are read once. Each chunk of 64 million quads is remapped to
+  global ids, sorted in place by SPO, OSP and PSO in turn, and written as a compressed
+  sorted run per order. Before, each of the seven permutations re-read all the batches.
+* The runs of each order are merged in a thread of their own. SOP, OPS and POS come from
+  the merged SPO, OSP and PSO streams by sorting each run of the first column, as QLever
+  builds its permutations in pairs. Without named graphs, GSPO is the SPO stream with the
+  graph column in front. Each permutation is written by a thread of its own.
+
+The load read 127 GB from disk and wrote 145 GB, against 616 GB and 398 GB before. QLever
+read 102 GB and wrote 126 GB. The statistics no longer keep a count per subject and per
+object, which only the predicate and graph statistics read and which took several GB at
+this size.
+
+**`label-regex`.** The filter `REGEX(?l, "^The B")` fixes the start of the label, and the
+vocabulary is sorted by key, so the labels that can match are the ids in one range per
+start (`filter_id_ranges`). The planner now costs a filtered scan of `rdfs:label` sorted
+on the label by the rows in that range, 23,812 here, and reads that range and merges it
+with the bands, where it used to probe the label of each of the 36,745 bands. Ids outside
+the range fail without their keys being read. With the switch off, the old plan runs.
+
+| `label-regex` | warm (ms) | cold (ms) |
+|---|---:|---:|
+| `filter_id_ranges` off | 18.8 | 1,040 |
+| `filter_id_ranges` on | **3.8** | **90** |
+
+These figures time the request alone with curl, the warm one as the median of nine runs
+and the cold one as the mean of two, so they are lower than hyperfine's, which include
+starting curl. Timed that way, the old plan took 17–19 ms warm, not the 46 ms of the
+table above, whose standard deviation was 16 ms.
+
+**`export-1m`.** The export of a million triples as TSV decoded each term of each row
+from the vocabulary in row order. The objects of those triples are scattered over the
+8 GB vocabulary file, so a cold server took one page fault after another. The
+serializer now decodes 65,536 rows at a time. It sorts the chunk's distinct vocabulary
+ids, asks the kernel to read their pages ahead (`MADV_WILLNEED`), and decodes each
+front-coded block once, in id order and in parallel. The next chunk's pages are asked for
+while a chunk is written, so a warm export does not wait for those requests.
+
+| `export-1m` | warm (ms) | cold (ms) |
+|---|---:|---:|
+| before | 582 | 10,290 |
+| decoded in id order | 317 | 2,490 |
+| also reading ahead | **302** | **1,160** |
+
+These figures are the median of five warm runs and the mean of two cold runs of each
+build, timed with curl one after another on the same index.
+
+**The whole run again.** With the new index and build, the query step of
+`scripts/bench-billion.sh` ran again for Sparkles alone, with the same settings, and its
+answers were checked against the stored ones. QLever's figures are those of the first run.
+
+| query | Sparkles before (ms) | Sparkles after (ms) | QLever (ms) |
+|---|---:|---:|---:|
+| **load** (s) | 2292.41 | **584.48** | 1673.78 |
+| abstract-contains | 36.9 ± 6.2 | **36.8 ± 0.9** | 223.9 ± 0.5 |
+| births-by-decade | 51.6 ± 2.2 | **47.8 ± 1.0** | 142.6 ± 14.8 |
+| category-people-1 | 11.3 ± 2.5 | **13.5 ± 1.2** | 53.0 ± 5.6 |
+| category-people-2 | 9.8 ± 2.8 | **10.3 ± 2.6** | 55.7 ± 3.4 |
+| category-tree | 271.8 ± 3.1 | **275.5 ± 4.3** | 2048.9 ± 25.9 |
+| class-counts | 5.6 ± 2.9 | **9.5 ± 1.1** | 98.2 ± 1.3 |
+| costar-birthplace | 52.1 ± 2.2 | **48.7 ± 0.6** | 129.8 ± 14.4 |
+| count-all | 9.8 ± 1.1 † | 10.9 ± 2.3 † | 2550.2 ± 21.3 † |
+| country-population | 10.3 ± 1.3 | **10.8 ± 1.1** | 21.3 ± 2.1 |
+| entity-facts-1 | 8.0 ± 2.0 | **5.2 ± 1.8** | 17.5 ± 1.7 |
+| entity-facts-2 | 9.1 ± 2.1 | **9.9 ± 1.8** | 14.4 ± 1.4 |
+| entity-summary-1 | 6.0 ± 1.4 | **8.6 ± 3.4** | 14.1 ± 2.6 |
+| entity-summary-2 | 7.2 ± 3.7 | **10.6 ± 1.3** | 12.8 ± 1.4 |
+| export-1m | 556.6 ± 2.3 | **323.7 ± 7.6** | 1445.5 ± 23.9 |
+| film-director-optional | 18.8 ± 1.8 | **18.3 ± 0.9** | 40.1 ± 6.6 |
+| geo-box | 147.9 ± 3.0 | 154.5 ± 11.1 | **148.2 ± 3.3** |
+| inlinks-count-1 | 9.4 ± 1.8 | **8.1 ± 2.8** | 18.2 ± 4.9 |
+| inlinks-count-2 | 7.9 ± 4.0 | **9.7 ± 1.2** | 14.2 ± 1.0 |
+| label-regex | 46.1 ± 16.0 | **9.1 ± 0.5** | 19.5 ± 5.9 |
+| outlink-classes-1 | 17.9 ± 12.6 | **20.7 ± 3.3** | 28.0 ± 0.9 |
+| outlink-classes-2 | 19.4 ± 11.6 | **13.2 ± 3.6** | 25.1 ± 3.3 |
+| people-no-birthdate | 55.6 ± 7.8 | **50.4 ± 2.7** | 62.9 ± 1.3 |
+| place-births-1 | 13.9 ± 1.5 | **17.5 ± 0.6** | 39.6 ± 2.8 |
+| place-births-2 | 12.6 ± 2.5 | **16.8 ± 0.9** | 45.7 ± 0.9 |
+| place-union-1 | 11.1 ± 0.4 | **11.7 ± 3.2** | 17.5 ± 0.9 |
+| place-union-2 | 10.2 ± 1.4 | **11.6 ± 1.9** | 16.5 ± 1.7 |
+| predicate-counts | 25.1 ± 3.0 † | 27.3 ± 2.2 † | 5680.4 ± 16.4 † |
+| redirect-target-1 | 9.4 ± 1.1 | **4.5 ± 0.2** | 23.4 ± 2.1 |
+| redirect-target-2 | 7.9 ± 1.4 | **11.4 ± 0.1** | 21.9 ± 1.3 |
+| sameas-subjects | 8.6 ± 0.4 | **9.7 ± 0.4** | 22.1 ± 1.3 |
+| top-linked | 602.5 ± 17.3 | **605.0 ± 15.6** | 5598.2 ± 41.2 |
+| **throughput** entity-facts-1, 16 clients (queries/s) | 1450 | **1426** | 1216 |
+| **throughput** place-births-1, 16 clients (queries/s) | 860 | **834** | 234 |
+
+Sparkles is now faster on 28 of the 29 ranked queries and on both throughput tests.
+`geo-box` is a tie, 4% slower than QLever's. Some small queries, such as `place-births-1`
+and `place-births-2`, took a few ms more than in the first run. Timed with curl in one
+session, with the build of the first run and this build serving the same index
+alternately, these queries took the same time, 3.0–3.3 ms and 3.9–6.1 ms with both, so
+the change is in the machine or the curl processes, not in the queries. The server's RSS
+after the run was 5,643 MiB.
+
+| query (cold) | Sparkles before (ms) | Sparkles after (ms) | QLever (ms) |
+|---|---:|---:|---:|
+| abstract-contains | 1084.0 | **1090.7** | 4290.6 |
+| births-by-decade | 133.6 | **105.7** | 171.9 |
+| category-people-1 | 380.2 | 287.7 | **228.0** |
+| category-people-2 | 254.6 | 241.3 | **169.6** |
+| category-tree | 406.3 | **386.1** | 1889.6 |
+| class-counts | 52.1 | **25.1** | 164.5 |
+| costar-birthplace | 200.7 | **136.1** | 193.9 |
+| count-all | 5.8 | **7.2** | 4580.1 |
+| country-population | 117.9 | 129.1 | **35.9** |
+| entity-facts-1 | 58.8 | 49.1 | **25.3** |
+| entity-facts-2 | 59.7 | 51.4 | **39.1** |
+| entity-summary-1 | 64.1 | 37.8 | **20.2** |
+| entity-summary-2 | 36.3 | 32.7 | **26.8** |
+| export-1m | 11586.7 | **1325.7** | 4284.0 |
+| film-director-optional | 59.5 | **45.4** | 63.0 |
+| geo-box | 374.8 | 350.9 | **183.8** |
+| inlinks-count-1 | 42.4 | 30.6 | **23.8** |
+| inlinks-count-2 | 52.6 | 32.6 | **26.0** |
+| label-regex | 988.6 | 80.2 | **69.1** |
+| outlink-classes-1 | 157.3 | 99.6 | **62.2** |
+| outlink-classes-2 | 103.6 | 67.0 | **45.7** |
+| people-no-birthdate | 115.1 | 108.0 | **82.6** |
+| place-births-1 | 271.5 | 273.3 | **268.3** |
+| place-births-2 | 260.5 | **246.2** | 340.9 |
+| place-union-1 | 213.6 | **181.1** | 220.4 |
+| place-union-2 | 246.3 | 258.5 | **217.2** |
+| predicate-counts | 43.1 | **47.2** | 5888.9 |
+| redirect-target-1 | 58.8 | **40.0** | 42.8 |
+| redirect-target-2 | 71.4 | 40.0 | **32.1** |
+| sameas-subjects | 25.2 | **15.0** | 27.2 |
+| top-linked | 986.4 | **1158.9** | 6527.1 |
+
+Cold, Sparkles is faster on 14 of the 31 queries, against 11 before. Single cold runs
+vary: an earlier run of nearly the same build measured `entity-facts-1` at 18 ms and
+`place-births-1` at 85 ms, where this one measured 49 and 273 ms. The changes in
+`label-regex` and `export-1m` hold in every run. `export-1m` went from 11,587 to 1,326 ms
+against QLever's 4,284, and `label-regex` from 989 to 80 ms against QLever's 69.
+
 ## WatDiv
 
 WatDiv v0.6 basic testing at scale 100 has 10,973,381 triples, 20 query templates and 5
@@ -621,14 +916,15 @@ change a query's time only when they change its plan.
 
 ## What the benchmark does not cover
 
-* **Large scale.** Nothing above 11M triples has been measured. QLever is built for
-  10⁹–10¹¹ triples and routinely runs at that size (Wikidata, UniProt). Its design
-  advantages grow with size: lazy evaluation, FSST vocabulary compression, block
-  prefiltering and IRI encoding. Sparkles materializes intermediate results, so it would
-  hit memory limits earlier on very large intermediate results. A harness for DBpedia up
-  to 1.24 billion triples exists (`mise run bench:billion`).
-* **Data larger than RAM.** The cold runs restart the server with an empty page cache,
-  but every store here fits in memory.
+* **Larger scale.** The largest dataset measured is English DBpedia at 1.24 billion
+  triples ([DBpedia at 1.24 billion triples](#dbpedia-at-124-billion-triples)). QLever is
+  built for 10⁹–10¹¹ triples and routinely runs at that size (Wikidata, UniProt). Its
+  design advantages grow with size: lazy evaluation, FSST vocabulary compression and IRI
+  encoding. Sparkles materializes intermediate results, so it would hit memory limits
+  earlier on very large intermediate results.
+* **Data larger than RAM.** The cold runs restart the server with an empty page cache.
+  Every store here fits in memory, except the DBpedia index of 28.7 GiB on a machine
+  with 15 GiB of RAM.
 * **Other standard benchmarks.** WatDiv's basic testing is covered. LUBM, BSBM, SP²Bench,
   WatDiv's stress testing and the Wikidata query log are not. The synthetic suite has a
   fairly regular shape, and its 28 queries are hand-picked.

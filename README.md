@@ -161,7 +161,7 @@ running queries.
 | Engine | What it is | Where Sparkles stands |
 |---|---|---|
 | [Apache Jena / Fuseki](https://jena.apache.org/) | The reference Java stack. It has ARQ, TDB2 on B+trees, Fuseki, on-the-fly inference, jena-text and GeoSPARQL. | Sparkles has the same protocols, endpoints, admin API and CLI model, on sorted columnar indexes. It is faster on every benchmark query at 10.5M triples, by a median of 78×. Reasoning is materialized, apart from RDFS on read. Sparkles writes RDF Patch but cannot apply it. It has ARQ's statistical aggregates and most of its function library, but not its property-function libraries, `LET` or `FOLD`, and there is no ontology API. |
-| [QLever](https://github.com/ad-freiburg/qlever) | A C++ engine for billions of triples, with lazy, streaming execution. | Sparkles uses the same index and execution architecture and adds exact term identity, MVCC updates, the Graph Store Protocol, reasoning and SHACL. It is faster on all 28 benchmark queries at 10.5M triples and on all 20 WatDiv templates, and it uses about a third more memory. It has been measured only up to 11M triples, and it materializes intermediate results. |
+| [QLever](https://github.com/ad-freiburg/qlever) | A C++ engine for billions of triples, with lazy, streaming execution. | Sparkles uses the same index and execution architecture and adds exact term identity, MVCC updates, the Graph Store Protocol, reasoning and SHACL. It is faster on all 28 benchmark queries at 10.5M triples and on all 20 WatDiv templates, and it uses about a third more memory. On English DBpedia (1.24 billion triples) it loads 2.9× faster and wins 28 of 29 ranked queries warm, but QLever wins most point lookups cold. It materializes intermediate results. |
 | [Oxigraph](https://github.com/oxigraph/oxigraph) | A Rust database and toolkit on RocksDB, with Python and WebAssembly packages. | Sparkles uses Oxigraph's parsers, SPARQL parser and datatypes, with its own storage and planner. It is faster on every benchmark query at 10.5M triples, by a median of 85×. It fsyncs its writes, so Oxigraph's single-triple updates are faster. It adds reasoning, validation, search, authentication and a UI. It has Rust and Python APIs and no WebAssembly build. |
 | [Fluree](https://github.com/fluree/db) | A versioned, permissioned ledger with clustering, licensed under BUSL-1.1. JSON-LD is its main interface. | Sparkles passes the W3C SPARQL suites in full and is compatible with Fuseki. It has point-in-time reads, snapshots, diffs and protections of triples in its configuration, but no branches, history queries, policies stored in the data or clustering. It is faster on every benchmark query that Fluree completes at 10.5M triples, by a median of 9.8×, but only by 1–5% on a few counts and point lookups. |
 
@@ -192,11 +192,16 @@ materializes its result. With the block cache turned off, the server's RSS after
 queries run up to 14× slower. A 256 MiB cache is as fast as the default on this data and
 uses 161 MiB less ([the memory tradeoff](docs/BENCHMARKS.md#memory-and-the-speed-it-buys)).
 
-Nothing has been measured above 11M triples. [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
-has every number for both data sizes, WatDiv, full-text search, cold starts and mixed
-read/write load, the memory tradeoff, and every query where Sparkles loses or ties. A
-harness for real data on DBpedia, from 10M up to 1.24 billion triples, runs with
-`mise run bench:billion [scale]` ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#benchmark-scripts)).
+On English DBpedia, 1.24 billion triples on the same machine, Sparkles loads the data in
+584 s against QLever's 1,674 s, with a peak RSS of 6.6 GiB against 11.1 GiB. Warm, it is
+faster on 28 of the 29 queries whose answers both engines agree on, and on both
+throughput tests. Cold, QLever is faster on most point lookups and small joins
+([DBpedia at 1.24 billion triples](docs/BENCHMARKS.md#dbpedia-at-124-billion-triples)).
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every number for all three data sizes,
+WatDiv, full-text search, cold starts and mixed read/write load, the memory tradeoff, and
+every query where Sparkles loses or ties. The DBpedia harness runs at any scale from 10M
+triples up with `mise run bench:billion [scale]`
+([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#benchmark-scripts)).
 
 ## Getting started
 
