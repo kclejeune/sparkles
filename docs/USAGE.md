@@ -509,7 +509,9 @@ sparkles rset results.srj --results text      # JSON, XML or TSV results to anot
 `convert` reads files, or standard input when no file is given or a file is `-`. It takes
 the syntax from `--syntax`, then from the file extension, and reads standard input as
 N-Quads by default. Besides the W3C syntaxes it reads and writes Jena's TriX (`trix`), RDF
-Thrift (`rt`), RDF Protobuf (`rpb`) and RDF/JSON (`rj`), which `load` takes as well. Compressed inputs are detected as `load` detects them. The output
+Thrift (`rt`), RDF Protobuf (`rpb`) and RDF/JSON (`rj`). `load` takes them as well, and
+`query --results trix` (or `rt`, `rpb`, `rj`) writes CONSTRUCT and DESCRIBE results in
+them. Compressed inputs are detected as `load` detects them. The output
 streams, so a file larger than memory converts in bounded memory. Turtle, TriG and
 RDF/XML output declare the prefixes that the input declared before its first statement.
 A quad in a named graph cannot be written in a triple syntax, so `convert` drops it with

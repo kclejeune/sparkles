@@ -178,6 +178,24 @@ fn convert_and_load_take_jena_syntaxes() {
     let o = run(dir, &["load", "--loc", "db", "g.trix.gz"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(err(&o).contains("loaded 2 quads"), "{}", err(&o));
+    // CONSTRUCT results in TriX
+    let o = run(
+        dir,
+        &[
+            "query",
+            "--loc",
+            "db",
+            "--results",
+            "trix",
+            "CONSTRUCT WHERE { ?s ?p ?o }",
+        ],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("<uri>http://example.org/o2</uri>"),
+        "{}",
+        out(&o)
+    );
 }
 
 #[test]
