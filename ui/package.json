@@ -45,5 +45,10 @@
     "cytoscape": "^3.34.3",
     "cytoscape-fcose": "^2.2.0",
     "maplibre-gl": "^6.11.2"
+  },
+  "pnpm": {
+    "overrides": {
+      "cookie@<0.7.0": "^0.7.0"
+    }
   }
 }
