@@ -3,12 +3,15 @@
 > **Status:** implemented
 >
 > **Phases:** Phase 1 shipped: the background build with catch-up, the policy, the
-> scheduler, the settings, the status, the metrics, the CLI and the UI.
+> scheduler, the settings, the status, the metrics, the CLI and the UI. Phase 2 shipped:
+> the spatial index's base built with the new generation, outside the writer lock, and
+> partial compaction ([§10](#10-phase-2-the-spatial-index-outside-the-lock-and-partial-compaction)).
 >
 > **User docs:** [API: Automatic compaction](../API.md#automatic-compaction) ·
 > [Usage: Automatic compaction](../USAGE.md#automatic-compaction) ·
 > [Features](../FEATURES.md#storage-tdb2-equivalent) ·
-> [Benchmarks: Automatic compaction](../BENCHMARKS.md#automatic-compaction-105m-triples)
+> [Benchmarks: Automatic compaction](../BENCHMARKS.md#automatic-compaction-105m-triples) ·
+> [Benchmarks: Partial compaction](../BENCHMARKS.md#partial-compaction-and-the-spatial-index)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end records how it landed.
@@ -80,7 +83,7 @@ unpredictable moment is worse than none.
 * Incremental or partial compaction, such as LSM levels or rewriting only the blocks a
   delta touches. A Sparkles generation is one sorted run per permutation, and the bulk
   builder rewrites all of it at 4.7 s per 10.5M quads. That is fast enough that a full
-  rewrite is the right unit for now.
+  rewrite is the right unit for now. Phase 2 later added partial compaction (§10).
 * Locating delta quads per block, as QLever's `LocatedTriples` does. That would change
   the read path and is a separate decision ([COMPARISON](../COMPARISON.md)).
 * Compaction in embedded use. The library gets the policy evaluation and the background
@@ -407,7 +410,7 @@ files next to the old one. The rules are:
 * **Spatial index.** A new generation needs a new base for its spatial index. The base
   is built under the writer lock during the switch, reusing the literals the previous
   base parsed. This is the largest part of the lock time for datasets with a spatial
-  index.
+  index. Phase 2 builds it with the generation instead (§10.1).
 * **Vector indexes.** A new generation's HNSW graphs are built again in the background.
   Searches are exact until they are ready. Frequent compaction of a dataset with large
   vector indexes costs CPU, and the per-dataset settings can slow it down.
@@ -479,8 +482,11 @@ operational configuration rather than data.
 **Phase 1.** Everything in this spec: the background build with catch-up, the policy,
 the scheduler, the configuration, the status, the metrics, the CLI and the UI.
 
-**Later.** Partial compaction of the permutations a delta touches, delta quads located
-per block, and adaptive thresholds that learn from the measured cost of statistics
+**Phase 2.** The spatial index's base built with the new generation, outside the writer
+lock, and partial compaction of the blocks a delta touches (§10).
+
+**Later.** Delta quads located per block, a vocabulary that can take new terms without a
+full build, and adaptive thresholds that learn from the measured cost of statistics
 corrections.
 
 ## 7. Acceptance examples
@@ -545,7 +551,154 @@ corrections.
 2. Should the age trigger skip datasets with configured backup schedules? A daily full
    upload may be costly over a slow link. The per-dataset setting can turn it off.
 
-## 10. Sources
+## 10. Phase 2: the spatial index outside the lock, and partial compaction
+
+Phase 1 left two costs that do not need to be paid. The switch built the spatial index's
+base under the writer lock, so the lock hold grew with the number of geometries. Every
+compaction also rewrote the whole generation, however small the part of it that the
+delta touched. Phase 2 removes both.
+
+### 10.1 The spatial index's base
+
+The base of a spatial index depends on the generation alone. Its rows come from the
+generation's own permutations and its geometry column from the generation's vocabulary,
+while the overlay holds the rows of the delta. A compaction therefore builds the new
+generation's base as soon as the generation is built and before the catch-up. It reads a
+snapshot of the new generation with an empty delta at the base commit `c0`, in the
+build's thread pool and at the build's priority. Literals that the outgoing generation's
+column holds are reused by their key, as at the switch before. A persistent store writes
+the base's files into `gen-<n>/geo/` with `c0` as their base commit, because
+`commit.json` is written only at the switch.
+
+The switch then gives the new snapshot a view of that base with an overlay of the
+commits carried over. Building the overlay scans the delta's inserted quads of the
+indexed predicates, so its cost follows the commits made during the build and not the
+size of the data.
+
+An index that changed during the build makes the early base useless. When the spatial
+index was reconfigured, rebuilt or disabled after the compaction read it, the switch finds
+another index or another epoch. It removes the files written for the early base and
+builds the base under the lock, as Phase 1 did, or gives the new generation no index when
+the index was disabled.
+
+The other indexes need no change.
+
+* The full-text index is checkpointed under a brief writer lock when the build starts
+  (see the Outcome's deviations). The checkpoint's cost follows the documents indexed
+  since the previous one, and the switch does no full-text work.
+* The switch starts the vector indexes' builds on background threads, which costs the
+  same whatever their size. Searches are exact until the new graphs are ready, as in
+  Phase 1.
+
+### 10.2 Partial compaction
+
+A generation is one sorted run per permutation. Each run is cut into blocks of up to
+32,768 rows that are compressed one by one, and a metadata record per block gives its
+first and last key, offset and row count. The 10.5M-quad benchmark generation has 2,254
+blocks over its seven permutations. A delta of a thousand quads in a few subjects touches
+about a hundred of them, yet a full compaction merges the vocabulary again, sorts every
+quad in each of its sort orders and encodes every block. A partial compaction rewrites
+the touched blocks and copies the rest.
+
+**Blocks.** A delta key belongs to the first block whose last key is not below it, and the
+last block takes the keys past the end. Consecutive blocks that hold delta keys form a
+run. A run is decoded, merged with its inserted keys, stripped of its deleted keys, and
+written again as the fewest blocks its rows need, of sizes that differ by one row at most.
+A run whose rows all went writes no block. Every other block is copied byte for byte, and
+its metadata record gets its new offset and first row. The new permutation reads the same
+as a full build's, except where the block boundaries fall. Inserted delta keys are never in
+the base and deleted ones always are, so a run's row count is known before it is decoded,
+and the run is streamed rather than held in memory. The seven permutations are written in
+parallel.
+
+**The vocabulary.** The base vocabulary is sorted, and a term's id is its position in it.
+A term added in the middle would change the id of every term after it, and with it every
+block that names one of them. A partial compaction therefore copies the vocabulary as it
+is, and it is possible only when the delta's inserted quads use no term of the delta
+vocabulary. Integers, decimals, doubles, booleans, dates, date-times and blank nodes are
+inline values and add no term, and neither does a quad between terms the dataset already
+has. A delta that adds a term makes the compaction a full one. Two alternatives were
+rejected:
+
+* Appending the new terms keeps every id when each new term sorts after the last base
+  term. IRIs and literals share one order, so this holds only for unusual data, and the
+  vocabulary's offsets and sparse index would still be written again.
+* Keeping a new term's delta id in the base blocks would put ids there that a build never
+  writes. The statistics' class items and the spatial index's base read vocabulary ids
+  only, so both would lose those quads.
+
+Terms that the delta's deletions left unused stay in a partially compacted vocabulary
+until the next full compaction. No quad names them, so they cost disk space and nothing
+else. `sparkles compact --partial off` drops them.
+
+**Statistics.** The statistics are updated rather than counted again. The quad,
+predicate and graph counts change by the delta's inserted and deleted quads. The distinct
+counts cover the subjects, objects and predicates, the subjects and objects of each
+predicate, and the instances of each class. Each of them changes where a key prefix
+appears or disappears, which an exact count of the prefix in the old generation tells. Each subject the delta
+touches has its characteristic set computed from its old quads and its changes, and moves
+from its old set to its new one. The result equals a full build's, with one exception. A
+full build keeps the 10,000 most common characteristic sets among those it sees, and the
+update keeps the most common among the old ones and those the delta makes, so the two can
+choose different rare sets when a dataset has more than that. The update runs next to the
+block rewrite. It reads through a block cache of its own, which decodes each old block
+once and keeps the old generation's blocks out of the store's cache.
+
+**Fragmentation.** The blocks of a run are packed evenly, and consecutive touched blocks
+are packed together, so a run leaves at most one block shorter than half full. Deletions
+can still leave short blocks behind, and successive partial compactions can add to them.
+The automatic choice compacts in full once the new permutations would hold more than
+1.25 times the blocks of a full build, which packs every block again.
+
+**The cost model.** A full build costs in proportion to the quads, since it merges the
+vocabulary, sorts and encodes all of them. A partial compaction costs in proportion to the
+blocks it rewrites, plus a copy of the other blocks at disk speed, plus the statistics
+update, which costs in proportion to the delta's quads. The automatic choice estimates
+both from the plan, with costs per unit measured on the 10.5M-quad benchmark data (§10.3),
+and compacts partially when the estimate is lower. A rewrite of every block still costs
+far less than a full build, because it neither merges the vocabulary nor sorts, so the
+estimate prefers a full build only when the delta is large against the base.
+
+**The setting.** `partial` is `auto` (the default), `off` or `always`:
+
+* `off` makes every compaction a full one.
+* `always` compacts partially whenever the delta adds no term.
+* `auto` compacts partially when the delta adds no term, the estimate favours it and the
+  fragmentation limit holds.
+
+The setting sits with the others in `compaction.json` and applies to every compaction of
+the dataset, automatic or not. The flag `--auto-compact-partial` gives the server's
+default, and `sparkles compact --partial` overrides it for one run. `CompactOptions`
+gains `partial`, and `CompactReport` and the status's `last` gain `mode` (`full` or
+`partial`), the reason a compaction that could have been partial was full, and the
+blocks rewritten and copied.
+
+**Everything else.** A partial compaction writes the same files into the same
+`gen-<n>` directory as a full one, under the same `compacting` marker, and the switch does
+not change. The catch-up, history, quotas and the crash points of §4.9 are therefore the
+same. In a backup repository, the copied vocabulary deduplicates against the old
+generation's, and so do the pieces of a permutation file that lie before its first
+rewritten block.
+
+### 10.3 Measurements
+
+The measurements ran on 2026-10-03 on a shared 16-core machine whose load average was
+between 12 and 50 while other builds ran, so single timings vary by a factor of two or
+more. [Benchmarks](../BENCHMARKS.md#partial-compaction-and-the-spatial-index) has the
+tables and how to run them.
+
+* **Spatial index.** With 100,000 point geometries in 300,000 quads and 100 commits
+  carried over, the switch held the writer lock for 109 to 170 ms when it built the base,
+  and for 2.7 to 4.3 ms when the build had built it. Without a spatial index it held it
+  for 2.5 to 20 ms.
+* **Partial compaction.** On the 10.5M-triple data, a full compaction took 7.5 to 16 s.
+  Partial compactions of deltas of 1,000 to 100,000 quads in few subjects rewrote 102 to
+  117 of the 2,254 blocks and took 0.14 to 0.82 s, with one run at 2.7 s. Deltas spread over
+  all subjects rewrote 1,201 to 1,223 blocks and took 0.6 to 2.4 s. The cost model's
+  units come from these runs: about 0.65 ms per rewritten block, 6.5 µs per delta quad for
+  the statistics and 1 µs per quad for a full build.
+
+## 11. Sources
 
 * LevelDB's implementation notes on compactions, and the RocksDB wiki pages on leveled
   compaction, background threads and the rate limiter, from general knowledge.
@@ -633,6 +786,44 @@ The compactions took 1.3–2.0 s and held the writer lock for 3.3–5.7 ms, agai
 50 ms of A14. The 860 commits made during two compactions had a p50 of 2.0 ms and a p99
 of 15 ms, the same as the rest of the run.
 
-**Not built.** Partial compaction, delta quads located per block, adaptive thresholds and
-compaction in embedded use without a server remain later work. The spatial index's base
-is still built under the writer lock at the switch.
+**Phase 2.** Landed on 2026-10-03 in three commits: the spatial index's base built with
+the generation (`dfa9d46`), partial compaction in the engine (`76d38b7`), and the cost
+model with the setting in the server, the CLI, the UI and the NixOS module (`6c46372`).
+
+* **Spatial index.** `Store::prebuild_geo` builds the base after the generation and before
+  the catch-up, and `switch_geo_locked` adds the overlay at the switch or falls back to
+  the Phase 1 path when the index changed meanwhile. A new failpoint,
+  `compact-indexed`, follows the early base. With 100,000 geometries the lock hold went
+  from 109 to 170 ms down to 2.7 to 4.3 ms, the same as without a spatial index.
+  `CompactOptions::geo_at_switch`, a hidden option, keeps the old path for the
+  measurement.
+* **Partial compaction.** `store/partial.rs` plans, writes and updates the statistics as
+  §10.2 describes. `PermWriter` gained `push_raw` and `end_block`, and `PermIndex`
+  `raw_block`. The setting is `partial` in `compaction.json`, `--auto-compact-partial` on
+  the server, `sparkles compact --partial` and `CompactOptions::partial`.
+  `CompactReport` and the status's `last` give `mode`, `fullReason`, `blocksRewritten`
+  and `blocksCopied`, and the task message and the UI name the blocks rewritten.
+
+Phase 2 deviated from its first design in one place. The automatic choice was first a
+limit of half the blocks rewritten. Spread deltas on the benchmark data touch 54% of the
+blocks, yet their partial compactions took 0.6 to 2.4 s against 7.5 to 16 s for a full
+build, so the limit made the wrong choice. The choice now compares estimated times, and
+only a delta that is large against the base makes a full build quicker.
+
+Tests in `compaction_tests.rs` compare partial and full compactions of the same commits
+over four rounds: a subject that gains 40,000 quads so that its block splits, ten
+thousand subjects deleted, changes spread over every block, everything deleted, and a
+few quads added back. Each round compares the quads, eight queries, the statistics with
+their ids written as terms, `sparkles check` and a reopen. A crash at each of six points
+of a partial compaction recovers the same state, commits made during a partial build
+are carried over, and the automatic choice and its reasons are covered. The tests in
+`geo_files_tests.rs` cover the base built before the switch, its files read back at
+open, and a rebuild or disable during the build. Two ignored tests take the
+measurements: `compaction_lock_with_a_spatial_index` and `partial_compaction_at_scale`.
+
+**Not built.** Delta quads located per block, a vocabulary that takes new terms without a
+full build, adaptive thresholds and compaction in embedded use without a server remain
+later work. The vector indexes' graphs are still built after the switch, so their
+searches are exact for a while after each compaction. A bulk commit still builds the
+spatial index's base under the writer lock, because it holds the lock for its whole
+rebuild anyway.

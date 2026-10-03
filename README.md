@@ -47,7 +47,8 @@ running queries.
 * MVCC snapshots with a single writer and a crash-safe WAL. Compaction writes immutable
   generations of 7 sorted, compressed permutations ([features](docs/FEATURES.md#storage-tdb2-equivalent)).
 * Automatic compaction in the background when a dataset's updates grow, with writes going
-  on during the build ([API](docs/API.md#automatic-compaction)).
+  on during the build. A delta that adds no terms rewrites only the index blocks it
+  touches ([API](docs/API.md#automatic-compaction)).
 * Durable commit ids, point-in-time reads by commit (`?at=commit:N`), time or named
   snapshot, and diffs between any two readable commits, as JSON or RDF Patch
   ([API](docs/API.md#point-in-time-reads-and-snapshots)).

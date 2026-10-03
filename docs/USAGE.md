@@ -1108,6 +1108,7 @@ compaction waits and the status at `/$/compaction/{ds}`.
 | `--auto-compact-threads N` | a quarter of the cores | Threads of an automatic compaction's build. On Linux they run at nice 10. |
 | `--auto-compact-io-mb N` | `0` | The average rate, in MiB per second, at which an automatic compaction may write its new index; `0` means no limit. |
 | `--auto-compact-max-running N` | `1` | Automatic compactions that may run on the server at once. |
+| `--auto-compact-partial MODE` | `auto` | Whether a compaction, automatic or not, may rewrite only the index blocks its delta touches: `auto`, `off` or `always`. |
 
 A dataset can override every setting but the threads, the rate and the running limit.
 The settings are stored in `compaction.json` in its directory:
@@ -1123,6 +1124,20 @@ curl -X PUT 'localhost:3030/$/compaction/db' -H 'Content-Type: application/json'
 
 A database that no server holds is never compacted on its own. `sparkles compact --loc db
 --if-due` compacts it only when its policy says so, which suits a cron job.
+
+A compaction whose delta uses only terms the dataset already has rewrites only the index
+blocks that the delta touches and copies the others. Numbers, dates, booleans and blank
+nodes never add terms, and neither do links between existing resources. A delta that adds
+a term, such as a new IRI or string, rebuilds the whole index. The `partial` setting
+chooses: `auto` compacts partially when the delta adds no term and that is estimated to
+be quicker than a rebuild, `off` always rebuilds, and `always` compacts partially whenever
+the delta adds no term. `sparkles compact --partial off` rebuilds once, which also drops terms that no quad
+uses any more. The compaction's task message and `last` in its status say which it was.
+
+```sh
+sparkles compaction --loc db --set partial=off     # always rebuild this dataset's index
+sparkles compact --loc db --partial always         # one partial compaction, if no term was added
+```
 
 Each compaction makes the next incremental backup upload the whole new generation, and a
 retention window keeps the old generation until its commits age out. Raise the ratio or

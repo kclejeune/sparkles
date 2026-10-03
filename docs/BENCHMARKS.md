@@ -1326,6 +1326,55 @@ Commits during a compaction were no slower than the others. The multi-second out
 appeared in both runs outside any compaction, and most likely come from `fsync`
 stalls on the shared machine.
 
+### Partial compaction and the spatial index
+
+Both measurements are ignored tests of the `sparkles` crate, run in release mode on
+2026-10-03 at `6c46372`. Other builds were running on the 16-core machine, with a load
+average between 12 and 50, so single timings vary by a factor of two or more.
+
+`partial_compaction_at_scale` loads the 10.5M-triple benchmark data
+(`SPARKLES_BENCH_NT`), then, for each delta, copies the store, applies the delta and
+compacts the copy once with `partial` forced to `always` and once to `off`. Each delta is
+90% new `foaf:knows` links and 10% deleted `foaf:age` quads, all between terms the data
+already has. A concentrated delta links 10 people to a narrow range of others and deletes
+the ages of consecutive people. A spread delta picks people at random. The generation has
+2,254 blocks over its seven permutations. The table gives the build time of the last run
+and, in parentheses, that of the run before it, at a higher load. An earlier run is left
+out, because the copied store was still being written back to disk while it compacted.
+
+| Delta | Blocks rewritten | Partial | Full |
+|---|---:|---:|---:|
+| 1,000 concentrated | 102 | 0.14 s (0.21 s) | 8.4 s (16.4 s) |
+| 10,000 concentrated | 107 | 2.7 s (0.20 s) | 8.1 s (11.3 s) |
+| 100,000 concentrated | 117 | 0.40 s (0.82 s) | 7.5 s (10.3 s) |
+| 1,000 spread | 1,201 | 1.6 s (2.4 s) | 9.4 s (16.4 s) |
+| 10,000 spread | 1,223 | 0.60 s (0.93 s) | 8.4 s (8.3 s) |
+| 100,000 spread | 1,223 | 1.1 s (1.4 s) | 13.6 s (8.8 s) |
+
+The 2.7 s of the second row is an outlier of a busy moment, since the same delta took
+0.20 s in the run before. The concentrated deltas touch few blocks of the
+subject-ordered permutations, but the deleted ages, which are integers spread over the
+object-ordered permutations, still touch a hundred blocks. A spread delta touches every
+block of five permutations and some of the other two, 54% in all, and a partial
+compaction of it still took a tenth of a full build. A full build merges the vocabulary
+and sorts every quad, which a partial compaction never does. Both kinds of compaction held
+the writer lock for 2 to 22 ms. The `auto` setting chose a partial compaction for every
+delta here.
+
+`compaction_lock_with_a_spatial_index` loads 100,000 features with a point geometry and a
+label (300,000 quads), enables the spatial index, and three times makes 500 commits that
+add features and then compacts while 100 more commits are made during the build. It
+compares the spatial index's base built under the writer lock at the switch, as before,
+with the base built with the generation.
+
+| Case | Writer lock at the switch |
+|---|---:|
+| No spatial index | 2.5–20 ms |
+| Spatial base built at the switch | 109–170 ms |
+| Spatial base built with the generation | 2.7–4.3 ms |
+
+The base takes about 0.1 s more of the build, which runs without the lock.
+
 ### GeoSPARQL Compliance Benchmark
 
 The GeoSPARQL Compliance Benchmark (Jovanovik, Homburg and Spasić, 2021) has 206 queries
