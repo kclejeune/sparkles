@@ -662,6 +662,46 @@ fn parameters() -> Map<String, J> {
         ),
     );
     put(
+        "describe",
+        q(
+            "describe",
+            json!({ "type": "string", "enum": ["cbd", "scbd", "outgoing"] }),
+            "The DESCRIBE mode of this query, over the dataset's setting.",
+        ),
+    );
+    put(
+        "describeLabels",
+        q(
+            "describe-labels",
+            json!({ "type": "boolean" }),
+            "Add the labels of the IRIs a DESCRIBE result links to.",
+        ),
+    );
+    put(
+        "describeReifiers",
+        q(
+            "describe-reifiers",
+            json!({ "type": "boolean" }),
+            "Include the reifiers of described triples.",
+        ),
+    );
+    put(
+        "describeMaxTriples",
+        q(
+            "describe-max-triples",
+            json!({ "type": "integer", "minimum": 1 }),
+            "A lower limit on the triples of a DESCRIBE result.",
+        ),
+    );
+    put(
+        "describeMaxDepth",
+        q(
+            "describe-max-depth",
+            json!({ "type": "integer", "minimum": 1 }),
+            "A lower limit on the levels a DESCRIBE follows.",
+        ),
+    );
+    put(
         "gspDefault",
         q(
             "default",

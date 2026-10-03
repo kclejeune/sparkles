@@ -562,6 +562,9 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/rdfs/{ds}`               | The dataset's RDFS-on-read setting, `{ "enabled": false }` when there is none. See [RDFS on read](#rdfs-on-read). |
 | PUT    | `/$/rdfs/{ds}`               | Sets RDFS on read, like Fuseki's `--rdfs`. The body is `{ "graph": IRI \| "default" }` for a schema graph of the dataset, or a schema document in an RDF syntax given by `Content-Type`. Needs `admin`. `400` for a malformed body, `415` for another content type, `403` on a read-only server. |
 | DELETE | `/$/rdfs/{ds}`               | Removes RDFS on read. Needs `admin`. |
+| GET    | `/$/describe/{ds}`           | *Extension.* The dataset's DESCRIBE setting. See [DESCRIBE](#describe). |
+| PUT    | `/$/describe/{ds}`           | *Extension.* Replaces the DESCRIBE setting with the JSON object's options: `mode`, `labels`, `reifiers`, `maxTriples` and `maxDepth`. Needs `admin`. `400` for a malformed body, `403` on a read-only server. |
+| DELETE | `/$/describe/{ds}`           | *Extension.* Restores the DESCRIBE defaults. Needs `admin`. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
 | DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
@@ -1302,6 +1305,9 @@ Query parameters beyond the standard protocol:
   --result-cache-mb N` sets the server-wide cache budget (default 512, `0` disables the
   cache). The cache is keyed by snapshot version, so updates invalidate it.
   `POST /$/cache/clear/{ds}` empties it.
+* `describe`, `describe-labels`, `describe-reifiers`, `describe-max-triples` and
+  `describe-max-depth` choose how a DESCRIBE query describes a resource. See
+  [DESCRIBE](#describe).
 
 ### CSV and TSV uploads
 
@@ -1369,6 +1375,10 @@ Both services list the following.
   `sd:defaultSupportedEntailmentProfile` OWL 2 RL for `owl-rl`. An `rdfs:comment` says that
   the inferences are materialized into `urn:x-sparkles:inferred` and not recomputed while
   a query runs.
+* The dataset's DESCRIBE setting, on the query service only. `spk:describeMode` is
+  `"cbd"`, `"scbd"` or `"outgoing"`, `spk:describeLabels` and `spk:describeReifiers` are
+  booleans, and `spk:describeMaxTriples` and `spk:describeMaxDepth` are present when the
+  setting has those limits. `spk:` is `urn:x-sparkles:`.
 * `sd:defaultDataset`, an `sd:Dataset` with its default graph and up to 1000 named
   graphs. Its `rdfs:seeAlso` links the dataset's VoID description,
   `/$/schema/{ds}?format=turtle` (see [Schema discovery](#schema-discovery)).
@@ -1556,6 +1566,69 @@ builder has `lateral(|w| …)`, and its path syntax accepts ranges (`"foaf:knows
 
 ARQ's other path forms (`:p^:q`, `distinct(…)`, `shortest(…)` and `multi(…)`),
 `SEMIJOIN`, `ANTIJOIN`, `LET`, `UNFOLD` and the `JSON` query form are not supported.
+
+### DESCRIBE
+
+A DESCRIBE query returns a description of each IRI and blank node that it names or that
+its WHERE clause binds. The dataset's setting decides what a description holds, and a
+request can ask for something else. The design is
+[spec G06 Phase 2](specs/G06-arq-query-extensions.md#11-phase-2-configurable-describe).
+
+There are three modes.
+
+| Mode | What a description holds |
+|---|---|
+| `cbd` (default) | The concise bounded description of the [W3C member submission](https://www.w3.org/submissions/CBD/). It holds the resource's triples and the triples of every blank node they lead to, recursively. It also holds the description of each reifier of an included triple. |
+| `scbd` | The symmetric concise bounded description. It adds the triples whose object is the resource, and follows their blank-node subjects backwards. |
+| `outgoing` | The resource's own triples. Blank nodes and reifiers are not followed. |
+
+A reifier is an RDF 1.2 reifier, `?r rdf:reifies <<( s p o )>>`, as the annotation syntax
+`s p o {| … |}` writes it. RDF 1.1 reification, `?r rdf:subject s ; rdf:predicate p ;
+rdf:object o`, counts as well. Four options refine the mode.
+
+| Option | Default | Effect |
+|---|---|---|
+| `labels` | `false` | Adds the `rdfs:label` and `skos:prefLabel` triples of the IRIs in the description. |
+| `reifiers` | `true` | Includes the descriptions of reifiers in `cbd` and `scbd`. |
+| `maxTriples` | none | Stops the result at this many triples. The response then has the header `Sparkles-Describe-Truncated: true`, and the plan has the warning `describe-truncated`. |
+| `maxDepth` | none | Follows at most this many levels. The resource's own triples are level 1, and each blank node or reifier followed adds a level. |
+
+The description is read from the query's dataset the way Jena's default handler reads
+it. That is the default graph and each named graph in which the resource appears. Blank
+nodes are followed only inside the graph where they were found, and the triples of all
+the graphs are merged into one result graph. Without a dataset in the query or the
+request, the default graph is the store's default graph, even when the store's queries
+see the union of its named graphs. `FROM` and `default-graph-uri` make the listed graphs
+the default graph, and `FROM NAMED` and `named-graph-uri` limit the named graphs.
+Materialized inferences are part of the default graph when the request reads them, and
+their graph is never read as a named graph. A caller limited to some graphs, or
+protected from some triples, gets descriptions without them.
+
+On data without reifiers, `cbd` gives Jena's answer. Jena's `DescribeBNodeClosure`
+ignores reifiers, so `"reifiers": false` gives Jena's answer on any data.
+
+The setting lives at `/$/describe/{ds}`. `GET` needs read access. It returns every
+option, with `null` for a limit that is not set, along with `source` (`dataset` or
+`default`) and the list of `modes`. `PUT` replaces the setting with a JSON object of
+options, and the options it leaves out take their defaults. `DELETE` restores the
+defaults. Both need admin, and a read-only server refuses them with `403`. A persistent
+dataset keeps its setting in `describe.json`.
+
+```sh
+curl -X PUT localhost:3030/$/describe/ds -H 'Content-Type: application/json' \
+  -d '{"mode": "scbd", "labels": true, "maxTriples": 10000}'
+curl 'localhost:3030/ds/sparql?describe=outgoing' --data-urlencode 'query=DESCRIBE <http://example.org/a>'
+sparkles describe-settings --loc db --set mode=scbd --set maxDepth=4
+sparkles query --loc db --describe outgoing --describe-labels 'DESCRIBE <http://example.org/a>'
+```
+
+A query request may set `describe=cbd|scbd|outgoing`, `describe-labels=true|false` and
+`describe-reifiers=true|false` over the dataset's setting. `describe-max-triples` and
+`describe-max-depth` take positive whole numbers. They can lower the dataset's limits
+but not raise them. A malformed value is a `400`. The
+[service description](#service-description) lists the setting, and the MCP tools and
+stored queries use it too. The `rows` budget and the timeout apply to a description as
+they apply to the rest of the query.
 
 ### Blank nodes
 

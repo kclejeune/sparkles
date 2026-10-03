@@ -63,6 +63,53 @@
           "type": "array"
         }
       },
+      "describe": {
+        "description": "The DESCRIBE mode of this query, over the dataset's setting.",
+        "in": "query",
+        "name": "describe",
+        "schema": {
+          "enum": [
+            "cbd",
+            "scbd",
+            "outgoing"
+          ],
+          "type": "string"
+        }
+      },
+      "describeLabels": {
+        "description": "Add the labels of the IRIs a DESCRIBE result links to.",
+        "in": "query",
+        "name": "describe-labels",
+        "schema": {
+          "type": "boolean"
+        }
+      },
+      "describeMaxDepth": {
+        "description": "A lower limit on the levels a DESCRIBE follows.",
+        "in": "query",
+        "name": "describe-max-depth",
+        "schema": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "describeMaxTriples": {
+        "description": "A lower limit on the triples of a DESCRIBE result.",
+        "in": "query",
+        "name": "describe-max-triples",
+        "schema": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "describeReifiers": {
+        "description": "Include the reifiers of described triples.",
+        "in": "query",
+        "name": "describe-reifiers",
+        "schema": {
+          "type": "boolean"
+        }
+      },
       "dryRun": {
         "description": "Run the write as a preview and roll it back. `dryRun` with no value means true.",
         "in": "query",
@@ -1635,6 +1682,90 @@
         "required": [
           "name",
           "quads"
+        ],
+        "type": "object"
+      },
+      "DescribeSetting": {
+        "properties": {
+          "labels": {
+            "type": "boolean"
+          },
+          "maxDepth": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "maxTriples": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "mode": {
+            "enum": [
+              "cbd",
+              "scbd",
+              "outgoing"
+            ],
+            "type": "string"
+          },
+          "reifiers": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "DescribeStatus": {
+        "properties": {
+          "labels": {
+            "type": "boolean"
+          },
+          "maxDepth": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "maxTriples": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "mode": {
+            "enum": [
+              "cbd",
+              "scbd",
+              "outgoing"
+            ],
+            "type": "string"
+          },
+          "modes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reifiers": {
+            "type": "boolean"
+          },
+          "source": {
+            "enum": [
+              "dataset",
+              "default"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "labels",
+          "reifiers",
+          "maxTriples",
+          "maxDepth",
+          "source",
+          "modes"
         ],
         "type": "object"
       },
@@ -6360,6 +6491,181 @@
         "summary": "Clone a dataset",
         "tags": [
           "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/describe/{ds}": {
+      "delete": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#describe"
+        },
+        "operationId": "deleteDescribe",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DescribeStatus"
+                }
+              }
+            },
+            "description": "The DESCRIBE setting after the removal."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove the DESCRIBE setting",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#describe"
+        },
+        "operationId": "getDescribe",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DescribeStatus"
+                }
+              }
+            },
+            "description": "The DESCRIBE setting."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get the DESCRIBE setting",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "put": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#describe"
+        },
+        "operationId": "setDescribe",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DescribeSetting"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DescribeStatus"
+                }
+              }
+            },
+            "description": "The new DESCRIBE setting."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Set the DESCRIBE setting",
+        "tags": [
+          "SPARQL"
         ],
         "x-sparkles-permission": "admin"
       }
@@ -12452,6 +12758,21 @@
             "$ref": "#/components/parameters/maxResultMb"
           },
           {
+            "$ref": "#/components/parameters/describe"
+          },
+          {
+            "$ref": "#/components/parameters/describeLabels"
+          },
+          {
+            "$ref": "#/components/parameters/describeReifiers"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxTriples"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxDepth"
+          },
+          {
             "description": "Label the response `text/plain` so a browser shows it.",
             "in": "query",
             "name": "force-accept",
@@ -12635,6 +12956,21 @@
           },
           {
             "$ref": "#/components/parameters/maxResultMb"
+          },
+          {
+            "$ref": "#/components/parameters/describe"
+          },
+          {
+            "$ref": "#/components/parameters/describeLabels"
+          },
+          {
+            "$ref": "#/components/parameters/describeReifiers"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxTriples"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxDepth"
           },
           {
             "description": "Label the response `text/plain` so a browser shows it.",
@@ -14938,6 +15274,21 @@
             "$ref": "#/components/parameters/maxResultMb"
           },
           {
+            "$ref": "#/components/parameters/describe"
+          },
+          {
+            "$ref": "#/components/parameters/describeLabels"
+          },
+          {
+            "$ref": "#/components/parameters/describeReifiers"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxTriples"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxDepth"
+          },
+          {
             "description": "Label the response `text/plain` so a browser shows it.",
             "in": "query",
             "name": "force-accept",
@@ -15032,6 +15383,21 @@
           },
           {
             "$ref": "#/components/parameters/maxResultMb"
+          },
+          {
+            "$ref": "#/components/parameters/describe"
+          },
+          {
+            "$ref": "#/components/parameters/describeLabels"
+          },
+          {
+            "$ref": "#/components/parameters/describeReifiers"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxTriples"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxDepth"
           },
           {
             "description": "Label the response `text/plain` so a browser shows it.",
@@ -15494,6 +15860,21 @@
             "$ref": "#/components/parameters/maxResultMb"
           },
           {
+            "$ref": "#/components/parameters/describe"
+          },
+          {
+            "$ref": "#/components/parameters/describeLabels"
+          },
+          {
+            "$ref": "#/components/parameters/describeReifiers"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxTriples"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxDepth"
+          },
+          {
             "description": "Label the response `text/plain` so a browser shows it.",
             "in": "query",
             "name": "force-accept",
@@ -15588,6 +15969,21 @@
           },
           {
             "$ref": "#/components/parameters/maxResultMb"
+          },
+          {
+            "$ref": "#/components/parameters/describe"
+          },
+          {
+            "$ref": "#/components/parameters/describeLabels"
+          },
+          {
+            "$ref": "#/components/parameters/describeReifiers"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxTriples"
+          },
+          {
+            "$ref": "#/components/parameters/describeMaxDepth"
           },
           {
             "description": "Label the response `text/plain` so a browser shows it.",

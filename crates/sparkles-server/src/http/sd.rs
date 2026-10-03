@@ -4,8 +4,8 @@
 //!
 //! The description names the endpoints, the languages, the result and input formats,
 //! the features, every extension function, aggregate and property function of this build
-//! ([`sparkles::sparql::catalog`]), the default entailment regime and the default
-//! dataset, with a link to the dataset's VoID description (`/$/schema/{ds}`). Only callers
+//! ([`sparkles::sparql::catalog`]), the dataset's DESCRIBE setting (`spk:describeMode`
+//! and its options), the default entailment regime and the default dataset, with a link to the dataset's VoID description (`/$/schema/{ds}`). Only callers
 //! that may query the dataset get here. Named graphs a caller may not read are left out,
 //! and triple counts are given only to callers that see every graph.
 
@@ -28,6 +28,7 @@ const ENT: &str = "http://www.w3.org/ns/entailment/";
 const OWL_PROFILE_RL: &str = "http://www.w3.org/ns/owl-profile/RL";
 const VOID: &str = "http://rdfs.org/ns/void#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
+const SPK: &str = "urn:x-sparkles:";
 
 /// The named graphs described at most.
 const MAX_GRAPHS: usize = 1000;
@@ -167,6 +168,7 @@ pub(super) async fn describe(
     let reasoning = ds.reasoning.read().clone();
     let federate = st.allow_service && p.has(ServerPerm::Federate);
     let read_only = st.read_only;
+    let describe = ds.store.describe_settings();
     blocking(move || {
         let f = facts(&ds, &p, reasoning.is_some())?;
         let enc = |s: &str| utf8_percent(s);
@@ -237,6 +239,24 @@ pub(super) async fn describe(
             }
             for pf in &properties {
                 out.add(s, sd("propertyFeature"), iri(pf));
+            }
+            // how DESCRIBE describes a resource here, unless a request asks otherwise
+            if !*update {
+                let d = &describe;
+                let spk = |l: &str| iri(&format!("{SPK}{l}"));
+                out.add(
+                    s,
+                    spk("describeMode"),
+                    Literal::new_simple_literal(d.mode.name()),
+                );
+                out.add(s, spk("describeLabels"), Literal::from(d.labels));
+                out.add(s, spk("describeReifiers"), Literal::from(d.reifiers));
+                if let Some(n) = d.max_triples {
+                    out.add(s, spk("describeMaxTriples"), count(n));
+                }
+                if let Some(n) = d.max_depth {
+                    out.add(s, spk("describeMaxDepth"), count(u64::from(n)));
+                }
             }
             // inferences are materialized, so queries match them as stored triples
             let (regime, profile) = match reasoning.as_ref().map(|r| r.profile.as_str()) {

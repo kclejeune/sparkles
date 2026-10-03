@@ -113,6 +113,11 @@ fn query_params(o: Op) -> Op {
         "maxRows",
         "maxRowsProduced",
         "maxResultMb",
+        "describe",
+        "describeLabels",
+        "describeReifiers",
+        "describeMaxTriples",
+        "describeMaxDepth",
     ])
     .query(
         "force-accept",
@@ -1484,6 +1489,16 @@ fn settings(p: &mut Paths) {
         "RdfsStatus",
         "RdfsRequest",
         "rdfs-on-read",
+    );
+    setting(
+        p,
+        "/$/describe/{ds}",
+        "SPARQL",
+        "DESCRIBE setting",
+        "Describe",
+        "DescribeStatus",
+        "DescribeSetting",
+        "describe",
     );
     setting(
         p,
