@@ -3995,12 +3995,32 @@ PUT /$/vector/ds/docs
 | `queryText` | `true` | Whether searches may pass text for this index. |
 | `batchSize` | 64 | Inputs per request, 1 to 2048. |
 | `maxInputChars` | 8000 | Inputs are cut at this many characters. |
+| `chunking` | none | Splits long texts into chunks, each embedded as its own vector: `{"size": N, "overlap": M, "unit": "chars" \| "tokens"}`. See below. |
 | `requestsPerMinute` | 0 | A ceiling on requests per minute. 0 sets none. |
+| `tokensPerMinute` | 0 | A ceiling on tokens per minute, estimated as one token per four characters of the inputs sent. 0 sets none. |
 | `maxRetries` | 5 | Retries after a network error, a timeout, `429` or `5xx`, with exponential backoff from 1 s to 60 s, or after the provider's `Retry-After`. |
 | `timeoutSecs` | 60 | The time one request may take, within the outbound timeout. |
 
 The index's predicate cannot also be a source predicate. Changing the `embedding` object
 keeps the index's build.
+
+**Chunking.** Without `chunking`, a text longer than `maxInputChars` is cut, and the rest
+is not embedded. With it, a text longer than `size` is split into chunks of at most
+`size` characters, or `size` tokens of four characters each with `"unit": "tokens"`.
+A chunk ends after the last whitespace in the second half of its window, and the next
+chunk repeats the last `overlap` characters or tokens of it, starting at a word where
+one starts in that stretch. A text is split into at most 1024 chunks. With `combine`,
+the joined text is split. Each chunk, after `inputPrefix`, is an input of its own, so a
+subject gets one vector per chunk. A vector search then finds the subject by its
+nearest chunk, and `distinct:subject` lists it once. A text that fits in one chunk is
+embedded as it was without chunking. `size` may be at most 1,000,000 characters, and
+`overlap` must be less than `size`. Turning chunking on or off, or changing it, embeds
+the affected texts again, since their inputs change.
+
+**Rate limits.** After each batch, the worker waits `60 / requestsPerMinute` seconds
+before the next one, and `60 × tokens / tokensPerMinute` seconds, where `tokens` is
+the batch's characters divided by four. The longer wait applies. Searches with text are
+not limited.
 
 * **What the worker writes.** It owns the index's predicate. After it reconciles a
   subject in a graph, the subject's vectors there are exactly the vectors of its current

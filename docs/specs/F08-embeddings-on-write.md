@@ -1,11 +1,11 @@
 # F08: Embeddings computed on write
 
-> **Status:** implemented in part
+> **Status:** implemented
 >
 > **Phases:** Phase 1 shipped: the configuration, the worker, the input record, full
 > passes, `reembed`, status, text queries, the HTTP, CLI, Python and UI surfaces, and tests
-> with a mock provider. Of Phase 2, the metrics shipped. Chunking and a token-based rate
-> limit are not built.
+> with a mock provider. Phase 2 shipped: the metrics, chunking of long texts and a
+> token-based rate limit.
 >
 > **User docs:** [API: Embeddings on write](../API.md#embeddings-on-write) · [Usage: Embeddings](../USAGE.md#embeddings-computed-on-write) · [Features](../FEATURES.md#sparql-arq-equivalent)
 >
@@ -593,7 +593,34 @@ at zero when the dataset is opened, like those of the status. The store's
 `embedding_metrics` returns them, and the library and router tests check them after an
 outage, a rejected input and a caught-up worker.
 
-**Not built.** Chunking and a token-based rate limit, the rest of Phase 2, were not
-built. The NixOS module has no vector settings, so it gained no embedding options, and
-`--embedding-secret` goes through its `extraArgs`. The Similar page and the MCP tool
-`similar_entities` do not search with text.
+**Chunking and token limits** (Phase 2, 2026-10-03). `EmbeddingConfig` gained
+`chunking` (`size`, `overlap` and `unit`, characters or tokens) and `tokensPerMinute`.
+`Chunking::split` cuts a text into windows of at most `size` characters that end after
+whitespace where the second half of the window has some, and starts each next window
+`overlap` characters back, moved forward to a word start within that stretch. Tokens
+count as four characters each, for chunk sizes and for the rate limit, since a
+tokenizer per model would be a large dependency and OpenAI's tokenizers average about
+four characters of English text a token. At most 1024 chunks are taken from one text.
+
+Each chunk becomes an input of its own, and so a vector of its own. §6 suggested a chunk
+predicate, and averaging the chunks' vectors into one was the other choice. Keeping
+each one fits the existing model: a subject already has one vector per literal, the
+reconciliation already compares a subject's sorted inputs with its vectors, and vector
+search already ranks a subject by its best vector and has `distinct:subject`. So a
+search finds the passage that matches, where the mean of the chunks would blur a long
+text into one point. The chunk's text is not stored, so a result names the subject but
+not the chunk. Short texts give the same single input as before, so turning chunking on
+re-embeds only the texts it splits.
+
+The rate limit counts the characters of the inputs a batch sent, divides by four, and
+holds the next batch for `60 × tokens / tokensPerMinute` seconds, or for the request
+limit's wait when that is longer. `embeddings.rs` checks the chunk vectors of a long
+label with an input prefix, a short label left whole, a search by the last chunk,
+re-embedding when chunking is turned off, and the wait after a batch under a token
+limit. A unit test checks the splitting, the overlap at word starts, hard cuts,
+characters against bytes, tokens, and the validation.
+
+**Not built.** The NixOS module has no vector settings, so it gained no embedding
+options, and `--embedding-secret` goes through its `extraArgs`. The Similar page and the
+MCP tool `similar_entities` do not search with text. A chunk's offsets are not stored
+next to its vector.

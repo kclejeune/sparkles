@@ -1977,7 +1977,9 @@ export type EmbeddingConfig = {
   queryText?: boolean;
   batchSize?: number;
   maxInputChars?: number;
+  chunking?: { size: number; overlap?: number; unit?: 'chars' | 'tokens' };
   requestsPerMinute?: number;
+  tokensPerMinute?: number;
   maxRetries?: number;
   timeoutSecs?: number;
 };
