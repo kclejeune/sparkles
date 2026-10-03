@@ -177,9 +177,10 @@ running queries.
   ([features](docs/FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)).
 * Storage quotas per dataset, and a shutdown that lets requests in flight finish within
   a grace period ([API](docs/API.md#storage-quotas)).
-* An MCP server for LLM agents, over stdio or at `/$/mcp` on the server. Each call runs as
-  its caller, within query budgets, and the write tool is opt-in. Each stored query is a
-  tool of its own ([usage](docs/USAGE.md#mcp-server-llm-agents)).
+* An MCP server for LLM agents, over stdio or at `/$/mcp` on the server, with a stdio
+  bridge to a running server. Each call runs as its caller, within query budgets, and the
+  write tool is opt-in. Each stored query is a tool of its own, and calls can read past
+  states from the dataset's history ([usage](docs/USAGE.md#mcp-server-llm-agents)).
 * A Docker image with a compose file, and a Nix package with a NixOS module
   ([Docker](docs/USAGE.md#docker), [NixOS](docs/USAGE.md#deploying-on-nixos)).
 
@@ -316,7 +317,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `graphql` | Run a GraphQL document, and print, install, delete or draft the mapping schema. |
 | `text-index`, `vector`, `geo-index` | Manage the full-text, vector and spatial indexes. |
 | `auth` | Hash passwords, manage API tokens and sign in for remote commands (`auth login`). |
-| `mcp` | Run the MCP server for LLM agents over stdio. `serve --mcp` serves it over HTTP. |
+| `mcp` | Run the MCP server for LLM agents over stdio. `serve --mcp` serves it over HTTP, and `mcp --url` bridges stdio to a running server. |
 | `fmt`, `lint`, `lsp` | Run the formatter, the linter or their language server. |
 | `convert` (`riot`), `compare` (`rdfdiff`), `qparse`, `uparse`, `iri`, `langtag` | Convert, validate and count RDF files, compare them up to blank-node isomorphism, print a query's algebra or plan, and check IRIs and language tags. |
 | `rsparql`, `rupdate`, `rset` | Query and update any SPARQL endpoint, and convert result sets. |

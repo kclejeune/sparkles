@@ -6674,6 +6674,8 @@ sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
              [--allow-update] [--allow-service] [--timeout SECS] [--query-memory-mb N]
              [--max-rows N] [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
              [--disable-tool NAME]... [--no-stored-queries] [--schema-max-entries N] [--text]
+             [--task-after-ms MS]
+sparkles mcp --url URL [--token TOKEN] [--insecure-http]
 ```
 
 | Flag | Default | Meaning |
@@ -6692,6 +6694,10 @@ sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
 | `--outbound-allow-private`, `--outbound-block-private`, `--outbound-allow HOST_OR_CIDR`, `--outbound-timeout S`, `--outbound-max-mb N` | private blocked, none, `60`, `256` | Where an allowed `SERVICE` may connect, as for `sparkles serve`. |
 | `--disable-tool NAME` | | Does not offer the tool. |
 | `--no-stored-queries` | off | Does not offer the datasets' stored queries as tools. |
+| `--task-after-ms MS` | `2000` | How long a call of a client that supports the tasks extension runs before it becomes a task (see [Tasks](#tasks)). |
+| `--url URL` | | Bridges stdio to the `/$/mcp` endpoint of a running server instead of opening databases (see [Bridge to a server](#bridge-to-a-server)). |
+| `--token TOKEN` | | With `--url`: the API token to send, instead of `SPARKLES_TOKEN` or the saved login. |
+| `--insecure-http` | off | With `--url`: allows plain `http` to a host other than localhost. |
 
 The process exits 0 when stdin closes and 1 on a startup error. Logs go to stderr.
 
@@ -6699,7 +6705,15 @@ The process exits 0 when stdin closes and 1 on a startup error. Logs go to stder
 handshake of `2025-11-25` and `2025-06-18`. Revision `2026-07-28` is stateless. It uses
 `server/discover`, and each request carries the protocol version and client capabilities
 in its `_meta`. An unknown revision gets `-32022` with `data.supported`. The capabilities
-are `{"tools": {}, "resources": {}, "prompts": {}}`. `server/discover` is cacheable for
+are these:
+
+```json
+{"tools": {"listChanged": true}, "resources": {"listChanged": true, "subscribe": true},
+ "prompts": {}, "completions": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}}
+```
+
+The legacy handshake leaves out `resources.subscribe`, because only
+`subscriptions/listen` serves resource updates. `server/discover` is cacheable for
 an hour (`ttlMs: 3600000`). `tools/list` is cacheable for a minute (`ttlMs: 60000`),
 because stored queries come and go as tools. Their `cacheScope` is `public`, except on
 an HTTP server with authentication, where tool listings differ between callers and the
@@ -6718,6 +6732,9 @@ open-world when SERVICE is allowed. The common arguments are:
 * `dataset`: a name from `list_datasets`. It is optional when the server has one
   dataset.
 * `atCommit` (integer): read the snapshot of that commit (see below).
+* `at` (integer or string): read a past state, given as a commit number, `commit:N`,
+  `time:<RFC 3339>`, `snapshot:<name>` or `head`. A call takes `at` or `atCommit`, not
+  both.
 * `reasoning` (boolean): include materialized inferences. By default they are included
   when the dataset has them.
 * IRIs may be given as `<http://…>`, `http://…` or a prefixed name (`ex:alice`, with the
@@ -6726,24 +6743,26 @@ open-world when SERVICE is allowed. The common arguments are:
 
 | Tool | Arguments (besides the common ones) | Result |
 |---|---|---|
-| `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}` |
+| `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable, graphql?}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}`. `graphql: true` marks a dataset that `graphql_query` reads. |
 | `describe_schema` | `section` (`summary`\|`classes`\|`predicates`\|`constraints`\|`profiles`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor`, `subjectClasses`, `shapes`, `classes` (IRIs, with `profiles`) | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?, superClassExpressions?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?, subjectClasses?: ["ex:Person 120", …, "untyped 3"]}], constraints?: [{source, graphs, mode?, threshold?, classes: [{class, closed?, properties: [{path, constraints: "min 1 · max 1 · datatype xsd:string", enforcement}]}]}], next, prefixes}`. The summary lists the largest classes and predicates. `classes` and `predicates` page through all entries in IRI order. `subjectClasses: true` adds the ten classes of each predicate's subjects with the most triples. `constraints` lists the [constraints layer](#constraints-layer), from the write-time SHACL validation or from the sources in `shapes`. `profiles` lists the [class profiles](#class-profiles) of the classes with the most instances, or of those in `classes`: `profiles: [{class, instances, properties: [{predicate, instances, triples, valuesPerInstance: "1..2", objects: {iri?, "xsd:string"?: n, …}, objectClasses?}], incoming}]`, with at most 25 properties and 10 incoming predicates per class. |
 | `diff_schema` | `from` (a commit, or `time:…` / `snapshot:…`), `to` (the head), `graph`, `reasoning`, `limit` (50, at most 500 entries per list), `timeoutSeconds` | `{dataset, from, to, graph, reasoning, counts, report: [Change], classes: {added: [iri], removed: [iri], changed: [{iri, changes: [Change]}]}, predicates: {…}, truncated, prefixes}`: the [schema diff](#schema-diffs) between two readable states. `404` for a commit beyond the head and `410` for one whose history is gone. |
 | `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, in SHACL Turtle or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
 | `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | One text block: a table or a JSON document (below). No `structuredContent`. |
 | `explain_query` | `query` (required), `includeAlgebra` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. |
-| `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, prefixes}`. Each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others. |
-| `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null}` |
+| `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`), `mode` (`cbd`\|`scbd`\|`outgoing`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, description?, prefixes}`. Each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others. With `mode`, `description` is `{mode, triples: ["s p o"], truncated}`: the resource's [DESCRIBE](#describe) in that mode, at most `maxTriples` triples. |
+| `find_paths` | `source` and `target` (IRIs; at least one), `predicates` (≤ 20 IRIs; default all), `algorithm` (`shortest`\|`allShortest`\|`kShortest`\|`all`), `direction` (`forward`\|`backward`\|`both`), `minLength`, `maxLength`, `k`, `limit` (10, ≤ 100), `maxVisited`, `weight` (an IRI), `defaultWeight`, `graph` (`default` or a named graph IRI), `timeoutSeconds` (30) | `{dataset, commit, algorithm, paths: [{source, target, length, cost, edges: ["s p o"]}], limited, edgesTruncated, prefixes}`: a [path search](#path-search) as `SERVICE path:search` runs it. With one end, the paths to or from every node it connects to, at most `limit`. At most 2000 edges are returned in all. A malformed search is `syntax`, with the `path:search` message. |
+| `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null, readable: [{from, to}], snapshots: [{name, commit}]}`. `readable` lists the commits whose state `at` and `atCommit` can read, and `snapshots` the 20 newest named snapshots. |
 | `search_text` | `query` (required, ≤ 1000 characters: terms, `"phrases"`, AND/OR, `+required`, `-excluded`), `predicates` (≤ 20 IRIs), `lang`, `limit` (20, ≤ 200), `withTypes` (true) | `{dataset, commit, hits: [{s, score, text, p, label?, types?}], limited, prefixes}`: BM25-ranked matches of `text:query`. `text` is the matched literal, escaped and at most 300 characters long, and `types` has at most 3 entries. Only in builds with the `text` feature. A dataset without an index (`textSearch: false`) gives `text-disabled`. |
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: an exact `spk:vectorSearch` over the stored `spk:vector` literals. The tool never computes embeddings. `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `shapesFormat` (`turtle` or `shaclc`), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
 | `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
-| `sparql_update` | `update` (required, ≤ 1 Mi characters), `message` (the commit message), `dryRun` (preview instead of committing), `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | `{dataset, committed, commit, inserted, deleted, message?, validation?, elapsedMs}`: the receipt of the write. A dry run adds `dryRun`, `wouldCommit`, `outcome`, `head`, `graphs`, `changes?`, `storage` and `error?` (below). Listed only when the server allows updates and the caller may write to a dataset (below). |
+| `graphql_query` | `query` (a GraphQL document, ≤ 65536 characters; leave it out for the API schema), `variables`, `operationName`, `maxBytes` (65536), `timeoutSeconds` (30) | One text block: the [GraphQL](#graphql) response as JSON with the dataset and commit added, `{dataset, commit, data?, errors?, extensions?}`, or the API schema (SDL) without `query`. Mutations are refused. Listed only while a dataset the caller may query through GraphQL has a schema installed. Only in builds with the `graphql` feature. |
+| `sparql_update` | `update` or `patch` (one of them, ≤ 1 Mi characters), `message` (the commit message), `ifHead` (a commit), `dryRun` (preview instead of committing), `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | `{dataset, committed, commit, inserted, deleted, patch?, message?, validation?, elapsedMs}`: the receipt of the write. A patch adds `patch: {rows, aborted, prevChecked, prefixesSet, prefixesRemoved}`. A dry run adds `dryRun`, `wouldCommit`, `outcome`, `head`, `graphs`, `changes?`, `storage` and `error?` (below). Listed only when the server allows updates and the caller may write to a dataset (below). |
 
-Every tool except `sparql_query` declares an `outputSchema` and returns
-`structuredContent` plus the same object as one compact JSON text block. `tools/list`
-has the complete JSON Schemas.
+Every tool except `sparql_query` and `graphql_query` declares an `outputSchema` and
+returns `structuredContent` plus the same object as one compact JSON text block.
+`tools/list` has the complete JSON Schemas.
 
 **Stored queries.** After the tools above, `tools/list` has one tool per
 [stored query](#stored-queries) that the caller may run and whose `mcp` is not `false`.
@@ -6753,7 +6772,7 @@ queries that would get the same name are both left out. The description is the q
 description, followed by its kind, dataset and version. The input schema has one
 property per parameter, with JSON type `integer`, `number`, `boolean` or `string`, its
 description, default and `enum`, and lists the required ones. It also has `format`,
-`maxRows`, `offset`, `atCommit` and `timeoutSeconds` from `sparql_query`, unless a
+`maxRows`, `offset`, `atCommit`, `at` and `timeoutSeconds` from `sparql_query`, unless a
 parameter has the same name. A call binds its arguments as a run over HTTP does and
 answers like `sparql_query`. A value that does not fit is `bad-argument`, and the
 message names the parameter.
@@ -6800,13 +6819,19 @@ boolean?, total | null, offset, returned, truncated: null | {reason: "maxRows"|"
 next: {offset, atCommit}}, termsShortened, prefixes, elapsedMs}`, also bounded by
 `maxBytes`.
 
-**Snapshots.** A call without `atCommit` reads the head and names its commit. With
-`atCommit`, the call reads that commit if it is the head or is still held. The server
-holds the last 4 commits read per dataset, and 32 overall, for 10 minutes after their
-last use. Otherwise the call fails with `unknown-commit`, with a message such as
-"commit 38 is no longer held (head is 42); rerun without atCommit …" or
-"commit 57 does not exist …". All internal queries of one call read one snapshot, and
-`describe_schema` cursors are bound to their snapshot.
+**Snapshots and past states.** A call without `atCommit` or `at` reads the head and
+names its commit. The server holds the last 4 commits read per dataset, and 32 overall,
+for 10 minutes after their last use, and a call that names a held commit reads it from
+memory. A commit the server does not hold is read from the dataset's
+[history](#point-in-time-reads-and-snapshots) when the dataset still keeps that state, within its named
+snapshots and retention window. `at` selects a state by commit, by time (the last commit
+at or before the instant) or by snapshot name, as the HTTP `?at=` parameter does. A state
+read from history is then held like any other. A commit beyond the head, an unknown
+snapshot or a time before history fails with `unknown-commit` (404). A state the dataset
+no longer keeps fails with `unknown-commit` (410), with a message such as
+"commit 38 is no longer held (head is 42); rerun without atCommit …", and the hint names
+the commits the dataset still keeps. All internal queries of one call read one snapshot,
+and `describe_schema` cursors are bound to their snapshot.
 
 ### The write tool
 
@@ -6828,6 +6853,19 @@ this tool fails with `not-an-update`. The result is the write's receipt, with th
 commit's sequence number, the quads inserted and deleted, and the validation summary when
 a guard ran.
 
+`patch` instead of `update` applies an [RDF Patch](#applying-rdf-patch) in its text form,
+as `POST /{ds}/patch` does. It needs a `write` grant that reaches the `patch` endpoint.
+The patch is one write, a `TA` row aborts it, and a `prev` header must name the head. A
+patch that does not parse, or whose `prev` names another commit, fails with
+`patch-error` (400 or 412) and writes nothing.
+
+`ifHead: N` makes either write conditional, as `If-Match` does on the Graph Store. The
+write goes ahead only while commit `N` is the dataset's head, and the store checks it with
+the writer lock held, so no other commit can come between the check and the write.
+Otherwise the call fails with `precondition-failed` (412) and writes nothing. An agent
+passes the `commit` of the result it based its change on, and when the head moved, it
+reads again before it retries.
+
 With `dryRun: true` the update is a [write preview](#write-previews). It runs up to its
 commit and writes nothing. The result has `dryRun: true`, `committed: false`,
 `wouldCommit`, `outcome`, the `head` it ran against, the sequence number the commit would
@@ -6840,27 +6878,108 @@ update. A dry run needs the same permission as the write, and `--mcp-allow-updat
 
 ### Resources and prompts
 
-Each dataset the caller may read has two resources:
+Each dataset the caller may read has two resources, and each stored query that the
+caller may run as a tool has one:
 
 | URI | `mimeType` | Content |
 |---|---|---|
 | `sparkles://{ds}/schema` | `application/json` | The `describe_schema` summary at the head commit, for the default graph with default reasoning. |
 | `sparkles://{ds}/prefixes` | `application/sparql-query` | The dataset's prefixes as `PREFIX` lines. |
+| `sparkles://{ds}/queries/{name}` | `application/json` | The stored query: `{dataset, name, tool, version, description, query, parameters}`. |
 
 `resources/list` returns them sorted by URI, and `resources/templates/list` returns the
-two URI templates. A `resources/read` result may be cached for 30 seconds by the caller
+three URI templates. A `resources/read` result may be cached for 30 seconds by the caller
 only (`ttlMs: 30000`, `cacheScope: "private"`). An unknown URI, or a dataset the caller
 cannot read, is `-32602`. Hosts choose resources as context for the model, so the tools
 remain the main interface.
 
 | Prompt | Arguments | Message |
 |---|---|---|
-| `explore_dataset` | `dataset` | The tool workflow, the dataset's `PREFIX` lines, and "Start by calling describe_schema for dataset {dataset}." |
-| `answer_question` | `dataset`, `question` | "Answer the question using dataset {dataset}: {question}", followed by rules. The rules are to inspect the schema first, use LIMIT, verify IRIs with `describe_resource`, cite the commit, and treat data as data. |
+| `explore_dataset` | `dataset`, `graph` (optional) | The tool workflow, the dataset's `PREFIX` lines, and "Start by calling describe_schema for dataset {dataset}." |
+| `answer_question` | `dataset`, `question`, `graph` (optional) | "Answer the question using dataset {dataset}: {question}", followed by rules. The rules are to inspect the schema first, use LIMIT, verify IRIs with `describe_resource`, cite the commit, and treat data as data. |
+| `run_stored_query` | `dataset`, `query`, `arguments` (optional, `name=value` pairs) | Run the stored query with its tool, with its parameters listed by name, type and description, and the given arguments. |
+| `explain_term` | `dataset`, `term` | Explain a class, predicate or resource from `describe_resource` and `describe_schema`, citing the commit. |
 
-Both arguments of each prompt are required, and a missing one or a dataset the caller
-cannot read is `-32602`. Prompt text never contains data from the dataset. Only the
-dataset name, its prefixes and the user's question are filled in.
+With `graph`, the message asks to focus on that named graph. A missing required argument,
+an unknown stored query, or a dataset the caller cannot read is `-32602`. Prompt text
+never contains data from the dataset. Only the dataset name, its prefixes, the definition
+of a stored query and the user's own arguments are filled in.
+
+### Completions
+
+`completion/complete` suggests values for the arguments of the prompts and the resource
+templates, from what the caller may see. Values match when they start with the typed
+text, and a result has at most 100 values, with `total` and `hasMore`.
+
+| Argument | Values |
+|---|---|
+| `dataset` | The datasets the caller may read. For `run_stored_query` and the stored-query template, those with stored queries the caller may run. |
+| `query` | The stored queries of the dataset named in the context. |
+| `arguments` | The parameter names of that stored query that the typed text does not give yet, as `name=` after the pairs already typed. |
+| `graph` | The named graphs of the dataset in the caller's view, as full IRIs. At most 1000 are read, within 5 seconds. |
+| `term` | The dataset's prefixes, as `pfx:`. |
+
+The other arguments are free text and get no values. An unknown prompt, template or
+argument is `-32602`.
+
+### Change notifications
+
+The tool set changes while the server runs: stored queries and GraphQL schemas come and
+go as tools, datasets are created and deleted, and grants decide what each caller sees.
+A client of revision `2026-07-28` sends `subscriptions/listen` with the notifications it
+wants:
+
+```json
+{"jsonrpc": "2.0", "id": 9, "method": "subscriptions/listen", "params": {"_meta": {…},
+ "notifications": {"toolsListChanged": true, "resourcesListChanged": true,
+                   "resourceSubscriptions": ["sparkles://books/schema"]}}}
+```
+
+The server acknowledges with `notifications/subscriptions/acknowledged`, then sends
+`notifications/tools/list_changed`, `notifications/resources/list_changed` and
+`notifications/resources/updated` (with the URI) until the client cancels the request.
+Over HTTP the answer is an SSE stream. A subscription looks at what its caller sees every
+2 seconds. It compares the tools the caller may call, with the versions of the stored
+queries behind them, and the URIs of its resources. For a subscribed resource it compares
+the dataset's head commit, its prefixes, or the stored query's version. A resource the
+caller may not read reports nothing. A legacy session gets the two list notifications on
+its stream from `notifications/initialized` on, and has no resource subscriptions. At
+most 64 subscriptions and sessions watch at once.
+
+### Tasks
+
+The server supports the tasks extension of MCP (`io.modelcontextprotocol/tasks`). When a
+client declares it in its capabilities, a tool call that runs longer than
+`--task-after-ms` (`--mcp-task-after-ms` over HTTP, 2 seconds by default) is answered
+with a task, `{resultType: "task", taskId, status: "working", pollIntervalMs: 500, …}`,
+and keeps running. The client polls `tasks/get`, which returns the call's result once
+the status is `completed`, `failed` or `cancelled`. `tasks/cancel` stops the call at the
+engine's next check, as `notifications/cancelled` does. No tool asks for input, so
+`tasks/update` is `-32602`. A task belongs to its caller, and another caller's
+`tasks/get` or `tasks/cancel` gets the answer for an unknown task. The result of a task
+is kept for 10 minutes after it ends, and at most 64 tasks run at once. Beyond that,
+calls run to their end as for a client without the extension. Over HTTP, `tasks/*`
+requests carry the task id as `Mcp-Name`.
+
+### Bridge to a server
+
+`sparkles mcp --url https://host:3030` serves stdio, as `sparkles mcp` does, but sends
+every message to the `/$/mcp` endpoint of that server, so that MCP hosts that launch
+stdio servers can use a database that a running server holds. The server's tools, limits
+and permissions apply. The bridge signs in with `--token`, else `SPARKLES_TOKEN`, else
+the token that `sparkles auth login` saved for that server, and an answer of `401` tells
+the host to run `sparkles auth login`. Plain `http` is refused for hosts other than
+localhost unless `--insecure-http` is given.
+
+The bridge adds the transport's headers (`MCP-Protocol-Version`, `Mcp-Method` and
+`Mcp-Name`), writes each message of a JSON or SSE answer as one line, and runs requests
+concurrently. `notifications/cancelled` drops the HTTP request it names, which cancels
+the call on the server. A legacy session keeps its `Mcp-Session-Id`, opens its
+notification stream after `notifications/initialized`, and ends when stdin closes.
+
+```json
+{ "command": "sparkles", "args": ["mcp", "--url", "https://sparql.example.org"] }
+```
 
 ### HTTP endpoint `/$/mcp`
 
@@ -6878,6 +6997,7 @@ dataset name, its prefixes and the user's question are filled in.
 | `--mcp-disable-tool NAME` | | Does not offer the tool (repeatable). |
 | `--mcp-no-stored-queries` | off | Does not offer the datasets' stored queries as tools. |
 | `--mcp-max-sessions N` | `256` | Sessions of legacy clients open at once. `0` serves those clients without sessions. |
+| `--mcp-task-after-ms MS` | `2000` | How long a call of a client that supports tasks runs before it becomes a task (see [Tasks](#tasks)). |
 
 A call may ask for a `timeoutSeconds` up to the server's `--timeout`, and calls default
 to 30 seconds. The intermediate-row cap is `--max-rows`.
@@ -6887,9 +7007,10 @@ specification. A client POSTs one JSON-RPC message with `Content-Type: applicati
 and `Accept: application/json, text/event-stream`.
 
 - A request of revision `2026-07-28` is stateless. It carries `MCP-Protocol-Version`,
-  `Mcp-Method` and, for `tools/call`, `resources/read` and `prompts/get`, `Mcp-Name`. The
-  answer is one `application/json` response. Headers that disagree with the body get
-  `400` with `-32020`. An unknown method gets `404` with `-32601`.
+  `Mcp-Method` and, for `tools/call`, `resources/read`, `prompts/get` and `tasks/*`,
+  `Mcp-Name`. The answer is one `application/json` response, except for
+  `subscriptions/listen`, whose answer is an SSE stream. Headers that disagree with the
+  body get `400` with `-32020`. An unknown method gets `404` with `-32601`.
 - A legacy client starts with `initialize` and gets an `Mcp-Session-Id`. It sends that
   header, and `MCP-Protocol-Version`, with every later message. Answers to its requests
   come as a short `text/event-stream`. GET with the session id opens the session's
@@ -6922,10 +7043,10 @@ the CSRF header as on every other route.
 **Limits.** A `tools/call` is charged to the `query` [rate limit](#rate-limiting) of its
 dataset, and a `sparql_update` call to the `update` limit, as the SPARQL endpoints are.
 The client key is the same, so a caller's MCP calls and its SPARQL requests share their
-budgets. A `resources/read` counts as a query. Listings, `initialize`, prompts and
-notifications are not charged. A limited message gets `429` or `503` with `Retry-After`,
-like any other request. The concurrency permits are held until the tool's work ends, even
-when the client has disconnected. Closing the connection of a stateless request cancels
+budgets. A `resources/read` counts as a query. Listings, completions, subscriptions,
+task polls, `initialize`, prompts and notifications are not charged. A limited message
+gets `429` or `503` with `Retry-After`, like any other request. The concurrency permits
+are held until the tool's work ends, even when the client has disconnected. Closing the connection of a stateless request cancels
 its tool call.
 
 **Origin and Host.** The endpoint is behind the same checks as every route. A request
@@ -6959,7 +7080,10 @@ is the equivalent HTTP status:
 | `timeout` | 408 | The call's timeout passed. |
 | `budget-memory`, `budget-rows`, `budget-rows-produced`, `budget-validation-work` | 507 | A query or validation budget was exceeded. |
 | `service-disabled` | 403 | A query uses SERVICE and it is not allowed. |
-| `unknown-commit` | 404 / 410 | `atCommit` is in the future (404) or no longer held (410). |
+| `unknown-commit` | 404 / 410 | `atCommit` or `at` names a commit beyond the head, an unknown snapshot or a time before history (404), or a state the server no longer holds and the dataset no longer keeps (410). |
+| `precondition-failed` | 412 | The dataset's head is not the commit of `ifHead`. Nothing was written. |
+| `patch-error` | 400 / 412 | A patch that does not parse (400), or whose `prev` names a commit other than the head (412). |
+| `graphql-error`, `graphql-not-installed` | 400 or 405, 404 | A GraphQL document that does not parse or validate, or a mutation (405). A dataset without a GraphQL schema. |
 | `stale-cursor` | 409 / 400 | A schema cursor whose snapshot is gone (409), or a malformed cursor (400). |
 | `unknown-graph`, `too-many-entries` | 404, 413 | Schema discovery errors. `unknown-graph` also covers the `graph` of a validation tool. |
 | `text-disabled` | 400 | `search_text` on a dataset without a full-text index. |

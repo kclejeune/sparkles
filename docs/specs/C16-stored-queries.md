@@ -374,6 +374,10 @@ query that filters by two parameters and returns 100 rows took a minimum of 7.7 
 HTTP, against 6.8 ms for the same query with constants sent to `/{ds}/sparql`. Both
 results bypassed the result cache. The medians were too noisy on that machine to compare.
 
-**Not built.** Stored updates, parameters that bind several values, per-user queries, a
-`--server` mode for `sparkles queries`, and `notifications/tools/list_changed` were not
-built.
+**Not built.** Stored updates, parameters that bind several values, per-user queries and
+a `--server` mode for `sparkles queries` were not built.
+
+**Later additions (2026-10-03).** MCP clients learn that a stored query was saved or
+deleted through `notifications/tools/list_changed`, each stored query offered as a tool
+is also a resource with its definition, and the `run_stored_query` prompt explains its
+parameters ([C11](C11-mcp-server.md#outcome)).

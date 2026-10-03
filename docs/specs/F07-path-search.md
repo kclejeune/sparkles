@@ -507,6 +507,10 @@ everyone took 1.6 s, because Dijkstra's algorithm seeks the index once per node 
 of sweeping whole levels.
 
 **Not built.** Edges from a nested pattern, a direction per predicate, a `path:edge`
-binding of the edge as a triple term, a dedicated MCP tool and the Cypher frontend's
-use of the operator were not built. Zero-weight edges can hide equally cheap paths from
-`path:allShortest`, as §9 says.
+binding of the edge as a triple term and the Cypher frontend's use of the operator were
+not built. Zero-weight edges can hide equally cheap paths from `path:allShortest`, as
+§9 says.
+
+**Later additions (2026-10-03).** The MCP server gained a dedicated tool, `find_paths`,
+which writes the search's block from its arguments and returns the paths with their
+edges ([C11](C11-mcp-server.md#outcome)).

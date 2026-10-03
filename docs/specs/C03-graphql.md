@@ -3,8 +3,9 @@
 > **Status:** implemented in part (Phase 1)
 >
 > **Phases:** Phase 1 shipped on 2026-10-02: the adapter, the schema configuration,
-> schema drafts, `/{ds}/graphql` and the CLI. Phase 2 (the UI, stored GraphQL queries
-> and MCP tools) is not built. Phase 3 is subscriptions, built only if a workload asks
+> schema drafts, `/{ds}/graphql` and the CLI. Of Phase 2, the MCP tool `graphql_query`
+> came on 2026-10-03 with [C11](C11-mcp-server.md#outcome), and the UI and stored
+> GraphQL queries are not built. Phase 3 is subscriptions, built only if a workload asks
 > for them.
 >
 > **User docs:** [API: GraphQL](../API.md#graphql) · [Usage: GraphQL](../USAGE.md#graphql) ·
@@ -1249,3 +1250,9 @@ schema editor, stored GraphQL queries, `persistedOnly`, the MCP tools,
 `QueryOptions::seed` and the per-group top-k, and Phase 3 holds subscriptions. Nested
 lists are not connections, and a nested `first` limits the response while the engine
 produces every value of the field.
+
+**Later additions (2026-10-03).** The MCP server gained `graphql_query`, which runs a
+document on a dataset with a schema installed, refuses mutations, and returns the API
+schema when called without a document ([C11](C11-mcp-server.md#outcome)). It answers
+with the GraphQL response as JSON, not compacted as tables are, and there is no separate
+`graphql_schema` tool. Stored GraphQL queries and their tools are still not built.

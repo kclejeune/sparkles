@@ -1554,6 +1554,14 @@ The tools are read-only unless the operator turns on the write tool:
   `section: "constraints"` lists the SHACL constraints per class, and with
   `subjectClasses: true` it names the classes that use each predicate. With
   `section: "profiles"` it lists the predicates the instances of each class use.
+  `describe_resource` with `mode` (`cbd`, `scbd` or `outgoing`) adds the resource's
+  DESCRIBE in that mode.
+* `find_paths` finds the shortest path, all shortest paths, the k shortest or all paths
+  up to a length between two nodes, or from one node, as
+  [`SERVICE path:search`](#finding-paths) does, and returns each path's edges.
+* `graphql_query` runs read-only GraphQL on a dataset with a GraphQL schema installed.
+  Called without a query, it returns the API schema to write queries against. It is
+  listed only while such a dataset exists.
 * `draft_shapes` drafts SHACL shapes or a ShEx schema from the data, with the number of
   instances each constraint would exclude.
 * `diff_schema` lists the classes and predicates that changed between two commits or
@@ -1571,15 +1579,22 @@ The tools are read-only unless the operator turns on the write tool:
 * `format` formats a SPARQL query or update, Turtle, TriG, N-Triples, N-Quads or JSON-LD
   the way `sparkles fmt` does, and returns the text with any warnings. It reads no
   dataset.
-* `sparql_update` runs SPARQL Update. It is offered only with `--allow-update` (or
-  `serve --mcp-allow-update`), never on a read-only server. Writes pass the dataset's
-  write-time validation, the call's `message` becomes the commit message, and `LOAD` is
-  refused. Hosts that confirm destructive tools ask before each call.
+* `sparql_update` runs SPARQL Update, or applies an RDF Patch given as `patch`. It is
+  offered only with `--allow-update` (or `serve --mcp-allow-update`), never on a
+  read-only server. Writes pass the dataset's write-time validation, the call's
+  `message` becomes the commit message, and `LOAD` is refused. `ifHead` makes the write
+  conditional. It happens only while that commit is still the head, so an agent that
+  read commit 42 does not overwrite a change it has not seen. Hosts that confirm
+  destructive tools ask before each call.
 
-Hosts can also attach two resources per dataset as context, the schema summary
-(`sparkles://{ds}/schema`) and the prefixes (`sparkles://{ds}/prefixes`). Two prompts,
-`explore_dataset` and `answer_question`, start a session with the tool workflow and the
-dataset's prefixes.
+Hosts can also attach resources as context: the schema summary
+(`sparkles://{ds}/schema`) and the prefixes (`sparkles://{ds}/prefixes`) of each
+dataset, and the definition of each stored query (`sparkles://{ds}/queries/{name}`).
+The prompts `explore_dataset` and `answer_question` start a session with the tool
+workflow and the dataset's prefixes, `run_stored_query` runs a stored query with its
+parameters explained, and `explain_term` explains a class, predicate or resource. Hosts
+that offer completion suggest dataset names, stored queries and their parameters, named
+graphs and prefixes for these arguments, from what the caller may see.
 
 [API.md](API.md#mcp-server) has the tool schemas. Results are sized for a model's
 context. Query rows come back as a compact table with the dataset's prefixes, up to 100
@@ -1587,7 +1602,16 @@ rows or 64 KiB by default. Every truncation is announced with the exact total an
 continue. Data values are escaped so they cannot pass for table structure or status
 lines. Every result names the commit it read. Passing that commit back as `atCommit`
 keeps a multi-call exploration on one snapshot. The server holds the last 4 commits read
-per dataset for 10 minutes.
+per dataset for 10 minutes, and older commits stay readable while the dataset's
+[history](API.md#point-in-time-reads-and-snapshots) keeps them. `at` reads a past state by
+commit, time or snapshot name, such as `"at": "time:2026-09-01T00:00:00Z"` or
+`"at": "snapshot:release-3"`, and `list_commits` lists the commits and snapshots that
+are readable.
+
+A call of a host that supports the tasks extension becomes a task when it runs longer
+than 2 seconds (`--task-after-ms`). The host polls for its result and can cancel it.
+Hosts that subscribe to changes hear when tools appear or go away, for example when a
+stored query is saved, and when a subscribed resource changes.
 
 Every call runs under the query timeout, a memory budget (`--query-memory-mb`, default
 2048), the intermediate-row cap and, with `--max-rows-produced`, a cap on the rows all of
@@ -1638,6 +1662,19 @@ The command line does the same with
 `claude mcp add --transport http sparkles 'https://sparql.example.org/$/mcp' --header
 "Authorization: Bearer $SPARKLES_TOKEN"`. Other hosts take the same URL and header. A
 server without auth needs no header, and it listens on loopback only.
+
+A host that only launches stdio servers can reach the endpoint through
+`sparkles mcp --url`, which forwards each message to the server. It signs in with the
+token that `sparkles auth login` saved for that server, or with `--token` or
+`SPARKLES_TOKEN`:
+
+```sh
+sparkles auth login --server https://sparql.example.org
+claude mcp add sparkles -- sparkles mcp --url https://sparql.example.org
+```
+
+This is also the way to give a stdio host a database that a running server holds, since
+`sparkles mcp --loc` cannot open it while the server has its lock.
 
 MCP calls follow the server's rules. The rate limits of the `query` and `update` classes
 apply per dataset, as for `/{ds}/sparql` and `/{ds}/update`, and the memory budget is the
