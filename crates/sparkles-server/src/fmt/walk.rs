@@ -91,6 +91,27 @@ pub fn walk_takes(path: &Path) -> bool {
 /// The files under `paths`, each once, in command-line order (directories sorted by
 /// path), and the errors (`path: error: …`) of paths that cannot be read.
 pub fn collect(paths: &[PathBuf], cwd: &Path, ignores: &Arc<Ignores>) -> (Vec<Input>, Vec<String>) {
+    collect_with(
+        paths,
+        cwd,
+        ignores,
+        walk_takes,
+        ("format", "formatted"),
+        &EXTENSIONS,
+    )
+}
+
+/// [`collect`] for another command: a walk visits the files `takes` accepts, and an
+/// empty directory is an error that says there is nothing to do (`verb`, `verb.0` the
+/// verb and `verb.1` its participle) and lists `extensions`.
+pub fn collect_with(
+    paths: &[PathBuf],
+    cwd: &Path,
+    ignores: &Arc<Ignores>,
+    takes: fn(&Path) -> bool,
+    verb: (&str, &str),
+    extensions: &[&str],
+) -> (Vec<Input>, Vec<String>) {
     let mut inputs = Vec::new();
     let mut errors = Vec::new();
     let mut seen = HashSet::new();
@@ -142,7 +163,7 @@ pub fn collect(paths: &[PathBuf], cwd: &Path, ignores: &Arc<Ignores>) -> (Vec<In
             .build();
         for entry in walk {
             match entry {
-                Ok(e) if e.file_type().is_some_and(|t| t.is_file()) && walk_takes(e.path()) => {
+                Ok(e) if e.file_type().is_some_and(|t| t.is_file()) && takes(e.path()) => {
                     found = true;
                     let rel = e.path().strip_prefix(&abs).unwrap_or(e.path());
                     let path = match p.as_os_str() == "." {
@@ -165,9 +186,11 @@ pub fn collect(paths: &[PathBuf], cwd: &Path, ignores: &Arc<Ignores>) -> (Vec<In
         }
         if !found {
             errors.push(format!(
-                "{}: error: no files to format in this directory (formatted extensions: {})",
+                "{}: error: no files to {} in this directory ({} extensions: {})",
                 p.display(),
-                EXTENSIONS.join(", ")
+                verb.0,
+                verb.1,
+                extensions.join(", ")
             ));
         }
     }

@@ -10,6 +10,7 @@
 //! `prune-prefixes` the input is read twice: stdin is kept in a temporary file).
 
 pub(crate) mod config;
+pub(crate) mod lint;
 pub(crate) mod report;
 mod walk;
 
@@ -126,14 +127,14 @@ pub struct FmtArgs {
     pub threads: Option<usize>,
 }
 
-fn parse_language(s: &str) -> Result<Language, String> {
+pub(crate) fn parse_language(s: &str) -> Result<Language, String> {
     Language::from_name(s)
         .ok_or_else(|| "expected sparql, turtle, trig, ntriples, nquads or jsonld".to_string())
 }
 
 /// A size: bytes, or a number with a binary suffix (`K`/`KiB`, `M`/`MiB`, `G`/`GiB`,
 /// `T`/`TiB`; ASCII case-insensitive, a space allowed before it).
-fn parse_size(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let n: u64 = s[..digits]
@@ -965,7 +966,7 @@ fn sniffed(text: &str) -> Result<Language, String> {
 /// Replace `path` (through symbolic links) with `text`: a temporary file in the same
 /// directory with the same permissions, synced, then renamed over it, so a reader sees
 /// the old file or the new one, never a partial one.
-fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     let target = std::fs::canonicalize(path)?;
     let dir = target.parent().unwrap_or(Path::new("."));
     let permissions = std::fs::metadata(&target)?.permissions();

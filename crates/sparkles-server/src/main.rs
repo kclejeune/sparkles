@@ -925,6 +925,11 @@ enum Cmd {
     /// -l) or rewrite (--write)
     #[cfg(feature = "fmt")]
     Fmt(fmt::FmtArgs),
+    /// Lint SPARQL, Turtle and TriG: unused and undefined prefixes, unused and unbound
+    /// variables, cartesian products, FILTER scope, language tags, datatypes and more
+    /// (--fix applies the safe fixes)
+    #[cfg(feature = "fmt")]
+    Lint(fmt::lint::LintArgs),
     /// A language server for editors (stdio): formatting and syntax diagnostics for the
     /// languages `sparkles fmt` formats
     #[cfg(feature = "fmt")]
@@ -2257,6 +2262,8 @@ fn run() -> Result<()> {
         Cmd::Mcp(args) => mcp::run(args, opts),
         #[cfg(feature = "fmt")]
         Cmd::Fmt(args) => fmt::run(args),
+        #[cfg(feature = "fmt")]
+        Cmd::Lint(args) => fmt::lint::run(args),
         #[cfg(feature = "fmt")]
         Cmd::Lsp(args) => lsp::run(args),
         Cmd::Shex(args) => shex_cmd::run(args, opts),

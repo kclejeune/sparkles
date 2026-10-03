@@ -5,6 +5,11 @@
 //! the `.sparklesfmt.toml` nearest to its file, as `sparkles fmt` would; there are no
 //! editor-side settings.
 //!
+//! SPARQL, Turtle and TriG documents are also linted (`sparkles lint`, with the config
+//! file's `[lint]` table), and the findings are published with the formatter's. A
+//! finding with a safe fix offers it as a quick fix (`textDocument/codeAction`), and
+//! `source.fixAll.sparkles` applies them all.
+//!
 //! A document's language comes from its `languageId`, else its extension, else its
 //! content. Languages this build does not format yet are refused when asked to format
 //! and get no diagnostics.
@@ -19,13 +24,15 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Exit, Notification as _,
     PublishDiagnostics,
 };
-use lsp_types::request::{Formatting, RangeFormatting, Request as _};
+use lsp_types::request::{CodeActionRequest, Formatting, RangeFormatting, Request as _};
 use lsp_types::{
-    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Diagnostic,
+    DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentFormattingParams, DocumentRangeFormattingParams,
-    NumberOrString, Position, PublishDiagnosticsParams, Range, TextEdit, Uri,
+    NumberOrString, Position, PublishDiagnosticsParams, Range, TextEdit, Uri, WorkspaceEdit,
 };
 use serde_json::{Value, json};
+use sparkles_fmt::lint::{self, LintOptions, Linted, Severity};
 use sparkles_fmt::{Detection, FormatError, Formatted, Language, Options};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -41,6 +48,9 @@ pub struct LspArgs {
 
 /// How long one formatting may take before it gives up.
 const DEADLINE: Duration = Duration::from_secs(10);
+
+/// The code action kind that applies every safe lint fix.
+const FIX_ALL: &str = "source.fixAll.sparkles";
 
 /// Serve until the client says `exit`. Exiting without `shutdown` first, or the client
 /// closing the connection, is an error (exit status 1, as the protocol asks).
@@ -75,6 +85,9 @@ fn serve(conn: &Connection) -> Result<()> {
                 "textDocumentSync": {"openClose": true, "change": 1},
                 "documentFormattingProvider": true,
                 "documentRangeFormattingProvider": true,
+                "codeActionProvider": {
+                    "codeActionKinds": ["quickfix", FIX_ALL],
+                },
             },
             "serverInfo": {"name": "sparkles", "version": env!("CARGO_PKG_VERSION")},
         }),
@@ -121,6 +134,9 @@ struct Doc {
     version: i32,
     /// the formatting of `text` and the options (or config error) it was made with
     result: Option<(Result<Options, String>, Result<Formatted, Refusal>)>,
+    /// the lint findings of `text` and the rule levels they were made with; `None`
+    /// inside for a language lint does not take
+    linted: Option<(Result<LintOptions, String>, Option<Linted>)>,
 }
 
 /// Why a document was not formatted.
@@ -180,6 +196,7 @@ impl Server {
                         language_id: d.language_id,
                         version: d.version,
                         result: None,
+                        linted: None,
                     },
                 );
                 self.stale.insert(d.uri);
@@ -208,6 +225,7 @@ impl Server {
                 }
                 doc.version = p.text_document.version;
                 doc.result = None;
+                doc.linted = None;
                 self.stale.insert(p.text_document.uri);
             }
             DidCloseTextDocument::METHOD => {
@@ -234,6 +252,14 @@ impl Server {
             RangeFormatting::METHOD => req
                 .extract::<DocumentRangeFormattingParams>(RangeFormatting::METHOD)
                 .map(|(_, p)| p.text_document.uri),
+            CodeActionRequest::METHOD => {
+                return match req.extract::<CodeActionParams>(CodeActionRequest::METHOD) {
+                    Ok((_, p)) => self.code_actions(id, &p),
+                    Err(_) => {
+                        Response::new_err(id, ErrorCode::InvalidParams as i32, "bad params".into())
+                    }
+                };
+            }
             m => {
                 return Response::new_err(
                     id,
@@ -279,6 +305,81 @@ impl Server {
         }
     }
 
+    /// The quick fixes of the lint findings in the requested range, and the action that
+    /// applies every safe fix.
+    fn code_actions(&mut self, id: RequestId, p: &CodeActionParams) -> Response {
+        let encoding = self.encoding;
+        let uri = &p.text_document.uri;
+        let Some(doc) = self.docs.get_mut(uri) else {
+            return Response::new_ok(id, Vec::<CodeActionOrCommand>::new());
+        };
+        let Some(linted) = doc.lint(uri).clone() else {
+            return Response::new_ok(id, Vec::<CodeActionOrCommand>::new());
+        };
+        let text = doc.text.clone();
+        let wanted = |k: &str| {
+            p.context
+                .only
+                .as_ref()
+                .is_none_or(|only| only.iter().any(|o| k.starts_with(o.as_str())))
+        };
+        let edit = |edits: Vec<TextEdit>| WorkspaceEdit {
+            changes: Some(std::iter::once((uri.clone(), edits)).collect()),
+            ..WorkspaceEdit::default()
+        };
+        let mut actions = Vec::new();
+        if wanted("quickfix") {
+            for d in &linted.diagnostics {
+                let Some(fix) = &d.fix else { continue };
+                if !lint::rule(d.rule).is_some_and(|r| r.safe_fix) {
+                    continue;
+                }
+                let r = range(&text, d.start, d.end, encoding);
+                if r.end < p.range.start || p.range.end < r.start {
+                    continue;
+                }
+                let edits = fix
+                    .edits
+                    .iter()
+                    .map(|e| TextEdit {
+                        range: range(&text, e.start, e.end, encoding),
+                        new_text: e.insert.clone(),
+                    })
+                    .collect();
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: fix.title.clone(),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![lint_diagnostic(&text, d, encoding)]),
+                    edit: Some(edit(edits)),
+                    is_preferred: Some(true),
+                    ..CodeAction::default()
+                }));
+            }
+        }
+        let fixable = linted
+            .diagnostics
+            .iter()
+            .any(|d| d.fix.is_some() && lint::rule(d.rule).is_some_and(|r| r.safe_fix));
+        if fixable && wanted(FIX_ALL) {
+            let opts = doc.lint_options(uri);
+            if let (Ok(opts), Some(lang)) = (opts, Some(linted.language))
+                && let Ok(fixed) = lint::fix(&text, lang, &opts)
+                && let Some(e) = text::minimal_edit(&text, &fixed.text)
+            {
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: "Fix all safe lint problems".to_string(),
+                    kind: Some(CodeActionKind::from(FIX_ALL.to_string())),
+                    edit: Some(edit(vec![TextEdit {
+                        range: range(&text, e.start, e.end, encoding),
+                        new_text: e.insert,
+                    }])),
+                    ..CodeAction::default()
+                }));
+            }
+        }
+        Response::new_ok(id, actions)
+    }
+
     /// Publish the diagnostics of every document that changed since they were last sent
     /// (an empty list for a closed one).
     fn publish(&mut self, conn: &Connection) -> Result<()> {
@@ -311,9 +412,54 @@ impl Doc {
         &self.result.as_ref().expect("just set").1
     }
 
+    /// The rule levels of a document, from the nearest config file's `[lint]` table.
+    fn lint_options(&self, uri: &Uri) -> Result<LintOptions, String> {
+        match file_path(uri.as_str()).as_deref().and_then(Path::parent) {
+            Some(dir) => config::lint_for_dir(dir),
+            None => Ok(LintOptions::default()),
+        }
+    }
+
+    /// The lint findings of the document, computed again only when the text or the rule
+    /// levels changed. `None` for a language lint does not take, or when linting failed.
+    fn lint(&mut self, uri: &Uri) -> &Option<Linted> {
+        let opts = self.lint_options(uri);
+        if !matches!(&self.linted, Some((o, _)) if *o == opts) {
+            let linted = match (&opts, language(&self.language_id, uri.as_str(), &self.text)) {
+                (Ok(o), Ok(lang)) if lint::lints(lang) => {
+                    let mut o = o.clone();
+                    o.deadline = Some(Instant::now() + DEADLINE);
+                    let text = &self.text;
+                    std::panic::catch_unwind(|| lint::lint(text, lang, &o))
+                        .ok()
+                        .and_then(Result::ok)
+                }
+                _ => None,
+            };
+            self.linted = Some((opts, linted));
+        }
+        &self.linted.as_ref().expect("just set").1
+    }
+
+    /// The formatter's diagnostics, then the lint findings (syntax errors once).
+    fn diagnostics(&mut self, uri: &Uri, enc: Encoding) -> Vec<Diagnostic> {
+        let mut out = self.format_diagnostics(uri, enc);
+        if let Some(l) = self.lint(uri).clone() {
+            // the lint's own findings replace the formatter's note on undeclared prefixes
+            out.retain(|d| d.code != Some(NumberOrString::String("undeclared-prefix".to_string())));
+            out.extend(
+                l.diagnostics
+                    .iter()
+                    .filter(|d| d.rule != "syntax")
+                    .map(|d| lint_diagnostic(&self.text, d, enc)),
+            );
+        }
+        out
+    }
+
     /// The formatter's warnings for a formatted document; otherwise a syntax error, the
     /// formatter refusing the document, or a broken config file.
-    fn diagnostics(&mut self, uri: &Uri, enc: Encoding) -> Vec<Diagnostic> {
+    fn format_diagnostics(&mut self, uri: &Uri, enc: Encoding) -> Vec<Diagnostic> {
         self.format(uri);
         let text = &self.text;
         let refusal = match &self.result.as_ref().expect("formatted").1 {
@@ -372,6 +518,24 @@ fn warning_severity(code: &str) -> DiagnosticSeverity {
     match code {
         "comment-moved" => DiagnosticSeverity::WARNING,
         _ => DiagnosticSeverity::INFORMATION,
+    }
+}
+
+/// A lint finding as an LSP diagnostic, over its whole range.
+fn lint_diagnostic(text: &str, d: &lint::Diagnostic, enc: Encoding) -> Diagnostic {
+    let severity = match d.severity {
+        Severity::Error => DiagnosticSeverity::ERROR,
+        Severity::Warning => DiagnosticSeverity::WARNING,
+        Severity::Info => DiagnosticSeverity::INFORMATION,
+        Severity::Hint => DiagnosticSeverity::HINT,
+    };
+    Diagnostic {
+        range: range(text, d.start, d.end, enc),
+        severity: Some(severity),
+        code: Some(NumberOrString::String(d.rule.to_string())),
+        source: Some("sparkles lint".to_string()),
+        message: d.message.clone(),
+        ..Diagnostic::default()
     }
 }
 
