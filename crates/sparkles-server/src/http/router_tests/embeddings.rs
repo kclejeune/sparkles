@@ -103,6 +103,28 @@ async fn embedding_indexes_through_the_api() {
     let st = caught_up(&s.app, "names").await;
     assert_eq!(st["embedding"]["embedded"], 3, "{st}");
 
+    // the metrics, by dataset and index
+    let m = get_uri(&s.app, "/$/metrics").await.text();
+    for line in [
+        "# TYPE sparkles_embedding_requests_total counter",
+        "sparkles_embedding_inputs_total{dataset=\"ds\",index=\"names\"} 3",
+        "sparkles_embedding_vectors_total{dataset=\"ds\",index=\"names\"} 3",
+        "sparkles_embedding_backlog{dataset=\"ds\",index=\"names\"} 0",
+        "sparkles_embedding_lag_commits{dataset=\"ds\",index=\"names\"} 0",
+        "sparkles_embedding_failures_total{dataset=\"ds\",index=\"names\",kind=\"transient\"} 0",
+        "sparkles_embedding_failures_total{dataset=\"ds\",index=\"names\",kind=\"rejected\"} 0",
+    ] {
+        assert!(m.lines().any(|l| l == line), "{line} in\n{m}");
+    }
+    let requests = mock.state().requests;
+    assert!(
+        m.lines().any(|l| l
+            == format!(
+                "sparkles_embedding_requests_total{{dataset=\"ds\",index=\"names\"}} {requests}"
+            )),
+        "{m}"
+    );
+
     // searching with text
     let r = sparql(
         &s.app,

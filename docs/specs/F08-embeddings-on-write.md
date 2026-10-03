@@ -4,8 +4,8 @@
 >
 > **Phases:** Phase 1 shipped: the configuration, the worker, the input record, full
 > passes, `reembed`, status, text queries, the HTTP, CLI, Python and UI surfaces, and tests
-> with a mock provider. Phase 2 (chunking, metrics, a token-based rate limit) is not
-> built.
+> with a mock provider. Of Phase 2, the metrics shipped. Chunking and a token-based rate
+> limit are not built.
 >
 > **User docs:** [API: Embeddings on write](../API.md#embeddings-on-write) · [Usage: Embeddings](../USAGE.md#embeddings-computed-on-write) · [Features](../FEATURES.md#sparql-arq-equivalent)
 >
@@ -582,7 +582,18 @@ Query texts have no quota of their own beyond the rate limits.
 lookups per commit and one hash check per changed quad, and a full pass reads every
 selected literal once.
 
-**Not built.** Phase 2: chunking, metrics in `/$/metrics`, and a token-based rate
-limit. The NixOS module has no vector settings, so it gained no embedding options, and
+**Metrics** (Phase 2, 2026-10-02). `/$/metrics` has the `sparkles_embedding_*` series
+per dataset label and index. Three counters give requests (retries included), inputs sent
+and vectors written. `sparkles_embedding_failures_total` counts failures by kind: failed
+batches (`transient`, `auth`, `refused`, `fatal`, `write`), inputs the provider refused
+(`rejected`), and subjects whose text could not be read (`read`). Two gauges give the
+backlog and the lag in commits behind the head. The datasets past
+`--metrics-max-datasets` share `$other`, as in the other series. Their counters and
+backlogs add up per index name, and the largest lag stands for them. The counters start
+at zero when the dataset is opened, like those of the status. The store's
+`embedding_metrics` returns them, and the library and router tests check them after an
+outage, a rejected input and a caught-up worker.
+
+**Not built.** Phase 2: chunking and a token-based rate limit. The NixOS module has no vector settings, so it gained no embedding options, and
 `--embedding-secret` goes through its `extraArgs`. The Similar page and the MCP tool
 `similar_entities` do not search with text.

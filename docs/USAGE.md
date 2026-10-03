@@ -2060,6 +2060,26 @@ services.sparkles.backup = {
 };
 ```
 
+`maxTasks` and `maxClones` pass `--max-tasks` and `--max-clones`. The options under
+`compaction.auto` set the server-wide [automatic compaction](#automatic-compaction)
+policy. `compaction.auto.enable = false` passes `--no-auto-compact`. Each of the others
+passes its `--auto-compact-*` flag when set, and leaves the server's default when `null`.
+The options are `minQuads`, `ratio`, `maxQuads`, `maxDeltaMb`, `maxWalMb`, `idleSeconds`,
+`maxAgeSeconds`, `minIntervalSeconds`, `threads`, `ioMb` and `maxRunning`. A dataset's
+own settings, made with `PUT /$/compaction/{ds}`, still override them:
+
+```nix
+services.sparkles = {
+  maxClones = 1;
+  compaction.auto = {
+    minQuads = 50000;
+    maxWalMb = 4096;
+    idleSeconds = 600;
+    threads = 2;
+  };
+};
+```
+
 When the service stops, requests in flight get `shutdownGrace` seconds (default 20) to
 finish before they are cancelled. The unit's `TimeoutStopSec` is `shutdownGrace + 15`,
 which leaves time for the cancelled requests to stop and for the final flush.

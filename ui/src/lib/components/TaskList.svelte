@@ -4,6 +4,7 @@
   import { toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { cancelTask } from '$lib/backups';
+  import { cloneDetail, cloneMethodText } from '$lib/clone';
   import { fmtRelative } from '$lib/format';
   import { followTasks, taskActive, taskFeed } from '$lib/tasks.svelte';
 
@@ -114,7 +115,9 @@
             <span class="badge">queued</span>
             {#if t.message}<span class="detail">{t.message}</span>{/if}
           {:else}
+            {@const how = t.state === 'done' ? cloneDetail(t) : null}
             {t.message ?? t.state}
+            {#if how}<span class="faint">({cloneMethodText(how)})</span>{/if}
           {/if}
         </span>
         {#if mayCancel(t)}

@@ -2193,6 +2193,11 @@ label, because its scope ends at the redefinition. An unused redefinition stays 
 the last declaration of its label that the output keeps binds a different namespace.
 Dropping it would extend that binding over the redefinition's scope, and the next run
 would compact IRIs there with it. Streamed and in-memory formatting follow the same rule.
+When pruning leaves a directive block with only the section comments of its dropped
+declarations, those comments are spaced as a comment block before the next statement,
+which is how the next run reads them. A blank line separates them from a multi-line
+statement on either side. Before this rule the output was not a fixpoint, and a stream
+reported `unstable-format` there instead of a syntax error later in the input.
 The opt-in task `fmt:jsonld-compare`, outside `ci`, compares the JSON-LD layout with
 `oxfmt`, which follows Prettier's JSON conventions and is already pinned in `ui/`. The
 SHACL shapes field became a CodeMirror editor so that its Format keeps one-step undo.

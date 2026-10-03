@@ -629,7 +629,8 @@ with `forkedFrom: null`.
 - **Concurrency.** `serve --max-clones` (default 2) limits the clones that run at once.
   Clones were already counted in the `--max-tasks` slots. A clone over its limit waits
   as `queued`, and a freed slot goes to the first waiting task that may run, so waiting
-  clones never hold back other tasks.
+  clones never hold back other tasks. The NixOS module sets both limits with its
+  `maxClones` and `maxTasks` options.
 
 **Measurements.** These are clone times with the release build through `sparkles clone`,
 on datasets loaded from the benchmark data (`scripts/gen-data.py`) with `sparkles load`.
@@ -654,5 +655,10 @@ has no `cloneFrom` alias. Question 3 is answered by `--max-clones`, which defaul
 **Not built.**
 - Cloning across servers through archives.
 - Branching and merging.
-- The UI's Clone dialog has no choice of type, graphs or mode. It makes a persistent
-  clone of every graph, which takes the file path when it can.
+
+**UI.** The dataset page's Clone dialog offers the type (persistent by default), all
+graphs or a chosen few (the source's graphs as checkboxes, plus typed IRIs and patterns),
+and for a persistent clone the index mode (`auto` by default). A partial clone that keeps
+inferences names the inferred graph for the user. When the task is done, the task list,
+the toast and the "Cloned into" banner say how the index was made, from the task's
+detail. The clone's own page shows the selection and the method from `origin.json`.

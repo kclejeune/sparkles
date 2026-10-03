@@ -1,7 +1,8 @@
 // GeoSPARQL literals for the UI's maps: which terms are geometries, WKT and GeoJSON read
 // into CRS84 GeoJSON (longitude, latitude) in the browser for the CRSs that need no
 // projection library (CRS84, EPSG:4326 with its axes swapped, Web Mercator), and the
-// rest sent to `POST /$/geo/convert`. Also the queries behind the explorer's map card.
+// rest, GML and KML among them, sent to `POST /$/geo/convert`. Also the queries behind
+// the explorer's map card.
 
 import type { GeoConverted, GeoJsonGeometry, Term } from './api';
 import { sparqlIri, sparqlString } from './rdf';
@@ -10,15 +11,25 @@ export const GEO = 'http://www.opengis.net/ont/geosparql#';
 export const GEOF = 'http://www.opengis.net/def/function/geosparql/';
 export const WKT_LITERAL = `${GEO}wktLiteral`;
 export const GEOJSON_LITERAL = `${GEO}geoJSONLiteral`;
+export const GML_LITERAL = `${GEO}gmlLiteral`;
+export const KML_LITERAL = `${GEO}kmlLiteral`;
+/** The geometry literal datatypes the maps draw. */
+export const GEO_LITERALS: readonly string[] = [
+  WKT_LITERAL,
+  GEOJSON_LITERAL,
+  GML_LITERAL,
+  KML_LITERAL,
+];
 export const WGS84_POS = 'http://www.w3.org/2003/01/geo/wgs84_pos#';
 export const CRS84 = 'http://www.opengis.net/def/crs/OGC/1.3/CRS84';
 
 /** A geometry literal: its lexical form and datatype. */
 export type GeoLiteral = { value: string; datatype: string };
 
-/** Whether a term is a `geo:wktLiteral` or `geo:geoJSONLiteral`. */
+/** Whether a term is a `geo:wktLiteral`, `geo:geoJSONLiteral`, `geo:gmlLiteral` or
+ *  `geo:kmlLiteral`. */
 export function isGeoLiteral(t: Term | null | undefined): t is Term & GeoLiteral {
-  return t?.type === 'literal' && (t.datatype === WKT_LITERAL || t.datatype === GEOJSON_LITERAL);
+  return t?.type === 'literal' && !!t.datatype && GEO_LITERALS.includes(t.datatype);
 }
 
 // --- coordinate reference systems -------------------------------------------------
@@ -322,6 +333,9 @@ export function localGeometry(lit: GeoLiteral): LocalGeometry {
       return { error: `malformed GeoJSON: ${(e as Error).message}` };
     }
   }
+  // the server reads GML and KML
+  if (lit.datatype === GML_LITERAL) return { convert: true, why: 'GML' };
+  if (lit.datatype === KML_LITERAL) return { convert: true, why: 'KML' };
   if (lit.datatype !== WKT_LITERAL) return { error: 'not a geometry literal' };
   const { crs, body } = splitWkt(lit.value);
   let g: GeoJsonGeometry | null;
@@ -450,7 +464,7 @@ export function abbreviate(value: string, max = 60): string {
  */
 export function geometryQuery(iri: string, limit = 20): string {
   const s = sparqlIri(iri);
-  const isGeo = `FILTER(isLiteral(?lit) && DATATYPE(?lit) IN (<${WKT_LITERAL}>, <${GEOJSON_LITERAL}>))`;
+  const isGeo = `FILTER(isLiteral(?lit) && DATATYPE(?lit) IN (${GEO_LITERALS.map((d) => `<${d}>`).join(', ')}))`;
   return `SELECT ?geom ?lit WHERE {
   { BIND(${s} AS ?geom) ${s} ?p ?lit . ${isGeo} }
   UNION
@@ -482,7 +496,7 @@ SELECT ?f (SAMPLE(?l) AS ?label) (MIN(?d) AS ?dist) (SAMPLE(?w) AS ?lit) WHERE {
   OPTIONAL { ?f <http://www.w3.org/2000/01/rdf-schema#label> ?l }
   OPTIONAL {
     ?f <${GEO}hasDefaultGeometry>|<${GEO}hasGeometry> ?gm .
-    ?gm <${GEO}asWKT>|<${GEO}asGeoJSON> ?w .
+    ?gm <${GEO}asWKT>|<${GEO}asGeoJSON>|<${GEO}asGML>|<${GEO}asKML> ?w .
     BIND(<${GEOF}distance>(?w, ${g}, uom:kilometre) AS ?d)
   }
 }

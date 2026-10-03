@@ -57,6 +57,31 @@ let
 
   datasetPath = name: ds: if ds.path != null then ds.path else "${cfg.dataDir}/declarative/${name}";
 
+  # the `compaction.auto` options that pass a value, and their flags
+  autoCompactFlags = {
+    minQuads = "--auto-compact-min-quads";
+    ratio = "--auto-compact-ratio";
+    maxQuads = "--auto-compact-max-quads";
+    maxDeltaMb = "--auto-compact-max-delta-mb";
+    maxWalMb = "--auto-compact-max-wal-mb";
+    idleSeconds = "--auto-compact-idle";
+    maxAgeSeconds = "--auto-compact-max-age";
+    minIntervalSeconds = "--auto-compact-min-interval";
+    threads = "--auto-compact-threads";
+    ioMb = "--auto-compact-io-mb";
+    maxRunning = "--auto-compact-max-running";
+  };
+
+  # an optional whole number: `null` keeps the server's default
+  optionalInt =
+    type: example: default: description:
+    mkOption {
+      type = types.nullOr type;
+      default = null;
+      inherit example;
+      description = "${description} `null`: the server's default, ${default}.";
+    };
+
   # directories of `fs` backup repositories (writable by the service)
   fsRoots = map (r: lib.removeSuffix "/" (toString r)) cfg.backup.fsRoots;
   dataDirSlash = "${lib.removeSuffix "/" (toString cfg.dataDir)}/";
@@ -109,6 +134,27 @@ let
     "--backup-max-tasks"
     (toString cfg.backup.maxTasks)
   ]
+  ++ lib.optionals (cfg.maxTasks != null) [
+    "--max-tasks"
+    (toString cfg.maxTasks)
+  ]
+  ++ lib.optionals (cfg.maxClones != null) [
+    "--max-clones"
+    (toString cfg.maxClones)
+  ]
+  ++ lib.optional (!cfg.compaction.auto.enable) "--no-auto-compact"
+  ++ lib.concatLists (
+    lib.mapAttrsToList (
+      name: flag:
+      let
+        v = cfg.compaction.auto.${name};
+      in
+      lib.optionals (v != null) [
+        flag
+        (toString v)
+      ]
+    ) autoCompactFlags
+  )
   ++ lib.optionals (cfg.unixSocket != null) [
     "--unix-socket"
     cfg.unixSocket
@@ -440,6 +486,79 @@ in
           set `[api] fs_roots` in the config file.
         '';
       };
+    };
+
+    maxTasks =
+      optionalInt types.ints.unsigned 2 "4"
+        "Background tasks that run at once (`--max-tasks`): compaction, clones, reasoning, full-text, spatial and vector index builds, and N-Quads backups. More wait, queued. `0`: no limit.";
+
+    maxClones =
+      optionalInt types.ints.unsigned 1 "2"
+        "Clones that run at once, within {option}`maxTasks` (`--max-clones`). More wait, queued. `0`: only {option}`maxTasks` limits them.";
+
+    compaction.auto = {
+      enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Compact datasets automatically when their policy says so. `false` passes
+          `--no-auto-compact`, which turns it off for every dataset. Manual compaction
+          (`POST /$/compact/{ds}`) still works. The other options of this group give the
+          server-wide policy, which a dataset's own settings (`PUT /$/compaction/{ds}`)
+          override. See the Automatic compaction section of `docs/USAGE.md`.
+        '';
+      };
+
+      minQuads =
+        optionalInt types.ints.unsigned 50000 "10000"
+          "The floor: the size and idle triggers need a delta of at least this many quads (`--auto-compact-min-quads`).";
+
+      ratio = mkOption {
+        type = types.nullOr (types.either types.ints.unsigned types.float);
+        default = null;
+        example = 0.1;
+        description = ''
+          Compact when the delta reaches the floor plus this share of the base index's
+          quads (`--auto-compact-ratio`, from 0 to 1000). `null`: the server's default,
+          0.05.
+        '';
+      };
+
+      maxQuads =
+        optionalInt types.ints.unsigned 5000000 "1000000"
+          "Compact at this delta size, whatever the base (`--auto-compact-max-quads`). `0`: no limit.";
+
+      maxDeltaMb =
+        optionalInt types.ints.unsigned 1024 "512"
+          "Compact when the delta takes about this many MiB of memory (`--auto-compact-max-delta-mb`). `0`: no limit.";
+
+      maxWalMb =
+        optionalInt types.ints.unsigned 4096 "1024"
+          "Compact when the write-ahead log passes this many MiB (`--auto-compact-max-wal-mb`). `0`: no limit.";
+
+      idleSeconds =
+        optionalInt types.ints.unsigned 600 "300"
+          "Compact a delta of at least the floor after this many seconds without a commit (`--auto-compact-idle`). `0` turns the trigger off.";
+
+      maxAgeSeconds =
+        optionalInt types.ints.unsigned 3600 "86400"
+          "Compact when the oldest change not yet compacted is this many seconds old (`--auto-compact-max-age`). `0` turns the trigger off.";
+
+      minIntervalSeconds =
+        optionalInt types.ints.unsigned 300 "60"
+          "Seconds between the end of a compaction and the start of the next automatic one (`--auto-compact-min-interval`).";
+
+      threads =
+        optionalInt types.ints.positive 2 "a quarter of the cores"
+          "Threads of an automatic compaction's build, which run at nice 10 (`--auto-compact-threads`).";
+
+      ioMb =
+        optionalInt types.ints.unsigned 100 "0"
+          "The average MiB per second at which an automatic compaction may write its new index (`--auto-compact-io-mb`). `0`: no limit.";
+
+      maxRunning =
+        optionalInt types.ints.positive 2 "1"
+          "Automatic compactions that may run on the server at once (`--auto-compact-max-running`).";
     };
 
     unixSocket = mkOption {

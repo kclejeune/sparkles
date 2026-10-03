@@ -1717,7 +1717,8 @@ these items.
 * A cell grid over each prepared region of 32 or more vertices decides most points and
   small regions in spatial joins and FILTERs without the exact test.
 * `geo:gmlLiteral` and `geo:kmlLiteral` parse, `geof:asGML` and `geof:asKML` write them,
-  and the index reads them.
+  and the index reads them. The UI's maps draw them too. The browser has no GML or KML
+  reader, so it sends them to `POST /$/geo/convert`.
 * `--geo-crs` registers projected CRSs from proj4 definitions, which transform through
   `proj4rs`.
 

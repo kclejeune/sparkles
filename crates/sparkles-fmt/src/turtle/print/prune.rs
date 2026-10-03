@@ -44,6 +44,12 @@ impl Pruned {
         self.end_blocks.is_empty() && decls.iter().all(|d| self.nodes.contains(d))
     }
 
+    /// Whether the block `decls` prints only the detached comment blocks of its dropped
+    /// declarations.
+    pub fn prints_only_blocks(&self, decls: &[NodeId]) -> bool {
+        !self.end_blocks.is_empty() && decls.iter().all(|d| self.nodes.contains(d))
+    }
+
     /// What passes on from the dropped declarations: blank lines and detached blocks,
     /// to the next item but a `VERSION`, or to the end.
     fn pass_on(&mut self, tx: &Tx<'_, '_>, decls: &[NodeId]) {
@@ -382,6 +388,31 @@ mod tests {
                 "# about\n\nPREFIX a: <http://e/a#>\n\n# section\n\nPREFIX b: <http://e/b#>\n<http://e/s> <http://e/p> 1 ."
             ),
             "# about\n\n# section\n\n<http://e/s> <http://e/p> 1 .\n"
+        );
+    }
+
+    #[test]
+    fn a_block_left_with_comments_alone_is_spaced_like_them() {
+        // the next time, the section header is detached before the statement after it,
+        // with a blank line next to a multi-line statement
+        assert_eq!(
+            pruned(
+                "PREFIX a: <http://e/a#>\na:s a:p 1 .\nPREFIX u: <http://u/>\n\n# section\n\nPREFIX u: <http://u/>\na:s a:p 1, 2 .\n"
+            ),
+            "PREFIX a: <http://e/a#>\n\na:s a:p 1 .\n\n# section\n\na:s\n  a:p 1, 2 ;\n.\n"
+        );
+        assert_eq!(
+            pruned(
+                "PREFIX a: <http://e/a#>\na:s a:p 1, 2 .\nPREFIX u: <http://u/>\n# section\n\nPREFIX u: <http://u/>\na:s a:p 1 .\n"
+            ),
+            "PREFIX a: <http://e/a#>\n\na:s\n  a:p 1, 2 ;\n.\n\n# section\n\na:s a:p 1 .\n"
+        );
+        // between flat statements, as written
+        assert_eq!(
+            pruned(
+                "PREFIX a: <http://e/a#>\na:s a:p 1 .\nPREFIX u: <http://u/>\n# section\n\nPREFIX u: <http://u/>\na:s a:p 2 .\n"
+            ),
+            "PREFIX a: <http://e/a#>\n\na:s a:p 1 .\n# section\n\na:s a:p 2 .\n"
         );
     }
 }

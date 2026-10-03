@@ -160,6 +160,71 @@ pub struct EmbeddingError {
     pub subject: Option<String>,
 }
 
+/// Why embedding failed, for the metrics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    /// a batch's request failed after its retries (a network error, a timeout, `429`,
+    /// `5xx`)
+    Transient,
+    /// `401` or `403`
+    Auth,
+    /// the outbound policy refused the endpoint
+    Refused,
+    /// a missing secret, or an answer that is not an embeddings response
+    Fatal,
+    /// an input the provider refused, or answered with a vector it cannot use
+    Rejected,
+    /// reading a pair's text from the store
+    Read,
+    /// writing a batch's vectors
+    Write,
+}
+
+impl FailureKind {
+    pub const ALL: [FailureKind; 7] = [
+        FailureKind::Transient,
+        FailureKind::Auth,
+        FailureKind::Refused,
+        FailureKind::Fatal,
+        FailureKind::Rejected,
+        FailureKind::Read,
+        FailureKind::Write,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            FailureKind::Transient => "transient",
+            FailureKind::Auth => "auth",
+            FailureKind::Refused => "refused",
+            FailureKind::Fatal => "fatal",
+            FailureKind::Rejected => "rejected",
+            FailureKind::Read => "read",
+            FailureKind::Write => "write",
+        }
+    }
+}
+
+/// One index's embedding counters and gauges since the store was opened, for metrics
+/// ([`Store::embedding_metrics`](crate::store::Store::embedding_metrics)).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmbeddingMetrics {
+    /// the vector index
+    pub index: String,
+    /// requests made, retries included
+    pub requests: u64,
+    /// inputs sent to the provider (cached inputs are not sent)
+    pub inputs: u64,
+    /// vectors written
+    pub vectors: u64,
+    /// failures by [`FailureKind::ALL`]'s order: batches for the kinds of a request,
+    /// pairs for `read`, inputs for `rejected`, batches for `write`
+    pub failures: [u64; 7],
+    /// subjects (per graph) waiting to be embedded, as in the status
+    pub backlog: u64,
+    /// commits since the newest one whose text is all embedded
+    pub lag: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddingBatch {

@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc a91121328dc132e438eb34c10d7c6def7f76100f7f56b9d11e61935c3e59ded0 # shrinks to trig = false, doc = "PREFIX ex: <http://example.org/>\n @prefix o: <http://other.org/> .\n# c\nex:s ex:p _:x . ex:s ex:p '''two\nlines''' . PREFIX o: <http://example.org/o/> ex:s ex:p '''two\nlines''' .\n", window = 1, read = 1, prune = true, conventional = false
+cc 777caaad6ac2649b7d6b78e7cc69bb0405af7233c664e4fac873b66f2b0162b0 # shrinks to trig = false, doc = "PREFIX ex: <http://example.org/>\n ex:s ex:p _:x . PREFIX unused: <http://unused.org/>\n\n# section\n\nPREFIX unused: <http://unused.org/> ex:s ex:p _:x, _:x . ex:s ex:p o:d .\n", window = 1, read = 1, prune = true, conventional = false

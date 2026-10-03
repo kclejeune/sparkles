@@ -9,8 +9,10 @@ import {
   geoCells,
   geoColumns,
   geometryQuery,
+  GML_LITERAL,
   inverseMercator,
   isGeoLiteral,
+  KML_LITERAL,
   localGeometry,
   nearbyQuery,
   normalizeCrs,
@@ -25,11 +27,17 @@ import {
 const wkt = (value: string): GeoLiteral => ({ value, datatype: WKT_LITERAL });
 const json = (value: string): GeoLiteral => ({ value, datatype: GEOJSON_LITERAL });
 const lit = (value: string, datatype?: string): Term => ({ type: 'literal', value, datatype });
+const GML_POINT =
+  '<gml:Point xmlns:gml="http://www.opengis.net/gml/3.2" srsName="http://www.opengis.net/def/crs/EPSG/0/4326"><gml:pos>48.853 2.3499</gml:pos></gml:Point>';
+const KML_LINE =
+  '<LineString xmlns="http://www.opengis.net/kml/2.2"><coordinates>2.29,48.86 2.35,48.85</coordinates></LineString>';
 
 describe('geometry literals', () => {
-  it('detects WKT and GeoJSON literals only', () => {
+  it('detects WKT, GeoJSON, GML and KML literals only', () => {
     expect(isGeoLiteral(lit('POINT(1 2)', WKT_LITERAL))).toBe(true);
     expect(isGeoLiteral(lit('{}', GEOJSON_LITERAL))).toBe(true);
+    expect(isGeoLiteral(lit(GML_POINT, GML_LITERAL))).toBe(true);
+    expect(isGeoLiteral(lit(KML_LINE, KML_LITERAL))).toBe(true);
     expect(isGeoLiteral(lit('POINT(1 2)'))).toBe(false);
     expect(isGeoLiteral({ type: 'uri', value: WKT_LITERAL })).toBe(false);
     expect(isGeoLiteral(null)).toBe(false);
@@ -223,6 +231,33 @@ describe('literals for the map', () => {
     expect(localGeometry(wkt('CIRCULARSTRING(0 0, 1 1, 2 0)'))).toMatchObject({ convert: true });
   });
 
+  it('sends GML and KML to the server', async () => {
+    const gml = { value: GML_POINT, datatype: GML_LITERAL };
+    const kml = { value: KML_LINE, datatype: KML_LITERAL };
+    expect(localGeometry(gml)).toEqual({ convert: true, why: 'GML' });
+    expect(localGeometry(kml)).toEqual({ convert: true, why: 'KML' });
+    const convert = vi.fn(async (batch: GeoLiteral[]): Promise<GeoConverted[]> =>
+      batch.map((l) =>
+        l.datatype === GML_LITERAL
+          ? { geometry: { type: 'Point', coordinates: [2.3499, 48.853] } }
+          : {
+              geometry: {
+                type: 'LineString',
+                coordinates: [
+                  [2.29, 48.86],
+                  [2.35, 48.85],
+                ],
+              },
+            },
+      ),
+    );
+    const res = await resolveGeometries([wkt('POINT(1 2)'), gml, kml], convert);
+    expect(convert).toHaveBeenCalledTimes(1);
+    expect(convert.mock.calls[0][0]).toEqual([gml, kml]);
+    expect(res[1]).toEqual({ geometry: { type: 'Point', coordinates: [2.3499, 48.853] } });
+    expect(res[2]).toMatchObject({ geometry: { type: 'LineString' } });
+  });
+
   it('lists empty and malformed GeoJSON as undrawable', () => {
     expect(localGeometry(wkt('POINT EMPTY'))).toEqual({ error: 'empty geometry' });
     expect(localGeometry(json('{'))).toEqual({ error: 'malformed GeoJSON: not JSON' });
@@ -289,6 +324,7 @@ describe('explorer queries', () => {
       '<http://ex.org/paris> <http://www.opengis.net/ont/geosparql#hasDefaultGeometry>',
     );
     expect(q).toContain('wgs84_pos#lat');
+    expect(q).toContain(`<${GML_LITERAL}>, <${KML_LITERAL}>`);
     expect(q).toMatch(/LIMIT 20$/);
   });
 

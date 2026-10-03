@@ -270,10 +270,11 @@ fn document(tx: &mut Tx<'_, '_>, n: NodeId) -> DocId {
     items.extend(order.into_iter().map(Item::Statement));
     let mut parts = Vec::new();
     parts.extend(tx.header());
-    // (a directive block, prints on several lines)
-    let mut prev: Option<(bool, bool)> = None;
+    // (doc, blank line before it, a directive block, prints on several lines, a
+    // directive block that prints only the detached blocks of its dropped declarations)
+    let mut printed = Vec::with_capacity(items.len());
     for item in &items {
-        let (doc, blank_before, directives, multi) = match item {
+        printed.push(match item {
             Item::Directives(ds, leading, pruned) => {
                 let blank = tx.comments.blank_before(ds[0]);
                 (
@@ -281,6 +282,7 @@ fn document(tx: &mut Tx<'_, '_>, n: NodeId) -> DocId {
                     blank,
                     true,
                     false,
+                    pruned.prints_only_blocks(ds),
                 )
             }
             Item::Statement(p) => {
@@ -293,12 +295,19 @@ fn document(tx: &mut Tx<'_, '_>, n: NodeId) -> DocId {
                     Some(o) => tx.concat([o, doc]),
                     None => doc,
                 };
-                (doc, p.blank, false, multi)
+                (doc, p.blank, false, multi, false)
             }
-        };
+        });
+    }
+    let mut prev: Option<(bool, bool)> = None;
+    for (i, &(doc, blank_before, directives, multi, only_blocks)) in printed.iter().enumerate() {
         if let Some((prev_directives, prev_multi)) = prev {
+            // comment blocks alone are detached before the next statement the next time,
+            // and spaced like one: a blank line next to a multi-line statement
+            let next_multi = printed.get(i + 1).is_some_and(|n| n.3);
             let blank = blank_before
                 || (prev_directives && !directives)
+                || (only_blocks && !prev_directives && (prev_multi || next_multi))
                 || (!prev_directives && !directives && (prev_multi || multi));
             parts.push(match blank {
                 true => tx.empty_line(),

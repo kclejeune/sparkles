@@ -21,6 +21,25 @@ const VERSION = '0.1.0-mock';
 const startedAt = new Date();
 const INFERRED = ox.namedNode('urn:x-sparkles:inferred');
 
+/** Which graphs a clone's `graph=` selection keeps (all when empty): `default`, an IRI,
+ *  or a pattern with `*`, which never matches the inferred graph. */
+function cloneGraphFilter(names) {
+  if (!names.length) return () => true;
+  const tests = names.map((n) => {
+    if (n === 'default' || n === 'urn:x-arq:DefaultGraph')
+      return (g) => g.termType === 'DefaultGraph';
+    if (!n.includes('*')) return (g) => g.termType === 'NamedNode' && g.value === n;
+    const re = new RegExp(
+      `^${n
+        .split('*')
+        .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        .join('.*')}$`,
+    );
+    return (g) => g.termType === 'NamedNode' && !g.equals(INFERRED) && re.test(g.value);
+  });
+  return (g) => tests.some((t) => t(g));
+}
+
 /** @type {Map<string, any>} */
 const datasets = new Map();
 /** @type {any[]} */
@@ -2065,23 +2084,77 @@ const server = http.createServer(async (req, res) => {
             if (!/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(target))
               return fail(res, 400, `invalid dataset name '${target}'`);
             if (datasets.has(target)) return fail(res, 409, `dataset /${target} already exists`);
+            const type = String(p.get('type') ?? 'persistent');
+            if (!['persistent', 'mem'].includes(type))
+              return fail(res, 400, `type must be persistent or mem, not '${type}'`);
+            const inferences = String(p.get('inferences') ?? 'copy');
+            if (!['copy', 'drop'].includes(inferences))
+              return fail(res, 400, `inferences must be copy or drop, not '${inferences}'`);
+            const mode = String(p.get('mode') ?? 'auto');
+            if (!['auto', 'link', 'rebuild'].includes(mode))
+              return fail(res, 400, `mode must be auto, link or rebuild, not '${mode}'`);
+            // `graphs` from a JSON body, `graph` (repeatable) from the query string
+            const graphs = Array.isArray(p.get('graphs'))
+              ? p.get('graphs').map(String)
+              : url.searchParams.getAll('graph');
+            const keep = cloneGraphFilter(graphs);
             const task = startTask('clone', ds, () => {
-              const c = makeDataset(target, 'persistent');
-              for (const q of ds.store.match()) c.store.add(q);
+              const started = Date.now();
+              const c = makeDataset(target, type);
+              const names = new Set();
+              for (const q of ds.store.match()) {
+                if (!keep(q.graph)) continue;
+                c.store.add(q);
+                names.add(q.graph.termType === 'DefaultGraph' ? '' : q.graph.value);
+              }
+              const partial = graphs.length > 0;
+              const copiesInferences =
+                inferences === 'copy' && (!partial || graphs.includes(INFERRED.value));
+              if (!copiesInferences)
+                for (const q of c.store.match(null, null, null, INFERRED)) c.store.delete(q);
               c.baseQuads = c.store.size;
               c.text = ds.text ? structuredClone(ds.text) : null;
               c.textRebuilt = ds.text ? { at: new Date().toISOString(), ms: 12 } : null;
               c.commits = [];
               addCommit(c, 'create', 0, 0, { quads: c.store.size, bulk: true });
-              c.reasoning = p.get('inferences') === 'drop' ? null : ds.reasoning;
+              c.reasoning =
+                copiesInferences && ds.reasoning
+                  ? {
+                      ...ds.reasoning,
+                      ...(partial ? { stale: true } : {}),
+                    }
+                  : null;
+              const reason =
+                mode === 'rebuild'
+                  ? 'a rebuild was asked for'
+                  : ds.type === 'mem'
+                    ? 'the source is in memory'
+                    : ds.deltaInserts || ds.deltaDeletes
+                      ? 'the source has changes since its last compaction'
+                      : partial
+                        ? 'some graphs are left out'
+                        : null;
+              const method =
+                reason || type === 'mem' ? 'rebuild' : mode === 'link' ? 'link' : 'reflink';
               c.origin = {
                 originFormat: 1,
                 clonedAt: new Date().toISOString(),
                 source: { name: ds.name, version: 0, generation: 'gen-0001', quads: ds.store.size },
                 forkedFrom: { id: ds.id, seq: headCommit(ds).seq },
-                inferences: c.reasoning ? 'copy' : 'drop',
+                inferences,
+                ...(partial ? { graphs } : {}),
+                method,
               };
-              return `cloned /${ds.name} at commit 0 (${c.store.size} quads) into /${target}`;
+              task.detail = {
+                method,
+                rebuildReason: reason,
+                type,
+                quads: c.store.size,
+                graphs: names.size,
+                bytes: c.store.size * 48,
+                millis: Date.now() - started,
+              };
+              return `cloned /${ds.name} at commit ${headCommit(ds).seq} (${c.store.size} quads) into /${target}`;
             });
             task.target = target;
             return send(res, 202, task);
