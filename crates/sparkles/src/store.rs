@@ -16,6 +16,7 @@ mod clone;
 mod compaction;
 #[cfg(test)]
 mod compaction_tests;
+mod describe;
 mod diff;
 mod embed;
 mod geo;
@@ -36,6 +37,7 @@ pub use compaction::{
     Blocker, COMPACTION_FILE, CompactOptions, CompactReport, CompactionMeasures, CompactionPolicy,
     CompactionSettings, SETTING_NAMES, Trigger, TriggerKind,
 };
+pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions};
 pub use quota::{QUOTA_FILE, QuotaSource, QuotaStatus};
 
@@ -989,6 +991,8 @@ pub struct Store {
     quota: quota::Quota,
     /// what the compaction policy looks at, and the dataset's own compaction settings
     compaction: compaction::Track,
+    /// the dataset's DESCRIBE setting (`describe.json` of a persistent store)
+    describe: parking_lot::RwLock<crate::sparql::describe::DescribeOptions>,
     /// test hooks by failpoint name
     #[cfg(any(test, feature = "failpoints"))]
     failpoints: Mutex<BTreeMap<&'static str, backup::Failpoint>>,
@@ -1123,6 +1127,7 @@ impl Store {
             commits: tokio::sync::watch::Sender::new(0),
             quota: quota::Quota::open(None, None).expect("no file to read in memory"),
             compaction: compaction::Track::new(0, None, Some(root.timestamp_ms)),
+            describe: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,
@@ -1364,6 +1369,7 @@ impl Store {
                 replayed.first().map(|c| c.timestamp_ms),
                 Some(head.timestamp_ms),
             ),
+            describe: parking_lot::RwLock::new(describe::read_settings(root)?),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,

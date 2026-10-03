@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod charsets;
 pub mod ctx;
 pub mod depth;
+pub mod describe;
 pub mod exec;
 mod exists;
 pub mod expr;
@@ -32,8 +33,7 @@ pub mod value;
 
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::Perm;
-use crate::store::{Chunk, Snapshot};
+use crate::store::Snapshot;
 pub use ctx::{Ctx, DatasetSpec, Optimizations};
 pub use exec::PlanInfo;
 use oxrdf::{BlankNode, GraphName, NamedOrBlankNode, Quad, Term, Triple};
@@ -105,6 +105,8 @@ pub struct QueryOptions {
     /// The outbound budget the request spends (`None`: a new one from
     /// [`outbound`](Self::outbound)), shared by several requests that count as one.
     pub outbound_budget: Option<Arc<crate::outbound::RequestBudget>>,
+    /// How DESCRIBE describes a resource (see [`describe`]).
+    pub describe: describe::DescribeOptions,
 }
 
 /// Which files `LOAD <file:…>` may read.
@@ -214,6 +216,8 @@ pub struct QueryResult {
     pub mem_peak_bytes: u64,
     /// Rows produced by all operators (see [`QueryOptions::max_rows_produced`]).
     pub rows_produced: u64,
+    /// DESCRIBE: the result stopped at [`describe::DescribeOptions::max_triples`]
+    pub describe_truncated: bool,
     pub ctx: Arc<Ctx>,
 }
 
@@ -558,6 +562,7 @@ fn execute_parsed(
         timing: Timing::default(),
         mem_peak_bytes: 0,
         rows_produced: 0,
+        describe_truncated: false,
         ctx: ctx.clone(),
     };
     match parsed {
@@ -591,7 +596,15 @@ fn execute_parsed(
             (result.triples, result.quads) = construct(&ctx, &table, template, graph_templates);
         }
         Query::Describe { .. } => {
-            result.triples = describe(&ctx, &table)?;
+            // a dataset the query or the protocol gave, or the inference overlay
+            let explicit = dataset.is_some()
+                || !opts.default_graph_uris.is_empty()
+                || !opts.named_graph_uris.is_empty()
+                || !opts.default_graph_extra.is_empty();
+            let d = describe::describe(&ctx, &table, &opts.describe, explicit)?;
+            result.triples = d.triples;
+            result.describe_truncated = d.truncated;
+            result.plan.warnings = ctx.warnings();
         }
     }
     result.timing = Timing {
@@ -760,66 +773,6 @@ fn construct(
         }
     }
     (out, quads)
-}
-
-/// DESCRIBE: bounded description (outgoing triples + blank node closure), like
-/// Jena's default `DescribeBNodeClosure`, over the default graph.
-fn describe(ctx: &Ctx, t: &Table) -> Result<Vec<Triple>> {
-    let mut resources: Vec<Id> = Vec::new();
-    let mut seen_r = FxHashSet::default();
-    for col in &t.cols {
-        for id in col {
-            if !id.is_undef()
-                && matches!(ctx.kind(*id), ctx::TermKind::Iri | ctx::TermKind::BNode)
-                && seen_r.insert(*id)
-            {
-                resources.push(*id);
-            }
-        }
-    }
-    let gf = match &ctx.dataset.default {
-        Some(gs) => plan::GraphFilter::Set({
-            let mut v: Vec<u64> = gs.iter().map(|g| g.0).collect();
-            v.sort_unstable();
-            v
-        }),
-        None if ctx.snap.union_default_graph => plan::GraphFilter::All,
-        None => plan::GraphFilter::Default,
-    };
-    let mut out = Vec::new();
-    let mut seen = FxHashSet::default();
-    let mut queue = resources;
-    let mut visited = FxHashSet::default();
-    while let Some(r) = queue.pop() {
-        ctx.check()?;
-        if !visited.insert(r) || r.tag() == crate::id::Tag::Local {
-            continue;
-        }
-        let mut keys = Vec::new();
-        ctx.snap.scan(Perm::Spo, &[r.0], |c| {
-            match c {
-                Chunk::Block(b, s, e) => keys.extend((s..e).map(|i| b.key(i))),
-                Chunk::Row(k) => keys.push(k),
-            }
-            Ok(true)
-        })?;
-        for k in keys {
-            if !gf.accepts(k[3]) {
-                continue;
-            }
-            let (s, p, o) = (Id(k[0]), Id(k[1]), Id(k[2]));
-            if !seen.insert((s, p, o)) {
-                continue;
-            }
-            if o.tag() == crate::id::Tag::BNode {
-                queue.push(o);
-            }
-            if let Some(q) = ctx.snap.quad_to_terms(&[s, p, o, Id::DEFAULT_GRAPH]) {
-                out.push(Triple::new(q.subject, q.predicate, q.object));
-            }
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

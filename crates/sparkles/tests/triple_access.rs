@@ -9,6 +9,7 @@ use sparkles::access::{
     Caller, GraphAccess, GraphRule, Graphs, Limits, Protection, Rule, TripleRules,
 };
 use sparkles::io::{RdfFormat, Source};
+use sparkles::sparql::describe::{DescribeMode, DescribeOptions};
 use sparkles::sparql::update::update;
 use sparkles::sparql::{QueryKind, QueryOptions, query};
 use sparkles::store::{Store, StoreOptions};
@@ -643,23 +644,38 @@ fn differential(seed: u64, union: bool) {
     };
     let names: Vec<&str> = c.rules.iter().map(|(p, _)| p.p.name.as_str()).collect();
     for q in QUERIES {
-        if union && q.starts_with("DESCRIBE") {
-            continue;
+        let mut variants = vec![DescribeOptions::default()];
+        if q.starts_with("DESCRIBE") {
+            variants.push(DescribeOptions {
+                mode: DescribeMode::Scbd,
+                labels: true,
+                ..Default::default()
+            });
         }
-        // the result cache holds the full answer first; the view must not read it
-        let _ = answer(&full, q, &QueryOptions::default());
-        let want = answer(&oracle, q, &QueryOptions::default());
-        let got = answer(&full, q, &restricted);
-        assert_eq!(
-            got, want,
-            "seed {seed}, union {union}, rules {names:?}, caller {:?}: {q}",
-            c.caller
-        );
-        assert_eq!(
-            answer(&full, q, &restricted),
-            want,
-            "cached, seed {seed}: {q}"
-        );
+        for describe in variants {
+            let restricted = QueryOptions {
+                describe: describe.clone(),
+                ..restricted.clone()
+            };
+            let plain = QueryOptions {
+                describe: describe.clone(),
+                ..Default::default()
+            };
+            // the result cache holds the full answer first; the view must not read it
+            let _ = answer(&full, q, &plain);
+            let want = answer(&oracle, q, &plain);
+            let got = answer(&full, q, &restricted);
+            assert_eq!(
+                got, want,
+                "seed {seed}, union {union}, rules {names:?}, caller {:?}: {q} {describe:?}",
+                c.caller
+            );
+            assert_eq!(
+                answer(&full, q, &restricted),
+                want,
+                "cached, seed {seed}: {q}"
+            );
+        }
     }
 }
 

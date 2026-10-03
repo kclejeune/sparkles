@@ -162,9 +162,14 @@ impl Dataset {
     // ------------------------------------------------------------------- SPARQL ------
 
     /// Run any SPARQL query and get the full result (solutions, boolean or triples, plus
-    /// the executed plan and timings).
+    /// the executed plan and timings). DESCRIBE follows the dataset's setting
+    /// ([`Store::describe_settings`](crate::store::Store::describe_settings)).
     pub fn query(&self, query: &str) -> Result<QueryResult> {
-        self.query_with(query, &QueryOptions::default())
+        let opts = QueryOptions {
+            describe: self.store.describe_settings(),
+            ..Default::default()
+        };
+        self.query_with(query, &opts)
     }
 
     pub fn query_with(&self, query: &str, opts: &QueryOptions) -> Result<QueryResult> {
