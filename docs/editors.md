@@ -10,9 +10,10 @@ An editor can format SPARQL, and the other languages `sparkles fmt` formats, in 
   error, the command prints nothing on stdout, writes a `path:LINE:COL: error: …` line to
   stderr and exits with status 2, so the buffer is left as it is.
 - **As a language server.** `sparkles lsp` speaks the Language Server Protocol over stdin
-  and stdout. It formats documents and publishes syntax errors and the formatter's
-  warnings as diagnostics while you type. It handles `textDocument/formatting` and
-  `textDocument/rangeFormatting`, which formats the whole document.
+  and stdout. It formats documents and publishes syntax errors, the formatter's warnings
+  and the findings of `sparkles lint` as diagnostics while you type. It handles
+  `textDocument/formatting`, `textDocument/rangeFormatting`, which formats the whole
+  document, and `textDocument/codeAction` for the lint's safe fixes.
 
 Both need the `sparkles` binary on the `PATH`, built with the `fmt` feature (on by
 default).
@@ -39,10 +40,20 @@ nothing. The server provides:
     position appears at the start of the document. An example is `option-not-implemented`,
     for a config key this build does not act on yet.
 
+  SPARQL, Turtle and TriG documents are also linted. Each finding has the source
+  `sparkles lint`, its rule as the code (`unused-prefix`, `cartesian-product`, …) and the
+  rule's severity, with the levels of the `[lint]` table of the nearest
+  `.sparklesfmt.toml`. The lint's `undefined-prefix` error takes the place of the
+  formatter's `undeclared-prefix` note.
+
   Diagnostics are cleared when the problem is fixed and when the document is closed. A
   document with a syntax error is not formatted. Formatting it returns no edit rather
   than an error, because its diagnostic already says why. Warnings do not stop
   formatting.
+- **Quick fixes.** A lint finding with a safe fix (`unused-prefix`, `language-tag-case`,
+  `redundant-datatype`) offers it as a `quickfix` code action. The `source.fixAll.sparkles`
+  action applies every safe fix at once, as `sparkles lint --fix` does, and only when the
+  result means the same as the document.
 - **Options.** Options come only from `.sparklesfmt.toml`. The server uses the file
   nearest to the document, found the way `sparkles fmt` finds it, and reads it again on
   every request, so an edit to it applies at once. Documents that are not files, such as

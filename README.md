@@ -144,6 +144,9 @@ running queries.
 * A formatter for SPARQL, Turtle/TriG, N-Triples/N-Quads and JSON-LD. It keeps comments
   and checks its own output. It runs as `sparkles fmt`, as `POST /$/format`, as the
   `sparkles lsp` language server ([editors](docs/editors.md)) and in the browser ([usage](docs/USAGE.md#formatting)).
+* A linter for SPARQL, Turtle and TriG, with rules for prefixes, variables, cartesian
+  products, FILTER scope, language tags and datatypes, and safe fixes. It runs as
+  `sparkles lint`, in the language server and in the query editor ([usage](docs/USAGE.md#linting)).
 
 **Operations**
 * A SvelteKit web UI, embedded in the binary. It has a query editor, results as a table,
@@ -276,7 +279,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `text-index`, `geo-index` | Manage the full-text and spatial indexes. |
 | `auth` | Hash passwords, manage API tokens and sign in for remote commands (`auth login`). |
 | `mcp` | Run the MCP server for LLM agents over stdio. `serve --mcp` serves it over HTTP. |
-| `fmt`, `lsp` | Run the formatter or its language server. |
+| `fmt`, `lint`, `lsp` | Run the formatter, the linter or their language server. |
 | `convert` (`riot`), `compare` (`rdfdiff`), `qparse`, `uparse`, `iri`, `langtag` | Convert, validate and count RDF files, compare them up to blank-node isomorphism, print a query's algebra or plan, and check IRIs and language tags. |
 | `rsparql`, `rupdate`, `rset` | Query and update any SPARQL endpoint, and convert result sets. |
 | `completions`, `man`, `openapi` | Print shell completions for bash, zsh, fish, elvish or PowerShell, write man pages, or print the OpenAPI description of the HTTP API. |

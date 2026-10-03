@@ -14,6 +14,8 @@ unicode-width.workspace = true
 # the reference parsers of the RDF syntaxes, the graph comparison and RDFC-1.0
 oxttl.workspace = true
 oxrdf.workspace = true
+# the lexical forms of XML Schema dates, times and durations (`sparkles lint`)
+oxsdatatypes.workspace = true
 # the reference parser of JSON-LD (strict JSON)
 json-event-parser.workspace = true
 # the sorted runs the line formats spill to disk

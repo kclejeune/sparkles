@@ -31,7 +31,8 @@ Sparkles preserves these Jena behaviours:
   derived integer types), dateTime, date, time, durations, booleans and strings. ORDER BY
   orders values as `ValueSpace` does.
 * **RIOT.** Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD 1.1. Jena's own
-  RDF/JSON, Thrift, Protobuf and TriX are out of scope (§5). Streaming `StreamRDF` sinks. The JSON,
+  RDF/JSON, Thrift, Protobuf and TriX were out of scope for v1 (§5). The server, `load`
+  and `convert` have since added them. Streaming `StreamRDF` sinks. The JSON,
   XML, CSV and TSV result formats.
 * **ARQ.** Full SPARQL 1.1 Query and Update, property paths, aggregates, subqueries,
   VALUES, SERVICE, EXISTS, the function library (XPath `fn:`, `math:`, `afn:`) and property

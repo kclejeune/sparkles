@@ -122,6 +122,34 @@ impl Client {
         }
     }
 
+    /// The next diagnostics published for `uri`, without the lint's findings (the
+    /// formatter's own, which these tests check).
+    fn fmt_diagnostics(&mut self, uri: &str) -> Value {
+        let mut p = self.diagnostics(uri);
+        let kept: Vec<Value> = p["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["source"] != "sparkles lint")
+            .cloned()
+            .collect();
+        p["diagnostics"] = Value::Array(kept);
+        p
+    }
+
+    /// `p` without the lint's findings.
+    fn fmt_diagnostics_of(&self, mut p: Value) -> Value {
+        let kept: Vec<Value> = p["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["source"] != "sparkles lint")
+            .cloned()
+            .collect();
+        p["diagnostics"] = Value::Array(kept);
+        p
+    }
+
     /// `initialize` offering `encodings`, then `initialized`; the server's capabilities.
     fn initialize(&mut self, encodings: &[&str]) -> Value {
         let r = self.request(
@@ -283,7 +311,7 @@ fn session_with_utf16_positions_crlf_and_a_config_file() {
     // a syntax error (at the `2`) after characters outside the BMP, on a line after a `\r\n`
     let bad = "PREFIX ex: <http://example.org/>\r\nSELECT * { BIND(\"𝄞𝄞\" AS 2) }\r\n";
     c.open(&uri, "sparql", bad);
-    let p = c.diagnostics(&uri);
+    let p = c.fmt_diagnostics(&uri);
     assert_eq!(p["version"], 1);
     let diags = p["diagnostics"].as_array().unwrap();
     assert_eq!(diags.len(), 1, "{p}");
@@ -316,7 +344,7 @@ fn session_with_utf16_positions_crlf_and_a_config_file() {
              "text": "?x"}]}),
     );
     assert_eq!(
-        c.diagnostics(&uri),
+        c.fmt_diagnostics(&uri),
         json!({"uri": uri, "version": 2, "diagnostics": []})
     );
     let r = c.format(&uri);
@@ -329,7 +357,7 @@ fn session_with_utf16_positions_crlf_and_a_config_file() {
     // fixed, unformatted, with `\r\n` line breaks and characters outside the BMP
     let text = "prefix ex: <http://example.org/>\r\nselect ?s {?s ex:p \"𝄞 é\" .\r\n # 😀 note\r\n?s ex:q ?o}\r\n";
     c.change(&uri, 3, text);
-    let p = c.diagnostics(&uri);
+    let p = c.fmt_diagnostics(&uri);
     assert_eq!(p["version"], 3);
     assert_eq!(p["diagnostics"], json!([]), "{p}");
     let expected = fmt_cli(d.path(), &path, text);
@@ -354,7 +382,7 @@ fn session_with_utf16_positions_crlf_and_a_config_file() {
     let tail = "\n# 😀 the end\n";
     let almost = format!("{}{tail}", expected.replace("    ?s ex:q", "  ?s   ex:q"));
     c.change(&uri, 4, &almost);
-    assert_eq!(c.diagnostics(&uri)["version"], 4);
+    assert_eq!(c.fmt_diagnostics(&uri)["version"], 4);
     let r = c.format(&uri);
     let e = &r["result"][0];
     assert_eq!(
@@ -366,7 +394,7 @@ fn session_with_utf16_positions_crlf_and_a_config_file() {
     // formatted already: no edits
     c.change(&uri, 5, &expected);
     assert_eq!(
-        c.diagnostics(&uri),
+        c.fmt_diagnostics(&uri),
         json!({"uri": uri, "version": 5, "diagnostics": []})
     );
     let r = c.format(&uri);
@@ -382,7 +410,7 @@ fn session_with_utf16_positions_crlf_and_a_config_file() {
     // and a broken one is shown: a warning, and an error for formatting
     std::fs::write(dir.join(".sparklesfmt.toml"), "line-widht = 80\n").unwrap();
     c.change(&uri, 6, text);
-    let p = c.diagnostics(&uri);
+    let p = c.fmt_diagnostics(&uri);
     assert_eq!(p["diagnostics"][0]["severity"], 2, "{p}");
     assert!(
         p["diagnostics"][0]["message"]
@@ -398,7 +426,7 @@ fn session_with_utf16_positions_crlf_and_a_config_file() {
         "textDocument/didClose",
         json!({"textDocument": {"uri": uri}}),
     );
-    assert_eq!(c.diagnostics(&uri)["diagnostics"], json!([]));
+    assert_eq!(c.fmt_diagnostics(&uri)["diagnostics"], json!([]));
     let r = c.format(&uri);
     assert!(
         r["error"]["message"]
@@ -520,8 +548,8 @@ fn warnings(p: &Value) -> Vec<(String, u64, Value)> {
         .as_array()
         .unwrap()
         .iter()
+        .filter(|d| d["source"] == "sparkles fmt")
         .map(|d| {
-            assert_eq!(d["source"], "sparkles fmt", "{d}");
             (
                 d["code"].as_str().unwrap().to_string(),
                 d["severity"].as_u64().unwrap(),
@@ -541,38 +569,39 @@ fn formatter_warnings_are_diagnostics() {
     let uri_q = uri(&d.path().join("q.rq"));
     let q = "PREFIX ex: <http://example.org/>\nSELECT * { ?s ex:p \"𝄞\" . ?s dc:x \"😀\"^^ # moved\n ex:t }\n";
     c.open(&uri_q, "sparql", q);
-    let p = c.diagnostics(&uri_q);
+    let all = c.diagnostics(&uri_q);
     let (dc, comment) = (q.find("dc:x").unwrap(), q.find("# moved").unwrap());
+    // the lint's error on the undeclared prefix takes the place of the formatter's note
+    let undefined: Vec<&Value> = all["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == "undefined-prefix" || d["code"] == "undeclared-prefix")
+        .collect();
+    assert_eq!(undefined.len(), 1, "{all}");
+    assert_eq!(undefined[0]["source"], "sparkles lint");
+    assert_eq!(undefined[0]["severity"], 1);
+    assert_eq!(undefined[0]["range"]["start"], position_of(q, dc, true));
+    assert!(
+        undefined[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("the prefix dc: is not declared"),
+        "{all}"
+    );
+    let p = c.fmt_diagnostics_of(all);
     assert_eq!(
         warnings(&p),
-        [
-            (
-                "undeclared-prefix".into(),
-                3,
-                json!({"line": 1, "character": 29})
-            ),
-            (
-                "comment-moved".into(),
-                2,
-                json!({"line": 1, "character": 41})
-            ),
-        ],
+        [(
+            "comment-moved".into(),
+            2,
+            json!({"line": 1, "character": 41})
+        )],
         "{p}"
     );
     assert_eq!(
         p["diagnostics"][0]["range"]["start"],
-        position_of(q, dc, true)
-    );
-    assert_eq!(
-        p["diagnostics"][1]["range"]["start"],
         position_of(q, comment, true)
-    );
-    assert!(
-        p["diagnostics"][0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("the prefix dc: is not declared"),
-        "{p}"
     );
     // formatting still works, with the warnings
     let r = c.format(&uri_q);
@@ -581,12 +610,12 @@ fn formatter_warnings_are_diagnostics() {
     let fixed = "PREFIX dc: <http://purl.org/dc/terms/>\nPREFIX ex: <http://example.org/>\nSELECT * { ?s ex:p \"𝄞\" . ?s dc:x \"😀\"^^ex:t } # stays\n";
     c.change(&uri_q, 2, fixed);
     assert_eq!(
-        c.diagnostics(&uri_q),
+        c.fmt_diagnostics(&uri_q),
         json!({"uri": uri_q, "version": 2, "diagnostics": []})
     );
     // back again, then closed: cleared
     c.change(&uri_q, 3, q);
-    assert_eq!(warnings(&c.diagnostics(&uri_q)).len(), 2);
+    assert_eq!(warnings(&c.diagnostics(&uri_q)).len(), 1);
     c.notify(
         "textDocument/didClose",
         json!({"textDocument": {"uri": uri_q}}),
@@ -597,7 +626,7 @@ fn formatter_warnings_are_diagnostics() {
     let uri_t = uri(&d.path().join("g.ttl"));
     let t = "PREFIX ex: <http://example.org/>\nex:a ex:b \"😀\"^^ # moved\n ex:t .\n";
     c.open(&uri_t, "turtle", t);
-    let p = c.diagnostics(&uri_t);
+    let p = c.fmt_diagnostics(&uri_t);
     assert_eq!(
         warnings(&p),
         [(
@@ -616,7 +645,7 @@ fn formatter_warnings_are_diagnostics() {
         2,
         "PREFIX ex: <http://example.org/>\nex:a ex:b \"😀\"^^ex:t . # stays\n",
     );
-    assert_eq!(c.diagnostics(&uri_t)["diagnostics"], json!([]));
+    assert_eq!(c.fmt_diagnostics(&uri_t)["diagnostics"], json!([]));
 
     // a warning without a position (a key this build does not act on yet) goes at 0:0
     let sub = d.path().join("conventional");
@@ -632,7 +661,7 @@ fn formatter_warnings_are_diagnostics() {
         "turtle",
         "PREFIX ex: <http://example.org/>\nex:a ex:b ex:c .\n",
     );
-    let p = c.diagnostics(&uri_c);
+    let p = c.fmt_diagnostics(&uri_c);
     if sparkles_fmt::turtle::print::CONVENTIONAL_IMPLEMENTED {
         assert_eq!(p["diagnostics"], json!([]), "{p}");
     } else {
@@ -686,4 +715,92 @@ fn exit_without_shutdown_fails() {
     let mut c = Client::start(d.path(), &[]);
     c.initialize(&[]);
     assert_eq!(c.wait(), Some(1));
+}
+
+/// `sparkles lint` in the language server: findings as diagnostics with the config
+/// file's `[lint]` levels, a quick fix per safe finding, and `source.fixAll.sparkles`.
+#[test]
+fn lint_findings_and_fixes() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join(".sparklesfmt.toml"),
+        "[lint]\nunused-prefix = \"error\"\nsingle-use-variable = \"off\"\n",
+    )
+    .unwrap();
+    let mut c = Client::start(d.path(), &[]);
+    let caps = c.initialize(&["utf-16"]);
+    assert_eq!(
+        caps["capabilities"]["codeActionProvider"]["codeActionKinds"],
+        json!(["quickfix", "source.fixAll.sparkles"]),
+        "{caps}"
+    );
+    let uri = uri(&d.path().join("q.rq"));
+    let q = "PREFIX ex: <http://example.org/>\nPREFIX foaf: <http://xmlns.com/foaf/0.1/>\nSELECT ?s ?n { ?s foaf:name ?n ; foaf:knows ?o FILTER(lang(?n) = \"en\" || ?n = \"😀\"@en-us) }\n";
+    c.open(&uri, "sparql", q);
+    let p = c.diagnostics(&uri);
+    let lint: Vec<(String, u64)> = p["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["source"] == "sparkles lint")
+        .map(|d| {
+            (
+                d["code"].as_str().unwrap().to_string(),
+                d["severity"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        lint,
+        [
+            ("unused-prefix".to_string(), 1),
+            ("language-tag-case".to_string(), 2)
+        ],
+        "{p}"
+    );
+    let tag = q.find("@en-us").unwrap();
+    let diag = p["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"] == "language-tag-case")
+        .unwrap()
+        .clone();
+    assert_eq!(diag["range"]["start"], position_of(q, tag, true));
+    assert_eq!(diag["range"]["end"], position_of(q, tag + 6, true));
+
+    // the quick fix on the tag
+    let r = c.request(
+        "textDocument/codeAction",
+        json!({"textDocument": {"uri": uri}, "range": diag["range"],
+               "context": {"diagnostics": [diag]}}),
+    );
+    let actions = r["result"].as_array().unwrap();
+    let quick = actions
+        .iter()
+        .find(|a| a["kind"] == "quickfix")
+        .unwrap_or_else(|| panic!("{r}"));
+    assert_eq!(quick["title"], "Write @en-US");
+    let edits = &quick["edit"]["changes"][&uri];
+    assert_eq!(apply(q, edits, true), q.replace("@en-us", "@en-US"));
+    // fix all: the unused prefix goes too
+    let r = c.request(
+        "textDocument/codeAction",
+        json!({"textDocument": {"uri": uri},
+               "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+               "context": {"diagnostics": [], "only": ["source.fixAll"]}}),
+    );
+    let actions = r["result"].as_array().unwrap();
+    assert_eq!(actions.len(), 1, "{r}");
+    assert_eq!(actions[0]["kind"], "source.fixAll.sparkles");
+    let fixed = apply(q, &actions[0]["edit"]["changes"][&uri], true);
+    assert_eq!(
+        fixed,
+        q.replace("PREFIX ex: <http://example.org/>\n", "")
+            .replace("@en-us", "@en-US")
+    );
+    c.change(&uri, 2, &fixed);
+    let p = c.diagnostics(&uri);
+    assert_eq!(p["diagnostics"], json!([]), "{p}");
+    assert_eq!(c.shutdown(), Some(0));
 }

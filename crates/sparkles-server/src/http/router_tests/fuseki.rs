@@ -243,6 +243,7 @@ async fn graph_store_takes_and_gives_jena_binary_syntaxes() {
         (JenaFormat::Thrift, "application/rdf+thrift"),
         (JenaFormat::Protobuf, "application/rdf+protobuf"),
         (JenaFormat::RdfJson, "application/rdf+json"),
+        (JenaFormat::TriX, "application/trix+xml"),
     ] {
         let mut w = RdfWriter::new(fmt, Vec::new());
         w.quad(&quad).unwrap();
@@ -271,6 +272,91 @@ async fn graph_store_takes_and_gives_jena_binary_syntaxes() {
     )
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+/// TriX in Graph Store requests, uploads, dataset exports and CONSTRUCT results: an
+/// unnamed `<graph>` is the default graph, a named one a named graph.
+#[tokio::test]
+async fn trix_in_and_out() {
+    let s = server();
+    let doc = r#"<trix xmlns="http://www.w3.org/2004/03/trix/trix-1/">
+  <graph>
+    <triple><uri>urn:t:s</uri><uri>urn:t:p</uri><plainLiteral xml:lang="en">default</plainLiteral></triple>
+  </graph>
+  <graph>
+    <uri>urn:t:g</uri>
+    <triple><id>b</id><uri>urn:t:p</uri><typedLiteral datatype="http://www.w3.org/2001/XMLSchema#integer">5</typedLiteral></triple>
+  </graph>
+</trix>"#;
+    // Jena's media type, on the dataset
+    let r = call(
+        &s.app,
+        "POST",
+        "/ds/data",
+        Some("application/trix"),
+        doc.into(),
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let named = get(&s.app, "/ds/data?graph=urn:t:g", "application/n-triples").await;
+    assert!(
+        named.text().contains("<urn:t:p> \"5\"^^"),
+        "{}",
+        named.text()
+    );
+    let ask = "/ds/sparql?query=ASK%7B%3Curn%3At%3As%3E%20%3Fp%20%22default%22%40en%7D";
+    assert_eq!(
+        get(&s.app, ask, "application/json").await.json()["boolean"],
+        true
+    );
+
+    // a named graph cannot go into one graph
+    let r = call(
+        &s.app,
+        "PUT",
+        "/ds/data?graph=urn:t:h",
+        Some("application/trix+xml"),
+        doc.into(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+
+    // the whole dataset as TriX holds the default graph and the named graphs
+    let all = get(&s.app, "/ds/data", "application/trix").await;
+    assert_eq!(all.status, StatusCode::OK);
+    assert_eq!(all.content_type, "application/trix+xml");
+    let mut nq = Vec::new();
+    crate::http::jena_formats::transcode(JenaFormat::TriX, &all.body[..], true, &mut nq).unwrap();
+    let nq = String::from_utf8(nq).unwrap();
+    assert!(nq.contains("\"default\"@en ."), "{nq}");
+    assert!(nq.contains("<urn:t:g> ."), "{nq}");
+
+    // CONSTRUCT by content negotiation and by name
+    let q = "CONSTRUCT%7B%3Fs%20%3Fp%20%3Fo%7DWHERE%7BGRAPH%20%3Curn%3At%3Ag%3E%7B%3Fs%20%3Fp%20%3Fo%7D%7D";
+    for (uri, accept) in [
+        (format!("/ds/sparql?query={q}"), "application/trix+xml"),
+        (format!("/ds/sparql?query={q}&format=trix"), "*/*"),
+    ] {
+        let r = get(&s.app, &uri, accept).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.content_type, "application/trix+xml", "{uri}");
+        let mut nt = Vec::new();
+        crate::http::jena_formats::transcode(JenaFormat::TriX, &r.body[..], false, &mut nt)
+            .unwrap();
+        assert_eq!(String::from_utf8(nt).unwrap().lines().count(), 1, "{uri}");
+    }
+
+    // an upload by content type
+    let r = call(
+        &s.app,
+        "POST",
+        "/ds/upload",
+        Some("application/trix+xml"),
+        doc.replace("urn:t:", "urn:u:").into(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["count"], 2);
 }
 
 #[tokio::test]

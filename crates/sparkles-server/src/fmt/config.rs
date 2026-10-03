@@ -1,8 +1,11 @@
 //! `.sparklesfmt.toml` (or `sparklesfmt.toml`): found by walking up from each file's
 //! directory, the nearest one wins, files are never merged, and the flags override it.
-//! Every value goes through [`options::set`], like the flags and the HTTP options.
+//! Every value goes through [`options::set`], like the flags and the HTTP options. The
+//! file's `[lint]` table sets the severity of `sparkles lint`'s rules
+//! ([`LintOptions::set`]).
 
 use sparkles_fmt::Options;
+use sparkles_fmt::lint::LintOptions;
 use sparkles_fmt::options::{self, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,22 +21,27 @@ pub struct Config {
     /// the path in messages
     pub path: PathBuf,
     pub options: Result<Options, String>,
+    /// the `[lint]` table's rule levels
+    pub lint: Result<LintOptions, String>,
 }
 
 impl Config {
     /// Read and check `path`, naming it `shown` in messages.
     pub fn load(path: &Path, shown: &Path) -> Config {
-        let options = match std::fs::read_to_string(path) {
-            Ok(text) => parse(&text).map_err(|e| e.render(shown)),
-            Err(e) => Err(format!(
-                "{}: error: {}",
-                shown.display(),
-                super::report::io(&e)
-            )),
+        let (options, lint) = match std::fs::read_to_string(path) {
+            Ok(text) => (
+                parse(&text).map_err(|e| e.render(shown)),
+                parse_lint(&text).map_err(|e| e.render(shown)),
+            ),
+            Err(e) => {
+                let m = format!("{}: error: {}", shown.display(), super::report::io(&e));
+                (Err(m.clone()), Err(m))
+            }
         };
         Config {
             path: shown.to_path_buf(),
             options,
+            lint,
         }
     }
 }
@@ -70,6 +78,14 @@ pub(crate) fn options_for_dir(dir: &Path) -> Result<Options, String> {
     match discover(Path::new(""), &mut HashMap::new(), dir) {
         None => Ok(Options::default()),
         Some(c) => c.options.clone(),
+    }
+}
+
+/// The lint rule levels of a file in `dir`, as [`options_for_dir`] finds its options.
+pub(crate) fn lint_for_dir(dir: &Path) -> Result<LintOptions, String> {
+    match discover(Path::new(""), &mut HashMap::new(), dir) {
+        None => Ok(LintOptions::default()),
+        Some(c) => c.lint.clone(),
     }
 }
 
@@ -145,6 +161,10 @@ pub fn parse(text: &str) -> Result<Options, ConfigError> {
     })?;
     let mut o = Options::default();
     for (key, value) in table {
+        // `sparkles lint`'s table ([`parse_lint`])
+        if key == "lint" && value.is_table() {
+            continue;
+        }
         let bad = |message: String| {
             ConfigError::Option(options::OptionError {
                 key: key.clone(),
@@ -169,6 +189,52 @@ pub fn parse(text: &str) -> Result<Options, ConfigError> {
             }
         };
         options::set(&mut o, &key, value).map_err(ConfigError::Option)?;
+    }
+    Ok(o)
+}
+
+/// The `[lint]` table of a config file's text: `rule = "error" | "warning" | "info" |
+/// "hint" | "off"`, over the rules' defaults.
+pub fn parse_lint(text: &str) -> Result<LintOptions, ConfigError> {
+    let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+        let (line, column) = e
+            .span()
+            .map_or((0, 0), |s| sparkles_fmt::line_col(text, s.start));
+        ConfigError::Toml {
+            message: e.message().trim_end().to_string(),
+            line,
+            column,
+        }
+    })?;
+    let mut o = LintOptions::default();
+    let Some(lint) = table.get("lint") else {
+        return Ok(o);
+    };
+    let bad = |key: &str, message: String| {
+        ConfigError::Option(options::OptionError {
+            key: key.to_string(),
+            message,
+        })
+    };
+    let lint = lint
+        .as_table()
+        .ok_or_else(|| bad("lint", "expected a table of rule levels".into()))?;
+    for (rule, level) in lint {
+        let key = format!("lint.{rule}");
+        let level = level.as_str().ok_or_else(|| {
+            bad(
+                &key,
+                "expected \"error\", \"warning\", \"info\", \"hint\" or \"off\"".into(),
+            )
+        })?;
+        o.set(rule, level).map_err(|e| {
+            // the rule name leads the message already
+            let message = e
+                .split_once(": ")
+                .map_or(e.as_str(), |(_, m)| m)
+                .to_string();
+            bad(&key, message)
+        })?;
     }
     Ok(o)
 }
@@ -360,6 +426,33 @@ mod tests {
             "{}",
             err("line-width = 80\nsort = \n")
         );
+    }
+
+    #[test]
+    fn the_lint_table() {
+        use sparkles_fmt::lint::Severity;
+        let text =
+            "line-width = 80\n[lint]\nunused-prefix = \"error\"\ncartesian-product = \"off\"\n";
+        // the formatter skips the table, and the lint reads only it
+        assert_eq!(parse(text).unwrap().line_width, 80);
+        let l = parse_lint(text).unwrap();
+        assert_eq!(l.level("unused-prefix"), Some(Severity::Error));
+        assert_eq!(l.level("cartesian-product"), None);
+        assert_eq!(l.level("filter-scope"), Some(Severity::Warning));
+        assert_eq!(parse_lint("").unwrap(), LintOptions::default());
+        let lint_err = |t: &str| {
+            parse_lint(t)
+                .unwrap_err()
+                .render(Path::new("dir/.sparklesfmt.toml"))
+        };
+        assert_eq!(
+            lint_err("[lint]\nno-such-rule = \"off\""),
+            "dir/.sparklesfmt.toml: error: lint.no-such-rule: unknown lint rule"
+        );
+        assert!(lint_err("[lint]\nunused-prefix = 1").contains("lint.unused-prefix: expected"));
+        assert!(lint_err("lint = 3").contains("lint: expected a table"));
+        // a `lint` key that is not a table is still the formatter's error
+        assert!(parse("lint = 3").is_err());
     }
 
     #[test]

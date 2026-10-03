@@ -60,6 +60,7 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 | GET    | `/$/whoami`   | The caller and its permissions. See [whoami](#whoami). |
 | GET    | `/$/openapi.json`, `/$/openapi.yaml` | The OpenAPI 3.1 description of the API. See [OpenAPI description](#openapi-description). |
 | POST   | `/$/format`   | Formats a SPARQL query or update. See [Formatting](#formatting). |
+| POST   | `/$/lint`     | Lints a SPARQL query or update, or a Turtle or TriG document. See [Linting](#linting). |
 | GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. `--metrics-addr` serves it on a second address too. |
 
 ```ts
@@ -794,7 +795,7 @@ page. They read no dataset.
 | `/$/validate/query` | `query`, `languageSyntax` (`SPARQL`, the default, or `ARQ`) | `{input, formatted, algebra}`, or `{input, errors}` |
 | `/$/validate/update` | `update`, `languageSyntax` | `{input, formatted}`, or `{input, errors}` |
 | `/$/validate/iri` | `iri` (repeatable) | `{iris: [{iri, errors: string[], warning: string[]}]}`. A relative IRI gets a warning. |
-| `/$/validate/data` | `data`, `languageSyntax` (Jena's names: `N-Quads`, the default, `Turtle`, `N-Triples`, `TriG`, `RDF/XML`, `JSON-LD`, `N3`, `RDF/JSON`) | `{input}`, or `{input, errors}` with the first syntax error |
+| `/$/validate/data` | `data`, `languageSyntax` (Jena's names: `N-Quads`, the default, `Turtle`, `N-Triples`, `TriG`, `RDF/XML`, `JSON-LD`, `N3`, `RDF/JSON`, `TriX`) | `{input}`, or `{input, errors}` with the first syntax error |
 | `/$/validate/langtag` | `langtag` or `lang` (repeatable) | `{langtags: [{input, errors, formatted, language, script?, region?, variant?, extension?, privateuse?}]}` |
 
 `errors` is `[{"parse-error": string, "parse-error-line"?: number, "parse-error-column"?:
@@ -1380,7 +1381,7 @@ leaves a `DST.clone-tmp-PID` directory, which the next run into `DST` removes.
 Results are negotiated with `Accept` or, Fuseki style, the `format=` parameter. Fuseki's
 `output=` and `results=` are the same parameter, and its short names work: `json`, `xml`,
 `sparql`, `csv`, `tsv` and `thrift` for results, and `json` (JSON-LD), `json-rdf`, `xml`,
-`text` (Turtle), `ttl`, `nt`, `n-quads` and `trig` for graphs. `force-accept` labels the
+`text` (Turtle), `ttl`, `nt`, `n-quads`, `trig` and `trix` for graphs. `force-accept` labels the
 response `text/plain`, so that a browser shows it.
 
 * SELECT/ASK: `application/sparql-results+json` (default), `application/sparql-results+xml`,
@@ -1391,13 +1392,25 @@ response `text/plain`, so that a browser shows it.
 * CONSTRUCT/DESCRIBE/GSP GET: `text/turtle` (default), `application/n-triples`,
   `application/n-quads`, `application/trig`, `application/ld+json`, `application/rdf+xml`,
   and Jena's RDF Thrift (`application/rdf+thrift`), RDF Protobuf
-  (`application/rdf+protobuf`) and RDF/JSON (`application/rdf+json`, graphs only).
+  (`application/rdf+protobuf`), RDF/JSON (`application/rdf+json`, graphs only) and TriX
+  (`application/trix+xml`, or Jena's `application/trix`).
 
 Graph Store writes and uploads read the same syntaxes, and Jena's N3 media types
 (`text/rdf+n3`, `text/n3`, `application/n3`) as Turtle. RDF Thrift and RDF Protobuf bodies
 may use prefix names, values (`valInteger`, `valDecimal`, `valDouble`) and triple terms,
 as Jena writes them. An upload takes them by the file name extensions `.rt`, `.trdf`,
-`.rpb`, `.pbrdf` and `.rj`. The JSONP `callback` and XSLT `stylesheet` parameters of
+`.rpb`, `.pbrdf`, `.rj` and `.trix`, compressed or not (`data.trix.gz`).
+
+TriX follows Jena's reader and writer. A `<graph>` without a name holds triples of the
+default graph, and a named one holds a named graph, so a TriX body sent to one graph
+(`?default` or `?graph=`) must not name its graphs. Plain literals are simple and
+language-tagged strings, and every other literal is a `<typedLiteral>`. The content of an
+`rdf:XMLLiteral` is kept as the XML it was written as. A directional language string is
+written with its direction after `--` in `xml:lang` (`en--ltr`), which Jena's reader
+understands. Triple terms are nested `<triple>` elements, and `<qname>` is read against
+the XML namespaces in scope. The writer writes full IRIs and no XML declaration, as Jena
+does. SPARQL Update's `LOAD` reads TriX too, by the response's media type or the `.trix`
+extension. The JSONP `callback` and XSLT `stylesheet` parameters of
 Fuseki are not supported.
 
 Query parameters beyond the standard protocol:
@@ -1453,7 +1466,8 @@ number of cells, a bad mapping or a refused template answers `400` with the file
 column, and nothing is committed. The N-Triples written for the tables count against
 `--max-decompressed-mb` (`413`) and the free-disk reserve (`507`). A template runs with
 the server's query memory and row budgets. Dry runs and timeouts work as for any upload.
-The Graph Store endpoint does not read CSV.
+The Graph Store endpoint does not read CSV. The web UI's upload form shows these options
+once a CSV or TSV file is chosen, and sends `base` and `key` in the query string.
 
 ### Service description
 
@@ -4918,6 +4932,54 @@ string, and both are checked.
 With authentication, the route accepts any caller and needs no dataset permission, like
 `/$/server`. Cookie sessions send the CSRF header, as for every other `POST`. Rate limits
 count the route in the `query` class.
+
+## Linting
+
+The design and its rationale are in [X04 Linter](specs/X04-linter.md).
+
+`POST /$/lint` lints a SPARQL query or update, or a Turtle or TriG document, with the
+rules of `sparkles lint` (see [USAGE.md](USAGE.md#linting)). It reads no dataset and no
+config file. The rule levels come with the request. A syntax error is one of the
+findings, so a document that does not parse still gets `200`. The UI's WebAssembly module
+answers the same request in the page, and the UI calls the endpoint only when the module
+is missing or fails.
+
+```ts
+type LintRequest = {
+  text: string;
+  language?: "sparql" | "turtle" | "trig";   // default: detected
+  rules?: Record<string, "error" | "warning" | "info" | "hint" | "off">;
+  fix?: boolean;                              // apply the safe fixes
+};
+type LintResult = {
+  language: string;
+  diagnostics: {
+    rule: string;                 // "unused-prefix", "syntax", …
+    severity: "error" | "warning" | "info" | "hint";
+    message: string;
+    line: number; column: number; endLine: number; endColumn: number;  // 1-based, in characters
+    from: number; to: number;     // the range in UTF-16 code units, like the editor's
+    fix?: { title: string; edits: { from: number; to: number; insert: string }[] };
+  }[];
+  text?: string;                  // with fix: the fixed document
+  applied?: number;               // with fix: how many fixes were applied
+};
+```
+
+```sh
+curl -s localhost:3030/'$/lint' -H 'Content-Type: application/json' \
+  -d '{"text": "PREFIX ex: <http://example.org/>\nSELECT ?s { ?s ?p ?o }", "rules": {"single-use-variable": "off"}}'
+```
+
+A `fix` is present only for the rules whose fixes are safe. With `fix: true`, the fixed
+text must parse to the same SPARQL algebra, or to an isomorphic graph or dataset, as the
+input, or the request fails with `422` and `code: "unsafe-fix"`. Other errors are `400`
+with `code: "bad-request"` for a bad body, rule or level, `415` with
+`code: "unsupported-language"` for a language the linter does not take, and `415` for a
+body that is not JSON. The endpoint follows `--format-endpoint`, `--format-max-mb` and
+`--format-timeout` as `POST /$/format` does, with `401`, `404`, `408` and `413` in the
+same cases, and it shares the formatter's slots. With authentication, it needs no dataset permission, and rate limits
+count it in the `query` class.
 
 ## `application/x-sparkles+json` (UI result format)
 

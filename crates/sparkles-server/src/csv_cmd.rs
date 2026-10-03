@@ -203,17 +203,20 @@ fn report(name: &str, s: &Stats, note: Option<&str>) {
 }
 
 /// The files of a `sparkles load`, with each table converted to a temporary N-Triples
-/// file. Keep it until the load is done: dropping it removes the files.
+/// file, and each file in one of Jena's syntaxes that the loader does not parse (TriX,
+/// RDF Thrift, RDF Protobuf, RDF/JSON) to a temporary N-Quads file. Keep it until the
+/// load is done: dropping it removes the files.
 pub struct Prepared {
     pub files: Vec<PathBuf>,
     /// the name of each file in messages (a table's own name for its N-Triples file)
     pub names: Vec<String>,
-    /// whether each file is a converted table (so `--compression` does not apply)
+    /// whether each file was converted (so `--compression` does not apply)
     pub converted: Vec<bool>,
     _temps: Vec<tempfile::TempPath>,
 }
 
-/// Convert the tables among `files` for a load. RDF files pass through.
+/// Convert the tables and the files in Jena's syntaxes among `files` for a load. Other
+/// RDF files pass through.
 pub fn prepare(files: &[PathBuf], args: &CsvArgs) -> Result<Prepared> {
     let jobs = jobs(files, args)?;
     let mut out = Prepared {
@@ -237,14 +240,43 @@ pub fn prepare(files: &[PathBuf], args: &CsvArgs) -> Result<Prepared> {
         out._temps.push(path);
     }
     for f in files {
-        match converted.get(f) {
-            Some(p) => out.files.push(p.clone()),
-            None => out.files.push(f.clone()),
+        if let Some(p) = converted.get(f) {
+            out.files.push(p.clone());
+            out.converted.push(true);
+        } else if let Some(j) = crate::http::jena_formats::JenaFormat::from_path(f) {
+            let path = jena_to_nquads(f, j)?;
+            out.files.push(path.to_path_buf());
+            out.converted.push(true);
+            out._temps.push(path);
+        } else {
+            out.files.push(f.clone());
+            out.converted.push(false);
         }
         out.names.push(f.display().to_string());
-        out.converted.push(converted.contains_key(f));
     }
     Ok(out)
+}
+
+/// A file in one of Jena's syntaxes as a temporary N-Quads file. Relative IRIs in TriX
+/// resolve against the file's `file://` IRI, as in the other syntaxes.
+fn jena_to_nquads(
+    path: &Path,
+    fmt: crate::http::jena_formats::JenaFormat,
+) -> Result<tempfile::TempPath> {
+    use std::io::Write;
+    let input = tabular::open(path, None)?;
+    let tmp = tempfile::Builder::new()
+        .prefix("sparkles-load-")
+        .suffix(".nq")
+        .tempfile()?;
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let base = format!("file://{}", abs.display());
+    let mut w = std::io::BufWriter::new(tmp.as_file());
+    crate::http::jena_formats::transcode_with_base(fmt, input, true, &mut w, Some(&base))
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    w.flush()?;
+    drop(w);
+    Ok(tmp.into_temp_path())
 }
 
 // ----------------------------------------------------------------- sparkles csv ----

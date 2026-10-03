@@ -44,6 +44,8 @@ flate2.workspace = true
 zstd = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 quick_cache = "0.7.0"
+# TriX, and GML and KML geometry literals (the version oxrdfxml and sparesults already use)
+quick-xml = "0.37"
 tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "stemmer", "stopwords", "lz4-compression"], optional = true }
 # the term automata of fuzzy `text:query` terms (the versions Tantivy uses)
 levenshtein_automata = { version = "0.2.1", optional = true }
@@ -53,8 +55,6 @@ tempfile = "3"
 georust = { workspace = true, optional = true }
 geo-index = { workspace = true, optional = true }
 geographiclib-rs = { workspace = true, optional = true }
-# GML and KML geometry literals (the version oxrdfxml already builds)
-quick-xml = { version = "0.37", optional = true }
 # CRSs an operator defines with proj4 strings (feature `geo-proj4`; pure Rust, MIT OR
 # Apache-2.0); `geo-epsg` adds crs-definitions' EPSG-derived table (CC0)
 proj4rs = { version = "0.2", default-features = false, optional = true }
@@ -78,7 +78,6 @@ geo = [
     "dep:georust",
     "dep:geo-index",
     "dep:geographiclib-rs",
-    "dep:quick-xml",
 ]
 # GeoSPARQL CRSs defined by proj4 strings in the operator's `crs.json`
 geo-proj4 = ["geo", "dep:proj4rs"]

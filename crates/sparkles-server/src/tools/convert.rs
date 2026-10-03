@@ -1,7 +1,12 @@
 //! `sparkles convert` (alias `riot`): parse, validate, count and convert RDF files,
 //! streaming (spec G05 §3.1). Also the term checks of `load --check`.
+//!
+//! Jena's syntaxes that oxrdfio does not read (TriX, RDF Thrift, RDF Protobuf and
+//! RDF/JSON) are read into N-Quads on a second thread as the input streams in, and
+//! written by [`crate::http::jena_formats::RdfWriter`].
 
 use super::terms::TermChecker;
+use crate::http::jena_formats::{JenaFormat, RdfWriter};
 use anyhow::{Context, Result, bail};
 use oxrdf::{GraphName, Quad};
 use oxrdfio::{RdfFormat, RdfParser, RdfSerializer};
@@ -22,8 +27,9 @@ pub struct ConvertArgs {
     /// Input files (`-` or none: standard input)
     files: Vec<PathBuf>,
     /// Input syntax for every input: Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD,
-    /// N3, short names (ttl, nt, nq, …) or a media type (default: from the file
-    /// extension; N-Quads for standard input)
+    /// N3, TriX, RDF Thrift, RDF Protobuf, RDF/JSON, short names (ttl, nt, nq, trix, rt,
+    /// rpb, rj, …) or a media type (default: from the file extension; N-Quads for
+    /// standard input)
     #[arg(long, value_name = "LANG")]
     syntax: Option<String>,
     /// Output syntax (default: N-Quads, which is N-Triples for the default graph)
@@ -93,11 +99,52 @@ fn is_quad_syntax(f: RdfFormat) -> bool {
     )
 }
 
+/// A syntax `convert` reads or writes: one of oxrdfio's, or one of Jena's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Syntax {
+    Rdf(RdfFormat),
+    Jena(JenaFormat),
+}
+
+impl Syntax {
+    /// A syntax by name, short name, file extension or media type.
+    pub fn named(name: &str) -> Option<Syntax> {
+        JenaFormat::from_name(name)
+            .map(Syntax::Jena)
+            .or_else(|| rdf_syntax(name).map(Syntax::Rdf))
+    }
+
+    /// The syntax of a file path (past a compression extension).
+    fn of_path(path: &std::path::Path) -> Option<Syntax> {
+        JenaFormat::from_path(path)
+            .map(Syntax::Jena)
+            .or_else(|| sparkles::io::format_for_path(path).map(|(f, _)| Syntax::Rdf(f)))
+    }
+
+    fn quads(self) -> bool {
+        match self {
+            Syntax::Rdf(f) => is_quad_syntax(f),
+            Syntax::Jena(j) => j.quads(),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Syntax::Rdf(f) => f.name(),
+            Syntax::Jena(j) => j.name(),
+        }
+    }
+}
+
 /// One input: a file or standard input.
 pub struct Input {
     pub name: String,
     pub path: Option<PathBuf>,
+    /// The syntax oxrdfio parses: N-Quads for an input in one of Jena's syntaxes, which
+    /// [`Input::reader`] transcodes.
     pub format: RdfFormat,
+    /// The input's syntax when it is one of Jena's.
+    pub jena: Option<JenaFormat>,
     pub base: Option<String>,
 }
 
@@ -105,17 +152,25 @@ impl Input {
     /// The inputs of `files` (none, or `-`: standard input).
     pub fn all(files: &[PathBuf], syntax: Option<&str>, base: Option<&str>) -> Result<Vec<Input>> {
         let forced = match syntax {
-            Some(s) => Some(rdf_syntax(s).with_context(|| format!("unknown syntax '{s}'"))?),
+            Some(s) => Some(Syntax::named(s).with_context(|| format!("unknown syntax '{s}'"))?),
             None => None,
+        };
+        let split = |s: Syntax| match s {
+            Syntax::Rdf(f) => (f, None),
+            Syntax::Jena(j) => (RdfFormat::NQuads, Some(j)),
         };
         if let Some(b) = base {
             oxiri::Iri::parse(b).map_err(|e| anyhow::anyhow!("--base {b}: {e}"))?;
         }
-        let stdin = || Input {
-            name: "stdin".into(),
-            path: None,
-            format: forced.unwrap_or(RdfFormat::NQuads),
-            base: base.map(str::to_string),
+        let stdin = || {
+            let (format, jena) = split(forced.unwrap_or(Syntax::Rdf(RdfFormat::NQuads)));
+            Input {
+                name: "stdin".into(),
+                path: None,
+                format,
+                jena,
+                base: base.map(str::to_string),
+            }
         };
         if files.is_empty() {
             return Ok(vec![stdin()]);
@@ -129,19 +184,19 @@ impl Input {
                 if !f.is_file() {
                     bail!("{}: no such file", f.display());
                 }
-                let format = match forced {
-                    Some(f) => f,
-                    None => sparkles::io::format_for_path(f)
-                        .map(|(f, _)| f)
-                        .with_context(|| {
-                            format!("{}: unknown RDF syntax (use --syntax)", f.display())
-                        })?,
+                let syntax = match forced {
+                    Some(s) => s,
+                    None => Syntax::of_path(f).with_context(|| {
+                        format!("{}: unknown RDF syntax (use --syntax)", f.display())
+                    })?,
                 };
+                let (format, jena) = split(syntax);
                 let abs = std::fs::canonicalize(f).unwrap_or_else(|_| f.clone());
                 Ok(Input {
                     name: f.display().to_string(),
                     path: Some(f.clone()),
                     format,
+                    jena,
                     base: Some(
                         base.map(str::to_string)
                             .unwrap_or_else(|| format!("file://{}", abs.display())),
@@ -151,8 +206,20 @@ impl Input {
             .collect()
     }
 
-    /// A [`Source`] of a file input, for the parallel parser.
+    /// Whether the input's syntax holds named graphs.
+    fn quads(&self) -> bool {
+        match self.jena {
+            Some(j) => j.quads(),
+            None => is_quad_syntax(self.format),
+        }
+    }
+
+    /// A [`Source`] of a file input in one of oxrdfio's syntaxes, for the parallel
+    /// parser.
     fn source(&self, compression: Option<Codec>, lenient: bool) -> Option<Source> {
+        if self.jena.is_some() {
+            return None;
+        }
         Some(Source {
             data: SourceData::File(self.path.clone()?),
             format: self.format,
@@ -165,15 +232,45 @@ impl Input {
         })
     }
 
-    /// The decompressed bytes of the input.
+    /// The decompressed bytes of the input, as N-Quads for an input in one of Jena's
+    /// syntaxes.
     pub fn reader(&self, compression: Option<Codec>) -> Result<Box<dyn Read>> {
+        let raw = self.raw_reader(compression)?;
+        let Some(j) = self.jena else {
+            return Ok(raw);
+        };
+        let (pipe, w) = std::io::pipe()?;
+        let base = self.base.clone();
+        let worker = std::thread::spawn(move || -> std::result::Result<(), String> {
+            let mut w = std::io::BufWriter::with_capacity(1 << 16, w);
+            crate::http::jena_formats::transcode_with_base(j, raw, true, &mut w, base.as_deref())
+                .map_err(|e| e.to_string())?;
+            std::io::Write::flush(&mut w).map_err(|e| e.to_string())
+        });
+        Ok(Box::new(Transcoded {
+            pipe,
+            worker: Some(worker),
+        }))
+    }
+
+    /// The decompressed bytes of the input as they are.
+    fn raw_reader(&self, compression: Option<Codec>) -> Result<Box<dyn Read + Send>> {
         match &self.path {
             Some(p) => {
-                let src = self.source(compression, false).expect("a file");
+                let src = Source {
+                    data: SourceData::File(p.clone()),
+                    format: self.format,
+                    compression,
+                    max_decompressed: None,
+                    graph: None,
+                    base: None,
+                    name: self.name.clone(),
+                    lenient: false,
+                };
                 let codec = src.codec()?;
                 let f =
                     std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
-                Ok(codec.reader(std::io::BufReader::with_capacity(1 << 16, f), None)?)
+                Ok(codec.reader_send(std::io::BufReader::with_capacity(1 << 16, f), None)?)
             }
             None => {
                 let mut stdin = std::io::stdin();
@@ -193,7 +290,7 @@ impl Input {
                     bail!("stdin: built without {codec}");
                 }
                 let r = std::io::Cursor::new(head[..n].to_vec()).chain(stdin);
-                Ok(codec.reader(std::io::BufReader::with_capacity(1 << 16, r), None)?)
+                Ok(codec.reader_send(std::io::BufReader::with_capacity(1 << 16, r), None)?)
             }
         }
     }
@@ -208,6 +305,30 @@ impl Input {
             p = p.lenient();
         }
         Ok(p)
+    }
+}
+
+/// N-Quads from a thread that transcodes an input in one of Jena's syntaxes. The
+/// transcoder's error ends the stream as an I/O error.
+struct Transcoded {
+    pipe: std::io::PipeReader,
+    worker: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
+}
+
+impl Read for Transcoded {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.pipe.read(buf)?;
+        if n == 0
+            && !buf.is_empty()
+            && let Some(worker) = self.worker.take()
+        {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                Err(_) => return Err(std::io::Error::other("the transcoding thread panicked")),
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -234,8 +355,8 @@ pub fn run(a: ConvertArgs) -> Result<()> {
     let writes = !(a.count || a.sink || a.validate);
     let mut out = if writes {
         let format = match &a.output {
-            Some(o) => rdf_syntax(o).with_context(|| format!("unknown output syntax '{o}'"))?,
-            None => RdfFormat::NQuads,
+            Some(o) => Syntax::named(o).with_context(|| format!("unknown output syntax '{o}'"))?,
+            None => Syntax::Rdf(RdfFormat::NQuads),
         };
         let codec = match &a.compress {
             Some(c) => Codec::parse(c)?,
@@ -270,11 +391,7 @@ pub fn run(a: ConvertArgs) -> Result<()> {
         }
         failed |= !o.errors.is_empty();
         total += o.statements;
-        let unit = if is_quad_syntax(input.format) {
-            "quads"
-        } else {
-            "triples"
-        };
+        let unit = if input.quads() { "quads" } else { "triples" };
         if a.count {
             println!("{}: {} {unit}", input.name, o.statements);
         }
@@ -300,18 +417,24 @@ pub fn run(a: ConvertArgs) -> Result<()> {
     Ok(())
 }
 
+/// A serializer of the output.
+enum Ser {
+    Rdf(oxrdfio::WriterQuadSerializer<Box<dyn sparkles::codec::FinishWrite>>),
+    Jena(RdfWriter<Box<dyn sparkles::codec::FinishWrite>>),
+}
+
 /// The output stream: one serializer for every input, created at the first statement so
 /// that it can declare the prefixes the input declared before it.
 struct Output {
-    format: RdfFormat,
+    format: Syntax,
     merge: bool,
     writer: Option<Box<dyn sparkles::codec::FinishWrite>>,
-    ser: Option<oxrdfio::WriterQuadSerializer<Box<dyn sparkles::codec::FinishWrite>>>,
+    ser: Option<Ser>,
     dropped: u64,
 }
 
 impl Output {
-    fn new(format: RdfFormat, w: Box<dyn sparkles::codec::FinishWrite>, merge: bool) -> Output {
+    fn new(format: Syntax, w: Box<dyn sparkles::codec::FinishWrite>, merge: bool) -> Output {
         Output {
             format,
             merge,
@@ -322,15 +445,19 @@ impl Output {
     }
 
     fn triples_only(&self) -> bool {
-        !is_quad_syntax(self.format)
+        !self.format.quads()
     }
 
     fn start(&mut self, prefixes: impl IntoIterator<Item = (String, String)>) {
         if self.ser.is_none() {
-            let ser =
-                sparkles::io::with_prefixes(RdfSerializer::from_format(self.format), prefixes);
             let w = self.writer.take().expect("the writer is taken once");
-            self.ser = Some(ser.for_writer(w));
+            self.ser = Some(match self.format {
+                Syntax::Rdf(f) => Ser::Rdf(
+                    sparkles::io::with_prefixes(RdfSerializer::from_format(f), prefixes)
+                        .for_writer(w),
+                ),
+                Syntax::Jena(j) => Ser::Jena(RdfWriter::new(j, w)),
+            });
         }
     }
 
@@ -343,11 +470,11 @@ impl Output {
                 return Ok(());
             }
         }
-        self.ser
-            .as_mut()
-            .expect("started")
-            .serialize_quad(&q)
-            .context("writing the output")
+        match self.ser.as_mut().expect("started") {
+            Ser::Rdf(s) => s.serialize_quad(&q),
+            Ser::Jena(s) => s.quad(&q),
+        }
+        .context("writing the output")
     }
 
     fn finish(mut self) -> Result<()> {
@@ -361,7 +488,10 @@ impl Output {
                 self.format.name()
             );
         }
-        let w = self.ser.take().expect("started").finish()?;
+        let w = match self.ser.take().expect("started") {
+            Ser::Rdf(s) => s.finish()?,
+            Ser::Jena(s) => s.finish()?,
+        };
         w.finish()?;
         Ok(())
     }
@@ -576,5 +706,34 @@ mod tests {
             Some(RdfFormat::JsonLd { .. })
         ));
         assert_eq!(rdf_syntax("csv"), None);
+    }
+
+    #[test]
+    fn jena_syntax_names() {
+        for (n, j) in [
+            ("TriX", JenaFormat::TriX),
+            ("application/trix", JenaFormat::TriX),
+            ("application/trix+xml", JenaFormat::TriX),
+            ("rt", JenaFormat::Thrift),
+            ("rdf-protobuf", JenaFormat::Protobuf),
+            ("RDF/JSON", JenaFormat::RdfJson),
+        ] {
+            assert_eq!(Syntax::named(n), Some(Syntax::Jena(j)), "{n}");
+        }
+        assert_eq!(
+            Syntax::named("json"),
+            Some(Syntax::Rdf(rdf_syntax("json").unwrap()))
+        );
+        for (p, j) in [
+            ("a.trix", JenaFormat::TriX),
+            ("a.TRIX.gz", JenaFormat::TriX),
+            ("a.rj", JenaFormat::RdfJson),
+        ] {
+            assert_eq!(
+                Syntax::of_path(std::path::Path::new(p)),
+                Some(Syntax::Jena(j)),
+                "{p}"
+            );
+        }
     }
 }

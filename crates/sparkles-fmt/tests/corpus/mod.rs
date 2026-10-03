@@ -459,6 +459,25 @@ pub fn fmt_known_failures() -> BTreeMap<String, String> {
     out
 }
 
+/// A negative test that only ARQ's syntax accepts, such as `constructwhere06`
+/// (`CONSTRUCT WHERE { GRAPH … }`). The formatter takes ARQ's syntax, as the engine does by
+/// default, and the engine's W3C harness likewise holds negative tests to strict SPARQL.
+pub fn arq_only(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    // the tests use relative IRIs, resolved against the file's URL
+    let base = format!("file://{}", path.display());
+    let Ok(arq) = spargebra::SparqlParser::new().with_base_iri(&base) else {
+        return false;
+    };
+    let strict = arq.clone().with_arq_syntax(false);
+    let parses = |p: &spargebra::SparqlParser| {
+        p.clone().parse_query(&text).is_ok() || p.clone().parse_update(&text).is_ok()
+    };
+    !parses(&strict) && parses(&arq)
+}
+
 /// The engine's `w3c-known-failures.txt`: tests the reference parser itself gets wrong.
 pub fn w3c_known_failures() -> BTreeSet<String> {
     let path =

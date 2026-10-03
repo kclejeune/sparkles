@@ -7043,6 +7043,83 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/lint": {
+      "post": {
+        "description": "Lints a SPARQL query or update, or a Turtle or TriG document, with the rules of `sparkles lint`. A syntax error is one of the findings, so the answer is `200` either way. `--format-endpoint` may limit or turn off the route.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#linting"
+        },
+        "operationId": "lint",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "A `LintRequest`: the text, its language, the rule levels and whether to apply the safe fixes.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A `LintResult`: the findings, and with `fix` the fixed text."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Lint SPARQL, Turtle or TriG",
+        "tags": [
+          "Formatting"
+        ],
+        "x-sparkles-permission": "any caller"
+      }
+    },
     "/$/mcp": {
       "delete": {
         "description": "Ends a legacy session.",

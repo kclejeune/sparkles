@@ -2225,4 +2225,7 @@ text changed and the warnings. The text may be up to 1 MiB, and `--mcp-max-bytes
 the result. A call runs within its `timeoutSeconds`. It reads no dataset and no config
 file.
 
-**Deferred:** fuzzing (§9.7), `sparkles lint`.
+**Deferred:** fuzzing (§9.7). `sparkles lint` landed later as its own spec,
+[X04](X04-linter.md), on the formatter's syntax tree. It adds a `[lint]` table to the
+config file, which the formatter ignores, lint diagnostics and quick fixes to
+`sparkles lsp`, and a `lint` function to the WebAssembly module.

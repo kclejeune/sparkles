@@ -220,3 +220,43 @@ fn check_resolves_paths_without_loading() {
         outside
     );
 }
+
+/// TriX by its extension: an unnamed graph is the default graph (here the `INTO GRAPH`
+/// target), a named one keeps its name, and relative IRIs resolve against the file.
+#[test]
+fn loads_trix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("data.trix");
+    std::fs::write(
+        &path,
+        r#"<trix xmlns="http://www.w3.org/2004/03/trix/trix-1/">
+  <graph>
+    <triple><uri>urn:a</uri><uri>urn:p</uri><plainLiteral xml:lang="en">x</plainLiteral></triple>
+  </graph>
+  <graph>
+    <uri>urn:g</uri>
+    <triple><uri>rel</uri><uri>urn:p</uri><typedLiteral datatype="http://www.w3.org/2001/XMLSchema#integer">1</typedLiteral></triple>
+  </graph>
+</trix>"#,
+    )
+    .unwrap();
+    let store = Store::in_memory(StoreOptions::default());
+    sparkles::sparql::update::update(
+        &store,
+        &format!("LOAD <{}> INTO GRAPH <urn:into>", file_url(&path)),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let ask = |q: &str| {
+        sparkles::sparql::query(store.snapshot(), q, &QueryOptions::default())
+            .unwrap()
+            .boolean
+    };
+    assert!(ask(
+        r#"ASK { GRAPH <urn:into> { <urn:a> <urn:p> "x"@en } }"#
+    ));
+    let rel = format!("{}/rel", file_url(tmp.path()));
+    assert!(ask(&format!(
+        "ASK {{ GRAPH <urn:g> {{ <{rel}> <urn:p> 1 }} }}"
+    )));
+}

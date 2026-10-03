@@ -702,6 +702,46 @@ implementation landed.
   - formatting SPARQL inside SHACL literals;
   - canonicalizing literal lexical forms.
 
+## Linter
+
+- **Spec:** [`X04-linter.md`](X04-linter.md), written on 2026-10-02 as internal
+  engineering, the `sparkles lint` that [X02](X02-formatter.md) deferred. Its sources are:
+  - the W3C SPARQL 1.1 and 1.2 Query specifications (variable scope, grouping, and the
+    algebra of FILTER, OPTIONAL and MINUS), RDF 1.1 and 1.2 Concepts, XML Schema 1.1
+    Part 2, BCP 47 (RFC 5646) and the IANA language subtag registry, the OWL 2 mapping to
+    RDF, and the Language Server Protocol 3.17;
+  - Apache Jena's `ARQConstants` and `MappedLoader` (Apache-2.0), read for the old
+    `jena.hpl.hp.com` namespaces and Jena's warning about them. No code was copied;
+  - the public documentation of ESLint and Ruff (MIT) for the command's conventions:
+    severities per rule, `--fix` for safe fixes only, and the exit statuses;
+  - the Sparkles code: the formatter's lexer, syntax tree, prefix scopes, reference
+    parses and equivalence checks.
+
+  No code was read or copied from another linter. Fluree was not consulted.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. **Dependencies:**
+  `oxsdatatypes` 0.2 (MIT OR Apache-2.0), already a dependency of `sparkles`, became a
+  dependency of `sparkles-fmt` for the XML Schema date, time and duration forms.
+- **Rejected** (spec §6): rules over the SPARQL algebra, a config file of its own, and
+  fixes that change a document's meaning.
+
+## TriX
+
+- **Design source:** Apache Jena's `ReaderTriX`, `WriterTriX`, `StreamWriterTriX` and
+  `TriX` classes and their tests `TestTriXReader`, `TestTriXBad` and `TestTriXWriter`
+  (Apache-2.0), read for behaviour: the element names of the HPL report and the W3C DTD,
+  the unnamed graph as the default graph, plain and typed literals, `rdf:XMLLiteral`
+  content, `<qname>`, triple terms, and the writer's layout. The format itself is
+  Carroll and Stickler's "TriX: RDF Triples in XML" (HP Labs, HPL-2004-56). No code was
+  copied, and Fluree was not consulted.
+- **Test files:** Jena's `jena-arq/testing/RIOT/Lang/TriX` directory is copied unchanged
+  into `testsuite/trix/jena`, with Jena's `LICENSE` (as `LICENSE-APACHE`) and `NOTICE`, as
+  the Apache License 2.0 allows. The unit tests of `sparkles::trix` run Jena's cases
+  against them.
+- **Implementation** (2026-10-02): `sparkles::trix` in the core crate, used by the
+  server's Jena formats, `sparkles load` and `sparkles convert`, and SPARQL Update's
+  `LOAD`. **Dependencies:** `quick-xml` 0.37 (MIT), already in the tree through
+  `oxrdfxml` and `sparesults`, became a direct dependency of `sparkles`.
+
 ## Patched spargebra (vendored)
 
 - **Adopted:** `spargebra` 0.4.7 from crates.io (2026-09-30). Its `Cargo.toml` gives the

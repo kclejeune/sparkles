@@ -3,6 +3,7 @@
 
 import { CSRF_HEADER, needsCsrf, type Level } from './auth';
 import { fmtBytes, fmtInt } from './format';
+import { mappingPart, tableParams } from './upload';
 
 export type DatasetType = 'persistent' | 'mem';
 
@@ -641,6 +642,51 @@ export type FormatResult = {
 export const format = (req: FormatRequest, signal?: AbortSignal) =>
   json<FormatResult>('/$/format', { ...jsonBody(req), signal });
 
+export type LintSeverity = 'error' | 'warning' | 'info' | 'hint';
+
+/** `POST /$/lint` (and the browser module's `lint`): SPARQL, Turtle or TriG. */
+export type LintRequest = {
+  text: string;
+  language?: 'sparql' | 'turtle' | 'trig';
+  /** rule levels over the defaults: a severity or `off` */
+  rules?: Record<string, LintSeverity | 'off'>;
+  /** apply the safe fixes and return the fixed `text` */
+  fix?: boolean;
+};
+
+export type LintEdit = { from: number; to: number; insert: string };
+
+export type LintDiagnostic = {
+  rule: string;
+  severity: LintSeverity;
+  message: string;
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+  /** the range in UTF-16 code units (the editor's unit) */
+  from: number;
+  to: number;
+  /** a safe fix */
+  fix?: { title: string; edits: LintEdit[] };
+};
+
+export type LintResult = {
+  language: string;
+  diagnostics: LintDiagnostic[];
+  /** with `fix`: the fixed text and the number of fixes applied */
+  text?: string;
+  applied?: number;
+};
+
+/**
+ * Lint a document. A syntax error is a finding (`rule: 'syntax'`), not an error. Throws an
+ * `ApiError`: `400` `bad-request`, `415` for a language lint does not take, `404` when the
+ * server turned formatting off.
+ */
+export const lint = (req: LintRequest, signal?: AbortSignal) =>
+  json<LintResult>('/$/lint', { ...jsonBody(req), signal });
+
 // --- datasets -----------------------------------------------------------------
 
 export async function listDatasets(): Promise<DatasetInfo[]> {
@@ -1244,26 +1290,38 @@ export type UploadResult = {
   count?: number;
   tripleCount?: number;
   quadCount?: number;
+  /** The CSV and TSV tables mapped to triples, one report each. */
+  tables?: { file: string; rows: number; triples: number; warnings?: string[] }[];
   /** The commit the upload produced (absent on servers that predate commits). */
   receipt?: Receipt;
 };
 
 /**
  * Multipart upload to /{ds}/upload with progress reporting (XHR, since fetch has no upload
- * progress). Asks for a commit receipt (`receipt=true`).
+ * progress). Asks for a commit receipt (`receipt=true`). `tables` maps the CSV and TSV
+ * files: `base` and `key` go in the query string, and a mapping or template file in the
+ * part the server reads it from.
  */
 export async function upload(
   ds: string,
   files: File[],
-  opts: { graph?: string; onProgress?: (p: UploadProgress) => void; signal?: AbortSignal } = {},
+  opts: {
+    graph?: string;
+    tables?: { base?: string; key?: string; mapping?: File | null };
+    onProgress?: (p: UploadProgress) => void;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<UploadResult | string> {
   const csrf = await csrfFor('POST');
   return new Promise((resolve, reject) => {
     const form = new FormData();
     if (opts.graph) form.append('graph', opts.graph);
+    const mapping = opts.tables?.mapping;
+    if (mapping) form.append(mappingPart(mapping.name), mapping, mapping.name);
     for (const f of files) form.append('file', f, f.name);
+    const params = opts.tables ? tableParams(opts.tables) : '';
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/${enc(ds)}/upload?receipt=true`);
+    xhr.open('POST', `/${enc(ds)}/upload?receipt=true${params ? `&${params}` : ''}`);
     xhr.setRequestHeader('Accept', 'application/json');
     if (csrf) xhr.setRequestHeader(CSRF_HEADER, csrf);
     xhr.upload.onprogress = (e) =>

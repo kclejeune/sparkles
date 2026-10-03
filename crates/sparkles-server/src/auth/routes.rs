@@ -96,8 +96,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/rdfs/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/quota/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/compaction/{ds}", &["GET", "PUT", "DELETE"]),
-    // the formatter (feature `fmt`); `serve --format-endpoint` is checked by the handler
+    // the formatter and the linter (feature `fmt`); `serve --format-endpoint` is checked
+    // by the handlers
     ("/$/format", &["POST"]),
+    ("/$/lint", &["POST"]),
     // MCP (`serve --mcp`): every message is checked against the caller's datasets
     ("/$/mcp", &["*"]),
     // backup repositories (feature `backup`)
@@ -212,7 +214,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/validate/data"
         | "/$/validate/langtag" => Caller,
         // reads no dataset; `--format-endpoint authenticated|off` is the handler's
-        "/$/format" => Caller,
+        "/$/format" | "/$/lint" => Caller,
         // each tool call reads or writes the datasets its caller may (`mcp::http`)
         "/$/mcp" => Caller,
         // a pure computation over the request's literals
@@ -1165,8 +1167,9 @@ mod tests {
         );
         // cancelling is checked by the handler
         assert_eq!(n(Method::DELETE, "/$/tasks/{id}"), Some(Need::Caller));
-        // formatting reads no dataset
+        // formatting and linting read no dataset
         assert_eq!(n(Method::POST, "/$/format"), Some(Need::Caller));
+        assert_eq!(n(Method::POST, "/$/lint"), Some(Need::Caller));
     }
 
     #[test]

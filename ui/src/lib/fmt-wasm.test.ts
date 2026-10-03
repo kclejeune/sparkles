@@ -101,6 +101,25 @@ describe('localFormatter', () => {
     expect(String(remote.mock.calls[0][0])).toBe('/$/format');
   });
 
+  it('lints with the module when it has a linter, else through the endpoint', async () => {
+    const remote = endpoint();
+    const answer = { language: 'sparql', diagnostics: [] };
+    const { m, load } = fake(() => answer);
+    const lint = vi.fn((request: string) =>
+      JSON.stringify({ ...answer, echo: JSON.parse(request) }),
+    );
+    const f = localFormatter(async () => ({ ...m, lint }));
+    expect(await f.lintAny({ text: 'ASK {}', fix: true })).toMatchObject({
+      echo: { text: 'ASK {}', fix: true },
+    });
+    expect(remote).not.toHaveBeenCalled();
+    // a module built before the linter: the endpoint
+    const old = localFormatter(load);
+    await expect(old.lintLocal({ text: 'ASK {}' })).rejects.toBeInstanceOf(LocalUnavailable);
+    await old.lintAny({ text: 'ASK {}' });
+    expect(String(remote.mock.calls[0][0])).toBe('/$/lint');
+  });
+
   it('uses the endpoint when the module does not load, and does not try again', async () => {
     const remote = endpoint();
     vi.spyOn(console, 'warn').mockImplementation(() => {});

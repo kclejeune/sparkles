@@ -21,7 +21,9 @@
     placeholder as cmPlaceholder,
   } from '@codemirror/view';
   import { onDestroy, onMount } from 'svelte';
+  import type { LintDiagnostic } from '$lib/api';
   import { minimalChange } from '$lib/fmt-edit';
+  import { lintView, setLintDiagnostics } from '$lib/lint-view';
   import { highlightError, sparql, type CompletionData } from '$lib/sparql-lang';
 
   let {
@@ -163,6 +165,7 @@
         indentWithTab,
       ]),
       sparql(completion),
+      lintView(),
       theme,
       EditorView.updateListener.of((u) => {
         if (u.docChanged) onchange(u.state.doc.toString());
@@ -204,6 +207,11 @@
 
   export function focus() {
     view?.focus();
+  }
+
+  /** Show lint findings (an empty list clears them). */
+  export function setLint(diagnostics: LintDiagnostic[]) {
+    view?.dispatch({ effects: setLintDiagnostics.of(diagnostics) });
   }
 
   /** The document and the cursor (UTF-16 code units, CodeMirror's unit), to format. */

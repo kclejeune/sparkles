@@ -24,6 +24,7 @@
   } from '$lib/shacl';
   import { readLang, validateLangKey, type ValidateLang } from '$lib/shex';
   import { load, save } from '$lib/storage';
+  import { tableKind, tableProblem, UPLOAD_ACCEPT } from '$lib/upload';
   import BackupsPanel from '$components/BackupsPanel.svelte';
   import CloneDialog from '$components/CloneDialog.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
@@ -149,7 +150,22 @@
   let uploadCtl: AbortController | null = null;
   let fileInput: HTMLInputElement | undefined = $state();
 
-  const ACCEPT = '.ttl,.nt,.nq,.trig,.rdf,.owl,.xml,.jsonld,.n3,.gz,.zst,.br,.lz4';
+  // CSV and TSV files: the default mapping's base IRI and key column, or a CSVW mapping
+  // or CONSTRUCT template file (the base IRI is kept per dataset)
+  let tableBase = $state('');
+  let tableKey = $state('');
+  let tableMapping = $state<File | null>(null);
+  let mappingInput: HTMLInputElement | undefined = $state();
+  const tableBaseKey = $derived(`sparkles.upload.base.${name}`);
+  $effect(() => {
+    tableBase = load(tableBaseKey, '');
+    tableKey = '';
+    tableMapping = null;
+  });
+  const hasTables = $derived(files.some((f) => tableKind(f.name)));
+  const tableIssue = $derived(
+    tableProblem(files, { base: tableBase, key: tableKey, mapping: tableMapping }),
+  );
 
   function addFiles(list: FileList | null | undefined) {
     if (!list) return;
@@ -166,8 +182,10 @@
     progress = 0;
     uploadCtl = new AbortController();
     try {
+      if (hasTables) save(tableBaseKey, tableBase.trim());
       const res = await api.upload(name, files, {
         graph: graph.trim() || undefined,
+        tables: hasTables ? { base: tableBase, key: tableKey, mapping: tableMapping } : undefined,
         onProgress: (p) => (progress = p.total ? p.loaded / p.total : 0),
         signal: uploadCtl.signal,
       });
@@ -175,12 +193,23 @@
         typeof res === 'object' ? (res.quadCount ?? res.tripleCount ?? res.count) : undefined;
       const receipt = typeof res === 'object' ? res.receipt : undefined;
       uploadReceipt = receipt ?? null;
+      const tables = typeof res === 'object' ? (res.tables ?? []) : [];
+      const rows = tables.reduce((a, t) => a + (t.rows ?? 0), 0);
+      const tableNote = tables.length
+        ? ` · ${fmtInt(rows)} row${rows === 1 ? '' : 's'} from ${tables.length} table${tables.length === 1 ? '' : 's'}`
+        : '';
+      const summary = receipt
+        ? receiptSummary(receipt)
+        : n != null
+          ? `${fmtInt(n)} quads added`
+          : undefined;
       toasts.push(
         'success',
         `Uploaded ${files.length} file${files.length === 1 ? '' : 's'}`,
-        receipt ? receiptSummary(receipt) : n != null ? `${fmtInt(n)} quads added` : undefined,
+        summary != null ? summary + tableNote : tableNote.slice(3) || undefined,
       );
       files = [];
+      tableMapping = null;
       refreshAll();
     } catch (e) {
       if (!(e instanceof DOMException && e.name === 'AbortError'))
@@ -1048,15 +1077,15 @@ ex:PersonShape a sh:NodeShape ;
               <Icon name="upload" size={20} />
               <span><strong>Drop RDF files</strong> or click to choose</span>
               <span class="faint"
-                >Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD. Format comes from the file
-                extension.</span
+                >Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD, TriX, Jena's RDF Thrift, RDF
+                Protobuf and RDF/JSON, and CSV or TSV tables. Format comes from the file extension.</span
               >
             </div>
             <input
               bind:this={fileInput}
               type="file"
               multiple
-              accept={ACCEPT}
+              accept={UPLOAD_ACCEPT}
               hidden
               onchange={(e) => addFiles(e.currentTarget.files)}
             />
@@ -1077,6 +1106,68 @@ ex:PersonShape a sh:NodeShape ;
                   </li>
                 {/each}
               </ul>
+            {/if}
+            {#if hasTables}
+              <fieldset class="tables">
+                <legend>CSV and TSV tables</legend>
+                <label class="field">
+                  Base IRI <span class="faint"
+                    >(the namespace of the rows and columns; optional with a mapping or template)</span
+                  >
+                  <input
+                    class="input mono"
+                    bind:value={tableBase}
+                    placeholder="http://example.org/people/"
+                  />
+                </label>
+                <label class="field">
+                  Key column <span class="faint"
+                    >(optional; names each row, else rows are numbered)</span
+                  >
+                  <input
+                    class="input mono"
+                    bind:value={tableKey}
+                    placeholder="id"
+                    disabled={tableMapping != null}
+                  />
+                </label>
+                <div class="field">
+                  <span
+                    >Mapping or template <span class="faint"
+                      >(optional; CSVW metadata in JSON, or a CONSTRUCT query in a .rq file)</span
+                    ></span
+                  >
+                  <div class="row">
+                    {#if tableMapping}
+                      <span class="mono">{tableMapping.name}</span>
+                      <button
+                        class="btn ghost icon sm"
+                        aria-label="Remove {tableMapping.name}"
+                        disabled={uploading}
+                        onclick={() => (tableMapping = null)}
+                      >
+                        <Icon name="x" size={12} />
+                      </button>
+                    {:else}
+                      <button class="btn sm" onclick={() => mappingInput?.click()}>
+                        Choose a file
+                      </button>
+                    {/if}
+                  </div>
+                  <input
+                    bind:this={mappingInput}
+                    type="file"
+                    accept=".json,.jsonld,.rq,.sparql"
+                    aria-label="Mapping or template file"
+                    hidden
+                    onchange={(e) => {
+                      tableMapping = e.currentTarget.files?.[0] ?? null;
+                      e.currentTarget.value = '';
+                    }}
+                  />
+                </div>
+                {#if tableIssue}<p class="faint warn">{tableIssue}</p>{/if}
+              </fieldset>
             {/if}
             <label class="field">
               Target graph <span class="faint"
@@ -1113,7 +1204,11 @@ ex:PersonShape a sh:NodeShape ;
             {/if}
             <div class="row">
               <span class="spacer"></span>
-              <button class="btn primary" disabled={!files.length || uploading} onclick={doUpload}>
+              <button
+                class="btn primary"
+                disabled={!files.length || uploading || tableIssue != null}
+                onclick={doUpload}
+              >
                 <Icon name="upload" size={14} /> Upload {files.length
                   ? `${files.length} file${files.length === 1 ? '' : 's'}`
                   : ''}
@@ -1558,6 +1653,25 @@ ex:PersonShape a sh:NodeShape ;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .tables {
+    display: grid;
+    gap: 10px;
+    margin: 0;
+    padding: 8px 10px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    min-width: 0;
+  }
+  .tables legend {
+    padding: 0 4px;
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+  }
+  .tables .warn {
+    margin: 0;
+    color: var(--warn);
+    font-size: var(--fs-sm);
   }
   .receipt {
     display: flex;

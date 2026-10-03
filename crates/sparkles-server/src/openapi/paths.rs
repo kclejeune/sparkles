@@ -1611,6 +1611,22 @@ fn format_and_mcp(p: &mut Paths) {
             )
             .errors(&[400, 408, 413, 415, 422]),
     );
+    p.add(
+        op(POST, "/$/lint", "lint", "Formatting", "Lint SPARQL, Turtle or TriG")
+            .doc("Lints a SPARQL query or update, or a Turtle or TriG document, with the rules of `sparkles lint`. A syntax error is one of the findings, so the answer is `200` either way. `--format-endpoint` may limit or turn off the route.")
+            .see("linting")
+            .body(
+                true,
+                "A `LintRequest`: the text, its language, the rule levels and whether to apply the safe fixes.",
+                json!({ "application/json": { "schema": { "type": "object", "required": ["text"] } } }),
+            )
+            .resp(
+                "200",
+                "A `LintResult`: the findings, and with `fix` the fixed text.",
+                Some(json!({ "application/json": { "schema": { "type": "object" } } })),
+            )
+            .errors(&[400, 413, 415]),
+    );
     let mcp = |m: Method, id: &str, summary: &str, d: &str| {
         op(m, "/$/mcp", id, "MCP", summary)
             .doc(d)

@@ -7,10 +7,15 @@
 //! endpoint's `status`, `error`, `code` and, for syntax errors, `line`, `column`,
 //! `language` and (when `error` holds only the head of the parser's message) `detail`.
 //!
+//! [`lint`] does the same for `POST /$/lint`: `{ text, language?, rules?, fix? }` in, and
+//! `{ language, diagnostics, text?, applied? }` out, with each diagnostic's range also in
+//! UTF-16 code units (`from`, `to`) for the editor.
+//!
 //! `mise run ui:wasm` builds it into the UI (`scripts/build-fmt-wasm.sh`). The module has
 //! no deadline (`std` reads no clock on this target): the UI formats an editor's text.
 
 use serde_json::{Map, Value as J, json};
+use sparkles_fmt::lint::{self, LintError, LintOptions};
 use sparkles_fmt::options::{self, Value};
 use sparkles_fmt::{Detection, FormatError, Language, Options};
 use wasm_bindgen::prelude::*;
@@ -66,6 +71,104 @@ fn run(request: &str) -> Result<J, J> {
         "language": f.language.name(),
         "warnings": warnings,
     }))
+}
+
+/// Lint the document of a `POST /$/lint` JSON body; the answer is the endpoint's JSON.
+#[wasm_bindgen]
+pub fn lint(request: &str) -> String {
+    match run_lint(request) {
+        Ok(v) | Err(v) => v.to_string(),
+    }
+}
+
+fn run_lint(request: &str) -> Result<J, J> {
+    let body: J = serde_json::from_str(request)
+        .map_err(|e| bad_request(&format!("invalid JSON: {e}"), None))?;
+    let obj = body
+        .as_object()
+        .ok_or_else(|| bad_request("expected a JSON object", None))?;
+    let text = obj
+        .get("text")
+        .and_then(J::as_str)
+        .ok_or_else(|| bad_request("expected `text`, the document to lint", None))?;
+    let lang = language(obj.get("language"), text)?;
+    let mut opts = LintOptions::default();
+    match obj.get("rules") {
+        None | Some(J::Null) => {}
+        Some(J::Object(rules)) => {
+            for (rule, level) in rules {
+                let level = level.as_str().ok_or_else(|| {
+                    bad_request(&format!("{rule}: expected a severity or \"off\""), None)
+                })?;
+                opts.set(rule, level).map_err(|e| bad_request(&e, None))?;
+            }
+        }
+        Some(_) => return Err(bad_request("`rules` must be an object", None)),
+    }
+    let fix = match obj.get("fix") {
+        None | Some(J::Null) => false,
+        Some(J::Bool(b)) => *b,
+        Some(_) => return Err(bad_request("`fix` must be true or false", None)),
+    };
+    if fix {
+        let f = lint::fix(text, lang, &opts).map_err(|e| lint_error(&e))?;
+        Ok(json!({
+            "language": lang.name(),
+            "text": f.text,
+            "applied": f.applied,
+            "diagnostics": f.diagnostics.iter().map(|d| diagnostic(&f.text, d)).collect::<Vec<J>>(),
+        }))
+    } else {
+        let l = lint::lint(text, lang, &opts).map_err(|e| lint_error(&e))?;
+        Ok(json!({
+            "language": lang.name(),
+            "diagnostics": l.diagnostics.iter().map(|d| diagnostic(text, d)).collect::<Vec<J>>(),
+        }))
+    }
+}
+
+/// A finding as `POST /$/lint` writes it: lines and columns as `sparkles lint` prints
+/// them, and `from`/`to` in UTF-16 code units. The fix is there only for rules whose
+/// fixes are safe.
+fn diagnostic(text: &str, d: &lint::Diagnostic) -> J {
+    let u16 = |b: usize| sparkles_fmt::byte_to_utf16(text, b);
+    let mut j = json!({
+        "rule": d.rule,
+        "severity": d.severity.name(),
+        "message": d.message,
+        "line": d.line,
+        "column": d.column,
+        "endLine": d.end_line,
+        "endColumn": d.end_column,
+        "from": u16(d.start),
+        "to": u16(d.end),
+    });
+    if let Some(f) = d
+        .fix
+        .as_ref()
+        .filter(|_| lint::rule(d.rule).is_some_and(|r| r.safe_fix))
+    {
+        j["fix"] = json!({
+            "title": f.title,
+            "edits": f.edits.iter().map(|e| json!({
+                "from": u16(e.start),
+                "to": u16(e.end),
+                "insert": e.insert,
+            })).collect::<Vec<J>>(),
+        });
+    }
+    j
+}
+
+/// The endpoint's answer to a linting error.
+fn lint_error(e: &LintError) -> J {
+    let status = match e {
+        LintError::UnsupportedLanguage(_) => 415,
+        LintError::Timeout => 408,
+        LintError::TooLarge => 413,
+        LintError::UnsafeFix => 422,
+    };
+    error(status, &e.to_string(), Some(e.code()))
 }
 
 /// The language the request names, else what the text looks like.
@@ -258,6 +361,40 @@ mod tests {
             let again = call(json!({ "text": r["text"], "language": language }));
             assert_eq!(again["changed"], false, "{language}: {again}");
         }
+    }
+
+    fn call_lint(req: J) -> J {
+        serde_json::from_str(&lint(&req.to_string())).unwrap()
+    }
+
+    #[test]
+    fn lints_like_the_endpoint() {
+        let text = "PREFIX ex: <http://x/>\nSELECT ?s { ?s ?p \"\u{1F600}\"@en-us }";
+        let r = call_lint(json!({ "text": text, "rules": { "single-use-variable": "off" } }));
+        assert_eq!(r["language"], "sparql");
+        let d = r["diagnostics"].as_array().unwrap();
+        assert_eq!(d.len(), 2, "{r}");
+        assert_eq!(d[0]["rule"], "unused-prefix");
+        assert_eq!(d[0]["severity"], "warning");
+        assert_eq!(
+            (d[0]["from"].as_u64(), d[0]["to"].as_u64()),
+            (Some(0), Some(22))
+        );
+        assert_eq!(d[0]["fix"]["edits"][0]["insert"], "");
+        // UTF-16 offsets past the emoji (two code units)
+        let tag = text[..text.find("@en-us").unwrap()].encode_utf16().count() as u64;
+        assert_eq!(d[1]["from"].as_u64(), Some(tag));
+        assert_eq!(d[1]["fix"]["edits"][0]["insert"], "@en-US");
+        let r = call_lint(json!({ "text": text, "fix": true }));
+        assert_eq!(r["applied"], 2);
+        assert_eq!(r["text"], "SELECT ?s { ?s ?p \"\u{1F600}\"@en-US }");
+        // errors
+        let r = call_lint(json!({ "text": "<a> <b> <c> .", "language": "ntriples" }));
+        assert_eq!(r["status"], 415);
+        let r = call_lint(json!({ "text": "x", "language": "sparql", "rules": { "nope": "off" } }));
+        assert_eq!(r["status"], 400);
+        let r = call_lint(json!({ "text": "SELECT * {", "language": "sparql" }));
+        assert_eq!(r["diagnostics"][0]["rule"], "syntax");
     }
 
     #[test]

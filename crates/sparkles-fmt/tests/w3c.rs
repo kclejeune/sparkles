@@ -71,25 +71,6 @@ fn run(case: &Case) -> Outcome {
     }
 }
 
-/// A negative test that only ARQ's syntax accepts, such as `constructwhere06`
-/// (`CONSTRUCT WHERE { GRAPH … }`). The formatter takes ARQ's syntax, as the engine does by
-/// default, and the engine's W3C harness likewise holds negative tests to strict SPARQL.
-fn arq_only(case: &Case) -> bool {
-    let Ok(text) = std::fs::read_to_string(&case.path) else {
-        return false;
-    };
-    // the tests use relative IRIs, resolved against the file's URL
-    let base = format!("file://{}", case.path.display());
-    let Ok(arq) = spargebra::SparqlParser::new().with_base_iri(&base) else {
-        return false;
-    };
-    let strict = arq.clone().with_arq_syntax(false);
-    let parses = |p: &spargebra::SparqlParser| {
-        p.clone().parse_query(&text).is_ok() || p.clone().parse_update(&text).is_ok()
-    };
-    !parses(&strict) && parses(&arq)
-}
-
 #[test]
 fn corpus_by_manifest() {
     let Some(cases) = suite() else { return };
@@ -126,7 +107,8 @@ fn corpus_by_manifest() {
                 None
             }
             (Kind::Negative, Outcome::Formatted { .. }) => {
-                if case.ids.iter().any(|id| w3c_known.contains(id)) || arq_only(case) {
+                if case.ids.iter().any(|id| w3c_known.contains(id)) || corpus::arq_only(&case.path)
+                {
                     rejected += 1;
                     None
                 } else {

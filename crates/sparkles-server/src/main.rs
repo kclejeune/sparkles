@@ -945,6 +945,11 @@ enum Cmd {
     /// -l) or rewrite (--write)
     #[cfg(feature = "fmt")]
     Fmt(fmt::FmtArgs),
+    /// Lint SPARQL, Turtle and TriG: unused and undefined prefixes, unused and unbound
+    /// variables, cartesian products, FILTER scope, language tags, datatypes and more
+    /// (--fix applies the safe fixes)
+    #[cfg(feature = "fmt")]
+    Lint(fmt::lint::LintArgs),
     /// A language server for editors (stdio): formatting and syntax diagnostics for the
     /// languages `sparkles fmt` formats
     #[cfg(feature = "fmt")]
@@ -1057,7 +1062,8 @@ enum Cmd {
         /// File containing the query
         #[arg(long)]
         query: Option<PathBuf>,
-        /// Output format: text, json, xml, csv, tsv, sparkles (graphs: ttl, nt, nq, trig, jsonld, rdfxml)
+        /// Output format: text, json, xml, csv, tsv, sparkles (graphs: ttl, nt, nq, trig, jsonld,
+        /// rdfxml, trix, rt, rpb, rj)
         #[arg(long, default_value = "text")]
         results: String,
         /// Print the query plan instead of executing
@@ -2328,6 +2334,8 @@ fn run() -> Result<()> {
         #[cfg(feature = "fmt")]
         Cmd::Fmt(args) => fmt::run(args),
         #[cfg(feature = "fmt")]
+        Cmd::Lint(args) => fmt::lint::run(args),
+        #[cfg(feature = "fmt")]
         Cmd::Lsp(args) => lsp::run(args),
         Cmd::Openapi { format } => openapi::print(format),
         Cmd::Completions(args) => {
@@ -2519,12 +2527,26 @@ fn run() -> Result<()> {
                     } else {
                         results::rdf_format_from_name(&fmt)
                     };
-                    results::write_graph(
-                        &r,
-                        f.context("unknown RDF format")?,
-                        &store.prefixes(),
-                        &mut out,
-                    )?;
+                    // Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON
+                    let jena = f
+                        .is_none()
+                        .then(|| http::jena_formats::JenaFormat::from_name(&fmt))
+                        .flatten();
+                    match jena {
+                        Some(j) => {
+                            let mut w = http::jena_formats::RdfWriter::new(j, &mut out);
+                            for t in &r.triples {
+                                w.triple(t)?;
+                            }
+                            w.finish()?;
+                        }
+                        None => results::write_graph(
+                            &r,
+                            f.context("unknown RDF format")?,
+                            &store.prefixes(),
+                            &mut out,
+                        )?,
+                    }
                 }
             }
             if time {

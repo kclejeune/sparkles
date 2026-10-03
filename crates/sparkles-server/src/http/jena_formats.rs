@@ -1,5 +1,6 @@
 //! RDF syntaxes Jena speaks that the Rust RDF crates do not: RDF Thrift and RDF
-//! Protobuf, Jena's binary encodings, and RDF/JSON. `RDFConnectionFuseki` sends graphs
+//! Protobuf, Jena's binary encodings, RDF/JSON, and TriX (whose reader and writer are
+//! [`sparkles::trix`]). `RDFConnectionFuseki` sends graphs
 //! and datasets in RDF Thrift and asks for RDF Thrift back, and for SELECT results in
 //! SPARQL Results Thrift.
 //!
@@ -25,6 +26,7 @@ pub enum JenaFormat {
     Thrift,
     Protobuf,
     RdfJson,
+    TriX,
 }
 
 impl JenaFormat {
@@ -34,19 +36,46 @@ impl JenaFormat {
             "application/rdf+thrift" => JenaFormat::Thrift,
             "application/rdf+protobuf" | "application/x-protobuf" => JenaFormat::Protobuf,
             "application/rdf+json" => JenaFormat::RdfJson,
+            "application/trix+xml" | "application/trix" => JenaFormat::TriX,
             _ => return None,
         })
     }
 
-    /// The format of a file name's extension (Jena's: `rt`, `trdf`, `rpb`, `pbrdf`, `rj`).
+    /// The format of a file name's extension (Jena's: `rt`, `trdf`, `rpb`, `pbrdf`, `rj`,
+    /// `trix`).
     pub fn from_file_name(name: &str) -> Option<JenaFormat> {
         let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
         Some(match ext.as_str() {
             "rt" | "trdf" => JenaFormat::Thrift,
             "rpb" | "pbrdf" => JenaFormat::Protobuf,
             "rj" => JenaFormat::RdfJson,
+            "trix" => JenaFormat::TriX,
             _ => return None,
         })
+    }
+
+    /// The format of a file path, looking past a compression extension
+    /// (`data.trix.gz`).
+    pub fn from_path(path: &std::path::Path) -> Option<JenaFormat> {
+        let name = path.file_name()?.to_str()?;
+        JenaFormat::from_file_name(sparkles::codec::Codec::strip_extension(name))
+    }
+
+    /// The format by one of the names `sparkles convert --syntax` and `?format=` take,
+    /// or by media type.
+    pub fn from_name(name: &str) -> Option<JenaFormat> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "trix" => JenaFormat::TriX,
+            "thrift" | "rdf-thrift" | "rt" | "trdf" => JenaFormat::Thrift,
+            "protobuf" | "rdf-protobuf" | "rpb" | "pbrdf" => JenaFormat::Protobuf,
+            "rdf/json" | "rdfjson" | "rdf-json" | "json-rdf" | "rj" => JenaFormat::RdfJson,
+            other => return JenaFormat::from_media_type(other),
+        })
+    }
+
+    /// Whether the format holds named graphs (RDF/JSON holds one graph).
+    pub fn quads(self) -> bool {
+        self != JenaFormat::RdfJson
     }
 
     pub fn file_extension(self) -> &'static str {
@@ -54,6 +83,7 @@ impl JenaFormat {
             JenaFormat::Thrift => "rt",
             JenaFormat::Protobuf => "rpb",
             JenaFormat::RdfJson => "rj",
+            JenaFormat::TriX => sparkles::trix::FILE_EXTENSION,
         }
     }
 
@@ -62,14 +92,16 @@ impl JenaFormat {
             JenaFormat::Thrift => "application/rdf+thrift",
             JenaFormat::Protobuf => "application/rdf+protobuf",
             JenaFormat::RdfJson => "application/rdf+json",
+            JenaFormat::TriX => sparkles::trix::MEDIA_TYPE,
         }
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             JenaFormat::Thrift => "RDF Thrift",
             JenaFormat::Protobuf => "RDF Protobuf",
             JenaFormat::RdfJson => "RDF/JSON",
+            JenaFormat::TriX => "TriX",
         }
     }
 }
@@ -92,6 +124,12 @@ fn bad<T>(msg: impl Into<String>) -> Res<T> {
     Err(DecodeError(msg.into()))
 }
 
+impl From<sparkles::trix::TrixError> for DecodeError {
+    fn from(e: sparkles::trix::TrixError) -> DecodeError {
+        DecodeError(e.to_string())
+    }
+}
+
 impl From<io::Error> for DecodeError {
     fn from(e: io::Error) -> DecodeError {
         DecodeError(format!("cannot read the body: {e}"))
@@ -106,6 +144,18 @@ pub fn transcode(
     input: impl Read,
     quads: bool,
     out: impl Write,
+) -> Result<u64, DecodeError> {
+    transcode_with_base(fmt, input, quads, out, None)
+}
+
+/// [`transcode`], resolving the relative IRIs of a TriX document against `base` (the
+/// other formats hold absolute IRIs only).
+pub fn transcode_with_base(
+    fmt: JenaFormat,
+    input: impl Read,
+    quads: bool,
+    out: impl Write,
+    base: Option<&str>,
 ) -> Result<u64, DecodeError> {
     let target = if quads {
         oxrdfio::RdfFormat::NQuads
@@ -130,6 +180,7 @@ pub fn transcode(
         JenaFormat::Thrift => ThriftReader::new(input).read_stream(&mut sink)?,
         JenaFormat::Protobuf => ProtoReader::new(input).read_stream(&mut sink)?,
         JenaFormat::RdfJson => read_rdf_json(input, &mut sink)?,
+        JenaFormat::TriX => sparkles::trix::parse(BufReader::new(input), base, &mut sink)?,
     }
     ser.finish()?;
     Ok(n)
@@ -1148,6 +1199,7 @@ pub struct RdfWriter<W: Write> {
     w: W,
     /// RDF/JSON: subject → predicate → objects, written at the end
     json: BTreeMap<String, BTreeMap<String, Vec<serde_json::Value>>>,
+    trix: sparkles::trix::TrixSerializer,
 }
 
 impl<W: Write> RdfWriter<W> {
@@ -1156,6 +1208,7 @@ impl<W: Write> RdfWriter<W> {
             fmt,
             w,
             json: BTreeMap::new(),
+            trix: sparkles::trix::TrixSerializer::new(),
         }
     }
 
@@ -1186,6 +1239,7 @@ impl<W: Write> RdfWriter<W> {
                     .push(o);
                 Ok(())
             }
+            JenaFormat::TriX => self.trix.triple(&mut self.w, t.as_ref()),
         }
     }
 
@@ -1203,6 +1257,7 @@ impl<W: Write> RdfWriter<W> {
         };
         match self.fmt {
             JenaFormat::RdfJson => self.triple(&t),
+            JenaFormat::TriX => self.trix.quad(&mut self.w, q.as_ref()),
             JenaFormat::Thrift => {
                 let mut o = TOut::new(&mut self.w);
                 o.field(3, ttype::STRUCT)?;
@@ -1253,6 +1308,9 @@ impl<W: Write> RdfWriter<W> {
                 })
                 .collect();
             serde_json::to_writer(&mut self.w, &doc).map_err(io::Error::other)?;
+        }
+        if self.fmt == JenaFormat::TriX {
+            self.trix.finish(&mut self.w)?;
         }
         self.w.flush()?;
         Ok(self.w)

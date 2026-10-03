@@ -120,8 +120,10 @@ pub fn classify(
         if admin == "ping" || admin == "metrics" || admin.starts_with("ready") || admin == "mcp" {
             return None;
         }
-        // reads that run queries over a dataset, and formatting (cheap, read-like work)
+        // reads that run queries over a dataset, and formatting and linting (cheap,
+        // read-like work)
         if admin == "format"
+            || admin == "lint"
             || admin.starts_with("validate/")
             || admin.starts_with("schema/")
             || admin.starts_with("stats/")

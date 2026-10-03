@@ -24,6 +24,7 @@ pub mod store;
 pub mod stored;
 pub mod tabular;
 pub mod text;
+pub mod trix;
 pub mod validation;
 pub mod vector;
 pub mod vocab;
