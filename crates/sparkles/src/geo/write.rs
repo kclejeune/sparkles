@@ -11,6 +11,7 @@
 
 use super::crs::{self, CRS84, CrsRef};
 use super::geom::{Geom, GeomType};
+use super::vocab;
 use georust::{Coord, Geometry, LineString, Polygon, Winding};
 use std::fmt::Write;
 
@@ -280,14 +281,47 @@ impl JsonWriter<'_> {
     }
 }
 
-/// A literal of datatype `dt` (`geo:wktLiteral` or `geo:geoJSONLiteral`).
+/// A literal of datatype `dt` (`geo:wktLiteral`, `geo:geoJSONLiteral`,
+/// `geo:gmlLiteral` or `geo:kmlLiteral`; WKT for any other). GeoJSON and KML of a
+/// geometry in an unknown CRS are written in its own coordinates, so callers check the
+/// CRS first.
 pub fn literal(g: &Geom, dt: &str) -> oxrdf::Literal {
-    let lex = if dt == super::vocab::GEOJSON_LITERAL {
-        to_geojson(g)
-    } else {
-        to_wkt(g)
+    let dt = result_datatype(dt);
+    let lex = match dt {
+        vocab::GEOJSON_LITERAL => to_geojson(g),
+        vocab::GML_LITERAL => super::xml::to_gml(g),
+        vocab::KML_LITERAL => super::xml::to_kml(g),
+        _ => to_wkt(g),
     };
     oxrdf::Literal::new_typed_literal(lex, oxrdf::NamedNode::new_unchecked(dt))
+}
+
+/// The datatype of a geometry computed from a literal of datatype `dt`: the same
+/// serialization, or WKT for a datatype that is not a geometry's.
+pub fn result_datatype(dt: &str) -> &'static str {
+    match dt {
+        vocab::GEOJSON_LITERAL => vocab::GEOJSON_LITERAL,
+        vocab::GML_LITERAL => vocab::GML_LITERAL,
+        vocab::KML_LITERAL => vocab::KML_LITERAL,
+        _ => vocab::WKT_LITERAL,
+    }
+}
+
+/// The lexical form of `g` as a literal of datatype `dt`; `None` for GeoJSON and KML
+/// of a geometry in an unknown CRS, which has no transform to CRS84.
+pub fn serialize(g: &Geom, dt: &str) -> Option<String> {
+    Some(match result_datatype(dt) {
+        vocab::GEOJSON_LITERAL => {
+            g.crs.known()?;
+            to_geojson(g)
+        }
+        vocab::KML_LITERAL => {
+            g.crs.known()?;
+            super::xml::to_kml(g)
+        }
+        vocab::GML_LITERAL => super::xml::to_gml(g),
+        _ => to_wkt(g),
+    })
 }
 
 #[cfg(test)]

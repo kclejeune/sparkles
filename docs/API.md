@@ -3143,6 +3143,18 @@ SELECT ?f ?d WHERE {
   `POLYHEDRALSURFACE` are read as line strings and polygons and keep their type for
   `geof:geometryType`.
 * `geo:geoJSONLiteral` is an RFC 7946 geometry, always in CRS84.
+* `geo:gmlLiteral` is a GML 3.2 geometry element. Sparkles reads levels 0 and 1 of the
+  Simple Features profile (`Point`, `LineString`, `LinearRing`, `Polygon`, `MultiPoint`,
+  `MultiCurve`, `MultiSurface`, `MultiGeometry`). It also reads `Curve`, `Ring`,
+  `Surface`, `PolyhedralSurface` and `Tin` made of linear segments and patches,
+  `Envelope`, and the GML 2 forms `coordinates`, `outerBoundaryIs`, `MultiLineString` and
+  `MultiPolygon`. The root element's `srsName` names the CRS, which is CRS84 when it is
+  missing, and positions follow that CRS's axis order as in WKT. `srsDimension` on the
+  root or on a `posList` sets the ordinates per position. Elements are matched by local
+  name, so GML with an older namespace or none still reads. Arcs and other curved
+  segments are malformed literals.
+* `geo:kmlLiteral` is a KML 2.2 `Point`, `LineString`, `LinearRing`, `Polygon` or
+  `MultiGeometry`. KML is always longitude, latitude and an optional altitude in CRS84.
 * Literals are stored as written. `"POINT(1 2)"` and `"Point (1.0 2.0)"` are different
   terms with equal geometries: `=` compares terms, and `geof:sfEquals` compares
   geometries. A literal that does not parse is stored all the same. Functions give a type
@@ -3152,7 +3164,9 @@ SELECT ?f ?d WHERE {
   EPSG:4326, EPSG:4979, the legacy `http://www.opengis.net/def/crs/EPSG/4326`, and Web
   Mercator (EPSG:3857). EPSG:4326 and EPSG:4979 are latitude first, as the EPSG
   definition says (GeoSPARQL Req 16). The legacy IRI is longitude first, as in Jena.
-  `https` forms, URNs and other EPSG versions are accepted as aliases. A literal in
+  `https` forms, URNs and other EPSG versions are accepted as aliases. The 120 UTM zones
+  are built in as well, and an operator can add projected CRSs from proj4 definitions
+  (see [CRSs from proj4 definitions](#crss-from-proj4-definitions)). A literal in
   another CRS is still a valid geometry. Accessors, constructions and relations between
   geometries of that same CRS work. Metric functions and mixes with other CRSs are type
   errors, and the index leaves the literal out.
@@ -3172,7 +3186,7 @@ first one's CRS.
 | `buffer(g, r, unit)`, `metricBuffer(g, r)`, `convexHull`, `envelope`, `boundary`, `centroid`, `intersection`, `union`, `difference`, `symDifference` | geometry (2D). A metric buffer on geographic data goes through a local projection, up to 1000 km. |
 | `area(g, unit)`, `length`, `perimeter` and their `metric…` forms | `xsd:double`, geodesic on geographic CRSs |
 | `getSRID` | `xsd:anyURI` |
-| `transform(g, crs)`, `asWKT`, `asGeoJSON` | geometry |
+| `transform(g, crs)`, `asWKT`, `asGeoJSON`, `asGML(g [, profile])`, `asKML` | geometry. `asGML` writes GML 3.2 of the Simple Features profile with `srsName`, whatever profile string it is given. `asKML` and `asGeoJSON` write CRS84 and are a type error for a CRS without a transform. |
 | `dimension`, `coordinateDimension`, `spatialDimension`, `numGeometries` | `xsd:integer` |
 | `is3D`, `isMeasured`, `isEmpty` | `xsd:boolean` |
 | `geometryType` | `xsd:anyURI` (`sf:Point`, …) |
@@ -3182,10 +3196,20 @@ first one's CRS.
 Operations over more input vertices than `serve --geo-op-vertices` (2,000,000) are type
 errors. Constructed geometries count against the query's memory budget.
 
-**`spatial:` property functions.** These use Jena's syntax and take constant arguments:
+**`spatial:` property functions.** These use Jena's syntax:
 
 ```sparql
 SELECT ?f WHERE { ?f spatial:nearby (48.8566 2.3522 5 uom:kilometre 10) }   # lat lon radius [unit [limit]]
+```
+
+An argument can also be a variable that the rest of the group binds, as in Jena. The
+function then runs one search per distinct binding of its arguments and joins each
+search with the rows that have that binding. EXPLAIN describes such a call as
+`[per binding of the arguments]`. A binding that does not make valid arguments, such as a
+latitude out of range or a literal that is not a geometry, matches nothing:
+
+```sparql
+SELECT ?f WHERE { ex:paris geo:hasGeometry/geo:asWKT ?w . ?f spatial:nearbyGeom (?w 5 uom:kilometre) }
 ```
 
 | Function | Arguments | Features whose geometry … |
@@ -3203,14 +3227,15 @@ There is one solution per feature. Under `GRAPH ?g`, the graph is that of the
 serialization. With a `limit`, the function returns the nearest matches, with ties broken
 by subject. For the box and cardinal functions, nearest means nearest to the box's
 centre. Every match is tested exactly. Without an index (off, building or failed), the
-answers are the same, computed by a scan. A malformed argument list, a coordinate out of
-range, an unknown unit or a non-integer limit is a `400` (`spatial:<name>: …`). A
-variable argument, or a build without the `geo` feature, gives `501`.
+answers are the same, computed by a scan. A malformed argument list, a constant
+coordinate out of range, an unknown unit or a non-integer limit is a `400`
+(`spatial:<name>: …`), and so is a variable argument that the rest of the group does not
+bind. A build without the `geo` feature gives `501`.
 
 **The spatial index.** The spatial index is optional per dataset. It indexes the geometry
 literals of the configured predicates in a packed R-tree over the generation's base, plus
 an overlay of the rows committed since. The default predicates are `geo:asWKT`,
-`geo:asGeoJSON` and `geo:hasSerialization`. Every snapshot sees exactly its own rows, so a
+`geo:asGeoJSON`, `geo:asGML`, `geo:asKML` and `geo:hasSerialization`. Every snapshot sees exactly its own rows, so a
 query can use the index at any commit. An update's own uncommitted changes and past
 states (`?at=`) run without it.
 
@@ -3380,7 +3405,7 @@ datatype or CRS may be an IRI, an `xsd:anyURI` literal or a plain string.
 | `greatCircleGeom(g1, g2, unit)` | The same, between the closest points. Projected geometries are measured on WGS 84. |
 | `angle(x1, y1, x2, y2)`, `angleDeg` | Direction clockwise from the y axis, in radians in [0, 2π) or in degrees. Degrees are rounded to 6 decimals, as in Jena. Jena's implementation is a quarter turn off south-east and north-west of the first point. Sparkles follows the documented meaning. |
 | `azimuth(lat1, lon1, lat2, lon2)`, `azimuthDeg` | Initial great-circle bearing clockwise from north, in radians in [0, 2π) or in degrees. |
-| `transform(g, datatype, crs)`, `transformDatatype(g, datatype)`, `transformSRS(g, crs)` | `g` in another datatype (`geo:wktLiteral`, `geo:geoJSONLiteral`), another CRS, or both. |
+| `transform(g, datatype, crs)`, `transformDatatype(g, datatype)`, `transformSRS(g, crs)` | `g` in another datatype (`geo:wktLiteral`, `geo:geoJSONLiteral`, `geo:gmlLiteral`, `geo:kmlLiteral`), another CRS, or both. |
 
 **UTM.** The 120 UTM zones on WGS 84 are built-in CRSs. They run from
 `http://www.opengis.net/def/crs/EPSG/0/32601` to `…/32660` in the north and from
@@ -3406,6 +3431,40 @@ The 7 others are listed with the reason in
 `testsuite/geosparql/oxigraph/expected-failures.txt`. They fail because EPSG:4326 is
 supported with its latitude-first axes, and because unclosed polygon rings are malformed
 literals.
+
+### CRSs from proj4 definitions
+
+`--geo-crs FILE` (or `SPARKLES_GEO_CRS`) registers projected CRSs from a JSON file before
+any database opens. The option applies to every command, so `serve`, `load`, `geo-index`
+and `query` read the same CRSs:
+
+```json
+{
+  "http://www.opengis.net/def/crs/EPSG/0/27700": {
+    "proj4": "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +towgs84=446.448,-125.157,542.06,0.15,0.247,0.842,-20.489 +units=m +no_defs",
+    "axis": "en"
+  }
+}
+```
+
+The key is the CRS IRI. The IRI aliases described under Literals apply to it, so
+`EPSG:27700` names the same CRS. `axis` is `en` (easting
+first, the default) or `ne` (northing first), the order of the literal's coordinates.
+The transforms run in `proj4rs`, a pure-Rust port of proj4js, which covers transverse
+Mercator, Lambert conformal conic, Lambert azimuthal equal-area, Albers, stereographic,
+Mercator, Swiss oblique Mercator, Krovak and other projections, and datum shifts by
+`+towgs84`. Grid shifts (`+nadgrids`) are not available. A registered CRS behaves like a
+UTM zone. Its literals are indexed, transformed to and from the other CRSs, and measured
+in metres. Geographic definitions (`+proj=longlat`) are refused, because
+geographic CRSs on datums other than WGS 84 are not supported. A built-in CRS cannot be
+redefined, and a file that the server cannot read stops it from starting. Changing the
+registered CRSs rebuilds a dataset's spatial index files when it opens.
+
+Sparkles ships no EPSG data, and the default build reads no other EPSG codes. A build
+with the `geo-epsg` cargo feature also looks up any projected EPSG code that is neither
+built in nor registered in the proj4 table of `crs-definitions`, which is derived from
+the EPSG dataset. The EPSG terms of use then apply to that binary. The axis order comes
+from the definition's WKT when it has an `AXIS`, and is easting first otherwise.
 
 ### Spatial joins and nearest neighbours
 
@@ -3433,7 +3492,13 @@ and its distinct geometries are packed into an R-tree for the query (`[tree join
 works without an index too.
 
 Each candidate pair is tested with the function itself. The answer, duplicates included,
-is therefore the same as the cross product with the filter. Geometries in an unknown CRS
+is therefore the same as the cross product with the filter. A region of 32 or more
+vertices that is tested against many candidates gets a grid of cells over its envelope.
+Each cell is inside the region, outside it, or on its boundary. A point or a region whose
+envelope covers only inside cells, or only outside cells, is decided without the exact
+computation. The same grid serves FILTERs with a constant region. Against 200,000 points,
+a 1,024-vertex polygon's `sfContains` tests took 60 ms with the grid and 256 ms without
+it. The grid takes about 16 bytes per vertex of the region, up to 64 KiB. Geometries in an unknown CRS
 are tested against those of the same CRS. A relation with a literal the index does not
 hold reads the pattern instead of searching the index. A disjointness test, a lower bound
 on a distance, a pattern that holds without an intersection, or a non-constant bound
@@ -3529,6 +3594,22 @@ Queries see them with `reasoning=true`, like other inferences:
 
 ```sparql
 SELECT ?g WHERE { ?g a geo:Geometry }          # ex:gA, given ex:gA a sf:Polygon
+```
+
+The vocabulary also types geometries from their serializations. A geometry whose
+`geo:asWKT`, `geo:asGeoJSON`, `geo:asGML`, `geo:asKML` or `geo:hasSerialization` literal
+declares a polygon gets `rdf:type sf:Polygon`, and so on for the other Simple Features
+types. A GML literal also gives the GML type of its root element, such as `gml:Polygon`.
+The GML classes come with their hierarchy, which follows the substitution groups of the
+GML 3.2 schemas (`gml:Polygon ⊑ gml:AbstractSurface ⊑ gml:AbstractGeometricPrimitive ⊑
+gml:AbstractGeometry ⊑ geo:Geometry`). The type is read from the WKT keyword, the GeoJSON
+`type` member or the XML root element, without checking the coordinates, and an empty
+WKT literal declares no type. These rules use the Sparkles rule builtins
+`geoSfType(?literal, ?type)` and `geoGmlType(?literal, ?type)`, which `--rules` files
+can use too:
+
+```sparql
+SELECT ?g WHERE { ?g a sf:Surface }            # every geometry with a polygon serialization
 ```
 
 **Default geometries.** Query rewrite follows `geo:hasDefaultGeometry` only.

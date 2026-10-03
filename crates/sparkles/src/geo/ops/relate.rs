@@ -15,6 +15,7 @@
 //! * an empty geometry is disjoint from everything (`sfDisjoint`, `ehDisjoint`) and in no
 //!   other relation (`rcc8dc` included, since it is not a region).
 
+use super::cells::{CellGrid, Side};
 use super::{OpError, guarded, in_crs, type_error};
 use crate::geo::geom::Geom;
 use crate::geo::{GeomRef, Relation};
@@ -59,6 +60,9 @@ pub struct Prepared {
     /// plain geometry)
     prep: Option<PreparedGeometry<'static, Geometry<f64>>>,
     facts: Facts,
+    /// a region's cell grid, which decides points and regions well inside or outside
+    /// it (regions of [`MIN_VERTICES`](super::cells::MIN_VERTICES) vertices or more)
+    cells: Option<CellGrid>,
 }
 
 impl Prepared {
@@ -69,7 +73,38 @@ impl Prepared {
             guarded("prepare", || PreparedGeometry::from(g.g.clone())).ok()
         };
         let facts = Facts::of(&g);
-        Prepared { g, prep, facts }
+        let cells = if g.empty {
+            None
+        } else {
+            guarded("prepare", || CellGrid::build(&g.g, g.vertices))
+                .ok()
+                .flatten()
+        };
+        Prepared {
+            g,
+            prep,
+            facts,
+            cells,
+        }
+    }
+
+    /// The matrix of `(self, b)`, with `b`'s facts `fb`, when the cell grid decides where `b` lies: `b` in the
+    /// region's interior, or disjoint from it. Only for points and regions, whose
+    /// boundaries' dimensions are known without computing them.
+    fn matrix_by_cells(&self, fb: &Facts) -> Option<IntersectionMatrix> {
+        let grid = self.cells.as_ref()?;
+        let rb = fb.rect?;
+        // b's interior and boundary dimensions
+        let (ib, bb) = match fb.dim {
+            0 => ('0', 'F'),
+            2 if fb.areal => ('2', '1'),
+            _ => return None,
+        };
+        let m = match grid.side([rb.min().x, rb.min().y, rb.max().x, rb.max().y])? {
+            Side::Inside => format!("{ib}{bb}2FF1FF2"),
+            Side::Outside => format!("FF2FF1{ib}{bb}2"),
+        };
+        m.parse().ok()
     }
 
     pub fn geom(&self) -> &GeomRef {
@@ -90,7 +125,10 @@ impl Prepared {
         if let Some(v) = decided(&self.facts, &fb, r) {
             return Ok(v);
         }
-        let im = self.matrix(&b, r.local())?;
+        let im = match self.matrix_by_cells(&fb) {
+            Some(im) => im,
+            None => self.matrix(&b, r.local())?,
+        };
         Ok(holds(&im, r, self.facts.dim, fb.dim))
     }
 
@@ -98,7 +136,11 @@ impl Prepared {
     pub fn relate(&self, b: &Geom, pattern: &str) -> Result<bool, OpError> {
         check_pattern(pattern)?;
         let b = in_crs(b, &self.g.crs)?;
-        let im = self.matrix(&b, "relate")?;
+        let fb = Facts::of(&b);
+        let im = match (fb.empty, self.matrix_by_cells(&fb)) {
+            (false, Some(im)) => im,
+            _ => self.matrix(&b, "relate")?,
+        };
         matches(&im, pattern)
     }
 }
@@ -487,5 +529,73 @@ mod tests {
             }
         }
         assert_eq!(tested, 24 * shapes.len() * shapes.len());
+    }
+
+    /// A region of 2 × 30 vertices with a hole, prepared with its cell grid: every
+    /// relation and a DE-9IM pattern agree with the unprepared computation for points,
+    /// small squares and small lines over and around it, in both argument orders.
+    #[test]
+    fn the_cell_grid_agrees_with_the_exact_relations() {
+        let mut ring = Vec::new();
+        for i in 0..60 {
+            let a = std::f64::consts::PI * f64::from(i) / 30.0;
+            let r = if i % 2 == 0 { 10.0 } else { 6.0 };
+            ring.push(format!("{} {}", r * a.cos(), r * a.sin()));
+        }
+        ring.push(ring[0].clone());
+        let region = format!(
+            "POLYGON(({}), (-1 -1, 1 -1, 1 1, -1 1, -1 -1))",
+            ring.join(", ")
+        );
+        let a = Arc::new(g(&region));
+        let p = Prepared::new(a.clone());
+        assert!(p.cells.is_some());
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % 24_000) as f64 / 1000.0 - 12.0
+        };
+        let mut by_cells = 0;
+        for i in 0..1500 {
+            let (cx, cy) = (next(), next());
+            let b = match i % 3 {
+                0 => format!("POINT({cx} {cy})"),
+                1 => format!(
+                    "POLYGON(({cx} {cy}, {} {cy}, {} {}, {cx} {}, {cx} {cy}))",
+                    cx + 0.3,
+                    cx + 0.3,
+                    cy + 0.3,
+                    cy + 0.3
+                ),
+                _ => format!("LINESTRING({cx} {cy}, {} {})", cx + 0.2, cy + 0.1),
+            };
+            let b = g(&b);
+            if p.matrix_by_cells(&Facts::of(&b)).is_some() {
+                by_cells += 1;
+            }
+            for r in Relation::ALL {
+                let exact = relation(&a, &b, r).unwrap();
+                assert_eq!(p.relation(&b, r).unwrap(), exact, "{r:?}(region, {b:?})");
+                let pb = Prepared::new(Arc::new(b.clone()));
+                assert_eq!(pb.relation(&a, r).unwrap(), relation(&b, &a, r).unwrap());
+            }
+            let im = a.g.relate(&b.g);
+            for pattern in [
+                "T*F**FFF*",
+                "0F2FF1FF2",
+                "FF2FF1212",
+                "2121F1212",
+                "****T****",
+            ] {
+                assert_eq!(
+                    p.relate(&b, pattern).unwrap(),
+                    im.matches(pattern).unwrap(),
+                    "{pattern} {b:?}"
+                );
+            }
+        }
+        assert!(by_cells > 600, "{by_cells}");
     }
 }

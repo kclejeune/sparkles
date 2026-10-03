@@ -1,20 +1,24 @@
 # G01: GeoSPARQL (OGC GeoSPARQL 1.1, Jena spatial extensions, spatial index)
 
-> **Status:** Phases 1 and 2 are implemented. Phase 3 is not built.
+> **Status:** Phases 1 and 2 are implemented. Phase 3 is partly implemented. Geometry
+> types from literals, variable `spatial:` arguments, cell prefilters, GML and KML, and
+> CRSs from proj4 definitions are built, and the rest of Phase 3 is not.
 >
 > **Phases:** Phase 1 covers geometry literals, CRSs and units, the `geof:` functions, the
 > spatial index with FILTER pushdown, Jena's `spatial:` property functions, and the server
 > and CLI surfaces. Phase 2 covers spatial joins and k-NN, Query Rewrite, `spatial:equals`,
 > RDFS entailment and default geometries, the aggregates, hulls and `isSimple`,
 > `spatialF:`, UTM zones, persisted index files, W3C Basic Geo points, `GET /{ds}/geo`,
-> `POST /$/geo/convert`, the UI maps and Oxigraph's GeoSPARQL tests. Phase 3 (GML and KML,
-> other EPSG CRSs) has not started.
+> `POST /$/geo/convert`, the UI maps and Oxigraph's GeoSPARQL tests. Phase 3 adds GML and
+> KML literals, `geometryTypes` entailment, variable `spatial:` arguments, a cell grid for
+> spatial tests and projected CRSs from proj4 definitions.
 >
 > **User docs:** [API: GeoSPARQL](../API.md#geosparql) ·
 > [API: hulls, aggregates, `spatialF:`, UTM and conversion](../API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion) ·
 > [API: spatial joins and nearest neighbours](../API.md#spatial-joins-and-nearest-neighbours) ·
 > [API: query rewrite and RDFS entailment](../API.md#query-rewrite-spatialequals-and-rdfs-entailment) ·
 > [API: maps in the web UI](../API.md#maps-in-the-web-ui) ·
+> [API: CRSs from proj4 definitions](../API.md#crss-from-proj4-definitions) ·
 > [Features](../FEATURES.md#sparql-arq-equivalent) ·
 > [Benchmarks: spatial index commit cost](../BENCHMARKS.md#spatial-index-commit-cost) ·
 > [Benchmarks: GeoSPARQL Compliance Benchmark](../BENCHMARKS.md#geosparql-compliance-benchmark)
@@ -1703,10 +1707,23 @@ that actually shipped.
 
 ## Outcome
 
-**Delivered.** Phases 1 and 2 landed on 2026-10-01.
-[PROVENANCE.md](PROVENANCE.md#geosparql) lists the dependencies. Phase 3 has not started.
-It covers GML and KML, a `proj4rs` CRS backend, variable `spatial:` arguments and cell
-prefilters.
+**Delivered.** Phases 1 and 2 landed on 2026-10-01, and part of Phase 3 on 2026-10-02.
+[PROVENANCE.md](PROVENANCE.md#geosparql) lists the dependencies. The Phase 3 work covers
+these items.
+* `--vocab geosparql` types geometries from their serializations (`sf:Polygon` from a WKT
+  `POLYGON`, `gml:Polygon` from a GML root element) and adds the GML class hierarchy.
+* `spatial:` arguments can be variables that the rest of the group binds, with one search
+  per binding.
+* A cell grid over each prepared region of 32 or more vertices decides most points and
+  small regions in spatial joins and FILTERs without the exact test.
+* `geo:gmlLiteral` and `geo:kmlLiteral` parse, `geof:asGML` and `geof:asKML` write them,
+  and the index reads them.
+* `--geo-crs` registers projected CRSs from proj4 definitions, which transform through
+  `proj4rs`.
+
+The rest of Phase 3 is not built. That is k-NN with arbitrary joins, simplified polygon
+approximations, `geo:hasMetricArea` and similar properties by rewrite, QLever's
+`SERVICE spatialSearch:` syntax, and the Compliance Benchmark in CI.
 
 **Decided by the maintainer.**
 * Measures are geodesic on WGS 84 by default, with haversine as a per-dataset option
@@ -1734,6 +1751,22 @@ prefilters.
   whole `geo.json` (§5.5). Changing `distance` or `queryRewrite` therefore keeps them.
   `?at=` snapshots run without the index, by scanning, instead of building a base on
   demand (§4.6).
+* Phase 3 departs from §4.1.3, §4.2.4 and §2.7 in these ways.
+  * Geometry types come with `--vocab geosparql` rather than a separate
+    `geometryTypes` rule. They are rules with two Sparkles builtins, `geoSfType` and
+    `geoGmlType`, and run with the profile's other rules. The type is read from the WKT
+    keyword, the GeoJSON `type` or the XML root element, without parsing coordinates.
+  * GML elements are matched by local name in any namespace, since real data (the
+    Compliance Benchmark's among it) uses outdated namespaces. `Envelope`,
+    `PolyhedralSurface`, `Tin` and the GML 2 forms read too. Curved segments do not.
+  * The CRS registry is per process and set by the global `--geo-crs` flag rather than
+    a `crs.json` per dataset, because a CRS IRI means the same thing in every dataset.
+    Only projected definitions are accepted. The registered definitions are part of the
+    index files' identity, so changing them rebuilds the index.
+  * No EPSG data ships, as decided (q16). The opt-in `geo-epsg` feature resolves other
+    EPSG codes through `crs-definitions`, which is derived from EPSG.
+  * A `spatial:` binding that does not make valid arguments matches nothing, while the
+    same constant is a `400`. An unbound argument variable is a `400`, no longer `501`.
 * Some choices were made during implementation and are open to revision:
   * `concaveHull`'s percentage maps linearly to the concavity.
   * `aggConcaveHull` takes one argument, because a SPARQL aggregate takes one expression.
@@ -1744,14 +1777,19 @@ prefilters.
   * `POST /$/geo/convert` is open to any caller.
 
 **Conformance.** The §7 examples and seeded comparisons of the index plan against the plain
-plan run as tests. The W3C and SHACL results did not change. Sparkles passes 37 of the 44
-cases in Oxigraph's GeoSPARQL suite. The other 7 are listed with reasons in
+plan run as tests, and so do the GML and KML examples printed in GeoSPARQL 1.1. The W3C
+and SHACL results did not change. Sparkles passes 37 of the 44 cases in Oxigraph's
+GeoSPARQL suite. The other 7 are listed with reasons in
 `testsuite/geosparql/oxigraph/expected-failures.txt`. On the Phase 1 build, the
 [Compliance Benchmark](../BENCHMARKS.md#geosparql-compliance-benchmark) scored 74 of 206.
-That includes 72 of the 77 WKT queries that need no entailment or rewrite. Two of the five
-misses are the empty-equality queries decided above. The other three are a distance case,
-a metre-buffer case and a benchmark error. The benchmark was not re-run after Phase 2.
+After Phase 3 it scores 187 of 206, against the 177 GeoSPARQL Fuseki 3.17 published.
+The extension requirements R25 to R30 ran against a database with RDFS entailment and
+query rewrite, and the others against the plain data. Without the extensions the score is
+166. The 19 misses are the empty-equality queries decided above, distances and a metre
+buffer computed another way, and rewrite answers that DE-9IM does not give.
 
 **Performance.** The index adds no measurable commit latency ([commit
 cost](../BENCHMARKS.md#spatial-index-commit-cost)). The §9 query targets have not been
-measured yet.
+measured yet. The cell grid made 200,000 `sfContains` tests against a 1,024-vertex polygon
+4.3 times faster (60 ms instead of 256 ms) and 5.4 times faster against a 16,384-vertex
+one, for about 16 bytes per region vertex, up to 64 KiB per region.

@@ -621,8 +621,11 @@ mod on {
             | Kind::VectorSearch(_)
             | Kind::HybridSearch(_)
             | Kind::SpatialScan(_)
-            | Kind::SpatialPf(_)
             | Kind::SpatialRelate(_) => {
+                leaves.push(n.clone());
+                true
+            }
+            Kind::SpatialPf(_) if n.children.is_empty() => {
                 leaves.push(n.clone());
                 true
             }

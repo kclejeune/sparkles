@@ -102,6 +102,11 @@ struct Cli {
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
+    /// GeoSPARQL: projected CRSs to support beyond the built-in ones, as a JSON file
+    /// mapping CRS IRIs to proj4 definitions:
+    /// {"<IRI>": {"proj4": "+proj=…", "axis": "en" | "ne"}}
+    #[arg(long, global = true, env = "SPARKLES_GEO_CRS", value_name = "FILE")]
+    geo_crs: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -970,7 +975,7 @@ enum Cmd {
         #[arg(long)]
         loc: PathBuf,
         /// index the geometry literals of these predicates (default: geo:asWKT,
-        /// geo:asGeoJSON, geo:hasSerialization)
+        /// geo:asGeoJSON, geo:asGML, geo:asKML, geo:hasSerialization)
         #[arg(long)]
         predicate: Vec<String>,
         /// feature → geometry links of the spatial: functions (default:
@@ -1803,6 +1808,9 @@ fn run() -> Result<()> {
     }
     if let Some(d) = otel::describe(&otel_guard) {
         tracing::info!("{d}");
+    }
+    if let Some(path) = &cli.geo_crs {
+        geo::register_crs_file(path)?;
     }
     let opts = store_opts(&cli);
     let no_validate = cli.no_validate;

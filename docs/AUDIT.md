@@ -18,7 +18,7 @@ audited (§2b). Each feature Sparkles added beyond this audit has a design spec 
 | jena-ontapi | 35K | The OWL 2 object API, with DL, EL, QL and RL profiles and no DL reasoner | Out of scope (§5) |
 | jena-shacl / jena-shex | 23K / 18K | SHACL Core and SHACL-SPARQL; ShEx 2 | `sparkles-shacl` implements SHACL Core and SHACL-SPARQL and passes the W3C suites (98/98 and 20/20). `sparkles-shex` implements ShEx 2.1 with ShExC, ShExJ, ShExR and shape maps, and passes 99.9% of the shexTest validation tests. Either can validate writes ([C10](specs/C10-write-time-validation.md), [G02](specs/G02-shex.md)). |
 | jena-text | 7.5K | A Lucene text index | A `text:query` subset over string literals, on Tantivy with BM25. It does not use jena-text's Lucene format or assembler ([F03](specs/F03-full-text-search.md)). |
-| jena-geosparql | 23K | GeoSPARQL 1.0/1.1 on JTS and Apache SIS. It has the `geof:` and `spatialF:` functions, `spatial:` property functions over an STR-tree of feature envelopes, query rewrite, GML, KML, WKT and GeoJSON literals, and EPSG CRSs. | `sparkles::geo` (the `geo` cargo feature), built on the `geo`, `geo-index` and `geographiclib-rs` crates with its own WKT and GeoJSON readers. It has the `geof:` functions over WKT and GeoJSON in the built-in CRSs, a packed R-tree per generation with an overlay of commits, the `spatial:` property functions, Jena's `spatialF:` filter functions, spatial joins, query rewrite and RDFS entailment of the GeoSPARQL vocabulary. It follows Jena where GeoSPARQL leaves room, and [COMPARISON.md](COMPARISON.md#geosparql) lists the divergences. GML and KML, geometry-type entailment, and CRSs beyond the built-in ones and the UTM zones are not supported yet (§5). The design is in [G01](specs/G01-geosparql.md). |
+| jena-geosparql | 23K | GeoSPARQL 1.0/1.1 on JTS and Apache SIS. It has the `geof:` and `spatialF:` functions, `spatial:` property functions over an STR-tree of feature envelopes, query rewrite, GML, KML, WKT and GeoJSON literals, and EPSG CRSs. | `sparkles::geo` (the `geo` cargo feature), built on the `geo`, `geo-index` and `geographiclib-rs` crates with its own WKT and GeoJSON readers. It has the `geof:` functions over WKT, GeoJSON, GML and KML, a packed R-tree per generation with an overlay of commits, the `spatial:` property functions, Jena's `spatialF:` filter functions, spatial joins, query rewrite, RDFS entailment of the GeoSPARQL vocabulary with geometry types from literals, and projected CRSs from proj4 definitions through `proj4rs`. It follows Jena where GeoSPARQL leaves room, and [COMPARISON.md](COMPARISON.md#geosparql) lists the divergences. EPSG codes need a proj4 definition from the operator, since no EPSG database ships (§5). The design is in [G01](specs/G01-geosparql.md). |
 | jena-rdfpatch, rdfconnection, querybuilder, serviceenhancer, cmds | — | Patch logs, client APIs, builders and the CLI | The CLI became the `sparkles` binary. The others do not apply in Rust. |
 | jena-tdb1, commonsrdf | — | Deprecated | Skipped |
 
@@ -160,6 +160,8 @@ GeoSPARQL is supported ([G01](specs/G01-geosparql.md)), except for these parts:
   conversions return 2D geometries.
 * **Unions of curves are not noded.** Two lines that cross stay two lines. JTS would split
   them at the crossing point. The result covers the same points either way.
-* **Other formats and CRSs.** There are no GML or KML literals, no geometry-type entailment,
-  and no CRSs beyond the built-in ones and the 120 UTM zones. Sparkles
-  ships no EPSG database.
+* **CRSs.** Sparkles ships no EPSG database. CRSs beyond the built-in ones and the 120
+  UTM zones need a proj4 definition from the operator (`--geo-crs`), or a build with the
+  `geo-epsg` feature. Geographic CRSs on other datums and grid-based datum shifts are
+  not supported.
+* **GML.** Curved segments (arcs, circles, splines) and solids are not read.

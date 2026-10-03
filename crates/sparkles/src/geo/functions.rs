@@ -12,7 +12,7 @@ use super::ops::accessors::{self, Bound};
 use super::ops::overlay::{Overlay, overlay};
 use super::ops::{self, OpError, construct, distance, hull, measure, relate, simple};
 use super::units::{Unit, UnitKind, unit};
-use super::vocab::{GEOF, GEOJSON_LITERAL, Relation, WKT_LITERAL};
+use super::vocab::{GEOF, GEOJSON_LITERAL, GML_LITERAL, KML_LITERAL, Relation, WKT_LITERAL};
 use super::{DistanceModel, GeomRef, memo, write};
 use crate::sparql::ctx::Ctx;
 use crate::sparql::expr::{Expr, Row, Val, arg};
@@ -53,6 +53,8 @@ pub const FUNCTIONS: &[&str] = &[
     "transform",
     "asWKT",
     "asGeoJSON",
+    "asGML",
+    "asKML",
     "area",
     "metricArea",
     "length",
@@ -107,6 +109,8 @@ pub fn call(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> Option<EvalRe
         "transform" => f.transform(),
         "asWKT" => f.convert(WKT_LITERAL),
         "asGeoJSON" => f.convert(GEOJSON_LITERAL),
+        "asGML" => f.as_gml(),
+        "asKML" => f.convert(KML_LITERAL),
         "area" => f.measure(measure::area, Some(1), SQUARE_METRE),
         "metricArea" => f.measure(measure::area, None, SQUARE_METRE),
         "length" => f.measure(measure::length, Some(1), METRE),
@@ -178,7 +182,7 @@ impl Call<'_, '_> {
     /// datatype of a geometry result).
     fn datatype(&self, i: usize) -> &'static str {
         match self.value(i) {
-            Ok(Value::Other { dt, .. }) if &*dt == GEOJSON_LITERAL => GEOJSON_LITERAL,
+            Ok(Value::Other { dt, .. }) => write::result_datatype(&dt),
             _ => WKT_LITERAL,
         }
     }
@@ -200,13 +204,8 @@ impl Call<'_, '_> {
 
     /// A constructed geometry as a literal of datatype `dt`, charged to the query.
     fn geometry(&self, g: &Geom, dt: &'static str) -> EvalResult<Val> {
-        let lex = if dt == GEOJSON_LITERAL {
-            // GeoJSON is CRS84: the writer transforms built-in CRSs, others have none
-            g.crs.known().ok_or(TypeError)?;
-            write::to_geojson(g)
-        } else {
-            write::to_wkt(g)
-        };
+        // GeoJSON and KML are CRS84: the writers transform built-in CRSs, others have none
+        let lex = write::serialize(g, dt).ok_or(TypeError)?;
         // held until the query ends, like the local vocabulary the literal lands in
         match self.ctx.charge(lex.len() as u64 + 64) {
             Ok(c) => std::mem::forget(c),
@@ -302,11 +301,26 @@ impl Call<'_, '_> {
         self.geometry(&out, self.datatype(0))
     }
 
-    /// `asWKT` / `asGeoJSON`.
+    /// `asWKT`, `asGeoJSON`, `asKML`.
     fn convert(&self, dt: &'static str) -> EvalResult<Val> {
         self.arity(1)?;
         let g = self.geom(0)?;
         self.geometry(&g, dt)
+    }
+
+    /// `asGML(g)` or `asGML(g, profile)`: GML 3.2 of the Simple Features profile, the
+    /// one profile Sparkles writes, whatever profile string is given.
+    fn as_gml(&self) -> EvalResult<Val> {
+        match self.args.len() {
+            1 => {}
+            2 => match self.value(1)? {
+                Value::Str(_) => {}
+                _ => return Err(TypeError),
+            },
+            _ => return Err(TypeError),
+        }
+        let g = self.geom(0)?;
+        self.geometry(&g, GML_LITERAL)
     }
 
     /// `area(g, unit)` and the like (`unit_arg` 1), or their `metric…` forms (in
@@ -472,6 +486,123 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
     const ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
     const WKT: &str = "http://www.opengis.net/ont/geosparql#wktLiteral";
+
+    /// GML and KML literals as arguments, and `asGML` and `asKML`, with the GeoSPARQL
+    /// 1.1 specification's example point in both.
+    #[test]
+    fn gml_and_kml() {
+        let s = store();
+        let gml = "\"<gml:Point xmlns:gml='http://www.opengis.net/gml/3.2' \
+                   srsName='http://www.opengis.net/def/crs/OGC/1.3/CRS84'>\
+                   <gml:pos>-83.38 33.95</gml:pos></gml:Point>\"^^geo:gmlLiteral";
+        let kml = "\"<Point xmlns='http://www.opengis.net/kml/2.2'>\
+                   <coordinates>-83.38,33.95</coordinates></Point>\"^^geo:kmlLiteral";
+        assert!(truth(&s, &format!("geof:sfEquals({gml}, {kml})")));
+        assert!(truth(
+            &s,
+            &format!("geof:sfEquals({gml}, \"POINT(-83.38 33.95)\"^^geo:wktLiteral)")
+        ));
+        assert_eq!(
+            lit(&s, &format!("geof:asWKT({gml})")).0,
+            "POINT(-83.38 33.95)"
+        );
+        let polygon = "\"<gml:Polygon xmlns:gml='http://www.opengis.net/gml/3.2'><gml:exterior>\
+                       <gml:LinearRing><gml:posList>0 0 10 0 10 10 0 10 0 0</gml:posList>\
+                       </gml:LinearRing></gml:exterior></gml:Polygon>\"^^geo:gmlLiteral";
+        assert!(truth(&s, &format!("geof:sfContains({polygon}, ?p1)")));
+        assert!(truth(&s, &format!("geof:sfEquals({polygon}, ?a)")));
+        assert_eq!(
+            lit(&s, "geof:asGML(?p1)"),
+            (
+                "<gml:Point xmlns:gml=\"http://www.opengis.net/gml/3.2\" \
+                 srsName=\"http://www.opengis.net/def/crs/OGC/1.3/CRS84\">\
+                 <gml:pos>2 2</gml:pos></gml:Point>"
+                    .into(),
+                crate::geo::vocab::GML_LITERAL.into()
+            )
+        );
+        // EPSG:4326 keeps its latitude-first order in GML, and KML is longitude first
+        assert!(
+            lit(&s, "geof:asGML(?p2)")
+                .0
+                .contains("<gml:pos>2 12</gml:pos>")
+        );
+        assert!(
+            lit(
+                &s,
+                "geof:asGML(?p2, \"http://www.opengis.net/def/profile/gmlsf2\")"
+            )
+            .0
+            .contains("EPSG/0/4326")
+        );
+        assert_eq!(
+            lit(&s, "geof:asKML(?p2)"),
+            (
+                "<Point xmlns=\"http://www.opengis.net/kml/2.2\">\
+                 <coordinates>12,2</coordinates></Point>"
+                    .into(),
+                crate::geo::vocab::KML_LITERAL.into()
+            )
+        );
+        // a constructed geometry keeps its argument's serialization
+        assert_eq!(
+            lit(&s, &format!("geof:envelope({polygon})")).1,
+            crate::geo::vocab::GML_LITERAL
+        );
+        assert_eq!(
+            lit(&s, &format!("geof:centroid({kml})")).1,
+            crate::geo::vocab::KML_LITERAL
+        );
+        // an unknown CRS has no KML, and a profile must be a string
+        assert_eq!(eval(&s, "geof:asKML(?m)"), None);
+        assert_eq!(eval(&s, "geof:asGML(?p1, 3)"), None);
+        assert!(
+            lit(&s, "geof:asGML(?m)")
+                .0
+                .contains("http://example.org/crs/mars")
+        );
+    }
+
+    /// A CRS registered from a proj4 definition works in literals: relations with
+    /// CRS84 geometries, transforms and metric functions.
+    #[cfg(feature = "geo-proj4")]
+    #[test]
+    fn registered_crs_literals() {
+        let iri = "http://example.org/crs/test-fn-utm31";
+        crate::geo::crs::register(
+            iri,
+            "+proj=utm +zone=31 +datum=WGS84 +units=m +no_defs",
+            false,
+        )
+        .unwrap();
+        let s = store();
+        let p = format!("\"<{iri}> POINT(500000 0)\"^^geo:wktLiteral");
+        let t = lit(
+            &s,
+            &format!("geof:transform({p}, <http://www.opengis.net/def/crs/OGC/1.3/CRS84>)"),
+        )
+        .0;
+        let x: f64 = t
+            .trim_start_matches("POINT(")
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((x - 3.0).abs() < 1e-9 && t.ends_with(" 0)"), "{t}");
+        assert!(truth(
+            &s,
+            &format!(
+                "geof:sfWithin({p}, \"POLYGON((2 -1, 4 -1, 4 1, 2 1, 2 -1))\"^^geo:wktLiteral)"
+            )
+        ));
+        let d = num(
+            &s,
+            &format!("geof:metricDistance({p}, \"<{iri}> POINT(501000 0)\"^^geo:wktLiteral)"),
+        );
+        assert!((d - 1000.0).abs() < 2.0, "{d}");
+        assert_eq!(lit(&s, &format!("geof:getSRID({p})")).0, iri);
+    }
 
     #[test]
     fn relations() {

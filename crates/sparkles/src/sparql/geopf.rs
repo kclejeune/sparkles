@@ -82,6 +82,18 @@ pub struct SpatialPfSpec {
     pub dedup: bool,
     /// result-cache key of the call's arguments
     pub key: u64,
+    /// Arguments bound by the rest of the group (the node's child): the call's argument
+    /// slots, each a constant or a variable. `query`, `radius_m` and `limit` are then
+    /// decoded once per distinct binding of the variables.
+    pub deferred: Option<Arc<[PathEnd]>>,
+}
+
+impl SpatialPfSpec {
+    /// Whether the call reads the rest of its group (child 0): it has variable
+    /// arguments.
+    pub fn needs_input(&self) -> bool {
+        self.deferred.is_some()
+    }
 }
 
 /// A `spatial:` triple taken out of a basic graph pattern, with its list elements.
@@ -243,8 +255,49 @@ pub fn fold_const(e: &Expr, ctx: &Ctx) -> Option<super::value::Value> {
 /// Helpers the spatial join and nearest-neighbour planning share.
 #[cfg(feature = "geo")]
 pub(crate) use on::{
-    constant_geom, distance_text, geof_call, number, scope_covers, unit_iri, warn,
+    constant_geom, decode_values, distance_text, geof_call, number, scope_covers, unit_iri, warn,
 };
+
+/// A `spatial:` call with variable arguments, joined to the rest of its group (`left`),
+/// which must bind them.
+pub(super) fn attach_spatial(p: &Planner<'_>, left: Node, search: Node) -> Result<Node> {
+    use super::plan::Kind;
+    let Kind::SpatialPf(spec) = &search.kind else {
+        unreachable!("only spatial: calls with variable arguments are attached here");
+    };
+    let slots = spec.deferred.as_deref().unwrap_or_default();
+    for s in slots {
+        if let PathEnd::Var(v) = s
+            && !left.vars.contains(v)
+        {
+            return Err(crate::error::Error::invalid(format!(
+                "{}: the argument ?{} is not bound by the rest of the group",
+                spec.func.name(),
+                p.ctx.var_name(*v)
+            )));
+        }
+    }
+    let mut vars = left.vars.clone();
+    for v in &search.vars {
+        if !vars.contains(v) {
+            vars.push(*v);
+        }
+    }
+    let mut certain = left.certain.clone();
+    certain.extend(search.vars.iter().copied());
+    let est = (left.est * search.est).max(1.0);
+    Ok(Node {
+        dist: vars.iter().map(|&v| (v, est)).collect(),
+        cost: left.cost + left.est.max(1.0) * search.cost,
+        vars,
+        certain,
+        sorted: Vec::new(),
+        est,
+        desc: search.desc,
+        kind: search.kind,
+        children: vec![left],
+    })
+}
 
 #[cfg(feature = "geo")]
 mod on {
@@ -312,46 +365,57 @@ mod on {
     // ----------------------------------------------------------- property functions --
 
     /// The decoded arguments of a `spatial:` call.
-    struct PfArgs {
-        query: Geom,
-        radius_m: Option<f64>,
-        limit: Option<usize>,
+    pub(crate) struct PfArgs {
+        pub(crate) query: Geom,
+        pub(crate) radius_m: Option<f64>,
+        pub(crate) limit: Option<usize>,
         /// the query has no extent (an empty geometry): nothing matches
-        empty: bool,
+        pub(crate) empty: bool,
     }
 
-    fn decode(p: &Planner<'_>, c: &SpatialCall) -> Result<PfArgs> {
+    /// The argument list a function takes, and its fewest and most arguments.
+    fn shape(func: SpatialPfKind) -> (&'static str, usize, usize) {
         use SpatialPfKind::*;
-        let name = c.func.name();
-        let bad = |m: String| Error::invalid(format!("{name}: {m}"));
-        let shape = match c.func {
-            Nearby | WithinCircle => "(lat lon radius [unit [limit]])",
-            NearbyGeom | WithinCircleGeom => "(geometry radius [unit [limit]])",
-            WithinBox | IntersectBox => "(latMin lonMin latMax lonMax [limit])",
+        match func {
+            Nearby | WithinCircle => ("(lat lon radius [unit [limit]])", 3, 5),
+            NearbyGeom | WithinCircleGeom => ("(geometry radius [unit [limit]])", 2, 4),
+            WithinBox | IntersectBox => ("(latMin lonMin latMax lonMax [limit])", 4, 5),
             WithinBoxGeom | IntersectBoxGeom | NorthGeom | SouthGeom | EastGeom | WestGeom => {
-                "(geometry [limit])"
+                ("(geometry [limit])", 1, 2)
             }
-            North | South | East | West => "(lat lon [limit])",
-        };
-        // every argument is a constant (a variable bound from the left is Phase-3 work)
+            North | South | East | West => ("(lat lon [limit])", 2, 3),
+        }
+    }
+
+    /// The arguments of a call whose arguments are all constants.
+    fn decode(p: &Planner<'_>, c: &SpatialCall) -> Result<PfArgs> {
+        let name = c.func.name();
+        let (shape, _, _) = shape(c.func);
         let mut vals = Vec::with_capacity(c.args.len());
         for a in &c.args {
             match p.term_pattern(a) {
-                PT::V(_) => {
-                    return Err(Error::Unsupported(format!(
-                        "{name}: variable arguments are not supported yet"
-                    )));
-                }
-                PT::C(id) => vals.push(p.ctx.value(id).ok_or_else(|| bad(shape.into()))?),
+                PT::V(_) => unreachable!("planned with deferred arguments"),
+                PT::C(id) => vals.push(
+                    p.ctx
+                        .value(id)
+                        .ok_or_else(|| Error::invalid(format!("{name}: {shape}")))?,
+                ),
             }
         }
-        let (fixed, max) = match c.func {
-            Nearby | WithinCircle => (3, 5),
-            NearbyGeom | WithinCircleGeom => (2, 4),
-            WithinBox | IntersectBox => (4, 5),
-            North | South | East | West => (2, 3),
-            _ => (1, 2),
-        };
+        decode_values(c.func, &vals, &config(p.ctx))
+    }
+
+    /// The arguments of a call from their values: at plan time for constants, and per
+    /// binding for variable arguments.
+    pub(crate) fn decode_values(
+        func: SpatialPfKind,
+        vals: &[Value],
+        cfg: &GeoConfig,
+    ) -> Result<PfArgs> {
+        use SpatialPfKind::*;
+        let name = func.name();
+        let bad = |m: String| Error::invalid(format!("{name}: {m}"));
+        let (shape, fixed, max) = shape(func);
         if vals.len() < fixed || vals.len() > max {
             return Err(bad(format!("expected {shape}")));
         }
@@ -374,9 +438,8 @@ mod on {
                 Err(bad(format!("{what} {x} is outside -180..180")))
             }
         };
-        let cfg = config(p.ctx);
         let geom = |i: usize| -> Result<Geom> {
-            match geometry(&vals[i], &cfg) {
+            match geometry(&vals[i], cfg) {
                 Some(Ok(g)) if g.bbox84().is_some() || g.empty => Ok(g),
                 Some(Ok(g)) => Err(bad(format!(
                     "the geometry's CRS {} is not supported",
@@ -415,7 +478,7 @@ mod on {
                 }
             }
         };
-        let mut a = match c.func {
+        let mut a = match func {
             Nearby | WithinCircle => PfArgs {
                 query: point(lat(0, "latitude")?, lon(1, "longitude")?),
                 radius_m: Some(radius(2, Some(3))?),
@@ -486,7 +549,25 @@ mod on {
             PT::V(v) => PathEnd::Var(v),
             PT::C(id) => PathEnd::Const(id),
         };
-        let a = decode(p, &c)?;
+        // variable arguments are bound by the rest of the group, and decoded per binding
+        let slots: Vec<PathEnd> = c
+            .args
+            .iter()
+            .map(|a| match p.term_pattern(a) {
+                PT::V(v) => PathEnd::Var(v),
+                PT::C(id) => PathEnd::Const(id),
+            })
+            .collect();
+        let deferred = slots.iter().any(|s| matches!(s, PathEnd::Var(_)));
+        let a = if deferred {
+            let (shape, fixed, max) = shape(c.func);
+            if !(fixed..=max).contains(&slots.len()) {
+                return Err(Error::invalid(format!("{name}: expected {shape}")));
+            }
+            None
+        } else {
+            Some(decode(p, &c)?)
+        };
         let mut vars = Vec::new();
         if let PathEnd::Var(v) = subject {
             vars.push(v);
@@ -499,10 +580,53 @@ mod on {
         {
             vars.push(gv);
         }
-        if a.empty || matches!(subject, PathEnd::Const(id) if id.tag() == crate::id::Tag::Local) {
+        if a.as_ref().is_some_and(|a| a.empty)
+            || matches!(subject, PathEnd::Const(id) if id.tag() == crate::id::Tag::Local)
+        {
             return Ok(Node::empty(vars));
         }
         let dedup = graph_var.is_none() && graph.multi();
+        let mut h = Fnv::new();
+        h.field(c.func.local().as_bytes());
+        for t in &c.args {
+            h.field(t.to_string().as_bytes());
+        }
+        let Some(a) = a else {
+            // one search per binding of the arguments, with a guess at its size
+            let desc = format!(
+                "{}{}{} ({}) [per binding of the arguments]",
+                vars.iter()
+                    .map(|v| format!("?{} ", ctx.var_name(*v)))
+                    .collect::<String>(),
+                if vars.is_empty() { "" } else { "← " },
+                name,
+                slots
+                    .iter()
+                    .map(|s| match s {
+                        PathEnd::Var(v) => format!("?{}", ctx.var_name(*v)),
+                        PathEnd::Const(id) => p.pt_str(&PT::C(*id)),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            let spec = SpatialPfSpec {
+                func: c.func,
+                query: Arc::new(envelope_geom([0.0, 0.0, 0.0, 0.0])),
+                radius_m: None,
+                limit: None,
+                subject,
+                graph,
+                graph_var,
+                dedup,
+                key: h.finish(),
+                deferred: Some(slots.into()),
+            };
+            let sorted = vars.clone();
+            let mut n = Node::leaf(Kind::SpatialPf(Box::new(spec)), vars, 8.0, desc);
+            n.cost = 64.0;
+            n.sorted = sorted;
+            return Ok(n);
+        };
         let cfg = config(ctx);
         let windows = pf_windows(c.func, &a.query, a.radius_m);
         // estimate: window rows (from the index, or a share of the predicates' rows by
@@ -571,11 +695,6 @@ mod on {
             a.limit.map(|l| format!(" limit {l}")).unwrap_or_default(),
             links.join("|"),
         );
-        let mut h = Fnv::new();
-        h.field(c.func.local().as_bytes());
-        for t in &c.args {
-            h.field(t.to_string().as_bytes());
-        }
         let spec = SpatialPfSpec {
             func: c.func,
             query: Arc::new(a.query),
@@ -586,6 +705,7 @@ mod on {
             graph_var,
             dedup,
             key: h.finish(),
+            deferred: None,
         };
         let sorted = vars.clone();
         let mut n = Node::leaf(Kind::SpatialPf(Box::new(spec)), vars, est, desc);
@@ -1373,6 +1493,113 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         );
     }
 
+    /// GML and KML serializations are indexed and searched like WKT.
+    #[test]
+    fn gml_and_kml_literals_are_searched() {
+        let s = Store::in_memory(StoreOptions::default());
+        let data = r#"
+@prefix ex: <http://example.org/> .
+@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+ex:fg geo:hasGeometry ex:gg . ex:gg geo:asGML "<gml:Point xmlns:gml='http://www.opengis.net/gml/3.2' srsName='http://www.opengis.net/def/crs/EPSG/0/4326'><gml:pos>2 2</gml:pos></gml:Point>"^^geo:gmlLiteral .
+ex:fk geo:hasGeometry ex:gk . ex:gk geo:asKML "<Point><coordinates>2.1,2</coordinates></Point>"^^geo:kmlLiteral .
+ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coordinates></Point>"^^geo:kmlLiteral .
+"#;
+        s.load(&[Source::from_bytes(
+            data.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        for indexed in [false, true] {
+            if indexed {
+                s.enable_geo(crate::geo::GeoConfig::default()).unwrap();
+            }
+            assert_eq!(
+                select(&s, "SELECT ?f { ?f spatial:nearby (2 2 50) }"),
+                ["fg", "fk"]
+            );
+            assert_eq!(
+                select(
+                    &s,
+                    "SELECT ?g { ?g geo:asKML ?w FILTER(geof:sfWithin(?w, \
+                     \"POLYGON((0 0, 5 0, 5 5, 0 5, 0 0))\"^^geo:wktLiteral)) }"
+                ),
+                ["gk"]
+            );
+        }
+    }
+
+    #[test]
+    fn variable_arguments() {
+        let s = store();
+        for indexed in [false, true] {
+            if indexed {
+                s.enable_geo(crate::geo::GeoConfig::default()).unwrap();
+            }
+            let constant = select(&s, "SELECT ?f { ?f spatial:nearby (2 2 50) }");
+            assert_eq!(constant, ["A", "p1"]);
+            assert_eq!(
+                select(
+                    &s,
+                    "SELECT ?f { VALUES (?lat ?lon) { (2 2) } \
+                     ?f spatial:nearby (?lat ?lon 50 uom:kilometre) }"
+                ),
+                constant
+            );
+            // bound by a triple pattern of the group, before or after the call
+            assert_eq!(
+                select(
+                    &s,
+                    "SELECT ?f { ?f spatial:nearbyGeom (?w 50 uom:kilometre) . ex:g1 geo:asWKT ?w }"
+                ),
+                constant
+            );
+            // one search per binding, each joined with its rows
+            assert_eq!(
+                select(
+                    &s,
+                    "SELECT ?f { VALUES ?r { 50 2000 } ?f spatial:nearby (2 2 ?r uom:kilometre) }"
+                ),
+                ["A", "A", "B", "C", "p1", "p1", "p2"]
+            );
+            // a binding that is not a valid argument matches nothing; so does an unbound one
+            assert_eq!(
+                select(
+                    &s,
+                    "SELECT ?f { VALUES ?lat { 91 \"x\" 2 UNDEF } ?f spatial:nearby (?lat 2 50) }"
+                ),
+                ["A", "p1"]
+            );
+            // a feature the group binds is checked against the search
+            assert_eq!(
+                select(
+                    &s,
+                    "SELECT ?f { VALUES (?f ?lat) { (ex:A 2) (ex:p3 2) } ?f spatial:nearby (?lat 2 50) }"
+                ),
+                ["A"]
+            );
+            // a limit from a variable
+            assert_eq!(
+                select(
+                    &s,
+                    "SELECT ?f { BIND(1 AS ?k) ?f spatial:nearby (0 0 5000 uom:kilometre ?k) }"
+                ),
+                ["A"]
+            );
+            let r = run(
+                &s,
+                "SELECT ?f { VALUES ?lat { 2 } ?f spatial:nearby (?lat 2 50) }",
+            )
+            .unwrap();
+            let pf = find(&r.plan, "SpatialPf").expect("a SpatialPf node");
+            assert!(
+                pf.description.contains("per binding of the arguments"),
+                "{}",
+                pf.description
+            );
+        }
+    }
+
     #[test]
     fn argument_errors() {
         let s = store();
@@ -1385,10 +1612,13 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         assert!(m.starts_with("spatial:nearby: latitude 91"), "{m}");
         let m = invalid("SELECT ?f { ?f spatial:nearby (0 0 1 uom:parsec) }");
         assert!(m.starts_with("spatial:nearby: unknown unit"), "{m}");
-        assert!(matches!(
-            err("SELECT ?f { ?f spatial:nearby (?lat 0 1) }"),
-            Error::Unsupported(m) if m == "spatial:nearby: variable arguments are not supported yet"
-        ));
+        let m = invalid("SELECT ?f { ?f spatial:nearby (?lat 0 1) }");
+        assert_eq!(
+            m,
+            "spatial:nearby: the argument ?lat is not bound by the rest of the group"
+        );
+        let m = invalid("SELECT ?f { ?f spatial:nearby (?lat 0) }");
+        assert!(m.starts_with("spatial:nearby: expected (lat lon"), "{m}");
         let m = invalid(
             "SELECT ?w { ?g geo:asWKT ?w \
              FILTER(geof:sfWithin(?w, \"POLYGON((0 0, 1 1\"^^geo:wktLiteral)) }",

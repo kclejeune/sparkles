@@ -64,10 +64,21 @@ pub struct GeoConfig {
     pub format_version: u32,
 }
 
+/// The geometry literals this build indexes: 2 added `geo:gmlLiteral` and
+/// `geo:kmlLiteral`. Part of [`GeoConfig::index_hash`], so index files that left such
+/// literals out are rebuilt.
+const LITERALS_VERSION: u32 = 2;
+
 fn default_predicates() -> Vec<String> {
-    [vocab::AS_WKT, vocab::AS_GEOJSON, vocab::HAS_SERIALIZATION]
-        .map(String::from)
-        .to_vec()
+    [
+        vocab::AS_WKT,
+        vocab::AS_GEOJSON,
+        vocab::AS_GML,
+        vocab::AS_KML,
+        vocab::HAS_SERIALIZATION,
+    ]
+    .map(String::from)
+    .to_vec()
 }
 fn default_feature_links() -> Vec<String> {
     [vocab::HAS_DEFAULT_GEOMETRY, vocab::HAS_GEOMETRY]
@@ -149,6 +160,7 @@ impl GeoConfig {
     /// a change of distance model, feature links or query rewrite leaves valid.
     pub fn index_hash(&self) -> u64 {
         let key = serde_json::json!([
+            LITERALS_VERSION,
             self.predicates,
             self.graphs,
             self.wgs84,
@@ -312,7 +324,7 @@ mod tests {
         let c: GeoConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(c, GeoConfig::default());
         assert!(c.validate().is_ok());
-        assert_eq!(c.predicates.len(), 3);
+        assert_eq!(c.predicates.len(), 5);
         assert_eq!(c.feature_links.len(), 2);
         assert_eq!(c.distance, DistanceModel::Geodesic);
         assert_eq!(c.max_geometry_bytes, 16 << 20);

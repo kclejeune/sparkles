@@ -25,6 +25,8 @@ pub const KML_LITERAL: &str = "http://www.opengis.net/ont/geosparql#kmlLiteral";
 /// Serialization predicates (geometry → literal).
 pub const AS_WKT: &str = "http://www.opengis.net/ont/geosparql#asWKT";
 pub const AS_GEOJSON: &str = "http://www.opengis.net/ont/geosparql#asGeoJSON";
+pub const AS_GML: &str = "http://www.opengis.net/ont/geosparql#asGML";
+pub const AS_KML: &str = "http://www.opengis.net/ont/geosparql#asKML";
 pub const HAS_SERIALIZATION: &str = "http://www.opengis.net/ont/geosparql#hasSerialization";
 /// Feature links (feature → geometry).
 pub const HAS_DEFAULT_GEOMETRY: &str = "http://www.opengis.net/ont/geosparql#hasDefaultGeometry";
@@ -42,9 +44,9 @@ pub const AGGREGATES: [&str; 6] = [
 ];
 
 /// Whether `dt` is a geometry literal datatype this build understands
-/// (`geo:wktLiteral`, `geo:geoJSONLiteral`).
+/// (`geo:wktLiteral`, `geo:geoJSONLiteral`, `geo:gmlLiteral`, `geo:kmlLiteral`).
 pub fn is_geometry_datatype(dt: &str) -> bool {
-    dt == WKT_LITERAL || dt == GEOJSON_LITERAL
+    dt == WKT_LITERAL || dt == GEOJSON_LITERAL || dt == GML_LITERAL || dt == KML_LITERAL
 }
 
 /// The 24 topological relations of GeoSPARQL (Simple Features, Egenhofer, RCC8), as

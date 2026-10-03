@@ -2,6 +2,11 @@
 //! forms, Web Mercator, the 120 UTM zones on WGS 84), IRI aliases and transforms between
 //! the built-in CRSs. Pure data, compiled without the `geo` feature too.
 //!
+//! With the `geo-proj4` feature, an operator registers projected CRSs by proj4 strings
+//! ([`register`], from a `crs.json` file), and they transform through `proj4rs`. With
+//! `geo-epsg`, an EPSG code that is neither built in nor registered is looked up in the
+//! EPSG-derived proj4 table of `crs-definitions` and registered on first use.
+//!
 //! Geometries are held in internal (east, north) order: (longitude, latitude) in degrees
 //! for the geographic CRSs, (easting, northing) in metres for the projected ones. A
 //! literal in a latitude-first CRS (EPSG:4326, EPSG:4979) is swapped on parse and
@@ -53,6 +58,8 @@ enum Projection {
     WebMercator,
     /// Universal Transverse Mercator on WGS 84: zone 1 to 60, northern or southern
     Utm { zone: u8, south: bool },
+    /// a registered proj4 definition: its index in [`REGISTERED`]
+    Registered(u8),
 }
 
 struct CrsDef {
@@ -131,7 +138,16 @@ const WGS84_A: f64 = 6_378_137.0;
 
 impl CrsId {
     fn def(self) -> &'static CrsDef {
-        &TABLE[usize::from(self.0)]
+        let i = usize::from(self.0);
+        match TABLE.get(i) {
+            Some(d) => d,
+            None => {
+                &REGISTERED[i - TABLE.len()]
+                    .get()
+                    .expect("an id is handed out after its CRS is registered")
+                    .def
+            }
+        }
     }
 
     /// The UTM zone `zone` (1 to 60) of the northern or southern hemisphere on WGS 84
@@ -203,9 +219,24 @@ impl CrsRef {
     }
 }
 
-/// The built-in CRS an IRI (or one of its aliases) names.
+/// The built-in or registered CRS an IRI (or one of its aliases) names.
 pub fn lookup(iri: &str) -> Option<CrsId> {
     let n = normalize(iri);
+    if let Some(id) = builtin(&n) {
+        return Some(id);
+    }
+    if let Some(id) = registry().read().ok()?.ids.get(&*n) {
+        return Some(*id);
+    }
+    #[cfg(feature = "geo-epsg")]
+    if let Some(id) = epsg::resolve(&n) {
+        return Some(id);
+    }
+    None
+}
+
+/// The built-in CRS of a normalized IRI.
+fn builtin(n: &str) -> Option<CrsId> {
     if let Some(i) = BASE.iter().position(|d| d.iri == n) {
         return Some(CrsId(i as u8));
     }
@@ -215,6 +246,280 @@ pub fn lookup(iri: &str) -> Option<CrsId> {
         32601..=32660 => CrsId::utm((code - 32600) as u8, false),
         32701..=32760 => CrsId::utm((code - 32700) as u8, true),
         _ => None,
+    }
+}
+
+// --------------------------------------------------------------- registered CRSs --
+
+/// Most CRSs registered in one process (their ids follow the built-in ones in a `u8`).
+pub const MAX_REGISTERED: usize = 128;
+
+/// A CRS registered from a proj4 definition.
+struct Registered {
+    def: CrsDef,
+    /// the definition as given, for [`registry_fingerprint`] and conflicts
+    proj4: String,
+    /// registered on first use from the build's EPSG table (`geo-epsg`), so the same in
+    /// every process of this build
+    auto: bool,
+    #[cfg(feature = "geo-proj4")]
+    proj: proj4rs::Proj,
+}
+
+/// The registered CRSs by index. Slots are set once and never change, so ids handed out
+/// stay valid and reads take no lock.
+static REGISTERED: [std::sync::OnceLock<Registered>; MAX_REGISTERED] =
+    [const { std::sync::OnceLock::new() }; MAX_REGISTERED];
+
+#[derive(Default)]
+struct Registry {
+    /// normalized IRI → id
+    ids: std::collections::HashMap<String, CrsId>,
+    n: usize,
+}
+
+fn registry() -> &'static std::sync::RwLock<Registry> {
+    static R: LazyLock<std::sync::RwLock<Registry>> = LazyLock::new(Default::default);
+    &R
+}
+
+/// Why a CRS definition was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisterError(pub String);
+
+impl std::fmt::Display for RegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RegisterError {}
+
+/// Register the projected CRS `iri` with the proj4 definition `proj4`, whose literals
+/// write northing first when `lat_first`. Registering the same definition again returns
+/// the same id. A built-in CRS, a different definition for a registered IRI, a geographic
+/// definition (`+proj=longlat`: geographic CRSs other than the built-in WGS 84 ones are
+/// not supported) and a definition `proj4rs` cannot read are refused.
+pub fn register(iri: &str, proj4: &str, lat_first: bool) -> Result<CrsId, RegisterError> {
+    register_as(iri, proj4, lat_first, false)
+}
+
+fn register_as(
+    iri: &str,
+    proj4: &str,
+    lat_first: bool,
+    auto: bool,
+) -> Result<CrsId, RegisterError> {
+    let err = |m: String| Err(RegisterError(format!("CRS <{iri}>: {m}")));
+    if oxiri::Iri::parse(iri.trim()).is_err() && !iri.contains(':') {
+        return err("not an IRI".into());
+    }
+    let n = normalize(iri).into_owned();
+    if builtin(&n).is_some() {
+        return err("is built in".into());
+    }
+    let proj4 = proj4.trim();
+    let mut reg = registry()
+        .write()
+        .map_err(|_| RegisterError("registry poisoned".into()))?;
+    if let Some(&id) = reg.ids.get(&n) {
+        let r = &REGISTERED[usize::from(id.0) - TABLE.len()]
+            .get()
+            .expect("registered");
+        return if r.proj4 == proj4 && r.def.lat_first == lat_first {
+            Ok(id)
+        } else {
+            err("is registered with another definition".into())
+        };
+    }
+    if reg.n >= MAX_REGISTERED {
+        return err(format!("more than {MAX_REGISTERED} CRSs are registered"));
+    }
+    let i = reg.n;
+    let id =
+        CrsId(u8::try_from(TABLE.len() + i).map_err(|_| RegisterError("too many CRSs".into()))?);
+    let r = Registered {
+        def: CrsDef {
+            iri: Cow::Owned(n.clone()),
+            kind: CrsKind::Projected,
+            lat_first,
+            projection: Projection::Registered(i as u8),
+        },
+        proj4: proj4.to_string(),
+        auto,
+        #[cfg(feature = "geo-proj4")]
+        proj: proj::read(proj4).map_err(|m| RegisterError(format!("CRS <{iri}>: {m}")))?,
+    };
+    #[cfg(not(feature = "geo-proj4"))]
+    {
+        let _ = (r, id, &mut reg);
+        err("this build has no proj4 support (cargo feature \"geo-proj4\")".into())
+    }
+    #[cfg(feature = "geo-proj4")]
+    {
+        if REGISTERED[i].set(r).is_err() {
+            return err("registered concurrently".into());
+        }
+        reg.n += 1;
+        reg.ids.insert(n, id);
+        Ok(id)
+    }
+}
+
+/// A hash of the definitions the operator registered (0 when there are none), part of the
+/// spatial index's identity: literals in a CRS registered later are indexed by a
+/// rebuild. CRSs of the build's EPSG table are left out, since every process of the
+/// build has them.
+pub fn registry_fingerprint() -> u64 {
+    let Ok(reg) = registry().read() else {
+        return 0;
+    };
+    let mut h: u64 = 0;
+    for slot in REGISTERED.iter().take(reg.n) {
+        if let Some(r) = slot.get().filter(|r| !r.auto) {
+            let mut f = super::Fnv::new();
+            f.field(r.def.iri.as_bytes());
+            f.field(r.proj4.as_bytes());
+            f.field(&[u8::from(r.def.lat_first)]);
+            h = h.wrapping_add(f.finish());
+        }
+    }
+    h
+}
+
+/// The registered CRSs: (IRI, proj4 definition, latitude first).
+pub fn registered() -> Vec<(String, String, bool)> {
+    let n = registry().read().map_or(0, |r| r.n);
+    REGISTERED
+        .iter()
+        .take(n)
+        .filter_map(|s| s.get())
+        .map(|r| (r.def.iri.to_string(), r.proj4.clone(), r.def.lat_first))
+        .collect()
+}
+
+/// One entry of a `crs.json` file.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrsFileEntry {
+    pub proj4: String,
+    /// `en` (easting first, the default) or `ne` (northing first)
+    #[serde(default)]
+    pub axis: Option<String>,
+}
+
+/// Register the CRSs of a `crs.json` file: `{ "<CRS IRI>": { "proj4": "+proj=…",
+/// "axis": "en" | "ne" } }`. Returns how many it holds.
+pub fn register_file(text: &str) -> Result<usize, RegisterError> {
+    let entries: std::collections::BTreeMap<String, CrsFileEntry> =
+        serde_json::from_str(text).map_err(|e| RegisterError(format!("crs.json: {e}")))?;
+    for (iri, e) in &entries {
+        let lat_first = match e.axis.as_deref().map(str::trim) {
+            None | Some("en") | Some("EN") => false,
+            Some("ne") | Some("NE") => true,
+            Some(a) => {
+                return Err(RegisterError(format!(
+                    "CRS <{iri}>: axis {a:?} is not \"en\" or \"ne\""
+                )));
+            }
+        };
+        register(iri, &e.proj4, lat_first)?;
+    }
+    Ok(entries.len())
+}
+
+#[cfg(feature = "geo-proj4")]
+mod proj {
+    use super::REGISTERED;
+    use std::sync::LazyLock;
+
+    static WGS84: LazyLock<proj4rs::Proj> = LazyLock::new(|| {
+        proj4rs::Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs")
+            .expect("the WGS 84 definition reads")
+    });
+
+    /// A projected CRS's proj4 definition, read.
+    pub(super) fn read(proj4: &str) -> Result<proj4rs::Proj, String> {
+        let p = proj4rs::Proj::from_proj_string(proj4)
+            .map_err(|e| format!("the proj4 definition does not read: {e}"))?;
+        if p.is_latlong() || p.is_geocent() {
+            return Err(
+                "only projected CRSs can be registered (geographic CRSs other than \
+                        the built-in WGS 84 ones are not supported)"
+                    .into(),
+            );
+        }
+        if !p.has_forward() || !p.has_inverse() {
+            return Err("the projection has no inverse".into());
+        }
+        Ok(p)
+    }
+
+    fn get(i: u8) -> Option<&'static proj4rs::Proj> {
+        REGISTERED.get(usize::from(i))?.get().map(|r| &r.proj)
+    }
+
+    /// Projected coordinates of registered CRS `i` → longitude, latitude in degrees.
+    pub(super) fn to_lonlat(i: u8, x: f64, y: f64) -> Option<(f64, f64)> {
+        let mut p = (x, y, 0.0);
+        proj4rs::transform::transform(get(i)?, &WGS84, &mut p).ok()?;
+        Some((p.0.to_degrees(), p.1.to_degrees()))
+    }
+
+    /// Longitude, latitude in degrees → projected coordinates of registered CRS `i`.
+    pub(super) fn from_lonlat(i: u8, lon: f64, lat: f64) -> Option<(f64, f64)> {
+        let mut p = (lon.to_radians(), lat.to_radians(), 0.0);
+        proj4rs::transform::transform(&WGS84, get(i)?, &mut p).ok()?;
+        Some((p.0, p.1))
+    }
+}
+
+#[cfg(not(feature = "geo-proj4"))]
+mod proj {
+    pub(super) fn to_lonlat(_: u8, _: f64, _: f64) -> Option<(f64, f64)> {
+        None
+    }
+    pub(super) fn from_lonlat(_: u8, _: f64, _: f64) -> Option<(f64, f64)> {
+        None
+    }
+}
+
+/// EPSG codes from the EPSG-derived table of `crs-definitions`, registered on first use.
+#[cfg(feature = "geo-epsg")]
+mod epsg {
+    use super::{CrsId, EPSG_PREFIX, register_as};
+
+    /// Codes the table lacks, or whose definition cannot be registered (geographic
+    /// CRSs among them), so they are not tried again.
+    static MISSES: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn resolve(n: &str) -> Option<CrsId> {
+        let code: u16 = n.strip_prefix(EPSG_PREFIX)?.parse().ok()?;
+        if MISSES.lock().ok()?.contains(&code) {
+            return None;
+        }
+        let id = definition(n, code);
+        if id.is_none()
+            && let Ok(mut m) = MISSES.lock()
+        {
+            m.push(code);
+        }
+        id
+    }
+
+    fn definition(n: &str, code: u16) -> Option<CrsId> {
+        let def = crs_definitions::from_code(code)?;
+        // the projected axes as the definition's WKT gives them, easting first otherwise
+        let lat_first = {
+            let wkt = def.wkt;
+            let first = wkt.find("AXIS[").map(|i| &wkt[i..]);
+            first.is_some_and(|a| {
+                a.split(']')
+                    .next()
+                    .is_some_and(|a| a.contains("NORTH") || a.contains("North"))
+            })
+        };
+        register_as(n, def.proj4, lat_first, true).ok()
     }
 }
 
@@ -291,6 +596,7 @@ pub fn to_lonlat(crs: CrsId, x: f64, y: f64) -> Option<(f64, f64)> {
             (y / WGS84_A).sinh().atan().to_degrees(),
         ),
         Projection::Utm { zone, south } => tm::inverse(zone, south, x, y)?,
+        Projection::Registered(i) => proj::to_lonlat(i, x, y)?,
     };
     (lon.is_finite() && lat.is_finite()).then_some((lon, lat))
 }
@@ -311,6 +617,7 @@ pub fn from_lonlat(crs: CrsId, lon: f64, lat: f64) -> Option<(f64, f64)> {
             )
         }
         Projection::Utm { zone, south } => tm::forward(zone, south, lon, lat)?,
+        Projection::Registered(i) => proj::from_lonlat(i, lon, lat)?,
     };
     (x.is_finite() && y.is_finite()).then_some((x, y))
 }
@@ -327,7 +634,7 @@ pub fn box_to_lonlat(crs: CrsId, b: [f64; 4]) -> Option<[f64; 4]> {
             let (x1, y1) = to_lonlat(crs, b[2], b[3])?;
             Some([x0, y0, x1, y1])
         }
-        Projection::Utm { .. } => {
+        Projection::Utm { .. } | Projection::Registered(_) => {
             const STEPS: usize = 64;
             let mut out = [
                 f64::INFINITY,
@@ -538,8 +845,109 @@ mod tests {
             assert_eq!(lookup(a), Some(WEB_MERCATOR), "{a}");
         }
         assert_eq!(lookup("http://example.org/crs/mars"), None);
+        #[cfg(not(feature = "geo-epsg"))]
         assert_eq!(lookup("http://www.opengis.net/def/crs/EPSG/0/27700"), None);
         assert_eq!(lookup("EPSG"), None);
+    }
+
+    /// A CRS registered from a proj4 string transforms like the built-in one it
+    /// duplicates (UTM zone 31 north), and a national grid round-trips.
+    #[cfg(feature = "geo-proj4")]
+    #[test]
+    fn registered_crss_transform() {
+        let utm = register(
+            "http://example.org/crs/test-utm31",
+            "+proj=utm +zone=31 +datum=WGS84 +units=m +no_defs",
+            false,
+        )
+        .unwrap();
+        assert_eq!(lookup("http://example.org/crs/test-utm31"), Some(utm));
+        assert_eq!(utm.kind(), CrsKind::Projected);
+        let builtin = CrsId::utm(31, false).unwrap();
+        for (lon, lat) in [(3.0, 0.0), (2.35, 48.85), (0.5, 60.0), (5.9, -10.0)] {
+            let a = from_lonlat(utm, lon, lat).unwrap();
+            let b = from_lonlat(builtin, lon, lat).unwrap();
+            assert!(
+                (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3,
+                "{a:?} {b:?}"
+            );
+            let (lo, la) = to_lonlat(utm, a.0, a.1).unwrap();
+            assert!((lo - lon).abs() < 1e-9 && (la - lat).abs() < 1e-9);
+            assert_eq!(
+                transform(utm, CRS84, a.0, a.1).map(|p| p.0.round()),
+                Some(lon.round())
+            );
+        }
+        // the same definition again is the same CRS; another one is refused
+        assert_eq!(
+            register(
+                "http://example.org/crs/test-utm31",
+                "+proj=utm +zone=31 +datum=WGS84 +units=m +no_defs",
+                false
+            ),
+            Ok(utm)
+        );
+        assert!(register("http://example.org/crs/test-utm31", "+proj=merc", false).is_err());
+        // built-in, geographic and unreadable definitions are refused
+        assert!(register("EPSG:32631", "+proj=utm +zone=31 +datum=WGS84", false).is_err());
+        assert!(
+            register(
+                "http://example.org/crs/test-ll",
+                "+proj=longlat +ellps=GRS80",
+                false
+            )
+            .is_err()
+        );
+        assert!(register("http://example.org/crs/test-bad", "+proj=nonsense", false).is_err());
+        // the British National Grid (OSGB 1936, a datum shift by +towgs84)
+        let n = register_file(
+            r#"{"http://example.org/crs/test-bng": {"proj4": "+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +towgs84=446.448,-125.157,542.06,0.15,0.247,0.842,-20.489 +units=m +no_defs", "axis": "en"}}"#,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        let bng = lookup("http://example.org/crs/test-bng").unwrap();
+        // Greenwich: about 538,900 E, 177,300 N
+        let (e, nn) = from_lonlat(bng, 0.0, 51.4779).unwrap();
+        assert!(
+            (538_000.0..540_000.0).contains(&e) && (176_500.0..178_500.0).contains(&nn),
+            "{e} {nn}"
+        );
+        let (lon, lat) = to_lonlat(bng, e, nn).unwrap();
+        assert!(lon.abs() < 1e-7 && (lat - 51.4779).abs() < 1e-7);
+        assert!(
+            registered()
+                .iter()
+                .any(|(i, _, _)| i == "http://example.org/crs/test-bng")
+        );
+        assert!(registry_fingerprint() != 0);
+        assert!(
+            register_file(r#"{"http://example.org/crs/x": {"proj4": "+proj=merc", "axis": "up"}}"#)
+                .is_err()
+        );
+    }
+
+    /// With the EPSG table, projected EPSG codes resolve on first use.
+    #[cfg(feature = "geo-epsg")]
+    #[test]
+    fn epsg_codes_resolve() {
+        let bng = lookup("http://www.opengis.net/def/crs/EPSG/0/27700").unwrap();
+        assert_eq!(lookup("EPSG:27700"), Some(bng));
+        let (e, n) = from_lonlat(bng, 0.0, 51.4779).unwrap();
+        assert!((538_000.0..540_000.0).contains(&e) && (176_500.0..178_500.0).contains(&n));
+        // Lambert-93
+        assert!(lookup("urn:ogc:def:crs:EPSG::2154").is_some());
+        // geographic codes and unknown ones do not
+        assert_eq!(lookup("EPSG:4258"), None);
+        assert_eq!(lookup("EPSG:4258"), None);
+        assert_eq!(lookup("EPSG:1"), None);
+        // and they leave no fingerprint
+        assert!(
+            !registered().iter().any(|(i, _, _)| i.ends_with("/27700")) || {
+                let before = registry_fingerprint();
+                lookup("EPSG:3035");
+                registry_fingerprint() == before
+            }
+        );
     }
 
     #[test]
@@ -570,7 +978,7 @@ mod tests {
         }
         assert_eq!(lookup("EPSG:32601"), CrsId::utm(1, false));
         for a in ["EPSG:32600", "EPSG:32661", "EPSG:32700", "EPSG:32761"] {
-            assert_eq!(lookup(a), None, "{a}");
+            assert!(builtin(&normalize(a)).is_none(), "{a}");
         }
         assert_eq!(CrsId::utm(0, false), None);
         assert_eq!(CrsId::utm(61, true), None);

@@ -42,6 +42,10 @@ pub(crate) enum BuiltinKind {
     ListLength,
     ListEntry,
     ListForAll,
+    /// Sparkles: the Simple Features type (`sf:Polygon`, …) a geometry literal declares
+    GeoSfType,
+    /// Sparkles: the GML type (`gml:Polygon`, …) of a `geo:gmlLiteral`'s root element
+    GeoGmlType,
 }
 
 use BuiltinKind::*;
@@ -84,6 +88,8 @@ impl BuiltinKind {
             "listLength" => ListLength,
             "listEntry" => ListEntry,
             "listForAll" => ListForAll,
+            "geoSfType" => GeoSfType,
+            "geoGmlType" => GeoGmlType,
             _ => return None,
         })
     }
@@ -91,7 +97,8 @@ impl BuiltinKind {
     pub fn check_arity(self, n: usize) -> Result<(), String> {
         let ok = match self {
             Equal | NotEqual | LessThan | GreaterThan | Le | Ge | IsDType | NotDType
-            | ListMember | ListContains | ListNotContains | ListLength | AddOne => n == 2,
+            | ListMember | ListContains | ListNotContains | ListLength | AddOne | GeoSfType
+            | GeoGmlType => n == 2,
             Sum | Difference | Product | Quotient | Min | Max | ListEntry | ListForAll => n == 3,
             IsLiteral | NotLiteral | IsBNode | NotBNode | IsFunctor | NotFunctor | Now => n == 1,
             NoValue => n == 2 || n == 3,
@@ -108,7 +115,7 @@ impl BuiltinKind {
     pub fn input_positions(self, n: usize) -> Vec<usize> {
         match self {
             Sum | Difference | Product | Quotient | Min | Max => vec![0, 1],
-            AddOne | ListMember | ListLength => vec![0],
+            AddOne | ListMember | ListLength | GeoSfType | GeoGmlType => vec![0],
             ListEntry => vec![0, 1],
             StrConcat | UriConcat => (0..n.saturating_sub(1)).collect(),
             Regex => vec![0, 1],
@@ -121,7 +128,7 @@ impl BuiltinKind {
     pub fn output_positions(self, n: usize) -> Vec<usize> {
         match self {
             Sum | Difference | Product | Quotient | Min | Max | ListEntry => vec![2],
-            AddOne | ListMember | ListLength => vec![1],
+            AddOne | ListMember | ListLength | GeoSfType | GeoGmlType => vec![1],
             StrConcat | UriConcat => vec![n - 1],
             Regex => (2..n).collect(),
             MakeTemp => (0..n).collect(),
@@ -453,6 +460,24 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             };
             let n = sparkles::id::Id::from_i64(ms.len() as i64).unwrap().0;
             ev.bind_and_continue(bi.args[1], n, k, b);
+            return;
+        }
+        GeoSfType | GeoGmlType => {
+            let Some(Term::Literal(l)) = t.term(a(0)) else {
+                return;
+            };
+            let (lex, dt) = (l.value(), l.datatype().as_str());
+            let iri = if bi.kind == GeoSfType {
+                sparkles::geo::types::sf_type(lex, dt)
+                    .map(|n| format!("{}{n}", sparkles::geo::vocab::SF))
+            } else {
+                sparkles::geo::types::gml_type(lex, dt)
+                    .map(|n| format!("{}{n}", sparkles::geo::types::GML_ONT))
+            };
+            if let Some(iri) = iri {
+                let v = t.id_for(&Term::NamedNode(NamedNode::new_unchecked(iri)));
+                ev.bind_and_continue(bi.args[1], v, k, b);
+            }
             return;
         }
         ListEntry => {

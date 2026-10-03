@@ -3,6 +3,7 @@
 
 pub mod accessors;
 pub mod aeqd;
+pub mod cells;
 pub mod construct;
 pub mod distance;
 pub mod hull;

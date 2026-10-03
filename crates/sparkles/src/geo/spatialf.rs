@@ -21,7 +21,7 @@ use super::crs::{self, CRS84, CrsRef, EPSG_4326};
 use super::geom::Geom;
 use super::ops::{self, distance, relate};
 use super::units::{Unit, UnitKind, unit};
-use super::vocab::{GEOJSON_LITERAL, Relation, SPATIALF, WKT_LITERAL};
+use super::vocab::{Relation, SPATIALF, WKT_LITERAL};
 use super::{DistanceModel, GeomRef, memo, write};
 use crate::sparql::ctx::Ctx;
 use crate::sparql::expr::{Expr, Row, Val, arg};
@@ -146,19 +146,14 @@ impl Call<'_, '_> {
     /// The datatype of geometry argument `i` (a GeoJSON literal or else WKT).
     fn datatype(&self, i: usize) -> &'static str {
         match self.value(i) {
-            Ok(Value::Other { dt, .. }) if &*dt == GEOJSON_LITERAL => GEOJSON_LITERAL,
+            Ok(Value::Other { dt, .. }) => write::result_datatype(&dt),
             _ => WKT_LITERAL,
         }
     }
 
     /// A geometry as a literal of datatype `dt`, charged to the query.
     fn geometry(&self, g: &Geom, dt: &'static str) -> EvalResult<Val> {
-        let lex = if dt == GEOJSON_LITERAL {
-            g.crs.known().ok_or(TypeError)?;
-            write::to_geojson(g)
-        } else {
-            write::to_wkt(g)
-        };
+        let lex = write::serialize(g, dt).ok_or(TypeError)?;
         match self.ctx.charge(lex.len() as u64 + 64) {
             Ok(c) => std::mem::forget(c),
             Err(_) => return Err(TypeError),
@@ -295,11 +290,13 @@ impl Call<'_, '_> {
         let g = self.geom(0)?;
         let dt = match datatype {
             None => self.datatype(0),
-            Some(i) => match &*self.uri(i)? {
-                WKT_LITERAL => WKT_LITERAL,
-                GEOJSON_LITERAL => GEOJSON_LITERAL,
-                _ => return Err(TypeError),
-            },
+            Some(i) => {
+                let dt = self.uri(i)?;
+                if !super::vocab::is_geometry_datatype(&dt) {
+                    return Err(TypeError);
+                }
+                write::result_datatype(&dt)
+            }
         };
         let out = match srs {
             None => (*g).clone(),

@@ -447,7 +447,11 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t
         }
         Kind::SpatialPf(spec) => {
-            let (t, c) = spatial_pf(ctx, spec, &n.vars)?;
+            let input = match n.children.len() {
+                0 => None,
+                _ => Some(child(0, &mut infos)?),
+            };
+            let (t, c) = spatial_pf(ctx, spec, input, &n.vars)?;
             counters = Some(c);
             t
         }
@@ -3927,7 +3931,12 @@ fn spatial_scan(
 }
 
 #[cfg(not(feature = "geo"))]
-fn spatial_pf(_: &Ctx, _: &super::geopf::SpatialPfSpec, _: &[VarId]) -> Result<(Table, Counters)> {
+fn spatial_pf(
+    _: &Ctx,
+    _: &super::geopf::SpatialPfSpec,
+    _: Option<Table>,
+    _: &[VarId],
+) -> Result<(Table, Counters)> {
     Err(crate::geo::not_built())
 }
 
