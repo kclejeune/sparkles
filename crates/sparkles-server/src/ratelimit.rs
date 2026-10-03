@@ -141,6 +141,7 @@ pub fn classify(
         | "/{ds}/diff"
         | "/{ds}/queries/{name}" => Some(Class::Query),
         "/{ds}/update" | "/{ds}/upload" => Some(Class::Update),
+        "/{ds}/patch" => Some(if read { Class::Query } else { Class::Update }),
         "/{ds}/data" | "/{ds}/{*graph}" => Some(if read { Class::Query } else { Class::Update }),
         "/{ds}" => {
             let q = uri.query().unwrap_or("");

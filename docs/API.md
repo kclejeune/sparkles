@@ -106,8 +106,8 @@ of the request carries it.
 `/$/ready` and `/$/metrics` are logged at DEBUG. Each line has these fields:
 
 * `dataset`, or `$none`.
-* `operation`: `query`, `update`, `gsp`, `upload`, `shacl`, `shex`, `explain`, `admin`,
-  `mcp` or `other`.
+* `operation`: `query`, `update`, `gsp`, `upload`, `patch`, `shacl`, `shex`, `explain`,
+  `admin`, `mcp` or `other`.
 * `status`.
 * `outcome`: `ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`,
   `rate_limited`, `denied` or `rejected`. `rejected` is a write refused by write-time
@@ -209,7 +209,8 @@ counted.
 | `/{ds}/get` | `get` | `gsp-r` | `Graph Store Protocol (Read)` |
 | `/{ds}/upload` | `upload` | `upload` | `File Upload` |
 | `/{ds}/shacl` | `shacl` | `SHACL` | `SHACL Validation` |
-| `/{ds}` | empty | `query`, `update`, `gsp-rw` or `gsp-r`, by the request | As above. |
+| `/{ds}/patch` | `patch` | `patch` | `RDF Patch` |
+| `/{ds}` | empty | `query`, `update`, `patch`, `gsp-rw` or `gsp-r`, by the request | As above. |
 
 The good and bad counts split `sparkles_requests_total` for the same dataset and route.
 `good` is `outcome="ok"`, and `bad` is the sum of the other outcomes. Fuseki counts a
@@ -765,7 +766,8 @@ way older Fuseki versions did. Fuseki 6 itself refuses such bodies. The syntaxes
   `fuseki:serviceQuery`, name operations that Sparkles serves, at the names it serves
   them at. Queries are served at the dataset URL, `sparql` and `query`. Updates are
   served at the dataset URL and `update`, and `gsp-rw` and `gsp-r` at the dataset URL,
-  `data` and `get`. `upload` and `shacl` keep their names, and `prefixes-r` and
+  `data` and `get`. `patch` is served at the dataset URL and `patch`. `upload` and
+  `shacl` keep their names, and `prefixes-r` and
   `prefixes-rw` are served at `prefixes`. `gsp-direct-rw` and `gsp-direct-r` need a
   server started with `--gsp-direct-naming`.
 * A dataset of type `tdb2:DatasetTDB2` or `tdb:DatasetTDB` becomes a persistent dataset,
@@ -776,7 +778,7 @@ way older Fuseki versions did. Fuseki 6 itself refuses such bodies. The syntaxes
 directory. `tdb2:unionDefaultGraph` must match `--union-default-graph`. Everything else
 is refused with a `400` that names it. That covers other dataset types such as text
 indexes, inference and GeoSPARQL, data to load with `ja:data`, contexts, access control in
-the description, RDF Patch and custom endpoint names. A service without a write endpoint
+the description and custom endpoint names. A service without a write endpoint
 is refused too, since Sparkles serves every endpoint of a dataset. Where Sparkles has
 another way to get the same result, the error names it, such as `PUT /$/text/{ds}` for a
 text index or `--auth-config` for access control.
@@ -1248,11 +1250,12 @@ leaves a `DST.clone-tmp-PID` directory, which the next run into `DST` removes.
 |------------|-----------------------|-------------|
 | GET/POST   | `/{ds}` , `/{ds}/sparql`, `/{ds}/query` | SPARQL 1.1 Query protocol, with a `query=` parameter, an `application/sparql-query` body, or a form. Supports `default-graph-uri` / `named-graph-uri`. |
 | GET/HEAD   | `/{ds}/sparql`, `/{ds}/query` | Without a query, the dataset's SPARQL 1.1 Service Description in RDF. See [Service description](#service-description). |
-| any        | `/{ds}`               | Also the update endpoint (`update=` or `application/sparql-update`), and the Graph Store endpoint for any other body. A form body (`application/x-www-form-urlencoded`) must hold `query` or `update`. A form with neither is refused and never read as RDF. The refusal is a `400`, or a write's authorization error for a caller without write access. |
+| any        | `/{ds}`               | Also the update endpoint (`update=` or `application/sparql-update`), the patch endpoint for a `POST` of `application/rdf-patch` or `application/rdf-patch+thrift`, and the Graph Store endpoint for any other body. A form body (`application/x-www-form-urlencoded`) must hold `query` or `update`. A form with neither is refused and never read as RDF. The refusal is a `400`, or a write's authorization error for a caller without write access. |
 | POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol, with an `update=` form or an `application/sparql-update` body. `using-graph-uri` and `using-named-graph-uri` are the `USING` and `USING NAMED` of every `DELETE`/`INSERT` operation. An operation with `USING`, `USING NAMED` or `WITH` of its own makes them a `400`. An update sent with GET (`/{ds}?update=…`) gets `405`. |
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol, with `?default` or `?graph=<iri>`. `?graph=default` and `?graph=urn:x-arq:DefaultGraph` name the default graph. `?graph=union` and `?graph=urn:x-arq:UnionGraph` read the union of the named graphs, each triple once. Writing to it is a `400`. A GET with neither parameter returns the whole dataset as N-Quads or TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
 | any        | `/{ds}/{path}`        | Fuseki's direct naming, with `sparkles serve --gsp-direct-naming`: the Graph Store Protocol on the graph whose IRI is the request URL without its query, such as `http://host:3030/ds/graphs/one`. The scheme and host are `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them, else `http` and `Host`. Endpoint names (`sparql`, `data`, `shacl`, …) keep their meaning, so a graph cannot be named by one of them. `?graph=` and `?default` are a `400`. Without the flag the path is a `404`. |
 | POST       | `/{ds}/upload`        | Multipart file upload. The format comes from the file name extension or the content type. Optional `graph` field. CSV and TSV tables are mapped to triples, as [CSV and TSV uploads](#csv-and-tsv-uploads) describes. |
+| POST/PATCH | `/{ds}/patch`         | Applies an RDF Patch in one commit, as Fuseki's `patch` operation. See [Applying RDF Patch](#applying-rdf-patch). |
 | POST       | `/{ds}/shacl`         | SHACL validation, as in Fuseki's `/{ds}/shacl`. See [SHACL validation](#shacl-validation). |
 | POST       | `/{ds}/shex`          | ShEx validation. This is a Sparkles extension; Fuseki has none. See [ShEx validation](#shex-validation). |
 
@@ -1578,7 +1581,9 @@ specifies, so it does not name the stored node with that label. In an update, `I
 DATA` makes a new stored node for each blank node label. `INSERT … WHERE` stores a new
 node for each blank node that the WHERE clause made, for example with
 `BIND(BNODE() AS ?b)`. That node gets a `_:b` label and is the same wherever the
-operation inserts it, inside triple terms too.
+operation inserts it, inside triple terms too. An RDF Patch treats labels as `INSERT
+DATA` does, unless it names a commit of the dataset in `prev` (see
+[Applying RDF Patch](#applying-rdf-patch)).
 
 ### Entity tags and conditional requests
 
@@ -1710,6 +1715,101 @@ new content lacks, and inserts only the quads the graph lacks. Its result and it
 receipt are those of replacing the graph, and its log, change feed entry and incremental
 validation cover only what changed.
 
+### Applying RDF Patch
+
+The design and its rationale are in [F10 Applying RDF Patch](specs/F10-replication.md).
+
+`POST /{ds}/patch` and `PATCH /{ds}/patch` apply an RDF Patch to the dataset, as Fuseki's
+`patch` operation does. A `POST` to the dataset URL whose content type is a patch's is
+the same request. The text form is `application/rdf-patch`, and a missing content type or
+`application/x-www-form-urlencoded`, which `curl --data` sends, also means the text form.
+The binary form is `application/rdf-patch+thrift`, the RDF Thrift rows that Jena's
+`RDFChangesWriterBinary` writes. Fuseki refuses that form, and Sparkles accepts it. Any
+other content type, or a charset other than UTF-8, is `415`. `GET`, `PUT`, `DELETE` and
+`HEAD` on `/{ds}/patch` are `405`. The body may be as large as `--max-upload-mb`, as for
+a Graph Store write.
+
+```
+curl -X POST http://localhost:3030/ds/patch -H 'Content-Type: application/rdf-patch' \
+  --data-binary @changes.rdfp
+```
+
+The whole patch is one write transaction, and a patch that changes data makes one commit
+of kind `patch`. The rows mean this:
+
+| Row | Effect |
+|---|---|
+| `A s p o [g] .` | Adds a quad. A quad that is already present changes nothing. |
+| `D s p o [g] .` | Deletes a quad. An absent quad changes nothing. |
+| `PA "prefix" <iri> [g] .` | Sets a prefix of the dataset. |
+| `PD "prefix" [g] .` | Removes a prefix of the dataset. |
+| `TX .`, `TB .`, `TC .`, `Z .` | Markers, which change nothing. |
+| `TA .` | Aborts the whole patch. Nothing is applied, and the answer is `200` with `"aborted": true`. Fuseki also answers success to a patch that aborts. |
+| `H name value .` | A header. `prev` and `message` are read as below, and the others are ignored. |
+
+Rows apply in order, so an `A` and then a `D` of the same quad leave it absent. A row
+without a graph term is in the default graph. Terms are written as in N-Triples, with
+blank nodes as `_:label` or `<_:label>`, Turtle's numbers, `true` and `false`, and triple
+terms as `<<( s p o )>>`. A patch with several `TX … TC` blocks is still one commit, as in
+Fuseki.
+
+Prefixes are not data, so `PA` and `PD` rows change the prefix map without a commit. They
+take effect once the data has committed, and a patch that changes only prefixes answers
+`"committed": false`. A graph term on them is accepted and does not narrow the change,
+because a dataset has one prefix map, as in Jena.
+
+A `prev` header whose value is the IRI of a commit of this dataset,
+`<urn:uuid:<dataset id>#commit:<n>>`, is a precondition. The patch applies only if commit
+`n` is the head, which is checked under the writer lock. Otherwise the answer is `412`:
+
+```json
+{ "error": "the patch expects commit 41 as the head of ds; the head is 43",
+  "code": "prev-mismatch", "prev": "urn:uuid:3f1c…#commit:41", "head": 43 }
+```
+
+This is the check an RDF Delta patch log makes when a patch is appended. The patches of
+[diffs](#diffs-between-commits) and of the [change feed](#change-feed) name their parent
+commit in `prev`, so a chain of them applies in order and stops at the first gap or
+repeat. A `prev` that names another dataset, or is not a commit IRI, is ignored, so a diff
+of one dataset applies to another. A patch without `prev` always applies.
+
+Blank node labels follow the rules of [Blank nodes](#blank-nodes). A label is local to
+the patch, so its first use makes a new stored node and later uses name that node, as in
+`INSERT DATA`. When the headers at the start of the patch name a commit of this dataset
+in `prev`, a label in the stored form, such as `_:b1f`, names the stored node with that
+number if the dataset has made it. A patch read from the dataset's own diff or change
+feed can therefore delete the blank nodes it names. A patch from another dataset, or from
+Jena, adds new blank nodes and cannot delete existing ones by label.
+
+The commit's message is `Sparkles-Commit-Message`, or else a `message` header with a
+string. `dryRun=true` previews the patch as [Write previews](#write-previews) describes,
+and `If-Match` is not read. Write-time validation, storage quotas and receipts apply as
+for any write. The request needs `write`, and the endpoint name `patch` in a grant limited
+to some endpoints. A caller whose grants cover some graphs can change only quads in the
+graphs it writes, and gets `403` for a row in another graph and for any `PA` or `PD`
+row.
+
+The default answer is `200` with JSON. `inserted` and `deleted` count the rows that took
+effect, and `rows` counts the rows read.
+
+```json
+{ "committed": true, "inserted": 2, "deleted": 1, "prefixesSet": 0, "prefixesRemoved": 0,
+  "rows": 5, "aborted": false, "prevChecked": true, "timing": { "totalMs": 0.8 } }
+```
+
+| Condition | Status | `code` |
+|---|---|---|
+| A syntax error, with `line` and `column`, or `row` and `offset` for the binary form | 400 | `patch-syntax` |
+| A row with a term the store cannot hold, such as a literal subject or an invalid IRI | 400 | `patch-term` |
+| An unsupported content type or charset | 415 | |
+| `prev` names a commit of this dataset that is not the head | 412 | `prev-mismatch` |
+| A body over `--max-upload-mb` | 413 | |
+| Write-time validation rejects the result | 422 | as for other writes |
+
+A failed patch applies nothing. A patch of adds alone with at least as many rows as the
+store's bulk threshold takes the bulk path of a large load, which rebuilds the index
+instead of growing the write-ahead log.
+
 ## Stored queries
 
 The design and its rationale are in [C16 Stored queries](specs/C16-stored-queries.md).
@@ -1798,7 +1898,7 @@ The design and its rationale are in [CI Durable commit identity](specs/CI-commit
 
 Every dataset has a **dataset id**, a UUID created with it, and a gap-free **commit
 sequence**. Each write that changes data gets the next `seq`. Such writes are updates,
-Graph Store PUT/POST/DELETE, uploads, loads and reasoning. A write with no net effect, such as inserting a
+Graph Store PUT/POST/DELETE, uploads, loads, applied RDF Patches and reasoning. A write with no net effect, such as inserting a
 quad that is already present, creates no commit. Commit 0 is the root. Compaction keeps
 the head. Ids survive restarts and are durable exactly when the data is.
 
@@ -1827,7 +1927,8 @@ type Commit = {
   seq: number; parent: number | null; ref: string;   // "commit:42"
   timestamp: string;             // RFC 3339 UTC with milliseconds, never decreasing
   kind: "create" | "baseline" | "update" | "gsp-put" | "gsp-post" | "gsp-delete"
-      | "upload" | "load" | "reason" | "reason-clear" | "transaction" | "embed" | "unknown";
+      | "upload" | "load" | "reason" | "reason-clear" | "transaction" | "embed" | "patch"
+      | "unknown";
   inserted: number; deleted: number;   // net change relative to the parent
   quads: number;                        // dataset size after the commit
   generation: string;                   // index generation it was made in
@@ -1840,7 +1941,7 @@ type Commit = {
 ```
 
 **Commit messages.** A write can carry a message in the `Sparkles-Commit-Message` request
-header. Updates, Graph Store `PUT`, `POST` and `DELETE`, and uploads accept it. The message
+header. Updates, Graph Store `PUT`, `POST` and `DELETE`, uploads and patches accept it. The message
 is stored with the commit and appears as `message` in receipts, in `/$/commits` and in
 `sparkles log`. It must be UTF-8 text of at most 1024 bytes with no control characters,
 and surrounding whitespace is trimmed. A header that is empty after trimming sets no
@@ -1986,7 +2087,8 @@ merge, which reads both states in full. That is `"compare"`, and in-memory datas
 always use it.
 
 **RDF Patch.** The patch formats follow Apache Jena's RDF Patch, which Jena's
-`jena-rdfpatch` module, Fuseki's patch endpoint and RDF Delta read. A patch names the
+`jena-rdfpatch` module, Fuseki's patch endpoint, RDF Delta and Sparkles'
+[patch endpoint](#applying-rdf-patch) read. A patch names the
 two states in its header, deletes with `D` rows and adds with `A` rows inside one
 transaction:
 
@@ -5187,7 +5289,7 @@ levels are `read` < `write` < `admin`.
 | Level | Allows |
 |---|---|
 | `read` | Queries (including full-text and vector search), explain, Graph Store GET/HEAD, SHACL, `DatasetInfo`, stats, schema, prefixes, commits, reasoning status and diagnostics, text index status, `/$/ready/{ds}` and the dataset's tasks. |
-| `write` | `read`, plus SPARQL Update, Graph Store PUT/POST/DELETE and upload. |
+| `write` | `read`, plus SPARQL Update, Graph Store PUT/POST/DELETE, upload and RDF Patch. |
 | `admin` | `write`, plus compaction, N-Quads backups, backups to repositories (create, delete, verify, restore), reasoning and clearing inferences, text and vector index configuration, clearing the result cache, cloning (as the source) and deletion. |
 
 There are three server permissions:
@@ -5262,8 +5364,8 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/repositories…` (other routes), `/$/backup-policies…` | | `server-admin` |
 | `/$/quota/{ds}` | PUT, DELETE | `server-admin`. The quota limits what the dataset's own admins can store. |
 | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/data` (GET, HEAD) | | `read` |
-| `/{ds}/update`, `/{ds}/upload`, `/{ds}/data` (other methods), `/{ds}/prefixes` (other methods) | | `write` |
-| `/{ds}` | any | Depends on the operation. `update=` or `application/sparql-update` needs `write`, queries and GET need `read`, and other writes need `write`. |
+| `/{ds}/update`, `/{ds}/upload`, `/{ds}/patch` (POST, PATCH), `/{ds}/data` (other methods), `/{ds}/prefixes` (other methods) | | `write` |
+| `/{ds}` | any | Depends on the operation. `update=`, `application/sparql-update` and a patch need `write`, queries and GET need `read`, and other writes need `write`. |
 | `/$/mcp` | any | Any caller. Each tool call needs `read` on its dataset, and `sparql_update` needs `write`. An anonymous caller that can read no dataset gets `401`. See [HTTP endpoint](#http-endpoint-mcp). |
 | `/$/auth/tokens` (GET, POST), `/$/auth/tokens/{id}` (DELETE) | | a signed-in caller |
 | `/$/auth/tokens?owner=…` | DELETE | `server-admin` |
@@ -5328,6 +5430,7 @@ granted only under `datasets`.
 | `gsp-r` | Graph Store reads (`GET` and `HEAD` on `/{ds}/data`, `/{ds}/get` and `/{ds}`) |
 | `gsp-rw` | Graph Store reads and writes |
 | `upload` | `/{ds}/upload` |
+| `patch` | RDF Patch on `/{ds}/patch` and `/{ds}` |
 | `shacl`, `shex` | `/{ds}/shacl`, `/{ds}/shex`, and the MCP validation tools |
 | `diff` | `/{ds}/diff` and the change feed `/{ds}/changes` |
 | `info` | The dataset's other routes that need `read` or `write`: its description, schema, prefixes, commits, index and reasoning status, snapshots, history and validation settings, and backups. MCP's `list_commits`, `describe_schema`, `draft_shapes` and resources count as `info`, and so do the stored-query definitions under `/$/queries/{ds}`. |

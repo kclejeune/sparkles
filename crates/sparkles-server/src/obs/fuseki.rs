@@ -40,9 +40,10 @@ const GSP_R: (&str, &str) = ("gsp-r", "Graph Store Protocol (Read)");
 const GSP_RW: (&str, &str) = ("gsp-rw", "Graph Store Protocol");
 const UPLOAD: (&str, &str) = ("upload", "File Upload");
 const SHACL: (&str, &str) = ("SHACL", "SHACL Validation");
+const PATCH: (&str, &str) = ("patch", "RDF Patch");
 
 /// Every endpoint a Sparkles dataset has, in Fuseki's terms.
-const ENDPOINTS: [Endpoint; 12] = [
+const ENDPOINTS: [Endpoint; 14] = [
     ep("", QUERY),
     ep("", UPDATE),
     ep("", GSP_RW),
@@ -55,6 +56,8 @@ const ENDPOINTS: [Endpoint; 12] = [
     ep("get", GSP_R),
     ep("upload", UPLOAD),
     ep("shacl", SHACL),
+    ep("", PATCH),
+    ep("patch", PATCH),
 ];
 
 /// The dataset route a request matched, as far as Fuseki has an endpoint for it.
@@ -69,6 +72,7 @@ pub(super) enum Route {
     Get,
     Upload,
     Shacl,
+    Patch,
 }
 
 /// The Fuseki route of a matched route (`None`: no Fuseki endpoint, such as `/$/…`,
@@ -83,6 +87,7 @@ pub(super) fn route(r: Option<&str>) -> Option<Route> {
         "/{ds}/get" => Route::Get,
         "/{ds}/upload" => Route::Upload,
         "/{ds}/shacl" => Route::Shacl,
+        "/{ds}/patch" => Route::Patch,
         _ => return None,
     })
 }
@@ -96,6 +101,7 @@ fn endpoint(route: Route, op: Op, read_only: bool) -> Option<usize> {
             Op::Query => 0,
             Op::Update => 1,
             Op::Gsp => gsp(2),
+            Op::Patch => 12,
             _ => return None,
         },
         Route::Sparql => 4,
@@ -105,6 +111,7 @@ fn endpoint(route: Route, op: Op, read_only: bool) -> Option<usize> {
         Route::Get => 9,
         Route::Upload => 10,
         Route::Shacl => 11,
+        Route::Patch => 13,
     })
 }
 

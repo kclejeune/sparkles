@@ -279,6 +279,7 @@ impl Store {
                     break;
                 }
                 PatchRow::Add(q) => {
+                    check_graph(&txn, &q)?;
                     let ids =
                         encode_add(&mut txn, &mut labels, &q).map_err(|e| row_error(e, rows))?;
                     if deleting {
@@ -288,6 +289,7 @@ impl Store {
                     }
                 }
                 PatchRow::Delete(q) => {
+                    check_graph(&txn, &q)?;
                     if !deleting {
                         deleting = true;
                         for ids in std::mem::take(&mut adds) {
@@ -446,6 +448,20 @@ impl Store {
             *cur = next;
         }
         Ok((set, removed))
+    }
+}
+
+/// A write limited to some graphs may change a row's graph: checked before the row's
+/// terms are looked up, so that the answer never depends on the data.
+fn check_graph(txn: &WriteTxn<'_>, q: &Quad) -> Result<()> {
+    let Some(access) = &txn.opts.graphs else {
+        return Ok(());
+    };
+    let g = graph_term(&q.graph_name);
+    if access.writable(g.as_ref()) {
+        Ok(())
+    } else {
+        Err(crate::access::GraphAccess::refused(g.as_ref()))
     }
 }
 

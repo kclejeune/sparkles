@@ -94,19 +94,17 @@ fn served(op: &str, server: &Server) -> Result<&'static [&'static str], String> 
         "gsp-rw" => &["", "data"],
         "gsp-r" => &["", "get", "data"],
         "upload" => &["upload"],
+        "patch" => &["", "patch"],
         "prefixes-r" | "prefixes-rw" => &["prefixes"],
         "shacl" if cfg!(feature = "shacl") => &["shacl"],
         "no-op" => &[
-            "", "sparql", "query", "update", "data", "get", "upload", "shacl", "prefixes",
+            "", "sparql", "query", "update", "data", "get", "upload", "shacl", "prefixes", "patch",
         ],
         "gsp-direct-rw" | "gsp-direct-r" if server.gsp_direct_naming => &[""],
         "gsp-direct-rw" | "gsp-direct-r" => {
             return Err(format!(
                 "fuseki:{op} needs a server started with --gsp-direct-naming"
             ));
-        }
-        "patch" => {
-            return Err("fuseki:patch is not supported: Sparkles cannot apply RDF Patch".into());
         }
         other => return Err(format!("the operation fuseki:{other} is not supported")),
     })
@@ -276,7 +274,7 @@ impl Description {
         let writes = endpoints.iter().any(|(op, _)| {
             matches!(
                 op.as_str(),
-                "update" | "gsp-rw" | "upload" | "gsp-direct-rw"
+                "update" | "gsp-rw" | "upload" | "gsp-direct-rw" | "patch"
             )
         });
         if !endpoints.is_empty() && !writes {
@@ -467,8 +465,9 @@ mod tests {
         assert!(e.contains("\u{201c}q\u{201d}"), "{e}");
         let e = spec(r#"[] a fuseki:Service ; fuseki:name "x" ; fuseki:endpoint [ fuseki:operation fuseki:query ] ; fuseki:dataset [ a ja:MemoryDataset ] ."#).unwrap_err();
         assert!(e.contains("read-only"), "{e}");
-        let e = spec(r#"[] a fuseki:Service ; fuseki:name "x" ; fuseki:endpoint [ fuseki:operation fuseki:patch ] ; fuseki:dataset [ a ja:MemoryDataset ] ."#).unwrap_err();
-        assert!(e.contains("RDF Patch"), "{e}");
+        // RDF Patch is served at the dataset URL and at `patch`, and is a write endpoint
+        assert!(spec(r#"[] a fuseki:Service ; fuseki:name "x" ; fuseki:endpoint [ fuseki:operation fuseki:patch ] ; fuseki:dataset [ a ja:MemoryDataset ] ."#).is_ok());
+        assert!(spec(r#"[] a fuseki:Service ; fuseki:name "x" ; fuseki:endpoint [ fuseki:operation fuseki:patch ; fuseki:name "patch" ] ; fuseki:dataset [ a ja:MemoryDataset ] ."#).is_ok());
         let e = spec(r#"[] a fuseki:Service ; fuseki:name "x" ; fuseki:dataset [ a tdb2:DatasetTDB2 ; tdb2:unionDefaultGraph true ] ."#).unwrap_err();
         assert!(e.contains("--union-default-graph"), "{e}");
         let e = spec(r#"[] a fuseki:Service ; fuseki:name "x" ; fuseki:allowedUsers "u" ; fuseki:dataset [ a ja:MemoryDataset ] ."#).unwrap_err();

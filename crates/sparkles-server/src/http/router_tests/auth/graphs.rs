@@ -57,6 +57,14 @@ level = "read"
 endpoints = ["gsp-r"]
 
 [[users]]
+name = "gupd"
+password = "{gupd}"
+[[users.grants]]
+dataset = "graphs"
+level = "write"
+endpoints = ["update"]
+
+[[users]]
 name = "gmix"
 password = "{gmix}"
 [[users.grants]]
@@ -74,6 +82,7 @@ endpoints = ["gsp-r", "info"]
         grad = h("grad-pw"),
         gep = h("gep-pw"),
         gmix = h("gmix-pw"),
+        gupd = h("gupd-pw"),
     )
 }
 
@@ -322,6 +331,62 @@ async fn updates_write_only_the_write_graphs() {
     .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert_eq!(r.err()["error"], "write access to /graphs required");
+}
+
+/// RDF Patch (F10 P13): write access to the rows' graphs, no prefix rows for a limited
+/// caller, and the endpoint name `patch`.
+#[tokio::test]
+async fn patches_write_only_the_write_graphs() {
+    let s = server();
+    let send = |user: &'static str, body: &'static str| {
+        let app = s.app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/graphs/patch",
+                &[
+                    ("authorization", &b(user)),
+                    ("content-type", "application/rdf-patch"),
+                ],
+                body,
+            )
+            .await
+        }
+    };
+    let r = send("grad", "A <http://ex/n> <http://ex/p> 1 <http://ex/a/1> .").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let start = head(&s.state, "graphs");
+    for body in [
+        "A <http://ex/n> <http://ex/p> 1 <http://ex/a/2> .",
+        "A <http://ex/n> <http://ex/p> 1 .",
+        "D <http://ex/b1> <http://ex/p> \"secret fox\" <http://ex/b/1> .",
+        "D <http://ex/zz> <http://ex/p> \"none\" <http://ex/b/1> .",
+        "PA \"ex\" <http://ex/> .",
+    ] {
+        let r = send("grad", body).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{body}: {}", r.text());
+    }
+    assert_eq!(head(&s.state, "graphs"), start);
+    for user in ["gra", "gupd"] {
+        let r = send(user, "A <http://ex/n> <http://ex/p> 1 <http://ex/a/1> .").await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{user}: {}", r.text());
+    }
+    // the dataset URL dispatches a patch under the same endpoint name
+    let r = call(
+        &s.app,
+        "POST",
+        "/graphs",
+        &[
+            ("authorization", &b("gupd")),
+            ("content-type", "application/rdf-patch"),
+        ],
+        "A <http://ex/n> <http://ex/p> 1 <http://ex/a/1> .",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    let r = send("gfull", "PA \"ex\" <http://ex/> .").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
 }
 
 #[tokio::test]

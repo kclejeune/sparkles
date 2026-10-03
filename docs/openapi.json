@@ -2115,6 +2115,46 @@
         ],
         "type": "object"
       },
+      "PatchResult": {
+        "additionalProperties": true,
+        "description": "What applying an RDF Patch did. With `receipt=true` or `Accept: application/x-sparkles+json` the body also has the members of a `Receipt`.",
+        "properties": {
+          "aborted": {
+            "description": "A `TA` row aborted the patch, and nothing was applied.",
+            "type": "boolean"
+          },
+          "committed": {
+            "description": "Whether the patch made a commit.",
+            "type": "boolean"
+          },
+          "deleted": {
+            "description": "`D` rows that removed a quad.",
+            "type": "integer"
+          },
+          "inserted": {
+            "description": "`A` rows that added a quad.",
+            "type": "integer"
+          },
+          "prefixesRemoved": {
+            "type": "integer"
+          },
+          "prefixesSet": {
+            "type": "integer"
+          },
+          "prevChecked": {
+            "description": "The patch's `prev` header named a commit of this dataset, which was the head.",
+            "type": "boolean"
+          },
+          "rows": {
+            "description": "The rows read, up to a `TA` that aborted the patch.",
+            "type": "integer"
+          },
+          "timing": {
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
       "PlanNode": {
         "additionalProperties": true,
         "properties": {
@@ -12559,7 +12599,7 @@
         "x-sparkles-permission": "read or write, by operation"
       },
       "post": {
-        "description": "A query (`application/sparql-query`, or a form with `query`), an update (`application/sparql-update`, or a form with `update`), or else a Graph Store POST of the RDF body. A form with neither is refused.",
+        "description": "A query (`application/sparql-query`, or a form with `query`), an update (`application/sparql-update`, or a form with `update`), an RDF Patch (`application/rdf-patch` or `application/rdf-patch+thrift`, as `/{ds}/patch`), or else a Graph Store POST of the RDF body. A form with neither is refused.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#per-dataset-sparql-protocol-fuseki-compatible"
         },
@@ -12689,6 +12729,17 @@
                 "type": "string"
               }
             },
+            "application/rdf-patch": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/rdf-patch+thrift": {
+              "schema": {
+                "contentMediaType": "application/octet-stream",
+                "type": "string"
+              }
+            },
             "application/sparql-query": {
               "schema": {
                 "type": "string"
@@ -12790,6 +12841,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/WriteCount"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PatchResult"
                     },
                     {
                       "$ref": "#/components/schemas/Receipt"
@@ -14205,6 +14259,324 @@
           "Graph Store"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/patch": {
+      "patch": {
+        "description": "Applies an RDF Patch as one write transaction, as Fuseki's `patch` operation does. The text form is `application/rdf-patch`, which a missing content type or `application/x-www-form-urlencoded` also means, and the binary form is `application/rdf-patch+thrift`. `TX`, `TC` and `Z` are markers, and `TA` aborts the whole patch with `200` and `aborted: true`. `PA` and `PD` change the dataset's prefixes. A `prev` header that names a commit of this dataset applies the patch only when that commit is the head, and is `412` otherwise. The body is limited by `--max-upload-mb`. A patch that changes data makes one commit of kind `patch`. The other methods are `405`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#applying-rdf-patch"
+        },
+        "operationId": "patch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/dryRun"
+          },
+          {
+            "$ref": "#/components/parameters/changes"
+          },
+          {
+            "$ref": "#/components/parameters/receipt"
+          },
+          {
+            "$ref": "#/components/parameters/validate"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          },
+          {
+            "$ref": "#/components/parameters/dryRunHeader"
+          },
+          {
+            "description": "The most validation results reported when a write is rejected.",
+            "in": "query",
+            "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/rdf-patch": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/rdf-patch+thrift": {
+              "schema": {
+                "contentMediaType": "application/octet-stream",
+                "type": "string"
+              }
+            }
+          },
+          "description": "The patch.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/PatchResult"
+                    },
+                    {
+                      "$ref": "#/components/schemas/DryRunReport"
+                    }
+                  ]
+                }
+              },
+              "application/x-sparkles+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PatchResult"
+                }
+              }
+            },
+            "description": "What the patch did, with a receipt or a dry run's report when asked.",
+            "headers": {
+              "Sparkles-Commit": {
+                "description": "The commit a read saw, or a write produced.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Sparkles-Dataset-Id": {
+                "description": "The dataset id.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Apply an RDF Patch",
+        "tags": [
+          "Graph Store"
+        ],
+        "x-sparkles-permission": "write"
+      },
+      "post": {
+        "description": "Applies an RDF Patch as one write transaction, as Fuseki's `patch` operation does. The text form is `application/rdf-patch`, which a missing content type or `application/x-www-form-urlencoded` also means, and the binary form is `application/rdf-patch+thrift`. `TX`, `TC` and `Z` are markers, and `TA` aborts the whole patch with `200` and `aborted: true`. `PA` and `PD` change the dataset's prefixes. A `prev` header that names a commit of this dataset applies the patch only when that commit is the head, and is `412` otherwise. The body is limited by `--max-upload-mb`. A patch that changes data makes one commit of kind `patch`. The other methods are `405`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#applying-rdf-patch"
+        },
+        "operationId": "patchPost",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/dryRun"
+          },
+          {
+            "$ref": "#/components/parameters/changes"
+          },
+          {
+            "$ref": "#/components/parameters/receipt"
+          },
+          {
+            "$ref": "#/components/parameters/validate"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          },
+          {
+            "$ref": "#/components/parameters/dryRunHeader"
+          },
+          {
+            "description": "The most validation results reported when a write is rejected.",
+            "in": "query",
+            "name": "validationLimit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/rdf-patch": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/rdf-patch+thrift": {
+              "schema": {
+                "contentMediaType": "application/octet-stream",
+                "type": "string"
+              }
+            }
+          },
+          "description": "The patch.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/PatchResult"
+                    },
+                    {
+                      "$ref": "#/components/schemas/DryRunReport"
+                    }
+                  ]
+                }
+              },
+              "application/x-sparkles+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PatchResult"
+                }
+              }
+            },
+            "description": "What the patch did, with a receipt or a dry run's report when asked.",
+            "headers": {
+              "Sparkles-Commit": {
+                "description": "The commit a read saw, or a write produced.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Sparkles-Dataset-Id": {
+                "description": "The dataset id.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Apply an RDF Patch",
+        "tags": [
+          "Graph Store"
+        ],
+        "x-sparkles-permission": "write"
       }
     },
     "/{ds}/prefixes": {

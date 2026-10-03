@@ -141,12 +141,14 @@ pub enum Endpoint {
     Shacl,
     Shex,
     Diff,
+    /// applying RDF Patch (`/{ds}/patch`, and a patch sent to `/{ds}`)
+    Patch,
     /// every other route that reads (or, for prefixes, writes) the dataset's description
     Info,
 }
 
 impl Endpoint {
-    pub const ALL: [Endpoint; 9] = [
+    pub const ALL: [Endpoint; 10] = [
         Endpoint::Query,
         Endpoint::Update,
         Endpoint::GspR,
@@ -155,6 +157,7 @@ impl Endpoint {
         Endpoint::Shacl,
         Endpoint::Shex,
         Endpoint::Diff,
+        Endpoint::Patch,
         Endpoint::Info,
     ];
 
@@ -168,6 +171,7 @@ impl Endpoint {
             Endpoint::Shacl => "shacl",
             Endpoint::Shex => "shex",
             Endpoint::Diff => "diff",
+            Endpoint::Patch => "patch",
             Endpoint::Info => "info",
         }
     }

@@ -733,6 +733,25 @@ pub(super) fn schemas() -> Map<String, J> {
         }),
     );
     put(
+        "PatchResult",
+        json!({
+            "type": "object",
+            "additionalProperties": true,
+            "description": "What applying an RDF Patch did. With `receipt=true` or `Accept: application/x-sparkles+json` the body also has the members of a `Receipt`.",
+            "properties": {
+                "committed": { "type": "boolean", "description": "Whether the patch made a commit." },
+                "inserted": { "type": "integer", "description": "`A` rows that added a quad." },
+                "deleted": { "type": "integer", "description": "`D` rows that removed a quad." },
+                "prefixesSet": { "type": "integer" },
+                "prefixesRemoved": { "type": "integer" },
+                "rows": { "type": "integer", "description": "The rows read, up to a `TA` that aborted the patch." },
+                "aborted": { "type": "boolean", "description": "A `TA` row aborted the patch, and nothing was applied." },
+                "prevChecked": { "type": "boolean", "description": "The patch's `prev` header named a commit of this dataset, which was the head." },
+                "timing": { "type": "object" },
+            },
+        }),
+    );
+    put(
         "WriteCount",
         json!({
             "type": "object",

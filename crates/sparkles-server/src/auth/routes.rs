@@ -138,6 +138,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/data", &["*"]),
     ("/{ds}/get", &["GET", "HEAD"]),
     ("/{ds}/upload", &["POST"]),
+    // RDF Patch: POST and PATCH apply, OPTIONS lists them, the others are 405
+    ("/{ds}/patch", &["*"]),
     ("/{ds}/explain", &["GET", "POST"]),
     ("/{ds}/text", &["GET", "POST"]),
     ("/{ds}/diff", &["GET"]),
@@ -311,6 +313,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/backups/{ds}/{repo}/{backup}/restore"
         | "/$/backups/{ds}/{repo}/{backup}/verify" => Dataset(Admin),
         "/{ds}/update" | "/{ds}/upload" => Dataset(Write),
+        // a method that is refused anyway needs only read, so a reader learns the 405
+        "/{ds}/patch" if safe(method) => Dataset(Read),
+        "/{ds}/patch" => Dataset(Write),
         "/{ds}/data" | "/{ds}/{*graph}" if get => Dataset(Read),
         "/{ds}/data" | "/{ds}/{*graph}" => Dataset(Write),
         "/{ds}" => {
@@ -349,6 +354,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/{ds}/data" | "/{ds}/{*graph}" if get => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" => Endpoint::GspRw,
         "/{ds}/upload" => Endpoint::Upload,
+        "/{ds}/patch" => Endpoint::Patch,
         "/{ds}/shacl" => Endpoint::Shacl,
         "/{ds}/shex" => Endpoint::Shex,
         "/{ds}/diff" | "/{ds}/changes" => Endpoint::Diff,
@@ -356,6 +362,10 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
             let ct = media_type(headers);
             if has_param(uri, "update") || ct == "application/sparql-update" {
                 Endpoint::Update
+            } else if *method == Method::POST
+                && (ct == sparkles::patch::MEDIA_TYPE || ct == sparkles::patch::MEDIA_TYPE_BINARY)
+            {
+                Endpoint::Patch
             } else if has_param(uri, "query")
                 || ct == "application/sparql-query"
                 // the body may hold `update=`: `dataset_root` re-checks

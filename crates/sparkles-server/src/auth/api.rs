@@ -53,6 +53,8 @@ pub fn cors_layer(st: &AppState, expose: Vec<HeaderName>) -> CorsLayer {
             Method::HEAD,
             Method::POST,
             Method::PUT,
+            // RDF Patch (`/{ds}/patch`)
+            Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
         ])
