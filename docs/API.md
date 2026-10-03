@@ -61,7 +61,7 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 | GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }`. When auth is on, anonymous callers get no `version` or `limits`. |
 | GET    | `/$/whoami`   | The caller and its permissions. See [whoami](#whoami). |
 | GET    | `/$/openapi.json`, `/$/openapi.yaml` | The OpenAPI 3.1 description of the API. See [OpenAPI description](#openapi-description). |
-| POST   | `/$/format`   | Formats a SPARQL query or update. See [Formatting](#formatting). |
+| POST   | `/$/format`   | Formats a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads or JSON-LD document. See [Formatting](#formatting). |
 | POST   | `/$/lint`     | Lints a SPARQL query or update, or a Turtle or TriG document. See [Linting](#linting). |
 | GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. `--metrics-addr` serves it on a second address too. |
 
@@ -110,7 +110,7 @@ of the request carries it.
 
 * `dataset`, or `$none`.
 * `operation`: `query`, `update`, `gsp`, `upload`, `patch`, `shacl`, `shex`, `explain`,
-  `admin`, `mcp` or `other`.
+  `admin`, `mcp`, `graphql` or `other`.
 * `status`.
 * `outcome`: `ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`,
   `rate_limited`, `denied` or `rejected`. `rejected` is a write refused by write-time
@@ -164,6 +164,7 @@ JSON object per line.
 | `sparkles_embedding_failures_total` | counter. Failed batches of kinds `transient` (after their retries), `auth`, `refused`, `fatal` and `write`. `rejected` counts inputs the provider refused or answered with an unusable vector, and `read` counts subjects whose text could not be read. | `dataset`, `index`, `kind` |
 | `sparkles_embedding_backlog` | gauge. Subjects (per graph) waiting to be embedded, the status's `backlog`. | `dataset`, `index` |
 | `sparkles_embedding_lag_commits` | gauge. Commits since the newest one whose text is all embedded, which is `headSeq − appliedSeq` of the status. | `dataset`, `index` |
+| `sparkles_graphql_groups` | histogram (1 … 64). The fetch groups, which are SPARQL queries, that each GraphQL request ran. | `dataset` |
 | `process_resident_memory_bytes` | gauge (Linux) | |
 
 Label values are bounded. `dataset` is an existing dataset name, or `$none` for requests
@@ -232,8 +233,8 @@ Fuseki's other meters come from Micrometer's JVM and system binders, and Sparkle
 equivalent for them. They are the `jvm_*` memory, garbage collector, thread and class
 loader gauges, `process_files_*`, `process_cpu_usage`, `system_cpu_usage`,
 `system_load_average_1m`, `disk_free_bytes` and `disk_total_bytes`. `/{ds}/shex`,
-`/{ds}/explain`, `/{ds}/prefixes` and the `/$/` routes have no Fuseki endpoint, so only
-the Sparkles names count them.
+`/{ds}/explain`, `/{ds}/graphql`, `/{ds}/prefixes` and the `/$/` routes have no Fuseki
+endpoint, so only the Sparkles names count them.
 
 #### Metrics listener
 
@@ -375,12 +376,13 @@ each request class per client:
 | Class | Requests |
 |-------|----------|
 | `auth` | Every path under `/$/auth/`, matched or not: login, token minting, device flow and the OIDC callback. |
-| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics`, `/$/format`, and MCP tool calls and resource reads at `/$/mcp` |
-| `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP `sparql_update` tool. A form POST to `/{ds}` counts as an update. |
-| `admin` | `/$/…` requests other than `GET`/`HEAD` and `POST /$/format`. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/format`, `/$/lint`, and MCP tool calls and resource reads at `/$/mcp` |
+| `update` | `/{ds}/update`, `/{ds}/upload`, `POST` and `PATCH /{ds}/patch`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP `sparql_update` tool. A form POST to `/{ds}` counts as an update. |
+| `admin` | `/$/…` requests other than `GET`, `HEAD` and `OPTIONS` that are not in the `query` class. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
 | `preauth` | Every request, before authentication. Counts failed credential checks per client address and per IPv6 /48. Has no per-dataset form. |
 
 `/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
+Neither are `/{ds}/text`, `/{ds}/changes`, `/{ds}/geo` and `/{ds}/prefixes`.
 An MCP message is charged by its tool and the dataset it names, and other MCP messages
 are not limited (see [HTTP endpoint](#http-endpoint-mcp)).
 
@@ -592,6 +594,8 @@ type DatasetInfo = {
   type: "persistent" | "mem";
   endpoints: { query: string; update: string; gsp: string; upload: string; shacl?: string; shex?: string /* each absent when built without its feature */ };
   quads: number;           // approximate total (base + delta)
+  id: string; head: number; modified: string;   // dataset id, head commit and its time (see Commits)
+  rdfs: null | { source: "upload" | "graph"; graph?: string };   // RDFS on read (see RDFS on read)
   reasoning: null | {
     profile: string; inferred: number; at: string;
     commit: number | null;       // commit the inferences were materialized at
@@ -1702,7 +1706,7 @@ WHERE { GRAPH ?g { ?s ?p ?o } }
   `Accept: application/trig` or `application/n-quads` to get the quads.
 * The `application/x-sparkles+json` document adds a `quads` array of
   `[subject, predicate, object, graph]` beside `triples`.
-* `sparkles query --format trig` or `--format nquads` prints the quads. In Rust,
+* `sparkles query --results trig` or `--results nq` prints the quads. In Rust,
   `QueryResult::quads` holds them and `Dataset::construct_quads` returns everything as
   quads. In Python, `construct()` returns the triples and their `quads` attribute holds
   the named graphs' quads.
@@ -1712,6 +1716,7 @@ builder has `lateral(|w| …)`, and its path syntax accepts ranges (`"foaf:knows
 
 ARQ's other path forms (`:p^:q`, `distinct(…)`, `shortest(…)` and `multi(…)`),
 `SEMIJOIN`, `ANTIJOIN`, `LET`, `UNFOLD` and the `JSON` query form are not supported.
+Shortest paths come from [path search](#path-search) instead.
 
 ### DESCRIBE
 
@@ -1810,8 +1815,8 @@ was read at and its serialization:
 ETag: W/"3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa:42:ttl"
 ```
 
-The last part is `ttl`, `nt`, `nq`, `trig`, `rdf` or `jsonld`, or `rt`, `rpb` and `rj`
-for Jena's syntaxes. The tag is weak because
+The last part is `ttl`, `nt`, `nq`, `trig`, `rdf` or `jsonld`, or `rt`, `rpb`, `rj` and
+`trix` for Jena's syntaxes. The tag is weak because
 the bytes of one commit's serialization can change without a commit. A compaction
 reorders the output, and a prefix change rewrites Turtle, while the data stays the same.
 The tag covers the whole dataset, so every commit changes the tag of every graph. A read
@@ -2293,8 +2298,10 @@ The design and its rationale are in [CI Durable commit identity](specs/CI-commit
 
 Every dataset has a **dataset id**, a UUID created with it, and a gap-free **commit
 sequence**. Each write that changes data gets the next `seq`. Such writes are updates,
-Graph Store PUT/POST/DELETE, uploads, loads, applied RDF Patches and reasoning. A write with no net effect, such as inserting a
-quad that is already present, creates no commit. Commit 0 is the root. Compaction keeps
+Graph Store PUT/POST/DELETE, uploads, loads, applied RDF Patches, reasoning and the
+vectors that [embeddings on write](#embeddings-on-write) store. A write with no net
+effect, such as inserting a quad that is already present, creates no commit. Commit 0 is
+the root. Compaction keeps
 the head. Ids survive restarts and are durable exactly when the data is.
 
 **Headers.** Every successful query, update, Graph Store, explain and SHACL validation
@@ -2696,9 +2703,13 @@ changed meaning. `sparkles backup` works on repositories directly and calls no r
 
 * the files of the dataset's current index generation (`gen-NNNN/…`): the permutations,
   the vocabulary, `wal.log` and `delta.vocab`
-* the commit catalog `commits.bin`
+* the commit catalog `commits.bin`, and `annotations.bin` with the commit messages and
+  digests
 * `CURRENT`, `dataset.json` and `prefixes.json`
-* `text.json`, `origin.json`, `validation.json` and `validation-shapes.ttl`, when the
+* the settings of the full-text, spatial and vector indexes (`text.json`, `geo.json`,
+  `vector.json`), `origin.json`, the write-time validation configuration
+  (`validation.json`, `validation-shapes.ttl` and the ShEx schema files), the stored
+  queries (`queries.json`) and the GraphQL configuration (`graphql.json`), when the
   dataset has them
 * `reasoning.json`, unless its inferences were made at a later commit than the captured
   one
@@ -3602,7 +3613,7 @@ The CLI is `sparkles vector`:
 
 ```sh
 sparkles vector create  --loc DB --name NAME --predicate IRI --dim D [--metric cosine|dot|euclidean]
-                        [--model LABEL] [--m 16] [--ef-construction 128] [--ef-search 64]
+                        [--model LABEL] [--m 16] [--ef-construction 128] [--ef-search 128]
                         [--exact-threshold 10000] [--no-hnsw]
 sparkles vector drop    --loc DB --name NAME
 sparkles vector rebuild --loc DB --name NAME
@@ -4067,7 +4078,7 @@ Each spatial operator in an executed plan reports these `counters`:
 
 ```ts
 type GeoConfig = {
-  predicates?: string[];        // serialization predicates; default geo:asWKT, geo:asGeoJSON, geo:hasSerialization
+  predicates?: string[];        // serialization predicates; default geo:asWKT, geo:asGeoJSON, geo:asGML, geo:asKML, geo:hasSerialization
   featureLinks?: string[];      // default geo:hasDefaultGeometry, geo:hasGeometry
   graphs?: { include?: "all" | string[]; exclude?: string[] };   // as for full-text search
   distance?: "geodesic" | "haversine";   // default "geodesic"
@@ -4844,8 +4855,8 @@ selectors are refused because every validated write would run them.
 | DELETE | `/$/validation/{ds}` | Turns validation off (`204`) and removes every validation file. |
 
 **Writes** are validated once per request, on the final state, before any byte is
-written. This covers updates, Graph Store PUT/POST/DELETE and uploads, and in the CLI
-`load`, `update`, `infer` and bulk loads. A write that touches neither the data graph nor
+written. This covers updates, Graph Store PUT/POST/DELETE, uploads and applied RDF
+Patches, and in the CLI `load`, `update`, `patch`, `infer` and bulk loads. A write that touches neither the data graph nor
 the shapes graphs is skipped. A write is also skipped when no shape reads any predicate
 it changes. For SHACL the predicates read are those of paths, targets, `sh:equals` and
 its siblings, and `rdf:type` and `rdfs:subClassOf` for classes. SHACL needs the state of
@@ -5546,7 +5557,8 @@ builds. Once the file system goes below the limit, it stops and removes what it 
 Nothing is committed in either case. An in-memory dataset (`dbType=mem`) holds at most
 `--max-mem-dataset-mb` (default 4096), estimated from its index files, delta and
 vocabulary. A commit that would grow it past that fails the same way, but deletes always
-pass. Storage quotas per dataset do not exist yet.
+pass. A persistent dataset can also have a storage quota of its own (see
+[Storage quotas](#storage-quotas)).
 
 **Files.** `sparkles load` reads the same codecs, chosen with
 `--compression auto|none|gzip|zstd|brotli|lz4`. `auto` goes by magic bytes, then by the
@@ -5584,16 +5596,24 @@ statuses are:
 * `405` for an update sent with GET
 * `408` for a timeout
 * `409` for a conflict
+* `410` for a commit that is no longer readable, with `{code: "history-gone"}` (see
+  [Point-in-time reads](#point-in-time-reads-and-snapshots))
 * `412` for a failed `If-Match` or `If-None-Match`, with `{code: "precondition-failed"}`
-  (see [Entity tags and conditional requests](#entity-tags-and-conditional-requests))
+  (see [Entity tags and conditional requests](#entity-tags-and-conditional-requests)), or
+  an RDF Patch whose `prev` is not the head
 * `413` for a body over its ceiling, or a compressed body over `--max-decompressed-mb`
 * `415` for an unsupported content type or `Content-Encoding`
+* `422` for a write that write-time validation rejects, and for output the formatter or
+  the linter refuses
 * `429` for a request over a rate limit
+* `501` for a feature this build was compiled without
 * `503` for a cancelled query, a request over a concurrency limit (see
   [Rate limiting](#rate-limiting)), a failed write-ahead log write, or a dataset that an
   in-place restore is replacing. After a failed WAL write, writes are refused until
   restart while reads continue. During a restore the body has
   `{code: "dataset-restoring"}`, with `Retry-After: 5`.
+* `507` for a request over a budget (see [Budgets](#budgets)), a dataset over its storage
+  quota, or a file system without the free space a write needs
 * `500` otherwise
 
 The backup routes add a machine-readable `code` (see
@@ -5830,9 +5850,9 @@ levels are `read` < `write` < `admin`.
 
 | Level | Allows |
 |---|---|
-| `read` | Queries (including full-text and vector search), explain, Graph Store GET/HEAD, SHACL, `DatasetInfo`, stats, schema, prefixes, commits, reasoning status and diagnostics, text index status, `/$/ready/{ds}` and the dataset's tasks. |
+| `read` | Queries (including full-text, vector and path search), stored-query runs, GraphQL, explain, Graph Store GET/HEAD, diffs and the change feed, SHACL and ShEx validation, `DatasetInfo`, stats, schema, prefixes, commits, reasoning status and diagnostics, the status and settings of the indexes and the other per-dataset settings, `/$/ready/{ds}` and the dataset's tasks. |
 | `write` | `read`, plus SPARQL Update, Graph Store PUT/POST/DELETE, upload and RDF Patch. |
-| `admin` | `write`, plus compaction, N-Quads backups, backups to repositories (create, delete, verify, restore), reasoning and clearing inferences, text and vector index configuration, clearing the result cache, cloning (as the source) and deletion. |
+| `admin` | `write`, plus compaction and its settings, N-Quads backups, backups to repositories (create, delete, verify, restore), reasoning and clearing inferences, the configuration of the text, spatial and vector indexes, write-time validation, RDFS on read, DESCRIBE, GraphQL and stored queries, named snapshots and retention, clearing the result cache, cloning (as the source) and deletion. |
 
 There are three server permissions:
 
@@ -5895,17 +5915,17 @@ without the permission is a `403` before any connection or file is opened, even 
 |---|---|---|
 | `/ui/*`, `/$/ping`, `/$/ready`, `/$/openapi.json`, `/$/openapi.yaml` | GET | Nothing. Without `metrics`, `/$/ready` lists only readable datasets. |
 | `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*` (including the back-channel logout), `/$/auth/device`, `/$/auth/token` | | Nothing. Invalid credentials are still `401`. |
-| `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | Any caller. `/$/format` admits nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. Cancelling a task (DELETE) needs `admin` on its dataset. |
+| `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/stats`, `/$/backups-list`, `/$/validate/*`, `/$/auth/logout`, `/$/format` (POST), `/$/lint` (POST), `/$/geo/convert` (POST) | | Any caller. `/$/format` and `/$/lint` admit nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. `/$/stats` covers the datasets the caller may read, and `/$/backups-list` the files of the datasets it administers. Cancelling a task (DELETE) needs `admin` on its dataset. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/vector/{ds}/{name}/recall`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
-| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT), `/$/compaction/{ds}` (PUT, `/$/queries/{ds}/{name}` (PUT, DELETE) | | `admin` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` needs `read` too. |
+| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/reason/{ds}/auto`, `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/vector/{ds}/{name}/reembed`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT), `/$/validation/{ds}`, `/$/rdfs/{ds}`, `/$/describe/{ds}`, `/$/compaction/{ds}` and `/$/graphql/{ds}` (PUT, DELETE), `/$/queries/{ds}/{name}` (PUT, DELETE) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
 | `/$/repositories` | GET | Any caller. `server-admin` gets the full list, callers with `admin` on some dataset get names and types, and other callers get an empty list. |
 | `/$/repositories…` (other routes), `/$/backup-policies…` | | `server-admin` |
 | `/$/quota/{ds}` | PUT, DELETE | `server-admin`. The quota limits what the dataset's own admins can store. |
-| `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/data` (GET, HEAD) | | `read` |
+| `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/text`, `/{ds}/diff`, `/{ds}/changes`, `/{ds}/geo`, `/{ds}/graphql`, `/{ds}/graphql/schema`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/data` (GET, HEAD) | | `read` |
 | `/{ds}/update`, `/{ds}/upload`, `/{ds}/patch` (POST, PATCH), `/{ds}/data` (other methods), `/{ds}/prefixes` (other methods) | | `write` |
 | `/{ds}` | any | Depends on the operation. `update=`, `application/sparql-update` and a patch need `write`, queries and GET need `read`, and other writes need `write`. |
 | `/$/mcp` | any | Any caller. Each tool call needs `read` on its dataset, and `sparql_update` needs `write`. An anonymous caller that can read no dataset gets `401`. See [HTTP endpoint](#http-endpoint-mcp). |
@@ -5975,6 +5995,7 @@ granted only under `datasets`.
 | `patch` | RDF Patch on `/{ds}/patch` and `/{ds}` |
 | `shacl`, `shex` | `/{ds}/shacl`, `/{ds}/shex`, and the MCP validation tools |
 | `diff` | `/{ds}/diff` and the change feed `/{ds}/changes` |
+| `graphql` | `/{ds}/graphql` and `/{ds}/graphql/schema`. A grant for `query` covers them too. |
 | `info` | The dataset's other routes that need `read` or `write`: its description, schema, prefixes, commits, index and reasoning status, snapshots, history and validation settings, and backups. MCP's `list_commits`, `describe_schema`, `draft_shapes` and resources count as `info`, and so do the stored-query definitions under `/$/queries/{ds}`. |
 
 A request through an endpoint that no grant names gets
@@ -6016,8 +6037,9 @@ Routes that report on the whole dataset answer `403` with
 `"… covers every graph of /wiki, and your access is limited to some graphs or triples"`. These are
 `/$/stats/{ds}`, `/$/reason/{ds}` (GET) and its diagnostics, `/$/text/{ds}`,
 `/$/geo/{ds}` and `/$/vector/{ds}…` status and recall, `/$/backups/{ds}…` (GET),
-`/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/{ds}/shacl`, `/{ds}/shex` and changes
-to `/{ds}/prefixes`. Other
+`/$/history/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/quota/{ds}` (GET),
+`/$/compaction/{ds}` (GET), `/{ds}/shacl`, `/{ds}/shex` and changes to `/{ds}/prefixes`.
+Other
 responses leave out figures that count every graph:
 
 * `DatasetInfo` counts in `quads` only the quads of the visible graphs, has no index or
@@ -6532,8 +6554,9 @@ without TLS.
 * `sparkles auth login|logout|status` and `sparkles auth token create|list|revoke` sign
   in to a server and manage tokens.
 
-`query`, `update` and `load` accept `--server URL --dataset NAME` (or `SPARKLES_SERVER`).
-They use the stored token (`$XDG_CONFIG_HOME/sparkles/credentials.toml`, mode 0600) or
+`query`, `update`, `load`, `patch`, `vector`, `quota`, `compaction` and
+`describe-settings` accept `--server URL --dataset NAME` (or `SPARKLES_SERVER`). They use
+the stored token (`$XDG_CONFIG_HOME/sparkles/credentials.toml`, mode 0600) or
 `SPARKLES_TOKEN`.
 
 **Rate limits.** Authentication failures are limited per client address before any
@@ -6603,6 +6626,7 @@ sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
 | `--timeout SECS` | `60` | Largest `timeoutSeconds` a call may ask for. Calls default to 30. |
 | `--query-memory-mb N` | `2048` | Memory budget of every call's queries. `0` means unlimited. |
 | `--max-rows N` | `200000000` | Rows of any intermediate result. |
+| `--max-rows-produced N` | `0` | Rows that all the operators of a call's query produce together. `0` means unlimited. |
 | `--mcp-max-rows N` / `--mcp-max-bytes N` | `1000` / `1048576` | Largest `maxRows` / `maxBytes` of `sparql_query`. |
 | `--max-concurrent N` | `4` | Tool calls running at once. Further calls wait, and their timeout runs while they wait. |
 | `--allow-update` | off | Offers `sparql_update` and opens the databases for writing. Without it the process never writes. |
