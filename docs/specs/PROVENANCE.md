@@ -1276,6 +1276,30 @@ implementation landed.
   - failing a query at `maxTriples`;
   - the union graph as the default source in a union store.
 
+## Fuseki configuration converter
+
+- **Spec:** [`G08-fuseki-configuration.md`](G08-fuseki-configuration.md), written on
+  2026-10-03 independently from:
+  - the Sparkles code, including the assembler bodies of `POST /$/datasets`, the auth
+    configuration and the settings files of each dataset;
+  - Apache Jena's sources (Apache-2.0): Fuseki's `FusekiConfig`, `FusekiServer.Builder`,
+    `FusekiVocab`, `Auth`, `Users`, `BuildLib` and `FMod_Shiro`, the assemblers' vocabularies
+    `TextVocab`, `VocabGeoSPARQL` with `GeoAssembler`, and `VocabSecurity`, read for
+    behaviour and defaults. No code was copied;
+  - Jena's example configurations in `jena-fuseki2/examples` and the test
+    configurations in `jena-fuseki2/jena-fuseki-main/testing` and
+    `jena-integration-tests/src/test/files/GeoAssembler`, copied unchanged into
+    `testsuite/fuseki-config/jena` with Jena's license and notice;
+  - Apache Shiro's documentation of `shiro.ini` and Eclipse Jetty's documentation of its
+    realm properties file.
+- **Implementation** (2026-10-03): from the spec and the Sparkles code. **Dependencies:**
+  none new.
+- **Rejected** (spec §9):
+  - reading assembler files as Sparkles' own configuration;
+  - approximating `localhostFilter` with anonymous grants;
+  - per-dataset timeouts;
+  - dataset aliases.
+
 ## OpenAPI description, shell completions and man pages
 
 - **Spec:** [`X03-openapi-and-completions.md`](X03-openapi-and-completions.md), written on

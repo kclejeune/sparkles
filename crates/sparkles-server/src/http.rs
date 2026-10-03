@@ -30,7 +30,7 @@ mod diff;
 mod dry_run;
 #[cfg(feature = "fmt")]
 mod format;
-mod fuseki;
+pub(crate) mod fuseki;
 #[cfg(feature = "graphql")]
 mod graphql;
 pub(crate) mod history;

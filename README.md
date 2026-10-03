@@ -321,6 +321,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `convert` (`riot`), `compare` (`rdfdiff`), `qparse`, `uparse`, `iri`, `langtag` | Convert, validate and count RDF files, compare them up to blank-node isomorphism, print a query's algebra or plan, and check IRIs and language tags. |
 | `rsparql`, `rupdate`, `rset` | Query and update any SPARQL endpoint, and convert result sets. |
 | `rdfpatch` | Print the rows of RDF Patch files and count them. |
+| `fuseki-config` | Convert a Fuseki configuration (`config.ttl`, `shiro.ini`) into Sparkles settings, or check what converts. `serve --fuseki-config` starts from one directly. |
 | `completions`, `man`, `openapi` | Print shell completions for bash, zsh, fish, elvish or PowerShell, write man pages, or print the OpenAPI description of the HTTP API. |
 
 [docs/USAGE.md](docs/USAGE.md#command-line-tools) describes each one.

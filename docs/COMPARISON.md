@@ -48,6 +48,7 @@ full feature list is in [FEATURES.md](FEATURES.md).
 | Graph Store naming | Indirect (`?graph=`, with `default` and `union`) and direct naming, where the request URL is the graph, configured per service | Both, with `?graph=union` read-only as in Fuseki. Direct naming is on for every dataset or none, with `serve --gsp-direct-naming`. |
 | Fuseki modules | Fuseki Main builds a server from modules (admin, UI, Shiro, Prometheus, graph access, GeoSPARQL index tasks), found through Java's `ServiceLoader` or `--modules` | The same functions are compiled in and chosen by cargo features and flags. There is no plugin interface. |
 | Command-line tools | `riot` (parse, validate, convert), `arq`/`sparql`, `qparse`, `uparse`, `update`, `rsparql`, `rupdate`, `rset`, `rdfdiff`, `infer`, `shacl`, `shex`, `rdfpatch`, `iri`, `langtag`, `schemagen` and `tdb2.*` | `load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`, `shacl` and `shex` cover `tdb2.*`, `arq`, `shacl` and `shex`. `convert` (alias `riot`), `qparse`, `uparse`, `compare` (aliases `rdfdiff` and `rdfcompare`), `iri`, `langtag`, `rsparql`, `rupdate`, `rset` and `rdfpatch` cover the rest, and `patch` applies an RDF Patch to a database. `qparse` prints spargebra's algebra and the physical plan, where Jena prints its own algebra, quad form and optimized algebra. There is no `schemagen`. |
+| Configuration | Assembler files (`config.ttl` and `run/configuration/*.ttl`) describe the services, datasets, text and spatial indexes, inference and access control. Users live in `shiro.ini` or the password file that `fuseki:passwd` names. | Server flags, settings files per dataset and a TOML auth configuration. `sparkles fuseki-config convert` translates a Fuseki configuration into them, with `tdb2.tdbdump` steps for the data and a report of each element it approximated or could not convert. `serve --fuseki-config` converts at each start. Assembler bodies of `POST /$/datasets` are read for the part that maps to one dataset ([G08](specs/G08-fuseki-configuration.md)). |
 | Storage | TDB2 on copy-on-write B+trees, and TDB1, which is deprecated | Sorted, compressed permutation files with a delta and a WAL. Sparkles reads neither TDB format, so data moves between Jena and Sparkles as N-Quads or other RDF dumps. |
 | RDFConnection / RDFLink | One interface for query, update, Graph Store operations and transactions, over a local dataset or a remote endpoint (`RDFConnectionRemote`, `RDFConnectionFuseki`) | `Dataset`, in Rust and Python, covers local databases. The Rust client `sparkles-client` covers remote servers with Jena's operations under Rust names (`query`, `select`, `update`, `get_graph`, `put_graph`, `load`), against Sparkles or any SPARQL endpoint, async or blocking. Its results stream as `oxrdf` terms and its writes return the commit they made. It has no transactions beyond one update request, and uses entity tags for optimistic concurrency, while Jena's remote transactions are a lock on the client. There is no remote client in Python. Jena's own remote clients work against the server: `RDFConnectionRemote`, `RDFConnectionFuseki`, `GSP`, `DSP`, `QueryExecHTTP` and `UpdateExecHTTP` are tested with every result format and RDF syntax (`mise run test:jena-clients`). |
 | Query builder | jena-querybuilder (`SelectBuilder`, `ConstructBuilder`, `AskBuilder`, `DescribeBuilder`, `UpdateBuilder`, `WhereBuilder`, `ExprFactory`) | `sparkles::querybuilder`, with the same builders, typed terms, escaped literals and `set_var` |
@@ -209,10 +210,10 @@ endpoint, query budgets, result cache or web UI.
 ### Out of scope for v1
 
 JavaScript functions, Jena's own RDF formats in the library's loader and the Python bindings, jena-ontapi
-object mapping, jena-text's Lucene index format and assembler configuration (Sparkles
-implements `text:query` itself),
-SHACL-AF rules (also absent from Jena), backward-chaining (LP) rules
-and Shiro authentication.
+object mapping, jena-text's Lucene index format (Sparkles implements `text:query`
+itself), SHACL-AF rules (also absent from Jena), backward-chaining (LP) rules, and Shiro
+as an authentication framework. `sparkles fuseki-config convert` moves the users and URL
+rules of a `shiro.ini` into Sparkles' auth configuration.
 
 ## Optimizations adopted from QLever
 
