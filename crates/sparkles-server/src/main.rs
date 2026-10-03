@@ -19,6 +19,8 @@ mod exposure;
 #[cfg(feature = "fmt")]
 mod fmt;
 mod geo;
+#[cfg(feature = "graphql")]
+mod graphql;
 mod http;
 #[cfg(feature = "fmt")]
 mod lsp;
@@ -715,6 +717,10 @@ enum Cmd {
         /// Largest number of classes, and of predicates, a schema report may have
         #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
         schema_max_entries: usize,
+        // the ceilings of GraphQL requests
+        #[cfg(feature = "graphql")]
+        #[command(flatten)]
+        graphql: graphql::ServeArgs,
         /// Fuseki's Graph Store direct naming on every dataset: a request to
         /// /{ds}/{path} that names no endpoint reads or writes the graph whose IRI is
         /// the request URL
@@ -1152,6 +1158,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: queries_cmd::QueriesCmd,
     },
+    /// GraphQL over a database: run a document, and print, install, delete or draft
+    /// the mapping schema
+    #[cfg(feature = "graphql")]
+    Graphql(graphql::GraphqlArgs),
     /// Merge updates into a freshly built index generation
     Compact {
         #[arg(long)]
@@ -1878,6 +1888,8 @@ fn run() -> Result<()> {
             no_geo_rewrite,
             map_style_url,
             schema_max_entries,
+            #[cfg(feature = "graphql")]
+            graphql,
             gsp_direct_naming,
             no_access_log,
             no_metrics,
@@ -2015,6 +2027,10 @@ fn run() -> Result<()> {
             });
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
             st.schema_max_entries = schema_max_entries;
+            #[cfg(feature = "graphql")]
+            {
+                st.graphql_limits = graphql.limits();
+            }
             st.gsp_direct_naming = gsp_direct_naming;
             st.allow_unvalidated_writes = allow_unvalidated_writes;
             st.http_compression = compress::HttpCompression::parse(
@@ -2689,6 +2705,8 @@ fn run() -> Result<()> {
         }
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
         Cmd::Queries { cmd } => queries_cmd::run(cmd, opts),
+        #[cfg(feature = "graphql")]
+        Cmd::Graphql(args) => graphql::run(args, opts),
         Cmd::Diff {
             loc,
             from,

@@ -87,6 +87,8 @@ sparkles-backup = { workspace = true, optional = true }
 sparkles-fmt = { workspace = true, optional = true }
 ignore = { workspace = true, optional = true }
 similar = { workspace = true, optional = true }
+# the GraphQL endpoint (feature `graphql`): `/{ds}/graphql`, `sparkles graphql`
+sparkles-graphql = { workspace = true, optional = true }
 # `sparkles lsp` (feature `fmt`): formatting and syntax diagnostics for editors over stdio
 lsp-server = { workspace = true, optional = true }
 lsp-types = { workspace = true, optional = true }
@@ -107,7 +109,7 @@ aws-lc-rs = "1"
 sparkles-fmt = { workspace = true, features = ["fault-injection"] }
 
 [features]
-default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "otel", "auth", "mcp", "backup", "fmt", "tls"]
+default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "otel", "auth", "mcp", "backup", "fmt", "tls", "graphql"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
@@ -149,6 +151,8 @@ fmt = [
     "dep:lsp-server",
     "dep:lsp-types",
 ]
+# the read-only GraphQL adapter: `/{ds}/graphql`, `/$/graphql/{ds}`, `sparkles graphql`
+graphql = ["dep:sparkles-graphql"]
 # mimalloc as the global allocator (faster joins than glibc malloc under concurrency);
 # without it, glibc's malloc_trim releases idle heap memory instead
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]

@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod cli_grants;
+#[cfg(feature = "graphql")]
+mod graphql;
 pub(super) mod graphs;
 mod idp;
 mod limits;

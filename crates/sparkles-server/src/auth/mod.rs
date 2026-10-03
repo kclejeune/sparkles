@@ -143,10 +143,12 @@ pub enum Endpoint {
     Diff,
     /// every other route that reads (or, for prefixes, writes) the dataset's description
     Info,
+    /// GraphQL queries (`/{ds}/graphql`); a `query` grant covers it
+    Graphql,
 }
 
 impl Endpoint {
-    pub const ALL: [Endpoint; 9] = [
+    pub const ALL: [Endpoint; 10] = [
         Endpoint::Query,
         Endpoint::Update,
         Endpoint::GspR,
@@ -156,6 +158,7 @@ impl Endpoint {
         Endpoint::Shex,
         Endpoint::Diff,
         Endpoint::Info,
+        Endpoint::Graphql,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -169,6 +172,7 @@ impl Endpoint {
             Endpoint::Shex => "shex",
             Endpoint::Diff => "diff",
             Endpoint::Info => "info",
+            Endpoint::Graphql => "graphql",
         }
     }
 
@@ -177,9 +181,12 @@ impl Endpoint {
     }
 
     /// Whether a grant for this endpoint covers a request to `e` (`gsp-rw` includes
-    /// the reads of `gsp-r`, as in Fuseki).
+    /// the reads of `gsp-r`, as in Fuseki, and `query` the GraphQL endpoint, which reads
+    /// no more than SPARQL does).
     pub fn covers(self, e: Endpoint) -> bool {
-        self == e || self == Endpoint::GspRw && e == Endpoint::GspR
+        self == e
+            || self == Endpoint::GspRw && e == Endpoint::GspR
+            || self == Endpoint::Query && e == Endpoint::Graphql
     }
 }
 

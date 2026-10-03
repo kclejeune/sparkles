@@ -139,6 +139,9 @@ pub struct Dataset {
     pub validation_metrics: Arc<crate::obs::ValidationMetrics>,
     /// the stored queries (`queries.json`)
     pub queries: sparkles::stored::Catalog,
+    /// the GraphQL configuration (`graphql.json`)
+    #[cfg(feature = "graphql")]
+    pub graphql: sparkles_graphql::Catalog,
     /// taken offline by `POST /$/datasets/{ds}?state=offline` (Fuseki): its services
     /// answer `503` until `?state=active`; not persisted
     pub offline: AtomicBool,
@@ -348,6 +351,9 @@ pub struct AppState {
     pub file_loads: sparkles::sparql::FileLoads,
     /// cap on the classes, and separately the predicates, of one schema report
     pub schema_max_entries: usize,
+    /// the ceilings of GraphQL requests (`--graphql-max-depth` and the like)
+    #[cfg(feature = "graphql")]
+    pub graphql_limits: sparkles_graphql::plan::Limits,
     /// Per-request budgets.
     pub limits: Limits,
     /// Emit one `sparkles::access` event per request.
@@ -632,6 +638,8 @@ impl AppState {
             outbound: Default::default(),
             file_loads: sparkles::sparql::FileLoads::Disabled,
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
+            #[cfg(feature = "graphql")]
+            graphql_limits: Default::default(),
             limits: Limits::default(),
             access_log: true,
             metrics: crate::obs::Metrics::new(true, 100),
@@ -702,6 +710,8 @@ impl AppState {
             outbound: Default::default(),
             file_loads: sparkles::sparql::FileLoads::Disabled,
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
+            #[cfg(feature = "graphql")]
+            graphql_limits: Default::default(),
             limits: Limits::default(),
             access_log: false,
             metrics: crate::obs::Metrics::new(false, 100),
@@ -766,6 +776,14 @@ impl AppState {
                 "stored queries of /{name}: {e}; they cannot be changed until it is fixed"
             );
         }
+        #[cfg(feature = "graphql")]
+        let graphql = sparkles_graphql::Catalog::open_or_broken(store.root());
+        #[cfg(feature = "graphql")]
+        if let Some(e) = graphql.broken() {
+            tracing::error!(
+                "GraphQL configuration of /{name}: {e}; it cannot be changed until it is fixed"
+            );
+        }
         Arc::new(Dataset {
             name: name.to_string(),
             kind,
@@ -776,6 +794,8 @@ impl AppState {
             validation: RwLock::new(validation),
             validation_metrics,
             queries,
+            #[cfg(feature = "graphql")]
+            graphql,
             offline: AtomicBool::new(false),
             #[cfg(feature = "reasoning")]
             closure: sparkles_reasoner::Cache::new(self.reason_cache_triples),

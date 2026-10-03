@@ -1913,6 +1913,184 @@ parameter. An unknown query is `404`.
 stored queries of a database directory (see [Usage](USAGE.md#stored-queries)). The Rust
 API is `sparkles::stored`.
 
+## GraphQL
+
+The design and its rationale are in [C03 GraphQL read adapter](specs/C03-graphql.md).
+
+A dataset can answer GraphQL queries at `/{ds}/graphql` once an administrator installs a
+mapping schema. The mapping schema is GraphQL SDL whose types and fields name RDF classes
+and predicates with directives. The server derives the schema clients see from it, with
+lookups, connections, filters and orders. A request runs as a fixed number of SPARQL
+queries on one snapshot, with the caller's graph view, budgets and rate limits. The number
+of queries depends on the document and never on the number of nodes in the answer.
+GraphQL is read-only: there are no mutations and no subscriptions.
+
+```graphql
+extend schema
+  @rdf(vocab: "http://example.org/")
+  @prefix(name: "ex", iri: "http://example.org/")
+  @lang(prefer: ["en", "", "*"])
+
+type Person @rdf(iri: "ex:Person") {
+  name: String
+  age: Int
+  email: [String!]!
+  knows: [Person!]!
+  knownBy: [Person!]! @rdf(iri: "ex:knows", inverse: true)
+  worksFor: Org
+}
+
+type Org {
+  name: String
+  population: Integer
+}
+```
+
+The server declares four directives, so the SDL does not.
+
+| Directive | Meaning |
+|---|---|
+| `@prefix(name:, iri:)` | On the schema, a prefix for the IRIs written in the SDL. The dataset's own prefixes are not used, so a change to them does not change an installed schema. |
+| `@rdf(iri:)` | On a type or interface, its class. On a field, its predicate, read from object to subject with `inverse: true`. On an enum value, the IRI it stands for. `subclasses: false` on a type counts direct instances only. |
+| `@rdf(vocab:)` | On the schema, the namespace of every type, field and enum value without an `@rdf(iri:)`. Without it, each needs one. |
+| `@lang(prefer:)` | The language ranges a string field prefers, on the field or the schema. |
+| `@single(onMany: MIN)` | A single-valued field with several values returns the smallest instead of an error. |
+
+Every mapped type has `id: ID!`, the node's IRI or a stored blank node label such as
+`_:b12`. A field typed with a mapped type, an interface, a union or `Node` reads nodes, and
+the other fields read values. A field typed `T` or `T!` is single-valued, and one typed as
+a list returns every value. A single-valued field that finds two values is a
+`MULTIPLE_VALUES` error at that field. A non-null field without a value is a
+`MISSING_VALUE` error, and installing one warns unless a write-time SHACL guard in
+`reject` mode with a `strict` baseline requires the value.
+
+| Scalar | Reads | Written as |
+|---|---|---|
+| `String` | literals, by their lexical form | a string |
+| `Boolean` | `xsd:boolean` | `true` or `false` |
+| `Int` | `xsd:integer` and its derived types | a number. A value outside 32 bits is `INVALID_VALUE`. |
+| `Integer` | the same | a string with the canonical form, exact at any size |
+| `Decimal` | `xsd:decimal` and the integers | a string with the canonical form |
+| `Float` | `xsd:double`, `xsd:float` and the other numbers | a number |
+| `DateTime`, `Date`, `Time`, `Duration` | the XSD types of the same names | the lexical form |
+| `IRI` | IRIs and `xsd:anyURI` | a string |
+| `LangString` | literals | `{ value, language, direction }` |
+| `RDFTerm` | any term | `{ kind, value, datatype, language, direction }` |
+
+A value that does not fit its field, such as an IRI in a `String` field, is an
+`INVALID_VALUE` error that names the node, the predicate and the value.
+
+**The API schema.** Without a `Query` type in the SDL, the server generates
+`person(id: ID!): Person` and `allPerson(filter:, orderBy:, first:, after:, last:,
+before:, offset:): PersonConnection!` for each mapped type, and `node(id: ID!): Node` in
+any case. A hand-written `Query` may name its fields freely: a field of type `T` with an
+`id: ID!` argument is a lookup, one of type `TConnection!` a connection, and one of type
+`[T!]!` a list with `filter`, `orderBy`, `first` and `offset`. A lookup is null for a node
+that is not a member of the type, whether it is missing, of another type or hidden from
+the caller. Members of a type are the nodes whose `rdf:type` is its class or reaches it
+over `rdfs:subClassOf`. `node(id:)` answers with the first mapped type the node belongs
+to, or as `Resource` with its `_types`.
+
+A connection has `edges`, `nodes`, `pageInfo` and `totalCount`. A cursor names the commit
+its page was read at, and a request with a cursor reads that commit, so pages do not shift
+while the data changes. A cursor of a commit that is no longer readable is
+`CURSOR_EXPIRED`. Multi-valued object fields take `filter`, `orderBy`, `first` and
+`offset`, and multi-valued value fields take `first`, `offset` and `orderBy: ASC|DESC`.
+String fields take `lang: ["fr", "en"]`, which returns the values of the first range that
+has any.
+
+`filter` takes the type's `TFilter`: a field per mapped field, `id`, `and`, `or` and
+`not`. A field filter holds when some value satisfies it, as SPARQL's `EXISTS` does.
+String filters have `eq`, `ne`, `in`, `notIn`, `lt`, `lte`, `gt`, `gte`, `startsWith`,
+`contains`, `regex` with `flags`, `lang` and `exists`. They compare the lexical form of
+literals. The other scalars compare typed values with the same operators except the
+string ones. A filter on an object field applies the type's filter to some value.
+Argument values become RDF terms in the query algebra and never query text. `orderBy`
+takes `NAME_ASC`, `AGE_DESC` and so on for single-valued value fields, and `ID_ASC` and
+`ID_DESC`. `ID_ASC` is appended to every order, so pages are exact.
+
+**Requests.**
+
+| Method | Path | Needs | Description |
+|---|---|---|---|
+| GET, POST | `/{ds}/graphql` | `read` through the `graphql` endpoint | Runs a document. `POST` takes `application/json` with `query`, `operationName` and `variables`, or the document as `application/graphql`. `GET` takes the same parameters in the query string and runs queries only. |
+| GET | `/{ds}/graphql/schema` | `read` through the `graphql` endpoint | The API schema as SDL. |
+| GET | `/$/graphql/{ds}` | `read` | The configuration with its version. `?version=N` reads a kept one. `ETag: "v<N>"`. |
+| GET | `/$/graphql/{ds}/versions` | `read` | The kept versions, newest first. |
+| PUT | `/$/graphql/{ds}` | `admin` | Installs a configuration as the next version. `201` for the first one, `200` otherwise, with `changed` and `warnings`. A body of `application/graphql` replaces the SDL and keeps the other fields. `If-Match` and `If-None-Match: *` apply. An invalid schema is `400` with each error and its line. |
+| DELETE | `/$/graphql/{ds}` | `admin` | Removes the configuration and its versions (`204`). |
+| GET | `/$/graphql/{ds}/draft` | `read` | A drafted mapping schema as SDL, or with `format=json` its decisions. `source=shapes` drafts from the write-time guard's SHACL shapes or the graph `shapesGraph`, and `source=observed` from the shapes the data supports, with `support`, `graph`, `class` and `minInstances`. Nothing is installed. |
+
+The configuration is kept in the database directory as `graphql.json`, which backups and
+clones include. An in-memory dataset keeps it in memory.
+
+```json
+{
+  "sdl": "extend schema @rdf(vocab: \"http://example.org/\") type Person { name: String }",
+  "dataGraph": "default",
+  "reasoning": null,
+  "introspection": true,
+  "limits": { "maxDepth": 12, "maxNodes": 100000, "defaultFirst": 100, "maxFirst": 1000 }
+}
+```
+
+`dataGraph` is `"default"`, `"union"` or a list of graph IRIs, and every query of the
+adapter reads it, as the caller's view allows. `reasoning` fixes whether the inferred
+graph is read, and `null` follows the SPARQL endpoint. `introspection: false` refuses
+`__schema` and `__type` to callers without `admin`. `limits` may lower the server's
+`--graphql-max-depth`, `--graphql-max-nodes`, `--graphql-default-first` and
+`--graphql-max-first`. Each version records the same metadata as a stored query, and the
+last 20 are kept.
+
+The request parameters of `/{ds}/sparql` apply in the query string: `at`, `timeout`,
+`reasoning`, `nocache` and the budget overrides. `explain=true` adds
+`extensions.sparkles.plan`, with each fetch group's path, SPARQL text, rows and time.
+Every response has `extensions.sparkles.commit` and the `Sparkles-Commit` header. The
+response is `application/graphql-response+json` when the client accepts it, and
+`application/json` otherwise.
+
+| Situation | `application/graphql-response+json` | `application/json` |
+|---|---|---|
+| Executed, with or without field errors | `200` | `200` |
+| A malformed request | `400` | `400` |
+| A document that does not parse | `400` | `200` |
+| A document that does not validate, a limit, or a bad variable | `422` | `200` |
+| A mutation sent with `GET` | `405` | `405` |
+| A budget | `507` | `507` |
+| The timeout | `408` | `408` |
+| Cancelled | `503` | `503` |
+| No such dataset, or no schema installed | `404` | `404` |
+
+The errors carry `extensions.code`: `GRAPHQL_PARSE_FAILED`, `GRAPHQL_VALIDATION_FAILED`,
+`BAD_USER_INPUT`, `QUERY_TOO_COMPLEX` (with `limit`, `estimate` and `path`),
+`CURSOR_INVALID`, `CURSOR_EXPIRED`, `BUDGET_EXCEEDED` (with `budget`, `limit` and
+`requested`), `TIMEOUT`, and the field errors `MULTIPLE_VALUES`, `MISSING_VALUE`,
+`INVALID_VALUE` and `UNRESOLVED_TYPE`. A field error nulls the field, and the null
+propagates to the nearest nullable parent as the GraphQL specification says. A budget, a
+timeout or a limit reached while running fails the whole request without `data`.
+
+**Limits.** Before a document runs, the server refuses it when its selection is deeper than
+`maxDepth` (12), when it needs more than 64 fetch groups, or when it could return more than
+`maxNodes` (100,000) nodes. The estimate multiplies each list's `first` or `last`, or
+`defaultFirst` (100), by its parent's, so `allPerson(first: 1000) { nodes { knows(first:
+1000) { name } } }` estimates 1,001,000. `first` and `last` above `maxFirst` (1,000) and
+below 0 are `BAD_USER_INPUT`. Introspection does not count against depth or nodes. All
+fetch groups of a request share one deadline and one count of rows produced
+(`--max-rows-produced`), and the response counts against `--max-result-mb`.
+
+**Access.** GraphQL requests belong to the endpoint `graphql` of grants. A grant whose
+`endpoints` list `query` covers `graphql` as well, and one that lists only `graphql` lets an
+application read through its schema without reaching `/{ds}/sparql`. Every fetch group
+runs with the caller's graph view and protections of triples, so filters, lookups,
+`totalCount` and type tests see only what the caller may read. Requests count against the
+`query` rate-limit class, are logged with `operation=graphql`, the operation name, the
+document hash and the number of groups, and are counted in the histogram
+`sparkles_graphql_groups`.
+
+`sparkles graphql --loc DB run|schema get|put|delete|versions|draft` runs documents and
+manages the configuration of a database directory (see [Usage](USAGE.md#graphql)). The
+Rust API is the crate `sparkles-graphql`.
+
 ## Commits
 
 The design and its rationale are in [CI Durable commit identity](specs/CI-commit-identity.md).

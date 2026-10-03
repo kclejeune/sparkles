@@ -83,11 +83,13 @@ pub enum Op {
     Admin,
     /// a message to the MCP endpoint (`/$/mcp`)
     Mcp,
+    /// a GraphQL request (`/{ds}/graphql`)
+    Graphql,
     Other,
 }
 
 impl Op {
-    pub const ALL: [Op; 10] = [
+    pub const ALL: [Op; 11] = [
         Op::Query,
         Op::Update,
         Op::Gsp,
@@ -97,6 +99,7 @@ impl Op {
         Op::Explain,
         Op::Admin,
         Op::Mcp,
+        Op::Graphql,
         Op::Other,
     ];
 
@@ -111,6 +114,7 @@ impl Op {
             Op::Explain => "explain",
             Op::Admin => "admin",
             Op::Mcp => "mcp",
+            Op::Graphql => "graphql",
             Op::Other => "other",
         }
     }
@@ -201,6 +205,17 @@ pub struct RequestReport {
     pub validation_ms: Option<u64>,
     /// query: the work of its spatial operators (candidates, exact tests, matches)
     pub geo_work: Option<crate::geo::Work>,
+    /// a GraphQL request: its operation name, document hash and engine executions
+    pub graphql: Option<GraphqlReport>,
+}
+
+/// What the access log and the metrics record of a GraphQL request.
+#[derive(Clone, Debug, Default)]
+pub struct GraphqlReport {
+    pub operation: Option<String>,
+    /// SHA-256 of the document
+    pub document: String,
+    pub groups: u64,
 }
 
 impl RequestReport {
@@ -241,6 +256,7 @@ fn route_op(route: Option<&str>, req: &Request) -> Op {
         "/{ds}/shacl" => Op::Shacl,
         "/{ds}/shex" => Op::Shex,
         "/{ds}/explain" => Op::Explain,
+        "/{ds}/graphql" | "/{ds}/graphql/schema" => Op::Graphql,
         "/{ds}" => {
             let q = req.uri().query().unwrap_or("");
             let has = |k: &str| form_urlencoded::parse(q.as_bytes()).any(|(a, _)| a == k);
@@ -514,6 +530,9 @@ fn access_event(
                 mem_peak_bytes = r.mem_peak_bytes,
                 validation = r.validation,
                 validation_ms = r.validation_ms,
+                graphql_operation = r.graphql.as_ref().and_then(|g| g.operation.as_deref()),
+                graphql_document = r.graphql.as_ref().map(|g| g.document.as_str()),
+                graphql_groups = r.graphql.as_ref().map(|g| g.groups),
                 principal,
                 auth = scheme,
                 auth_error,
@@ -601,7 +620,13 @@ pub struct DsMetrics {
     geo_work: [AtomicU64; crate::geo::WORK.len()],
     /// requests per Fuseki endpoint (`--metrics-fuseki-names`)
     fuseki: fuseki::Counters,
+    /// engine executions per GraphQL request, by [`GROUP_BUCKETS`]
+    graphql_groups: [AtomicU64; GROUP_BUCKETS.len() + 1],
+    graphql_groups_sum: AtomicU64,
 }
+
+/// Upper bounds of the `sparkles_graphql_groups` histogram, without `+Inf`.
+const GROUP_BUCKETS: [u64; 7] = [1, 2, 4, 8, 16, 32, 64];
 
 fn budget_index(k: BudgetKind) -> usize {
     match k {
@@ -685,6 +710,14 @@ impl Metrics {
             for (c, n) in ds.geo_work.iter().zip(g) {
                 c.fetch_add(n, Ordering::Relaxed);
             }
+        }
+        if let Some(g) = &r.graphql {
+            let i = GROUP_BUCKETS
+                .iter()
+                .position(|b| g.groups <= *b)
+                .unwrap_or(GROUP_BUCKETS.len());
+            ds.graphql_groups[i].fetch_add(1, Ordering::Relaxed);
+            ds.graphql_groups_sum.fetch_add(g.groups, Ordering::Relaxed);
         }
         if outcome == Outcome::Budget
             && let Some(k) = r.budget
@@ -1151,6 +1184,43 @@ pub fn render_prometheus(st: &AppState) -> String {
                 m.ops[op.index()].response_bytes.load(Ordering::Relaxed)
             );
         }
+    }
+    family(
+        &mut o,
+        "sparkles_graphql_groups",
+        "histogram",
+        "Engine executions (fetch groups) per GraphQL request.",
+    );
+    for (ds, m) in &series {
+        let total: u64 = m
+            .graphql_groups
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum();
+        if total == 0 {
+            continue;
+        }
+        let ds = escape_label(ds);
+        let mut acc = 0;
+        for (i, c) in m.graphql_groups.iter().enumerate() {
+            acc += c.load(Ordering::Relaxed);
+            let le = GROUP_BUCKETS
+                .get(i)
+                .map_or("+Inf".to_string(), |b| b.to_string());
+            let _ = writeln!(
+                o,
+                "sparkles_graphql_groups_bucket{{dataset=\"{ds}\",le=\"{le}\"}} {acc}"
+            );
+        }
+        let _ = writeln!(
+            o,
+            "sparkles_graphql_groups_sum{{dataset=\"{ds}\"}} {}",
+            m.graphql_groups_sum.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            o,
+            "sparkles_graphql_groups_count{{dataset=\"{ds}\"}} {total}"
+        );
     }
     family(
         &mut o,

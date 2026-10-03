@@ -409,6 +409,7 @@ pub(super) fn add_all(p: &mut Paths) {
     schema(p);
     admin(p);
     queries(p);
+    graphql(p);
     history(p);
     search(p);
     settings(p);
@@ -1090,6 +1091,172 @@ fn queries(p: &mut Paths) {
             .errors(&[400, 408, 507]),
         );
     }
+}
+
+fn graphql_response() -> J {
+    let schema = json!({
+        "type": "object",
+        "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+        "properties": {
+            "data": { "type": ["object", "null"] },
+            "errors": { "type": "array", "items": { "type": "object" } },
+            "extensions": { "type": "object" },
+        },
+    });
+    json!({
+        "application/graphql-response+json": { "schema": schema.clone() },
+        "application/json": { "schema": schema },
+    })
+}
+
+fn graphql(p: &mut Paths) {
+    let config = || {
+        json!({
+            "application/json": { "schema": {
+                "type": "object",
+                "description": "The configuration: `sdl` (the mapping schema), `dataGraph`, `reasoning`, `introspection` and `limits`, with the version's `version`, `parent`, `created`, `author`, `message`, `datasetCommit` and `digest`.",
+                "additionalProperties": true,
+            } },
+        })
+    };
+    for (m, id, summary) in [
+        (GET, "graphqlGet", "Run a GraphQL query"),
+        (POST, "graphqlPost", "Run a GraphQL query (POST)"),
+    ] {
+        let mut o = op(m.clone(), "/{ds}/graphql", id, "GraphQL", summary)
+            .doc("Runs a GraphQL document against the dataset's installed schema, as the GraphQL over HTTP draft defines it. `GET` takes `query`, `operationName` and `variables` (JSON) in the query string and runs queries only. The parameters `at`, `timeout`, `reasoning`, `nocache`, `explain` and the budget overrides of `/{ds}/sparql` apply. The response is `application/graphql-response+json` when the client accepts it, else `application/json`; a document that does not validate answers `422` under the first and `200` under the second.")
+            .see("graphql")
+            .params(&["timeout", "reasoning", "nocache", "at"])
+            .query("explain", boolean(), "Add each fetch group's SPARQL, rows and time to `extensions.sparkles.plan`.");
+        if m == GET {
+            o = o
+                .query("query", s(), "The GraphQL document.")
+                .query("operationName", s(), "The operation to run.")
+                .query("variables", s(), "The variables as a JSON object.");
+        } else {
+            o = o.body(
+                true,
+                "A GraphQL request: `query`, `operationName` and `variables` as JSON, or the document alone as `application/graphql`.",
+                json!({
+                    "application/json": { "schema": {
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": { "type": "string" },
+                            "operationName": { "type": ["string", "null"] },
+                            "variables": { "type": ["object", "null"] },
+                            "extensions": { "type": ["object", "null"] },
+                        },
+                    } },
+                    "application/graphql": { "schema": text() },
+                }),
+            );
+        }
+        let o = o
+            .resp_h("200", "The response, with or without execution errors.", Some(graphql_response()), commit_headers())
+            .resp("400", "A malformed request, or a document that does not parse.", Some(graphql_response()))
+            .resp("404", "No such dataset, or no schema installed.", Some(graphql_response()))
+            .resp("422", "A document that does not validate, or over a limit (`application/graphql-response+json`).", Some(graphql_response()))
+            .errors(&[405, 408, 503, 507]);
+        let o = if m == POST { o.errors(&[415]) } else { o };
+        p.add(o);
+    }
+    p.add(
+        op(
+            GET,
+            "/{ds}/graphql/schema",
+            "graphqlApiSchema",
+            "GraphQL",
+            "Get the API schema",
+        )
+        .doc("The schema clients see, as SDL, without the mapping directives.")
+        .see("graphql")
+        .resp(
+            "200",
+            "The API schema.",
+            Some(json!({ "text/plain": text() })),
+        )
+        .errors(&[404]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/graphql/{ds}",
+            "getGraphqlConfig",
+            "GraphQL",
+            "Get the GraphQL configuration",
+        )
+        .see("graphql")
+        .query("version", int(), "An older version, while it is kept.")
+        .resp_h(
+            "200",
+            "The configuration with its version.",
+            Some(config()),
+            json!({ "ETag": { "description": "`\"v<N>\"`", "schema": { "type": "string" } } }),
+        )
+        .errors(&[404]),
+    );
+    p.add(
+        op(PUT, "/$/graphql/{ds}", "putGraphqlConfig", "GraphQL", "Install a GraphQL schema")
+            .doc("Checks the mapping schema and installs it as the next version. The body is the configuration as JSON, with an optional `message`, or the SDL alone as `application/graphql`, which keeps the other fields. The answer has `changed` and `warnings`, such as a non-null field no write-time guard backs. `If-Match: \"v<N>\"` installs only over version N, and `If-None-Match: *` only when none is installed.")
+            .see("graphql")
+            .params(&["ifMatch", "ifNoneMatch", "commitMessage"])
+            .body(
+                true,
+                "",
+                json!({
+                    "application/json": { "schema": { "type": "object", "required": ["sdl"], "additionalProperties": true } },
+                    "application/graphql": { "schema": text() },
+                }),
+            )
+            .resp("200", "Installed as a new version, or unchanged (`changed: false`).", Some(config()))
+            .resp("201", "Installed.", Some(config()))
+            .errors(&[400, 409, 412]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/graphql/{ds}",
+            "deleteGraphqlConfig",
+            "GraphQL",
+            "Remove the GraphQL configuration",
+        )
+        .see("graphql")
+        .param("ifMatch")
+        .no_content("Removed with its versions.")
+        .errors(&[404, 412]),
+    );
+    p.add(
+        op(GET, "/$/graphql/{ds}/versions", "listGraphqlVersions", "GraphQL", "List the versions of the GraphQL configuration")
+            .see("graphql")
+            .resp(
+                "200",
+                "The kept versions, newest first.",
+                Some(json!({ "application/json": { "schema": { "type": "object", "additionalProperties": true } } })),
+            ),
+    );
+    p.add(
+        op(GET, "/$/graphql/{ds}/draft", "draftGraphqlSchema", "GraphQL", "Draft a mapping schema")
+            .doc("Drafts a mapping schema for review, from SHACL shapes (`source=shapes`: the write-time guard's, or the graph `shapesGraph`) or from the data (`source=observed`, with the selection of `/$/schema/{ds}/shapes`). Nothing is installed.")
+            .see("graphql")
+            .query("source", json!({ "type": "string", "enum": ["shapes", "observed"] }), "Shapes when there is a shapes graph or a SHACL guard, else observed.")
+            .query("shapesGraph", s(), "A named graph of SHACL shapes.")
+            .query("support", json!({ "type": "number" }), "Observed: the share of instances a constraint must hold for (default 1).")
+            .query("graph", s(), "Observed: `default`, `union` or a graph IRI.")
+            .query("class", s(), "Observed: only these classes (repeatable).")
+            .query("minInstances", int(), "Observed: skip classes with fewer instances.")
+            .query("format", json!({ "type": "string", "enum": ["sdl", "json"] }), "`json` for the decisions behind the draft.")
+            .param("timeout")
+            .resp(
+                "200",
+                "The draft.",
+                Some(json!({
+                    "text/plain": text(),
+                    "application/json": { "schema": { "type": "object", "additionalProperties": true } },
+                })),
+            )
+            .errors(&[400]),
+    );
 }
 
 fn history(p: &mut Paths) {

@@ -30,6 +30,8 @@ mod dry_run;
 #[cfg(feature = "fmt")]
 mod format;
 mod fuseki;
+#[cfg(feature = "graphql")]
+mod graphql;
 pub(crate) mod history;
 mod inline;
 mod jena_formats;
@@ -190,6 +192,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         );
     // the spatial index (`/$/geo`)
     let app = app.merge(crate::geo::routes());
+    // the GraphQL endpoint (`/{ds}/graphql`, `/$/graphql`)
+    #[cfg(feature = "graphql")]
+    let app = app.merge(graphql::routes());
     // Fuseki's admin routes that Sparkles has no route of its own for
     let app = app.merge(fuseki::routes());
     // automatic compaction (`/$/compaction`)
