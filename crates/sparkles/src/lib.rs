@@ -10,6 +10,7 @@ pub use sparkles_core::{
 };
 
 pub mod dataset;
+pub mod embed;
 pub mod querybuilder;
 
 pub use dataset::{Dataset, GraphView, QuadIter, Solution, Solutions, Transaction};

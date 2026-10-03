@@ -124,6 +124,23 @@ pub struct QueryOptions {
     /// with different credentials or views never share results; `None` is one shared
     /// scope.
     pub service_scope: Option<Arc<str>>,
+    /// Whether the default graph is the union of the named graphs for this request,
+    /// overriding the store's [`StoreOptions::union_default_graph`](crate::store::StoreOptions)
+    /// (`None`: the store's setting). Unlike a protocol dataset whose default graph is
+    /// `urn:x-arq:UnionGraph`, it leaves the named graphs as they are.
+    pub union_default_graph: Option<bool>,
+}
+
+/// `snap` with the request's union default graph setting, if it overrides the store's.
+pub fn with_union_default(snap: Arc<Snapshot>, opts: &QueryOptions) -> Arc<Snapshot> {
+    match opts.union_default_graph {
+        Some(u) if u != snap.union_default_graph => {
+            let mut s = (*snap).clone();
+            s.union_default_graph = u;
+            Arc::new(s)
+        }
+        _ => snap,
+    }
 }
 
 /// Which files `LOAD <file:…>` may read.
@@ -341,6 +358,7 @@ fn make_ctx(
 ) -> Result<Ctx> {
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
+    let snap = with_union_default(snap, opts);
     // a view that hides triples reads the snapshot without them
     let snap = match &opts.graphs {
         Some(a) => a.masked(&snap)?,

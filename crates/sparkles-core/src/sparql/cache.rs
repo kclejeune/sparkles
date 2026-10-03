@@ -244,8 +244,14 @@ fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
     // makes a new instance; a past state shares its generation's instance)
     let _ = write!(
         s,
-        "g{}|c{}|{:?}|{:?}|{}|",
-        ctx.snap.generation.uid, ctx.snap.commit, ds.default, ds.named, ds.union_default
+        "g{}|c{}|{:?}|{:?}|{}|{}|",
+        ctx.snap.generation.uid,
+        ctx.snap.commit,
+        ds.default,
+        ds.named,
+        ds.union_default,
+        // a request may override the store's union default graph
+        ctx.snap.union_default_graph
     );
     // a view that hides triples reads other data than the commit holds
     if let Some(m) = &ctx.snap.mask {
