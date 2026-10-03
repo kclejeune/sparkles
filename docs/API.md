@@ -2790,7 +2790,7 @@ SELECT ?name ?op ?commit ?time ?author WHERE {
 | `hist:graph` | The graph, unbound for the default graph. A constant IRI filters, and `hist:defaultGraph` selects the default graph. Without it, every graph the caller may read is searched. |
 | `hist:commit`, `hist:time` | The commit's number (`xsd:integer`) and time (`xsd:dateTime`). |
 | `hist:kind`, `hist:author`, `hist:message` | The commit's kind (`update`, `load`, …), the caller that made it, and its message. The author is unbound when the server runs without authentication. |
-| `hist:from`, `hist:to` | The first and last commit read: a number, an `xsd:dateTime`, or a selector string such as `"commit:42"`. `hist:to` defaults to the state the query reads, so `at=` limits history too. |
+| `hist:from`, `hist:to` | The first and last commit read: a number, an `xsd:dateTime`, or a selector string such as `"commit:42"`. Either may be a variable that the rest of the group binds. `hist:to` defaults to the state the query reads, so `at=` limits history too. |
 | `hist:limit`, `hist:order` | The most changes read, and `hist:ascending` (the default) or `hist:descending`, which lists the newest commits first. |
 
 Constants in the triple are looked up in the log's index, so a query about one subject or
@@ -2804,6 +2804,26 @@ SELECT ?s (MAX(?c) AS ?last) WHERE {
   ?s a <http://example.org/Person> .
   SERVICE hist:changes { << ?s ?p ?o >> hist:commit ?c }
 } GROUP BY ?s
+```
+
+The terms of the triple, `hist:graph`, `hist:from` and `hist:to` can take their values
+from the rest of the group. In the query above, `?s` is bound by `?s a ex:Person`, so the
+call looks up the changes of each person, once per distinct subject, instead of reading
+every change and joining. The call runs after the rest of the group, as a path search
+does, and a solution of the group whose variable is unbound leaves that term open.
+`hist:limit` then applies to each lookup. A variable of `hist:from` or `hist:to` must be
+bound by the group, and is `400` otherwise.
+
+```sparql
+PREFIX hist: <urn:x-sparkles:history#>
+# the changes of two subjects since commit 100, newest first, at most 5 each
+SELECT ?s ?p ?o ?c WHERE {
+  VALUES (?s ?since) { (<http://example.org/alice> 100) (<http://example.org/bob> 100) }
+  SERVICE hist:changes {
+    << ?s ?p ?o >> hist:commit ?c ; hist:from ?since ;
+                   hist:order hist:descending ; hist:limit 5 .
+  }
+}
 ```
 
 `hist:subject`, `hist:predicate` and `hist:object` give the triple without the SPARQL 1.2

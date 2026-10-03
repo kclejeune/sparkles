@@ -925,6 +925,99 @@ fn sparql_history_queries() {
 }
 
 #[test]
+fn sparql_history_queries_take_bindings_from_their_group() {
+    let s = Store::in_memory(opts());
+    upd(
+        &s,
+        "INSERT DATA { <urn:a> <urn:name> \"Ann\" . <urn:b> <urn:name> \"Bo\" . <urn:c> <urn:name> \"Cy\" }",
+    ); // 1
+    upd(
+        &s,
+        "DELETE DATA { <urn:a> <urn:name> \"Ann\" } ; INSERT DATA { <urn:a> <urn:name> \"Anna\" }",
+    ); // 2
+    upd(&s, "INSERT DATA { <urn:a> a <urn:P> . <urn:b> a <urn:P> }"); // 3
+    upd(
+        &s,
+        "INSERT DATA { GRAPH <urn:g> { <urn:b> <urn:name> \"Bob\" } }",
+    ); // 4
+    let q = QueryOptions::default();
+    let snap = s.snapshot();
+    let run = |body: &str| select(snap.clone(), &format!("{HIST} {body}"), &q);
+    // the subjects come from the group: one lookup per subject
+    assert_eq!(
+        run(
+            "SELECT ?s ?v ?c WHERE { ?s a :P . SERVICE hist:changes { << ?s :name ?v >> hist:op \"add\" ; hist:commit ?c } } ORDER BY ?s ?c ?v"
+        ),
+        vec![
+            "<urn:a> Ann 1",
+            "<urn:a> Anna 2",
+            "<urn:b> Bo 1",
+            "<urn:b> Bob 4"
+        ]
+    );
+    // a predicate, an object and a graph from VALUES
+    assert_eq!(
+        run(
+            "SELECT ?s ?c WHERE { VALUES (?p ?v) { (:name \"Bo\") (:name \"Anna\") } SERVICE hist:changes { << ?s ?p ?v >> hist:commit ?c } } ORDER BY ?s"
+        ),
+        vec!["<urn:a> 2", "<urn:b> 1"]
+    );
+    assert_eq!(
+        run(
+            "SELECT ?v WHERE { VALUES ?g { :g } SERVICE hist:changes { << ?s :name ?v >> hist:graph ?g } }"
+        ),
+        vec!["Bob"]
+    );
+    // the commit range from the group, per solution
+    assert_eq!(
+        run(
+            "SELECT ?f ?v WHERE { VALUES ?f { 2 3 } SERVICE hist:changes { << :a :name ?v >> hist:op \"add\" ; hist:from ?f } } ORDER BY ?f"
+        ),
+        vec!["2 Anna"]
+    );
+    assert_eq!(
+        run(
+            "SELECT ?t (COUNT(*) AS ?n) WHERE { VALUES ?t { 1 4 } SERVICE hist:changes { << ?s ?p ?o >> hist:to ?t } } GROUP BY ?t ORDER BY ?t"
+        ),
+        vec!["1 3", "4 8"]
+    );
+    // the limit applies to each lookup
+    assert_eq!(
+        run(
+            "SELECT ?s ?c WHERE { VALUES ?s { :a :b } SERVICE hist:changes { << ?s :name ?v >> hist:commit ?c ; hist:order hist:descending ; hist:limit 1 } } ORDER BY ?s"
+        ),
+        vec!["<urn:a> 2", "<urn:b> 4"]
+    );
+    // a variable the group may leave unbound is bound by the lookup
+    assert_eq!(
+        run(
+            "SELECT ?s ?v WHERE { VALUES ?s { :c UNDEF } SERVICE hist:changes { << ?s :name ?v >> hist:op \"remove\" } } ORDER BY ?s"
+        ),
+        vec!["<urn:a> Ann"]
+    );
+    // a value that cannot match, and a variable the change disagrees with
+    assert!(
+        run("SELECT ?s WHERE { VALUES ?p { \"name\" } SERVICE hist:changes { << ?s ?p ?o >> } }")
+            .is_empty()
+    );
+    assert_eq!(
+        run(
+            "SELECT ?c WHERE { VALUES (?s ?c) { (:a 2) } SERVICE hist:changes { << ?s :name ?v >> hist:commit ?c } }"
+        ),
+        vec!["2", "2"]
+    );
+    // a range variable the group does not bind is an error
+    for bad in [
+        "SELECT * WHERE { SERVICE hist:changes { << ?s ?p ?o >> hist:from ?f } }",
+        "SELECT * WHERE { ?s a :P . SERVICE hist:changes { << ?s ?p ?o >> hist:to ?t } }",
+        "SELECT * WHERE { VALUES ?f { \"soon\" } SERVICE hist:changes { << ?s ?p ?o >> hist:from ?f } }",
+    ] {
+        let e = sparkles::sparql::query(snap.clone(), &format!("{HIST} {bad}"), &q);
+        assert!(e.is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn diffs_read_the_change_log_where_states_are_gone() {
     let dir = tempfile::tempdir().unwrap();
     let s = Store::open(

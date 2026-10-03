@@ -1725,6 +1725,16 @@ states around it, and checks graph views and the `410` with the log off.
 `http/diff_tests.rs` checks that JSON pages, patches and an event stream resumed with
 `Last-Event-ID` are the same before and after a compaction.
 
+**Bindings from the group.** A later change let `hist:changes` read its group. The
+triple's terms, `hist:graph`, `hist:from` and `hist:to` may be variables that the rest
+of the join group binds. The planner attaches the call after join ordering, as it does
+a path search, and the call looks up the changes once per distinct binding of those
+variables, then extends each solution with the changes that agree with it. An unbound
+value leaves its term open, `hist:limit` applies to each lookup, and an unbound
+`hist:from` or `hist:to` variable is an error. A call none of whose variables the group
+binds is joined as a leaf, as before. `history_log.rs` covers subjects from a triple
+pattern, predicates, objects and graphs from `VALUES`, ranges per solution, the limit
+per lookup, unbound values and the errors.
+
 **Not built.** Full-text search at pins (§11.6) and pin rebasing remain deferred, as do
-periods per quad, a history query that takes bindings from the rest of its group, and
-point-in-time reads rebuilt from the change log.
+periods per quad and point-in-time reads rebuilt from the change log.

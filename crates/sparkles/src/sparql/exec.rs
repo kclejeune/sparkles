@@ -477,7 +477,13 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             counters = Some(c);
             t
         }
-        Kind::HistoryChanges(spec) => super::history_svc::run(ctx, spec, &n.vars)?,
+        Kind::HistoryChanges(spec) => {
+            let input = match n.children.len() {
+                0 => None,
+                _ => Some(child(0, &mut infos)?),
+            };
+            super::history_svc::run(ctx, spec, input.as_ref(), &n.vars)?
+        }
         Kind::HybridSearch(spec) => {
             let (t, c) = super::hybrid::search(ctx, spec, &n.vars)?;
             counters = Some(c);
