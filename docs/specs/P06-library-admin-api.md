@@ -1,18 +1,20 @@
 # P06: Library administration API and parity
 
-> **Status:** specified
+> **Status:** implemented in part (step 1 of Phase 1)
 >
-> **Phases:** None shipped. Phase 1 splits the engine into `sparkles-core` and a
-> `sparkles` facade crate, adds the `Control` type for cancellation and progress, moves
-> the per-dataset state that only the server keeps today into the library, gives
-> `Dataset` its handles for snapshots, history, backups, indexes, schema, stored queries,
-> reasoning, validation, settings and GraphQL, adds the `Catalog` of datasets in one data
-> directory, moves the server's handlers onto them, and adds the two parity tests.
-> Phase 2 closes the Python bindings' gaps against that surface. Phase 3 adds dataset
-> renames over HTTP and in the CLI, and catalog commands for a stopped server's data
-> directory.
+> **Phases:** Step 1 of Phase 1 (§8.1) shipped. The engine is the `sparkles-core`
+> package in `crates/sparkles-core`. `crates/sparkles` is the `sparkles` facade, which
+> re-exports the engine's modules and holds `Dataset` and the query builder, and the
+> satellite crates depend on `sparkles-core`. The rest of Phase 1 adds the `Control` type
+> for cancellation and progress, moves the per-dataset state that only the server keeps
+> today into the library, gives `Dataset` its handles for snapshots, history, backups,
+> indexes, schema, stored queries, reasoning, validation, settings and GraphQL, adds the
+> `Catalog` of datasets in one data directory, moves the server's handlers onto them, and
+> adds the two parity tests. Phase 2 closes the Python bindings' gaps against that
+> surface. Phase 3 adds dataset renames over HTTP and in the CLI, and catalog commands
+> for a stopped server's data directory. None of these is built.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** none. The crate split changes no HTTP API, command or file format.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end will record how it lands.

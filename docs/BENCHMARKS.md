@@ -1278,7 +1278,7 @@ Logging and metrics add no measurable overhead.
 
 This test compares commit latency on the same store with the spatial index on and off,
 on the laptop with nothing else running. It ran on 2026-10-01 with a release build at `02e3a78`, using
-`commit_latency` in `crates/sparkles/src/store/geo.rs`. The figures are medians of 200
+`commit_latency` in `crates/sparkles-core/src/store/geo.rs`. The figures are medians of 200
 one-triple commits and of 20 commits of 1,000 `geo:asWKT` points each, over three runs.
 
 | | Index off | Index on |
