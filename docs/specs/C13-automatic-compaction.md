@@ -604,7 +604,10 @@ The defaults are those of §2.1 and §2.3.
 * The write rate is enforced where the builder already calls its interrupt hook, every
   65,536 quads while it encodes and between its phases. It is an average over the build,
   and a single permutation can be written faster than the rate.
-* There are no NixOS module options for the flags. `extraArgs` passes them.
+* The NixOS module has typed options for the flags under
+  `services.sparkles.compaction.auto`, added after landing. `enable = false` passes
+  `--no-auto-compact`, and an option left `null` keeps the server's default. The VM test
+  checks a policy on one node and compaction turned off on the other.
 
 **Tests.** `crates/sparkles/src/store/compaction_tests.rs` covers commits during the
 build in persistent and in-memory stores (300 commits of inserts, deletes, blank nodes,

@@ -2,7 +2,9 @@
 # data across restarts, serves the embedded UI, and backs a dataset up into an `fs`
 # repository of its backup config and restores it; with authentication and native TLS
 # (node `authed`), it serves HTTP/1.1 and HTTP/2 over TLS, nginx proxies to it over https,
-# and it tells clients behind nginx apart for the failed-login budget.
+# and it tells clients behind nginx apart for the failed-login budget. The automatic
+# compaction and clone options reach the server: a policy on one node, compaction turned
+# off on the other.
 { self }:
 {
   name = "sparkles";
@@ -25,6 +27,12 @@
           configFile = "/etc/sparkles/backup.toml";
           maxTasks = 1;
           fsRoots = [ "/var/lib/sparkles-backups" ];
+        };
+        maxClones = 1;
+        compaction.auto = {
+          minQuads = 5000;
+          ratio = 0.1;
+          idleSeconds = 0;
         };
       };
       environment.etc."sparkles/backup.toml" = {
@@ -56,6 +64,7 @@
           enable = true;
           virtualHost = "sparkles.test";
         };
+        compaction.auto.enable = false;
         # anonymous callers keep full access; alice signs in with a password
         auth.configFile = "/etc/sparkles/auth.toml";
         tls = {
@@ -134,6 +143,14 @@
     )
     assert last_value(out) == "49", out
 
+    # the automatic compaction policy and the clone limit come from the module's options
+    c = json.loads(machine.succeed(f"curl -sf {base}/\\$/compaction/demo"))
+    assert c["serverEnabled"], c
+    assert c["policy"]["minDeltaQuads"] == 5000, c
+    assert abs(c["policy"]["deltaRatio"] - 0.1) < 1e-9, c
+    assert c["policy"]["idleSeconds"] == 0, c
+    machine.succeed("systemctl show -p ExecStart sparkles.service | grep -q -- '--max-clones 1'")
+
     # the admin API and the embedded UI are reachable through the proxy
     machine.succeed(f"curl -sf {base}/\\$/datasets | grep -q scratch")
     machine.succeed(f"curl -sf {base}/ui/ | grep -qi '<html'")
@@ -186,6 +203,8 @@
     authed.wait_for_unit("sparkles.service")
     authed.wait_for_open_port(3030)
     authed.wait_for_unit("nginx.service")
+    c = json.loads(authed.succeed(f"curl -sf {base}/\\$/compaction/demo"))
+    assert not c["serverEnabled"] and c["state"] == "off", c
     ask = f"'{base}/demo/sparql?query=ASK%7B%7D'"
 
     # the server speaks TLS itself: HTTP/2 and HTTP/1.1 through ALPN, nothing in clear

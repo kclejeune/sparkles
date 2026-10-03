@@ -629,7 +629,8 @@ with `forkedFrom: null`.
 - **Concurrency.** `serve --max-clones` (default 2) limits the clones that run at once.
   Clones were already counted in the `--max-tasks` slots. A clone over its limit waits
   as `queued`, and a freed slot goes to the first waiting task that may run, so waiting
-  clones never hold back other tasks.
+  clones never hold back other tasks. The NixOS module sets both limits with its
+  `maxClones` and `maxTasks` options.
 
 **Measurements.** These are clone times with the release build through `sparkles clone`,
 on datasets loaded from the benchmark data (`scripts/gen-data.py`) with `sparkles load`.
