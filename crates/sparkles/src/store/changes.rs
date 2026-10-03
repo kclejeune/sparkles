@@ -5,9 +5,11 @@
 //! commit's changes are the quads it added and removed relative to its parent, the diff
 //! of one commit. Within the retained generations' logs, one walk reads every commit of
 //! the page. A bulk commit has no log records, so its changes come from comparing the
-//! two states. A client that saw commit `n` asks for the commits after `n`, so the feed
-//! resumes from any readable commit.
+//! two states. Commits whose generations are gone are read from the change log
+//! ([`ChangeLog`]). A client that saw commit `n` asks for the commits after `n`, so the
+//! feed resumes from any commit either source holds.
 
+use super::changelog::{ChangeCommit, LogCommit};
 use super::diff::{Keys, QuadKey, Step, key_quad};
 use super::*;
 use crate::history::At;
@@ -163,9 +165,10 @@ impl Store {
     /// The commits after commit `after`, each with its net changes, in order: a page of
     /// at most `o.max_commits` commits (none when `after` is the head). `after` must be
     /// readable, like every commit listed: a commit past the head is
-    /// [`Error::NotFound`], and one whose state is no longer kept is
-    /// [`Error::HistoryGone`]. A page ends early where the readable history does, so
-    /// the next page reports the commit that cannot be read.
+    /// [`Error::NotFound`]. The commits the write-ahead logs no longer hold are read
+    /// from the change log, and a commit neither has is [`Error::HistoryGone`]. A page
+    /// ends early where one source does, so the next page reads from the other or
+    /// reports the commit that cannot be read.
     pub fn changes(&self, after: u64, o: &ChangesOptions) -> Result<ChangePage> {
         // protections that depend on the data would need the view of every commit
         if o.graphs
@@ -210,7 +213,12 @@ impl Store {
             for s in after + 1..=last {
                 let d = match self.diff(&At::Commit(s - 1), &At::Commit(s), &o.diff_options(0)) {
                     Ok(d) => d,
-                    Err(e) if page.commits.is_empty() => return Err(e),
+                    Err(e) if page.commits.is_empty() => {
+                        return match self.changes_from_log(after, last, head, o)? {
+                            Some(p) => Ok(p),
+                            None => Err(e),
+                        };
+                    }
                     Err(_) => break,
                 };
                 let c = CommitChanges {
@@ -230,17 +238,25 @@ impl Store {
             });
         };
         // the page stays within one readable range
-        {
+        let unreadable = {
             let current = commit::generation_number(&self.snapshot().generation.name);
             let h = hist.lock();
             let ranges = h.reconstructable(current, head.seq);
             match ranges.iter().find(|r| r.0 <= after && after <= r.1) {
-                Some(r) if r.1 > after => last = last.min(r.1),
-                found => {
-                    let seq = if found.is_some() { after + 1 } else { after };
-                    return Err(self.history_gone(&h, seq, head.seq, None, self.commit(seq)));
+                Some(r) if r.1 > after => {
+                    last = last.min(r.1);
+                    None
                 }
+                found => Some(if found.is_some() { after + 1 } else { after }),
             }
+        };
+        if let Some(seq) = unreadable {
+            // the write-ahead logs no longer hold the next commit: the change log may
+            if let Some(p) = self.changes_from_log(after, last, head, o)? {
+                return Ok(p);
+            }
+            let h = hist.lock();
+            return Err(self.history_gone(&h, seq, head.seq, None, self.commit(seq)));
         }
         for step in self.diff_plan(after, last)? {
             match step {
@@ -325,5 +341,90 @@ impl Store {
             head,
             commits: page.commits,
         })
+    }
+
+    /// A page read from the change log, for commits whose generations are gone. It
+    /// ends before the first commit the log does not record, and is `None` when the
+    /// log does not record the commit after `after`. A bulk commit too large to record
+    /// is compared between its two states while they are kept, and is otherwise listed
+    /// with its counts only.
+    fn changes_from_log(
+        &self,
+        after: u64,
+        last: u64,
+        head: CommitInfo,
+        o: &ChangesOptions,
+    ) -> Result<Option<ChangePage>> {
+        let Some(log) = self.changelog.as_ref().filter(|l| l.is_enabled()) else {
+            return Ok(None);
+        };
+        log.flush(false)?;
+        let mut page = Page {
+            o,
+            commits: Vec::new(),
+            listed: 0,
+        };
+        let view = o.graphs.as_ref().filter(|a| !a.reads_everything());
+        let mut readable: FxHashMap<Arc<[u8]>, bool> = FxHashMap::default();
+        let ddo = o.diff_options(0);
+        let meta = |c: &ChangeCommit| self.commit(c.seq).unwrap_or_else(|| c.info());
+        let mut next = after + 1;
+        while next <= last && !page.full() {
+            // a summary is resolved outside the scan, which holds the log's lock
+            let mut summary: Option<Arc<ChangeCommit>> = None;
+            log.commits(next, last, &mut || ddo.check(), &mut |e| match e {
+                LogCommit::Changes(c, changes) => {
+                    let mut net: FxHashMap<QuadKey, bool> = FxHashMap::default();
+                    for (add, k) in changes {
+                        // a graph view lists the changes of its graphs only
+                        if view.is_some_and(|a| !super::diff::visible_key(a, &mut readable, &k)) {
+                            continue;
+                        }
+                        net.insert(k, add);
+                    }
+                    if !page.push(CommitChanges::from_net(meta(&c), net)) {
+                        return Ok(false);
+                    }
+                    next = c.seq + 1;
+                    Ok(!page.full())
+                }
+                LogCommit::Summary(c) => {
+                    summary = Some(c);
+                    Ok(false)
+                }
+                LogCommit::Missing => Ok(false),
+            })?;
+            let Some(c) = summary else {
+                break;
+            };
+            let max = o.max_quads;
+            let d = self.diff(
+                &At::Commit(c.seq - 1),
+                &At::Commit(c.seq),
+                &o.diff_options(max),
+            );
+            let cc = match d {
+                Ok(d) => CommitChanges {
+                    commit: d.to.commit,
+                    added: d.added,
+                    removed: d.removed,
+                    changes: Some(d.changes),
+                },
+                Err(e @ (Error::Cancelled | Error::Timeout)) => return Err(e),
+                Err(_) => CommitChanges::counts_only(meta(&c)),
+            };
+            if !page.push(cc) {
+                break;
+            }
+            next = c.seq + 1;
+        }
+        if page.commits.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ChangePage {
+            after,
+            head,
+            commits: page.commits,
+        }))
     }
 }

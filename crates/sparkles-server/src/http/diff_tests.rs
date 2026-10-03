@@ -462,7 +462,28 @@ async fn the_change_feed_keeps_its_budget() {
     assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE);
     assert_eq!(r.json()["code"], "changes-too-large");
     assert_eq!(r.json()["commit"], 5);
-    // history that is gone is 410
+    // after a compaction the change log serves the commits, within the same budget
+    compact_until_gone(&s).await;
+    let r = get(&s.app, "/h/changes?after=1").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["commits"].as_array().unwrap().len(), 1, "{j}");
+    assert_eq!(j["commits"][0]["commit"]["seq"], 2);
+    // history that neither source holds is 410
+    let r = put_json(
+        &s.app,
+        "/$/history/h",
+        r#"{"changeLog": {"enabled": false}}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = get(&s.app, "/h/changes?after=1").await;
+    assert_eq!(r.status, StatusCode::GONE, "{}", r.text());
+    assert_eq!(r.json()["code"], "history-gone");
+}
+
+/// Compact `h` and wait until commit 1 can no longer be read.
+async fn compact_until_gone(s: &Server) {
     let r = send(
         &s.app,
         Request::post("/$/compact/h").body(Body::empty()).unwrap(),
@@ -471,14 +492,64 @@ async fn the_change_feed_keeps_its_budget() {
     assert!(r.status.is_success());
     // the compaction is a background task, slow on a loaded machine
     for _ in 0..6000 {
-        let r = get(&s.app, "/h/changes?after=1").await;
-        if r.status == StatusCode::GONE {
-            assert_eq!(r.json()["code"], "history-gone");
+        if get(&s.app, "/h/sparql?at=1&query=ASK%7B%7D").await.status == StatusCode::GONE {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("commit 1 stayed readable after compaction");
+}
+
+#[tokio::test]
+async fn the_change_feed_reads_the_change_log_across_a_compaction() {
+    let s = server(|_| {}).await;
+    let feed = |uri: &'static str, accept: &'static str| {
+        let app = s.app.clone();
+        async move {
+            let r = get_with(&app, uri, "accept", accept).await;
+            assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+            (r.text(), r.header("sparkles-changes-next"))
+        }
+    };
+    let asks = [
+        ("/h/changes?after=0", "application/json"),
+        ("/h/changes?after=commit:1&limit=2", "application/json"),
+        ("/h/changes?after=0", "application/rdf-patch"),
+    ];
+    let mut before = Vec::new();
+    for (uri, accept) in asks {
+        before.push(feed(uri, accept).await);
+    }
+    compact_until_gone(&s).await;
+    // the same pages, now read from the change log
+    for ((uri, accept), b) in asks.into_iter().zip(&before) {
+        assert_eq!(&feed(uri, accept).await, b, "{uri}");
+    }
+    // an event stream resumes from a commit whose generation is gone
+    let res = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/h/changes")
+                .header("accept", "text/event-stream")
+                .header("last-event-id", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut body = res.into_body().into_data_stream();
+    let ev = read_events(&mut body, 3).await;
+    let ids: Vec<&str> = ev.iter().map(|e| e.0.as_str()).collect();
+    assert_eq!(ids, ["2", "3", "4"]);
+    let third: J = serde_json::from_str(&ev[1].1).unwrap();
+    assert_eq!(third["changes"][0]["op"], "-");
+    assert_eq!(third["changes"][0]["subject"], "<urn:a>");
+    // new commits follow on the same stream
+    update(&s.app, "h", "INSERT DATA { <urn:d> <urn:p> 4 }").await;
+    let ev = read_events(&mut body, 1).await;
+    assert_eq!(ev[0].0, "5");
 }
 
 #[tokio::test]

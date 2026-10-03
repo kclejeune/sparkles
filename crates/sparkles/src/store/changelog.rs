@@ -226,6 +226,37 @@ pub struct Unrecorded {
     pub reason: UnrecordedReason,
 }
 
+/// One commit's record, as [`ChangeLog::commits`] reads it.
+pub(crate) enum LogCommit {
+    /// the commit's net changes, `true` for an addition
+    Changes(Arc<ChangeCommit>, Vec<(bool, QuadKey)>),
+    /// a bulk commit whose changes were not recorded
+    Summary(Arc<ChangeCommit>),
+    /// a commit the log has no record of, or only a gap record
+    Missing,
+}
+
+impl ChangeCommit {
+    /// The commit as a catalog record would have it, for a commit the catalog no longer
+    /// keeps. The size of the dataset after it is not recorded, so `quads` is 0.
+    pub(crate) fn info(&self) -> CommitInfo {
+        CommitInfo {
+            seq: self.seq,
+            timestamp_ms: self.timestamp_ms,
+            kind: self.kind,
+            inserted: self.inserted,
+            deleted: self.deleted,
+            quads: 0,
+            generation: 0,
+            bulk: self.bulk,
+            exact: true,
+            reconstructed: false,
+            default_graph: true,
+            unvalidated: false,
+        }
+    }
+}
+
 /// One decoded record.
 enum Record {
     Changes(Arc<ChangeCommit>, Vec<(bool, QuadKey)>),
@@ -1507,6 +1538,60 @@ impl ChangeLog {
             }
         });
         Ok(holes)
+    }
+
+    /// Read the records of commits `from` through `to` in commit order, calling `visit`
+    /// for each until it returns `false`. The first commit the log has no record of is
+    /// visited as [`LogCommit::Missing`], and ends the read. The caller must not touch
+    /// the log from `visit`, which runs under its lock.
+    pub(crate) fn commits(
+        &self,
+        from: u64,
+        to: u64,
+        check: &mut dyn FnMut() -> Result<()>,
+        visit: &mut dyn FnMut(LogCommit) -> Result<bool>,
+    ) -> Result<()> {
+        if from > to {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock();
+        let mut next = from;
+        for i in 0..inner.segs.len() {
+            let (sf, sl) = (inner.segs[i].first, inner.segs[i].last);
+            if sl < next {
+                continue;
+            }
+            if sf > next {
+                // older than the log, or a hole between segments
+                visit(LogCommit::Missing)?;
+                return Ok(());
+            }
+            let ix = self.index(&mut inner, i)?;
+            let lo = ix.recs.partition_point(|r| r.seq < next);
+            let hi = ix.recs.partition_point(|r| r.seq <= to);
+            for e in &ix.recs[lo..hi] {
+                check()?;
+                let item = match e.hole {
+                    Some((_, UnrecordedReason::Gap)) => LogCommit::Missing,
+                    _ => match self.read(&inner, i, e.offset)? {
+                        Record::Changes(c, changes) => LogCommit::Changes(c, changes),
+                        Record::Summary(c) => LogCommit::Summary(c),
+                        Record::Gap { .. } => LogCommit::Missing,
+                    },
+                };
+                next = e.seq + 1;
+                if !visit(item)? {
+                    return Ok(());
+                }
+            }
+            if next > to {
+                return Ok(());
+            }
+        }
+        if next <= to {
+            visit(LogCommit::Missing)?;
+        }
+        Ok(())
     }
 
     /// The bytes on disk (or in memory).

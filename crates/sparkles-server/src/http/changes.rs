@@ -188,9 +188,11 @@ pub(super) async fn changes(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
     let at = selector(&params, "after")?.unwrap_or(At::Head);
-    let after = match last_event {
-        Some(n) => n,
-        None => {
+    let after = match (last_event, &at) {
+        (Some(n), _) => n,
+        // a commit number needs no catalog record: the change log may hold the commit
+        (None, At::Commit(n)) => *n,
+        (None, _) => {
             let ds = ds.clone();
             blocking(move || Ok(ds.store.resolve(&at)?.commit.seq)).await?
         }

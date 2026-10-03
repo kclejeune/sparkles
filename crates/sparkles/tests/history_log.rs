@@ -978,6 +978,104 @@ fn diffs_read_the_change_log_where_states_are_gone() {
 }
 
 #[test]
+fn the_change_feed_reads_the_change_log_where_generations_are_gone() {
+    use sparkles::access::{GraphAccess, GraphRule, Graphs};
+    use sparkles::store::ChangesOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(
+        &dir.path().join("db"),
+        StoreOptions {
+            bulk_threshold: 20,
+            change_log_bulk_max_quads: 30,
+            ..opts()
+        },
+    )
+    .unwrap();
+    let mut states = churn(&s, 11, 120);
+    // a bulk commit too large to record, then more commits and compactions
+    let body: String = (0..40)
+        .map(|i| format!("<urn:bulk{i}> <urn:p0> {i} .\n"))
+        .collect();
+    s.load(&[Source::from_bytes(
+        body.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let bulk = s.head_commit().seq;
+    states.insert(bulk, live(&s));
+    states.extend(churn(&s, 12, 60));
+    s.compact().unwrap();
+    upd(&s, "INSERT DATA { <urn:last> <urn:p0> 1 }");
+    states.insert(s.head_commit().seq, live(&s));
+    let head = s.head_commit().seq;
+    assert!(
+        s.snapshot_at(&At::Commit(1), &HistoryOptions::default())
+            .is_err(),
+        "the first commits' generations are collected"
+    );
+    // follow the feed from the start in pages of several sizes
+    for size in [1, 7, 100] {
+        let o = ChangesOptions {
+            max_commits: size,
+            ..Default::default()
+        };
+        let mut after = 0;
+        while after < head {
+            let p = s
+                .changes(after, &o)
+                .unwrap_or_else(|e| panic!("after {after}: {e}"));
+            assert!(!p.commits.is_empty(), "after {after}");
+            for c in &p.commits {
+                let seq = c.commit.seq;
+                assert_eq!(seq, after + 1, "commits are consecutive");
+                after = seq;
+                if !c.complete() {
+                    // a bulk commit the log has only the counts of, its states gone
+                    assert_eq!(seq, bulk);
+                    continue;
+                }
+                let (mut rem, mut add) = (BTreeSet::new(), BTreeSet::new());
+                for (op, q) in c.iter() {
+                    match op {
+                        DiffOp::Add => add.insert(nquads_line(&q)),
+                        DiffOp::Remove => rem.insert(nquads_line(&q)),
+                    };
+                }
+                assert_eq!(
+                    (rem, add),
+                    delta(&states[&(seq - 1)], &states[&seq]),
+                    "commit {seq}"
+                );
+            }
+        }
+    }
+    // a graph view lists the changes of its graphs only, and every commit
+    let o = ChangesOptions {
+        max_commits: 1000,
+        graphs: Some(Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new(["default"], &[])),
+            Graphs::none(),
+        ))),
+        ..Default::default()
+    };
+    let p = s.changes(0, &o).unwrap();
+    assert!(p.commits.len() > 1);
+    assert_eq!(p.commits[0].commit.seq, 1);
+    for c in &p.commits {
+        assert!(c.iter().all(|(_, q)| q.graph_name.is_default_graph()));
+    }
+    // without the change log the commits are gone
+    s.set_change_log_settings(ChangeLogSettings {
+        enabled: Some(false),
+        ..Default::default()
+    })
+    .unwrap();
+    let e = s.changes(0, &ChangesOptions::default()).err().unwrap();
+    assert!(matches!(e, Error::HistoryGone(_)), "{e}");
+}
+
+#[test]
 fn a_log_ahead_of_the_data_starts_again() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");

@@ -2697,7 +2697,8 @@ every change, so `limit` with a patch format is `400`.
 the quads it added and removed relative to its parent. It needs read permission on the
 dataset. `after` takes the selectors of `at` and defaults to the head, so a request
 without it waits for the next commit. Resuming is simple: a client that applied commit
-`n` asks for the commits after `n`. That works from any readable commit, as for diffs.
+`n` asks for the commits after `n`. That works from any commit whose changes the
+write-ahead logs or the [change log](#history-queries) still hold, as for diffs.
 
 | Parameter | Meaning |
 |---|---|
@@ -2730,10 +2731,16 @@ changes out, so a patch page that would start with such a commit is `507` with
 `code: "changes-too-large"` and the commit's number. A body over `--max-export-mb` is cut
 off as for other streamed bodies.
 
-A commit past the head is `404`. A commit whose state is no longer kept is
-`410 history-gone`, and so is the first commit after a gap in the readable history: its
-changes need the state before it. A page ends where the readable history does, so the
-next request reports the commit that cannot be read.
+The feed reads the write-ahead logs of the retained generations first. Commits whose
+generation was compacted away are read from the dataset's change log, in the same
+formats and with the same access rules. A bulk commit that the log recorded with its
+counts only is listed with `"complete": false`, like a commit over the budget, once its
+states are gone. A page ends where one source does, and the next request continues from
+the other.
+
+A commit past the head is `404`. A commit that neither the write-ahead logs nor the
+change log holds is `410 history-gone`. This happens when the change log is off, or
+retention dropped the commit, or the log has a gap there.
 
 **Long polling.** With `wait=N`, a request that finds no commit after `after` waits up to
 N seconds for one and then answers, with an empty list if none came. The server wakes
@@ -2832,9 +2839,10 @@ counts only. A `gap` is a stretch the log could not record. A SPARQL history que
 these commits silently. `sparkles history --loc DB --subject IRI` prints the same changes
 from the command line.
 
-**Diffs** read the change log when the write-ahead logs cannot answer, so
-`/{ds}/diff?from=12` works even after the generation that held commit 12 was compacted
-away. Point-in-time reads still need a retained generation.
+**Diffs** and the [change feed](#change-feed) read the change log when the write-ahead
+logs cannot answer, so `/{ds}/diff?from=12` and `/{ds}/changes?after=12` work even after
+the generation that held commit 12 was compacted away. Point-in-time reads still need a
+retained generation.
 
 **Access.** A caller sees the changes of the graphs it may read, without the triples its
 protections hide. A caller with a protection that depends on the data (classes or

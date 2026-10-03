@@ -377,7 +377,15 @@ fn the_change_feed_lists_each_commit_once() {
 #[test]
 fn the_change_feed_stops_at_gaps() {
     let dir = tempfile::tempdir().unwrap();
-    let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    // without the change log, which would fill the gap (history_log.rs)
+    let s = Store::open(
+        &dir.path().join("db"),
+        StoreOptions {
+            change_log: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let u = |q: &str| update(&s, q, &QueryOptions::default()).unwrap();
     u("INSERT DATA { <urn:a> <urn:p> 1 }");
     u("INSERT DATA { <urn:b> <urn:p> 2 }");
