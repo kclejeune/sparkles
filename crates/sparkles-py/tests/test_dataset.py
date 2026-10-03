@@ -256,7 +256,7 @@ def test_formats() -> None:
     assert repr(RdfFormat.RDF_XML) == "RdfFormat.RDF_XML"
 
 
-JENA_PATCHES = Path(__file__).resolve().parents[2] / "sparkles" / "tests" / "patch"
+JENA_PATCHES = Path(__file__).resolve().parents[2] / "sparkles-core" / "tests" / "patch"
 
 
 def test_apply_patch() -> None:
