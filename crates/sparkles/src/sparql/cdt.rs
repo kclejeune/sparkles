@@ -1271,6 +1271,30 @@ mod tests {
     }
 
     #[test]
+    fn relabels_blank_nodes_in_nested_literals() {
+        let relabel = |lex: &str, dt: &str| {
+            let l = Literal::new_typed_literal(lex, NamedNode::new_unchecked(dt));
+            relabel_literal(&l, &mut |b| format!("x{b}")).map(|l| l.value().to_string())
+        };
+        assert_eq!(
+            relabel(
+                &format!("[_:a, [_:b], '[_:a]'^^<{LIST}>, \"_:c\", {{'k': _:c}}]"),
+                LIST
+            )
+            .as_deref(),
+            Some(r#"[_:xa, [_:xb], [_:xa], "_:c", {"k" : _:xc}]"#)
+        );
+        assert_eq!(
+            relabel(&format!("{{'k': \"{{'j': _:a}}\"^^<{MAP}>}}"), MAP).as_deref(),
+            Some(r#"{"k" : {"j" : _:xa}}"#)
+        );
+        // no blank node, an ill-formed literal and another datatype stay as they are
+        assert_eq!(relabel("[\"_:a\"]", LIST), None);
+        assert_eq!(relabel("[_:a", LIST), None);
+        assert_eq!(relabel("[_:a]", "http://example/List"), None);
+    }
+
+    #[test]
     fn equality_and_order() {
         let eq = |a: &str, b: &str| equals_cdt(a, LIST, b, LIST);
         assert_eq!(eq("[1]", "[1.0]"), Ok(true));
