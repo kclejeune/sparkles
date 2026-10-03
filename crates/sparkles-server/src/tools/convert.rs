@@ -345,9 +345,12 @@ impl Input {
         }
         let mut r = stdin_reader(how.compression)?;
         let (head, complete) = read_head(&mut r)?;
+        let nquads = Kind::Rdf(Syntax::Rdf(RdfFormat::NQuads));
         let kind = match sniff::sniff(&head, complete) {
+            // N-Triples is N-Quads without graphs: read as before, as N-Quads
+            Sniffed::Found(Kind::Rdf(Syntax::Rdf(RdfFormat::NTriples))) => nquads,
             Sniffed::Found(k) => k,
-            Sniffed::Unknown => Kind::Rdf(Syntax::Rdf(RdfFormat::NQuads)),
+            Sniffed::Unknown => nquads,
             Sniffed::Ambiguous(c) => bail!("stdin: {} (use --syntax)", ambiguous(&c)),
         };
         let input = Input::new("stdin".into(), None, kind, base);

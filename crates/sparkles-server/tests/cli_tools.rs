@@ -326,6 +326,13 @@ fn convert_sniffs_the_syntax() {
         let o = run_stdin(dir, &["convert", "--count", "--base", "http://e/t/"], body);
         assert_eq!(out(&o), format!("stdin: {want}\n"), "{name}: {}", err(&o));
     }
+    // N-Triples on standard input reads as N-Quads, as it did before sniffing
+    let o = run_stdin(
+        dir,
+        &["convert", "--count"],
+        b"<http://e/s> <http://e/p> \"x\" .\n",
+    );
+    assert_eq!(out(&o), "stdin: 1 quads\n", "{}", err(&o));
     // TriX, RDF Thrift and RDF Protobuf written by convert, read back without --syntax
     for fmt in ["trix", "rt", "rpb"] {
         let o = run(dir, &["convert", "g.trig", "--output", fmt]);
