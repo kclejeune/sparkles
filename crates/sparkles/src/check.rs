@@ -992,6 +992,20 @@ impl Checker<'_> {
             }
             summary.push_str(", block first keys checked for order");
         }
+        match crate::vocab::verify_sparse_index(dir, &offsets, data) {
+            None => {}
+            Some(Ok(n)) => summary.push_str(&format!(", sparse index of {n} keys")),
+            // the server does without an index it cannot read, but would use one that
+            // reads well and names other keys
+            Some(Err((error, m))) => run.add(
+                if error {
+                    Issue::error(m)
+                } else {
+                    Issue::warning(m)
+                }
+                .file(format!("{name}/vocab.idx")),
+            ),
+        }
         VocabRun {
             millis: run.millis(),
             run,

@@ -1141,6 +1141,13 @@ enum Cmd {
         #[arg(long)]
         if_due: bool,
     },
+    /// Add the sparse vocabulary index (vocab.idx) to a database whose current index was
+    /// built before it existed, so that a cold server looks up a term with one read
+    /// instead of one per step of a binary search. A load or compaction writes it too.
+    VocabIndex {
+        #[arg(long)]
+        loc: PathBuf,
+    },
     /// Back up to a backup repository (create, list, show, delete, restore, verify,
     /// policy); without a subcommand, write a compressed N-Quads dump of --loc to --out
     /// (zstd unless --compress says otherwise)
@@ -2627,6 +2634,14 @@ fn run() -> Result<()> {
         Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Quota(args) => quota_cmd::run(args, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
+        Cmd::VocabIndex { loc } => {
+            let store = Store::open(&loc, opts)?;
+            match store.add_vocab_index()? {
+                Some(n) => println!("wrote vocab.idx ({n} entries)"),
+                None => println!("the current index already has vocab.idx"),
+            }
+            Ok(())
+        }
         Cmd::Compact { loc, if_due } => {
             let store = Store::open(&loc, opts)?;
             if if_due {

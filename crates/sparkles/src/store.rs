@@ -3671,6 +3671,22 @@ impl Store {
         Ok(path)
     }
 
+    /// Write the sparse vocabulary index (`vocab.idx`) of the current generation when
+    /// it has none, because an older version built it. The store opened next uses it.
+    /// Returns its number of entries, or `None` when the generation already has one or
+    /// the store is in memory.
+    pub fn add_vocab_index(&self) -> Result<Option<usize>> {
+        let _w = self.writer.lock();
+        let snap = self.snapshot();
+        let Some(dir) = snap.generation.dir.as_ref() else {
+            return Ok(None);
+        };
+        if dir.join("vocab.idx").exists() {
+            return Ok(None);
+        }
+        crate::vocab::add_sparse_index(dir).map(Some)
+    }
+
     pub fn disk_bytes(&self) -> u64 {
         match &self.root {
             Some(r) => dir_size(r),
