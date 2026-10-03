@@ -176,6 +176,7 @@ impl Syntax {
     }
 
     /// The media type of the syntax, as the server names it.
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     pub fn media_type(self) -> &'static str {
         match self {
             Syntax::Rdf(f) => sparkles::sparql::results::rdf_media_type(f),

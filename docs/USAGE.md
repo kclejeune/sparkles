@@ -410,6 +410,7 @@ sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes
 sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
 sparkles compaction --loc db --set deltaRatio=0.02     # automatic compaction settings; --default removes them
 sparkles describe-settings --loc db --set mode=scbd   # how DESCRIBE describes a resource; --default removes it
+sparkles ping    127.0.0.1:3030               # GET /$/ready over HTTP, then HTTPS; exit 0 on 200 (health checks)
 ```
 
 `sparkles dump` writes N-Quads by default. `--format`, or the extension of `--out`, picks
@@ -2149,8 +2150,12 @@ The file must be readable by uid 10001, and it should not be readable by others,
 `ports` can publish the port on every interface, as `"3030:3030"` does. Serve it over
 HTTPS, through a reverse proxy in front of the container or with `--tls-cert` and
 `--tls-key` on mounted files ([TLS](#tls)), because plain HTTP sends passwords and tokens
-in the clear. The image's health check speaks plain HTTP, so a server with `--tls-cert`
-needs its own health check in `compose.yaml`.
+in the clear. The image's health check runs `sparkles ping`, which asks for `/$/ready`
+over plain HTTP and then over HTTPS, so it works with `--tls-cert` as well. On the
+loopback address it accepts the server's certificate without checking the name, since
+the certificate names the public host. `SPARKLES_HEALTHCHECK_PORT` sets the port when
+`serve` listens on another one than 3030, and `SPARKLES_HEALTHCHECK_URL` sets the whole
+target, such as `https://127.0.0.1:8443`.
 
 ### Configuring the container
 

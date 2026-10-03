@@ -33,6 +33,8 @@ mod openapi;
 mod otel;
 mod outbound;
 mod patch_cmd;
+#[cfg(feature = "auth")]
+mod ping_cmd;
 mod queries_cmd;
 mod quota_cmd;
 mod ratelimit;
@@ -1174,6 +1176,10 @@ enum Cmd {
     /// Show or change a dataset's automatic compaction settings, on a local database or
     /// on a server
     Compaction(compaction_cmd::CompactionArgs),
+    /// Ask a server whether it is ready (GET /$/ready), over HTTPS or HTTP: exit status 0
+    /// when it answers 200. The container image's health check runs it.
+    #[cfg(feature = "auth")]
+    Ping(ping_cmd::PingArgs),
     /// Show or change how DESCRIBE describes a resource in a dataset (cbd, scbd or
     /// outgoing, labels, reifiers and limits), on a local database or on a server
     DescribeSettings(describe_cmd::DescribeArgs),
@@ -2768,6 +2774,8 @@ fn run() -> Result<()> {
         Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Quota(args) => quota_cmd::run(args, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
+        #[cfg(feature = "auth")]
+        Cmd::Ping(args) => ping_cmd::run(args),
         Cmd::VocabIndex { loc } => {
             let store = Store::open(&loc, opts)?;
             match store.add_vocab_index()? {
