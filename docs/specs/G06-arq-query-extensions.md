@@ -910,6 +910,29 @@ planner checks each basic graph pattern for a property function, and value compa
 check for the two composite datatypes only when both values are literals of an unknown
 datatype. A composite literal is parsed each time an operation reads it.
 
+**Container functions.** A later change added `apf:container`, `apf:bag`, `apf:seq` and
+`apf:alt`, and `rdfs:member` as ARQ's container function, to `sparql/arqpf.rs`. They
+follow Jena's `container` class and `GraphContainerUtils`. A container is a resource
+typed `rdf:Bag`, `rdf:Seq` or `rdf:Alt`. A bound container gives its members in the
+order of their `rdf:_n` numbers, a bound member is counted once per numbered triple that
+holds it, and an unbound container is each typed resource, or each subject of a triple
+whose object is the bound member. `rdfs:member` concatenates the stored `rdfs:member`
+triples with the members of every container, as ARQ does.
+
+The non-goal of §12.1 was that ARQ's reading of `rdfs:member` changes the answers and
+plans of queries that use it as a property. Jena's PropertyFunctions suite writes the
+function as a plain triple pattern, so passing it needs ARQ's reading there. The
+planner therefore reads `rdfs:member` as the function only while the store holds a
+resource typed as a container, checked with one index lookup per type when a basic
+graph pattern uses `rdfs:member`. Without a container, the function's solutions are
+exactly the stored triples, so the pattern stays an ordinary triple pattern with its
+plans. An OPTIONAL whose right side reads a variable through `rdfs:member` is not run
+per left row, unlike the library's other functions. ARQ's PropertyFunctions suite now
+passes in full (48 of 48), and `tests/arq_library.rs` checks the functions against
+Jena 6.2.0's `arq` on a dataset with each container type, an untyped resource with
+numbered triples and a stored `rdfs:member` triple, and that the plan changes only with
+a container in the store.
+
 **Phase 3, not built.** JavaScript functions, `afn:context`, the Leviathan library,
-`rdfs:member` and the container functions, locale collation, the `JSON` query form,
-ARQ's `EXISTS { … }` element, and Phase 3 methods in the query builder.
+locale collation, the `JSON` query form, ARQ's `EXISTS { … }` element, and Phase 3
+methods in the query builder.

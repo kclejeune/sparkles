@@ -1699,6 +1699,9 @@ function takes several arguments.
 | `?a apf:assign ?b` | One side bound | Binds the other side to it, or checks that both are the same value |
 | `?b apf:bnode ?label` | `?b` bound | The label of a blank node. `apf:blankNode` is the same |
 | `?s apf:versionARQ ?v` | | `<urn:x-sparkles:>` and the Sparkles version |
+| `?c apf:container ?m` | | Each member of an RDF container, in the order of its `rdf:_1`, `rdf:_2`, … triples |
+| `?c apf:bag ?m`, `apf:seq`, `apf:alt` | | The same for the containers of one type |
+| `?c rdfs:member ?m` | | The stored `rdfs:member` triples, then the members of every container |
 
 ARQ evaluates a property function for each solution of the patterns written before it,
 with their values in place of its variables, and Sparkles gives the same answers. A list
@@ -1720,11 +1723,15 @@ before it is a leaf of the group's join order. A call that reads some is attache
 rest of its group and evaluates once per distinct value of what it reads. An OPTIONAL
 whose calls read the left side runs as a `Lateral` operator per left row.
 
-ARQ also makes `rdfs:member` a property function that adds the `rdf:_1`, `rdf:_2`, …
-members of `rdf:Bag`, `rdf:Seq` and `rdf:Alt` containers to the `rdfs:member` triples.
-Sparkles keeps `rdfs:member` an ordinary property, so that queries over it keep their
-meaning and their plans, and it has no `apf:bag`, `apf:seq`, `apf:alt` or
-`apf:container`. JavaScript functions are not supported.
+A container is a resource typed `rdf:Bag`, `rdf:Seq` or `rdf:Alt`, and its members are
+the objects of its `rdf:_1`, `rdf:_2`, … triples. A resource without one of these types
+has no members, whatever its numbered triples. With the container given, its members come
+in the order of their numbers. With a member given, a container that holds it twice
+answers twice. ARQ registers `rdfs:member` as a property function too, so a plain
+`?c rdfs:member ?m` also gives the members of every container. Sparkles follows ARQ
+while the store holds a resource typed as a container. Without one, `rdfs:member` stays
+an ordinary triple pattern. Both readings give the same solutions in that case, so
+queries over `rdfs:member` keep their plans. JavaScript functions are not supported.
 
 ### ARQ syntax extensions
 

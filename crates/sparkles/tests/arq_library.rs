@@ -314,6 +314,79 @@ fn property_function_plans() {
     assert!(plain.contains("\"OptionalJoin\""), "{plain}");
 }
 
+const CONTAINER_DATA: &str = "PREFIX : <http://example/>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+:b a rdf:Bag ; rdf:_1 :x ; rdf:_2 :y ; rdf:_3 :x .
+:s a rdf:Seq ; rdf:_2 :z ; rdf:_1 :y ; rdf:_10 :w .
+:a a rdf:Alt ; rdf:_1 :x .
+:n rdf:_1 :x .
+:m rdfs:member :x .
+";
+
+/// arq 6.2.0 on `CONTAINER_DATA`: `rdfs:member` gives the stored triples and the members
+/// of every container, `apf:bag`, `apf:seq` and `apf:alt` those of one type, and a
+/// resource without a container type has no members.
+#[test]
+fn container_functions_match_arq() {
+    let s = ttl(CONTAINER_DATA);
+    let member = "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
+    check(
+        &s,
+        &format!("{member} SELECT ?c ?m {{ ?c rdfs:member ?m }}"),
+        ":m :x\n:s :y\n:s :z\n:s :w\n:a :x\n:b :x\n:b :y\n:b :x",
+    );
+    check(
+        &s,
+        &format!("{member} SELECT ?c {{ ?c rdfs:member :x }}"),
+        ":m\n:a\n:b\n:b",
+    );
+    check(
+        &s,
+        &format!("{member} SELECT (COUNT(*) AS ?n) {{ :b rdfs:member :x }}"),
+        "2",
+    );
+    check(
+        &s,
+        &format!("{member} SELECT ?m {{ :n rdfs:member ?m }}"),
+        "",
+    );
+    check(&s, "SELECT ?c ?m { ?c apf:bag ?m }", ":b :x\n:b :y\n:b :x");
+    check(&s, "SELECT ?c ?m { ?c apf:seq ?m }", ":s :y\n:s :z\n:s :w");
+    check(&s, "SELECT ?c ?m { ?c apf:alt ?m }", ":a :x");
+    check(
+        &s,
+        "SELECT ?c ?m { ?c apf:container ?m }",
+        ":s :y\n:s :z\n:s :w\n:a :x\n:b :x\n:b :y\n:b :x",
+    );
+    check(&s, "SELECT ?c { ?c apf:seq :y }", ":s");
+    check(&s, "SELECT ?m { :s apf:bag ?m }", "");
+    // a container's members come in the order of their numbers
+    let r = query(
+        s.snapshot(),
+        &format!("{PREFIXES} SELECT ?m {{ :s apf:seq ?m }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let got: Vec<String> = r.rows().iter().map(|row| short(&row[0])).collect();
+    assert_eq!(got, [":y", ":z", ":w"]);
+}
+
+/// Without a container in the store, `rdfs:member` is an ordinary triple pattern, with
+/// the same solutions and its plans; with one, it is the property function.
+#[test]
+fn rdfs_member_is_a_property_function_only_with_containers() {
+    let q =
+        "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> SELECT ?c ?m { ?c rdfs:member ?m }";
+    let plain = ttl("PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+<http://example/m> rdfs:member <http://example/x> .
+<http://example/n> <http://www.w3.org/1999/02/22-rdf-syntax-ns#_1> <http://example/y> .");
+    assert!(!explain(&plain, q).contains("\"PropertyFunction\""));
+    check(&plain, q, ":m :x");
+    let s = ttl(CONTAINER_DATA);
+    assert!(explain(&s, q).contains("\"PropertyFunction\""));
+}
+
 // ------------------------------------------------- half joins and path forms ------
 
 const JOIN_DATA: &str = "PREFIX : <http://example/>

@@ -1160,6 +1160,14 @@ impl<'a> Planner<'a> {
             GP::Bgp { patterns } => {
                 // ARQ's property function library: the variables bound before a call
                 // are those of the group's earlier elements
+                let members;
+                let patterns = match super::arqpf::container_members(self.ctx, patterns) {
+                    Some(m) => {
+                        members = m;
+                        &members
+                    }
+                    None => patterns,
+                };
                 let rest;
                 let patterns = if super::arqpf::has_calls(patterns) {
                     let (pcalls, others) = super::arqpf::take_calls(patterns)?;
