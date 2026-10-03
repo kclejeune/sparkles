@@ -280,6 +280,8 @@ pub fn read_vars(gp: &GraphPattern, out: &mut Vec<String>) {
         | GP::Lateral { left, right }
         | GP::Union { left, right }
         | GP::Minus { left, right }
+        | GP::SemiJoin { left, right }
+        | GP::AntiJoin { left, right }
         | GP::LeftJoin { left, right, .. } => {
             read_vars(left, out);
             read_vars(right, out);

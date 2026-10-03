@@ -53,10 +53,14 @@ keywords! {
     // graph patterns
     Optional => "OPTIONAL",
     Minus => "MINUS",
-    // Jena ARQ's lateral join, assignment and UNFOLD
+    // Jena ARQ's lateral join, assignment, UNFOLD, half joins and path functions
     Lateral => "LATERAL",
     Let => "LET",
     Unfold => "UNFOLD",
+    Semijoin => "SEMIJOIN",
+    Antijoin => "ANTIJOIN",
+    Multi => "MULTI",
+    Shortest => "SHORTEST",
     Union => "UNION",
     Graph => "GRAPH",
     Service => "SERVICE",

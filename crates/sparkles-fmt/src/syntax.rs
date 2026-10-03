@@ -176,4 +176,10 @@ pub enum NodeKind {
     Let,
     /// `UNFOLD(expr AS ?v)` or `UNFOLD(expr AS ?v, ?w)`
     Unfold,
+    /// `SEMIJOIN { … }`
+    SemiJoin,
+    /// `ANTIJOIN { … }`
+    AntiJoin,
+    /// `distinct(path)`, `multi(path)` or `shortest(path)`
+    PathFunction,
 }

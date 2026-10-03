@@ -1514,7 +1514,9 @@ fn children(p: &GraphPattern) -> Vec<&GraphPattern> {
         | G::Lateral { left, right }
         | G::LeftJoin { left, right, .. }
         | G::Union { left, right }
-        | G::Minus { left, right } => vec![left, right],
+        | G::Minus { left, right }
+        | G::SemiJoin { left, right }
+        | G::AntiJoin { left, right } => vec![left, right],
         G::Filter { inner, .. }
         | G::Graph { inner, .. }
         | G::Extend { inner, .. }

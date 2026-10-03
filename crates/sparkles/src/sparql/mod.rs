@@ -303,6 +303,8 @@ pub fn validate_scoping(gp: &GraphPattern) -> Result<()> {
         | GP::Lateral { left, right }
         | GP::Union { left, right }
         | GP::Minus { left, right }
+        | GP::SemiJoin { left, right }
+        | GP::AntiJoin { left, right }
         | GP::LeftJoin { left, right, .. } => {
             validate_scoping(left)?;
             validate_scoping(right)

@@ -336,6 +336,11 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             let r = child(1, &mut infos)?;
             minus(ctx, l, &r, &mut note)?
         }
+        Kind::HalfJoin { anti } => {
+            let l = child(0, &mut infos)?;
+            let r = child(1, &mut infos)?;
+            half_join(ctx, l, &r, *anti)?
+        }
         Kind::Union => {
             let mut out = Table::new(n.vars.clone());
             for i in 0..n.children.len() {
@@ -2690,6 +2695,43 @@ fn unfold(
         }
     }
     Ok(out)
+}
+
+/// ARQ's SEMIJOIN and ANTIJOIN (`QueryIterHalfJoin`): the rows of `l` compatible with a
+/// row of `r` (with none, when `anti`), each once and unchanged. Unlike MINUS, a row of
+/// `r` that shares no bound variable with a row of `l` is compatible with it.
+fn half_join(ctx: &Ctx, mut l: Table, r: &Table, anti: bool) -> Result<Table> {
+    let lay = layout(&l, r);
+    let r_undef = lay.shared.iter().any(|&(_, rc)| has_undef(r, rc));
+    let set: FxHashSet<Vec<Id>> = if r_undef {
+        FxHashSet::default()
+    } else {
+        (0..r.len())
+            .map(|j| lay.shared.iter().map(|&(_, rc)| r.cols[rc][j]).collect())
+            .collect()
+    };
+    let mut keep = vec![false; l.len()];
+    for (i, k) in keep.iter_mut().enumerate() {
+        if i % 4096 == 0 {
+            ctx.check()?;
+        }
+        let all_defined = lay.shared.iter().all(|&(lc, _)| !l.cols[lc][i].is_undef());
+        let matched = if r.is_empty() {
+            false
+        } else if lay.shared.is_empty() {
+            true
+        } else if !r_undef && all_defined {
+            let key: Vec<Id> = lay.shared.iter().map(|&(lc, _)| l.cols[lc][i]).collect();
+            set.contains(&key)
+        } else {
+            (0..r.len()).any(|j| compatible(&l, r, i, j, &lay.shared))
+        };
+        *k = matched != anti;
+    }
+    let sorted = l.sorted.clone();
+    l.filter_rows(&keep);
+    l.sorted = sorted;
+    Ok(l)
 }
 
 fn minus(ctx: &Ctx, mut l: Table, r: &Table, note: &mut Option<String>) -> Result<Table> {

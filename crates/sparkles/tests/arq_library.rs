@@ -1,6 +1,7 @@
 //! The rest of Jena ARQ's query language (spec G06, Phase 3): `LET`, the composite
-//! datatypes with `FOLD` and `UNFOLD`, and the property function library, against ARQ's
-//! tests and Jena 6.2.0's answers.
+//! datatypes with `FOLD` and `UNFOLD`, the property function library, `SEMIJOIN` and
+//! `ANTIJOIN`, and the path forms `distinct(…)` and `multi(…)`, against ARQ's tests and
+//! Jena 6.2.0's answers.
 //!
 //! The cases cite their source: the tests of Jena's `jena-arq/testing/ARQ`
 //! (`Syntax-ARQ`) and the output of Jena 6.2.0's `arq` command for the same data and
@@ -311,4 +312,90 @@ fn property_function_plans() {
     // a query without the library plans as before
     let plain = explain(&s, "SELECT * { ?s :name ?n OPTIONAL { ?s :list ?l } }");
     assert!(plain.contains("\"OptionalJoin\""), "{plain}");
+}
+
+// ------------------------------------------------- half joins and path forms ------
+
+const JOIN_DATA: &str = "PREFIX : <http://example/>
+:a :p 1 ; :q 2 .
+:b :p 3 .
+:c :p 4 ; :q 5 ; :r 5 .
+:a :n :b, :c ; :m :b .
+:b :n :d .
+:c :n :d .
+:d :m :e .
+";
+
+/// arq 6.2.0 on `JOIN_DATA`: a row of the right side that shares no variable with a
+/// left row is compatible with it, unlike in MINUS.
+#[test]
+fn semijoin_and_antijoin_match_arq() {
+    let s = ttl(JOIN_DATA);
+    check(
+        &s,
+        "SELECT * { ?s :p ?o SEMIJOIN { ?s :q ?z } }",
+        ":a 1 \n :c 4",
+    );
+    check(&s, "SELECT * { ?s :p ?o ANTIJOIN { ?s :q ?z } }", ":b 3");
+    check(
+        &s,
+        "SELECT * { ?s :p ?o SEMIJOIN { ?x :q ?z } }",
+        ":a 1 \n :b 3 \n :c 4",
+    );
+    check(
+        &s,
+        "SELECT * { ?s :p ?o ANTIJOIN { ?x :nothing ?z } }",
+        ":a 1 \n :b 3 \n :c 4",
+    );
+    check(&s, "SELECT * { ?s :p ?o ANTIJOIN { ?x :q ?z } }", "");
+    check(
+        &s,
+        "SELECT ?s ?o ?r { ?s :p ?o OPTIONAL { ?s :r ?r } SEMIJOIN { ?s :q ?r } }",
+        ":a 1 - \n :c 4 5",
+    );
+    check(
+        &s,
+        "SELECT * { ?s :p ?o MINUS { ?x :q ?z } }",
+        ":a 1 \n :b 3 \n :c 4",
+    );
+    for q in [
+        "SELECT * { ?s :p ?o SEMIJOIN { ?s :q ?z } }",
+        "SELECT * { ?s :p ?o ANTIJOIN { ?s :q ?z } }",
+    ] {
+        assert!(!parses_strict(q), "{q}");
+    }
+    assert!(parses_strict(
+        "PREFIX semijoin: <http://s/> SELECT * { semijoin:x ?p ?o }"
+    ));
+    let plan = explain(&s, "SELECT * { ?s :p ?o SEMIJOIN { ?s :q ?z } }");
+    assert!(plan.contains("\"SemiJoin\""), "{plan}");
+}
+
+/// arq 6.2.0 on `JOIN_DATA`: `distinct(…)` gives each pair once, and `multi(…)` counts
+/// the walks of its closures.
+#[test]
+fn path_forms_match_arq() {
+    let s = ttl(JOIN_DATA);
+    check(&s, "SELECT ?y { :a distinct(:n/:n) ?y }", ":d");
+    check(&s, "SELECT ?y { :a :n/:n ?y }", ":d \n :d");
+    check(
+        &s,
+        "SELECT ?y { :a multi(:n*) ?y }",
+        ":a \n :b \n :c \n :d \n :d",
+    );
+    check(&s, "SELECT ?y { :a :n* ?y }", ":a \n :b \n :c \n :d");
+    check(
+        &s,
+        "SELECT ?x ?y { ?x distinct(:n|:m) ?y }",
+        ":a :b \n :a :c \n :b :d \n :c :d \n :d :e",
+    );
+    check(
+        &s,
+        "SELECT ?y { :a multi(:n+/:m?) ?y }",
+        ":b \n :c \n :d \n :d \n :e \n :e",
+    );
+    assert!(!parses_strict("SELECT * { ?s distinct(:p) ?o }"));
+    // ARQ parses shortest(…) but does not evaluate it
+    let q = format!("{PREFIXES}SELECT * {{ ?s shortest(:n*) ?o }}");
+    assert!(query(ttl(JOIN_DATA).snapshot(), &q, &QueryOptions::default()).is_err());
 }

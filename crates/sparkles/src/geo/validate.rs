@@ -31,7 +31,9 @@ impl Visitor<'_> {
             GP::Join { left, right }
             | GP::Lateral { left, right }
             | GP::Union { left, right }
-            | GP::Minus { left, right } => {
+            | GP::Minus { left, right }
+            | GP::SemiJoin { left, right }
+            | GP::AntiJoin { left, right } => {
                 self.pattern(left)?;
                 self.pattern(right)
             }

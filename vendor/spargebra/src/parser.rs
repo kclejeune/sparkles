@@ -112,8 +112,9 @@ impl SparqlParser {
     }
 
     /// Whether Jena ARQ's extensions of the SPARQL syntax are accepted (the default) or
-    /// are syntax errors: `LATERAL`, `LET`, `UNFOLD`, path ranges (`p{2}`,
-    /// `p{1,3}`, `p{2,}`, `p{,3}`, `p{*}`, `p{+}`), `GRAPH` blocks in CONSTRUCT
+    /// are syntax errors: `LATERAL`, `LET`, `UNFOLD`, `SEMIJOIN`, `ANTIJOIN`, path ranges (`p{2}`,
+    /// `p{1,3}`, `p{2,}`, `p{,3}`, `p{*}`, `p{+}`) and `distinct(…)`, `multi(…)` and
+    /// `shortest(…)` paths, `GRAPH` blocks in CONSTRUCT
     /// templates and ARQ's aggregates (`MEDIAN`, `MODE`, `STDEV`, …, `FOLD`,
     /// `AGG <iri>(…)`).
     ///
@@ -595,6 +596,9 @@ enum PartialGraphPattern {
     #[cfg(feature = "sep-0006")]
     Lateral(GraphPattern),
     Minus(GraphPattern),
+    /// ARQ's `SEMIJOIN { … }` and `ANTIJOIN { … }`
+    SemiJoin(GraphPattern),
+    AntiJoin(GraphPattern),
     Bind(Expression, Variable),
     /// ARQ's `LET (?v := expr)`
     Assign(Expression, Variable),
@@ -906,6 +910,9 @@ fn add_defined_variables<'a>(pattern: &'a GraphPattern, set: &mut HashSet<&'a Va
         | GraphPattern::Minus { left, right } => {
             add_defined_variables(left, set);
             add_defined_variables(right, set);
+        }
+        GraphPattern::SemiJoin { left, .. } | GraphPattern::AntiJoin { left, .. } => {
+            add_defined_variables(left, set);
         }
         GraphPattern::Graph { inner, .. } => {
             add_defined_variables(inner, set);
@@ -1656,6 +1663,12 @@ parser! {
                     PartialGraphPattern::Minus(p) => {
                         g = GraphPattern::Minus { left: Box::new(g), right: Box::new(p) }
                     }
+                    PartialGraphPattern::SemiJoin(p) => {
+                        g = GraphPattern::SemiJoin { left: Box::new(g), right: Box::new(p) }
+                    }
+                    PartialGraphPattern::AntiJoin(p) => {
+                        g = GraphPattern::AntiJoin { left: Box::new(g), right: Box::new(p) }
+                    }
                     PartialGraphPattern::Bind(expression, variable) => {
                         let mut contains = false;
                         g.on_in_scope_variable(|v| {
@@ -1731,7 +1744,15 @@ parser! {
             Ok(patterns)
         }
 
-        rule GraphPatternNotTriples() -> PartialGraphPattern = GroupOrUnionGraphPattern() / OptionalGraphPattern() / LateralGraphPattern() / MinusGraphPattern() / GraphGraphPattern() / ServiceGraphPattern() / Filter() / Bind() / InlineData() / Assignment() / Unfold()
+        rule GraphPatternNotTriples() -> PartialGraphPattern = GroupOrUnionGraphPattern() / OptionalGraphPattern() / LateralGraphPattern() / MinusGraphPattern() / GraphGraphPattern() / ServiceGraphPattern() / Filter() / Bind() / InlineData() / Assignment() / Unfold() / SemiJoinGraphPattern() / AntiJoinGraphPattern()
+
+        // ARQ's `SEMIJOIN { … }` and `ANTIJOIN { … }`
+        rule SemiJoinGraphPattern() -> PartialGraphPattern = i("SEMIJOIN") _ arq() p:GroupGraphPattern() {
+            PartialGraphPattern::SemiJoin(p)
+        }
+        rule AntiJoinGraphPattern() -> PartialGraphPattern = i("ANTIJOIN") _ arq() p:GroupGraphPattern() {
+            PartialGraphPattern::AntiJoin(p)
+        }
 
         // ARQ's `LET (?v := expr)` (`Assignment` in ARQ's grammar)
         rule Assignment() -> PartialGraphPattern = i("LET") _ arq() "(" _ v:Var() _ ":=" _ e:Expression() _ ")" {
@@ -2080,7 +2101,11 @@ parser! {
             v:iri() { v.into() } /
             "a" { rdf::TYPE.into_owned().into() } /
             "!" _ p:PathNegatedPropertySet() { p } /
-            "(" _ p:Path() _ ")" { p }
+            "(" _ p:Path() _ ")" { p } /
+            // ARQ's `distinct(path)`, `multi(path)` and `shortest(path)`
+            i("DISTINCT") _ "(" _ arq() p:Path() _ ")" { PropertyPathExpression::Distinct(Box::new(p)) } /
+            i("MULTI") _ "(" _ arq() p:Path() _ ")" { PropertyPathExpression::Multi(Box::new(p)) } /
+            i("SHORTEST") _ "(" _ arq() p:Path() _ ")" { PropertyPathExpression::Shortest(Box::new(p)) }
 
         rule PathNegatedPropertySet() -> PropertyPathExpression =
             "(" _ p:PathNegatedPropertySet_item() **<1,> ("|" _) ")" {

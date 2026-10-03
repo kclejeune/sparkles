@@ -2,7 +2,8 @@
 //!
 //! A node only where the path has structure: a plain IRI or `a` stays a token, `p*` is a
 //! `PathElt`, `^p` a `PathInverse`, `a/b` a `PathSequence`, `a|b` a `PathAlternative`,
-//! `!p` and `!(…)` a `PathNegated`, `(…)` a `PathBracketed`.
+//! `!p` and `!(…)` a `PathNegated`, `(…)` a `PathBracketed`, and ARQ's `distinct(…)`,
+//! `multi(…)` and `shortest(…)` a `PathFunction`.
 
 use super::Parser;
 use super::term;
@@ -96,8 +97,20 @@ fn path_range(p: &mut Parser<'_>) {
     p.expect(TokenKind::RBrace);
 }
 
-/// `PathPrimary ::= iri | 'a' | '!' PathNegatedPropertySet | '(' Path ')'`
+/// `PathPrimary ::= iri | 'a' | '!' PathNegatedPropertySet | '(' Path ')'`, and ARQ's
+/// `distinct(path)`, `multi(path)` and `shortest(path)`.
 fn path_primary(p: &mut Parser<'_>) -> bool {
+    if let Some(kw @ (Kw::Distinct | Kw::Multi | Kw::Shortest)) = p.current_kw()
+        && p.nth(1) == TokenKind::LParen
+    {
+        let m = p.start(NodeKind::PathFunction);
+        p.bump_as(TokenKind::Kw(kw));
+        p.bump();
+        path(p);
+        p.expect(TokenKind::RParen);
+        m.complete(p);
+        return false;
+    }
     match p.current() {
         TokenKind::Bang => {
             let m = p.start(NodeKind::PathNegated);

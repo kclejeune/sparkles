@@ -37,6 +37,16 @@ pub fn lateral(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     spaced(cx, n)
 }
 
+/// `SemiJoin`: `SEMIJOIN {`.
+pub fn semi_join(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
+    spaced(cx, n)
+}
+
+/// `AntiJoin`: `ANTIJOIN {`.
+pub fn anti_join(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
+    spaced(cx, n)
+}
+
 /// `Minus`: `MINUS {`.
 pub fn minus(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     spaced(cx, n)

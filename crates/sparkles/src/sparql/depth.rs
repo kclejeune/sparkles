@@ -183,7 +183,9 @@ impl Walk {
             GraphPattern::Join { left, right }
             | GraphPattern::Lateral { left, right }
             | GraphPattern::Union { left, right }
-            | GraphPattern::Minus { left, right } => {
+            | GraphPattern::Minus { left, right }
+            | GraphPattern::SemiJoin { left, right }
+            | GraphPattern::AntiJoin { left, right } => {
                 self.pattern(left, n).max(self.pattern(right, n))
             }
             GraphPattern::LeftJoin {
@@ -295,6 +297,9 @@ impl Walk {
             PropertyPathExpression::Sequence(a, b) | PropertyPathExpression::Alternative(a, b) => {
                 self.path(a, n).max(self.path(b, n))
             }
+            PropertyPathExpression::Distinct(a)
+            | PropertyPathExpression::Multi(a)
+            | PropertyPathExpression::Shortest(a) => self.path(a, n),
             // the planner unrolls up to 32 steps of a range into a chain of joins
             PropertyPathExpression::Range { path, min, .. } => {
                 self.path(path, n).saturating_add((*min).min(32) as usize)

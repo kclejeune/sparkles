@@ -237,7 +237,9 @@ fn assigned(p: &GraphPattern, out: &mut Vec<String>) {
         | G::Lateral { left, right }
         | G::LeftJoin { left, right, .. }
         | G::Union { left, right }
-        | G::Minus { left, right } => {
+        | G::Minus { left, right }
+        | G::SemiJoin { left, right }
+        | G::AntiJoin { left, right } => {
             assigned(left, out);
             assigned(right, out);
         }

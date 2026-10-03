@@ -42,10 +42,14 @@ export const KEYWORDS = [
   'OFFSET',
   'VALUES',
   'OPTIONAL',
-  // Jena ARQ's lateral join, assignment and UNFOLD
+  // Jena ARQ's lateral join, assignment, UNFOLD, half joins and path functions
   'LATERAL',
   'LET',
   'UNFOLD',
+  'SEMIJOIN',
+  'ANTIJOIN',
+  'MULTI',
+  'SHORTEST',
   'GRAPH',
   'SERVICE',
   'SILENT',

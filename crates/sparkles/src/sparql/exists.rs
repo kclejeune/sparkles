@@ -745,6 +745,7 @@ fn zero_length(p: &PropertyPathExpression) -> bool {
         PP::Sequence(a, b) | PP::Alternative(a, b) => zero_length(a) || zero_length(b),
         PP::ZeroOrMore(_) | PP::ZeroOrOne(_) => true,
         PP::Range { path, min, .. } => *min == 0 || zero_length(path),
+        PP::Distinct(a) | PP::Multi(a) | PP::Shortest(a) => zero_length(a),
     }
 }
 
@@ -800,7 +801,9 @@ pub(super) fn pure_pattern(gp: &GraphPattern) -> bool {
         GP::Join { left, right }
         | GP::Lateral { left, right }
         | GP::Union { left, right }
-        | GP::Minus { left, right } => pure_pattern(left) && pure_pattern(right),
+        | GP::Minus { left, right }
+        | GP::SemiJoin { left, right }
+        | GP::AntiJoin { left, right } => pure_pattern(left) && pure_pattern(right),
         GP::Graph { inner, .. }
         | GP::Distinct { inner }
         | GP::Reduced { inner }

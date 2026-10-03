@@ -508,6 +508,8 @@ pub fn node(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
             K::Filter => pattern::filter(cx, n),
             K::Bind => pattern::bind(cx, n),
             K::Let => pattern::assign(cx, n),
+            K::SemiJoin => pattern::semi_join(cx, n),
+            K::AntiJoin => pattern::anti_join(cx, n),
             K::Unfold => pattern::unfold(cx, n),
             K::InlineValues => values::inline_values(cx, n),
             K::ValuesRow => values::values_row(cx, n),
@@ -531,6 +533,7 @@ pub fn node(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
             K::PathInverse => path::path_inverse(cx, n),
             K::PathNegated => path::path_negated(cx, n),
             K::PathBracketed => path::path_bracketed(cx, n),
+            K::PathFunction => path::path_function(cx, n),
             // expressions
             K::OrChain => expr::or_chain(cx, n),
             K::AndChain => expr::and_chain(cx, n),
@@ -610,6 +613,8 @@ impl CommentRules for SparqlRules {
                 | K::Bind
                 | K::Let
                 | K::Unfold
+                | K::SemiJoin
+                | K::AntiJoin
                 | K::InlineValues
                 | K::SubSelect
                 | K::QuadsGraph

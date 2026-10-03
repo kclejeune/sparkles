@@ -25,6 +25,13 @@ pub enum PropertyPathExpression {
         /// `None` for the unbounded forms
         max: Option<u64>,
     },
+    /// Jena ARQ's `distinct(path)`: the pairs of nodes the path connects, each once.
+    Distinct(Box<Self>),
+    /// Jena ARQ's `multi(path)`: the path with every `*`, `+` and `?` inside it counting
+    /// the ways through the graph, as the ranges `{*}`, `{+}` and `{0,1}` do.
+    Multi(Box<Self>),
+    /// Jena ARQ's `shortest(path)`, which ARQ parses but does not evaluate.
+    Shortest(Box<Self>),
 }
 
 impl PropertyPathExpression {
@@ -84,6 +91,21 @@ impl PropertyPathExpression {
                 path.fmt_sse(f)?;
                 f.write_str(")")
             }
+            Self::Distinct(p) => {
+                f.write_str("(distinct ")?;
+                p.fmt_sse(f)?;
+                f.write_str(")")
+            }
+            Self::Multi(p) => {
+                f.write_str("(multi ")?;
+                p.fmt_sse(f)?;
+                f.write_str(")")
+            }
+            Self::Shortest(p) => {
+                f.write_str("(shortest ")?;
+                p.fmt_sse(f)?;
+                f.write_str(")")
+            }
         }
     }
 }
@@ -115,6 +137,9 @@ impl fmt::Display for PropertyPathExpression {
                 (n, Some(m)) => write!(f, "({path}){{{n},{m}}}"),
                 (n, None) => write!(f, "({path}){{{n},}}"),
             },
+            Self::Distinct(p) => write!(f, "distinct({p})"),
+            Self::Multi(p) => write!(f, "multi({p})"),
+            Self::Shortest(p) => write!(f, "shortest({p})"),
         }
     }
 }
@@ -665,6 +690,13 @@ pub enum GraphPattern {
         variable: Variable,
         expression: Expression,
     },
+    /// Jena ARQ's `SEMIJOIN { … }`: the solutions of `left` that are compatible with at
+    /// least one solution of `right`, each once and unchanged.
+    SemiJoin { left: Box<Self>, right: Box<Self> },
+    /// Jena ARQ's `ANTIJOIN { … }`: the solutions of `left` that are compatible with no
+    /// solution of `right`. Unlike MINUS, a solution of `right` that shares no variable
+    /// with one of `left` is compatible with it.
+    AntiJoin { left: Box<Self>, right: Box<Self> },
     /// Jena ARQ's `UNFOLD(expr AS ?v1, ?v2)`: one solution per element of the
     /// `cdt:List` literal, or per entry of the `cdt:Map` literal, that `expression`
     /// evaluates to. `variable` gets the element or key, `second` the position or value.
@@ -734,6 +766,8 @@ impl fmt::Display for GraphPattern {
                     | Self::Extend { .. }
                     | Self::Assign { .. }
                     | Self::Unfold { .. }
+                    | Self::SemiJoin { .. }
+                    | Self::AntiJoin { .. }
                     | Self::Filter { .. } => {
                         // The second block might be considered as a modification of the first one.
                         write!(f, "{left} {{ {right} }}")
@@ -796,6 +830,8 @@ impl fmt::Display for GraphPattern {
                 None => write!(f, "{inner} UNFOLD({expression} AS {variable})"),
             },
             Self::Minus { left, right } => write!(f, "{left} MINUS {{ {right} }}"),
+            Self::SemiJoin { left, right } => write!(f, "{left} SEMIJOIN {{ {right} }}"),
+            Self::AntiJoin { left, right } => write!(f, "{left} ANTIJOIN {{ {right} }}"),
             Self::Service {
                 name,
                 inner,
@@ -990,6 +1026,20 @@ impl GraphPattern {
                 right.fmt_sse(f)?;
                 f.write_str(")")
             }
+            Self::SemiJoin { left, right } => {
+                f.write_str("(semijoin ")?;
+                left.fmt_sse(f)?;
+                f.write_str(" ")?;
+                right.fmt_sse(f)?;
+                f.write_str(")")
+            }
+            Self::AntiJoin { left, right } => {
+                f.write_str("(antijoin ")?;
+                left.fmt_sse(f)?;
+                f.write_str(" ")?;
+                right.fmt_sse(f)?;
+                f.write_str(")")
+            }
             Self::Service {
                 name,
                 inner,
@@ -1167,7 +1217,9 @@ impl GraphPattern {
                 }
                 inner.lookup_in_scope_variables(callback);
             }
-            Self::Minus { left, .. } => left.lookup_in_scope_variables(callback),
+            Self::Minus { left, .. }
+            | Self::SemiJoin { left, .. }
+            | Self::AntiJoin { left, .. } => left.lookup_in_scope_variables(callback),
             Self::Group {
                 variables,
                 aggregates,
@@ -1221,6 +1273,8 @@ impl GraphPattern {
             }
             Self::Join { left, right }
             | Self::Minus { left, right }
+            | Self::SemiJoin { left, right }
+            | Self::AntiJoin { left, right }
             | Self::Union { left, right } => {
                 left.lookup_used_variables(callback);
                 right.lookup_used_variables(callback);

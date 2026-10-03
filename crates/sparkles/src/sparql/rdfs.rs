@@ -381,7 +381,9 @@ impl Rewriter<'_> {
             G::Join { left, right }
             | G::Lateral { left, right }
             | G::Union { left, right }
-            | G::Minus { left, right } => {
+            | G::Minus { left, right }
+            | G::SemiJoin { left, right }
+            | G::AntiJoin { left, right } => {
                 self.walk(left);
                 self.walk(right);
             }
@@ -793,6 +795,8 @@ impl Rewriter<'_> {
                 self.path_changes(a, top) || self.path_changes(b, top)
             }
             P::ZeroOrMore(x) | P::OneOrMore(x) | P::ZeroOrOne(x) => self.path_changes(x, false),
+            P::Distinct(x) | P::Shortest(x) => self.path_changes(x, top),
+            P::Multi(x) => self.path_changes(&super::plan::counted(x), top),
             // a short range is rewritten as its sequences, so its links count as at the top
             P::Range { path: x, max, .. } => {
                 self.path_changes(x, top && max.is_some_and(|m| m <= RANGE_UNROLL))
@@ -833,6 +837,24 @@ impl Rewriter<'_> {
             P::Alternative(a, b) => GraphPattern::Union {
                 left: Box::new(self.path(s, a, o)),
                 right: Box::new(self.path(s, b, o)),
+            },
+            // the pairs of the rewritten path, each once
+            P::Distinct(x) => {
+                let mut vars = Vec::new();
+                collect_vars(s, &mut vars);
+                collect_vars(o, &mut vars);
+                GraphPattern::Distinct {
+                    inner: Box::new(GraphPattern::Project {
+                        inner: Box::new(self.path(s, x, o)),
+                        variables: dedup(vars),
+                    }),
+                }
+            }
+            P::Multi(x) => self.path(s, &super::plan::counted(x), o),
+            P::Shortest(_) => GraphPattern::Path {
+                subject: s.clone(),
+                path: path.clone(),
+                object: o.clone(),
             },
             P::NegatedPropertySet(list) => {
                 let f = self.fresh();
@@ -930,6 +952,9 @@ impl Rewriter<'_> {
                 min: *min,
                 max: *max,
             },
+            P::Distinct(x) => P::Distinct(b(x)),
+            P::Multi(x) => P::Multi(b(x)),
+            P::Shortest(x) => P::Shortest(b(x)),
         }
     }
 }
@@ -1137,7 +1162,9 @@ fn blank_to_var(gp: &mut GraphPattern) {
         G::Join { left, right }
         | G::Lateral { left, right }
         | G::Union { left, right }
-        | G::Minus { left, right } => {
+        | G::Minus { left, right }
+        | G::SemiJoin { left, right }
+        | G::AntiJoin { left, right } => {
             blank_to_var(left);
             blank_to_var(right);
         }

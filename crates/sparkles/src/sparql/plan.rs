@@ -295,6 +295,11 @@ pub enum Kind {
         expr: Option<Expr>,
     },
     Minus,
+    /// ARQ's SEMIJOIN (`anti`: ANTIJOIN): the rows of child 0 compatible with a row of
+    /// child 1 (with none)
+    HalfJoin {
+        anti: bool,
+    },
     Union,
     Filter(Vec<Expr>),
     Extend(VarId, Expr),
@@ -499,6 +504,8 @@ impl Node {
             } => "CartesianProduct",
             Kind::LeftJoin { .. } => "OptionalJoin",
             Kind::Minus => "Minus",
+            Kind::HalfJoin { anti: false } => "SemiJoin",
+            Kind::HalfJoin { anti: true } => "AntiJoin",
             Kind::Union => "Union",
             Kind::Filter(_) => "Filter",
             Kind::Extend(..) => "Bind",
@@ -778,6 +785,31 @@ impl<'a> Planner<'a> {
                     }
                 }
                 Ok(union(children))
+            }
+            GP::SemiJoin { left, right } | GP::AntiJoin { left, right } => {
+                // the left side's solutions are kept unchanged, so a filter over the
+                // result is a filter over the left side
+                let anti = matches!(gp, GP::AntiJoin { .. });
+                let l = self.plan(left, g, filters)?;
+                let r = self.plan(right, g, Vec::new())?;
+                if l.is_empty() || (r.is_empty() && anti) {
+                    return Ok(l);
+                }
+                if r.is_empty() {
+                    return Ok(Node::empty(l.vars.clone()));
+                }
+                let shared: Vec<String> = l
+                    .vars
+                    .iter()
+                    .filter(|v| r.vars.contains(v))
+                    .map(|v| format!("?{}", self.ctx.var_name(*v)))
+                    .collect();
+                let desc = format!("on {}", shared.join(" "));
+                let mut n = Node::unary(Kind::HalfJoin { anti }, l, desc);
+                n.est = (n.est * 0.5).max(1.0);
+                n.cost += r.cost + r.est;
+                n.children.push(r);
+                Ok(n)
             }
             GP::Minus { left, right } => {
                 let l = self.plan(left, g, filters)?;
@@ -1182,7 +1214,7 @@ impl<'a> Planner<'a> {
             } => {
                 let s = self.term_pattern(subject);
                 let o = self.term_pattern(object);
-                self.collect_path(s, path, o, g, items);
+                self.collect_path(s, path, o, g, items)?;
                 items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
             GP::Join { left, right } => {
@@ -1280,9 +1312,35 @@ impl<'a> Planner<'a> {
         o: PT,
         g: &ActiveGraph,
         items: &mut Vec<Item>,
-    ) {
+    ) -> Result<()> {
         use PropertyPathExpression as PP;
         match path {
+            // ARQ's `multi(path)`: the path with its closures counting walks
+            PP::Multi(p) => return self.collect_path(s, &counted(p), o, g, items),
+            // ARQ's `distinct(path)`: the pairs the path connects, each once
+            PP::Distinct(p) => {
+                let mut sub = Vec::new();
+                self.collect_path(s, p, o, g, &mut sub)?;
+                let node = self.plan_group(sub, Vec::new())?;
+                let mut vars = Vec::new();
+                for x in [s, o] {
+                    if let PT::V(v) = x
+                        && !vars.contains(&v)
+                    {
+                        vars.push(v);
+                    }
+                }
+                let n = project(node, vars, self.ctx);
+                let mut d = Node::unary(Kind::Distinct, n, "distinct(path)".into());
+                d.est = d.children[0].est;
+                items.push(Item::Node(d));
+                return Ok(());
+            }
+            PP::Shortest(_) => {
+                return Err(Error::invalid(
+                    "shortest(…) paths are not implemented (ARQ does not evaluate them either)",
+                ));
+            }
             PP::NamedNode(n) => items.push(Item::Triple(Triple {
                 t: [
                     s,
@@ -1291,11 +1349,11 @@ impl<'a> Planner<'a> {
                 ],
                 graph: g.clone(),
             })),
-            PP::Reverse(p) => self.collect_path(o, p, s, g, items),
+            PP::Reverse(p) => self.collect_path(o, p, s, g, items)?,
             PP::Sequence(a, b) => {
                 let mid = PT::V(self.ctx.fresh_var());
-                self.collect_path(s, a, mid, g, items);
-                self.collect_path(mid, b, o, g, items);
+                self.collect_path(s, a, mid, g, items)?;
+                self.collect_path(mid, b, o, g, items)?;
             }
             // ARQ's PathCompiler: `p{n,m}` with n ≥ 1 is n steps of p, then p{0,m-n}
             // (p{*} when unbounded); the steps are joined like a sequence's
@@ -1307,7 +1365,7 @@ impl<'a> Planner<'a> {
                     } else {
                         PT::V(self.ctx.fresh_var())
                     };
-                    self.collect_path(from, path, to, g, items);
+                    self.collect_path(from, path, to, g, items)?;
                     from = to;
                 }
                 if *max != Some(*min) {
@@ -1331,6 +1389,7 @@ impl<'a> Planner<'a> {
                 graph: g.clone(),
             })),
         }
+        Ok(())
     }
 
     /// A `spk:vectorSearch` call as a search leaf:
@@ -2514,7 +2573,7 @@ impl<'a> Planner<'a> {
                 let mut branches = Vec::new();
                 for a in alts {
                     let mut items = Vec::new();
-                    self.collect_path(p.s, a, p.o, &p.graph, &mut items);
+                    self.collect_path(p.s, a, p.o, &p.graph, &mut items)?;
                     branches.push(self.plan_group(items, Vec::new())?);
                 }
                 return Ok(join(left, union(branches), self.ctx));
@@ -2544,7 +2603,7 @@ impl<'a> Planner<'a> {
             }
             _ => {
                 let mut items = Vec::new();
-                self.collect_path(p.s, &p.path, p.o, &p.graph, &mut items);
+                self.collect_path(p.s, &p.path, p.o, &p.graph, &mut items)?;
                 let n = self.plan_group(items, Vec::new())?;
                 return Ok(join(left, n, self.ctx));
             }
@@ -2579,7 +2638,7 @@ impl<'a> Planner<'a> {
             _ => {
                 let (a, b) = (self.ctx.fresh_var(), self.ctx.fresh_var());
                 let mut items = Vec::new();
-                self.collect_path(PT::V(a), inner, PT::V(b), &p.graph, &mut items);
+                self.collect_path(PT::V(a), inner, PT::V(b), &p.graph, &mut items)?;
                 let edges = self.plan_group(items, Vec::new())?;
                 let mut keep = vec![a, b];
                 if let Some(g) = gvar {
@@ -4308,7 +4367,10 @@ fn certain_names(gp: &GraphPattern, out: &mut Vec<String>) {
             certain_names(left, out);
             certain_names(right, out);
         }
-        GP::LeftJoin { left, .. } | GP::Minus { left, .. } => certain_names(left, out),
+        GP::LeftJoin { left, .. }
+        | GP::Minus { left, .. }
+        | GP::SemiJoin { left, .. }
+        | GP::AntiJoin { left, .. } => certain_names(left, out),
         GP::Filter { inner, .. }
         | GP::Distinct { inner }
         | GP::Reduced { inner }
@@ -4343,6 +4405,42 @@ fn certain_names(gp: &GraphPattern, out: &mut Vec<String>) {
             let _ = variables;
         }
         _ => {}
+    }
+}
+
+/// ARQ's `multi(path)`: `path` with each `*`, `+` and `?` as the counted range `{*}`,
+/// `{+}` or `{0,1}`. A `distinct(…)` inside keeps its set semantics.
+pub(super) fn counted(p: &PropertyPathExpression) -> PropertyPathExpression {
+    use PropertyPathExpression as PP;
+    let b = |x: &PropertyPathExpression| Box::new(counted(x));
+    match p {
+        PP::ZeroOrMore(x) => PP::Range {
+            path: b(x),
+            min: 0,
+            max: None,
+        },
+        PP::OneOrMore(x) => PP::Range {
+            path: b(x),
+            min: 1,
+            max: None,
+        },
+        PP::ZeroOrOne(x) => PP::Range {
+            path: b(x),
+            min: 0,
+            max: Some(1),
+        },
+        PP::Range { path, min, max } => PP::Range {
+            path: b(path),
+            min: *min,
+            max: *max,
+        },
+        PP::Reverse(x) => PP::Reverse(b(x)),
+        PP::Sequence(x, y) => PP::Sequence(b(x), b(y)),
+        PP::Alternative(x, y) => PP::Alternative(b(x), b(y)),
+        PP::Multi(x) => counted(x),
+        PP::NamedNode(_) | PP::NegatedPropertySet(_) | PP::Distinct(_) | PP::Shortest(_) => {
+            p.clone()
+        }
     }
 }
 
@@ -4405,7 +4503,9 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
             GP::Join { left, right }
             | GP::Lateral { left, right }
             | GP::Union { left, right }
-            | GP::Minus { left, right } => {
+            | GP::Minus { left, right }
+            | GP::SemiJoin { left, right }
+            | GP::AntiJoin { left, right } => {
                 walk(left, out);
                 walk(right, out);
             }

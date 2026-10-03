@@ -1,6 +1,6 @@
 //! Group graph patterns and their elements: triples statements, `OPTIONAL`, `MINUS`,
 //! `UNION`, `GRAPH`, `SERVICE`, `FILTER`, `BIND`, `VALUES`, subqueries and Jena ARQ's
-//! `LATERAL`, `LET` and `UNFOLD`.
+//! `LATERAL`, `LET`, `UNFOLD`, `SEMIJOIN` and `ANTIJOIN`.
 //!
 //! The shapes: a `GroupGraphPattern` holds `{`, then either a `SubSelect` or its
 //! elements, then `}`. A nested group, alone or in a `UNION` chain, is a `Union` of
@@ -58,6 +58,8 @@ fn at_pattern_not_triples(p: &Parser<'_>) -> bool {
                     | Kw::Lateral
                     | Kw::Let
                     | Kw::Unfold
+                    | Kw::Semijoin
+                    | Kw::Antijoin
                     | Kw::Minus
                     | Kw::Graph
                     | Kw::Service
@@ -94,6 +96,8 @@ fn graph_pattern_not_triples(p: &mut Parser<'_>) {
         Kw::Lateral => NodeKind::Lateral,
         Kw::Let => NodeKind::Let,
         Kw::Unfold => NodeKind::Unfold,
+        Kw::Semijoin => NodeKind::SemiJoin,
+        Kw::Antijoin => NodeKind::AntiJoin,
         Kw::Minus => NodeKind::Minus,
         Kw::Graph => NodeKind::GraphPattern,
         Kw::Service => NodeKind::Service,
@@ -104,7 +108,9 @@ fn graph_pattern_not_triples(p: &mut Parser<'_>) {
     let m = p.start(kind);
     p.bump_as(TokenKind::Kw(kw));
     match kw {
-        Kw::Optional | Kw::Lateral | Kw::Minus => group_graph_pattern(p),
+        Kw::Optional | Kw::Lateral | Kw::Minus | Kw::Semijoin | Kw::Antijoin => {
+            group_graph_pattern(p)
+        }
         Kw::Graph => {
             term::var_or_iri(p);
             group_graph_pattern(p);

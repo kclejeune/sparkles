@@ -229,7 +229,9 @@ fn uses_service(p: &GraphPattern) -> bool {
         GraphPattern::Join { left, right }
         | GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => uses_service(left) || uses_service(right),
+        | GraphPattern::Minus { left, right }
+        | GraphPattern::SemiJoin { left, right }
+        | GraphPattern::AntiJoin { left, right } => uses_service(left) || uses_service(right),
         GraphPattern::Filter { inner, .. }
         | GraphPattern::Graph { inner, .. }
         | GraphPattern::Extend { inner, .. }
