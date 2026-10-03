@@ -1,12 +1,16 @@
 # G06: Jena ARQ's query language extensions
 
-> **Status:** implemented in part
+> **Status:** implemented
 >
 > **Phases:** Phase 1 shipped on 2026-10-02: `LATERAL`, property path ranges and
 > CONSTRUCT templates with `GRAPH`. Phase 2 shipped on 2026-10-02: configurable DESCRIBE
-> (§11). The rest of ARQ's function library is a later phase and will extend this spec.
+> (§11). Phase 3 shipped on 2026-10-03: `LET`, the composite datatypes with `FOLD` and
+> `UNFOLD`, the property function library, the rest of the function library, `SEMIJOIN`,
+> `ANTIJOIN` and ARQ's other path forms (§12).
 >
 > **User docs:** [API: ARQ syntax extensions](../API.md#arq-syntax-extensions) ·
+> [API: extension functions](../API.md#extension-functions-and-aggregates) ·
+> [API: property functions](../API.md#arqs-property-functions) ·
 > [API: DESCRIBE](../API.md#describe) ·
 > [Features](../FEATURES.md#sparql-arq-equivalent) ·
 > [Comparison with Jena](../COMPARISON.md#vs-apache-jena--fuseki)
@@ -527,6 +531,206 @@ node.
   one named graph into another along blank nodes, which Jena never does, and the stored
   default graph would be left out.
 
+## 12. Phase 3: the rest of ARQ's language and library
+
+This section was added for Phase 3. Its sources are ARQ's grammar (`main.jj`:
+`Assignment`, `Unfold`, `SemiJoinGraphPattern`, `AntiJoinGraphPattern`, the `FOLD`
+aggregate and the `PathPrimary` and `PathSequence` forms), `AlgebraGenerator`,
+`SyntaxVarScope`, `QueryIterAssign`, `QueryIterUnfold`, `QueryIterHalfJoin`, the
+`org.apache.jena.cdt` package with `NVCompare` and `ValueSpace`, the aggregators
+`AggFoldList` and `AggFoldMap`, the function library `CDTLiteralFunctions`, the
+property functions of `org.apache.jena.sparql.pfunction.library` with `GraphList`,
+`StandardFunctions` and the classes of `org.apache.jena.sparql.function.library`,
+`XSDFuncOp` and `NodeValueOps`, and the path engines `PathEngine1` and `PathEngineN`. The
+tests are ARQ's `testing/ARQ` (`Syntax-ARQ`, `PropertyFunctions`) and Jena's
+`testing/SPARQL-CDTs`, and Jena 6.2.0's `arq` command gave the answers for the rest.
+
+### 12.1 Goals
+
+* `LET`, `UNFOLD`, `FOLD`, `SEMIJOIN`, `ANTIJOIN` and the path forms `distinct(…)`,
+  `multi(…)`, `shortest(…)` and `:p^:q` parse behind the `arq()` guard of §2 and give
+  ARQ's answers.
+* The composite datatypes `cdt:List` and `cdt:Map` have Jena's lexical forms, equality,
+  order and 16 functions, and Jena's SPARQL-CDTs suite passes apart from listed cases.
+* ARQ's property function library runs as ordinary operators, with ARQ's answers.
+* Every function of Jena's `FunctionRegistry` that does not need a JavaScript engine or
+  ARQ's execution context is implemented.
+* Queries without these forms plan exactly as before.
+
+Non-goals:
+* JavaScript functions (`js:`), which need a JavaScript engine.
+* `afn:context`, which reads ARQ's execution context, and the Leviathan library
+  (`lfn:`), which is not part of ARQ's `afn:` and `fn:` libraries.
+* `rdfs:member` as a property function. ARQ registers it, which changes what a query
+  over `rdfs:member` means, and the container functions `apf:bag`, `apf:seq`,
+  `apf:alt` and `apf:container` with it.
+* The `JSON` query form and ARQ's `EXISTS { … }` group element.
+
+### 12.2 Syntax and algebra
+
+The vendored spargebra gains these forms.
+
+| Syntax | Algebra | SSE |
+|---|---|---|
+| `LET (?v := e)` | `GraphPattern::Assign { inner, variable, expression }` | `(assign ((?v e)) …)` |
+| `UNFOLD(e AS ?v, ?w)` | `GraphPattern::Unfold { inner, expression, variable, second }` | `(unfold (e ?v ?w) …)` |
+| `SEMIJOIN { … }` | `GraphPattern::SemiJoin { left, right }` | `(semijoin L R)` |
+| `ANTIJOIN { … }` | `GraphPattern::AntiJoin { left, right }` | `(antijoin L R)` |
+| `FOLD(DISTINCT? e, f ORDER BY …)` | `AggregateExpression::Fold { expr, value, distinct, order }` | `(fold e f (order …))` |
+| `distinct(p)`, `multi(p)`, `shortest(p)` | `PropertyPathExpression::Distinct`, `Multi`, `Shortest` | `(distinct p)` … |
+| `:p^:q` | `Sequence(:p, Reverse(:q))` | `(seq :p (reverse :q))` |
+
+`LET` may assign a variable that is in scope, as ARQ's `SyntaxVarScope` allows. Neither
+variable of `UNFOLD` may be in scope (ARQ's `checkUNFOLD`). The in-scope variables of a
+half join are those of its left side. The check against nested aggregates covers every
+expression of `FOLD`.
+
+### 12.3 `LET`
+
+ARQ's `QueryIterAssign` evaluates the expression per solution. An error leaves the
+solution as it is. An unbound variable takes the value. A bound one keeps the solution
+when its value is the same value as the expression's (`Node.sameValueAs`, under which
+`1` and `1.0` are the same and `1` and `1e0` are not) and drops it otherwise. The
+planner plans a `LET` of a variable that the pattern before it cannot bind as `BIND`, so
+those plans are `Extend`. Any other `LET` is a `Let` operator that computes the column
+and compares it where the variable is bound.
+
+### 12.4 Composite datatypes, `FOLD` and `UNFOLD`
+
+A `cdt:List` or `cdt:Map` literal keeps its lexical form in the store, and a new module
+parses it when an operation needs its value. The grammar is Jena's `cdt_literals.jj`:
+IRIs, blank nodes, literals in Turtle's syntax without prefixes, numbers, booleans,
+`null` and nested lists and maps, with distinct IRI or literal keys in a map. A literal
+that does not parse is ill-formed, and only the same literal equals it.
+
+* `=` is `CompositeDatatypeList.isEqual` and its map form, element by element with
+  `Node.sameValueAs`. Two different blank nodes cannot be compared, which is an error.
+* `<` is the proposal's list-less-than and map-less-than: element by element, by the
+  elements' `<` and `=`, an empty list first and then by length. A `null` against a value
+  is an error.
+* ORDER BY uses the same walk with ORDER BY's order of the elements, `null` first, and
+  breaks ties by lexical form. Lists and maps sort after the other literals.
+* The functions are those of `CDTLiteralFunctions`, with Jena's argument checks and
+  errors. A function that returns its argument unchanged, such as `cdt:put` of an entry
+  that is there, returns the same term.
+
+Values built by functions, `FOLD` and `UNFOLD` are written canonically: `, ` between
+elements, terms as Turtle writes them without prefixes, and a map's entries in key order
+(`CDTKeySorter`). Jena writes a map in hash order, so lexical forms can differ and values
+cannot.
+
+`FOLD` is an aggregate of the group operator. It sorts the group's rows by its ORDER BY
+with ORDER BY's order, then folds the values into a list (errors become `null`, and
+`DISTINCT` keeps the first of equal terms and one `null`) or into a map (rows whose key is
+an error or a blank node are skipped, and a later row replaces a value). An empty group
+gives an empty list or map. `UNFOLD` is an operator over its input's rows that parses the
+literal of each distinct value once. It gives one row per element (with the position
+from 1) or per entry (with the value), leaves a `null` unbound, gives no rows for an empty
+list or map, and keeps the row once with both variables unbound for any other value or an
+error, as `QueryIterUnfold` does.
+
+### 12.5 Property functions
+
+ARQ's library is `list:member`, `list:index` and `list:length` in `list:`, and
+`apf:strSplit`, `apf:concat`, `apf:str`, `apf:splitIRI` (`apf:splitURI`),
+`apf:assign`, `apf:bnode` (`apf:blankNode`) and the list functions under their class
+names in `apf:`, with the old `jena.hpl.hp.com` namespaces too. Jena's documentation
+lists `apf:versionARQ`, which Jena 6 no longer has. Sparkles binds `<urn:x-sparkles:>`
+and its own version to it.
+
+ARQ evaluates a property function per solution of the patterns before it in its basic
+graph pattern, with their values substituted. The planner takes the calls out of each
+basic graph pattern, with their list arguments, and notes which of the variables a call
+reads (its list for the list functions, its arguments for `apf:strSplit`, `apf:concat`
+and `apf:str`) are bound by the group's earlier elements or by earlier patterns of the
+same basic graph pattern. A call that reads none of them is a leaf of the join order,
+which for the list functions with an unbound list enumerates the heads of all lists, as
+`GraphList.findAllLists` does. A call that reads some is attached to the rest of the
+group. It solves each distinct substitution of what it reads once, and keeps each
+solution that agrees with the row on every variable the row binds. Reading only the
+variables bound before the call gives ARQ's order-dependent answers in a planner that
+reorders joins: `?l list:member 4 . ?x :p ?l` finds the heads of the lists that hold 4,
+not the cells.
+
+An OPTIONAL whose right side calls a function that reads a variable of the left side is
+evaluated per left row, as ARQ substitutes into an OPTIONAL's right side. The `Lateral`
+operator of §3.3 gains an optional mode for it, which keeps a left row without solutions
+and applies the OPTIONAL's filter. Lists are read per named graph: a basic graph pattern
+with calls is never a simple `GRAPH ?g` group.
+
+The list walks follow `GraphList`: a node is a list when it is `rdf:nil` or has an
+`rdf:rest`, members are the `rdf:first` objects along `rdf:rest`, `list:index` counts
+from 0 and finds a member's first position only, and `list:length` of a constant length
+with an unbound list has no solutions. A walk stops at a cycle.
+
+### 12.6 Functions
+
+The registry diff adds `fn:format-number`, `fn:collation-key` and `fn:apply`, and
+`afn:sprintf`, `afn:system-timezone`, `afn:nowtz`, `afn:version`, `afn:collation`,
+`afn:eval`, `afn:print`, `afn:execTime` and `afn:wait`.
+
+* `afn:sprintf` formats as `String.format`, with ARQ's mapping of terms to Java values
+  in `XSDFuncOp.javaSprintf`, including its oddities: a language-tagged string is passed
+  as its tag, and an IRI as a quoted string. `%f` and `%e` round the shortest decimal
+  digits half up, as Java's `Formatter` does.
+* `fn:format-number` is `DecimalFormat` with the picture as its pattern, as ARQ
+  implements it, and the third argument as a language tag for the symbols.
+* `fn:apply` and `afn:eval` call an extension function or cast by IRI.
+* `afn:collation` returns its string. Ordering by a locale's collator would need a
+  collation library and a value kind for sort keys.
+* `afn:print` and `afn:execTime` return `true` without printing.
+* `afn:localname` and `afn:namespace` change to Jena's split of an IRI
+  (`SplitIRI.splitXML`), which `apf:splitIRI` uses too.
+
+`NodeValueOps` defines `+`, `-`, `*` and `/` on dates, times and durations beyond
+SPARQL's. Sparkles adds a date or time plus or minus a duration, the difference of two
+times, sums of durations of different kinds, a duration times or divided by a number and
+the ratio of two durations, keeping `xsd:dayTimeDuration` where F&O 3.1 does.
+
+### 12.7 Half joins and path forms
+
+`SemiJoin` and `AntiJoin` are operators over both sides' tables, which hash the right
+side on the shared variables and fall back to a compatibility scan for rows with unbound
+shared variables. As in `QueryIterHalfJoin`, a right row that shares no variable with a
+left row is compatible with it, unlike in MINUS. Filters over a half join are pushed into
+its left side, whose rows it keeps unchanged.
+
+`PathEngine1` gives `distinct(p)` a set of end nodes per start node, so the planner plans
+it as the distinct pairs of `p`. `PathEngineN` counts walks, so `multi(p)` is `p` with its
+`*`, `+` and `?` replaced by the counted ranges `{*}`, `{+}` and `{0,1}` of §4. ARQ throws
+"not implemented" for `shortest(p)`, and the planner refuses it.
+
+### 12.8 Acceptance examples
+
+* **A18.** Jena's SPARQL-CDTs suite runs with the W3C harness, with the cases Sparkles
+  answers otherwise listed with their reasons.
+* **A19.** ARQ's `PropertyFunctions` tests run with the W3C harness, with the container
+  tests listed.
+* **A20.** ARQ's `syntax-let-*` tests parse or fail as in ARQ, and `LET` over bound,
+  unbound and failed values gives Jena 6.2.0's answers.
+* **A21.** `FOLD` with ORDER BY and `UNFOLD` of the result give Jena 6.2.0's answers.
+* **A22.** `SEMIJOIN`, `ANTIJOIN`, `distinct(…)`, `multi(…)` and `:p^:q` give Jena
+  6.2.0's answers, including an antijoin with no shared variables.
+* **A23.** `afn:sprintf`, `fn:format-number`, `fn:apply`, `afn:localname` and the
+  temporal operators give Jena 6.2.0's strings and values.
+* **A24.** The benchmark's queries get the same plans as before.
+* **A25.** The W3C SPARQL suites still pass 482/328/157/269.
+
+### 12.9 Rejected alternatives
+
+* **Rewriting `LET` as `BIND` with a filter.** `Extend` cannot rebind a variable, and a
+  filter after a fresh variable needs a rename of every later use.
+* **A value kind for composite literals.** Parsing the lexical form when an operation
+  needs it keeps the store, the dictionary and the result writers unchanged. Queries
+  that touch lists parse them, which costs a few microseconds per literal.
+* **Property functions as row-at-a-time callbacks.** ARQ calls a function per binding.
+  Solving each distinct substitution once in an operator gives the same answers and lets
+  a call that reads nothing take part in the join order.
+* **Reading every variable the group binds into a call.** It would be simpler, but it
+  changes ARQ's answers wherever a call comes before the pattern that binds its list.
+* **`rdfs:member` as ARQ's container function.** It is ARQ's default, but it changes the
+  answers and plans of queries that use `rdfs:member` as a property.
+
 ## Outcome
 
 **Delivered.** Phase 1 landed on 2026-10-02 as designed in §2 to §6:
@@ -645,3 +849,64 @@ scan per described triple. `scbd` adds one object-prefix scan per node.
 **Phase 2, not built.** Handlers registered by users, the inverse functional form of the
 submission, DESCRIBE options in Python, in Python transactions and in the remote
 client, and a UI control for the setting.
+
+**Phase 3, delivered.** The rest of ARQ's language and library landed on 2026-10-03 as
+§12 designs it:
+- `LET` (`GraphPattern::Assign`, planned as `BIND` or a `Let` operator), `UNFOLD`
+  (`GraphPattern::Unfold` and an `Unfold` operator), `FOLD`
+  (`AggregateExpression::Fold`), `SEMIJOIN` and `ANTIJOIN` (`SemiJoin` and `AntiJoin`
+  operators), and the paths `distinct(…)`, `multi(…)`, `shortest(…)` (refused) and
+  `:p^:q`, all behind the `arq()` guard;
+- `sparql/cdt.rs` with the lexical forms, equality, order and the 16 `cdt:` functions;
+- `sparql/arqpf.rs` with the `list:` and `apf:` property functions as a
+  `PropertyFunction` operator, and the optional mode of `Lateral` for OPTIONALs whose
+  calls read the left side;
+- `sparql/fnformat.rs` with `afn:sprintf` and `fn:format-number`, and the other new
+  functions and temporal operators in `expr.rs` and `fnlib.rs`;
+- the service description lists the `cdt:` functions and the property functions, the
+  formatter parses and prints every new form, and the editor knows the keywords and
+  offers the `cdt:`, `list:` and `apf:` names after their prefixes.
+
+**Phase 3, deviations and decisions.**
+- A blank node label in a CDT literal names a blank node of the query that reads it.
+  Jena's loader also relates it to the data file's blank nodes, which Sparkles does not,
+  so 11 of the suite's blank node tests fail. Two more fail because Sparkles stores
+  `"01"^^xsd:integer` as `1`.
+- The property functions read only the variables bound before the call. A call with an
+  unbound list therefore lists heads even when a later pattern binds the list, as in ARQ.
+- `apf:concat` with a bound subject compares it with the concatenation, where ARQ fails.
+  `apf:versionARQ`, missing from Jena 6, binds `<urn:x-sparkles:>` and the Sparkles
+  version, and `afn:version` returns the Sparkles version.
+- `afn:sprintf` conversions that Java refuses are expression errors, where ARQ fails the
+  whole query. `%c` is always an error, as Java takes no `BigInteger` for it.
+- `fn:format-number` knows the separators of the common European languages and uses the
+  root locale's for other tags.
+- `afn:collation` orders by code point, and `afn:print` and `afn:execTime` print nothing.
+- A day-time duration times or divided by a number, and the difference of two times,
+  stay `xsd:dayTimeDuration`, where ARQ gives `xsd:duration`. A number times a duration
+  and a year-month duration times a number are defined as in F&O 3.1.
+- `afn:localname` and `afn:namespace` now split as Jena does, which changes their
+  answers for IRIs whose last segment starts with a digit or holds a character that an
+  XML name cannot.
+- The query builder has no methods for the Phase 3 forms.
+
+**Phase 3, tests.** Jena's `SPARQL-CDTs` (655 tests) and ARQ's `PropertyFunctions` (48)
+are vendored in `testsuite/jena-arq` with Jena's license and run from `tests/w3c.rs`:
+642 and 39 pass, and the 13 and 9 others are listed with their reasons in
+`expected-failures.txt` (A18, A19). `tests/arq_library.rs` checks `LET`, `FOLD`,
+`UNFOLD`, the property functions, the half joins and the path forms against Jena 6.2.0's
+answers, and the plans of calls and OPTIONALs (A20 to A22). `tests/arq_functions.rs`
+checks the new functions and operators (A23), and unit tests cover the CDT parser,
+`sprintf`, `DecimalFormat` patterns and the IRI split. The formatter has golden files
+for every new form. The 28 benchmark queries get the same EXPLAIN from main and from this
+branch on a 210,509-triple dataset, apart from the generated names of aggregates (A24).
+The W3C SPARQL suites still pass 482/328/157/269 (A25).
+
+**Phase 3, cost.** Queries without the new forms run the code they ran before. The
+planner checks each basic graph pattern for a property function, and value comparisons
+check for the two composite datatypes only when both values are literals of an unknown
+datatype. A composite literal is parsed each time an operation reads it.
+
+**Phase 3, not built.** JavaScript functions, `afn:context`, the Leviathan library,
+`rdfs:member` and the container functions, locale collation, the `JSON` query form,
+ARQ's `EXISTS { … }` element, and Phase 3 methods in the query builder.

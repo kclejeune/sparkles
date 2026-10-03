@@ -1543,15 +1543,18 @@ curl -H 'Accept: text/turtle' http://localhost:3030/ds/sparql
 Besides the SPARQL 1.1 and 1.2 built-ins, Sparkles implements these functions. The
 prefixes are `fn:` for `http://www.w3.org/2005/xpath-functions#`, `math:` for
 `http://www.w3.org/2005/xpath-functions/math#`, `afn:` for Jena ARQ's
-`http://jena.apache.org/ARQ/function#` and `spk:` for `urn:x-sparkles:`.
+`http://jena.apache.org/ARQ/function#`, `cdt:` for
+`http://w3id.org/awslabs/neptune/SPARQL-CDTs/` and `spk:` for `urn:x-sparkles:`.
 
 * `fn:` string functions are `string-length`, `substring`, `upper-case`, `lower-case`,
   `contains`, `starts-with`, `ends-with`, `substring-before`, `substring-after`,
   `concat`, `string-join`, `normalize-space`, `normalize-unicode`, `matches`, `replace`
   and `encode-for-uri`.
 * `fn:` numeric functions are `abs`, `ceiling`, `floor`, `round` (with an optional
-  precision), `round-half-to-even`, `numeric-mod` and `numeric-integer-divide`. The
-  boolean ones are `not` and `boolean`, and `fn:error` is always an error.
+  precision), `round-half-to-even`, `numeric-mod`, `numeric-integer-divide` and
+  `format-number`. The boolean ones are `not` and `boolean`, and `fn:error` is always an
+  error. `fn:apply(f, args…)` calls the extension function or cast whose IRI `f` is, and
+  `fn:collation-key(s, c)` is ARQ's key, the base64 of `s@c` as `xsd:base64Binary`.
 * `fn:` date and time functions are the `year-`, `month-`, `day-`, `hours-`, `minutes-`,
   `seconds-` and `timezone-from-dateTime`, `-from-date` and `-from-time` accessors,
   `years-`, `months-`, `days-`, `hours-`, `minutes-` and `seconds-from-duration`,
@@ -1562,10 +1565,15 @@ prefixes are `fn:` for `http://www.w3.org/2005/xpath-functions#`, `math:` for
   timezone.
 * `math:` has `pi`, `e`, `sqrt`, `exp`, `exp10`, `log`, `log10`, `pow`, `sin`, `cos`,
   `tan`, `asin`, `acos`, `atan` and `atan2`.
-* `afn:` has `localname`, `namespace`, `now`, `sqrt`, `pi`, `e`, `min`, `max`,
-  `strjoin`, `bnode`, `strlen`, `substr` and `substring` (zero-based, as Java's
-  `String.substring`), `sha1sum`, `uuid`, `struuid`, `evenInteger`, `langeq`, `date`,
-  `timezone` and `adjust-to-timezone`.
+* `afn:` has `localname`, `namespace`, `now`, `nowtz`, `sqrt`, `pi`, `e`, `min`, `max`,
+  `strjoin`, `sprintf`, `bnode`, `strlen`, `substr` and `substring` (zero-based, as
+  Java's `String.substring`), `sha1sum`, `uuid`, `struuid`, `evenInteger`, `langeq`,
+  `date`, `timezone`, `system-timezone`, `adjust-to-timezone`, `version`, `collation`,
+  `eval`, `print`, `execTime` and `wait`. `afn:localname` and `afn:namespace` split an
+  IRI as Jena does, before the longest XML name at its end, so the local name of
+  `<http://ex/a/1x>` is `x`.
+* `cdt:` has the functions of Jena's composite datatypes, described in
+  [ARQ syntax extensions](#arq-syntax-extensions).
 * `spk:` has the vector functions `cosine`, `dot`, `euclidean` and `dimension` (see
   [Vector similarity](#vector-similarity)). The `geof:` and `spatialF:` functions are in
   [GeoSPARQL](#geosparql).
@@ -1610,21 +1618,115 @@ GROUP BY ?dept
 The formatter, the editor and the query builder (`expr::median`, `expr::stdev` and the
 others) know these aggregates.
 
-Some of ARQ's library is not supported. These are `afn:sprintf`, `afn:print`,
-`afn:collation`, `fn:collation-key`, `fn:format-number`, `fn:apply`,
-`afn:system-timezone`, `afn:nowtz`, `afn:version`, `afn:wait`, `afn:execTime`,
-`afn:eval` and `afn:context`, `AGG` with more than one argument, `FOLD`, `cdt:` literals,
-`LET`, the `apf:` and `list:` property functions and JavaScript functions. ARQ parses
+**Formatting text.** `afn:sprintf(format, args…)` formats as Java's `String.format`,
+with the arguments ARQ hands to Java: integers, decimals, doubles and floats as numbers,
+dates and dateTimes as dates, strings and booleans as themselves, a language-tagged
+string as its language tag, and any other term as its string in double quotes, as ARQ
+gives it. The conversions are `%s`, `%S`, `%d`, `%x`, `%X`, `%o`, `%f`, `%e`, `%E`,
+`%g`, `%G`, `%b`, `%B`, `%%`, `%n` and the `%t` date conversions, with Java's flags,
+widths, precisions and argument indexes (`%2$s`, `%<s`). `%f` and `%e` round half up, as
+Java does. Dates are formatted in UTC. A conversion that does not fit its argument, such
+as `%d` of a double or any `%c`, is an error, where ARQ fails the whole query.
+
+```sparql
+SELECT (afn:sprintf("%s earns %,.2f", ?name, ?salary) AS ?line) WHERE { … }
+```
+
+`fn:format-number(value, picture, locale?)` formats as Java's `DecimalFormat`, which is
+what ARQ uses, and not with F&O's picture syntax. The picture has `0` and `#` digits,
+`,` grouping, `.`, a negative subpattern after `;`, `%` and `‰`, quoted text and the
+scientific form `0.###E0`. Values round half to even. The third argument is a language
+tag that sets the separators and the minus sign. Sparkles knows those of the common
+European languages and uses the root locale's for any other tag, so
+`fn:format-number(1234.5, "#,##0.00", "de")` is `"1.234,50"`.
+
+**Other functions of ARQ's library.** `afn:eval(f, args…)` is `fn:apply`.
+`afn:system-timezone()` is the offset of the server's local timezone as an
+`xsd:dayTimeDuration`, and `afn:nowtz()` is `NOW()` in that timezone. `afn:version()` is
+the Sparkles version. `afn:wait(ms)` sleeps that many milliseconds and returns `true`,
+stopping early when the query is cancelled or times out. Three of them differ from ARQ.
+`afn:collation(c, s)` returns `s`, so it orders by code point where ARQ orders by the
+locale's collator. `afn:print(x)` and `afn:execTime()` return `true` without printing, as
+a server has no console for them.
+
+**Dates, times and durations.** Besides SPARQL's arithmetic on dateTimes and durations,
+`+` and `-` add a duration to a date or a time and subtract one from it, and subtract two
+times. Durations of different kinds add up to an `xsd:duration`. `*` and `/` multiply and
+divide a day-time or year-month duration by a number, and `/` gives the ratio of two
+day-time or two year-month durations as an `xsd:decimal`.
+
+```sparql
+SELECT ?due WHERE { ?task ex:start ?d BIND(?d + "P14D"^^xsd:dayTimeDuration AS ?due) }
+```
+
+These follow ARQ, with two differences. A day-time duration times a number, a day-time
+duration divided by a number and the difference of two times stay
+`xsd:dayTimeDuration`, where ARQ gives an `xsd:duration` of the same value. A number
+times a duration and a year-month duration times a number are defined, as in F&O 3.1,
+where ARQ reports an error.
+
+Some of ARQ's library is not supported. These are `afn:context` (ARQ's execution
+context), the Leviathan library (`lfn:`), `AGG` with more than one argument and
+JavaScript functions (`js:`), which need a JavaScript engine. ARQ parses
 `GROUP_CONCAT(… ; ORDER BY …)` only to fail with "not implemented", and SPARQL 1.2 has no
 such form, so Sparkles does not accept it. An unknown function is an error, so its
 `BIND` leaves the variable unbound.
 
+### ARQ's property functions
+
+Sparkles implements ARQ's property function library. The prefixes are `list:` for
+`http://jena.apache.org/ARQ/list#` and `apf:` for `http://jena.apache.org/ARQ/property#`,
+and ARQ's older `http://jena.hpl.hp.com/ARQ/…` namespaces work too. A call is a triple
+pattern whose predicate is the function, with a list as its subject or object where the
+function takes several arguments.
+
+| Function | Arguments | What it does |
+|---|---|---|
+| `?list list:member ?m` | | Each member of an RDF collection, once per position |
+| `?list list:index (?i ?m)` | | Each member with its position, counted from 0. With `?m` given, the first position only |
+| `?list list:length ?n` | | The number of members |
+| `?t apf:strSplit (str regex)` | Both literals | Each token of `str`, split at the matches of `regex` and trimmed, as Java's `String.split` gives them. Empty tokens at the end are dropped |
+| `?s apf:concat (a b …)` | All bound | The concatenation of the strings of the arguments |
+| `?s apf:str ?o` | `?o` bound | The string of `?o` |
+| `<iri> apf:splitIRI (?ns ?local)` | The IRI bound | The IRI's namespace, as an IRI, and its local name, split as `afn:localname` does. `apf:splitURI` is the same |
+| `?a apf:assign ?b` | One side bound | Binds the other side to it, or checks that both are the same value |
+| `?b apf:bnode ?label` | `?b` bound | The label of a blank node. `apf:blankNode` is the same |
+| `?s apf:versionARQ ?v` | | `<urn:x-sparkles:>` and the Sparkles version |
+
+ARQ evaluates a property function for each solution of the patterns written before it,
+with their values in place of its variables, and Sparkles gives the same answers. A list
+function whose list variable is bound by an earlier pattern walks that node's list, so
+`?x :items ?l . ?l list:member ?m` gives the members of each `?l`. With the list
+variable unbound, as in `?l list:member "b"`, the function finds the heads of every list
+that holds the member. The same holds inside an OPTIONAL: in
+`?s :p ?o OPTIONAL { ?s apf:splitIRI (?ns ?local) }`, the right side reads `?s` from each
+left row. A function reads lists in the graph that its `GRAPH` block names, or the
+default graph.
+
+```sparql
+PREFIX list: <http://jena.apache.org/ARQ/list#>
+SELECT ?book ?i ?author WHERE { ?book ex:authors ?l . ?l list:index (?i ?author) }
+```
+
+EXPLAIN shows a call as a `PropertyFunction` operator. A call that reads no variable bound
+before it is a leaf of the group's join order. A call that reads some is attached to the
+rest of its group and evaluates once per distinct value of what it reads. An OPTIONAL
+whose calls read the left side runs as a `Lateral` operator per left row.
+
+ARQ also makes `rdfs:member` a property function that adds the `rdf:_1`, `rdf:_2`, …
+members of `rdf:Bag`, `rdf:Seq` and `rdf:Alt` containers to the `rdfs:member` triples.
+Sparkles keeps `rdfs:member` an ordinary property, so that queries over it keep their
+meaning and their plans, and it has no `apf:bag`, `apf:seq`, `apf:alt` or
+`apf:container`. JavaScript functions are not supported.
+
 ### ARQ syntax extensions
 
 Fuseki parses queries with Jena ARQ's syntax, a superset of SPARQL, and so does Sparkles.
-Besides ARQ's aggregates above, it accepts `LATERAL`, property path ranges and CONSTRUCT
-templates with `GRAPH`, with ARQ's results. None of them changes the meaning of a SPARQL
-query. The Rust parser rejects them with `SparqlParser::with_arq_syntax(false)`, and
+Besides ARQ's aggregates above, it accepts `LATERAL`, `LET`, `SEMIJOIN`, `ANTIJOIN`,
+property path ranges and the path forms `distinct(…)`, `multi(…)` and `:p^:q`,
+CONSTRUCT templates with `GRAPH`, and Jena's composite datatypes with `FOLD` and
+`UNFOLD`, with ARQ's results. None of them changes the meaning of a SPARQL query. The
+Rust parser rejects them with `SparqlParser::with_arq_syntax(false)`, and
 `sparkles qparse --syntax sparql` checks a query as strict SPARQL. The design is spec
 [G06](specs/G06-arq-query-extensions.md).
 
@@ -1707,11 +1809,84 @@ WHERE { GRAPH ?g { ?s ?p ?o } }
   quads. In Python, `construct()` returns the triples and their `quads` attribute holds
   the named graphs' quads.
 
-The formatter, the editor's highlighting and the query builder know the three forms. The
-builder has `lateral(|w| …)`, and its path syntax accepts ranges (`"foaf:knows{1,3}"`).
+**`LET (?v := expr)`** assigns the value of the expression to `?v`, as `BIND` does, but
+`?v` may already be in scope. Where a solution binds `?v`, it is kept when the value is
+the same value as the expression's and dropped otherwise. Same value is Jena's test, so
+`1` and `1.0` are the same value and `1` and `1e0` are not. An expression error leaves
+the solution as it is, and an unbound `?v` takes the value.
 
-ARQ's other path forms (`:p^:q`, `distinct(…)`, `shortest(…)` and `multi(…)`),
-`SEMIJOIN`, `ANTIJOIN`, `LET`, `UNFOLD` and the `JSON` query form are not supported.
+```sparql
+SELECT ?s WHERE { ?s ex:status ?st LET (?st := "active") }
+```
+
+A `LET` of a variable that the patterns before it cannot bind is planned as `BIND`, and
+any other runs as a `Let` operator.
+
+**`SEMIJOIN { … }` and `ANTIJOIN { … }`** keep the solutions before them that are
+compatible with at least one solution of the group, or with none, each once and
+unchanged. The group's variables do not reach the result. Unlike `MINUS`, a solution of
+the group that shares no variable with a solution before it is compatible with it, so
+`ANTIJOIN` with a group that has any solution removes everything. EXPLAIN shows a
+`SemiJoin` or `AntiJoin` operator, which hashes the group's solutions on the shared
+variables.
+
+```sparql
+SELECT ?p WHERE { ?p a ex:Person SEMIJOIN { ?p ex:authorOf ?doc } }
+```
+
+**More path forms.** `distinct(path)` gives each pair of nodes the path connects once.
+`multi(path)` counts the ways through the graph, with each `*`, `+` and `?` in it
+evaluated as the range `{*}`, `{+}` and `{0,1}`. `:p^:q`, an `^` between two path
+elements, is `:p/^:q`. ARQ parses `shortest(path)` but does not evaluate it, and in
+Sparkles such a query is an error too.
+
+**Composite datatypes.** Jena 5 and 6 read two literal datatypes of the SPARQL CDTs
+proposal, `cdt:List` and `cdt:Map`. A list literal is written `"[1, \"a\"@en, <http://x>,
+null, [2, 3]]"^^cdt:List`, and a map literal
+`"{\"k\" : 1, <http://x> : {\"inner\" : true}}"^^cdt:Map`. Elements are RDF terms in
+Turtle's syntax without prefixes, nested lists and maps, or `null`. Map keys are IRIs or
+literals and must be distinct.
+
+* `=` compares lists element by element and maps entry by entry, with Jena's same-value
+  test, and `<` orders lists and maps as the proposal defines. Comparing two different
+  blank nodes, or a `null` with a value under `<`, is an error. ORDER BY places lists
+  and maps after the other literals.
+* The functions are `cdt:List(…)` and `cdt:Map(k1, v1, …)` (an error in an argument is
+  a `null`), `cdt:size`, `cdt:get` (positions from 1), `cdt:head`, `cdt:tail`,
+  `cdt:subseq`, `cdt:reverse`, `cdt:concat`, `cdt:contains`, `cdt:containsTerm`,
+  `cdt:containsKey`, `cdt:keys`, `cdt:put`, `cdt:remove` and `cdt:merge`.
+* `FOLD(DISTINCT? expr ORDER BY …)` is an aggregate that folds the values of a group
+  into a list, an error giving `null`. `FOLD(key, value ORDER BY …)` folds them into a
+  map, skipping errors and blank nodes as keys, a later solution replacing the value of
+  an earlier one.
+* `UNFOLD(expr AS ?v)` gives a solution per element of the list or entry of the map that
+  `expr` returns, and `UNFOLD(expr AS ?v, ?w)` also binds `?w` to the position (from 1)
+  or the entry's value. A `null` leaves its variable unbound, an empty list gives no
+  solutions, and any other value gives the solution once with both variables unbound.
+
+```sparql
+SELECT ?person ?i ?friend WHERE {
+  { SELECT ?person (FOLD(?f ORDER BY ?f) AS ?friends)
+    WHERE { ?person foaf:knows ?f } GROUP BY ?person }
+  UNFOLD(?friends AS ?friend, ?i)
+}
+```
+
+A list or map that Sparkles builds is written in a canonical form, with `, ` between
+elements and a map's entries in key order. Jena writes a map's entries in hash order, so
+its lexical forms can differ from Sparkles' while the values are equal. A blank node
+label inside a literal names a blank node of the query that reads it. Jena's loader also
+matches it with the blank nodes of the data file the literal came from, which Sparkles
+does not. Jena's SPARQL-CDTs tests run in the W3C harness: 642 of 655 pass, and the 13
+others are those blank nodes and two that keep `"01"^^xsd:integer` apart from `1`.
+
+The formatter, the editor's highlighting and the query builder know `LATERAL`, ranges
+and CONSTRUCT with `GRAPH`, and the formatter and the editor know the other forms too.
+The builder has `lateral(|w| …)`, and its path syntax accepts ranges
+(`"foaf:knows{1,3}"`).
+
+ARQ's `JSON` query form and its `EXISTS { … }` and `NOT EXISTS { … }` group elements are
+not supported.
 
 ### DESCRIBE
 
