@@ -70,6 +70,9 @@ with any server.
 sparkles convert [FILES]... [--syntax LANG] [--output LANG] [--base IRI]
                  [--count | --validate | --sink] [--check] [--strict] [--lenient]
                  [--merge] [--compression CODEC] [--compress [CODEC]] [--time]
+                 [-r] [--include GLOB]... [--exclude GLOB]...
+                 [-o FILE | --out-dir DIR [--overwrite] [-j N]]
+                 [--mapping FILE | --template FILE.rq | --key COLUMN]
 ```
 
 * Inputs are files, or standard input when there are none or a file is `-`. The syntax
@@ -356,7 +359,25 @@ and `load` transcodes each file into a temporary N-Quads file before the load, a
 server does with request bodies. The reader and writer are the server's
 (`http/jena_formats.rs`), and TriX's live in the core crate (`sparkles::trix`).
 
+On 2026-10-03 `convert` learned to read directories and to tell a syntax from the
+content. `--recursive` reads the files below a directory, filtered by `--include` and
+`--exclude` globs. `--output-file` writes one output stream to a file, and `--out-dir`
+writes one file per input, mirroring the tree, with `--jobs` files converted in
+parallel and `--overwrite` needed to replace a file. When neither `--syntax` nor the
+extension names a syntax, the first 8 KiB after decompression decide it
+(`tools/sniff.rs`). A file in a directory whose syntax is unknown or ambiguous is skipped
+with a warning, and a file given by name or standard input with ambiguous content is an
+error that names the candidates. CSV and TSV files go through the mapping of `load`
+(spec [C05](C05-tabular-imports.md)), with `--mapping`, `--template` and `--key`. Errors
+read `file:line:column: message`. Directory runs and `--out-dir` print each file's count
+and a summary, and exit with status 1 when any file failed.
+
 **Deviations and decisions.**
+- `convert --out` was already Jena's alias of `--output`, the output syntax. The output
+  file therefore has its own flag, `--output-file` (`-o`), and `--format` became a
+  third alias of `--output`.
+- Standard input that matches no syntax is still read as N-Quads, so that a parse error
+  names the line, as before content detection existed.
 - `qparse` and `uparse` print the input formatted by `sparkles fmt` rather than
   spargebra's rendering of the parse. The rendering moves aggregates into a subquery and
   names them with random hex, which reads worse than the input. The parse still decides

@@ -106,6 +106,46 @@ impl Cache {
     }
 }
 
+/// The tables of `sparkles convert`: the mapping options, and the mapping files they
+/// name, read once.
+pub struct Tables {
+    args: CsvArgs,
+    cache: Cache,
+    part: usize,
+}
+
+impl Tables {
+    pub fn new(args: CsvArgs) -> Tables {
+        Tables {
+            args,
+            cache: Cache::default(),
+            part: 0,
+        }
+    }
+
+    /// The conversion options of the table at `path` (`None`: standard input), named
+    /// `name` in messages and tab-separated when `tsv`, with a note when a CSVW
+    /// metadata file next to it gives the mapping.
+    pub fn options(
+        &mut self,
+        path: Option<&Path>,
+        name: &str,
+        tsv: bool,
+    ) -> Result<(Options, Option<String>)> {
+        let (mapping, note) = self.args.mapping_for(path, &mut self.cache)?;
+        let mut o = match path {
+            Some(p) => Options::for_file(mapping, p),
+            None => Options::new(mapping, name),
+        };
+        o.name = name.to_string();
+        o.tsv = tsv;
+        o.base = self.args.base.clone();
+        o.part = self.part;
+        self.part += 1;
+        Ok((o, note))
+    }
+}
+
 /// One table to convert: the file, and the table of the mapping it is.
 struct Job {
     path: PathBuf,

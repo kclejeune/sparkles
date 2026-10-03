@@ -647,6 +647,10 @@ sparkles convert --count *.ttl                # triples (or quads) per file and 
 sparkles convert --validate data.ttl          # syntax errors and term warnings, exit 1 on any
 sparkles convert --check data.ttl > out.nq    # convert, and warn about IRIs and language tags
 sparkles convert data.trix --output ttl       # Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON too
+sparkles convert -r data/ -o all.nq.zst       # a directory tree into one file
+sparkles convert -r data/ --out-dir nt/ --format nt -j 4   # one file per input, 4 at a time
+sparkles convert -r data/ --include '*.ttl' --exclude 'drafts/**' --count
+sparkles convert people.csv --base http://ex.org/p/ --key id --output ttl   # CSV and TSV tables
 sparkles load --loc db --check --strict data.ttl   # the same checks before a load
 sparkles qparse 'SELECT ...'                  # the query, formatted
 sparkles qparse --print algebra,plan --query q.rq  # SPARQL algebra (SSE) and the physical plan
@@ -662,15 +666,43 @@ sparkles rdfpatch changes.rdfp                # the rows of RDF Patch files, and
 ```
 
 `convert` reads files, or standard input when no file is given or a file is `-`. It takes
-the syntax from `--syntax`, then from the file extension, and reads standard input as
-N-Quads by default. Besides the W3C syntaxes it reads and writes Jena's TriX (`trix`), RDF
-Thrift (`rt`), RDF Protobuf (`rpb`) and RDF/JSON (`rj`). `load` takes them as well, and
+the syntax from `--syntax`, then from the file extension. When neither decides, it looks
+at the first 8 KiB of the content after decompression. XML is RDF/XML or TriX by its root
+element. JSON is RDF/JSON when its top level maps subjects to objects of predicates, and
+JSON-LD otherwise. Binary content is RDF Thrift or RDF Protobuf when its first row has
+the shape Jena writes. Text whose statements are each one line of terms is N-Quads or
+N-Triples, other Turtle-like text is TriG when it has a `GRAPH` keyword or a `{` block and
+Turtle otherwise, and lines with the same number of tabs or commas are TSV or CSV.
+Content that fits two syntaxes, such as `{}`, is an error that names both. Standard
+input that matches nothing is read as N-Quads, as before. An extension or `--syntax`
+always wins over the content. Besides the W3C syntaxes `convert` reads and writes Jena's
+TriX (`trix`), RDF Thrift (`rt`), RDF Protobuf (`rpb`) and RDF/JSON (`rj`). `load` takes them as well, and
 `query --results trix` (or `rt`, `rpb`, `rj`) writes CONSTRUCT and DESCRIBE results in
 them. Compressed inputs are detected as `load` detects them. The output
 streams, so a file larger than memory converts in bounded memory. Turtle, TriG and
 RDF/XML output declare the prefixes that the input declared before its first statement.
 A quad in a named graph cannot be written in a triple syntax, so `convert` drops it with
 a warning, or with `--merge` writes it into the default graph.
+
+A directory is read with `--recursive` (`-r`), file by file in path order. `--include`
+and `--exclude` take globs, which can be repeated. A glob without `/` matches the file
+name, and one with `/` matches the path below the directory, where `*` stays within one
+directory and `**` crosses them. A file in a directory whose syntax cannot be told is
+skipped with a warning. CSV and TSV files are converted with the mapping options of
+`load` (`--mapping`, `--template`, `--key`), and `--base` gives the default mapping's
+namespace. A `-metadata.json` file next to a table is read with it rather than converted.
+
+The output goes to standard output, or to `--output-file` (`-o`), whose extension picks
+the syntax and the compression unless `--output` and `--compress` name them. `--out` and
+`--format` are aliases of `--output`, so the file needs its own flag. `--out-dir DIR`
+writes one file per input instead, at the input's path below the directory it was found
+in, with the output syntax's extension in place of the input's. `--compress` adds its
+extension. The files are converted in parallel, `--jobs` (`-j`) at a time, by default
+one per CPU up to 8. A file that exists is replaced only with `--overwrite`, and a file
+that fails to convert leaves nothing behind. With directories or `--out-dir`, `convert`
+prints the statements of each file and a summary with the number of files, the total
+and the time. Errors give the file, line and column, and the exit status is 1 when any
+file failed.
 
 `--count`, `--sink` and `--validate` write no data. Files are then parsed in parallel, as
 `load` parses them. When a file has a syntax error, it is parsed again in order so that

@@ -116,11 +116,7 @@ fn convert_counts_and_validates() {
     // a syntax error has its position and exit status 1
     let o = run(dir, &["convert", "--validate", "bad.nt"]);
     assert_eq!(o.status.code(), Some(1));
-    assert!(
-        err(&o).contains("bad.nt: Parser error at line 2"),
-        "{}",
-        err(&o)
-    );
+    assert!(err(&o).contains("bad.nt:2:27: "), "{}", err(&o));
     let o = run(dir, &["convert", "--count", "bad.nt"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(out(&o).contains("bad.nt: 2 triples"), "{}", out(&o));
@@ -138,6 +134,230 @@ fn convert_counts_and_validates() {
     let o = run(dir, &["convert", "--validate", "a.ttl"]);
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(out(&o), "");
+}
+
+/// Directories: merged into one output file, or mirrored into an output directory in
+/// parallel; files without a known extension by their content, unknown ones skipped.
+#[test]
+fn convert_directories() {
+    let d = setup();
+    let dir = d.path();
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(tree.join("sub/deeper")).unwrap();
+    std::fs::write(tree.join("a.ttl"), TTL).unwrap();
+    std::fs::write(tree.join("sub/g.trig"), TRIG).unwrap();
+    // no extension: N-Triples by its lines
+    std::fs::write(
+        tree.join("sub/deeper/plain"),
+        "<http://e/s> <http://e/p> \"x\" .\n",
+    )
+    .unwrap();
+    std::fs::write(tree.join("people.csv"), "id,name\n7,Ann\n").unwrap();
+    std::fs::write(tree.join("README.md"), "Some notes.\n").unwrap();
+
+    // a directory needs --recursive
+    let o = run(dir, &["convert", "tree"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("--recursive"), "{}", err(&o));
+
+    // merged into one file, its syntax and compression from the extension
+    let base = ["--base", "http://e/t/"];
+    let o = run(
+        dir,
+        &[&["convert", "-r", "tree", "-o", "all.nq.gz"][..], &base].concat(),
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let e = err(&o);
+    assert!(e.contains("warning: skipping tree/README.md"), "{e}");
+    assert!(e.contains("tree/people.csv: 2 triples"), "{e}");
+    assert!(e.contains("4 files, 8 statements"), "{e}");
+    let o = run(dir, &["convert", "--count", "all.nq.gz"]);
+    assert_eq!(out(&o), "all.nq.gz: 8 quads\n", "{}", err(&o));
+
+    // --include and --exclude
+    let o = run(
+        dir,
+        &[
+            "convert",
+            "-r",
+            "tree",
+            "--include",
+            "*.ttl",
+            "--include",
+            "**/plain",
+            "--count",
+        ],
+    );
+    assert_eq!(
+        out(&o),
+        "tree/a.ttl: 3 triples\ntree/sub/deeper/plain: 1 triples\ntotal: 4\n",
+        "{}",
+        err(&o)
+    );
+    let o = run(
+        dir,
+        &[
+            &[
+                "convert",
+                "-r",
+                "tree",
+                "--exclude",
+                "sub/**",
+                "--exclude",
+                "*.md",
+                "--count",
+            ][..],
+            &base,
+        ]
+        .concat(),
+    );
+    assert!(out(&o).ends_with("total: 5\n"), "{}{}", out(&o), err(&o));
+
+    // mirrored into a directory
+    let o = run(
+        dir,
+        &[
+            &[
+                "convert",
+                "-r",
+                "tree",
+                "--out-dir",
+                "out",
+                "--format",
+                "nt",
+                "--merge",
+                "-j",
+                "2",
+            ][..],
+            &base,
+        ]
+        .concat(),
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    for f in [
+        "out/a.nt",
+        "out/sub/g.nt",
+        "out/sub/deeper/plain.nt",
+        "out/people.nt",
+    ] {
+        assert!(dir.join(f).is_file(), "{f}: {}", err(&o));
+    }
+    let g = std::fs::read_to_string(dir.join("out/sub/g.nt")).unwrap();
+    assert_eq!(g.lines().count(), 2, "{g}");
+    // existing files need --overwrite
+    let only_ttl = [
+        "convert",
+        "-r",
+        "tree",
+        "--include",
+        "*.ttl",
+        "--out-dir",
+        "out",
+        "--format",
+        "nt",
+    ];
+    let o = run(dir, &only_ttl);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("exists (use --overwrite)"), "{}", err(&o));
+    let o = run(dir, &[&only_ttl[..], &["--overwrite"]].concat());
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        err(&o).contains("tree/a.ttl -> out/a.nt: 3 triples"),
+        "{}",
+        err(&o)
+    );
+
+    // a file that fails: its position, exit status 1, the others still converted
+    std::fs::write(tree.join("broken.nt"), "<http://e/s> <http://e/p> .\n").unwrap();
+    let o = run(
+        dir,
+        &[
+            "convert",
+            "-r",
+            "tree",
+            "--include",
+            "*.nt",
+            "--include",
+            "*.ttl",
+            "--out-dir",
+            "out2",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1));
+    let e = err(&o);
+    assert!(e.contains("tree/broken.nt:1:"), "{e}");
+    assert!(e.contains("2 files, 3 statements"), "{e}");
+    assert!(e.contains("1 failed"), "{e}");
+    assert!(dir.join("out2/a.nq").is_file());
+    assert!(!dir.join("out2/broken.nq").exists());
+}
+
+/// Content sniffing: standard input and files without a known extension.
+#[test]
+fn convert_sniffs_the_syntax() {
+    let d = setup();
+    let dir = d.path();
+    let cases: &[(&str, &[u8], &str)] = &[
+        ("t1", TTL.as_bytes(), "3 triples"),
+        ("t2", TRIG.as_bytes(), "2 quads"),
+        (
+            "t3",
+            b"<http://e/s> <http://e/p> <http://e/o> <http://e/g> .\n",
+            "1 quads",
+        ),
+        (
+            "t4",
+            b"<?xml version=\"1.0\"?>\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+              <rdf:Description rdf:about=\"http://e/s\"><rdf:value>1</rdf:value></rdf:Description></rdf:RDF>",
+            "1 triples",
+        ),
+        ("t5", br#"{"@id": "http://e/s", "http://e/p": "x"}"#, "1 quads"),
+        (
+            "t6",
+            br#"{"http://e/s": {"http://e/p": [{"type": "literal", "value": "x"}]}}"#,
+            "1 triples",
+        ),
+        ("t7", b"id\tname\n7\tAnn\n", "2 triples"),
+    ];
+    for (name, body, want) in cases {
+        std::fs::write(dir.join(name), body).unwrap();
+        let o = run(dir, &["convert", "--count", "--base", "http://e/t/", name]);
+        assert_eq!(out(&o), format!("{name}: {want}\n"), "{name}: {}", err(&o));
+        let o = run_stdin(dir, &["convert", "--count", "--base", "http://e/t/"], body);
+        assert_eq!(out(&o), format!("stdin: {want}\n"), "{name}: {}", err(&o));
+    }
+    // TriX, RDF Thrift and RDF Protobuf written by convert, read back without --syntax
+    for fmt in ["trix", "rt", "rpb"] {
+        let o = run(dir, &["convert", "g.trig", "--output", fmt]);
+        assert!(o.status.success(), "{}", err(&o));
+        let o = run_stdin(dir, &["convert", "--count"], &o.stdout);
+        assert_eq!(out(&o), "stdin: 2 quads\n", "{fmt}: {}", err(&o));
+    }
+    // compressed standard input is decompressed before it is sniffed
+    let o = run(dir, &["convert", "a.ttl.gz", "--output", "ttl"]);
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&o.stdout).unwrap();
+    let o = run_stdin(dir, &["convert", "--count"], &gz.finish().unwrap());
+    assert_eq!(out(&o), "stdin: 3 triples\n", "{}", err(&o));
+    // an extension or --syntax wins over the content
+    std::fs::write(dir.join("lies.nt"), TTL).unwrap();
+    let o = run(dir, &["convert", "--count", "lies.nt"]);
+    assert_eq!(o.status.code(), Some(1));
+    let o = run_stdin(
+        dir,
+        &["convert", "--count", "--syntax", "nt"],
+        TTL.as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(1));
+    // ambiguous and unknown content
+    std::fs::write(dir.join("empty"), "{}").unwrap();
+    let o = run(dir, &["convert", "empty"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("JSON-LD or RDF/JSON"), "{}", err(&o));
+    std::fs::write(dir.join("notes"), "hello world\n").unwrap();
+    let o = run(dir, &["convert", "notes"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("unknown RDF syntax"), "{}", err(&o));
 }
 
 /// Jena's syntaxes in `convert` and `load`: TriG to TriX and back, TriX to RDF Thrift

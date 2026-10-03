@@ -12,14 +12,15 @@ pub mod convert;
 pub mod endpoint;
 pub mod rdfpatch;
 pub mod rset;
+pub mod sniff;
 pub mod sparql;
 pub mod table;
 pub mod terms;
 
 #[derive(clap::Subcommand)]
 pub enum ToolCmd {
-    /// Parse, validate, count and convert RDF files between syntaxes, streaming (Jena's
-    /// riot); exits with status 1 on syntax errors
+    /// Parse, validate, count and convert RDF files and directories between syntaxes,
+    /// streaming (Jena's riot); exits with status 1 when any input had errors
     #[command(visible_alias = "riot")]
     Convert(convert::ConvertArgs),
     /// Print a SPARQL query parsed: as SPARQL, as SPARQL algebra (SSE) or as the
