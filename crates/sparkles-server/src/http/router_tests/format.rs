@@ -382,3 +382,68 @@ async fn authenticated_mode_refuses_anonymous_callers() {
         assert_eq!(r.status, expected, "{mode:?}: {}", r.text());
     }
 }
+
+/// `POST /$/lint`: findings with UTF-16 ranges and safe fixes, `fix`, rule levels, the
+/// error shapes and `--format-endpoint`.
+#[tokio::test]
+async fn lints_json_bodies() {
+    let (_d, app) = fmt_server(|_| {});
+    let text = "PREFIX ex: <http://x/>\nSELECT ?s { ?s ?p \"\u{1F600}\"@en-us }";
+    let r = post_json(
+        &app,
+        "/$/lint",
+        json!({ "text": text, "rules": { "single-use-variable": "off" } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["language"], "sparql");
+    let d = j["diagnostics"].as_array().unwrap();
+    assert_eq!(d.len(), 2, "{j}");
+    assert_eq!(d[0]["rule"], "unused-prefix");
+    assert_eq!(
+        (d[0]["line"].as_u64(), d[0]["column"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(
+        (d[0]["from"].as_u64(), d[0]["to"].as_u64()),
+        (Some(0), Some(22))
+    );
+    let tag = text[..text.find("@en-us").unwrap()].encode_utf16().count() as u64;
+    assert_eq!(d[1]["from"].as_u64(), Some(tag));
+    assert_eq!(d[1]["fix"]["title"], "Write @en-US");
+    let r = post_json(&app, "/$/lint", json!({ "text": text, "fix": true })).await;
+    let j = r.json();
+    assert_eq!(j["applied"], 2, "{j}");
+    assert_eq!(j["text"], "SELECT ?s { ?s ?p \"\u{1F600}\"@en-US }");
+    // a syntax error is a finding, not an error
+    let r = post_json(
+        &app,
+        "/$/lint",
+        json!({ "text": "SELECT * {", "language": "sparql" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["diagnostics"][0]["rule"], "syntax");
+    // errors
+    let r = post_json(
+        &app,
+        "/$/lint",
+        json!({ "text": "<a> <b> <c> .", "language": "ntriples" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(r.json()["code"], "unsupported-language");
+    let r = post_json(
+        &app,
+        "/$/lint",
+        json!({ "text": "ASK {}", "rules": { "nope": "off" } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = post_as(&app, "/$/lint", "application/sparql-query", "ASK {}").await;
+    assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let (_d, app) = fmt_server(|st| st.format.endpoint = FormatEndpoint::Off);
+    let r = post_json(&app, "/$/lint", json!({ "text": "ASK {}" })).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}

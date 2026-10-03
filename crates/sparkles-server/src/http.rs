@@ -33,6 +33,8 @@ mod fuseki;
 pub(crate) mod history;
 mod inline;
 pub(crate) mod jena_formats;
+#[cfg(feature = "fmt")]
+mod lint;
 mod queries;
 mod schema;
 pub(crate) use schema::constraints::ShapesRequest;

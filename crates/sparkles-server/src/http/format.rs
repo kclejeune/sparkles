@@ -23,10 +23,15 @@ pub const SPARKLES_FORMAT_CHANGED: &str = "sparkles-format-changed";
 
 pub fn routes(st: &AppState) -> Router<Arc<AppState>> {
     let limit = st.format.max_bytes.map_or(usize::MAX, |b| b as usize);
-    Router::new().route(
-        "/$/format",
-        post(format).layer(DefaultBodyLimit::max(limit)),
-    )
+    Router::new()
+        .route(
+            "/$/format",
+            post(format).layer(DefaultBodyLimit::max(limit)),
+        )
+        .route(
+            "/$/lint",
+            post(super::lint::lint_handler).layer(DefaultBodyLimit::max(limit)),
+        )
 }
 
 /// What to format, from either body form.
