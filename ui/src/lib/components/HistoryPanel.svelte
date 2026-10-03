@@ -14,7 +14,17 @@
     nextBefore,
   } from '$lib/commits';
   import { fmtInt, fmtRelative } from '$lib/format';
-  import { diffLine, diffSummary, normalizeAt, readable, validAt } from '$lib/history';
+  import {
+    diffLine,
+    diffSummary,
+    historyBy,
+    historyLine,
+    historyTerm,
+    normalizeAt,
+    readable,
+    unrecordedNote,
+    validAt,
+  } from '$lib/history';
   import { LatestRun } from '$lib/supersede';
   import Icon from './Icon.svelte';
 
@@ -138,6 +148,41 @@
     diffForm = null;
     diff = null;
     diffError = null;
+  }
+
+  // --- history queries: the recorded changes of a resource -----------------------
+
+  /** Changes listed by a history search at most. */
+  const HISTORY_LIMIT = 200;
+  let histForm = $state({ subject: '', predicate: '' });
+  let hist = $state<api.HistoryChanges | null>(null);
+  let histError = $state<api.ApiError | Error | null>(null);
+  let histLoading = $state(false);
+
+  async function loadHistory() {
+    const subject = historyTerm(histForm.subject);
+    const predicate = historyTerm(histForm.predicate);
+    if (!subject && !predicate) return;
+    const owns = runs.claim('changes');
+    histLoading = true;
+    try {
+      const h = await api.historyChanges(name, {
+        subject: subject ?? undefined,
+        predicate: predicate ?? undefined,
+        order: 'desc',
+        limit: HISTORY_LIMIT,
+      });
+      if (!owns()) return;
+      hist = h;
+      histError = null;
+    } catch (e) {
+      if (owns()) {
+        hist = null;
+        histError = e as Error;
+      }
+    } finally {
+      if (owns()) histLoading = false;
+    }
   }
 
   function queryAt(c: api.Commit) {
@@ -264,7 +309,7 @@
                   <button
                     class="btn ghost sm"
                     title="Show what this commit changed"
-                    disabled={!readable(c) || c.seq === 0}
+                    disabled={c.seq === 0}
                     onclick={() => showDiff(c)}>Diff</button
                   >
                   <button
@@ -344,6 +389,65 @@
                 </p>
               {/if}
             {/if}
+          {/if}
+        </div>
+      {/if}
+      <form
+        class="diff diff-head"
+        onsubmit={(e) => {
+          e.preventDefault();
+          void loadHistory();
+        }}
+      >
+        <strong>Changes of</strong>
+        <label
+          ><span class="faint">subject</span>
+          <input
+            class="input sm mono"
+            size="22"
+            placeholder="<http://example.org/x>"
+            bind:value={histForm.subject}
+          /></label
+        >
+        <label
+          ><span class="faint">predicate</span>
+          <input
+            class="input sm mono"
+            size="18"
+            placeholder="any"
+            bind:value={histForm.predicate}
+          /></label
+        >
+        <button
+          class="btn sm"
+          disabled={histLoading || (!histForm.subject.trim() && !histForm.predicate.trim())}
+        >
+          {#if histLoading}<span class="spinner"></span>{/if} Find
+        </button>
+      </form>
+      {#if histError}
+        <div class="diff">
+          <div class="error-box">
+            <strong>Could not read the change log.</strong>
+            <span class="muted">{api.errorMessage(histError)}</span>
+          </div>
+        </div>
+      {:else if hist}
+        <div class="diff">
+          <p class="faint diff-sum">
+            {fmtInt(hist.changes.length)} change{hist.changes.length === 1 ? '' : 's'}, newest first{hist.truncated
+              ? ` (the newest ${fmtInt(HISTORY_LIMIT)})`
+              : ''}. {unrecordedNote(hist)}
+          </p>
+          {#if hist.changes.length}
+            <pre class="diff-lines">{#each hist.changes as c, i (i)}<span
+                  class="faint"
+                  title={c.timestamp}
+                  >{String(c.commit).padStart(6)}  </span><span
+                  class:ins={c.op === 'add'}
+                  class:del={c.op === 'remove'}>{historyLine(c)}</span
+                >{#if historyBy(c)}<span class="faint">  # {historyBy(c)}</span
+                  >{/if}{'\n'}{/each}</pre>
           {/if}
         </div>
       {/if}

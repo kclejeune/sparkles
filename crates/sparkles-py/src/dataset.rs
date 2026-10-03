@@ -18,8 +18,9 @@ use crate::{admin, interrupt};
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString};
+use pyo3::types::{PyBytes, PyDict, PyString};
 use sparkles::history::{At, HistoryOptions};
+use sparkles::sparql::describe::{DescribeMode, DescribeOptions};
 use sparkles::sparql::{QueryKind, QueryOptions, QueryResult};
 use sparkles::store::{Store, StoreOptions};
 use std::collections::BTreeMap;
@@ -56,6 +57,56 @@ pub struct QueryArgs<'py> {
     pub max_rows_produced: Option<u64>,
     pub cancel: Option<Bound<'py, PyAny>>,
     pub at: Option<Bound<'py, PyAny>>,
+    /// DESCRIBE options over the dataset's setting: a mode, or a dict of options.
+    pub describe: Option<Bound<'py, PyAny>>,
+}
+
+/// The DESCRIBE options of a query: `base` (the dataset's setting) with the `describe`
+/// argument over it, which is a mode (`"cbd"`, `"scbd"` or `"outgoing"`) or a dict of
+/// `mode`, `labels`, `reifiers`, `max_triples` and `max_depth` (`None` or `0`: no limit).
+pub fn describe_options(
+    base: DescribeOptions,
+    ob: Option<&Bound<'_, PyAny>>,
+) -> PyResult<DescribeOptions> {
+    let Some(ob) = ob.filter(|o| !o.is_none()) else {
+        return Ok(base);
+    };
+    let py = ob.py();
+    let mut o = base;
+    if let Ok(s) = ob.cast::<PyString>() {
+        o.mode = DescribeMode::parse(s.to_str()?).py(py)?;
+        return Ok(o);
+    }
+    let Ok(d) = ob.cast::<PyDict>() else {
+        return Err(PyTypeError::new_err(
+            "describe must be a mode (str) or a dict of DESCRIBE options",
+        ));
+    };
+    for (k, v) in d.iter() {
+        let k: String = k
+            .extract()
+            .map_err(|_| PyTypeError::new_err("DESCRIBE option names are str"))?;
+        let key = match k.as_str() {
+            "max_triples" => "maxTriples",
+            "max_depth" => "maxDepth",
+            other => other,
+        };
+        let value = if v.is_none() {
+            "none".to_string()
+        } else if let Ok(b) = v.cast::<pyo3::types::PyBool>() {
+            b.is_true().to_string()
+        } else if let Ok(n) = v.extract::<u64>() {
+            n.to_string()
+        } else if let Ok(s) = v.cast::<PyString>() {
+            s.to_str()?.to_string()
+        } else {
+            return Err(PyTypeError::new_err(format!(
+                "DESCRIBE option {k}: expected a str, bool, int or None"
+            )));
+        };
+        o.set(key, &value).py(py)?;
+    }
+    Ok(o)
 }
 
 /// The engine's options for a query's arguments, and the state it reads (`None`: the
@@ -232,8 +283,8 @@ impl PyDataset {
     ) -> PyResult<Bound<'py, PyAny>> {
         let ds = self.ds(py)?;
         let (mut opts, at) = query_options(&args)?;
-        // DESCRIBE follows the dataset's setting
-        opts.describe = ds.store().describe_settings();
+        // DESCRIBE follows the dataset's setting, with the query's options over it
+        opts.describe = describe_options(ds.store().describe_settings(), args.describe.as_ref())?;
         let cancel = opts.cancel.clone().unwrap_or_default();
         let query = query.to_string();
         let r = interrupt::run(py, &cancel, move || {
@@ -278,6 +329,7 @@ pub fn query_args<'py>(
     max_rows_produced: Option<u64>,
     cancel: Option<Bound<'py, PyAny>>,
     at: Option<Bound<'py, PyAny>>,
+    describe: Option<Bound<'py, PyAny>>,
 ) -> QueryArgs<'py> {
     QueryArgs {
         base_iri,
@@ -292,6 +344,7 @@ pub fn query_args<'py>(
         max_rows_produced,
         cancel,
         at,
+        describe,
     }
 }
 
@@ -361,7 +414,7 @@ impl PyDataset {
 
     /// Load RDF from `input` (str, bytes or a binary file object) or the file at
     /// `path`; returns the number of new quads.
-    #[pyo3(signature = (input = None, format = None, *, path = None, base_iri = None, to_graph = None, compression = None, lenient = false))]
+    #[pyo3(signature = (input = None, format = None, *, path = None, base_iri = None, to_graph = None, compression = None, lenient = false, mapping = None, template = None, key = None))]
     #[allow(clippy::too_many_arguments)]
     fn load(
         &self,
@@ -373,8 +426,31 @@ impl PyDataset {
         to_graph: Option<&Bound<'_, PyAny>>,
         compression: Option<&str>,
         lenient: bool,
+        mapping: Option<PathBuf>,
+        template: Option<PathBuf>,
+        key: Option<String>,
     ) -> PyResult<u64> {
         let graph = opt(to_graph, iri_from_py)?;
+        let table = crate::io::table_kind(format, path.as_deref())?;
+        if let Some(kind) = table {
+            let args = crate::io::TableArgs {
+                kind,
+                mapping,
+                template,
+                key,
+                base: base_iri,
+                compression: codec_from_py(py, compression)?,
+            };
+            let ds = self.ds_for_write(py)?;
+            return crate::io::load_table(py, input, path.as_deref(), &args, graph, move |src| {
+                ds.store().load(&[src])
+            });
+        }
+        if mapping.is_some() || template.is_some() || key.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "mapping, template and key apply to CSV and TSV input",
+            ));
+        }
         if let Some(i) = input.filter(|i| !i.is_none())
             && path.is_none()
             && crate::io::is_file_object(i)?
@@ -451,7 +527,7 @@ impl PyDataset {
 
     /// Run a SPARQL query: `QuerySolutions` for SELECT, `bool` for ASK, `QueryTriples`
     /// for CONSTRUCT and DESCRIBE.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None))]
     #[allow(clippy::too_many_arguments)]
     fn query<'py>(
         &self,
@@ -469,6 +545,7 @@ impl PyDataset {
         max_rows_produced: Option<u64>,
         cancel: Option<Bound<'py, PyAny>>,
         at: Option<Bound<'py, PyAny>>,
+        describe: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = query_args(
             base_iri,
@@ -483,12 +560,13 @@ impl PyDataset {
             max_rows_produced,
             cancel,
             at,
+            describe,
         );
         self.run_query(py, query, args, None)
     }
 
     /// Run a SELECT query.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None))]
     #[allow(clippy::too_many_arguments)]
     fn select<'py>(
         &self,
@@ -506,6 +584,7 @@ impl PyDataset {
         max_rows_produced: Option<u64>,
         cancel: Option<Bound<'py, PyAny>>,
         at: Option<Bound<'py, PyAny>>,
+        describe: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = query_args(
             base_iri,
@@ -520,12 +599,13 @@ impl PyDataset {
             max_rows_produced,
             cancel,
             at,
+            describe,
         );
         self.run_query(py, query, args, Some(&[QueryKind::Select]))
     }
 
     /// Run an ASK query.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None))]
     #[allow(clippy::too_many_arguments)]
     fn ask<'py>(
         &self,
@@ -543,6 +623,7 @@ impl PyDataset {
         max_rows_produced: Option<u64>,
         cancel: Option<Bound<'py, PyAny>>,
         at: Option<Bound<'py, PyAny>>,
+        describe: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = query_args(
             base_iri,
@@ -557,12 +638,13 @@ impl PyDataset {
             max_rows_produced,
             cancel,
             at,
+            describe,
         );
         self.run_query(py, query, args, Some(&[QueryKind::Ask]))
     }
 
     /// Run a CONSTRUCT or DESCRIBE query.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None))]
     #[allow(clippy::too_many_arguments)]
     fn construct<'py>(
         &self,
@@ -580,6 +662,7 @@ impl PyDataset {
         max_rows_produced: Option<u64>,
         cancel: Option<Bound<'py, PyAny>>,
         at: Option<Bound<'py, PyAny>>,
+        describe: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = query_args(
             base_iri,
@@ -594,6 +677,7 @@ impl PyDataset {
             max_rows_produced,
             cancel,
             at,
+            describe,
         );
         self.run_query(
             py,
@@ -860,9 +944,15 @@ impl PyDataset {
             )
             .into());
         }
-        write_output(py, out, codec, move |w| match graph {
-            None => ds.dump(w, format),
-            Some(g) => {
+        write_output(py, out, codec, move |w| match (graph, format) {
+            (None, crate::io::Fmt::Rdf(f)) => ds.dump(w, f),
+            (None, crate::io::Fmt::Jena(_)) => {
+                // a triple syntax holds the default graph, as `dump` writes it
+                let g = (!format.supports_datasets()).then_some(GraphName::DefaultGraph);
+                let quads = ds.quads(g.as_ref().map(|g| g.as_ref()), None, None, None);
+                serialize_quads(w, format, ds.prefixes(), quads, false)
+            }
+            (Some(g), _) => {
                 let quads = ds.quads(Some(g.as_ref()), None, None, None);
                 serialize_quads(w, format, ds.prefixes(), quads, false)
             }
@@ -939,7 +1029,7 @@ impl PyDataset {
         let format = if compact {
             None
         } else {
-            format_from_py(format)?
+            crate::io::rdf_only(format_from_py(format)?, "shapes")?
         };
         let shapes = match shapes.filter(|s| !s.is_none()) {
             None => None,

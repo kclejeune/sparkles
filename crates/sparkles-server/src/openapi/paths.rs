@@ -1431,6 +1431,26 @@ fn history(p: &mut Paths) {
             .errors(&[400, 410, 507])
             .paginated("seq", &["after", "limit"], "next"),
     );
+    p.add(
+        op(GET, "/{ds}/history", "historyChanges", "History", "History query")
+            .doc("The recorded changes of a range of commits, read from the change log, which outlives compactions. Each change is an addition or a removal of a quad with its commit's number, time, kind, author and message. `subject`, `predicate` and `object` take N-Triples terms or bare IRIs and may repeat.")
+            .see("history-queries")
+            .query("subject", s(), "A subject term; repeat for several.")
+            .query("predicate", s(), "A predicate IRI; repeat for several.")
+            .query("object", s(), "An object term; repeat for several.")
+            .query("graph", s(), "A graph IRI or `default`; repeat for several.")
+            .query("from", s(), "A selector of the first commit read; the first by default.")
+            .query("to", s(), "A selector of the last commit read; the head by default.")
+            .query("op", json!({ "type": "string", "enum": ["add", "remove"] }), "Only additions or only removals.")
+            .query("order", json!({ "type": "string", "enum": ["asc", "desc"], "default": "asc" }), "Oldest or newest commits first.")
+            .query("limit", json!({ "type": "integer", "minimum": 1, "default": 1000 }), "The most changes listed, at most `--max-rows`.")
+            .resp(
+                "200",
+                "The changes, and the commits whose changes are not recorded.",
+                Some(json!({ "application/json": { "schema": sref("HistoryChanges") } })),
+            )
+            .errors(&[400, 501]),
+    );
 }
 
 fn search(p: &mut Paths) {

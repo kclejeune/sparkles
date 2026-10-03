@@ -16,6 +16,7 @@ mod compaction_cmd;
 mod compress;
 mod csv_cmd;
 mod describe_cmd;
+mod dump_cmd;
 mod exposure;
 #[cfg(feature = "fmt")]
 mod fmt;
@@ -33,6 +34,8 @@ mod openapi;
 mod otel;
 mod outbound;
 mod patch_cmd;
+#[cfg(feature = "auth")]
+mod ping_cmd;
 mod queries_cmd;
 mod quota_cmd;
 mod ratelimit;
@@ -92,6 +95,14 @@ struct Cli {
     /// Old index generations named snapshots may keep per dataset
     #[arg(long, global = true, default_value_t = 8)]
     history_max_generations: usize,
+    /// Do not record the change log that history queries read, unless a dataset's
+    /// settings turn it on
+    #[arg(long, global = true)]
+    no_change_log: bool,
+    /// The most disk a dataset's change log may use, in MiB (0: unlimited); a dataset's
+    /// settings override it
+    #[arg(long, global = true, default_value_t = 1024)]
+    change_log_mb: u64,
     /// Named snapshots per dataset
     #[arg(long, global = true, default_value_t = 256)]
     max_snapshots: usize,
@@ -418,6 +429,135 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
                 }
             };
             print_history(&store.set_catalog_horizon(c)?, "text")?;
+        }
+    }
+    Ok(())
+}
+
+/// The arguments of `sparkles history`.
+struct HistoryArgs {
+    subject: Vec<String>,
+    predicate: Vec<String>,
+    object: Vec<String>,
+    graph: Vec<String>,
+    from: Option<String>,
+    to: Option<String>,
+    op: Option<String>,
+    limit: usize,
+    desc: bool,
+    format: String,
+}
+
+/// A term argument: N-Triples syntax, or a bare IRI.
+fn term_arg(v: &str) -> Result<oxrdf::Term> {
+    let v = v.trim();
+    if v.starts_with('<') || v.starts_with('"') || v.starts_with("_:") {
+        v.parse::<oxrdf::Term>()
+            .map_err(|e| anyhow::anyhow!("invalid term {v:?}: {e}"))
+    } else {
+        Ok(oxrdf::Term::NamedNode(
+            oxrdf::NamedNode::new(v).with_context(|| format!("invalid IRI {v:?}"))?,
+        ))
+    }
+}
+
+fn history_cmd(loc: &std::path::Path, a: HistoryArgs, opts: StoreOptions) -> Result<()> {
+    use sparkles::store::{DiffOp, HistoryBound, HistoryQuery};
+    if !matches!(a.format.as_str(), "text" | "json") {
+        bail!("unknown format {:?}: use text or json", a.format);
+    }
+    let store = Store::open(loc, opts)?;
+    let terms = |v: &[String]| v.iter().map(|t| term_arg(t)).collect::<Result<Vec<_>>>();
+    let predicates = terms(&a.predicate)?
+        .into_iter()
+        .map(|t| match t {
+            oxrdf::Term::NamedNode(n) => Ok(n),
+            t => bail!("--predicate {t} is not an IRI"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let graphs = a
+        .graph
+        .iter()
+        .map(|g| match g.as_str() {
+            "default" => Ok(oxrdf::GraphName::DefaultGraph),
+            g => Ok(oxrdf::GraphName::NamedNode(
+                oxrdf::NamedNode::new(g).with_context(|| format!("invalid graph IRI {g:?}"))?,
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bound = |s: &Option<String>| -> Result<Option<HistoryBound>> {
+        Ok(match s {
+            Some(s) => Some(HistoryBound::At(s.parse()?)),
+            None => None,
+        })
+    };
+    let q = HistoryQuery {
+        subjects: terms(&a.subject)?,
+        predicates,
+        objects: terms(&a.object)?,
+        graphs,
+        from: bound(&a.from)?,
+        to: bound(&a.to)?,
+        op: match a.op.as_deref() {
+            None => None,
+            Some("add") => Some(DiffOp::Add),
+            Some("remove") => Some(DiffOp::Remove),
+            Some(o) => bail!("--op must be add or remove, not {o:?}"),
+        },
+        limit: a.limit,
+        descending: a.desc,
+        ..Default::default()
+    };
+    let t = Instant::now();
+    let r = store.history_changes(&q)?;
+    eprintln!(
+        "commits {}..{}: {} change(s){} ({:.1} ms)",
+        r.from,
+        r.to,
+        r.changes.len(),
+        if r.truncated {
+            ", more past --limit"
+        } else {
+            ""
+        },
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    for u in &r.unrecorded {
+        eprintln!(
+            "commits {}..{} are not recorded ({})",
+            u.from,
+            u.to,
+            serde_json::to_value(u.reason)?.as_str().unwrap_or("")
+        );
+    }
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    for c in &r.changes {
+        if a.format == "json" {
+            let j = serde_json::json!({
+                "commit": c.commit.seq,
+                "timestamp": c.commit.timestamp(),
+                "kind": c.commit.kind.name(),
+                "author": c.commit.author.as_deref(),
+                "message": c.commit.message.as_deref(),
+                "op": match c.op { DiffOp::Add => "add", DiffOp::Remove => "remove" },
+                "quad": sparkles::annotations::nquads_line(&c.quad),
+            });
+            writeln!(out, "{j}")?;
+        } else {
+            let who = match (&c.commit.author, &c.commit.message) {
+                (Some(a), Some(m)) => format!("  # {a}: {m}"),
+                (Some(a), None) => format!("  # {a}"),
+                (None, Some(m)) => format!("  # {m}"),
+                (None, None) => String::new(),
+            };
+            writeln!(
+                out,
+                "{:>8}  {}  {} {}{who}",
+                c.commit.seq,
+                c.commit.timestamp(),
+                c.op.sign(),
+                sparkles::annotations::nquads_line(&c.quad)
+            )?;
         }
     }
     Ok(())
@@ -1127,6 +1267,17 @@ enum Cmd {
         /// DESCRIBE adds the rdfs:label and skos:prefLabel of the IRIs it links to
         #[arg(long)]
         describe_labels: bool,
+        /// DESCRIBE adds the reifiers of the triples it describes
+        #[arg(long)]
+        describe_reifiers: bool,
+        /// DESCRIBE writes at most this many triples per query (it can only lower the
+        /// dataset's limit)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        describe_max_triples: Option<u64>,
+        /// DESCRIBE follows blank nodes this many steps deep at most (it can only lower
+        /// the dataset's limit)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        describe_max_depth: Option<u32>,
         // where SERVICE may connect in a local run (a --server applies its own policy)
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
@@ -1157,19 +1308,9 @@ enum Cmd {
     /// Apply RDF Patch files to a database, one commit per file, or send them to a
     /// server's patch endpoint
     Patch(patch_cmd::PatchArgs),
-    /// Write the database as N-Quads, to stdout or a file
-    Dump {
-        #[arg(long)]
-        loc: PathBuf,
-        /// a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME
-        #[arg(long)]
-        at: Option<String>,
-        /// Write to this file instead of stdout (its extension picks the compression)
-        #[arg(long)]
-        out: Option<PathBuf>,
-        #[command(flatten)]
-        compress: CompressArgs,
-    },
+    /// Write the database, or a dataset on a server, in any RDF syntax (N-Quads by
+    /// default), to stdout or a file
+    Dump(dump_cmd::DumpArgs),
     /// Write-time validation of a database (SHACL, or ShEx with --lang shex): status,
     /// set, or turn off
     #[cfg(any(feature = "shacl", feature = "shex"))]
@@ -1180,6 +1321,10 @@ enum Cmd {
     /// Show or change a dataset's automatic compaction settings, on a local database or
     /// on a server
     Compaction(compaction_cmd::CompactionArgs),
+    /// Ask a server whether it is ready (GET /$/ready), over HTTPS or HTTP: exit status 0
+    /// when it answers 200. The container image's health check runs it.
+    #[cfg(feature = "auth")]
+    Ping(ping_cmd::PingArgs),
     /// Show or change how DESCRIBE describes a resource in a dataset (cbd, scbd or
     /// outgoing, labels, reifiers and limits), on a local database or on a server
     DescribeSettings(describe_cmd::DescribeArgs),
@@ -1305,6 +1450,42 @@ enum Cmd {
         /// diff (lines marked + and -), json, count, patch (RDF Patch) or
         /// patch-binary (RDF Patch in RDF Thrift)
         #[arg(long, default_value = "diff")]
+        format: String,
+    },
+    /// The recorded changes of a range of commits, from the change log: the quads added
+    /// and removed, and the commit, time and author of each change
+    History {
+        #[arg(long)]
+        loc: PathBuf,
+        /// a subject (an IRI, or an N-Triples term); repeat for several
+        #[arg(long)]
+        subject: Vec<String>,
+        /// a predicate IRI; repeat for several
+        #[arg(long)]
+        predicate: Vec<String>,
+        /// an object (an IRI, or an N-Triples term such as '"Ann"@en'); repeat for several
+        #[arg(long)]
+        object: Vec<String>,
+        /// a graph IRI, or `default`; repeat for several
+        #[arg(long)]
+        graph: Vec<String>,
+        /// the first commit read (N, commit:N, time:<RFC 3339>, snapshot:NAME, head)
+        #[arg(long)]
+        from: Option<String>,
+        /// the last commit read (by default the head)
+        #[arg(long)]
+        to: Option<String>,
+        /// only additions (add) or only removals (remove)
+        #[arg(long)]
+        op: Option<String>,
+        /// the most changes listed
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// newest commits first
+        #[arg(long)]
+        desc: bool,
+        /// text or json
+        #[arg(long, default_value = "text")]
         format: String,
     },
     /// List the database's commits (works while a server holds the database)
@@ -1536,6 +1717,8 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         max_prefixes: cli.max_prefixes,
         commit_digests: cli.commit_digests,
         wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
+        change_log: !cli.no_change_log,
+        change_log_max_bytes: cli.change_log_mb << 20,
         ..Default::default()
     }
 }
@@ -2543,6 +2726,9 @@ fn run() -> Result<()> {
             rdfs_graph,
             describe,
             describe_labels,
+            describe_reifiers,
+            describe_max_triples,
+            describe_max_depth,
             outbound,
         } => {
             let q = match (query, text) {
@@ -2551,13 +2737,25 @@ fn run() -> Result<()> {
                 _ => bail!("no query given"),
             };
             if loc.is_none() && data.is_empty() && server.is_some() {
-                if describe.is_some() || describe_labels {
-                    bail!(
-                        "--describe and --describe-labels apply to --loc and --data; a server \
-                         uses its dataset's setting (sparkles describe-settings)"
-                    );
-                }
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
+                // the server's DESCRIBE request parameters, over the dataset's setting
+                let mut params: Vec<(&str, String)> = Vec::new();
+                if let Some(m) = &describe {
+                    sparkles::sparql::describe::DescribeMode::parse(m)?;
+                    params.push(("describe", m.clone()));
+                }
+                if describe_labels {
+                    params.push(("describe-labels", "true".into()));
+                }
+                if describe_reifiers {
+                    params.push(("describe-reifiers", "true".into()));
+                }
+                if let Some(n) = describe_max_triples {
+                    params.push(("describe-max-triples", n.to_string()));
+                }
+                if let Some(n) = describe_max_depth {
+                    params.push(("describe-max-depth", n.to_string()));
+                }
                 #[cfg(feature = "auth")]
                 return remote::client::query(
                     server.as_deref(),
@@ -2567,6 +2765,7 @@ fn run() -> Result<()> {
                     &fmt,
                     timeout,
                     explain,
+                    &params,
                 );
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
@@ -2596,7 +2795,8 @@ fn run() -> Result<()> {
                         d.mode = sparkles::sparql::describe::DescribeMode::parse(m)?;
                     }
                     d.labels |= describe_labels;
-                    d
+                    d.reifiers |= describe_reifiers;
+                    d.lowered(describe_max_triples, describe_max_depth)
                 },
                 ..Default::default()
             };
@@ -2778,44 +2978,7 @@ fn run() -> Result<()> {
             at,
             format,
         } => print_log(&loc, limit, before, after, at.as_deref(), &format),
-        Cmd::Dump {
-            loc,
-            at,
-            out,
-            compress,
-        } => {
-            let store = Store::open(&loc, opts)?;
-            let codec = compress.codec(
-                out.as_deref()
-                    .and_then(sparkles::codec::Codec::from_extension)
-                    .unwrap_or_default(),
-            )?;
-            let sink: Box<dyn std::io::Write> = match &out {
-                Some(p) => Box::new(
-                    std::fs::File::create(p)
-                        .with_context(|| format!("creating {}", p.display()))?,
-                ),
-                None => Box::new(std::io::stdout().lock()),
-            };
-            let mut w = codec.writer(
-                std::io::BufWriter::new(sink),
-                compress.level(),
-                compress.threads(),
-            )?;
-            match at {
-                Some(a) => {
-                    let a: sparkles::history::At = a.parse()?;
-                    let r = store.resolve(&a)?;
-                    eprintln!("at commit {} ({})", r.commit.seq, r.commit.timestamp());
-                    store.dump_nquads_at(&a, &mut w)?;
-                }
-                None => {
-                    store.dump_nquads(&mut w)?;
-                }
-            }
-            w.finish()?;
-            Ok(())
-        }
+        Cmd::Dump(args) => dump_cmd::run(args, opts),
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
         Cmd::Queries { cmd } => queries_cmd::run(cmd, opts),
         #[cfg(feature = "graphql")]
@@ -2827,10 +2990,40 @@ fn run() -> Result<()> {
             graph,
             format,
         } => diff_cmd(&loc, &from, &to, graph.as_deref(), &format, opts),
+        Cmd::History {
+            loc,
+            subject,
+            predicate,
+            object,
+            graph,
+            from,
+            to,
+            op,
+            limit,
+            desc,
+            format,
+        } => history_cmd(
+            &loc,
+            HistoryArgs {
+                subject,
+                predicate,
+                object,
+                graph,
+                from,
+                to,
+                op,
+                limit,
+                desc,
+                format,
+            },
+            opts,
+        ),
         #[cfg(any(feature = "shacl", feature = "shex"))]
         Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Quota(args) => quota_cmd::run(args, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
+        #[cfg(feature = "auth")]
+        Cmd::Ping(args) => ping_cmd::run(args),
         Cmd::VocabIndex { loc } => {
             let store = Store::open(&loc, opts)?;
             match store.add_vocab_index()? {

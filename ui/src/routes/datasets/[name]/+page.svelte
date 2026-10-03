@@ -29,6 +29,7 @@
   import BackupsPanel from '$components/BackupsPanel.svelte';
   import CloneDialog from '$components/CloneDialog.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
+  import DescribePanel from '$components/DescribePanel.svelte';
   import FullTextPanel from '$components/FullTextPanel.svelte';
   import HistoryPanel from '$components/HistoryPanel.svelte';
   import SnapshotsPanel from '$components/SnapshotsPanel.svelte';
@@ -968,6 +969,9 @@ ex:PersonShape a sh:NodeShape ;
 
         <!-- write-time validation -->
         <WriteValidationPanel {name} {prefixes} refreshKey={refreshKick} />
+
+        <!-- how DESCRIBE describes a resource -->
+        <DescribePanel {name} canEdit={auth.can(name, 'admin') && !readOnly} />
 
         <!-- predicates -->
         <section class="panel">

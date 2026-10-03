@@ -11,6 +11,7 @@ import http from 'node:http';
 import { performance } from 'node:perf_hooks';
 import ox from 'oxigraph';
 import { handleBackups } from './backups.mjs';
+import { handleDescribe } from './describe.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
@@ -1941,6 +1942,8 @@ const server = http.createServer(async (req, res) => {
       })
     )
       return;
+    // the DESCRIBE setting of a dataset (mock/describe.mjs)
+    if (await handleDescribe(req, res, url, seg, { datasets, send, readBody })) return;
     // vector indexes (mock/vector.mjs)
     if (
       await handleVector(req, res, url, seg, {

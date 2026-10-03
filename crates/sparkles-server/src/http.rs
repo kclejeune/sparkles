@@ -33,9 +33,10 @@ mod format;
 pub(crate) mod fuseki;
 #[cfg(feature = "graphql")]
 mod graphql;
+mod hist;
 pub(crate) mod history;
 mod inline;
-pub(crate) mod jena_formats;
+pub(crate) use sparkles::jena_formats;
 #[cfg(feature = "fmt")]
 mod lint;
 mod patch;
@@ -183,6 +184,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/text", get(text_search).post(text_search))
         .route("/{ds}/diff", get(diff::diff))
         .route("/{ds}/changes", get(changes::changes))
+        .route("/{ds}/history", get(hist::history))
         .route("/{ds}/shacl", post(shacl))
         .route("/{ds}/shex", post(shex::shex))
         .route("/{ds}/prefixes", any(dataset_prefixes))
@@ -879,12 +881,27 @@ fn body_write_options(
     st: &AppState,
     params: &Params,
     headers: &HeaderMap,
+    p: Option<&Principal>,
 ) -> ApiResult<(WriteDeadline, CancelOnDrop)> {
     let timeout = update_timeout(st, params);
     let mut opts = validation::write_options(st, params, headers, None)?;
+    opts.author = p.and_then(author);
     let (cancel, guard) = cancel_on_drop();
     opts.cancel = Some(cancel);
     Ok((WriteDeadline { opts, timeout }, guard))
+}
+
+/// The author a write records in the change log: the authenticated caller (its
+/// owner's identity for a minted token), none when authentication is off.
+pub(crate) fn author(p: &Principal) -> Option<Arc<str>> {
+    use crate::auth::Kind;
+    if let Some(o) = &p.info.owner {
+        return Some(o.log_name().into());
+    }
+    match p.kind {
+        Kind::Local | Kind::Anonymous => None,
+        k => Some(format!("{}:{}", k.as_str(), p.name).into()),
+    }
 }
 
 /// Write options whose deadline is not set yet (see [`body_write_options`]).
@@ -1874,6 +1891,7 @@ async fn update_endpoint(
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Update);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
     opts.write.graphs = opts.graphs.clone();
+    opts.write.author = author(&p);
     // a client that disconnects drops this future: the update stops at its next check
     // (or while it waits for the writer lock) and commits nothing
     let (cancel, _cancel_on_drop) = cancel_on_drop();
@@ -2670,7 +2688,8 @@ async fn gsp_on(
             };
             let replace = method == Method::PUT;
             let wanted = receipt_wanted(&params, &headers);
-            let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            let (mut wopts, _cancel_on_drop) =
+                body_write_options(&st, &params, &headers, Some(&p))?;
             wopts.opts.precondition =
                 conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
             wopts.opts.graphs = view.clone();
@@ -2741,7 +2760,8 @@ async fn gsp_on(
             }
             history::reject_at(&params)?;
             let wanted = receipt_wanted(&params, &headers);
-            let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            let (mut wopts, _cancel_on_drop) =
+                body_write_options(&st, &params, &headers, Some(&p))?;
             wopts.opts.precondition =
                 conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
             wopts.opts.graphs = view.clone();
@@ -2819,7 +2839,12 @@ async fn upload(
     let params = Params::from_query(&uri);
     history::reject_at(&params)?;
     let wanted = receipt_wanted(&params, &headers);
-    let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+    let (mut wopts, _cancel_on_drop) = body_write_options(
+        &st,
+        &params,
+        &headers,
+        request.extensions().get::<Principal>(),
+    )?;
     // each quad must land in a graph the caller may write
     wopts.opts.graphs = request
         .extensions()

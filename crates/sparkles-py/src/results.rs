@@ -395,7 +395,7 @@ impl PyQueryTriples {
         let out = output_from_py(output)?;
         let format = format_from_py(format)?
             .or_else(|| format_of_output(&out))
-            .unwrap_or(oxrdfio::RdfFormat::Turtle);
+            .unwrap_or(crate::io::Fmt::Rdf(oxrdfio::RdfFormat::Turtle));
         let triples: Vec<Triple> = self.triples.lock().unwrap().by_ref().collect();
         let named = if format.supports_datasets() {
             self.quads.clone()

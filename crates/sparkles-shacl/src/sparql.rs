@@ -202,6 +202,12 @@ fn check_prebinding(gp: &GraphPattern, prebound: &[String]) -> Result<()> {
         }
         GP::Extend {
             inner, variable, ..
+        }
+        | GP::Assign {
+            inner, variable, ..
+        }
+        | GP::Unfold {
+            inner, variable, ..
         } => {
             if prebound.iter().any(|p| p == variable.as_str()) {
                 bail!(

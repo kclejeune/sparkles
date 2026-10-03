@@ -5,8 +5,12 @@ import {
   diffLine,
   diffSummary,
   expiresParam,
+  historyBy,
+  historyLine,
+  historyTerm,
   normalizeAt,
   readable,
+  unrecordedNote,
   validAt,
   validSnapshotName,
 } from './history';
@@ -60,7 +64,11 @@ describe('the state a read saw', () => {
 
   it('labels the head and reads without at', () => {
     const at = atInfo(
-      new Headers({ 'Sparkles-At': 'head', 'Sparkles-Commit': '57', 'Sparkles-Head': '57' }),
+      new Headers({
+        'Sparkles-At': 'head',
+        'Sparkles-Commit': '57',
+        'Sparkles-Head': '57',
+      }),
     )!;
     expect(at.historical).toBe(false);
     expect(atLabel(at)).toBe('at commit 57 (head)');
@@ -76,7 +84,13 @@ describe('the state a read saw', () => {
 describe('diffs', () => {
   it('formats changes as signed N-Quads lines', () => {
     expect(
-      diffLine({ op: '-', subject: '<urn:a>', predicate: '<urn:p>', object: '"1"', graph: null }),
+      diffLine({
+        op: '-',
+        subject: '<urn:a>',
+        predicate: '<urn:p>',
+        object: '"1"',
+        graph: null,
+      }),
     ).toBe('− <urn:a> <urn:p> "1" .');
     expect(
       diffLine({
@@ -96,5 +110,48 @@ describe('diffs', () => {
     expect(expiresParam('7d')).toBe('7d');
     expect(expiresParam('2030-01-01T00:00:00Z')).toBe('2030-01-01T00:00:00.000Z');
     expect(() => expiresParam('soon')).toThrow();
+  });
+});
+
+describe('history queries', () => {
+  const change = {
+    op: 'remove' as const,
+    subject: '<urn:a>',
+    predicate: '<urn:name>',
+    object: '"Ann"',
+    graph: null,
+    commit: 2,
+    timestamp: '2026-10-03T10:00:00.000Z',
+    kind: 'update',
+  };
+
+  it('formats a change and who made it', () => {
+    expect(historyLine(change)).toBe('− <urn:a> <urn:name> "Ann" .');
+    expect(historyLine({ ...change, op: 'add', graph: '<urn:g>' })).toBe(
+      '+ <urn:a> <urn:name> "Ann" <urn:g> .',
+    );
+    expect(historyBy(change)).toBe('');
+    expect(historyBy({ ...change, author: 'user:ann', message: 'rename' })).toBe(
+      'user:ann · rename',
+    );
+  });
+
+  it('notes the commits it could not see', () => {
+    expect(unrecordedNote({ unrecorded: [] })).toBe('');
+    expect(
+      unrecordedNote({
+        unrecorded: [
+          { from: 1, to: 40, reason: 'before-log' },
+          { from: 57, to: 57, reason: 'bulk' },
+        ],
+      }),
+    ).toBe(
+      'Not shown: commits 1–40 (older than the change log), commit 57 (a bulk load too large to record).',
+    );
+  });
+
+  it('reads search terms', () => {
+    expect(historyTerm('  ')).toBeNull();
+    expect(historyTerm(' <urn:a> ')).toBe('<urn:a>');
   });
 });

@@ -1,6 +1,6 @@
 //! RDF syntaxes Jena speaks that the Rust RDF crates do not: RDF Thrift and RDF
 //! Protobuf, Jena's binary encodings, RDF/JSON, and TriX (whose reader and writer are
-//! [`sparkles::trix`]). `RDFConnectionFuseki` sends graphs
+//! [`crate::trix`]). `RDFConnectionFuseki` sends graphs
 //! and datasets in RDF Thrift and asks for RDF Thrift back, and for SELECT results in
 //! SPARQL Results Thrift.
 //!
@@ -58,7 +58,7 @@ impl JenaFormat {
     /// (`data.trix.gz`).
     pub fn from_path(path: &std::path::Path) -> Option<JenaFormat> {
         let name = path.file_name()?.to_str()?;
-        JenaFormat::from_file_name(sparkles::codec::Codec::strip_extension(name))
+        JenaFormat::from_file_name(crate::codec::Codec::strip_extension(name))
     }
 
     /// The format by one of the names `sparkles convert --syntax` and `?format=` take,
@@ -83,7 +83,7 @@ impl JenaFormat {
             JenaFormat::Thrift => "rt",
             JenaFormat::Protobuf => "rpb",
             JenaFormat::RdfJson => "rj",
-            JenaFormat::TriX => sparkles::trix::FILE_EXTENSION,
+            JenaFormat::TriX => crate::trix::FILE_EXTENSION,
         }
     }
 
@@ -92,7 +92,7 @@ impl JenaFormat {
             JenaFormat::Thrift => "application/rdf+thrift",
             JenaFormat::Protobuf => "application/rdf+protobuf",
             JenaFormat::RdfJson => "application/rdf+json",
-            JenaFormat::TriX => sparkles::trix::MEDIA_TYPE,
+            JenaFormat::TriX => crate::trix::MEDIA_TYPE,
         }
     }
 
@@ -124,8 +124,8 @@ fn bad<T>(msg: impl Into<String>) -> Res<T> {
     Err(DecodeError(msg.into()))
 }
 
-impl From<sparkles::trix::TrixError> for DecodeError {
-    fn from(e: sparkles::trix::TrixError) -> DecodeError {
+impl From<crate::trix::TrixError> for DecodeError {
+    fn from(e: crate::trix::TrixError) -> DecodeError {
         DecodeError(e.to_string())
     }
 }
@@ -180,7 +180,7 @@ pub fn transcode_with_base(
         JenaFormat::Thrift => ThriftReader::new(input).read_stream(&mut sink)?,
         JenaFormat::Protobuf => ProtoReader::new(input).read_stream(&mut sink)?,
         JenaFormat::RdfJson => read_rdf_json(input, &mut sink)?,
-        JenaFormat::TriX => sparkles::trix::parse(BufReader::new(input), base, &mut sink)?,
+        JenaFormat::TriX => crate::trix::parse(BufReader::new(input), base, &mut sink)?,
     }
     ser.finish()?;
     Ok(n)
@@ -1199,7 +1199,7 @@ pub struct RdfWriter<W: Write> {
     w: W,
     /// RDF/JSON: subject → predicate → objects, written at the end
     json: BTreeMap<String, BTreeMap<String, Vec<serde_json::Value>>>,
-    trix: sparkles::trix::TrixSerializer,
+    trix: crate::trix::TrixSerializer,
 }
 
 impl<W: Write> RdfWriter<W> {
@@ -1208,7 +1208,7 @@ impl<W: Write> RdfWriter<W> {
             fmt,
             w,
             json: BTreeMap::new(),
-            trix: sparkles::trix::TrixSerializer::new(),
+            trix: crate::trix::TrixSerializer::new(),
         }
     }
 

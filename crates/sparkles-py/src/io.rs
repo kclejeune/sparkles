@@ -1,5 +1,9 @@
 //! RDF formats, inputs and outputs: `RdfFormat`, `parse`, `serialize`, and the sources
 //! and sinks that `Dataset.load` and `Dataset.dump` share with them.
+//!
+//! Besides oxrdfio's syntaxes, `RdfFormat` names Jena's TriX, RDF Thrift, RDF Protobuf
+//! and RDF/JSON ([`sparkles::jena_formats`]). An input in one of them is read into
+//! N-Quads first, in memory, and an output is written by the engine's writer.
 
 use crate::errors::{EngineResult, invalid};
 use crate::results::PyQuadIterator;
@@ -11,12 +15,55 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use sparkles::codec::Codec;
 use sparkles::io::{Source, SourceData};
+use sparkles::jena_formats::{JenaFormat, RdfWriter};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 // ----------------------------------------------------------------------- formats ----
+
+/// A syntax: one of oxrdfio's, or one of Jena's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fmt {
+    Rdf(RdfFormat),
+    Jena(JenaFormat),
+}
+
+impl Fmt {
+    pub fn name(self) -> &'static str {
+        match self {
+            Fmt::Rdf(f) => f.name(),
+            Fmt::Jena(j) => j.name(),
+        }
+    }
+
+    pub fn supports_datasets(self) -> bool {
+        match self {
+            Fmt::Rdf(f) => f.supports_datasets(),
+            Fmt::Jena(j) => j.quads(),
+        }
+    }
+
+    /// The format of a file path, past a compression extension.
+    pub fn of_path(p: &Path) -> Option<Fmt> {
+        JenaFormat::from_path(p)
+            .map(Fmt::Jena)
+            .or_else(|| sparkles::io::format_for_path(p).map(|(f, _)| Fmt::Rdf(f)))
+    }
+}
+
+/// The format where only oxrdfio's syntaxes are read (shapes, schemas).
+pub fn rdf_only(f: Option<Fmt>, what: &str) -> PyResult<Option<RdfFormat>> {
+    match f {
+        None => Ok(None),
+        Some(Fmt::Rdf(f)) => Ok(Some(f)),
+        Some(Fmt::Jena(j)) => Err(PyValueError::new_err(format!(
+            "{what} are not read in {}",
+            j.name()
+        ))),
+    }
+}
 
 /// An RDF serialization format.
 #[pyclass(
@@ -29,7 +76,7 @@ use std::path::{Path, PathBuf};
 )]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PyRdfFormat {
-    pub inner: RdfFormat,
+    pub inner: Fmt,
 }
 
 impl Hash for PyRdfFormat {
@@ -46,30 +93,48 @@ const JSON_LD: RdfFormat = RdfFormat::JsonLd {
 impl PyRdfFormat {
     #[classattr]
     const TURTLE: PyRdfFormat = PyRdfFormat {
-        inner: RdfFormat::Turtle,
+        inner: Fmt::Rdf(RdfFormat::Turtle),
     };
     #[classattr]
     const N_TRIPLES: PyRdfFormat = PyRdfFormat {
-        inner: RdfFormat::NTriples,
+        inner: Fmt::Rdf(RdfFormat::NTriples),
     };
     #[classattr]
     const N_QUADS: PyRdfFormat = PyRdfFormat {
-        inner: RdfFormat::NQuads,
+        inner: Fmt::Rdf(RdfFormat::NQuads),
     };
     #[classattr]
     const TRIG: PyRdfFormat = PyRdfFormat {
-        inner: RdfFormat::TriG,
+        inner: Fmt::Rdf(RdfFormat::TriG),
     };
     #[classattr]
     const N3: PyRdfFormat = PyRdfFormat {
-        inner: RdfFormat::N3,
+        inner: Fmt::Rdf(RdfFormat::N3),
     };
     #[classattr]
     const RDF_XML: PyRdfFormat = PyRdfFormat {
-        inner: RdfFormat::RdfXml,
+        inner: Fmt::Rdf(RdfFormat::RdfXml),
     };
     #[classattr]
-    const JSON_LD: PyRdfFormat = PyRdfFormat { inner: JSON_LD };
+    const JSON_LD: PyRdfFormat = PyRdfFormat {
+        inner: Fmt::Rdf(JSON_LD),
+    };
+    #[classattr]
+    const TRIX: PyRdfFormat = PyRdfFormat {
+        inner: Fmt::Jena(JenaFormat::TriX),
+    };
+    #[classattr]
+    const RDF_THRIFT: PyRdfFormat = PyRdfFormat {
+        inner: Fmt::Jena(JenaFormat::Thrift),
+    };
+    #[classattr]
+    const RDF_PROTOBUF: PyRdfFormat = PyRdfFormat {
+        inner: Fmt::Jena(JenaFormat::Protobuf),
+    };
+    #[classattr]
+    const RDF_JSON: PyRdfFormat = PyRdfFormat {
+        inner: Fmt::Jena(JenaFormat::RdfJson),
+    };
 
     #[getter]
     fn name(&self) -> &'static str {
@@ -78,17 +143,29 @@ impl PyRdfFormat {
 
     #[getter]
     fn media_type(&self) -> &'static str {
-        self.inner.media_type()
+        match self.inner {
+            Fmt::Rdf(f) => f.media_type(),
+            Fmt::Jena(j) => j.media_type(),
+        }
     }
 
     #[getter]
     fn file_extension(&self) -> &'static str {
-        self.inner.file_extension()
+        match self.inner {
+            Fmt::Rdf(f) => f.file_extension(),
+            Fmt::Jena(j) => j.file_extension(),
+        }
     }
 
+    /// The IRI of the format's specification.
     #[getter]
     fn iri(&self) -> &'static str {
-        self.inner.iri()
+        match self.inner {
+            Fmt::Rdf(f) => f.iri(),
+            Fmt::Jena(JenaFormat::TriX) => "http://www.w3.org/2004/03/trix/",
+            Fmt::Jena(JenaFormat::RdfJson) => "https://www.w3.org/TR/rdf-json/",
+            Fmt::Jena(_) => "https://jena.apache.org/documentation/io/rdf-binary.html",
+        }
     }
 
     #[getter]
@@ -100,14 +177,16 @@ impl PyRdfFormat {
     #[staticmethod]
     fn from_extension(extension: &str) -> Option<PyRdfFormat> {
         let ext = extension.trim_start_matches('.');
-        sparkles::io::format_for_path(Path::new(&format!("x.{ext}")))
-            .map(|(inner, _)| PyRdfFormat { inner })
+        Fmt::of_path(Path::new(&format!("x.{ext}"))).map(|inner| PyRdfFormat { inner })
     }
 
     /// The format of a media type such as `text/turtle`, or `None`.
     #[staticmethod]
     fn from_media_type(media_type: &str) -> Option<PyRdfFormat> {
-        sparkles::io::format_for_media_type(media_type).map(|inner| PyRdfFormat { inner })
+        sparkles::io::format_for_media_type(media_type)
+            .map(Fmt::Rdf)
+            .or_else(|| JenaFormat::from_media_type(media_type).map(Fmt::Jena))
+            .map(|inner| PyRdfFormat { inner })
     }
 
     fn __str__(&self) -> &'static str {
@@ -116,20 +195,24 @@ impl PyRdfFormat {
 
     fn __repr__(&self) -> String {
         let attr = match self.inner {
-            RdfFormat::Turtle => "TURTLE",
-            RdfFormat::NTriples => "N_TRIPLES",
-            RdfFormat::NQuads => "N_QUADS",
-            RdfFormat::TriG => "TRIG",
-            RdfFormat::N3 => "N3",
-            RdfFormat::RdfXml => "RDF_XML",
-            _ => "JSON_LD",
+            Fmt::Rdf(RdfFormat::Turtle) => "TURTLE",
+            Fmt::Rdf(RdfFormat::NTriples) => "N_TRIPLES",
+            Fmt::Rdf(RdfFormat::NQuads) => "N_QUADS",
+            Fmt::Rdf(RdfFormat::TriG) => "TRIG",
+            Fmt::Rdf(RdfFormat::N3) => "N3",
+            Fmt::Rdf(RdfFormat::RdfXml) => "RDF_XML",
+            Fmt::Rdf(_) => "JSON_LD",
+            Fmt::Jena(JenaFormat::TriX) => "TRIX",
+            Fmt::Jena(JenaFormat::Thrift) => "RDF_THRIFT",
+            Fmt::Jena(JenaFormat::Protobuf) => "RDF_PROTOBUF",
+            Fmt::Jena(JenaFormat::RdfJson) => "RDF_JSON",
         };
         format!("RdfFormat.{attr}")
     }
 }
 
 /// A `format` argument: an `RdfFormat`, or a name, extension or media type.
-pub fn format_from_py(ob: Option<&Bound<'_, PyAny>>) -> PyResult<Option<RdfFormat>> {
+pub fn format_from_py(ob: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Fmt>> {
     let Some(ob) = ob.filter(|o| !o.is_none()) else {
         return Ok(None);
     };
@@ -142,12 +225,14 @@ pub fn format_from_py(ob: Option<&Bound<'_, PyAny>>) -> PyResult<Option<RdfForma
     let s = s.to_str()?;
     let found = sparkles::sparql::results::rdf_format_from_name(s)
         .or_else(|| sparkles::io::format_for_media_type(s))
+        .map(Fmt::Rdf)
+        .or_else(|| JenaFormat::from_name(s).map(Fmt::Jena))
         .or_else(|| PyRdfFormat::from_extension(s).map(|f| f.inner))
         .or_else(|| match s.to_ascii_lowercase().as_str() {
-            "n-triples" => Some(RdfFormat::NTriples),
-            "n-quads" => Some(RdfFormat::NQuads),
-            "rdf/xml" | "rdf-xml" => Some(RdfFormat::RdfXml),
-            "n3" => Some(RdfFormat::N3),
+            "n-triples" => Some(Fmt::Rdf(RdfFormat::NTriples)),
+            "n-quads" => Some(Fmt::Rdf(RdfFormat::NQuads)),
+            "rdf/xml" | "rdf-xml" => Some(Fmt::Rdf(RdfFormat::RdfXml)),
+            "n3" => Some(Fmt::Rdf(RdfFormat::N3)),
             _ => None,
         });
     match found {
@@ -176,6 +261,16 @@ pub fn source_from_py(
 ) -> PyResult<Source> {
     let format = format_from_py(format)?;
     let input = input.filter(|i| !i.is_none());
+    // a path in one of Jena's syntaxes, by its extension
+    let format = format.or_else(|| {
+        path.as_deref()
+            .and_then(JenaFormat::from_path)
+            .map(Fmt::Jena)
+    });
+    if let Some(Fmt::Jena(j)) = format {
+        return jena_source(py, j, input, path, base_iri, graph, compression, lenient);
+    }
+    let format = rdf_only(format, "datasets")?;
     let mut src = match (input, path) {
         (Some(_), Some(_)) => return Err(PyValueError::new_err("give input or path, not both")),
         (None, None) => return Err(PyValueError::new_err("give input or path")),
@@ -214,6 +309,74 @@ pub fn source_from_py(
         src.base = base_iri;
     }
     src.compression = codec_from_py(py, compression)?;
+    src.lenient = lenient;
+    Ok(src)
+}
+
+/// A source of an input in one of Jena's syntaxes: read whole, decompressed and
+/// transcoded into N-Quads.
+#[allow(clippy::too_many_arguments)]
+fn jena_source(
+    py: Python<'_>,
+    fmt: JenaFormat,
+    input: Option<&Bound<'_, PyAny>>,
+    path: Option<PathBuf>,
+    base_iri: Option<String>,
+    graph: Option<NamedNode>,
+    compression: Option<&str>,
+    lenient: bool,
+) -> PyResult<Source> {
+    let explicit = codec_from_py(py, compression)?;
+    let (raw, name, base): (Box<dyn Read + Send>, String, Option<String>) = match (input, path) {
+        (Some(_), Some(_)) => return Err(PyValueError::new_err("give input or path, not both")),
+        (None, None) => return Err(PyValueError::new_err("give input or path")),
+        (None, Some(p)) => {
+            if !p.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("No such file: {}", p.display()),
+                )
+                .into());
+            }
+            let mut src = Source::from_bytes(Vec::new(), RdfFormat::NQuads, None);
+            src.data = SourceData::File(p.clone());
+            src.name = p.display().to_string();
+            src.compression = explicit;
+            let codec = src.codec().py(py)?;
+            let f = std::fs::File::open(&p)?;
+            let abs = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            (
+                codec
+                    .reader_send(std::io::BufReader::with_capacity(1 << 16, f), None)
+                    .py(py)?,
+                p.display().to_string(),
+                Some(format!("file://{}", abs.display())),
+            )
+        }
+        (Some(i), None) => {
+            let bytes = input_bytes(i)?;
+            let codec = explicit
+                .or_else(|| Codec::sniff(&bytes))
+                .unwrap_or(Codec::None);
+            (
+                codec
+                    .reader_send(std::io::Cursor::new(bytes), None)
+                    .py(py)?,
+                "<input>".to_string(),
+                None,
+            )
+        }
+    };
+    let base = base_iri.or(base);
+    let nquads = py
+        .detach(|| {
+            let mut out = Vec::new();
+            sparkles::jena_formats::transcode_with_base(fmt, raw, true, &mut out, base.as_deref())
+                .map(|_| out)
+        })
+        .map_err(|e| invalid(py, format!("{name}: {}: {e}", fmt.name())))?;
+    let mut src = Source::from_bytes(nquads, RdfFormat::NQuads, graph);
+    src.name = name;
     src.lenient = lenient;
     Ok(src)
 }
@@ -324,10 +487,39 @@ pub fn quad_stream(
     let explicit = codec_from_py(py, compression)?;
     let (reader, format, base, graph, name): (Box<dyn Read + Send>, _, _, _, String) = match input {
         Some(i) if path.is_none() && is_file_object(i)? => {
-            let Some(f) = format_from_py(format)? else {
-                return Err(PyValueError::new_err(
-                    "format is required when reading from input",
-                ));
+            let f = match format_from_py(format)? {
+                None => {
+                    return Err(PyValueError::new_err(
+                        "format is required when reading from input",
+                    ));
+                }
+                Some(Fmt::Jena(j)) => {
+                    // read whole, then parsed as N-Quads
+                    let bytes = PyBytes::new(py, &input_bytes(i)?);
+                    let src = jena_source(
+                        py,
+                        j,
+                        Some(bytes.as_any()),
+                        None,
+                        base_iri.clone(),
+                        graph.clone(),
+                        compression,
+                        lenient,
+                    )?;
+                    let SourceData::Bytes(b) = src.data else {
+                        unreachable!("an input is read into bytes")
+                    };
+                    return stream_of(
+                        py,
+                        Box::new(std::io::Cursor::new(b)),
+                        RdfFormat::NQuads,
+                        None,
+                        graph,
+                        lenient,
+                        src.name,
+                    );
+                }
+                Some(Fmt::Rdf(f)) => f,
             };
             let mut r = PyFileReader::new(i.clone().unbind());
             let name = "<file object>".to_string();
@@ -366,6 +558,19 @@ pub fn quad_stream(
             (r, src.format, src.base, src.graph, src.name)
         }
     };
+    stream_of(py, reader, format, base, graph, lenient, name)
+}
+
+/// A streaming parse of `reader` in `format`.
+fn stream_of(
+    py: Python<'_>,
+    reader: Box<dyn Read + Send>,
+    format: RdfFormat,
+    base: Option<String>,
+    graph: Option<NamedNode>,
+    lenient: bool,
+    name: String,
+) -> PyResult<QuadStream> {
     let mut parser = oxrdfio::RdfParser::from_format(format);
     if let Some(b) = base {
         parser = parser
@@ -403,6 +608,142 @@ fn input_bytes(i: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     Err(PyTypeError::new_err(
         "input must be str, bytes or a file object with read()",
     ))
+}
+
+// ------------------------------------------------------------------------ tables ----
+
+/// Whether a load reads a CSV or TSV table: `format` names one (`"csv"`, `"tsv"` or a
+/// media type), or there is no format and the path's extension is `.csv`, `.tsv` or
+/// `.tab` (before a compression extension).
+pub fn table_kind(
+    format: Option<&Bound<'_, PyAny>>,
+    path: Option<&Path>,
+) -> PyResult<Option<sparkles::tabular::TabularKind>> {
+    use sparkles::tabular::TabularKind;
+    match format.filter(|f| !f.is_none()) {
+        Some(f) => {
+            let Ok(s) = f.cast::<PyString>() else {
+                return Ok(None);
+            };
+            let s = s.to_str()?;
+            Ok(match s.to_ascii_lowercase().as_str() {
+                "csv" => Some(TabularKind::Csv),
+                "tsv" | "tab" => Some(TabularKind::Tsv),
+                other => sparkles::tabular::tabular_media_type(other),
+            })
+        }
+        None => Ok(path.and_then(sparkles::tabular::tabular_kind)),
+    }
+}
+
+/// How a table maps to triples (spec C05).
+pub struct TableArgs {
+    pub kind: sparkles::tabular::TabularKind,
+    /// a CSVW metadata file
+    pub mapping: Option<PathBuf>,
+    /// a SPARQL CONSTRUCT template run for each row
+    pub template: Option<PathBuf>,
+    /// the column that names each row's subject in the default mapping
+    pub key: Option<String>,
+    /// the default mapping's namespace
+    pub base: Option<String>,
+    pub compression: Option<Codec>,
+}
+
+/// Convert a table from `input` (str, bytes or a file object) or `path` into a
+/// temporary N-Triples file, and hand it to `load` as a source into `graph`. Warnings of
+/// the conversion become Python warnings.
+pub fn load_table(
+    py: Python<'_>,
+    input: Option<&Bound<'_, PyAny>>,
+    path: Option<&Path>,
+    args: &TableArgs,
+    graph: Option<NamedNode>,
+    load: impl FnOnce(Source) -> sparkles::Result<u64> + Send,
+) -> PyResult<u64> {
+    use sparkles::tabular::{self, Mapping, Options};
+    use std::sync::Arc;
+    let input = input.filter(|i| !i.is_none());
+    let metadata = args
+        .mapping
+        .as_deref()
+        .map(|m| tabular::read_metadata(m).map(Arc::new))
+        .transpose()
+        .py(py)?;
+    let mapping = match (&args.template, metadata) {
+        (Some(t), metadata) => Mapping::Template {
+            template: Arc::new(tabular::read_template(t).py(py)?),
+            metadata,
+        },
+        (None, Some(m)) => Mapping::Csvw(m),
+        (None, None) => {
+            // a CSVW metadata file next to the table, as `sparkles load` finds it
+            let beside = path.map(|p| {
+                let mut s = p.as_os_str().to_owned();
+                s.push("-metadata.json");
+                PathBuf::from(s)
+            });
+            match beside.filter(|b| b.is_file() && args.key.is_none()) {
+                Some(b) => Mapping::Csvw(Arc::new(tabular::read_metadata(&b).py(py)?)),
+                None => Mapping::Default {
+                    key: args.key.clone(),
+                },
+            }
+        }
+    };
+    let (reader, mut opts): (Box<dyn Read + Send>, Options) = match (input, path) {
+        (Some(_), Some(_)) => return Err(PyValueError::new_err("give input or path, not both")),
+        (None, None) => return Err(PyValueError::new_err("give input or path")),
+        (None, Some(p)) => {
+            if !p.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("No such file: {}", p.display()),
+                )
+                .into());
+            }
+            let f = std::fs::File::open(p)?;
+            let mut src = Source::from_bytes(Vec::new(), RdfFormat::NTriples, None);
+            src.data = SourceData::File(p.to_path_buf());
+            src.name = p.display().to_string();
+            src.compression = args.compression;
+            let codec = src.codec().py(py)?;
+            let r = codec
+                .reader_send(std::io::BufReader::with_capacity(1 << 16, f), None)
+                .py(py)?;
+            (r, Options::for_file(mapping, p))
+        }
+        (Some(i), None) => {
+            let bytes = input_bytes(i)?;
+            let codec = match args.compression {
+                Some(c) => c,
+                None => Codec::sniff(&bytes).unwrap_or(Codec::None),
+            };
+            let r = codec
+                .reader_send(std::io::Cursor::new(bytes), None)
+                .py(py)?;
+            (r, Options::new(mapping, "<input>"))
+        }
+    };
+    opts.tsv = args.kind == tabular::TabularKind::Tsv;
+    opts.base = args.base.clone();
+    let name = opts.name.clone();
+    let (n, warnings) = py
+        .detach(|| -> sparkles::Result<_> {
+            let (tmp, stats) = tabular::to_ntriples_file(reader, &opts, None)?;
+            let n = load(tabular::source(&tmp, graph, &name))?;
+            Ok((n, stats.warnings))
+        })
+        .py(py)?;
+    for w in &warnings {
+        PyErr::warn(
+            py,
+            &py.get_type::<pyo3::exceptions::PyUserWarning>(),
+            &std::ffi::CString::new(format!("{}: {w}", opts.name)).unwrap_or_default(),
+            1,
+        )?;
+    }
+    Ok(n)
 }
 
 // ----------------------------------------------------------------------- outputs ----
@@ -503,9 +844,9 @@ pub fn write_output<'py>(
 }
 
 /// The format of an output path (`out.nq.zst` is N-Quads), if any.
-pub fn format_of_output(out: &Output) -> Option<RdfFormat> {
+pub fn format_of_output(out: &Output) -> Option<Fmt> {
     match out {
-        Output::Path(p) => sparkles::io::format_for_path(p).map(|(f, _)| f),
+        Output::Path(p) => Fmt::of_path(p),
         _ => None,
     }
 }
@@ -514,11 +855,15 @@ pub fn format_of_output(out: &Output) -> Option<RdfFormat> {
 /// With `strict`, a quad of a named graph in a triple format is an error.
 pub fn serialize_quads(
     w: &mut dyn Write,
-    format: RdfFormat,
+    format: Fmt,
     prefixes: BTreeMap<String, String>,
     quads: impl Iterator<Item = sparkles::Result<Quad>>,
     strict: bool,
 ) -> sparkles::Result<u64> {
+    let format = match format {
+        Fmt::Rdf(f) => f,
+        Fmt::Jena(j) => return serialize_jena(w, j, quads, strict),
+    };
     let ser = sparkles::io::with_prefixes(RdfSerializer::from_format(format), prefixes);
     let mut out = ser.for_writer(w);
     let quads_format = format.supports_datasets();
@@ -535,6 +880,34 @@ pub fn serialize_quads(
                 )));
             }
             out.serialize_triple(TripleRef::new(&q.subject, &q.predicate, &q.object))?;
+        }
+        n += 1;
+    }
+    out.finish()?;
+    Ok(n)
+}
+
+/// [`serialize_quads`] in one of Jena's syntaxes.
+fn serialize_jena(
+    w: &mut dyn Write,
+    fmt: JenaFormat,
+    quads: impl Iterator<Item = sparkles::Result<Quad>>,
+    strict: bool,
+) -> sparkles::Result<u64> {
+    let mut out = RdfWriter::new(fmt, w);
+    let mut n = 0;
+    for q in quads {
+        let q = q?;
+        if fmt.quads() {
+            out.quad(&q)?;
+        } else {
+            if strict && q.graph_name != GraphName::DefaultGraph {
+                return Err(sparkles::Error::invalid(format!(
+                    "{} has no named graphs: {q}",
+                    fmt.name()
+                )));
+            }
+            out.triple(&oxrdf::Triple::new(q.subject, q.predicate, q.object))?;
         }
         n += 1;
     }

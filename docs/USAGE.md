@@ -460,6 +460,10 @@ sparkles compact --loc db                     # merge updates into a new generat
 sparkles compact --loc db --if-due            # only when the compaction policy says so (for cron)
 sparkles dump    --loc db > dump.nq
 sparkles dump    --loc db --out dump.nq.zst   # compression from the extension, or --compress
+sparkles dump    --loc db --out dump.trig.gz  # syntax from the extension too, or --format
+sparkles dump    --loc db --format ttl --merge   # every graph as one Turtle graph
+sparkles dump    --loc db --format nt --graph http://ex.org/g   # one graph's triples
+sparkles dump    --server URL --dataset ds --out ds.rt   # a server's dataset, in RDF Thrift
 sparkles backup  --loc db --out backups/      # zstd; --compress gzip --level 9, --threads 8
 sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
 sparkles clone   --loc db --to part --graph default --graph 'http://ex.org/g/*'   # some graphs only
@@ -490,7 +494,21 @@ sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes
 sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
 sparkles compaction --loc db --set deltaRatio=0.02     # automatic compaction settings; --default removes them
 sparkles describe-settings --loc db --set mode=scbd   # how DESCRIBE describes a resource; --default removes it
+sparkles ping    127.0.0.1:3030               # GET /$/ready over HTTP, then HTTPS; exit 0 on 200 (health checks)
 ```
+
+`sparkles dump` writes N-Quads by default. `--format`, or the extension of `--out`, picks
+another syntax: TriG, N-Triples, Turtle, JSON-LD, RDF/XML, TriX, RDF Thrift (`rt`), RDF
+Protobuf (`rpb`) or RDF/JSON (`rj`). A compression extension after it, as in
+`dump.ttl.gz`, compresses the output. The dump streams from one snapshot, and Turtle, TriG
+and RDF/XML declare the dataset's prefixes. A triple syntax holds the default graph only,
+so the other graphs are left out with a warning unless `--merge` writes them into the
+default graph. `--graph IRI`, which can be repeated, limits the dump to some graphs, and
+`--graph default` names the default graph. In a triple syntax the graphs it names are
+written as one graph. `--at` dumps a past state. With `--server URL --dataset NAME` the
+dump comes from the server's Graph Store endpoint in the syntax asked for. When the
+endpoint cannot give that subset in that syntax, such as two graphs or `--merge`, the
+dump is read as N-Quads and converted locally.
 
 `sparkles infer` updates the materialization that `reasoning.json` records when its
 rules are the same and monotonic and the commit diff still reaches its commit. It reads
@@ -568,6 +586,20 @@ long the commit catalog keeps the metadata of commits that can no longer be read
 it, every commit stays listed. Over HTTP the same features are `?at=`, `GET /{ds}/diff`,
 `/$/snapshots/{ds}` and `/$/history/{ds}`
 ([API: Point-in-time reads and snapshots](API.md#point-in-time-reads-and-snapshots)).
+
+`sparkles history` lists the recorded changes of a subject, predicate, object or graph
+across commits, with each commit's time, author and message. It reads the change log,
+which keeps the changes after a compaction too
+([API: History queries](API.md#history-queries)).
+
+```sh
+sparkles history --loc db --subject http://example.org/alice
+sparkles history --loc db --predicate http://example.org/price --from time:2026-10-01T00:00:00Z
+sparkles history --loc db --subject http://example.org/alice --desc --limit 1   # the last change
+```
+
+The same queries run in SPARQL through `SERVICE <urn:x-sparkles:history#changes>`, and
+over HTTP as `GET /{ds}/history`.
 
 A server also offers a change feed, `GET /{ds}/changes?after=N`. It lists the commits after
 commit N with their changes, as JSON or as one RDF Patch per commit. With `wait=30` a
@@ -719,6 +751,10 @@ sparkles convert --count *.ttl                # triples (or quads) per file and 
 sparkles convert --validate data.ttl          # syntax errors and term warnings, exit 1 on any
 sparkles convert --check data.ttl > out.nq    # convert, and warn about IRIs and language tags
 sparkles convert data.trix --output ttl       # Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON too
+sparkles convert -r data/ -o all.nq.zst       # a directory tree into one file
+sparkles convert -r data/ --out-dir nt/ --format nt -j 4   # one file per input, 4 at a time
+sparkles convert -r data/ --include '*.ttl' --exclude 'drafts/**' --count
+sparkles convert people.csv --base http://ex.org/p/ --key id --output ttl   # CSV and TSV tables
 sparkles load --loc db --check --strict data.ttl   # the same checks before a load
 sparkles qparse 'SELECT ...'                  # the query, formatted
 sparkles qparse --print algebra,plan --query q.rq  # SPARQL algebra (SSE) and the physical plan
@@ -734,15 +770,43 @@ sparkles rdfpatch changes.rdfp                # the rows of RDF Patch files, and
 ```
 
 `convert` reads files, or standard input when no file is given or a file is `-`. It takes
-the syntax from `--syntax`, then from the file extension, and reads standard input as
-N-Quads by default. Besides the W3C syntaxes it reads and writes Jena's TriX (`trix`), RDF
-Thrift (`rt`), RDF Protobuf (`rpb`) and RDF/JSON (`rj`). `load` takes them as well, and
+the syntax from `--syntax`, then from the file extension. When neither decides, it looks
+at the first 8 KiB of the content after decompression. XML is RDF/XML or TriX by its root
+element. JSON is RDF/JSON when its top level maps subjects to objects of predicates, and
+JSON-LD otherwise. Binary content is RDF Thrift or RDF Protobuf when its first row has
+the shape Jena writes. Text whose statements are each one line of terms is N-Quads or
+N-Triples, other Turtle-like text is TriG when it has a `GRAPH` keyword or a `{` block and
+Turtle otherwise, and lines with the same number of tabs or commas are TSV or CSV.
+Content that fits two syntaxes, such as `{}`, is an error that names both. Standard
+input that matches nothing is read as N-Quads, as before. An extension or `--syntax`
+always wins over the content. Besides the W3C syntaxes `convert` reads and writes Jena's
+TriX (`trix`), RDF Thrift (`rt`), RDF Protobuf (`rpb`) and RDF/JSON (`rj`). `load` takes them as well, and
 `query --results trix` (or `rt`, `rpb`, `rj`) writes CONSTRUCT and DESCRIBE results in
 them. Compressed inputs are detected as `load` detects them. The output
 streams, so a file larger than memory converts in bounded memory. Turtle, TriG and
 RDF/XML output declare the prefixes that the input declared before its first statement.
 A quad in a named graph cannot be written in a triple syntax, so `convert` drops it with
 a warning, or with `--merge` writes it into the default graph.
+
+A directory is read with `--recursive` (`-r`), file by file in path order. `--include`
+and `--exclude` take globs, which can be repeated. A glob without `/` matches the file
+name, and one with `/` matches the path below the directory, where `*` stays within one
+directory and `**` crosses them. A file in a directory whose syntax cannot be told is
+skipped with a warning. CSV and TSV files are converted with the mapping options of
+`load` (`--mapping`, `--template`, `--key`), and `--base` gives the default mapping's
+namespace. A `-metadata.json` file next to a table is read with it rather than converted.
+
+The output goes to standard output, or to `--output-file` (`-o`), whose extension picks
+the syntax and the compression unless `--output` and `--compress` name them. `--out` and
+`--format` are aliases of `--output`, so the file needs its own flag. `--out-dir DIR`
+writes one file per input instead, at the input's path below the directory it was found
+in, with the output syntax's extension in place of the input's. `--compress` adds its
+extension. The files are converted in parallel, `--jobs` (`-j`) at a time, by default
+one per CPU up to 8. A file that exists is replaced only with `--overwrite`, and a file
+that fails to convert leaves nothing behind. With directories or `--out-dir`, `convert`
+prints the statements of each file and a summary with the number of files, the total
+and the time. Errors give the file, line and column, and the exit status is 1 when any
+file failed.
 
 `--count`, `--sink` and `--validate` write no data. Files are then parsed in parallel, as
 `load` parses them. When a file has a syntax error, it is parsed again in order so that
@@ -769,7 +833,9 @@ the same, and made-up names of aggregates and blank nodes print as `?.0` and `_:
 empty database unless `--loc` or `--data` gives one with real statistics. A syntax
 error exits with status 1. Like Fuseki, `qparse` and `uparse` accept Jena ARQ's syntax
 extensions by default ([API.md](API.md#arq-syntax-extensions)). `--syntax sparql` (or
-Jena's `SPARQL_11` and `SPARQL_12`) rejects them, and `--syntax arq` is the default.
+Jena's `SPARQL_11` and `SPARQL_12`) rejects them, and `--syntax arq` is the default. In
+SSE, ARQ's forms print as Jena prints them, such as `(assign …)`, `(unfold …)`,
+`(semijoin …)`, `(antijoin …)` and `(fold …)`.
 
 `compare` reads both files into memory and compares them as RDF datasets up to
 blank-node isomorphism. The diff lists quads only in the first file with `<` and quads
@@ -898,9 +964,15 @@ sparkles describe-settings --loc db --default                        # back to t
 sparkles describe-settings --server URL --dataset db --set mode=outgoing
 ```
 
+The dataset page of the web UI shows the setting too. An admin of the dataset can change
+the mode, the labels and reifiers and the two limits there, or go back to the defaults.
+
 A request can choose another mode with `describe=scbd` and lower the limits with
-`describe-max-triples` and `describe-max-depth`. `sparkles query --describe MODE` does
-the same for a local query. [API.md](API.md#describe) describes the modes and options.
+`describe-max-triples` and `describe-max-depth`. `sparkles query` takes the same options
+as `--describe MODE`, `--describe-labels`, `--describe-reifiers`, `--describe-max-triples
+N` and `--describe-max-depth N`. They apply to a local query, and with `--server` they
+travel to the server as the request parameters. [API.md](API.md#describe) describes the
+modes and options.
 
 ### GraphQL
 
@@ -1777,6 +1849,9 @@ ds = Dataset("mydb")                               # a database directory, locke
 ds.load(path="data.ttl.gz")                        # format and compression from the name
 ds.load(text, "turtle", to_graph="http://ex.org/g")
 ds.load(open("data.nq.zst", "rb"), "nq")           # read as it is parsed, in one commit
+ds.load(path="data.trix")                          # Jena's TriX, RDF Thrift, RDF Protobuf, RDF/JSON
+ds.load(path="people.csv", base_iri="http://ex.org/p/", key="id")   # a CSV or TSV table
+ds.dump("dump.rt.gz")                              # RDF Thrift, gzipped
 
 rows = ds.query("""
     PREFIX foaf: <http://xmlns.com/foaf/0.1/>
@@ -1809,12 +1884,32 @@ CONSTRUCT and DESCRIBE. `select`, `ask` and `construct` check the query form and
 * `max_rows`, `max_memory_bytes` and `max_rows_produced` are budgets. A query past one
   raises `BudgetExceededError`.
 * `cancel` takes a `CancelToken`, and `at` reads a past state (see below).
+* `describe` changes how DESCRIBE describes a resource for this query. It takes a mode
+  (`"cbd"`, `"scbd"` or `"outgoing"`) or a dict of `mode`, `labels`, `reifiers`,
+  `max_triples` and `max_depth`, where `None` removes a limit. The options apply over the
+  dataset's setting ([DESCRIBE modes](#describe-modes)). A transaction's `query` takes
+  it too.
 
 `update` takes the same `timeout`, budgets and `cancel`. `apply_patch` applies an RDF
 Patch from a `str` or `bytes` as the server's patch endpoint does, and returns a
 `PatchStats` with the commit and the counts of the rows that took effect. A row is `None` at an unbound
 variable, and `row.get("name", default)` returns the default instead.
 `QuerySolutions.serialize` must come before the rows are iterated, and it consumes them.
+
+`RdfFormat` names oxrdfio's syntaxes and Jena's TriX (`RdfFormat.TRIX`), RDF Thrift
+(`RDF_THRIFT`), RDF Protobuf (`RDF_PROTOBUF`) and RDF/JSON (`RDF_JSON`). `load`, `dump`,
+`parse` and `serialize` take all of them, by name, extension or media type as well.
+An input in one of Jena's syntaxes is read into memory and converted to N-Quads before
+it is parsed, so it does not stream. RDF/JSON holds one graph, so `dump` writes the
+default graph, or `from_graph`.
+
+`load` reads a CSV or TSV table when the format is `"csv"` or `"tsv"`, or the path ends
+in `.csv`, `.tsv` or `.tab`, before any compression extension. The table is mapped as
+`sparkles load` maps it ([Loading CSV and TSV](#loading-csv-and-tsv)). `base_iri` is the
+default mapping's namespace and `key` names the column of each row's subject. `mapping`
+names a CSVW metadata file, and `template` a SPARQL CONSTRUCT query run for each row. A
+`-metadata.json` file next to the table is used when none of them is given. Warnings of
+the conversion are Python warnings.
 
 `sparkles.parse` parses as it reads, from a path, bytes or a file object, so the first
 quads come before the input has been read to the end. A syntax error is raised by the
@@ -2249,8 +2344,12 @@ The file must be readable by uid 10001, and it should not be readable by others,
 `ports` can publish the port on every interface, as `"3030:3030"` does. Serve it over
 HTTPS, through a reverse proxy in front of the container or with `--tls-cert` and
 `--tls-key` on mounted files ([TLS](#tls)), because plain HTTP sends passwords and tokens
-in the clear. The image's health check speaks plain HTTP, so a server with `--tls-cert`
-needs its own health check in `compose.yaml`.
+in the clear. The image's health check runs `sparkles ping`, which asks for `/$/ready`
+over plain HTTP and then over HTTPS, so it works with `--tls-cert` as well. On the
+loopback address it accepts the server's certificate without checking the name, since
+the certificate names the public host. `SPARKLES_HEALTHCHECK_PORT` sets the port when
+`serve` listens on another one than 3030, and `SPARKLES_HEALTHCHECK_URL` sets the whole
+target, such as `https://127.0.0.1:8443`.
 
 ### Configuring the container
 

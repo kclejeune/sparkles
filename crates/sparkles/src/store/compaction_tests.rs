@@ -426,6 +426,25 @@ fn a_crash_at_any_point_recovers() {
         let c = Store::open(&crash, StoreOptions::default()).unwrap();
         assert_eq!(c.head_commit().seq, head, "{point}");
         assert_eq!(dump(&c), d, "{point}");
+        // the change log lost nothing: the crashed copy records what the original did
+        let changes = |s: &Store| -> Vec<(u64, DiffOp, String)> {
+            let r = s
+                .history_changes(&HistoryQuery {
+                    to: Some(HistoryBound::Commit(head)),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(
+                r.unrecorded.iter().all(|u| u.to <= 1),
+                "{point}: {:?}",
+                r.unrecorded
+            );
+            r.changes
+                .iter()
+                .map(|x| (x.commit.seq, x.op, crate::annotations::nquads_line(&x.quad)))
+                .collect()
+        };
+        assert_eq!(changes(&c), changes(&s), "{point}");
         assert_eq!(gens(&crash), vec![current(&crash)], "{point}");
         // the recovered store takes writes and compacts
         churn(&c, 130);

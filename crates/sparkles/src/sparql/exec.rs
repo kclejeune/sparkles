@@ -336,6 +336,11 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             let r = child(1, &mut infos)?;
             minus(ctx, l, &r, &mut note)?
         }
+        Kind::HalfJoin { anti } => {
+            let l = child(0, &mut infos)?;
+            let r = child(1, &mut infos)?;
+            half_join(ctx, l, &r, *anti)?
+        }
         Kind::Union => {
             let mut out = Table::new(n.vars.clone());
             for i in 0..n.children.len() {
@@ -378,6 +383,16 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t.vars.push(*v);
             t.cols.push(col);
             t
+        }
+        Kind::Assign(v, e) => {
+            let mut t = child(0, &mut infos)?;
+            let col = compute_column(ctx, &t, e, &mut expr_report)?;
+            assign(ctx, &mut t, *v, col)?;
+            t
+        }
+        Kind::Unfold { expr, var, second } => {
+            let t = child(0, &mut infos)?;
+            unfold(ctx, &t, expr, *var, *second, &mut expr_report)?
         }
         Kind::Sort(vars) => {
             let mut t = child(0, &mut infos)?;
@@ -436,6 +451,13 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             counters = Some(c);
             t
         }
+        Kind::PropertyFn(spec) => {
+            let input = match n.children.len() {
+                0 => None,
+                _ => Some(child(0, &mut infos)?),
+            };
+            super::arqpf::run(ctx, spec, input.as_ref(), &n.vars)?
+        }
         Kind::TextSearch(spec) => crate::text::search(ctx, spec, &n.vars)?,
         Kind::VectorSearch(spec) => {
             let input = match n.children.len() {
@@ -455,6 +477,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             counters = Some(c);
             t
         }
+        Kind::HistoryChanges(spec) => super::history_svc::run(ctx, spec, &n.vars)?,
         Kind::HybridSearch(spec) => {
             let (t, c) = super::hybrid::search(ctx, spec, &n.vars)?;
             counters = Some(c);
@@ -2577,6 +2600,141 @@ fn materialize_left(l: &Table, r: &Table, lay: &JoinLayout, li: &[u32], rj: &[u3
     }
 }
 
+/// ARQ's `LET (?v := e)` where ?v may be bound (`QueryIterAssign`): `col` holds the
+/// expression's value per row (`UNDEF` for an error). An unbound ?v takes the value; a
+/// bound ?v keeps the solution when the value is the same value (Jena's
+/// `Node.sameValueAs`) and drops it otherwise; an error leaves the solution as it is.
+fn assign(ctx: &Ctx, t: &mut Table, v: VarId, col: Vec<Id>) -> Result<()> {
+    let Some(c) = t.col_of(v) else {
+        t.vars.push(v);
+        t.cols.push(col);
+        return Ok(());
+    };
+    let mut keep = vec![true; t.len()];
+    for (i, new) in col.into_iter().enumerate() {
+        if i % 4096 == 0 {
+            ctx.check()?;
+        }
+        let old = t.cols[c][i];
+        if new.is_undef() || old == new {
+            continue;
+        }
+        if old.is_undef() {
+            t.cols[c][i] = new;
+            continue;
+        }
+        keep[i] = match (ctx.term(old), ctx.term(new)) {
+            (Some(a), Some(b)) => super::cdt::same_value(&a, &b).unwrap_or(false),
+            _ => false,
+        };
+    }
+    if keep.iter().any(|k| !k) {
+        let sorted = t.sorted.clone();
+        t.filter_rows(&keep);
+        t.sorted = sorted;
+    }
+    Ok(())
+}
+
+/// ARQ's `UNFOLD(e AS ?v, ?w)` (`QueryIterUnfold`): each solution once per element of
+/// the `cdt:List` (?v the element, ?w its position from 1) or entry of the `cdt:Map`
+/// (?v the key, ?w the value) that `e` gives. A null leaves its variable unbound, an
+/// empty list or map gives no solutions, and any other value or an error gives the
+/// solution once with both variables unbound.
+fn unfold(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    v: VarId,
+    w: Option<VarId>,
+    report: &mut ExprReport,
+) -> Result<Table> {
+    let col = compute_column(ctx, t, e, report)?;
+    let mut vars = t.vars.clone();
+    vars.push(v);
+    vars.extend(w);
+    let mut out = Table::new(vars);
+    let mut row: Vec<Id> = Vec::with_capacity(out.width());
+    // the elements of each distinct literal, interned once
+    let mut seen: FxHashMap<Id, Option<Vec<(Id, Id)>>> = FxHashMap::default();
+    for (i, id) in col.into_iter().enumerate() {
+        if i % 4096 == 0 {
+            ctx.check()?;
+            ctx.check_output(out.len(), out.width())?;
+        }
+        let elems = seen.entry(id).or_insert_with(|| {
+            let t = ctx.term(id)?;
+            let parts = super::cdt::unfold(&t)?;
+            let intern = |x: Option<oxrdf::Term>| x.map_or(Id::UNDEF, |x| ctx.intern_term(&x));
+            Some(
+                parts
+                    .into_iter()
+                    .map(|(a, b)| (intern(a), intern(b)))
+                    .collect(),
+            )
+        });
+        row.clear();
+        row.extend(t.cols.iter().map(|c| c[i]));
+        match elems {
+            Some(elems) => {
+                for &(a, b) in elems.iter() {
+                    row.truncate(t.width());
+                    row.push(a);
+                    if w.is_some() {
+                        row.push(b);
+                    }
+                    out.push_row(&row);
+                }
+            }
+            None => {
+                row.push(Id::UNDEF);
+                if w.is_some() {
+                    row.push(Id::UNDEF);
+                }
+                out.push_row(&row);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// ARQ's SEMIJOIN and ANTIJOIN (`QueryIterHalfJoin`): the rows of `l` compatible with a
+/// row of `r` (with none, when `anti`), each once and unchanged. Unlike MINUS, a row of
+/// `r` that shares no bound variable with a row of `l` is compatible with it.
+fn half_join(ctx: &Ctx, mut l: Table, r: &Table, anti: bool) -> Result<Table> {
+    let lay = layout(&l, r);
+    let r_undef = lay.shared.iter().any(|&(_, rc)| has_undef(r, rc));
+    let set: FxHashSet<Vec<Id>> = if r_undef {
+        FxHashSet::default()
+    } else {
+        (0..r.len())
+            .map(|j| lay.shared.iter().map(|&(_, rc)| r.cols[rc][j]).collect())
+            .collect()
+    };
+    let mut keep = vec![false; l.len()];
+    for (i, k) in keep.iter_mut().enumerate() {
+        if i % 4096 == 0 {
+            ctx.check()?;
+        }
+        let all_defined = lay.shared.iter().all(|&(lc, _)| !l.cols[lc][i].is_undef());
+        let matched = if r.is_empty() {
+            false
+        } else if lay.shared.is_empty() {
+            true
+        } else if !r_undef && all_defined {
+            let key: Vec<Id> = lay.shared.iter().map(|&(lc, _)| l.cols[lc][i]).collect();
+            set.contains(&key)
+        } else {
+            (0..r.len()).any(|j| compatible(&l, r, i, j, &lay.shared))
+        };
+        *k = matched != anti;
+    }
+    let sorted = l.sorted.clone();
+    l.filter_rows(&keep);
+    l.sorted = sorted;
+    Ok(l)
+}
+
 fn minus(ctx: &Ctx, mut l: Table, r: &Table, note: &mut Option<String>) -> Result<Table> {
     let lay = layout(&l, r);
     if lay.shared.is_empty() || r.is_empty() {
@@ -3161,8 +3319,10 @@ fn group(
     let mut args = Vec::with_capacity(aggs.len());
     for (_, agg) in aggs {
         args.push(match &agg.expr {
+            // FOLD evaluates its expressions itself, in its ORDER BY's order
             Some(e)
-                if t.len() >= super::exprcache::MIN_ROWS
+                if agg.fold.is_none()
+                    && t.len() >= super::exprcache::MIN_ROWS
                     && super::exprcache::eligible(&[e]).is_ok() =>
             {
                 super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
@@ -3441,6 +3601,9 @@ fn aggregate(
     agg: &Agg,
     arg: Option<&super::exprcache::PerValue<Option<Id>>>,
 ) -> Id {
+    if let (Some(spec), Some(e)) = (&agg.fold, &agg.expr) {
+        return fold(ctx, t, map, rows, e, agg.distinct, spec);
+    }
     let Some(e) = &agg.expr else {
         // COUNT(*)
         let n = if agg.distinct {
@@ -3551,6 +3714,96 @@ fn aggregate(
         }
     };
     result.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
+}
+
+/// ARQ's `FOLD` of one group (`AggFoldList`, `AggFoldMap`): the values of `e` in the
+/// group's rows, sorted by the fold's ORDER BY first, as a `cdt:List` literal (an error
+/// is a null, and DISTINCT keeps the first of equal terms and one null), or the `e`
+/// keys with the `value` values as a `cdt:Map` literal (a row whose key is an error or a
+/// blank node is skipped, a later row replaces an earlier one's value).
+fn fold(
+    ctx: &Ctx,
+    t: &Table,
+    map: &[Option<usize>],
+    rows: &[u32],
+    e: &Expr,
+    distinct: bool,
+    fold: &super::plan::Fold,
+) -> Id {
+    use super::cdt::{Elem, Map, map_put};
+    let row = |i: u32| Row {
+        table: t,
+        i: i as usize,
+        map,
+        dec: None,
+    };
+    let mut order: Vec<u32> = rows.to_vec();
+    if !fold.order.is_empty() {
+        let keys: Vec<Vec<Option<Value>>> = rows
+            .iter()
+            .map(|&i| {
+                fold.order
+                    .iter()
+                    .map(|(k, _)| eval(k, &row(i), ctx).ok().and_then(|v| v.value(ctx).ok()))
+                    .collect()
+            })
+            .collect();
+        let mut idx: Vec<usize> = (0..rows.len()).collect();
+        idx.sort_by(|&a, &b| {
+            for (k, (_, asc)) in fold.order.iter().enumerate() {
+                let o = order_cmp(keys[a][k].as_ref(), keys[b][k].as_ref());
+                let o = if *asc { o } else { o.reverse() };
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            Ordering::Equal
+        });
+        order = idx.into_iter().map(|j| rows[j]).collect();
+    }
+    let term = |x: &Expr, i: u32| {
+        eval(x, &row(i), ctx)
+            .ok()
+            .and_then(|v| ctx.term(v.into_id(ctx)))
+    };
+    let value = match &fold.value {
+        None => {
+            let mut list = Vec::with_capacity(order.len());
+            let mut seen = FxHashSet::default();
+            let mut null = false;
+            for i in order {
+                match eval(e, &row(i), ctx) {
+                    Ok(v) => {
+                        let id = v.into_id(ctx);
+                        if distinct && !seen.insert(id) {
+                            continue;
+                        }
+                        list.push(ctx.term(id).map_or(Elem::Null, Elem::Term));
+                    }
+                    Err(_) => {
+                        if distinct && null {
+                            continue;
+                        }
+                        null = true;
+                        list.push(Elem::Null);
+                    }
+                }
+            }
+            super::cdt::list_value(&list)
+        }
+        Some(v) => {
+            let mut m = Map::new();
+            for i in order {
+                let Some(k @ (oxrdf::Term::NamedNode(_) | oxrdf::Term::Literal(_))) = term(e, i)
+                else {
+                    continue;
+                };
+                map_put(&mut m, k, term(v, i).map_or(Elem::Null, Elem::Term));
+            }
+            super::cdt::map_value(&m)
+        }
+    };
+    ctx.intern_value(&value)
 }
 
 // ------------------------------------------------------------------ paths ------

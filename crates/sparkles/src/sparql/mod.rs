@@ -1,8 +1,10 @@
 //! SPARQL 1.1 query & update engine (ARQ equivalent).
 
 pub mod aggext;
+pub mod arqpf;
 pub mod cache;
 pub mod catalog;
+pub mod cdt;
 pub mod charsets;
 pub mod ctx;
 pub mod depth;
@@ -11,10 +13,12 @@ pub mod exec;
 mod exists;
 pub mod expr;
 mod exprcache;
+mod fnformat;
 mod fnlib;
 pub mod geojoin;
 pub mod geopf;
 pub mod georewrite;
+pub mod history_svc;
 pub mod hybrid;
 pub mod indexjoin;
 mod joinorder;
@@ -300,6 +304,8 @@ pub fn validate_scoping(gp: &GraphPattern) -> Result<()> {
         | GP::Lateral { left, right }
         | GP::Union { left, right }
         | GP::Minus { left, right }
+        | GP::SemiJoin { left, right }
+        | GP::AntiJoin { left, right }
         | GP::LeftJoin { left, right, .. } => {
             validate_scoping(left)?;
             validate_scoping(right)
@@ -312,6 +318,8 @@ pub fn validate_scoping(gp: &GraphPattern) -> Result<()> {
         | GP::Reduced { inner }
         | GP::Slice { inner, .. }
         | GP::Group { inner, .. }
+        | GP::Assign { inner, .. }
+        | GP::Unfold { inner, .. }
         | GP::Service { inner, .. } => validate_scoping(inner),
         _ => Ok(()),
     }

@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+PREFIX cdt: <http://w3id.org/awslabs/neptune/SPARQL-CDTs/>
+select ?s ?x ?i ?m {
+  ?s ex:p ?o let(?y:=?o+1) LET ( ?o := 1 ) .
+  { select ?s (fold(distinct ?o order by desc(?o) ?s) as ?l) (FOLD(?o,?s ORDER BY ?o) AS ?m) { ?s ex:p ?o } group by ?s }
+  unfold(?l as ?x , ?i)
+  UNFOLD ( cdt:List(1, 2) AS ?z )
+}

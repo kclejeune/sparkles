@@ -109,6 +109,10 @@ impl Store {
                 report.rotated.push(oldest.name);
             }
         }
+        if let Some(log) = self.changelog.as_ref().filter(|l| l.is_enabled()) {
+            log.flush(false)?;
+            log.enforce(Some(now))?;
+        }
         if let Some(hist) = &self.history {
             {
                 let w = self.writer.lock();

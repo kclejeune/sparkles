@@ -296,9 +296,260 @@ pub fn java_substring(s: &str, start: i64, end: Option<i64>) -> EvalResult<Strin
         .collect())
 }
 
+/// The local system timezone's offset from UTC, in seconds (UTC where it is unknown).
+pub fn local_offset() -> i64 {
+    #[cfg(unix)]
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as libc::time_t);
+        let mut tm = std::mem::MaybeUninit::<libc::tm>::zeroed();
+        // SAFETY: localtime_r writes the broken-down time into `tm`, which outlives the
+        // call, and reads only `now`
+        let ok = unsafe { !libc::localtime_r(&now, tm.as_mut_ptr()).is_null() };
+        if ok {
+            // SAFETY: localtime_r succeeded, so it initialized `tm`
+            let offset = unsafe { tm.assume_init() }.tm_gmtoff;
+            // a c_long, which is narrower than i64 on some targets
+            #[allow(clippy::useless_conversion)]
+            return i64::from(offset);
+        }
+    }
+    0
+}
+
+/// Base64 with MIME line breaks (76 characters a line, CRLF), as Java's
+/// `Base64.getMimeEncoder()` writes it.
+pub fn base64_mime(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut line = 0;
+    for chunk in bytes.chunks(3) {
+        if line == 76 {
+            out.push_str("\r\n");
+            line = 0;
+        }
+        let n = chunk.len();
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let v = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= n {
+                out.push(char::from(A[((v >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+        line += 4;
+    }
+    out
+}
+
+/// The operators on dates, times and durations that SPARQL's built-in arithmetic leaves
+/// out, as ARQ and F&O 3.1 define them: a date or time plus or minus a duration, the
+/// difference of two times, a duration times or divided by a number, and the ratio of
+/// two durations. A day-time duration stays one, where ARQ gives an `xsd:duration`.
+/// `None` when the operands are none of these.
+pub fn temporal(x: &Value, y: &Value, op: &super::value::NumOp) -> Option<EvalResult<Value>> {
+    use super::value::NumOp;
+    let some = |r: Option<Value>| Some(r.ok_or(TypeError));
+    let seconds = |n: &Value| {
+        Num::of(n).ok().and_then(|n| {
+            n.to_decimal()
+                .or_else(|| Decimal::try_from(n.to_double()).ok())
+        })
+    };
+    match (x, y, op) {
+        (Value::Date(d), Value::YearMonth(e), NumOp::Add) => {
+            some(d.checked_add_year_month_duration(*e).map(Value::Date))
+        }
+        (Value::Date(d), Value::YearMonth(e), NumOp::Sub) => {
+            some(d.checked_sub_year_month_duration(*e).map(Value::Date))
+        }
+        (Value::Date(d), Value::DayTime(e), NumOp::Add) => {
+            some(d.checked_add_day_time_duration(*e).map(Value::Date))
+        }
+        (Value::Date(d), Value::DayTime(e), NumOp::Sub) => {
+            some(d.checked_sub_day_time_duration(*e).map(Value::Date))
+        }
+        (Value::Date(d), Value::Duration(e), NumOp::Add) => {
+            some(d.checked_add_duration(*e).map(Value::Date))
+        }
+        (Value::Date(d), Value::Duration(e), NumOp::Sub) => {
+            some(d.checked_sub_duration(*e).map(Value::Date))
+        }
+        (Value::Time(t), Value::DayTime(e), NumOp::Add) => {
+            some(t.checked_add_day_time_duration(*e).map(Value::Time))
+        }
+        (Value::Time(t), Value::DayTime(e), NumOp::Sub) => {
+            some(t.checked_sub_day_time_duration(*e).map(Value::Time))
+        }
+        (Value::Time(t), Value::Duration(e), NumOp::Add) => {
+            some(t.checked_add_duration(*e).map(Value::Time))
+        }
+        (Value::Time(t), Value::Duration(e), NumOp::Sub) => {
+            some(t.checked_sub_duration(*e).map(Value::Time))
+        }
+        (Value::Time(t), Value::Time(u), NumOp::Sub) => some(t.checked_sub(*u).map(Value::DayTime)),
+        // durations of different kinds, as general durations
+        (
+            Value::Duration(_) | Value::DayTime(_) | Value::YearMonth(_),
+            Value::Duration(_) | Value::DayTime(_) | Value::YearMonth(_),
+            NumOp::Add | NumOp::Sub,
+        ) => {
+            let general = |v: &Value| match v {
+                Value::Duration(d) => *d,
+                Value::DayTime(d) => (*d).into(),
+                Value::YearMonth(d) => (*d).into(),
+                _ => unreachable!("a duration"),
+            };
+            let (d, e) = (general(x), general(y));
+            some(
+                match op {
+                    NumOp::Add => d.checked_add(e),
+                    _ => d.checked_sub(e),
+                }
+                .map(Value::Duration),
+            )
+        }
+        (Value::DayTime(d), n, NumOp::Mul) | (n, Value::DayTime(d), NumOp::Mul)
+            if n.is_numeric() =>
+        {
+            some(
+                seconds(n)
+                    .and_then(|k| d.as_seconds().checked_mul(k))
+                    .map(|s| Value::DayTime(DayTimeDuration::new(s))),
+            )
+        }
+        (Value::DayTime(d), n, NumOp::Div) if n.is_numeric() => some(
+            seconds(n)
+                .filter(|k| *k != Decimal::from(0))
+                .and_then(|k| d.as_seconds().checked_div(k))
+                .map(|s| Value::DayTime(DayTimeDuration::new(s))),
+        ),
+        (Value::YearMonth(d), n, NumOp::Mul) | (n, Value::YearMonth(d), NumOp::Mul)
+            if n.is_numeric() =>
+        {
+            // F&O: the months, multiplied and rounded half up
+            let months = Decimal::from(d.years() * 12 + d.months());
+            some(
+                seconds(n)
+                    .and_then(|k| months.checked_mul(k))
+                    .and_then(round_months)
+                    .map(|m| Value::YearMonth(oxsdatatypes::YearMonthDuration::new(m))),
+            )
+        }
+        (Value::YearMonth(d), n, NumOp::Div) if n.is_numeric() => {
+            let months = Decimal::from(d.years() * 12 + d.months());
+            some(
+                seconds(n)
+                    .filter(|k| *k != Decimal::from(0))
+                    .and_then(|k| months.checked_div(k))
+                    .and_then(round_months)
+                    .map(|m| Value::YearMonth(oxsdatatypes::YearMonthDuration::new(m))),
+            )
+        }
+        (Value::DayTime(d), Value::DayTime(e), NumOp::Div) => some(
+            (e.as_seconds() != Decimal::from(0))
+                .then(|| d.as_seconds().checked_div(e.as_seconds()))
+                .flatten()
+                .map(Value::Decimal),
+        ),
+        (Value::YearMonth(d), Value::YearMonth(e), NumOp::Div) => {
+            let (a, b) = (d.years() * 12 + d.months(), e.years() * 12 + e.months());
+            some(
+                (b != 0)
+                    .then(|| Decimal::from(a).checked_div(Decimal::from(b)))
+                    .flatten()
+                    .map(Value::Decimal),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// A number of months rounded half up (F&O's rounding of `yearMonthDuration` products).
+fn round_months(m: Decimal) -> Option<i64> {
+    let half = Decimal::from_str("0.5").ok()?;
+    let r = if m >= Decimal::from(0) {
+        m.checked_add(half)?.checked_floor()?
+    } else {
+        m.checked_sub(half)?.checked_ceil()?
+    };
+    Integer::try_from(r).ok().map(i64::from)
+}
+
+/// Where Jena splits an IRI into a namespace and a local name (`SplitIRI.splitXML`): the
+/// local name is the longest XML 1.1 NCName at the end that starts with an NCName start
+/// character, never the whole IRI, and does not break a `%` escape. `mailto:` keeps a
+/// character after it. An IRI that ends with no such name splits at its end.
+pub fn split_xml(iri: &str) -> usize {
+    fn start(c: char) -> bool {
+        matches!(c,
+            'A'..='Z' | '_' | 'a'..='z' | '\u{C0}'..='\u{2FF}' | '\u{370}'..='\u{37D}'
+            | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{2070}'..='\u{218F}'
+            | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}'
+            | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+    }
+    fn name(c: char) -> bool {
+        start(c)
+            || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}'
+                | '\u{203F}'..='\u{2040}')
+    }
+    let chars: Vec<(usize, char)> = iri.char_indices().collect();
+    let n = chars.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut i = n - 1;
+    while i >= 1 && name(chars[i].1) {
+        i -= 1;
+    }
+    let mut j = i + 1;
+    if j >= n {
+        return iri.len();
+    }
+    if j >= 2 && chars[j - 2].1 == '%' {
+        j += 1;
+    }
+    if chars[j - 1].1 == '%' {
+        j += 2;
+        if j > n {
+            return iri.len();
+        }
+    }
+    while j < n {
+        if start(chars[j].1) && !(j == 7 && iri.starts_with("mailto:")) {
+            break;
+        }
+        j += 1;
+    }
+    chars.get(j).map_or(iri.len(), |c| c.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_iris_as_jena() {
+        fn split(s: &str) -> (&str, &str) {
+            s.split_at(split_xml(s))
+        }
+        assert_eq!(
+            split("http://www.w3.org/2001/XMLSchema#integer"),
+            ("http://www.w3.org/2001/XMLSchema#", "integer")
+        );
+        assert_eq!(split("http://example/a/b"), ("http://example/a/", "b"));
+        assert_eq!(split("http://example/a/"), ("http://example/a/", ""));
+        assert_eq!(split("http://example/a/1x"), ("http://example/a/1", "x"));
+        assert_eq!(split("urn:x"), ("urn:", "x"));
+        assert_eq!(split("mailto:me"), ("mailto:m", "e"));
+        assert_eq!(split("http://ex/a%20b"), ("http://ex/a%20", "b"));
+    }
 
     #[test]
     fn rounds_decimal_numerals() {

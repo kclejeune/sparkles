@@ -13,6 +13,7 @@ pub mod history;
 pub mod id;
 pub mod index;
 pub mod io;
+pub mod jena_formats;
 pub mod nesting;
 pub mod outbound;
 pub mod patch;

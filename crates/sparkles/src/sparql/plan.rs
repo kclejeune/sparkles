@@ -233,7 +233,21 @@ pub struct Agg {
     pub func: AggregateFunction,
     pub expr: Option<Expr>,
     pub distinct: bool,
+    /// ARQ's FOLD: `expr` is the list element or the map key
+    pub fold: Option<Box<Fold>>,
 }
+
+/// The parts of ARQ's `FOLD(expr, value ORDER BY …)` besides its first expression.
+#[derive(Clone)]
+pub struct Fold {
+    /// the map value; `None` folds into a `cdt:List`
+    pub value: Option<Expr>,
+    /// sort keys of the group's solutions (ascending when `true`)
+    pub order: Vec<(Expr, bool)>,
+}
+
+/// The IRI that names FOLD in EXPLAIN and in the result cache's keys.
+pub const FOLD: &str = "http://w3id.org/awslabs/neptune/SPARQL-CDTs/fold";
 
 #[derive(Clone, Debug)]
 pub enum PathEnd {
@@ -281,9 +295,24 @@ pub enum Kind {
         expr: Option<Expr>,
     },
     Minus,
+    /// ARQ's SEMIJOIN (`anti`: ANTIJOIN): the rows of child 0 compatible with a row of
+    /// child 1 (with none)
+    HalfJoin {
+        anti: bool,
+    },
     Union,
     Filter(Vec<Expr>),
     Extend(VarId, Expr),
+    /// ARQ's `LET` of a variable that the child may bind: where it is bound, a solution
+    /// whose value is not the same value as the expression's is dropped
+    Assign(VarId, Expr),
+    /// ARQ's `UNFOLD`: a solution per element of the `cdt:List` or entry of the
+    /// `cdt:Map` that `expr` gives
+    Unfold {
+        expr: Expr,
+        var: VarId,
+        second: Option<VarId>,
+    },
     Sort(Vec<VarId>),
     OrderBy {
         keys: Vec<(Expr, bool)>,
@@ -381,9 +410,14 @@ pub enum Kind {
     /// `LATERAL`: the right side evaluated per group of the rows of the left side (child
     /// 0); see [`super::lateral`]
     Lateral(Box<super::lateral::LateralSpec>),
+    /// a property function of ARQ's library (`list:member`, `apf:strSplit`, …); child 0,
+    /// if any, is the rest of the group, which binds variables the call reads
+    PropertyFn(Box<super::arqpf::PfSpec>),
     /// paths as solutions (`SERVICE path:search`); child 0, if any, is the rest of the
     /// group, which binds the source or the target
     PathSearch(Box<super::pathsearch::PathSearchSpec>),
+    /// the recorded changes of the dataset (`SERVICE hist:changes`)
+    HistoryChanges(Box<super::history_svc::HistorySpec>),
 }
 
 #[derive(Clone)]
@@ -472,9 +506,13 @@ impl Node {
             } => "CartesianProduct",
             Kind::LeftJoin { .. } => "OptionalJoin",
             Kind::Minus => "Minus",
+            Kind::HalfJoin { anti: false } => "SemiJoin",
+            Kind::HalfJoin { anti: true } => "AntiJoin",
             Kind::Union => "Union",
             Kind::Filter(_) => "Filter",
             Kind::Extend(..) => "Bind",
+            Kind::Assign(..) => "Let",
+            Kind::Unfold { .. } => "Unfold",
             Kind::Sort(_) => "Sort",
             Kind::OrderBy { limit: Some(_), .. } => "TopK",
             Kind::OrderBy { .. } => "OrderBy",
@@ -497,6 +535,7 @@ impl Node {
             Kind::Unpack { .. } => "TripleTerm",
             Kind::Path { .. } => "TransitivePath",
             Kind::Lateral(_) => "Lateral",
+            Kind::PropertyFn(_) => "PropertyFunction",
             Kind::Service { .. } => "Service",
             Kind::TextSearch(_) => "TextSearch",
             Kind::VectorSearch(_) => "VectorSearch",
@@ -509,6 +548,7 @@ impl Node {
             Kind::SpatialKnn(_) => "SpatialKnn",
             Kind::SpatialRelate(_) => "SpatialRelate",
             Kind::PathSearch(_) => "PathSearch",
+            Kind::HistoryChanges(_) => "HistoryChanges",
         }
     }
 }
@@ -715,6 +755,19 @@ impl<'a> Planner<'a> {
                 left,
                 right,
                 expression,
+            } if super::arqpf::reads_left(self, left, right) => {
+                // ARQ evaluates the OPTIONAL per left row, so that the property functions
+                // of the right side read the left side's values
+                let certain = certain_vars(left, self.ctx);
+                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let l = self.plan(left, g, push)?;
+                let n = super::lateral::plan_optional(self, l, right, expression.as_ref(), g)?;
+                Ok(self.apply_filters(n, top))
+            }
+            GP::LeftJoin {
+                left,
+                right,
+                expression,
             } => {
                 let certain = certain_vars(left, self.ctx);
                 let (push, top) = self.split_filters(filters, |v| certain.contains(v));
@@ -735,6 +788,31 @@ impl<'a> Planner<'a> {
                     }
                 }
                 Ok(union(children))
+            }
+            GP::SemiJoin { left, right } | GP::AntiJoin { left, right } => {
+                // the left side's solutions are kept unchanged, so a filter over the
+                // result is a filter over the left side
+                let anti = matches!(gp, GP::AntiJoin { .. });
+                let l = self.plan(left, g, filters)?;
+                let r = self.plan(right, g, Vec::new())?;
+                if l.is_empty() || (r.is_empty() && anti) {
+                    return Ok(l);
+                }
+                if r.is_empty() {
+                    return Ok(Node::empty(l.vars.clone()));
+                }
+                let shared: Vec<String> = l
+                    .vars
+                    .iter()
+                    .filter(|v| r.vars.contains(v))
+                    .map(|v| format!("?{}", self.ctx.var_name(*v)))
+                    .collect();
+                let desc = format!("on {}", shared.join(" "));
+                let mut n = Node::unary(Kind::HalfJoin { anti }, l, desc);
+                n.est = (n.est * 0.5).max(1.0);
+                n.cost += r.cost + r.est;
+                n.children.push(r);
+                Ok(n)
             }
             GP::Minus { left, right } => {
                 let l = self.plan(left, g, filters)?;
@@ -769,6 +847,77 @@ impl<'a> Planner<'a> {
                 let mut n = Node::unary(Kind::Extend(v, e), child, desc);
                 n.vars.push(v);
                 n.dist.insert(v, n.est);
+                Ok(self.apply_filters(n, top))
+            }
+            GP::Assign {
+                inner,
+                variable,
+                expression,
+            } => {
+                let v = self.ctx.var(variable.as_str());
+                let (push, top) = self.split_filters(filters, |x| *x != v);
+                let child = self.plan(inner, g, push)?;
+                let e = self.compile(expression, g);
+                let desc = format!("?{} := {}", variable.as_str(), e.display(self.ctx));
+                if let Some(&c) = self.subst.get(&v) {
+                    // the outer solution binds ?v (a LATERAL or EXISTS substitution): a
+                    // different value drops the solution, and an error keeps it
+                    let keep = Expr::Coalesce(vec![
+                        Expr::Eq(Box::new(e), Box::new(Expr::Const(c))),
+                        Expr::Const(Id::from_bool(true)),
+                    ]);
+                    return Ok(self.apply_filters(filter(child, vec![keep], self.ctx), top));
+                }
+                let n = if child.vars.contains(&v) {
+                    // LET of a variable the pattern may bind: compared where it is bound
+                    let mut n = Node::unary(Kind::Assign(v, e), child, desc);
+                    n.est *= FILTER_SELECTIVITY.max(0.5);
+                    n
+                } else {
+                    // LET of a new variable is BIND
+                    let mut n = Node::unary(Kind::Extend(v, e), child, desc);
+                    n.vars.push(v);
+                    n.dist.insert(v, n.est);
+                    n
+                };
+                Ok(self.apply_filters(n, top))
+            }
+            GP::Unfold {
+                inner,
+                expression,
+                variable,
+                second,
+            } => {
+                let v = self.ctx.var(variable.as_str());
+                let w = second.as_ref().map(|s| self.ctx.var(s.as_str()));
+                let (push, top) = self.split_filters(filters, |x| *x != v && Some(*x) != w);
+                let child = self.plan(inner, g, push)?;
+                let e = self.compile(expression, g);
+                let desc = match second {
+                    Some(s) => format!(
+                        "{} AS ?{}, ?{}",
+                        e.display(self.ctx),
+                        variable.as_str(),
+                        s.as_str()
+                    ),
+                    None => format!("{} AS ?{}", e.display(self.ctx), variable.as_str()),
+                };
+                let mut n = Node::unary(
+                    Kind::Unfold {
+                        expr: e,
+                        var: v,
+                        second: w,
+                    },
+                    child,
+                    desc,
+                );
+                // a list or map of a few elements per solution
+                n.est *= 4.0;
+                n.cost += n.est;
+                for x in [Some(v), w].into_iter().flatten() {
+                    n.vars.push(x);
+                    n.dist.insert(x, n.est);
+                }
                 Ok(self.apply_filters(n, top))
             }
             GP::Values {
@@ -901,6 +1050,7 @@ impl<'a> Planner<'a> {
                                 func: AggregateFunction::Count,
                                 expr: None,
                                 distinct: *distinct,
+                                fold: None,
                             },
                             AggregateExpression::FunctionCall {
                                 name,
@@ -910,12 +1060,39 @@ impl<'a> Planner<'a> {
                                 func: name.clone(),
                                 expr: Some(self.compile(expr, g)),
                                 distinct: *distinct,
+                                fold: None,
+                            },
+                            AggregateExpression::Fold {
+                                expr,
+                                value,
+                                distinct,
+                                order,
+                            } => Agg {
+                                func: AggregateFunction::Custom(
+                                    spargebra::term::NamedNode::new_unchecked(FOLD),
+                                ),
+                                expr: Some(self.compile(expr, g)),
+                                distinct: *distinct,
+                                fold: Some(Box::new(Fold {
+                                    value: value.as_ref().map(|e| self.compile(e, g)),
+                                    order: order
+                                        .iter()
+                                        .map(|o| match o {
+                                            OrderExpression::Asc(e) => (self.compile(e, g), true),
+                                            OrderExpression::Desc(e) => (self.compile(e, g), false),
+                                        })
+                                        .collect(),
+                                })),
                             },
                         };
                         (self.ctx.var(v.as_str()), agg)
                     })
                     .collect();
                 let n = group(child, keys, aggs, self.ctx);
+                Ok(self.apply_filters(n, filters))
+            }
+            GP::Service { inner, name, .. } if super::history_svc::is_changes(name) => {
+                let n = super::history_svc::history_leaf(self, inner)?;
                 Ok(self.apply_filters(n, filters))
             }
             GP::Service { name, inner, .. } if super::pathsearch::is_search(name) => {
@@ -981,6 +1158,22 @@ impl<'a> Planner<'a> {
         use GraphPattern as GP;
         match gp {
             GP::Bgp { patterns } => {
+                // ARQ's property function library: the variables bound before a call
+                // are those of the group's earlier elements
+                let rest;
+                let patterns = if super::arqpf::has_calls(patterns) {
+                    let (pcalls, others) = super::arqpf::take_calls(patterns)?;
+                    let mut bound = item_vars(items);
+                    for c in pcalls {
+                        let n = super::arqpf::leaf(self, c, g, &bound)?;
+                        bound.extend(n.vars.iter().copied());
+                        items.push(Item::Node(n));
+                    }
+                    rest = others;
+                    &rest
+                } else {
+                    patterns
+                };
                 let (calls, patterns) = super::textpf::extract(patterns)?;
                 let (vcalls, patterns) = super::textpf::take_calls(
                     &patterns,
@@ -1028,7 +1221,7 @@ impl<'a> Planner<'a> {
             } => {
                 let s = self.term_pattern(subject);
                 let o = self.term_pattern(object);
-                self.collect_path(s, path, o, g, items);
+                self.collect_path(s, path, o, g, items)?;
                 items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
             GP::Join { left, right } => {
@@ -1126,9 +1319,35 @@ impl<'a> Planner<'a> {
         o: PT,
         g: &ActiveGraph,
         items: &mut Vec<Item>,
-    ) {
+    ) -> Result<()> {
         use PropertyPathExpression as PP;
         match path {
+            // ARQ's `multi(path)`: the path with its closures counting walks
+            PP::Multi(p) => return self.collect_path(s, &counted(p), o, g, items),
+            // ARQ's `distinct(path)`: the pairs the path connects, each once
+            PP::Distinct(p) => {
+                let mut sub = Vec::new();
+                self.collect_path(s, p, o, g, &mut sub)?;
+                let node = self.plan_group(sub, Vec::new())?;
+                let mut vars = Vec::new();
+                for x in [s, o] {
+                    if let PT::V(v) = x
+                        && !vars.contains(&v)
+                    {
+                        vars.push(v);
+                    }
+                }
+                let n = project(node, vars, self.ctx);
+                let mut d = Node::unary(Kind::Distinct, n, "distinct(path)".into());
+                d.est = d.children[0].est;
+                items.push(Item::Node(d));
+                return Ok(());
+            }
+            PP::Shortest(_) => {
+                return Err(Error::invalid(
+                    "shortest(…) paths are not implemented (ARQ does not evaluate them either)",
+                ));
+            }
             PP::NamedNode(n) => items.push(Item::Triple(Triple {
                 t: [
                     s,
@@ -1137,11 +1356,11 @@ impl<'a> Planner<'a> {
                 ],
                 graph: g.clone(),
             })),
-            PP::Reverse(p) => self.collect_path(o, p, s, g, items),
+            PP::Reverse(p) => self.collect_path(o, p, s, g, items)?,
             PP::Sequence(a, b) => {
                 let mid = PT::V(self.ctx.fresh_var());
-                self.collect_path(s, a, mid, g, items);
-                self.collect_path(mid, b, o, g, items);
+                self.collect_path(s, a, mid, g, items)?;
+                self.collect_path(mid, b, o, g, items)?;
             }
             // ARQ's PathCompiler: `p{n,m}` with n ≥ 1 is n steps of p, then p{0,m-n}
             // (p{*} when unbounded); the steps are joined like a sequence's
@@ -1153,7 +1372,7 @@ impl<'a> Planner<'a> {
                     } else {
                         PT::V(self.ctx.fresh_var())
                     };
-                    self.collect_path(from, path, to, g, items);
+                    self.collect_path(from, path, to, g, items)?;
                     from = to;
                 }
                 if *max != Some(*min) {
@@ -1177,6 +1396,7 @@ impl<'a> Planner<'a> {
                 graph: g.clone(),
             })),
         }
+        Ok(())
     }
 
     /// A `spk:vectorSearch` call as a search leaf:
@@ -1594,7 +1814,9 @@ impl<'a> Planner<'a> {
         };
         fn plain(gp: &GraphPattern) -> bool {
             match gp {
-                GraphPattern::Bgp { .. } | GraphPattern::Path { .. } => true,
+                // ARQ's property functions read lists per graph
+                GraphPattern::Bgp { patterns } => !super::arqpf::has_calls(patterns),
+                GraphPattern::Path { .. } => true,
                 GraphPattern::Join { left, right } => plain(left) && plain(right),
                 GraphPattern::Filter { inner, expr } => plain(inner) && !has_exists(expr),
                 _ => false,
@@ -2007,6 +2229,7 @@ impl<'a> Planner<'a> {
                 Kind::VectorSearch(s) => s.needs_input(),
                 Kind::SpatialPf(s) => s.needs_input(),
                 Kind::PathSearch(s) => s.needs_input(),
+                Kind::PropertyFn(s) => s.needs_input(),
                 _ => false,
             });
         for n in nodes {
@@ -2064,6 +2287,7 @@ impl<'a> Planner<'a> {
             result = match &d.kind {
                 Kind::SpatialPf(_) => super::geopf::attach_spatial(self, result, d)?,
                 Kind::PathSearch(_) => super::pathsearch::attach(self, result, d)?,
+                Kind::PropertyFn(_) => super::arqpf::attach(result, d),
                 _ => self.attach_vector(result, d)?,
             };
             let (now, later): (Vec<Expr>, Vec<Expr>) =
@@ -2356,7 +2580,7 @@ impl<'a> Planner<'a> {
                 let mut branches = Vec::new();
                 for a in alts {
                     let mut items = Vec::new();
-                    self.collect_path(p.s, a, p.o, &p.graph, &mut items);
+                    self.collect_path(p.s, a, p.o, &p.graph, &mut items)?;
                     branches.push(self.plan_group(items, Vec::new())?);
                 }
                 return Ok(join(left, union(branches), self.ctx));
@@ -2386,7 +2610,7 @@ impl<'a> Planner<'a> {
             }
             _ => {
                 let mut items = Vec::new();
-                self.collect_path(p.s, &p.path, p.o, &p.graph, &mut items);
+                self.collect_path(p.s, &p.path, p.o, &p.graph, &mut items)?;
                 let n = self.plan_group(items, Vec::new())?;
                 return Ok(join(left, n, self.ctx));
             }
@@ -2421,7 +2645,7 @@ impl<'a> Planner<'a> {
             _ => {
                 let (a, b) = (self.ctx.fresh_var(), self.ctx.fresh_var());
                 let mut items = Vec::new();
-                self.collect_path(PT::V(a), inner, PT::V(b), &p.graph, &mut items);
+                self.collect_path(PT::V(a), inner, PT::V(b), &p.graph, &mut items)?;
                 let edges = self.plan_group(items, Vec::new())?;
                 let mut keep = vec![a, b];
                 if let Some(g) = gvar {
@@ -4150,7 +4374,10 @@ fn certain_names(gp: &GraphPattern, out: &mut Vec<String>) {
             certain_names(left, out);
             certain_names(right, out);
         }
-        GP::LeftJoin { left, .. } | GP::Minus { left, .. } => certain_names(left, out),
+        GP::LeftJoin { left, .. }
+        | GP::Minus { left, .. }
+        | GP::SemiJoin { left, .. }
+        | GP::AntiJoin { left, .. } => certain_names(left, out),
         GP::Filter { inner, .. }
         | GP::Distinct { inner }
         | GP::Reduced { inner }
@@ -4162,7 +4389,10 @@ fn certain_names(gp: &GraphPattern, out: &mut Vec<String>) {
             }
             certain_names(inner, out);
         }
-        GP::Extend { inner, .. } => certain_names(inner, out),
+        // a failed expression or a null element leaves the variable unbound
+        GP::Extend { inner, .. } | GP::Assign { inner, .. } | GP::Unfold { inner, .. } => {
+            certain_names(inner, out)
+        }
         GP::Project { inner, variables } => {
             let mut inner_names = Vec::new();
             certain_names(inner, &mut inner_names);
@@ -4183,6 +4413,76 @@ fn certain_names(gp: &GraphPattern, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// ARQ's `multi(path)`: `path` with each `*`, `+` and `?` as the counted range `{*}`,
+/// `{+}` or `{0,1}`. A `distinct(…)` inside keeps its set semantics.
+pub(super) fn counted(p: &PropertyPathExpression) -> PropertyPathExpression {
+    use PropertyPathExpression as PP;
+    let b = |x: &PropertyPathExpression| Box::new(counted(x));
+    match p {
+        PP::ZeroOrMore(x) => PP::Range {
+            path: b(x),
+            min: 0,
+            max: None,
+        },
+        PP::OneOrMore(x) => PP::Range {
+            path: b(x),
+            min: 1,
+            max: None,
+        },
+        PP::ZeroOrOne(x) => PP::Range {
+            path: b(x),
+            min: 0,
+            max: Some(1),
+        },
+        PP::Range { path, min, max } => PP::Range {
+            path: b(path),
+            min: *min,
+            max: *max,
+        },
+        PP::Reverse(x) => PP::Reverse(b(x)),
+        PP::Sequence(x, y) => PP::Sequence(b(x), b(y)),
+        PP::Alternative(x, y) => PP::Alternative(b(x), b(y)),
+        PP::Multi(x) => counted(x),
+        PP::NamedNode(_) | PP::NegatedPropertySet(_) | PP::Distinct(_) | PP::Shortest(_) => {
+            p.clone()
+        }
+    }
+}
+
+/// The variables the items of a group bind.
+fn item_vars(items: &[Item]) -> FxHashSet<VarId> {
+    let mut out = FxHashSet::default();
+    for it in items {
+        match it {
+            Item::Triple(t) => {
+                out.extend(t.t.iter().filter_map(|x| match x {
+                    PT::V(v) => Some(*v),
+                    PT::C(_) => None,
+                }));
+                if let ActiveGraph::Var(v) = t.graph {
+                    out.insert(v);
+                }
+            }
+            Item::Path(p) => {
+                for x in [p.s, p.o] {
+                    if let PT::V(v) = x {
+                        out.insert(v);
+                    }
+                }
+            }
+            Item::Node(n) => out.extend(n.vars.iter().copied()),
+            Item::Unpack(u) => {
+                out.insert(u.t);
+                out.extend(u.parts.iter().filter_map(|x| match x {
+                    PT::V(v) => Some(*v),
+                    PT::C(_) => None,
+                }));
+            }
+        }
+    }
+    out
 }
 
 /// All variable names mentioned in a pattern (for EXISTS / SERVICE).
@@ -4210,11 +4510,19 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
             GP::Join { left, right }
             | GP::Lateral { left, right }
             | GP::Union { left, right }
-            | GP::Minus { left, right } => {
+            | GP::Minus { left, right }
+            | GP::SemiJoin { left, right }
+            | GP::AntiJoin { left, right } => {
                 walk(left, out);
                 walk(right, out);
             }
             GP::Extend {
+                inner, expression, ..
+            }
+            | GP::Assign {
+                inner, expression, ..
+            }
+            | GP::Unfold {
                 inner, expression, ..
             } => {
                 expr_vars(expression, out);

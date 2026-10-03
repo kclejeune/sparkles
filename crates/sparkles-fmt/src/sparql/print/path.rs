@@ -37,6 +37,24 @@ pub fn path_bracketed(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     tight(cx, n)
 }
 
+/// `PathFunction`: ARQ's `distinct(p)`, `multi(p)` and `shortest(p)`, with the name in
+/// lower case as ARQ writes it.
+pub fn path_function(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
+    let mut parts = Vec::new();
+    for e in cx.children(n) {
+        match e {
+            crate::tree::Element::Token(t)
+                if matches!(cx.tree.token_kind(t), crate::lex::TokenKind::Kw(_)) =>
+            {
+                let name = cx.tree.token_text(t).to_ascii_lowercase();
+                parts.push(cx.text(&name));
+            }
+            e => parts.push(term::element(cx, e)),
+        }
+    }
+    cx.concat(parts)
+}
+
 /// The children with nothing between them; IRIs compacted, `a` as `a`.
 fn tight(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     let parts: Vec<DocId> = cx

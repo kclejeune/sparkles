@@ -706,6 +706,8 @@ fn construct(gp: &GraphPattern) -> &'static str {
         GP::Union { .. } => "a UNION",
         GP::Minus { .. } => "a MINUS",
         GP::Extend { .. } => "a BIND",
+        GP::Assign { .. } => "a LET",
+        GP::Unfold { .. } => "an UNFOLD",
         GP::Values { .. } => "a VALUES block",
         GP::Service { .. } => "a SERVICE call",
         GP::Group { .. } | GP::Project { .. } => "a sub-select",
@@ -721,6 +723,7 @@ fn property_functions(patterns: &[TriplePattern]) -> std::result::Result<(), Str
         Ok(false) => Ok(()),
         _ => Err("it calls a property function".to_string()),
     };
+    call(Ok(super::arqpf::has_calls(patterns)))?;
     call(super::textpf::extract(patterns).map(|(c, _)| !c.is_empty()))?;
     call(
         super::textpf::take_calls(patterns, crate::vector::VECTOR_SEARCH, "spk:vectorSearch")
@@ -742,6 +745,7 @@ fn zero_length(p: &PropertyPathExpression) -> bool {
         PP::Sequence(a, b) | PP::Alternative(a, b) => zero_length(a) || zero_length(b),
         PP::ZeroOrMore(_) | PP::ZeroOrOne(_) => true,
         PP::Range { path, min, .. } => *min == 0 || zero_length(path),
+        PP::Distinct(a) | PP::Multi(a) | PP::Shortest(a) => zero_length(a),
     }
 }
 
@@ -782,6 +786,12 @@ pub(super) fn pure_pattern(gp: &GraphPattern) -> bool {
         GP::Filter { expr, inner } => pure(expr) && pure_pattern(inner),
         GP::Extend {
             inner, expression, ..
+        }
+        | GP::Assign {
+            inner, expression, ..
+        }
+        | GP::Unfold {
+            inner, expression, ..
         } => pure(expression) && pure_pattern(inner),
         GP::LeftJoin {
             left,
@@ -791,7 +801,9 @@ pub(super) fn pure_pattern(gp: &GraphPattern) -> bool {
         GP::Join { left, right }
         | GP::Lateral { left, right }
         | GP::Union { left, right }
-        | GP::Minus { left, right } => pure_pattern(left) && pure_pattern(right),
+        | GP::Minus { left, right }
+        | GP::SemiJoin { left, right }
+        | GP::AntiJoin { left, right } => pure_pattern(left) && pure_pattern(right),
         GP::Graph { inner, .. }
         | GP::Distinct { inner }
         | GP::Reduced { inner }
@@ -808,6 +820,15 @@ pub(super) fn pure_pattern(gp: &GraphPattern) -> bool {
             aggregates.iter().all(|(_, a)| match a {
                 AggregateExpression::CountSolutions { .. } => true,
                 AggregateExpression::FunctionCall { expr, .. } => pure(expr),
+                AggregateExpression::Fold {
+                    expr, value, order, ..
+                } => {
+                    pure(expr)
+                        && value.as_ref().is_none_or(pure)
+                        && order.iter().all(|o| match o {
+                            OrderExpression::Asc(e) | OrderExpression::Desc(e) => pure(e),
+                        })
+                }
             }) && pure_pattern(inner)
         }
         // a remote endpoint answers as it likes

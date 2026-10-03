@@ -2089,6 +2089,14 @@
         },
         "type": "object"
       },
+      "HistoryChanges": {
+        "additionalProperties": true,
+        "description": "`{dataset, datasetId, head, from, to, truncated, changes: [{op, subject, predicate, object, graph, commit, timestamp, kind, author?, message?}], unrecorded: [{from, to, reason}]}`",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#history-queries"
+        },
+        "type": "object"
+      },
       "HistoryRequest": {
         "additionalProperties": true,
         "description": "`{keepCommits?, keepAge?, maxBytes?, schedules?, catalog?}`",
@@ -15904,6 +15912,138 @@
         "summary": "Get the API schema",
         "tags": [
           "GraphQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/history": {
+      "get": {
+        "description": "The recorded changes of a range of commits, read from the change log, which outlives compactions. Each change is an addition or a removal of a quad with its commit's number, time, kind, author and message. `subject`, `predicate` and `object` take N-Triples terms or bare IRIs and may repeat.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#history-queries"
+        },
+        "operationId": "historyChanges",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "A subject term; repeat for several.",
+            "in": "query",
+            "name": "subject",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A predicate IRI; repeat for several.",
+            "in": "query",
+            "name": "predicate",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "An object term; repeat for several.",
+            "in": "query",
+            "name": "object",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A graph IRI or `default`; repeat for several.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A selector of the first commit read; the first by default.",
+            "in": "query",
+            "name": "from",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A selector of the last commit read; the head by default.",
+            "in": "query",
+            "name": "to",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only additions or only removals.",
+            "in": "query",
+            "name": "op",
+            "schema": {
+              "enum": [
+                "add",
+                "remove"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Oldest or newest commits first.",
+            "in": "query",
+            "name": "order",
+            "schema": {
+              "default": "asc",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most changes listed, at most `--max-rows`.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryChanges"
+                }
+              }
+            },
+            "description": "The changes, and the commits whose changes are not recorded."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "History query",
+        "tags": [
+          "History"
         ],
         "x-sparkles-permission": "read"
       }

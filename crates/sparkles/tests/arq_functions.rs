@@ -13,6 +13,7 @@ use sparkles::store::{Store, StoreOptions};
 const PREFIXES: &str = "PREFIX fn: <http://www.w3.org/2005/xpath-functions#>
 PREFIX afn: <http://jena.apache.org/ARQ/function#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX math: <http://www.w3.org/2005/xpath-functions/math#>
 ";
 
 fn check(s: &Store, expr: &str, want: &str) {
@@ -211,4 +212,151 @@ fn uuids_are_fresh() {
         })
         .collect();
     assert_eq!(v, ["true", "36", "true"]);
+}
+
+/// The functions of ARQ's registry that came later (spec G06, Phase 3): `afn:sprintf`,
+/// `fn:format-number`, `fn:apply` and `afn:eval`, `fn:collation-key`, Jena's split of an
+/// IRI in `afn:localname`, and the operators on dates, times and durations.
+#[test]
+fn library_functions_match_arq() {
+    let s = Store::in_memory(StoreOptions::default());
+    for (expr, want) in [
+        ("afn:localname(<http://ex/a/1x>)", "\"x\""),
+        ("afn:namespace(<http://ex/a/1x>)", "\"http://ex/a/1\""),
+        ("afn:localname(<http://ex/a/>)", "\"\""),
+        // Java's String.format, with half-up rounding of the shortest decimal digits
+        ("afn:sprintf(\"%.2f\", 0.125e0)", "\"0.13\""),
+        ("afn:sprintf(\"%.2f\", 1.005e0)", "\"1.01\""),
+        ("afn:sprintf(\"%08.3f\", -3.5e0)", "\"-003.500\""),
+        (
+            "afn:sprintf(\"%5.2f|%d|%s\", 3.14159, 42, \"s\")",
+            "\" 3.14|42|s\"",
+        ),
+        ("afn:sprintf(\"%,d\", 1234567)", "\"1,234,567\""),
+        ("afn:sprintf(\"%+d %(d\", 5, -5)", "\"+5 (5)\""),
+        ("afn:sprintf(\"%s %S\", 1e10, \"ab\")", "\"1.0E10 AB\""),
+        ("afn:sprintf(\"%2$s %1$s\", \"a\", \"b\")", "\"b a\""),
+        (
+            "afn:sprintf(\"%g|%g\", 0.0001234e0, 123456789.0e0)",
+            "\"0.000123400|1.23457e+08\"",
+        ),
+        (
+            "afn:sprintf(\"%x %X %#x %o\", 255, 255, 255, 8)",
+            "\"ff FF 0xff 10\"",
+        ),
+        (
+            "afn:sprintf(\"%10.4s|%-6b|\", \"abcdef\", true)",
+            "\"      abcd|true  |\"",
+        ),
+        (
+            "afn:sprintf(\"%.1f|%e\", 2.25, 0.0e0)",
+            "\"2.3|0.000000e+00\"",
+        ),
+        // ARQ passes a language-tagged string as its tag, and an IRI as its string in
+        // quotes
+        (
+            "afn:sprintf(\"%s|%s\", \"x\"@en, <http://x>)",
+            "\"en|\\\"http://x\\\"\"",
+        ),
+        // a conversion Java refuses fails the query in ARQ and is an error here
+        ("afn:sprintf(\"%d\", 1.5e0)", ""),
+        ("afn:sprintf(\"%c\", 65)", ""),
+        ("afn:sprintf(\"%s %s\", 1)", ""),
+        // Java's DecimalFormat, rounding half to even
+        ("fn:format-number(1234.5678, \"#,##0.00\")", "\"1,234.57\""),
+        ("fn:format-number(0.125, \"0.00\")", "\"0.12\""),
+        ("fn:format-number(0.375, \"0.00\")", "\"0.38\""),
+        ("fn:format-number(0.5, \"#.##\")", "\"0.5\""),
+        ("fn:format-number(7, \"000\")", "\"007\""),
+        ("fn:format-number(0.256, \"0.0%\")", "\"25.6%\""),
+        (
+            "fn:format-number(-1234.5, \"$#,##0.00;($#,##0.00)\")",
+            "\"($1,234.50)\"",
+        ),
+        ("fn:format-number(1234.0, \"0.###E0\")", "\"1.234E3\""),
+        ("fn:format-number(12345.0, \"##0.#####E0\")", "\"12.345E3\""),
+        ("fn:format-number(-0.0e0, \"0.0\")", "\"-0.0\""),
+        (
+            "fn:format-number(1234.5, \"#,##0.00\", \"de\")",
+            "\"1.234,50\"",
+        ),
+        ("fn:format-number(\"x\", \"0\")", ""),
+        // a function by its IRI
+        ("fn:apply(fn:upper-case, \"abc\")", "\"ABC\""),
+        ("fn:apply(xsd:integer, \"12\")", "12"),
+        ("afn:eval(math:sqrt, 4)", "2.0e0"),
+        ("fn:apply(<http://example/nothing>, 1)", ""),
+        (
+            "fn:collation-key(\"abc\", \"fi\")",
+            "\"YWJjQGZp\"^^xsd:base64Binary",
+        ),
+        ("afn:collation(\"fi\", \"a\")", "\"a\""),
+        ("afn:print(\"x\")", "true"),
+        ("afn:wait(1)", "true"),
+        (
+            "DATATYPE(afn:system-timezone()) = xsd:dayTimeDuration",
+            "true",
+        ),
+        ("DATATYPE(afn:nowtz()) = xsd:dateTime", "true"),
+        // dates, times and durations
+        (
+            "\"2020-01-31\"^^xsd:date + \"P1M\"^^xsd:yearMonthDuration",
+            "\"2020-02-29\"^^xsd:date",
+        ),
+        (
+            "\"2020-01-31\"^^xsd:date + \"P1D\"^^xsd:dayTimeDuration",
+            "\"2020-02-01\"^^xsd:date",
+        ),
+        (
+            "\"2020-01-31\"^^xsd:date - \"P1D\"^^xsd:duration",
+            "\"2020-01-30\"^^xsd:date",
+        ),
+        (
+            "\"10:00:00\"^^xsd:time + \"PT90M\"^^xsd:dayTimeDuration",
+            "\"11:30:00\"^^xsd:time",
+        ),
+        (
+            "\"PT1H\"^^xsd:dayTimeDuration / \"PT15M\"^^xsd:dayTimeDuration",
+            "4.0",
+        ),
+        (
+            "\"P1Y\"^^xsd:yearMonthDuration / \"P3M\"^^xsd:yearMonthDuration",
+            "4.0",
+        ),
+        (
+            "\"P1D\"^^xsd:duration + \"PT1H\"^^xsd:dayTimeDuration",
+            "\"P1DT1H\"^^xsd:duration",
+        ),
+        // ARQ gives these an xsd:duration; F&O 3.1 keeps the day-time duration
+        (
+            "\"10:00:00\"^^xsd:time - \"09:15:00\"^^xsd:time",
+            "\"PT45M\"^^xsd:dayTimeDuration",
+        ),
+        (
+            "\"PT1H\"^^xsd:dayTimeDuration * 2.5",
+            "\"PT2H30M\"^^xsd:dayTimeDuration",
+        ),
+        (
+            "\"PT1H\"^^xsd:dayTimeDuration / 4",
+            "\"PT15M\"^^xsd:dayTimeDuration",
+        ),
+        // F&O 3.1 defines these, which ARQ leaves undefined
+        (
+            "2 * \"PT1H\"^^xsd:dayTimeDuration",
+            "\"PT2H\"^^xsd:dayTimeDuration",
+        ),
+        (
+            "\"P1Y\"^^xsd:yearMonthDuration * 1.5",
+            "\"P1Y6M\"^^xsd:yearMonthDuration",
+        ),
+    ] {
+        check(&s, expr, want);
+    }
+    let q = format!("{PREFIXES}SELECT (afn:version() AS ?v) WHERE {{}}");
+    let rows = query(s.snapshot(), &q, &QueryOptions::default())
+        .unwrap()
+        .rows();
+    assert!(
+        matches!(&rows[0][0], Some(Term::Literal(l)) if l.value() == env!("CARGO_PKG_VERSION"))
+    );
 }

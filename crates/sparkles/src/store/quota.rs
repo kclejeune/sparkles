@@ -384,6 +384,7 @@ mod tests {
         };
         let s = Store::open(dir.path(), opts).unwrap();
         s.load(&[ttl(500, "a")]).unwrap();
+        s.flush_change_log().unwrap();
         let used = s.disk_usage();
         s.set_quota(Some(used + used / 2)).unwrap();
         let commit = s.head_commit().seq;

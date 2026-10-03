@@ -271,17 +271,22 @@ pub fn arg_list(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     cx.delimited(n, open, &items, close, false)
 }
 
-/// `Arg`: the expression and the `,` after it, or `GROUP_CONCAT`'s `?n; SEPARATOR =
-/// ", "`.
+/// `Arg`: the expression and the `,` after it, `GROUP_CONCAT`'s `?n; SEPARATOR =
+/// ", "`, or the last argument of ARQ's FOLD with its ` ORDER BY ?a DESC(?b)`.
 pub fn arg(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     let mut parts = Vec::new();
-    let mut after_semicolon = false;
+    let mut spaced = false;
     for e in cx.children(n) {
-        if after_semicolon {
+        let order = matches!(e, Element::Token(t)
+            if cx.tree.token_kind(t) == TokenKind::Kw(Kw::Order));
+        if spaced || order {
             parts.push(cx.space());
         }
         if let Element::Token(t) = e {
-            after_semicolon |= cx.tree.token_kind(t) == TokenKind::Semicolon;
+            spaced |= matches!(
+                cx.tree.token_kind(t),
+                TokenKind::Semicolon | TokenKind::Kw(Kw::Order)
+            );
         }
         parts.push(element(cx, e));
     }
