@@ -70,6 +70,11 @@ pub enum Error {
     /// written. [`preview::catch`](crate::preview::catch) turns it into an `Ok`.
     #[error("dry run: nothing was committed")]
     DryRun(Box<crate::preview::Preview>),
+    /// An RDF Patch that cannot be read or applied: a syntax error, a term the store
+    /// cannot hold, or a `prev` header that names a commit other than the head. Nothing
+    /// was written.
+    #[error("{0}")]
+    Patch(Box<crate::patch::PatchError>),
 }
 
 /// Which budget a request exceeded.

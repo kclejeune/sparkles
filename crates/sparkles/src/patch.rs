@@ -24,6 +24,15 @@
 //! protocol, one per row, with no framing. A literal of type `xsd:string` or with a
 //! language tag carries no datatype, as Jena writes it. A base direction goes in the
 //! literal's `baseDirection` field, which Jena's patch reader ignores.
+//!
+//! [`PatchReader`] reads both forms back, row by row ([`read`]).
+
+mod read;
+#[cfg(test)]
+mod tests_read;
+mod thrift;
+
+pub use read::{PatchError, PatchErrorKind, PatchReader, PatchRow, PrevMismatch, binary_for_path};
 
 use crate::store::DiffOp;
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
@@ -71,6 +80,64 @@ impl<W: Write> PatchWriter<W> {
             writeln!(self.buf, "H {name} <{iri}> .")?;
         }
         self.flush_row()
+    }
+
+    /// A header row whose value is any term (`H name term .`).
+    pub fn header_term(&mut self, name: &str, value: &Term) -> io::Result<()> {
+        if self.binary {
+            let mut t = Thrift::new(&mut self.buf);
+            t.field(1, STRUCT); // RDF_Patch_Row.header
+            t.field(1, BINARY); // Patch_Header.name
+            t.string(name);
+            t.field(2, STRUCT); // Patch_Header.value
+            t.term(value);
+            t.stop();
+            t.stop();
+        } else {
+            write!(self.buf, "H {name} ")?;
+            text_term(&mut self.buf, value);
+            self.buf.extend_from_slice(b" .\n");
+        }
+        self.flush_row()
+    }
+
+    /// A prefix set (`PA "prefix" <iri> .`) or removed (`PD "prefix" .`).
+    pub fn prefix(&mut self, prefix: &str, iri: Option<&str>) -> io::Result<()> {
+        if self.binary {
+            let mut t = Thrift::new(&mut self.buf);
+            // RDF_Patch_Row.prefixAdd (4) or .prefixDel (5)
+            t.field(if iri.is_some() { 4 } else { 5 }, STRUCT);
+            t.field(2, BINARY);
+            t.string(prefix);
+            if let Some(i) = iri {
+                t.field(3, BINARY);
+                t.string(i);
+            }
+            t.stop();
+            t.stop();
+        } else {
+            let p = oxrdf::Literal::new_simple_literal(prefix);
+            match iri {
+                Some(i) => writeln!(self.buf, "PA {p} <{i}> .")?,
+                None => writeln!(self.buf, "PD {p} .")?,
+            }
+        }
+        self.flush_row()
+    }
+
+    /// Any row read by [`PatchReader`].
+    pub fn row(&mut self, row: &PatchRow) -> io::Result<()> {
+        match row {
+            PatchRow::Header(n, v) => self.header_term(n, v),
+            PatchRow::Begin => self.begin(),
+            PatchRow::Commit => self.commit(),
+            PatchRow::Abort => self.txn(2, "TA"),
+            PatchRow::Segment => self.txn(3, "Z"),
+            PatchRow::Add(q) => self.change(DiffOp::Add, q),
+            PatchRow::Delete(q) => self.change(DiffOp::Remove, q),
+            PatchRow::PrefixSet(p, i) => self.prefix(p, Some(i)),
+            PatchRow::PrefixRemove(p) => self.prefix(p, None),
+        }
     }
 
     /// The start of a transaction (`TX .`).

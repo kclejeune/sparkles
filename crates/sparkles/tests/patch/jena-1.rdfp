@@ -1,0 +1,17 @@
+H id <uuid:bbe2edae-325e-11ec-abcc-a70bbba0dfb1> .
+TX .
+PA "ex" "http://example/" .
+PA "foaf" "http://xmlns.com/foaf/0.1/" <http://example/g> .
+A <http://example/s> <http://example/p> <http://example/o1> <http://example/g> .
+A <http://example/s> <http://example/p> 123 .
+A <http://example/s> <http://example/p> 12.5 .
+A <http://example/s> <http://example/p> 1.0e0 .
+A <http://example/s> <http://example/p> true .
+A <http://example/s> <http://example/p> "abc\ndef" .
+A <http://example/s> <http://example/p> "chat"@fr .
+A <http://example/s> <http://example/p> "2026-10-02"^^<http://www.w3.org/2001/XMLSchema#date> .
+A <_:b1> <http://example/p> <_:b2> .
+A <http://example/s> <http://example/p> <<( <_:714caf0a-78c6-4eab-ac8e-1cf7ee17a8ab> <http://example/q> "x" )>> <http://example/g> .
+D <http://example/s> <http://example/p> <http://example/o1> <http://example/g> .
+PD "ex" .
+TC .
