@@ -5,7 +5,8 @@
 //
 // Seeded on the first request: a `places` dataset of a few Paris sights and cities with
 // their geometries in CRS84, EPSG:4326 (latitude first), GeoJSON, a UTM zone (which only
-// the server converts) and one malformed literal, with the index enabled. Geometries are
+// the server converts), GML and KML, and one malformed literal, with the index enabled.
+// The GML and KML geometries are not indexed here. Geometries are
 // read just enough for the mock: every coordinate pair of the literal, and its centroid.
 
 import ox from 'oxigraph';
@@ -13,6 +14,8 @@ import ox from 'oxigraph';
 const GEO = 'http://www.opengis.net/ont/geosparql#';
 const WKT = `${GEO}wktLiteral`;
 const GEOJSON = `${GEO}geoJSONLiteral`;
+const GML = `${GEO}gmlLiteral`;
+const KML = `${GEO}kmlLiteral`;
 const SERIALIZATIONS = [`${GEO}asWKT`, `${GEO}asGeoJSON`, `${GEO}hasSerialization`];
 const LINKS = [`${GEO}hasDefaultGeometry`, `${GEO}hasGeometry`];
 const CRS84 = 'http://www.opengis.net/def/crs/OGC/1.3/CRS84';
@@ -41,6 +44,10 @@ ex:seine a ex:River ; rdfs:label "Seine" ; geo:hasGeometry ex:seineGeom .
 ex:seineGeom geo:asGeoJSON "{\\"type\\":\\"LineString\\",\\"coordinates\\":[[2.25,48.84],[2.3,48.86],[2.36,48.85]]}"^^geo:geoJSONLiteral .
 ex:bois a ex:Park ; rdfs:label "Bois de Boulogne" ; geo:hasGeometry ex:boisGeom .
 ex:boisGeom geo:asWKT "POLYGON((2.23 48.85, 2.27 48.85, 2.27 48.88, 2.23 48.88, 2.23 48.85))"^^geo:wktLiteral .
+ex:notreDame a ex:Monument ; rdfs:label "Notre-Dame" ; geo:hasGeometry ex:notreDameGeom .
+ex:notreDameGeom geo:asGML "<gml:Point xmlns:gml=\\"http://www.opengis.net/gml/3.2\\" srsName=\\"${EPSG4326}\\"><gml:pos>48.853 2.3499</gml:pos></gml:Point>"^^geo:gmlLiteral .
+ex:canal a ex:River ; rdfs:label "Canal Saint-Martin" ; geo:hasGeometry ex:canalGeom .
+ex:canalGeom geo:asKML "<LineString xmlns=\\"http://www.opengis.net/kml/2.2\\"><coordinates>2.3655,48.8532 2.3668,48.8718 2.3696,48.8833</coordinates></LineString>"^^geo:kmlLiteral .
 ex:atlantis a ex:City ; rdfs:label "Atlantis" ; geo:hasGeometry ex:atlantisGeom .
 ex:atlantisGeom geo:asWKT "POINT(1)"^^geo:wktLiteral .
 `;
@@ -56,6 +63,25 @@ function read(value, datatype) {
     } catch {
       return { crs: CRS84, error: 'malformed geoJSONLiteral' };
     }
+  }
+  if (datatype === GML) {
+    const crs = /srsName="([^"]*)"/.exec(value)?.[1] ?? CRS84;
+    const text = [...value.matchAll(/<gml:(?:pos|posList)[^>]*>([^<]*)</g)].map((m) => m[1]);
+    const ps = pairs(text.join(' ').trim().split(/\s+/).filter(Boolean).map(Number));
+    if (!ps.length || ps.some((p) => p.some(Number.isNaN)))
+      return { crs, error: 'malformed gmlLiteral' };
+    return { crs, points: crs === EPSG4326 ? ps.map(([a, b]) => [b, a]) : ps };
+  }
+  if (datatype === KML) {
+    const text = /<coordinates>([^<]*)<\/coordinates>/.exec(value)?.[1] ?? '';
+    const ps = text
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((t) => t.split(',').slice(0, 2).map(Number));
+    if (!ps.length || ps.some((p) => p.length < 2 || p.some(Number.isNaN)))
+      return { crs: CRS84, error: 'malformed kmlLiteral' };
+    return { crs: CRS84, points: ps };
   }
   const m = /^\s*<([^>]*)>\s*/.exec(value);
   const crs = m ? m[1] : CRS84;
@@ -102,7 +128,8 @@ function geometry(value, datatype) {
   }
   const r = read(value, datatype);
   if (r.error) return null;
-  if (/^\s*(<[^>]*>\s*)?POLYGON/i.test(value)) return { type: 'Polygon', coordinates: [r.points] };
+  if (/^\s*(<[^>]*>\s*)?POLYGON|<(gml:)?Polygon\b/i.test(value))
+    return { type: 'Polygon', coordinates: [r.points] };
   if (r.points.length === 1) return { type: 'Point', coordinates: r.points[0] };
   return { type: 'LineString', coordinates: r.points };
 }

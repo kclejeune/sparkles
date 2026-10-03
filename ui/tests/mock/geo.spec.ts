@@ -49,6 +49,33 @@ test('the Map tab draws the geometry column; a row click highlights it', async (
   await expect(popup).toContainText('Eiffel Tower');
 });
 
+test('the Map tab draws GML and KML literals through the server', async ({ page }) => {
+  await run(
+    page,
+    `PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?label ?w WHERE {
+  ?f rdfs:label ?label ; geo:hasGeometry ?g .
+  ?g geo:asGML|geo:asKML ?w .
+} ORDER BY ?label`,
+  );
+  const results = page.getByRole('region', { name: 'Results' });
+  await expect(results.getByRole('grid')).toContainText('Notre-Dame');
+  const converted = page.waitForRequest((r) => r.url().endsWith('/$/geo/convert'));
+  await results.getByRole('tab', { name: 'Map' }).click();
+  const literals = (await converted)
+    .postDataJSON()
+    .literals.map((l: { datatype: string }) => l.datatype);
+  expect(literals.sort()).toEqual([
+    'http://www.opengis.net/ont/geosparql#gmlLiteral',
+    'http://www.opengis.net/ont/geosparql#kmlLiteral',
+  ]);
+  const map = page.getByRole('region', { name: 'Result map' });
+  await expect(map).toHaveAttribute('data-state', 'ready');
+  await expect(map).toHaveAttribute('data-features', '2');
+  await expect(results.getByText('2 drawn')).toBeVisible();
+});
+
 test('an explored feature shows its map card and lists nearby features', async ({ page }) => {
   await page.goto(`/ui/explore?ds=places&iri=${encodeURIComponent(`${PLACES}paris`)}`);
   await expect(page.getByRole('heading', { name: 'Location' })).toBeVisible();

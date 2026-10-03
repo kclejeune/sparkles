@@ -3928,8 +3928,9 @@ the inferences removes them. The reasoning status records both options (`vocabul
 The UI draws geometries with MapLibre GL JS, which it loads when a map first opens. Maps
 appear in three places:
 
-* The Map tab of query results. Literals in CRS84, EPSG:4326 and Web Mercator are read in
-  the browser, and others go through `POST /$/geo/convert`.
+* The Map tab of query results. WKT and GeoJSON literals in CRS84, EPSG:4326 and Web
+  Mercator are read in the browser. Other CRSs and every GML and KML literal go through
+  `POST /$/geo/convert`.
 * The explorer's map card, with Nearby (`spatial:nearbyGeom`).
 * The map of the Spatial index panel, which calls `GET /{ds}/geo` for the box in view.
 
