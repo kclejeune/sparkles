@@ -12,6 +12,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Running the server](#running-the-server)
   * [Network exposure](#network-exposure)
   * [Endpoints and operations](#endpoints-and-operations)
+  * [Migrating from Fuseki](#migrating-from-fuseki)
   * [`serve` options](#serve-options)
 * [Command-line tools](#command-line-tools)
   * [Shell completions and man pages](#shell-completions-and-man-pages)
@@ -190,6 +191,50 @@ and host from `X-Forwarded-Proto` and `X-Forwarded-Host`.
 directory. It takes Jena and a JDK from nixpkgs, or from `JENA_HOME` and `JAVA`
 ([DEVELOPMENT.md](DEVELOPMENT.md)).
 
+### Migrating from Fuseki
+
+`sparkles fuseki-config convert` reads a Fuseki configuration and writes the equivalent
+Sparkles setup into a directory. It takes a `config.ttl`, any service files, or a Fuseki
+base directory such as `run/`. A directory is read with its `config.ttl`, every file in
+its `configuration/` directory and its `shiro.ini`:
+
+```sh
+sparkles fuseki-config convert /srv/fuseki/run --out sparkles/
+sh sparkles/load.sh      # once, with Fuseki stopped
+sh sparkles/serve.sh     # extra arguments go to sparkles serve
+```
+
+The directory holds these files:
+
+* `serve.sh` runs `sparkles serve` with the converted flags, such as `--loc`, `--mem`,
+  `--text`, `--geo`, `--rdfs`, `--timeout` and `--union-default-graph`.
+* `load.sh` moves the data. Sparkles cannot read TDB files, so for each TDB2 database it
+  runs Jena's `tdb2.tdbdump` and loads the dump with `sparkles load`. It also loads the
+  files that `ja:data` and `ja:externalContent` name, and materializes inferences with
+  `sparkles infer`.
+* `auth.toml` is the auth configuration, written when the configuration has users or
+  access rules. Users come from `shiro.ini` or from the file that `fuseki:passwd` names.
+  Plain-text passwords are hashed with argon2id, and a user whose password is already
+  hashed is left commented out until you add a hash from `sparkles auth hash`. Shiro's
+  `[urls]` rules, `fuseki:allowedUsers` and graph access control become grants. Where
+  Sparkles cannot express a rule exactly, the grant gives less access, never more.
+* `datasets/NAME/` holds a dataset's `text.json`, `geo.json`, RDFS schema and rules.
+* `report.txt` lists every element of the configuration as converted, approximated, a
+  manual step, ignored or unsupported, with the reason.
+
+The report is also printed. `--check` prints it and writes nothing, and `--format json`
+prints it as JSON. The exit status is 1 when something important has no Sparkles
+equivalent, such as an endpoint at a name Sparkles does not serve, a dataset assembled
+from selected graphs or custom Java code. It is 2 when the configuration cannot be read.
+
+`sparkles serve --fuseki-config PATH` converts the configuration at each start and
+serves the result. It loads `ja:data` files into in-memory datasets at each start, as
+Fuseki does, keeps its persistent datasets in `<data>/fuseki/`, and refuses to start when
+the report has an unsupported item. Flags given on the command line win over the
+converted ones. It suits trying a configuration out, and the files of `convert` are the
+better base for a lasting migration. [Spec G08](specs/G08-fuseki-configuration.md) lists
+how each Fuseki setting converts.
+
 ### Restricting users to some graphs
 
 With `--auth-config`, a grant can cover only some named graphs of a dataset, or only some
@@ -304,6 +349,7 @@ happens to materialized inferences, and the limits.
 | `--text NAME[=FILE]` | | Enable full-text search for a dataset. `FILE` is a `text.json`-shaped configuration file. |
 | `--validate NAME[=FILE]` | | Set a dataset's write-time validation from `FILE`, a `PUT /$/validation/{ds}` body, or with `NAME` alone validate the dataset with the configuration it has. Shapes and schemas without inline text are read from the path in `source`, relative to `FILE`. The data is validated in full before the server listens, and the result is logged. A `reject` configuration the data does not pass stops the start ([API](API.md#write-time-validation)). |
 | `--rdfs NAME=FILE` | | Answer a dataset's queries over the RDFS closure of its graphs with respect to the schema in `FILE`, as Fuseki's `--rdfs` does. The setting is kept like one made with `PUT /$/rdfs/{ds}` ([API](API.md#rdfs-on-read)). |
+| `--fuseki-config PATH` | | Start from a Fuseki configuration, a `config.ttl` or a Fuseki base directory, converted at each start (see [Migrating from Fuseki](#migrating-from-fuseki)). Flags given on the command line win. A part with no Sparkles equivalent stops the start. |
 | `--geo NAME[=FILE]` | | Enable the spatial index for a dataset. `FILE` is a `geo.json`-shaped configuration file. The build runs before the server starts listening. |
 | `--geo-mb N` | `4096` | Memory for each dataset's spatial index (geometry column and trees). A build that would exceed it is refused, the status says `over-budget`, and queries run without the index. |
 | `--geo-op-vertices N` | `2000000` | Largest total of input vertices for one geometry operation (overlay, buffer, hull, relate). A larger operation is a type error. |
