@@ -20,3 +20,17 @@ SPARQL-CDTs/bnodes/manifest#bnodes-turtle-45 blank node shared with the data fil
 SPARQL-CDTs/bnodes/manifest#bnodes-turtle-46 blank node shared with the data file
 SPARQL-CDTs/bnodes/manifest#bnodes-turtle-sparql-01 blank node kept apart from the query's
 SPARQL-CDTs/bnodes/manifest#bnodes-turtle-sparql-02 blank node kept apart from the query's
+#
+# ARQ makes rdfs:member a property function that also gives the rdf:_1, rdf:_2, … members
+# of the rdf:Bag, rdf:Seq and rdf:Alt containers. Sparkles matches rdfs:member as an
+# ordinary property, so that queries over it keep their meaning and their plans. ARQ's
+# manifest names these tests only, so they are listed by name.
+Property_Function_-_container_1 rdfs:member is a property
+Property_Function_-_container_2 rdfs:member is a property
+Property_Function_-_container_3 rdfs:member is a property
+Property_Function_-_container_4 rdfs:member is a property
+Property_Function_-_container_5 rdfs:member is a property
+Property_Function_-_container_6 rdfs:member is a property
+Property_Function_-_container_7 rdfs:member is a property
+Property_Function_-_container_8 rdfs:member is a property
+Property_Function_-_container_9 rdfs:member is a property

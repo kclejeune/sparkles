@@ -1,6 +1,7 @@
 //! SPARQL 1.1 query & update engine (ARQ equivalent).
 
 pub mod aggext;
+pub mod arqpf;
 pub mod cache;
 pub mod catalog;
 pub mod cdt;

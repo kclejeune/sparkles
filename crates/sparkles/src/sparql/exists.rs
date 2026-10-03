@@ -723,6 +723,7 @@ fn property_functions(patterns: &[TriplePattern]) -> std::result::Result<(), Str
         Ok(false) => Ok(()),
         _ => Err("it calls a property function".to_string()),
     };
+    call(Ok(super::arqpf::has_calls(patterns)))?;
     call(super::textpf::extract(patterns).map(|(c, _)| !c.is_empty()))?;
     call(
         super::textpf::take_calls(patterns, crate::vector::VECTOR_SEARCH, "spk:vectorSearch")

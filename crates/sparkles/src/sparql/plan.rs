@@ -405,6 +405,9 @@ pub enum Kind {
     /// `LATERAL`: the right side evaluated per group of the rows of the left side (child
     /// 0); see [`super::lateral`]
     Lateral(Box<super::lateral::LateralSpec>),
+    /// a property function of ARQ's library (`list:member`, `apf:strSplit`, …); child 0,
+    /// if any, is the rest of the group, which binds variables the call reads
+    PropertyFn(Box<super::arqpf::PfSpec>),
     /// paths as solutions (`SERVICE path:search`); child 0, if any, is the rest of the
     /// group, which binds the source or the target
     PathSearch(Box<super::pathsearch::PathSearchSpec>),
@@ -523,6 +526,7 @@ impl Node {
             Kind::Unpack { .. } => "TripleTerm",
             Kind::Path { .. } => "TransitivePath",
             Kind::Lateral(_) => "Lateral",
+            Kind::PropertyFn(_) => "PropertyFunction",
             Kind::Service { .. } => "Service",
             Kind::TextSearch(_) => "TextSearch",
             Kind::VectorSearch(_) => "VectorSearch",
@@ -736,6 +740,19 @@ impl<'a> Planner<'a> {
                 let mut fs = filters;
                 fs.extend(self.compile(expr, g).conjuncts());
                 self.plan(inner, g, fs)
+            }
+            GP::LeftJoin {
+                left,
+                right,
+                expression,
+            } if super::arqpf::reads_left(self, left, right) => {
+                // ARQ evaluates the OPTIONAL per left row, so that the property functions
+                // of the right side read the left side's values
+                let certain = certain_vars(left, self.ctx);
+                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let l = self.plan(left, g, push)?;
+                let n = super::lateral::plan_optional(self, l, right, expression.as_ref(), g)?;
+                Ok(self.apply_filters(n, top))
             }
             GP::LeftJoin {
                 left,
@@ -1102,6 +1119,22 @@ impl<'a> Planner<'a> {
         use GraphPattern as GP;
         match gp {
             GP::Bgp { patterns } => {
+                // ARQ's property function library: the variables bound before a call
+                // are those of the group's earlier elements
+                let rest;
+                let patterns = if super::arqpf::has_calls(patterns) {
+                    let (pcalls, others) = super::arqpf::take_calls(patterns)?;
+                    let mut bound = item_vars(items);
+                    for c in pcalls {
+                        let n = super::arqpf::leaf(self, c, g, &bound)?;
+                        bound.extend(n.vars.iter().copied());
+                        items.push(Item::Node(n));
+                    }
+                    rest = others;
+                    &rest
+                } else {
+                    patterns
+                };
                 let (calls, patterns) = super::textpf::extract(patterns)?;
                 let (vcalls, patterns) = super::textpf::take_calls(
                     &patterns,
@@ -1715,7 +1748,9 @@ impl<'a> Planner<'a> {
         };
         fn plain(gp: &GraphPattern) -> bool {
             match gp {
-                GraphPattern::Bgp { .. } | GraphPattern::Path { .. } => true,
+                // ARQ's property functions read lists per graph
+                GraphPattern::Bgp { patterns } => !super::arqpf::has_calls(patterns),
+                GraphPattern::Path { .. } => true,
                 GraphPattern::Join { left, right } => plain(left) && plain(right),
                 GraphPattern::Filter { inner, expr } => plain(inner) && !has_exists(expr),
                 _ => false,
@@ -2128,6 +2163,7 @@ impl<'a> Planner<'a> {
                 Kind::VectorSearch(s) => s.needs_input(),
                 Kind::SpatialPf(s) => s.needs_input(),
                 Kind::PathSearch(s) => s.needs_input(),
+                Kind::PropertyFn(s) => s.needs_input(),
                 _ => false,
             });
         for n in nodes {
@@ -2185,6 +2221,7 @@ impl<'a> Planner<'a> {
             result = match &d.kind {
                 Kind::SpatialPf(_) => super::geopf::attach_spatial(self, result, d)?,
                 Kind::PathSearch(_) => super::pathsearch::attach(self, result, d)?,
+                Kind::PropertyFn(_) => super::arqpf::attach(result, d),
                 _ => self.attach_vector(result, d)?,
             };
             let (now, later): (Vec<Expr>, Vec<Expr>) =
@@ -4307,6 +4344,40 @@ fn certain_names(gp: &GraphPattern, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// The variables the items of a group bind.
+fn item_vars(items: &[Item]) -> FxHashSet<VarId> {
+    let mut out = FxHashSet::default();
+    for it in items {
+        match it {
+            Item::Triple(t) => {
+                out.extend(t.t.iter().filter_map(|x| match x {
+                    PT::V(v) => Some(*v),
+                    PT::C(_) => None,
+                }));
+                if let ActiveGraph::Var(v) = t.graph {
+                    out.insert(v);
+                }
+            }
+            Item::Path(p) => {
+                for x in [p.s, p.o] {
+                    if let PT::V(v) = x {
+                        out.insert(v);
+                    }
+                }
+            }
+            Item::Node(n) => out.extend(n.vars.iter().copied()),
+            Item::Unpack(u) => {
+                out.insert(u.t);
+                out.extend(u.parts.iter().filter_map(|x| match x {
+                    PT::V(v) => Some(*v),
+                    PT::C(_) => None,
+                }));
+            }
+        }
+    }
+    out
 }
 
 /// All variable names mentioned in a pattern (for EXISTS / SERVICE).

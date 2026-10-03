@@ -296,9 +296,75 @@ pub fn java_substring(s: &str, start: i64, end: Option<i64>) -> EvalResult<Strin
         .collect())
 }
 
+/// Where Jena splits an IRI into a namespace and a local name (`SplitIRI.splitXML`): the
+/// local name is the longest XML 1.1 NCName at the end that starts with an NCName start
+/// character, never the whole IRI, and does not break a `%` escape. `mailto:` keeps a
+/// character after it. An IRI that ends with no such name splits at its end.
+pub fn split_xml(iri: &str) -> usize {
+    fn start(c: char) -> bool {
+        matches!(c,
+            'A'..='Z' | '_' | 'a'..='z' | '\u{C0}'..='\u{2FF}' | '\u{370}'..='\u{37D}'
+            | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{2070}'..='\u{218F}'
+            | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}'
+            | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+    }
+    fn name(c: char) -> bool {
+        start(c)
+            || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}'
+                | '\u{203F}'..='\u{2040}')
+    }
+    let chars: Vec<(usize, char)> = iri.char_indices().collect();
+    let n = chars.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut i = n - 1;
+    while i >= 1 && name(chars[i].1) {
+        i -= 1;
+    }
+    let mut j = i + 1;
+    if j >= n {
+        return iri.len();
+    }
+    if j >= 2 && chars[j - 2].1 == '%' {
+        j += 1;
+    }
+    if chars[j - 1].1 == '%' {
+        j += 2;
+        if j > n {
+            return iri.len();
+        }
+    }
+    while j < n {
+        if start(chars[j].1) && !(j == 7 && iri.starts_with("mailto:")) {
+            break;
+        }
+        j += 1;
+    }
+    chars.get(j).map_or(iri.len(), |c| c.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_iris_as_jena() {
+        let split = |s: &str| {
+            let at = split_xml(s);
+            (&s[..at], &s[at..])
+        };
+        assert_eq!(
+            split("http://www.w3.org/2001/XMLSchema#integer"),
+            ("http://www.w3.org/2001/XMLSchema#", "integer")
+        );
+        assert_eq!(split("http://example/a/b"), ("http://example/a/", "b"));
+        assert_eq!(split("http://example/a/"), ("http://example/a/", ""));
+        assert_eq!(split("http://example/a/1x"), ("http://example/a/1", "x"));
+        assert_eq!(split("urn:x"), ("urn:", "x"));
+        assert_eq!(split("mailto:me"), ("mailto:m", "e"));
+        assert_eq!(split("http://ex/a%20b"), ("http://ex/a%20", "b"));
+    }
 
     #[test]
     fn rounds_decimal_numerals() {

@@ -727,6 +727,14 @@ fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Pat
                 .or_else(|| t.id.rsplit_once("/jena-arq/").map(|x| x.1))
                 .unwrap_or(&t.id)
                 .to_string();
+        // an entry without an IRI (ARQ's own manifests) by its name, spaces as `_`
+        let short = match (
+            t.id.starts_with("_:"),
+            m.obj(&t.entry, &format!("{MF}name")),
+        ) {
+            (true, Some(Term::Literal(name))) => name.value().replace(char::is_whitespace, "_"),
+            _ => short,
+        };
         let r = match t.kind.as_str() {
             "QueryEvaluationTest" => {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_query_test(t, m)))
@@ -840,6 +848,19 @@ fn sparql_cdts() {
         "SPARQL CDTs (Jena)",
         &dir,
         &["SPARQL-CDTs/manifest-all.ttl"],
+        &dir.join("expected-failures.txt"),
+    );
+}
+
+/// Apache Jena's tests of ARQ's property functions (`jena-arq/testing/ARQ/
+/// PropertyFunctions`), vendored in `testsuite/jena-arq` like the CDT tests.
+#[test]
+fn arq_property_functions() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/jena-arq");
+    run_suite_in(
+        "ARQ property functions (Jena)",
+        &dir,
+        &["ARQ/PropertyFunctions/manifest.ttl"],
         &dir.join("expected-failures.txt"),
     );
 }

@@ -389,6 +389,10 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             );
             super::exists::pure_pattern(&l.pattern)
         }
+        Kind::PropertyFn(spec) => {
+            let _ = write!(s, "{:?}", spec);
+            true
+        }
         Kind::Filter(es) => es.iter().all(deterministic),
         Kind::Extend(_, e) | Kind::Assign(_, e) | Kind::Unfold { expr: e, .. } => deterministic(e),
         Kind::LeftJoin { expr } => expr.as_ref().is_none_or(deterministic),

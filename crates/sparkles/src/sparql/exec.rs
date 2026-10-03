@@ -446,6 +446,13 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             counters = Some(c);
             t
         }
+        Kind::PropertyFn(spec) => {
+            let input = match n.children.len() {
+                0 => None,
+                _ => Some(child(0, &mut infos)?),
+            };
+            super::arqpf::run(ctx, spec, input.as_ref(), &n.vars)?
+        }
         Kind::TextSearch(spec) => crate::text::search(ctx, spec, &n.vars)?,
         Kind::VectorSearch(spec) => {
             let input = match n.children.len() {

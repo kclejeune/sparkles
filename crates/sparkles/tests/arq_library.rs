@@ -1,11 +1,14 @@
 //! The rest of Jena ARQ's query language (spec G06, Phase 3): `LET`, the composite
-//! datatypes with `FOLD` and `UNFOLD`, against ARQ's tests and Jena 6.2.0's answers.
+//! datatypes with `FOLD` and `UNFOLD`, and the property function library, against ARQ's
+//! tests and Jena 6.2.0's answers.
 //!
 //! The cases cite their source: the tests of Jena's `jena-arq/testing/ARQ`
 //! (`Syntax-ARQ`) and the output of Jena 6.2.0's `arq` command for the same data and
-//! query ("arq 6.2.0"). Jena's `SPARQL-CDTs` suite runs in full from `tests/w3c.rs`.
+//! query ("arq 6.2.0"). Jena's `SPARQL-CDTs` and `PropertyFunctions` suites run in full
+//! from `tests/w3c.rs`.
 //! Expected solutions are compared as bags: rows sorted, cells abbreviated with the
-//! prefixes below and separated by spaces, `-` for unbound.
+//! prefixes below and separated by spaces, `-` for unbound and `""` for the empty
+//! string.
 
 use oxrdf::Term;
 use sparkles::io::{RdfFormat, Source};
@@ -17,17 +20,19 @@ PREFIX ex: <http://example.org/>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 PREFIX cdt: <http://w3id.org/awslabs/neptune/SPARQL-CDTs/>
+PREFIX list: <http://jena.apache.org/ARQ/list#>
+PREFIX apf: <http://jena.apache.org/ARQ/property#>
 ";
 
-fn ttl(data: &str) -> Store {
+fn load(data: &str, format: RdfFormat) -> Store {
     let s = Store::in_memory(StoreOptions::default());
-    s.load(&[Source::from_bytes(
-        data.as_bytes().to_vec(),
-        RdfFormat::Turtle,
-        None,
-    )])
-    .unwrap();
+    s.load(&[Source::from_bytes(data.as_bytes().to_vec(), format, None)])
+        .unwrap();
     s
+}
+
+fn ttl(data: &str) -> Store {
+    load(data, RdfFormat::Turtle)
 }
 
 fn short(t: &Option<Term>) -> String {
@@ -43,6 +48,7 @@ fn short(t: &Option<Term>) -> String {
                 format!("<{s}>")
             }
         }
+        Some(Term::Literal(l)) if l.value().is_empty() => "\"\"".into(),
         Some(Term::Literal(l)) => l.value().replace(' ', ""),
         Some(t) => t.to_string(),
     }
@@ -212,4 +218,97 @@ fn unfold_and_fold_syntax() {
     assert!(parses("SELECT (FOLD(?s, ?o) AS ?m) { ?s ?p ?o }"));
     assert!(!parses_strict("SELECT (FOLD(?o) AS ?l) { ?s ?p ?o }"));
     assert!(!parses("SELECT (FOLD(COUNT(?o)) AS ?l) { ?s ?p ?o }"));
+}
+
+// ------------------------------------------------------- property functions ------
+
+const PF_DATA: &str = "PREFIX : <http://example/>
+:a :name \"x y\" ; :list (\"b\" \"c\") .
+:b :name \"z\" ; :list () .
+:g1 { :s :p (\"p\" \"q\") }
+:g2 { :s :p (\"r\") }
+";
+
+/// arq 6.2.0 on `PF_DATA`: the list functions over lists the group binds or finds, per
+/// named graph, and the `apf:` functions with inputs from the group.
+#[test]
+fn property_functions_match_arq() {
+    let s = load(PF_DATA, RdfFormat::TriG);
+    check(
+        &s,
+        "SELECT ?t { ?t apf:strSplit (\"a, b,,c, , \" \",\") }",
+        "a \n b \n \"\" \n c \n \"\" \n \"\"",
+    );
+    check(
+        &s,
+        "SELECT ?t { ?t apf:strSplit (\",a\" \",\") }",
+        "\"\" \n a",
+    );
+    check(
+        &s,
+        "SELECT ?s ?t { ?s :name ?n . ?t apf:strSplit (?n \" \") }",
+        ":a x \n :a y \n :b z",
+    );
+    check(
+        &s,
+        "SELECT ?x { \"b\" apf:strSplit (\"a b c\" \" \") BIND(1 AS ?x) }",
+        "1",
+    );
+    check(
+        &s,
+        "SELECT ?z { ?s :name ?n . ?z apf:concat (\"<\" ?n \">\") }",
+        "<xy> \n <z>",
+    );
+    check(
+        &s,
+        "SELECT ?g ?m { GRAPH ?g { ?l list:member ?m } }",
+        ":g1 p \n :g1 q \n :g2 r",
+    );
+    check(
+        &s,
+        "SELECT ?s ?n { ?s :list ?l . ?l list:length ?n }",
+        ":a 2 \n :b 0",
+    );
+    check(
+        &s,
+        "SELECT ?s ?i ?m { ?s :list ?l . ?l list:index (?i ?m) }",
+        ":a 0 b \n :a 1 c",
+    );
+    check(
+        &s,
+        "SELECT ?s ?ln { ?s :name ?n OPTIONAL { ?s apf:splitIRI (?ns ?ln) } }",
+        ":a a \n :b b",
+    );
+    check(
+        &s,
+        "SELECT ?n ?ln { ?s :name ?n . ?s apf:splitIRI (\"http://example/\" ?ln) }",
+        "xy a \n z b",
+    );
+    let heads = rows(&s, "SELECT ?l { ?l list:member \"b\" }");
+    assert_eq!(heads.len(), 1, "{heads:?}");
+    let v = rows(&s, "SELECT ?s ?v { ?s apf:versionARQ ?v }");
+    assert_eq!(
+        v,
+        vec![format!("<urn:x-sparkles:> {}", env!("CARGO_PKG_VERSION"))]
+    );
+}
+
+/// A call that reads no variable of its group is a leaf of the join order; one that
+/// reads a variable bound before it runs over the rest of the group.
+#[test]
+fn property_function_plans() {
+    let s = load(PF_DATA, RdfFormat::TriG);
+    let leaf = explain(&s, "SELECT * { ?l list:member ?m . ?x :list ?l }");
+    assert!(leaf.contains("\"PropertyFunction\""), "{leaf}");
+    let dependent = explain(&s, "SELECT * { ?x :list ?l . ?l list:member ?m }");
+    assert!(dependent.contains("\"PropertyFunction\""), "{dependent}");
+    // the OPTIONAL runs per left row, so splitIRI reads ?s
+    let optional = explain(
+        &s,
+        "SELECT * { ?s :name ?n OPTIONAL { ?s apf:splitIRI (?ns ?ln) } }",
+    );
+    assert!(optional.contains("\"Lateral\""), "{optional}");
+    // a query without the library plans as before
+    let plain = explain(&s, "SELECT * { ?s :name ?n OPTIONAL { ?s :list ?l } }");
+    assert!(plain.contains("\"OptionalJoin\""), "{plain}");
 }
