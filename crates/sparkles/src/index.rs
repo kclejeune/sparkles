@@ -249,7 +249,7 @@ impl BlockMeta {
     }
 }
 
-fn encode_column(col: &[u64], scratch: &mut Vec<u8>) -> Vec<u8> {
+pub(crate) fn encode_column(col: &[u64], scratch: &mut Vec<u8>) -> Vec<u8> {
     scratch.clear();
     let mut prev = 0u64;
     for &v in col {

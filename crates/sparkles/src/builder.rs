@@ -7,10 +7,19 @@
 //! 2. **Vocabulary merge**: k-way merge of all partial vocabularies into the sorted,
 //!    front-coded base vocabulary; per-batch `rank → global id` maps are written
 //!    sequentially along the way.
-//! 3. **Remap** (parallel) batch quads to global ids.
-//! 4. **Permutations**: for each permutation, sort (in memory with a parallel sort if it
-//!    fits into the memory budget, otherwise via sorted runs + k-way merge) and stream
-//!    into the block writer. Statistics for the planner are gathered on the way.
+//! 3. **Remap and sort**: the batches are read once, in chunks of `sort_mem_quads`
+//!    quads, and remapped to global ids in parallel. Each chunk is sorted in place in the
+//!    order of SPO, OSP and PSO (and GSPO when there are named graphs) and written as a
+//!    compressed sorted run per order (see [`runs`]). Input that fits into the budget is
+//!    one chunk, kept in memory.
+//! 4. **Permutations**: the runs of each order are merged, one order per thread, and
+//!    streamed into its permutation. The order's partner permutation (SOP from SPO, OPS
+//!    from OSP, POS from PSO) shares its first column and is produced from the same
+//!    stream by sorting each run of that column (QLever builds its permutations in
+//!    these pairs). Without named graphs GSPO is SPO behind the one graph. Writers run
+//!    in threads of their own. Statistics for the planner are gathered on the way.
+
+mod runs;
 
 use crate::error::{Error, Result};
 use crate::id::{self, Id, Tag};
@@ -29,7 +38,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Clone, Debug)]
 pub struct BuildOptions {
@@ -179,6 +188,8 @@ pub struct Builder {
     next_bnode: AtomicU64,
     prefixes: Mutex<BTreeMap<String, String>>,
     input_quads: AtomicU64,
+    /// whether a quad is in a graph other than the default graph
+    named_graphs: AtomicBool,
     progress: Option<ProgressFn>,
     interrupt: Option<InterruptFn>,
 }
@@ -213,6 +224,7 @@ impl Builder {
             next_batch: AtomicUsize::new(0),
             prefixes: Mutex::new(BTreeMap::new()),
             input_quads: AtomicU64::new(0),
+            named_graphs: AtomicBool::new(false),
             progress: None,
             interrupt: None,
         })
@@ -298,6 +310,9 @@ impl Builder {
         write_u64s(&self.tmp.join(format!("b{id}.q")), quads.as_flattened())?;
         self.input_quads
             .fetch_add(quads.len() as u64, Ordering::Relaxed);
+        if quads.iter().any(|q| q[3] != Id::DEFAULT_GRAPH.0) {
+            self.named_graphs.store(true, Ordering::Relaxed);
+        }
         self.batches.lock().push(BatchInfo {
             id,
             keys: entries.len() as u64,
@@ -324,80 +339,37 @@ impl Builder {
         let terms = self.merge_vocab(&batches)?;
         self.report(&format!("vocabulary: {terms} terms"));
 
-        // ---- 3. remap ------------------------------------------------------------
-        self.interrupted()?;
-        let in_memory = total_in as usize <= self.opts.sort_mem_quads;
-        let remapped: Vec<Vec<[u64; 4]>> = batches
-            .par_iter()
-            .map(|b| -> Result<Vec<[u64; 4]>> {
-                let map = read_map(&self.tmp.join(format!("b{}.map", b.id)))?;
-                let mut quads = read_quads(&self.tmp.join(format!("b{}.q", b.id)))?;
-                for q in quads.iter_mut() {
-                    for v in q.iter_mut() {
-                        if Id(*v).tag() == Tag::Local {
-                            *v = Id::vocab(map[Id(*v).payload() as usize]).0;
-                        }
-                    }
-                }
-                std::fs::remove_file(self.tmp.join(format!("b{}.map", b.id)))?;
-                if in_memory {
-                    std::fs::remove_file(self.tmp.join(format!("b{}.q", b.id)))?;
-                    Ok(quads)
-                } else {
-                    write_u64s(&self.tmp.join(format!("b{}.q", b.id)), quads.as_flattened())?;
-                    Ok(Vec::new())
-                }
-            })
-            .collect::<Result<_>>()?;
-
-        // ---- 4. permutations -----------------------------------------------------
+        // ---- 3. remap and sort; 4. permutations ------------------------------------
         let vocab = Vocab::open(&self.dir)?;
         let rdf_type = vocab
             .find(&id::iri_key(oxrdf::vocab::rdf::TYPE.as_str()))
             .ok()
             .map(|i| Id::vocab(i).0);
-        let mut stats = Stats::default();
-        let all: Vec<[u64; 4]> = if in_memory {
-            remapped.into_iter().flatten().collect()
+        drop(vocab);
+        let plan = Plan::new(self.named_graphs.load(Ordering::Relaxed));
+        let mut built = if total_in as usize <= self.opts.sort_mem_quads {
+            self.build_in_memory(&batches, &plan, rdf_type)?
         } else {
-            Vec::new()
+            let runs = self.sorted_runs(&batches, &plan)?;
+            self.merge_runs(runs, &plan, rdf_type)?
         };
-        let mut keys: Vec<Key> = Vec::new();
+        // statistics in Perm::ALL order: POS adds to the predicates PSO found
+        built.sort_by_key(|(p, _, _)| p.index());
+        let mut stats = Stats::default();
         let mut rows = 0;
-        for perm in Perm::ALL {
-            self.interrupted()?;
-            self.report(&format!("building permutation {}", perm.name()));
-            let mut w = PermWriter::create(&self.dir, perm)?;
-            let mut col = StatsCollector::new(perm, rdf_type);
-            if in_memory {
-                keys.clear();
-                keys.par_extend(
-                    all.par_iter()
-                        .map(|q| perm.to_key(&[Id(q[0]), Id(q[1]), Id(q[2]), Id(q[3])])),
-                );
-                keys.par_sort_unstable();
-                keys.dedup();
-                for k in &keys {
-                    col.push(k);
-                    w.push(*k)?;
-                }
-            } else {
-                // the merged runs can repeat a quad that occurs in several batches:
-                // drop repeats before both consumers, so statistics match the index
-                let mut last: Option<Key> = None;
-                self.external_sort(perm, &batches, |k| {
-                    if last == Some(k) {
-                        return Ok(());
-                    }
-                    last = Some(k);
-                    col.push(&k);
-                    w.push(k)
-                })?;
+        for (perm, col, n) in built {
+            if let Some(col) = col {
+                col.finish(&mut stats);
             }
-            col.finish(&mut stats);
-            rows = w.finish(&self.dir, perm)?;
+            if perm == Perm::Spo {
+                rows = n;
+            } else if n != rows {
+                return Err(Error::Corrupt(format!(
+                    "permutation {} has {n} rows, spo {rows}",
+                    perm.name()
+                )));
+            }
         }
-        drop(keys);
         stats.quads = rows;
         stats.predicates.sort_by_key(|p| p.p);
 
@@ -482,73 +454,327 @@ impl Builder {
         w.finish()
     }
 
-    /// Sorted runs + k-way merge for inputs that exceed the in-memory budget.
-    fn external_sort(
-        &self,
-        perm: Perm,
-        batches: &[BatchInfo],
-        mut out: impl FnMut(Key) -> Result<()>,
-    ) -> Result<()> {
-        let mut runs = Vec::new();
-        let mut buf: Vec<Key> = Vec::new();
-        let flush = |buf: &mut Vec<Key>, runs: &mut Vec<PathBuf>| -> Result<()> {
-            buf.par_sort_unstable();
-            buf.dedup();
-            let p = self.tmp.join(format!("run-{}-{}", perm.name(), runs.len()));
-            write_u64s(&p, buf.as_flattened())?;
-            runs.push(p);
-            buf.clear();
-            Ok(())
-        };
-        for b in batches {
-            let quads = read_quads(&self.tmp.join(format!("b{}.q", b.id)))?;
-            for q in quads {
-                buf.push(perm.to_key(&[Id(q[0]), Id(q[1]), Id(q[2]), Id(q[3])]));
-                if buf.len() >= self.opts.sort_mem_quads {
-                    flush(&mut buf, &mut runs)?;
+    /// Read the batches of `chunk` into `buf`, remapped to global ids, and delete them.
+    fn load_chunk(&self, chunk: &[BatchInfo], buf: &mut Vec<Key>) -> Result<()> {
+        let n: usize = chunk.iter().map(|b| b.quads as usize).sum();
+        buf.clear();
+        buf.resize(n, [0; 4]);
+        let mut parts = Vec::with_capacity(chunk.len());
+        let mut rest = buf.as_mut_slice();
+        for b in chunk {
+            let (part, r) = rest.split_at_mut(b.quads as usize);
+            parts.push(part);
+            rest = r;
+        }
+        chunk
+            .par_iter()
+            .zip(parts)
+            .try_for_each(|(b, out)| -> Result<()> {
+                let mp = self.tmp.join(format!("b{}.map", b.id));
+                let qp = self.tmp.join(format!("b{}.q", b.id));
+                let map = read_map(&mp)?;
+                let f = File::open(&qp)?;
+                if f.metadata()?.len() != b.quads * 32 {
+                    return Err(Error::Corrupt(format!("batch file {}", qp.display())));
                 }
-            }
-        }
-        flush(&mut buf, &mut runs)?;
-        struct RunReader {
-            r: BufReader<File>,
-        }
-        impl RunReader {
-            fn next(&mut self) -> Result<Option<Key>> {
-                let mut b = [0u8; 32];
-                match self.r.read_exact(&mut b) {
-                    Ok(()) => Ok(Some(std::array::from_fn(|i| {
-                        u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())
-                    }))),
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-                    Err(e) => Err(e.into()),
+                if b.quads > 0 {
+                    // SAFETY: temporary file written by this builder and not modified
+                    // concurrently.
+                    let m = unsafe { Mmap::map(&f)? };
+                    let _ = m.advise(memmap2::Advice::Sequential);
+                    for (q, raw) in out.iter_mut().zip(m.as_chunks::<32>().0) {
+                        for (i, v) in q.iter_mut().enumerate() {
+                            let x = u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+                            *v = if Id(x).tag() == Tag::Local {
+                                Id::vocab(map[Id(x).payload() as usize]).0
+                            } else {
+                                x
+                            };
+                        }
+                    }
                 }
-            }
-        }
-        let mut readers: Vec<RunReader> = runs
-            .iter()
-            .map(|p| -> Result<_> {
-                Ok(RunReader {
-                    r: BufReader::with_capacity(1 << 20, File::open(p)?),
-                })
+                std::fs::remove_file(&mp)?;
+                std::fs::remove_file(&qp)?;
+                Ok(())
             })
-            .collect::<Result<_>>()?;
-        let mut heap = BinaryHeap::new();
-        for (i, r) in readers.iter_mut().enumerate() {
-            if let Some(k) = r.next()? {
-                heap.push(Reverse((k, i)));
+    }
+
+    /// Sort `buf`, keys in `from` order, in place in the order of `to`.
+    fn sort_as(buf: &mut [Key], from: Perm, to: Perm) {
+        if from != to {
+            buf.par_iter_mut()
+                .with_min_len(1 << 14)
+                .for_each(|k| *k = reorder(from, to, k));
+        }
+        buf.par_sort_unstable();
+    }
+
+    /// Phase 3 for input larger than the sort budget: per chunk of batches, one sorted
+    /// run per order of the plan. Returns the run files of each order.
+    fn sorted_runs(&self, batches: &[BatchInfo], plan: &Plan) -> Result<Vec<Vec<PathBuf>>> {
+        let budget = self.opts.sort_mem_quads.max(1) as u64;
+        let mut chunks: Vec<&[BatchInfo]> = Vec::new();
+        let mut start = 0;
+        let mut size = 0;
+        for (i, b) in batches.iter().enumerate() {
+            if i > start && size + b.quads > budget {
+                chunks.push(&batches[start..i]);
+                start = i;
+                size = 0;
+            }
+            size += b.quads;
+        }
+        if start < batches.len() {
+            chunks.push(&batches[start..]);
+        }
+        let mut runs: Vec<Vec<PathBuf>> = vec![Vec::new(); plan.orders.len()];
+        let mut buf: Vec<Key> = Vec::new();
+        for (c, chunk) in chunks.iter().enumerate() {
+            self.interrupted()?;
+            self.report(&format!(
+                "sorting chunk {} of {} ({} quads)",
+                c + 1,
+                chunks.len(),
+                chunk.iter().map(|b| b.quads).sum::<u64>()
+            ));
+            self.load_chunk(chunk, &mut buf)?;
+            let mut cur = Perm::Spo;
+            for (o, (first, _)) in plan.orders.iter().enumerate() {
+                Self::sort_as(&mut buf, cur, *first);
+                cur = *first;
+                if o == 0 {
+                    buf.dedup();
+                }
+                let p = self.tmp.join(format!("run-{}-{c}", first.name()));
+                runs::write_run(&p, &buf)?;
+                runs[o].push(p);
             }
         }
-        while let Some(Reverse((k, i))) = heap.pop() {
-            out(k)?;
-            if let Some(n) = readers[i].next()? {
-                heap.push(Reverse((n, i)));
+        Ok(runs)
+    }
+
+    /// Phase 4 for input larger than the sort budget: the runs of each order are merged
+    /// in a thread of their own.
+    fn merge_runs(
+        &self,
+        runs: Vec<Vec<PathBuf>>,
+        plan: &Plan,
+        rdf_type: Option<u64>,
+    ) -> Result<Vec<Built>> {
+        self.interrupted()?;
+        self.report(&format!("building permutations {}", plan.names()));
+        let results: Vec<Result<Vec<Built>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = plan
+                .orders
+                .iter()
+                .zip(runs)
+                .map(|((first, derived), files)| {
+                    s.spawn(move || {
+                        let out = std::thread::scope(|rs| {
+                            let mut cursors: Vec<runs::Cursor> = files
+                                .iter()
+                                .map(|p| runs::Cursor::threaded(rs, p.clone()))
+                                .collect();
+                            self.build_perms(*first, derived, rdf_type, |emit| {
+                                runs::merge(&mut cursors, emit)
+                            })
+                        });
+                        for p in &files {
+                            let _ = std::fs::remove_file(p);
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
+                .collect()
+        });
+        let mut out = Vec::new();
+        for r in results {
+            out.extend(r?);
+        }
+        Ok(out)
+    }
+
+    /// Phases 3 and 4 for input that fits into the sort budget: one chunk, sorted in
+    /// memory per order.
+    fn build_in_memory(
+        &self,
+        batches: &[BatchInfo],
+        plan: &Plan,
+        rdf_type: Option<u64>,
+    ) -> Result<Vec<Built>> {
+        let mut buf: Vec<Key> = Vec::new();
+        self.load_chunk(batches, &mut buf)?;
+        let mut cur = Perm::Spo;
+        let mut out = Vec::new();
+        for (first, derived) in &plan.orders {
+            self.interrupted()?;
+            let names: Vec<&str> = std::iter::once(first)
+                .chain(derived)
+                .map(|p| p.name())
+                .collect();
+            self.report(&format!("building permutations {}", names.join(", ")));
+            Self::sort_as(&mut buf, cur, *first);
+            cur = *first;
+            out.extend(self.build_perms(*first, derived, rdf_type, |emit| {
+                buf.iter().try_for_each(|&k| emit(k))
+            })?);
+        }
+        Ok(out)
+    }
+
+    /// Stream the sorted keys that `feed` produces in `first` order into the permutation
+    /// `first` and those `derived` from it, each written by a thread of its own. Repeated
+    /// keys are dropped before every consumer, so statistics match the index.
+    fn build_perms(
+        &self,
+        first: Perm,
+        derived: &[Perm],
+        rdf_type: Option<u64>,
+        feed: impl FnOnce(&mut dyn FnMut(Key) -> Result<()>) -> Result<()>,
+    ) -> Result<Vec<Built>> {
+        const BATCH: usize = 1 << 16;
+        let dir = &self.dir;
+        std::thread::scope(|s| {
+            let mut senders = Vec::new();
+            let mut handles = Vec::new();
+            for &perm in std::iter::once(&first).chain(derived) {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<Arc<Vec<Key>>>(4);
+                senders.push(tx);
+                let regroup = (perm != first && perm.order()[0] == first.order()[0]).then(|| {
+                    runs::Regroup::new(&self.tmp, perm.name(), self.opts.sort_mem_quads / 4)
+                });
+                handles.push(s.spawn(move || -> Result<Built> {
+                    let mut w = PermWriter::create(dir, perm)?;
+                    let mut col = has_stats(perm).then(|| StatsCollector::new(perm, rdf_type));
+                    let mut put = |k: Key| -> Result<()> {
+                        if let Some(c) = &mut col {
+                            c.push(&k);
+                        }
+                        w.push(k)
+                    };
+                    match regroup {
+                        Some(mut rg) => {
+                            for batch in rx {
+                                for k in batch.iter() {
+                                    rg.push(reorder(first, perm, k), &mut put)?;
+                                }
+                            }
+                            rg.finish(&mut put)?;
+                        }
+                        // the same order behind a constant column: GSPO from SPO in one graph
+                        None => {
+                            for batch in rx {
+                                for k in batch.iter() {
+                                    put(reorder(first, perm, k))?;
+                                }
+                            }
+                        }
+                    }
+                    let rows = w.finish(dir, perm)?;
+                    Ok((perm, col, rows))
+                }));
             }
+            let mut batch: Vec<Key> = Vec::with_capacity(BATCH);
+            let mut last: Option<Key> = None;
+            let send = |batch: &mut Vec<Key>| -> Result<()> {
+                self.interrupted()?;
+                let b = Arc::new(std::mem::replace(batch, Vec::with_capacity(BATCH)));
+                for tx in &senders {
+                    // a writer stopped: its error is reported below
+                    tx.send(b.clone()).map_err(|_| Error::Cancelled)?;
+                }
+                Ok(())
+            };
+            let fed = feed(&mut |k| {
+                if last == Some(k) {
+                    return Ok(());
+                }
+                last = Some(k);
+                batch.push(k);
+                if batch.len() == BATCH {
+                    send(&mut batch)?;
+                }
+                Ok(())
+            })
+            .and_then(|()| {
+                if batch.is_empty() {
+                    Ok(())
+                } else {
+                    send(&mut batch)
+                }
+            });
+            drop(senders);
+            let mut built = Vec::new();
+            let mut err = None;
+            for h in handles {
+                match h.join().unwrap_or_else(|_| Err(panicked())) {
+                    Ok(b) => built.push(b),
+                    Err(e) => {
+                        err.get_or_insert(e);
+                    }
+                }
+            }
+            match (err, fed) {
+                (Some(e), _) | (None, Err(e)) => Err(e),
+                (None, Ok(())) => Ok(built),
+            }
+        })
+    }
+}
+
+/// A permutation written: its statistics (if it gathers any) and its rows.
+type Built = (Perm, Option<StatsCollector>, u64);
+
+fn panicked() -> Error {
+    Error::Corrupt("a thread of the index build panicked".into())
+}
+
+/// Key `k` of permutation `from` as a key of `to`.
+#[inline]
+fn reorder(from: Perm, to: Perm, k: &Key) -> Key {
+    to.to_key(&from.to_quad(k))
+}
+
+/// Whether the statistics read anything from permutation `perm`.
+fn has_stats(perm: Perm) -> bool {
+    matches!(
+        perm,
+        Perm::Spo | Perm::Osp | Perm::Pso | Perm::Pos | Perm::Gspo
+    )
+}
+
+/// The orders the build sorts, each with the permutations produced from its stream.
+struct Plan {
+    orders: Vec<(Perm, Vec<Perm>)>,
+}
+
+impl Plan {
+    fn new(named_graphs: bool) -> Plan {
+        let mut orders = vec![
+            (Perm::Spo, vec![Perm::Sop]),
+            (Perm::Osp, vec![Perm::Ops]),
+            (Perm::Pso, vec![Perm::Pos]),
+        ];
+        if named_graphs {
+            orders.push((Perm::Gspo, Vec::new()));
+        } else {
+            orders[0].1.push(Perm::Gspo);
         }
-        for p in runs {
-            std::fs::remove_file(p)?;
-        }
-        Ok(())
+        Plan { orders }
+    }
+
+    fn names(&self) -> String {
+        let names: Vec<&str> = self
+            .orders
+            .iter()
+            .flat_map(|(f, d)| std::iter::once(f).chain(d))
+            .map(|p| p.name())
+            .collect();
+        names.join(", ")
     }
 }
 
@@ -694,6 +920,8 @@ struct StatsCollector {
     rdf_type: Option<u64>,
     prev: Option<Key>,
     distinct0: u64,
+    /// whether `out` is kept
+    runs: bool,
     // per col0 run
     run_count: u64,
     run_distinct1: u64,
@@ -717,6 +945,7 @@ impl StatsCollector {
             rdf_type,
             prev: None,
             distinct0: 0,
+            runs: matches!(perm, Perm::Pso | Perm::Pos | Perm::Gspo),
             run_count: 0,
             run_distinct1: 0,
             out: Vec::new(),
@@ -762,7 +991,11 @@ impl StatsCollector {
     fn push(&mut self, k: &Key) {
         let new0 = self.prev.is_none_or(|p| p[0] != k[0]);
         if new0 {
-            if let Some(p) = self.prev {
+            // only the predicate and graph statistics read the runs: SPO and OSP would
+            // keep one per subject or object
+            if let Some(p) = self.prev
+                && self.runs
+            {
                 self.out.push((p[0], self.run_count, self.run_distinct1));
             }
             self.distinct0 += 1;
@@ -812,7 +1045,9 @@ impl StatsCollector {
     }
 
     fn finish(mut self, stats: &mut Stats) {
-        if let Some(p) = self.prev {
+        if let Some(p) = self.prev
+            && self.runs
+        {
             self.out.push((p[0], self.run_count, self.run_distinct1));
         }
         if let Some((c, n, _)) = self.class_cur.take() {
@@ -892,11 +1127,6 @@ fn read_map(path: &Path) -> Result<Vec<u64>> {
         .iter()
         .map(|c| u64::from_le_bytes(*c))
         .collect())
-}
-
-fn read_quads(path: &Path) -> Result<Vec<[u64; 4]>> {
-    let v = read_map(path)?;
-    Ok(v.as_chunks::<4>().0.to_vec())
 }
 
 pub fn now_rfc3339() -> String {
@@ -1040,6 +1270,77 @@ mod tests {
         assert_eq!(small.1, big.1);
         assert_eq!(small.2, big.2);
         assert_eq!(short, big);
+    }
+
+    /// Every permutation holds each distinct quad once, in its own order, whether it is
+    /// sorted from runs or produced from its partner's stream (with spilled first-column
+    /// runs), with and without named graphs.
+    #[test]
+    fn permutations_hold_every_quad_in_order() {
+        let mut nq = String::new();
+        for rep in 0..2 {
+            for i in 0..300 {
+                let g = match (i % 4, rep) {
+                    (0, _) => String::new(),
+                    (k, _) => format!("<http://ex.org/g{k}>"),
+                };
+                nq.push_str(&format!(
+                    "<http://ex.org/s{}> <http://ex.org/p{}> \"o{}\" {g} .\n",
+                    i % 23,
+                    i % 3,
+                    i % 41
+                ));
+            }
+        }
+        let default_only: String = nq
+            .lines()
+            .filter(|l| !l.contains("/g"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        for data in [&nq, &default_only] {
+            for opts in [
+                BuildOptions {
+                    batch_quads: 13,
+                    sort_mem_quads: 40,
+                    threads: 2,
+                    ..Default::default()
+                },
+                BuildOptions::default(),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let b = Builder::new(dir.path(), opts).unwrap();
+                b.add_source(&Source::from_bytes(
+                    data.as_bytes().to_vec(),
+                    RdfFormat::NQuads,
+                    None,
+                ))
+                .unwrap();
+                b.finish().unwrap();
+                let cache = BlockCache::new(1 << 20);
+                let read = |p: Perm| {
+                    let idx = PermIndex::open(dir.path(), p).unwrap();
+                    let mut keys = Vec::new();
+                    idx.for_each_range(&cache, &[], |b, s, e| {
+                        keys.extend((s..e).map(|i| b.key(i)));
+                        Ok(())
+                    })
+                    .unwrap();
+                    keys
+                };
+                let quads: Vec<[Id; 4]> = read(Perm::Spo)
+                    .iter()
+                    .map(|k| Perm::Spo.to_quad(k))
+                    .collect();
+                let distinct: std::collections::HashSet<_> = data.lines().collect();
+                assert_eq!(quads.len(), distinct.len());
+                assert!(std::fs::read_dir(dir.path().join("tmp")).is_err());
+                for p in Perm::ALL {
+                    let mut want: Vec<Key> = quads.iter().map(|q| p.to_key(q)).collect();
+                    want.sort_unstable();
+                    assert_eq!(read(p), want, "{}", p.name());
+                }
+            }
+        }
     }
 
     #[test]
