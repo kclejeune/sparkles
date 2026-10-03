@@ -14,6 +14,7 @@ mod clone;
 mod compaction;
 mod compaction_cmd;
 mod compress;
+mod config_cmd;
 mod csv_cmd;
 mod describe_cmd;
 mod dump_cmd;
@@ -1697,9 +1698,12 @@ enum Cmd {
     // rset
     #[command(flatten)]
     Tools(tools::ToolCmd),
-    /// Fuseki configurations: convert config.ttl, its service files and shiro.ini into
-    /// serve flags, dataset settings and an auth configuration
-    FusekiConfig(fuseki_config::FusekiConfigArgs),
+    /// Configurations of other servers: import one as serve flags, dataset settings and
+    /// an auth configuration, or check what converts
+    ///
+    /// Sources: fuseki (Apache Jena Fuseki's config.ttl, the service files of
+    /// run/configuration/, and shiro.ini or the password file of fuseki:passwd).
+    Config(config_cmd::ConfigArgs),
     /// CSV and TSV tables: convert them to RDF without loading, or print the CSVW
     /// metadata of the default mapping
     Csv(csv_cmd::CsvCmdArgs),
@@ -2616,7 +2620,7 @@ fn run() -> Result<()> {
         Cmd::Man(args) => cli_docs::man(args, <Cli as clap::CommandFactory>::command()),
         Cmd::Shex(args) => shex_cmd::run(args, opts),
         Cmd::Tools(cmd) => tools::run(cmd, opts),
-        Cmd::FusekiConfig(args) => fuseki_config::run(args),
+        Cmd::Config(args) => config_cmd::run(args),
         Cmd::Csv(args) => csv_cmd::run(args),
         Cmd::Load {
             loc,

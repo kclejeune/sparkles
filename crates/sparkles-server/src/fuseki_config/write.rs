@@ -121,7 +121,7 @@ fn serve_script(plan: &Plan) -> String {
     let args = serve_args(plan);
     let mut s = String::from(
         "#!/bin/sh\n\
-         # Sparkles, converted from a Fuseki configuration by `sparkles fuseki-config convert`.\n\
+         # Sparkles, converted from a Fuseki configuration by `sparkles config import fuseki`.\n\
          # Run load.sh once before the first start. Extra arguments go to `sparkles serve`.\n\
          set -eu\n\
          cd \"$(dirname \"$0\")\"\n\
@@ -303,7 +303,7 @@ fn grant_tables(table: &str, g: &Grants) -> Vec<String> {
 /// file is not written and nothing is hashed.
 pub fn auth_toml(plan: &AuthPlan, realm: Option<&str>, report: &mut Report) -> Result<String> {
     let mut lines: Vec<String> = vec![
-        "# Converted from a Fuseki configuration by `sparkles fuseki-config convert`.".into(),
+        "# Converted from a Fuseki configuration by `sparkles config import fuseki`.".into(),
         "# Check it with `sparkles auth check --config auth.toml`. Keep it at mode 0600.".into(),
         "version = 1".into(),
     ];

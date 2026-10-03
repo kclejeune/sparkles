@@ -1,12 +1,12 @@
 //! The converter against Apache Jena's own Fuseki configurations, copied into
-//! `testsuite/fuseki-config/jena` under the Apache License 2.0 (spec G08 §8).
+//! `testsuite/fuseki/jena` under the Apache License 2.0 (spec G08 §8).
 
 use super::convert::{Mode, Plan};
 use super::report::Kind;
 use super::{UserSource, plan_for, write};
 use std::path::PathBuf;
 
-/// The directories of `testsuite/fuseki-config/jena` with configurations.
+/// The directories of `testsuite/fuseki/jena` with configurations.
 const SUBDIRS: [&str; 6] = [
     "examples",
     "examples/rdfs",
@@ -17,7 +17,7 @@ const SUBDIRS: [&str; 6] = [
 ];
 
 fn jena() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/fuseki-config/jena")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/fuseki/jena")
 }
 
 fn plan(rel: &str) -> Plan {

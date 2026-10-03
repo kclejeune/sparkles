@@ -15,7 +15,7 @@ use std::path::PathBuf;
 /// What the plan is for: files to keep, or a server starting now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// `fuseki-config convert`: in-memory datasets with data become persistent ones
+    /// `config import fuseki`: in-memory datasets with data become persistent ones
     Files,
     /// `serve --fuseki-config`: in-memory datasets load their data at each start
     Serve,

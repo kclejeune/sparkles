@@ -1,5 +1,6 @@
-//! `sparkles fuseki-config convert` and `serve --fuseki-config` as the real binary
-//! (spec G08), on Apache Jena's example configurations in `testsuite/fuseki-config/jena`.
+//! `sparkles config import fuseki`, `sparkles config check fuseki` and
+//! `serve --fuseki-config` as the real binary
+//! (spec G08), on Apache Jena's example configurations in `testsuite/fuseki/jena`.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant};
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
 
 fn jena() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/fuseki-config/jena")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/fuseki/jena")
 }
 
 fn run(dir: &Path, args: &[&str]) -> Output {
@@ -33,13 +34,14 @@ fn example(name: &str) -> String {
 }
 
 #[test]
-fn convert_writes_the_output_and_reports() {
+fn import_writes_the_output_and_reports() {
     let d = tempfile::tempdir().unwrap();
     let o = run(
         d.path(),
         &[
-            "fuseki-config",
-            "convert",
+            "config",
+            "import",
+            "fuseki",
             &example("config-tdb2.ttl"),
             "--out",
             "out",
@@ -70,8 +72,9 @@ fn convert_writes_the_output_and_reports() {
     let o = run(
         d.path(),
         &[
-            "fuseki-config",
-            "convert",
+            "config",
+            "import",
+            "fuseki",
             &example("config-tdb2.ttl"),
             "--out",
             "out",
@@ -88,8 +91,9 @@ fn exit_statuses_and_formats() {
     let o = run(
         d.path(),
         &[
-            "fuseki-config",
-            "convert",
+            "config",
+            "import",
+            "fuseki",
             "--check",
             &example("tdb2-select-graphs.ttl"),
         ],
@@ -102,8 +106,9 @@ fn exit_statuses_and_formats() {
     let o = run(
         d.path(),
         &[
-            "fuseki-config",
-            "convert",
+            "config",
+            "import",
+            "fuseki",
             "--check",
             &example("rdfs/vocabulary.ttl"),
         ],
@@ -111,15 +116,16 @@ fn exit_statuses_and_formats() {
     assert_eq!(o.status.code(), Some(2), "{}", err(&o));
     let o = run(
         d.path(),
-        &["fuseki-config", "convert", "--check", "missing.ttl"],
+        &["config", "import", "fuseki", "--check", "missing.ttl"],
     );
     assert_eq!(o.status.code(), Some(2));
     // the report as JSON
     let o = run(
         d.path(),
         &[
-            "fuseki-config",
-            "convert",
+            "config",
+            "import",
+            "fuseki",
             "--check",
             "--format",
             "json",
@@ -139,6 +145,45 @@ fn exit_statuses_and_formats() {
     );
 }
 
+/// `config check` is `config import --check`: the same report and exit statuses, and
+/// nothing written.
+#[test]
+fn check_is_import_check() {
+    let d = tempfile::tempdir().unwrap();
+    for (name, code) in [
+        ("config-tdb2.ttl", 0),
+        ("tdb2-select-graphs.ttl", 1),
+        ("rdfs/vocabulary.ttl", 2),
+    ] {
+        let check = run(d.path(), &["config", "check", "fuseki", &example(name)]);
+        let import = run(
+            d.path(),
+            &["config", "import", "fuseki", "--check", &example(name)],
+        );
+        assert_eq!(check.status.code(), Some(code), "{name}: {}", err(&check));
+        assert_eq!(check.status.code(), import.status.code(), "{name}");
+        assert_eq!(out(&check), out(&import), "{name}");
+    }
+    let o = run(
+        d.path(),
+        &[
+            "config",
+            "check",
+            "fuseki",
+            "--format",
+            "json",
+            &example("config-text-tdb2.ttl"),
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    serde_json::from_str::<serde_json::Value>(&out(&o)).unwrap();
+    assert!(std::fs::read_dir(d.path()).unwrap().next().is_none());
+    // an unknown source is a usage error, and the help lists the sources
+    let o = run(d.path(), &["config", "import", "jena", "config.ttl"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(err(&o).contains("fuseki"), "{}", err(&o));
+}
+
 #[test]
 fn a_fuseki_base_directory_with_shiro() {
     let d = tempfile::tempdir().unwrap();
@@ -156,7 +201,7 @@ fn a_fuseki_base_directory_with_shiro() {
     .unwrap();
     let o = run(
         d.path(),
-        &["fuseki-config", "convert", "run", "--out", "out"],
+        &["config", "import", "fuseki", "run", "--out", "out"],
     );
     assert!(o.status.code() == Some(0), "{}{}", out(&o), err(&o));
     let report = out(&o);
@@ -284,7 +329,7 @@ fn serve_sh_starts() {
         let d = tempfile::tempdir().unwrap();
         let o = run(
             d.path(),
-            &["fuseki-config", "convert", &config, "--out", "out"],
+            &["config", "import", "fuseki", &config, "--out", "out"],
         );
         assert_eq!(o.status.code(), Some(0), "{}{}", out(&o), err(&o));
         let port = port(5546..5560);

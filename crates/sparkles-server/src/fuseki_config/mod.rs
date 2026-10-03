@@ -1,4 +1,4 @@
-//! `sparkles fuseki-config convert` and `serve --fuseki-config` (spec G08): a Fuseki
+//! `sparkles config import fuseki` and `serve --fuseki-config` (spec G08): a Fuseki
 //! configuration (`config.ttl`, `run/configuration/*.ttl`, `shiro.ini` or the password
 //! file) converted into `serve` flags, settings files and an auth configuration, with a
 //! report of every element.
@@ -20,45 +20,6 @@ use anyhow::{Context, Result, bail};
 use convert::{Inputs, Mode, Plan};
 use graph::{ConfigGraph, FUSEKI, format_of};
 use std::path::{Path, PathBuf};
-
-#[derive(clap::Args)]
-pub struct FusekiConfigArgs {
-    #[command(subcommand)]
-    cmd: FusekiConfigCmd,
-}
-
-#[derive(clap::Subcommand)]
-enum FusekiConfigCmd {
-    /// Convert a Fuseki configuration into a `serve` script, settings files and an auth
-    /// configuration, and report what was converted, approximated or unsupported (exit
-    /// status 1 when something important could not be converted, 2 on an error)
-    Convert {
-        /// Fuseki configuration files (config.ttl and service files), or Fuseki base
-        /// directories holding config.ttl, configuration/ and shiro.ini
-        #[arg(required = true, value_name = "PATH")]
-        inputs: Vec<PathBuf>,
-        /// Directory to write serve.sh, load.sh, auth.toml, the dataset settings and
-        /// report.txt into
-        #[arg(long, default_value = "sparkles-config")]
-        out: PathBuf,
-        /// Only print the report: write nothing and hash no password
-        #[arg(long)]
-        check: bool,
-        /// Write into --out even when it is not empty
-        #[arg(long)]
-        force: bool,
-        /// Shiro's shiro.ini with the users and URL rules (default: a shiro.ini next to
-        /// the configuration)
-        #[arg(long, value_name = "FILE", conflicts_with = "passwd")]
-        shiro: Option<PathBuf>,
-        /// The password file of fuseki:passwd (default: the file the configuration names)
-        #[arg(long, value_name = "FILE")]
-        passwd: Option<PathBuf>,
-        /// Report format: text or json
-        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
-        format: String,
-    },
-}
 
 /// Where the users come from.
 #[derive(Default)]
@@ -216,44 +177,41 @@ pub fn plan_for(paths: &[PathBuf], users: &UserSource, mode: Mode) -> Result<Pla
     Ok(plan)
 }
 
-/// `sparkles fuseki-config …`
-pub fn run(args: FusekiConfigArgs) -> Result<()> {
-    match args.cmd {
-        FusekiConfigCmd::Convert {
-            inputs,
-            out,
-            check,
-            force,
-            shiro,
-            passwd,
-            format,
-        } => {
-            let users = UserSource { shiro, passwd };
-            let mut plan = match plan_for(&inputs, &users, Mode::Files) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("error: {e:#}");
-                    std::process::exit(2);
-                }
-            };
-            if !check && let Err(e) = write::write_dir(&mut plan, &out, force) {
-                eprintln!("error: {e:#}");
-                std::process::exit(2);
-            }
-            if format == "json" {
-                println!("{}", serde_json::to_string_pretty(&plan.report)?);
-            } else {
-                print!("{}", plan.report.text());
-                if !check {
-                    println!("wrote {}: run load.sh once, then serve.sh", out.display());
-                }
-            }
-            if plan.report.has_unsupported() {
-                std::process::exit(1);
-            }
-            Ok(())
+/// `sparkles config import fuseki` and `sparkles config check fuseki`: convert, write
+/// the files into `out` (a directory and whether to write into it when it is not
+/// empty) unless it is `None`, and print the report. The exit status is 1 when
+/// something important could not be converted and 2 on an error.
+pub fn import(
+    inputs: &[PathBuf],
+    users: &UserSource,
+    out: Option<(&Path, bool)>,
+    json: bool,
+) -> Result<()> {
+    let mut plan = match plan_for(inputs, users, Mode::Files) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    if let Some((dir, force)) = out
+        && let Err(e) = write::write_dir(&mut plan, dir, force)
+    {
+        eprintln!("error: {e:#}");
+        std::process::exit(2);
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan.report)?);
+    } else {
+        print!("{}", plan.report.text());
+        if let Some((dir, _)) = out {
+            println!("wrote {}: run load.sh once, then serve.sh", dir.display());
         }
     }
+    if plan.report.has_unsupported() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// What `serve --fuseki-config` adds to the server's own flags.
@@ -314,7 +272,7 @@ pub fn for_serve(path: &Path, data_dir: &Path, own_auth: bool) -> Result<ServeAd
             .collect();
         bail!(
             "--fuseki-config {}: these parts have no Sparkles equivalent; convert the \
-             configuration with `sparkles fuseki-config convert` and edit the result:\n{}",
+             configuration with `sparkles config import fuseki` and edit the result:\n{}",
             path.display(),
             bad.join("\n")
         );

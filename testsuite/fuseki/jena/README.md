@@ -10,8 +10,8 @@ These files are copied unchanged from Apache Jena:
 - `testing/GeoAssembler/` from `jena-integration-tests/src/test/files/GeoAssembler`.
 
 The unit tests in `crates/sparkles-server/src/fuseki_config/tests.rs` and
-`crates/sparkles-server/tests/cli_fuseki_config.rs` convert them with
-`sparkles fuseki-config convert` (spec G08).
+`crates/sparkles-server/tests/cli_config.rs` convert them with
+`sparkles config import fuseki` (spec G08).
 
 Apache Jena is distributed under the Apache License 2.0, which is in `LICENSE-APACHE`.
 Jena's `NOTICE` file is included as the license asks.
