@@ -1112,6 +1112,34 @@ implementation landed.
   - C ABI calls through Node.js FFI libraries;
   - results pushed through ThreadsafeFunctions.
 
+## Library administration API and parity
+
+- **Spec:** [`P06-library-admin-api.md`](P06-library-admin-api.md), written on 2026-10-03
+  from:
+  - the Sparkles code: the embedded API, the store and its modules, the history, schema,
+    stored query and guard modules, the backup, reasoner, SHACL, ShEx and GraphQL crates,
+    the server's registry, task system, handlers and route coverage test, the client's
+    operation table, and the Python bindings with their stub;
+  - `docs/openapi.json` and the UI's API modules, for the inventory of operations;
+  - the specs P01, P02, P04, X03, CI, C01, C02, C10, C12, C12b, C13, C16, F05 and F06;
+  - the Rust API Guidelines, the Cargo Book on features and dependency renaming, the
+    standard library's documentation of `File::try_lock` and the `flock(2)` man page, and
+    the Tokio documentation of runtimes and `block_on`;
+  - the PyO3 user guide, PEP 702, and the Python documentation of `ast` and `tomllib`.
+- **Implementation:** not started.
+- **Planned dependencies:** none new to the root lock. The facade crate depends on the
+  workspace's existing crates. The Python wheel gains `sparkles-backup` with
+  `object_store` and its AWS client, and `sparkles-graphql`, which the server already
+  links.
+- **Rejected** (spec §12):
+  - generating the bindings from the OpenAPI description;
+  - keeping `Store` as the embedding API;
+  - a separate administration crate;
+  - extension traits in each satellite crate;
+  - registering the satellites in the core through trait objects;
+  - JSON in and JSON out in the Rust API;
+  - an async library API.
+
 ## Automatic compaction
 
 - **Spec:** [`C13-automatic-compaction.md`](C13-automatic-compaction.md), written on
