@@ -381,6 +381,9 @@ pub enum Kind {
     /// `LATERAL`: the right side evaluated per group of the rows of the left side (child
     /// 0); see [`super::lateral`]
     Lateral(Box<super::lateral::LateralSpec>),
+    /// paths as solutions (`SERVICE path:search`); child 0, if any, is the rest of the
+    /// group, which binds the source or the target
+    PathSearch(Box<super::pathsearch::PathSearchSpec>),
 }
 
 #[derive(Clone)]
@@ -505,6 +508,7 @@ impl Node {
             Kind::SpatialJoin(_) => "SpatialJoin",
             Kind::SpatialKnn(_) => "SpatialKnn",
             Kind::SpatialRelate(_) => "SpatialRelate",
+            Kind::PathSearch(_) => "PathSearch",
         }
     }
 }
@@ -912,6 +916,10 @@ impl<'a> Planner<'a> {
                     })
                     .collect();
                 let n = group(child, keys, aggs, self.ctx);
+                Ok(self.apply_filters(n, filters))
+            }
+            GP::Service { name, inner, .. } if super::pathsearch::is_search(name) => {
+                let n = super::pathsearch::path_search_leaf(self, inner, g)?;
                 Ok(self.apply_filters(n, filters))
             }
             GP::Service {
@@ -1998,6 +2006,7 @@ impl<'a> Planner<'a> {
             nodes.into_iter().partition(|n| match &n.kind {
                 Kind::VectorSearch(s) => s.needs_input(),
                 Kind::SpatialPf(s) => s.needs_input(),
+                Kind::PathSearch(s) => s.needs_input(),
                 _ => false,
             });
         for n in nodes {
@@ -2052,10 +2061,10 @@ impl<'a> Planner<'a> {
             }
         }
         for d in dependent {
-            result = if matches!(d.kind, Kind::SpatialPf(_)) {
-                super::geopf::attach_spatial(self, result, d)?
-            } else {
-                self.attach_vector(result, d)?
+            result = match &d.kind {
+                Kind::SpatialPf(_) => super::geopf::attach_spatial(self, result, d)?,
+                Kind::PathSearch(_) => super::pathsearch::attach(self, result, d)?,
+                _ => self.attach_vector(result, d)?,
             };
             let (now, later): (Vec<Expr>, Vec<Expr>) =
                 std::mem::take(&mut filters).into_iter().partition(|f| {

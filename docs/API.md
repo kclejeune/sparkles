@@ -3432,6 +3432,91 @@ SELECT ?s ?score ?textRank ?vectorRank WHERE {
   searches, and malformed calls and options give `400`. The call needs the `text`
   feature and a full-text index.
 
+## Path search
+
+`SERVICE path:search { … }` returns paths between nodes as solutions, where a property
+path such as `foaf:knows+` only says that one exists. The service runs inside Sparkles,
+so it needs no outbound access and ignores `--no-service`. The design is in
+[F07](specs/F07-path-search.md).
+
+```sparql
+PREFIX path: <urn:x-sparkles:path#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?path ?i ?s ?o WHERE {
+  SERVICE path:search {
+    [] path:source <http://example.org/alice> ;
+       path:target <http://example.org/dave> ;
+       path:predicate foaf:knows ;
+       path:algorithm path:allShortest ;
+       path:pathIndex ?path ;
+       path:edgeIndex ?i ;
+       path:edgeSubject ?s ;
+       path:edgeObject ?o .
+  }
+}
+ORDER BY ?path ?i
+```
+
+The block holds triples with one subject, usually `[]`, whose predicates are the
+parameters below. An unknown parameter, or one given twice that takes one value, fails
+with `400`.
+
+| Parameter | Value | Default | Meaning |
+|---|---|---|---|
+| `path:source` | a variable or a constant | required | The first node of each path. |
+| `path:target` | a variable or a constant | required | The last node of each path. |
+| `path:algorithm` | `path:shortest`, `path:allShortest`, `path:kShortest` or `path:all` | `path:shortest` | One shortest path per pair, every shortest path, the `k` shortest paths (Yen's algorithm), or every path up to `path:maxLength`. |
+| `path:predicate` | an IRI, repeatable | every predicate | The predicates whose triples are edges. |
+| `path:direction` | `path:forward`, `path:backward` or `path:both` | `path:forward` | Follow a triple from subject to object, from object to subject, or both ways. |
+| `path:minLength` | an integer | 1 | The fewest edges. 0 adds the empty path from a node to itself. The shortest modes take 0 or 1. |
+| `path:maxLength` | an integer | none | The most edges. `path:all` requires it. |
+| `path:k` | a positive integer | none | The paths per pair of `path:kShortest`, which requires it. |
+| `path:limit` | a positive integer | none | The most paths of the whole call. |
+| `path:maxVisited` | a positive integer | 10,000,000 | The most nodes one search may visit. A search that visits more fails. |
+| `path:weight` | an IRI | none | The property of an edge's RDF 1.2 reifier that holds its weight. |
+| `path:defaultWeight` | a non-negative number | 1 | The weight of an edge without one. |
+| `path:pathIndex` | a variable | | The path's number in the result, from 0. |
+| `path:edgeIndex` | a variable | | The edge's position in its path, from 0. |
+| `path:edgeSubject`, `path:edgePredicate`, `path:edgeObject` | variables | | The edge's triple as stored. |
+| `path:length` | a variable | | The number of edges, an `xsd:integer`. |
+| `path:cost` | a variable | | The sum of the weights, an `xsd:double`. Without `path:weight` it is the length. |
+
+* **Paths.** A path never visits a node twice, except that it may end where it started.
+  So a search from a node to itself finds the shortest cycle through it, as
+  `?s foaf:knows+ ?s` would, and the empty path only with `path:minLength 0`. Two
+  triples between the same nodes with different predicates make two different paths.
+  Literals can end a path.
+* **Rows.** With any of `path:edgeIndex`, `path:edgeSubject`, `path:edgePredicate` and
+  `path:edgeObject`, the call returns one row per edge. Without them it returns one row
+  per path. A path of length 0 has one row with the edge variables unbound. The source
+  and target variables are bound to each path's ends.
+* **Sources and targets from the query.** When `path:source` or `path:target` is a
+  variable that another pattern of the same group binds, such as a `VALUES` block or a
+  triple pattern, each solution of that pattern is extended with the paths between its
+  own source and target. A solution with a source and no target gets the paths to every
+  node the source reaches, and one with a target and no source gets the paths from every
+  node that reaches the target. A search whose source and target are both unbound fails
+  with `400`. `path:kShortest` needs both ends bound, and so does a weighted search with
+  `path:maxLength` in the shortest modes.
+* **Weights.** `path:weight ex:km` reads the weight of the edge `(s p o)` from the
+  reifiers of the triple term `<<( s p o )>>`, which is what the Turtle annotation
+  `ex:a ex:road ex:b {| ex:km 12 |}` writes. The smallest value counts when there are
+  several. A weight that is not a non-negative number fails the query. The shortest
+  modes then use Dijkstra's algorithm and `path:kShortest` uses Yen's algorithm with
+  Dijkstra's. Lengths still count edges.
+* **Graphs and access.** The search reads the active graph, as a triple pattern would.
+  Under `GRAPH ?g` each named graph is searched on its own and `?g` is bound to it. A
+  path never uses a triple that the caller's grants or protections hide, and a hidden
+  reifier gives no weight.
+* **Without predicates** every triple is an edge, `rdf:type` included, so a search
+  without `path:predicate` usually visits far more nodes than one with them.
+* **Budgets.** Besides `path:maxVisited`, a search counts against the query's timeout,
+  memory budget and row limits. `path:allShortest` and `path:all` can find
+  exponentially many paths, which `path:limit` bounds.
+* **Plans.** EXPLAIN shows a `PathSearch` operator with the mode, the ends, the
+  predicates and the limits. The executed plan adds the searches run, the nodes they
+  visited and the paths found.
+
 ## GeoSPARQL
 
 The design and its rationale are in [G01 GeoSPARQL](specs/G01-geosparql.md).

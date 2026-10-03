@@ -137,6 +137,9 @@ running queries.
 * Embeddings computed on write. A vector index can embed selected literals through an
   OpenAI-compatible endpoint, such as OpenAI, Ollama or vLLM, in the background after
   each commit, and searches can pass text ([API](docs/API.md#embeddings-on-write)).
+* Path search that returns paths as solutions: the shortest, all shortest or k shortest
+  paths between nodes, or every path up to a length, with optional edge weights
+  ([API](docs/API.md#path-search)).
 * GeoSPARQL 1.1 with a spatial index per dataset, Jena's `spatial:` and `spatialF:`
   functions, spatial joins and nearest-neighbour search ([API](docs/API.md#geosparql)).
 

@@ -700,6 +700,50 @@ Query times are mean ± σ in ms, with TSV results, 10 runs at 1.05M and 5 at 10
 
 QLever has no highlighting, so its `highlight` form returns the plain literals.
 
+## Path search
+
+These runs time `SERVICE path:search` ([F07](specs/F07-path-search.md)) against the
+property path queries that test the same reachability, on the `foaf:knows` graph of the
+benchmark data. The `+` path from person 0 reaches 89,090 nodes at 1.05M and 892,556 at 10.5M. The pair
+queries go from person 0 to the last person, 99,999 or 999,999, whose shortest chains
+have 12 and 17 edges. The queries are Sparkles syntax, so they are not part of
+`scripts/bench.sh`, which runs the same queries on every engine. QLever has a path
+search service of its own with other parameters, and it was not measured.
+
+The runs were on 2026-10-02 with Sparkles at the F07 commit, against a warm server with
+the result cache off. Each query ran 31 times, interleaved with the others, with the
+client pinned to one core. Other agents were compiling on the machine, and the load
+average stayed between 33 and 80 on 16 cores, so the medians are noisy. The minimum is
+the better guide to the cost of each query.
+
+| query | what it does | 1.05M min | 1.05M median | 10.5M min | 10.5M median |
+|---|---|---:|---:|---:|---:|
+| `reach-plus` | `COUNT` of `ex:0 foaf:knows+ ?x` | 11.6 | 27.9 | 132.8 | 248.2 |
+| `ps-any` | `COUNT` of one shortest path to every reachable person | 19.0 | 42.1 | 226.8 | 384.8 |
+| `ask-pair` | `ASK { ex:0 foaf:knows+ ex:last }` | 11.2 | 24.4 | 123.1 | 192.1 |
+| `ps-pair` | the shortest path between the same pair, one row per edge | 1.0 | 1.5 | 3.0 | 4.1 |
+| `ps-pair-all` | every shortest path between them (1 at 1.05M, 3 at 10.5M) | 0.9 | 1.7 | 2.7 | 4.0 |
+| `ps-pair-both` | the shortest path with `path:direction path:both` | 1.1 | 1.7 | 1.6 | 2.3 |
+| `ps-pair-k5` | the 5 shortest paths, by Yen's algorithm | 11.4 | 23.5 | 68.6 | 106.6 |
+| `ps-values10` | the distance from 10 people bound by `VALUES` to the last person | 2.6 | 6.2 | 12.2 | 18.3 |
+| `ps-all4` | `COUNT` of every path of up to 4 edges from person 0 (21 and 43) | 0.7 | 1.1 | 0.7 | 1.1 |
+| `pp-len4` | the same count as a `UNION` of four fixed-length property paths | 0.8 | 1.3 | 0.7 | 1.3 |
+| `ps-any-weighted` | `ps-any` with `path:weight`, run by Dijkstra's algorithm | 87.5 | 220.2 | 1,644 | 5,094 |
+
+Times are in ms. Between one pair, the bidirectional search is 11 to 41 times faster than
+`ASK` with `foaf:knows+`, because it stops when the two frontiers meet near the middle,
+while the property path explores everything person 0 reaches. A search from one person
+to everyone costs 1.6 to 1.7 times the `+` query. It reads the same index ranges with the
+same batched sweeps, but it also keeps a parent and a level for each person and returns
+a path for each. The weighted search is 5 to 7 times slower than the unweighted one.
+Dijkstra's algorithm settles one node at a time, so it seeks the index once per person
+instead of sweeping whole levels, and it keeps a heap. None of the edges in the data has
+a weight, so every edge counts 1 and the answers equal the unweighted ones.
+
+The server's peak resident memory after these runs was 205 MB at 1.05M and 936 MB at
+10.5M, most of it the block cache. A search charges 48 bytes per visited node against the
+query's memory budget, about 43 MB for the 892,556 nodes at 10.5M.
+
 ## Optimization switches (A/B)
 
 Each executor optimization can be switched off with `SPARKLES_DISABLE_OPTIMIZATIONS`. The

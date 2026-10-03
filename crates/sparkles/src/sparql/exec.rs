@@ -446,6 +446,15 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             counters = Some(c);
             t
         }
+        Kind::PathSearch(spec) => {
+            let input = match n.children.len() {
+                0 => None,
+                _ => Some(child(0, &mut infos)?),
+            };
+            let (t, c) = super::pathsearch::run(ctx, spec, input, &n.vars)?;
+            counters = Some(c);
+            t
+        }
         Kind::HybridSearch(spec) => {
             let (t, c) = super::hybrid::search(ctx, spec, &n.vars)?;
             counters = Some(c);

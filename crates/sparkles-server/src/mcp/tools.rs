@@ -1519,8 +1519,10 @@ fn children(p: &GraphPattern) -> Vec<&GraphPattern> {
     }
 }
 
+/// Whether the pattern calls a remote SERVICE (a path search runs locally).
 fn has_service(p: &GraphPattern) -> bool {
-    matches!(p, GraphPattern::Service { .. }) || children(p).into_iter().any(has_service)
+    matches!(p, GraphPattern::Service { name, .. } if !sparkles::sparql::pathsearch::is_search(name))
+        || children(p).into_iter().any(has_service)
 }
 
 /// Constant IRIs and literals of the triple patterns outside SERVICE.

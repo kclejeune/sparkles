@@ -20,6 +20,7 @@ mod joinorder;
 mod keyfilter;
 mod keyprobe;
 pub mod lateral;
+pub mod pathsearch;
 pub mod plan;
 pub mod rdfs;
 pub mod results;

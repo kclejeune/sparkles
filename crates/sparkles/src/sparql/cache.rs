@@ -345,6 +345,11 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             );
             true
         }
+        Kind::PathSearch(spec) => {
+            // every parameter is in the spec, ids and variables included
+            let _ = write!(s, "{spec:?}");
+            true
+        }
         Kind::TextSearch(t) => {
             // the view's epoch changes with every rebuild of the index
             let epoch = ctx.snap.text.as_ref().map_or(0, |v| v.epoch);
