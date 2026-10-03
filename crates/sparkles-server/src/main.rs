@@ -99,6 +99,12 @@ struct Cli {
     /// (a database keeps the setting once it is on)
     #[arg(long, global = true)]
     commit_digests: bool,
+    /// The most a write-ahead log grows ahead of its commits at once, in KiB, as zero
+    /// bytes written and synced in advance (0: no preallocation; each commit appends).
+    /// A commit that overwrites preallocated bytes syncs its data without a file-system
+    /// journal commit, which on ext4 and XFS takes a fraction of the time
+    #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_WAL_PREALLOC_BYTES >> 10)]
+    wal_prealloc_kb: u64,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
@@ -1434,6 +1440,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         max_snapshots: cli.max_snapshots,
         max_prefixes: cli.max_prefixes,
         commit_digests: cli.commit_digests,
+        wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
         ..Default::default()
     }
 }

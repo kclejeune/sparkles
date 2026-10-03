@@ -69,6 +69,9 @@ pub(crate) struct Quota {
     /// a generation a background compaction is building: not counted, so that a
     /// compaction never makes the dataset refuse writes
     excluded: Mutex<Option<PathBuf>>,
+    /// bytes preallocated after the last commit of the write-ahead log: on disk, but
+    /// not counted (see [`StoreOptions::wal_prealloc_bytes`](super::StoreOptions::wal_prealloc_bytes))
+    preallocated: AtomicU64,
 }
 
 impl Quota {
@@ -86,6 +89,7 @@ impl Quota {
             used: AtomicU64::new(0),
             measured: Mutex::new(None),
             excluded: Mutex::new(None),
+            preallocated: AtomicU64::new(0),
         })
     }
 
@@ -109,7 +113,10 @@ impl Quota {
                 .store(dir_size(root).saturating_sub(building), Ordering::Relaxed);
             *m = Some(Instant::now());
         }
-        self.used.load(Ordering::Relaxed)
+        // the zero bytes preallocated after the last commit of the log are not data
+        self.used
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.preallocated.load(Ordering::Relaxed))
     }
 
     /// Leave `dir` (a generation being built in the background) out of the measured
@@ -124,7 +131,13 @@ impl Quota {
         *self.measured.lock() = None;
     }
 
-    /// A small commit appended `bytes` to the write-ahead log.
+    /// The write-ahead log now holds `bytes` of preallocated zeros after its last commit.
+    pub(crate) fn set_preallocated(&self, bytes: u64) {
+        self.preallocated.store(bytes, Ordering::Relaxed);
+    }
+
+    /// A small commit grew the write-ahead log by `bytes`, its records and any zeros
+    /// preallocated after them.
     pub(crate) fn add(&self, bytes: u64) {
         if self.root.is_some() {
             self.used.fetch_add(bytes, Ordering::Relaxed);

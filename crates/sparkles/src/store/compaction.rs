@@ -877,12 +877,7 @@ impl Store {
             cache: self.cache.clone(),
             delta: Delta::default(),
             wal: if persistent {
-                Some(BufWriter::new(
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(dir.join("wal.log"))?,
-                ))
+                Some(BufWriter::new(wal::open_for_append(&dir.join("wal.log"))?))
             } else {
                 None
             },
@@ -968,8 +963,12 @@ impl Store {
                 return Err(e);
             }
             let wal = cu.wal.take().expect("a persistent store has a log");
+            w.trim_wal();
             w.wal = Some(wal);
             w.wal_len = cu.wal_len;
+            w.wal_alloc = cu.wal_len;
+            self.wal_end.store(cu.wal_len, Ordering::Relaxed);
+            self.quota.set_preallocated(0);
             *gen_.wal_index.lock() = Some(std::mem::replace(
                 &mut cu.index,
                 wal::WalIndex::new(base.seq, false),

@@ -56,7 +56,7 @@ use std::io::{BufWriter, Read, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Immutable base index generation.
 pub struct Generation {
@@ -840,7 +840,20 @@ pub struct StoreOptions {
     /// [`annotations::change_digest`](crate::annotations::change_digest)). A persistent
     /// store remembers it: once on, later openings compute digests too.
     pub commit_digests: bool,
+    /// Persistent stores: the most a write-ahead log grows ahead of its commits at once
+    /// (0: no preallocation, each commit appends to the file). The log grows by zero
+    /// bytes that are written and synced in advance, at first 64 KiB at a time and then
+    /// by its size, up to this. A commit then overwrites bytes that are already
+    /// allocated, and on ext4 and XFS its `fdatasync` does without a journal commit.
+    /// That is several times faster, and it no longer waits behind the journal
+    /// writes of other files on the same file system. The log's logical end is where
+    /// its last commit ends: replay, readers and backups stop at the first zero
+    /// record, and an open truncates the zero tail.
+    pub wal_prealloc_bytes: u64,
 }
+
+/// Default of [`StoreOptions::wal_prealloc_bytes`].
+pub const DEFAULT_WAL_PREALLOC_BYTES: u64 = 4 << 20;
 
 /// Default of [`StoreOptions::max_prefixes`].
 pub const DEFAULT_MAX_PREFIXES: usize = 1000;
@@ -873,6 +886,7 @@ impl Default for StoreOptions {
             geo_files: true,
             vector_files: true,
             commit_digests: false,
+            wal_prealloc_bytes: DEFAULT_WAL_PREALLOC_BYTES,
         }
     }
 }
@@ -881,6 +895,8 @@ struct WriterState {
     wal: Option<BufWriter<File>>,
     /// bytes of complete transactions in the current generation's WAL
     wal_len: u64,
+    /// the WAL file's length: past `wal_len` it holds preallocated zero bytes
+    wal_alloc: u64,
     next_bnode: u64,
     /// the latest commit
     head: CommitInfo,
@@ -890,6 +906,24 @@ struct WriterState {
     closed: bool,
     /// while a compaction runs: each commit's changes, for it to carry over
     tap: Option<Vec<compaction::TapCommit>>,
+}
+
+impl WriterState {
+    /// Cut the space preallocated after the last commit off the WAL, before the store
+    /// closes or moves on to another generation's log: a log that is no longer
+    /// written ends at its last commit (an open truncates it as well). Not after a
+    /// failed write, whose bytes the next open sorts out.
+    fn trim_wal(&mut self) {
+        let (len, alloc) = (self.wal_len, self.wal_alloc);
+        if !self.poisoned
+            && alloc > len
+            && let Some(wal) = self.wal.as_mut()
+            && wal.flush().is_ok()
+            && wal.get_ref().set_len(len).is_ok()
+        {
+            self.wal_alloc = len;
+        }
+    }
 }
 
 /// Commit metadata for a transaction that is committed by rebuilding the generation.
@@ -936,6 +970,9 @@ pub struct Store {
     // backup lease guards, whose drop collects history without a `&Store`
     current: Arc<ArcSwap<Snapshot>>,
     writer: Arc<Mutex<WriterState>>,
+    /// the current WAL's logical length ([`WriterState::wal_len`]), for readers that do
+    /// not take the writer lock
+    wal_end: AtomicU64,
     cache: Arc<BlockCache>,
     results: Arc<crate::sparql::cache::ResultCache>,
     prefixes: Mutex<BTreeMap<String, String>>,
@@ -1055,6 +1092,7 @@ impl Store {
             writer: Arc::new(Mutex::new(WriterState {
                 wal: None,
                 wal_len: 0,
+                wal_alloc: 0,
                 next_bnode: 0,
                 head: root,
                 poisoned: false,
@@ -1078,6 +1116,7 @@ impl Store {
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(false),
             writers_waiting: Default::default(),
+            wal_end: AtomicU64::new(0),
             commits: tokio::sync::watch::Sender::new(0),
             quota: quota::Quota::open(None, None).expect("no file to read in memory"),
             compaction: compaction::Track::new(0, None, Some(root.timestamp_ms)),
@@ -1259,10 +1298,7 @@ impl Store {
             .last()
             .map(|c| catalog.get(c.seq).filter(|r| r.seq == c.seq).unwrap_or(*c))
             .unwrap_or(base);
-        let wal = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal_path)?;
+        let wal = wal::open_for_append(&wal_path)?;
         let dvocab_len = gen_.dvocab.len();
         *gen_.wal_index.lock() = Some(wal_index);
         let history = open_history(root, dataset_id, gen_no, head.seq, &catalog)?;
@@ -1290,6 +1326,7 @@ impl Store {
             writer: Arc::new(Mutex::new(WriterState {
                 wal: Some(BufWriter::new(wal)),
                 wal_len,
+                wal_alloc: wal_len,
                 next_bnode,
                 head,
                 poisoned: false,
@@ -1313,6 +1350,7 @@ impl Store {
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(guard_required_by(root)),
             writers_waiting: Default::default(),
+            wal_end: AtomicU64::new(wal_len),
             commits: tokio::sync::watch::Sender::new(head.seq),
             quota: quota::Quota::open(Some(root), opts.max_disk_bytes)?,
             compaction: compaction::Track::new(
@@ -3258,10 +3296,7 @@ impl Store {
                 &dir.join("commit.json"),
                 &commit::gen_commit_bytes(self.dataset_id, origin, &head),
             )?;
-            let wal = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("wal.log"))?;
+            let wal = wal::open_for_append(&dir.join("wal.log"))?;
             sync_dir(&dir)?;
             sync_dir(root)?;
             // a bulk commit's message is durable before the switch (no digest: its
@@ -3275,8 +3310,12 @@ impl Store {
                 }
                 return Err(e);
             }
+            w.trim_wal();
+            w.wal_alloc = wal.metadata()?.len();
             w.wal = Some(BufWriter::new(wal));
             w.wal_len = 0;
+            self.wal_end.store(0, Ordering::Relaxed);
+            self.quota.set_preallocated(0);
             *gen_.wal_index.lock() = Some(wal::WalIndex::new(head.seq, false));
         } else if bulk.is_some() {
             annotation = self.annotate(&head, message.clone(), || None)?;
@@ -3694,12 +3733,14 @@ impl Store {
         }
     }
 
-    /// Size of the current generation's write-ahead log (0 for an in-memory store): one
-    /// `stat`, without the writer lock, so buffered records may not be counted yet.
+    /// Size of the current generation's write-ahead log, up to the end of its last
+    /// commit, without the space preallocated after it (0 for an in-memory store). It is
+    /// read without the writer lock.
     pub fn wal_bytes(&self) -> u64 {
-        let Some(root) = &self.root else { return 0 };
-        let wal = root.join(&self.snapshot().generation.name).join("wal.log");
-        std::fs::metadata(wal).map_or(0, |m| m.len())
+        if self.root.is_none() {
+            return 0;
+        }
+        self.wal_end.load(Ordering::Relaxed)
     }
 }
 
@@ -4376,7 +4417,9 @@ impl WriteTxn<'_> {
             .store
             .annotate(&c, message, || Some(self.change_lines()))?;
         let next_bnode = self.guard.next_bnode;
-        if let Some(wal) = self.guard.wal.as_mut() {
+        let prealloc = self.wal_prealloc();
+        let w = &mut *self.guard;
+        if let Some(wal) = w.wal.as_mut() {
             let mut data = Vec::with_capacity(self.log.len() * WAL_REC);
             let mut rec = [0u8; WAL_REC];
             for (op, q) in &self.log {
@@ -4397,22 +4440,29 @@ impl WriteTxn<'_> {
             data.extend_from_slice(&rec);
             // once the first byte is written, a failure leaves the WAL in an unknown
             // state: refuse further writes, so a seq can never be written twice
+            let alloc_before = w.wal_alloc;
             let written = wal
-                .write_all(&data)
-                .and_then(|_| wal.flush())
+                .flush()
+                .and_then(|_| {
+                    wal::write_commit(wal.get_ref(), w.wal_len, &mut w.wal_alloc, &data, prealloc)
+                })
                 .map_err(Error::from)
                 .and_then(|_| sync_commit(wal.get_ref(), &gen_.dvocab));
             if let Err(e) = written {
-                self.guard.poisoned = true;
+                w.poisoned = true;
                 let _ = self.store.annotations.lock().undo(c.seq);
                 return Err(e);
             }
-            self.store.quota.add(data.len() as u64);
-            self.guard.wal_len += data.len() as u64;
+            // the bytes the file grew by: the records past its end and any zeros after,
+            // which the quota does not count
+            self.store.quota.add(w.wal_alloc - alloc_before);
+            w.wal_len += data.len() as u64;
+            self.store.quota.set_preallocated(w.wal_alloc - w.wal_len);
+            self.store.wal_end.store(w.wal_len, Ordering::Relaxed);
             if let Some(ix) = gen_.wal_index.lock().as_mut() {
                 ix.note(wal::WalPoint {
                     seq: c.seq,
-                    offset: self.guard.wal_len,
+                    offset: w.wal_len,
                     folding: false,
                 });
             }
@@ -4466,6 +4516,22 @@ impl WriteTxn<'_> {
     /// The bytes the commit appends to the WAL.
     fn wal_bytes(&self) -> u64 {
         (self.log.len() as u64 + 1) * WAL_REC as u64
+    }
+
+    /// The most this commit may preallocate in the WAL past its records (see
+    /// [`StoreOptions::wal_prealloc_bytes`]): none when that would take the disk below
+    /// the free space the store keeps. The preallocation only saves time, so it never
+    /// makes a commit fail. The quota does not count it.
+    fn wal_prealloc(&self) -> u64 {
+        let p = self.store.opts.wal_prealloc_bytes;
+        let wal_bytes = self.wal_bytes();
+        if p == 0 || self.guard.wal_len + wal_bytes <= self.guard.wal_alloc {
+            return p;
+        }
+        if self.store.check_disk(wal_bytes + p + 4096).is_err() {
+            return 0;
+        }
+        p
     }
 
     /// The in-memory size of the store after this transaction (in-memory stores).
@@ -4720,7 +4786,9 @@ impl Drop for Store {
     fn drop(&mut self) {
         // a lease guard outliving the store must not collect in a directory that another
         // process (or a restore's swap) may own next
-        self.writer.lock().closed = true;
+        let mut w = self.writer.lock();
+        w.closed = true;
+        w.trim_wal();
     }
 }
 
@@ -4916,6 +4984,15 @@ pub(crate) fn replay_wal(
     let recs = buf.as_chunks::<WAL_REC>().0;
     // the last complete transaction may be torn; damage before it is corruption
     let last_commit = recs.iter().rposition(|r| r[0] == WAL_COMMIT);
+    // where the last transaction starts: a commit that overwrites preallocated space may
+    // reach the disk in any order of its pages, so a crash can leave zeros in the middle
+    // of it, before its commit record. It was never acknowledged, and is torn.
+    let last_txn = last_commit.map(|l| {
+        recs[..l]
+            .iter()
+            .rposition(|r| r[0] == WAL_COMMIT)
+            .map_or(0, |p| p + 1)
+    });
     let dvocab_len = from.generation.dvocab.len();
     let mut out = Replay {
         delta: Delta::default(),
@@ -5073,6 +5150,8 @@ pub(crate) fn replay_wal(
                 });
                 txn_start = i + 1;
             }
+            // zeros in the last transaction: torn
+            _ if last_txn.is_some_and(|t| i >= t) && wal::is_zero_record(rec) => break,
             // damage before the last commit record is not a torn tail: truncating here
             // would drop the committed transactions after it
             op if last_commit.is_some_and(|l| i < l) => {
