@@ -36,14 +36,14 @@ behaviour, and the Outcome explains the difference.
 |---|---|
 | `CI` | Durable commit identity. The commit sequence, dataset ids and receipts that most later features build on. |
 | `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, a GraphQL adapter, CSV and TSV imports, cloning, inference freshness, access control, write-time validation, the MCP server, automatic compaction, write previews and stored queries. |
-| `F` | Larger data features: a Cypher frontend, full-text and vector search, embeddings computed on write, backups to object storage, retained history and point-in-time reads, branches and merges, replication, and encryption at rest. |
+| `F` | Larger data features: a Cypher frontend, full-text and vector search, path search, embeddings computed on write, backups to object storage, retained history and point-in-time reads, branches and merges, replication, and encryption at rest. |
 | `G` | Gaps against Apache Jena that were out of scope for the first version: GeoSPARQL, ShEx, the SHACL Compact Syntax and the command-line tools. |
 | `P` | Bindings that embed the engine in other languages: Python. |
 | `X` | Internal engineering that does not derive from any other database product: compression codecs and the formatter. |
 
 Numbers are stable. Gaps in the numbering are roadmap items without a spec: writes and a
-property-graph representation for the Cypher frontend, path search and a Datalog
-frontend. G01 replaced the narrower geospatial item on that list.
+property-graph representation for the Cypher frontend, and a Datalog frontend. G01
+replaced the narrower geospatial item on that list.
 
 ## Specs
 
@@ -74,6 +74,7 @@ there is no code yet.
 | [F04](F04-vector-search.md) | `spk:vector` literals, similarity functions and exact top-k `spk:vectorSearch` | implemented in part (Phase 1) |
 | [F05](F05-snapshot-repositories.md) | Incremental, deduplicated backups to a file system or S3, restore, verification, policies and GC | implemented in part (Phase 1, most of Phase 2) |
 | [F06](F06-snapshots-and-point-in-time.md) | Point-in-time reads with `?at=`, named snapshots, a retention window and diffs between commits | implemented in part (Phases 1 and 2) |
+| [F07](F07-path-search.md) | Paths as solutions through `SERVICE path:search`: one, all or the k shortest paths, or every path up to a length, over chosen predicates and directions, with ends bound by the query and weights on reifiers | implemented (Phase 1) |
 | [F08](F08-embeddings-on-write.md) | Vectors computed from selected literals by an OpenAI-compatible embeddings endpoint after each commit, with catch-up, re-embedding, status and text queries | implemented in part (Phase 1) |
 | [F09](F09-branches-and-merges.md) | Branches that share their parent's index until they compact, `?branch=` and `/{ds}@{branch}`, three-way merges of quad sets with cell conflicts and resolutions, protected branches, and clones of branches | specified |
 | [F10](F10-replication.md) | Applying RDF Patch through Fuseki's `patch` operation, with `H prev` as a concurrency check, then read replicas that pull commits as RDF Patch, keep the primary's commit ids, bootstrap from a generation copy or a backup, and are promoted by hand | specified |

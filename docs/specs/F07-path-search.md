@@ -1,8 +1,11 @@
 # F07: Path search
 
-> **Status:** specified
+> **Status:** implemented
 >
-> **Phases:** none shipped.
+> **Phases:** Phase 1 shipped. It covers `SERVICE path:search` with the four modes,
+> predicate sets and directions, ends bound by the query, weights on reifiers, the
+> limits and the masked view. Searches per named graph under `GRAPH ?g`, planned for
+> Phase 2, came with it. The rest of Phase 2 and Phase 3 are not built.
 >
 > **User docs:** [API: Path search](../API.md#path-search) · [Features](../FEATURES.md#sparql-arq-equivalent)
 >
@@ -431,4 +434,79 @@ The graph for A1 to A6 has the triples `a→b`, `b→c`, `c→d`, `a→e`, `e→
 
 ## Outcome
 
-Not built yet.
+**Delivered** on 2026-10-02, as Phase 1.
+
+* **Planning.** `crates/sparkles/src/sparql/pathsearch.rs` holds the operator. The
+  planner turns `SERVICE <urn:x-sparkles:path#search>` into a `PathSearch` leaf before
+  it would plan a remote call, so the outbound policy and `--no-service` never apply to
+  it. A leaf with a variable source or target is attached to the rest of its join group
+  after the join order is chosen, the way a vector search with a variable query is. The
+  leaf's description in EXPLAIN gives the mode, the ends, the predicates, the direction
+  and the limits, and the executed plan adds the counters `searches`, `visited`, `paths`
+  and `sweeps`. The result cache keys the leaf on its whole configuration.
+* **Adjacency.** Each predicate is a lane of `PSO` or `POS` rows, and a search without
+  predicates reads `SPO` and `OSP`. A breadth-first level of at least 64 nodes whose
+  size times 512 reaches the lane's row count is expanded by one merged pass over the
+  lane, as in the transitive path operator. Smaller levels seek per node. Rows of
+  graphs outside the active graph are skipped and equal triples of several graphs are
+  merged. In both directions a self-loop is one edge.
+* **Searches.** One unweighted pair runs as a bidirectional breadth-first search that
+  expands the smaller frontier a whole level at a time. A source with several or
+  unbound targets runs one forward search, and a target without a source one backward
+  search. Weighted searches use Dijkstra's algorithm with a binary heap.
+  `path:kShortest` uses Yen's algorithm, and its unweighted spur searches are
+  bidirectional too, around the banned nodes and edges. `path:all` is a depth-first
+  enumeration pruned by a bounded backward search from the targets. A cycle through
+  the source ends at a virtual id that stands for the source.
+* **Output.** A path that no output needs edges for (no edge variable, no weight, one
+  path per pair) keeps only its length, which the breadth-first tree already knows.
+  A search to every node returns its paths in the order it finished their ends, by
+  length and id for a breadth-first search and by cost for Dijkstra's algorithm. Each
+  input row is extended with the rows of its own pair, and output variables that the
+  input binds are joined, not overwritten.
+* **MCP.** No dedicated tool was added. Path searches run through `sparql_query` and
+  `explain_query`, and `explain_query` no longer warns that SERVICE is disabled when the
+  only SERVICE is a path search.
+
+**Deviations.**
+* `GRAPH ?g` around the call is not an error. The planner already evaluates a group
+  that is not a plain join group once per named graph, so each named graph is searched
+  on its own and `?g` is bound to it. The error of §4.8 remains for a graph variable
+  that reaches the leaf any other way.
+* In the shortest modes, a weighted search with `path:maxLength` enumerates paths in
+  cost order with Yen's algorithm and keeps the cheapest ones within the length, which
+  is exact. It therefore needs both ends bound, like `path:kShortest`.
+* `path:maxVisited` counts every search of a pair, so the spur searches of Yen's
+  algorithm share one budget.
+* `path:defaultWeight` without `path:weight` is an error, and so is `path:k` outside
+  `path:kShortest`.
+* RDFS on read does not add edges. The search reads the stored triples of the view, so
+  a triple derived through `rdfs:subPropertyOf` on read is not an edge.
+
+**Tests at landing.** `crates/sparkles/tests/path_search.rs` has ten tests. They cover
+the acceptance examples A1 to A10, rows per path and per edge, the three directions,
+ends from `VALUES`, `BIND` and triple patterns, limits and every planning error,
+searches per named graph and in the union graph, weights from annotations, and a
+protection that hides an edge. Two differential tests build random graphs with two
+predicates and compare every mode and direction with paths enumerated by brute force
+in the test, the unbounded search with the `+` property path, and the weighted modes
+with brute-force costs. `mise run ci` passes, and the W3C suites pass 482/328/157/269 with no failures.
+
+**Performance at landing.** Measured on the benchmark data's `foaf:knows` graph with a
+warm server, 31 interleaved runs per query, while other builds kept the load average
+between 33 and 80 on 16 cores ([BENCHMARKS.md](../BENCHMARKS.md#path-search)). The
+fastest runs at 10.5M were 3.0 ms for the shortest path between two people 17 edges
+apart, against 123 ms for `ASK` with `foaf:knows+` on the same pair, and 2.7 ms for all
+three shortest paths. One shortest path from a person to each of the 892,556 nodes it
+reaches took 227 ms, against 133 ms for counting the same nodes with `foaf:knows+`, so
+returning paths costs 1.7 times the reachability query. The 5 shortest paths took 69 ms,
+and every path of up to 4 edges took 0.7 ms, the same as the `UNION` of four fixed-length
+property paths. Before Yen's spur searches became bidirectional, the 5 shortest paths
+visited more than 10 million nodes and failed. A weighted search from one person to
+everyone took 1.6 s, because Dijkstra's algorithm seeks the index once per node instead
+of sweeping whole levels.
+
+**Not built.** Edges from a nested pattern, a direction per predicate, a `path:edge`
+binding of the edge as a triple term, a dedicated MCP tool and the Cypher frontend's
+use of the operator. Zero-weight edges can hide equally cheap paths from
+`path:allShortest`, as §9 says.

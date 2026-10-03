@@ -1,7 +1,8 @@
 # Usage
 
 This guide covers operating the `sparkles` binary: running the server, the command-line
-tools, automatic compaction, the formatter, backups, outbound requests, integrity checks,
+tools, automatic compaction, the formatter, backups, outbound requests, path search,
+integrity checks,
 the MCP server, embedding the library, the Python package and deploying on NixOS. [API.md](API.md)
 specifies the HTTP API. [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and
 testing.
@@ -18,6 +19,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Formatting](#formatting)
 * [Backup repositories](#backup-repositories)
 * [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
+* [Finding paths](#finding-paths)
 * [Embeddings computed on write](#embeddings-computed-on-write)
 * [Checking a database](#checking-a-database)
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
@@ -1024,6 +1026,55 @@ it. Without the flag, the server refuses file loads with `403`. `DIR` may not ho
 data directory. The local `sparkles update` reads any file its user can read. Library
 users set `QueryOptions::file_loads` to `FileLoads::Anywhere` (the default),
 `FileLoads::under(dir)` or `FileLoads::Disabled`.
+
+## Finding paths
+
+A property path tells whether two nodes are connected. A path search returns the
+connections themselves, one row per edge or per path, through the local service
+`SERVICE path:search`. The parameters are in [API.md](API.md#path-search), and the design
+is in [F07](specs/F07-path-search.md).
+
+The shortest chain of `foaf:knows` between two people, edge by edge:
+
+```sh
+sparkles query --loc ./db '
+PREFIX path: <urn:x-sparkles:path#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?i ?s ?o WHERE {
+  SERVICE path:search {
+    [] path:source <http://example.org/person/0> ;
+       path:target <http://example.org/person/999999> ;
+       path:predicate foaf:knows ;
+       path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o .
+  }
+} ORDER BY ?i'
+```
+
+The ends can come from the rest of the query. This finds the distance from each of two
+people to everyone who works for one organization:
+
+```sparql
+SELECT ?a ?b ?len WHERE {
+  VALUES ?a { <http://example.org/person/1> <http://example.org/person/2> }
+  ?b <http://example.org/worksFor> <http://example.org/org/7> .
+  SERVICE path:search {
+    [] path:source ?a ; path:target ?b ; path:predicate foaf:knows ; path:length ?len .
+  }
+}
+```
+
+`path:algorithm path:allShortest` returns every shortest path, `path:kShortest` with
+`path:k 5` the five shortest, and `path:all` with `path:maxLength 4` every path of up to
+four edges. `path:direction path:both` ignores the direction of the triples. Name the
+predicates when you can, because a search without them follows every triple, including
+`rdf:type`. A search stops with an error when it visits more than 10 million nodes. Raise
+the limit with `path:maxVisited`, or narrow the search with `path:maxLength` or
+predicates.
+
+Paths are computed per query and nothing is indexed ahead of time. On the 10.5M-triple
+benchmark data, the shortest path between two people 17 edges apart takes about 3 ms,
+where `ASK { … foaf:knows+ … }` for the same pair takes about 125 ms, because the search
+runs from both ends at once ([BENCHMARKS.md](BENCHMARKS.md#path-search)).
 
 ## Embeddings computed on write
 
