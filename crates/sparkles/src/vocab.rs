@@ -329,6 +329,15 @@ impl VocabWriter {
         Ok(id)
     }
 
+    /// Keys pushed so far.
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     pub fn finish(mut self) -> Result<u64> {
         self.offsets.write_all(&self.count.to_le_bytes())?;
         self.data.flush()?;

@@ -20,12 +20,13 @@
 //!    in threads of their own. Statistics for the planner are gathered on the way.
 
 mod runs;
+mod vocabmerge;
 
 use crate::error::{Error, Result};
 use crate::id::{self, Id, Tag};
 use crate::index::{Key, Perm, PermWriter};
 use crate::io::{QuadSink, Source, parse_source};
-use crate::vocab::{Vocab, VocabWriter};
+use crate::vocab::Vocab;
 use memmap2::Mmap;
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
 use parking_lot::Mutex;
@@ -33,9 +34,9 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -152,6 +153,8 @@ struct BatchInfo {
     id: usize,
     keys: u64,
     quads: u64,
+    /// every [`vocabmerge::SAMPLE_EVERY`]th key of the partial vocabulary
+    samples: Vec<vocabmerge::Sample>,
 }
 
 /// Blank node label scope (one per source document), sharded to reduce contention.
@@ -280,6 +283,7 @@ impl Builder {
             quads: Vec::new(),
             keybuf: Vec::with_capacity(128),
             taken: 0,
+            last: Default::default(),
         }
     }
 
@@ -300,6 +304,7 @@ impl Builder {
             w.write_all(k)?;
         }
         w.flush()?;
+        let samples = vocabmerge::samples(entries.iter().map(|(k, _)| &**k));
         for q in quads.iter_mut() {
             for v in q.iter_mut() {
                 if Id(*v).tag() == Tag::Local {
@@ -317,6 +322,7 @@ impl Builder {
             id,
             keys: entries.len() as u64,
             quads: quads.len() as u64,
+            samples,
         });
         Ok(())
     }
@@ -334,9 +340,25 @@ impl Builder {
 
         // ---- 2. vocabulary merge -------------------------------------------------
         self.interrupted()?;
-        // the merge reads every batch's vocabulary and writes its map at once
-        crate::disk::ensure_open_files(2 * batches.len() as u64 + 256)?;
-        let terms = self.merge_vocab(&batches)?;
+        // each merging thread reads every batch's vocabulary, and the maps are open
+        let threads = self.opts.threads.max(1) as u64;
+        crate::disk::ensure_open_files((threads + 1) * batches.len() as u64 + 256)?;
+        let parts: Vec<vocabmerge::Partial> = batches
+            .iter_mut()
+            .map(|b| vocabmerge::Partial {
+                voc: self.tmp.join(format!("b{}.voc", b.id)),
+                map: self.tmp.join(format!("b{}.map", b.id)),
+                keys: b.keys,
+                samples: std::mem::take(&mut b.samples),
+            })
+            .collect();
+        let (terms, starts) =
+            vocabmerge::merge(&self.dir, &self.tmp, &parts, self.opts.threads, &|| {
+                self.interrupted()
+            })?;
+        for p in parts {
+            std::fs::remove_file(p.voc)?;
+        }
         self.report(&format!("vocabulary: {terms} terms"));
 
         // ---- 3. remap and sort; 4. permutations ------------------------------------
@@ -348,9 +370,9 @@ impl Builder {
         drop(vocab);
         let plan = Plan::new(self.named_graphs.load(Ordering::Relaxed));
         let mut built = if total_in as usize <= self.opts.sort_mem_quads {
-            self.build_in_memory(&batches, &plan, rdf_type)?
+            self.build_in_memory(&batches, &starts, &plan, rdf_type)?
         } else {
-            let runs = self.sorted_runs(&batches, &plan)?;
+            let runs = self.sorted_runs(&batches, &starts, &plan)?;
             self.merge_runs(runs, &plan, rdf_type)?
         };
         // statistics in Perm::ALL order: POS adds to the predicates PSO found
@@ -395,67 +417,9 @@ impl Builder {
         Ok(meta)
     }
 
-    fn merge_vocab(&self, batches: &[BatchInfo]) -> Result<u64> {
-        struct Run {
-            r: BufReader<File>,
-            map: BufWriter<File>,
-            left: u64,
-        }
-        let mut runs: Vec<Run> = batches
-            .iter()
-            .map(|b| -> Result<Run> {
-                Ok(Run {
-                    r: BufReader::with_capacity(
-                        1 << 16,
-                        File::open(self.tmp.join(format!("b{}.voc", b.id)))?,
-                    ),
-                    map: BufWriter::new(File::create(self.tmp.join(format!("b{}.map", b.id)))?),
-                    left: b.keys,
-                })
-            })
-            .collect::<Result<_>>()?;
-        fn next_key(run: &mut Run) -> Result<Option<Vec<u8>>> {
-            if run.left == 0 {
-                return Ok(None);
-            }
-            run.left -= 1;
-            let mut len = [0u8; 4];
-            run.r.read_exact(&mut len)?;
-            let mut k = vec![0u8; u32::from_le_bytes(len) as usize];
-            run.r.read_exact(&mut k)?;
-            Ok(Some(k))
-        }
-        let mut heap = BinaryHeap::new();
-        for (i, run) in runs.iter_mut().enumerate() {
-            if let Some(k) = next_key(run)? {
-                heap.push(Reverse((k, i)));
-            }
-        }
-        let mut w = VocabWriter::create(&self.dir)?;
-        let mut last: Option<(Vec<u8>, u64)> = None;
-        while let Some(Reverse((k, i))) = heap.pop() {
-            let gid = match &last {
-                Some((lk, gid)) if *lk == k => *gid,
-                _ => {
-                    let gid = w.push(&k)?;
-                    last = Some((k, gid));
-                    gid
-                }
-            };
-            runs[i].map.write_all(&gid.to_le_bytes())?;
-            if let Some(k) = next_key(&mut runs[i])? {
-                heap.push(Reverse((k, i)));
-            }
-        }
-        for (b, mut run) in batches.iter().zip(runs) {
-            run.map.flush()?;
-            std::fs::remove_file(self.tmp.join(format!("b{}.voc", b.id)))?;
-        }
-        w.finish()
-    }
-
-    /// Read the batches of `chunk` into `buf`, remapped to global ids, and delete them.
-    fn load_chunk(&self, chunk: &[BatchInfo], buf: &mut Vec<Key>) -> Result<()> {
+    /// Read the batches of `chunk` into `buf`, remapped to global ids (`starts`: the first
+    /// id of each range of the vocabulary merge), and delete them.
+    fn load_chunk(&self, chunk: &[BatchInfo], starts: &[u64], buf: &mut Vec<Key>) -> Result<()> {
         let n: usize = chunk.iter().map(|b| b.quads as usize).sum();
         buf.clear();
         buf.resize(n, [0; 4]);
@@ -486,7 +450,8 @@ impl Builder {
                         for (i, v) in q.iter_mut().enumerate() {
                             let x = u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
                             *v = if Id(x).tag() == Tag::Local {
-                                Id::vocab(map[Id(x).payload() as usize]).0
+                                Id::vocab(vocabmerge::global(starts, map[Id(x).payload() as usize]))
+                                    .0
                             } else {
                                 x
                             };
@@ -511,7 +476,12 @@ impl Builder {
 
     /// Phase 3 for input larger than the sort budget: per chunk of batches, one sorted
     /// run per order of the plan. Returns the run files of each order.
-    fn sorted_runs(&self, batches: &[BatchInfo], plan: &Plan) -> Result<Vec<Vec<PathBuf>>> {
+    fn sorted_runs(
+        &self,
+        batches: &[BatchInfo],
+        starts: &[u64],
+        plan: &Plan,
+    ) -> Result<Vec<Vec<PathBuf>>> {
         let budget = self.opts.sort_mem_quads.max(1) as u64;
         let mut chunks: Vec<&[BatchInfo]> = Vec::new();
         let mut start = 0;
@@ -537,7 +507,7 @@ impl Builder {
                 chunks.len(),
                 chunk.iter().map(|b| b.quads).sum::<u64>()
             ));
-            self.load_chunk(chunk, &mut buf)?;
+            self.load_chunk(chunk, starts, &mut buf)?;
             let mut cur = Perm::Spo;
             for (o, (first, _)) in plan.orders.iter().enumerate() {
                 Self::sort_as(&mut buf, cur, *first);
@@ -603,11 +573,12 @@ impl Builder {
     fn build_in_memory(
         &self,
         batches: &[BatchInfo],
+        starts: &[u64],
         plan: &Plan,
         rdf_type: Option<u64>,
     ) -> Result<Vec<Built>> {
         let mut buf: Vec<Key> = Vec::new();
-        self.load_chunk(batches, &mut buf)?;
+        self.load_chunk(batches, starts, &mut buf)?;
         let mut cur = Perm::Spo;
         let mut out = Vec::new();
         for (first, derived) in &plan.orders {
@@ -789,6 +760,9 @@ pub struct Encoder<'b> {
     keybuf: Vec<u8>,
     /// quads taken, for the [`InterruptFn`] calls
     taken: u64,
+    /// the last subject and predicate IRIs and their batch-local ids: N-Triples files
+    /// usually repeat them on consecutive lines
+    last: [(String, u64); 2],
 }
 
 impl Encoder<'_> {
@@ -839,9 +813,24 @@ impl Encoder<'_> {
         r
     }
 
+    /// [`Self::iri`] for the subject (`slot` 0) or predicate (1), with the last one kept.
+    #[inline]
+    fn iri_cached(&mut self, iri: &str, slot: usize) -> u64 {
+        let (last, id) = &self.last[slot];
+        if *id != 0 && last == iri {
+            return *id;
+        }
+        let id = self.iri(iri);
+        let (last, last_id) = &mut self.last[slot];
+        last.clear();
+        last.push_str(iri);
+        *last_id = id;
+        id
+    }
+
     pub fn push_quad(&mut self, q: &Quad) -> Result<()> {
         let s = match &q.subject {
-            NamedOrBlankNode::NamedNode(n) => self.iri(n.as_str()),
+            NamedOrBlankNode::NamedNode(n) => self.iri_cached(n.as_str(), 0),
             NamedOrBlankNode::BlankNode(b) => {
                 Id::bnode(self.scope.get(b.as_str(), &self.b.next_bnode)).0
             }
@@ -852,7 +841,7 @@ impl Encoder<'_> {
                 ));
             }
         };
-        let p = self.iri(q.predicate.as_str());
+        let p = self.iri_cached(q.predicate.as_str(), 1);
         let o = self.term(&q.object);
         let g = match &q.graph_name {
             GraphName::DefaultGraph => Id::DEFAULT_GRAPH.0,
@@ -890,9 +879,18 @@ impl Encoder<'_> {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        let keys = std::mem::take(&mut self.keys);
-        let quads = std::mem::take(&mut self.quads);
+        // the next batch is about as large as this one: no rehashing on the way
+        let (nk, nq) = (self.keys.len(), self.quads.len());
+        let keys = std::mem::replace(
+            &mut self.keys,
+            FxHashMap::with_capacity_and_hasher(nk, Default::default()),
+        );
+        let quads = std::mem::replace(&mut self.quads, Vec::with_capacity(nq));
         self.key_bytes = 0;
+        // batch-local ids start over
+        for (_, id) in &mut self.last {
+            *id = 0;
+        }
         self.b.write_batch(keys, quads)
     }
 }
