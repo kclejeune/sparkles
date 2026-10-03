@@ -7,6 +7,8 @@
 //! authorization layer. A test compares the paths with the route table, and the
 //! document with its checked-in copy, `docs/openapi.json`.
 
+#[cfg(test)]
+mod contract_tests;
 mod paths;
 mod schemas;
 #[cfg(test)]
@@ -811,9 +813,10 @@ take `limit` with `before` or `after`. Backup listings take `limit` and `before`
 `412`. Responses of queries and writes carry `Sparkles-Commit` and `Sparkles-Dataset-Id`.
 
 **Coverage.** Every route of the server is described with its methods, parameters and \
-media types. The common bodies are described member by member. Some admin bodies (backups, \
-index status, reasoning, validation, history) are open objects that link to their section \
-of the reference.";
+media types. The common bodies are described member by member, and so are the admin \
+bodies of history, stored queries, the search indexes, reasoning, validation and backups. \
+The other admin bodies (diffs, the change feed, write previews, backup policies) are open \
+objects that link to their section of the reference.";
 
 fn tags() -> J {
     let t = |name: &str, d: &str, anchor: &str| json!({ "name": name, "description": d, "externalDocs": { "url": api_doc(anchor) } });

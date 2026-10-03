@@ -209,7 +209,7 @@ export const SPATIAL_TERMS: Record<string, [string, boolean][]> = {
   // Jena ARQ's property function library
   'http://jena.apache.org/ARQ/list#': 'member index length'.split(' ').map((p) => [p, false]),
   'http://jena.apache.org/ARQ/property#':
-    'strSplit concat str splitIRI splitURI assign bnode blankNode versionARQ'
+    'strSplit concat str splitIRI splitURI assign bnode blankNode versionARQ container bag seq alt'
       .split(' ')
       .map((p) => [p, false]),
   'http://www.opengis.net/ont/sf#':

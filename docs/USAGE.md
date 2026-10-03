@@ -691,6 +691,10 @@ Two environment variables switch off read paths for comparisons.
 that a page fault reads the device's whole read-ahead window and blocks are not read
 ahead. `SPARKLES_SPARSE_VOCAB=off` looks terms up without `vocab.idx`.
 
+`SPARKLES_UI_DIR=DIR` makes the server read the web UI from a UI build directory, such as
+`ui/build`, instead of the copy embedded in the binary. The Nix package sets it to its UI
+build, so that its binary needs no UI at compile time.
+
 `sparkles schema --loc db --format void` prints the schema report as a VoID description
 in Turtle, and `--format turtle` adds the declared RDFS/OWL schema. The server answers
 `GET /$/schema/{ds}` the same way when the request asks for Turtle or another RDF syntax
@@ -1951,9 +1955,12 @@ variable, and `row.get("name", default)` returns the default instead.
 `RdfFormat` names oxrdfio's syntaxes and Jena's TriX (`RdfFormat.TRIX`), RDF Thrift
 (`RDF_THRIFT`), RDF Protobuf (`RDF_PROTOBUF`) and RDF/JSON (`RDF_JSON`). `load`, `dump`,
 `parse` and `serialize` take all of them, by name, extension or media type as well.
-An input in one of Jena's syntaxes is read into memory and converted to N-Quads before
-it is parsed, so it does not stream. RDF/JSON holds one graph, so `dump` writes the
-default graph, or `from_graph`.
+An input in one of Jena's syntaxes streams through the engine's reader on a thread of
+its own. `parse` and a file object's `load` take the quads as the reader finds them.
+`load` from a path or from bytes writes them as N-Quads to a temporary file in the
+system's temporary directory (`TMPDIR`) for the bulk loader and removes the file
+afterwards. The reader of RDF/JSON reads its whole document first. RDF/JSON holds one
+graph, so `dump` writes the default graph, or `from_graph`.
 
 `load` reads a CSV or TSV table when the format is `"csv"` or `"tsv"`, or the path ends
 in `.csv`, `.tsv` or `.tab`, before any compression extension. The table is mapped as

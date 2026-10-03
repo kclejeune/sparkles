@@ -115,10 +115,10 @@ fn make_inputs(emb: &EmbeddingConfig, mut texts: Vec<(usize, String)>) -> Vec<St
             Vec::new()
         } else {
             let joined: Vec<&str> = texts.iter().map(|(_, t)| t.as_str()).collect();
-            vec![emb.input(&joined.join("\n"))]
+            emb.inputs(&joined.join("\n"))
         }
     } else {
-        texts.iter().map(|(_, t)| emb.input(t)).collect()
+        texts.iter().flat_map(|(_, t)| emb.inputs(t)).collect()
     };
     inputs.sort();
     inputs.dedup();
@@ -803,6 +803,7 @@ impl Store {
             requests,
             ms,
             sent,
+            sent_chars,
         } = done;
         let vectors = {
             let mut works = self.embed.works.lock();
@@ -860,6 +861,15 @@ impl Store {
                 Instant::now()
                     + Duration::from_secs_f64(60.0 / batch.emb.requests_per_minute as f64),
             );
+        }
+        if batch.emb.tokens_per_minute > 0 && sent_chars > 0 {
+            // the tokens of the batch, estimated from its length, spread over a minute
+            let tokens = sent_chars.div_ceil(crate::vector::embed::config::CHARS_PER_TOKEN as u64);
+            let until = Instant::now()
+                + Duration::from_secs_f64(
+                    60.0 * tokens as f64 / batch.emb.tokens_per_minute as f64,
+                );
+            w.next_request = Some(w.next_request.map_or(until, |t| t.max(until)));
         }
         if sent > 0 {
             w.stats.last_batch = Some(crate::vector::embed::EmbeddingBatch {

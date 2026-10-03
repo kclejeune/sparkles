@@ -2,8 +2,10 @@
 //! and sinks that `Dataset.load` and `Dataset.dump` share with them.
 //!
 //! Besides oxrdfio's syntaxes, `RdfFormat` names Jena's TriX, RDF Thrift, RDF Protobuf
-//! and RDF/JSON ([`sparkles::jena_formats`]). An input in one of them is read into
-//! N-Quads first, in memory, and an output is written by the engine's writer.
+//! and RDF/JSON ([`sparkles::jena_formats`]). An input in one of them is read by the
+//! engine's reader on a thread of its own as it streams: `parse` and file objects take
+//! the N-Quads it writes through a pipe, and `Dataset.load` spools them to a temporary
+//! file for the bulk loader. An output is written by the engine's writer.
 
 use crate::errors::{EngineResult, invalid};
 use crate::results::PyQuadIterator;
@@ -258,7 +260,7 @@ pub fn source_from_py(
     graph: Option<NamedNode>,
     compression: Option<&str>,
     lenient: bool,
-) -> PyResult<Source> {
+) -> PyResult<(Source, Option<Spool>)> {
     let format = format_from_py(format)?;
     let input = input.filter(|i| !i.is_none());
     // a path in one of Jena's syntaxes, by its extension
@@ -268,7 +270,8 @@ pub fn source_from_py(
             .map(Fmt::Jena)
     });
     if let Some(Fmt::Jena(j)) = format {
-        return jena_source(py, j, input, path, base_iri, graph, compression, lenient);
+        let (src, spool) = jena_source(py, j, input, path, base_iri, graph, compression, lenient)?;
+        return Ok((src, Some(spool)));
     }
     let format = rdf_only(format, "datasets")?;
     let mut src = match (input, path) {
@@ -310,24 +313,19 @@ pub fn source_from_py(
     }
     src.compression = codec_from_py(py, compression)?;
     src.lenient = lenient;
-    Ok(src)
+    Ok((src, None))
 }
 
-/// A source of an input in one of Jena's syntaxes: read whole, decompressed and
-/// transcoded into N-Quads.
-#[allow(clippy::too_many_arguments)]
-fn jena_source(
+/// The decompressed bytes of an input in one of Jena's syntaxes, its name for errors, and
+/// the base its path gives.
+fn jena_raw(
     py: Python<'_>,
-    fmt: JenaFormat,
     input: Option<&Bound<'_, PyAny>>,
     path: Option<PathBuf>,
-    base_iri: Option<String>,
-    graph: Option<NamedNode>,
     compression: Option<&str>,
-    lenient: bool,
-) -> PyResult<Source> {
+) -> PyResult<(Box<dyn Read + Send>, String, Option<String>)> {
     let explicit = codec_from_py(py, compression)?;
-    let (raw, name, base): (Box<dyn Read + Send>, String, Option<String>) = match (input, path) {
+    Ok(match (input, path) {
         (Some(_), Some(_)) => return Err(PyValueError::new_err("give input or path, not both")),
         (None, None) => return Err(PyValueError::new_err("give input or path")),
         (None, Some(p)) => {
@@ -353,6 +351,27 @@ fn jena_source(
                 Some(format!("file://{}", abs.display())),
             )
         }
+        (Some(i), None) if is_file_object(i)? => {
+            let mut r = PyFileReader::new(i.clone().unbind());
+            let name = "<file object>".to_string();
+            let (codec, head) = py
+                .detach(|| -> sparkles::Result<_> {
+                    let (sniffed, head) = sparkles::io::sniff_codec(&mut r, None, &name)?;
+                    let codec = match explicit {
+                        Some(c) => Codec::detect(Some(c), &head, None)?.0,
+                        None => sniffed,
+                    };
+                    Ok((codec, head))
+                })
+                .py(py)?;
+            (
+                codec
+                    .reader_send(std::io::Cursor::new(head).chain(r), None)
+                    .py(py)?,
+                name,
+                None,
+            )
+        }
         (Some(i), None) => {
             let bytes = input_bytes(i)?;
             let codec = explicit
@@ -366,19 +385,123 @@ fn jena_source(
                 None,
             )
         }
-    };
-    let base = base_iri.or(base);
-    let nquads = py
-        .detach(|| {
-            let mut out = Vec::new();
-            sparkles::jena_formats::transcode_with_base(fmt, raw, true, &mut out, base.as_deref())
-                .map(|_| out)
+    })
+}
+
+/// N-Quads from a thread that reads an input in one of Jena's syntaxes with the
+/// engine's reader, through a pipe, so the input is never held whole: TriX, RDF Thrift
+/// and RDF Protobuf are read as they arrive (RDF/JSON's reader reads its document
+/// first). The reader's error ends the stream as an I/O error.
+struct Transcoded {
+    pipe: std::io::PipeReader,
+    worker: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+
+impl Transcoded {
+    fn start(
+        fmt: JenaFormat,
+        raw: Box<dyn Read + Send>,
+        base: Option<String>,
+        name: String,
+    ) -> std::io::Result<Transcoded> {
+        let (pipe, w) = std::io::pipe()?;
+        let worker = std::thread::spawn(move || -> Result<(), String> {
+            let mut w = BufWriter::with_capacity(1 << 16, w);
+            sparkles::jena_formats::transcode_with_base(fmt, raw, true, &mut w, base.as_deref())
+                .map_err(|e| format!("{name}: {}: {e}", fmt.name()))?;
+            w.flush().map_err(|e| e.to_string())
+        });
+        Ok(Transcoded {
+            pipe,
+            worker: Some(worker),
         })
-        .map_err(|e| invalid(py, format!("{name}: {}: {e}", fmt.name())))?;
-    let mut src = Source::from_bytes(nquads, RdfFormat::NQuads, graph);
+    }
+}
+
+impl Read for Transcoded {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.pipe.read(buf)?;
+        if n == 0
+            && !buf.is_empty()
+            && let Some(worker) = self.worker.take()
+        {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                // a syntax error, as the parsers report theirs
+                Ok(Err(e)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        sparkles::Error::RdfParse(e),
+                    ));
+                }
+                Err(_) => return Err(std::io::Error::other("the reading thread panicked")),
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// A temporary file that holds a transcoded input until the load that reads it ends;
+/// it is removed when dropped.
+pub struct Spool(PathBuf);
+
+impl Spool {
+    fn create() -> std::io::Result<(Spool, std::fs::File)> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir();
+        loop {
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = dir.join(format!("sparkles-load-{}-{n}.nq", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&p)
+            {
+                Ok(f) => return Ok((Spool(p), f)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for Spool {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A source of an input in one of Jena's syntaxes for the bulk loader: read by the
+/// engine's reader as it streams and written as N-Quads to a temporary file in the
+/// system's temporary directory, so neither the input nor its N-Quads are held in
+/// memory. The source reads the file until the [`Spool`] is dropped.
+#[allow(clippy::too_many_arguments)]
+fn jena_source(
+    py: Python<'_>,
+    fmt: JenaFormat,
+    input: Option<&Bound<'_, PyAny>>,
+    path: Option<PathBuf>,
+    base_iri: Option<String>,
+    graph: Option<NamedNode>,
+    compression: Option<&str>,
+    lenient: bool,
+) -> PyResult<(Source, Spool)> {
+    let (raw, name, base) = jena_raw(py, input, path, compression)?;
+    let base = base_iri.or(base);
+    let (spool, file) = Spool::create()?;
+    py.detach(|| -> Result<(), String> {
+        let mut w = BufWriter::with_capacity(1 << 16, file);
+        sparkles::jena_formats::transcode_with_base(fmt, raw, true, &mut w, base.as_deref())
+            .map_err(|e| e.to_string())?;
+        w.flush().map_err(|e| e.to_string())
+    })
+    .map_err(|e| invalid(py, format!("{name}: {}: {e}", fmt.name())))?;
+    let mut src = Source::from_bytes(Vec::new(), RdfFormat::NQuads, graph);
+    src.data = SourceData::File(spool.0.clone());
+    src.compression = Some(Codec::None);
     src.name = name;
     src.lenient = lenient;
-    Ok(src)
+    Ok((src, spool))
 }
 
 /// Whether `input` is a file object rather than `str` or bytes.
@@ -494,29 +617,15 @@ pub fn quad_stream(
                     ));
                 }
                 Some(Fmt::Jena(j)) => {
-                    // read whole, then parsed as N-Quads
-                    let bytes = PyBytes::new(py, &input_bytes(i)?);
-                    let src = jena_source(
+                    return jena_stream(
                         py,
                         j,
-                        Some(bytes.as_any()),
+                        Some(i),
                         None,
-                        base_iri.clone(),
-                        graph.clone(),
+                        base_iri,
+                        graph,
                         compression,
                         lenient,
-                    )?;
-                    let SourceData::Bytes(b) = src.data else {
-                        unreachable!("an input is read into bytes")
-                    };
-                    return stream_of(
-                        py,
-                        Box::new(std::io::Cursor::new(b)),
-                        RdfFormat::NQuads,
-                        None,
-                        graph,
-                        lenient,
-                        src.name,
                     );
                 }
                 Some(Fmt::Rdf(f)) => f,
@@ -539,7 +648,17 @@ pub fn quad_stream(
             (r, f, base_iri, graph, name)
         }
         _ => {
-            let src = source_from_py(
+            // Jena's syntaxes, by name or by the path's extension, stream through the
+            // engine's reader
+            let jena = match format_from_py(format)? {
+                Some(Fmt::Jena(j)) => Some(j),
+                Some(Fmt::Rdf(_)) => None,
+                None => path.as_deref().and_then(JenaFormat::from_path),
+            };
+            if let Some(j) = jena {
+                return jena_stream(py, j, input, path, base_iri, graph, compression, lenient);
+            }
+            let (src, _) = source_from_py(
                 py,
                 input,
                 format,
@@ -559,6 +678,32 @@ pub fn quad_stream(
         }
     };
     stream_of(py, reader, format, base, graph, lenient, name)
+}
+
+/// A streaming parse of an input in one of Jena's syntaxes: the engine's reader runs on
+/// its own thread and hands N-Quads to the parser through a pipe.
+#[allow(clippy::too_many_arguments)]
+fn jena_stream(
+    py: Python<'_>,
+    fmt: JenaFormat,
+    input: Option<&Bound<'_, PyAny>>,
+    path: Option<PathBuf>,
+    base_iri: Option<String>,
+    graph: Option<NamedNode>,
+    compression: Option<&str>,
+    lenient: bool,
+) -> PyResult<QuadStream> {
+    let (raw, name, base) = jena_raw(py, input, path, compression)?;
+    let r = Transcoded::start(fmt, raw, base_iri.or(base), name.clone())?;
+    stream_of(
+        py,
+        Box::new(r),
+        RdfFormat::NQuads,
+        None,
+        graph,
+        lenient,
+        name,
+    )
 }
 
 /// A streaming parse of `reader` in `format`.

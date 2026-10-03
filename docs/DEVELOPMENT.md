@@ -438,14 +438,20 @@ a `Cargo.toml` or `Cargo.lock` changes. The second one unpacks that target direc
 compiles the workspace crates. A change to a Rust source file therefore recompiles the
 workspace crates and nothing else.
 
-`sparkles` and `sparkles-cli` share one dependency derivation. The UI is copied into the
-source tree in the package's own build phase, so a UI change rebuilds the package but
-neither the dependencies nor the unit tests. The `sparkles-tests` check reuses the same
-dependency derivation, which also compiles the dependencies of
-`cargo test -p sparkles --lib`, because the engine alone enables fewer features than the
-server does. The formatter's WebAssembly module has its own dependency derivation for
+`sparkles` and `sparkles-cli` share one binary. The Nix build embeds no UI in it, and
+`sparkles` is a small wrapper that sets `SPARKLES_UI_DIR` to the UI's store path, from
+which the server reads the UI at run time. A UI change therefore rebuilds the UI and the
+wrapper, and no Rust code. Builds outside Nix (`mise run build`, the Dockerfile) still
+embed `ui/build` in the binary. The `sparkles-tests` check reuses the same dependency
+derivation, which also compiles the dependencies of `cargo test -p sparkles --lib`,
+because the engine alone enables fewer features than the server does.
+
+The formatter's WebAssembly module has its own dependency derivation for
 `wasm32-unknown-unknown` with the `fmt-wasm` profile from `Cargo.toml`, which
-`scripts/build-fmt-wasm.sh` also uses.
+`scripts/build-fmt-wasm.sh` also uses. Its second derivation compiles a source tree in
+which every workspace crate is stubbed except `sparkles-fmt`, `sparkles-fmt-wasm` and the
+vendored spargebra, so an edit to the server or the engine does not rebuild the module,
+and with it the UI.
 
 Dependency updates need no hash in the Nix files. crane reads `Cargo.lock` and fetches
 each crate by the checksum recorded there, so `cargo update` followed by `nix build` is
@@ -456,9 +462,12 @@ nixpkgs' own Rust hooks, from `crates/sparkles-py/Cargo.lock`, and has no separa
 dependency layer. maturin runs cargo itself with PyO3's interpreter settings, so a
 dependency layer built by crane would not match its build.
 
-The `.drv` paths show whether a change reaches the dependency layer. After a change,
+The `.drv` paths show what a change rebuilds. After a change,
 `nix path-info --derivation .#packages.x86_64-linux.sparkles.cargoArtifacts` prints the
-same path as before unless a manifest or the lockfile changed.
+same path as before unless a manifest or the lockfile changed. In the same way,
+`.#packages.x86_64-linux.sparkles-cli`, which is also `sparkles.passthru.unwrapped`, keeps
+its path across a UI change, and `.#packages.x86_64-linux.sparkles-fmt-wasm` keeps its
+path across a change to any crate but the formatter's two.
 
 ## Third-party licenses
 

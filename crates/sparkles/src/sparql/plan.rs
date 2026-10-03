@@ -1215,6 +1215,14 @@ impl<'a> Planner<'a> {
             GP::Bgp { patterns } => {
                 // ARQ's property function library: the variables bound before a call
                 // are those of the group's earlier elements
+                let members;
+                let patterns = match super::arqpf::container_members(self.ctx, patterns) {
+                    Some(m) => {
+                        members = m;
+                        &members
+                    }
+                    None => patterns,
+                };
                 let rest;
                 let patterns = if super::arqpf::has_calls(patterns) {
                     let (pcalls, others) = super::arqpf::take_calls(patterns)?;
@@ -2285,6 +2293,7 @@ impl<'a> Planner<'a> {
                 Kind::SpatialPf(s) => s.needs_input(),
                 Kind::PathSearch(s) => s.needs_input(),
                 Kind::PropertyFn(s) => s.needs_input(),
+                Kind::HistoryChanges(s) => s.needs_input(),
                 _ => false,
             });
         for n in nodes {
@@ -2342,6 +2351,7 @@ impl<'a> Planner<'a> {
             result = match &d.kind {
                 Kind::SpatialPf(_) => super::geopf::attach_spatial(self, result, d)?,
                 Kind::PathSearch(_) => super::pathsearch::attach(self, result, d)?,
+                Kind::HistoryChanges(_) => super::history_svc::attach(self, result, d)?,
                 Kind::PropertyFn(_) => super::arqpf::attach(result, d),
                 _ => self.attach_vector(result, d)?,
             };

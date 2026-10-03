@@ -522,6 +522,8 @@ pub struct Embedded {
     pub(crate) requests: u64,
     pub(crate) ms: f64,
     pub(crate) sent: u64,
+    /// the characters of the inputs sent
+    pub(crate) sent_chars: u64,
 }
 
 impl Batch {
@@ -545,6 +547,7 @@ impl Batch {
         }
         let mut requests = 0;
         let sent = todo.len() as u64;
+        let sent_chars = todo.iter().map(|i| i.chars().count() as u64).sum();
         // at most `batchSize` inputs per request: a pair can have several
         let mut r = Ok(());
         for chunk in todo.chunks(self.emb.batch_size.max(1)) {
@@ -577,6 +580,7 @@ impl Batch {
             requests,
             ms: t0.elapsed().as_secs_f64() * 1000.0,
             sent,
+            sent_chars,
             batch: self,
         }
     }

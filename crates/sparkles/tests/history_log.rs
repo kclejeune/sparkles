@@ -925,6 +925,99 @@ fn sparql_history_queries() {
 }
 
 #[test]
+fn sparql_history_queries_take_bindings_from_their_group() {
+    let s = Store::in_memory(opts());
+    upd(
+        &s,
+        "INSERT DATA { <urn:a> <urn:name> \"Ann\" . <urn:b> <urn:name> \"Bo\" . <urn:c> <urn:name> \"Cy\" }",
+    ); // 1
+    upd(
+        &s,
+        "DELETE DATA { <urn:a> <urn:name> \"Ann\" } ; INSERT DATA { <urn:a> <urn:name> \"Anna\" }",
+    ); // 2
+    upd(&s, "INSERT DATA { <urn:a> a <urn:P> . <urn:b> a <urn:P> }"); // 3
+    upd(
+        &s,
+        "INSERT DATA { GRAPH <urn:g> { <urn:b> <urn:name> \"Bob\" } }",
+    ); // 4
+    let q = QueryOptions::default();
+    let snap = s.snapshot();
+    let run = |body: &str| select(snap.clone(), &format!("{HIST} {body}"), &q);
+    // the subjects come from the group: one lookup per subject
+    assert_eq!(
+        run(
+            "SELECT ?s ?v ?c WHERE { ?s a :P . SERVICE hist:changes { << ?s :name ?v >> hist:op \"add\" ; hist:commit ?c } } ORDER BY ?s ?c ?v"
+        ),
+        vec![
+            "<urn:a> Ann 1",
+            "<urn:a> Anna 2",
+            "<urn:b> Bo 1",
+            "<urn:b> Bob 4"
+        ]
+    );
+    // a predicate, an object and a graph from VALUES
+    assert_eq!(
+        run(
+            "SELECT ?s ?c WHERE { VALUES (?p ?v) { (:name \"Bo\") (:name \"Anna\") } SERVICE hist:changes { << ?s ?p ?v >> hist:commit ?c } } ORDER BY ?s"
+        ),
+        vec!["<urn:a> 2", "<urn:b> 1"]
+    );
+    assert_eq!(
+        run(
+            "SELECT ?v WHERE { VALUES ?g { :g } SERVICE hist:changes { << ?s :name ?v >> hist:graph ?g } }"
+        ),
+        vec!["Bob"]
+    );
+    // the commit range from the group, per solution
+    assert_eq!(
+        run(
+            "SELECT ?f ?v WHERE { VALUES ?f { 2 3 } SERVICE hist:changes { << :a :name ?v >> hist:op \"add\" ; hist:from ?f } } ORDER BY ?f"
+        ),
+        vec!["2 Anna"]
+    );
+    assert_eq!(
+        run(
+            "SELECT ?t (COUNT(*) AS ?n) WHERE { VALUES ?t { 1 4 } SERVICE hist:changes { << ?s ?p ?o >> hist:to ?t } } GROUP BY ?t ORDER BY ?t"
+        ),
+        vec!["1 3", "4 8"]
+    );
+    // the limit applies to each lookup
+    assert_eq!(
+        run(
+            "SELECT ?s ?c WHERE { VALUES ?s { :a :b } SERVICE hist:changes { << ?s :name ?v >> hist:commit ?c ; hist:order hist:descending ; hist:limit 1 } } ORDER BY ?s"
+        ),
+        vec!["<urn:a> 2", "<urn:b> 4"]
+    );
+    // a variable the group may leave unbound is bound by the lookup
+    assert_eq!(
+        run(
+            "SELECT ?s ?v WHERE { VALUES ?s { :c UNDEF } SERVICE hist:changes { << ?s :name ?v >> hist:op \"remove\" } } ORDER BY ?s"
+        ),
+        vec!["<urn:a> Ann"]
+    );
+    // a value that cannot match, and a variable the change disagrees with
+    assert!(
+        run("SELECT ?s WHERE { VALUES ?p { \"name\" } SERVICE hist:changes { << ?s ?p ?o >> } }")
+            .is_empty()
+    );
+    assert_eq!(
+        run(
+            "SELECT ?c WHERE { VALUES (?s ?c) { (:a 2) } SERVICE hist:changes { << ?s :name ?v >> hist:commit ?c } }"
+        ),
+        vec!["2", "2"]
+    );
+    // a range variable the group does not bind is an error
+    for bad in [
+        "SELECT * WHERE { SERVICE hist:changes { << ?s ?p ?o >> hist:from ?f } }",
+        "SELECT * WHERE { ?s a :P . SERVICE hist:changes { << ?s ?p ?o >> hist:to ?t } }",
+        "SELECT * WHERE { VALUES ?f { \"soon\" } SERVICE hist:changes { << ?s ?p ?o >> hist:from ?f } }",
+    ] {
+        let e = sparkles::sparql::query(snap.clone(), &format!("{HIST} {bad}"), &q);
+        assert!(e.is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn diffs_read_the_change_log_where_states_are_gone() {
     let dir = tempfile::tempdir().unwrap();
     let s = Store::open(
@@ -975,6 +1068,104 @@ fn diffs_read_the_change_log_where_states_are_gone() {
         }
     }
     assert!(via_log > 0, "some diffs start at a collected state");
+}
+
+#[test]
+fn the_change_feed_reads_the_change_log_where_generations_are_gone() {
+    use sparkles::access::{GraphAccess, GraphRule, Graphs};
+    use sparkles::store::ChangesOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(
+        &dir.path().join("db"),
+        StoreOptions {
+            bulk_threshold: 20,
+            change_log_bulk_max_quads: 30,
+            ..opts()
+        },
+    )
+    .unwrap();
+    let mut states = churn(&s, 11, 120);
+    // a bulk commit too large to record, then more commits and compactions
+    let body: String = (0..40)
+        .map(|i| format!("<urn:bulk{i}> <urn:p0> {i} .\n"))
+        .collect();
+    s.load(&[Source::from_bytes(
+        body.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let bulk = s.head_commit().seq;
+    states.insert(bulk, live(&s));
+    states.extend(churn(&s, 12, 60));
+    s.compact().unwrap();
+    upd(&s, "INSERT DATA { <urn:last> <urn:p0> 1 }");
+    states.insert(s.head_commit().seq, live(&s));
+    let head = s.head_commit().seq;
+    assert!(
+        s.snapshot_at(&At::Commit(1), &HistoryOptions::default())
+            .is_err(),
+        "the first commits' generations are collected"
+    );
+    // follow the feed from the start in pages of several sizes
+    for size in [1, 7, 100] {
+        let o = ChangesOptions {
+            max_commits: size,
+            ..Default::default()
+        };
+        let mut after = 0;
+        while after < head {
+            let p = s
+                .changes(after, &o)
+                .unwrap_or_else(|e| panic!("after {after}: {e}"));
+            assert!(!p.commits.is_empty(), "after {after}");
+            for c in &p.commits {
+                let seq = c.commit.seq;
+                assert_eq!(seq, after + 1, "commits are consecutive");
+                after = seq;
+                if !c.complete() {
+                    // a bulk commit the log has only the counts of, its states gone
+                    assert_eq!(seq, bulk);
+                    continue;
+                }
+                let (mut rem, mut add) = (BTreeSet::new(), BTreeSet::new());
+                for (op, q) in c.iter() {
+                    match op {
+                        DiffOp::Add => add.insert(nquads_line(&q)),
+                        DiffOp::Remove => rem.insert(nquads_line(&q)),
+                    };
+                }
+                assert_eq!(
+                    (rem, add),
+                    delta(&states[&(seq - 1)], &states[&seq]),
+                    "commit {seq}"
+                );
+            }
+        }
+    }
+    // a graph view lists the changes of its graphs only, and every commit
+    let o = ChangesOptions {
+        max_commits: 1000,
+        graphs: Some(Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new(["default"], &[])),
+            Graphs::none(),
+        ))),
+        ..Default::default()
+    };
+    let p = s.changes(0, &o).unwrap();
+    assert!(p.commits.len() > 1);
+    assert_eq!(p.commits[0].commit.seq, 1);
+    for c in &p.commits {
+        assert!(c.iter().all(|(_, q)| q.graph_name.is_default_graph()));
+    }
+    // without the change log the commits are gone
+    s.set_change_log_settings(ChangeLogSettings {
+        enabled: Some(false),
+        ..Default::default()
+    })
+    .unwrap();
+    let e = s.changes(0, &ChangesOptions::default()).err().unwrap();
+    assert!(matches!(e, Error::HistoryGone(_)), "{e}");
 }
 
 #[test]

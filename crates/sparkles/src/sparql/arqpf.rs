@@ -1,7 +1,19 @@
 //! Jena ARQ's property function library: `list:member`, `list:index` and `list:length`
-//! over RDF collections, and `apf:strSplit`, `apf:concat`, `apf:str`, `apf:splitIRI`
-//! (also `apf:splitURI`), `apf:assign`, `apf:bnode` (also `apf:blankNode`) and
-//! `apf:versionARQ`.
+//! over RDF collections, `rdfs:member`, `apf:container`, `apf:bag`, `apf:seq` and
+//! `apf:alt` over RDF containers, and `apf:strSplit`, `apf:concat`, `apf:str`,
+//! `apf:splitIRI` (also `apf:splitURI`), `apf:assign`, `apf:bnode` (also
+//! `apf:blankNode`) and `apf:versionARQ`.
+//!
+//! # Containers
+//!
+//! A container is a resource typed `rdf:Bag`, `rdf:Seq` or `rdf:Alt`, and its members are
+//! the objects of its `rdf:_1`, `rdf:_2`, … triples. `apf:container` gives the members of
+//! any container, and `apf:bag`, `apf:seq` and `apf:alt` those of one type, in the order
+//! of their numbers. ARQ registers `rdfs:member` as the same function as `apf:container`,
+//! plus the stored `rdfs:member` triples. Sparkles does the same, but only while the
+//! store holds a container: without one the two readings give the same solutions, so
+//! `rdfs:member` stays an ordinary triple pattern there and keeps its plans
+//! ([`container_members`]).
 //!
 //! # Plans
 //!
@@ -57,13 +69,45 @@ pub enum PfKind {
     Assign,
     BNode,
     Version,
+    /// the members of a container of this type (any type: `None`)
+    Container(Option<ContainerType>),
+    /// `rdfs:member`: the stored triples, and the members of every container
+    RdfsMember,
 }
+
+/// The type of an RDF container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ContainerType {
+    Bag,
+    Seq,
+    Alt,
+}
+
+impl ContainerType {
+    const ALL: [ContainerType; 3] = [ContainerType::Bag, ContainerType::Seq, ContainerType::Alt];
+
+    fn iri(self) -> NamedNode {
+        let local = match self {
+            ContainerType::Bag => "Bag",
+            ContainerType::Seq => "Seq",
+            ContainerType::Alt => "Alt",
+        };
+        NamedNode::new_unchecked(format!("{RDF_NS}{local}"))
+    }
+}
+
+const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+/// `rdfs:member`
+pub const RDFS_MEMBER: &str = "http://www.w3.org/2000/01/rdf-schema#member";
+/// The predicate that stands for `rdfs:member` once it is read as ARQ's property
+/// function ([`container_members`]).
+const RDFS_MEMBER_CALL: &str = "urn:x-sparkles:arq#rdfsMember";
 
 /// The local names of the list functions.
 pub const LIST_FUNCTIONS: [&str; 3] = ["member", "index", "length"];
 /// The local names of the `apf:` functions. ARQ finds them by class name, so the list
 /// functions are there too.
-pub const APF_FUNCTIONS: [&str; 15] = [
+pub const APF_FUNCTIONS: [&str; 19] = [
     "strSplit",
     "concat",
     "str",
@@ -79,12 +123,19 @@ pub const APF_FUNCTIONS: [&str; 15] = [
     "member",
     "index",
     "length",
+    "container",
+    "bag",
+    "seq",
+    "alt",
 ];
 
 impl PfKind {
     /// The property function `iri` names, if it is one of the library.
     pub fn of(iri: &str) -> Option<PfKind> {
         use PfKind::*;
+        if iri == RDFS_MEMBER_CALL {
+            return Some(RdfsMember);
+        }
         if let Some(l) = iri
             .strip_prefix(LIST)
             .or_else(|| iri.strip_prefix(LIST_OLD))
@@ -110,6 +161,10 @@ impl PfKind {
             "listMember" | "member" => Member,
             "listIndex" | "index" => Index,
             "listLength" | "length" => Length,
+            "container" => Container(None),
+            "bag" => Container(Some(ContainerType::Bag)),
+            "seq" => Container(Some(ContainerType::Seq)),
+            "alt" => Container(Some(ContainerType::Alt)),
             _ => return None,
         })
     }
@@ -126,6 +181,11 @@ impl PfKind {
             PfKind::Assign => "apf:assign",
             PfKind::BNode => "apf:bnode",
             PfKind::Version => "apf:versionARQ",
+            PfKind::Container(None) => "apf:container",
+            PfKind::Container(Some(ContainerType::Bag)) => "apf:bag",
+            PfKind::Container(Some(ContainerType::Seq)) => "apf:seq",
+            PfKind::Container(Some(ContainerType::Alt)) => "apf:alt",
+            PfKind::RdfsMember => "rdfs:member",
         }
     }
 
@@ -144,7 +204,7 @@ impl PfKind {
             PfKind::Member | PfKind::Index | PfKind::Length | PfKind::SplitIri => (true, false),
             PfKind::BNode => (true, false),
             PfKind::StrSplit | PfKind::Concat | PfKind::Str => (false, true),
-            PfKind::Assign => (true, true),
+            PfKind::Assign | PfKind::Container(_) | PfKind::RdfsMember => (true, true),
             PfKind::Version => (false, false),
         }
     }
@@ -157,7 +217,62 @@ pub fn iris() -> Vec<String> {
         .map(|l| format!("{LIST}{l}"))
         .collect();
     out.extend(APF_FUNCTIONS.iter().map(|l| format!("{APF}{l}")));
+    out.push(RDFS_MEMBER.to_string());
     out
+}
+
+/// `patterns` with `rdfs:member` read as ARQ's container property function, when they
+/// use it and the store holds a container (`None` otherwise). Without a container the
+/// function's solutions are those of the stored triples, so the patterns are left as
+/// they are.
+pub(super) fn container_members(
+    ctx: &Ctx,
+    patterns: &[TriplePattern],
+) -> Option<Vec<TriplePattern>> {
+    let is_member = |t: &TriplePattern| matches!(&t.predicate, NamedNodePattern::NamedNode(p) if p.as_str() == RDFS_MEMBER);
+    if !patterns.iter().any(is_member) || !has_containers(ctx) {
+        return None;
+    }
+    Some(
+        patterns
+            .iter()
+            .map(|t| {
+                let mut t = t.clone();
+                if is_member(&t) {
+                    t.predicate =
+                        NamedNodePattern::NamedNode(NamedNode::new_unchecked(RDFS_MEMBER_CALL));
+                }
+                t
+            })
+            .collect(),
+    )
+}
+
+/// Whether any graph of the store types a resource `rdf:Bag`, `rdf:Seq` or `rdf:Alt`.
+fn has_containers(ctx: &Ctx) -> bool {
+    let ty = ctx.intern_term(&Term::NamedNode(rdf::TYPE.into_owned()));
+    ContainerType::ALL.iter().any(|c| {
+        let t = ctx.intern_term(&Term::NamedNode(c.iri()));
+        if [ty, t].iter().any(|x| x.tag() == crate::id::Tag::Local) {
+            return false;
+        }
+        let mut found = false;
+        let prefix = [ty.0, t.0];
+        let _ = ctx.snap.scan_between_cols(
+            Perm::Pos,
+            pad(&prefix, 0),
+            pad(&prefix, u64::MAX),
+            crate::index::ALL_COLS,
+            |c| {
+                found = match c {
+                    Chunk::Block(_, s, e) => e > s,
+                    Chunk::Row(_) => true,
+                };
+                Ok(!found)
+            },
+        );
+        found
+    })
 }
 
 /// Whether `patterns` call a property function of the library.
@@ -400,6 +515,7 @@ pub(super) fn leaf(
             (p.ctx.snap.estimate(Perm::Pso, &[first.0]) as f64).max(1.0)
         }
         PfKind::StrSplit => 8.0,
+        PfKind::Container(_) | PfKind::RdfsMember if inputs.is_empty() => 100.0,
         _ => 1.0,
     };
     let mut n = Node::leaf(
@@ -775,6 +891,14 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
                 Some(_) => Vec::new(),
             }
         }
+        PfKind::Container(ty) => containers(lists, ty, args[0], args[1])?,
+        PfKind::RdfsMember => {
+            // the stored triples, then the members of the containers, as ARQ concatenates
+            let member = ctx.intern_term(&Term::NamedNode(NamedNode::new_unchecked(RDFS_MEMBER)));
+            let mut out = lists.pairs(member, args[0], args[1])?;
+            out.extend(containers(lists, None, args[0], args[1])?);
+            out
+        }
         PfKind::Version => {
             let subject =
                 ctx.intern_term(&Term::NamedNode(NamedNode::new_unchecked(VERSION_SUBJECT)));
@@ -787,6 +911,50 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             }
         }
     })
+}
+
+/// The (container, member) solutions of a container function of type `ty` (`None`: any
+/// type) with subject `c` and object `m` (`None`: unbound), as ARQ's `container`
+/// computes them: a bound container's members in order, or each container's.
+fn containers(
+    lists: &Lists<'_>,
+    ty: Option<ContainerType>,
+    c: Option<Id>,
+    m: Option<Id>,
+) -> Result<Vec<Vec<Id>>> {
+    let one = |c: Id| -> Result<Vec<Vec<Id>>> {
+        if !lists.is_container(c, ty)? {
+            return Ok(Vec::new());
+        }
+        let members = lists.container_members(c)?;
+        Ok(match m {
+            // once per numbered triple that holds it
+            Some(m) => vec![vec![c, m]; members.iter().filter(|x| x.1 == m).count()],
+            None => {
+                // in the order of the numbers, the last triple of a number winning
+                let mut by_number: std::collections::BTreeMap<u64, Id> = Default::default();
+                for (n, x) in members {
+                    by_number.insert(n, x);
+                }
+                by_number.into_values().map(|x| vec![c, x]).collect()
+            }
+        })
+    };
+    let mut out = Vec::new();
+    match c {
+        Some(c) => out = one(c)?,
+        None => {
+            let candidates = match m {
+                None => lists.containers(ty)?,
+                // the subjects of the triples whose object is the member
+                Some(m) => dedup(lists.subjects_of(m)?),
+            };
+            for c in candidates {
+                out.extend(one(c)?);
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn re_id(a: Option<Id>) -> Id {
@@ -864,6 +1032,8 @@ struct Lists<'a> {
     first: Id,
     rest: Id,
     nil: Id,
+    /// the number of each predicate that is an `rdf:_n` (`None`: another predicate)
+    numbers: std::cell::RefCell<FxHashMap<Id, Option<u64>>>,
 }
 
 /// The most cells a list walk follows (a cycle stops it earlier).
@@ -878,7 +1048,131 @@ impl<'a> Lists<'a> {
             first: iri(rdf::FIRST),
             rest: iri(rdf::REST),
             nil: iri(rdf::NIL),
+            numbers: Default::default(),
         }
+    }
+
+    /// The columns `cols` (of the permutation's order) of the quads with `prefix`, in
+    /// the active graph, without the repeats of one triple in several graphs.
+    fn scan_pairs(&self, perm: Perm, prefix: &[u64], cols: [usize; 2]) -> Result<Vec<(Id, Id)>> {
+        let mut out = Vec::new();
+        if prefix.iter().any(|&x| Id(x).tag() == crate::id::Tag::Local) {
+            return Ok(out);
+        }
+        let gc = perm.col_of(G);
+        let (lo, hi) = (pad(prefix, 0), pad(prefix, u64::MAX));
+        self.ctx
+            .snap
+            .scan_between_cols(perm, lo, hi, crate::index::ALL_COLS, |c| {
+                match c {
+                    Chunk::Block(b, s, e) => {
+                        for i in s..e {
+                            if self.graph.accepts(b.cols[gc][i]) {
+                                out.push((Id(b.cols[cols[0]][i]), Id(b.cols[cols[1]][i])));
+                            }
+                        }
+                    }
+                    Chunk::Row(k) => {
+                        if self.graph.accepts(k[gc]) {
+                            out.push((Id(k[cols[0]]), Id(k[cols[1]])));
+                        }
+                    }
+                }
+                Ok(true)
+            })?;
+        out.dedup();
+        Ok(out)
+    }
+
+    /// The (subject, object) pairs of predicate `p`'s triples, with the subject `s` and
+    /// the object `o` when they are given.
+    fn pairs(&self, p: Id, s: Option<Id>, o: Option<Id>) -> Result<Vec<Vec<Id>>> {
+        Ok(match (s, o) {
+            (Some(s), Some(o)) => self
+                .scan(Perm::Pso, &[p.0, s.0, o.0], 2)?
+                .into_iter()
+                .map(|o| vec![s, o])
+                .collect(),
+            (Some(s), None) => self
+                .scan(Perm::Pso, &[p.0, s.0], 2)?
+                .into_iter()
+                .map(|o| vec![s, o])
+                .collect(),
+            (None, Some(o)) => self
+                .scan(Perm::Pos, &[p.0, o.0], 2)?
+                .into_iter()
+                .map(|s| vec![s, o])
+                .collect(),
+            (None, None) => self
+                .scan_pairs(Perm::Pso, &[p.0], [1, 2])?
+                .into_iter()
+                .map(|(s, o)| vec![s, o])
+                .collect(),
+        })
+    }
+
+    /// The number `n` of a predicate `rdf:_n`.
+    fn number(&self, p: Id) -> Option<u64> {
+        *self
+            .numbers
+            .borrow_mut()
+            .entry(p)
+            .or_insert_with(|| match self.ctx.term(p) {
+                Some(Term::NamedNode(n)) => n
+                    .as_str()
+                    .strip_prefix(RDF_NS)
+                    .and_then(|l| l.strip_prefix('_'))
+                    .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|d| d.parse().ok()),
+                _ => None,
+            })
+    }
+
+    /// Whether `c` is typed as a container of type `ty` (any type: `None`).
+    fn is_container(&self, c: Id, ty: Option<ContainerType>) -> Result<bool> {
+        let rdf_type = self
+            .ctx
+            .intern_term(&Term::NamedNode(rdf::TYPE.into_owned()));
+        for t in ContainerType::ALL {
+            if ty.is_some_and(|x| x != t) {
+                continue;
+            }
+            let t = self.ctx.intern_term(&Term::NamedNode(t.iri()));
+            if !self.scan(Perm::Pso, &[rdf_type.0, c.0, t.0], 2)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The numbered members of `c`: (number, member) for each `rdf:_n` triple.
+    fn container_members(&self, c: Id) -> Result<Vec<(u64, Id)>> {
+        Ok(self
+            .scan_pairs(Perm::Spo, &[c.0], [1, 2])?
+            .into_iter()
+            .filter_map(|(p, o)| self.number(p).map(|n| (n, o)))
+            .collect())
+    }
+
+    /// The resources typed as containers of type `ty` (any type: `None`), each once.
+    fn containers(&self, ty: Option<ContainerType>) -> Result<Vec<Id>> {
+        let rdf_type = self
+            .ctx
+            .intern_term(&Term::NamedNode(rdf::TYPE.into_owned()));
+        let mut out = Vec::new();
+        for t in ContainerType::ALL {
+            if ty.is_some_and(|x| x != t) {
+                continue;
+            }
+            let t = self.ctx.intern_term(&Term::NamedNode(t.iri()));
+            out.extend(self.scan(Perm::Pos, &[rdf_type.0, t.0], 2)?);
+        }
+        Ok(dedup(out))
+    }
+
+    /// The subjects of the triples whose object is `o`.
+    fn subjects_of(&self, o: Id) -> Result<Vec<Id>> {
+        self.scan(Perm::Osp, &[o.0], 1)
     }
 
     /// The column `col` (of the permutation's order) of the quads with `prefix`, in the

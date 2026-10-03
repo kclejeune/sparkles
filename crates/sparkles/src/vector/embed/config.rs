@@ -10,6 +10,11 @@ pub const MAX_BATCH: usize = 2048;
 pub const MAX_LIST: usize = 16;
 /// Longest input, in characters.
 pub const MAX_INPUT_CHARS: usize = 1_000_000;
+/// Most chunks one text is split into; the text past them is not embedded.
+pub const MAX_CHUNKS: usize = 1024;
+/// Characters per token, for the estimates of `tokensPerMinute` and of chunk sizes in
+/// tokens. OpenAI's tokenizers average about four characters of English text a token.
+pub const CHARS_PER_TOKEN: usize = 4;
 
 /// Where the bearer token of the requests comes from. The key itself is never stored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +53,86 @@ fn default_timeout() -> f64 {
 }
 fn is_false(b: &bool) -> bool {
     !*b
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// The unit of a chunk's size and overlap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChunkUnit {
+    /// characters (Unicode scalar values)
+    #[default]
+    Chars,
+    /// approximate tokens, [`CHARS_PER_TOKEN`] characters each
+    Tokens,
+}
+
+/// How long texts are split (`EmbeddingConfig::chunking`). Each chunk is embedded as its
+/// own input, so a subject gets one vector per chunk, and a search finds the subject by
+/// its nearest chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Chunking {
+    /// the most characters or tokens a chunk holds
+    pub size: usize,
+    /// how much of the end of a chunk the next one repeats
+    #[serde(default)]
+    pub overlap: usize,
+    #[serde(default)]
+    pub unit: ChunkUnit,
+}
+
+impl Chunking {
+    /// The size and overlap in characters.
+    fn chars(&self) -> (usize, usize) {
+        let k = match self.unit {
+            ChunkUnit::Chars => 1,
+            ChunkUnit::Tokens => CHARS_PER_TOKEN,
+        };
+        (self.size.saturating_mul(k), self.overlap.saturating_mul(k))
+    }
+
+    /// The chunks of `text`: windows of at most `size` characters, each ending after
+    /// whitespace when the second half of its window has some, each starting `overlap`
+    /// characters before the end of the previous one (moved forward to the start of a
+    /// word when one is near). A text that fits is one chunk.
+    pub fn split(&self, text: &str) -> Vec<String> {
+        let (size, overlap) = self.chars();
+        let size = size.max(1);
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() <= size {
+            return vec![text.to_string()];
+        }
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < chars.len() && out.len() < MAX_CHUNKS {
+            let mut end = (start + size).min(chars.len());
+            if end < chars.len() {
+                // break after the last whitespace of the window's second half
+                if let Some(i) = (start + size / 2..end)
+                    .rev()
+                    .find(|&i| chars[i].is_whitespace())
+                {
+                    end = i + 1;
+                }
+            }
+            out.push(chars[start..end].iter().collect::<String>());
+            if end >= chars.len() {
+                break;
+            }
+            let mut next = end.saturating_sub(overlap).max(start + 1);
+            if overlap > 0 {
+                // start at a word when one starts within the overlap
+                if let Some(i) = (next..end).find(|&i| i > 0 && chars[i - 1].is_whitespace()) {
+                    next = i;
+                }
+            }
+            start = next;
+        }
+        out
+    }
 }
 
 /// How a vector index computes its vectors (`VectorIndexConfig::embedding`).
@@ -92,6 +177,14 @@ pub struct EmbeddingConfig {
     /// 0: no ceiling
     #[serde(default)]
     pub requests_per_minute: u32,
+    /// the most tokens sent a minute, estimated from the inputs' lengths
+    /// ([`CHARS_PER_TOKEN`]); 0: no ceiling
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tokens_per_minute: u64,
+    /// split long texts into chunks, each embedded as its own vector (`None`: a text is
+    /// one input, cut at `maxInputChars`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunking: Option<Chunking>,
     #[serde(default = "default_retries")]
     pub max_retries: u32,
     #[serde(default = "default_timeout")]
@@ -123,6 +216,8 @@ impl EmbeddingConfig {
             batch_size: default_batch(),
             max_input_chars: default_max_input_chars(),
             requests_per_minute: 0,
+            tokens_per_minute: 0,
+            chunking: None,
             max_retries: default_retries(),
             timeout_secs: default_timeout(),
         }
@@ -209,6 +304,21 @@ impl EmbeddingConfig {
         if self.requests_per_minute > 1_000_000 {
             return bad("requestsPerMinute: at most 1000000".into());
         }
+        if self.tokens_per_minute > 1_000_000_000 {
+            return bad("tokensPerMinute: at most 1000000000".into());
+        }
+        if let Some(c) = &self.chunking {
+            let (size, overlap) = c.chars();
+            if c.size == 0 || size > MAX_INPUT_CHARS {
+                return bad(format!(
+                    "chunking.size: 1 to {MAX_INPUT_CHARS} characters ({} tokens)",
+                    MAX_INPUT_CHARS / CHARS_PER_TOKEN
+                ));
+            }
+            if overlap >= size {
+                return bad("chunking.overlap: less than the size".into());
+            }
+        }
         if self.max_retries > 20 {
             return bad("maxRetries: at most 20".into());
         }
@@ -277,6 +387,15 @@ impl EmbeddingConfig {
             &format!("{}{text}", self.input_prefix),
             self.max_input_chars,
         )
+    }
+
+    /// The stored inputs of a text: one per chunk with `chunking`, else one
+    /// ([`input`](Self::input)).
+    pub fn inputs(&self, text: &str) -> Vec<String> {
+        match &self.chunking {
+            Some(c) => c.split(text).iter().map(|t| self.input(t)).collect(),
+            None => vec![self.input(text)],
+        }
     }
 
     /// The input of a search's text.
@@ -383,10 +502,84 @@ mod tests {
         c.input_prefix = "passage: ".into();
         c.max_input_chars = 12;
         assert_eq!(c.input("héllo world"), "passage: hél");
+        assert_eq!(c.inputs("héllo world"), ["passage: hél"]);
         assert_ne!(c.identity(8), c.identity(16));
         let mut d = c.clone();
         d.url = "http://elsewhere/".into();
         d.batch_size = 1;
         assert_eq!(c.identity(8), d.identity(8));
+    }
+
+    #[test]
+    fn chunks() {
+        let c = |size, overlap, unit| Chunking {
+            size,
+            overlap,
+            unit,
+        };
+        // a text that fits is one chunk
+        assert_eq!(c(20, 5, ChunkUnit::Chars).split("short"), ["short"]);
+        // windows end after whitespace, and the next one starts at a word of the overlap
+        assert_eq!(
+            c(10, 0, ChunkUnit::Chars).split("aaaa bbbb cccc dddd"),
+            ["aaaa bbbb ", "cccc dddd"]
+        );
+        assert_eq!(
+            c(10, 5, ChunkUnit::Chars).split("aaaa bbbb cccc dddd"),
+            ["aaaa bbbb ", "bbbb cccc ", "cccc dddd"]
+        );
+        // no whitespace: hard cuts, the overlap repeated
+        assert_eq!(
+            c(4, 1, ChunkUnit::Chars).split("abcdefghij"),
+            ["abcd", "defg", "ghij"]
+        );
+        // characters, not bytes; tokens are four characters
+        assert_eq!(c(2, 0, ChunkUnit::Chars).split("ééé"), ["éé", "é"]);
+        assert_eq!(
+            c(1, 0, ChunkUnit::Tokens).split("abcdefgh"),
+            ["abcd", "efgh"]
+        );
+        // every character is in some chunk, in order
+        let text: String = (0..500).map(|i| format!("w{i} ")).collect();
+        let parts = c(37, 9, ChunkUnit::Chars).split(&text);
+        assert!(parts.iter().all(|p| p.chars().count() <= 37));
+        assert!(parts.first().unwrap().starts_with("w0 "));
+        assert!(parts.last().unwrap().ends_with("w499 "));
+        for w in parts.windows(2) {
+            let tail: String = w[0]
+                .chars()
+                .rev()
+                .take(9)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            assert!(tail.contains(w[1].split(' ').next().unwrap()), "{w:?}");
+        }
+        // the validation
+        let mut e = cfg();
+        e.chunking = Some(c(10, 10, ChunkUnit::Chars));
+        assert!(
+            e.validate("http://x/emb")
+                .unwrap_err()
+                .to_string()
+                .contains("overlap")
+        );
+        e.chunking = Some(c(0, 0, ChunkUnit::Chars));
+        assert!(
+            e.validate("http://x/emb")
+                .unwrap_err()
+                .to_string()
+                .contains("size")
+        );
+        e.chunking = Some(c(500, 50, ChunkUnit::Tokens));
+        assert!(e.validate("http://x/emb").is_ok());
+        let j: EmbeddingConfig = serde_json::from_str(
+            r#"{"url":"http://x/","model":"m","predicates":["http://x/p"],"tokensPerMinute":1000,
+                "chunking":{"size":200,"overlap":20,"unit":"tokens"}}"#,
+        )
+        .unwrap();
+        assert_eq!(j.tokens_per_minute, 1000);
+        assert_eq!(j.chunking, Some(c(200, 20, ChunkUnit::Tokens)));
     }
 }

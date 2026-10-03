@@ -28,8 +28,15 @@
 //! * `hist:limit` and `hist:order` (`hist:ascending`, the default, or
 //!   `hist:descending`, newest commits first).
 //!
-//! Without `hist:graph`, changes in every graph the caller may read are listed. The
-//! call reads the change log only; it does not join with its group's bindings.
+//! Without `hist:graph`, changes in every graph the caller may read are listed.
+//!
+//! The triple's terms, `hist:graph`, `hist:from` and `hist:to` may be variables that the
+//! rest of the join group binds, as in `?s a ex:Person . SERVICE hist:changes { << ?s
+//! ex:name ?n >> hist:commit ?c }`. The call is then attached to the group after join
+//! ordering, as a path search is: it reads the group's solutions, looks up the changes
+//! once per distinct binding of those variables, and extends each solution with the
+//! changes of its binding. `hist:limit` applies to each lookup. A variable of `hist:from`
+//! or `hist:to` must be bound by the group.
 
 use super::ctx::Ctx;
 use super::plan::{Kind, Node, PT, Planner};
@@ -39,6 +46,7 @@ use crate::id::Id;
 use crate::store::{DiffOp, HistoryBound, HistoryQuery};
 use oxrdf::vocab::xsd;
 use oxrdf::{GraphName, Literal, NamedNode, Term};
+use rustc_hash::FxHashMap;
 use spargebra::algebra::GraphPattern;
 use spargebra::term::{NamedNodePattern, TermPattern};
 
@@ -82,15 +90,67 @@ pub struct HistorySpec {
     pub message: Option<VarId>,
     pub from: Option<HistoryBound>,
     pub to: Option<HistoryBound>,
+    /// `hist:from` and `hist:to` given as variables, which the group must bind
+    pub from_var: Option<VarId>,
+    pub to_var: Option<VarId>,
     pub limit: Option<u64>,
     pub descending: bool,
+    /// the variables of the slots and bounds that the rest of the group binds: read from
+    /// the input rows (set when the call is attached)
+    pub inputs: Vec<VarId>,
+}
+
+impl HistorySpec {
+    /// The variables the call may read from the rest of its group.
+    fn readable(&self) -> Vec<VarId> {
+        let mut v: Vec<VarId> = [&self.s, &self.p, &self.o, &self.g]
+            .into_iter()
+            .filter_map(|s| match s {
+                Slot::Var(v) => Some(*v),
+                _ => None,
+            })
+            .chain(self.from_var)
+            .chain(self.to_var)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// The variables the call binds.
+    fn outputs(&self) -> Vec<VarId> {
+        let mut vars: Vec<VarId> = Vec::new();
+        for s in [&self.s, &self.p, &self.o, &self.g, &self.op] {
+            if let Slot::Var(v) = s {
+                vars.push(*v);
+            }
+        }
+        vars.extend(
+            [self.commit, self.time, self.kind, self.author, self.message]
+                .into_iter()
+                .flatten(),
+        );
+        vars.sort_unstable();
+        vars.dedup();
+        vars
+    }
+
+    /// Whether the call may read the rest of its group. It is attached after the join
+    /// order, which decides.
+    pub fn needs_input(&self) -> bool {
+        !self.readable().is_empty()
+    }
 }
 
 fn slot(p: &Planner<'_>, t: &TermPattern, name: &str) -> Result<Slot> {
     Ok(match t {
+        // a variable the planner replaced by its value is that value
         TermPattern::Variable(_) => match p.term_pattern(t) {
             PT::V(v) => Slot::Var(v),
-            PT::C(_) => return Err(bad(format!("{name} must be a variable"))),
+            PT::C(id) => match p.ctx.term(id) {
+                Some(t) => Slot::Const(t),
+                None => return Err(bad(format!("{name} has no value"))),
+            },
         },
         TermPattern::BlankNode(_) => Slot::Any,
         TermPattern::NamedNode(n) => Slot::Const(Term::NamedNode(n.clone())),
@@ -100,9 +160,19 @@ fn slot(p: &Planner<'_>, t: &TermPattern, name: &str) -> Result<Slot> {
 }
 
 fn bound(t: &TermPattern, name: &str) -> Result<HistoryBound> {
-    let TermPattern::Literal(l) = t else {
-        return Err(bad(format!(
+    match t {
+        TermPattern::Literal(l) => bound_term(&Term::Literal(l.clone()), name),
+        _ => Err(bad(format!(
             "hist:{name} takes a commit number, an xsd:dateTime or a selector string"
+        ))),
+    }
+}
+
+/// A bound from a constant, or from the value a variable has in the group.
+fn bound_term(t: &Term, name: &str) -> Result<HistoryBound> {
+    let Term::Literal(l) = t else {
+        return Err(bad(format!(
+            "hist:{name} takes a commit number, an xsd:dateTime or a selector string, not {t}"
         )));
     };
     let dt = l.datatype();
@@ -167,8 +237,11 @@ pub(super) fn history_leaf(p: &Planner<'_>, inner: &GraphPattern) -> Result<Node
         message: None,
         from: None,
         to: None,
+        from_var: None,
+        to_var: None,
         limit: None,
         descending: false,
+        inputs: Vec::new(),
     };
     if let Some(tp) = reified.first() {
         let TermPattern::Triple(t) = &tp.object else {
@@ -178,10 +251,7 @@ pub(super) fn history_leaf(p: &Planner<'_>, inner: &GraphPattern) -> Result<Node
         spec.p = match &t.predicate {
             NamedNodePattern::NamedNode(n) => Slot::Const(Term::NamedNode(n.clone())),
             NamedNodePattern::Variable(v) => {
-                match p.term_pattern(&TermPattern::Variable(v.clone())) {
-                    PT::V(v) => Slot::Var(v),
-                    PT::C(_) => return Err(bad("the predicate must be a variable")),
-                }
+                slot(p, &TermPattern::Variable(v.clone()), "the predicate")?
             }
         };
         spec.o = slot(p, &t.object, "the object")?;
@@ -245,6 +315,17 @@ pub(super) fn history_leaf(p: &Planner<'_>, inner: &GraphPattern) -> Result<Node
             "kind" => spec.kind = Some(out(o, name)?),
             "author" => spec.author = Some(out(o, name)?),
             "message" => spec.message = Some(out(o, name)?),
+            "from" | "to" if matches!(o, TermPattern::Variable(_)) => {
+                let (var, b) = match name {
+                    "from" => (&mut spec.from_var, &mut spec.from),
+                    _ => (&mut spec.to_var, &mut spec.to),
+                };
+                match slot(p, o, name)? {
+                    Slot::Var(v) => *var = Some(v),
+                    Slot::Const(t) => *b = Some(bound_term(&t, name)?),
+                    Slot::Any => unreachable!("a variable"),
+                }
+            }
             "from" => spec.from = Some(bound(o, name)?),
             "to" => spec.to = Some(bound(o, name)?),
             "limit" => {
@@ -268,19 +349,7 @@ pub(super) fn history_leaf(p: &Planner<'_>, inner: &GraphPattern) -> Result<Node
             other => return Err(bad(format!("unknown property hist:{other}"))),
         }
     }
-    let mut vars: Vec<VarId> = Vec::new();
-    for s in [&spec.s, &spec.p, &spec.o, &spec.g, &spec.op] {
-        if let Slot::Var(v) = s {
-            vars.push(*v);
-        }
-    }
-    vars.extend(
-        [spec.commit, spec.time, spec.kind, spec.author, spec.message]
-            .into_iter()
-            .flatten(),
-    );
-    vars.sort_unstable();
-    vars.dedup();
+    let vars = spec.outputs();
     let desc = format!("history {spec:?}");
     let est = spec.limit.map_or(1000.0, |l| l as f64);
     let mut n = Node::leaf(
@@ -307,8 +376,164 @@ pub(super) fn history_leaf(p: &Planner<'_>, inner: &GraphPattern) -> Result<Node
     Ok(n)
 }
 
-/// Run a planned history query on the change log of the query's snapshot.
-pub(super) fn run(ctx: &Ctx, spec: &HistorySpec, vars: &[VarId]) -> Result<Table> {
+/// Attach a call whose variables the rest of its group may bind to that group's plan
+/// `left`. A call that reads none of them is joined with the group as a leaf.
+pub(super) fn attach(p: &Planner<'_>, left: Node, call: Node) -> Result<Node> {
+    let Kind::HistoryChanges(spec) = &call.kind else {
+        unreachable!("a history query");
+    };
+    for (v, name) in [(spec.from_var, "from"), (spec.to_var, "to")] {
+        if let Some(v) = v
+            && !left.vars.contains(&v)
+        {
+            return Err(bad(format!(
+                "hist:{name} ?{} is not bound by the rest of the group; bind it, for example with VALUES",
+                p.ctx.var_name(v)
+            )));
+        }
+    }
+    let inputs: Vec<VarId> = spec
+        .readable()
+        .into_iter()
+        .filter(|v| left.vars.contains(v))
+        .collect();
+    if inputs.is_empty() {
+        return Ok(super::plan::join(left, call, p.ctx));
+    }
+    let mut spec = (**spec).clone();
+    spec.inputs = inputs;
+    let mut vars = left.vars.clone();
+    for v in &call.vars {
+        if !vars.contains(v) {
+            vars.push(*v);
+        }
+    }
+    let mut certain = left.certain.clone();
+    certain.extend(call.certain.iter().copied());
+    let est = (left.est * 10.0).max(1.0);
+    Ok(Node {
+        dist: vars.iter().map(|&v| (v, est)).collect(),
+        cost: left.cost + est * 8.0,
+        vars,
+        certain,
+        sorted: Vec::new(),
+        est,
+        desc: format!("history {spec:?}"),
+        kind: Kind::HistoryChanges(Box::new(spec)),
+        children: vec![left],
+    })
+}
+
+/// Run a planned history query on the change log of the query's snapshot. With `input`
+/// (an attached call), the changes are looked up once per distinct binding of the
+/// input variables, and each input row is extended with the changes that agree with it.
+pub(super) fn run(
+    ctx: &Ctx,
+    spec: &HistorySpec,
+    input: Option<&Table>,
+    vars: &[VarId],
+) -> Result<Table> {
+    let Some(input) = input else {
+        if let Some(v) = spec.from_var.or(spec.to_var) {
+            return Err(bad(format!(
+                "?{} in hist:from or hist:to is not bound by the rest of the group",
+                ctx.var_name(v)
+            )));
+        }
+        let t = lookup(ctx, spec, vars)?;
+        ctx.produced(t.len())?;
+        return Ok(t);
+    };
+    let outputs = spec.outputs();
+    let key_cols: Vec<Option<usize>> = spec.inputs.iter().map(|v| input.col_of(*v)).collect();
+    let mut memo: FxHashMap<Vec<Id>, Table> = FxHashMap::default();
+    let mut out = Table::new(vars.to_vec());
+    let mut row = vec![Id::UNDEF; vars.len()];
+    let mut rows = 0usize;
+    for i in 0..input.len() {
+        if i % 1024 == 0 {
+            ctx.check()?;
+            ctx.check_output(out.len(), out.width())?;
+        }
+        let key: Vec<Id> = key_cols
+            .iter()
+            .map(|c| c.map_or(Id::UNDEF, |c| input.cols[c][i]))
+            .collect();
+        if !memo.contains_key(&key) {
+            let t = match bind(ctx, spec, &key)? {
+                // the lookup binds the call's variables but those whose values the row
+                // gave as constants
+                Some(s) => lookup(ctx, &s, &s.outputs())?,
+                None => Table::empty(outputs.clone()),
+            };
+            rows += t.len();
+            ctx.check_rows(rows)?;
+            memo.insert(key.clone(), t);
+        }
+        let t = &memo[&key];
+        'sol: for j in 0..t.len() {
+            for (o, v) in vars.iter().enumerate() {
+                let have = input.col_of(*v).map_or(Id::UNDEF, |c| input.cols[c][i]);
+                let got = t.col_of(*v).map_or(Id::UNDEF, |c| t.get(j, c));
+                row[o] = match (have.is_undef(), got.is_undef()) {
+                    (_, true) => have,
+                    (true, false) => got,
+                    (false, false) if have == got => have,
+                    // the change disagrees with the row on a variable both bind
+                    (false, false) => continue 'sol,
+                };
+            }
+            out.push_row(&row);
+        }
+    }
+    ctx.produced(out.len())?;
+    Ok(out)
+}
+
+/// The call with the values of one binding of its input variables as constants. An
+/// unbound value leaves its variable to the lookup. `None` when no change can match,
+/// such as a literal in the predicate's place.
+fn bind(ctx: &Ctx, spec: &HistorySpec, key: &[Id]) -> Result<Option<HistorySpec>> {
+    let mut s = spec.clone();
+    s.inputs.clear();
+    for (v, k) in spec.inputs.iter().zip(key) {
+        if k.is_undef() {
+            continue;
+        }
+        let Some(t) = ctx.term(*k) else {
+            return Ok(None);
+        };
+        for slot in [&mut s.s, &mut s.p, &mut s.o, &mut s.g] {
+            if *slot == Slot::Var(*v) {
+                *slot = Slot::Const(t.clone());
+            }
+        }
+        if spec.from_var == Some(*v) {
+            s.from = Some(bound_term(&t, "from")?);
+            s.from_var = None;
+        }
+        if spec.to_var == Some(*v) {
+            s.to = Some(bound_term(&t, "to")?);
+            s.to_var = None;
+        }
+    }
+    if let Some(v) = s.from_var.or(s.to_var) {
+        return Err(bad(format!(
+            "?{} in hist:from or hist:to is unbound in a solution of the group",
+            ctx.var_name(v)
+        )));
+    }
+    let ok = match &s.p {
+        Slot::Const(t) => matches!(t, Term::NamedNode(_)),
+        _ => true,
+    } && !matches!(&s.g, Slot::Const(Term::Literal(_)))
+        && !matches!(&s.s, Slot::Const(Term::Literal(_)));
+    Ok(ok.then_some(s))
+}
+
+/// One lookup in the change log: the changes that match the call's constants, as rows
+/// of `vars`.
+fn lookup(ctx: &Ctx, spec: &HistorySpec, vars: &[VarId]) -> Result<Table> {
     let Some(log) = ctx.snap.change_log.as_ref() else {
         return Err(Error::HistoryUnsupported(
             "history queries need a store with a change log".into(),
@@ -458,7 +683,6 @@ pub(super) fn run(ctx: &Ctx, spec: &HistorySpec, vars: &[VarId]) -> Result<Table
             t.push_row(&row);
         }
     }
-    ctx.produced(t.len())?;
     Ok(t)
 }
 

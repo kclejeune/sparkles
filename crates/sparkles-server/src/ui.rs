@@ -1,5 +1,9 @@
 //! The SvelteKit UI (ui/build), embedded into the binary and served under /ui/.
 //!
+//! With `SPARKLES_UI_DIR` set to a UI build directory, the UI is read from there
+//! instead, at run time. The Nix package sets it to its UI build, so that a change to
+//! the UI rebuilds no Rust code.
+//!
 //! The build writes brotli and gzip siblings of the larger text assets
 //! (`ui/scripts/precompress.mjs`); they are served by `Accept-Encoding`, with
 //! `Content-Encoding` set so the response compression layer leaves them alone.
@@ -18,6 +22,42 @@ use crate::state::AppState;
 #[derive(rust_embed::RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/../../ui/build"]
 struct Assets;
+
+/// The directory the UI is read from instead of the embedded build
+/// (`SPARKLES_UI_DIR`), read once.
+fn ui_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::var_os("SPARKLES_UI_DIR")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .as_deref()
+}
+
+/// The bytes of the UI file at `path`, from [`ui_dir`] or the embedded build.
+fn asset(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
+    match ui_dir() {
+        Some(dir) => read_under(dir, path).map(std::borrow::Cow::Owned),
+        None => Assets::get(path).map(|f| f.data),
+    }
+}
+
+/// The file at the relative `path` under `dir`. Only plain names are followed, so no
+/// path leads out of the directory.
+fn read_under(dir: &std::path::Path, path: &str) -> Option<Vec<u8>> {
+    if path
+        .split('/')
+        .any(|c| c.is_empty() || c == "." || c == ".." || c.contains('\\'))
+    {
+        return None;
+    }
+    let p = dir.join(path);
+    if !p.is_file() {
+        return None;
+    }
+    std::fs::read(p).ok()
+}
 
 /// Whether `Accept-Encoding` allows `coding` (a q-value of 0 refuses it; `*` allows
 /// anything not listed).
@@ -47,10 +87,10 @@ fn accepts(headers: &HeaderMap, coding: &str) -> bool {
 }
 
 fn file(path: &str, headers: &HeaderMap, map_origin: Option<&str>) -> Option<Response> {
-    let f = Assets::get(path)?;
+    let f = asset(path)?;
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     let csp = if mime.essence_str() == "text/html" {
-        Some(page_csp(&f.data, map_origin))
+        Some(page_csp(&f, map_origin))
     } else if path.starts_with("_app/immutable/workers/") {
         Some(worker_csp(map_origin))
     } else {
@@ -64,7 +104,7 @@ fn file(path: &str, headers: &HeaderMap, map_origin: Option<&str>) -> Option<Res
     let mut encoded = None;
     let mut varies = false;
     for (coding, ext) in [("br", "br"), ("gzip", "gz")] {
-        let Some(c) = Assets::get(&format!("{path}.{ext}")) else {
+        let Some(c) = asset(&format!("{path}.{ext}")) else {
             continue;
         };
         varies = true;
@@ -79,7 +119,7 @@ fn file(path: &str, headers: &HeaderMap, map_origin: Option<&str>) -> Option<Res
                 (header::CACHE_CONTROL, cache.to_string()),
                 (header::CONTENT_ENCODING, coding.to_string()),
             ],
-            c.data.into_owned(),
+            c.into_owned(),
         )
             .into_response(),
         None => (
@@ -87,7 +127,7 @@ fn file(path: &str, headers: &HeaderMap, map_origin: Option<&str>) -> Option<Res
                 (header::CONTENT_TYPE, mime.as_ref().to_string()),
                 (header::CACHE_CONTROL, cache.to_string()),
             ],
-            f.data.into_owned(),
+            f.into_owned(),
         )
             .into_response(),
     };
@@ -310,6 +350,28 @@ mod tests {
             "https://exa mple.com/",
         ] {
             assert!(map_style_origin(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_ui_directory_serves_plain_paths_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("_app")).unwrap();
+        std::fs::write(dir.path().join("_app/x.js"), b"go()").unwrap();
+        std::fs::write(dir.path().join("index.html"), b"<p>").unwrap();
+        assert_eq!(read_under(dir.path(), "_app/x.js").unwrap(), b"go()");
+        assert_eq!(read_under(dir.path(), "index.html").unwrap(), b"<p>");
+        for bad in [
+            "",
+            "_app",
+            "_app/",
+            "../index.html",
+            "_app/../index.html",
+            "./index.html",
+            "_app\\x.js",
+            "missing.js",
+        ] {
+            assert!(read_under(dir.path(), bad).is_none(), "{bad}");
         }
     }
 

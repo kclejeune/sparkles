@@ -194,6 +194,68 @@ fn languages_are_configured_per_index() {
     assert_eq!(hits(&s, "\"run\" \"lang:en\""), ["a", "b", "d"]);
 }
 
+const CJK_DATA: &str = r#"
+@prefix ex: <http://example.org/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:tokyo rdfs:label "東京都は日本の首都です"@ja .
+ex:kyoto rdfs:label "京都は古い都です"@ja .
+ex:coffee rdfs:label "コーヒーを飲む"@ja .
+ex:beijing rdfs:label "北京是中国的首都"@zh .
+ex:seoul rdfs:label "서울특별시는 한국의 수도"@ko .
+ex:wide rdfs:label "ＡＢＣ食品"@ja .
+ex:kana rdfs:label "ｶﾞｲﾄﾞﾌﾞｯｸ"@ja .
+"#;
+
+#[test]
+fn cjk_text_is_searched_by_bigrams() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        CJK_DATA.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.enable_text(langs(&["zh", "ja", "ko"])).unwrap();
+    assert_eq!(
+        s.text_status().unwrap().config.languages,
+        serde_json::from_str::<TextConfig>(
+            r#"{"languages": {"ja": "cjk", "ko": "cjk", "zh": "cjk"}}"#
+        )
+        .unwrap()
+        .languages
+    );
+    // a word is the OR of its bigrams, so 東京都 also finds 京都
+    assert_eq!(hits(&s, "\"東京都\" \"lang:ja\""), ["kyoto", "tokyo"]);
+    // a phrase keeps the bigrams in order
+    assert_eq!(hits(&s, "'\\\"東京都\\\"' \"lang:ja\""), ["tokyo"]);
+    assert_eq!(hits(&s, "\"首都\" \"lang:ja\""), ["tokyo"]);
+    assert_eq!(hits(&s, "\"首都\" \"lang:zh\""), ["beijing"]);
+    assert_eq!(hits(&s, "\"コーヒー\" \"lang:ja\""), ["coffee"]);
+    assert_eq!(hits(&s, "\"서울\"@ko"), ["seoul"]);
+    // full-width letters and half-width Katakana are folded on both sides
+    assert_eq!(hits(&s, "\"abc\" \"lang:ja\""), ["wide"]);
+    assert_eq!(hits(&s, "\"ガイド\" \"lang:ja\""), ["kana"]);
+    // without a language, the standard analyzer keeps a run of CJK text as one word
+    assert_eq!(hits(&s, "\"首都\""), Vec::<String>::new());
+    // "all" names the stemmed languages and leaves CJK out
+    let all = TextConfig {
+        languages: Languages::All,
+        ..Default::default()
+    };
+    assert!(
+        all.languages
+            .resolve()
+            .iter()
+            .all(|(_, a)| *a != Analyzer::Cjk)
+    );
+    // the analyzer can be named for another tag
+    let cfg: TextConfig = serde_json::from_str(r#"{"languages": {"yue": "cjk"}}"#).unwrap();
+    assert_eq!(
+        cfg.languages.resolve(),
+        [("yue".to_string(), Analyzer::Cjk)]
+    );
+}
+
 #[test]
 fn stemmed_fields_persist_and_follow_updates() {
     let tmp = tempfile::tempdir().unwrap();

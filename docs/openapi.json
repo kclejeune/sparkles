@@ -938,11 +938,275 @@
         "type": "object"
       },
       "Backup": {
-        "additionalProperties": true,
         "description": "A backup: the summary plus its manifest's files, blobs and upload statistics.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-types"
         },
+        "properties": {
+          "addedBytes": {
+            "type": "integer"
+          },
+          "commit": {
+            "properties": {
+              "quads": {
+                "type": "integer"
+              },
+              "ref": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "timestamp": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "seq",
+              "timestamp",
+              "quads",
+              "ref"
+            ],
+            "type": "object"
+          },
+          "completed": {
+            "type": "string"
+          },
+          "created": {
+            "type": "string"
+          },
+          "dataset": {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "persistent",
+                  "mem"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "id",
+              "type"
+            ],
+            "type": "object"
+          },
+          "derived": {
+            "properties": {
+              "text": {
+                "oneOf": [
+                  {
+                    "properties": {
+                      "rebuildOnRestore": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "rebuildOnRestore"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "files": {
+            "items": {
+              "properties": {
+                "blobs": {
+                  "items": {
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "size": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "size"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "kind": {
+                  "enum": [
+                    "immutable",
+                    "append",
+                    "meta"
+                  ],
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "size": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path",
+                "kind",
+                "size",
+                "sha256",
+                "blobs"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "format": {
+            "type": "integer"
+          },
+          "generation": {
+            "type": "string"
+          },
+          "indexFormat": {
+            "type": "integer"
+          },
+          "logicalBytes": {
+            "type": "integer"
+          },
+          "millis": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "policy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository": {
+            "type": "string"
+          },
+          "run": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sameLineage": {
+            "type": "boolean"
+          },
+          "server": {
+            "properties": {
+              "version": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "version"
+            ],
+            "type": "object"
+          },
+          "stats": {
+            "properties": {
+              "addedBytes": {
+                "type": "integer"
+              },
+              "blobs": {
+                "type": "integer"
+              },
+              "files": {
+                "type": "integer"
+              },
+              "logicalBytes": {
+                "type": "integer"
+              },
+              "newBlobs": {
+                "type": "integer"
+              },
+              "reusedBlobs": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "verified": {
+            "oneOf": [
+              {
+                "properties": {
+                  "at": {
+                    "type": "string"
+                  },
+                  "level": {
+                    "enum": [
+                      "exists",
+                      "data",
+                      "restore"
+                    ],
+                    "type": "string"
+                  },
+                  "status": {
+                    "enum": [
+                      "ok",
+                      "error"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "level",
+                  "status",
+                  "at"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "repository",
+          "dataset",
+          "commit",
+          "created",
+          "completed",
+          "millis",
+          "logicalBytes",
+          "addedBytes",
+          "policy",
+          "run",
+          "note",
+          "verified",
+          "format",
+          "generation",
+          "files"
+        ],
         "type": "object"
       },
       "BackupFiles": {
@@ -954,12 +1218,54 @@
         "type": "object"
       },
       "BackupList": {
-        "additionalProperties": true,
-        "description": "`{backups: BackupSummary[], next}` or, per dataset, `{dataset, datasetId, backups}`.",
+        "anyOf": [
+          {
+            "properties": {
+              "backups": {
+                "items": {
+                  "$ref": "#/components/schemas/BackupSummary"
+                },
+                "type": "array"
+              },
+              "next": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "backups"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "backups": {
+                "items": {
+                  "$ref": "#/components/schemas/BackupSummary"
+                },
+                "type": "array"
+              },
+              "dataset": {
+                "type": "string"
+              },
+              "datasetId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "dataset",
+              "datasetId",
+              "backups"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "A page of backups, or a dataset's backups in every repository.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-routes"
-        },
-        "type": "object"
+        }
       },
       "BackupRequest": {
         "additionalProperties": true,
@@ -967,6 +1273,153 @@
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-routes"
         },
+        "type": "object"
+      },
+      "BackupSummary": {
+        "description": "A backup as listings give it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-types"
+        },
+        "properties": {
+          "addedBytes": {
+            "type": "integer"
+          },
+          "commit": {
+            "properties": {
+              "quads": {
+                "type": "integer"
+              },
+              "ref": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "timestamp": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "seq",
+              "timestamp",
+              "quads",
+              "ref"
+            ],
+            "type": "object"
+          },
+          "completed": {
+            "type": "string"
+          },
+          "created": {
+            "type": "string"
+          },
+          "dataset": {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "persistent",
+                  "mem"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "id",
+              "type"
+            ],
+            "type": "object"
+          },
+          "logicalBytes": {
+            "type": "integer"
+          },
+          "millis": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "policy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository": {
+            "type": "string"
+          },
+          "run": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sameLineage": {
+            "type": "boolean"
+          },
+          "verified": {
+            "oneOf": [
+              {
+                "properties": {
+                  "at": {
+                    "type": "string"
+                  },
+                  "level": {
+                    "enum": [
+                      "exists",
+                      "data",
+                      "restore"
+                    ],
+                    "type": "string"
+                  },
+                  "status": {
+                    "enum": [
+                      "ok",
+                      "error"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "level",
+                  "status",
+                  "at"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "repository",
+          "dataset",
+          "commit",
+          "created",
+          "completed",
+          "millis",
+          "logicalBytes",
+          "addedBytes",
+          "policy",
+          "run",
+          "note",
+          "verified"
+        ],
         "type": "object"
       },
       "BudgetError": {
@@ -2064,10 +2517,69 @@
         "type": "object"
       },
       "GeoConfig": {
-        "additionalProperties": true,
         "description": "The spatial index's configuration.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#geosparql"
+        },
+        "properties": {
+          "distance": {
+            "enum": [
+              "geodesic",
+              "haversine"
+            ],
+            "type": "string"
+          },
+          "featureLinks": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "formatVersion": {
+            "type": "integer"
+          },
+          "graphs": {
+            "properties": {
+              "exclude": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "include": {
+                "oneOf": [
+                  {
+                    "const": "all"
+                  },
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "maxGeometryBytes": {
+            "type": "integer"
+          },
+          "maxVertices": {
+            "type": "integer"
+          },
+          "predicates": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "queryRewrite": {
+            "type": "boolean"
+          },
+          "wgs84": {
+            "type": "boolean"
+          }
         },
         "type": "object"
       },
@@ -2088,19 +2600,304 @@
         "type": "object"
       },
       "GeoStatus": {
-        "additionalProperties": true,
+        "anyOf": [
+          {
+            "properties": {
+              "enabled": {
+                "const": false
+              }
+            },
+            "required": [
+              "enabled"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "commit": {
+                "type": "integer"
+              },
+              "config": {
+                "$ref": "#/components/schemas/GeoConfig"
+              },
+              "crs": {
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "description": "Literals per CRS IRI.",
+                "type": "object"
+              },
+              "enabled": {
+                "const": true
+              },
+              "files": {
+                "properties": {
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "opened": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "bytes",
+                  "opened"
+                ],
+                "type": "object"
+              },
+              "formatVersion": {
+                "type": "integer"
+              },
+              "generation": {
+                "type": "string"
+              },
+              "lastBuild": {
+                "properties": {
+                  "at": {
+                    "type": "string"
+                  },
+                  "ms": {
+                    "type": "number"
+                  },
+                  "rows": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "at",
+                  "ms"
+                ],
+                "type": "object"
+              },
+              "literals": {
+                "type": "integer"
+              },
+              "memory": {
+                "properties": {
+                  "budgetBytes": {
+                    "type": "integer"
+                  },
+                  "geometryBytes": {
+                    "type": "integer"
+                  },
+                  "mappedBytes": {
+                    "type": "integer"
+                  },
+                  "overlayBytes": {
+                    "type": "integer"
+                  },
+                  "treeBytes": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "treeBytes",
+                  "geometryBytes",
+                  "overlayBytes",
+                  "budgetBytes"
+                ],
+                "type": "object"
+              },
+              "message": {
+                "type": "string"
+              },
+              "progress": {
+                "type": "number"
+              },
+              "rows": {
+                "properties": {
+                  "base": {
+                    "type": "integer"
+                  },
+                  "overlay": {
+                    "type": "integer"
+                  },
+                  "tail": {
+                    "type": "integer"
+                  },
+                  "wgs84": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "base",
+                  "overlay",
+                  "tail"
+                ],
+                "type": "object"
+              },
+              "skipped": {
+                "properties": {
+                  "empty": {
+                    "type": "integer"
+                  },
+                  "malformed": {
+                    "type": "integer"
+                  },
+                  "tooLarge": {
+                    "type": "integer"
+                  },
+                  "unknownCrs": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "malformed",
+                  "unknownCrs",
+                  "tooLarge",
+                  "empty"
+                ],
+                "type": "object"
+              },
+              "state": {
+                "enum": [
+                  "ready",
+                  "building",
+                  "failed",
+                  "over-budget"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "enabled",
+              "state",
+              "generation",
+              "commit",
+              "rows",
+              "literals",
+              "skipped",
+              "crs",
+              "memory",
+              "config",
+              "formatVersion"
+            ],
+            "type": "object"
+          }
+        ],
         "description": "The spatial index's configuration and state, or `{enabled: false}`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#geosparql"
-        },
-        "type": "object"
+        }
       },
       "HistoryChanges": {
-        "additionalProperties": true,
-        "description": "`{dataset, datasetId, head, from, to, truncated, changes: [{op, subject, predicate, object, graph, commit, timestamp, kind, author?, message?}], unrecorded: [{from, to, reason}]}`",
+        "description": "The recorded changes that match a history query, in N-Triples syntax.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#history-queries"
         },
+        "properties": {
+          "changes": {
+            "items": {
+              "properties": {
+                "author": {
+                  "type": "string"
+                },
+                "commit": {
+                  "type": "integer"
+                },
+                "graph": {
+                  "description": "`null` for the default graph.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "object": {
+                  "type": "string"
+                },
+                "op": {
+                  "enum": [
+                    "add",
+                    "remove"
+                  ],
+                  "type": "string"
+                },
+                "predicate": {
+                  "type": "string"
+                },
+                "subject": {
+                  "type": "string"
+                },
+                "timestamp": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "subject",
+                "predicate",
+                "object",
+                "graph",
+                "commit",
+                "timestamp",
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "unrecorded": {
+            "items": {
+              "properties": {
+                "from": {
+                  "type": "integer"
+                },
+                "reason": {
+                  "enum": [
+                    "before-log",
+                    "bulk",
+                    "gap"
+                  ],
+                  "type": "string"
+                },
+                "to": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "from",
+                "to",
+                "reason"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "datasetId",
+          "head",
+          "from",
+          "to",
+          "truncated",
+          "changes",
+          "unrecorded"
+        ],
         "type": "object"
       },
       "HistoryRequest": {
@@ -2112,11 +2909,287 @@
         "type": "object"
       },
       "HistoryStatus": {
-        "additionalProperties": true,
-        "description": "The retention window, the kept generations and the history cache.",
+        "description": "The retention window, the kept generations, the change log and the history cache.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#named-snapshots-and-retention"
         },
+        "properties": {
+          "bytes": {
+            "description": "Disk of the kept generations that are not current.",
+            "type": "integer"
+          },
+          "cache": {
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "entries": {
+                "type": "integer"
+              },
+              "hits": {
+                "type": "integer"
+              },
+              "materializations": {
+                "type": "integer"
+              },
+              "misses": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "entries",
+              "bytes",
+              "hits",
+              "misses",
+              "materializations"
+            ],
+            "type": "object"
+          },
+          "catalog": {
+            "properties": {
+              "firstRetained": {
+                "type": "integer"
+              },
+              "keepAge": {
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ]
+              },
+              "keepCommits": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "firstRetained"
+            ],
+            "type": "object"
+          },
+          "changeLog": {
+            "oneOf": [
+              {
+                "properties": {
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "first": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "last": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "maxBytes": {
+                    "type": "integer"
+                  },
+                  "pending": {
+                    "type": "integer"
+                  },
+                  "segments": {
+                    "type": "integer"
+                  },
+                  "settings": {
+                    "properties": {
+                      "enabled": {
+                        "type": [
+                          "boolean",
+                          "null"
+                        ]
+                      },
+                      "keepAge": {
+                        "type": [
+                          "string",
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "keepCommits": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "maxBytes": {
+                        "type": [
+                          "integer",
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "enabled",
+                  "segments",
+                  "bytes",
+                  "pending",
+                  "maxBytes",
+                  "settings"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "generations": {
+            "items": {
+              "properties": {
+                "baseSeq": {
+                  "type": "integer"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "current": {
+                  "type": "boolean"
+                },
+                "endSeq": {
+                  "type": "integer"
+                },
+                "heldBy": {
+                  "description": "`head`, `snapshot:NAME` or `retention`.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "baseSeq",
+                "endSeq",
+                "bytes",
+                "current",
+                "heldBy"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "oldestReconstructable": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reconstructable": {
+            "items": {
+              "properties": {
+                "from": {
+                  "type": "integer"
+                },
+                "to": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "from",
+                "to"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "retention": {
+            "properties": {
+              "keepAge": {
+                "description": "`7d`, or seconds.",
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ]
+              },
+              "keepCommits": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "maxBytes": {
+                "description": "A number, or `10GiB` in a PUT.",
+                "type": [
+                  "integer",
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "schedules": {
+            "items": {
+              "properties": {
+                "every": {
+                  "type": "string"
+                },
+                "keepLast": {
+                  "type": "integer"
+                },
+                "prefix": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "prefix",
+                "every",
+                "keepLast"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "snapshots": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "dataset",
+          "datasetId",
+          "head",
+          "reconstructable",
+          "bytes",
+          "generations",
+          "retention",
+          "schedules",
+          "snapshots",
+          "catalog",
+          "cache"
+        ],
         "type": "object"
       },
       "Level": {
@@ -2234,11 +3307,71 @@
         "type": "object"
       },
       "NamedSnapshot": {
-        "additionalProperties": true,
         "description": "A named snapshot: the commit it pins and its expiry.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#named-snapshots-and-retention"
         },
+        "properties": {
+          "commit": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Commit"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created": {
+            "type": "string"
+          },
+          "expires": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reconstructable": {
+            "type": "boolean"
+          },
+          "ref": {
+            "description": "`snapshot:NAME`.",
+            "type": "string"
+          },
+          "seq": {
+            "type": "integer"
+          },
+          "warm": {
+            "description": "Kept materialized.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "ref",
+          "seq",
+          "commit",
+          "created",
+          "expires",
+          "note",
+          "reconstructable",
+          "warm"
+        ],
         "type": "object"
       },
       "OAuthError": {
@@ -2652,11 +3785,236 @@
         "type": "object"
       },
       "ReasoningStatus": {
-        "additionalProperties": true,
         "description": "The materialized inferences of a dataset and whether they are current.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reasoning-status-and-diagnostics"
         },
+        "properties": {
+          "at": {
+            "description": "When the run finished.",
+            "type": "string"
+          },
+          "auto": {
+            "properties": {
+              "debounceSeconds": {
+                "type": "number"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "maxDelaySeconds": {
+                "type": "number"
+              },
+              "scheduledAt": {
+                "type": "string"
+              },
+              "source": {
+                "enum": [
+                  "server",
+                  "dataset"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "enabled",
+              "source"
+            ],
+            "type": "object"
+          },
+          "commit": {
+            "description": "The commit the inferences were materialized at.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "commitsSince": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "fetchedImports": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "geoDefaultGeometry": {
+            "const": true
+          },
+          "head": {
+            "type": "integer"
+          },
+          "imports": {
+            "items": {
+              "properties": {
+                "graph": {
+                  "type": "string"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "location": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "iri"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "inferred": {
+            "type": "integer"
+          },
+          "inputGraphs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "inputs": {
+            "properties": {
+              "dataGraphs": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "imports": {
+                "enum": [
+                  "none",
+                  "dataset",
+                  "fetch"
+                ],
+                "type": "string"
+              },
+              "locationMapping": {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "ontologyGraphs": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "dataGraphs",
+              "imports"
+            ],
+            "type": "object"
+          },
+          "profile": {
+            "examples": [
+              "rdfs",
+              "rdfs-simple",
+              "owl-rl",
+              "rules"
+            ],
+            "type": "string"
+          },
+          "run": {
+            "properties": {
+              "changes": {
+                "properties": {
+                  "checked": {
+                    "type": "integer"
+                  },
+                  "derived": {
+                    "type": "integer"
+                  },
+                  "explicitAdded": {
+                    "type": "integer"
+                  },
+                  "explicitRemoved": {
+                    "type": "integer"
+                  },
+                  "removed": {
+                    "type": "integer"
+                  },
+                  "source": {
+                    "enum": [
+                      "memory",
+                      "store"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "fallback": {
+                "type": "string"
+              },
+              "inferredAdded": {
+                "type": "integer"
+              },
+              "inferredRemoved": {
+                "type": "integer"
+              },
+              "method": {
+                "enum": [
+                  "full",
+                  "incremental"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "method",
+              "inferredAdded",
+              "inferredRemoved"
+            ],
+            "type": "object"
+          },
+          "stale": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "staleReason": {
+            "type": "string"
+          },
+          "vocabularies": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "watchedGraphs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "profile",
+          "inferred",
+          "at",
+          "commit",
+          "head",
+          "stale",
+          "commitsSince",
+          "auto",
+          "warnings"
+        ],
         "type": "object"
       },
       "RecallReport": {
@@ -2691,27 +4049,356 @@
         "type": "object"
       },
       "Repository": {
-        "additionalProperties": true,
-        "description": "A backup repository with its totals.",
+        "description": "A backup repository with its settings, status and totals.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-types"
         },
+        "properties": {
+          "allowHttp": {
+            "type": "boolean"
+          },
+          "bucket": {
+            "type": "string"
+          },
+          "conditionalWrites": {
+            "type": "boolean"
+          },
+          "credentials": {
+            "description": "Where the credentials come from. Sparkles stores no secrets.",
+            "properties": {
+              "accessKeyIdVar": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "secretAccessKeyVar": {
+                "type": "string"
+              },
+              "sessionTokenVar": {
+                "type": "string"
+              },
+              "source": {
+                "enum": [
+                  "default",
+                  "env",
+                  "file",
+                  "named"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "source"
+            ],
+            "type": "object"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kmsKeyId": {
+            "type": "string"
+          },
+          "lastGc": {
+            "additionalProperties": true,
+            "description": "The last garbage collection's report, with `finished`.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "maxConcurrency": {
+            "type": "integer"
+          },
+          "maxDownloadBytesPerSec": {
+            "type": "integer"
+          },
+          "maxUploadBytesPerSec": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "pathStyle": {
+            "type": "boolean"
+          },
+          "policies": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "readonly": {
+            "type": "boolean"
+          },
+          "region": {
+            "type": "string"
+          },
+          "source": {
+            "description": "`config`: from `--backup-config`, read-only through the API.",
+            "enum": [
+              "api",
+              "config"
+            ],
+            "type": "string"
+          },
+          "sse": {
+            "enum": [
+              "AES256",
+              "aws:kms"
+            ],
+            "type": "string"
+          },
+          "stats": {
+            "oneOf": [
+              {
+                "properties": {
+                  "asOf": {
+                    "type": "string"
+                  },
+                  "backups": {
+                    "type": "integer"
+                  },
+                  "datasets": {
+                    "type": "integer"
+                  },
+                  "dedupRatio": {
+                    "type": "number"
+                  },
+                  "logicalBytes": {
+                    "type": "integer"
+                  },
+                  "storedBytes": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "backups",
+                  "datasets",
+                  "storedBytes",
+                  "logicalBytes",
+                  "dedupRatio",
+                  "asOf"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "properties": {
+              "checked": {
+                "type": "string"
+              },
+              "conditionalWrites": {
+                "type": "boolean"
+              },
+              "error": {
+                "type": "string"
+              },
+              "reachable": {
+                "type": "boolean"
+              },
+              "singleWriter": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "reachable",
+              "checked",
+              "singleWriter"
+            ],
+            "type": "object"
+          },
+          "test": {
+            "$ref": "#/components/schemas/TestReport"
+          },
+          "type": {
+            "enum": [
+              "fs",
+              "s3",
+              "gcs",
+              "azure"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type",
+          "source",
+          "id",
+          "status",
+          "stats",
+          "lastGc",
+          "policies"
+        ],
         "type": "object"
       },
       "RepositoryConfig": {
-        "additionalProperties": true,
         "description": "A repository's settings: name, type, location and limits.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-types"
         },
+        "properties": {
+          "allowHttp": {
+            "type": "boolean"
+          },
+          "bucket": {
+            "type": "string"
+          },
+          "conditionalWrites": {
+            "type": "boolean"
+          },
+          "credentials": {
+            "description": "Where the credentials come from. Sparkles stores no secrets.",
+            "properties": {
+              "accessKeyIdVar": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "secretAccessKeyVar": {
+                "type": "string"
+              },
+              "sessionTokenVar": {
+                "type": "string"
+              },
+              "source": {
+                "enum": [
+                  "default",
+                  "env",
+                  "file",
+                  "named"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "source"
+            ],
+            "type": "object"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "kmsKeyId": {
+            "type": "string"
+          },
+          "maxConcurrency": {
+            "type": "integer"
+          },
+          "maxDownloadBytesPerSec": {
+            "type": "integer"
+          },
+          "maxUploadBytesPerSec": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "pathStyle": {
+            "type": "boolean"
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "readonly": {
+            "type": "boolean"
+          },
+          "region": {
+            "type": "string"
+          },
+          "sse": {
+            "enum": [
+              "AES256",
+              "aws:kms"
+            ],
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "fs",
+              "s3",
+              "gcs",
+              "azure"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ],
         "type": "object"
       },
       "RepositoryList": {
-        "additionalProperties": true,
-        "description": "`{repositories: (Repository | RepositoryBrief)[]}`",
+        "description": "The repositories, in full or in brief.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-routes"
         },
+        "properties": {
+          "repositories": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/Repository"
+                },
+                {
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "reachable": {
+                      "type": "boolean"
+                    },
+                    "readonly": {
+                      "type": "boolean"
+                    },
+                    "type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "type",
+                    "readonly",
+                    "reachable"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "repositories"
+        ],
         "type": "object"
       },
       "RestoreRequest": {
@@ -2896,11 +4583,33 @@
         "type": "object"
       },
       "SnapshotList": {
-        "additionalProperties": true,
-        "description": "`{dataset, datasetId, head, snapshots: NamedSnapshot[]}`",
+        "description": "A dataset's named snapshots.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#named-snapshots-and-retention"
         },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "snapshots": {
+            "items": {
+              "$ref": "#/components/schemas/NamedSnapshot"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "datasetId",
+          "head",
+          "snapshots"
+        ],
         "type": "object"
       },
       "SnapshotRequest": {
@@ -3044,19 +4753,169 @@
         "type": "object"
       },
       "StoredQuery": {
-        "additionalProperties": true,
-        "description": "A stored query definition: `query`, `description`, `parameters`, `results`, `mcp`, and on reads `name`, `dataset`, `kind` and `version`.",
+        "description": "A stored query definition. A PUT sends `query` and the optional members, and reads add `name`, `dataset`, `kind` and `version`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-queries"
         },
+        "properties": {
+          "changed": {
+            "description": "On a PUT: whether a new version was stored.",
+            "type": "boolean"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "SELECT",
+              "ASK",
+              "CONSTRUCT",
+              "DESCRIBE"
+            ],
+            "type": "string"
+          },
+          "mcp": {
+            "description": "Whether the MCP server offers it as a tool.",
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "description": "The parameters by name, with their types and defaults.",
+            "type": "object"
+          },
+          "query": {
+            "type": "string"
+          },
+          "results": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "version": {
+            "properties": {
+              "author": {
+                "type": "string"
+              },
+              "created": {
+                "type": "string"
+              },
+              "datasetCommit": {
+                "type": "integer"
+              },
+              "digest": {
+                "description": "SHA-256 of the definition.",
+                "type": "string"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "version",
+              "created",
+              "digest"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "query"
+        ],
         "type": "object"
       },
       "StoredQueryList": {
-        "additionalProperties": true,
-        "description": "`{dataset, queries: [...]}`",
+        "description": "A dataset's stored queries, without their text.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-queries"
         },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "queries": {
+            "items": {
+              "properties": {
+                "changed": {
+                  "description": "On a PUT: whether a new version was stored.",
+                  "type": "boolean"
+                },
+                "dataset": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "SELECT",
+                    "ASK",
+                    "CONSTRUCT",
+                    "DESCRIBE"
+                  ],
+                  "type": "string"
+                },
+                "mcp": {
+                  "description": "Whether the MCP server offers it as a tool.",
+                  "type": "boolean"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "parameters": {
+                  "additionalProperties": true,
+                  "description": "The parameters by name, with their types and defaults.",
+                  "type": "object"
+                },
+                "results": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "version": {
+                  "properties": {
+                    "author": {
+                      "type": "string"
+                    },
+                    "created": {
+                      "type": "string"
+                    },
+                    "datasetCommit": {
+                      "type": "integer"
+                    },
+                    "digest": {
+                      "description": "SHA-256 of the definition.",
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "version",
+                    "created",
+                    "digest"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "version"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "queries"
+        ],
         "type": "object"
       },
       "StoredQueryVersions": {
@@ -3156,18 +5015,134 @@
         "type": "object"
       },
       "TestReport": {
-        "additionalProperties": true,
         "description": "The result of a repository's connection test.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-types"
         },
+        "properties": {
+          "conditionalWrites": {
+            "type": "boolean"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "steps": {
+            "items": {
+              "properties": {
+                "error": {
+                  "type": "string"
+                },
+                "millis": {
+                  "type": "integer"
+                },
+                "ok": {
+                  "type": "boolean"
+                },
+                "step": {
+                  "enum": [
+                    "create",
+                    "create-again",
+                    "read",
+                    "list",
+                    "delete"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "step",
+                "ok",
+                "millis"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "conditionalWrites",
+          "steps"
+        ],
         "type": "object"
       },
       "TextConfig": {
-        "additionalProperties": true,
         "description": "The full-text index's configuration.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#full-text-search"
+        },
+        "properties": {
+          "docstoreCompression": {
+            "enum": [
+              "zstd",
+              "lz4",
+              "none"
+            ],
+            "type": "string"
+          },
+          "graphs": {
+            "properties": {
+              "exclude": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "include": {
+                "oneOf": [
+                  {
+                    "const": "all"
+                  },
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "languages": {
+            "oneOf": [
+              {
+                "const": "all"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "A language tag's analyzer, such as `english` or `cjk`.",
+                "type": "object"
+              }
+            ]
+          },
+          "maxHits": {
+            "type": "integer"
+          },
+          "maxTextBytes": {
+            "type": "integer"
+          },
+          "predicates": {
+            "oneOf": [
+              {
+                "const": "all"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          }
         },
         "type": "object"
       },
@@ -3180,12 +5155,96 @@
         "type": "object"
       },
       "TextStatus": {
-        "additionalProperties": true,
+        "anyOf": [
+          {
+            "properties": {
+              "enabled": {
+                "const": false
+              }
+            },
+            "required": [
+              "enabled"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "config": {
+                "$ref": "#/components/schemas/TextConfig"
+              },
+              "diskBytes": {
+                "type": "integer"
+              },
+              "docs": {
+                "type": "integer"
+              },
+              "enabled": {
+                "const": true
+              },
+              "epoch": {
+                "type": "integer"
+              },
+              "formatVersion": {
+                "type": "integer"
+              },
+              "lastRebuild": {
+                "properties": {
+                  "at": {
+                    "type": "string"
+                  },
+                  "docs": {
+                    "type": "integer"
+                  },
+                  "ms": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "at",
+                  "ms"
+                ],
+                "type": "object"
+              },
+              "message": {
+                "type": "string"
+              },
+              "segments": {
+                "type": "integer"
+              },
+              "seq": {
+                "description": "The commit the index reflects.",
+                "type": "integer"
+              },
+              "state": {
+                "enum": [
+                  "ready",
+                  "stale"
+                ],
+                "type": "string"
+              },
+              "storeSeq": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "enabled",
+              "state",
+              "docs",
+              "seq",
+              "storeSeq",
+              "epoch",
+              "diskBytes",
+              "segments",
+              "config",
+              "formatVersion"
+            ],
+            "type": "object"
+          }
+        ],
         "description": "The full-text index's configuration and state, or `{enabled: false}`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#full-text-search"
-        },
-        "type": "object"
+        }
       },
       "TokenCreated": {
         "allOf": [
@@ -3392,20 +5451,276 @@
         "type": "object"
       },
       "ValidationConfig": {
-        "additionalProperties": true,
         "description": "A write-time validation configuration, SHACL or ShEx.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#write-time-validation"
         },
+        "properties": {
+          "baseline": {
+            "enum": [
+              "strict",
+              "grandfather"
+            ],
+            "type": "string"
+          },
+          "dataGraph": {
+            "oneOf": [
+              {
+                "enum": [
+                  "default",
+                  "union"
+                ],
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "format": {
+            "description": "2 when stored.",
+            "type": "integer"
+          },
+          "includeInferences": {
+            "type": "boolean"
+          },
+          "language": {
+            "enum": [
+              "shacl",
+              "shex"
+            ],
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "reject",
+              "warn",
+              "off"
+            ],
+            "type": "string"
+          },
+          "reportLimit": {
+            "type": "integer"
+          },
+          "schema": {
+            "additionalProperties": true,
+            "description": "ShEx: `{inline, format?, base?, source?}` or `{graphs, prefixes?, base?}`, stored with `file`, `format` and `sha256`.",
+            "type": "object"
+          },
+          "shapeMap": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "properties": {
+                    "node": {
+                      "type": "string"
+                    },
+                    "shape": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "node",
+                    "shape"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "shapes": {
+            "additionalProperties": true,
+            "description": "SHACL: `{graphs?, inline?, format?}`, stored with `file` and `sha256`.",
+            "type": "object"
+          },
+          "threshold": {
+            "enum": [
+              "violation",
+              "warning",
+              "info"
+            ],
+            "type": "string"
+          },
+          "timeoutSeconds": {
+            "type": "number"
+          },
+          "updated": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
         "type": "object"
       },
       "ValidationStatus": {
-        "additionalProperties": true,
-        "description": "`{language, config, status}`, or `{config: null}`.",
+        "anyOf": [
+          {
+            "properties": {
+              "config": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "config"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "config": {
+                "$ref": "#/components/schemas/ValidationConfig"
+              },
+              "language": {
+                "enum": [
+                  "shacl",
+                  "shex"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "properties": {
+                  "associations": {
+                    "type": "integer"
+                  },
+                  "baseline": {
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "blocking": {
+                            "type": "integer"
+                          },
+                          "bySeverity": {
+                            "properties": {
+                              "info": {
+                                "type": "integer"
+                              },
+                              "violation": {
+                                "type": "integer"
+                              },
+                              "warning": {
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "commit": {
+                            "type": "integer"
+                          },
+                          "conforms": {
+                            "type": "boolean"
+                          },
+                          "millis": {
+                            "type": "number"
+                          },
+                          "total": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "counters": {
+                    "properties": {
+                      "bypassed": {
+                        "type": "integer"
+                      },
+                      "passed": {
+                        "type": "integer"
+                      },
+                      "rejected": {
+                        "type": "integer"
+                      },
+                      "skipped": {
+                        "type": "integer"
+                      },
+                      "warned": {
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "incremental": {
+                    "properties": {
+                      "fullShapes": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "localShapes": {
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "lastCheck": {
+                    "additionalProperties": true,
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "lastFullMillis": {
+                    "type": "number"
+                  },
+                  "mode": {
+                    "enum": [
+                      "reject",
+                      "warn",
+                      "off"
+                    ],
+                    "type": "string"
+                  },
+                  "recentRejections": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "shapeCount": {
+                    "type": "integer"
+                  },
+                  "warnings": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "mode",
+                  "counters",
+                  "warnings",
+                  "recentRejections"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "language",
+              "config",
+              "status"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "`{language, config, status}`, or `{config: null}` without validation.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#write-time-validation"
-        },
-        "type": "object"
+        }
       },
       "ValidatorResult": {
         "additionalProperties": true,
@@ -3416,11 +5731,154 @@
         "type": "object"
       },
       "VectorIndexConfig": {
-        "additionalProperties": true,
         "description": "A vector index's configuration.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#vector-indexes"
         },
+        "properties": {
+          "dimension": {
+            "type": "integer"
+          },
+          "embedding": {
+            "properties": {
+              "apiKey": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "`{secret: NAME}`, or `{env}` and `{file}` locally.",
+                "type": "object"
+              },
+              "batchSize": {
+                "type": "integer"
+              },
+              "chunking": {
+                "properties": {
+                  "overlap": {
+                    "type": "integer"
+                  },
+                  "size": {
+                    "type": "integer"
+                  },
+                  "unit": {
+                    "enum": [
+                      "chars",
+                      "tokens"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "size"
+                ],
+                "type": "object"
+              },
+              "classes": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "combine": {
+                "type": "boolean"
+              },
+              "inputPrefix": {
+                "type": "string"
+              },
+              "languages": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "maxInputChars": {
+                "type": "integer"
+              },
+              "maxRetries": {
+                "type": "integer"
+              },
+              "model": {
+                "type": "string"
+              },
+              "predicates": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "query": {
+                "type": "string"
+              },
+              "queryPrefix": {
+                "type": "string"
+              },
+              "queryText": {
+                "type": "boolean"
+              },
+              "requestsPerMinute": {
+                "type": "integer"
+              },
+              "sendDimensions": {
+                "type": "boolean"
+              },
+              "timeoutSecs": {
+                "type": "number"
+              },
+              "tokensPerMinute": {
+                "type": "integer"
+              },
+              "url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "url",
+              "model"
+            ],
+            "type": "object"
+          },
+          "exactThreshold": {
+            "type": "integer"
+          },
+          "hnsw": {
+            "oneOf": [
+              {
+                "const": false
+              },
+              {
+                "properties": {
+                  "efConstruction": {
+                    "type": "integer"
+                  },
+                  "efSearch": {
+                    "type": "integer"
+                  },
+                  "m": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            ]
+          },
+          "metric": {
+            "enum": [
+              "cosine",
+              "dot",
+              "euclidean"
+            ],
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "predicate": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "predicate",
+          "dimension"
+        ],
         "type": "object"
       },
       "VectorIndexCreated": {
@@ -3432,19 +5890,459 @@
         "type": "object"
       },
       "VectorIndexStatus": {
-        "additionalProperties": true,
         "description": "One vector index: its configuration and state.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#vector-indexes"
         },
+        "properties": {
+          "dimension": {
+            "type": "integer"
+          },
+          "embedding": {
+            "properties": {
+              "appliedSeq": {
+                "type": "integer"
+              },
+              "backlog": {
+                "type": "integer"
+              },
+              "config": {
+                "properties": {
+                  "apiKey": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "`{secret: NAME}`, or `{env}` and `{file}` locally.",
+                    "type": "object"
+                  },
+                  "batchSize": {
+                    "type": "integer"
+                  },
+                  "chunking": {
+                    "properties": {
+                      "overlap": {
+                        "type": "integer"
+                      },
+                      "size": {
+                        "type": "integer"
+                      },
+                      "unit": {
+                        "enum": [
+                          "chars",
+                          "tokens"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "size"
+                    ],
+                    "type": "object"
+                  },
+                  "classes": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "combine": {
+                    "type": "boolean"
+                  },
+                  "inputPrefix": {
+                    "type": "string"
+                  },
+                  "languages": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "maxInputChars": {
+                    "type": "integer"
+                  },
+                  "maxRetries": {
+                    "type": "integer"
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "predicates": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "query": {
+                    "type": "string"
+                  },
+                  "queryPrefix": {
+                    "type": "string"
+                  },
+                  "queryText": {
+                    "type": "boolean"
+                  },
+                  "requestsPerMinute": {
+                    "type": "integer"
+                  },
+                  "sendDimensions": {
+                    "type": "boolean"
+                  },
+                  "timeoutSecs": {
+                    "type": "number"
+                  },
+                  "tokensPerMinute": {
+                    "type": "integer"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "url",
+                  "model"
+                ],
+                "type": "object"
+              },
+              "embedded": {
+                "type": "integer"
+              },
+              "endpoint": {
+                "type": "string"
+              },
+              "failed": {
+                "type": "integer"
+              },
+              "headSeq": {
+                "type": "integer"
+              },
+              "lastBatch": {
+                "properties": {
+                  "at": {
+                    "type": "string"
+                  },
+                  "inputs": {
+                    "type": "integer"
+                  },
+                  "ms": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "at",
+                  "inputs",
+                  "ms"
+                ],
+                "type": "object"
+              },
+              "lastError": {
+                "properties": {
+                  "at": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "subject": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "at",
+                  "message"
+                ],
+                "type": "object"
+              },
+              "model": {
+                "type": "string"
+              },
+              "requests": {
+                "type": "integer"
+              },
+              "retryAt": {
+                "type": "string"
+              },
+              "scan": {
+                "properties": {
+                  "done": {
+                    "type": "integer"
+                  },
+                  "total": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "done",
+                  "total"
+                ],
+                "type": "object"
+              },
+              "state": {
+                "enum": [
+                  "idle",
+                  "scanning",
+                  "embedding",
+                  "backoff",
+                  "paused",
+                  "disabled"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "model",
+              "endpoint",
+              "backlog",
+              "appliedSeq",
+              "headSeq"
+            ],
+            "type": "object"
+          },
+          "exactThreshold": {
+            "type": "integer"
+          },
+          "files": {
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "opened": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "bytes",
+              "opened"
+            ],
+            "type": "object"
+          },
+          "generation": {
+            "type": "string"
+          },
+          "hnsw": {
+            "oneOf": [
+              {
+                "properties": {
+                  "efConstruction": {
+                    "type": "integer"
+                  },
+                  "efSearch": {
+                    "type": "integer"
+                  },
+                  "layers": {
+                    "type": "integer"
+                  },
+                  "m": {
+                    "type": "integer"
+                  },
+                  "nodes": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lastBuild": {
+            "properties": {
+              "at": {
+                "type": "string"
+              },
+              "ms": {
+                "type": "number"
+              },
+              "rows": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "at",
+              "ms"
+            ],
+            "type": "object"
+          },
+          "memory": {
+            "properties": {
+              "hnswBytes": {
+                "type": "integer"
+              },
+              "residency": {
+                "enum": [
+                  "heap",
+                  "mmap"
+                ],
+                "type": "string"
+              },
+              "segmentBytes": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "segmentBytes",
+              "hnswBytes",
+              "residency"
+            ],
+            "type": "object"
+          },
+          "message": {
+            "type": "string"
+          },
+          "metric": {
+            "enum": [
+              "cosine",
+              "dot",
+              "euclidean"
+            ],
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "overlay": {
+            "properties": {
+              "deletes": {
+                "type": "integer"
+              },
+              "inserts": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "inserts",
+              "deletes"
+            ],
+            "type": "object"
+          },
+          "predicate": {
+            "type": "string"
+          },
+          "progress": {
+            "type": "number"
+          },
+          "rows": {
+            "type": "integer"
+          },
+          "skipped": {
+            "properties": {
+              "malformed": {
+                "type": "integer"
+              },
+              "wrongDimension": {
+                "type": "integer"
+              },
+              "zeroNorm": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "malformed",
+              "wrongDimension",
+              "zeroNorm"
+            ],
+            "type": "object"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "building",
+              "failed",
+              "over-budget"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "predicate",
+          "dimension",
+          "metric",
+          "state",
+          "generation",
+          "rows",
+          "overlay",
+          "skipped",
+          "memory",
+          "hnsw",
+          "exactThreshold"
+        ],
         "type": "object"
       },
       "VectorStatus": {
-        "additionalProperties": true,
-        "description": "`{budgetBytes, usedBytes, generation, indexes, predicates}`",
+        "description": "The vector indexes and the predicates packed without one.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#vector-indexes"
         },
+        "properties": {
+          "budgetBytes": {
+            "type": "integer"
+          },
+          "generation": {
+            "type": "string"
+          },
+          "indexes": {
+            "items": {
+              "$ref": "#/components/schemas/VectorIndexStatus"
+            },
+            "type": "array"
+          },
+          "predicates": {
+            "items": {
+              "properties": {
+                "bytes": {
+                  "type": "integer"
+                },
+                "dimensions": {
+                  "items": {
+                    "properties": {
+                      "dimension": {
+                        "type": "integer"
+                      },
+                      "vectors": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "dimension",
+                      "vectors"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "malformed": {
+                  "type": "integer"
+                },
+                "predicate": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "predicate",
+                "bytes",
+                "malformed",
+                "dimensions"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "usedBytes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "budgetBytes",
+          "usedBytes",
+          "generation",
+          "indexes",
+          "predicates"
+        ],
         "type": "object"
       },
       "VerifyRequest": {
@@ -3646,7 +6544,7 @@
     "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md"
   },
   "info": {
-    "description": "The HTTP API of Sparkles, a SPARQL server compatible with Apache Jena Fuseki. `docs/API.md` is the reference, and each operation links to its section.\n\n**Authentication.** Without `sparkles serve --auth-config` the server needs no credentials, and every caller may do everything. With it, each operation lists the schemes it accepts, and `x-sparkles-permission` names the permission it needs: `public`, `any caller`, `signed in`, `web session`, a dataset level (`read`, `write`, `admin`) or a server permission (`metrics`, `federate`, `server-admin`). A caller without a level on a dataset gets `404`, as for a missing dataset. Session and proxy principals send `X-Sparkles-CSRF` on unsafe requests. Trusted proxy headers are honored only from configured proxies and are not listed as schemes.\n\n**Errors.** Every non-2xx response has the `Error` body, with the `requestId` of the response's `X-Request-Id`. A budget error (`507`) adds `budget`, `limit` and `requested`.\n\n**Pagination.** Listings that page say so in `x-sparkles-pagination`. Schema listings take `limit` and an opaque `cursor` and answer `{items, total, next}`. Commit listings take `limit` with `before` or `after`. Backup listings take `limit` and `before`. A null `next` ends the listing.\n\n**Conditional requests.** Graph Store reads carry a weak `ETag` naming the commit read. `If-Match` and `If-None-Match` make writes conditional, and a failed condition answers `412`. Responses of queries and writes carry `Sparkles-Commit` and `Sparkles-Dataset-Id`.\n\n**Coverage.** Every route of the server is described with its methods, parameters and media types. The common bodies are described member by member. Some admin bodies (backups, index status, reasoning, validation, history) are open objects that link to their section of the reference.",
+    "description": "The HTTP API of Sparkles, a SPARQL server compatible with Apache Jena Fuseki. `docs/API.md` is the reference, and each operation links to its section.\n\n**Authentication.** Without `sparkles serve --auth-config` the server needs no credentials, and every caller may do everything. With it, each operation lists the schemes it accepts, and `x-sparkles-permission` names the permission it needs: `public`, `any caller`, `signed in`, `web session`, a dataset level (`read`, `write`, `admin`) or a server permission (`metrics`, `federate`, `server-admin`). A caller without a level on a dataset gets `404`, as for a missing dataset. Session and proxy principals send `X-Sparkles-CSRF` on unsafe requests. Trusted proxy headers are honored only from configured proxies and are not listed as schemes.\n\n**Errors.** Every non-2xx response has the `Error` body, with the `requestId` of the response's `X-Request-Id`. A budget error (`507`) adds `budget`, `limit` and `requested`.\n\n**Pagination.** Listings that page say so in `x-sparkles-pagination`. Schema listings take `limit` and an opaque `cursor` and answer `{items, total, next}`. Commit listings take `limit` with `before` or `after`. Backup listings take `limit` and `before`. A null `next` ends the listing.\n\n**Conditional requests.** Graph Store reads carry a weak `ETag` naming the commit read. `If-Match` and `If-None-Match` make writes conditional, and a failed condition answers `412`. Responses of queries and writes carry `Sparkles-Commit` and `Sparkles-Dataset-Id`.\n\n**Coverage.** Every route of the server is described with its methods, parameters and media types. The common bodies are described member by member, and so are the admin bodies of history, stored queries, the search indexes, reasoning, validation and backups. The other admin bodies (diffs, the change feed, write previews, backup policies) are open objects that link to their section of the reference.",
     "license": {
       "identifier": "Apache-2.0",
       "name": "Apache-2.0"

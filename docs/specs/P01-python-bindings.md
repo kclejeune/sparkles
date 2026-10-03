@@ -783,8 +783,8 @@ and inputs:
 * `RdfFormat` names Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON, and `load`,
   `load_files`, `dump`, `parse`, `serialize` and `QueryTriples.serialize` read and write
   them. Their reader and writer moved from the server crate into the core crate as
-  `sparkles::jena_formats`. An input in one of them is converted to N-Quads in memory
-  before it is parsed, so such a load does not stream.
+  `sparkles::jena_formats`. An input in one of them was converted to N-Quads in memory
+  before it was parsed. It streams since a later change, described below.
 * `Dataset.load` reads CSV and TSV tables with the mapping of spec
   [C05](C05-tabular-imports.md), through `mapping`, `template`, `key` and `base_iri`.
 * The query methods of datasets and transactions take `describe`, a DESCRIBE mode or a
@@ -793,3 +793,18 @@ and inputs:
 
 `tests/test_formats_tables_describe.py` covers the three, and the stub test checks the
 new names and arguments.
+
+A later change made the inputs in Jena's syntaxes stream. The engine's reader runs on a
+thread of its own and writes N-Quads to a pipe. `parse` and a file object's `load` parse
+them from the pipe as they arrive, so the first quads come before the input has been
+read and a syntax error ends the iteration. `load` from a path or from bytes, and
+`load_files`, keep the bulk loader. The reader writes the N-Quads to a temporary file in
+the system's temporary directory, which the loader reads and the binding removes when
+the load ends. TriX, RDF Thrift and RDF Protobuf stream, and RDF/JSON's reader reads its
+whole document first. Bytes given as input are copied once, as for the other syntaxes.
+A parse of 400,000 quads from an RDF Thrift file (34 MB as N-Quads) raised the process's
+peak memory by 3 MiB, where the earlier conversion held the input and all of its
+N-Quads. The tests check that a file object streams in each binary syntax and TriX, that
+a truncated stream fails as a syntax error, and, in a child process with its own
+`TMPDIR`, that parsing a large RDF Thrift file grows the peak memory by less than a
+quarter of the N-Quads' size and that a load removes its temporary file.

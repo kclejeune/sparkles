@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import gzip
 import io
+import os
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -77,6 +81,91 @@ def test_rdf_json_holds_the_default_graph() -> None:
     assert Dataset().load(io.BytesIO(rj), RdfFormat.RDF_JSON) == 2
     with pytest.raises(sparkles.SparklesError):
         sparkles.serialize(list(ds), format=RdfFormat.RDF_JSON)
+
+
+class Chunks(io.RawIOBase):
+    """A binary file object that hands out its data in small pieces."""
+
+    def __init__(self, data: bytes, size: int = 256) -> None:
+        self.data = data
+        self.size = size
+        self.pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, n: int = -1) -> bytes:
+        chunk = self.data[self.pos : self.pos + min(self.size, n if n >= 0 else self.size)]
+        self.pos += len(chunk)
+        return chunk
+
+
+def big(n: int) -> Dataset:
+    ds = Dataset()
+    nt = "".join(
+        f'<http://ex.org/s{i}> <http://ex.org/p> "a literal of some length, number {i}" .\n'
+        for i in range(n)
+    )
+    ds.load(nt, "nt")
+    return ds
+
+
+@pytest.mark.parametrize("fmt", [RdfFormat.RDF_THRIFT, RdfFormat.RDF_PROTOBUF, RdfFormat.TRIX])
+def test_jena_syntaxes_stream(fmt: RdfFormat) -> None:
+    data = big(5000).dump(format=fmt)
+    src = Chunks(data)
+    it = sparkles.parse(src, fmt)
+    next(it)
+    # the first quads come before the input has been read to the end
+    assert src.pos < len(data)
+    assert len(list(it)) == 4999
+    # a file object loads in one transaction as it is read
+    assert Dataset().load(Chunks(data), fmt) == 5000
+
+
+def test_a_broken_stream_fails_while_it_is_read() -> None:
+    data = big(2000).dump(format=RdfFormat.RDF_THRIFT)
+    it = sparkles.parse(data[: len(data) // 2], RdfFormat.RDF_THRIFT)
+    with pytest.raises(sparkles.RdfSyntaxError, match="Thrift"):
+        list(it)
+
+
+def test_large_jena_inputs_are_not_held_in_memory(tmp_path: Path) -> None:
+    """A parse of a large RDF Thrift file keeps its memory flat, and a load spools the
+    N-Quads to a temporary file that it removes."""
+    n = 400_000
+    path = tmp_path / "big.rt"
+    big(n).dump(path)
+    nquads = len(big(1000).dump(format="nq")) * n // 1000
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    script = textwrap.dedent(
+        f"""
+        import resource, sys
+        import sparkles
+
+        def peak():
+            r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return r if sys.platform == "darwin" else r * 1024
+
+        sparkles.Dataset().load('<http://e/a> <http://e/b> <http://e/c> .', "nt")
+        before = peak()
+        count = sum(1 for _ in sparkles.parse(path={str(path)!r}))
+        grew = peak() - before
+        ds = sparkles.Dataset()
+        loaded = ds.load(path={str(path)!r})
+        print(count, grew, loaded, len(ds))
+        """
+    )
+    env = dict(os.environ, TMPDIR=str(spool), PYTHONPATH=os.pathsep.join(sys.path))
+    out = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True
+    ).stdout.split()
+    count, grew, loaded, size = map(int, out)
+    assert count == n and loaded == n and size == n
+    # the old reading held the whole input and its N-Quads; a stream holds a pipe's worth
+    assert grew < nquads // 4, (grew, nquads)
+    assert list(spool.iterdir()) == []
 
 
 def test_a_broken_document_names_the_syntax() -> None:

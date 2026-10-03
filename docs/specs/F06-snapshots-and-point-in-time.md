@@ -1565,7 +1565,8 @@ patch lists every change, so `limit` with a patch format is refused.
 with its net changes relative to its parent, in pages bounded by `max_commits` and
 `max_quads`. Within the logs one walk reads every commit of a page, and a bulk commit's
 changes come from comparing its two states. A page stays within one readable range, so
-the commit after a gap answers `410`. `Store::subscribe_commits` is a watch channel that
+the commit after a gap answered `410` until the feed also read the change log (see
+Phase 3). `Store::subscribe_commits` is a watch channel that
 each published commit updates. `GET /{ds}/changes?after=SEL&limit=&wait=` serves pages as
 JSON or as one patch per commit, needs read permission, and caps a page at
 `--max-rows` changes. A commit whose changes alone pass that is listed with its counts
@@ -1707,11 +1708,36 @@ caller as the author and needs the `diff` grant.
   cache of eight. Records are read one at a time through the index, so a query that
   matches most of a large log reads it record by record.
 - SPARQL history queries skip unrecorded commits without saying so, as §11.4 allows.
-- The change feed (`/{ds}/changes`) still reads the write-ahead logs and still ends where
-  the readable history does. Diffs read the change log, but the feed does not.
+
+**The change feed and the change log.** A later change made `/{ds}/changes` read the
+change log too. `Store::changes` reads the retained generations' write-ahead logs as
+before. When they no longer hold the commit after `after`, it reads the change log with
+`ChangeLog::commits`, which visits the records in commit order and stops at the first
+commit the log does not record. The page has the same JSON and RDF Patch output, graph
+views filter its changes in the same way, and a caller whose protections depend on the
+data still gets `403`. A bulk commit that the log summarized is compared between its two
+states while they are kept, and otherwise listed with its counts only, as a commit over
+the budget is. A page ends where one source does, and `410` is left for a commit that
+neither holds. A selector `commit:N` for `after` no longer needs the commit's catalog
+record. `history_log.rs` follows the feed in pages of 1, 7 and 100 commits over a random
+history with compactions and a summarized bulk commit, checks each commit against the
+states around it, and checks graph views and the `410` with the log off.
+`http/diff_tests.rs` checks that JSON pages, patches and an event stream resumed with
+`Last-Event-ID` are the same before and after a compaction.
+
+**Bindings from the group.** A later change let `hist:changes` read its group. The
+triple's terms, `hist:graph`, `hist:from` and `hist:to` may be variables that the rest
+of the join group binds. The planner attaches the call after join ordering, as it does
+a path search, and the call looks up the changes once per distinct binding of those
+variables, then extends each solution with the changes that agree with it. An unbound
+value leaves its term open, `hist:limit` applies to each lookup, and an unbound
+`hist:from` or `hist:to` variable is an error. A call none of whose variables the group
+binds is joined as a leaf, as before. `history_log.rs` covers subjects from a triple
+pattern, predicates, objects and graphs from `VALUES`, ranges per solution, the limit
+per lookup, unbound values and the errors.
 
 **Not built.** Full-text search at pins (§11.6) and pin rebasing remain deferred, as do
-periods per quad, a history query that takes bindings from the rest of its group, and
+periods per quad and
 point-in-time reads rebuilt from the change log.
 
 **Later additions (2026-10-03).** The MCP read tools take `at` and read past states as

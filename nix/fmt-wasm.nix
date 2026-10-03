@@ -5,7 +5,9 @@
 #
 # Like nix/package.nix, the build is in two layers (crane): the dependencies, compiled for
 # wasm32-unknown-unknown with the `fmt-wasm` profile from the manifests and Cargo.lock
-# alone, then the script, which compiles the workspace crates and runs wasm-bindgen.
+# alone, then the script, which compiles the workspace crates and runs wasm-bindgen. The
+# script's source has every workspace crate stubbed but the formatter, its WebAssembly
+# crate and the vendored spargebra, so an edit to another crate changes neither layer.
 {
   lib,
   craneLib,
@@ -42,40 +44,59 @@ let
     doCheck = false;
   };
 
+  # the manifests, Cargo.lock and the targets of every crate, which crane stubs
+  manifests = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../Cargo.toml
+      ../Cargo.lock
+      (craneLib.fileset.commonCargoSources ../crates)
+      (craneLib.fileset.commonCargoSources ../vendor)
+    ];
+  };
+
   cargoArtifacts = craneLib.buildDepsOnly (
     commonArgs
     // {
-      src = lib.fileset.toSource {
-        root = ../.;
-        fileset = lib.fileset.unions [
-          ../Cargo.toml
-          ../Cargo.lock
-          (craneLib.fileset.commonCargoSources ../crates)
-          (craneLib.fileset.commonCargoSources ../vendor)
-        ];
-      };
+      src = manifests;
       buildPhaseCargoCommand = "cargoWithProfile build --locked -p sparkles-fmt-wasm";
     }
   );
+
+  # what the script compiles, besides the stubs
+  real = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../Cargo.toml
+      ../rust-toolchain.toml
+      ../crates/sparkles-fmt
+      ../crates/sparkles-fmt-wasm
+      ../vendor
+      ../scripts/build-fmt-wasm.sh
+    ];
+  };
+
+  # The workspace with the other crates stubbed, and the real formatter crates in place.
+  src = craneLib.mkDummySrc {
+    src = manifests;
+    cargoLock = ../Cargo.lock;
+    extraDummyScript = ''
+      chmod -R u+w $out
+      rm -rf $out/Cargo.toml $out/crates/sparkles-fmt $out/crates/sparkles-fmt-wasm $out/vendor
+      cp -r --no-preserve=mode ${real}/crates/sparkles-fmt ${real}/crates/sparkles-fmt-wasm $out/crates/
+      cp -r --no-preserve=mode ${real}/vendor $out/vendor
+      mkdir -p $out/scripts
+      cp --no-preserve=mode ${real}/Cargo.toml ${real}/rust-toolchain.toml $out/
+      cp --no-preserve=mode ${real}/scripts/build-fmt-wasm.sh $out/scripts/
+    '';
+  };
 in
 assert lib.assertMsg (wasm-bindgen-cli.version == locked)
   "nix/fmt-wasm.nix builds wasm-bindgen-cli ${wasm-bindgen-cli.version} but Cargo.lock has wasm-bindgen ${locked}: update its version and hashes";
 craneLib.mkCargoDerivation (
   commonArgs
   // {
-    inherit cargoArtifacts;
-
-    src = lib.fileset.toSource {
-      root = ../.;
-      fileset = lib.fileset.unions [
-        ../Cargo.toml
-        ../Cargo.lock
-        ../rust-toolchain.toml
-        ../crates
-        ../vendor
-        ../scripts/build-fmt-wasm.sh
-      ];
-    };
+    inherit cargoArtifacts src;
 
     nativeBuildInputs = [ wasm-bindgen-cli ];
 

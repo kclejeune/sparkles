@@ -10,7 +10,9 @@ use sparkles::sparql::{QueryOptions, query};
 use sparkles::store::{Store, StoreOptions};
 use sparkles::vector::VectorIndexConfig;
 use sparkles::vector::embed::mock::MockProvider;
-use sparkles::vector::embed::{ApiKey, EmbeddingConfig, Environment, FailureKind, SecretSource};
+use sparkles::vector::embed::{
+    ApiKey, ChunkUnit, Chunking, EmbeddingConfig, Environment, FailureKind, Prepared, SecretSource,
+};
 use std::time::Duration;
 
 const EMB: &str = "http://example.org/emb";
@@ -424,6 +426,98 @@ fn searches_with_text() {
         panic!("no error")
     };
     assert!(matches!(e, sparkles::Error::Service(_)), "{e:?}");
+}
+
+#[test]
+fn long_texts_are_embedded_in_chunks() {
+    let mock = MockProvider::start(DIM);
+    let chunking = Chunking {
+        size: 24,
+        overlap: 8,
+        unit: ChunkUnit::Chars,
+    };
+    let s = store(&mock, |e| {
+        e.chunking = Some(chunking);
+        e.input_prefix = "passage: ".into();
+    });
+    let long = "the quick brown fox jumps over the lazy dog and runs into the woods";
+    run(
+        &s,
+        &format!("INSERT DATA {{ ex:a rdfs:label \"{long}\" . ex:b rdfs:label \"short\" }}"),
+    );
+    embed(&s);
+    // one vector per chunk, each chunk with the prefix
+    let chunks = chunking.split(long);
+    assert!(chunks.len() > 2, "{chunks:?}");
+    let mut want: Vec<String> = chunks
+        .iter()
+        .map(|c| expected(&format!("passage: {c}")))
+        .collect();
+    want.sort();
+    want.dedup();
+    assert_eq!(vectors(&s, "http://example.org/a", None), want);
+    // a text that fits is one input, as without chunking
+    assert_eq!(
+        vectors(&s, "http://example.org/b", None),
+        [expected("passage: short")]
+    );
+    // a search finds the subject by its nearest chunk
+    let last = format!("passage: {}", chunks.last().unwrap());
+    let q = format!(
+        "{PREFIXES}SELECT ?s WHERE {{ (?s ?score) spk:vectorSearch (ex:emb \"{last}\" 1) }}"
+    );
+    let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
+    assert_eq!(
+        r.rows()[0][0].as_ref().unwrap().to_string(),
+        "<http://example.org/a>"
+    );
+    // changing the chunking embeds the texts again
+    let before = mock.state().requests;
+    s.create_vector_index(
+        "docs",
+        config(&mock, |e| e.input_prefix = "passage: ".into()),
+    )
+    .unwrap();
+    embed(&s);
+    assert!(mock.state().requests > before);
+    assert_eq!(
+        vectors(&s, "http://example.org/a", None),
+        [expected(&format!("passage: {long}"))]
+    );
+}
+
+#[test]
+fn tokens_per_minute_spaces_the_batches() {
+    let mock = MockProvider::start(DIM);
+    let s = store(&mock, |e| {
+        e.batch_size = 1;
+        // 40 characters are about 10 tokens, a tenth of the minute's budget
+        e.tokens_per_minute = 100;
+    });
+    let text = "x".repeat(40);
+    run(
+        &s,
+        &format!("INSERT DATA {{ ex:a rdfs:label \"{text}\" . ex:b rdfs:label \"{text}y\" }}"),
+    );
+    // the worker's steps by hand: a full pass, then the first batch
+    let batch = loop {
+        match s.embed_prepare() {
+            Prepared::Batch(b) => break b,
+            Prepared::Progress => continue,
+            Prepared::Idle => panic!("idle with a backlog"),
+            Prepared::Wait(d) => panic!("waits {d:?} before the first batch"),
+        }
+    };
+    s.embed_apply(batch.run(&|_| true));
+    // the next batch waits about six seconds (10 tokens of 100 a minute)
+    match s.embed_prepare() {
+        Prepared::Wait(d) => assert!(
+            d > Duration::from_secs(4) && d <= Duration::from_secs(7),
+            "{d:?}"
+        ),
+        _ => panic!("no wait for the token budget"),
+    }
+    assert_eq!(mock.state().requests, 1);
 }
 
 #[test]

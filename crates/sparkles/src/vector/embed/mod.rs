@@ -20,7 +20,7 @@ pub mod config;
 pub mod mock;
 pub(crate) mod worker;
 
-pub use config::{ApiKey, EmbeddingConfig};
+pub use config::{ApiKey, ChunkUnit, Chunking, EmbeddingConfig};
 pub use worker::{Batch, Embedded, Prepared};
 
 use crate::outbound::OutboundPolicy;

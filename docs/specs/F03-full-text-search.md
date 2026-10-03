@@ -793,6 +793,22 @@ scores share a rank. The rank exists for `spk:hybridSearch`
 ([F04](F04-vector-search.md#outcome)), which fuses a text ranking with a vector ranking,
 and is not produced when the query does not use it.
 
-**Not built.** Online rebuilds with a journal, `text` on dataset creation, analyzers other
-than Tantivy's (Lucene's Porter and light stemmers, CJK segmentation), and the rest of
-Phase 3 apart from hybrid retrieval.
+**CJK text** (2026-10-03). The `cjk` analyzer segments Chinese, Japanese and Korean
+text without a dictionary, as Lucene's `CJKAnalyzer` does. Its tokenizer, in
+`text/cjk.rs`, implements Tantivy's `Tokenizer` trait and adds no crate. A run of Han,
+Hiragana, Katakana or Hangul characters becomes its overlapping bigrams, and a run of one
+character a unigram. Other letters and digits form words, split as the standard
+tokenizer splits them, and the Katakana middle dot separates words. Before that,
+full-width ASCII is folded to ASCII and half-width Katakana to full-width, with a
+following voiced or semi-voiced mark joined to its kana, as Lucene's `CJKWidthFilter`
+does. The tokens are then lowercased. Unlike Lucene, the analyzer removes no stop words.
+The tags `zh`, `ja` and `ko` take it by default, `{"yue": "cjk"}` names it for another
+tag, and `"all"` still means the stemmed languages, so an index configured with `"all"`
+keeps its fields. A word in a query is the OR of its bigrams, as Lucene's query parser
+reads a word the analyzer splits, and a phrase keeps them in order. `text_lang.rs`
+searches Japanese, Chinese and Korean literals by words, phrases, folded widths and
+half-width Katakana, and unit tests cover the bigrams, offsets and width folding.
+
+**Not built.** Online rebuilds with a journal, `text` on dataset creation, Lucene's Porter
+and light stemmers, dictionary-based CJK segmentation, and the rest of Phase 3 apart from
+hybrid retrieval.

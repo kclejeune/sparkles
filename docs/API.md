@@ -35,9 +35,12 @@ a page and the member that continues the listing.
 
 The common bodies have full schemas. They are the error body, the SPARQL results, dataset
 and server information, readiness, tasks, commits and receipts, whoami, tokens, schema
-pages and the formatter's request and result. Some admin bodies, such as those of
-backups, the search indexes, reasoning, write-time validation and history, are open
-objects that link to their section of this page.
+pages and the formatter's request and result. So do the most used admin bodies: history
+status, snapshots and history queries, stored queries, the configuration and status of
+the full-text, vector and spatial indexes, reasoning status, write-time validation, and
+backup repositories and backups. A test checks these against the bodies a server
+returns. The other admin bodies, such as diffs, the change feed, write previews and
+backup policies, are open objects that link to their section of this page.
 
 The UI's Server page links both documents. Any OpenAPI viewer can open them, for example
 Swagger UI or Redocly pointed at `http://localhost:3030/$/openapi.json`. The Rust client
@@ -1720,6 +1723,9 @@ function takes several arguments.
 | `?a apf:assign ?b` | One side bound | Binds the other side to it, or checks that both are the same value |
 | `?b apf:bnode ?label` | `?b` bound | The label of a blank node. `apf:blankNode` is the same |
 | `?s apf:versionARQ ?v` | | `<urn:x-sparkles:>` and the Sparkles version |
+| `?c apf:container ?m` | | Each member of an RDF container, in the order of its `rdf:_1`, `rdf:_2`, … triples |
+| `?c apf:bag ?m`, `apf:seq`, `apf:alt` | | The same for the containers of one type |
+| `?c rdfs:member ?m` | | The stored `rdfs:member` triples, then the members of every container |
 
 ARQ evaluates a property function for each solution of the patterns written before it,
 with their values in place of its variables, and Sparkles gives the same answers. A list
@@ -1741,11 +1747,15 @@ before it is a leaf of the group's join order. A call that reads some is attache
 rest of its group and evaluates once per distinct value of what it reads. An OPTIONAL
 whose calls read the left side runs as a `Lateral` operator per left row.
 
-ARQ also makes `rdfs:member` a property function that adds the `rdf:_1`, `rdf:_2`, …
-members of `rdf:Bag`, `rdf:Seq` and `rdf:Alt` containers to the `rdfs:member` triples.
-Sparkles keeps `rdfs:member` an ordinary property, so that queries over it keep their
-meaning and their plans, and it has no `apf:bag`, `apf:seq`, `apf:alt` or
-`apf:container`. JavaScript functions are not supported.
+A container is a resource typed `rdf:Bag`, `rdf:Seq` or `rdf:Alt`, and its members are
+the objects of its `rdf:_1`, `rdf:_2`, … triples. A resource without one of these types
+has no members, whatever its numbered triples. With the container given, its members come
+in the order of their numbers. With a member given, a container that holds it twice
+answers twice. ARQ registers `rdfs:member` as a property function too, so a plain
+`?c rdfs:member ?m` also gives the members of every container. Sparkles follows ARQ
+while the store holds a resource typed as a container. Without one, `rdfs:member` stays
+an ordinary triple pattern. Both readings give the same solutions in that case, so
+queries over `rdfs:member` keep their plans. JavaScript functions are not supported.
 
 ### ARQ syntax extensions
 
@@ -2792,7 +2802,8 @@ every change, so `limit` with a patch format is `400`.
 the quads it added and removed relative to its parent. It needs read permission on the
 dataset. `after` takes the selectors of `at` and defaults to the head, so a request
 without it waits for the next commit. Resuming is simple: a client that applied commit
-`n` asks for the commits after `n`. That works from any readable commit, as for diffs.
+`n` asks for the commits after `n`. That works from any commit whose changes the
+write-ahead logs or the [change log](#history-queries) still hold, as for diffs.
 
 | Parameter | Meaning |
 |---|---|
@@ -2825,10 +2836,16 @@ changes out, so a patch page that would start with such a commit is `507` with
 `code: "changes-too-large"` and the commit's number. A body over `--max-export-mb` is cut
 off as for other streamed bodies.
 
-A commit past the head is `404`. A commit whose state is no longer kept is
-`410 history-gone`, and so is the first commit after a gap in the readable history: its
-changes need the state before it. A page ends where the readable history does, so the
-next request reports the commit that cannot be read.
+The feed reads the write-ahead logs of the retained generations first. Commits whose
+generation was compacted away are read from the dataset's change log, in the same
+formats and with the same access rules. A bulk commit that the log recorded with its
+counts only is listed with `"complete": false`, like a commit over the budget, once its
+states are gone. A page ends where one source does, and the next request continues from
+the other.
+
+A commit past the head is `404`. A commit that neither the write-ahead logs nor the
+change log holds is `410 history-gone`. This happens when the change log is off, or
+retention dropped the commit, or the log has a gap there.
 
 **Long polling.** With `wait=N`, a request that finds no commit after `after` waits up to
 N seconds for one and then answers, with an empty list if none came. The server wakes
@@ -2878,7 +2895,7 @@ SELECT ?name ?op ?commit ?time ?author WHERE {
 | `hist:graph` | The graph, unbound for the default graph. A constant IRI filters, and `hist:defaultGraph` selects the default graph. Without it, every graph the caller may read is searched. |
 | `hist:commit`, `hist:time` | The commit's number (`xsd:integer`) and time (`xsd:dateTime`). |
 | `hist:kind`, `hist:author`, `hist:message` | The commit's kind (`update`, `load`, …), the caller that made it, and its message. The author is unbound when the server runs without authentication. |
-| `hist:from`, `hist:to` | The first and last commit read: a number, an `xsd:dateTime`, or a selector string such as `"commit:42"`. `hist:to` defaults to the state the query reads, so `at=` limits history too. |
+| `hist:from`, `hist:to` | The first and last commit read: a number, an `xsd:dateTime`, or a selector string such as `"commit:42"`. Either may be a variable that the rest of the group binds. `hist:to` defaults to the state the query reads, so `at=` limits history too. |
 | `hist:limit`, `hist:order` | The most changes read, and `hist:ascending` (the default) or `hist:descending`, which lists the newest commits first. |
 
 Constants in the triple are looked up in the log's index, so a query about one subject or
@@ -2892,6 +2909,26 @@ SELECT ?s (MAX(?c) AS ?last) WHERE {
   ?s a <http://example.org/Person> .
   SERVICE hist:changes { << ?s ?p ?o >> hist:commit ?c }
 } GROUP BY ?s
+```
+
+The terms of the triple, `hist:graph`, `hist:from` and `hist:to` can take their values
+from the rest of the group. In the query above, `?s` is bound by `?s a ex:Person`, so the
+call looks up the changes of each person, once per distinct subject, instead of reading
+every change and joining. The call runs after the rest of the group, as a path search
+does, and a solution of the group whose variable is unbound leaves that term open.
+`hist:limit` then applies to each lookup. A variable of `hist:from` or `hist:to` must be
+bound by the group, and is `400` otherwise.
+
+```sparql
+PREFIX hist: <urn:x-sparkles:history#>
+# the changes of two subjects since commit 100, newest first, at most 5 each
+SELECT ?s ?p ?o ?c WHERE {
+  VALUES (?s ?since) { (<http://example.org/alice> 100) (<http://example.org/bob> 100) }
+  SERVICE hist:changes {
+    << ?s ?p ?o >> hist:commit ?c ; hist:from ?since ;
+                   hist:order hist:descending ; hist:limit 5 .
+  }
+}
 ```
 
 `hist:subject`, `hist:predicate` and `hist:object` give the triple without the SPARQL 1.2
@@ -2927,9 +2964,10 @@ counts only. A `gap` is a stretch the log could not record. A SPARQL history que
 these commits silently. `sparkles history --loc DB --subject IRI` prints the same changes
 from the command line.
 
-**Diffs** read the change log when the write-ahead logs cannot answer, so
-`/{ds}/diff?from=12` works even after the generation that held commit 12 was compacted
-away. Point-in-time reads still need a retained generation.
+**Diffs** and the [change feed](#change-feed) read the change log when the write-ahead
+logs cannot answer, so `/{ds}/diff?from=12` and `/{ds}/changes?after=12` work even after
+the generation that held commit 12 was compacted away. Point-in-time reads still need a
+retained generation.
 
 **Access.** A caller sees the changes of the graphs it may read, without the triples its
 protections hide. A caller with a protection that depends on the data (classes or
@@ -3803,9 +3841,19 @@ SELECT ?s ?score ?label WHERE {
     without an analyzer in the index is searched unstemmed and filtered by its tag.
   * The analyzers are `arabic`, `danish`, `dutch`, `english`, `finnish`, `french`,
     `german`, `greek`, `hungarian`, `italian`, `norwegian`, `portuguese`, `romanian`,
-    `russian`, `spanish`, `swedish`, `tamil` and `turkish`. Their default tags are `ar`,
-    `da`, `nl`, `en`, `fi`, `fr`, `de`, `el`, `hu`, `it`, `no` (and `nb` and `nn`), `pt`,
-    `ro`, `ru`, `es`, `sv`, `ta` and `tr`.
+    `russian`, `spanish`, `swedish`, `tamil`, `turkish` and `cjk`. Their default tags are
+    `ar`, `da`, `nl`, `en`, `fi`, `fr`, `de`, `el`, `hu`, `it`, `no` (and `nb` and `nn`),
+    `pt`, `ro`, `ru`, `es`, `sv`, `ta` and `tr`, and `zh`, `ja` and `ko` for `cjk`.
+    `"all"` names the 18 stemmed languages, so CJK is listed on its own, as in
+    `["en", "zh", "ja", "ko"]`.
+  * `cjk` segments Chinese, Japanese and Korean text without a dictionary, as Lucene's
+    `CJKAnalyzer` does. A run of Han, Hiragana, Katakana or Hangul characters becomes its
+    overlapping pairs of characters, so `東京都` is indexed as `東京` and `京都`, and a
+    lone character stays a token. Other words are split and lowercased as usual.
+    Full-width letters and digits match their ASCII forms, and half-width Katakana
+    matches full-width. A query word is the OR of its pairs, so `東京都` also finds
+    `京都`, and the phrase `"東京都"` finds the three characters in a row. Without a
+    language, the standard analyzer keeps a run of CJK characters as one word.
 * **Consistency.** Indexes are updated in the same commit as the data, so a query sees
   the text of its own snapshot, including the writes just before it. A write only stages
   its documents. The index commit, which writes a new segment, happens at the next text
@@ -4055,12 +4103,32 @@ PUT /$/vector/ds/docs
 | `queryText` | `true` | Whether searches may pass text for this index. |
 | `batchSize` | 64 | Inputs per request, 1 to 2048. |
 | `maxInputChars` | 8000 | Inputs are cut at this many characters. |
+| `chunking` | none | Splits long texts into chunks, each embedded as its own vector: `{"size": N, "overlap": M, "unit": "chars" \| "tokens"}`. See below. |
 | `requestsPerMinute` | 0 | A ceiling on requests per minute. 0 sets none. |
+| `tokensPerMinute` | 0 | A ceiling on tokens per minute, estimated as one token per four characters of the inputs sent. 0 sets none. |
 | `maxRetries` | 5 | Retries after a network error, a timeout, `429` or `5xx`, with exponential backoff from 1 s to 60 s, or after the provider's `Retry-After`. |
 | `timeoutSecs` | 60 | The time one request may take, within the outbound timeout. |
 
 The index's predicate cannot also be a source predicate. Changing the `embedding` object
 keeps the index's build.
+
+**Chunking.** Without `chunking`, a text longer than `maxInputChars` is cut, and the rest
+is not embedded. With it, a text longer than `size` is split into chunks of at most
+`size` characters, or `size` tokens of four characters each with `"unit": "tokens"`.
+A chunk ends after the last whitespace in the second half of its window, and the next
+chunk repeats the last `overlap` characters or tokens of it, starting at a word where
+one starts in that stretch. A text is split into at most 1024 chunks. With `combine`,
+the joined text is split. Each chunk, after `inputPrefix`, is an input of its own, so a
+subject gets one vector per chunk. A vector search then finds the subject by its
+nearest chunk, and `distinct:subject` lists it once. A text that fits in one chunk is
+embedded as it was without chunking. `size` may be at most 1,000,000 characters, and
+`overlap` must be less than `size`. Turning chunking on or off, or changing it, embeds
+the affected texts again, since their inputs change.
+
+**Rate limits.** After each batch, the worker waits `60 / requestsPerMinute` seconds
+before the next one, and `60 × tokens / tokensPerMinute` seconds, where `tokens` is
+the batch's characters divided by four. The longer wait applies. Searches with text are
+not limited.
 
 * **What the worker writes.** It owns the index's predicate. After it reconciles a
   subject in a graph, the subject's vectors there are exactly the vectors of its current
