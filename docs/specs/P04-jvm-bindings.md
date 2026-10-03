@@ -900,7 +900,7 @@ TDB2 itself refuses. The union default graph setting is not stored in a TDB2 dat
 lives in the assembler or the code that opens the database, and §3.7 carries it over.
 
 The path through a dump stays available and is what [G08](G08-fuseki-configuration.md)
-writes. `sparkles fuseki-config convert` emits a script that runs Jena's
+writes. `sparkles config import fuseki` emits a script that runs Jena's
 `tdb2.tdbdump` on each TDB2 location and loads the dump with `sparkles load`. Both paths
 read the data through TDB2, so they give the same quads. The in-process import avoids
 the intermediate N-Quads file and the second parse, and suits programs that already have
