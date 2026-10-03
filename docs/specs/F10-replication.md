@@ -1375,7 +1375,7 @@ replication waits until all other planned work is done, so the apply path was bu
 patches from clients and was not shaped for replicas that keep a primary's commit ids.
 The work landed in six commits after the spec. `44dc19e` added the reader, `e0366f4` the
 engine's apply path and the commit kind, `8121894` the endpoint, `7d170ba` the commands,
-`d7f135c` the Python method, and a last commit the documentation, the UI's commit kind
+`d7f135c` the Python method, and `496ca00` the documentation, the UI's commit kind
 and the Jena client checks.
 
 * **Reader.** `sparkles::patch` gained `PatchReader`, `PatchRow`, `PatchError` and
@@ -1457,7 +1457,10 @@ and the Jena client checks.
 - `mise run test:jena-clients` writes a patch with Jena's `RDFChangesCollector`, sends it
   through Jena's text and binary writers to `/{ds}/patch` and `/{ds}`, and compares the
   datasets with the one `RDFPatchOps.applyChange` makes. All 144 checks pass.
-- GATES
+- Crate and server tests, Clippy over all targets, `mise run lint:features`, the Python
+  and UI suites, the W3C suites (SPARQL 1.0 482/482, 1.1 query 328/328, 1.1 update
+  157/157, 1.2 269/269) and `mise run ci` pass. Two tests unrelated to patches timed out
+  once on a machine with a load average above 60 and passed when run again.
 
 **Not built.** Phases 2 and 3: roles, replicas, the commit stream, captures, holds,
 `minCommit`, promotion and lineages, archiving, synchronous replication and failover.
