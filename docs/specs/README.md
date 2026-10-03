@@ -37,7 +37,7 @@ behaviour, and the Outcome explains the difference.
 | `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, a GraphQL adapter, CSV and TSV imports, cloning, inference freshness, access control, write-time validation, the MCP server, automatic compaction, write previews and stored queries. |
 | `F` | Larger data features: a Cypher frontend, full-text and vector search, path search, embeddings computed on write, backups to object storage, retained history and point-in-time reads, branches and merges, replication, and encryption at rest. |
 | `G` | Gaps against Apache Jena that were out of scope for the first version: GeoSPARQL, ShEx, the SHACL Compact Syntax, the command-line tools and the converter of Fuseki configurations. |
-| `P` | Bindings and clients for other programs. These are the Python package that embeds the engine and the Rust client of remote servers. |
+| `P` | Bindings and clients for other programs. These are the Python package that embeds the engine, the Rust client of remote servers, and the Node.js packages for the embedded engine and a remote client. |
 | `X` | Internal engineering that does not derive from any other database product: compression codecs, the formatter, the linter, and the OpenAPI description with shell completions. |
 
 Numbers are stable. Gaps in the numbering are roadmap items without a spec: writes and a
@@ -86,6 +86,7 @@ there is no code yet.
 | [G08](G08-fuseki-configuration.md) | `sparkles config import fuseki`, which turns a Fuseki configuration and its `shiro.ini` or password file into a `serve` script, a data migration script, an auth configuration and dataset settings with a report of each element, and `serve --fuseki-config` | implemented |
 | [P01](P01-python-bindings.md) | The `sparkles` Python package: datasets, SPARQL, terms, quads, transactions, dumps, reasoning and validation, built with PyO3 and maturin as abi3 wheels | implemented in part (Phase 1, most of Phase 2) |
 | [P02](P02-rust-client.md) | `sparkles-client`, an async and blocking Rust client for Sparkles and any SPARQL endpoint, with streaming results as `oxrdf` terms, receipts, the Graph Store Protocol, retries that honour `Retry-After`, and a test that checks it against the OpenAPI description | implemented |
+| [P05](P05-node-bindings.md) | Node.js and TypeScript packages: the engine as a napi-rs addon with prebuilt binaries, async iteration of results in batches off the JavaScript thread, transactions on the single writer with `AbortSignal`, RDF/JS terms and a Comunica source, a remote client typed from the OpenAPI description, and what a browser build would take | specified |
 | [X01](X01-compression-codecs.md) | zstd and brotli next to gzip and LZ4 for inputs, responses, dumps, backups and the UI's assets | implemented in part (Phase 1) |
 | [X02](X02-formatter.md) | `sparkles fmt`, `POST /$/format`, `sparkles lsp` and the UI's Format button for SPARQL and RDF | implemented |
 | [X03](X03-openapi-and-completions.md) | An OpenAPI 3.1 description at `/$/openapi.json`, kept equal to the route table by a test and checked in, `sparkles openapi`, shell completions and man pages | implemented in part (Phase 1) |
