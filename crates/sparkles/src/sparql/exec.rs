@@ -3318,8 +3318,10 @@ fn group(
     let mut args = Vec::with_capacity(aggs.len());
     for (_, agg) in aggs {
         args.push(match &agg.expr {
+            // FOLD evaluates its expressions itself, in its ORDER BY's order
             Some(e)
-                if t.len() >= super::exprcache::MIN_ROWS
+                if agg.fold.is_none()
+                    && t.len() >= super::exprcache::MIN_ROWS
                     && super::exprcache::eligible(&[e]).is_ok() =>
             {
                 super::exprcache::per_value(ctx, t, &[e], false, report, |v| {

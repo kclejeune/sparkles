@@ -1698,8 +1698,8 @@ with their values in place of its variables, and Sparkles gives the same answers
 function whose list variable is bound by an earlier pattern walks that node's list, so
 `?x :items ?l . ?l list:member ?m` gives the members of each `?l`. With the list
 variable unbound, as in `?l list:member "b"`, the function finds the heads of every list
-that holds the member. The same holds inside an OPTIONAL: in
-`?s :p ?o OPTIONAL { ?s apf:splitIRI (?ns ?local) }`, the right side reads `?s` from each
+that holds the member. The same holds inside an OPTIONAL, so in
+`?s :p ?o OPTIONAL { ?s apf:splitIRI (?ns ?local) }` the right side reads `?s` from each
 left row. A function reads lists in the graph that its `GRAPH` block names, or the
 default graph.
 
@@ -1825,8 +1825,9 @@ any other runs as a `Let` operator.
 **`SEMIJOIN { … }` and `ANTIJOIN { … }`** keep the solutions before them that are
 compatible with at least one solution of the group, or with none, each once and
 unchanged. The group's variables do not reach the result. Unlike `MINUS`, a solution of
-the group that shares no variable with a solution before it is compatible with it, so
-`ANTIJOIN` with a group that has any solution removes everything. EXPLAIN shows a
+the group that shares no variable with a solution before it is compatible with it. An
+`ANTIJOIN` whose group shares no variable with the patterns before it therefore removes
+every solution when the group has one. EXPLAIN shows a
 `SemiJoin` or `AntiJoin` operator, which hashes the group's solutions on the shared
 variables.
 
