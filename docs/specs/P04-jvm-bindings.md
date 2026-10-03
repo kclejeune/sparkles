@@ -1341,18 +1341,20 @@ its items are independent.
 
 ## 11. Open questions
 
-1. **Coordinates and package.** `io.github.kclejeune` is a Maven Central namespace that
-   the GitHub account can verify. Default: group `io.github.kclejeune`, artifacts
-   `sparkles-jena`, `sparkles-jena-natives` and `sparkles-jena-all`, package
+1. **Coordinates and package.** Decided on 2026-10-03: group `io.github.kclejeune`, a
+   Maven Central namespace that the GitHub account can verify, with artifacts
+   `sparkles-jena`, `sparkles-jena-natives` and `sparkles-jena-all` and package
    `io.github.kclejeune.sparkles.jena`.
 2. **One jar for Jena 5 and 6.** Compiling against 5.6 without deprecated API should
    work on 6.x, and CI tests both. If an API needed by the binding changed shape between
-   them, the alternative is two artifacts. Default: one artifact, revisited if the Jena 6
-   test matrix fails.
+   them, the alternative is two artifacts. Decided on 2026-10-03: one artifact if the
+   Jena 6 test matrix passes with it, and two otherwise, whichever keeps the build simpler.
 3. **Blank node labels.** Default: `DATASET`, which keeps Jena's behaviour within a
    process and costs memory per label, with `TRANSACTION` documented for loading data.
-4. **Writes outside a transaction.** Default: refuse them, as TDB2 does, with
-   `autocommit(true)` for the in-memory dataset's behaviour.
+4. **Writes outside a transaction.** Decided on 2026-10-03: refuse them by default, as
+   TDB2 does, and let `autocommit(true)` turn each such write into its own commit, as
+   Jena's in-memory dataset behaves. The refusal is a default, not a requirement of the
+   design.
 5. **The natives jar.** Default: the main natives jar carries all five platforms, with
    classifier jars for slim deployments. The alternative makes the classifiers the
    default and needs the user to choose a platform.
@@ -1368,10 +1370,17 @@ its items are independent.
    Phase 3.
 10. **Sharing with P01.** The transaction worker moves into `sparkles::embed`. Default:
     P04 uses it, and the Python bindings move onto it when they next change.
-11. **Generated code's license.** UniFFI is licensed MPL-2.0, which is already in the
-    tree through `imbl` and `option-ext`. The generated Kotlin comes from its templates.
-    Default: list UniFFI in the natives jar's third-party licenses and in the jar that
-    holds the generated classes.
+11. **Generated code's license.** Decided on 2026-10-03. UniFFI is licensed MPL-2.0,
+    which is already in the tree through `imbl` and `option-ext`, and the generated
+    Kotlin comes from its templates. Sparkles uses UniFFI unmodified as a build tool and
+    a library. MPL-2.0 is a file-level license, so it covers UniFFI's own files and any
+    generated file derived from its templates, and it places no conditions on the rest of
+    Sparkles or on programs that use the bindings. The obligations are to keep UniFFI's
+    notices and to make the source of MPL-covered files available, which the public
+    repository and the sources jar already do. Users of the bindings who redistribute the
+    jars unmodified carry the same notices and nothing more. UniFFI is listed in the
+    natives jar's third-party licenses and in the jar that holds the generated classes,
+    and the generated files keep their license header.
 
 ## 12. Sources
 
