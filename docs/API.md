@@ -2753,6 +2753,115 @@ the error's JSON body.
 curl -N -H 'Accept: text/event-stream' 'http://localhost:3030/ds/changes?after=41'
 ```
 
+### History queries
+
+A history query asks how the data changed, such as when a triple was added or removed,
+which commit last changed a subject, or which values a property took over time. It reads the
+**change log**, which records the net changes of every commit and outlives compactions,
+so history reaches further back than point-in-time reads. Each change is one quad added
+or removed, with its commit's number, time, kind, author and message. The design is in
+[F06 §11](specs/F06-snapshots-and-point-in-time.md#11-phase-3-history-queries-and-the-change-log).
+
+**In SPARQL**, a history query is a `SERVICE` call whose block holds one reified triple
+(SPARQL 1.2). The reifier stands for the change, and `hist:` properties describe it:
+
+```sparql
+PREFIX hist: <urn:x-sparkles:history#>
+PREFIX ex:   <http://example.org/>
+# the names alice has had, and who set them
+SELECT ?name ?op ?commit ?time ?author WHERE {
+  SERVICE hist:changes {
+    << ex:alice ex:name ?name >> hist:op ?op ; hist:commit ?commit ;
+                                 hist:time ?time ; hist:author ?author .
+  }
+} ORDER BY ?commit
+```
+
+| Property | Meaning |
+|---|---|
+| `hist:op` | `"add"` or `"remove"`, bound or used as a filter. |
+| `hist:graph` | The graph, unbound for the default graph. A constant IRI filters, and `hist:defaultGraph` selects the default graph. Without it, every graph the caller may read is searched. |
+| `hist:commit`, `hist:time` | The commit's number (`xsd:integer`) and time (`xsd:dateTime`). |
+| `hist:kind`, `hist:author`, `hist:message` | The commit's kind (`update`, `load`, …), the caller that made it, and its message. The author is unbound when the server runs without authentication. |
+| `hist:from`, `hist:to` | The first and last commit read: a number, an `xsd:dateTime`, or a selector string such as `"commit:42"`. `hist:to` defaults to the state the query reads, so `at=` limits history too. |
+| `hist:limit`, `hist:order` | The most changes read, and `hist:ascending` (the default) or `hist:descending`, which lists the newest commits first. |
+
+Constants in the triple are looked up in the log's index, so a query about one subject or
+one property reads only the commits that touched it. The other questions are plain
+SPARQL over the changes:
+
+```sparql
+PREFIX hist: <urn:x-sparkles:history#>
+# which commit last changed each subject of a class, by joining the current state
+SELECT ?s (MAX(?c) AS ?last) WHERE {
+  ?s a <http://example.org/Person> .
+  SERVICE hist:changes { << ?s ?p ?o >> hist:commit ?c }
+} GROUP BY ?s
+```
+
+`hist:subject`, `hist:predicate` and `hist:object` give the triple without the SPARQL 1.2
+syntax (`[] hist:subject ex:alice ; hist:object ?o ; hist:op ?op`). History queries work
+through every query endpoint, the MCP query tool included, and their results are never
+cached.
+
+**Over HTTP**, `GET /{ds}/history` returns the changes as JSON. It needs the same grant
+as `/{ds}/diff`.
+
+| Parameter | Meaning |
+|---|---|
+| `subject`, `predicate`, `object` | Terms in N-Triples syntax (`<iri>`, `_:b1`, `"Ann"@en`); a bare IRI is read as an IRI. Each may repeat. |
+| `graph` | A graph IRI or `default`; may repeat. |
+| `from`, `to` | Selectors of `at`; the first commit and the head by default. |
+| `op` | `add` or `remove`. |
+| `order` | `asc` (default) or `desc`. |
+| `limit` | The most changes listed, from 1 to `--max-rows` (default 1,000). |
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…", "head": 57, "from": 1, "to": 57, "truncated": false,
+  "changes": [ { "op": "add", "subject": "<http://example.org/alice>",
+                 "predicate": "<http://example.org/name>", "object": "\"Ann\"", "graph": null,
+                 "commit": 12, "timestamp": "2026-10-03T09:14:02.118Z", "kind": "update",
+                 "author": "user:bob", "message": "fix the name" } ],
+  "unrecorded": [ { "from": 1, "to": 3, "reason": "before-log" } ] }
+```
+
+`unrecorded` names the commits whose changes the log does not hold. `before-log` commits
+are older than the log, because it started later or retention dropped them. A `bulk`
+commit loaded more than 1,000,000 quads into a non-empty dataset and is recorded with its
+counts only. A `gap` is a stretch the log could not record. A SPARQL history query skips
+these commits silently. `sparkles history --loc DB --subject IRI` prints the same changes
+from the command line.
+
+**Diffs** read the change log when the write-ahead logs cannot answer, so
+`/{ds}/diff?from=12` works even after the generation that held commit 12 was compacted
+away. Point-in-time reads still need a retained generation.
+
+**Access.** A caller sees the changes of the graphs it may read, without the triples its
+protections hide. A caller with a protection that depends on the data (classes or
+patterns) gets `403` for history queries, as for the change feed.
+
+**The log.** The changes are written by a background thread shortly after each commit,
+so a commit does no extra I/O. The log is synced before a compaction or a bulk commit
+replaces the current generation and when the dataset closes. After a crash, the next
+open recovers the unsynced tail from the write-ahead log, without the authors of those
+commits. The log lives in `<dataset>/changes/` and counts toward the dataset's quota. It
+is on by default with a 1 GiB limit, and whole segments of 16 MiB are dropped, oldest
+first. `serve --no-change-log` and `--change-log-mb` change the server's default, and a
+dataset's own settings go in the `changeLog` member of `PUT /$/history/{ds}`:
+
+```json
+{ "changeLog": { "enabled": true, "keepCommits": 100000, "keepAge": "90d", "maxBytes": "4GiB" } }
+```
+
+`keepCommits` and `keepAge` keep the segments that hold any of the last N commits or any
+commit of the given age, and `maxBytes` caps the total (0 is unlimited), winning over the
+other two. A field that is left out takes the server's default, and `"changeLog": null`
+restores every default. Turning the log off deletes it, and turning it on starts it at
+the next commit. `GET /$/history/{ds}` reports the log as `changeLog`: `enabled`, the
+`first` and `last` commits covered, `segments`, `bytes`, `pending` commits not yet
+written, `maxBytes`, `settings` and an `error` if the log stopped. Backups and clones do
+not copy the log.
+
 ### Named snapshots and retention
 
 | Method | Path | Description |
@@ -2762,7 +2871,7 @@ curl -N -H 'Accept: text/event-stream' 'http://localhost:3030/ds/changes?after=4
 | GET | `/$/snapshots/{ds}/{name}` | `NamedSnapshot` |
 | DELETE | `/$/snapshots/{ds}/{name}` | `204`. Generations that only this snapshot kept are removed. |
 | GET | `/$/history/{ds}` | `HistoryStatus` |
-| PUT | `/$/history/{ds}` | Sets the retention window and returns `HistoryStatus`. The body is `{ keepCommits?, keepAge?, maxBytes?, schedules?, catalog? }`. `schedules` replaces the pin schedules when it is present, and `catalog` replaces the catalog horizon (`null` turns it off). |
+| PUT | `/$/history/{ds}` | Sets the retention window and returns `HistoryStatus`. The body is `{ keepCommits?, keepAge?, maxBytes?, schedules?, catalog?, changeLog? }`. `schedules` replaces the pin schedules when it is present, `catalog` replaces the catalog horizon (`null` turns it off), and `changeLog` replaces the change log settings (see [History queries](#history-queries)). |
 
 ```ts
 type NamedSnapshot = { name: string; ref: string; seq: number; commit: Commit | null;
@@ -2781,6 +2890,11 @@ type HistoryStatus = { dataset: string; datasetId: string; head: number;
   retention: Retention; schedules: Schedule[]; snapshots: number;
   catalog: { keepCommits: number | null; keepAge: string | null;   // the catalog horizon
              firstRetained: number };                              // the oldest commit listed
+  changeLog: { enabled: boolean; first: number | null; last: number | null;
+               segments: number; bytes: number; pending: number; maxBytes: number;
+               settings: { enabled: boolean | null; keepCommits: number | null;
+                           keepAge: string | null; maxBytes: number | null };
+               error: string | null } | null;   // see History queries
   cache: { entries: number; bytes: number; hits: number; misses: number; materializations: number } };
 ```
 

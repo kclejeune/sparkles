@@ -611,17 +611,29 @@ async fn diff_errors_tags_and_budgets() {
     .await;
     assert!(r.status.is_success());
     // the compaction is a background task, slow on a loaded machine
+    let mut gone = false;
     for _ in 0..6000 {
-        if get(&s.app, "/h/diff?from=commit:1&to=commit:3")
-            .await
-            .status
-            == StatusCode::GONE
-        {
-            return;
+        if get(&s.app, "/h/sparql?at=1&query=ASK%7B%7D").await.status == StatusCode::GONE {
+            gone = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("commit 1 stayed readable after compaction");
+    assert!(gone, "commit 1 stayed readable after compaction");
+    // the change log still has the changes of commit 3, whose parent state is gone
+    let r = get(&s.app, "/h/diff?from=commit:2&to=commit:3").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["method"], "log");
+    // without it, a diff of a gone commit is 410
+    let r = put_json(
+        &s.app,
+        "/$/history/h",
+        r#"{"changeLog": {"enabled": false}}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = get(&s.app, "/h/diff?from=commit:2&to=commit:3").await;
+    assert_eq!(r.status, StatusCode::GONE, "{}", r.text());
 }
 
 #[tokio::test]
@@ -937,4 +949,132 @@ async fn clone_and_backup_at_a_commit() {
     let nq = std::fs::read_to_string(file).unwrap();
     assert_eq!(nq.lines().count(), 2, "{nq}");
     assert!(nq.contains("urn:g1") && !nq.contains("urn:c"));
+}
+
+#[tokio::test]
+async fn history_queries_over_http() {
+    let s = server(|_| {}).await;
+    let ops = |j: &J| -> Vec<String> {
+        j["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                format!(
+                    "{} {} {}",
+                    c["commit"],
+                    c["op"].as_str().unwrap(),
+                    c["subject"].as_str().unwrap()
+                )
+            })
+            .collect()
+    };
+    let r = get(&s.app, "/h/history").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        ops(&j),
+        [
+            "1 add <urn:a>",
+            "2 add <urn:b>",
+            "3 remove <urn:a>",
+            "4 add <urn:c>"
+        ]
+    );
+    assert_eq!(
+        (j["from"].as_u64(), j["to"].as_u64(), j["head"].as_u64()),
+        (Some(1), Some(4), Some(4))
+    );
+    assert_eq!(j["truncated"], false);
+    assert_eq!(j["unrecorded"], json!([]));
+    assert_eq!(j["changes"][0]["timestamp"], "2030-01-01T00:00:10.000Z");
+    assert_eq!(j["changes"][0]["kind"], "update");
+    assert_eq!(j["changes"][1]["graph"], "<urn:g1>");
+    // filters: a bare IRI, an N-Triples literal, a graph, an operation, a range
+    let j = get(&s.app, "/h/history?subject=urn:a").await.json();
+    assert_eq!(ops(&j), ["1 add <urn:a>", "3 remove <urn:a>"]);
+    let j = get(&s.app, "/h/history?subject=%3Curn:a%3E&op=remove")
+        .await
+        .json();
+    assert_eq!(ops(&j), ["3 remove <urn:a>"]);
+    let j = get(&s.app, "/h/history?object=%22three%22").await.json();
+    assert_eq!(ops(&j), ["4 add <urn:c>"]);
+    let j = get(&s.app, "/h/history?graph=urn:g1").await.json();
+    assert_eq!(ops(&j), ["2 add <urn:b>"]);
+    let j = get(&s.app, "/h/history?graph=default&from=2&to=commit:3")
+        .await
+        .json();
+    assert_eq!(ops(&j), ["3 remove <urn:a>"]);
+    let j = get(&s.app, "/h/history?from=time:2030-01-01T00:00:25Z")
+        .await
+        .json();
+    assert_eq!(ops(&j), ["3 remove <urn:a>", "4 add <urn:c>"]);
+    // the last change, newest first
+    let j = get(&s.app, "/h/history?order=desc&limit=1").await.json();
+    assert_eq!(ops(&j), ["4 add <urn:c>"]);
+    assert_eq!(j["truncated"], true);
+    // bad parameters
+    for q in [
+        "op=maybe",
+        "order=up",
+        "limit=0",
+        "subject=%3Curn:a",
+        "predicate=%22x%22",
+        "from=yesterday",
+    ] {
+        let r = get(&s.app, &format!("/h/history?{q}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{q}: {}", r.text());
+    }
+    // SPARQL over the protocol
+    let q = "PREFIX hist: <urn:x-sparkles:history#> SELECT (COUNT(*) AS ?n) WHERE { SERVICE hist:changes { << ?s ?p ?o >> hist:op ?op } }";
+    let r = get_with(
+        &s.app,
+        &format!(
+            "/h/sparql?query={}",
+            form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+        ),
+        "accept",
+        "text/csv",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.text().lines().nth(1), Some("4"));
+    // a past state sees the history up to it
+    let r = get_with(
+        &s.app,
+        &format!(
+            "/h/sparql?at=2&query={}",
+            form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+        ),
+        "accept",
+        "text/csv",
+    )
+    .await;
+    assert_eq!(r.text().lines().nth(1), Some("2"));
+    // the settings and state in /$/history
+    let j = get(&s.app, "/$/history/h").await.json();
+    assert_eq!(j["changeLog"]["enabled"], true);
+    assert_eq!(j["changeLog"]["last"], 4);
+    let r = put_json(
+        &s.app,
+        "/$/history/h",
+        r#"{"changeLog": {"keepCommits": 10, "maxBytes": "64MiB"}}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["changeLog"]["settings"]["keepCommits"], 10);
+    assert_eq!(j["changeLog"]["maxBytes"], 64 << 20);
+    let r = put_json(&s.app, "/$/history/h", r#"{"changeLog": {"keep": 1}}"#).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = put_json(
+        &s.app,
+        "/$/history/h",
+        r#"{"changeLog": {"enabled": false}}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = get(&s.app, "/h/history").await;
+    assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED, "{}", r.text());
+    assert_eq!(r.json()["code"], "history-unsupported");
 }

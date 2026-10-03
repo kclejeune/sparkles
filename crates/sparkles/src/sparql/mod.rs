@@ -18,6 +18,7 @@ mod fnlib;
 pub mod geojoin;
 pub mod geopf;
 pub mod georewrite;
+pub mod history_svc;
 pub mod hybrid;
 pub mod indexjoin;
 mod joinorder;

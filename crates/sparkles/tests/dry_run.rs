@@ -384,6 +384,8 @@ fn a_dry_run_changes_no_file() {
     };
     let s = Store::open(&root, opts).unwrap();
     seed(&s);
+    // the change log's background writer has nothing left to write
+    s.flush_change_log().unwrap();
     let before = files(&root);
     let head = s.head_commit();
     let mut r = Rng(7);

@@ -416,6 +416,8 @@ pub enum Kind {
     /// paths as solutions (`SERVICE path:search`); child 0, if any, is the rest of the
     /// group, which binds the source or the target
     PathSearch(Box<super::pathsearch::PathSearchSpec>),
+    /// the recorded changes of the dataset (`SERVICE hist:changes`)
+    HistoryChanges(Box<super::history_svc::HistorySpec>),
 }
 
 #[derive(Clone)]
@@ -546,6 +548,7 @@ impl Node {
             Kind::SpatialKnn(_) => "SpatialKnn",
             Kind::SpatialRelate(_) => "SpatialRelate",
             Kind::PathSearch(_) => "PathSearch",
+            Kind::HistoryChanges(_) => "HistoryChanges",
         }
     }
 }
@@ -1086,6 +1089,10 @@ impl<'a> Planner<'a> {
                     })
                     .collect();
                 let n = group(child, keys, aggs, self.ctx);
+                Ok(self.apply_filters(n, filters))
+            }
+            GP::Service { inner, name, .. } if super::history_svc::is_changes(name) => {
+                let n = super::history_svc::history_leaf(self, inner)?;
                 Ok(self.apply_filters(n, filters))
             }
             GP::Service { name, inner, .. } if super::pathsearch::is_search(name) => {

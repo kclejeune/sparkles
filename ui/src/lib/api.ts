@@ -253,7 +253,12 @@ export type DatasetStats = {
   deltaDeletes: number;
   terms: number;
   graphs: { name: string | null; quads: number }[];
-  predicates: { iri: string; count: number; distinctSubjects: number; distinctObjects: number }[];
+  predicates: {
+    iri: string;
+    count: number;
+    distinctSubjects: number;
+    distinctObjects: number;
+  }[];
   classes: { iri: string; instances: number }[];
   diskBytes: number;
   /** Storage quota of a persistent dataset (null in memory); absent on servers that predate it. */
@@ -261,7 +266,13 @@ export type DatasetStats = {
   /** Decoded-block cache. */
   cache: { entries: number; bytes: number; hits: number; misses: number };
   /** Query (sub)result cache; absent on servers that predate it. */
-  resultCache?: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number };
+  resultCache?: {
+    enabled: boolean;
+    entries: number;
+    bytes: number;
+    hits: number;
+    misses: number;
+  };
   /** Reasoning status; absent on servers that predate it. */
   reasoning?: ReasoningStatus | null;
   /** Spatial index status (null: disabled); absent on servers that predate it. */
@@ -425,7 +436,11 @@ function budgetOf(body: Record<string, unknown>): Budget | undefined {
     kind !== 'dataset-bytes'
   )
     return undefined;
-  return { kind, limit: Number(body.limit ?? 0), requested: Number(body.requested ?? 0) };
+  return {
+    kind,
+    limit: Number(body.limit ?? 0),
+    requested: Number(body.requested ?? 0),
+  };
 }
 
 /** What to do about an exceeded budget, in plain words. */
@@ -524,7 +539,9 @@ export async function request(path: string, init: RequestInit = {}): Promise<Res
     res = await fetch(path, withToken);
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') throw e;
-    throw new ApiError(0, 'Cannot reach the Sparkles server', { detail: String(e) });
+    throw new ApiError(0, 'Cannot reach the Sparkles server', {
+      detail: String(e),
+    });
   }
   if (res.status === 401) authHooks.unauthorized();
   if (!res.ok) throw await toError(res);
@@ -541,7 +558,9 @@ export async function json<T>(path: string, init: RequestInit = {}): Promise<T> 
   try {
     return JSON.parse(text) as T;
   } catch {
-    throw new ApiError(res.status, 'Server returned invalid JSON', { detail: text.slice(0, 300) });
+    throw new ApiError(res.status, 'Server returned invalid JSON', {
+      detail: text.slice(0, 300),
+    });
   }
 }
 
@@ -584,7 +603,9 @@ export async function ready(signal?: AbortSignal): Promise<ReadyInfo> {
     res = await fetch('/$/ready', { signal, cache: 'no-store' });
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') throw e;
-    throw new ApiError(0, 'Cannot reach the Sparkles server', { detail: String(e) });
+    throw new ApiError(0, 'Cannot reach the Sparkles server', {
+      detail: String(e),
+    });
   }
   if (res.status !== 200 && res.status !== 503) throw await toError(res);
   return (await res.json()) as ReadyInfo;
@@ -592,7 +613,10 @@ export async function ready(signal?: AbortSignal): Promise<ReadyInfo> {
 
 /** The metrics registry as JSON (`404` when the server runs with `--no-metrics`). */
 export const metricsSnapshot = (signal?: AbortSignal) =>
-  json<MetricsSnapshot>('/$/metrics?format=json', { signal, cache: 'no-store' });
+  json<MetricsSnapshot>('/$/metrics?format=json', {
+    signal,
+    cache: 'no-store',
+  });
 
 // --- formatting ---------------------------------------------------------------
 
@@ -624,7 +648,12 @@ export type FormatRequest = {
   options?: FormatOptions;
 };
 
-export type FormatWarning = { code: string; message: string; line: number; column: number };
+export type FormatWarning = {
+  code: string;
+  message: string;
+  line: number;
+  column: number;
+};
 
 export type FormatResult = {
   text: string;
@@ -714,7 +743,10 @@ export const compactionStatus = (ds: string) => json<CompactionStatus>(`/$/compa
 
 /** Replace the dataset's own compaction settings (`PUT /$/compaction/{ds}`). */
 export const setCompaction = (ds: string, own: Partial<CompactionPolicy>) =>
-  json<CompactionStatus>(`/$/compaction/${enc(ds)}`, { ...jsonBody(own), method: 'PUT' });
+  json<CompactionStatus>(`/$/compaction/${enc(ds)}`, {
+    ...jsonBody(own),
+    method: 'PUT',
+  });
 
 /** Remove the dataset's own compaction settings (`DELETE /$/compaction/{ds}`). */
 export const clearCompaction = (ds: string) =>
@@ -730,7 +762,9 @@ export const reason = (ds: string, profile: ReasonProfile, rules?: string) =>
 
 /** Drop the dataset's cached query results (`POST /$/cache/clear/{ds}`, a Sparkles extension). */
 export const clearResultCache = (ds: string) =>
-  json<{ cleared: number; bytes: number }>(`/$/cache/clear/${enc(ds)}`, { method: 'POST' });
+  json<{ cleared: number; bytes: number }>(`/$/cache/clear/${enc(ds)}`, {
+    method: 'POST',
+  });
 
 export const dropInferences = (ds: string) =>
   json<unknown>(`/$/reason/${enc(ds)}`, { method: 'DELETE' });
@@ -889,7 +923,12 @@ export type SchemaSummary = {
     anonymousTypeTargets: number;
     anonymousClassExpressions: number;
   };
-  ontology: { iri: string; labels: Lit[]; versionInfo: Lit[]; comments: Lit[] }[];
+  ontology: {
+    iri: string;
+    labels: Lit[];
+    versionInfo: Lit[];
+    comments: Lit[];
+  }[];
   hierarchy: { roots: string[]; cycles: string[][] };
   classes: Page<SchemaClass>;
   predicates: Page<SchemaPredicate>;
@@ -932,7 +971,9 @@ function schemaParams(opts: SchemaOptions, cursor?: string): string {
 
 /** `GET /$/schema/{ds}`: the report with the first page of classes and predicates. */
 export const schemaSummary = (ds: string, opts: SchemaOptions = {}) =>
-  json<SchemaSummary>(`/$/schema/${enc(ds)}${schemaParams(opts)}`, { signal: opts.signal });
+  json<SchemaSummary>(`/$/schema/${enc(ds)}${schemaParams(opts)}`, {
+    signal: opts.signal,
+  });
 
 /** One page of `GET /$/schema/{ds}/classes|predicates` after `cursor`. */
 export function schemaPage<K extends 'classes' | 'predicates'>(
@@ -1007,7 +1048,10 @@ export async function query(
 ): Promise<SparklesResult> {
   const res = await request(`/${enc(ds)}/sparql${queryParams(opts)}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/sparql-query', Accept: SPARKLES_JSON },
+    headers: {
+      'Content-Type': 'application/sparql-query',
+      Accept: SPARKLES_JSON,
+    },
     body: sparql,
     signal: opts.signal,
   });
@@ -1056,7 +1100,10 @@ export async function update(
 ): Promise<UpdateResult | null> {
   const res = await request(`/${enc(ds)}/update?receipt=true`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/sparql-update', Accept: 'application/json' },
+    headers: {
+      'Content-Type': 'application/sparql-update',
+      Accept: 'application/json',
+    },
     body: sparql,
     signal,
   });
@@ -1188,7 +1235,11 @@ export async function shaclRaw(
 
 /** Why a node does not conform to a shape (`appinfo.failures` of a ShEx result). */
 export type ShexFailure =
-  | { kind: 'nodeKind' | 'datatype' | 'facet' | 'valueSet'; value: Term; constraint: string }
+  | {
+      kind: 'nodeKind' | 'datatype' | 'facet' | 'valueSet';
+      value: Term;
+      constraint: string;
+    }
   | {
       kind: 'cardinality';
       predicate: string;
@@ -1252,7 +1303,10 @@ function shexRequest(
   const qs = p.toString();
   return request(`/${enc(ds)}/shex${qs ? `?${qs}` : ''}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/plain' },
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/plain',
+    },
     // the envelope: the schema is sniffed (ShExJ when it starts with `{`, else ShExC)
     body: JSON.stringify({ schema, map }),
     signal: opts.signal,
@@ -1292,7 +1346,12 @@ export type UploadResult = {
   tripleCount?: number;
   quadCount?: number;
   /** The CSV and TSV tables mapped to triples, one report each. */
-  tables?: { file: string; rows: number; triples: number; warnings?: string[] }[];
+  tables?: {
+    file: string;
+    rows: number;
+    triples: number;
+    warnings?: string[];
+  }[];
   /** The commit the upload produced (absent on servers that predate commits). */
   receipt?: Receipt;
 };
@@ -1326,7 +1385,10 @@ export async function upload(
     xhr.setRequestHeader('Accept', 'application/json');
     if (csrf) xhr.setRequestHeader(CSRF_HEADER, csrf);
     xhr.upload.onprogress = (e) =>
-      opts.onProgress?.({ loaded: e.loaded, total: e.lengthComputable ? e.total : 0 });
+      opts.onProgress?.({
+        loaded: e.loaded,
+        total: e.lengthComputable ? e.total : 0,
+      });
     xhr.onerror = () => reject(new ApiError(0, 'Upload failed: network error'));
     xhr.onabort = () => reject(new DOMException('Upload cancelled', 'AbortError'));
     xhr.onload = () => {
@@ -1341,7 +1403,12 @@ export async function upload(
         const receipt = receiptOf(body as Record<string, unknown>);
         return resolve({ ...(body as UploadResult), receipt });
       }
-      const b = body as { error?: string; detail?: string; line?: number; column?: number };
+      const b = body as {
+        error?: string;
+        detail?: string;
+        line?: number;
+        column?: number;
+      };
       reject(
         new ApiError(xhr.status, b?.error ?? `Upload failed (${xhr.status})`, {
           detail: b?.detail,
@@ -1389,7 +1456,10 @@ export type ReasoningStatus = {
 };
 
 /** Parsed `Sparkles-Inferences` response header (sent only when not fresh). */
-export type InferencesNotice = { stale: boolean | null; commitsSince: number | null };
+export type InferencesNotice = {
+  stale: boolean | null;
+  commitsSince: number | null;
+};
 
 export function parseInferencesHeader(v: string | null): InferencesNotice | undefined {
   if (!v) return undefined;
@@ -1508,7 +1578,13 @@ export function diagnostics(ds: string, opts: DiagnosticsOptions = {}): Promise<
 export type DatasetOrigin = {
   originFormat: 1;
   clonedAt: string;
-  source: { name: string; path?: string; version: number; generation: string; quads: number };
+  source: {
+    name: string;
+    path?: string;
+    version: number;
+    generation: string;
+    quads: number;
+  };
   forkedFrom: { id: string; seq: number };
   inferences: 'copy' | 'drop';
   /** A partial clone's selection. */
@@ -1658,7 +1734,12 @@ export type GeoStatus = {
   rows: { base: number; overlay: number; tail: number; wgs84?: number };
   /** Distinct parsed geometries. */
   literals: number;
-  skipped: { malformed: number; unknownCrs: number; tooLarge: number; empty: number };
+  skipped: {
+    malformed: number;
+    unknownCrs: number;
+    tooLarge: number;
+    empty: number;
+  };
   /** Literals per CRS IRI. */
   crs: Record<string, number>;
   /** `mappedBytes`: index files read in place (not counted against the budget). */
@@ -1715,7 +1796,12 @@ export type GeoFeature = {
   type: 'Feature';
   id: string;
   geometry: GeoJsonGeometry;
-  properties: { subject: string; feature?: string; graph: string | null; predicate: string };
+  properties: {
+    subject: string;
+    feature?: string;
+    graph: string | null;
+    predicate: string;
+  };
 };
 
 export type GeoFeatureCollection = {
@@ -1820,7 +1906,11 @@ export type VectorMetric = 'cosine' | 'dot' | 'euclidean';
 export type VectorIndexState = 'ready' | 'building' | 'failed' | 'over-budget';
 
 /** The HNSW settings of an index (the defaults are 16, 128 and 128). */
-export type HnswConfig = { m?: number; efConstruction?: number; efSearch?: number };
+export type HnswConfig = {
+  m?: number;
+  efConstruction?: number;
+  efSearch?: number;
+};
 
 /** The body of `PUT /$/vector/{ds}/{name}`. */
 export type VectorIndexConfig = {
@@ -1979,7 +2069,9 @@ export const rebuildVectorIndex = (ds: string, name: string) =>
 
 /** Embed every selected text of an index again (after its model changed). */
 export const reembedVectorIndex = (ds: string, name: string) =>
-  json<VectorIndexStatus>(`${vectorPath(ds, name)}/reembed`, { method: 'POST' });
+  json<VectorIndexStatus>(`${vectorPath(ds, name)}/reembed`, {
+    method: 'POST',
+  });
 
 /** Measure recall@k against the exact search, with stored vectors as the queries. */
 export function vectorRecall(
@@ -2163,7 +2255,79 @@ export function diff(ds: string, opts: DiffOptions = {}): Promise<Diff> {
   if (opts.quads) p.set('quads', 'true');
   if (opts.limit != null) p.set('limit', String(opts.limit));
   const qs = p.toString();
-  return json<Diff>(`/${enc(ds)}/diff${qs ? `?${qs}` : ''}`, { signal: opts.signal });
+  return json<Diff>(`/${enc(ds)}/diff${qs ? `?${qs}` : ''}`, {
+    signal: opts.signal,
+  });
+}
+
+/** One recorded change of `GET /{ds}/history`. */
+export type HistoryChange = {
+  op: 'add' | 'remove';
+  subject: string;
+  predicate: string;
+  object: string;
+  /** null for the default graph */
+  graph: string | null;
+  commit: number;
+  timestamp: string;
+  kind: string;
+  author?: string;
+  message?: string;
+};
+
+/** `GET /{ds}/history`: the recorded changes of a range of commits. */
+export type HistoryChanges = {
+  dataset: string;
+  datasetId: string;
+  head: number;
+  from: number;
+  to: number;
+  truncated: boolean;
+  changes: HistoryChange[];
+  /** commits whose changes the change log does not hold */
+  unrecorded: {
+    from: number;
+    to: number;
+    reason: 'before-log' | 'bulk' | 'gap';
+  }[];
+};
+
+export type HistoryOptions = {
+  /** N-Triples terms or bare IRIs */
+  subject?: string;
+  predicate?: string;
+  object?: string;
+  /** an IRI, or `default` */
+  graph?: string;
+  from?: string;
+  to?: string;
+  op?: 'add' | 'remove';
+  order?: 'asc' | 'desc';
+  limit?: number;
+  signal?: AbortSignal;
+};
+
+export function historyChanges(ds: string, opts: HistoryOptions = {}): Promise<HistoryChanges> {
+  const p = new URLSearchParams();
+  for (const k of [
+    'subject',
+    'predicate',
+    'object',
+    'graph',
+    'from',
+    'to',
+    'op',
+    'order',
+  ] as const) {
+    const v = opts[k];
+    if (v) p.set(k, v);
+  }
+  if (opts.limit != null) p.set('limit', String(opts.limit));
+  const qs = p.toString();
+  return json<HistoryChanges>(`/${enc(ds)}/history${qs ? `?${qs}` : ''}`, {
+    signal: opts.signal,
+    cache: 'no-store',
+  });
 }
 
 // ------------------------------------------------------ write-time validation ------
@@ -2208,7 +2372,10 @@ export type WriteValidationStatus = {
   counters: Record<GuardStatusName, number>;
   warnings: string[];
   /** SHACL: how shapes are validated on a write */
-  incremental?: { localShapes: number; fullShapes: { shape: string; reason: string }[] };
+  incremental?: {
+    localShapes: number;
+    fullShapes: { shape: string; reason: string }[];
+  };
   lastCheck?: ValidationCheck | null;
   recentRejections?: ValidationCheck[];
 };
@@ -2349,7 +2516,10 @@ export function draftShapesPath(ds: string, opts: DraftOptions = {}): string {
 }
 
 export const draftShapes = (ds: string, opts: DraftOptions = {}) =>
-  json<ShapesDraft>(draftShapesPath(ds, opts), { signal: opts.signal, cache: 'no-store' });
+  json<ShapesDraft>(draftShapesPath(ds, opts), {
+    signal: opts.signal,
+    cache: 'no-store',
+  });
 
 // ------------------------------------------------- class profiles, schema diffs ------
 
@@ -2406,7 +2576,10 @@ export function schemaProfilesPath(ds: string, opts: ProfileOptions = {}): strin
 }
 
 export const schemaProfiles = (ds: string, opts: ProfileOptions = {}) =>
-  json<ClassProfiles>(schemaProfilesPath(ds, opts), { signal: opts.signal, cache: 'no-store' });
+  json<ClassProfiles>(schemaProfilesPath(ds, opts), {
+    signal: opts.signal,
+    cache: 'no-store',
+  });
 
 /** One difference of a field between two reports: a value, or members of a list. */
 export type SchemaChange =
@@ -2460,7 +2633,10 @@ export function schemaDiffPath(ds: string, opts: SchemaDiffOptions): string {
 }
 
 export const schemaDiff = (ds: string, opts: SchemaDiffOptions) =>
-  json<SchemaDiff>(schemaDiffPath(ds, opts), { signal: opts.signal, cache: 'no-store' });
+  json<SchemaDiff>(schemaDiffPath(ds, opts), {
+    signal: opts.signal,
+    cache: 'no-store',
+  });
 
 // ------------------------------------------------------------ stored queries ------
 
@@ -2523,7 +2699,9 @@ export async function storedQueries(ds: string, signal?: AbortSignal): Promise<S
 }
 
 export const storedQuery = (ds: string, name: string) =>
-  json<StoredQuery>(`/$/queries/${enc(ds)}/${enc(name)}`, { cache: 'no-store' });
+  json<StoredQuery>(`/$/queries/${enc(ds)}/${enc(name)}`, {
+    cache: 'no-store',
+  });
 
 export const putStoredQuery = (ds: string, name: string, def: StoredDefinition) =>
   json<StoredQuery & { changed: boolean }>(`/$/queries/${enc(ds)}/${enc(name)}`, {
@@ -2548,7 +2726,10 @@ export async function runStoredQuery(
 ): Promise<SparklesResult> {
   const res = await request(`/${enc(ds)}/queries/${enc(name)}${queryParams(opts)}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: SPARKLES_JSON },
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: SPARKLES_JSON,
+    },
     body: new URLSearchParams(values).toString(),
     signal: opts.signal,
   });

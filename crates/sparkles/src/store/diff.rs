@@ -28,7 +28,7 @@ use std::time::Instant;
 pub(crate) type QuadKey = [Arc<[u8]>; 4];
 
 /// How a quad changed between `from` and `to`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiffOp {
     /// in `to`, not in `from`
     Add,
@@ -772,6 +772,13 @@ impl Store {
             let (sb, _) = self.snapshot_at(&At::Commit(hi), &self.history_opts(o))?;
             let (sa, sb) = (view.masked(&sa)?, view.masked(&sb)?);
             compared += compare_states(&sa, &sb, &mut net)?;
+        } else if lo != hi
+            && let Some(n) = self.diff_via_change_log(&rf, from, &rt, to, o, &mut net)?
+        {
+            // a state the generations no longer hold, or a bulk commit between them:
+            // the change log has every commit's changes
+            method = DiffMethod::Log;
+            log_changes += n;
         } else if lo != hi {
             if self.root.is_some() {
                 // both ends must be readable, whatever path leads between them
@@ -831,6 +838,71 @@ impl Store {
             compared,
             changes,
         })
+    }
+
+    /// The changes between two commits from the change log, when the write-ahead logs
+    /// cannot give them all (an end is no longer readable, or a bulk commit lies between
+    /// them) and the change log records every commit between them. `None` otherwise.
+    fn diff_via_change_log(
+        &self,
+        rf: &Resolved,
+        from: &At,
+        rt: &Resolved,
+        to: &At,
+        o: &DiffOptions,
+        net: &mut Net<'_>,
+    ) -> Result<Option<u64>> {
+        let Some(log) = self.changelog.as_ref().filter(|l| l.is_enabled()) else {
+            return Ok(None);
+        };
+        let (lo, hi) = (
+            rf.commit.seq.min(rt.commit.seq),
+            rf.commit.seq.max(rt.commit.seq),
+        );
+        let readable = match &self.history {
+            Some(_) => {
+                self.check_readable(rf, from).is_ok()
+                    && self.check_readable(rt, to).is_ok()
+                    && self
+                        .diff_plan(lo, hi)?
+                        .iter()
+                        .all(|s| matches!(s, Step::Log { .. }))
+            }
+            None => {
+                let ho = self.history_opts(o);
+                self.snapshot_at(&At::Commit(lo), &ho).is_ok()
+                    && self.snapshot_at(&At::Commit(hi), &ho).is_ok()
+            }
+        };
+        if readable {
+            return Ok(None);
+        }
+        log.flush(false)?;
+        let mut filter = super::changelog::LogFilter::default();
+        if let Some(g) = &o.graph {
+            filter.keys[0] = Some(vec![graph_key(g)]);
+        }
+        let mut found: Vec<(QuadKey, bool)> = Vec::new();
+        let mut n = 0u64;
+        let mut check = || {
+            n += 1;
+            if n & 0xFF == 0 { o.check() } else { Ok(()) }
+        };
+        let holes = log.scan(lo + 1, hi, &filter, false, &mut check, &mut |_, add, k| {
+            found.push((k.clone(), add));
+            if found.len() & 0xFFFF == 0 {
+                o.over(found.len() as u64)?;
+            }
+            Ok(true)
+        })?;
+        if !holes.is_empty() {
+            return Ok(None);
+        }
+        let changes = found.len() as u64;
+        for (k, add) in found {
+            net.toggle(k, add)?;
+        }
+        Ok(Some(changes))
     }
 
     fn history_opts(&self, o: &DiffOptions) -> crate::history::HistoryOptions {

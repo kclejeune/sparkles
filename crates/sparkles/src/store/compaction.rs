@@ -925,6 +925,9 @@ impl Store {
             }
         }
         self.failpoint("compact-caught-up");
+        // the commits up to the new base are in the old generation's log only: the change
+        // log must hold them durably before that log can go
+        self.sync_change_log()?;
         // the switch, under the writer lock
         let mut w = self.writer.lock();
         let tl = Instant::now();
@@ -998,6 +1001,7 @@ impl Store {
             counts: Default::default(),
             historical: false,
             mask: None,
+            change_log: self.changelog.clone(),
         };
         self.rebuild_geo_locked(&mut new_snap, &view);
         let quads = new_snap.len();

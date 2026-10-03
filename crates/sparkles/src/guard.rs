@@ -102,6 +102,9 @@ pub struct WriteOptions {
     /// the message recorded with the commit (see
     /// [`annotations::validate_message`](crate::annotations::validate_message))
     pub message: Option<Arc<str>>,
+    /// who makes the write, recorded with its changes in the change log (a server
+    /// records its authenticated caller)
+    pub author: Option<Arc<str>>,
     /// checked once the writer lock is held, before anything is written
     pub precondition: Option<Precondition>,
     /// fail with [`Error::WriterBusy`](crate::Error::WriterBusy) instead of waiting

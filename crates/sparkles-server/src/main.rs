@@ -92,6 +92,14 @@ struct Cli {
     /// Old index generations named snapshots may keep per dataset
     #[arg(long, global = true, default_value_t = 8)]
     history_max_generations: usize,
+    /// Do not record the change log that history queries read, unless a dataset's
+    /// settings turn it on
+    #[arg(long, global = true)]
+    no_change_log: bool,
+    /// The most disk a dataset's change log may use, in MiB (0: unlimited); a dataset's
+    /// settings override it
+    #[arg(long, global = true, default_value_t = 1024)]
+    change_log_mb: u64,
     /// Named snapshots per dataset
     #[arg(long, global = true, default_value_t = 256)]
     max_snapshots: usize,
@@ -418,6 +426,135 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
                 }
             };
             print_history(&store.set_catalog_horizon(c)?, "text")?;
+        }
+    }
+    Ok(())
+}
+
+/// The arguments of `sparkles history`.
+struct HistoryArgs {
+    subject: Vec<String>,
+    predicate: Vec<String>,
+    object: Vec<String>,
+    graph: Vec<String>,
+    from: Option<String>,
+    to: Option<String>,
+    op: Option<String>,
+    limit: usize,
+    desc: bool,
+    format: String,
+}
+
+/// A term argument: N-Triples syntax, or a bare IRI.
+fn term_arg(v: &str) -> Result<oxrdf::Term> {
+    let v = v.trim();
+    if v.starts_with('<') || v.starts_with('"') || v.starts_with("_:") {
+        v.parse::<oxrdf::Term>()
+            .map_err(|e| anyhow::anyhow!("invalid term {v:?}: {e}"))
+    } else {
+        Ok(oxrdf::Term::NamedNode(
+            oxrdf::NamedNode::new(v).with_context(|| format!("invalid IRI {v:?}"))?,
+        ))
+    }
+}
+
+fn history_cmd(loc: &std::path::Path, a: HistoryArgs, opts: StoreOptions) -> Result<()> {
+    use sparkles::store::{DiffOp, HistoryBound, HistoryQuery};
+    if !matches!(a.format.as_str(), "text" | "json") {
+        bail!("unknown format {:?}: use text or json", a.format);
+    }
+    let store = Store::open(loc, opts)?;
+    let terms = |v: &[String]| v.iter().map(|t| term_arg(t)).collect::<Result<Vec<_>>>();
+    let predicates = terms(&a.predicate)?
+        .into_iter()
+        .map(|t| match t {
+            oxrdf::Term::NamedNode(n) => Ok(n),
+            t => bail!("--predicate {t} is not an IRI"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let graphs = a
+        .graph
+        .iter()
+        .map(|g| match g.as_str() {
+            "default" => Ok(oxrdf::GraphName::DefaultGraph),
+            g => Ok(oxrdf::GraphName::NamedNode(
+                oxrdf::NamedNode::new(g).with_context(|| format!("invalid graph IRI {g:?}"))?,
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bound = |s: &Option<String>| -> Result<Option<HistoryBound>> {
+        Ok(match s {
+            Some(s) => Some(HistoryBound::At(s.parse()?)),
+            None => None,
+        })
+    };
+    let q = HistoryQuery {
+        subjects: terms(&a.subject)?,
+        predicates,
+        objects: terms(&a.object)?,
+        graphs,
+        from: bound(&a.from)?,
+        to: bound(&a.to)?,
+        op: match a.op.as_deref() {
+            None => None,
+            Some("add") => Some(DiffOp::Add),
+            Some("remove") => Some(DiffOp::Remove),
+            Some(o) => bail!("--op must be add or remove, not {o:?}"),
+        },
+        limit: a.limit,
+        descending: a.desc,
+        ..Default::default()
+    };
+    let t = Instant::now();
+    let r = store.history_changes(&q)?;
+    eprintln!(
+        "commits {}..{}: {} change(s){} ({:.1} ms)",
+        r.from,
+        r.to,
+        r.changes.len(),
+        if r.truncated {
+            ", more past --limit"
+        } else {
+            ""
+        },
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    for u in &r.unrecorded {
+        eprintln!(
+            "commits {}..{} are not recorded ({})",
+            u.from,
+            u.to,
+            serde_json::to_value(u.reason)?.as_str().unwrap_or("")
+        );
+    }
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    for c in &r.changes {
+        if a.format == "json" {
+            let j = serde_json::json!({
+                "commit": c.commit.seq,
+                "timestamp": c.commit.timestamp(),
+                "kind": c.commit.kind.name(),
+                "author": c.commit.author.as_deref(),
+                "message": c.commit.message.as_deref(),
+                "op": match c.op { DiffOp::Add => "add", DiffOp::Remove => "remove" },
+                "quad": sparkles::annotations::nquads_line(&c.quad),
+            });
+            writeln!(out, "{j}")?;
+        } else {
+            let who = match (&c.commit.author, &c.commit.message) {
+                (Some(a), Some(m)) => format!("  # {a}: {m}"),
+                (Some(a), None) => format!("  # {a}"),
+                (None, Some(m)) => format!("  # {m}"),
+                (None, None) => String::new(),
+            };
+            writeln!(
+                out,
+                "{:>8}  {}  {} {}{who}",
+                c.commit.seq,
+                c.commit.timestamp(),
+                c.op.sign(),
+                sparkles::annotations::nquads_line(&c.quad)
+            )?;
         }
     }
     Ok(())
@@ -1307,6 +1444,42 @@ enum Cmd {
         #[arg(long, default_value = "diff")]
         format: String,
     },
+    /// The recorded changes of a range of commits, from the change log: the quads added
+    /// and removed, and the commit, time and author of each change
+    History {
+        #[arg(long)]
+        loc: PathBuf,
+        /// a subject (an IRI, or an N-Triples term); repeat for several
+        #[arg(long)]
+        subject: Vec<String>,
+        /// a predicate IRI; repeat for several
+        #[arg(long)]
+        predicate: Vec<String>,
+        /// an object (an IRI, or an N-Triples term such as '"Ann"@en'); repeat for several
+        #[arg(long)]
+        object: Vec<String>,
+        /// a graph IRI, or `default`; repeat for several
+        #[arg(long)]
+        graph: Vec<String>,
+        /// the first commit read (N, commit:N, time:<RFC 3339>, snapshot:NAME, head)
+        #[arg(long)]
+        from: Option<String>,
+        /// the last commit read (by default the head)
+        #[arg(long)]
+        to: Option<String>,
+        /// only additions (add) or only removals (remove)
+        #[arg(long)]
+        op: Option<String>,
+        /// the most changes listed
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// newest commits first
+        #[arg(long)]
+        desc: bool,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// List the database's commits (works while a server holds the database)
     Log {
         #[arg(long)]
@@ -1536,6 +1709,8 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         max_prefixes: cli.max_prefixes,
         commit_digests: cli.commit_digests,
         wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
+        change_log: !cli.no_change_log,
+        change_log_max_bytes: cli.change_log_mb << 20,
         ..Default::default()
     }
 }
@@ -2827,6 +3002,34 @@ fn run() -> Result<()> {
             graph,
             format,
         } => diff_cmd(&loc, &from, &to, graph.as_deref(), &format, opts),
+        Cmd::History {
+            loc,
+            subject,
+            predicate,
+            object,
+            graph,
+            from,
+            to,
+            op,
+            limit,
+            desc,
+            format,
+        } => history_cmd(
+            &loc,
+            HistoryArgs {
+                subject,
+                predicate,
+                object,
+                graph,
+                from,
+                to,
+                op,
+                limit,
+                desc,
+                format,
+            },
+            opts,
+        ),
         #[cfg(any(feature = "shacl", feature = "shex"))]
         Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Quota(args) => quota_cmd::run(args, opts),

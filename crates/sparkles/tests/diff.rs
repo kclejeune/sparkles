@@ -262,6 +262,9 @@ fn random_histories_across_compactions_and_bulk_commits() {
             StoreOptions {
                 bulk_threshold: 6,
                 history_max_generations: 64,
+                // the write-ahead logs and state comparisons alone (the change log is
+                // checked in history_log.rs)
+                change_log: false,
                 ..Default::default()
             },
         )
@@ -407,7 +410,15 @@ fn the_change_feed_stops_at_gaps() {
 fn gaps_in_history_are_compared() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
-    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    // without the change log, which would read the gap's changes (history_log.rs)
+    let s = Store::open(
+        &root,
+        StoreOptions {
+            change_log: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let u = |q: &str| update(&s, q, &QueryOptions::default()).unwrap();
     u("INSERT DATA { <urn:a> <urn:p> 1 }");
     u("INSERT DATA { <urn:b> <urn:p> 2 }");

@@ -93,8 +93,10 @@ impl Server {
     fn head(&self) -> u64 {
         self.ds().store.head_commit().seq
     }
-    /// Every file of the dataset's directory with its bytes.
+    /// Every file of the dataset's directory with its bytes, once the change log's
+    /// background writer has written what earlier commits queued.
     fn files(&self) -> BTreeMap<String, Vec<u8>> {
+        self.ds().store.flush_change_log().unwrap();
         let root = self.ds().store.root().unwrap().to_path_buf();
         let mut out = BTreeMap::new();
         let mut stack = vec![root.clone()];

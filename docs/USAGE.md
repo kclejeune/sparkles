@@ -569,6 +569,20 @@ it, every commit stays listed. Over HTTP the same features are `?at=`, `GET /{ds
 `/$/snapshots/{ds}` and `/$/history/{ds}`
 ([API: Point-in-time reads and snapshots](API.md#point-in-time-reads-and-snapshots)).
 
+`sparkles history` lists the recorded changes of a subject, predicate, object or graph
+across commits, with each commit's time, author and message. It reads the change log,
+which keeps the changes after a compaction too
+([API: History queries](API.md#history-queries)).
+
+```sh
+sparkles history --loc db --subject http://example.org/alice
+sparkles history --loc db --predicate http://example.org/price --from time:2026-10-01T00:00:00Z
+sparkles history --loc db --subject http://example.org/alice --desc --limit 1   # the last change
+```
+
+The same queries run in SPARQL through `SERVICE <urn:x-sparkles:history#changes>`, and
+over HTTP as `GET /{ds}/history`.
+
 A server also offers a change feed, `GET /{ds}/changes?after=N`. It lists the commits after
 commit N with their changes, as JSON or as one RDF Patch per commit. With `wait=30` a
 request waits for the next commit, and with `Accept: text/event-stream` the commits arrive
