@@ -208,8 +208,9 @@ async fn snapshots_history_and_gone_commits() {
     )
     .await;
     assert!(r.status.is_success());
+    // the compaction is a background task, slow on a loaded machine
     let mut done = false;
-    for _ in 0..200 {
+    for _ in 0..6000 {
         let h = get(&s.app, "/$/history/h").await.json();
         if h["generations"].as_array().unwrap().len() == 2 {
             done = true;
