@@ -223,11 +223,11 @@ impl Store {
             write_atomic(&dir.join(file), &cfg)?;
         }
         // write-time validation stays configured (the clone judges its first write in
-        // full), and the stored queries come along
+        // full), and the stored queries and the GraphQL configuration come along
         if let Some(root) = &self.root {
             for f in crate::guard::config::FILES
                 .iter()
-                .chain([&crate::stored::FILE])
+                .chain([&crate::stored::FILE, &"graphql.json"])
             {
                 match std::fs::read(root.join(f)) {
                     Ok(b) => write_atomic(&dir.join(f), &b)?,

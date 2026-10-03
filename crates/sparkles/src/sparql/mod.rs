@@ -108,6 +108,10 @@ pub struct QueryOptions {
     pub outbound_budget: Option<Arc<crate::outbound::RequestBudget>>,
     /// How DESCRIBE describes a resource (see [`describe`]).
     pub describe: describe::DescribeOptions,
+    /// The count of rows produced that [`max_rows_produced`](Self::max_rows_produced)
+    /// limits (`None`: a new one), shared by several queries that count as one request,
+    /// such as the fetch groups of one GraphQL request.
+    pub work: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Which files `LOAD <file:…>` may read.
@@ -342,6 +346,9 @@ fn make_ctx(
     }
     if let Some(m) = opts.max_rows_produced {
         ctx.max_rows_produced = m;
+    }
+    if let Some(w) = &opts.work {
+        ctx.rows_produced = w.clone();
     }
     ctx.allow_service = opts.allow_service;
     ctx.forbid_service = opts.forbid_service;

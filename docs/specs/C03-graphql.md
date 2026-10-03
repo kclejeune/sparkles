@@ -1,15 +1,17 @@
 # C03: GraphQL read adapter
 
-> **Status:** specified
+> **Status:** implemented in part (Phase 1)
 >
-> **Phases:** None shipped. Phase 1 is the adapter, the schema configuration, schema
-> drafts, `/{ds}/graphql` and the CLI. Phase 2 adds the UI, stored GraphQL queries and
-> MCP tools. Phase 3 is subscriptions, built only if a workload asks for them.
+> **Phases:** Phase 1 shipped on 2026-10-02: the adapter, the schema configuration,
+> schema drafts, `/{ds}/graphql` and the CLI. Phase 2 (the UI, stored GraphQL queries
+> and MCP tools) is not built. Phase 3 is subscriptions, built only if a workload asks
+> for them.
 >
-> **User docs:** none yet.
+> **User docs:** [API: GraphQL](../API.md#graphql) · [Usage: GraphQL](../USAGE.md#graphql) ·
+> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how it landed.
 
 This is a clean-room design. It was written from the GraphQL specification (the October
 2021 edition and the current working draft), the GraphQL over HTTP working draft, the
@@ -1140,4 +1142,111 @@ French. `ex:Employee rdfs:subClassOf ex:Person`. Some `ex:Org` nodes have `ex:na
 
 ## Outcome
 
-Not built.
+**Phase 1 delivered on 2026-10-02.** Phases 2 and 3 are not built.
+
+- The crate `sparkles-graphql` holds the adapter. `mapping` parses the SDL with
+  `apollo-compiler` next to a prelude that declares the four directives, the scalars the
+  SDL does not declare, `LangString`, `RDFTerm` and `Node`, and checks it as §3.3 says.
+  Every error names its line. `api` writes the API schema as SDL, and `apollo-compiler`
+  validates it. `plan` walks the selection tree with the specification's CollectFields
+  and makes the fetch groups. `algebra` builds each group as `spargebra` algebra. `exec`
+  runs the groups in order on one snapshot and assembles the response. `config` keeps
+  `graphql.json` with 20 versions, and `draft` reads SHACL shapes or C02's drafted shapes
+  and writes the commented SDL.
+- The engine gained `QueryOptions::work`, the row count of `--max-rows-produced`, shared
+  by every group of a request. The groups also share one deadline, and the serialized
+  response counts against `--max-result-mb`.
+- The server's `http::graphql` module serves `/{ds}/graphql`, `/{ds}/graphql/schema`,
+  `/$/graphql/{ds}`, `…/versions` and `…/draft`, behind the default-on `graphql` feature.
+  Grants gained the endpoint `graphql`, which `query` covers. Requests count against the
+  `query` rate-limit class, are measured as `operation="graphql"`, fill the histogram
+  `sparkles_graphql_groups`, and log the operation name, the document hash and the
+  number of groups. `serve` has `--graphql-max-depth`, `--graphql-max-nodes`,
+  `--graphql-default-first` and `--graphql-max-first`. `sparkles graphql --loc DB` has
+  `run`, and `schema get|put|delete|versions|draft`. Backups and clones of a persistent
+  dataset carry `graphql.json`.
+
+**Deviations and additions.**
+
+- The response is assembled by `apollo-compiler`'s `resolvers::Execution`, whose
+  resolvers read the groups' rows and never query. It gives the specification's null
+  propagation, `__typename` and introspection. A field error carries its code through a
+  table the resolvers fill, since the executor's errors have a message only.
+- `VALUES` cannot hold blank nodes, so each blank node parent of a child group is one
+  `UNION` branch whose variable is bound through `QueryOptions::initial_bindings`. The
+  explained text of such a group names a variable bound outside it, so A17 holds for
+  groups whose parents are IRIs.
+- An order key sorts a node by its smallest value, or its largest one for `_DESC`, with
+  `GROUP BY` and `MIN` or `MAX`. A node with two values of an order field then appears
+  once instead of twice.
+- String filters compare the lexical form of literals, `STR(?x)`, so `eq: "Ann"` matches
+  `"Ann"@en` as well. The other scalars compare typed values.
+- `TFilter` has no `exists` for object fields. `not: { worksFor: {} }` says that a node
+  has no value, since an empty filter on an object field holds when some value exists.
+- The default language range `"*"` matches every value, tagged or not, so a `String`
+  field over plain literals needs no `@lang`. A `lang` argument that names other ranges
+  filters as §4.5 says.
+- Drafts type a field whose class has no drafted type, and a field with `sh:nodeKind
+  sh:IRI`, as `Node` rather than `Resource`. Such a value is answered as its mapped type
+  when it has one, and as `Resource` otherwise. Mapping schemas accept fields typed
+  `Node` for the same reason.
+- Without `source`, a draft reads shapes when a shapes graph is named or a SHACL guard is
+  installed, and the data otherwise. A non-null field is backed when the guard runs in
+  `reject` mode with a `strict` baseline over exactly the schema's `dataGraph`.
+- A5's document, `allPerson(first: 1000) { nodes { name knows { name } } }`, estimates
+  1,000 + 1,000 × 100 = 101,000 nodes with the default `defaultFirst`, one more than
+  `maxNodes` allows. The tests run it with `knows(first: 10)` or a raised limit.
+- `persistedOnly: true` is refused at `PUT`, because stored GraphQL queries are Phase 2.
+  The CLI's `--force` is accepted and does nothing yet.
+- A cursor's `h` hashes the field's name, not its alias, with its filter and order and
+  the schema version.
+- A `PUT` with `application/graphql` replaces the SDL and keeps the other fields of the
+  installed configuration.
+- A malformed HTTP request has the code `BAD_REQUEST`, and an operation name that the
+  document does not have is `GRAPHQL_VALIDATION_FAILED`. A `403` from the access layer
+  has Sparkles' JSON error body, not a GraphQL response.
+- `explain=true` also returns `extensions.sparkles.timing`, the time of parsing,
+  planning, the groups and assembly, and `groups`, the number of engine executions.
+- The configuration of an in-memory dataset is not in its backups, as for stored queries.
+
+**Tests.** The crate's tests cover A4 to A11, A14, A15 and A17, abstract types, blank
+nodes, mapping errors with their lines and the non-null warnings. A differential test
+runs 400 random documents over 40 random graphs, with nested `and`, `or`, `not` and
+object filters, orders, slices, nested lists and multi-valued fields, and compares each
+answer with hand-written SPARQL. The server's tests cover A1 to A3, A6 with
+`CURSOR_EXPIRED` after a compaction, A11, A12, A14, A15 and A17 over HTTP, the status
+codes of both media types and the metrics. The access-control tests cover A13: a view of
+some graphs answers as a store holding only those graphs, a hidden node is null like a
+missing one, a `graphql`-only grant reads `/{ds}/graphql` and gets `403` from
+`/{ds}/sparql`, a `query` grant covers `graphql`, and protections of triples apply to
+lookups, collections and `totalCount`. A CLI test drafts, installs and runs.
+
+**Measurements.** The release build ran on the 1.05M-triple data of
+`scripts/gen-data.py` in memory, with mimalloc preloaded and pinned to cores 0–11, with
+`crates/sparkles-graphql/tests/bench.rs`. The machine was shared with other builds, with
+a load average of 45 to 49 on 16 cores, so absolute times are inflated and vary by up to
+2× between runs. Each value is the median of 21 runs that alternate the four
+measurements, with the result cache off.
+
+| Document | Groups | GraphQL ms | Groups as SPARQL ms | Adapter ms | One SPARQL query ms |
+|---|---|---|---|---|---|
+| `person(id:) { name age knows { name } }` | 2 | 2.58 | 2.35 | 0.09 | 10.98 |
+| `allPerson(first: 100) { nodes { id name age } }` | 1 | 26.40 | 25.13 | 0.25 | 24.09 |
+| `allPerson(first: 1000) { nodes { name knows(first: 10) { name } } }` | 2 | 56.39 | 39.31 | 7.10 | 47.35 |
+| the same page with `filter`, `orderBy`, `totalCount` and `worksFor` | 3 | 23.13 | 21.67 | 0.32 | 52.75 |
+| a page of 1,000 with two sibling lists, `knows` and `authorOf` | 3 | 49.79 | 33.29 | 8.82 | 40.83 |
+
+"Groups as SPARQL" runs the groups' explained text through `sparkles::sparql::query`.
+"Adapter" is parsing, planning and assembly. "One SPARQL query" is the query a developer
+would write with nested `OPTIONAL`s, without per-parent limits. For lookups, pages and
+filtered pages, the adapter adds 0.1 to 0.3 ms and stays within §15's target. For a
+response of about 3,600 nodes, assembly takes 7 to 9 ms, about 2 µs per node, and the
+request is about 40% slower than its groups run as SPARQL, which misses the 10% target.
+Assembly runs the generic executor once per object and builds a JSON value per field,
+and it was not profiled further. The single SPARQL query was slower than the adapter for
+the lookup and the filtered page, and faster for the two pages of 1,000 people.
+
+**Not built.** Phase 2 (the UI's GraphQL page and schema editor, stored GraphQL
+queries, `persistedOnly`, the MCP tools, `QueryOptions::seed` and the per-group top-k)
+and Phase 3 (subscriptions). Nested lists are not connections, and a nested `first`
+limits the response while the engine produces every value of the field.

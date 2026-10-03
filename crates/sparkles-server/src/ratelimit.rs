@@ -128,6 +128,7 @@ pub fn classify(
             || admin.starts_with("schema/")
             || admin.starts_with("stats/")
             || admin == "reason/{ds}/diagnostics"
+            || admin == "graphql/{ds}/draft"
         {
             return Some(Class::Query);
         }
@@ -141,7 +142,9 @@ pub fn classify(
         | "/{ds}/shacl"
         | "/{ds}/shex"
         | "/{ds}/diff"
-        | "/{ds}/queries/{name}" => Some(Class::Query),
+        | "/{ds}/queries/{name}"
+        | "/{ds}/graphql"
+        | "/{ds}/graphql/schema" => Some(Class::Query),
         "/{ds}/update" | "/{ds}/upload" => Some(Class::Update),
         "/{ds}/patch" => Some(if read { Class::Query } else { Class::Update }),
         "/{ds}/data" | "/{ds}/{*graph}" => Some(if read { Class::Query } else { Class::Update }),

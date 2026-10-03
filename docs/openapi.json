@@ -7277,6 +7277,398 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/graphql/{ds}": {
+      "delete": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphql"
+        },
+        "operationId": "deleteGraphqlConfig",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed with its versions."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove the GraphQL configuration",
+        "tags": [
+          "GraphQL"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphql"
+        },
+        "operationId": "getGraphqlConfig",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "An older version, while it is kept.",
+            "in": "query",
+            "name": "version",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "description": "The configuration: `sdl` (the mapping schema), `dataGraph`, `reasoning`, `introspection` and `limits`, with the version's `version`, `parent`, `created`, `author`, `message`, `datasetCommit` and `digest`.",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The configuration with its version.",
+            "headers": {
+              "ETag": {
+                "description": "`\"v<N>\"`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get the GraphQL configuration",
+        "tags": [
+          "GraphQL"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "put": {
+        "description": "Checks the mapping schema and installs it as the next version. The body is the configuration as JSON, with an optional `message`, or the SDL alone as `application/graphql`, which keeps the other fields. The answer has `changed` and `warnings`, such as a non-null field no write-time guard backs. `If-Match: \"v<N>\"` installs only over version N, and `If-None-Match: *` only when none is installed.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphql"
+        },
+        "operationId": "putGraphqlConfig",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ifNoneMatch"
+          },
+          {
+            "$ref": "#/components/parameters/commitMessage"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/graphql": {
+              "schema": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "required": [
+                  "sdl"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "description": "The configuration: `sdl` (the mapping schema), `dataGraph`, `reasoning`, `introspection` and `limits`, with the version's `version`, `parent`, `created`, `author`, `message`, `datasetCommit` and `digest`.",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Installed as a new version, or unchanged (`changed: false`)."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "description": "The configuration: `sdl` (the mapping schema), `dataGraph`, `reasoning`, `introspection` and `limits`, with the version's `version`, `parent`, `created`, `author`, `message`, `datasetCommit` and `digest`.",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Installed."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Install a GraphQL schema",
+        "tags": [
+          "GraphQL"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/graphql/{ds}/draft": {
+      "get": {
+        "description": "Drafts a mapping schema for review, from SHACL shapes (`source=shapes`: the write-time guard's, or the graph `shapesGraph`) or from the data (`source=observed`, with the selection of `/$/schema/{ds}/shapes`). Nothing is installed.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphql"
+        },
+        "operationId": "draftGraphqlSchema",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "Shapes when there is a shapes graph or a SHACL guard, else observed.",
+            "in": "query",
+            "name": "source",
+            "schema": {
+              "enum": [
+                "shapes",
+                "observed"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "A named graph of SHACL shapes.",
+            "in": "query",
+            "name": "shapesGraph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Observed: the share of instances a constraint must hold for (default 1).",
+            "in": "query",
+            "name": "support",
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "description": "Observed: `default`, `union` or a graph IRI.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Observed: only these classes (repeatable).",
+            "in": "query",
+            "name": "class",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Observed: skip classes with fewer instances.",
+            "in": "query",
+            "name": "minInstances",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`json` for the decisions behind the draft.",
+            "in": "query",
+            "name": "format",
+            "schema": {
+              "enum": [
+                "sdl",
+                "json"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The draft."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Draft a mapping schema",
+        "tags": [
+          "GraphQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/graphql/{ds}/versions": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphql"
+        },
+        "operationId": "listGraphqlVersions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The kept versions, newest first."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the versions of the GraphQL configuration",
+        "tags": [
+          "GraphQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/history/{ds}": {
       "get": {
         "externalDocs": {
@@ -14826,6 +15218,696 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/{ds}/graphql": {
+      "get": {
+        "description": "Runs a GraphQL document against the dataset's installed schema, as the GraphQL over HTTP draft defines it. `GET` takes `query`, `operationName` and `variables` (JSON) in the query string and runs queries only. The parameters `at`, `timeout`, `reasoning`, `nocache`, `explain` and the budget overrides of `/{ds}/sparql` apply. The response is `application/graphql-response+json` when the client accepts it, else `application/json`; a document that does not validate answers `422` under the first and `200` under the second.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphql"
+        },
+        "operationId": "graphqlGet",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/reasoning"
+          },
+          {
+            "$ref": "#/components/parameters/nocache"
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "description": "Add each fetch group's SPARQL, rows and time to `extensions.sparkles.plan`.",
+            "in": "query",
+            "name": "explain",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The GraphQL document.",
+            "in": "query",
+            "name": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The operation to run.",
+            "in": "query",
+            "name": "operationName",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The variables as a JSON object.",
+            "in": "query",
+            "name": "variables",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/graphql-response+json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The response, with or without execution errors.",
+            "headers": {
+              "Sparkles-Commit": {
+                "description": "The commit a read saw, or a write produced.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Sparkles-Dataset-Id": {
+                "description": "The dataset id.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/graphql-response+json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A malformed request, or a document that does not parse."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/graphql-response+json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such dataset, or no schema installed."
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "422": {
+            "content": {
+              "application/graphql-response+json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A document that does not validate, or over a limit (`application/graphql-response+json`)."
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Run a GraphQL query",
+        "tags": [
+          "GraphQL"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "Runs a GraphQL document against the dataset's installed schema, as the GraphQL over HTTP draft defines it. `GET` takes `query`, `operationName` and `variables` (JSON) in the query string and runs queries only. The parameters `at`, `timeout`, `reasoning`, `nocache`, `explain` and the budget overrides of `/{ds}/sparql` apply. The response is `application/graphql-response+json` when the client accepts it, else `application/json`; a document that does not validate answers `422` under the first and `200` under the second.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphql"
+        },
+        "operationId": "graphqlPost",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/reasoning"
+          },
+          {
+            "$ref": "#/components/parameters/nocache"
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "description": "Add each fetch group's SPARQL, rows and time to `extensions.sparkles.plan`.",
+            "in": "query",
+            "name": "explain",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/graphql": {
+              "schema": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "extensions": {
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "operationName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "query": {
+                    "type": "string"
+                  },
+                  "variables": {
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "A GraphQL request: `query`, `operationName` and `variables` as JSON, or the document alone as `application/graphql`.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/graphql-response+json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The response, with or without execution errors.",
+            "headers": {
+              "Sparkles-Commit": {
+                "description": "The commit a read saw, or a write produced.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Sparkles-Dataset-Id": {
+                "description": "The dataset id.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/graphql-response+json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A malformed request, or a document that does not parse."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/graphql-response+json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "No such dataset, or no schema installed."
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "content": {
+              "application/graphql-response+json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "description": "A GraphQL response: `data`, `errors` with `extensions.code`, and `extensions.sparkles` with the commit read and, with `explain=true`, each fetch group's SPARQL, rows and time.",
+                  "properties": {
+                    "data": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "errors": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "extensions": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "A document that does not validate, or over a limit (`application/graphql-response+json`)."
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Run a GraphQL query (POST)",
+        "tags": [
+          "GraphQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/graphql/schema": {
+      "get": {
+        "description": "The schema clients see, as SDL, without the mapping directives.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphql"
+        },
+        "operationId": "graphqlApiSchema",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The API schema."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get the API schema",
+        "tags": [
+          "GraphQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/{ds}/patch": {
       "patch": {
         "description": "Applies an RDF Patch as one write transaction, as Fuseki's `patch` operation does. The text form is `application/rdf-patch`, which a missing content type or `application/x-www-form-urlencoded` also means, and the binary form is `application/rdf-patch+thrift`. `TX`, `TC` and `Z` are markers, and `TA` aborts the whole patch with `200` and `aborted: true`. `PA` and `PD` change the dataset's prefixes. A `prev` header that names a commit of this dataset applies the patch only when that commit is the head, and is `412` otherwise. The body is limited by `--max-upload-mb`. A patch that changes data makes one commit of kind `patch`. The other methods are `405`.",
@@ -17823,6 +18905,13 @@
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-queries"
       },
       "name": "Stored queries"
+    },
+    {
+      "description": "Read-only GraphQL over a dataset, and its mapping schema.",
+      "externalDocs": {
+        "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphql"
+      },
+      "name": "GraphQL"
     },
     {
       "description": "Commits, diffs, the change feed, snapshots and retention.",

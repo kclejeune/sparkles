@@ -137,10 +137,11 @@ of a restricted principal is the union of the named graphs it can read (§4).
 | `upload` | `/{ds}/upload` |
 | `shacl`, `shex` | `/{ds}/shacl`, `/{ds}/shex`, and the MCP validation tools |
 | `diff` | `/{ds}/diff` |
+| `graphql` | `/{ds}/graphql` and `/{ds}/graphql/schema` ([C03](C03-graphql.md)). A grant that lists `query` covers it too. |
 | `info` | Every other route that needs `read` or `write` on the dataset: its description, statistics, schema, prefixes, commits, reasoning and index status, snapshots and history settings, validation settings, backups listing and readiness. The MCP tools and resources that describe a dataset count as `info`. |
 
 The first six names are Fuseki's operation names. As in Fuseki, `gsp-rw` includes the
-reads of `gsp-r`. Routes that need `admin` have no endpoint name, because only
+reads of `gsp-r`, and `query` includes `graphql`, which reads no more than SPARQL does. Routes that need `admin` have no endpoint name, because only
 unrestricted grants give `admin`.
 
 ### 2.3 Evaluation

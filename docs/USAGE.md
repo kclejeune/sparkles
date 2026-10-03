@@ -789,6 +789,54 @@ A request can choose another mode with `describe=scbd` and lower the limits with
 `describe-max-triples` and `describe-max-depth`. `sparkles query --describe MODE` does
 the same for a local query. [API.md](API.md#describe) describes the modes and options.
 
+### GraphQL
+
+A dataset can also answer GraphQL queries, for front-end code and typed clients that do
+not speak SPARQL. An administrator installs a mapping schema, GraphQL SDL whose types and
+fields name classes and predicates. The server drafts one from the write-time guard's
+SHACL shapes or from the data, and nothing is installed until someone reviews and puts it.
+
+```sh
+sparkles graphql --loc db schema draft --source observed > schema.graphql
+# review schema.graphql: rename types and fields, make fields lists or single values
+sparkles graphql --loc db schema put schema.graphql --message "first schema"
+echo '{ allPerson(first: 10) { nodes { name knows { name } } } }' | sparkles graphql --loc db run
+sparkles graphql --loc db schema get --api
+```
+
+A drafted type looks like this. The comments say what each decision rests on, such as a
+field drafted as one value because the data never had two.
+
+```graphql
+extend schema @prefix(name: "ex", iri: "http://example.org/")
+
+type Person @rdf(iri: "ex:Person") {
+  # observed at most one value per instance at commit 12; nothing enforces this
+  name: String @rdf(iri: "ex:name")
+  knows: [Person!]! @rdf(iri: "ex:knows")
+}
+```
+
+On a server the same steps are `GET /$/graphql/{ds}/draft`, `PUT /$/graphql/{ds}` (it
+needs `admin`) and `POST /{ds}/graphql`. A GraphQL client such as GraphiQL or a code
+generator works against `/{ds}/graphql` with introspection:
+
+```sh
+curl 'localhost:3030/$/graphql/books/draft?source=observed' > schema.graphql
+curl -X PUT 'localhost:3030/$/graphql/books' -H 'Content-Type: application/graphql' \
+  --data-binary @schema.graphql
+curl localhost:3030/books/graphql -H 'Content-Type: application/json' \
+  -d '{"query": "{ allPerson(first: 2, orderBy: [NAME_ASC]) { nodes { name } pageInfo { endCursor } } }"}'
+```
+
+A request runs as a fixed number of SPARQL queries, one per level of nested objects and
+per group of list fields, whatever the number of nodes, and `explain=true` shows them.
+The caller's graph view, protections of triples, budgets and rate limits apply as on
+`/{ds}/sparql`, and a grant can be limited to the `graphql` endpoint. Pages of a
+connection read the commit of their cursor, so they stay consistent while the data
+changes. [API.md](API.md#graphql) describes the directives, the generated schema, the
+filters and the errors.
+
 ### Loading CSV and TSV
 
 `sparkles load` reads `.csv` and `.tsv` files, compressed or not, next to RDF files, and

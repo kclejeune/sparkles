@@ -849,6 +849,11 @@ fn tags() -> J {
             "stored-queries"
         ),
         t(
+            "GraphQL",
+            "Read-only GraphQL over a dataset, and its mapping schema.",
+            "graphql"
+        ),
+        t(
             "History",
             "Commits, diffs, the change feed, snapshots and retention.",
             "commits"

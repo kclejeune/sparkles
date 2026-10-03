@@ -153,6 +153,12 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/shex", &["POST"]),
     ("/{ds}/geo", &["GET"]),
     ("/{ds}/prefixes", &["*"]),
+    // the GraphQL endpoint (feature `graphql`)
+    ("/{ds}/graphql", &["GET", "POST"]),
+    ("/{ds}/graphql/schema", &["GET"]),
+    ("/$/graphql/{ds}", &["GET", "PUT", "DELETE"]),
+    ("/$/graphql/{ds}/versions", &["GET"]),
+    ("/$/graphql/{ds}/draft", &["GET"]),
     // Graph Store direct naming (`serve --gsp-direct-naming`)
     ("/{ds}/{*graph}", &["*"]),
 ];
@@ -254,7 +260,11 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/get"
         | "/{ds}/shacl"
         | "/{ds}/shex"
-        | "/{ds}/geo" => Dataset(Read),
+        | "/{ds}/geo"
+        | "/{ds}/graphql"
+        | "/{ds}/graphql/schema"
+        | "/$/graphql/{ds}/versions"
+        | "/$/graphql/{ds}/draft" => Dataset(Read),
         "/$/reason/{ds}"
         | "/$/text/{ds}"
         | "/$/geo/{ds}"
@@ -268,6 +278,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/describe/{ds}"
         | "/$/quota/{ds}"
         | "/$/compaction/{ds}"
+        | "/$/graphql/{ds}"
         | "/{ds}/prefixes"
             if get =>
         {
@@ -296,6 +307,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/history/{ds}"
         | "/$/queries/{ds}/{name}"
         | "/$/validation/{ds}"
+        | "/$/graphql/{ds}"
         | "/$/rdfs/{ds}"
         | "/$/describe/{ds}" => Dataset(Admin),
         // backups: the listing is filtered by the handler (names and types for dataset
@@ -358,6 +370,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/text"
         | "/{ds}/geo"
         | "/{ds}/queries/{name}" => Endpoint::Query,
+        "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
         "/{ds}/update" => Endpoint::Update,
         "/{ds}/get" => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" if get => Endpoint::GspR,
