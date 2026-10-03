@@ -644,9 +644,9 @@ among the divergences.
 
 ### After the build and filter work
 
-These figures are from the same machine and data, with Sparkles at commit `bf279e9`. That
-build also has the work merged into the main branch after `4995963`. Its load was pinned
-to the P-cores and ran under the same 14 GiB cap.
+These figures are from the same machine and data. The load ran at commit `9ba8d08` and the
+queries at `d4e3549`, and both builds also have the work merged into the main branch after
+`4995963`. The load was pinned to the P-cores and ran under the same 14 GiB cap.
 
 **Bulk load.** The Sparkles load of the full data took 584 s, against 2,292 s before and
 QLever's 1,674 s, with a peak RSS of 6,769 MiB against 8,408 MiB before. The index it
