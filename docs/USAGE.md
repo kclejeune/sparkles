@@ -2,9 +2,9 @@
 
 This guide covers operating the `sparkles` binary: running the server, the command-line
 tools, automatic compaction, the formatter, backups, outbound requests, integrity checks,
-the MCP server, embedding the library, the Python package and deploying on NixOS. [API.md](API.md)
-specifies the HTTP API. [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and
-testing.
+the MCP server, embedding the library, the Python package, the Rust client and deploying
+on NixOS. [API.md](API.md) specifies the HTTP API. [DEVELOPMENT.md](DEVELOPMENT.md)
+covers building from source and testing.
 
 Sparkles is experimental. The on-disk format, HTTP API and CLI may change between commits
 without a migration path, so keep backups of anything you cannot regenerate.
@@ -24,6 +24,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
 * [Embedding the library](#embedding-the-library)
 * [Python](#python)
+* [Rust client](#rust-client)
 * [Deploying on NixOS](#deploying-on-nixos)
 
 ## Running the server
@@ -1613,6 +1614,140 @@ stops a running query or update and raises `KeyboardInterrupt`. On the main thre
 request runs on a helper thread while the main thread waits and handles signals, which
 adds a few microseconds to each request. A `CancelToken` passed as `cancel=` stops the
 requests it was given from any thread.
+
+## Rust client
+
+`crates/sparkles-client` is a client library for a Sparkles server, and for any server
+that speaks the SPARQL 1.1 Protocol, such as Fuseki, QLever, Oxigraph or Wikidata. It is
+async on tokio and reqwest, with a blocking form for programs without a runtime. It does
+not depend on the engine or the server crate. [Spec P02](specs/P02-rust-client.md) is the
+design, and `cargo doc -p sparkles-client` builds the API reference.
+
+```toml
+[dependencies]
+sparkles-client = { git = "https://github.com/kclejeune/sparkles" }
+```
+
+### Queries and updates
+
+```rust
+use sparkles_client::{At, Client, QueryOptions};
+
+let client = Client::builder("https://sparql.example.org")
+    .saved_credentials()                     // the token of `sparkles auth login`
+    .build()?;
+let ds = client.dataset("library");
+
+let receipt = ds.update("INSERT DATA { <urn:a> <urn:p> 1 }").await?;
+println!("commit {:?}", receipt.commit_seq);
+
+let mut rows = ds.select("SELECT ?s ?o WHERE { ?s ?p ?o }").await?;
+while let Some(row) = rows.next().await {
+    let row = row?;                          // a sparesults::QuerySolution of oxrdf terms
+    println!("{:?} {:?}", row.get("s"), row.get("o"));
+}
+
+let before = ds
+    .query_with("SELECT * { ?s ?p ?o }", &QueryOptions::new().at(At::Commit(41)))
+    .await?;
+```
+
+`query` returns `QueryResults`, whose variant comes from the response's media type.
+`Solutions` stream SELECT results, `Boolean` is an ASK's answer, and `Graph` streams the
+triples of a CONSTRUCT or DESCRIBE. `select`, `ask` and `construct` expect one form and
+return an error for another. Results are parsed as they arrive, and dropping a stream
+closes the connection, which cancels the query on the server. Every result carries
+`meta()`, with the commit it read (`Sparkles-Commit`), the state of an `at` read, the
+entity tag and the rate-limit fields.
+
+An update returns a `Receipt` with the commit it produced, the commit's counts and the
+server's whole JSON answer. `UpdateOptions` sets a commit message, a dry run,
+`using-graph-uri` and the server's `timeout`. `ds.batch()` collects updates and quads
+for `INSERT DATA` and `DELETE DATA`, and sends them as one request, which commits all of
+them or none.
+
+The names follow Jena's `RDFConnection`:
+
+| Jena | Rust client |
+|---|---|
+| `query`, `querySelect`, `queryAsk`, `queryConstruct` | `query`, `select`, `ask`, `construct` |
+| `update` | `update`, `batch().…commit()` |
+| `fetch(graph)`, `fetchDataset` | `get_graph`, `get_dataset` |
+| `load(graph, file)`, `put`, `delete` | `load`, `load_into`, `post_graph`, `put_graph`, `delete_graph` |
+| `loadDataset`, `putDataset` | `post_dataset`, `put_dataset` |
+| `RDFConnectionRemote.service(url)` | `Endpoint::new(url)`, `Endpoint::fuseki(base, name)` |
+
+### Graph Store, uploads and the admin API
+
+```rust
+use sparkles_client::{RdfBody, UploadOptions, UploadPart, WriteOptions};
+use sparkles_client::oxrdf::NamedNode;
+
+let g = NamedNode::new("http://example.org/g")?;
+ds.put_graph(g.clone(), RdfBody::file("data.ttl.gz")?).await?;   // sent gzipped
+let triples = ds.get_graph(g.clone()).await?;
+let etag = triples.meta().etag.clone().unwrap();
+// replace the graph only if nobody wrote since the read
+ds.put_graph_with(g, RdfBody::file("new.ttl")?, &WriteOptions::new().if_match(etag)).await?;
+
+ds.upload(vec![UploadPart::file("people.csv")?],
+          &UploadOptions::new().base("http://example.org/p/").key("id")).await?;
+let rows = ds.run_stored("older", &serde_json::json!({ "min": 40 })).await?;
+
+let task = ds.backup_nquads().await?;
+client.wait_for_task(&task.id, std::time::Duration::from_secs(1)).await?;
+```
+
+`Dataset` also has `commits`, `commit`, `info`, `stats`, `schema`, `backups` and the
+stored query calls, and `Client` has `server`, `whoami`, `datasets`, `create_dataset`,
+`delete_dataset`, `tasks`, `task` and `cancel_task`. `client.call_json(method, path,
+query, body)` reaches any other JSON operation of the API.
+
+### Other SPARQL servers
+
+```rust
+use sparkles_client::Endpoint;
+
+let wikidata = Endpoint::new("https://query.wikidata.org/sparql")?;
+let answer = wikidata.ask("ASK { wd:Q42 wdt:P31 wd:Q5 }").await?;
+
+let fuseki = Endpoint::fuseki("http://localhost:3030", "ds")?;   // /ds/sparql, /update, /data
+```
+
+A plain endpoint gets only the protocol's parameters. Options that only Sparkles
+understands, such as `at` or a commit message, are refused with `Error::Config` rather
+than sent and ignored. A query goes as a GET while its URL stays under 2,000 bytes, and as
+a POST form otherwise.
+
+### Credentials, retries and deadlines
+
+The builder takes `basic_auth(user, password)`, `bearer_token(token)` for API tokens and
+OIDC access tokens, `token_source(…)` for tokens that expire and are refreshed after a
+`401`, and `saved_credentials()` for the token of `sparkles auth login`. `SPARKLES_TOKEN`
+takes precedence over the saved token. `Client::from_env()` picks the server as the
+CLI's `--server` does. Credentials are never sent over plain http to a host other than
+localhost unless the builder calls `allow_insecure_http()`.
+
+A request is retried, three times by default, when the connection failed, on `429`, and
+on `503` with `Retry-After`. In those cases the server did no work, so writes are
+retried too. Reads, queries, `PUT` and `DELETE` are also retried after other transport
+errors and on `502`, `503` and `504`. The client waits as long as `Retry-After` says, or
+until the reset time of an exhausted `RateLimit` field, else it backs off exponentially
+with jitter. `RetryPolicy` changes the counts and delays. Each options type takes a
+`deadline` for the whole call, a `CancellationToken`, extra headers and `no_retry()`.
+
+### Blocking
+
+```rust
+let client = sparkles_client::blocking::Client::new("http://localhost:3030")?;
+for row in client.dataset("ds").select("SELECT * { ?s ?p ?o } LIMIT 10")? {
+    println!("{:?}", row?);
+}
+```
+
+The blocking client runs its own tokio runtime with one worker thread, and its results
+are iterators. Like reqwest's blocking client, it must not be called from inside an async
+runtime. Without the default `blocking` feature, the crate has only the async API.
 
 ## Deploying on NixOS
 

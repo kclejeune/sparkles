@@ -127,7 +127,8 @@ ui/ (SvelteKit)  ──HTTP──▶  sparkles-server (axum; Fuseki protocol + /
                                    ├─ sparkles-shacl    (SHACL Core + SHACL-SPARQL, write-time validation)
                                    ├─ sparkles-shex     (ShEx 2.1, write-time validation)
                                    ├─ sparkles-fmt      (formatter; also built for the browser as sparkles-fmt-wasm)
-                                   └─ sparkles-backup   (repositories on a file system or S3, backups, restore, policies)
+                                   ├─ sparkles-backup   (repositories on a file system or S3, backups, restore, policies)
+                                   └─ sparkles-client   (the Rust client; the CLI shares its credentials file code)
                                    │
 sparkles (library)
  ├─ id        64-bit tagged ids, inline literals

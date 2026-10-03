@@ -38,7 +38,7 @@ behaviour, and the Outcome explains the difference.
 | `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, a GraphQL adapter, CSV and TSV imports, cloning, inference freshness, access control, write-time validation, the MCP server, automatic compaction, write previews and stored queries. |
 | `F` | Larger data features: a Cypher frontend, full-text and vector search, embeddings computed on write, backups to object storage, retained history and point-in-time reads, branches and merges, replication, and encryption at rest. |
 | `G` | Gaps against Apache Jena that were out of scope for the first version: GeoSPARQL, ShEx, the SHACL Compact Syntax and the command-line tools. |
-| `P` | Bindings that embed the engine in other languages: Python. |
+| `P` | Bindings and clients for other programs. These are the Python package that embeds the engine and the Rust client of remote servers. |
 | `X` | Internal engineering that does not derive from any other database product: compression codecs, the formatter, and the OpenAPI description with shell completions. |
 
 Numbers are stable. Gaps in the numbering are roadmap items without a spec: writes and a
@@ -84,6 +84,7 @@ there is no code yet.
 | [G05](G05-command-line-tools.md) | `convert` (`riot`), `qparse`, `uparse`, `compare` (`rdfdiff`), `iri`, `langtag`, `rsparql`, `rupdate` and `rset`, and IRI and language-tag warnings in `convert --check`, `load --check` and `/$/validate/iri` | implemented |
 | [G06](G06-arq-query-extensions.md) | Jena ARQ's syntax extensions: `LATERAL`, property path ranges `{n,m}` and CONSTRUCT templates with `GRAPH` | implemented in part (Phase 1) |
 | [P01](P01-python-bindings.md) | The `sparkles` Python package: datasets, SPARQL, terms, quads, transactions, dumps, reasoning and validation, built with PyO3 and maturin as abi3 wheels | implemented in part (Phase 1, most of Phase 2) |
+| [P02](P02-rust-client.md) | `sparkles-client`, an async and blocking Rust client for Sparkles and any SPARQL endpoint, with streaming results as `oxrdf` terms, receipts, the Graph Store Protocol, retries that honour `Retry-After`, and a test that checks it against the OpenAPI description | implemented |
 | [X01](X01-compression-codecs.md) | zstd and brotli next to gzip and LZ4 for inputs, responses, dumps, backups and the UI's assets | implemented in part (Phase 1) |
 | [X02](X02-formatter.md) | `sparkles fmt`, `POST /$/format`, `sparkles lsp` and the UI's Format button for SPARQL and RDF | implemented |
 | [X03](X03-openapi-and-completions.md) | An OpenAPI 3.1 description at `/$/openapi.json`, kept equal to the route table by a test and checked in, `sparkles openapi`, shell completions and man pages | implemented in part (Phase 1) |

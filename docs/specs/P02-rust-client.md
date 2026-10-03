@@ -1,6 +1,10 @@
 # P02: A Rust client for Sparkles and other SPARQL servers
 
-> **Status:** specified
+> **Status:** implemented
+>
+> **Phases:** One phase. The crate, its contract test, the tests against a server and a
+> mock, and the CLI's shared credentials module shipped. The [Outcome](#outcome) lists
+> what was left out.
 >
 > **User docs:** [Usage: Rust client](../USAGE.md#rust-client) ·
 > [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) ·
@@ -74,7 +78,7 @@ option.
 | Approach | For | Against |
 |---|---|---|
 | progenitor | Generates an idiomatic async reqwest client at build time, with typed builders. | It reads OpenAPI 3.0 through the `openapiv3` crate. The Sparkles document is 3.1 and uses 3.1 features such as type arrays (`["integer", "null"]`) and `const`, so it would need a downgrade step. Its responses are JSON or opaque byte streams, so the SPARQL results would still need the code this spec describes. |
-| openapi-generator's `rust` target | Mature, and supports 3.1 input. | A Java tool at build time. It generates one model per schema and a function per operation, with no streaming. The 58 open admin schemas become untyped maps. Content negotiation across a dozen media types, which is most of the SPARQL API, becomes a string body. |
+| openapi-generator's `rust` target | Mature, and its recent versions read 3.1 documents. | A Java tool at build time. It generates one model per schema and a function per operation, with no streaming. The 58 open admin schemas become untyped maps. Content negotiation across a dozen media types, which is most of the SPARQL API, becomes a string body. |
 | **Hand-written, with the document as the contract** | The API follows Jena and Oxigraph rather than the route table. Results stream as RDF terms, and the code stays small. | Someone has to keep it in step with the server. |
 
 The design takes the last row. The checked-in `docs/openapi.json` is the contract, and a
@@ -137,7 +141,7 @@ use sparkles_client::{Client, Endpoint, QueryResults};
 
 // a Sparkles server
 let client = Client::builder("https://sparql.example.org")
-    .saved_credentials()?          // the token of `sparkles auth login`
+    .saved_credentials()           // the token of `sparkles auth login`
     .build()?;
 let ds = client.dataset("library");
 
@@ -328,9 +332,9 @@ media type the client cannot parse is an error that names it.
 
 ### 5.3 URLs
 
-The base URL may have a path (`https://host/sparkles`). Path parameters are
-percent-encoded, except that a Graph Store graph path keeps its slashes. Dataset names are
-encoded like the CLI encodes them.
+The base URL may have a path (`https://host/sparkles`). Each path parameter, such as a
+dataset name, is percent-encoded as one segment. Graphs are named by `?graph=`, never by
+Fuseki's direct naming.
 
 ### 5.4 Commit messages
 
@@ -429,4 +433,70 @@ code.
 
 ## Outcome
 
-To be written when the implementation lands.
+**Delivered.** The crate landed on 2026-10-02 as `crates/sparkles-client`, with the
+layout of §3.
+- `Client`, `ClientBuilder`, `Endpoint` and `Dataset` cover the methods of §4.1 to §4.5.
+  `UpdateBatch` is §5.6's batch. `blocking` mirrors the async API with iterators.
+- `routes.rs` holds the 31 operations the client calls. Three tests read
+  `docs/openapi.json`. The first checks each operation's method, path, query parameters,
+  headers and body media types. The second deserializes the typed bodies from the
+  required and the full members of their schemas. The third checks that each typed
+  operation answers the schema the client reads.
+- The CLI reads and writes the credentials file through `sparkles_client::credentials`.
+  The server crate's `auth` feature depends on the client without its blocking facade.
+  `--server`, `rsparql` and `rupdate` keep their own request code, as §6 proposed.
+- `scripts/lint-features.sh` lints the crate without default features.
+- No new crate entered the lock file. The client turns on reqwest's `stream` and
+  `multipart` features and the `async-tokio` features of oxrdfio and sparesults. The
+  binary's license notices are unchanged.
+
+**Deviations and decisions.**
+- `QueryResults::Boolean` carries the response's metadata, like the other variants, so
+  that an ASK's commit header is not lost.
+- The contract test found that `GET /$/commits/{ds}/{ref}` answers a `CommitResponse`,
+  which wraps the commit with the dataset's name and id. `Dataset::commit` unwraps it.
+  The third test was added after this, so that a typed method cannot read the wrong
+  schema again.
+- `call_json` takes a method and a path instead of an `operationId`. The operation
+  table lists only the operations the client has methods for, so an id lookup would
+  have reached nothing new. Calls made this way get the client's authentication, retries
+  and errors, but the contract test does not cover them.
+- `Dataset::schema` takes only `at`. The report's other parameters are reachable through
+  `call_json`.
+- The `timeout` option is allowed on plain endpoints, because Fuseki reads the same
+  parameter. `at`, `reasoning`, `dry_run`, `validate` and the commit message are refused
+  there with `Error::Config`.
+- The blocking runtime has one worker thread rather than a current-thread scheduler, so
+  that pooled connections keep being driven between calls and several threads can share
+  one blocking client.
+- Basic credentials are encoded by a small Base64 function in the crate, which saves a
+  dependency.
+- With authentication on, an anonymous caller gets `401` on a dataset and a signed-in
+  caller without access gets `404`, as C09 specifies. A9 was written for the first case.
+  A static token from the configuration file has no owner, so A9 checks that `whoami`
+  reports a token principal with the token's grant instead.
+
+**Tests.**
+- 19 unit tests cover the contract (§2), URL normalization with the CLI's cases, the
+  credentials file, the `Retry-After` and `RateLimit` parsers, the retry rules, backoff
+  bounds, commit messages, path encoding, file name syntaxes, N-Triples bodies, batches,
+  dataset URLs, and the refusals on plain endpoints and plain http.
+- `tests/retries.rs` runs A11 and the other rules of §4.8 against an axum mock on a port
+  in 5550–5559, together with deadlines and cancellation of a stalled result stream and
+  the token refresh after a `401`.
+- `crates/sparkles-server/tests/rust_client.rs` runs A1 to A10 through the async API
+  against `sparkles serve` on a port in 5540–5544, and A9 and A12 through the blocking
+  facade against a server with an auth configuration on a port in 5545–5549.
+- `tests/cli_auth.rs` passes unchanged with the shared credentials module.
+
+**Measurements.** None were taken. The client adds no work beyond reqwest's and the
+parsers'. The machine was shared with other builds at landing, so a throughput figure
+would have reflected that load rather than the client.
+
+**Not built.**
+- Proactive pacing from the `RateLimit` field (§5.5).
+- `Client::from_env` and `saved_credentials` are not covered by an integration test,
+  because they read process-wide environment variables. The file format is tested.
+- A typed `SchemaSummary`, statistics and backups, which stay `serde_json::Value`.
+- The change feed, diffs between commits, snapshots, clones, search, reasoning and
+  validation calls, which are reachable through `call_json` only.

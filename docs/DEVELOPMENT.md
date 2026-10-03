@@ -128,6 +128,7 @@ errors, over the builds that `mise run lint` does not cover:
 * the server with no optional feature, with each default feature on its own, and with
   `mcp,shacl` and `mcp,shex`;
 * `sparkles` and `sparkles-fmt` with their features off;
+* `sparkles-client` without its blocking facade;
 * the `sparkles-backup` library without a backend.
 
 Code that only some features use is gated on those features, and this task catches dead
