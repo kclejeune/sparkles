@@ -685,7 +685,7 @@ struct CreateArgs {
     /// HNSW candidates while building (default 128)
     #[arg(long)]
     ef_construction: Option<usize>,
-    /// HNSW candidates while searching (default 64)
+    /// HNSW candidates while searching (default 128)
     #[arg(long)]
     ef_search: Option<usize>,
     /// Searches over at most this many rows are exact (default 10000)
