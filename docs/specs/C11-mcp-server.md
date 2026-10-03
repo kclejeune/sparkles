@@ -1573,7 +1573,8 @@ since the design added five tools or arguments.
 - **Completions.** `completion/complete` suggests dataset names (for stored queries, the
   datasets that have some), stored-query names, the parameter names a stored query's
   `arguments` lack, named graphs of the caller's view (at most 1000, read by a query
-  under a 5 s deadline) and prefixes. Everything comes from what the caller may see.
+  under a 5 s deadline) and prefixes. Everything comes from what the caller may see,
+  and a completion takes one of the tool calls' concurrency slots.
   Completions need prompts and templates to complete, so the prompts `run_stored_query`
   (`dataset`, `query`, `arguments`) and `explain_term` (`dataset`, `term`) were added,
   `explore_dataset` and `answer_question` take an optional `graph`, and each stored query
@@ -1581,10 +1582,11 @@ since the design added five tools or arguments.
   template.
 - **Change notifications.** The capabilities declare `tools.listChanged`,
   `resources.listChanged` and `resources.subscribe`. `subscriptions/listen` delivers
-  tool list changes, resource list changes and updates of the subscribed resources. A
-  subscription compares what its caller sees every 2 seconds: the tools it may call with
-  the versions of their stored queries, its resource URIs, and per subscribed resource
-  its dataset's head commit, prefixes or stored-query version. A session of the
+  tool list changes, resource list changes and updates of the subscribed resources.
+  Every 2 seconds a subscription compares what its caller sees. It compares the tools
+  the caller may call with the versions of their stored queries, the URIs of its
+  resources, and for each subscribed resource the dataset's head commit, prefixes or
+  stored-query version. A session of the
   `initialize` era gets the two list notifications on its stream from
   `notifications/initialized` on. At most 64 subscriptions and sessions watch at once.
 - **Tasks.** The server declares the tasks extension (SEP-2663, which rmcp 3.5
@@ -1627,6 +1629,16 @@ since the design added five tools or arguments.
 3. Progress notifications were not built, since the tasks extension covers long calls.
 4. There is no `--watch-interval` flag. The 2-second interval is a constant of the
    configuration.
+
+**Tests at landing.** Tests over the in-memory stdio transport cover reads of past
+states by commit, time and snapshot name with their errors, `ifHead` and patches,
+`find_paths`, `list_changes`, the DESCRIBE modes, `graphql_query` before and after a
+schema is installed, every completion, `subscriptions/listen` with each notification and
+its cancellation, list changes on a legacy session, and tasks that complete and that are
+cancelled. Router tests over HTTP cover a subscription's SSE stream, completions and
+task ownership for two callers, and `find_paths` and `list_changes` under graph grants.
+An end-to-end test runs the bridge binary against a server with authentication, without
+a login, with `--token` and with the saved login.
 
 **Not built.** OAuth protected-resource metadata, audience validation and scope
 challenges (deviation 3 of Phase 2) are still not built. MCP has no measurements in

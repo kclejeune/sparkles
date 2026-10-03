@@ -60,7 +60,14 @@ impl McpServer {
     pub async fn complete(&self, req: Request, call: Call) -> Result<Completion, ContextError> {
         let server = self.clone();
         let request_id = call.request_id.clone();
+        // a completion takes a slot of the tool calls, as its graph listing is a query
+        let Ok(permit) = self.shared.slots.clone().acquire_owned().await else {
+            return Err(ContextError::Tool(super::errors::ToolError::internal(
+                &request_id,
+            )));
+        };
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             Tools {
                 server: &server,
                 call: &call,
