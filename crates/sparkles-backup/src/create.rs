@@ -32,7 +32,7 @@ use crate::{
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
-use sparkles::store::{CapturedFile, FileKind, FileSource};
+use sparkles_core::store::{CapturedFile, FileKind, FileSource};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -585,9 +585,10 @@ impl Repository {
             return Ok(());
         };
         let reserve = reserve.unwrap_or(0);
-        match sparkles::disk::check_reserve(std::path::Path::new(path), reserve, need, cached) {
+        match sparkles_core::disk::check_reserve(std::path::Path::new(path), reserve, need, cached)
+        {
             Ok(()) => Ok(()),
-            Err(sparkles::Error::StorageFull(msg)) => Err(BackupError::new(
+            Err(sparkles_core::Error::StorageFull(msg)) => Err(BackupError::new(
                 Code::InsufficientStorage,
                 format!(
                     "repository {}: {msg}{}",

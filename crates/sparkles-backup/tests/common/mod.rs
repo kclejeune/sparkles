@@ -12,10 +12,10 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use sparkles::sparql::QueryOptions;
-use sparkles::sparql::update::update;
-use sparkles::store::{CapturedFile, FileKind, FileSource, LeaseGuard, Store, StoreOptions};
 use sparkles_backup::{CreateOptions, OpenEnv, RepoConfig, Repository, Source};
+use sparkles_core::sparql::QueryOptions;
+use sparkles_core::sparql::update::update;
+use sparkles_core::store::{CapturedFile, FileKind, FileSource, LeaseGuard, Store, StoreOptions};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,10 +71,10 @@ pub async fn memory_repo() -> (Repository, Arc<InMemory>) {
 pub fn synthetic(files: Vec<(&str, FileKind, Vec<u8>)>) -> Source {
     Source {
         dataset_id: uuid::Uuid::new_v4(),
-        commit: sparkles::commit::CommitInfo {
+        commit: sparkles_core::commit::CommitInfo {
             seq: 1,
             timestamp_ms: 1_790_000_000_000,
-            kind: sparkles::commit::CommitKind::Update,
+            kind: sparkles_core::commit::CommitKind::Update,
             inserted: 1,
             deleted: 0,
             quads: 1,
@@ -86,7 +86,7 @@ pub fn synthetic(files: Vec<(&str, FileKind, Vec<u8>)>) -> Source {
             unvalidated: false,
         },
         generation: "gen-0001".into(),
-        index_format: sparkles::builder::FORMAT_VERSION,
+        index_format: sparkles_core::builder::FORMAT_VERSION,
         files: files
             .into_iter()
             .map(|(path, kind, bytes)| CapturedFile {

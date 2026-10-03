@@ -1,7 +1,7 @@
 //! The data the drafted-shapes tests of the SHACL and ShEx crates share.
 
-use sparkles::io::{RdfFormat, Source};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::store::{Store, StoreOptions};
 
 const PREFIXES: &str = "@prefix ex: <http://ex.org/> .
 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .

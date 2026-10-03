@@ -14,9 +14,9 @@ use crate::INFERRED_GRAPH;
 use anyhow::Context as _;
 use oxrdf::Term;
 use serde::{Deserialize, Serialize};
-use sparkles::id::Id;
-use sparkles::index::Perm;
-use sparkles::store::{Snapshot, Store};
+use sparkles_core::id::Id;
+use sparkles_core::index::Perm;
+use sparkles_core::store::{Snapshot, Store};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `owl:imports`
@@ -178,10 +178,10 @@ impl LocationMapping {
     /// lm:altPrefix "…" ]`. Literals and IRIs are accepted alike.
     pub fn from_jena(
         bytes: &[u8],
-        format: sparkles::io::RdfFormat,
+        format: sparkles_core::io::RdfFormat,
     ) -> anyhow::Result<LocationMapping> {
         const LM: &str = "http://jena.hpl.hp.com/2004/08/location-mapping#";
-        let (quads, _) = sparkles::io::parse_to_vec(&sparkles::io::Source::from_bytes(
+        let (quads, _) = sparkles_core::io::parse_to_vec(&sparkles_core::io::Source::from_bytes(
             bytes.to_vec(),
             format,
             None,
@@ -462,7 +462,7 @@ pub fn fetch_imports(
     store: &Store,
     inputs: &Inputs,
     refresh: &[String],
-    opts: &sparkles::sparql::QueryOptions,
+    opts: &sparkles_core::sparql::QueryOptions,
 ) -> anyhow::Result<Fetched> {
     let mut out = Fetched::default();
     if inputs.imports != ImportMode::Fetch {
@@ -473,7 +473,7 @@ pub fn fetch_imports(
         return Ok(out);
     }
     let mut opts = opts.clone();
-    opts.outbound_budget = Some(sparkles::outbound::RequestBudget::new(&opts.outbound));
+    opts.outbound_budget = Some(sparkles_core::outbound::RequestBudget::new(&opts.outbound));
     let mut attempted: BTreeSet<String> = BTreeSet::new();
     // `Ok(true)`: a new attempt (whatever its outcome)
     let mut load = |iri: &str, location: &str, replace: bool, out: &mut Fetched| {
@@ -491,17 +491,17 @@ pub fn fetch_imports(
         } else {
             format!("LOAD <{location}> INTO GRAPH <{iri}>")
         };
-        match sparkles::sparql::update::update(store, &u, &opts) {
+        match sparkles_core::sparql::update::update(store, &u, &opts) {
             Ok(_) => {
                 tracing::info!(import = iri, location, "fetched an import");
                 out.fetched.push(iri.to_string());
                 Ok(true)
             }
             Err(
-                e @ (sparkles::Error::NotPermitted(_)
-                | sparkles::Error::BudgetExceeded(_)
-                | sparkles::Error::Timeout
-                | sparkles::Error::Cancelled),
+                e @ (sparkles_core::Error::NotPermitted(_)
+                | sparkles_core::Error::BudgetExceeded(_)
+                | sparkles_core::Error::Timeout
+                | sparkles_core::Error::Cancelled),
             ) => Err(anyhow::Error::new(e).context(format!("fetching owl:imports <{iri}>"))),
             Err(e) => {
                 out.warnings

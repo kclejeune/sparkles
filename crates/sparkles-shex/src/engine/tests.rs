@@ -4,8 +4,8 @@ use crate::{Association, NoImports, Schema};
 use oxrdf::NamedNode;
 use proptest::prelude::*;
 use rustc_hash::FxHashSet;
-use sparkles::io::{RdfFormat, Source};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::store::{Store, StoreOptions};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
@@ -303,15 +303,15 @@ fn limits_are_typed_errors() {
     let err = |opts: ValidateOptions| {
         validate(&store.snapshot(), &schema, &m, &opts)
             .unwrap_err()
-            .downcast::<sparkles::Error>()
+            .downcast::<sparkles_core::Error>()
             .unwrap()
     };
     match err(ValidateOptions {
         max_pairs: Some(100),
         ..Default::default()
     }) {
-        sparkles::Error::BudgetExceeded(b) => {
-            assert_eq!(b.kind, sparkles::BudgetKind::ValidationWork)
+        sparkles_core::Error::BudgetExceeded(b) => {
+            assert_eq!(b.kind, sparkles_core::BudgetKind::ValidationWork)
         }
         e => panic!("{e:?}"),
     }
@@ -319,12 +319,12 @@ fn limits_are_typed_errors() {
         cancel: Some(Arc::new(AtomicBool::new(true))),
         ..Default::default()
     });
-    assert!(matches!(e, sparkles::Error::Cancelled), "{e:?}");
+    assert!(matches!(e, sparkles_core::Error::Cancelled), "{e:?}");
     let e = err(ValidateOptions {
         timeout: Some(Duration::ZERO),
         ..Default::default()
     });
-    assert!(matches!(e, sparkles::Error::Timeout), "{e:?}");
+    assert!(matches!(e, sparkles_core::Error::Timeout), "{e:?}");
     // the report limit
     let r = validate(
         &store.snapshot(),

@@ -732,8 +732,8 @@ fn bind_head(rule: &CRule, hi: usize, pre: &[usize], t: Triple) -> Option<Vec<u6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sparkles::io::{RdfFormat, Source};
-    use sparkles::store::{Snapshot, Store, StoreOptions};
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Snapshot, Store, StoreOptions};
     use std::sync::Arc;
 
     const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -853,7 +853,7 @@ mod tests {
                         &l[1..2],
                     )))
                 })
-                .chain([sparkles::id::Id::from_i64(7).unwrap().0])
+                .chain([sparkles_core::id::Id::from_i64(7).unwrap().0])
                 .collect();
             Vocab {
                 classes: get("C"),

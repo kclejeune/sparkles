@@ -40,8 +40,8 @@ use crate::neigh::Neigh;
 use crate::semact::ActCtx;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use sparkles::id::Id;
-use sparkles::{Budget as Exceeded, BudgetKind};
+use sparkles_core::id::Id;
+use sparkles_core::{Budget as Exceeded, BudgetKind};
 
 /// The partitions one match may still try ([`crate::ValidateOptions::max_partitions`]).
 #[derive(Clone, Copy, Debug)]
@@ -56,16 +56,18 @@ impl Budget {
         Budget { limit, used: 0 }
     }
 
-    /// Count `n` more partitions; [`sparkles::Error::BudgetExceeded`] with the
+    /// Count `n` more partitions; [`sparkles_core::Error::BudgetExceeded`] with the
     /// `validation-work` budget once past the limit.
-    pub fn charge(&mut self, n: u64) -> sparkles::Result<()> {
+    pub fn charge(&mut self, n: u64) -> sparkles_core::Result<()> {
         self.used = self.used.saturating_add(n);
         match self.limit {
-            Some(limit) if self.used > limit => Err(sparkles::Error::BudgetExceeded(Exceeded {
-                kind: BudgetKind::ValidationWork,
-                limit,
-                requested: self.used,
-            })),
+            Some(limit) if self.used > limit => {
+                Err(sparkles_core::Error::BudgetExceeded(Exceeded {
+                    kind: BudgetKind::ValidationWork,
+                    limit,
+                    requested: self.used,
+                }))
+            }
             _ => Ok(()),
         }
     }
@@ -74,7 +76,7 @@ impl Budget {
 /// Does `neigh` match `shape`? `read(value, tc)` tells whether an arc's value satisfies
 /// a triple constraint's value expression under the current typing (`Unknown` during
 /// discovery); it is not called for constraints without a value expression. Budget
-/// errors are [`sparkles::Error::BudgetExceeded`].
+/// errors are [`sparkles_core::Error::BudgetExceeded`].
 pub fn matches(
     shape: &ShapeIr,
     neigh: &Neigh,
@@ -902,7 +904,7 @@ mod tests {
         let mut b = Budget::new(Some(3));
         b.charge(3).unwrap();
         match b.charge(1) {
-            Err(sparkles::Error::BudgetExceeded(e)) => {
+            Err(sparkles_core::Error::BudgetExceeded(e)) => {
                 assert_eq!(
                     (e.kind, e.limit, e.requested),
                     (BudgetKind::ValidationWork, 3, 4)
@@ -1080,8 +1082,8 @@ mod tests {
         let mut budget = Budget::new(Some(1000));
         let r = matches_with(&s, &n, &all_ok, &mut budget, &mut Recorder::default());
         assert!(t.elapsed().as_secs_f64() < 1.0, "{:?}", t.elapsed());
-        match r.unwrap_err().downcast::<sparkles::Error>() {
-            Ok(sparkles::Error::BudgetExceeded(e)) => {
+        match r.unwrap_err().downcast::<sparkles_core::Error>() {
+            Ok(sparkles_core::Error::BudgetExceeded(e)) => {
                 assert_eq!((e.kind, e.limit), (BudgetKind::ValidationWork, 1000))
             }
             other => panic!("{other:?}"),

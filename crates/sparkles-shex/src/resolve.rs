@@ -13,8 +13,8 @@
 use crate::ast::{Label, Schema, ShapeDecl, ShapeExpr, TripleExpr};
 use crate::error::SchemaError;
 use anyhow::{anyhow, bail};
-use sparkles::outbound::{OutboundPolicy, RequestBudget};
-use sparkles::sparql::FileLoads;
+use sparkles_core::outbound::{OutboundPolicy, RequestBudget};
+use sparkles_core::sparql::FileLoads;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -169,7 +169,7 @@ impl FileResolver {
         for url in urls {
             let path = match self.files.check(url) {
                 Ok(p) => p,
-                Err(sparkles::Error::NotPermitted(_)) => bail!(self.file_refusal(url)),
+                Err(sparkles_core::Error::NotPermitted(_)) => bail!(self.file_refusal(url)),
                 // missing inside the load directory: try the next form
                 Err(_) => continue,
             };
@@ -209,13 +209,13 @@ impl FileResolver {
             policy.timeout = policy.timeout.min(self.limits.timeout);
             let left = self.limits.max_bytes.saturating_sub(self.used.bytes());
             policy.max_response_bytes = policy.max_response_bytes.min(left);
-            match sparkles::outbound::fetch_text(&policy, budget, url, ACCEPT) {
+            match sparkles_core::outbound::fetch_text(&policy, budget, url, ACCEPT) {
                 Ok(text) => {
                     self.charge(iri, text.len() as u64)?;
                     return parse(&text, url).map(Some);
                 }
-                Err(sparkles::Error::NotPermitted(m)) => bail!("import not allowed: {m}"),
-                Err(e @ sparkles::Error::BudgetExceeded(_)) => {
+                Err(sparkles_core::Error::NotPermitted(m)) => bail!("import not allowed: {m}"),
+                Err(e @ sparkles_core::Error::BudgetExceeded(_)) => {
                     bail!("import <{iri}>: {e}")
                 }
                 // not there (an HTTP error, most likely 404): try the next form

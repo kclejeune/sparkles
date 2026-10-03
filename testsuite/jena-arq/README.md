@@ -7,9 +7,9 @@ The directories here are copied unchanged from Apache Jena's `jena-arq/testing`:
 - `ARQ/PropertyFunctions` holds the tests of ARQ's property function library
   (`list:member`, `list:index`, `list:length`, `apf:splitIRI` and the others).
 
-`crates/sparkles/tests/w3c.rs` runs their manifests with the W3C harness. The tests whose
-answers Sparkles gives otherwise on purpose are listed in `expected-failures.txt` with the
-reason.
+`crates/sparkles-core/tests/w3c.rs` runs their manifests with the W3C harness. The tests
+whose answers Sparkles gives otherwise on purpose are listed in `expected-failures.txt`
+with the reason.
 
 Apache Jena is distributed under the Apache License 2.0, which is in `LICENSE-APACHE`.
 Jena's `NOTICE` file is included as the license asks.

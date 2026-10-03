@@ -281,7 +281,7 @@ export function vectorIndexFor(ds, predicate, dim, opts) {
     };
   const metric = opts.metric ?? cfg.metric;
   const rows = e.building ? 0 : e.baseRows;
-  // the reasons of the server's plan counters (crates/sparkles/src/vector/search.rs)
+  // the reasons of the server's plan counters (crates/sparkles-core/src/vector/search.rs)
   let exactBecause = null;
   if (!cfg.hnsw) exactBecause = null;
   else if (opts.exact) exactBecause = 'exact:true';

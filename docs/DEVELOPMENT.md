@@ -102,15 +102,15 @@ mise run ui:e2e        # Playwright end-to-end tests against a real server
 mise run test:jena-clients  # Apache Jena's own HTTP clients against a real server
 ```
 
-`crates/sparkles/tests/w3c.rs` runs the W3C SPARQL suites vendored in an Apache Jena
-checkout. It looks for the checkout at `../../apache/jena`, next to this repository, or
-at `SPARKLES_W3C_DIR`. The SHACL suites come from the same checkout, or from
+`crates/sparkles-core/tests/w3c.rs` runs the W3C SPARQL suites vendored in an Apache
+Jena checkout. It looks for the checkout at `../../apache/jena`, next to this
+repository, or at `SPARKLES_W3C_DIR`. The SHACL suites come from the same checkout, or from
 `SPARKLES_SHACL_TESTS`. Without the checkout, the suites are skipped.
 
 All of these suites pass: 482/482, 328/328, 157/157 and 269/269 for SPARQL, and 98/98
 and 20/20 for SHACL. The eight SHACL 1.2 list tests pass, and all 32 test pairs of the
 SHACLC suite read to the expected graph and write back to it.
-`crates/sparkles/tests/w3c-known-failures.txt` lists known failures and is empty.
+`crates/sparkles-core/tests/w3c-known-failures.txt` lists known failures and is empty.
 
 `mise run test:jena-clients` (`scripts/test-jena-clients.sh`) builds a debug server, starts
 it on a temporary data directory on port 5230 with `--gsp-direct-naming`, and runs
@@ -139,7 +139,7 @@ errors, over the builds that `mise run lint` does not cover:
 
 * the server with no optional feature, with each default feature but `mimalloc` on its
   own, with `geo-epsg`, and with `mcp,shacl`, `mcp,shex`, `mcp,fmt` and `graphql,shacl`;
-* `sparkles` and `sparkles-fmt` with their features off;
+* `sparkles-core`, `sparkles` and `sparkles-fmt` with their features off;
 * `sparkles-client` without its blocking facade;
 * the `sparkles-backup` library without a backend.
 
@@ -409,7 +409,8 @@ The flake is built on flake-parts, rust-overlay and crane, with the toolchain fr
   * a dev shell;
   * `checks`:
     * the packages;
-    * `sparkles-tests`, which runs the engine's unit tests (`cargo test -p sparkles --lib`);
+    * `sparkles-tests`, which runs the unit tests of the engine and the facade
+      (`cargo test -p sparkles-core -p sparkles --lib`);
     * `fmt`, which runs rustfmt over the workspace and `crates/sparkles-py` as
       `mise run fmt:check` does;
     * `python-bindings`, which builds `sparkles-py` and runs the pytest suite on the
@@ -443,8 +444,9 @@ workspace crates and nothing else.
 which the server reads the UI at run time. A UI change therefore rebuilds the UI and the
 wrapper, and no Rust code. Builds outside Nix (`mise run build`, the Dockerfile) still
 embed `ui/build` in the binary. The `sparkles-tests` check reuses the same dependency
-derivation, which also compiles the dependencies of `cargo test -p sparkles --lib`,
-because the engine alone enables fewer features than the server does.
+derivation, which also compiles the dependencies of
+`cargo test -p sparkles-core -p sparkles --lib`, because the engine alone enables fewer
+features than the server does.
 
 The formatter's WebAssembly module has its own dependency derivation for
 `wasm32-unknown-unknown` with the `fmt-wasm` profile from `Cargo.toml`, which

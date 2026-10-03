@@ -36,10 +36,11 @@ running queries.
    project's crates: `oxrdf`, `oxttl`, `oxrdfxml`, `oxjsonld`, `spargebra`, `sparesults`
    and `oxsdatatypes`. Sparkles adds the storage, planner, executor, server, reasoner and
    UI.
-4. **Library first.** `crates/sparkles` is an embeddable engine with no HTTP or async
-   dependencies. It is the counterpart of Jena's `core`, `arq` and `tdb2`. The server
-   (`sparkles-server`, the Fuseki equivalent) and the reasoner are separate crates built on
-   its public API.
+4. **Library first.** The engine in `crates/sparkles-core` has no HTTP or async
+   dependencies. The `sparkles` crate in `crates/sparkles` re-exports it and adds the
+   embedded `Dataset` API. Together they are the counterpart of Jena's `core`, `arq` and
+   `tdb2`. The server (`sparkles-server`, the Fuseki equivalent) and the reasoner are
+   separate crates built on their public API.
 
 ## Highlights
 
@@ -336,8 +337,9 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 
 ## Library usage
 
-`crates/sparkles` is an embeddable engine with no HTTP or async dependencies. The CLI and
-server are built on its public API.
+The `sparkles` crate (`crates/sparkles`) is the embeddable library. It has no HTTP or async
+dependencies and re-exports the engine of `crates/sparkles-core`. The CLI and server are
+built on its public API.
 
 ```rust
 use sparkles::Dataset;
@@ -441,7 +443,8 @@ while let Some(row) = rows.next().await {
 
 | Path | Role | Jena analogue |
 |---|---|---|
-| `crates/sparkles` | Ids, vocabulary, permutation index, bulk builder, store (MVCC and WAL), SPARQL engine and RDF I/O | jena-core, jena-arq, jena-tdb2, jena-db, jena-querybuilder, jena-rdfconnection (in-process) |
+| `crates/sparkles-core` | Ids, vocabulary, permutation index, bulk builder, store (MVCC and WAL), SPARQL engine and RDF I/O | jena-core, jena-arq, jena-tdb2, jena-db |
+| `crates/sparkles` | The library: the engine's modules under their own names, the embedded `Dataset` API and the query builder | jena-querybuilder, jena-rdfconnection (in-process) |
 | `crates/sparkles-reasoner` | RDFS, OWL 2 RL and Jena rules, materialized into `urn:x-sparkles:inferred` by semi-naive forward chaining | jena-core `reasoner` |
 | `crates/sparkles-shacl` | SHACL Core and SHACL-SPARQL validation over store snapshots | jena-shacl |
 | `crates/sparkles-shex` | ShEx 2.1 validation over store snapshots, with ShExC, ShExJ and ShExR schemas and shape maps | jena-shex |

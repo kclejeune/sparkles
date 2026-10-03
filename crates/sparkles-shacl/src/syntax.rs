@@ -4,8 +4,8 @@
 use crate::compact;
 use anyhow::{Context as _, Result};
 use oxrdf::{Graph, Triple};
-use sparkles::codec::Codec;
-use sparkles::io::{RdfFormat, Source};
+use sparkles_core::codec::Codec;
+use sparkles_core::io::{RdfFormat, Source};
 use std::fmt;
 use std::path::Path;
 
@@ -46,7 +46,7 @@ impl ShapesSyntax {
         if base.eq_ignore_ascii_case(compact::MEDIA_TYPE) {
             return Some(ShapesSyntax::Compact);
         }
-        sparkles::io::format_for_media_type(base).map(ShapesSyntax::Rdf)
+        sparkles_core::io::format_for_media_type(base).map(ShapesSyntax::Rdf)
     }
 
     /// The syntax (and compression) of a file name: `.shaclc` and `.shc` are SHACLC,
@@ -58,7 +58,7 @@ impl ShapesSyntax {
         if compact::EXTENSIONS.contains(&ext) {
             return Some((ShapesSyntax::Compact, codec));
         }
-        sparkles::io::format_for_path(path).map(|(f, c)| (ShapesSyntax::Rdf(f), c))
+        sparkles_core::io::format_for_path(path).map(|(f, c)| (ShapesSyntax::Rdf(f), c))
     }
 
     /// The syntax named by a short name, as in `--format` flags and MCP arguments:
@@ -114,7 +114,7 @@ pub fn read_document(
             src.base = base.map(str::to_string);
             src.name = "<shapes>".into();
             let (quads, prefixes) =
-                sparkles::io::parse_to_vec(&src).context("parsing shapes graph")?;
+                sparkles_core::io::parse_to_vec(&src).context("parsing shapes graph")?;
             let mut graph = Graph::new();
             for q in quads {
                 graph.insert(&Triple::new(q.subject, q.predicate, q.object));

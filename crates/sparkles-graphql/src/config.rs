@@ -8,8 +8,8 @@ use crate::Compiled;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sparkles::error::{Error, Result};
-use sparkles::guard::config::DataGraphSel;
+use sparkles_core::error::{Error, Result};
+use sparkles_core::guard::config::DataGraphSel;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -298,7 +298,7 @@ impl Catalog {
             };
         }
         let bytes = serde_json::to_vec_pretty(doc).map_err(|e| Error::Io(e.into()))?;
-        sparkles::guard::config::write_atomic(&path, &bytes)
+        sparkles_core::guard::config::write_atomic(&path, &bytes)
     }
 
     fn writable(&self) -> Result<()> {
@@ -353,7 +353,7 @@ impl Catalog {
         let version = Version {
             version: next_version,
             parent: (have > 0).then_some(have),
-            created: sparkles::builder::now_rfc3339(),
+            created: sparkles_core::builder::now_rfc3339(),
             author: change.author,
             message: change.message,
             dataset_commit: change.dataset_commit,

@@ -15,7 +15,7 @@
 //! nothing is copied into memory.
 //!
 //! ```no_run
-//! # use sparkles::store::{Store, StoreOptions};
+//! # use sparkles_core::store::{Store, StoreOptions};
 //! # fn main() -> anyhow::Result<()> {
 //! let store = Store::in_memory(StoreOptions::default());
 //! let schema = sparkles_shex::Schema::parse_shexc(
@@ -77,7 +77,7 @@ pub use resolve::{FileResolver, NoImports, Resolver};
 
 use oxrdf::{NamedNode, Term};
 use serde::Serialize;
-use sparkles::store::Snapshot;
+use sparkles_core::store::Snapshot;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -95,7 +95,7 @@ pub enum SchemaFormat {
     /// the JSON-LD syntax (`application/shex+json`)
     ShExJ,
     /// ShExR: RDF in the ShEx vocabulary, in an RDF syntax
-    ShExR(sparkles::io::RdfFormat),
+    ShExR(sparkles_core::io::RdfFormat),
 }
 
 impl SchemaFormat {
@@ -104,7 +104,7 @@ impl SchemaFormat {
         match s.trim().to_ascii_lowercase().as_str() {
             "shexc" | "shex" => Some(SchemaFormat::ShExC),
             "shexj" | "json" => Some(SchemaFormat::ShExJ),
-            "shexr" => Some(SchemaFormat::ShExR(sparkles::io::RdfFormat::Turtle)),
+            "shexr" => Some(SchemaFormat::ShExR(sparkles_core::io::RdfFormat::Turtle)),
             _ => None,
         }
     }
@@ -150,7 +150,7 @@ impl Schema {
     /// Parse ShExR: RDF text in `format`, in the ShEx vocabulary.
     pub fn from_shexr(
         text: &str,
-        format: sparkles::io::RdfFormat,
+        format: sparkles_core::io::RdfFormat,
         base: Option<&str>,
     ) -> Result<Schema, ParseError> {
         shexr::from_text(text, format, base)
@@ -163,7 +163,7 @@ impl Schema {
 
     /// The ShExR form as Turtle, with the schema's prefixes.
     pub fn to_shexr_turtle(&self) -> String {
-        shexr::to_text(self, sparkles::io::RdfFormat::Turtle)
+        shexr::to_text(self, sparkles_core::io::RdfFormat::Turtle)
     }
 }
 
@@ -401,7 +401,7 @@ pub enum ShexFailure {
 }
 
 fn term_json<S: serde::Serializer>(t: &Term, s: S) -> Result<S::Ok, S::Error> {
-    sparkles::sparql::results::term_json(t).serialize(s)
+    sparkles_core::sparql::results::term_json(t).serialize(s)
 }
 
 /// The result of one association of the fixed map.
@@ -503,7 +503,7 @@ pub struct ValidateOptions {
     /// The options `SPARQL` selectors run with: row and memory budgets, SERVICE and the
     /// outbound policy. The dataset (the validation's data graph), the timeout and the
     /// cancel flag are the validation's. `None`: the defaults (no budgets, no SERVICE).
-    pub selector_query: Option<sparkles::sparql::QueryOptions>,
+    pub selector_query: Option<sparkles_core::sparql::QueryOptions>,
 }
 
 /// The default of [`ValidateOptions::max_pairs`].
@@ -533,8 +533,8 @@ impl Default for ValidateOptions {
 
 /// Validate the shape map's associations on the data graph of a snapshot.
 ///
-/// Errors (in the `anyhow::Error`): [`sparkles::Error::Timeout`],
-/// [`sparkles::Error::Cancelled`], [`sparkles::Error::BudgetExceeded`] (the
+/// Errors (in the `anyhow::Error`): [`sparkles_core::Error::Timeout`],
+/// [`sparkles_core::Error::Cancelled`], [`sparkles_core::Error::BudgetExceeded`] (the
 /// `validation-work` budget), [`TooManyResults`], [`SchemaError`] (a label the schema
 /// does not define, START without a start shape), or an invalid data graph.
 pub fn validate(

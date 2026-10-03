@@ -6,9 +6,9 @@
 //! read.
 
 use crate::ir::{Dir, Ir, ShapeId};
-use sparkles::id::Id;
-use sparkles::store::Snapshot;
-use sparkles::validation::DataGraph;
+use sparkles_core::id::Id;
+use sparkles_core::store::Snapshot;
+use sparkles_core::validation::DataGraph;
 
 /// A compiled schema resolved against one snapshot.
 #[derive(Clone, Debug, Default)]
@@ -232,9 +232,9 @@ mod tests {
     use crate::ir::{SeId, ShapeIr, Tri};
     use crate::matcher::build::Builder;
     use crate::matcher::{ActMark, Acts, Budget, matches_with};
-    use sparkles::io::{RdfFormat, Source};
-    use sparkles::sparql::ctx::UNION_GRAPH_IRI;
-    use sparkles::store::{Store, StoreOptions};
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::sparql::ctx::UNION_GRAPH_IRI;
+    use sparkles_core::store::{Store, StoreOptions};
     use std::sync::Arc;
 
     const EX: &str = "http://ex.org/";

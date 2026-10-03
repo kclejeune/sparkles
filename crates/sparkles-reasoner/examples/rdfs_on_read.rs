@@ -6,10 +6,10 @@
 //! cargo run --release -p sparkles-reasoner --example rdfs_on_read -- 1000000
 //! ```
 
-use sparkles::io::{RdfFormat, Source};
-use sparkles::sparql::rdfs::{RdfsOnRead, schema_of_graph};
-use sparkles::sparql::{QueryOptions, query};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::sparql::rdfs::{RdfsOnRead, schema_of_graph};
+use sparkles_core::sparql::{QueryOptions, query};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::{INFERRED_GRAPH, Profile, ReasonOptions, materialize};
 use std::sync::Arc;
 use std::time::Instant;

@@ -2,9 +2,9 @@
 //! (`infer --geo-default-geometry`).
 
 use oxrdf::Term;
-use sparkles::io::{RdfFormat, Source};
-use sparkles::sparql::{QueryOptions, query};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::sparql::{QueryOptions, query};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::{
     Extras, INFERRED_GRAPH, Profile, ReasonOptions, ReasonReport, clear, materialize_with,
 };
@@ -141,7 +141,7 @@ fn features_with_one_geometry_get_it_as_default() {
 #[test]
 fn rewrite_sees_materialized_default_geometries() {
     let s = store();
-    let rewrite = sparkles::geo::GeoConfig {
+    let rewrite = sparkles_core::geo::GeoConfig {
         query_rewrite: true,
         ..Default::default()
     };

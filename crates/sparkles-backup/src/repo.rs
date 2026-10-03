@@ -39,7 +39,7 @@ use object_store::path::Path as Key;
 use object_store::{
     ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, PutResult,
 };
-use sparkles::outbound::OutboundPolicy;
+use sparkles_core::outbound::OutboundPolicy;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -476,7 +476,7 @@ fn check_destination(cfg: &RepoConfig, p: &OutboundPolicy) -> Result<()> {
     let Some(e) = &cfg.endpoint else {
         return Ok(());
     };
-    let refused = |f: sparkles::outbound::Failure| {
+    let refused = |f: sparkles_core::outbound::Failure| {
         invalid(
             "endpoint",
             format!("the server's outbound policy refuses it: {f}"),

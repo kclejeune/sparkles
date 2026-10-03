@@ -253,7 +253,7 @@ pub fn to_json(t: &Term, scalar: Scalar) -> Result<J, Unfit> {
     let Term::Literal(l) = t else {
         return Err(unfit(t, scalar.name()));
     };
-    if !sparkles::xsd::is_valid(l) {
+    if !sparkles_core::xsd::is_valid(l) {
         return Err(Unfit(format!("{t} is ill-formed for its datatype")));
     }
     let local = xsd_local(l);
@@ -335,7 +335,7 @@ pub fn input_term(v: &J, scalar: Scalar, prefixes: &[(String, String)]) -> Resul
     };
     let typed = |lex: String, local: &str| -> Result<Term, String> {
         let l = Literal::new_typed_literal(lex, xsd(local));
-        if sparkles::xsd::is_valid(&l) {
+        if sparkles_core::xsd::is_valid(&l) {
             Ok(Term::Literal(l))
         } else {
             Err(format!("'{}' is not a valid xsd:{local}", l.value()))

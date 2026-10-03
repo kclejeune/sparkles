@@ -6,9 +6,9 @@
 //! `SPARKLES_GRAPHQL_BENCH_DATA=~/.cache/sparkles-bench/1m/data.nt cargo test --release
 //! -p sparkles-graphql --test bench -- --ignored --nocapture`
 
-use sparkles::io::{RdfFormat, Source};
-use sparkles::sparql::QueryOptions;
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::sparql::QueryOptions;
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_graphql::{Compiled, Config, Options, Request, execute_on};
 use std::time::Instant;
 
@@ -148,11 +148,11 @@ fn bench() {
             // the groups' own text, run directly (with their parent ids in VALUES)
             let t = Instant::now();
             for q in &groups {
-                sparkles::sparql::query(store.snapshot(), q, &qopts).unwrap();
+                sparkles_core::sparql::query(store.snapshot(), q, &qopts).unwrap();
             }
             let d = t.elapsed().as_secs_f64() * 1000.0;
             let t = Instant::now();
-            rows = sparkles::sparql::query(store.snapshot(), &sparql, &qopts)
+            rows = sparkles_core::sparql::query(store.snapshot(), &sparql, &qopts)
                 .unwrap()
                 .len();
             let o = t.elapsed().as_secs_f64() * 1000.0;

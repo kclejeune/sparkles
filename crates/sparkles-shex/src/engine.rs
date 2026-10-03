@@ -16,9 +16,9 @@ use crate::{
 };
 use oxrdf::Term;
 use rustc_hash::FxHashMap;
-use sparkles::id::Id;
-use sparkles::store::Snapshot;
-use sparkles::validation::DataGraph;
+use sparkles_core::id::Id;
+use sparkles_core::store::Snapshot;
+use sparkles_core::validation::DataGraph;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -203,7 +203,7 @@ pub(crate) fn validate_typed(
     };
     let values = t
         .values()
-        .filter(|((n, _), _)| n.tag() != sparkles::id::Tag::Local)
+        .filter(|((n, _), _)| n.tag() != sparkles_core::id::Tag::Local)
         .collect();
     Ok((out, values))
 }

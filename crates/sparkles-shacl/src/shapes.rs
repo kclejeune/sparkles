@@ -12,8 +12,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use oxrdf::vocab::xsd;
 use oxrdf::{Graph, Literal, NamedNode, NamedNodeRef, NamedOrBlankNodeRef, Term, TermRef, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
-use sparkles::io::Source;
-use sparkles::sparql::value::Value;
+use sparkles_core::io::Source;
+use sparkles_core::sparql::value::Value;
 use std::fmt;
 
 /// Index into the term table of a [`Shapes`].
@@ -283,7 +283,7 @@ impl Shapes {
         let mut src = Source::from_bytes(text.as_bytes().to_vec(), format, None);
         src.base = base.map(str::to_string);
         src.name = "<shapes>".into();
-        let (quads, _) = sparkles::io::parse_to_vec(&src).context("parsing shapes graph")?;
+        let (quads, _) = sparkles_core::io::parse_to_vec(&src).context("parsing shapes graph")?;
         let mut fresh: FxHashMap<oxrdf::BlankNode, oxrdf::BlankNode> = FxHashMap::default();
         let mut relabel = |b: oxrdf::BlankNode| fresh.entry(b).or_default().clone();
         let mut g = Graph::new();
@@ -310,11 +310,14 @@ impl Shapes {
     /// special IRI `urn:x-arq:DefaultGraph` also names the default graph). Blank nodes
     /// keep their store identity, so shapes may refer to blank nodes of the data graph
     /// (e.g. when the shapes graph and the data graph are the same graph).
-    pub fn from_store(snap: &sparkles::store::Snapshot, graph: Option<&str>) -> Result<Shapes> {
+    pub fn from_store(
+        snap: &sparkles_core::store::Snapshot,
+        graph: Option<&str>,
+    ) -> Result<Shapes> {
         let g = crate::data::read_graph(snap, graph)?;
         let mut shapes = Parser::new(&g).parse(true)?;
         shapes.source_graph = graph
-            .filter(|g| *g != sparkles::sparql::ctx::DEFAULT_GRAPH_IRI)
+            .filter(|g| *g != sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI)
             .map(str::to_string);
         Ok(shapes)
     }
@@ -322,7 +325,7 @@ impl Shapes {
     /// Read and merge several graphs of the store into one shapes graph (a graph that
     /// does not exist contributes nothing). `$shapesGraph` names the first.
     pub fn from_store_graphs(
-        snap: &sparkles::store::Snapshot,
+        snap: &sparkles_core::store::Snapshot,
         graphs: &[String],
     ) -> Result<Shapes> {
         Shapes::from_store_graphs_with(snap, graphs, None)
@@ -331,7 +334,7 @@ impl Shapes {
     /// [`Shapes::from_store_graphs`], merged with the triples of `extra` (shapes read
     /// from a file, see [`Shapes::read_graph`]).
     pub fn from_store_graphs_with(
-        snap: &sparkles::store::Snapshot,
+        snap: &sparkles_core::store::Snapshot,
         graphs: &[String],
         extra: Option<&Graph>,
     ) -> Result<Shapes> {

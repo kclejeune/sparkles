@@ -4,8 +4,8 @@
 //! cargo run --release -p sparkles-reasoner --example bench -- 100000 rdfs
 //! ```
 
-use sparkles::io::{RdfFormat, Source};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::{Profile, ReasonOptions, infer, materialize};
 use std::time::Instant;
 

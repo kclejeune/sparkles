@@ -1,35 +1,16 @@
-pub mod access;
-pub mod annotations;
-pub mod builder;
-pub mod check;
-pub mod codec;
-pub mod commit;
+//! The Sparkles library. The engine lives in `sparkles-core`, and this crate re-exports
+//! its modules under their own names, so `sparkles::store::Store` and
+//! `sparkles::sparql::QueryOptions` are the engine's types. The embedded [`Dataset`] API
+//! and the [`querybuilder`] are defined here.
+
+pub use sparkles_core::{
+    access, annotations, builder, check, codec, commit, disk, error, geo, guard, history, id,
+    index, io, jena_formats, nesting, outbound, patch, preview, schema, sparql, store, stored,
+    tabular, text, trix, validation, vector, vocab, xsd,
+};
+
 pub mod dataset;
-pub mod disk;
-pub mod error;
-pub mod geo;
-pub mod guard;
-pub mod history;
-pub mod id;
-pub mod index;
-pub mod io;
-pub mod jena_formats;
-pub mod nesting;
-pub mod outbound;
-pub mod patch;
-pub mod preview;
 pub mod querybuilder;
-pub mod schema;
-pub mod sparql;
-pub mod store;
-pub mod stored;
-pub mod tabular;
-pub mod text;
-pub mod trix;
-pub mod validation;
-pub mod vector;
-pub mod vocab;
-pub mod xsd;
 
 pub use dataset::{Dataset, GraphView, QuadIter, Solution, Solutions, Transaction};
-pub use error::{Budget, BudgetKind, Error, Result};
+pub use sparkles_core::{Budget, BudgetKind, Error, Result};

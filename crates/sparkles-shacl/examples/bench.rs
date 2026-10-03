@@ -8,8 +8,8 @@
 //! With an expected report (e.g. from Jena's `shacl validate`), the results are compared
 //! on (focusNode, resultPath, value, sourceConstraintComponent, severity).
 
-use sparkles::io::{RdfFormat, Source};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_shacl::{Shapes, ValidateOptions, validate};
 use std::collections::BTreeMap;
 use std::path::Path;
