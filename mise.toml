@@ -243,6 +243,10 @@ description = "Release build of the server/CLI with the embedded UI"
 depends = ["ui:build"]
 run = "cargo build --release -p sparkles-server"
 
+[tasks."docker:build"]
+description = "Build the Docker image of compose.yaml (Dockerfile: UI, formatter WebAssembly and release binary); SPARKLES_BUILD_JOBS=N caps the compile jobs; not part of ci"
+run = "docker compose build"
+
 [tasks.licenses]
 description = "Regenerate THIRD_PARTY_LICENSES.md (the crates the binary links, from Cargo.lock) and THIRD_PARTY_LICENSES-UI.md (the npm packages in the UI bundle, written by the UI build)"
 depends = ["ui:build"]
