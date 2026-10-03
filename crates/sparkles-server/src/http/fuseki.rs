@@ -16,7 +16,7 @@ use serde_json::{Map, Value as J, json};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-pub(super) mod assembler;
+pub(crate) mod assembler;
 mod validate;
 
 /// The routes, merged into `http::router` before its layers.

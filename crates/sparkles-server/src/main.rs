@@ -19,6 +19,7 @@ mod describe_cmd;
 mod exposure;
 #[cfg(feature = "fmt")]
 mod fmt;
+mod fuseki_config;
 mod geo;
 #[cfg(feature = "graphql")]
 mod graphql;
@@ -655,12 +656,18 @@ enum Cmd {
         /// Add an in-memory dataset (not persisted), e.g. --mem ds
         #[arg(long)]
         mem: Vec<String>,
+        /// Start from a Fuseki configuration: a config.ttl, or a Fuseki base directory
+        /// with config.ttl, configuration/ and shiro.ini. Its datasets, indexes,
+        /// inference, timeouts and access rules are converted at each start, and the
+        /// flags given here win; a part with no Sparkles equivalent stops the start
+        #[arg(long, value_name = "PATH")]
+        fuseki_config: Option<PathBuf>,
         /// Serve an existing database directory, e.g. --loc ds=/path/to/db
         #[arg(long)]
         loc: Vec<String>,
-        /// Default query timeout in seconds
-        #[arg(long, default_value_t = 60.0)]
-        timeout: f64,
+        /// Default query timeout in seconds [default: 60]
+        #[arg(long, value_name = "TIMEOUT")]
+        timeout: Option<f64>,
         /// Largest `timeout` a query or update may ask for, in seconds (0: unlimited);
         /// never below --timeout or --update-timeout
         #[arg(long, default_value_t = 1800.0)]
@@ -774,8 +781,9 @@ enum Cmd {
         #[arg(long)]
         allow_unvalidated_writes: bool,
         /// Timeout of SPARQL updates without a `timeout` parameter, in seconds (0: none)
-        #[arg(long, default_value_t = 0.0)]
-        update_timeout: f64,
+        /// [default: 0]
+        #[arg(long, value_name = "UPDATE_TIMEOUT")]
+        update_timeout: Option<f64>,
         /// Re-materialize stale inferences automatically once a dataset has had no
         /// commit for this many seconds (off by default; each run holds the writer lock)
         #[arg(long, value_name = "SECS")]
@@ -1508,6 +1516,9 @@ enum Cmd {
     // rset
     #[command(flatten)]
     Tools(tools::ToolCmd),
+    /// Fuseki configurations: convert config.ttl, its service files and shiro.ini into
+    /// serve flags, dataset settings and an auth configuration
+    FusekiConfig(fuseki_config::FusekiConfigArgs),
     /// CSV and TSV tables: convert them to RDF without loading, or print the CSVW
     /// metadata of the default mapping
     Csv(csv_cmd::CsvCmdArgs),
@@ -1903,21 +1914,22 @@ fn run() -> Result<()> {
             data,
             host,
             port,
-            mem,
-            loc,
+            mut mem,
+            mut loc,
+            fuseki_config,
             timeout,
             max_timeout,
-            read_only,
+            mut read_only,
             no_service,
             embedding_secret,
             no_embedding,
             outbound,
             load_dir,
             idle_release_ms,
-            text,
-            geo,
+            mut text,
+            mut geo,
             validate,
-            rdfs,
+            mut rdfs,
             geo_mb,
             geo_op_vertices,
             no_geo_rewrite,
@@ -1925,11 +1937,11 @@ fn run() -> Result<()> {
             schema_max_entries,
             #[cfg(feature = "graphql")]
             graphql,
-            gsp_direct_naming,
+            mut gsp_direct_naming,
             no_access_log,
             no_metrics,
             metrics_max_datasets,
-            metrics_fuseki_names,
+            mut metrics_fuseki_names,
             metrics_addr,
             query_memory_mb,
             max_result_mb,
@@ -1938,7 +1950,7 @@ fn run() -> Result<()> {
             max_rows_produced,
             update_timeout,
             allow_unvalidated_writes,
-            auto_reason,
+            mut auto_reason,
             auto_reason_max_delay,
             reason_cache_triples,
             http_compression,
@@ -1956,7 +1968,7 @@ fn run() -> Result<()> {
             max_mem_dataset_mb,
             max_dataset_mb,
             shutdown_grace,
-            auth_config,
+            mut auth_config,
             #[cfg(feature = "backup")]
             backup_config,
             #[cfg(feature = "backup")]
@@ -1981,6 +1993,32 @@ fn run() -> Result<()> {
             mcp,
             ..
         } => {
+            // a Fuseki configuration adds datasets, settings and access rules; the flags
+            // given on the command line win
+            let mut fuseki = None;
+            let (mut timeout, mut update_timeout) = (timeout, update_timeout);
+            if let Some(path) = &fuseki_config {
+                let f = fuseki_config::for_serve(path, &data, auth_config.is_some())?;
+                mem.extend(f.mem.iter().cloned());
+                loc.extend(f.loc.iter().cloned());
+                text.extend(f.text.iter().cloned());
+                geo.extend(f.geo.iter().cloned());
+                rdfs.extend(f.rdfs.iter().cloned());
+                timeout = timeout.or(f.timeout);
+                update_timeout = update_timeout.or(f.update_timeout);
+                read_only |= f.read_only;
+                gsp_direct_naming |= f.gsp_direct_naming;
+                metrics_fuseki_names |= f.metrics_fuseki_names && !no_metrics;
+                if auth_config.is_none() {
+                    auth_config = f.auth_config.clone();
+                }
+                if f.auto_reason && auto_reason.is_none() {
+                    auto_reason = Some(5.0);
+                }
+                fuseki = Some(f);
+            }
+            let timeout = timeout.unwrap_or(60.0);
+            let update_timeout = update_timeout.unwrap_or(0.0);
             // an open server on the network, or a bad auth configuration, stops the
             // server before anything else
             exposure::check(
@@ -2020,6 +2058,9 @@ fn run() -> Result<()> {
             let hosts = exposure::Hosts::new(bound, &public_host)?;
             // commits keep the disk reserve; in-memory datasets stay within their limit
             let mut opts = opts;
+            if fuseki.as_ref().is_some_and(|f| f.union_default_graph) {
+                opts.union_default_graph = true;
+            }
             opts.min_free_disk_bytes = (min_free_disk_mb > 0).then_some(min_free_disk_mb << 20);
             opts.max_memory_bytes = (max_mem_dataset_mb > 0).then_some(max_mem_dataset_mb << 20);
             // persistent datasets without a quota of their own get this one
@@ -2214,6 +2255,9 @@ fn run() -> Result<()> {
             for r in rdfs {
                 rdfs::configure(&st, &r)?;
             }
+            if let Some(f) = &fuseki {
+                fuseki_config::start(&st, f)?;
+            }
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .thread_stack_size(THREAD_STACK)
@@ -2389,6 +2433,7 @@ fn run() -> Result<()> {
         Cmd::Man(args) => cli_docs::man(args, <Cli as clap::CommandFactory>::command()),
         Cmd::Shex(args) => shex_cmd::run(args, opts),
         Cmd::Tools(cmd) => tools::run(cmd, opts),
+        Cmd::FusekiConfig(args) => fuseki_config::run(args),
         Cmd::Csv(args) => csv_cmd::run(args),
         Cmd::Load {
             loc,

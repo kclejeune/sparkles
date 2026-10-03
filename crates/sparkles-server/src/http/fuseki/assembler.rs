@@ -88,26 +88,13 @@ fn as_subject(t: &Term) -> Option<NamedOrBlankNode> {
 /// The operations Sparkles serves and the endpoint names it serves them at (`""` is the
 /// dataset URL itself).
 fn served(op: &str, server: &Server) -> Result<&'static [&'static str], String> {
-    Ok(match op {
-        "query" => &["", "sparql", "query"],
-        "update" => &["", "update"],
-        "gsp-rw" => &["", "data"],
-        "gsp-r" => &["", "get", "data"],
-        "upload" => &["upload"],
-        "patch" => &["", "patch"],
-        "prefixes-r" | "prefixes-rw" => &["prefixes"],
-        "shacl" if cfg!(feature = "shacl") => &["shacl"],
-        "no-op" => &[
-            "", "sparql", "query", "update", "data", "get", "upload", "shacl", "prefixes", "patch",
-        ],
-        "gsp-direct-rw" | "gsp-direct-r" if server.gsp_direct_naming => &[""],
-        "gsp-direct-rw" | "gsp-direct-r" => {
-            return Err(format!(
-                "fuseki:{op} needs a server started with --gsp-direct-naming"
-            ));
-        }
-        other => return Err(format!("the operation fuseki:{other} is not supported")),
-    })
+    if matches!(op, "gsp-direct-rw" | "gsp-direct-r") && !server.gsp_direct_naming {
+        return Err(format!(
+            "fuseki:{op} needs a server started with --gsp-direct-naming"
+        ));
+    }
+    crate::fuseki_config::endpoints::served_names(op)
+        .ok_or_else(|| format!("the operation fuseki:{op} is not supported"))
 }
 
 impl Description {

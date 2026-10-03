@@ -61,6 +61,8 @@ pub use handlers::MAX_AUTH_BODY;
 pub use handlers::SESSION_COOKIE;
 #[cfg(feature = "auth")]
 pub use policy::Auth;
+#[cfg(all(not(test), feature = "auth"))]
+pub use policy::hash_password;
 #[cfg(all(test, feature = "auth"))]
 pub use policy::{hash_password, hash_password_with, new_token, token_hash};
 #[cfg(all(test, feature = "auth"))]
