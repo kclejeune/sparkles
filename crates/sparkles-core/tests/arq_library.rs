@@ -581,7 +581,7 @@ fn cdt_bnode_labels_of_the_query_name_its_own_nodes() {
 /// to the nodes it names there.
 #[test]
 fn cdt_bnode_labels_in_updates() {
-    use sparkles::sparql::update::update;
+    use sparkles_core::sparql::update::update;
     let s = ttl("PREFIX ex: <http://example.org/>
 ex:a a ex:T . ex:b a ex:T .
 ");
@@ -625,7 +625,10 @@ fn cdt_bnode_labels_survive_a_dump_and_a_patch() {
     // the patch's labels are its own, as in INSERT DATA
     let p = Store::in_memory(StoreOptions::default());
     let patch: String = dump.lines().map(|l| format!("A {l}\n")).collect();
-    p.apply_patch(patch.as_bytes(), &sparkles::store::PatchOptions::default())
-        .unwrap();
+    p.apply_patch(
+        patch.as_bytes(),
+        &sparkles_core::store::PatchOptions::default(),
+    )
+    .unwrap();
     check(&p, CDT_BNODES_SAME, "true true true true");
 }
