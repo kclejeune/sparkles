@@ -4025,13 +4025,15 @@ impl WriteTxn<'_> {
         self.intern_key(&key)
     }
 
-    /// Intern a term whose blank nodes (including those inside RDF 1.2 triple terms) are
-    /// scoped by `labels`: unseen labels get fresh blank node ids.
+    /// Intern a term whose blank nodes (including those inside RDF 1.2 triple terms and
+    /// composite literals) are scoped by `labels`: unseen labels get fresh blank node ids.
     pub fn intern_scoped(
         &mut self,
         t: &Term,
         labels: &mut std::collections::HashMap<String, Id>,
     ) -> Result<Id> {
+        let relabeled = self.relabel_cdt(t, labels);
+        let t = relabeled.as_ref().unwrap_or(t);
         match t {
             Term::BlankNode(b) => {
                 if let Some(&id) = labels.get(b.as_str()) {
@@ -4059,6 +4061,28 @@ impl WriteTxn<'_> {
             }
             t => self.intern(t),
         }
+    }
+
+    /// `t` with the blank node labels inside its composite literals (`cdt:List`,
+    /// `cdt:Map`) replaced by the labels of the stored nodes `labels` gives them, new
+    /// ones for unseen labels, or `None` when it holds no such literal. The labels of a
+    /// literal and of the terms around it name the same nodes, as Jena's loader has it.
+    pub fn relabel_cdt(
+        &mut self,
+        t: &Term,
+        labels: &mut std::collections::HashMap<String, Id>,
+    ) -> Option<Term> {
+        crate::sparql::cdt::relabel_term(t, &mut |b| {
+            let id = match labels.get(b) {
+                Some(&id) => id,
+                None => {
+                    let id = self.new_bnode();
+                    labels.insert(b.to_string(), id);
+                    id
+                }
+            };
+            id::bnode_label(id.payload())
+        })
     }
 
     pub fn intern_key(&mut self, key: &[u8]) -> Result<Id> {
@@ -4106,6 +4130,9 @@ impl WriteTxn<'_> {
         let p = self.intern_key(&id::iri_key(q.predicate.as_str()))?;
         let o = match &q.object {
             t @ (Term::BlankNode(_) | Term::Triple(_)) => self.intern_scoped(t, labels)?,
+            Term::Literal(l) if crate::sparql::cdt::may_name_bnodes(l) => {
+                self.intern_scoped(&q.object, labels)?
+            }
             t => self.intern(t)?,
         };
         let g = match &q.graph_name {

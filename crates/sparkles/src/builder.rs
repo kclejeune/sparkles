@@ -26,6 +26,7 @@ use crate::error::{Error, Result};
 use crate::id::{self, Id, Tag};
 use crate::index::{Key, Perm, PermWriter};
 use crate::io::{QuadSink, Source, parse_source};
+use crate::sparql::cdt;
 use crate::vocab::Vocab;
 use memmap2::Mmap;
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
@@ -788,6 +789,9 @@ impl Encoder<'_> {
                 if let Some(id) = id::inline_literal(l.value(), l.datatype().as_str()) {
                     return id.0;
                 }
+                if cdt::may_name_bnodes(l) {
+                    return self.cdt_literal(t);
+                }
                 let mut kb = std::mem::take(&mut self.keybuf);
                 kb.clear();
                 id::write_literal_key(l, &mut kb);
@@ -797,6 +801,8 @@ impl Encoder<'_> {
             }
             Term::NamedNode(n) => self.iri(n.as_str()),
             Term::Triple(_) => {
+                let relabeled = self.relabel(t);
+                let t = relabeled.as_ref().unwrap_or(t);
                 let mut kb = std::mem::take(&mut self.keybuf);
                 kb.clear();
                 let (scope, next) = (self.scope.clone(), &self.b.next_bnode);
@@ -806,6 +812,29 @@ impl Encoder<'_> {
                 r
             }
         }
+    }
+
+    /// `t` with the blank node labels inside its composite literals (`cdt:List`,
+    /// `cdt:Map`) replaced by the labels of the nodes this source's labels name, or
+    /// `None` when it holds no such literal.
+    fn relabel(&self, t: &Term) -> Option<Term> {
+        let (scope, next) = (&self.scope, &self.b.next_bnode);
+        cdt::relabel_term(t, &mut |b| id::bnode_label(scope.get(b, next)))
+    }
+
+    /// The id of a composite literal that may name blank nodes (see [`Self::relabel`]).
+    #[cold]
+    fn cdt_literal(&mut self, t: &Term) -> u64 {
+        let relabeled = self.relabel(t);
+        let Term::Literal(l) = relabeled.as_ref().unwrap_or(t) else {
+            unreachable!("a literal stays a literal")
+        };
+        let mut kb = std::mem::take(&mut self.keybuf);
+        kb.clear();
+        id::write_literal_key(l, &mut kb);
+        let r = self.local(&kb);
+        self.keybuf = kb;
+        r
     }
 
     fn iri(&mut self, iri: &str) -> u64 {

@@ -574,6 +574,93 @@ fn literal(lex: &str, dt: &str) -> Term {
     ))
 }
 
+// ------------------------------------------------------------ blank node labels ----
+//
+// A blank node label inside a composite literal is scoped like a label outside it. A
+// loader gives the labels of a literal the nodes its file's labels name, and a query
+// gives the labels of a literal written in its text nodes of its own. Both write the
+// literal again with each label replaced by the label of the node it names, so a query
+// that reads the literal later finds that node (see `Ctx::intern_term`).
+
+/// Whether a literal is a composite literal whose lexical form may name blank nodes.
+/// This is the only test that a literal without blank nodes pays.
+#[inline]
+pub fn may_name_bnodes(l: &Literal) -> bool {
+    is_cdt(l.datatype().as_str()) && l.value().contains("_:")
+}
+
+/// A composite literal with each blank node label in it replaced by `f(label)`, also in
+/// the lists, maps and composite literals nested in it, written in the canonical form.
+/// `None` when the literal is not a composite literal, names no blank node or is
+/// ill-formed, so that it is kept as it is.
+pub fn relabel_literal(l: &Literal, f: &mut dyn FnMut(&str) -> String) -> Option<Literal> {
+    if !may_name_bnodes(l) {
+        return None;
+    }
+    let dt = l.datatype().as_str();
+    relabel_lexical(l.value(), dt, f)
+        .map(|lex| Literal::new_typed_literal(lex, NamedNode::new_unchecked(dt)))
+}
+
+/// [`relabel_literal`] for a term: a literal, or a triple term whose object holds one.
+pub fn relabel_term(t: &Term, f: &mut dyn FnMut(&str) -> String) -> Option<Term> {
+    match t {
+        Term::Literal(l) => relabel_literal(l, f).map(Term::Literal),
+        Term::Triple(tr) => {
+            let o = relabel_term(&tr.object, f)?;
+            Some(Term::Triple(Box::new(oxrdf::Triple::new(
+                tr.subject.clone(),
+                tr.predicate.clone(),
+                o,
+            ))))
+        }
+        _ => None,
+    }
+}
+
+fn relabel_lexical(lex: &str, dt: &str, f: &mut dyn FnMut(&str) -> String) -> Option<String> {
+    let mut changed = false;
+    if dt == LIST {
+        let l: Vec<Elem> = parse_list(lex)?
+            .into_iter()
+            .map(|e| relabel_elem(e, f, &mut changed))
+            .collect();
+        changed.then(|| list_lexical(&l))
+    } else {
+        let mut m = Map::new();
+        for (k, v) in parse_map(lex)? {
+            let k = relabel_elem_term(k, f, &mut changed);
+            let v = relabel_elem(v, f, &mut changed);
+            map_put(&mut m, k, v);
+        }
+        changed.then(|| map_lexical(&m))
+    }
+}
+
+fn relabel_elem(e: Elem, f: &mut dyn FnMut(&str) -> String, changed: &mut bool) -> Elem {
+    match e {
+        Elem::Term(t) => Elem::Term(relabel_elem_term(t, f, changed)),
+        Elem::Null => Elem::Null,
+    }
+}
+
+fn relabel_elem_term(t: Term, f: &mut dyn FnMut(&str) -> String, changed: &mut bool) -> Term {
+    match t {
+        Term::BlankNode(b) => {
+            *changed = true;
+            Term::BlankNode(BlankNode::new_unchecked(f(b.as_str())))
+        }
+        Term::Literal(l) => match relabel_literal(&l, f) {
+            Some(l) => {
+                *changed = true;
+                Term::Literal(l)
+            }
+            None => Term::Literal(l),
+        },
+        t => t,
+    }
+}
+
 // ----------------------------------------------------------- equality and order ----
 
 /// Jena's order of map keys (`CDTKeySorter`): IRIs first, by IRI; then literals by

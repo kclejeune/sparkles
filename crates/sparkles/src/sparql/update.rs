@@ -509,7 +509,16 @@ fn run_op(
                             TermPattern::NamedNode(n) => {
                                 Some(txn.intern(&Term::NamedNode(n.clone()))?)
                             }
-                            TermPattern::Literal(l) => Some(txn.intern(&Term::Literal(l.clone()))?),
+                            TermPattern::Literal(l) => {
+                                // the labels inside a composite literal of the template
+                                // name the template's blank nodes, new per solution
+                                let l = super::cdt::relabel_literal(l, &mut |b| {
+                                    let b = BlankNode::new_unchecked(b);
+                                    crate::id::bnode_label(bnode(txn, &mut bnodes, &b).payload())
+                                })
+                                .unwrap_or_else(|| l.clone());
+                                Some(txn.intern(&Term::Literal(l))?)
+                            }
                             t @ TermPattern::Triple(_) => {
                                 let mut bn = |b: &str| {
                                     let id = match bnodes.get(b) {
@@ -819,6 +828,15 @@ impl Minted {
                 };
                 let o = self.stored(txn, &tr.object);
                 Term::Triple(Box::new(oxrdf::Triple::new(s, tr.predicate.clone(), o)))
+            }
+            // the labels inside a composite literal name blank nodes as the labels
+            // outside it do. A label of no stored or minted node stays as it is.
+            Term::Literal(l) => {
+                super::cdt::relabel_literal(l, &mut |b| match crate::id::parse_bnode_payload(b) {
+                    Some(p) => crate::id::bnode_label(self.id(txn, Id::bnode(p)).payload()),
+                    None => b.to_string(),
+                })
+                .map_or_else(|| t.clone(), Term::Literal)
             }
             t => t.clone(),
         }

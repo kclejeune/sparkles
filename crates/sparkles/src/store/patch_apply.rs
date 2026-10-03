@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use crate::guard::{Precondition, WriteOptions};
 use crate::id::{self, Id};
 use crate::patch::{PatchError, PatchErrorKind, PatchReader, PatchRow};
+use crate::sparql::cdt;
 use oxrdf::{BlankNode, GraphName, NamedOrBlankNode, Quad, Term, Triple};
 use std::collections::HashMap;
 use std::io::Read;
@@ -112,6 +113,21 @@ fn relabel(t: &Term, f: &mut impl FnMut(&BlankNode) -> Option<Id>) -> Option<Ter
             let o = relabel(&tr.object, f)?;
             Term::Triple(Box::new(Triple::new(s, tr.predicate.clone(), o)))
         }
+        Term::Literal(l) if cdt::may_name_bnodes(l) => {
+            let mut ok = true;
+            let l = cdt::relabel_literal(l, &mut |b| match f(&BlankNode::new_unchecked(b)) {
+                Some(id) => id::bnode_label(id.payload()),
+                None => {
+                    ok = false;
+                    b.to_string()
+                }
+            });
+            match l {
+                Some(l) if ok => Term::Literal(l),
+                Some(_) => return None,
+                None => t.clone(),
+            }
+        }
         t => t.clone(),
     })
 }
@@ -137,8 +153,10 @@ fn encode_add(txn: &mut WriteTxn<'_>, labels: &mut Labels, q: &Quad) -> Result<[
         if let Term::BlankNode(b) = t {
             return Ok(labels.get_or_new(txn, b.as_str()));
         }
-        // give every label of a triple term its node first, then relabel
-        if let Term::Triple(_) = t {
+        // give every label of a triple term or a composite literal its node first,
+        // then relabel
+        if matches!(t, Term::Triple(_)) || matches!(t, Term::Literal(l) if cdt::may_name_bnodes(l))
+        {
             let mut names = Vec::new();
             collect_labels(t, &mut names);
             for l in &names {
@@ -167,6 +185,12 @@ fn collect_labels(t: &Term, out: &mut Vec<String>) {
                 out.push(b.as_str().to_string());
             }
             collect_labels(&tr.object, out);
+        }
+        Term::Literal(l) => {
+            cdt::relabel_literal(l, &mut |b| {
+                out.push(b.to_string());
+                b.to_string()
+            });
         }
         _ => {}
     }

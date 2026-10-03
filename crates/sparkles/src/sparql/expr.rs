@@ -1901,7 +1901,7 @@ impl Compiler<'_> {
         match e {
             E::NamedNode(n) => Expr::Const(self.ctx.intern_term(&Term::NamedNode(n.clone()))),
             E::Literal(l) => {
-                let t = Term::Literal(l.clone());
+                let t = Term::Literal(self.ctx.query_literal(l).into_owned());
                 let id = self.ctx.intern_term(&t);
                 if id.is_inline() {
                     Expr::Const(id)
