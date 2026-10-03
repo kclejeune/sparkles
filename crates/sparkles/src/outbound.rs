@@ -54,6 +54,10 @@ pub const DEFAULT_MAX_REDIRECTS: usize = 5;
 /// Default bytes all the outbound requests of one SPARQL request may receive: four
 /// full-size responses.
 pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 4 * DEFAULT_MAX_RESPONSE_BYTES;
+/// Inputs per request of a bulk SERVICE without a size, as in Jena.
+pub const DEFAULT_SERVICE_BULK_SIZE: usize = 10;
+/// The most inputs per request of a bulk SERVICE, as in Jena.
+pub const DEFAULT_SERVICE_BULK_MAX: usize = 100;
 /// Default time all the outbound requests of one SPARQL request may take, summed.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(4 * 60);
 
@@ -253,6 +257,12 @@ pub struct OutboundPolicy {
     pub max_request_bytes: u64,
     /// Time all the requests of one SPARQL request may take, summed.
     pub request_timeout: Duration,
+    /// Inputs per request of a `SERVICE <loop:bulk:…>` (Jena's
+    /// `serviceBulkBindingCount`).
+    pub service_bulk_size: usize,
+    /// The most inputs per request of any bulk SERVICE; `bulk+n` is capped to it (Jena's
+    /// `serviceBulkMaxBindingCount`).
+    pub service_bulk_max: usize,
     pub resolver: Arc<dyn Resolver>,
 }
 
@@ -267,6 +277,8 @@ impl Default for OutboundPolicy {
             max_redirects: DEFAULT_MAX_REDIRECTS,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            service_bulk_size: DEFAULT_SERVICE_BULK_SIZE,
+            service_bulk_max: DEFAULT_SERVICE_BULK_MAX,
             resolver: Arc::new(SystemResolver),
         }
     }
@@ -283,6 +295,8 @@ impl fmt::Debug for OutboundPolicy {
             .field("max_redirects", &self.max_redirects)
             .field("max_request_bytes", &self.max_request_bytes)
             .field("request_timeout", &self.request_timeout)
+            .field("service_bulk_size", &self.service_bulk_size)
+            .field("service_bulk_max", &self.service_bulk_max)
             .finish_non_exhaustive()
     }
 }

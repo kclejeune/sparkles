@@ -990,7 +990,7 @@ fn admin(p: &mut Paths) {
             "/$/cache/clear/{ds}",
             "clearCache",
             "Datasets",
-            "Clear the query result cache",
+            "Clear the query result cache and the cache of remote SERVICE results",
         )
         .see("datasets-admin")
         .json("200", "What was dropped.", "CacheCleared"),

@@ -819,6 +819,9 @@ pub struct StoreOptions {
     pub result_cache_bytes: u64,
     /// Only results that took at least this long (ms) to compute are cached.
     pub result_cache_min_ms: f64,
+    /// Budget for cached remote SERVICE results (`SERVICE <cache:…>`); 0 disables
+    /// that cache.
+    pub service_cache_bytes: u64,
     pub union_default_graph: bool,
     pub build: BuildOptions,
     /// Loads smaller than this many quads go through the transactional delta; larger
@@ -911,6 +914,7 @@ impl Default for StoreOptions {
             cache_bytes: 1 << 30,
             result_cache_bytes: 512 << 20,
             result_cache_min_ms: 1.0,
+            service_cache_bytes: 64 << 20,
             union_default_graph: false,
             build: BuildOptions::default(),
             bulk_threshold: 250_000,
@@ -1142,9 +1146,10 @@ impl Store {
         forked_from: Option<ForkedFrom>,
     ) -> Store {
         let cache = Arc::new(BlockCache::new(opts.cache_bytes));
-        let results = Arc::new(crate::sparql::cache::ResultCache::new(
+        let results = Arc::new(crate::sparql::cache::ResultCache::with_service(
             opts.result_cache_bytes,
             opts.result_cache_min_ms,
+            opts.service_cache_bytes,
         ));
         let dvocab_len = gen_.dvocab.len();
         let mut limits = Store::log_limits(&opts);
@@ -1263,9 +1268,10 @@ impl Store {
         let gen_ = Generation::open(&root.join(&name), &name, true)?;
         let gen_no = commit::generation_number(&name);
         let cache = Arc::new(BlockCache::new(opts.cache_bytes));
-        let results = Arc::new(crate::sparql::cache::ResultCache::new(
+        let results = Arc::new(crate::sparql::cache::ResultCache::with_service(
             opts.result_cache_bytes,
             opts.result_cache_min_ms,
+            opts.service_cache_bytes,
         ));
         let mut next_bnode = gen_.meta.next_bnode;
         // prefixes.json holds the whole map once written (so removals persist); the

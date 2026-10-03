@@ -316,6 +316,9 @@ impl Request<'_> {
         ctx.forbid_service = self.opts.forbid_service;
         ctx.outbound = self.opts.outbound.clone();
         ctx.outbound_budget = self.budget.clone();
+        if let Some(s) = &self.opts.service_scope {
+            ctx.service_scope = s.clone();
+        }
         if let Some(o) = self.opts.optimizations {
             ctx.opt = o;
         }

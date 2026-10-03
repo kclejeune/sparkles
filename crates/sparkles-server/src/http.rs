@@ -3637,6 +3637,14 @@ async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
                 "hits": rcache.hits(),
                 "misses": rcache.misses(),
             },
+            "serviceCache": {
+                "enabled": rcache.service.enabled(),
+                "entries": rcache.service.entries(),
+                "bytes": rcache.service.bytes(),
+                "capacityBytes": rcache.service.capacity(),
+                "hits": rcache.service.hits(),
+                "misses": rcache.service.misses(),
+            },
         }))
         .into_response();
         let resp = with_commit(resp, &ds, snap.commit);
@@ -3645,13 +3653,21 @@ async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
     .await
 }
 
-/// `POST /$/cache/clear/{ds}` (extension): drop the dataset's cached query results.
+/// `POST /$/cache/clear/{ds}` (extension): drop the dataset's cached query results and
+/// its cached remote SERVICE results.
 async fn clear_cache(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
     let c = ds.store.result_cache();
     let (entries, bytes) = (c.entries(), c.bytes());
+    let (s_entries, s_bytes) = (c.service.entries(), c.service.bytes());
     c.clear();
-    Ok(Json(json!({ "cleared": entries, "bytes": bytes })))
+    c.service.clear();
+    Ok(Json(json!({
+        "cleared": entries,
+        "bytes": bytes,
+        "serviceCleared": s_entries,
+        "serviceBytes": s_bytes,
+    })))
 }
 
 async fn prefixes(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {

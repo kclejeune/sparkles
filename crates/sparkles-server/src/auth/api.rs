@@ -93,6 +93,8 @@ pub fn restrict(
     opts.forbid_file_load = !p.has(ServerPerm::ServerAdmin);
     opts.graphs = p.view(ds, e);
     opts.write.graphs = opts.graphs.clone();
+    // remote results cached for one caller and endpoint are never read by another
+    opts.service_scope = Some(format!("{}\u{1f}{e:?}", p.id()).into());
 }
 
 /// The external base URL the auth configuration sets (`server.public_url`), if any.

@@ -9,6 +9,7 @@ pub mod charsets;
 pub mod ctx;
 pub mod depth;
 pub mod describe;
+pub mod enhancer;
 pub mod exec;
 mod exists;
 pub mod expr;
@@ -31,6 +32,7 @@ pub mod rdfs;
 pub mod results;
 mod sample;
 pub mod stats;
+pub mod svccache;
 pub mod table;
 pub mod textpf;
 pub mod update;
@@ -116,6 +118,12 @@ pub struct QueryOptions {
     /// limits (`None`: a new one), shared by several queries that count as one request,
     /// such as the fetch groups of one GraphQL request.
     pub work: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Who the request runs for, as far as the cache of remote SERVICE results is
+    /// concerned (see [`svccache`]): entries written under one scope are never read
+    /// under another. The server sets it to the caller and the endpoint, so callers
+    /// with different credentials or views never share results; `None` is one shared
+    /// scope.
+    pub service_scope: Option<Arc<str>>,
 }
 
 /// Which files `LOAD <file:…>` may read.
@@ -370,6 +378,9 @@ fn make_ctx(
         None => None,
     };
     ctx.use_cache = !opts.no_cache;
+    if let Some(s) = &opts.service_scope {
+        ctx.service_scope = s.clone();
+    }
     if let Some(o) = opts.optimizations {
         ctx.opt = o;
     }

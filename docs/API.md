@@ -582,7 +582,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
 | DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
-| POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results. Returns `{ "cleared": number /* entries */, "bytes": number }`. |
+| POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results and its cached remote SERVICE results ([SERVICE options](#service-options-loop-bulk-and-cache)). Returns `{ "cleared": number /* entries */, "bytes": number, "serviceCleared": number, "serviceBytes": number }`. |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's prefixes plus well-known ones. |
 | GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. |
 | POST/PUT | `/{ds}/prefixes`           | Binds `prefix` to `uri`, given in the query, a form or a JSON body `{prefix, uri}`. Names may be up to 256 bytes and IRIs up to 4096. An invalid name or IRI is a `400`. So is a new prefix once the dataset has `--max-prefixes` (1000) of them. Replacing an existing binding is fine. Prefixes of loaded data are added up to the same limit. Prefixes are metadata, so no commit is made. |
@@ -638,6 +638,7 @@ type DatasetStats = {
   quota: DatasetQuota | null;   // persistent datasets: the storage quota and its usage
   cache: { entries: number; bytes: number; hits: number; misses: number };        // decoded-block cache (--cache-mb)
   resultCache: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number }; // query (sub)result cache (--result-cache-mb)
+  serviceCache: { enabled: boolean; entries: number; bytes: number; capacityBytes: number; hits: number; misses: number }; // remote SERVICE results (--service-cache-mb)
   reasoning: ReasoningStatus | null;
   geo: GeoStatus | null;   // the spatial index (see GeoSPARQL)
   datasets: { [path: string]: FusekiCounters };   // Fuseki's form, under "/ds"
@@ -1456,7 +1457,8 @@ Query parameters beyond the standard protocol:
   it. It is meant for benchmarking, and `explain` accepts it too. `sparkles serve
   --result-cache-mb N` sets the server-wide cache budget (default 512, `0` disables the
   cache). The cache is keyed by snapshot version, so updates invalidate it.
-  `POST /$/cache/clear/{ds}` empties it.
+  `POST /$/cache/clear/{ds}` empties it. `nocache=true` also skips the cache of remote
+  results that `SERVICE <cache:…>` uses ([SERVICE options](#service-options-loop-bulk-and-cache)).
 * `describe`, `describe-labels`, `describe-reifiers`, `describe-max-triples` and
   `describe-max-depth` choose how a DESCRIBE query describes a resource. See
   [DESCRIBE](#describe).
@@ -1896,6 +1898,80 @@ The builder has `lateral(|w| …)`, and its path syntax accepts ranges
 
 ARQ's `JSON` query form and its `EXISTS { … }` and `NOT EXISTS { … }` group elements are
 not supported.
+
+### SERVICE options: loop, bulk and cache
+
+Sparkles reads the options of Jena's service enhancer (`jena-serviceenhancer`) at the
+front of a SERVICE IRI. `SERVICE <loop:bulk+10:cache:https://query.wikidata.org/sparql>`
+has the options `loop`, `bulk+10` and `cache`, and the endpoint
+`https://query.wikidata.org/sparql`. Options are `:`-separated, and the first segment
+that is not an option starts the endpoint. Without an endpoint after the options, as in
+`SERVICE <loop:>`, the service is the dataset the query runs on. The design is spec
+[G10](specs/G10-service-enhancer.md).
+
+```sparql
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?s ?l {
+  VALUES ?s { wd:Q1686799 wd:Q54837 wd:Q54872 wd:Q54871 wd:Q108379795 }
+  SERVICE <cache:loop:bulk+5:https://query.wikidata.org/sparql> {
+    SELECT ?l { ?s rdfs:label ?l FILTER(langMatches(lang(?l), 'en')) } ORDER BY ?l LIMIT 1
+  }
+}
+```
+
+This query gives each item its own first English label. The five items go to Wikidata in
+one request, and a second run answers from the cache without a request.
+
+| Option | Effect |
+|---|---|
+| `loop` | Evaluates the SERVICE once per solution of the patterns before it in the group, with that solution's values in place of its variables, as `LATERAL` does. Unlike `LATERAL`, the values also replace variables of sub-selects that do not project them, as in Jena. Inside OPTIONAL, a solution without results is kept. |
+| `bulk`, `bulk+n` | Sends the solutions of a loop to a remote endpoint `n` at a time in one request. `bulk` alone sends `--service-bulk-size` (10), and `n` is capped at `--service-bulk-max` (100). |
+| `cache`, `cache+default` | Reads the dataset's cache of remote results, one entry per solution of the loop, and stores what it fetches. Without `loop`, the whole result is one entry. |
+| `cache+clear` | Drops the entries of this SERVICE's inputs, fetches them again and stores them. |
+| `cache+off` | Neither reads nor writes the cache. |
+| `optimize` | Accepted for compatibility. It has no effect. |
+
+`SERVICE <urn:x-arq:self> { … }`, and options without an endpoint, read the dataset of
+the query in its default graph and under the caller's view. They need neither
+`--allow-service` nor the `federate` permission, because no request leaves the server.
+On the dataset itself, `bulk` and `cache` have no effect, and the result cache serves
+repeated queries.
+
+A bulk request has one of two shapes. When the pattern is made of triple patterns, paths
+of at least one step, joins, `GRAPH` and FILTERs whose variables the pattern always
+binds, the inputs go in one VALUES block numbered by `?__idx__`:
+
+```sparql
+SELECT * WHERE {
+  { VALUES (?d ?__idx__) { (<urn:dept1> 0) (<urn:dept2> 1) } { ?d <urn:hasEmployee> ?p } }
+  UNION { BIND(1000000000 AS ?__idx__) }
+} ORDER BY ?__idx__
+```
+
+Any other pattern, such as a sub-select with LIMIT, is sent as Jena sends it, as a UNION
+of the pattern with each input's values, each member binding `?__idx__`. In both shapes
+the last solution is an end marker. When an endpoint cuts a response short, the marker
+is missing, and the inputs of that request are sent again one at a time. Each input
+therefore gets the solutions its own request would get, and the cut response is not
+cached. Both shapes are plain SPARQL 1.1, which Fuseki, QLever and Wikidata answer.
+
+Every request follows the outbound policy and counts against the request's outbound
+budget. A caller without `federate`, or a server with SERVICE turned off, is refused even
+when the cache holds the answer. Cache entries are kept per caller and per endpoint of
+the request, so callers with different credentials or graph views never read each
+other's entries. Library users choose the scope with `QueryOptions::service_scope`. The
+cache holds `--service-cache-mb` (64) per dataset, skips any entry larger than an eighth
+of that, and keeps no entry for a response that was cut short. `POST /$/cache/clear/{ds}`
+empties it, the `no_cache` query option skips it, and the dataset's statistics report it
+as `serviceCache`.
+
+EXPLAIN shows a loop as a `Lateral` operator with the endpoint, the keys, the bulk size
+and shape, and the cache mode. Its counters give the inputs, the requests, the cache hits
+and the bulk requests sent again.
+
+Jena's slice-aware cache, which serves overlapping LIMIT and OFFSET ranges from stored
+pages, and its management functions `se:cacheRm` and `se:cacheLs` are not supported.
 
 ### DESCRIBE
 

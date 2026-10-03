@@ -48,6 +48,13 @@ pub struct LateralSpec {
     /// side's values): a left row without solutions on the right is kept, and the
     /// expression is the OPTIONAL's filter
     pub optional: Option<Option<spargebra::algebra::Expression>>,
+    /// Jena's `SERVICE <loop:>`: the substitution also reaches the variables of
+    /// sub-selects that do not project them, and the keys are every variable of the
+    /// left side that the right side mentions anywhere
+    pub unscoped: bool,
+    /// `SERVICE <loop:…>` over a remote endpoint: the right side is sent there, for
+    /// several groups at once with `bulk` (see [`super::enhancer`])
+    pub service: Option<Box<super::enhancer::RemoteLoop>>,
 }
 
 /// The names of the variables `R` mentions where substitution reaches them: in scope,
@@ -93,7 +100,7 @@ pub(super) fn plan(
     right: &GraphPattern,
     g: &ActiveGraph,
 ) -> Result<Node> {
-    plan_with(p, left, right, g, None)
+    plan_with(p, left, right, g, None, false)
 }
 
 /// The plan of `LeftJoin(left, right, expr)` that evaluates `right` per group of
@@ -105,7 +112,20 @@ pub(super) fn plan_optional(
     expr: Option<&spargebra::algebra::Expression>,
     g: &ActiveGraph,
 ) -> Result<Node> {
-    plan_with(p, left, right, g, Some(expr.cloned()))
+    plan_with(p, left, right, g, Some(expr.cloned()), false)
+}
+
+/// The plan of `left` joined (or, with `optional`, left-joined) with
+/// `SERVICE <loop:> { right }` over the dataset itself: a `LATERAL` whose substitution
+/// reaches into sub-selects, evaluated against the query's default graph as a separate
+/// query would be.
+pub(super) fn plan_loop_self(
+    p: &mut Planner<'_>,
+    left: Node,
+    right: &GraphPattern,
+    optional: Option<Option<spargebra::algebra::Expression>>,
+) -> Result<Node> {
+    plan_with(p, left, right, &ActiveGraph::Default, optional, true)
 }
 
 fn plan_with(
@@ -114,9 +134,15 @@ fn plan_with(
     right: &GraphPattern,
     g: &ActiveGraph,
     optional: Option<Option<spargebra::algebra::Expression>>,
+    unscoped: bool,
 ) -> Result<Node> {
     let ctx = p.ctx;
-    let keys: Vec<VarId> = mentioned(right)
+    let names = if unscoped {
+        super::enhancer::all_vars(right)
+    } else {
+        mentioned(right)
+    };
+    let keys: Vec<VarId> = names
         .iter()
         .map(|n| ctx.var(n))
         .filter(|v| left.vars.contains(v))
@@ -182,6 +208,8 @@ fn plan_with(
         outer,
         outer_scoped,
         optional,
+        unscoped,
+        service: None,
     };
     Ok(Node {
         kind: Kind::Lateral(Box::new(spec)),
@@ -230,7 +258,9 @@ pub(super) fn run(
         for (k, id) in spec.keys.iter().zip(key) {
             if !id.is_undef() {
                 p.subst.insert(*k, *id);
-                p.scoped.insert(*k);
+                if !spec.unscoped {
+                    p.scoped.insert(*k);
+                }
             }
         }
         let graph = match &spec.graph {

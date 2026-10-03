@@ -1363,6 +1363,33 @@ implementation landed.
   - per-dataset timeouts;
   - dataset aliases.
 
+## SERVICE enhancer
+
+- **Spec:** [`G10-service-enhancer.md`](G10-service-enhancer.md), written on 2026-10-03
+  independently from:
+  - the Sparkles code: the `Lateral` operator and join test of G06, the SERVICE executor,
+    the outbound policy, the result cache and access control;
+  - Apache Jena's `jena-serviceenhancer` sources (Apache-2.0): `ServiceOpts`,
+    `TransformSE_JoinStrategy`, `TransformSE_EffectiveOptions`, `BatchQueryRewriter`,
+    `ServiceEnhancerConstants` and the assembler vocabulary, read for syntax and
+    behaviour. No code was copied;
+  - the module's tests `TestServiceEnhancerMisc`,
+    `AbstractTestServiceEnhancerResultSetLimits` and
+    `TestServiceEnhancerBatchQueryRewriter`, whose data and cases are ported with
+    citations to `crates/sparkles/tests/service_enhancer.rs`;
+  - the module's documentation page in `jena-site`
+    (`source/documentation/query/service_enhancer.md`);
+  - SPARQL 1.1 Query and SPARQL 1.1 Federated Query.
+- **Implementation** (2026-10-03): from the spec and the Sparkles code. The cache uses
+  `quick_cache`, already a dependency. **Dependencies:** none new.
+- **Rejected** (spec §10):
+  - Jena's slice-aware cache and result-size learning;
+  - the management functions `se:cacheRm` and `se:cacheLs`;
+  - one cache per server shared by callers;
+  - the UNION form for every pattern;
+  - caching `urn:x-arq:self`;
+  - requests in parallel.
+
 ## OpenAPI description, shell completions and man pages
 
 - **Spec:** [`X03-openapi-and-completions.md`](X03-openapi-and-completions.md), written on
