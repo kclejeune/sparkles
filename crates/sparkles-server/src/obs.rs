@@ -77,6 +77,8 @@ pub enum Op {
     Update,
     Gsp,
     Upload,
+    /// applying RDF Patch
+    Patch,
     Shacl,
     Shex,
     Explain,
@@ -87,11 +89,12 @@ pub enum Op {
 }
 
 impl Op {
-    pub const ALL: [Op; 10] = [
+    pub const ALL: [Op; 11] = [
         Op::Query,
         Op::Update,
         Op::Gsp,
         Op::Upload,
+        Op::Patch,
         Op::Shacl,
         Op::Shex,
         Op::Explain,
@@ -106,6 +109,7 @@ impl Op {
             Op::Update => "update",
             Op::Gsp => "gsp",
             Op::Upload => "upload",
+            Op::Patch => "patch",
             Op::Shacl => "shacl",
             Op::Shex => "shex",
             Op::Explain => "explain",
@@ -238,6 +242,7 @@ fn route_op(route: Option<&str>, req: &Request) -> Op {
         "/{ds}/update" => Op::Update,
         "/{ds}/data" | "/{ds}/get" | "/{ds}/{*graph}" => Op::Gsp,
         "/{ds}/upload" => Op::Upload,
+        "/{ds}/patch" => Op::Patch,
         "/{ds}/shacl" => Op::Shacl,
         "/{ds}/shex" => Op::Shex,
         "/{ds}/explain" => Op::Explain,
@@ -253,6 +258,8 @@ fn route_op(route: Option<&str>, req: &Request) -> Op {
                 Op::Query
             } else if has("update") || ct.starts_with("application/sparql-update") {
                 Op::Update
+            } else if ct.starts_with(sparkles::patch::MEDIA_TYPE) {
+                Op::Patch
             } else {
                 Op::Gsp
             }

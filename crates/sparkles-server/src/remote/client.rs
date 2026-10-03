@@ -6,7 +6,7 @@ use super::{JsonBody, Remote, login, normalize};
 use anyhow::{Context, Result, bail};
 use reqwest::Method;
 use serde_json::{Value as J, json};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// `sparkles auth login`
@@ -470,6 +470,61 @@ pub fn load(
             j["count"].as_u64().unwrap_or(0),
             f.display()
         );
+    }
+    Ok(())
+}
+
+/// `sparkles patch --server URL --dataset DS FILES…`: each patch sent to the dataset's
+/// patch endpoint, one commit per file.
+pub fn patch(
+    server: Option<&str>,
+    insecure: bool,
+    dataset: &str,
+    files: &[PathBuf],
+    format: Option<&str>,
+    message: Option<&str>,
+) -> Result<()> {
+    let r = Remote::open(server, insecure)?;
+    for f in files {
+        let binary = crate::tools::rdfpatch::binary_input(f, format);
+        let mut body = Vec::new();
+        crate::tools::rdfpatch::open(f)?.read_to_end(&mut body)?;
+        let req = with_message(
+            r.req(
+                Method::POST,
+                &format!("/{}/patch?receipt=true", ds_path(dataset)),
+            ),
+            message,
+        )
+        .header(
+            "content-type",
+            if binary {
+                sparkles::patch::MEDIA_TYPE_BINARY
+            } else {
+                sparkles::patch::MEDIA_TYPE
+            },
+        )
+        .header("accept", "application/json")
+        .body(body);
+        let j = r.check(req.send(), Some(dataset))?.json_value()?;
+        let seq = j["commit"]["seq"].as_u64().unwrap_or(0);
+        let outcome = if j["aborted"] == true {
+            format!("aborted · head {seq}")
+        } else if j["committed"] == true {
+            format!("commit {seq}")
+        } else {
+            format!("no change · head {seq}")
+        };
+        let line = format!(
+            "inserted {} · deleted {} · {outcome}",
+            j["inserted"].as_u64().unwrap_or(0),
+            j["deleted"].as_u64().unwrap_or(0)
+        );
+        if files.len() > 1 {
+            eprintln!("{}: {line}", f.display());
+        } else {
+            eprintln!("{line}");
+        }
     }
     Ok(())
 }

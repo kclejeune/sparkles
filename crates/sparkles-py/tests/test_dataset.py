@@ -254,3 +254,30 @@ def test_formats() -> None:
     assert RdfFormat.N_QUADS.supports_datasets and not RdfFormat.TURTLE.supports_datasets
     assert RdfFormat.JSON_LD.media_type == "application/ld+json"
     assert repr(RdfFormat.RDF_XML) == "RdfFormat.RDF_XML"
+
+
+JENA_PATCHES = Path(__file__).resolve().parents[2] / "sparkles" / "tests" / "patch"
+
+
+def test_apply_patch() -> None:
+    ds = Dataset()
+    s = ds.apply_patch('TX .\nA <urn:a> <urn:p> "1" .\nA <urn:b> <urn:p> <urn:c> <urn:g> .\nTC .\n')
+    assert (s.committed, s.commit, s.inserted, s.deleted, s.rows) == (True, 1, 2, 0, 4)
+    assert len(ds) == 2
+    assert ds.commits(1)[0].kind == "patch"
+    # TA aborts the whole patch
+    s = ds.apply_patch(b"A <urn:q> <urn:p> 1 . TA .")
+    assert s.aborted and not s.committed and len(ds) == 2
+    # prefix rows change the prefixes without a commit
+    s = ds.apply_patch('PA "ex" <http://example.org/> .', message="unused")
+    assert s.prefixes_set == 1 and not s.committed
+    assert ds.prefixes["ex"] == "http://example.org/"
+    # the binary form, as Jena writes it
+    s = ds.apply_patch((JENA_PATCHES / "jena-1.trp").read_bytes(), binary=True)
+    assert (s.inserted, s.deleted) == (10, 1)
+    with pytest.raises(RdfSyntaxError):
+        ds.apply_patch("A <urn:a> <urn:p> .")
+    with pytest.raises(InvalidInputError):
+        ds.apply_patch('A "s" <urn:p> 1 .')
+    with pytest.raises(TypeError):
+        ds.apply_patch(42)  # type: ignore[arg-type]

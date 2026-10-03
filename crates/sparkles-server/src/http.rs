@@ -36,6 +36,7 @@ mod inline;
 pub(crate) mod jena_formats;
 #[cfg(feature = "fmt")]
 mod lint;
+mod patch;
 mod queries;
 pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
@@ -161,6 +162,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/{ds}/upload",
             post(upload).layer(DefaultBodyLimit::max(
+                state
+                    .limits
+                    .max_upload_bytes
+                    .map_or(usize::MAX, |b| b as usize),
+            )),
+        )
+        .route(
+            "/{ds}/patch",
+            any(patch::patch).layer(DefaultBodyLimit::max(
                 state
                     .limits
                     .max_upload_bytes
@@ -494,6 +504,10 @@ impl From<Error> for ApiError {
             Error::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Error::GuardMissing(_) => StatusCode::NOT_IMPLEMENTED,
             Error::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
+            Error::Patch(p) if p.kind == sparkles::patch::PatchErrorKind::PrevMismatch => {
+                StatusCode::PRECONDITION_FAILED
+            }
+            Error::Patch(_) => StatusCode::BAD_REQUEST,
             // a write handler answers a dry run with its preview before errors are mapped
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -504,6 +518,7 @@ impl From<Error> for ApiError {
             Error::HistoryUnsupported(_) => json!({ "error": msg, "code": "history-unsupported" }),
             Error::StorageFull(_) => json!({ "error": msg, "code": "storage-full" }),
             Error::PreconditionFailed(_) => json!({ "error": msg, "code": "precondition-failed" }),
+            Error::Patch(p) => json!({ "error": msg, "code": p.kind.code() }),
             Error::Conflict(_) if msg.starts_with("history-limit") => {
                 json!({ "error": msg, "code": "history-limit" })
             }
@@ -933,6 +948,10 @@ async fn dataset_root(
     let form = method == Method::POST && ct == "application/x-www-form-urlencoded";
     let query = params.has("query") || ct == "application/sparql-query";
     let update = params.has("update") || ct == "application/sparql-update";
+    // Fuseki dispatches a patch sent to the dataset by its content type
+    if method == Method::POST && patch::is_patch_type(&ct) && !query && !update {
+        return patch::apply(st, Path(name), p, uri, headers, body).await;
+    }
     if !(form || query || update) {
         // a Graph Store request: its body streams
         return gsp(st, Path(name), p, method, uri, headers, body).await;
@@ -4612,6 +4631,8 @@ mod limits_tests;
 mod nesting_tests;
 #[cfg(test)]
 mod obs_tests;
+#[cfg(test)]
+mod patch_tests;
 #[cfg(test)]
 mod router_tests;
 #[cfg(all(test, feature = "text"))]

@@ -45,12 +45,14 @@ pub enum CommitKind {
     Transaction,
     /// vectors written by a vector index's embedding worker
     Embed,
+    /// an RDF Patch applied (`POST /{ds}/patch`, `sparkles patch`, `Store::apply_patch`)
+    Patch,
     /// a WAL commit written by an older version after this one had upgraded the database
     Unknown,
 }
 
 impl CommitKind {
-    const ALL: [CommitKind; 13] = [
+    const ALL: [CommitKind; 14] = [
         CommitKind::Create,
         CommitKind::Baseline,
         CommitKind::Update,
@@ -63,6 +65,7 @@ impl CommitKind {
         CommitKind::ReasonClear,
         CommitKind::Transaction,
         CommitKind::Embed,
+        CommitKind::Patch,
         CommitKind::Unknown,
     ];
 
@@ -81,6 +84,7 @@ impl CommitKind {
             CommitKind::ReasonClear => 9,
             CommitKind::Transaction => 10,
             CommitKind::Embed => 11,
+            CommitKind::Patch => 12,
             CommitKind::Unknown => 255,
         }
     }
@@ -107,6 +111,7 @@ impl CommitKind {
             CommitKind::ReasonClear => "reason-clear",
             CommitKind::Transaction => "transaction",
             CommitKind::Embed => "embed",
+            CommitKind::Patch => "patch",
             CommitKind::Unknown => "unknown",
         }
     }

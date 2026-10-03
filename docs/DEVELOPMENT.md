@@ -111,7 +111,9 @@ it on a temporary data directory on port 5230 with `--gsp-direct-naming`, and ru
 `testsuite/jena-clients/JenaClients.java` with Java's single-file launcher. The program
 uses Jena's `RDFConnectionRemote`, `RDFConnectionFuseki`, `GSP`, `DSP`, `QueryExecHTTP`
 and `UpdateExecHTTP` with every query send mode, result format and RDF syntax Jena has,
-gzip in both directions, uploads, direct naming and SHACL. It also makes the admin calls
+gzip in both directions, uploads, direct naming and SHACL. It sends patches written by
+Jena's text and binary patch writers to the patch endpoint and compares the result with
+Jena's own application of them. It also makes the admin calls
 Fuseki's clients make, such as creating datasets from forms and assemblers, backups,
 compaction, tasks, statistics, offline datasets and the validators. It prints a line per
 check and exits with the number of failures. Jena and a JDK come from nixpkgs unless

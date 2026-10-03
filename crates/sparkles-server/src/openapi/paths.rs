@@ -9,6 +9,7 @@ const HEAD: Method = Method::HEAD;
 const POST: Method = Method::POST;
 const PUT: Method = Method::PUT;
 const DELETE: Method = Method::DELETE;
+const PATCH: Method = Method::PATCH;
 
 /// RDF syntaxes the server reads and writes, with whether they are binary.
 const RDF: &[(&str, bool)] = &[
@@ -2283,8 +2284,10 @@ fn protocol(p: &mut Paths) {
     if let J::Object(m) = rdf_in() {
         post_body.extend(m);
     }
+    post_body.insert("application/rdf-patch".into(), text());
+    post_body.insert("application/rdf-patch+thrift".into(), binary());
     let o = op(POST, "/{ds}", "datasetPost", "SPARQL", "Query, update or add data")
-        .doc("A query (`application/sparql-query`, or a form with `query`), an update (`application/sparql-update`, or a form with `update`), or else a Graph Store POST of the RDF body. A form with neither is refused.")
+        .doc("A query (`application/sparql-query`, or a form with `query`), an update (`application/sparql-update`, or a form with `update`), an RDF Patch (`application/rdf-patch` or `application/rdf-patch+thrift`, as `/{ds}/patch`), or else a Graph Store POST of the RDF body. A form with neither is refused.")
         .see("per-dataset-sparql-protocol-fuseki-compatible")
         .params(&["gspGraph", "gspDefault"])
         .body(true, "A query, an update or RDF data.", J::Object(post_body));
@@ -2300,7 +2303,7 @@ fn protocol(p: &mut Paths) {
                 };
                 m.insert(
                     "application/json".into(),
-                    json!({ "schema": { "anyOf": [sref("UpdateResult"), sref("WriteCount"), sref("Receipt"), sref("DryRunReport")] } }),
+                    json!({ "schema": { "anyOf": [sref("UpdateResult"), sref("WriteCount"), sref("PatchResult"), sref("Receipt"), sref("DryRunReport")] } }),
                 );
                 J::Object(m)
             }),
@@ -2390,6 +2393,32 @@ fn protocol(p: &mut Paths) {
             }),
         );
     p.add(write_errors(write_params(write_ok(o, "200"))));
+    for (m, id) in [(POST, "patchPost"), (PATCH, "patch")] {
+        let o = op(m, "/{ds}/patch", id, "Graph Store", "Apply an RDF Patch")
+            .doc("Applies an RDF Patch as one write transaction, as Fuseki's `patch` operation does. The text form is `application/rdf-patch`, which a missing content type or `application/x-www-form-urlencoded` also means, and the binary form is `application/rdf-patch+thrift`. `TX`, `TC` and `Z` are markers, and `TA` aborts the whole patch with `200` and `aborted: true`. `PA` and `PD` change the dataset's prefixes. A `prev` header that names a commit of this dataset applies the patch only when that commit is the head, and is `412` otherwise. The body is limited by `--max-upload-mb`. A patch that changes data makes one commit of kind `patch`. The other methods are `405`.")
+            .see("applying-rdf-patch")
+            .body(
+                true,
+                "The patch.",
+                json!({
+                    "application/rdf-patch": text(),
+                    "application/rdf-patch+thrift": binary(),
+                }),
+            );
+        p.add(
+            write_params(o)
+                .resp_h(
+                    "200",
+                    "What the patch did, with a receipt or a dry run's report when asked.",
+                    Some(json!({
+                        "application/json": { "schema": { "anyOf": [sref("PatchResult"), sref("DryRunReport")] } },
+                        "application/x-sparkles+json": { "schema": sref("PatchResult") },
+                    })),
+                    commit_headers(),
+                )
+                .errors(&[400, 403, 405, 408, 412, 413, 415, 422, 503, 507]),
+        );
+    }
     for (m, id) in [(GET, "explainGet"), (POST, "explainPost")] {
         let mut o = op(m.clone(), "/{ds}/explain", id, "SPARQL", "Explain a query")
             .doc("The algebra and the plan, without running the query.")

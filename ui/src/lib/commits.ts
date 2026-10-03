@@ -15,6 +15,7 @@ const KIND_LABELS: Record<CommitKind, string> = {
   'reason-clear': 'inferences dropped',
   transaction: 'transaction',
   embed: 'embeddings',
+  patch: 'RDF Patch',
   unknown: 'unknown',
 };
 

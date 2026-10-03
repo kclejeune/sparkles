@@ -29,6 +29,7 @@ mod obs;
 mod openapi;
 mod otel;
 mod outbound;
+mod patch_cmd;
 mod queries_cmd;
 mod quota_cmd;
 mod ratelimit;
@@ -1139,6 +1140,9 @@ enum Cmd {
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
     },
+    /// Apply RDF Patch files to a database, one commit per file, or send them to a
+    /// server's patch endpoint
+    Patch(patch_cmd::PatchArgs),
     /// Write the database as N-Quads, to stdout or a file
     Dump {
         #[arg(long)]
@@ -2659,6 +2663,7 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
+        Cmd::Patch(a) => patch_cmd::run(a, opts, no_validate),
         #[cfg(feature = "auth")]
         Cmd::Auth { cmd } => auth::cli::run(cmd),
         Cmd::Vector(a) => vector::cli(a, opts),

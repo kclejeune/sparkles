@@ -53,6 +53,11 @@ pub fn engine(py: Python<'_>, e: sparkles::Error) -> PyErr {
         E::Conflict(_) | E::PreconditionFailed(_) | E::WriterBusy => "ConflictError",
         E::Rejected(_) | E::GuardMissing(_) => "WriteRejectedError",
         E::NotPermitted(_) => "PermissionDeniedError",
+        E::Patch(ref p) => match p.kind {
+            sparkles::patch::PatchErrorKind::Syntax => "RdfSyntaxError",
+            sparkles::patch::PatchErrorKind::Term => "InvalidInputError",
+            sparkles::patch::PatchErrorKind::PrevMismatch => "ConflictError",
+        },
         _ => "SparklesError",
     };
     new_err(py, class, msg)

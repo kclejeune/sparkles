@@ -58,6 +58,7 @@ fn services(st: &AppState) -> Vec<(&'static str, &'static str, Vec<&'static str>
         ("gsp-r", "Graph Store Protocol (Read)", vec!["get"]),
         ("upload", "File Upload", vec!["upload"]),
         ("prefixes-rw", "Read-write prefixes", vec!["prefixes"]),
+        ("patch", "RDF Patch", vec!["", "patch"]),
     ];
     if cfg!(feature = "shacl") {
         s.push(("SHACL", "SHACL Validation", vec!["shacl"]));
