@@ -404,7 +404,8 @@ impl Describer<'_> {
         self.sources(g).any(|s| s == src)
     }
 
-    /// The quads whose permuted key starts with `prefix`, as `[s, p, o, g]`.
+    /// The quads whose permuted key starts with `prefix`, as `[s, p, o, g]`. The `rows`
+    /// budget, the deadline and cancellation stop a scan of a hub's many quads.
     fn quads(&self, perm: Perm, prefix: &[u64]) -> Result<Vec<[Id; 4]>> {
         let mut keys = Vec::new();
         self.ctx.snap.scan(perm, prefix, |c| {
@@ -412,6 +413,8 @@ impl Describer<'_> {
                 Chunk::Block(b, s, e) => keys.extend((s..e).map(|i| b.key(i))),
                 Chunk::Row(k) => keys.push(k),
             }
+            self.ctx.check()?;
+            self.ctx.check_rows(keys.len())?;
             Ok(true)
         })?;
         Ok(keys.iter().map(|k| perm.to_quad(k)).collect())

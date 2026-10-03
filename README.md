@@ -76,6 +76,9 @@ running queries.
   answers ([API](docs/API.md#extension-functions-and-aggregates)).
 * ARQ's `LATERAL`, property path ranges such as `p{1,3}` and CONSTRUCT templates with
   `GRAPH`, which Fuseki users write ([API](docs/API.md#arq-syntax-extensions)).
+* DESCRIBE as Jena's concise bounded description by default, or the symmetric form or
+  the resource's own triples, with labels and limits, per dataset or per request
+  ([API](docs/API.md#describe)).
 * A SPARQL 1.1 Service Description per dataset ([API](docs/API.md#service-description)).
 * Federated `SERVICE` queries under an outbound network policy ([usage](docs/USAGE.md#outbound-requests-service-and-load)).
 

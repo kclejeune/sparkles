@@ -229,7 +229,9 @@ impl PyDataset {
         want: Option<&[QueryKind]>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ds = self.ds(py)?;
-        let (opts, at) = query_options(&args)?;
+        let (mut opts, at) = query_options(&args)?;
+        // DESCRIBE follows the dataset's setting
+        opts.describe = ds.store().describe_settings();
         let cancel = opts.cancel.clone().unwrap_or_default();
         let query = query.to_string();
         let r = interrupt::run(py, &cancel, move || {
