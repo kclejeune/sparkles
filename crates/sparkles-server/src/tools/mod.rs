@@ -1,5 +1,6 @@
 //! File-level tools, the command-line equivalents of Jena's `riot`, `qparse`, `uparse`,
-//! `rdfdiff`/`rdfcompare`, `iri`, `langtag`, `rsparql`, `rupdate` and `rset` (spec G05).
+//! `rdfdiff`/`rdfcompare`, `iri`, `langtag`, `rsparql`, `rupdate` and `rset` (spec G05),
+//! and `rdfpatch` (spec F10).
 //! The subcommands are flattened into `sparkles`' own.
 
 use anyhow::Result;
@@ -9,6 +10,7 @@ pub mod compare;
 pub mod convert;
 #[cfg(feature = "auth")]
 pub mod endpoint;
+pub mod rdfpatch;
 pub mod rset;
 pub mod sparql;
 pub mod table;
@@ -44,6 +46,10 @@ pub enum ToolCmd {
     /// Convert a SPARQL result set between formats (JSON, XML, TSV in; text, JSON, XML,
     /// CSV, TSV out)
     Rset(rset::RsetArgs),
+    /// Parse RDF Patch files and write their rows back, with the counts of data, prefix
+    /// and transaction rows on standard error (Jena's rdfpatch); exits with status 1 on
+    /// errors
+    Rdfpatch(rdfpatch::RdfpatchArgs),
 }
 
 #[derive(clap::Args)]
@@ -106,6 +112,7 @@ pub fn run(cmd: ToolCmd, opts: StoreOptions) -> Result<()> {
         #[cfg(feature = "auth")]
         ToolCmd::Rupdate(a) => endpoint::rupdate(a),
         ToolCmd::Rset(a) => rset::run(a),
+        ToolCmd::Rdfpatch(a) => rdfpatch::run(a),
     }
 }
 

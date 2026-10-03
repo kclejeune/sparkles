@@ -212,6 +212,11 @@ impl<W: Write> PatchWriter<W> {
         r
     }
 
+    /// Flush the underlying writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+
     pub fn into_inner(self) -> W {
         self.w
     }
