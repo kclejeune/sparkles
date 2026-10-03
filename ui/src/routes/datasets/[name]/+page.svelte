@@ -24,6 +24,7 @@
   } from '$lib/shacl';
   import { readLang, validateLangKey, type ValidateLang } from '$lib/shex';
   import { load, save } from '$lib/storage';
+  import { cloneDetail, cloneMethodText, originSummary } from '$lib/clone';
   import BackupsPanel from '$components/BackupsPanel.svelte';
   import CloneDialog from '$components/CloneDialog.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
@@ -57,9 +58,12 @@
   let cloneOpen = $state(false);
   /** The last clone of this dataset that finished, for an "Open" link. */
   let cloned = $state<string | null>(null);
+  /** How that clone was made (from its task's detail), when the server says. */
+  let clonedHow = $state<string | null>(null);
   $effect(() => {
     void name;
     cloned = null;
+    clonedHow = null;
   });
 
   async function loadStats() {
@@ -475,10 +479,7 @@ ex:PersonShape a sh:NodeShape ;
               class="mono"
               href={resolve('/datasets/[name]', { name: o.source.name })}>/{o.source.name}</a
             >{:else}<span class="mono">{o.source.name}</span>{/if}
-          at commit {o.forkedFrom.seq}, {new Date(o.clonedAt).toLocaleString()}{o.inferences ===
-          'drop'
-            ? ', without inferences'
-            : ''}
+          at commit {o.forkedFrom.seq}, {new Date(o.clonedAt).toLocaleString()}{originSummary(o)}
         </div>
       {/if}
     </div>
@@ -513,7 +514,10 @@ ex:PersonShape a sh:NodeShape ;
   {#if cloned}
     <div class="cloned row">
       <Icon name="check" size={14} />
-      <span>Cloned into <span class="mono">/{cloned}</span>.</span>
+      <span
+        >Cloned into <span class="mono">/{cloned}</span>.{#if clonedHow}
+          <span class="faint">The clone {clonedHow}.</span>{/if}</span
+      >
       <a class="btn sm" href={resolve('/datasets/[name]', { name: cloned })}>Open</a>
       <span class="spacer"></span>
       <button class="btn ghost icon sm" aria-label="Dismiss" onclick={() => (cloned = null)}
@@ -1218,7 +1222,13 @@ ex:PersonShape a sh:NodeShape ;
                 else if (t.state === 'cancelled')
                   toasts.push('info', `${t.kind} cancelled`, t.message);
                 else if (t.kind === 'clone' && t.target) {
-                  toasts.push('success', `Cloned into /${t.target}`, t.message);
+                  const d = cloneDetail(t);
+                  clonedHow = d ? cloneMethodText(d) : null;
+                  toasts.push(
+                    'success',
+                    `Cloned into /${t.target}`,
+                    [t.message, clonedHow].filter(Boolean).join('; '),
+                  );
                   cloned = t.target;
                 } else if (t.kind === 'text-rebuild')
                   toasts.push('success', 'Full-text index built', t.message);
@@ -1244,6 +1254,7 @@ ex:PersonShape a sh:NodeShape ;
   bind:open={cloneOpen}
   source={name}
   hasInferences={!!info?.reasoning}
+  graphs={stats?.graphs ?? []}
   onstarted={() => taskKick++}
 />
 

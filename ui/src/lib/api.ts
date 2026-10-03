@@ -3,6 +3,7 @@
 
 import { CSRF_HEADER, needsCsrf, type Level } from './auth';
 import { fmtBytes, fmtInt } from './format';
+import { cloneBody, type CloneMethod, type CloneOptions } from './clone';
 
 export type DatasetType = 'persistent' | 'mem';
 
@@ -1452,11 +1453,15 @@ export type DatasetOrigin = {
   source: { name: string; path?: string; version: number; generation: string; quads: number };
   forkedFrom: { id: string; seq: number };
   inferences: 'copy' | 'drop';
+  /** A partial clone's selection. */
+  graphs?: string[];
+  /** How the index was made; absent on servers that predate it. */
+  method?: CloneMethod;
 };
 
-/** Copy one snapshot of `ds` into the new persistent dataset `name` (a task). */
-export const cloneDataset = (ds: string, name: string, inferences: 'copy' | 'drop' = 'copy') =>
-  json<Task>(`/$/datasets/${enc(ds)}/clone`, jsonBody({ name, inferences }));
+/** Copy one snapshot of `ds` into the new dataset `name` (a task); see `cloneBody`. */
+export const cloneDataset = (ds: string, name: string, opts: CloneOptions = {}) =>
+  json<Task>(`/$/datasets/${enc(ds)}/clone`, jsonBody(cloneBody(name, opts)));
 
 // --- commits ----------------------------------------------------------------------
 

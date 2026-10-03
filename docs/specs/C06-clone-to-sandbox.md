@@ -654,5 +654,10 @@ has no `cloneFrom` alias. Question 3 is answered by `--max-clones`, which defaul
 **Not built.**
 - Cloning across servers through archives.
 - Branching and merging.
-- The UI's Clone dialog has no choice of type, graphs or mode. It makes a persistent
-  clone of every graph, which takes the file path when it can.
+
+**UI.** The dataset page's Clone dialog offers the type (persistent by default), all
+graphs or a chosen few (the source's graphs as checkboxes, plus typed IRIs and patterns),
+and for a persistent clone the index mode (`auto` by default). A partial clone that keeps
+inferences names the inferred graph for the user. When the task is done, the task list,
+the toast and the "Cloned into" banner say how the index was made, from the task's
+detail. The clone's own page shows the selection and the method from `origin.json`.
