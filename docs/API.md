@@ -23,6 +23,7 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 | GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }`. When auth is on, anonymous callers get no `version` or `limits`. |
 | GET    | `/$/whoami`   | The caller and its permissions. See [whoami](#whoami). |
 | POST   | `/$/format`   | Formats a SPARQL query or update. See [Formatting](#formatting). |
+| POST   | `/$/lint`     | Lints a SPARQL query or update, or a Turtle or TriG document. See [Linting](#linting). |
 | GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. `--metrics-addr` serves it on a second address too. |
 
 ```ts
@@ -4393,6 +4394,54 @@ string, and both are checked.
 With authentication, the route accepts any caller and needs no dataset permission, like
 `/$/server`. Cookie sessions send the CSRF header, as for every other `POST`. Rate limits
 count the route in the `query` class.
+
+## Linting
+
+The design and its rationale are in [X03 Linter](specs/X03-linter.md).
+
+`POST /$/lint` lints a SPARQL query or update, or a Turtle or TriG document, with the
+rules of `sparkles lint` (see [USAGE.md](USAGE.md#linting)). It reads no dataset and no
+config file. The rule levels come with the request. A syntax error is one of the
+findings, so a document that does not parse still gets `200`. The UI's WebAssembly module
+answers the same request in the page, and the UI calls the endpoint only when the module
+is missing or fails.
+
+```ts
+type LintRequest = {
+  text: string;
+  language?: "sparql" | "turtle" | "trig";   // default: detected
+  rules?: Record<string, "error" | "warning" | "info" | "hint" | "off">;
+  fix?: boolean;                              // apply the safe fixes
+};
+type LintResult = {
+  language: string;
+  diagnostics: {
+    rule: string;                 // "unused-prefix", "syntax", …
+    severity: "error" | "warning" | "info" | "hint";
+    message: string;
+    line: number; column: number; endLine: number; endColumn: number;  // 1-based, in characters
+    from: number; to: number;     // the range in UTF-16 code units, like the editor's
+    fix?: { title: string; edits: { from: number; to: number; insert: string }[] };
+  }[];
+  text?: string;                  // with fix: the fixed document
+  applied?: number;               // with fix: how many fixes were applied
+};
+```
+
+```sh
+curl -s localhost:3030/'$/lint' -H 'Content-Type: application/json' \
+  -d '{"text": "PREFIX ex: <http://example.org/>\nSELECT ?s { ?s ?p ?o }", "rules": {"single-use-variable": "off"}}'
+```
+
+A `fix` is present only for the rules whose fixes are safe. With `fix: true`, the fixed
+text must parse to the same SPARQL algebra, or to an isomorphic graph or dataset, as the
+input, or the request fails with `422` and `code: "unsafe-fix"`. Other errors are `400`
+with `code: "bad-request"` for a bad body, rule or level, `415` with
+`code: "unsupported-language"` for a language the linter does not take, and `415` for a
+body that is not JSON. The endpoint follows `--format-endpoint`, `--format-max-mb` and
+`--format-timeout` as `POST /$/format` does, with `401`, `404`, `408` and `413` in the
+same cases, and it shares the formatter's slots. With authentication, it needs no dataset permission, and rate limits
+count it in the `query` class.
 
 ## `application/x-sparkles+json` (UI result format)
 

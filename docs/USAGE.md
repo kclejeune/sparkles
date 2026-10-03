@@ -796,6 +796,66 @@ with syntax errors and the formatter's warnings as diagnostics. [editors.md](edi
 has the editor setups. `POST /$/format` is the HTTP form ([API.md](API.md#formatting)).
 The UI formats in the page when it is built with the formatter's WebAssembly module.
 
+## Linting
+
+`sparkles lint` finds mistakes and doubtful constructs in SPARQL queries and updates
+(`.rq`, `.ru`, `.sparql`) and in Turtle (`.ttl`) and TriG (`.trig`) documents. It walks
+directories and reads ignore files and config files as `sparkles fmt` does. The design is
+in [spec X03](specs/X03-linter.md).
+
+```sh
+sparkles lint queries/ shapes/            # path:line:column: severity [rule] message
+sparkles lint --fix queries/              # apply the safe fixes in place
+sparkles lint --strict --format json .    # warnings fail too; a JSON report
+sparkles lint --rule cartesian-product=error --rule single-use-variable=off q.rq
+sparkles lint --stdin-filepath q.rq < q.rq
+sparkles lint --list-rules                # every rule with its default severity
+```
+
+The exit status is 0 when no finding is an error, 1 when one is (or a warning is under
+`--strict`), and 2 when a file, flag or config file cannot be used. With `--fix` and
+stdin, the fixed text goes to stdout and the remaining findings go to stderr.
+
+| Rule | Default | What it finds |
+|---|---|---|
+| `syntax` | error | The document does not parse. This rule cannot be turned off. |
+| `undefined-prefix` | error | A prefixed name whose prefix is not declared before it. |
+| `unused-prefix` | warning | A prefix declaration nothing uses. `--fix` removes it. |
+| `unused-variable` | warning | A variable bound by `BIND` or `VALUES` that nothing reads. |
+| `single-use-variable` | hint | A variable that occurs once in a pattern and is not projected. It is a wildcard or a typo. |
+| `unbound-variable` | warning | A variable that is projected, filtered, ordered or used in a template but never bound. |
+| `cartesian-product` | warning | A pattern that shares no variable with the patterns before it in its group. |
+| `select-star-group-by` | error | `SELECT *` in a query that groups. |
+| `ungrouped-variable` | error | A projected variable that is neither grouped nor aggregated. |
+| `filter-scope` | warning | A FILTER in a nested group that tests a variable bound only outside the group, so it removes every row. |
+| `filter-equality` | hint | `FILTER(?v = <iri>)` where the IRI could go in the triple pattern. |
+| `iri-space` | warning | An IRI, an `IRI("…")` argument or an `xsd:anyURI` that holds whitespace. |
+| `language-tag-case` | warning | A language tag not written as BCP 47 recommends (`en-US`). `--fix` rewrites it. |
+| `deprecated-language-tag` | warning | A deprecated language tag or subtag, with its replacement. |
+| `suspicious-datatype` | warning | An invalid lexical form, an unknown XML Schema datatype, a misspelled XML Schema namespace, or `rdf:langString` as a datatype. |
+| `redundant-datatype` | info | `"…"^^xsd:string`, which is the plain string. `--fix` drops the datatype. |
+| `deprecated-syntax` | warning | Jena's old `jena.hpl.hp.com` function namespaces, or `owl:DataRange`. |
+
+The SPARQL rules look at variables in their scope. A subquery's variables are its own,
+and `MINUS` and `EXISTS` patterns bind nothing outside themselves. A variable whose name
+starts with `_` is exempt from the two unused-variable rules. A safe fix never changes
+what the document means. `--fix` checks this, and it writes nothing when the fixed text
+does not parse to the same algebra, graph or dataset.
+
+The `[lint]` table of `.sparklesfmt.toml` sets the rules' severities for the files under
+it, and `--rule` overrides it. The formatter ignores the table.
+
+```toml
+[lint]
+unused-prefix = "error"
+single-use-variable = "off"
+```
+
+`sparkles lsp` publishes the same findings in editors and offers the safe fixes as quick
+fixes ([editors.md](editors.md)). The UI's query editor lints while you type, and its
+Format menu fixes the safe findings. `POST /$/lint` is the HTTP form
+([API.md](API.md#linting)).
+
 ## Backup repositories
 
 Backup repositories (see [API.md](API.md#backup-repositories)) also work offline, on a
