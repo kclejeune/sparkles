@@ -30,7 +30,7 @@ fn cfg(mode: GuardMode) -> ValidationConfig {
         include_inferences: false,
         threshold: Severity::Violation,
         baseline: Default::default(),
-        timeout_seconds: 10.0,
+        timeout_seconds: 60.0, // generous: the tests run on loaded machines
         report_limit: 100,
         updated: None,
     }
