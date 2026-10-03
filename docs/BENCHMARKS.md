@@ -462,7 +462,7 @@ cache. Fluree's rose to 9,998 MiB.
 
 The growth of Sparkles' median commit from 1.7 ms at 1.05M to 4.1 ms at 10.5M did not come
 from the dataset. A profile of the churn at 10.5M found no per-commit work that grows
-with the base: a commit's CPU time was 0.3 to 0.5 ms at both sizes, mostly the HTTP
+with the base. A commit took 0.3 to 0.5 ms of CPU time at both sizes, mostly for the HTTP
 request, the update's parse and the first decode of each index block a commit touches.
 The growth came from the benchmark. The `updates` mode copies every engine's store right
 before the first engine's churn, and on forge the copies are not reflinks. At 10.5M they
@@ -476,14 +476,15 @@ for another's copies.
 
 Commits also no longer wait for journal commits. The write-ahead log now grows ahead of
 its commits by zero bytes that are written and synced in advance, at first 64 KiB at a
-time and then by its own size, up to 4 MiB (`--wal-prealloc-kb`; `0` turns it off). A
-commit then overwrites blocks that are already allocated, and ext4 and XFS sync them
-without a journal commit. Every acknowledged commit is still synced before its answer.
-Replay, readers, backups and the quota stop at the end of the last commit, a crash that
-leaves zeros inside the last transaction makes it a torn tail, and a close trims the
-zeros. A small Python loop that appends 400 bytes and calls `fdatasync` took a median of
-0.29 ms on the laptop when it was idle and 4.4 to 7.1 ms while other agents were building.
-Overwriting preallocated bytes took 0.13 ms and 0.15 to 0.56 ms.
+time and then by its own size, up to 4 MiB. `--wal-prealloc-kb` sets that limit, and `0`
+turns preallocation off. A commit then overwrites blocks that are already allocated, and
+ext4 and XFS sync them without a journal commit. Every acknowledged commit is still synced
+before its answer. Replay, readers, backups and the quota stop at the end of the last
+commit. A crash that leaves zeros inside the last transaction makes it a torn tail, and a
+close trims the zeros. A small Python loop that appends 400 bytes and calls `fdatasync`
+took a median of 0.29 ms on the laptop when it was idle and 4.4 to 7.1 ms while other
+agents were building. Overwriting preallocated bytes took 0.13 ms when idle and 0.15 to
+0.56 ms while busy.
 
 The A/B runs below alternated the two settings of the same build on forge. Another agent
 was measuring on forge for part of the time, so the absolute times vary between pairs,
@@ -499,10 +500,10 @@ and a forge re-run of `MODE=updates` will give the comparable figures.
 With the copies' writeback running, the median of the five pairs was 2.78 ms and 278
 commits/s preallocated, against 4.44 ms and 195 commits/s appended. The preallocated log
 won four of the five pairs in each setting. Only the first pair ran on an idle forge.
-Group commit would let concurrent writers share one sync, but the
-`updates` mode sends one commit at a time and the `mixed` mode has one writer, so it was
-not built. On the laptop, where fsyncs took 0.3 ms while it was quiet, the churn showed no
-difference beyond the run-to-run noise.
+Group commit would let concurrent writers share one sync, but the `updates` mode sends one
+commit at a time and the `mixed` mode has one writer, so it was not built. On the laptop,
+where fsyncs took 0.3 ms while it was quiet, the churn showed no difference beyond the
+run-to-run noise.
 
 The `mixed` mode runs 16 concurrent `star-join` readers with `oha` for 30 s while one
 writer commits single-triple `INSERT DATA` requests as fast as it can. Every request opens
