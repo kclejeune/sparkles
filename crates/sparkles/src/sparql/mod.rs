@@ -19,6 +19,7 @@ pub mod indexjoin;
 mod joinorder;
 mod keyfilter;
 mod keyprobe;
+pub mod pathsearch;
 pub mod plan;
 pub mod rdfs;
 pub mod results;

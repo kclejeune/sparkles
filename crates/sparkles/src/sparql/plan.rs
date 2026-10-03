@@ -373,6 +373,9 @@ pub enum Kind {
     /// a topological property matched against asserted and derived triples (Query
     /// Rewrite), or `spatial:equals`
     SpatialRelate(Box<super::georewrite::SpatialRelateSpec>),
+    /// paths as solutions (`SERVICE path:search`); child 0, if any, is the rest of the
+    /// group, which binds the source or the target
+    PathSearch(Box<super::pathsearch::PathSearchSpec>),
 }
 
 #[derive(Clone)]
@@ -496,6 +499,7 @@ impl Node {
             Kind::SpatialJoin(_) => "SpatialJoin",
             Kind::SpatialKnn(_) => "SpatialKnn",
             Kind::SpatialRelate(_) => "SpatialRelate",
+            Kind::PathSearch(_) => "PathSearch",
         }
     }
 }
@@ -872,6 +876,10 @@ impl<'a> Planner<'a> {
                     })
                     .collect();
                 let n = group(child, keys, aggs, self.ctx);
+                Ok(self.apply_filters(n, filters))
+            }
+            GP::Service { name, inner, .. } if super::pathsearch::is_search(name) => {
+                let n = super::pathsearch::path_search_leaf(self, inner, g)?;
                 Ok(self.apply_filters(n, filters))
             }
             GP::Service {
@@ -1913,9 +1921,12 @@ impl<'a> Planner<'a> {
             super::charsets::register(self.ctx, &stars);
         }
         // searches that read the rest of the group are attached to it at the end
-        let (dependent, nodes): (Vec<Node>, Vec<Node>) = nodes
-            .into_iter()
-            .partition(|n| matches!(&n.kind, Kind::VectorSearch(s) if s.needs_input()));
+        let (dependent, nodes): (Vec<Node>, Vec<Node>) =
+            nodes.into_iter().partition(|n| match &n.kind {
+                Kind::VectorSearch(s) => s.needs_input(),
+                Kind::PathSearch(s) => s.needs_input(),
+                _ => false,
+            });
         for n in nodes {
             leaves.push(vec![n]);
         }
@@ -1968,7 +1979,10 @@ impl<'a> Planner<'a> {
             }
         }
         for d in dependent {
-            result = self.attach_vector(result, d)?;
+            result = match &d.kind {
+                Kind::PathSearch(_) => super::pathsearch::attach(self, result, d)?,
+                _ => self.attach_vector(result, d)?,
+            };
             let (now, later): (Vec<Expr>, Vec<Expr>) =
                 std::mem::take(&mut filters).into_iter().partition(|f| {
                     !f.has_exists() && f.var_set().iter().all(|v| result.vars.contains(v))
