@@ -8,7 +8,15 @@
 // through the endpoint instead. An error the formatter reports (a syntax error, a
 // refusal) is final: the endpoint would answer the same.
 
-import { ApiError, format as formatRemote, type FormatRequest, type FormatResult } from './api';
+import {
+  ApiError,
+  format as formatRemote,
+  lint as lintRemote,
+  type FormatRequest,
+  type FormatResult,
+  type LintRequest,
+  type LintResult,
+} from './api';
 
 /** What the generated bindings (wasm-bindgen `--target web`) export. */
 export type FmtModule = {
@@ -16,6 +24,9 @@ export type FmtModule = {
   default: () => Promise<unknown>;
   /** a `POST /$/format` JSON body in, the endpoint's JSON answer out */
   format: (request: string) => string;
+  /** a `POST /$/lint` JSON body in, the endpoint's JSON answer out (modules built before
+   * the linter have none) */
+  lint?: (request: string) => string;
 };
 
 /** The browser formatter is not there: not in this build, not loaded, or broken. */
@@ -27,9 +38,9 @@ export class LocalUnavailable extends Error {
 }
 
 /** The endpoint's answer: the result, or the `ApiError` the endpoint's status would make. */
-function answerOf(text: string): FormatResult {
+function answerOf<T = FormatResult>(text: string): T {
   const body = JSON.parse(text);
-  if (typeof body.status !== 'number') return body as FormatResult;
+  if (typeof body.status !== 'number') return body as T;
   throw new ApiError(body.status, String(body.error), {
     detail: body.detail,
     line: body.line,
@@ -85,7 +96,30 @@ export function localFormatter(load: (() => Promise<FmtModule>) | undefined) {
     return formatRemote(req, signal);
   }
 
-  return { formatLocal, formatAny };
+  async function lintLocal(req: LintRequest): Promise<LintResult> {
+    const m = broken ? null : await module();
+    if (!m?.lint) throw new LocalUnavailable('the browser linter is not available');
+    let answer: string;
+    try {
+      answer = m.lint(JSON.stringify(req));
+    } catch (e) {
+      broken = true;
+      console.warn('The browser formatter failed; linting on the server from now on', e);
+      throw new LocalUnavailable('the browser linter failed', { cause: e });
+    }
+    return answerOf<LintResult>(answer);
+  }
+
+  async function lintAny(req: LintRequest, signal?: AbortSignal): Promise<LintResult> {
+    try {
+      return await lintLocal(req);
+    } catch (e) {
+      if (!(e instanceof LocalUnavailable)) throw e;
+    }
+    return lintRemote(req, signal);
+  }
+
+  return { formatLocal, formatAny, lintLocal, lintAny };
 }
 
 // The bindings when the UI was built with them. `VITE_FMT_WASM=off` leaves them out (the
@@ -102,3 +136,6 @@ export const formatLocal = shared.formatLocal;
 
 /** Format in the browser when the module is there and works, else through `POST /$/format`. */
 export const formatAny = shared.formatAny;
+
+/** Lint in the browser when the module is there and works, else through `POST /$/lint`. */
+export const lintAny = shared.lintAny;

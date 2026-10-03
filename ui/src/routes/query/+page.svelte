@@ -13,7 +13,8 @@
   import { triplesToGraph, type Triple } from '$lib/graph';
   import { applyMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
   import { formatEditor } from '$lib/fmt-edit';
-  import { formatAny } from '$lib/fmt-wasm';
+  import { formatAny, lintAny } from '$lib/fmt-wasm';
+  import { lintCounts, lintSummary } from '$lib/lint-view';
   import { LatestRun } from '$lib/supersede';
   import { load, save } from '$lib/storage';
   import GraphView from '$components/GraphView.svelte';
@@ -59,6 +60,7 @@
   const DEFAULT_QUERY = EXAMPLES[0].query;
   const STORE_KEY = 'sparkles.queryTabs';
   const FORMAT_ON_RUN_KEY = 'sparkles.formatOnRun';
+  const LINT_KEY = 'sparkles.lint';
   const LIMITS = [1_000, 10_000, 100_000, 1_000_000];
 
   const saved = load<{
@@ -89,6 +91,15 @@
   /** Format the query before each Run (per viewer, off by default). */
   let formatOnRun = $state(load<boolean>(FORMAT_ON_RUN_KEY, false) === true);
   $effect(() => save(FORMAT_ON_RUN_KEY, formatOnRun));
+  /** Lint the query while it is edited (per viewer, on by default). */
+  let lintOn = $state(load<boolean>(LINT_KEY, true) !== false);
+  $effect(() => save(LINT_KEY, lintOn));
+  let lintDiagnostics = $state<api.LintDiagnostic[]>([]);
+  /** the server refused linting (turned off, or not for this caller): stop asking */
+  let lintRefused = false;
+  let lintSeq = 0;
+  const lintCount = $derived(lintCounts(lintDiagnostics));
+  const fixable = $derived(lintDiagnostics.some((d) => d.fix));
   let renaming = $state<string | null>(null);
   let editor: SparqlEditor | undefined = $state();
 
@@ -322,6 +333,55 @@
   function setQuery(q: string) {
     const t = tabs.find((x) => x.id === activeId);
     if (t) t.query = q;
+  }
+
+  // lint the active query a moment after it stops changing, in the browser when the
+  // module is there, else through POST /$/lint
+  $effect(() => {
+    const text = active.query;
+    const tab = activeId;
+    if (!lintOn || !editor) {
+      lintDiagnostics = [];
+      editor?.setLint([]);
+      return;
+    }
+    const timer = setTimeout(() => void lintQuery(text, tab), 400);
+    return () => clearTimeout(timer);
+  });
+
+  async function lintQuery(text: string, tab: string) {
+    const seq = ++lintSeq;
+    let found: api.LintDiagnostic[] = [];
+    if (text.trim() && !lintRefused) {
+      try {
+        found = (await lintAny({ text, language: 'sparql' })).diagnostics;
+      } catch (e) {
+        if (e instanceof api.ApiError && [401, 403, 404].includes(e.status)) lintRefused = true;
+      }
+    }
+    if (seq !== lintSeq || tab !== activeId) return;
+    lintDiagnostics = found;
+    editor?.setLint(found);
+  }
+
+  /** Apply the lint's safe fixes, as one undoable change. */
+  async function fixQuery() {
+    formatMenuOpen = false;
+    const ed = editor;
+    if (!ed) return;
+    const { text } = ed.snapshot();
+    try {
+      const r = await lintAny({ text, language: 'sparql', fix: true });
+      if (r.text != null && r.text !== text) ed.replaceFormatted(r.text, null);
+      toasts.push(
+        'success',
+        r.applied
+          ? `Fixed ${r.applied} lint problem${r.applied === 1 ? '' : 's'}`
+          : 'Nothing to fix',
+      );
+    } catch (e) {
+      toasts.error('Fixing the query failed', e);
+    }
   }
 
   function openExample(i: number) {
@@ -950,9 +1010,30 @@
             <input type="checkbox" bind:checked={formatOnRun} />
             <span>Format on run</span>
           </label>
+          <label class="menu-item check">
+            <input type="checkbox" bind:checked={lintOn} />
+            <span>Lint while typing</span>
+          </label>
+          <button class="menu-item" disabled={!fixable} onclick={() => void fixQuery()}>
+            Fix lint problems
+          </button>
         </div>
       {/if}
     </div>
+    {#if lintOn && lintDiagnostics.length}
+      <span
+        class="lint-status"
+        class:error={lintCount.error > 0}
+        class:warning={lintCount.error === 0 && lintCount.warning > 0}
+        role="status"
+        title={lintDiagnostics
+          .map((d) => `${d.line}:${d.column} ${d.message} [${d.rule}]`)
+          .join('\n')}
+      >
+        <Icon name={lintCount.error || lintCount.warning ? 'alert' : 'info'} size={12} />
+        {lintSummary(lintDiagnostics)}
+      </span>
+    {/if}
     <button
       class="btn sm"
       onclick={runExplain}
@@ -1707,6 +1788,20 @@
   .format-menu {
     width: auto;
     white-space: nowrap;
+  }
+  .lint-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: var(--fs-sm);
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+  .lint-status.warning {
+    color: var(--warn);
+  }
+  .lint-status.error {
+    color: var(--danger);
   }
   .menu-item.check {
     display: flex;

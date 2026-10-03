@@ -349,6 +349,43 @@ function readyInfo() {
 }
 
 /**
+ * The mock's stand-in for the linter: one rule, `unused-prefix` (a PREFIX whose label no
+ * prefixed name uses), with the endpoint's answer shape and its safe fix. With `fix`, the
+ * declarations are removed.
+ */
+function mockLint(text) {
+  const diagnostics = [];
+  const decl = /^[ \t]*PREFIX\s+([A-Za-z][\w-]*)?:\s*<[^>]*>[ \t]*\n?/gim;
+  for (const m of text.matchAll(decl)) {
+    const label = m[1] ?? '';
+    const rest = text.slice(0, m.index) + text.slice(m.index + m[0].length);
+    const used = new RegExp(`(^|[\\s(,;/^|!{])${label}:`, 'm').test(
+      rest.replace(/<[^>]*>|"[^"]*"|#.*$/gm, ''),
+    );
+    if (used) continue;
+    const declText = m[0].replace(/\s+$/, '');
+    const start = m.index + (m[0].length - m[0].trimStart().length);
+    const lineNo = text.slice(0, m.index).split('\n').length;
+    diagnostics.push({
+      rule: 'unused-prefix',
+      severity: 'warning',
+      message: `the prefix ${label}: is declared but never used`,
+      line: lineNo,
+      column: 1 + start - m.index,
+      endLine: lineNo,
+      endColumn: 1 + start - m.index + declText.trimStart().length,
+      from: start,
+      to: start + declText.trimStart().length,
+      fix: {
+        title: `Remove the unused prefix ${label}:`,
+        edits: [{ from: m.index, to: m.index + m[0].length, insert: '' }],
+      },
+    });
+  }
+  return diagnostics;
+}
+
+/**
  * The mock's stand-in for the formatter: runs of spaces and tabs become one space
  * (outside strings, IRIs and comments), lines lose their trailing whitespace, and the
  * text ends with one newline. The cursor (UTF-16 offset) maps through the same edits. A
@@ -1944,6 +1981,29 @@ const server = http.createServer(async (req, res) => {
             language: body.language ?? 'sparql',
             cursorOffset: out.cursor,
             warnings: [],
+          });
+        }
+        // the linter, a stand-in (see mockLint)
+        case 'lint': {
+          if (req.method !== 'POST') return fail(res, 405, 'method not allowed');
+          let body;
+          try {
+            body = JSON.parse((await readBody(req)).toString('utf8'));
+          } catch {
+            return fail(res, 400, 'invalid JSON', { code: 'bad-request' });
+          }
+          if (typeof body?.text !== 'string')
+            return fail(res, 400, 'expected `text`', { code: 'bad-request' });
+          const found = mockLint(body.text);
+          if (!body.fix) return send(res, 200, { language: 'sparql', diagnostics: found });
+          let text = body.text;
+          for (const d of [...found].reverse())
+            for (const e of d.fix.edits) text = text.slice(0, e.from) + e.insert + text.slice(e.to);
+          return send(res, 200, {
+            language: 'sparql',
+            text,
+            applied: found.length,
+            diagnostics: mockLint(text),
           });
         }
         // the mock runs open, like a server without --auth-config

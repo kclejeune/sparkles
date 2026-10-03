@@ -642,6 +642,51 @@ export type FormatResult = {
 export const format = (req: FormatRequest, signal?: AbortSignal) =>
   json<FormatResult>('/$/format', { ...jsonBody(req), signal });
 
+export type LintSeverity = 'error' | 'warning' | 'info' | 'hint';
+
+/** `POST /$/lint` (and the browser module's `lint`): SPARQL, Turtle or TriG. */
+export type LintRequest = {
+  text: string;
+  language?: 'sparql' | 'turtle' | 'trig';
+  /** rule levels over the defaults: a severity or `off` */
+  rules?: Record<string, LintSeverity | 'off'>;
+  /** apply the safe fixes and return the fixed `text` */
+  fix?: boolean;
+};
+
+export type LintEdit = { from: number; to: number; insert: string };
+
+export type LintDiagnostic = {
+  rule: string;
+  severity: LintSeverity;
+  message: string;
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+  /** the range in UTF-16 code units (the editor's unit) */
+  from: number;
+  to: number;
+  /** a safe fix */
+  fix?: { title: string; edits: LintEdit[] };
+};
+
+export type LintResult = {
+  language: string;
+  diagnostics: LintDiagnostic[];
+  /** with `fix`: the fixed text and the number of fixes applied */
+  text?: string;
+  applied?: number;
+};
+
+/**
+ * Lint a document. A syntax error is a finding (`rule: 'syntax'`), not an error. Throws an
+ * `ApiError`: `400` `bad-request`, `415` for a language lint does not take, `404` when the
+ * server turned formatting off.
+ */
+export const lint = (req: LintRequest, signal?: AbortSignal) =>
+  json<LintResult>('/$/lint', { ...jsonBody(req), signal });
+
 // --- datasets -----------------------------------------------------------------
 
 export async function listDatasets(): Promise<DatasetInfo[]> {
