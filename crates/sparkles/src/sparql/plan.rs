@@ -2880,13 +2880,67 @@ pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
             .is_ok_and(|v| v.is_some_and(|v| n.vars.contains(&v) && n.sorted.first() != Some(&v)))
     });
     let sort_cost = if unsorted { n.est * 0.5 } else { 0.0 };
+    let in_ranges = prefix_rows(&n, &exprs, ctx);
     let mut f = Node::unary(Kind::Filter(exprs), n, desc);
     f.cost += sort_cost;
     f.est = (f.est * sel).max(if f.est > 0.0 { 1.0 } else { 0.0 });
+    if let Some((rows, ranges)) = in_ranges {
+        // the scan reads only the key ranges of the start, whose rows mostly pass
+        f.cost = rows + 4.0 * ranges as f64;
+        f.est = f.est.min(rows.max(1.0));
+    }
     for d in f.dist.values_mut() {
         *d = d.min(f.est.max(1.0));
     }
     f
+}
+
+/// The rows a FILTER over scan `n` reads, and the key ranges it reads them in, when a
+/// conjunct fixes the start of the string of the scan's sorted column (`STRSTARTS`, a
+/// start-anchored `REGEX`): the filtered scan then reads only the rows of the base
+/// vocabulary's ids with that start and of the ids outside the base vocabulary (see
+/// `key_ranges` in the executor). `None` when the scan reads every row.
+fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
+    let o = &ctx.opt;
+    if !(o.filter_id_ranges && o.filter_scan_runs && o.filter_key_ranges) {
+        return None;
+    }
+    let Kind::Scan(spec) = &n.kind else {
+        return None;
+    };
+    let &(col, v) = spec.cols.first()?;
+    if col != spec.prefix.len() || col >= 4 || spec.dedup {
+        return None;
+    }
+    // the conjuncts over the column alone, as the executor tests them
+    let on_key: Vec<Expr> = exprs
+        .iter()
+        .filter(|e| super::exprcache::input(&[e]) == Ok(Some(v)))
+        .cloned()
+        .collect();
+    let prefixes = super::keyfilter::KeyFilter::new(&on_key, v)?.key_prefixes()?;
+    let vocab = &ctx.snap.generation.vocab;
+    let mut ids = vec![(0, Id::vocab(0).0 - 1)];
+    for p in prefixes {
+        let (a, b) = vocab.prefix_range(&p);
+        if a < b {
+            ids.push((Id::vocab(a).0, Id::vocab(b - 1).0));
+        }
+    }
+    ids.push((Id::vocab(vocab.len()).0, u64::MAX));
+    let bound = |v: u64, fill: u64| {
+        let mut k = crate::index::pad(&spec.prefix, fill);
+        k[col] = v;
+        k
+    };
+    let mut rows = 0.0;
+    for &(lo, hi) in &ids {
+        rows += ctx
+            .snap
+            .count_between(spec.perm, bound(lo, 0), bound(hi, u64::MAX))
+            .ok()? as f64;
+    }
+    Some((rows.min(n.est), ids.len()))
 }
 
 /// Comparison of the range variable with a numeric constant: `?v op c`.

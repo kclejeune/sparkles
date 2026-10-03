@@ -497,11 +497,38 @@ pub(super) fn key_filter_mask(
     let lo = uniq.partition_point(|id| id.tag() < Tag::Vocab);
     let hi = lo + uniq[lo..].partition_point(|id| id.tag() == Tag::Vocab);
     ctx.check()?;
+    // the vocabulary ids whose keys are read: with a fixed start, only those of the keys
+    // with that start (the vocabulary is sorted by key), the others fail unread
+    let spans: Vec<(usize, usize)> = match kf.key_prefixes() {
+        Some(prefixes) if ctx.opt.filter_id_ranges => {
+            let mut spans: Vec<(usize, usize)> = prefixes
+                .iter()
+                .map(|p| {
+                    let (a, b) = vocab.prefix_range(p);
+                    let at = |x: u64| lo + uniq[lo..hi].partition_point(|id| id.payload() < x);
+                    (at(a), at(b))
+                })
+                .filter(|(s, e)| s < e)
+                .collect();
+            spans.sort_unstable();
+            spans
+        }
+        _ => vec![(lo, hi)],
+    };
     // a copy of the filter per task: threads sharing a regular expression contend for
     // its match caches
-    hit[lo..hi]
-        .par_chunks_mut(4096)
-        .zip(uniq[lo..hi].par_chunks(4096))
+    let mut read: Vec<(&mut [bool], &[Id])> = Vec::with_capacity(spans.len());
+    let mut rest_hit = &mut hit[..];
+    let mut at = 0;
+    for &(s, e) in &spans {
+        let (_, tail) = rest_hit.split_at_mut(s - at);
+        let (span, tail) = tail.split_at_mut(e - s);
+        read.push((span, &uniq[s..e]));
+        rest_hit = tail;
+        at = e;
+    }
+    read.into_par_iter()
+        .flat_map(|(h, ids)| h.par_chunks_mut(4096).zip(ids.par_chunks(4096)))
         .for_each_init(
             || kf.clone(),
             |kf, (h, ids)| {

@@ -162,6 +162,8 @@ fn check(s: &Store, q: &str) -> bool {
     assert_eq!(a, solutions(&run(s, q, counts)), "{q}");
     let whole = Optimizations::ALL.disable("filter_key_ranges").unwrap();
     assert_eq!(a, solutions(&run(s, q, whole)), "{q}");
+    let every_key = Optimizations::ALL.disable("filter_id_ranges").unwrap();
+    assert_eq!(a, solutions(&run(s, q, every_key)), "{q}");
     has_op(&fast.plan, "CountFilterFromRuns") || has_desc(&fast.plan, "[runs of ?")
 }
 
@@ -235,6 +237,99 @@ fn counts_from_runs_match_the_generic_filter() {
             );
             assert_eq!(a, b, "{q}");
         }
+    }
+}
+
+/// A FILTER after a join, tested once per distinct value on vocabulary keys: with a
+/// fixed start, the ids outside the key ranges of that start fail unread, with the same
+/// solutions as reading every key, before and after updates that add terms.
+#[test]
+fn id_ranges_match_reading_every_key() {
+    let s = store(0x1d_7a, 30_000, false);
+    // the subjects of ex:v twice over: the filter runs on a join's rows
+    let shape = "SELECT ?s ?v WHERE { ?s ex:v ?v . ?s ex:v ?u FILTER({E}) } ORDER BY ?v ?s";
+    let filters = [
+        r#"STRSTARTS({X}, "Ab")"#,
+        r#"STRSTARTS({X}, "Ada"@en-us)"#,
+        r#"STRSTARTS(STR({X}), "http://ex.org/i1")"#,
+        r#"STRSTARTS(STR({X}), "1")"#,
+        r#"STRSTARTS({X}, "ünï")"#,
+        r#"REGEX({X}, "^Ada")"#,
+        r#"REGEX({X}, "^ab", "s")"#,
+        r#"REGEX({X}, "^ab", "i")"#,
+        r#"REGEX(STR({X}), "^b\"?q")"#,
+        r#"REGEX({X}, "^Ab") && LANGMATCHES(LANG({X}), "en")"#,
+        r#"STRSTARTS({X}, "zzz")"#,
+    ];
+    let generic = Optimizations::ALL
+        .disable("count_filter_runs,filter_scan_runs")
+        .unwrap();
+    let every_key = generic.disable("filter_id_ranges").unwrap();
+    let check = |s: &Store| {
+        for f in filters {
+            let q = shape.replace("{E}", &f.replace("{X}", "?v"));
+            let a = solutions(&run(s, &q, generic));
+            assert!(!a.is_empty() || f.contains("zzz"), "{q}");
+            assert_eq!(a, solutions(&run(s, &q, every_key)), "{q}");
+            assert_eq!(a, solutions(&run(s, &q, Optimizations::NONE)), "{q}");
+        }
+    };
+    check(&s);
+    super::opt_tests::update(
+        &s,
+        r#"INSERT DATA { ex:s1 ex:v "Ab new"@en , "Ab typed"^^ex:dt , "Ada 9"^^xsd:string , ex:i1new .
+           ex:s2 ex:v "ab" , "Ab" } ; DELETE WHERE { ?s ex:v "Ab1"@en }"#,
+    );
+    check(&s);
+}
+
+/// A FILTER that fixes the start of a label is costed by the rows of the label's key
+/// ranges: the planner reads those ranges and joins them with the class, instead of
+/// probing the label of every instance (DBpedia's `label-regex`).
+#[test]
+fn prefix_filters_are_costed_by_their_key_ranges() {
+    let mut nt = String::new();
+    for i in 0..6000 {
+        let class = if i % 3 == 0 { "Band" } else { "Person" };
+        let name = if i % 50 == 0 { "The B" } else { "Other " };
+        nt.push_str(&format!(
+            "<http://ex.org/e{i}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/{class}> .\n\
+             <http://ex.org/e{i}> <http://ex.org/label> \"{name}{i}\"@en .\n"
+        ));
+    }
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    for f in [r#"REGEX(?l, "^The B")"#, r#"STRSTARTS(?l, "The B")"#] {
+        let q = format!(
+            "SELECT ?s ?l WHERE {{ ?s a ex:Band ; ex:label ?l FILTER({f}) }} ORDER BY ?l ?s"
+        );
+        // the estimated cost of the filtered scan of the labels
+        fn filter_cost(p: &PlanInfo) -> Option<f64> {
+            if p.operator == "Filter" && p.children.iter().any(|c| c.operator == "IndexScan") {
+                return Some(p.estimated_cost);
+            }
+            p.children.iter().find_map(filter_cost)
+        }
+        let fast = run(&s, &q, Optimizations::ALL);
+        assert!(has_desc(&fast.plan, "key ranges"), "{q}: {:#?}", fast.plan);
+        let a = solutions(&fast);
+        assert_eq!(a.len(), 40, "{q}");
+        // 120 rows in the range of "The B", read in 3 key ranges
+        let cost = filter_cost(&fast.plan).unwrap();
+        assert!(cost < 200.0, "{q}: {cost}");
+        let off = run(
+            &s,
+            &q,
+            Optimizations::ALL.disable("filter_id_ranges").unwrap(),
+        );
+        assert!(filter_cost(&off.plan).unwrap() >= 6000.0, "{q}");
+        assert_eq!(a, solutions(&off), "{q}");
+        assert_eq!(a, solutions(&run(&s, &q, Optimizations::NONE)), "{q}");
     }
 }
 

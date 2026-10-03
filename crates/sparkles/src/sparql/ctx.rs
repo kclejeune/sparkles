@@ -171,10 +171,14 @@ pub struct Optimizations {
     /// index joins that a fused star reads together are costed for the keys of the
     /// star's input, which a fused star probes in every pattern
     pub fused_star_costs: bool,
+    /// a FILTER tested on vocabulary keys whose `STRSTARTS` or start-anchored `REGEX`
+    /// fixes the start of the string rejects the base-vocabulary ids outside the id
+    /// ranges of the keys with that start, without reading their keys
+    pub filter_id_ranges: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 29] = [
+    pub const NAMES: [&str; 30] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -204,6 +208,7 @@ impl Optimizations {
         "characteristic_sets",
         "probed_keys",
         "fused_star_costs",
+        "filter_id_ranges",
     ];
 
     /// Everything on.
@@ -237,6 +242,7 @@ impl Optimizations {
         characteristic_sets: true,
         probed_keys: true,
         fused_star_costs: true,
+        filter_id_ranges: true,
     };
 
     /// Everything off: the generic operators only.
@@ -270,6 +276,7 @@ impl Optimizations {
         characteristic_sets: false,
         probed_keys: false,
         fused_star_costs: false,
+        filter_id_ranges: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -303,6 +310,7 @@ impl Optimizations {
             "characteristic_sets" => &mut self.characteristic_sets,
             "probed_keys" => &mut self.probed_keys,
             "fused_star_costs" => &mut self.fused_star_costs,
+            "filter_id_ranges" => &mut self.filter_id_ranges,
             _ => return None,
         })
     }
