@@ -392,7 +392,7 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 
 ## Nix
 
-The flake is built on flake-parts and rust-overlay, with the toolchain from
+The flake is built on flake-parts, rust-overlay and crane, with the toolchain from
 `rust-toolchain.toml`. It provides:
 
 * **Packages:**
@@ -409,6 +409,9 @@ The flake is built on flake-parts and rust-overlay, with the toolchain from
   * a dev shell;
   * `checks`:
     * the packages;
+    * `sparkles-tests`, which runs the engine's unit tests (`cargo test -p sparkles --lib`);
+    * `fmt`, which runs rustfmt over the workspace and `crates/sparkles-py` as
+      `mise run fmt:check` does;
     * `python-bindings`, which builds `sparkles-py` and runs the pytest suite on the
       installed package;
     * `ui-licenses`, which checks that `THIRD_PARTY_LICENSES-UI.md` matches the UI build;
@@ -425,6 +428,37 @@ nix build .#sparkles-cli
 nix flake check          # packages + NixOS VM test (Linux, needs KVM) + UI end-to-end tests
 nix build .#checks.x86_64-linux.ui-e2e -L   # only the UI end-to-end tests
 ```
+
+### How the Rust build is layered
+
+crane builds `sparkles`, `sparkles-cli` and `sparkles-fmt-wasm` in two derivations each.
+The first one compiles only the dependencies. It sees the manifests and `Cargo.lock`,
+and every workspace source file is replaced by an empty stub, so it is rebuilt only when
+a `Cargo.toml` or `Cargo.lock` changes. The second one unpacks that target directory and
+compiles the workspace crates. A change to a Rust source file therefore recompiles the
+workspace crates and nothing else.
+
+`sparkles` and `sparkles-cli` share one dependency derivation. The UI is copied into the
+source tree in the package's own build phase, so a UI change rebuilds the package but
+neither the dependencies nor the unit tests. The `sparkles-tests` check reuses the same
+dependency derivation, which also compiles the dependencies of
+`cargo test -p sparkles --lib`, because the engine alone enables fewer features than the
+server does. The formatter's WebAssembly module has its own dependency derivation for
+`wasm32-unknown-unknown` with the `fmt-wasm` profile from `Cargo.toml`, which
+`scripts/build-fmt-wasm.sh` also uses.
+
+Dependency updates need no hash in the Nix files. crane reads `Cargo.lock` and fetches
+each crate by the checksum recorded there, so `cargo update` followed by `nix build` is
+enough. Two exceptions remain. A new version of the `wasm-bindgen` crate needs the same
+version of `wasm-bindgen-cli` in `nix/fmt-wasm.nix`, with its two hashes, and the build
+stops with a message until they agree. The Python package is built by maturin through
+nixpkgs' own Rust hooks, from `crates/sparkles-py/Cargo.lock`, and has no separate
+dependency layer. maturin runs cargo itself with PyO3's interpreter settings, so a
+dependency layer built by crane would not match its build.
+
+The `.drv` paths show whether a change reaches the dependency layer. After a change,
+`nix path-info --derivation .#packages.x86_64-linux.sparkles.cargoArtifacts` prints the
+same path as before unless a manifest or the lockfile changed.
 
 ## Third-party licenses
 

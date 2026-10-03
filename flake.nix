@@ -3,6 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    crane.url = "github:ipetkov/crane";
     flake-parts.url = "github:hercules-ci/flake-parts";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -35,20 +36,18 @@
           final: prev:
           let
             pkgs = final.extend inputs.rust-overlay.overlays.default;
-            toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-            rustPlatform = pkgs.makeRustPlatform {
-              cargo = toolchain;
-              rustc = toolchain;
-            };
-            fmtWasm = final.callPackage ./nix/fmt-wasm.nix { inherit rustPlatform; };
+            craneLib = (inputs.crane.mkLib pkgs).overrideToolchain (
+              p: p.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml
+            );
+            fmtWasm = final.callPackage ./nix/fmt-wasm.nix { inherit craneLib; };
             ui = final.callPackage ./nix/ui.nix { inherit fmtWasm; };
           in
           {
             sparkles-fmt-wasm = fmtWasm;
             sparkles-ui = ui;
-            sparkles = final.callPackage ./nix/package.nix { inherit rustPlatform ui; };
+            sparkles = final.callPackage ./nix/package.nix { inherit craneLib ui; };
             sparkles-cli = final.callPackage ./nix/package.nix {
-              inherit rustPlatform;
+              inherit craneLib;
               ui = null;
             };
           };
@@ -64,6 +63,9 @@
         }:
         let
           toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          # the Rust packages (crane, which builds the dependencies as a layer of their own)
+          craneLib = (inputs.crane.mkLib pkgs).overrideToolchain toolchain;
+          # the Python bindings (maturin, through nixpkgs' hooks)
           rustPlatform = pkgs.makeRustPlatform {
             cargo = toolchain;
             rustc = toolchain;
@@ -83,17 +85,17 @@
 
           packages = {
             # the formatter for the browser (WebAssembly), built into the UI
-            sparkles-fmt-wasm = pkgs.callPackage ./nix/fmt-wasm.nix { inherit rustPlatform; };
+            sparkles-fmt-wasm = pkgs.callPackage ./nix/fmt-wasm.nix { inherit craneLib; };
             # the web UI (static SvelteKit build)
             sparkles-ui = pkgs.callPackage ./nix/ui.nix { fmtWasm = self'.packages.sparkles-fmt-wasm; };
             # `sparkles` binary: CLI + server with the UI embedded
             sparkles = pkgs.callPackage ./nix/package.nix {
-              inherit rustPlatform;
+              inherit craneLib;
               ui = self'.packages.sparkles-ui;
             };
             # same binary without the UI build (no Node.js needed; /ui shows a placeholder)
             sparkles-cli = pkgs.callPackage ./nix/package.nix {
-              inherit rustPlatform;
+              inherit craneLib;
               ui = null;
             };
             # the Python bindings (crates/sparkles-py) for nixpkgs' python3
@@ -137,6 +139,25 @@
 
           checks = {
             inherit (self'.packages) sparkles sparkles-cli;
+            # the engine's unit tests, on the packages' dependency layer
+            sparkles-tests = self'.packages.sparkles-cli.passthru.tests;
+            # rustfmt, as `mise run fmt:check` runs it (crates/sparkles-py is its own
+            # workspace, outside `--all`)
+            fmt = craneLib.cargoFmt {
+              pname = "sparkles";
+              version = (lib.importTOML ./Cargo.toml).workspace.package.version;
+              src = lib.fileset.toSource {
+                root = ./.;
+                fileset = lib.fileset.unions [
+                  ./Cargo.toml
+                  ./Cargo.lock
+                  (craneLib.fileset.commonCargoSources ./crates)
+                  (craneLib.fileset.commonCargoSources ./vendor)
+                ];
+              };
+              cargoExtraArgs = "--all";
+              postBuild = "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml -- --check";
+            };
             # the wheel, installed, with the pytest suite as its check phase
             python-bindings = self'.packages.sparkles-py;
             # THIRD_PARTY_LICENSES-UI.md is the notices file the UI build writes (the build

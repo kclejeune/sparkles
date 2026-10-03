@@ -2,8 +2,13 @@
 # JavaScript bindings, as scripts/build-fmt-wasm.sh builds them for `mise run ui:wasm`. The
 # UI package builds them in when given them (`fmtWasm`); without them the UI formats
 # through POST /$/format.
+#
+# Like nix/package.nix, the build is in two layers (crane): the dependencies, compiled for
+# wasm32-unknown-unknown with the `fmt-wasm` profile from the manifests and Cargo.lock
+# alone, then the script, which compiles the workspace crates and runs wasm-bindgen.
 {
   lib,
+  craneLib,
   rustPlatform,
   buildWasmBindgenCli,
   fetchCrate,
@@ -25,43 +30,65 @@ let
       hash = "sha256-vmUrWVU7kPJJxO5qIVeAkwQyWDELO1Z4Z5gitz2kco8=";
     };
   };
+
+  commonArgs = {
+    pname = "sparkles-fmt-wasm";
+    inherit version;
+    strictDeps = true;
+    cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ../Cargo.lock; };
+    # the script's target and profile (the profile is in the workspace's Cargo.toml)
+    CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+    CARGO_PROFILE = "fmt-wasm";
+    doCheck = false;
+  };
+
+  cargoArtifacts = craneLib.buildDepsOnly (
+    commonArgs
+    // {
+      src = lib.fileset.toSource {
+        root = ../.;
+        fileset = lib.fileset.unions [
+          ../Cargo.toml
+          ../Cargo.lock
+          (craneLib.fileset.commonCargoSources ../crates)
+          (craneLib.fileset.commonCargoSources ../vendor)
+        ];
+      };
+      buildPhaseCargoCommand = "cargoWithProfile build --locked -p sparkles-fmt-wasm";
+    }
+  );
 in
 assert lib.assertMsg (wasm-bindgen-cli.version == locked)
   "nix/fmt-wasm.nix builds wasm-bindgen-cli ${wasm-bindgen-cli.version} but Cargo.lock has wasm-bindgen ${locked}: update its version and hashes";
-rustPlatform.buildRustPackage {
-  pname = "sparkles-fmt-wasm";
-  inherit version;
+craneLib.mkCargoDerivation (
+  commonArgs
+  // {
+    inherit cargoArtifacts;
 
-  src = lib.fileset.toSource {
-    root = ../.;
-    fileset = lib.fileset.unions [
-      ../Cargo.toml
-      ../Cargo.lock
-      ../rust-toolchain.toml
-      ../crates
-      ../vendor
-      ../scripts/build-fmt-wasm.sh
-    ];
-  };
+    src = lib.fileset.toSource {
+      root = ../.;
+      fileset = lib.fileset.unions [
+        ../Cargo.toml
+        ../Cargo.lock
+        ../rust-toolchain.toml
+        ../crates
+        ../vendor
+        ../scripts/build-fmt-wasm.sh
+      ];
+    };
 
-  cargoLock.lockFile = ../Cargo.lock;
-  nativeBuildInputs = [ wasm-bindgen-cli ];
+    nativeBuildInputs = [ wasm-bindgen-cli ];
 
-  # the script's own build (for wasm32-unknown-unknown, which rust-toolchain.toml adds to
-  # the toolchain), not the host build of buildRustPackage
-  buildPhase = ''
-    runHook preBuild
-    bash scripts/build-fmt-wasm.sh "$out"
-    runHook postBuild
-  '';
-  doCheck = false;
-  installPhase = ''
-    runHook preInstall
-    runHook postInstall
-  '';
+    # the script writes the module and its bindings to $out
+    buildPhaseCargoCommand = ''bash scripts/build-fmt-wasm.sh "$out"'';
+    installPhaseCommand = "";
+    doInstallCargoArtifacts = false;
 
-  meta = {
-    description = "The Sparkles formatter for the browser (WebAssembly)";
-    license = lib.licenses.asl20;
-  };
-}
+    passthru = { inherit cargoArtifacts; };
+
+    meta = {
+      description = "The Sparkles formatter for the browser (WebAssembly)";
+      license = lib.licenses.asl20;
+    };
+  }
+)
