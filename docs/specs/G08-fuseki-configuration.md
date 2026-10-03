@@ -2,8 +2,8 @@
 
 > **Status:** implemented
 >
-> **Phases:** One phase, shipped on 2026-10-03: `sparkles fuseki-config convert`, its
-> `--check` report, and `serve --fuseki-config`.
+> **Phases:** One phase, shipped on 2026-10-03: `sparkles config import fuseki`, its
+> `--check` report (also `sparkles config check fuseki`), and `serve --fuseki-config`.
 >
 > **User docs:** [Usage: Migrating from Fuseki](../USAGE.md#migrating-from-fuseki) ·
 > [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) ·
@@ -37,8 +37,8 @@ configuration. This spec adds a converter that does the translation and says wha
 could not translate:
 
 ```
-sparkles fuseki-config convert config.ttl --out sparkles/
-sparkles fuseki-config convert run/ --check
+sparkles config import fuseki config.ttl --out sparkles/
+sparkles config check fuseki run/
 sparkles serve --fuseki-config config.ttl
 ```
 
@@ -66,9 +66,9 @@ Non-goals:
 
 ## 2. Input
 
-`convert` takes one or more paths. A file is read as RDF in the syntax its extension
-names (Turtle, TriG, N-Triples, N-Quads, RDF/XML or JSON-LD). A directory is read as a
-Fuseki base directory: its `config.ttl`, every RDF file in its `configuration/`
+`config import fuseki` takes one or more paths. A file is read as RDF in the syntax its
+extension names (Turtle, TriG, N-Triples, N-Quads, RDF/XML or JSON-LD). A directory is
+read as a Fuseki base directory: its `config.ttl`, every RDF file in its `configuration/`
 subdirectory, and its `shiro.ini`. When the input is a file, a `shiro.ini` and a
 `configuration/` directory next to it are read too, and the report names them.
 `--shiro FILE` and `--passwd FILE` name the user files explicitly.
@@ -83,8 +83,8 @@ some of them against its working directory, which is usually the same directory.
 
 ## 3. Output
 
-`convert` writes into `--out DIR` (default `sparkles-config`), which must be empty or
-missing unless `--force` is given:
+`config import` writes into `--out DIR` (default `sparkles-config`), which must be empty
+or missing unless `--force` is given:
 
 | File | Content |
 |---|---|
@@ -98,7 +98,8 @@ missing unless `--force` is given:
 
 Persistent datasets live in `db/NAME` under the output directory and are served with
 `--loc NAME=db/NAME`. In-memory datasets are served with `--mem NAME`. `--check` writes
-nothing and only prints the report. `--format json` prints the report as JSON.
+nothing and only prints the report. `config check` is the same as
+`config import --check`. `--format json` prints the report as JSON.
 
 `serve --fuseki-config PATH` runs the same conversion when the server starts and applies
 the result directly. It refuses to start when the report has an unsupported item. It
@@ -162,7 +163,7 @@ The dataset of a service is resolved through its wrappers:
 |---|---|---|
 | `tdb2:DatasetTDB2`, `tdb2:DatasetTDB`, `tdb:DatasetTDB` with a location | a persistent dataset, with a `tdb2.tdbdump` step in `load.sh` | manual step |
 | the same at `--mem--`, `ja:MemoryDataset`, `ja:DatasetTxnMem` | an in-memory dataset | converted |
-| `ja:data` on an in-memory dataset | a persistent dataset loaded by `load.sh`; `serve --fuseki-config` loads it into memory at each start | approximated for `convert`, converted for `serve` |
+| `ja:data` on an in-memory dataset | a persistent dataset loaded by `load.sh`; `serve --fuseki-config` loads it into memory at each start | approximated for `config import`, converted for `serve` |
 | `tdb2:unionDefaultGraph true` | `--union-default-graph` when every dataset agrees | converted, else unsupported |
 | `ja:RDFDataset` whose graphs are `ja:MemoryModel`s with `ja:externalContent` | the files loaded into the default graph or into each `ja:graphName` | as `ja:data` |
 | `ja:RDFDataset` whose graphs are the default graph or the union graph of one TDB2 dataset, under their own names | that dataset, with `--union-default-graph` for `urn:x-arq:UnionGraph` | converted |
@@ -292,8 +293,8 @@ happened. The kinds are:
 | `unsupported` | Sparkles has no equivalent, and clients or users will notice. |
 
 The exit status is 0 when nothing is unsupported, 1 when something is, and 2 when the
-input cannot be read or holds no Fuseki service. `convert` still writes its output when
-the status is 1, so that the operator can fix the rest by hand.
+input cannot be read or holds no Fuseki service. `config import` still writes its output
+when the status is 1, so that the operator can fix the rest by hand.
 
 ## 8. Acceptance examples
 
@@ -338,7 +339,7 @@ the status is 1, so that the operator can fix the rest by hand.
 (`convert.rs` and `access.rs`), the writer of the output directory (`write.rs`) and the
 command (`mod.rs`). The endpoint table of §5.1 moves out of
 `http/fuseki/assembler.rs` so that both readers share it. The Jena configurations used by
-the tests are copied unchanged into `testsuite/fuseki-config/jena` with Jena's license
+the tests are copied unchanged into `testsuite/fuseki/jena` with Jena's license
 and notice.
 
 ## Outcome
@@ -348,7 +349,7 @@ and notice.
 §10 planned: `service.rs` reads services, endpoints and the dataset wrappers, `parts.rs`
 reads text indexes, GeoSPARQL, registries, assembled datasets and reasoners, and
 `report.rs` holds the report. `endpoints.rs` holds the table of §5.1, which the assembler
-bodies of `POST /$/datasets` now use too. `sparkles fuseki-config convert` writes the
+bodies of `POST /$/datasets` now use too. `sparkles config import fuseki` writes the
 files of §3, and `serve --fuseki-config` writes its settings files and auth configuration
 under `<data>/fuseki/`.
 
@@ -377,7 +378,7 @@ under `<data>/fuseki/`.
   absolute ones.
 
 **Tests.** `fuseki_config/tests.rs` converts every configuration in
-`testsuite/fuseki-config/jena` and checks A1 to A10: memory and TDB datasets, the union
+`testsuite/fuseki/jena` and checks A1 to A10: memory and TDB datasets, the union
 default graph, the text index against `TextConfig`, inference with and without a schema,
 the three timeout examples, RDFS on read, selected graphs, endpoint names, the context
 path, `allowedUsers` with a password file, endpoint users, graph access control, a
@@ -385,10 +386,20 @@ Fuseki base directory with `shiro.ini` whose `auth.toml` passes `FileConfig::loa
 GeoSPARQL against `GeoConfig`. A10 compares five of Jena's examples with the assembler
 bodies. `users.rs` and `access.rs` have unit tests for Shiro's sections and filters,
 password forms, Ant patterns and Fuseki's `allowedUsers` rules.
-`tests/cli_fuseki_config.rs` runs the binary: the exit statuses 0, 1 and 2, `--check`,
-`--format json`, `--force`, a base directory whose `auth.toml` passes
+`tests/cli_config.rs` runs the binary: the exit statuses 0, 1 and 2, `--check` and
+`config check`, `--format json`, `--force`, a base directory whose `auth.toml` passes
 `sparkles auth check`, the converted `serve.sh` of a text and a GeoSPARQL configuration
 started on a port in 5540–5559, and A11 with `serve --fuseki-config`.
+
+**Command rename.** On 2026-10-03 the converter moved from a Fuseki-specific command
+group to `sparkles config import fuseki`, and `sparkles config check fuseki` became the
+shorthand for `config import fuseki --check`. The first argument names the kind of
+configuration, so that other servers' configurations can be added beside Fuseki's. The
+behaviour, the exit statuses and the report did not change. The output files changed
+only in the command that the header comments of `serve.sh` and `auth.toml` name, and
+`serve --fuseki-config` kept its name. The CLI code is in `config_cmd.rs`, which calls
+`fuseki_config`, and the Jena configurations moved to `testsuite/fuseki/jena`. This spec
+uses the new command names throughout.
 
 **Not built.** Per-dataset timeouts, dataset aliases, Shiro realms other than `[users]`,
 custom operations and Java code (§1 non-goals and §9). Jetty's `OBF:` passwords are not

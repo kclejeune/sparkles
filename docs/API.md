@@ -800,7 +800,7 @@ the description and custom endpoint names. A service without a write endpoint
 is refused too, since Sparkles serves every endpoint of a dataset. Where Sparkles has
 another way to get the same result, the error names it, such as `PUT /$/text/{ds}` for a
 text index or `--auth-config` for access control.
-`sparkles fuseki-config convert` translates a whole configuration, with its indexes,
+`sparkles config import fuseki` translates a whole configuration, with its indexes,
 inference, timeouts and access rules, into server flags and settings files
 ([Usage: Migrating from Fuseki](USAGE.md#migrating-from-fuseki)).
 
@@ -6430,7 +6430,7 @@ on whether a quad or a hidden graph exists. A refused write changes nothing and 
 | `fuseki:allowedUsers` on an endpoint | a grant with `endpoints = ["query"]`, `["update"]`, `["gsp-r"]` … |
 | `fuseki:allowedUsers "*"` | a role that every user holds, or `[external] default_roles` |
 
-`sparkles fuseki-config convert` applies this table to a configuration and its user
+`sparkles config import fuseki` applies this table to a configuration and its user
 file ([Usage: Migrating from Fuseki](USAGE.md#migrating-from-fuseki)).
 
 Fuseki applies graph access control to read-only datasets only. Sparkles grants `write`

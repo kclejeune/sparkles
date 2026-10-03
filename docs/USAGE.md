@@ -228,13 +228,14 @@ directory. It takes Jena and a JDK from nixpkgs, or from `JENA_HOME` and `JAVA`
 
 ### Migrating from Fuseki
 
-`sparkles fuseki-config convert` reads a Fuseki configuration and writes the equivalent
-Sparkles setup into a directory. It takes a `config.ttl`, any service files, or a Fuseki
-base directory such as `run/`. A directory is read with its `config.ttl`, every file in
-its `configuration/` directory and its `shiro.ini`:
+`sparkles config import fuseki` reads a Fuseki configuration and writes the equivalent
+Sparkles setup into a directory. The first argument of `config import` names the kind of
+configuration, and `fuseki` is the only kind. The command takes a `config.ttl`, any
+service files, or a Fuseki base directory such as `run/`. A directory is read with its
+`config.ttl`, every file in its `configuration/` directory and its `shiro.ini`:
 
 ```sh
-sparkles fuseki-config convert /srv/fuseki/run --out sparkles/
+sparkles config import fuseki /srv/fuseki/run --out sparkles/
 sh sparkles/load.sh      # once, with Fuseki stopped
 sh sparkles/serve.sh     # extra arguments go to sparkles serve
 ```
@@ -257,18 +258,19 @@ The directory holds these files:
 * `report.txt` lists every element of the configuration as converted, approximated, a
   manual step, ignored or unsupported, with the reason.
 
-The report is also printed. `--check` prints it and writes nothing, and `--format json`
-prints it as JSON. The exit status is 1 when something important has no Sparkles
-equivalent, such as an endpoint at a name Sparkles does not serve, a dataset assembled
-from selected graphs or custom Java code. It is 2 when the configuration cannot be read.
+The report is also printed. `--check` prints it and writes nothing, and
+`sparkles config check fuseki PATH` does the same. `--format json` prints the report as
+JSON. The exit status is 1 when something important has no Sparkles equivalent, such as
+an endpoint at a name Sparkles does not serve, a dataset assembled from selected graphs
+or custom Java code. It is 2 when the configuration cannot be read.
 
 `sparkles serve --fuseki-config PATH` converts the configuration at each start and
 serves the result. It loads `ja:data` files into in-memory datasets at each start, as
 Fuseki does, keeps its persistent datasets in `<data>/fuseki/`, and refuses to start when
 the report has an unsupported item. Flags given on the command line win over the
-converted ones. It suits trying a configuration out, and the files of `convert` are the
-better base for a lasting migration. [Spec G08](specs/G08-fuseki-configuration.md) lists
-how each Fuseki setting converts.
+converted ones. It suits trying a configuration out, and the files of `config import`
+are the better base for a lasting migration. [Spec G08](specs/G08-fuseki-configuration.md)
+lists how each Fuseki setting converts.
 
 ### Restricting users to some graphs
 
@@ -633,6 +635,8 @@ The other commands are:
 * `describe-settings`, for a dataset's DESCRIBE mode ([below](#describe-modes));
 * `graphql`, for a dataset's GraphQL schema and queries ([below](#graphql));
 * `csv`, for CSV and TSV tables ([below](#loading-csv-and-tsv));
+* `config import` and `config check`, for Fuseki configurations
+  ([above](#migrating-from-fuseki));
 * `snapshot`, for named snapshots and history retention;
 * `quota`, for the storage quota of a dataset, locally or on a `--server`;
 * `compaction`, for a dataset's automatic compaction settings, locally or on a `--server`

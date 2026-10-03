@@ -1304,7 +1304,7 @@ implementation landed.
   - Jena's example configurations in `jena-fuseki2/examples` and the test
     configurations in `jena-fuseki2/jena-fuseki-main/testing` and
     `jena-integration-tests/src/test/files/GeoAssembler`, copied unchanged into
-    `testsuite/fuseki-config/jena` with Jena's license and notice;
+    `testsuite/fuseki/jena` with Jena's license and notice;
   - Apache Shiro's documentation of `shiro.ini` and Eclipse Jetty's documentation of its
     realm properties file.
 - **Implementation** (2026-10-03): from the spec and the Sparkles code. **Dependencies:**
