@@ -41,6 +41,9 @@ pub const FN_FUNCTIONS: &[&str] = &[
     "not",
     "boolean",
     "error",
+    "format-number",
+    "collation-key",
+    "apply",
     "dateTime",
     "year-from-dateTime",
     "month-from-dateTime",
@@ -105,6 +108,15 @@ pub const AFN_FUNCTIONS: &[&str] = &[
     "date",
     "timezone",
     "adjust-to-timezone",
+    "sprintf",
+    "system-timezone",
+    "nowtz",
+    "version",
+    "collation",
+    "eval",
+    "print",
+    "execTime",
+    "wait",
 ];
 
 /// Sparkles' vector functions (`spk:`, `urn:x-sparkles:`).
@@ -120,6 +132,7 @@ pub fn extension_functions() -> Vec<String> {
     add(MATH, MATH_FUNCTIONS);
     add(AFN, AFN_FUNCTIONS);
     add(crate::vector::NS, SPK_FUNCTIONS);
+    add(super::cdt::NS, &super::cdt::FUNCTIONS);
     #[cfg(feature = "geo")]
     {
         use crate::geo::vocab::{GEOF, Relation, SPATIALF};
@@ -153,8 +166,9 @@ pub fn extension_aggregates() -> Vec<String> {
     out
 }
 
-/// Every property function IRI: `text:query`, the vector and hybrid searches, and with
-/// the `geo` feature Jena's `spatial:` property functions.
+/// Every property function IRI: `text:query`, the vector and hybrid searches, ARQ's
+/// `list:` and `apf:` libraries, and with the `geo` feature Jena's `spatial:` property
+/// functions.
 pub fn property_functions() -> Vec<String> {
     #[cfg_attr(not(feature = "geo"), allow(unused_mut))]
     let mut out = vec![
@@ -162,6 +176,7 @@ pub fn property_functions() -> Vec<String> {
         crate::vector::VECTOR_SEARCH.to_string(),
         super::hybrid::HYBRID_SEARCH.to_string(),
     ];
+    out.extend(super::arqpf::iris());
     #[cfg(feature = "geo")]
     out.extend(
         crate::geo::vocab::SpatialPfKind::ALL
@@ -248,6 +263,15 @@ mod tests {
                 "_ => Err(TypeError),\n        };",
             ),
             "spk:",
+        );
+        listed(
+            &super::super::cdt::FUNCTIONS,
+            arms(
+                include_str!("cdt.rs"),
+                "match local {",
+                "_ => Err(TypeError),\n    }",
+            ),
+            "cdt:",
         );
         #[cfg(feature = "geo")]
         {

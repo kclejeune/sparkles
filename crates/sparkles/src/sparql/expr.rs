@@ -560,7 +560,12 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
                         .map(|r| Val::V(Value::YearMonth(r)))
                         .ok_or(TypeError);
                 }
-                _ => {}
+                // ARQ's and F&O's other operators on dates, times and durations
+                _ => {
+                    if let Some(r) = fnlib::temporal(&x, &y, &op) {
+                        return r.map(Val::V);
+                    }
+                }
             }
             arith(op, &x, &y).map(Val::V)
         }
@@ -1485,12 +1490,13 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
     })
 }
 
-/// Is `iri` a supported extension function (fn:, math:, afn:, and with the `geo`
+/// Is `iri` a supported extension function (fn:, math:, afn:, cdt:, and with the `geo`
 /// feature geof:, spatialF:)?
 pub fn is_extension(iri: &str) -> bool {
     iri.starts_with(FN)
         || iri.starts_with(MATH)
         || iri.starts_with(AFN)
+        || iri.starts_with(super::cdt::NS)
         || iri.starts_with(crate::vector::NS)
         || (cfg!(feature = "geo")
             && (iri.starts_with(crate::geo::vocab::GEOF)
@@ -1501,6 +1507,9 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
     #[cfg(feature = "geo")]
     if let Some(r) = crate::geo::functions::call(iri, args, row, ctx) {
         return r;
+    }
+    if let Some(l) = iri.strip_prefix(super::cdt::NS) {
+        return super::cdt::call(l, args, row, ctx);
     }
     let a = |i: usize| arg(args, i, row, ctx);
     let dbl = |i: usize| -> EvalResult<f64> { Ok(Num::of(&*a(i)?)?.to_double().into()) };
@@ -1635,6 +1644,42 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
             }
             "not" => Ok(b(!a(0)?.ebv()?)),
             "boolean" => Ok(b(a(0)?.ebv()?)),
+            "format-number" => {
+                if !(2..=3).contains(&args.len()) {
+                    return Err(TypeError);
+                }
+                let value = match Num::of(&*a(0)?)? {
+                    Num::Integer(i) => super::fnformat::FormatValue::Integer(i64::from(i).into()),
+                    n => super::fnformat::FormatValue::Double(f64::from(n.to_double())),
+                };
+                let picture = a(1)?;
+                let picture = picture.as_str().ok_or(TypeError)?;
+                let locale = if args.len() == 3 {
+                    Some(a(2)?.as_str().ok_or(TypeError)?.to_string())
+                } else {
+                    None
+                };
+                Ok(s(super::fnformat::format_number(
+                    value,
+                    picture,
+                    locale.as_deref(),
+                )?))
+            }
+            // ARQ's key: the string and the collation, base64-encoded
+            "collation-key" => {
+                let x = a(0)?;
+                let c = if args.len() > 1 {
+                    a(1)?.lexical()?.to_string()
+                } else {
+                    String::new()
+                };
+                let text = format!("{}@{c}", x.lexical()?);
+                v(Value::Other {
+                    lex: fnlib::base64_mime(text.as_bytes()).into(),
+                    dt: "http://www.w3.org/2001/XMLSchema#base64Binary".into(),
+                })
+            }
+            "apply" => dynamic_call(args, row, ctx),
             _ => Err(TypeError),
         };
     }
@@ -1714,12 +1759,52 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
                 let Value::Iri(i) = a(0)?.into_owned() else {
                     return Err(TypeError);
                 };
-                let cut = i.rfind(['#', '/', ':']).map_or(0, |p| p + 1);
+                // Jena's split: the local name is the longest NCName at the end
+                let cut = fnlib::split_xml(&i);
                 Ok(s(if l == "localname" {
                     &i[cut..]
                 } else {
                     &i[..cut]
                 }))
+            }
+            "sprintf" => {
+                if args.len() < 2 {
+                    return Err(TypeError);
+                }
+                let format = a(0)?;
+                let format = format.lexical()?;
+                let mut values = Vec::with_capacity(args.len() - 1);
+                for i in 1..args.len() {
+                    values.push(sprintf_arg(&*a(i)?));
+                }
+                Ok(s(super::fnformat::sprintf(&format, &values)?))
+            }
+            "system-timezone" => v(Value::DayTime(DayTimeDuration::new(fnlib::local_offset()))),
+            "nowtz" => v(fnlib::adjust(
+                &Value::DateTime(ctx.now),
+                fnlib::TzArg::Offset(DayTimeDuration::new(fnlib::local_offset())),
+                None,
+            )?),
+            "version" => Ok(s(env!("CARGO_PKG_VERSION"))),
+            // ARQ's sort key orders by the collation's rules; here by code point
+            "collation" => {
+                let x = a(1)?;
+                Ok(s(x.lexical()?))
+            }
+            // a function by its IRI, as fn:apply
+            "eval" => dynamic_call(args, row, ctx),
+            // ARQ prints the argument or the time; a server has no console for it
+            "print" | "execTime" => Ok(b(true)),
+            "wait" => {
+                let ms = u64::try_from(int(0)?).map_err(|_| TypeError)?;
+                let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+                while let Some(left) = end.checked_duration_since(std::time::Instant::now()) {
+                    if left.is_zero() || ctx.check().is_err() {
+                        break;
+                    }
+                    std::thread::sleep(left.min(std::time::Duration::from_millis(20)));
+                }
+                Ok(b(true))
             }
             "now" => fb(Function::Now),
             "sqrt" => d(dbl(0)?.sqrt()),
@@ -1757,6 +1842,48 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
         return cast(&NamedNode::new_unchecked(iri), v.into_owned(), ctx);
     }
     Err(TypeError)
+}
+
+/// ARQ's `fn:apply` and `afn:eval`: call the extension function or cast whose IRI the
+/// first argument is with the other arguments.
+fn dynamic_call(args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
+    let f = eval(args.first().ok_or(TypeError)?, row, ctx)?.value(ctx)?;
+    let Value::Iri(iri) = f else {
+        return Err(TypeError);
+    };
+    let rest = &args[1..];
+    if is_cast(&iri) {
+        let x = arg(rest, 0, row, ctx)?.into_owned();
+        return cast(&NamedNode::new_unchecked(&*iri), x, ctx);
+    }
+    // the dynamic functions themselves are not called this way, so that a call cannot
+    // nest without end
+    if !is_extension(&iri) || iri.ends_with("#apply") || iri.ends_with("#eval") {
+        return Err(TypeError);
+    }
+    extension(&iri, rest, row, ctx)
+}
+
+/// An `afn:sprintf` argument as ARQ hands it to Java: numbers, dates and dateTimes,
+/// strings and booleans as themselves, a language-tagged string as its tag, and any
+/// other term as its string in quotes.
+fn sprintf_arg(v: &Value) -> super::fnformat::Arg {
+    use super::fnformat::Arg;
+    match v {
+        Value::Integer(i) => Arg::Integer(i64::from(*i).into()),
+        Value::Decimal(d) => Arg::Decimal(*d),
+        Value::Double(d) => Arg::Double(f64::from(*d)),
+        Value::Float(f) => Arg::Float(f32::from(*f)),
+        Value::DateTime(d) => Arg::Date(*d),
+        Value::Date(d) => match DateTime::try_from(*d) {
+            Ok(d) => Arg::Date(d),
+            Err(_) => Arg::Str(d.to_string()),
+        },
+        Value::Str(x) => Arg::Str(x.to_string()),
+        Value::Bool(x) => Arg::Bool(*x),
+        Value::Lang(_, l) | Value::LangDir(_, l, _) => Arg::Str(l.to_string()),
+        v => Arg::Str(format!("\"{}\"", v.lexical().unwrap_or_default())),
+    }
 }
 
 /// Compile a spargebra expression. `var` maps variable names to ids; `subst` provides

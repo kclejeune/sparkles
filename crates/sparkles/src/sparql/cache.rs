@@ -389,8 +389,12 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             );
             super::exists::pure_pattern(&l.pattern)
         }
+        Kind::PropertyFn(spec) => {
+            let _ = write!(s, "{:?}", spec);
+            true
+        }
         Kind::Filter(es) => es.iter().all(deterministic),
-        Kind::Extend(_, e) => deterministic(e),
+        Kind::Extend(_, e) | Kind::Assign(_, e) | Kind::Unfold { expr: e, .. } => deterministic(e),
         Kind::LeftJoin { expr } => expr.as_ref().is_none_or(deterministic),
         Kind::OrderBy { keys, limit } => {
             let _ = write!(s, "limit={limit:?}");
@@ -406,9 +410,26 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
                     a.distinct,
                     a.expr.as_ref().map(|e| e.display(ctx)).unwrap_or_default()
                 );
+                if let Some(f) = &a.fold {
+                    let _ = write!(
+                        s,
+                        "fold/{}/{};",
+                        f.value.as_ref().map(|e| e.display(ctx)).unwrap_or_default(),
+                        f.order
+                            .iter()
+                            .map(|(e, asc)| format!("{asc}:{}", e.display(ctx)))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                }
             }
-            aggs.iter()
-                .all(|(_, a)| a.expr.as_ref().is_none_or(deterministic))
+            aggs.iter().all(|(_, a)| {
+                a.expr.as_ref().is_none_or(deterministic)
+                    && a.fold.as_ref().is_none_or(|f| {
+                        f.value.as_ref().is_none_or(deterministic)
+                            && f.order.iter().all(|(e, _)| deterministic(e))
+                    })
+            })
         }
         Kind::Path {
             spec,

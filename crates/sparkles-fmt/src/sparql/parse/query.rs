@@ -284,7 +284,7 @@ fn at_order_condition(p: &Parser<'_>) -> bool {
 }
 
 /// `OrderCondition ::= ( ( 'ASC' | 'DESC' ) BrackettedExpression ) | ( Constraint | Var )`
-fn order_condition(p: &mut Parser<'_>) {
+pub(super) fn order_condition(p: &mut Parser<'_>) {
     let m = p.start(NodeKind::OrderCondition);
     if p.eat_kw(Kw::Asc) || p.eat_kw(Kw::Desc) {
         expr::bracketted(p);

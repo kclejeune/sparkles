@@ -350,6 +350,28 @@ fn aggregate_args(p: &mut Parser<'_>, kw: Kw) {
             p.error("aggregate functions cannot be nested");
         }
     }
+    // ARQ's `FOLD(expr, value ORDER BY …)`: the value is a second argument, and the
+    // ORDER BY goes with the last one
+    if kw == Kw::Fold {
+        if p.at(TokenKind::Comma) {
+            p.bump();
+            a.complete(p);
+            let b = p.start(NodeKind::Arg);
+            let from = p.events.len();
+            expression(p);
+            if contains_aggregate(&p.events[from..]) {
+                p.error("aggregate functions cannot be nested");
+            }
+            fold_order(p);
+            b.complete(p);
+        } else {
+            fold_order(p);
+            a.complete(p);
+        }
+        p.expect(TokenKind::RParen);
+        m.complete(p);
+        return;
+    }
     // the separator goes with the argument, so that a comment after the argument stays
     // the argument's wherever it is printed
     if kw == Kw::GroupConcat && p.eat(TokenKind::Semicolon) {
@@ -365,6 +387,19 @@ fn aggregate_args(p: &mut Parser<'_>, kw: Kw) {
     a.complete(p);
     p.expect(TokenKind::RParen);
     m.complete(p);
+}
+
+/// FOLD's `ORDER BY` conditions, if any.
+fn fold_order(p: &mut Parser<'_>) {
+    if p.eat_kw(Kw::Order) {
+        p.expect_kw(Kw::By);
+        loop {
+            super::query::order_condition(p);
+            if p.at(TokenKind::RParen) || p.has_error() {
+                break;
+            }
+        }
+    }
 }
 
 /// Whether the events of an aggregate's argument start an aggregate of the same query

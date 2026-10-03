@@ -769,7 +769,9 @@ the same, and made-up names of aggregates and blank nodes print as `?.0` and `_:
 empty database unless `--loc` or `--data` gives one with real statistics. A syntax
 error exits with status 1. Like Fuseki, `qparse` and `uparse` accept Jena ARQ's syntax
 extensions by default ([API.md](API.md#arq-syntax-extensions)). `--syntax sparql` (or
-Jena's `SPARQL_11` and `SPARQL_12`) rejects them, and `--syntax arq` is the default.
+Jena's `SPARQL_11` and `SPARQL_12`) rejects them, and `--syntax arq` is the default. In
+SSE, ARQ's forms print as Jena prints them, such as `(assign …)`, `(unfold …)`,
+`(semijoin …)`, `(antijoin …)` and `(fold …)`.
 
 `compare` reads both files into memory and compares them as RDF datasets up to
 blank-node isomorphism. The diff lists quads only in the first file with `<` and quads

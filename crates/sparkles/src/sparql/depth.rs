@@ -183,7 +183,9 @@ impl Walk {
             GraphPattern::Join { left, right }
             | GraphPattern::Lateral { left, right }
             | GraphPattern::Union { left, right }
-            | GraphPattern::Minus { left, right } => {
+            | GraphPattern::Minus { left, right }
+            | GraphPattern::SemiJoin { left, right }
+            | GraphPattern::AntiJoin { left, right } => {
                 self.pattern(left, n).max(self.pattern(right, n))
             }
             GraphPattern::LeftJoin {
@@ -196,6 +198,12 @@ impl Walk {
             ),
             GraphPattern::Filter { expr, inner } => self.expr(expr, n).max(self.pattern(inner, n)),
             GraphPattern::Extend {
+                inner, expression, ..
+            }
+            | GraphPattern::Assign {
+                inner, expression, ..
+            }
+            | GraphPattern::Unfold {
                 inner, expression, ..
             } => self.pattern(inner, n).max(self.expr(expression, n)),
             GraphPattern::Values { bindings, .. } => bindings
@@ -217,6 +225,15 @@ impl Walk {
                 .map(|(_, a)| match a {
                     AggregateExpression::CountSolutions { .. } => n,
                     AggregateExpression::FunctionCall { expr, .. } => self.expr(expr, n),
+                    AggregateExpression::Fold {
+                        expr, value, order, ..
+                    } => value
+                        .iter()
+                        .chain(order.iter().map(|o| match o {
+                            OrderExpression::Asc(e) | OrderExpression::Desc(e) => e,
+                        }))
+                        .map(|e| self.expr(e, n))
+                        .fold(self.expr(expr, n), usize::max),
                 })
                 .fold(self.pattern(inner, n), usize::max),
             GraphPattern::Graph { inner, .. }
@@ -280,6 +297,9 @@ impl Walk {
             PropertyPathExpression::Sequence(a, b) | PropertyPathExpression::Alternative(a, b) => {
                 self.path(a, n).max(self.path(b, n))
             }
+            PropertyPathExpression::Distinct(a)
+            | PropertyPathExpression::Multi(a)
+            | PropertyPathExpression::Shortest(a) => self.path(a, n),
             // the planner unrolls up to 32 steps of a range into a chain of joins
             PropertyPathExpression::Range { path, min, .. } => {
                 self.path(path, n).saturating_add((*min).min(32) as usize)

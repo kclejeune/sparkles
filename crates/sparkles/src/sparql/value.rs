@@ -390,6 +390,12 @@ fn num_cmp(a: Num, b: Num) -> Option<Ordering> {
 pub fn compare(a: &Value, b: &Value) -> EvalResult<Option<Ordering>> {
     use Value::*;
     Ok(match (a, b) {
+        // ARQ's list-less-than and map-less-than (cdt:List, cdt:Map)
+        (Other { lex: l1, dt: d1 }, Other { lex: l2, dt: d2 })
+            if d1 == d2 && super::cdt::is_cdt(d1) =>
+        {
+            Some(super::cdt::compare_cdt(l1, l2, d1, false)?)
+        }
         _ if a.is_numeric() && b.is_numeric() => num_cmp(Num::of(a)?, Num::of(b)?),
         (Str(x), Str(y)) => Some(x.cmp(y)),
         (Lang(x, lx), Lang(y, ly)) if lx.eq_ignore_ascii_case(ly) => Some(x.cmp(y)),
@@ -439,6 +445,11 @@ pub fn equals(a: &Value, b: &Value) -> EvalResult<bool> {
         (Bool(x), Bool(y)) => x == y,
         (Str(_), Lang(..)) | (Lang(..), Str(_)) => false,
         (Lang(..), _) | (_, Lang(..)) => false,
+        (Other { lex: l1, dt: d1 }, Other { lex: l2, dt: d2 })
+            if super::cdt::is_cdt(d1) && super::cdt::is_cdt(d2) =>
+        {
+            super::cdt::equals_cdt(l1, d1, l2, d2)?
+        }
         (Other { lex: l1, dt: d1 }, Other { lex: l2, dt: d2 }) => {
             if l1 == l2 && d1 == d2 {
                 true
@@ -527,6 +538,14 @@ pub fn order_cmp(a: Option<&Value>, b: Option<&Value>) -> Ordering {
             }
             return Ordering::Equal;
         }
+        // ARQ orders composite literals after the other value spaces it knows
+        (Value::Other { lex: l1, dt: d1 }, Value::Other { lex: l2, dt: d2 })
+            if d1 == d2 && super::cdt::is_cdt(d1) =>
+        {
+            if let Ok(o) = super::cdt::compare_cdt(l1, l2, d1, true) {
+                return o;
+            }
+        }
         _ => {}
     }
     if let Ok(Some(o)) = compare(a, b)
@@ -545,7 +564,9 @@ pub fn order_cmp(a: Option<&Value>, b: Option<&Value>) -> Ordering {
             Value::Date(_) => 5,
             Value::Time(_) => 6,
             Value::Duration(_) | Value::YearMonth(_) | Value::DayTime(_) => 7,
-            _ => 8,
+            Value::Other { dt, .. } if &**dt == super::cdt::LIST => 8,
+            Value::Other { dt, .. } if &**dt == super::cdt::MAP => 9,
+            _ => 10,
         }
     }
     let (ra, rb) = (lit_rank(a), lit_rank(b));

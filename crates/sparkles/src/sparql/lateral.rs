@@ -44,6 +44,10 @@ pub struct LateralSpec {
     pub outer: Vec<(VarId, Id)>,
     /// which of `outer` a sub-select hides (see [`Planner::scoped`])
     pub outer_scoped: Vec<VarId>,
+    /// an OPTIONAL evaluated per left row (ARQ's property functions read the left
+    /// side's values): a left row without solutions on the right is kept, and the
+    /// expression is the OPTIONAL's filter
+    pub optional: Option<Option<spargebra::algebra::Expression>>,
 }
 
 /// The names of the variables `R` mentions where substitution reaches them: in scope,
@@ -89,6 +93,28 @@ pub(super) fn plan(
     right: &GraphPattern,
     g: &ActiveGraph,
 ) -> Result<Node> {
+    plan_with(p, left, right, g, None)
+}
+
+/// The plan of `LeftJoin(left, right, expr)` that evaluates `right` per group of
+/// `left`'s rows, as ARQ evaluates an OPTIONAL with substitution.
+pub(super) fn plan_optional(
+    p: &mut Planner<'_>,
+    left: Node,
+    right: &GraphPattern,
+    expr: Option<&spargebra::algebra::Expression>,
+    g: &ActiveGraph,
+) -> Result<Node> {
+    plan_with(p, left, right, g, Some(expr.cloned()))
+}
+
+fn plan_with(
+    p: &mut Planner<'_>,
+    left: Node,
+    right: &GraphPattern,
+    g: &ActiveGraph,
+    optional: Option<Option<spargebra::algebra::Expression>>,
+) -> Result<Node> {
     let ctx = p.ctx;
     let keys: Vec<VarId> = mentioned(right)
         .iter()
@@ -97,7 +123,7 @@ pub(super) fn plan(
         .collect();
     // the right side planned without substitution, for its variables and estimates
     let r = p.plan(right, g, Vec::new())?;
-    if keys.is_empty() {
+    if keys.is_empty() && optional.is_none() {
         return Ok(super::plan::join(left, r, ctx));
     }
     let mut vars = left.vars.clone();
@@ -107,12 +133,17 @@ pub(super) fn plan(
             vars.push(*v);
         }
     }
-    for v in &r.certain {
-        if !certain.contains(v) {
-            certain.push(*v);
+    if optional.is_none() {
+        for v in &r.certain {
+            if !certain.contains(v) {
+                certain.push(*v);
+            }
         }
     }
-    let est = join_est(&left, &r, &keys).max(1.0);
+    let est = match optional {
+        Some(_) => join_est(&left, &r, &keys).max(left.est).max(1.0),
+        None => join_est(&left, &r, &keys).max(1.0),
+    };
     // a group plans and runs the right side, a fraction of its unsubstituted cost
     let groups = keys
         .iter()
@@ -133,7 +164,8 @@ pub(super) fn plan(
         })
         .collect();
     let desc = format!(
-        "per row on {}",
+        "{}per row on {}",
+        if optional.is_some() { "OPTIONAL " } else { "" },
         keys.iter()
             .map(|k| format!("?{}", ctx.var_name(*k)))
             .collect::<Vec<_>>()
@@ -149,6 +181,7 @@ pub(super) fn plan(
         keys,
         outer,
         outer_scoped,
+        optional,
     };
     Ok(Node {
         kind: Kind::Lateral(Box::new(spec)),
@@ -210,11 +243,16 @@ pub(super) fn run(
         let node = p.plan(&spec.pattern, &graph, Vec::new())?;
         let (r, _) = execute(ctx, &node)?;
         solutions += r.len();
-        if r.is_empty() {
-            continue;
-        }
         let rows = l.take_rows(&groups[key]);
-        let joined = join_tables(ctx, &rows, &r, &[], false)?;
+        let joined = match &spec.optional {
+            Some(expr) => {
+                let expr = expr.as_ref().map(|e| p.compile(e, &graph));
+                let mut note = None;
+                super::exec::left_join(ctx, &rows, &r, expr.as_ref(), &mut note)?
+            }
+            None if r.is_empty() => continue,
+            None => join_tables(ctx, &rows, &r, &[], false)?,
+        };
         ctx.check_output(out.len() + joined.len(), vars.len())?;
         out.append(joined.project(vars));
     }
