@@ -392,32 +392,29 @@ fn run(
     let plan = plan::Planner::new(c, &doc, &vars, limits).plan(op)?;
     // the snapshot: the cursors' commit, which `at` must agree with, or `at`, or the head
     let snap = match plan.commit {
-        Some(commit) => {
-            let s = match &opts.at {
-                Some(at) => {
-                    let s = resolve(Some(at)).map_err(GqlError::from_engine)?;
-                    if s.commit != commit {
-                        return Err(GqlError::new(
-                            Code::CursorInvalid,
-                            format!(
-                                "the cursors name commit {commit}, and at names commit {}",
-                                s.commit
-                            ),
-                        ));
-                    }
-                    s
+        Some(commit) => match &opts.at {
+            Some(at) => {
+                let s = resolve(Some(at)).map_err(GqlError::from_engine)?;
+                if s.commit != commit {
+                    return Err(GqlError::new(
+                        Code::CursorInvalid,
+                        format!(
+                            "the cursors name commit {commit}, and at names commit {}",
+                            s.commit
+                        ),
+                    ));
                 }
-                None => {
-                    let head = resolve(None).map_err(GqlError::from_engine)?;
-                    if head.commit == commit {
-                        head
-                    } else {
-                        resolve(Some(&At::Commit(commit))).map_err(|e| cursor_error(e, commit))?
-                    }
+                s
+            }
+            None => {
+                let head = resolve(None).map_err(GqlError::from_engine)?;
+                if head.commit == commit {
+                    head
+                } else {
+                    resolve(Some(&At::Commit(commit))).map_err(|e| cursor_error(e, commit))?
                 }
-            };
-            s
-        }
+            }
+        },
         None => resolve(opts.at.as_ref()).map_err(GqlError::from_engine)?,
     };
     resp.commit = Some(snap.commit);

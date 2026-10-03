@@ -364,7 +364,8 @@ pub fn parse(sdl: &str, backing: Backing) -> Result<(Mapping, Valid<Schema>), Ve
         .parse(prelude, "prelude.graphql")
         .add_ast(&doc)
         .build()
-        .and_then(|s| s.validate())
+        .map_err(Box::new)
+        .and_then(|s| s.validate().map_err(Box::new))
     {
         Ok(s) => s,
         Err(e) => {
@@ -817,19 +818,17 @@ fn read(
     })
 }
 
+/// The IRI of a type, field or enum value: its `@rdf(iri:)`, or the vocabulary's.
+type IriOf<'a> = dyn Fn(&str, Option<&ast::Directive>, &str, Option<usize>, &mut Vec<SdlError>) -> Option<NamedNode>
+    + 'a;
+
 #[allow(clippy::too_many_arguments)]
 fn field_map(
     schema: &Valid<Schema>,
     tname: &str,
     fname: &str,
     f: &Component<FieldDefinition>,
-    iri_of: &dyn Fn(
-        &str,
-        Option<&ast::Directive>,
-        &str,
-        Option<usize>,
-        &mut Vec<SdlError>,
-    ) -> Option<NamedNode>,
+    iri_of: &IriOf,
     is_mapped: &dyn Fn(&str) -> bool,
     enums: &[EnumMap],
     errors: &mut Vec<SdlError>,

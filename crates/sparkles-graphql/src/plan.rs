@@ -606,6 +606,7 @@ impl<'a> Planner<'a> {
         fields: &[&'a Field],
         depth: u32,
         mult: u64,
+        at: &str,
     ) -> Result<(), GqlError> {
         let declared = self.plan.groups[g].declared.clone();
         let types = self.concrete(g, &declared);
@@ -617,7 +618,7 @@ impl<'a> Planner<'a> {
                     continue;
                 }
                 let k = key(f0);
-                let path = format!("{}.{}", self.plan.groups[g].path, f0.response_key());
+                let path = format!("{at}.{}", f0.response_key());
                 self.depth(depth + 1, &path)?;
                 if name == "id" {
                     self.plan.groups[g]
@@ -684,7 +685,7 @@ impl<'a> Planner<'a> {
                                     mult
                                 };
                                 self.count_nodes(n, &path)?;
-                                self.plan_nodes(c, &fs, depth + 1, n)?;
+                                self.plan_nodes(c, &fs, depth + 1, n, &path)?;
                                 c
                             }
                         };
@@ -813,7 +814,7 @@ impl<'a> Planner<'a> {
                         ty,
                     ))?;
                     self.count_nodes(1, &path)?;
-                    self.plan_nodes(g, &fs, 1, 1)?;
+                    self.plan_nodes(g, &fs, 1, 1, &path)?;
                     self.plan.roots.insert(k, RootPlan::Lookup { group: g });
                 }
                 RootKind::Node => {
@@ -824,7 +825,7 @@ impl<'a> Planner<'a> {
                         "Node",
                     ))?;
                     self.count_nodes(1, &path)?;
-                    self.plan_nodes(g, &fs, 1, 1)?;
+                    self.plan_nodes(g, &fs, 1, 1, &path)?;
                     self.plan.roots.insert(k, RootPlan::Node { group: g });
                 }
                 RootKind::List(ty) => {
@@ -850,7 +851,7 @@ impl<'a> Planner<'a> {
                         ty,
                     ))?;
                     self.count_nodes(first, &path)?;
-                    self.plan_nodes(g, &fs, 1, first)?;
+                    self.plan_nodes(g, &fs, 1, first, &path)?;
                     self.plan.roots.insert(k, RootPlan::List { group: g });
                 }
                 RootKind::Connection(ty) => {
@@ -893,15 +894,18 @@ impl<'a> Planner<'a> {
                     for (_, cfs) in parts {
                         match cfs[0].name.as_str() {
                             "nodes" => {
-                                self.depth(2, &format!("{path}.nodes"))?;
-                                self.plan_nodes(g, &cfs, 2, size)?;
+                                let at = format!("{path}.{}", cfs[0].response_key());
+                                self.depth(2, &at)?;
+                                self.plan_nodes(g, &cfs, 2, size, &at)?;
                             }
                             "edges" => {
-                                self.depth(2, &format!("{path}.edges"))?;
+                                let edges = format!("{path}.{}", cfs[0].response_key());
+                                self.depth(2, &edges)?;
                                 for (_, efs) in self.grouped(&format!("{ty}Edge"), &cfs) {
                                     if efs[0].name == "node" {
-                                        self.depth(3, &format!("{path}.edges.node"))?;
-                                        self.plan_nodes(g, &efs, 3, size)?;
+                                        let at = format!("{edges}.{}", efs[0].response_key());
+                                        self.depth(3, &at)?;
+                                        self.plan_nodes(g, &efs, 3, size, &at)?;
                                     }
                                 }
                             }

@@ -769,6 +769,7 @@ impl ObjectValue for NodeObj<'_> {
 
 /// Assemble the response data from the groups' rows. Returns the data (`None` when a
 /// null reached the root) and the errors.
+#[allow(clippy::too_many_arguments)]
 pub fn assemble(
     c: &Compiled,
     plan: &Plan,
