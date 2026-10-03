@@ -1211,10 +1211,14 @@ mod tests {
         assert_eq!(approximation(CRS84), None);
     }
 
+    /// `((lon, lat), (easting, northing))`
+    #[cfg(feature = "geo-epsg")]
+    type RefPoint = ((f64, f64), (f64, f64));
+
     /// A projected CRS from the EPSG table against PROJ 9.9: `(lon, lat)` on ETRS89 or
     /// RGF93 (taken as WGS 84) and the easting and northing PROJ gives.
     #[cfg(feature = "geo-epsg")]
-    fn check_points(code: &str, points: &[((f64, f64), (f64, f64))], tolerance: f64) {
+    fn check_points(code: &str, points: &[RefPoint], tolerance: f64) {
         let id = lookup(code).unwrap_or_else(|| panic!("{code}: {:?}", refusal(code)));
         for &((lon, lat), (e, n)) in points {
             let (x, y) = from_lonlat(id, lon, lat).unwrap();
@@ -1242,12 +1246,12 @@ mod tests {
         // Lambert-93 and ETRS89 / UTM 32N are on GRS 80 datums: exact to the millimetre
         check_points(
             "EPSG:2154",
-            &[((2.3488, 48.8534), (652_216.6260, 6_861_681.5000))],
+            &[((2.3488, 48.8534), (652_216.626, 6_861_681.5))],
             0.005,
         );
         check_points(
             "EPSG:25832",
-            &[((8.6821, 50.1109), (477_269.5084, 5_551_009.5748))],
+            &[((8.6821, 50.1109), (477_269.508, 5_551_009.575))],
             0.005,
         );
         for c in ["EPSG:2154", "EPSG:25832"] {
@@ -1260,9 +1264,9 @@ mod tests {
         check_points(
             "EPSG:27700",
             &[
-                ((0.0, 51.4779), (538_985.2278, 177_334.1875)),
-                ((-3.1883, 55.9533), (325_897.3207, 674_001.7423)),
-                ((-5.7147, 50.0657), (134_266.4944, 25_011.1472)),
+                ((0.0, 51.4779), (538_985.228, 177_334.188)),
+                ((-3.1883, 55.9533), (325_897.321, 674_001.742)),
+                ((-5.7147, 50.0657), (134_266.494, 25_011.147)),
             ],
             5.0,
         );
@@ -1271,8 +1275,8 @@ mod tests {
         check_points(
             "EPSG:28992",
             &[
-                ((4.8924, 52.3731), (121_304.1846, 487_362.1723)),
-                ((5.4697, 51.4416), (160_735.8921, 383_614.7969)),
+                ((4.8924, 52.3731), (121_304.185, 487_362.172)),
+                ((5.4697, 51.4416), (160_735.892, 383_614.797)),
             ],
             1.0,
         );

@@ -631,9 +631,9 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
         assert_eq!(ws.len(), 1, "{ws:?}");
         assert_eq!(ws[0].code, "geo-crs-approximate");
         assert!(ws[0].message.starts_with("EPSG:27700 (OSGB 1936"), "{ws:?}");
-        let ws = run(&format!(
-            "geof:transform(\"POINT(0 51.4779)\"^^geo:wktLiteral, <http://www.opengis.net/def/crs/EPSG/0/27700>)"
-        ));
+        let ws = run(
+            "geof:transform(\"POINT(0 51.4779)\"^^geo:wktLiteral, <http://www.opengis.net/def/crs/EPSG/0/27700>)",
+        );
         assert!(ws.iter().any(|w| w.code == "geo-crs-approximate"), "{ws:?}");
         // an exact CRS adds nothing
         let ws = run(
