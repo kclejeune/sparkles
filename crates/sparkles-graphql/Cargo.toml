@@ -21,3 +21,4 @@ serde_json_bytes = "0.2"
 [dev-dependencies]
 tempfile.workspace = true
 oxrdfio.workspace = true
+oxttl.workspace = true

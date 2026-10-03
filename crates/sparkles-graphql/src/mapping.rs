@@ -865,7 +865,7 @@ fn field_map(
         Target::Scalar(s)
     } else if enums.iter().any(|e| e.name == named) {
         Target::Enum(named.to_string())
-    } else if is_mapped(named) || schema.get_union(named).is_some() {
+    } else if is_mapped(named) || schema.get_union(named).is_some() || named == "Node" {
         Target::Object(named.to_string())
     } else {
         errors.push(err(

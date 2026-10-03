@@ -53,30 +53,42 @@ pub fn prefix_of<'a>(iri: &str, prefixes: &'a [(String, String)]) -> Option<&'a 
 }
 
 /// Names for a set of IRIs in one scope, by the four steps of §4.1. `reserved` names
-/// count as taken. `case` adjusts the first letter of a name (types keep it, the caller
-/// decides).
+/// count as taken.
 pub fn assign(
     iris: &[String],
     prefixes: &[(String, String)],
     reserved: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
-    let base: Vec<String> = iris.iter().map(|i| sanitize(local_name(i))).collect();
+    let items: Vec<(String, String)> = iris
+        .iter()
+        .map(|i| (i.clone(), sanitize(local_name(i))))
+        .collect();
+    assign_bases(&items, prefixes, reserved)
+}
+
+/// [`assign`] with the step-2 name of each IRI given (`sh:name`, an inverse's `…Of`).
+pub fn assign_bases(
+    items: &[(String, String)],
+    prefixes: &[(String, String)],
+    reserved: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let base: Vec<String> = items.iter().map(|(_, b)| b.clone()).collect();
     let mut out = base.clone();
     let count = |names: &[String], n: &str| names.iter().filter(|x| *x == n).count();
     // step 3: colliding names take their prefix
-    for i in 0..iris.len() {
+    for i in 0..items.len() {
         if count(&base, &base[i]) > 1 || reserved(&base[i]) {
-            out[i] = match prefix_of(&iris[i], prefixes) {
+            out[i] = match prefix_of(&items[i].0, prefixes) {
                 Some(p) => sanitize(&format!("{p}_{}", base[i])),
-                None => format!("{}_{}", base[i], short_hash(&iris[i])),
+                None => format!("{}_{}", base[i], short_hash(&items[i].0)),
             };
         }
     }
     // step 4: names that still collide take a hash
     let snapshot = out.clone();
-    for i in 0..iris.len() {
+    for i in 0..items.len() {
         if count(&snapshot, &snapshot[i]) > 1 || reserved(&snapshot[i]) {
-            out[i] = format!("{}_{}", snapshot[i], short_hash(&iris[i]));
+            out[i] = format!("{}_{}", snapshot[i], short_hash(&items[i].0));
         }
     }
     out

@@ -3968,6 +3968,7 @@ dependencies = [
  "apollo-compiler",
  "oxrdf",
  "oxrdfio",
+ "oxttl",
  "parking_lot",
  "quick_cache",
  "serde",
