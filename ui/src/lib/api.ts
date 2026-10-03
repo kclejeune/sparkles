@@ -158,6 +158,24 @@ export type CompactionPolicy = {
   minIntervalSeconds: number;
 };
 
+/** How DESCRIBE describes a resource: `cbd`, `scbd` or `outgoing`. */
+export type DescribeMode = 'cbd' | 'scbd' | 'outgoing';
+
+/** The options of a dataset's DESCRIBE setting (`null` limits: none). */
+export type DescribeOptions = {
+  mode: DescribeMode;
+  labels: boolean;
+  reifiers: boolean;
+  maxTriples: number | null;
+  maxDepth: number | null;
+};
+
+/** `GET /$/describe/{ds}`: the options in force, and whether the dataset sets them. */
+export type DescribeSetting = DescribeOptions & {
+  source: 'default' | 'dataset';
+  modes: DescribeMode[];
+};
+
 /** `GET /$/compaction/{ds}`: what automatic compaction sees of a dataset, and does. */
 export type CompactionStatus = {
   dataset: string;
@@ -751,6 +769,18 @@ export const setCompaction = (ds: string, own: Partial<CompactionPolicy>) =>
 /** Remove the dataset's own compaction settings (`DELETE /$/compaction/{ds}`). */
 export const clearCompaction = (ds: string) =>
   json<CompactionStatus>(`/$/compaction/${enc(ds)}`, { method: 'DELETE' });
+
+/** `GET /$/describe/{ds}`. */
+export const describeSetting = (ds: string) =>
+  json<DescribeSetting>(`/$/describe/${enc(ds)}`, { cache: 'no-store' });
+
+/** Replace the dataset's DESCRIBE setting (`PUT /$/describe/{ds}`). */
+export const setDescribeSetting = (ds: string, o: DescribeOptions) =>
+  json<DescribeSetting>(`/$/describe/${enc(ds)}`, { ...jsonBody(o), method: 'PUT' });
+
+/** Back to the server's defaults (`DELETE /$/describe/{ds}`). */
+export const clearDescribeSetting = (ds: string) =>
+  json<DescribeSetting>(`/$/describe/${enc(ds)}`, { method: 'DELETE' });
 
 export const backup = (ds: string) => json<Task>(`/$/backup/${enc(ds)}`, { method: 'POST' });
 

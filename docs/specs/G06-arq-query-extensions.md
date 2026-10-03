@@ -805,7 +805,9 @@ non-goals), and parallel evaluation of `LATERAL` groups.
 - `sparkles describe-settings`, and `--describe` and `--describe-labels` on
   `sparkles query`;
 - the Python bindings' dataset queries, which use the dataset's setting. Queries inside
-  a Python transaction use the defaults.
+  a Python transaction use the defaults. Since 2026-10-03 a transaction uses the
+  dataset's setting as it was when the transaction began, and every Python query method
+  takes a `describe` argument, a mode or a dict of options over that setting.
 
 **Phase 2, deviations and decisions.**
 - The default answer changed in two ways. Descriptions now include the triples of named
@@ -818,8 +820,9 @@ non-goals), and parallel evaluation of `LATERAL` groups.
   stores, because the old reading included the stored default graph that a view's union
   leaves out. They now run it.
 - `--describe` and `--describe-labels` on `sparkles query` apply to `--loc` and `--data`.
-  With `--server`, the command refuses them and the dataset's setting applies, so the
-  remote client was left unchanged.
+  At first `--server` refused them. Since 2026-10-03 the remote client sends them as the
+  request parameters, along with the newer `--describe-reifiers`,
+  `--describe-max-triples` and `--describe-max-depth`.
 - Jena 6.2.0's `arq` command fails with a `NullPointerException` when a DESCRIBE query
   has `FROM` or `FROM NAMED` (`DescribeBNodeClosure` gets no dataset). The rules of §11.4
   for `FROM` are therefore checked against the design only, not against Jena.

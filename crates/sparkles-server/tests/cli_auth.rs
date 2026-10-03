@@ -301,6 +301,40 @@ fn device_login_status_tokens_and_logout() {
         "ASK { ?s ?p ?o }",
     ]));
     assert!(stdout(&q).contains("\"boolean\":true"), "{}", stdout(&q));
+    // DESCRIBE options travel as request parameters: scbd adds the incoming triple
+    let u = run(sparkles(s.home.path()).args([
+        "update",
+        "--server",
+        &s.url,
+        "--dataset",
+        "wiki",
+        "INSERT DATA { <urn:z> <urn:p> <urn:a> }",
+    ]));
+    assert!(u.status.success(), "{}", stderr(&u));
+    let describe = |extra: &[&str]| {
+        let mut args = vec![
+            "query",
+            "--server",
+            &s.url,
+            "--dataset",
+            "wiki",
+            "--results",
+            "nt",
+        ];
+        args.extend_from_slice(extra);
+        args.push("DESCRIBE <urn:a>");
+        let d = run(sparkles(s.home.path()).args(&args));
+        assert!(d.status.success(), "{}", stderr(&d));
+        stdout(&d)
+    };
+    assert!(!describe(&[]).contains("<urn:z>"));
+    let both = describe(&["--describe", "scbd"]);
+    assert!(
+        both.contains("<urn:z> <urn:p> <urn:a>") && both.contains("<urn:a> <urn:b> <urn:c>"),
+        "{both}"
+    );
+    let one = describe(&["--describe", "scbd", "--describe-max-triples", "1"]);
+    assert_eq!(one.lines().count(), 1, "{one}");
     let gz = s.home.path().join("data.ttl.gz");
     let mut enc = flate2::write::GzEncoder::new(
         std::fs::File::create(&gz).unwrap(),

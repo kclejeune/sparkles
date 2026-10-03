@@ -16,6 +16,7 @@ mod compaction_cmd;
 mod compress;
 mod csv_cmd;
 mod describe_cmd;
+mod dump_cmd;
 mod exposure;
 #[cfg(feature = "fmt")]
 mod fmt;
@@ -33,6 +34,8 @@ mod openapi;
 mod otel;
 mod outbound;
 mod patch_cmd;
+#[cfg(feature = "auth")]
+mod ping_cmd;
 mod queries_cmd;
 mod quota_cmd;
 mod ratelimit;
@@ -1264,6 +1267,17 @@ enum Cmd {
         /// DESCRIBE adds the rdfs:label and skos:prefLabel of the IRIs it links to
         #[arg(long)]
         describe_labels: bool,
+        /// DESCRIBE adds the reifiers of the triples it describes
+        #[arg(long)]
+        describe_reifiers: bool,
+        /// DESCRIBE writes at most this many triples per query (it can only lower the
+        /// dataset's limit)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        describe_max_triples: Option<u64>,
+        /// DESCRIBE follows blank nodes this many steps deep at most (it can only lower
+        /// the dataset's limit)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        describe_max_depth: Option<u32>,
         // where SERVICE may connect in a local run (a --server applies its own policy)
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
@@ -1294,19 +1308,9 @@ enum Cmd {
     /// Apply RDF Patch files to a database, one commit per file, or send them to a
     /// server's patch endpoint
     Patch(patch_cmd::PatchArgs),
-    /// Write the database as N-Quads, to stdout or a file
-    Dump {
-        #[arg(long)]
-        loc: PathBuf,
-        /// a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME
-        #[arg(long)]
-        at: Option<String>,
-        /// Write to this file instead of stdout (its extension picks the compression)
-        #[arg(long)]
-        out: Option<PathBuf>,
-        #[command(flatten)]
-        compress: CompressArgs,
-    },
+    /// Write the database, or a dataset on a server, in any RDF syntax (N-Quads by
+    /// default), to stdout or a file
+    Dump(dump_cmd::DumpArgs),
     /// Write-time validation of a database (SHACL, or ShEx with --lang shex): status,
     /// set, or turn off
     #[cfg(any(feature = "shacl", feature = "shex"))]
@@ -1317,6 +1321,10 @@ enum Cmd {
     /// Show or change a dataset's automatic compaction settings, on a local database or
     /// on a server
     Compaction(compaction_cmd::CompactionArgs),
+    /// Ask a server whether it is ready (GET /$/ready), over HTTPS or HTTP: exit status 0
+    /// when it answers 200. The container image's health check runs it.
+    #[cfg(feature = "auth")]
+    Ping(ping_cmd::PingArgs),
     /// Show or change how DESCRIBE describes a resource in a dataset (cbd, scbd or
     /// outgoing, labels, reifiers and limits), on a local database or on a server
     DescribeSettings(describe_cmd::DescribeArgs),
@@ -2718,6 +2726,9 @@ fn run() -> Result<()> {
             rdfs_graph,
             describe,
             describe_labels,
+            describe_reifiers,
+            describe_max_triples,
+            describe_max_depth,
             outbound,
         } => {
             let q = match (query, text) {
@@ -2726,13 +2737,25 @@ fn run() -> Result<()> {
                 _ => bail!("no query given"),
             };
             if loc.is_none() && data.is_empty() && server.is_some() {
-                if describe.is_some() || describe_labels {
-                    bail!(
-                        "--describe and --describe-labels apply to --loc and --data; a server \
-                         uses its dataset's setting (sparkles describe-settings)"
-                    );
-                }
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
+                // the server's DESCRIBE request parameters, over the dataset's setting
+                let mut params: Vec<(&str, String)> = Vec::new();
+                if let Some(m) = &describe {
+                    sparkles::sparql::describe::DescribeMode::parse(m)?;
+                    params.push(("describe", m.clone()));
+                }
+                if describe_labels {
+                    params.push(("describe-labels", "true".into()));
+                }
+                if describe_reifiers {
+                    params.push(("describe-reifiers", "true".into()));
+                }
+                if let Some(n) = describe_max_triples {
+                    params.push(("describe-max-triples", n.to_string()));
+                }
+                if let Some(n) = describe_max_depth {
+                    params.push(("describe-max-depth", n.to_string()));
+                }
                 #[cfg(feature = "auth")]
                 return remote::client::query(
                     server.as_deref(),
@@ -2742,6 +2765,7 @@ fn run() -> Result<()> {
                     &fmt,
                     timeout,
                     explain,
+                    &params,
                 );
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
@@ -2771,7 +2795,8 @@ fn run() -> Result<()> {
                         d.mode = sparkles::sparql::describe::DescribeMode::parse(m)?;
                     }
                     d.labels |= describe_labels;
-                    d
+                    d.reifiers |= describe_reifiers;
+                    d.lowered(describe_max_triples, describe_max_depth)
                 },
                 ..Default::default()
             };
@@ -2953,44 +2978,7 @@ fn run() -> Result<()> {
             at,
             format,
         } => print_log(&loc, limit, before, after, at.as_deref(), &format),
-        Cmd::Dump {
-            loc,
-            at,
-            out,
-            compress,
-        } => {
-            let store = Store::open(&loc, opts)?;
-            let codec = compress.codec(
-                out.as_deref()
-                    .and_then(sparkles::codec::Codec::from_extension)
-                    .unwrap_or_default(),
-            )?;
-            let sink: Box<dyn std::io::Write> = match &out {
-                Some(p) => Box::new(
-                    std::fs::File::create(p)
-                        .with_context(|| format!("creating {}", p.display()))?,
-                ),
-                None => Box::new(std::io::stdout().lock()),
-            };
-            let mut w = codec.writer(
-                std::io::BufWriter::new(sink),
-                compress.level(),
-                compress.threads(),
-            )?;
-            match at {
-                Some(a) => {
-                    let a: sparkles::history::At = a.parse()?;
-                    let r = store.resolve(&a)?;
-                    eprintln!("at commit {} ({})", r.commit.seq, r.commit.timestamp());
-                    store.dump_nquads_at(&a, &mut w)?;
-                }
-                None => {
-                    store.dump_nquads(&mut w)?;
-                }
-            }
-            w.finish()?;
-            Ok(())
-        }
+        Cmd::Dump(args) => dump_cmd::run(args, opts),
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
         Cmd::Queries { cmd } => queries_cmd::run(cmd, opts),
         #[cfg(feature = "graphql")]
@@ -3034,6 +3022,8 @@ fn run() -> Result<()> {
         Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Quota(args) => quota_cmd::run(args, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
+        #[cfg(feature = "auth")]
+        Cmd::Ping(args) => ping_cmd::run(args),
         Cmd::VocabIndex { loc } => {
             let store = Store::open(&loc, opts)?;
             match store.add_vocab_index()? {

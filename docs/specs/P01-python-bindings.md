@@ -775,6 +775,21 @@ Other features added methods to the bindings after Phase 2, on 2026-10-02.
 templates with `GRAPH` ([G06](G06-arq-query-extensions.md#outcome)), and dataset queries
 use the dataset's DESCRIBE setting. `Dataset.embed` and `reembed_vector_index` serve the
 embeddings of [F08](F08-embeddings-on-write.md), and `Dataset.apply_patch` applies an RDF
-Patch as one commit and returns its `PatchStats` ([F10](F10-replication.md)). The
-bindings still read and write only the W3C RDF syntaxes, not Jena's TriX, RDF Thrift, RDF
-Protobuf or RDF/JSON.
+Patch as one commit and returns its `PatchStats` ([F10](F10-replication.md)).
+
+On 2026-10-03 the bindings took the rest of the engine's syntaxes
+and inputs:
+
+* `RdfFormat` names Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON, and `load`,
+  `load_files`, `dump`, `parse`, `serialize` and `QueryTriples.serialize` read and write
+  them. Their reader and writer moved from the server crate into the core crate as
+  `sparkles::jena_formats`. An input in one of them is converted to N-Quads in memory
+  before it is parsed, so such a load does not stream.
+* `Dataset.load` reads CSV and TSV tables with the mapping of spec
+  [C05](C05-tabular-imports.md), through `mapping`, `template`, `key` and `base_iri`.
+* The query methods of datasets and transactions take `describe`, a DESCRIBE mode or a
+  dict of options over the dataset's setting. A transaction now uses the dataset's
+  setting, where it used the defaults before.
+
+`tests/test_formats_tables_describe.py` covers the three, and the stub test checks the
+new names and arguments.

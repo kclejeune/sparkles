@@ -72,11 +72,14 @@ pub struct PyTransaction {
     writer: WriterSlot,
     /// the thread that began it
     owner: ThreadId,
+    /// the dataset's DESCRIBE setting when the transaction began
+    describe: sparkles::sparql::describe::DescribeOptions,
 }
 
 impl PyTransaction {
     /// Begin a transaction on `ds`: waits for the writer lock without the GIL.
     pub fn begin(py: Python<'_>, ds: sparkles::Dataset, writer: WriterSlot) -> PyResult<Self> {
+        let describe = ds.store().describe_settings();
         let (req_tx, req_rx) = channel::<Req>();
         let (resp_tx, resp_rx) = channel::<Resp>();
         std::thread::Builder::new()
@@ -108,6 +111,7 @@ impl PyTransaction {
             })),
             writer,
             owner,
+            describe,
         })
     }
 
@@ -213,7 +217,10 @@ impl PyTransaction {
         args: QueryArgs<'py>,
         want: Option<&[QueryKind]>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (opts, at) = query_options(&args)?;
+        let (mut opts, at) = query_options(&args)?;
+        // DESCRIBE follows the dataset's setting, with the query's options over it
+        opts.describe =
+            crate::dataset::describe_options(self.describe.clone(), args.describe.as_ref())?;
         if at.is_some() {
             return Err(crate::errors::invalid(
                 py,
@@ -315,7 +322,7 @@ impl PyTransaction {
 
     /// Run a SPARQL query that sees this transaction's changes: `QuerySolutions` for
     /// SELECT, `bool` for ASK, `QueryTriples` for CONSTRUCT and DESCRIBE.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, describe = None))]
     #[allow(clippy::too_many_arguments)]
     fn query<'py>(
         &self,
@@ -332,6 +339,7 @@ impl PyTransaction {
         max_memory_bytes: Option<u64>,
         max_rows_produced: Option<u64>,
         cancel: Option<Bound<'py, PyAny>>,
+        describe: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = query_args(
             base_iri,
@@ -346,6 +354,7 @@ impl PyTransaction {
             max_rows_produced,
             cancel,
             None,
+            describe,
         );
         self.run_query(py, query, args, None)
     }

@@ -308,6 +308,7 @@ fn accept_for(results: &str) -> Result<&'static str> {
 }
 
 /// `sparkles query --server URL --dataset DS`: the response body goes to stdout.
+#[allow(clippy::too_many_arguments)]
 pub fn query(
     server: Option<&str>,
     insecure: bool,
@@ -316,6 +317,7 @@ pub fn query(
     results: &str,
     timeout: Option<f64>,
     explain: bool,
+    params: &[(&str, String)],
 ) -> Result<()> {
     let r = Remote::open(server, insecure)?;
     let mut path = format!(
@@ -323,8 +325,17 @@ pub fn query(
         ds_path(dataset),
         if explain { "explain" } else { "sparql" }
     );
+    let mut q = form_urlencoded::Serializer::new(String::new());
     if let Some(t) = timeout {
-        path.push_str(&format!("?timeout={t}"));
+        q.append_pair("timeout", &t.to_string());
+    }
+    for (k, v) in params {
+        q.append_pair(k, v);
+    }
+    let q = q.finish();
+    if !q.is_empty() {
+        path.push('?');
+        path.push_str(&q);
     }
     let req = if explain {
         r.req(Method::POST, &path)

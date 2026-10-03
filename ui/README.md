@@ -80,6 +80,9 @@ seconds. Searches report the plan counters `method` and `exactBecause`. With
 `MOCK_ROLE=dataset-admin` the caller can manage the indexes of `foaf` and only read
 those of `scratch`.
 
+`mock/describe.mjs` mocks the DESCRIBE setting of each dataset (`/$/describe/{ds}`).
+It starts at the defaults, and it checks a `PUT` body as the server does.
+
 The maps use MapLibre GL JS over the bundled Natural Earth basemap (`src/lib/basemap/`,
 with its source and license). MapLibre loads only when a map opens. The Playwright
 configurations run the full Chromium in headless mode (`channel: 'chromium'`), because
