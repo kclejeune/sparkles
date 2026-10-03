@@ -250,7 +250,7 @@ mod tests {
     fn file(path: &str, sizes: &[u64]) -> FileEntry {
         FileEntry {
             path: path.into(),
-            kind: sparkles::store::FileKind::Immutable,
+            kind: sparkles_core::store::FileKind::Immutable,
             size: sizes.iter().sum(),
             sha256: hex64('a'),
             blobs: sizes
@@ -443,11 +443,11 @@ mod tests {
     #[test]
     fn a_newer_index_format_is_incompatible() {
         let mut m = good();
-        m.index_format = sparkles::builder::FORMAT_VERSION + 1;
-        let e = validate(&m, PIECE, sparkles::builder::FORMAT_VERSION).unwrap_err();
+        m.index_format = sparkles_core::builder::FORMAT_VERSION + 1;
+        let e = validate(&m, PIECE, sparkles_core::builder::FORMAT_VERSION).unwrap_err();
         assert_eq!(e.code(), Code::IncompatibleFormat);
         assert_eq!(e.http_status(), 422);
-        let v = sparkles::builder::FORMAT_VERSION;
+        let v = sparkles_core::builder::FORMAT_VERSION;
         assert!(
             e.message()
                 .contains(&format!("index format {}; this build reads {v}", v + 1)),

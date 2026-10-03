@@ -1,4 +1,4 @@
-//! The constraints layer of a schema report ([`sparkles::schema::constraints`]) from
+//! The constraints layer of a schema report ([`sparkles_core::schema::constraints`]) from
 //! parsed shapes: for each class that shapes target, the property shapes with a
 //! predicate path and their `sh:minCount`, `sh:maxCount`, `sh:datatype`, `sh:class` and
 //! `sh:nodeKind`.
@@ -14,11 +14,11 @@ use crate::shapes::{Constraint, ShapeId, Shapes, Target};
 use anyhow::Result;
 use oxrdf::Term;
 use rustc_hash::FxHashSet;
-use sparkles::guard::{GuardMode, Severity};
-use sparkles::schema::constraints::{
+use sparkles_core::guard::{GuardMode, Severity};
+use sparkles_core::schema::constraints::{
     ClassConstraints, ConstraintSource, Enforcement, PropertyConstraint, SourceKind,
 };
-use sparkles::store::Snapshot;
+use sparkles_core::store::Snapshot;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What checks a set of shapes.
@@ -219,7 +219,7 @@ pub fn graphs_source(snap: &Snapshot, graphs: &[String]) -> Result<ConstraintSou
     let iris: Vec<String> = graphs
         .iter()
         .map(|g| match g.as_str() {
-            "default" => sparkles::sparql::ctx::DEFAULT_GRAPH_IRI.to_string(),
+            "default" => sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI.to_string(),
             g => g.to_string(),
         })
         .collect();

@@ -31,9 +31,9 @@ use crate::ir::{Dir, Ir, Se, SeId};
 use crate::{Association, NodeSelector, ShapeMap};
 use oxrdf::Term;
 use rustc_hash::FxHashSet;
-use sparkles::id::Id;
-use sparkles::store::Snapshot;
-use sparkles::validation::DataGraph;
+use sparkles_core::id::Id;
+use sparkles_core::store::Snapshot;
+use sparkles_core::validation::DataGraph;
 
 /// The static part of the analysis: what a validation reads and follows.
 #[derive(Clone, Debug, Default)]
@@ -167,7 +167,7 @@ impl Plan {
 
     /// The nodes that read the neighbourhood of `y` through one referring constraint, in
     /// `data`.
-    pub fn readers(r: &Resolved, data: &DataGraph, y: Id) -> sparkles::Result<Vec<Id>> {
+    pub fn readers(r: &Resolved, data: &DataGraph, y: Id) -> sparkles_core::Result<Vec<Id>> {
         let mut out = Vec::new();
         for &(p, d) in &r.steps {
             out.extend(match d {
@@ -189,7 +189,7 @@ impl Plan {
         states: [Option<&DataGraph>; 2],
         changes: &[[Id; 3]],
         max_visit: usize,
-    ) -> sparkles::Result<Option<Vec<Id>>> {
+    ) -> sparkles_core::Result<Option<Vec<Id>>> {
         let r = self.resolve(view);
         let mut stack = Plan::direct(&r, changes);
         let mut seen: FxHashSet<Id> = stack.iter().copied().collect();
@@ -227,7 +227,7 @@ pub(super) fn associations(
     view: &Snapshot,
     data: Option<&DataGraph>,
     nodes: &[(Id, Term)],
-) -> sparkles::Result<ShapeMap> {
+) -> sparkles_core::Result<ShapeMap> {
     let mut out = Vec::new();
     let mut seen: FxHashSet<(&Term, &crate::ShapeLabel)> = FxHashSet::default();
     let fixed = |t: &Option<Term>| -> Option<Option<Id>> {

@@ -124,7 +124,7 @@ fn valid_number(n: &NumericLiteral) -> bool {
         lex.as_str(),
         oxrdf::NamedNode::new_unchecked(format!("{XSD}{dt}")),
     );
-    !lex.trim().is_empty() && lex.trim() == lex && sparkles::xsd::is_valid(&lit)
+    !lex.trim().is_empty() && lex.trim() == lex && sparkles_core::xsd::is_valid(&lit)
 }
 
 /// The facet rules of a node constraint (both syntaxes): no numeric facet on a

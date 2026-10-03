@@ -261,7 +261,7 @@ impl fmt::Display for ValidationReport {
 /// result path is `{"type": "path", "value": "<SPARQL property path>"}`.
 pub fn result_json(r: &ValidationResult) -> serde_json::Value {
     use serde_json::json;
-    use sparkles::sparql::results::term_json;
+    use sparkles_core::sparql::results::term_json;
     let path = |p: &PropertyPath| match p {
         PropertyPath::Predicate(n) => term_json(&n.clone().into()),
         p => json!({ "type": "path", "value": p.to_string() }),

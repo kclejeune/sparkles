@@ -4,9 +4,9 @@
 
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use rustc_hash::FxHashMap;
-use sparkles::id::{self, Id, Tag};
-use sparkles::sparql::value::Value;
-use sparkles::store::Snapshot;
+use sparkles_core::id::{self, Id, Tag};
+use sparkles_core::sparql::value::Value;
+use sparkles_core::store::Snapshot;
 use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

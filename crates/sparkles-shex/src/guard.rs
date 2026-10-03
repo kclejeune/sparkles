@@ -5,7 +5,7 @@
 //! The decisions are those of write-time SHACL validation (`sparkles_shacl::guard`):
 //!
 //! * `reject`: a commit that would leave a nonconformant association is not written
-//!   (the store reports [`sparkles::Error::Rejected`]); enabling it requires the current
+//!   (the store reports [`sparkles_core::Error::Rejected`]); enabling it requires the current
 //!   data to conform;
 //! * `warn`: the commit is written; its receipt carries the findings.
 //!
@@ -53,26 +53,26 @@ use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use sparkles::commit::CommitKind;
-pub use sparkles::guard::config::BaselinePolicy;
-use sparkles::guard::config::{
+use sparkles_core::commit::CommitKind;
+pub use sparkles_core::guard::config::BaselinePolicy;
+use sparkles_core::guard::config::{
     Baseline, CONFIG_FILE, CheckHistory, CheckRecord, Counters, DataGraphSel, DecisionCounts,
     STATUS_FILE, StatusFile, sha256_hex, write_atomic,
 };
-use sparkles::guard::{
+use sparkles_core::guard::{
     Candidate, Changes, CommitGuard, GuardLanguage, GuardMode, GuardStatus, Severity,
     SeverityCounts, Strategy, ValidationSummary, WriteOptions,
 };
-use sparkles::id::Id;
-use sparkles::store::{Snapshot, Store};
-use sparkles::validation::DataGraph;
+use sparkles_core::id::Id;
+use sparkles_core::store::{Snapshot, Store};
+use sparkles_core::validation::DataGraph;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-pub use sparkles::guard::config::{SHEX_SCHEMA_SHEXC_FILE, SHEX_SCHEMA_SHEXJ_FILE};
+pub use sparkles_core::guard::config::{SHEX_SCHEMA_SHEXC_FILE, SHEX_SCHEMA_SHEXJ_FILE};
 
 /// The `format` of a ShEx `validation.json`.
 pub const CONFIG_FORMAT: u32 = 2;
@@ -445,7 +445,7 @@ impl ShexGuard {
         snap: &Arc<Snapshot>,
         o: &WriteOptions,
         deadline: Instant,
-    ) -> sparkles::Result<(ResultMap, PairValues)> {
+    ) -> sparkles_core::Result<(ResultMap, PairValues)> {
         match self.options(snap, o, deadline) {
             Some(vo) => {
                 let (rm, mut values) =
@@ -477,7 +477,7 @@ impl ShexGuard {
         view: &Arc<Snapshot>,
         before: Option<(&Arc<Snapshot>, &Model)>,
         o: &WriteOptions,
-    ) -> sparkles::Result<(ValidationSummary, PairValues)> {
+    ) -> sparkles_core::Result<(ValidationSummary, PairValues)> {
         let t0 = Instant::now();
         let deadline = self.deadline(t0, o);
         let (rm, typing) = self.validate_map(m, view, o, deadline)?;
@@ -525,7 +525,7 @@ impl ShexGuard {
             cancel: o.cancel.clone(),
             only_nonconformant: true,
             // a guard never runs SERVICE
-            selector_query: Some(sparkles::sparql::QueryOptions {
+            selector_query: Some(sparkles_core::sparql::QueryOptions {
                 forbid_service: true,
                 ..Default::default()
             }),
@@ -541,7 +541,7 @@ impl ShexGuard {
         before: &Model,
         c: &Candidate<'_>,
         reason: &str,
-    ) -> sparkles::Result<Checked> {
+    ) -> sparkles_core::Result<Checked> {
         let base = Arc::new(c.base.clone());
         let (mut s, typing) = self.validate_state(m, &c.view, Some((&base, before)), c.opts)?;
         s.fallback = Some(reason.to_string());
@@ -580,7 +580,7 @@ impl ShexGuard {
         post: &Option<(ValidateOptions, DataGraph)>,
         pre: &Option<(ValidateOptions, DataGraph)>,
         t0: Instant,
-    ) -> sparkles::Result<Propagation> {
+    ) -> sparkles_core::Result<Propagation> {
         let typing = self.typing.lock();
         let Some(t) = typing
             .as_ref()
@@ -759,7 +759,7 @@ impl ShexGuard {
 
     /// Validate a write to the data graph: the associations it can affect when the
     /// counts of the head are known, everything otherwise.
-    fn check_data(&self, m: &Model, c: &Candidate<'_>) -> sparkles::Result<Checked> {
+    fn check_data(&self, m: &Model, c: &Candidate<'_>) -> sparkles_core::Result<Checked> {
         let t0 = Instant::now();
         let Changes::Log(log) = c.changes else {
             return self.full(m, m, c, "bulk");
@@ -794,7 +794,7 @@ impl ShexGuard {
         let deadline = self.deadline(t0, c.opts);
         let base = Arc::new(c.base.clone());
         let state =
-            |snap: &Arc<Snapshot>| -> sparkles::Result<Option<(ValidateOptions, DataGraph)>> {
+            |snap: &Arc<Snapshot>| -> sparkles_core::Result<Option<(ValidateOptions, DataGraph)>> {
                 let Some(vo) = self.options(snap, c.opts, deadline) else {
                     return Ok(None);
                 };
@@ -861,7 +861,7 @@ impl ShexGuard {
         old: &Arc<Model>,
         seq: u64,
         live: bool,
-    ) -> sparkles::Result<ValidationSummary> {
+    ) -> sparkles_core::Result<ValidationSummary> {
         let new = match load_graph_model(&self.cfg, &c.view) {
             Ok(m) => Arc::new(m),
             Err(e) => {
@@ -1027,15 +1027,15 @@ fn read_predicates(ir: &Ir, map: &ShapeMap) -> Option<Vec<String>> {
 
 /// An error of the validation engine as a store error: timeouts, cancellation and
 /// budgets keep their kind.
-fn engine_error(e: anyhow::Error) -> sparkles::Error {
-    match e.downcast::<sparkles::Error>() {
+fn engine_error(e: anyhow::Error) -> sparkles_core::Error {
+    match e.downcast::<sparkles_core::Error>() {
         Ok(e) => e,
-        Err(e) => sparkles::Error::Invalid(format!("ShEx validation failed: {e:#}")),
+        Err(e) => sparkles_core::Error::Invalid(format!("ShEx validation failed: {e:#}")),
     }
 }
 
 impl CommitGuard for ShexGuard {
-    fn check(&self, c: &Candidate<'_>) -> sparkles::Result<ValidationSummary> {
+    fn check(&self, c: &Candidate<'_>) -> sparkles_core::Result<ValidationSummary> {
         let seq = c.base.commit + 1;
         // a dry run validates like a write and records nothing: no counters, no history,
         // no state for the next commit
@@ -1298,16 +1298,16 @@ fn compile_schema(parsed: &Schema, resolver: &dyn Resolver) -> Result<(CompiledS
 
 /// The triples of the named graphs `graphs` of `snap`, as one graph (graphs the
 /// snapshot does not have add nothing).
-fn graphs_of(snap: &Snapshot, graphs: &[String]) -> sparkles::Result<oxrdf::Graph> {
-    use sparkles::index::Perm;
-    use sparkles::store::Chunk;
+fn graphs_of(snap: &Snapshot, graphs: &[String]) -> sparkles_core::Result<oxrdf::Graph> {
+    use sparkles_core::index::Perm;
+    use sparkles_core::store::Chunk;
     let mut g = oxrdf::Graph::new();
     for iri in graphs {
         let Some(id) = snap.lookup_iri(iri) else {
             continue;
         };
         snap.scan(Perm::Gspo, &[id.0], |c| {
-            let mut add = |k: &sparkles::index::Key| {
+            let mut add = |k: &sparkles_core::index::Key| {
                 if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(k)) {
                     g.insert(&oxrdf::Triple::from(q));
                 }
@@ -1506,7 +1506,7 @@ pub fn set_config(
         store.set_guard(None);
         store.set_guard_required(false);
         if let Some(r) = &root {
-            sparkles::guard::config::remove_files(r, &[])?;
+            sparkles_core::guard::config::remove_files(r, &[])?;
             StatusFile::remove(r)?;
         }
         drop(txn);
@@ -1537,7 +1537,7 @@ pub fn set_config(
     let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
     // the configuration as written
     cfg.format = CONFIG_FORMAT;
-    cfg.updated = Some(sparkles::guard::config::now_rfc3339());
+    cfg.updated = Some(sparkles_core::guard::config::now_rfc3339());
     if !in_graphs {
         cfg.schema.file = Some(loaded.file.to_string());
         cfg.schema.format = Some(loaded.format.to_string());
@@ -1568,7 +1568,7 @@ pub fn set_config(
         } else {
             &[CONFIG_FILE, file]
         };
-        sparkles::guard::config::remove_files(r, keep)?;
+        sparkles_core::guard::config::remove_files(r, keep)?;
         StatusFile::remove(r)?;
         if !in_graphs {
             write_atomic(&r.join(file), text.as_bytes())?;

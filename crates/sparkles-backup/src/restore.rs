@@ -20,9 +20,9 @@ use crate::{
 use futures::{StreamExt, TryStreamExt};
 use object_store::{GetOptions, ObjectStore};
 use serde_json::Value as J;
-use sparkles::check::{CheckOptions, Status};
-use sparkles::commit::ForkedFrom;
-use sparkles::store::Store;
+use sparkles_core::check::{CheckOptions, Status};
+use sparkles_core::commit::ForkedFrom;
+use sparkles_core::store::Store;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -91,8 +91,8 @@ impl From<std::io::Error> for Failure {
     }
 }
 
-impl From<sparkles::Error> for Failure {
-    fn from(e: sparkles::Error) -> Failure {
+impl From<sparkles_core::Error> for Failure {
+    fn from(e: sparkles_core::Error) -> Failure {
         Failure::Other(e.into())
     }
 }
@@ -118,9 +118,9 @@ impl Repository {
     ///    times, then fails with `checksum mismatch in blob <id> (<path>)`), then each
     ///    file's own `sha256`; files are created with `create_new` inside `tmp` only;
     /// 3. the identity rule (`o.identity`, `o.id_in_use`, `o.in_place_head`;
-    ///    `409 duplicate-dataset-id`), with `sparkles::commit::reidentify` for `new`;
+    ///    `409 duplicate-dataset-id`), with `sparkles_core::commit::reidentify` for `new`;
     /// 4. fsync every file and directory; write `restore.json` ([`crate::RestoreRecord`]);
-    /// 5. `sparkles::check` (quick or full per `o.check`; `Warning` is success);
+    /// 5. `sparkles_core::check` (quick or full per `o.check`; `Warning` is success);
     /// 6. open the store with `o.store_opts`: its head must be `commit.seq` and its
     ///    quad count `commit.quads` (`500 restore-mismatch`); close it.
     ///
@@ -190,7 +190,7 @@ impl Repository {
         manifest::validate(
             &m,
             self.marker.piece_bytes,
-            sparkles::builder::FORMAT_VERSION,
+            sparkles_core::builder::FORMAT_VERSION,
         )?;
         let keep = identity_rule(&m, o)?;
         check_free_space(
@@ -231,7 +231,7 @@ impl Repository {
             let dir = tmp.to_path_buf();
             blocking(move || {
                 if let Some(from) = forked_from {
-                    sparkles::commit::reidentify(&dir, dataset_id, from)?;
+                    sparkles_core::commit::reidentify(&dir, dataset_id, from)?;
                 }
                 let mut f = OpenOptions::new()
                     .write(true)
@@ -251,9 +251,10 @@ impl Repository {
                 o.ctl.report(0.9, "checking");
                 let dir = tmp.to_path_buf();
                 let quick = level == crate::CheckLevel::Quick;
-                let report =
-                    blocking(move || Ok(sparkles::check::check(&dir, &CheckOptions { quick })?))
-                        .await?;
+                let report = blocking(move || {
+                    Ok(sparkles_core::check::check(&dir, &CheckOptions { quick })?)
+                })
+                .await?;
                 let json = serde_json::to_value(&report).expect("a check report serializes");
                 if report.status == Status::Error {
                     return Err(Failure::Check { report: json });
@@ -642,11 +643,11 @@ fn write_at(f: &File, buf: &[u8], off: u64) -> std::io::Result<()> {
 /// the message ("restoring nightly-2026…").
 pub fn check_free_space(dir: &Path, logical: u64, reserve: u64, what: &str) -> Result<()> {
     let need = logical.saturating_add(logical / 10);
-    let free = sparkles::disk::free_bytes(dir)?;
+    let free = sparkles_core::disk::free_bytes(dir)?;
     if free >= need.saturating_add(reserve) {
         return Ok(());
     }
-    let h = sparkles::error::human_bytes;
+    let h = sparkles_core::error::human_bytes;
     Err(BackupError::new(
         Code::InsufficientStorage,
         format!(

@@ -4,8 +4,8 @@
 
 use oxrdf::Term;
 use serde_json::{Value as J, json};
-use sparkles::io::{RdfFormat, Source};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_graphql::{Compiled, Config, Options, Request, execute_on};
 
 const EX: &str = "http://example.org/";
@@ -112,7 +112,7 @@ fn filter(r: &mut Rng, depth: u32, k: &mut usize) -> (J, String) {
     }
 }
 
-fn ids(r: &sparkles::sparql::QueryResult) -> Vec<String> {
+fn ids(r: &sparkles_core::sparql::QueryResult) -> Vec<String> {
     r.rows()
         .into_iter()
         .filter_map(|row| match &row[0] {
@@ -177,7 +177,7 @@ fn graphql_answers_equal_sparql() {
             let base = format!(
                 "PREFIX ex: <{EX}> SELECT ?n WHERE {{ {{ SELECT DISTINCT ?n WHERE {{ ?n a ex:T FILTER({e}) }} }} OPTIONAL {{ ?n ex:age ?o }} }} {sort}"
             );
-            let all = sparkles::sparql::query(store.snapshot(), &base, &Default::default())
+            let all = sparkles_core::sparql::query(store.snapshot(), &base, &Default::default())
                 .unwrap_or_else(|err| panic!("{base}: {err}"));
             let all = ids(&all);
             assert_eq!(got["totalCount"], all.len(), "{gq} {f}\n{base}");
@@ -200,7 +200,7 @@ fn graphql_answers_equal_sparql() {
                 let q = format!("SELECT DISTINCT ?m WHERE {{ <{id}> <{EX}knows> ?m }} ORDER BY ?m");
                 let knows =
                     ids(
-                        &sparkles::sparql::query(store.snapshot(), &q, &Default::default())
+                        &sparkles_core::sparql::query(store.snapshot(), &q, &Default::default())
                             .unwrap(),
                     );
                 let have: Vec<String> = n["knows"]
@@ -212,7 +212,7 @@ fn graphql_answers_equal_sparql() {
                 assert_eq!(have, knows, "{id}");
                 let q = format!("SELECT DISTINCT ?v WHERE {{ <{id}> <{EX}name> ?v }} ORDER BY ?v");
                 let names: Vec<String> =
-                    sparkles::sparql::query(store.snapshot(), &q, &Default::default())
+                    sparkles_core::sparql::query(store.snapshot(), &q, &Default::default())
                         .unwrap()
                         .rows()
                         .into_iter()

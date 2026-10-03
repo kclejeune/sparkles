@@ -8,10 +8,10 @@ use anyhow::{Result, bail};
 use oxrdf::{Literal, NamedNode, Term};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
-use sparkles::id::Id;
-use sparkles::sparql::value;
-use sparkles::store::Snapshot;
-use sparkles::xsd;
+use sparkles_core::id::Id;
+use sparkles_core::sparql::value;
+use sparkles_core::store::Snapshot;
+use sparkles_core::xsd;
 use std::cmp::Ordering;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -146,7 +146,7 @@ pub(crate) fn validate_selected(
             if let Sel::Nodes(nodes) = s {
                 for n in nodes.iter_mut() {
                     // a delta id past the snapshot's vocabulary: a term it does not have
-                    let unknown = n.tag() == sparkles::id::Tag::Delta && n.payload() >= known;
+                    let unknown = n.tag() == sparkles_core::id::Tag::Delta && n.payload() >= known;
                     if unknown && let Some(t) = after.term(*n) {
                         *n = data.resolve(&t, shapes.bnodes_in_store);
                     }
@@ -459,7 +459,10 @@ impl<'a> Engine<'a> {
 
     /// Whether `n` is a node of the data graph (the subject or object of a triple).
     fn is_node(&self, n: Id) -> Result<bool> {
-        if matches!(n.tag(), sparkles::id::Tag::Local | sparkles::id::Tag::Undef) {
+        if matches!(
+            n.tag(),
+            sparkles_core::id::Tag::Local | sparkles_core::id::Tag::Undef
+        ) {
             return Ok(false);
         }
         let mut found = false;

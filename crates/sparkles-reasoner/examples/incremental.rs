@@ -11,8 +11,8 @@
 //! is put back after each measurement, with an untimed incremental run.
 
 use oxrdf::{GraphName, NamedNode, Quad, Triple};
-use sparkles::io::{RdfFormat, Source};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::{
     Cache, Extras, Incremental, Method, Profile, ReasonOptions, ReasonReport, dred_overdeletion,
     infer, materialize_incremental,
@@ -230,12 +230,12 @@ fn main() {
     let got: BTreeSet<String> = {
         let snap = s.snapshot();
         let g = snap.lookup_iri(sparkles_reasoner::INFERRED_GRAPH).unwrap();
-        snap.scan_keys(sparkles::index::Perm::Gspo, &[g.0])
+        snap.scan_keys(sparkles_core::index::Perm::Gspo, &[g.0])
             .unwrap()
             .iter()
             .map(|k| {
                 let q = snap
-                    .quad_to_terms(&sparkles::index::Perm::Gspo.to_quad(k))
+                    .quad_to_terms(&sparkles_core::index::Perm::Gspo.to_quad(k))
                     .unwrap();
                 Triple::new(q.subject, q.predicate, q.object).to_string()
             })

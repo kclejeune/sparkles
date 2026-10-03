@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-sparkles.workspace = true
+sparkles-core.workspace = true
 object_store = { workspace = true, features = ["tokio"] }
 async-trait.workspace = true
 percent-encoding.workspace = true

@@ -5,10 +5,10 @@ mod common;
 use common::*;
 use object_store::path::Path as Key;
 use object_store::{ObjectStoreExt, PutPayload};
-use sparkles::store::{Store, StoreOptions};
 use sparkles_backup::{
     Code, OpenEnv, RepoConfig, Repository, RestoreOptions, VerifyLevel, VerifyOptions, VerifyStatus,
 };
+use sparkles_core::store::{Store, StoreOptions};
 
 fn level(level: VerifyLevel) -> VerifyOptions {
     VerifyOptions {

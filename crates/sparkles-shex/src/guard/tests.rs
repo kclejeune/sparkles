@@ -2,12 +2,12 @@ use super::*;
 use crate::{FileResolver, Status};
 use oxrdf::{Literal, NamedNode, Term};
 use proptest::prelude::{Strategy as Gen, *};
-use sparkles::Error;
-use sparkles::guard::Strategy;
-use sparkles::io::{RdfFormat, Source};
-use sparkles::sparql::QueryOptions;
-use sparkles::sparql::update::{UpdateStats, update};
-use sparkles::store::StoreOptions;
+use sparkles_core::Error;
+use sparkles_core::guard::Strategy;
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::sparql::QueryOptions;
+use sparkles_core::sparql::update::{UpdateStats, update};
+use sparkles_core::store::StoreOptions;
 
 const P: &str = "PREFIX ex: <http://ex.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/> ";
 
@@ -39,7 +39,7 @@ fn cfg(mode: &str, schema: &str, map: &str) -> ShexValidationConfig {
     .unwrap()
 }
 
-fn upd(s: &Store, u: &str) -> sparkles::Result<UpdateStats> {
+fn upd(s: &Store, u: &str) -> sparkles_core::Result<UpdateStats> {
     update(s, &format!("{P}{u}"), &QueryOptions::default())
 }
 
@@ -444,24 +444,31 @@ fn switching_languages_and_turning_off() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
     let s = loaded(&root);
-    std::fs::write(root.join(sparkles::guard::config::SHACL_SHAPES_FILE), "").unwrap();
+    std::fs::write(
+        root.join(sparkles_core::guard::config::SHACL_SHAPES_FILE),
+        "",
+    )
+    .unwrap();
     std::fs::write(
         root.join(CONFIG_FILE),
         r#"{"format":1,"mode":"warn","shapes":{"file":"validation-shapes.ttl"}}"#,
     )
     .unwrap();
     installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
-    assert!(!exists(&root, sparkles::guard::config::SHACL_SHAPES_FILE));
+    assert!(!exists(
+        &root,
+        sparkles_core::guard::config::SHACL_SHAPES_FILE
+    ));
     assert!(exists(&root, SHEX_SCHEMA_SHEXC_FILE));
     assert_eq!(
-        sparkles::guard::config::config_language(&root).unwrap(),
+        sparkles_core::guard::config::config_language(&root).unwrap(),
         Some(GuardLanguage::Shex)
     );
     assert!(matches!(
         set_config(&s, None, &NoImports).unwrap(),
         SetOutcome::Removed
     ));
-    for f in sparkles::guard::config::FILES {
+    for f in sparkles_core::guard::config::FILES {
         assert!(!exists(&root, f), "{f}");
     }
     assert!(s.guard().is_none() && !s.guard_required());
@@ -579,7 +586,10 @@ fn change() -> impl Gen<Value = (bool, Triple)> {
     (any::<bool>(), (0u8..6, pred, 0u8..10))
 }
 
-fn write(s: &Store, changes: &[(bool, Triple)]) -> sparkles::Result<sparkles::commit::Receipt> {
+fn write(
+    s: &Store,
+    changes: &[(bool, Triple)],
+) -> sparkles_core::Result<sparkles_core::commit::Receipt> {
     let mut t = s.write();
     for &(ins, (a, b, c)) in changes {
         let q = [
@@ -1022,7 +1032,7 @@ fn writes_are_validated_incrementally() {
 /// skips follow previews too, which would apply a preview's state if the guard kept it.
 #[test]
 fn dry_runs_report_the_write_and_leave_the_guard_alone() {
-    use sparkles::preview::{self, DryRun};
+    use sparkles_core::preview::{self, DryRun};
     fn strip(v: &mut serde_json::Value) {
         match v {
             serde_json::Value::Object(m) => {
@@ -1040,7 +1050,7 @@ fn dry_runs_report_the_write_and_leave_the_guard_alone() {
         strip(&mut v);
         v
     };
-    let outcome = |r: sparkles::Result<UpdateStats>| {
+    let outcome = |r: sparkles_core::Result<UpdateStats>| {
         let (rejected, s) = match r {
             Ok(st) => (false, st.commit.unwrap().validation.map(|v| (*v).clone())),
             Err(Error::Rejected(r)) => (true, Some(r.summary)),
@@ -1052,7 +1062,7 @@ fn dry_runs_report_the_write_and_leave_the_guard_alone() {
     };
     let dry = |s: &Store, u: &str| {
         let opts = QueryOptions {
-            write: sparkles::guard::WriteOptions {
+            write: sparkles_core::guard::WriteOptions {
                 dry_run: Some(DryRun::default()),
                 ..Default::default()
             },
@@ -1085,7 +1095,7 @@ fn dry_runs_report_the_write_and_leave_the_guard_alone() {
             }
             let mut c = cfg(mode, SCHEMA, MAP);
             if grandfather {
-                c.baseline = sparkles::guard::config::BaselinePolicy::Grandfather;
+                c.baseline = sparkles_core::guard::config::BaselinePolicy::Grandfather;
             }
             let (g, _) = installed(set_config(&s, Some(c), &NoImports).unwrap());
             stores.push(s);

@@ -30,10 +30,10 @@ pub use config::{Catalog, Change, Config, Limits as SchemaLimits, Stored, Versio
 pub use error::{Code, GqlError, Outcome};
 use serde_json::{Map, Value as J, json};
 use sha2::{Digest, Sha256};
-use sparkles::guard::config::DataGraphSel;
-use sparkles::history::At;
-use sparkles::sparql::QueryOptions;
-use sparkles::store::Snapshot;
+use sparkles_core::guard::config::DataGraphSel;
+use sparkles_core::history::At;
+use sparkles_core::sparql::QueryOptions;
+use sparkles_core::store::Snapshot;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -59,7 +59,7 @@ pub struct Compiled {
 /// Why a configuration was refused.
 #[derive(Debug)]
 pub enum PutError {
-    Engine(sparkles::Error),
+    Engine(sparkles_core::Error),
     Sdl(Vec<mapping::SdlError>),
 }
 
@@ -191,7 +191,7 @@ impl Compiled {
     /// The query options of the adapter's data graph (§3.1), from the caller's options.
     pub fn data_options(&self, base: &QueryOptions) -> QueryOptions {
         let mut o = base.clone();
-        let inferred = sparkles::guard::config::INFERRED_GRAPH.to_string();
+        let inferred = sparkles_core::guard::config::INFERRED_GRAPH.to_string();
         let reasoning = self
             .config
             .reasoning
@@ -199,7 +199,8 @@ impl Compiled {
         o.named_graph_uris.clear();
         match &self.config.data_graph {
             DataGraphSel::Named(n) if n == "union" => {
-                o.default_graph_uris = vec![sparkles::sparql::ctx::UNION_GRAPH_IRI.to_string()];
+                o.default_graph_uris =
+                    vec![sparkles_core::sparql::ctx::UNION_GRAPH_IRI.to_string()];
                 o.default_graph_extra.clear();
             }
             DataGraphSel::Named(_) => {
@@ -295,7 +296,7 @@ pub struct Response {
 }
 
 /// The snapshot of an `at` selector (`None`: the head).
-pub type Resolve<'a> = &'a dyn Fn(Option<&At>) -> sparkles::Result<Arc<Snapshot>>;
+pub type Resolve<'a> = &'a dyn Fn(Option<&At>) -> sparkles_core::Result<Arc<Snapshot>>;
 
 /// Run a request against the snapshots `resolve` gives (§6.1): the head, the request's
 /// `at`, or the commit its cursors name.
@@ -337,9 +338,9 @@ pub fn execute_on(
     execute(c, req, opts, &resolve)
 }
 
-fn cursor_error(e: sparkles::Error, commit: u64) -> GqlError {
+fn cursor_error(e: sparkles_core::Error, commit: u64) -> GqlError {
     match e {
-        sparkles::Error::HistoryGone(g) => GqlError::new(
+        sparkles_core::Error::HistoryGone(g) => GqlError::new(
             Code::CursorExpired,
             format!("the cursor's commit {commit} is no longer readable"),
         )
@@ -348,11 +349,13 @@ fn cursor_error(e: sparkles::Error, commit: u64) -> GqlError {
             "oldestReadableCommit",
             g.reconstructable.first().map(|r| r.0),
         ),
-        sparkles::Error::HistoryUnsupported(m) | sparkles::Error::NotFound(m) => GqlError::new(
-            Code::CursorExpired,
-            format!("the cursor's commit {commit} cannot be read: {m}"),
-        )
-        .with("commit", commit),
+        sparkles_core::Error::HistoryUnsupported(m) | sparkles_core::Error::NotFound(m) => {
+            GqlError::new(
+                Code::CursorExpired,
+                format!("the cursor's commit {commit} cannot be read: {m}"),
+            )
+            .with("commit", commit)
+        }
         e => GqlError::from_engine(e),
     }
 }

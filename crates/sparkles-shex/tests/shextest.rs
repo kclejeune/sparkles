@@ -37,9 +37,9 @@
 use oxrdf::dataset::{CanonicalizationAlgorithm, CanonicalizationHashAlgorithm};
 use oxrdf::{BlankNode, Graph, Literal, NamedNode, Term, TermRef};
 use serde_json::Value;
-use sparkles::id::Id;
-use sparkles::io::RdfFormat;
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::id::Id;
+use sparkles_core::io::RdfFormat;
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_shex::{
     Association, FileResolver, NodeSelector, ResultMap, Schema, SemAct, ShapeExpr, ShapeLabel,
     ShapeMap, Status, TripleExpr, ValidateOptions,
@@ -1121,7 +1121,7 @@ fn load_data(url: &str, focus: Option<&Term>) -> Result<(Store, Option<Term>), S
             let id = txn
                 .intern_scoped(b, &mut labels)
                 .map_err(|e| e.to_string())?;
-            Some(Term::BlankNode(sparkles::store::bnode_for(id)))
+            Some(Term::BlankNode(sparkles_core::store::bnode_for(id)))
         }
         f => f.cloned(),
     };

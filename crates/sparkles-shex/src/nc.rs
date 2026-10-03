@@ -1,5 +1,5 @@
 //! Node constraints on store ids: kind and datatype from the id's tag or term kind,
-//! lexical validity through [`sparkles::xsd`], string facets in code points, patterns
+//! lexical validity through [`sparkles_core::xsd`], string facets in code points, patterns
 //! with SPARQL `REGEX` semantics, numeric facets with XPath promotion, and value sets
 //! as id sets, base-vocabulary id ranges for IRI stems, and language ranges. Results
 //! for vocabulary ids are cached per constraint.
@@ -15,10 +15,10 @@ use crate::report::compact_iri;
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{Literal, NamedNode, Term};
 use rustc_hash::{FxHashMap, FxHashSet};
-use sparkles::id::{Id, Tag, unpack_decimal};
-use sparkles::sparql::expr::{compile_regex, lang_matches};
-use sparkles::sparql::value::{Value, compare};
-use sparkles::store::{Snapshot, TermKind};
+use sparkles_core::id::{Id, Tag, unpack_decimal};
+use sparkles_core::sparql::expr::{compile_regex, lang_matches};
+use sparkles_core::sparql::value::{Value, compare};
+use sparkles_core::store::{Snapshot, TermKind};
 use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
@@ -376,7 +376,7 @@ impl<'a> Node<'a> {
         }
         let l = self.literal()?;
         let v = Value::from_literal(l);
-        (v.is_numeric() && sparkles::xsd::is_valid(l)).then_some(v)
+        (v.is_numeric() && sparkles_core::xsd::is_valid(l)).then_some(v)
     }
 }
 
@@ -590,7 +590,7 @@ fn datatype_ok(dt: &Datatype, n: &Node<'_>) -> bool {
     }
     match n.literal() {
         Some(l) if l.datatype().as_str() == dt.iri => {
-            dt.iri == rdf::LANG_STRING.as_str() || sparkles::xsd::is_valid(l)
+            dt.iri == rdf::LANG_STRING.as_str() || sparkles_core::xsd::is_valid(l)
         }
         _ => false,
     }
@@ -830,8 +830,8 @@ fn write_values(vs: &[ValueSetValue], prefixes: &PrefixMap) -> String {
 mod tests {
     use super::*;
     use crate::ast::NumericLiteral as N;
-    use sparkles::io::{RdfFormat, Source};
-    use sparkles::store::{Store, StoreOptions};
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
 
     const XSDNS: &str = "http://www.w3.org/2001/XMLSchema#";
 
@@ -913,10 +913,10 @@ mod tests {
         let s = snap.lookup_iri(s).unwrap();
         let p = snap.lookup_iri("http://ex.org/p").unwrap();
         let mut found = Vec::new();
-        snap.scan(sparkles::index::Perm::Spo, &[s.0, p.0], |c| {
+        snap.scan(sparkles_core::index::Perm::Spo, &[s.0, p.0], |c| {
             match c {
-                sparkles::store::Chunk::Row(k) => found.push(Id(k[2])),
-                sparkles::store::Chunk::Block(b, s, e) => {
+                sparkles_core::store::Chunk::Row(k) => found.push(Id(k[2])),
+                sparkles_core::store::Chunk::Block(b, s, e) => {
                     found.extend((s..e).map(|i| Id(b.key(i)[2])))
                 }
             }

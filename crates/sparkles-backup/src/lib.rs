@@ -46,7 +46,7 @@ pub use repo::Repository;
 pub use types::*;
 
 use object_store::ObjectStore;
-use sparkles::commit::ForkedFrom;
+use sparkles_core::commit::ForkedFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,7 +81,7 @@ pub struct OpenEnv {
     /// endpoint resolves to must pass it, and connections go to exactly those
     /// addresses (`None`: anywhere; the server sets it for repositories registered
     /// through its API)
-    pub outbound: Option<sparkles::outbound::OutboundPolicy>,
+    pub outbound: Option<sparkles_core::outbound::OutboundPolicy>,
     /// count this repository's object requests here (`None`: counters of its own,
     /// [`Repository::requests`]); a server keeps one per repository name, so the
     /// counts survive reopening
@@ -198,7 +198,7 @@ pub struct RestoreOptions {
     /// greater than the backup's commit)
     pub in_place_head: Option<u64>,
     /// options of the `Store::open` that verifies the restored directory
-    pub store_opts: sparkles::store::StoreOptions,
+    pub store_opts: sparkles_core::store::StoreOptions,
     pub ctl: Ctl,
 }
 
@@ -236,7 +236,7 @@ pub struct RestoreReport {
     pub identity: &'static str,
     /// with `new`: the source id and the backup's commit
     pub forked_from: Option<ForkedFrom>,
-    /// the `sparkles::check` report (JSON), unless the check was skipped
+    /// the `sparkles_core::check` report (JSON), unless the check was skipped
     pub check: Option<serde_json::Value>,
     pub millis: u64,
 }
@@ -249,7 +249,7 @@ pub struct VerifyOptions {
     /// `verify-*` directory inside it, removed afterwards; default the system temp dir)
     pub tmp_dir: Option<PathBuf>,
     /// level `restore`: options of the verifying `Store::open`
-    pub store_opts: sparkles::store::StoreOptions,
+    pub store_opts: sparkles_core::store::StoreOptions,
     pub ctl: Ctl,
 }
 
@@ -279,7 +279,7 @@ pub fn now_rfc3339() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
-    sparkles::commit::rfc3339_ms(ms)
+    sparkles_core::commit::rfc3339_ms(ms)
 }
 
 #[cfg(test)]

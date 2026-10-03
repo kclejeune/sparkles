@@ -15,10 +15,10 @@ use oxrdf::{Literal, NamedNode, Term};
 use rustc_hash::FxHashSet;
 use spargebra::Query;
 use spargebra::algebra::GraphPattern;
-use sparkles::id::{Id, Tag};
-use sparkles::sparql::plan::{ActiveGraph, Planner};
-use sparkles::sparql::table::Table;
-use sparkles::sparql::{Ctx, depth, exec, parse_query};
+use sparkles_core::id::{Id, Tag};
+use sparkles_core::sparql::plan::{ActiveGraph, Planner};
+use sparkles_core::sparql::table::Table;
+use sparkles_core::sparql::{Ctx, depth, exec, parse_query};
 use std::sync::Arc;
 
 /// Variables that may be pre-bound (and so must not be assigned by the query).
@@ -484,7 +484,7 @@ impl Engine<'_> {
             let g = match &self.shapes.source_graph {
                 Some(iri) => Term::NamedNode(NamedNode::new_unchecked(iri.clone())),
                 None => Term::NamedNode(NamedNode::new_unchecked(
-                    sparkles::sparql::ctx::DEFAULT_GRAPH_IRI,
+                    sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI,
                 )),
             };
             b.push(("shapesGraph", g));

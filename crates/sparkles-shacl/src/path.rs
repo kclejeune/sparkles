@@ -7,7 +7,7 @@ use crate::vocab::{rdf, sh};
 use anyhow::{Result, anyhow, bail};
 use oxrdf::{BlankNode, NamedNode, Term, Triple};
 use rustc_hash::FxHashSet;
-use sparkles::id::Id;
+use sparkles_core::id::Id;
 use std::fmt;
 
 /// A SHACL property path.

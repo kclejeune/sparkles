@@ -26,10 +26,10 @@ use crate::semact::{ActCtx, Registry};
 use oxrdf::Term;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use sparkles::id::{Id, Tag};
-use sparkles::store::Snapshot;
-use sparkles::validation::DataGraph;
-use sparkles::{Budget as Exceeded, BudgetKind};
+use sparkles_core::id::{Id, Tag};
+use sparkles_core::store::Snapshot;
+use sparkles_core::validation::DataGraph;
+use sparkles_core::{Budget as Exceeded, BudgetKind};
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -55,17 +55,17 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// [`sparkles::Error::Cancelled`] or [`sparkles::Error::Timeout`] once due.
-    pub fn check(&self) -> sparkles::Result<()> {
+    /// [`sparkles_core::Error::Cancelled`] or [`sparkles_core::Error::Timeout`] once due.
+    pub fn check(&self) -> sparkles_core::Result<()> {
         if self
             .cancel
             .as_ref()
             .is_some_and(|c| c.load(Ordering::Relaxed))
         {
-            return Err(sparkles::Error::Cancelled);
+            return Err(sparkles_core::Error::Cancelled);
         }
         if self.deadline.is_some_and(|d| Instant::now() > d) {
-            return Err(sparkles::Error::Timeout);
+            return Err(sparkles_core::Error::Timeout);
         }
         Ok(())
     }
@@ -456,7 +456,7 @@ impl Typing {
         if let Some(limit) = max_pairs
             && self.pairs.len() >= limit
         {
-            return Err(sparkles::Error::BudgetExceeded(Exceeded {
+            return Err(sparkles_core::Error::BudgetExceeded(Exceeded {
                 kind: BudgetKind::ValidationWork,
                 limit: limit as u64,
                 requested: limit as u64 + 1,

@@ -1,13 +1,13 @@
 //! Write previews (dry runs) under write-time SHACL validation: a dry run reports the
 //! summary the write gets and leaves the guard as it was.
 
-use sparkles::Error;
-use sparkles::guard::{GuardMode, Severity, WriteOptions};
-use sparkles::io::{RdfFormat, Source};
-use sparkles::preview::{self, DryRun};
-use sparkles::sparql::QueryOptions;
-use sparkles::sparql::update::{UpdateStats, update};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::Error;
+use sparkles_core::guard::{GuardMode, Severity, WriteOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::preview::{self, DryRun};
+use sparkles_core::sparql::QueryOptions;
+use sparkles_core::sparql::update::{UpdateStats, update};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_shacl::guard::{
     self, BaselinePolicy, DataGraphSel, SetOutcome, ShaclGuard, ShapesSource, ValidationConfig,
 };
@@ -56,7 +56,7 @@ fn store_with_shapes() -> Store {
     s
 }
 
-fn upd(s: &Store, u: &str) -> sparkles::Result<UpdateStats> {
+fn upd(s: &Store, u: &str) -> sparkles_core::Result<UpdateStats> {
     update(s, &format!("{P}{u}"), &QueryOptions::default())
 }
 
@@ -92,7 +92,7 @@ fn status(g: &ShaclGuard) -> serde_json::Value {
 }
 
 /// Whether a write was rejected, and its summary.
-fn outcome(r: sparkles::Result<UpdateStats>) -> (bool, serde_json::Value) {
+fn outcome(r: sparkles_core::Result<UpdateStats>) -> (bool, serde_json::Value) {
     let (rejected, s) = match r {
         Ok(st) => (false, st.commit.unwrap().validation.map(|v| (*v).clone())),
         Err(Error::Rejected(r)) => (true, Some(r.summary)),

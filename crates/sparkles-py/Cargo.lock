@@ -2445,7 +2445,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "sparkles",
+ "sparkles-core",
  "thiserror 2.0.21",
  "tracing",
  "uuid",
@@ -2469,7 +2469,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "spargebra",
- "sparkles",
+ "sparkles-core",
  "tempfile",
  "tracing",
 ]
@@ -2492,7 +2492,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "spargebra",
- "sparkles",
+ "sparkles-core",
  "thiserror 2.0.21",
  "tracing",
 ]

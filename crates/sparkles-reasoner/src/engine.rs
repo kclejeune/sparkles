@@ -1028,7 +1028,7 @@ pub(crate) fn incremental_blocker(r: &CRule, terms: &Terms) -> Option<String> {
             CHead::Triple(s, p, o) => {
                 let bnode = [s, p, o].into_iter().any(|x| match x {
                     Slot::Const(c) => {
-                        sparkles::id::Id(*c).tag() == sparkles::id::Tag::Local
+                        sparkles_core::id::Id(*c).tag() == sparkles_core::id::Tag::Local
                             && terms.kind(*c) == crate::terms::Kind::BNode
                     }
                     _ => false,

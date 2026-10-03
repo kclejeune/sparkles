@@ -1,11 +1,11 @@
 //! Write-time SHACL validation: the store's commit guard.
 
-use sparkles::Error;
-use sparkles::guard::{GuardMode, GuardStatus, Severity};
-use sparkles::io::{RdfFormat, Source};
-use sparkles::sparql::update::update;
-use sparkles::sparql::{QueryOptions, query};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::Error;
+use sparkles_core::guard::{GuardMode, GuardStatus, Severity};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::sparql::update::update;
+use sparkles_core::sparql::{QueryOptions, query};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_shacl::guard::{self, DataGraphSel, SetOutcome, ShapesSource, ValidationConfig};
 
 const SHAPES: &str = r#"
@@ -47,7 +47,7 @@ fn store_with_shapes(opts: StoreOptions) -> Store {
     s
 }
 
-fn upd(s: &Store, u: &str) -> sparkles::Result<sparkles::sparql::update::UpdateStats> {
+fn upd(s: &Store, u: &str) -> sparkles_core::Result<sparkles_core::sparql::update::UpdateStats> {
     update(s, &format!("{P}{u}"), &QueryOptions::default())
 }
 
@@ -216,7 +216,7 @@ fn bulk_loads_are_validated_before_the_switch() {
         "ex:p50 a ex:Person ; ex:name \"n\" .",
     );
     let r = s
-        .load_as(&[src(&fixed)], sparkles::commit::CommitKind::Load)
+        .load_as(&[src(&fixed)], sparkles_core::commit::CommitKind::Load)
         .unwrap();
     assert!(r.commit.bulk);
     let v = r.validation.unwrap();
@@ -269,7 +269,7 @@ fn validated_databases_fail_closed_without_a_guard() {
     ));
     // a bypass is allowed and counted
     let opts = QueryOptions {
-        write: sparkles::guard::WriteOptions {
+        write: sparkles_core::guard::WriteOptions {
             bypass_validation: true,
             ..Default::default()
         },
@@ -390,13 +390,15 @@ fn inline(mode: GuardMode, shapes: &str) -> ValidationConfig {
     c
 }
 
-fn summary(st: sparkles::sparql::update::UpdateStats) -> sparkles::guard::ValidationSummary {
+fn summary(
+    st: sparkles_core::sparql::update::UpdateStats,
+) -> sparkles_core::guard::ValidationSummary {
     (*st.commit.unwrap().validation.unwrap()).clone()
 }
 
 #[test]
 fn writes_validate_only_the_focus_nodes_they_affect() {
-    use sparkles::guard::Strategy;
+    use sparkles_core::guard::Strategy;
     let s = Store::in_memory(StoreOptions::default());
     let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
     for i in 0..2000 {
@@ -437,7 +439,7 @@ fn writes_validate_only_the_focus_nodes_they_affect() {
 
 #[test]
 fn warn_mode_keeps_exact_counts_across_writes() {
-    use sparkles::guard::Strategy;
+    use sparkles_core::guard::Strategy;
     let s = store_with_shapes(StoreOptions::default());
     upd(
         &s,
@@ -473,7 +475,7 @@ fn warn_mode_keeps_exact_counts_across_writes() {
 
 #[test]
 fn the_state_of_the_head_survives_a_restart() {
-    use sparkles::guard::Strategy;
+    use sparkles_core::guard::Strategy;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
     {
@@ -516,7 +518,7 @@ fn the_state_of_the_head_survives_a_restart() {
 
 #[test]
 fn grandfather_mode_blocks_only_new_results() {
-    use sparkles::guard::Strategy;
+    use sparkles_core::guard::Strategy;
     use sparkles_shacl::guard::BaselinePolicy;
     let s = store_with_shapes(StoreOptions::default());
     upd(&s, "INSERT DATA { ex:a a ex:Person }").unwrap();
@@ -572,7 +574,7 @@ ex:KeyUnique a sh:NodeShape ; sh:targetSubjectsOf ex:key ;
 
 #[test]
 fn anchored_sparql_constraints_are_validated_incrementally() {
-    use sparkles::guard::Strategy;
+    use sparkles_core::guard::Strategy;
     let s = Store::in_memory(StoreOptions::default());
     let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
     for i in 0..300 {
@@ -618,7 +620,7 @@ fn anchored_sparql_constraints_are_validated_incrementally() {
 
 #[test]
 fn where_targets_select_the_nodes_that_conform() {
-    use sparkles::guard::Strategy;
+    use sparkles_core::guard::Strategy;
     let shapes = r#"
 @prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://ex.org/> .
 ex:AdultPerson a sh:NodeShape ;
@@ -670,7 +672,7 @@ ex:NotPerson a sh:NodeShape ; sh:targetWhere [ sh:not [ sh:class ex:Person ] ] ;
 
 #[test]
 fn subclass_changes_validate_the_instances_they_affect() {
-    use sparkles::guard::Strategy;
+    use sparkles_core::guard::Strategy;
     let shapes = r#"
 @prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://ex.org/> .
 ex:AgentShape a sh:NodeShape ; sh:targetClass ex:Agent ;
@@ -761,7 +763,7 @@ fn bypassed_writes_are_flagged_in_the_commit_log() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
     let catalog = |root: &std::path::Path| -> Vec<(u64, bool)> {
-        let (_, cs) = sparkles::commit::read_catalog(&root.join("commits.bin"))
+        let (_, cs) = sparkles_core::commit::read_catalog(&root.join("commits.bin"))
             .unwrap()
             .unwrap();
         cs.iter().map(|c| (c.seq, c.unvalidated)).collect()
@@ -770,7 +772,7 @@ fn bypassed_writes_are_flagged_in_the_commit_log() {
         let s = Store::open(&root, StoreOptions::default()).unwrap();
         enable(&s, inline(GuardMode::Reject, SHAPES));
         let bypass = QueryOptions {
-            write: sparkles::guard::WriteOptions {
+            write: sparkles_core::guard::WriteOptions {
                 bypass_validation: true,
                 ..Default::default()
             },
@@ -806,7 +808,7 @@ fn bypassed_writes_are_flagged_in_the_commit_log() {
         assert!(c.commit.unvalidated);
         assert_eq!(
             c.validation.unwrap().status,
-            sparkles::guard::GuardStatus::Bypassed
+            sparkles_core::guard::GuardStatus::Bypassed
         );
     }
     let flags = catalog(&root);

@@ -108,20 +108,20 @@ impl GqlError {
     }
 
     /// The error of an engine failure that fails a whole request.
-    pub fn from_engine(e: sparkles::Error) -> GqlError {
+    pub fn from_engine(e: sparkles_core::Error) -> GqlError {
         match e {
-            sparkles::Error::BudgetExceeded(b) => {
+            sparkles_core::Error::BudgetExceeded(b) => {
                 GqlError::new(Code::BudgetExceeded, b.to_string())
                     .with("budget", serde_json::to_value(b.kind).unwrap_or_default())
                     .with("limit", b.limit)
                     .with("requested", b.requested)
             }
-            sparkles::Error::Timeout => GqlError::new(Code::Timeout, "the request timed out"),
-            sparkles::Error::Cancelled => {
+            sparkles_core::Error::Timeout => GqlError::new(Code::Timeout, "the request timed out"),
+            sparkles_core::Error::Cancelled => {
                 GqlError::new(Code::Cancelled, "the request was cancelled")
             }
             // a value the engine refuses, such as a regex pattern
-            sparkles::Error::Invalid(m) => GqlError::new(Code::BadUserInput, m),
+            sparkles_core::Error::Invalid(m) => GqlError::new(Code::BadUserInput, m),
             e => GqlError::new(Code::Internal, e.to_string()),
         }
     }

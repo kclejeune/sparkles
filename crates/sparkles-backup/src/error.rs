@@ -346,9 +346,9 @@ impl From<object_store::Error> for BackupError {
     }
 }
 
-impl From<sparkles::Error> for BackupError {
-    fn from(e: sparkles::Error) -> BackupError {
-        use sparkles::Error as E;
+impl From<sparkles_core::Error> for BackupError {
+    fn from(e: sparkles_core::Error) -> BackupError {
+        use sparkles_core::Error as E;
         let code = match &e {
             E::Cancelled => Code::Cancelled,
             E::Unsupported(_) => Code::BackupUnsupported,

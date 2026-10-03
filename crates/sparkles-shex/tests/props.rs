@@ -4,8 +4,8 @@
 
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use proptest::prelude::*;
-use sparkles::id::Id;
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::id::Id;
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_shex::ast::{
     Exclusion, NodeConstraint, NodeKind, NumericLiteral, ObjectLiteral, ObjectValue, Stem,
     ValueSetValue,
@@ -183,9 +183,9 @@ fn store_with(terms: &[Term]) -> (Store, Vec<Id>) {
             nt.push_str(&format!("{} {} {} .\n", q.subject, q.predicate, q.object));
         }
         store
-            .load(&[sparkles::io::Source::from_bytes(
+            .load(&[sparkles_core::io::Source::from_bytes(
                 nt.into_bytes(),
-                sparkles::io::RdfFormat::NTriples,
+                sparkles_core::io::RdfFormat::NTriples,
                 None,
             )])
             .unwrap();

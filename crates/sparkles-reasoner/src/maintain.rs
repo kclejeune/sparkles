@@ -18,10 +18,10 @@ use crate::terms::Terms;
 use oxrdf::{GraphName, NamedNode, Term};
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
-use sparkles::history::At;
-use sparkles::id::Id;
-use sparkles::index::Perm;
-use sparkles::store::{Chunk, DiffOp, DiffOptions, Snapshot, Store};
+use sparkles_core::history::At;
+use sparkles_core::id::Id;
+use sparkles_core::index::Perm;
+use sparkles_core::store::{Chunk, DiffOp, DiffOptions, Snapshot, Store};
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -231,7 +231,7 @@ pub(crate) fn previous(
     let generalized: FxHashSet<Triple> = keys
         .iter()
         .map(|k| {
-            let id = |b: &[u8]| terms.id_for(&sparkles::id::key_to_term(b));
+            let id = |b: &[u8]| terms.id_for(&sparkles_core::id::key_to_term(b));
             [id(&k[0]), id(&k[1]), id(&k[2])]
         })
         .collect();
@@ -363,7 +363,9 @@ impl RawChanges {
                             .push((g, op == DiffOp::Add));
                     }
                     for (t, changed) in by_triple {
-                        let stored = t.iter().all(|&x| Id(x).tag() != sparkles::id::Tag::Local);
+                        let stored = t
+                            .iter()
+                            .all(|&x| Id(x).tag() != sparkles_core::id::Tag::Local);
                         let (mut before, mut after) = (false, false);
                         for &g in inputs {
                             let now =
@@ -517,7 +519,7 @@ fn delta_changes(
 pub(crate) fn keep(
     store: &Store,
     cache: Option<&Cache>,
-    receipt: &sparkles::commit::Receipt,
+    receipt: &sparkles_core::commit::Receipt,
     before: &Arc<Snapshot>,
     digest: u64,
     inputs: &[GraphRef],
@@ -740,7 +742,7 @@ fn write_atomic(root: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
 /// appended to the log.
 pub(crate) fn save(
     store: &Store,
-    receipt: &sparkles::commit::Receipt,
+    receipt: &sparkles_core::commit::Receipt,
     digest: u64,
     inputs: &[GraphRef],
     terms: &Terms,

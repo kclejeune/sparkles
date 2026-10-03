@@ -1,9 +1,9 @@
 //! Load an N-Triples file, materialize a profile, then run a query over default ∪
 //! inferred and print estimated vs actual rows per operator (planner diagnostics).
 //! `cargo run --release -p sparkles-reasoner --example explain_inferred -- data.nt owl-rl QUERY`
-use sparkles::io::Source;
-use sparkles::sparql::{PlanInfo, QueryOptions, query};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::Source;
+use sparkles_core::sparql::{PlanInfo, QueryOptions, query};
+use sparkles_core::store::{Store, StoreOptions};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();

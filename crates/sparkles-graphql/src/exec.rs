@@ -17,8 +17,8 @@ use apollo_compiler::response::JsonMap;
 use apollo_compiler::validation::Valid;
 use oxrdf::Term;
 use serde_json::{Map, Value as J, json};
-use sparkles::sparql::QueryOptions;
-use sparkles::store::Snapshot;
+use sparkles_core::sparql::QueryOptions;
+use sparkles_core::store::Snapshot;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,7 +70,7 @@ fn node_ids(d: &Data) -> Vec<Term> {
         .collect()
 }
 
-fn engine(e: sparkles::Error) -> GqlError {
+fn engine(e: sparkles_core::Error) -> GqlError {
     GqlError::from_engine(e)
 }
 
@@ -85,7 +85,7 @@ impl Run<'_> {
         &self,
         built_q: &spargebra::Query,
         bindings: Vec<(String, Term)>,
-    ) -> Result<sparkles::sparql::QueryResult, GqlError> {
+    ) -> Result<sparkles_core::sparql::QueryResult, GqlError> {
         let mut o = self.opts.clone();
         if let Some(d) = self.deadline {
             let left = d.saturating_duration_since(Instant::now());
@@ -95,19 +95,19 @@ impl Run<'_> {
             o.timeout = Some(left);
         }
         o.initial_bindings = bindings;
-        sparkles::sparql::execute_query(self.snap.clone(), built_q, &o, 0.0).map_err(engine)
+        sparkles_core::sparql::execute_query(self.snap.clone(), built_q, &o, 0.0).map_err(engine)
     }
 }
 
-fn col(r: &sparkles::sparql::QueryResult, name: &str) -> Option<usize> {
+fn col(r: &sparkles_core::sparql::QueryResult, name: &str) -> Option<usize> {
     r.vars.iter().position(|v| v == name)
 }
 
-fn cell(r: &sparkles::sparql::QueryResult, c: Option<usize>, i: usize) -> Option<Term> {
+fn cell(r: &sparkles_core::sparql::QueryResult, c: Option<usize>, i: usize) -> Option<Term> {
     c.and_then(|c| r.term(r.table.cols[c][i]))
 }
 
-fn decode_nodes(r: &sparkles::sparql::QueryResult, b: &Built, parent: bool, d: &mut Data) {
+fn decode_nodes(r: &sparkles_core::sparql::QueryResult, b: &Built, parent: bool, d: &mut Data) {
     let pc = if parent { col(r, "p") } else { None };
     let nc = col(r, "n");
     let sc: Vec<Option<usize>> = b.singles.iter().map(|v| col(r, v.as_str())).collect();

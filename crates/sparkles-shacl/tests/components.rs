@@ -1,8 +1,8 @@
 //! Unit tests for every constraint component, targets, paths and report output.
 
 use oxrdf::Term;
-use sparkles::io::{RdfFormat, Source};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_shacl::{PropertyPath, Shapes, ValidateOptions, ValidationReport, validate};
 
 const PREFIXES: &str = "@prefix ex: <http://ex.org/> .
