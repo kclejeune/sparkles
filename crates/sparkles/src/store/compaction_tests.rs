@@ -368,6 +368,7 @@ fn a_crash_at_any_point_recovers() {
     for point in [
         "compact-started",
         "compact-built",
+        "compact-indexed",
         "compact-caught-up",
         "compact-before-current",
         "after",
@@ -875,4 +876,104 @@ fn full_text_search_sees_the_commits_carried_over() {
     drop(s);
     let s = Store::open(&root, StoreOptions::default()).unwrap();
     assert_eq!(hits(&s), 2);
+}
+
+/// A feature with a point geometry and a label: three quads.
+#[cfg(feature = "geo")]
+fn feature(i: usize) -> String {
+    let geo = "http://www.opengis.net/ont/geosparql#";
+    let (x, y) = (
+        (i % 3600) as f64 / 10.0 - 180.0,
+        (i / 3600 % 1800) as f64 / 10.0 - 90.0,
+    );
+    format!(
+        "<urn:f{i}> <{geo}hasGeometry> <urn:g{i}> .\n<urn:g{i}> <{geo}asWKT> \"POINT({x} {y})\"^^<{geo}wktLiteral> .\n<urn:f{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"feature {i}\" .\n"
+    )
+}
+
+#[cfg(feature = "geo")]
+fn insert_feature(s: &Store, i: usize) {
+    upd(
+        s,
+        &format!("INSERT DATA {{ {} }}", feature(i).replace(" .\n", " . ")),
+    );
+}
+
+/// How long the switch holds the writer lock with and without a spatial index, and with
+/// the index's base built under the lock (as before it was built with the generation)
+/// or beforehand. `SPARKLES_BENCH_GEOMS` sets the number of geometries (100,000). Run
+/// it in release mode: `cargo test --release -p sparkles --features geo --lib --
+/// --ignored --nocapture compaction_lock_with_a_spatial_index`.
+#[cfg(feature = "geo")]
+#[test]
+#[ignore]
+fn compaction_lock_with_a_spatial_index() {
+    let n: usize = std::env::var("SPARKLES_BENCH_GEOMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let mut data = String::new();
+    for i in 0..n {
+        data.push_str(&feature(i));
+    }
+    println!("{n} geometries, {} quads", n * 3);
+    println!(
+        "{:<28} {:>9} {:>9} {:>9} {:>8}",
+        "case", "lock ms", "build ms", "total ms", "carried"
+    );
+    for (label, with_geo, at_switch) in [
+        ("no spatial index", false, false),
+        ("spatial base at the switch", true, true),
+        ("spatial base with the build", true, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+        s.load(&[Source::from_bytes(
+            data.clone().into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        s.compact().unwrap();
+        if with_geo {
+            let st = s.enable_geo(crate::geo::GeoConfig::default()).unwrap();
+            assert_eq!(st.state, "ready", "{st:?}");
+        }
+        let mut next = n;
+        let mut locks = Vec::new();
+        for round in 0..3 {
+            for _ in 0..500 {
+                insert_feature(&s, next);
+                next += 1;
+            }
+            let start = next;
+            next += 100;
+            s.set_failpoint(
+                "compact-built",
+                Some(Arc::new(move |st: &Store| {
+                    for i in start..start + 100 {
+                        insert_feature(st, i);
+                    }
+                })),
+            );
+            let r = s
+                .compact_with(&CompactOptions {
+                    geo_at_switch: at_switch,
+                    ..Default::default()
+                })
+                .unwrap();
+            s.set_failpoint("compact-built", None);
+            assert!(r.abandoned.is_none());
+            if with_geo {
+                assert_eq!(s.geo_status().unwrap().state, "ready");
+            }
+            println!(
+                "{:<28} {:>9.1} {:>9.0} {:>9.0} {:>8}   (round {round})",
+                label, r.lock_ms, r.build_ms, r.total_ms, r.caught_up_commits
+            );
+            locks.push(r.lock_ms);
+        }
+        locks.sort_by(f64::total_cmp);
+        println!("{label:<28} median lock {:.1} ms", locks[1]);
+    }
 }

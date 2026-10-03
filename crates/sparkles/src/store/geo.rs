@@ -10,8 +10,13 @@
 //! * **Commits** add their inserted rows to the tail (`maintain_geo`). A failure there
 //!   never fails the write: the index turns `failed` and queries run without it until a
 //!   rebuild (or a compaction) builds it again.
-//! * **Bulk commits and compactions** build the new generation's base under the writer
-//!   lock before it is published, keeping the epoch. Literals the previous generation's
+//! * **Compactions** build the new generation's base while they build the generation,
+//!   without the writer lock, from the new generation alone. The switch then adds only
+//!   the overlay of the commits carried over, so the lock is held for milliseconds
+//!   whatever the number of geometries. A compaction that finds the index reconfigured,
+//!   rebuilt or disabled meanwhile builds the base under the lock, as a bulk commit does.
+//! * **Bulk commits** build the new generation's base under the writer lock before it is
+//!   published, keeping the epoch. In both cases, literals the previous generation's
 //!   column holds are taken from it (by their key), so only new literals are parsed.
 //! * **Files.** A persistent store writes each base it builds to `gen-NNNN/geo/` and
 //!   reads it back from there (in place, decoding geometries on demand), so opening the
@@ -39,6 +44,19 @@ use crate::geo::persist::{self, Identity, Problem};
 use std::path::PathBuf;
 #[cfg(feature = "geo")]
 use std::sync::atomic::Ordering;
+
+/// A spatial index base that a compaction built for its new generation before the
+/// switch ([`Store::prebuild_geo`]).
+#[cfg(feature = "geo")]
+pub(super) struct GeoPrebuilt {
+    idx: Arc<GeoIndex>,
+    epoch: u64,
+    lookup: Arc<Lookup>,
+    built: std::thread::Result<Result<GeoBase>>,
+}
+
+#[cfg(not(feature = "geo"))]
+pub(super) struct GeoPrebuilt;
 
 /// The failpoint name that marks background builds as paused (see
 /// [`Store::pause_geo_build`]).
@@ -319,6 +337,114 @@ impl Store {
         }
         #[cfg(not(feature = "geo"))]
         let _ = new;
+    }
+
+    /// During a compaction, before the switch and without the writer lock: build the
+    /// spatial index base of the new generation from `new`, a snapshot of that
+    /// generation with an empty delta at the generation's base commit (the base depends
+    /// on the generation alone).
+    /// Literals that `prev`'s column holds are taken from it. `None` without a spatial
+    /// index, or when the index was reconfigured, rebuilt or disabled meanwhile.
+    pub(super) fn prebuild_geo(
+        &self,
+        new: &Snapshot,
+        prev: &Snapshot,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Option<GeoPrebuilt> {
+        #[cfg(feature = "geo")]
+        {
+            let idx = self.geo.load_full()?;
+            let epoch = idx.epoch();
+            let superseded =
+                || cancel() || idx.retired.load(Ordering::SeqCst) || idx.epoch() != epoch;
+            let lookup = Arc::new(Lookup::new(new, &idx.config));
+            // the index's own progress belongs to the build that the status reports
+            let progress = std::sync::atomic::AtomicU32::new(0);
+            let ctl = BuildCtl {
+                budget: idx.budget,
+                progress: &progress,
+                cancel: &superseded,
+            };
+            let prev_base = prev
+                .geo
+                .as_ref()
+                .filter(|v| v.config.index_hash() == idx.config.index_hash())
+                .and_then(|v| v.usable().cloned());
+            let reuse = prev_base.as_ref().map(|b| Reuse {
+                snap: prev,
+                column: &b.column,
+            });
+            // `commit.json`, which gives the files' base commit, is written at the switch
+            let files = self.geo_files(new, &idx.config).map(|(d, mut id)| {
+                id.base_seq = new.commit;
+                (d, id)
+            });
+            let reading = new.without_cache_fill();
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                base_for(
+                    &reading,
+                    &idx.config,
+                    &lookup,
+                    &ctl,
+                    files.as_ref(),
+                    false,
+                    self.opts.geo_files,
+                    reuse.as_ref(),
+                )
+            }));
+            if superseded() || matches!(built, Ok(Err(crate::error::Error::Cancelled))) {
+                return None;
+            }
+            Some(GeoPrebuilt {
+                idx,
+                epoch,
+                lookup,
+                built,
+            })
+        }
+        #[cfg(not(feature = "geo"))]
+        {
+            let _ = (new, prev, cancel);
+            None
+        }
+    }
+
+    /// At a compaction's switch, under the writer lock and before `new` is published:
+    /// give `new` the spatial index base built before the switch, with an overlay of
+    /// the commits carried over, or build the base now when there is none or it was
+    /// superseded.
+    pub(super) fn switch_geo_locked(
+        &self,
+        new: &mut Snapshot,
+        prev: &Snapshot,
+        pre: Option<GeoPrebuilt>,
+    ) {
+        #[cfg(feature = "geo")]
+        if let Some(p) = pre {
+            let current = self.geo.load_full().filter(|idx| {
+                Arc::ptr_eq(idx, &p.idx)
+                    && !idx.retired.load(Ordering::SeqCst)
+                    && idx.epoch() == p.epoch
+            });
+            if let Some(idx) = current {
+                prev.generation.geo.retire();
+                let (view, message, last) = finish_view(&idx, p.epoch, new, p.lookup, p.built);
+                new.geo = Some(Arc::new(view));
+                idx.finish(p.epoch, message, last);
+                return;
+            }
+            // superseded: the files it wrote for the new generation go with it
+            if let Some(root) = &self.root
+                && let Some(gdir) = new.generation.dir.as_ref().filter(|d| d.starts_with(root))
+            {
+                new.generation
+                    .geo
+                    .with_files(|| persist::remove(&persist::dir_of(gdir)));
+            }
+        }
+        #[cfg(not(feature = "geo"))]
+        let _ = pre;
+        self.rebuild_geo_locked(new, prev);
     }
 
     /// The view of a past state (`?at=`): the configuration, never ready.

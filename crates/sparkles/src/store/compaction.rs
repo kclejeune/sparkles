@@ -460,6 +460,10 @@ pub struct CompactOptions {
     /// stops the build ([`Error::Cancelled`]) when set
     pub cancel: Option<Arc<AtomicBool>>,
     pub progress: Option<crate::builder::ProgressFn>,
+    /// build the spatial index base under the writer lock at the switch, as before it
+    /// was built with the generation (for measurements)
+    #[doc(hidden)]
+    pub geo_at_switch: bool,
 }
 
 /// What a compaction did.
@@ -866,13 +870,37 @@ impl Store {
         }
         self.failpoint("compact-started");
         let tb = Instant::now();
-        let meta = self.build_compacted(&snap0, &dir, next_bnode, o)?;
-        let build = tb.elapsed();
+        let pool = build_pool(o, self.opts.build.threads)?;
+        let meta = match &pool {
+            Some(p) => p.install(|| self.build_compacted(&snap0, &dir, next_bnode, o)),
+            None => self.build_compacted(&snap0, &dir, next_bnode, o),
+        }?;
+        let mut build = tb.elapsed();
         self.failpoint("compact-built");
         let persistent = self.root.is_some();
         let mut gen_ = Generation::open(&dir, &name, persistent)?;
         gen_._tmp = tmp;
         let gen_ = Arc::new(gen_);
+        // the spatial index base of the new generation, built now rather than at the
+        // switch: it depends on the generation alone, and the switch adds the overlay of
+        // the commits carried over
+        let geo = if o.geo_at_switch {
+            None
+        } else {
+            let tg = Instant::now();
+            let base_only = self.base_snapshot(&gen_, base.seq);
+            let stop = || cancelled();
+            let pre = match &pool {
+                Some(p) => p.install(|| self.prebuild_geo(&base_only, &snap0, &stop)),
+                None => self.prebuild_geo(&base_only, &snap0, &stop),
+            };
+            build += tg.elapsed();
+            pre
+        };
+        self.failpoint("compact-indexed");
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
         let mut cu = CatchUp {
             gen_: gen_.clone(),
             cache: self.cache.clone(),
@@ -1003,7 +1031,7 @@ impl Store {
             mask: None,
             change_log: self.changelog.clone(),
         };
-        self.rebuild_geo_locked(&mut new_snap, &view);
+        self.switch_geo_locked(&mut new_snap, &view, geo);
         let quads = new_snap.len();
         self.current.store(Arc::new(new_snap));
         self.commits.send_replace(view.commit);
@@ -1067,32 +1095,38 @@ impl Store {
             bopts.threads = t.max(1);
         }
         let interrupt = self.compaction_interrupt(o, dir);
-        let build = || -> Result<IndexMeta> {
-            let mut builder = Builder::new(dir, bopts.clone())?.with_interrupt(interrupt.clone());
-            if let Some(p) = &o.progress {
-                builder = builder.with_progress(p.clone());
-            }
-            write_snapshot(&builder, snap, None, |_| Ok(true), &[])?;
-            builder.add_prefixes(self.prefixes());
-            let meta = builder.finish()?;
-            interrupt()?;
-            Ok(meta)
-        };
-        if o.threads.is_none() && !o.low_priority {
-            return build();
+        let mut builder = Builder::new(dir, bopts)?.with_interrupt(interrupt.clone());
+        if let Some(p) = &o.progress {
+            builder = builder.with_progress(p.clone());
         }
-        let low = o.low_priority;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(bopts.threads)
-            .thread_name(|i| format!("compact-{i}"))
-            .start_handler(move |_| {
-                if low {
-                    lower_priority();
-                }
-            })
-            .build()
-            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-        pool.install(build)
+        write_snapshot(&builder, snap, None, |_| Ok(true), &[])?;
+        builder.add_prefixes(self.prefixes());
+        let meta = builder.finish()?;
+        interrupt()?;
+        Ok(meta)
+    }
+
+    /// A snapshot of `gen_` alone, with an empty delta, at commit `seq` (what a
+    /// compaction's new generation holds before the commits carried over).
+    fn base_snapshot(&self, gen_: &Arc<Generation>, seq: u64) -> Snapshot {
+        Snapshot {
+            generation: gen_.clone(),
+            delta: Delta::default(),
+            version: 0,
+            cache: self.cache.clone(),
+            results: self.results.clone(),
+            dvocab_len: gen_.dvocab.len(),
+            commit: seq,
+            text: None,
+            geo: None,
+            union_default_graph: self.opts.union_default_graph,
+            geo_op_vertices: self.opts.geo_op_vertices,
+            delta_stats: Default::default(),
+            counts: Default::default(),
+            historical: false,
+            mask: None,
+            change_log: None,
+        }
     }
 
     /// What stops or paces a compaction's build: its cancel flag, the free-space reserve,
@@ -1124,6 +1158,26 @@ impl Store {
             Ok(())
         })
     }
+}
+
+/// The thread pool a compaction builds in: its own when `o` limits the threads or
+/// lowers their priority (`None`: the global pool). `threads` is the default count.
+fn build_pool(o: &CompactOptions, threads: usize) -> Result<Option<rayon::ThreadPool>> {
+    if o.threads.is_none() && !o.low_priority {
+        return Ok(None);
+    }
+    let low = o.low_priority;
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(o.threads.unwrap_or(threads).max(1))
+        .thread_name(|i| format!("compact-{i}"))
+        .start_handler(move |_| {
+            if low {
+                lower_priority();
+            }
+        })
+        .build()
+        .map(Some)
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))
 }
 
 /// Remove the unfinished builds of compactions that a crash interrupted: directories
