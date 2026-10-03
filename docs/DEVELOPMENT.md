@@ -68,7 +68,7 @@ mise run openapi      # rewrite docs/openapi.json after an API change (a test fa
 mise run docs:screenshots # the README's screenshots (docs/images) from the demo dataset in docs/demo
 mise run docker:build # the Docker image of compose.yaml (not in ci)
 mise run gen-data 1000000 target/bench-data/10m.nt
-mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
+mise run bench        # Sparkles vs Fuseki, QLever, Fluree and Oxigraph; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:text   # full-text search: Sparkles vs Fuseki with jena-text vs QLever
 mise run bench:watdiv # the same engines on WatDiv's 20 query templates, 11M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
@@ -96,7 +96,7 @@ runs every hook over the whole tree.
 mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, Python binding tests, license notices
 mise run lint:features # clippy over feature combinations (in ci)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
-mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
+mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites, SHACL 1.2 list tests, SHACLC pairs
 mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, ShExR, validation
 mise run ui:e2e        # Playwright end-to-end tests against a real server
 mise run test:jena-clients  # Apache Jena's own HTTP clients against a real server
@@ -108,8 +108,9 @@ at `SPARKLES_W3C_DIR`. The SHACL suites come from the same checkout, or from
 `SPARKLES_SHACL_TESTS`. Without the checkout, the suites are skipped.
 
 All of these suites pass: 482/482, 328/328, 157/157 and 269/269 for SPARQL, and 98/98
-and 20/20 for SHACL. `crates/sparkles/tests/w3c-known-failures.txt` lists known failures
-and is empty.
+and 20/20 for SHACL. The eight SHACL 1.2 list tests pass, and all 32 test pairs of the
+SHACLC suite read to the expected graph and write back to it.
+`crates/sparkles/tests/w3c-known-failures.txt` lists known failures and is empty.
 
 `mise run test:jena-clients` (`scripts/test-jena-clients.sh`) builds a debug server, starts
 it on a temporary data directory on port 5230 with `--gsp-direct-naming`, and runs
@@ -128,12 +129,16 @@ another port. The task is not part of `mise run ci`.
 The shexTest suite comes from the same Jena checkout (`jena-shex`). Set
 `SPARKLES_SHEX_TESTS` to use an upstream shexTest checkout instead.
 `crates/sparkles-shex/tests/known-failures.txt` lists the tests that fail, with reasons.
+Sparkles passes all 425 syntax, 99 negative-syntax, 14 negative-structure and 418
+representation tests, and reads and writes all 418 ShExR schemas. Of the validation
+tests, 1,062 pass and one is a known failure. The 42 tests that check blank-node labels
+are skipped, because the store does not keep them.
 
 `mise run lint:features` (`scripts/lint-features.sh`) runs clippy, with warnings as
 errors, over the builds that `mise run lint` does not cover:
 
-* the server with no optional feature, with each default feature on its own, and with
-  `mcp,shacl` and `mcp,shex`;
+* the server with no optional feature, with each default feature but `mimalloc` on its
+  own, with `geo-epsg`, and with `mcp,shacl`, `mcp,shex`, `mcp,fmt` and `graphql,shacl`;
 * `sparkles` and `sparkles-fmt` with their features off;
 * `sparkles-client` without its blocking facade;
 * the `sparkles-backup` library without a backend.
@@ -245,8 +250,8 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
   and the answers stay comparable. The commit rate and latency go to `churn.json`. The
   queries, the answer check and the memory readings then run on the changed stores, and
   all results go to `results-updates/`. The harness never compacts the Sparkles copy,
-  and Sparkles does not compact on its own, so its queries read the base index merged
-  with the delta of the commits.
+  and 5,000 single-triple commits stay below the 10,000-quad minimum of automatic
+  compaction, so its queries read the base index merged with the delta of the commits.
 
   The `mixed` mode runs each engine alone on a fresh copy of its store. For 30 seconds
   (`--mixed-seconds`), 16 clients run `star-join` through `oha` while one writer commits
@@ -280,12 +285,14 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
   The script loads each store without timing it, then times each text index build and
   records the index size on disk. Sparkles and Jena index `foaf:name`, `ex:title` and
   `rdfs:label`. QLever indexes every literal, since its text index cannot be limited to
-  predicates, so its queries join the matching literal with the predicate. There are six
+  predicates, so its queries join the matching literal with the predicate. There are seven
   queries. Two take the top 10 by score, one for a rare word and one for a common word.
   The third counts all hits of the common word, the fourth joins them with a structural
   pattern, and the fifth asks for two words that must both occur. The sixth returns the
   hits of the common word with highlighted literals, which QLever cannot produce, so its
-  form returns plain literals and only the counts are compared. Before timing, the script
+  form returns plain literals and only the counts are compared. The seventh is a stemmed
+  search in English titles, which QLever runs for the indexed word, since it does not stem.
+  Before timing, the script
   compares every engine's hit counts and hit sets with `scripts/bench-answers.py`. Scores and their order are never compared,
   because the engines rank differently. QLever builds its index with explicit scoring,
   because its BM25 and TF-IDF scoring fail on language-tagged literals in version 0.5.48.
