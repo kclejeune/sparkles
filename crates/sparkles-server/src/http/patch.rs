@@ -114,7 +114,7 @@ pub(super) async fn apply(
     let view = p.view(&name, Endpoint::Patch);
     let restricted = view.is_some();
     let wanted = receipt_wanted(&params, &headers);
-    let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+    let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers, Some(&p))?;
     wopts.opts.graphs = view;
     let dry = wopts
         .opts

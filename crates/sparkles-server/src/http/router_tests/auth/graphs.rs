@@ -993,3 +993,40 @@ async fn the_service_description_follows_the_grants() {
     .await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn history_follows_the_graph_grants() {
+    let s = server();
+    let r = update_as(
+        &s.app,
+        "graphs",
+        &b("gfull"),
+        "DELETE DATA { GRAPH <http://ex/b/1> { <http://ex/b1> <http://ex/p> \"secret fox\" } } ; \
+         INSERT DATA { GRAPH <http://ex/a/1> { <http://ex/a1> <http://ex/p> \"alpha cat\" } }",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // SPARQL: the changes of the graphs the caller reads
+    let q = "PREFIX hist: <urn:x-sparkles:history#> \
+             SELECT ?o { SERVICE hist:changes { << ?s <http://ex/p> ?o >> hist:from 2 } }";
+    assert_eq!(
+        column(&s.app, "gfull", q).await.unwrap(),
+        ["alpha cat", "secret fox"]
+    );
+    assert_eq!(column(&s.app, "gra", q).await.unwrap(), ["alpha cat"]);
+    // HTTP: the same view, and the author the server recorded
+    let r = get_as(&s.app, "/graphs/history?from=2", Some(&b("gfull"))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let changes = j["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 2);
+    assert!(changes.iter().all(|c| c["author"] == "user:gfull"), "{j}");
+    let r = get_as(&s.app, "/graphs/history?from=2", Some(&b("gra"))).await;
+    let j = r.json();
+    let changes = j["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{j}");
+    assert_eq!(changes[0]["graph"], "<http://ex/a/1>");
+    // the history endpoint needs the diff grant, which gep's endpoints leave out
+    let r = get_as(&s.app, "/graphs/history", Some(&b("gep"))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+}

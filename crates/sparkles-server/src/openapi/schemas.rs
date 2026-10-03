@@ -621,6 +621,13 @@ pub(super) fn schemas() -> Map<String, J> {
         ),
     );
     put(
+        "HistoryChanges",
+        open(
+            "`{dataset, datasetId, head, from, to, truncated, changes: [{op, subject, predicate, object, graph, commit, timestamp, kind, author?, message?}], unrecorded: [{from, to, reason}]}`",
+            "history-queries",
+        ),
+    );
+    put(
         "NamedSnapshot",
         open(
             "A named snapshot: the commit it pins and its expiry.",

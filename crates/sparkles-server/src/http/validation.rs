@@ -49,6 +49,8 @@ pub(super) fn write_options(
         cancel: None,
         report_limit,
         message: super::conditional::commit_message(headers)?,
+        // the handler names the caller (see `super::author`)
+        author: None,
         precondition: None,
         no_wait: false,
         graphs: None,

@@ -175,6 +175,7 @@ fn history_json(name: &str, ds: &Dataset, h: &sparkles::history::HistoryStatus) 
             "firstRetained": h.first_commit,
         },
         "snapshots": h.snapshots,
+        "changeLog": ds.store.change_log_status().map(|s| change_log_json(&s)),
         "cache": {
             "entries": h.cache_entries,
             "bytes": h.cache_bytes,
@@ -183,6 +184,70 @@ fn history_json(name: &str, ds: &Dataset, h: &sparkles::history::HistoryStatus) 
             "materializations": h.materializations,
         },
     })
+}
+
+/// The change log's state and settings.
+pub(super) fn change_log_json(s: &sparkles::store::ChangeLogStatus) -> J {
+    json!({
+        "enabled": s.enabled,
+        "first": s.first,
+        "last": s.last,
+        "segments": s.segments,
+        "bytes": s.bytes,
+        "pending": s.pending,
+        "maxBytes": s.max_bytes,
+        "settings": {
+            "enabled": s.settings.enabled,
+            "keepCommits": s.settings.keep_commits,
+            "keepAge": s.settings.keep_age_ms.map(|ms| format!("{}s", ms / 1000)),
+            "maxBytes": s.settings.max_bytes,
+        },
+        "error": s.error,
+    })
+}
+
+/// The `changeLog` member of a `PUT /$/history/{ds}` body: every field it leaves out
+/// takes the server's default.
+fn change_log_param(v: &J) -> ApiResult<sparkles::store::ChangeLogSettings> {
+    let bad = |m: &str| err(StatusCode::BAD_REQUEST, format!("changeLog.{m}"));
+    let J::Object(o) = v else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "changeLog must be an object or null",
+        ));
+    };
+    let mut s = sparkles::store::ChangeLogSettings::default();
+    for (k, v) in o {
+        if v.is_null() {
+            continue;
+        }
+        match k.as_str() {
+            "enabled" => {
+                s.enabled = Some(
+                    v.as_bool()
+                        .ok_or_else(|| bad("enabled must be true or false"))?,
+                )
+            }
+            "keepCommits" => {
+                s.keep_commits = Some(
+                    v.as_u64()
+                        .ok_or_else(|| bad("keepCommits must be a number"))?,
+                )
+            }
+            "keepAge" => {
+                s.keep_age_ms = Some(parse_age(v).ok_or_else(|| {
+                    bad("keepAge must be seconds or a duration like 90s, 30m, 12h, 7d, 2w")
+                })?)
+            }
+            "maxBytes" => {
+                s.max_bytes = Some(parse_size(v).ok_or_else(|| {
+                    bad("maxBytes must be a number of bytes or a size like 512MiB, 10GiB")
+                })?)
+            }
+            other => return Err(bad(&format!("{other} is not a setting"))),
+        }
+    }
+    Ok(s)
 }
 
 fn retention_json(r: Retention) -> J {
@@ -482,7 +547,16 @@ pub(super) async fn put_history(
             ));
         }
     };
+    // `changeLog` replaces the change log settings when present
+    let change_log = match j.get("changeLog") {
+        None => None,
+        Some(J::Null) => Some(sparkles::store::ChangeLogSettings::default()),
+        Some(v) => Some(change_log_param(v)?),
+    };
     blocking(move || {
+        if let Some(c) = change_log {
+            ds.store.set_change_log_settings(c)?;
+        }
         if let Some(s) = schedules {
             ds.store.set_schedules(s)?;
         }

@@ -455,6 +455,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             counters = Some(c);
             t
         }
+        Kind::HistoryChanges(spec) => super::history_svc::run(ctx, spec, &n.vars)?,
         Kind::HybridSearch(spec) => {
             let (t, c) = super::hybrid::search(ctx, spec, &n.vars)?;
             counters = Some(c);

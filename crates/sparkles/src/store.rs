@@ -11,6 +11,7 @@
 //!   `CURRENT` (TDB2 `Data-NNNN` compaction).
 
 mod backup;
+mod changelog;
 mod changes;
 mod clone;
 mod compaction;
@@ -20,6 +21,7 @@ mod describe;
 mod diff;
 mod embed;
 mod geo;
+mod history_query;
 mod mem_history;
 mod patch_apply;
 mod preview;
@@ -32,6 +34,10 @@ pub use backup::{
     BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard, MEMORY_CAPTURE_PREFIX,
     MemoryCaptureOptions,
 };
+pub use changelog::{
+    CHANGE_LOG_FILE, CHANGES_DIR, ChangeCommit, ChangeLog, ChangeLogSettings, ChangeLogStatus,
+    Unrecorded, UnrecordedReason,
+};
 pub use changes::{ChangePage, ChangesOptions, CommitChanges};
 pub use clone::{CloneMethod, CloneMode, CloneOptions, CloneReport};
 pub use compaction::{
@@ -40,6 +46,7 @@ pub use compaction::{
 };
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
+pub use history_query::{HistoryBound, HistoryChange, HistoryQuery, HistoryResult};
 pub use patch_apply::{PatchOptions, PatchOutcome, parse_commit_iri};
 pub use quota::{QUOTA_FILE, QuotaSource, QuotaStatus};
 
@@ -234,6 +241,8 @@ pub struct Snapshot {
     /// the quads a triple-level access view hides, when this snapshot is such a view's
     /// (they are in the delta as deletions; see [`crate::access::triples`])
     pub mask: Option<Arc<crate::access::Mask>>,
+    /// the store's change log, which history queries read (see [`ChangeLog`])
+    pub change_log: Option<Arc<ChangeLog>>,
 }
 
 /// The kind of term an id stands for (see [`Snapshot::term_kind`]).
@@ -868,7 +877,23 @@ pub struct StoreOptions {
     /// its last commit ends: replay, readers and backups stop at the first zero
     /// record, and an open truncates the zero tail.
     pub wal_prealloc_bytes: u64,
+    /// Record each commit's net changes in the change log ([`ChangeLog`]), which history
+    /// queries read and which outlives compactions. A dataset's `changelog.json` can
+    /// turn it off or on.
+    pub change_log: bool,
+    /// The most the change log may hold, in bytes on disk (0: unlimited); whole segments
+    /// are dropped from the oldest. In-memory stores keep at most 64 MiB.
+    pub change_log_max_bytes: u64,
+    /// The size at which a change log segment is sealed and a new one started.
+    pub change_log_segment_bytes: u64,
+    /// A bulk commit's changes are recorded when the dataset was empty and the new state
+    /// holds at most this many quads, or when both states together hold at most this
+    /// many; a larger one is recorded with its counts only.
+    pub change_log_bulk_max_quads: u64,
 }
+
+/// Default of [`StoreOptions::change_log_max_bytes`]: 1 GiB.
+pub const DEFAULT_CHANGE_LOG_MAX_BYTES: u64 = 1 << 30;
 
 /// Default of [`StoreOptions::wal_prealloc_bytes`].
 pub const DEFAULT_WAL_PREALLOC_BYTES: u64 = 4 << 20;
@@ -905,6 +930,10 @@ impl Default for StoreOptions {
             vector_files: true,
             commit_digests: false,
             wal_prealloc_bytes: DEFAULT_WAL_PREALLOC_BYTES,
+            change_log: true,
+            change_log_max_bytes: DEFAULT_CHANGE_LOG_MAX_BYTES,
+            change_log_segment_bytes: 16 << 20,
+            change_log_bulk_max_quads: 1_000_000,
         }
     }
 }
@@ -1016,6 +1045,8 @@ pub struct Store {
     history: Option<Arc<Mutex<crate::history::HistoryState>>>,
     /// pins and the retention window of an in-memory store, as kept snapshots
     mem_history: Option<Mutex<crate::history::MemHistory>>,
+    /// the net changes of every commit, kept across generations
+    changelog: Option<Arc<ChangeLog>>,
     /// write guard checked before every commit (write-time validation)
     guard: parking_lot::RwLock<Option<Arc<dyn crate::guard::CommitGuard>>>,
     /// told the outcome of every guard decision (metrics)
@@ -1116,6 +1147,11 @@ impl Store {
             opts.result_cache_min_ms,
         ));
         let dvocab_len = gen_.dvocab.len();
+        let mut limits = Store::log_limits(&opts);
+        if limits.default_max_bytes == 0 || limits.default_max_bytes > 64 << 20 {
+            limits.default_max_bytes = 64 << 20;
+        }
+        let changelog = Some(ChangeLog::memory(dataset_id, limits));
         let store = Store {
             root: None,
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
@@ -1134,6 +1170,7 @@ impl Store {
                 counts: Default::default(),
                 mask: None,
                 historical: false,
+                change_log: changelog.clone(),
             })),
             writer: Arc::new(Mutex::new(WriterState {
                 wal: None,
@@ -1160,6 +1197,7 @@ impl Store {
             embed: Default::default(),
             history: None,
             mem_history: Some(Mutex::new(Default::default())),
+            changelog,
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(false),
@@ -1353,6 +1391,11 @@ impl Store {
         let history = open_history(root, dataset_id, gen_no, head.seq, &catalog)?;
         let annotations =
             crate::annotations::Annotations::open(root, dataset_id, head.seq, opts.commit_digests)?;
+        let changelog = Some(changelog::ChangeLog::open(
+            root,
+            dataset_id,
+            Store::log_limits(&opts),
+        )?);
         let store = Store {
             root: Some(root.to_path_buf()),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
@@ -1371,6 +1414,7 @@ impl Store {
                 counts: Default::default(),
                 mask: None,
                 historical: false,
+                change_log: changelog.clone(),
             })),
             writer: Arc::new(Mutex::new(WriterState {
                 wal: Some(BufWriter::new(wal)),
@@ -1397,6 +1441,7 @@ impl Store {
             embed: Default::default(),
             history: Some(Arc::new(Mutex::new(history))),
             mem_history: None,
+            changelog,
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(guard_required_by(root)),
@@ -1416,6 +1461,10 @@ impl Store {
         };
         *store.compaction.settings.lock() = compaction::read_settings(root)?;
         store.collect_history(gen_no, head.seq);
+        if let Err(e) = store.recover_change_log() {
+            // history queries report the commits it could not record
+            tracing::warn!(error = %e, "could not recover the change log");
+        }
         store.open_text(&wal_text)?;
         store.open_geo();
         store.open_vectors();
@@ -1688,6 +1737,7 @@ impl Store {
             counts: Default::default(),
             mask: None,
             historical: true,
+            change_log: self.changelog.clone(),
         });
         h.cache.insert(
             0,
@@ -3154,6 +3204,8 @@ impl Store {
         check: Option<(crate::guard::Changes<'_>, &crate::guard::WriteOptions)>,
     ) -> Result<(u64, Receipt)> {
         let before = snap.len();
+        // the head state before a bulk commit, whose changes the change log records
+        let prior = self.snapshot();
         // a running compaction gives up: this rebuild makes a new generation itself
         w.tap = None;
         if bulk.is_some() {
@@ -3175,6 +3227,8 @@ impl Store {
             // the old generation's WAL is the only other copy of the recent commits' ids:
             // the catalog must be durable before it is discarded
             self.catalog.lock().sync()?;
+            // and so must the change log, which recovers its tail from that WAL
+            self.sync_change_log()?;
             // and so must the full-text index, which could otherwise only catch up from it
             #[cfg(feature = "text")]
             if let Some(ti) = self.text.load_full() {
@@ -3279,6 +3333,7 @@ impl Store {
                 counts: Default::default(),
                 mask: None,
                 historical: false,
+                change_log: self.changelog.clone(),
             })
         };
         // a bulk commit is validated on the built generation, before anything is published
@@ -3408,9 +3463,13 @@ impl Store {
             counts: Default::default(),
             mask: None,
             historical: false,
+            change_log: self.changelog.clone(),
         };
         if bulk.is_some() {
             self.rebuild_text_locked(&mut new_snap, snap.text.clone());
+            // the bulk commit's changes, while the state before it is at hand
+            let author = check.as_ref().and_then(|(_, o)| o.author.clone());
+            self.log_bulk_commit(&head, message.clone(), author, &prior, &new_snap);
         }
         // a new generation needs its own spatial base (bulk commits and compactions)
         self.rebuild_geo_locked(&mut new_snap, snap);
@@ -3921,6 +3980,7 @@ impl WriteTxn<'_> {
             counts: Default::default(),
             mask: None,
             historical: false,
+            change_log: self.base.change_log.clone(),
         }
     }
 
@@ -4334,6 +4394,20 @@ impl WriteTxn<'_> {
                 changes: self.log.clone(),
             });
         }
+        if let Some(log) = self.store.changelog.as_ref().filter(|l| l.is_enabled()) {
+            // the background writer turns the ids into keys
+            log.push(changelog::Pending {
+                commit: changelog::ChangeCommit::of(
+                    &c,
+                    self.opts.author.clone(),
+                    annotation.message.clone(),
+                ),
+                body: changelog::PendingBody::Log {
+                    generation: gen_.clone(),
+                    changes: self.log.clone(),
+                },
+            });
+        }
         self.guard.head = c;
         self.store.catalog.lock().append(c);
         self.store.forget_annotations();
@@ -4355,6 +4429,7 @@ impl WriteTxn<'_> {
             counts: Default::default(),
             mask: None,
             historical: false,
+            change_log: self.base.change_log.clone(),
         };
         self.store.maintain_text(&mut snap, &self.log);
         self.store.maintain_geo(&mut snap, &self.log);
@@ -4654,6 +4729,11 @@ impl Drop for Store {
             w.closed = true;
             w.trim_wal();
         }
+        if let Some(log) = &self.changelog
+            && let Err(e) = log.flush(true)
+        {
+            tracing::warn!(error = %e, "could not write the change log on close");
+        }
         self.embed.close();
     }
 }
@@ -4891,6 +4971,7 @@ pub(crate) fn replay_wal(
         counts: Default::default(),
         mask: None,
         historical: false,
+        change_log: None,
     };
     let mut quads = out.base_quads;
     let mut seen_v2 = false;

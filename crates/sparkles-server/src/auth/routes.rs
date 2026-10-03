@@ -149,6 +149,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/text", &["GET", "POST"]),
     ("/{ds}/diff", &["GET"]),
     ("/{ds}/changes", &["GET"]),
+    ("/{ds}/history", &["GET"]),
     ("/{ds}/shacl", &["POST"]),
     ("/{ds}/shex", &["POST"]),
     ("/{ds}/geo", &["GET"]),
@@ -257,6 +258,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/text"
         | "/{ds}/diff"
         | "/{ds}/changes"
+        | "/{ds}/history"
         | "/{ds}/get"
         | "/{ds}/shacl"
         | "/{ds}/shex"
@@ -379,7 +381,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/{ds}/patch" => Endpoint::Patch,
         "/{ds}/shacl" => Endpoint::Shacl,
         "/{ds}/shex" => Endpoint::Shex,
-        "/{ds}/diff" | "/{ds}/changes" => Endpoint::Diff,
+        "/{ds}/diff" | "/{ds}/changes" | "/{ds}/history" => Endpoint::Diff,
         "/{ds}" => {
             let ct = media_type(headers);
             if has_param(uri, "update") || ct == "application/sparql-update" {

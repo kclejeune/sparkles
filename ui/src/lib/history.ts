@@ -1,6 +1,6 @@
 // Point-in-time reads, named snapshots and diffs (docs/API.md, "Point-in-time reads and
 // snapshots").
-import type { AtInfo, Commit, DiffQuad } from './api';
+import type { AtInfo, Commit, DiffQuad, HistoryChange, HistoryChanges } from './api';
 import { fmtInt, fmtRelative } from './format';
 
 /** A snapshot name: a letter or digit, then letters, digits, `.`, `_` or `-`, 64 at most. */
@@ -61,6 +61,41 @@ export function readable(c: Pick<Commit, 'reconstructable'>): boolean {
 export function diffLine(q: DiffQuad): string {
   const g = q.graph ? ` ${q.graph}` : '';
   return `${q.op === '+' ? '+' : '−'} ${q.subject} ${q.predicate} ${q.object}${g} .`;
+}
+
+/** A recorded change as one N-Quads line with its sign. */
+export function historyLine(c: HistoryChange): string {
+  return diffLine({ ...c, op: c.op === 'add' ? '+' : '-' });
+}
+
+/** Who made a change's commit and why: "user:ann · fix names", or "". */
+export function historyBy(c: HistoryChange): string {
+  return [c.author, c.message].filter(Boolean).join(' · ');
+}
+
+/** The note on commits a history query could not see, or "". */
+export function unrecordedNote(h: Pick<HistoryChanges, 'unrecorded'>): string {
+  const parts = h.unrecorded.map((u) => {
+    const range =
+      u.from === u.to ? `commit ${fmtInt(u.from)}` : `commits ${fmtInt(u.from)}–${fmtInt(u.to)}`;
+    const why =
+      u.reason === 'before-log'
+        ? 'older than the change log'
+        : u.reason === 'bulk'
+          ? 'a bulk load too large to record'
+          : 'not recorded';
+    return `${range} (${why})`;
+  });
+  return parts.length ? `Not shown: ${parts.join(', ')}.` : '';
+}
+
+/**
+ * A term typed into a history search: N-Triples (`<iri>`, `_:b1`, `"text"`) as it is, a
+ * bare IRI as it is (the server reads it as one), or null for an empty field.
+ */
+export function historyTerm(input: string): string | null {
+  const s = input.trim();
+  return s ? s : null;
 }
 
 /** "+3 −1", or "no change". */

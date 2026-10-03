@@ -153,6 +153,7 @@ impl Tools<'_> {
             cancel: Some(self.call.cancel.clone()),
             report_limit: None,
             message: message.clone(),
+            author: crate::http::author(&self.call.principal),
             precondition: None,
             no_wait: false,
             graphs: opts.graphs.clone(),
