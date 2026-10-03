@@ -2044,7 +2044,8 @@ last 20 are kept.
 
 The request parameters of `/{ds}/sparql` apply in the query string: `at`, `timeout`,
 `reasoning`, `nocache` and the budget overrides. `explain=true` adds
-`extensions.sparkles.plan`, with each fetch group's path, SPARQL text, rows and time.
+`extensions.sparkles.plan`, with each fetch group's path, SPARQL text, rows and time, and
+`extensions.sparkles.timing`, with the time of parsing, planning, the groups and assembly.
 Every response has `extensions.sparkles.commit` and the `Sparkles-Commit` header. The
 response is `application/graphql-response+json` when the client accepts it, and
 `application/json` otherwise.
