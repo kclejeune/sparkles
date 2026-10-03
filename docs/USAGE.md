@@ -376,6 +376,10 @@ sparkles compact --loc db                     # merge updates into a new generat
 sparkles compact --loc db --if-due            # only when the compaction policy says so (for cron)
 sparkles dump    --loc db > dump.nq
 sparkles dump    --loc db --out dump.nq.zst   # compression from the extension, or --compress
+sparkles dump    --loc db --out dump.trig.gz  # syntax from the extension too, or --format
+sparkles dump    --loc db --format ttl --merge   # every graph as one Turtle graph
+sparkles dump    --loc db --format nt --graph http://ex.org/g   # one graph's triples
+sparkles dump    --server URL --dataset ds --out ds.rt   # a server's dataset, in RDF Thrift
 sparkles backup  --loc db --out backups/      # zstd; --compress gzip --level 9, --threads 8
 sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
 sparkles clone   --loc db --to part --graph default --graph 'http://ex.org/g/*'   # some graphs only
@@ -407,6 +411,19 @@ sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server
 sparkles compaction --loc db --set deltaRatio=0.02     # automatic compaction settings; --default removes them
 sparkles describe-settings --loc db --set mode=scbd   # how DESCRIBE describes a resource; --default removes it
 ```
+
+`sparkles dump` writes N-Quads by default. `--format`, or the extension of `--out`, picks
+another syntax: TriG, N-Triples, Turtle, JSON-LD, RDF/XML, TriX, RDF Thrift (`rt`), RDF
+Protobuf (`rpb`) or RDF/JSON (`rj`). A compression extension after it, as in
+`dump.ttl.gz`, compresses the output. The dump streams from one snapshot, and Turtle, TriG
+and RDF/XML declare the dataset's prefixes. A triple syntax holds the default graph only,
+so the other graphs are left out with a warning unless `--merge` writes them into the
+default graph. `--graph IRI`, which can be repeated, limits the dump to some graphs, and
+`--graph default` names the default graph. In a triple syntax the graphs it names are
+written as one graph. `--at` dumps a past state. With `--server URL --dataset NAME` the
+dump comes from the server's Graph Store endpoint in the syntax asked for. When the
+endpoint cannot give that subset in that syntax, such as two graphs or `--merge`, the
+dump is read as N-Quads and converted locally.
 
 `sparkles infer` updates the materialization that `reasoning.json` records when its
 rules are the same and monotonic and the commit diff still reaches its commit. It reads

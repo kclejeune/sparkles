@@ -115,16 +115,25 @@ impl Syntax {
     }
 
     /// The syntax of a file path (past a compression extension).
-    fn of_path(path: &std::path::Path) -> Option<Syntax> {
+    pub fn of_path(path: &std::path::Path) -> Option<Syntax> {
         JenaFormat::from_path(path)
             .map(Syntax::Jena)
             .or_else(|| sparkles::io::format_for_path(path).map(|(f, _)| Syntax::Rdf(f)))
     }
 
-    fn quads(self) -> bool {
+    /// Whether the syntax holds named graphs.
+    pub fn quads(self) -> bool {
         match self {
             Syntax::Rdf(f) => is_quad_syntax(f),
             Syntax::Jena(j) => j.quads(),
+        }
+    }
+
+    /// The media type of the syntax, as the server names it.
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Syntax::Rdf(f) => sparkles::sparql::results::rdf_media_type(f),
+            Syntax::Jena(j) => j.media_type(),
         }
     }
 
@@ -425,7 +434,7 @@ enum Ser {
 
 /// The output stream: one serializer for every input, created at the first statement so
 /// that it can declare the prefixes the input declared before it.
-struct Output {
+pub struct Output {
     format: Syntax,
     merge: bool,
     writer: Option<Box<dyn sparkles::codec::FinishWrite>>,
@@ -434,7 +443,7 @@ struct Output {
 }
 
 impl Output {
-    fn new(format: Syntax, w: Box<dyn sparkles::codec::FinishWrite>, merge: bool) -> Output {
+    pub fn new(format: Syntax, w: Box<dyn sparkles::codec::FinishWrite>, merge: bool) -> Output {
         Output {
             format,
             merge,
@@ -448,7 +457,7 @@ impl Output {
         !self.format.quads()
     }
 
-    fn start(&mut self, prefixes: impl IntoIterator<Item = (String, String)>) {
+    pub fn start(&mut self, prefixes: impl IntoIterator<Item = (String, String)>) {
         if self.ser.is_none() {
             let w = self.writer.take().expect("the writer is taken once");
             self.ser = Some(match self.format {
@@ -461,7 +470,7 @@ impl Output {
         }
     }
 
-    fn write(&mut self, mut q: Quad) -> Result<()> {
+    pub fn write(&mut self, mut q: Quad) -> Result<()> {
         if !q.graph_name.is_default_graph() {
             if self.merge {
                 q.graph_name = GraphName::DefaultGraph;
@@ -477,7 +486,7 @@ impl Output {
         .context("writing the output")
     }
 
-    fn finish(mut self) -> Result<()> {
+    pub fn finish(mut self) -> Result<()> {
         self.start(std::iter::empty());
         if self.dropped > 0 {
             eprintln!(

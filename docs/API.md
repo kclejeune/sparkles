@@ -5564,7 +5564,8 @@ contain U+FFFD. Syntax errors still fail the load.
 `--threads N` (zstd). `sparkles backup` and `/$/backup` write zstd (level 3) by default,
 which is about five times faster than gzip for a slightly larger file. `--compress gzip`
 (`?compression=gzip`) gives `.nq.gz`, as Fuseki writes. `sparkles dump --out FILE` goes by
-the file's extension, and writes uncompressed without one.
+the file's extension, and writes uncompressed without one. The extension before the
+compression one, as in `dump.ttl.zst`, picks the syntax unless `--format` names it.
 
 **Full-text documents** keep their terms in columns of the index since index format 2, so
 the Tantivy doc store holds no fields and its codec no longer changes the index size. The

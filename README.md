@@ -285,7 +285,7 @@ These commands work on a database directory (`--loc`) that no server has open:
 ```sh
 sparkles load    --loc db data/*.ttl.gz       # parallel bulk load
 sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv, --explain, --time
-sparkles dump    --loc db --out dump.nq.zst   # N-Quads, compressed by extension
+sparkles dump    --loc db --out dump.nq.zst   # syntax and compression by extension
 sparkles compact --loc db                     # merge updates into a new generation
 sparkles backup  create --loc db --repo local # incremental backup to a repository
 sparkles check   --loc db                     # read-only integrity check

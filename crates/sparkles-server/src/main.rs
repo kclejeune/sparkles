@@ -16,6 +16,7 @@ mod compaction_cmd;
 mod compress;
 mod csv_cmd;
 mod describe_cmd;
+mod dump_cmd;
 mod exposure;
 #[cfg(feature = "fmt")]
 mod fmt;
@@ -1149,19 +1150,9 @@ enum Cmd {
     /// Apply RDF Patch files to a database, one commit per file, or send them to a
     /// server's patch endpoint
     Patch(patch_cmd::PatchArgs),
-    /// Write the database as N-Quads, to stdout or a file
-    Dump {
-        #[arg(long)]
-        loc: PathBuf,
-        /// a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME
-        #[arg(long)]
-        at: Option<String>,
-        /// Write to this file instead of stdout (its extension picks the compression)
-        #[arg(long)]
-        out: Option<PathBuf>,
-        #[command(flatten)]
-        compress: CompressArgs,
-    },
+    /// Write the database, or a dataset on a server, in any RDF syntax (N-Quads by
+    /// default), to stdout or a file
+    Dump(dump_cmd::DumpArgs),
     /// Write-time validation of a database (SHACL, or ShEx with --lang shex): status,
     /// set, or turn off
     #[cfg(any(feature = "shacl", feature = "shex"))]
@@ -2733,44 +2724,7 @@ fn run() -> Result<()> {
             at,
             format,
         } => print_log(&loc, limit, before, after, at.as_deref(), &format),
-        Cmd::Dump {
-            loc,
-            at,
-            out,
-            compress,
-        } => {
-            let store = Store::open(&loc, opts)?;
-            let codec = compress.codec(
-                out.as_deref()
-                    .and_then(sparkles::codec::Codec::from_extension)
-                    .unwrap_or_default(),
-            )?;
-            let sink: Box<dyn std::io::Write> = match &out {
-                Some(p) => Box::new(
-                    std::fs::File::create(p)
-                        .with_context(|| format!("creating {}", p.display()))?,
-                ),
-                None => Box::new(std::io::stdout().lock()),
-            };
-            let mut w = codec.writer(
-                std::io::BufWriter::new(sink),
-                compress.level(),
-                compress.threads(),
-            )?;
-            match at {
-                Some(a) => {
-                    let a: sparkles::history::At = a.parse()?;
-                    let r = store.resolve(&a)?;
-                    eprintln!("at commit {} ({})", r.commit.seq, r.commit.timestamp());
-                    store.dump_nquads_at(&a, &mut w)?;
-                }
-                None => {
-                    store.dump_nquads(&mut w)?;
-                }
-            }
-            w.finish()?;
-            Ok(())
-        }
+        Cmd::Dump(args) => dump_cmd::run(args, opts),
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
         Cmd::Queries { cmd } => queries_cmd::run(cmd, opts),
         #[cfg(feature = "graphql")]
