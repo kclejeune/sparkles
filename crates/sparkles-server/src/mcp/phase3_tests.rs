@@ -239,3 +239,409 @@ async fn graphql_query() {
     let (_, e) = c.error("graphql_query", json!({"query": "{ nope }"})).await;
     assert_eq!(e["code"], "graphql-error");
 }
+
+/// Save a stored query of `ds`.
+fn put_query(ds: &crate::state::Dataset, name: &str, def: Value) {
+    let d: sparkles::stored::Definition = serde_json::from_value(def).unwrap();
+    ds.queries
+        .put(name, d, sparkles::stored::Change::default())
+        .unwrap();
+}
+
+/// `completion/complete` of argument `arg` of `reference`.
+async fn complete(c: &mut Client, reference: Value, arg: &str, value: &str, ctx: Value) -> Value {
+    let r = c
+        .request(
+            40,
+            "completion/complete",
+            json!({"_meta": m(), "ref": reference, "argument": {"name": arg, "value": value},
+                   "context": {"arguments": ctx}}),
+        )
+        .await;
+    r.get("result")
+        .map_or(r.clone(), |res| res["completion"].clone())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completions() {
+    let server = server_with(
+        &[
+            ("alpha", &[FIXTURE]),
+            ("beta", &[FIXTURE]),
+            ("other", &[CHAIN]),
+        ],
+        McpConfig::default(),
+    );
+    let alpha = server.state.get("alpha").unwrap();
+    sparkles::sparql::update::update(
+        &alpha.store,
+        "INSERT DATA { GRAPH <http://ex.org/g/one> { <http://ex.org/x> <http://ex.org/y> 1 } GRAPH <http://ex.org/g/two> { <http://ex.org/x> <http://ex.org/y> 2 } GRAPH <http://other.org/g> { <http://ex.org/x> <http://ex.org/y> 3 } }",
+        &sparkles::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    put_query(
+        &alpha,
+        "older",
+        json!({"query": "SELECT ?p WHERE { ?p <http://ex.org/age> ?a FILTER(?a >= ?min && ?a <= ?max) OPTIONAL { ?p <http://ex.org/label> ?label } }",
+               "parameters": {"min": {"type": "integer"}, "max": {"type": "integer"}, "label": {"type": "string", "required": false}}}),
+    );
+    put_query(&alpha, "everything", json!({"query": "ASK { ?s ?p ?o }"}));
+    let mut c = Client::start(server);
+    let prompt = |name: &str| json!({"type": "ref/prompt", "name": name});
+    // dataset names
+    let r = complete(&mut c, prompt("explore_dataset"), "dataset", "", json!({})).await;
+    assert_eq!(
+        r,
+        json!({"values": ["alpha", "beta", "other"], "total": 3, "hasMore": false})
+    );
+    let r = complete(&mut c, prompt("answer_question"), "dataset", "b", json!({})).await;
+    assert_eq!(r["values"], json!(["beta"]));
+    // resource templates
+    let r = complete(
+        &mut c,
+        json!({"type": "ref/resource", "uri": "sparkles://{dataset}/schema"}),
+        "dataset",
+        "o",
+        json!({}),
+    )
+    .await;
+    assert_eq!(r["values"], json!(["other"]));
+    // stored queries: only the datasets that have some, then their names
+    let r = complete(&mut c, prompt("run_stored_query"), "dataset", "", json!({})).await;
+    assert_eq!(r["values"], json!(["alpha"]));
+    let r = complete(
+        &mut c,
+        json!({"type": "ref/resource", "uri": "sparkles://{dataset}/queries/{query}"}),
+        "query",
+        "",
+        json!({"dataset": "alpha"}),
+    )
+    .await;
+    assert_eq!(r["values"], json!(["everything", "older"]));
+    // parameter names, leaving out those already given
+    let ctx = json!({"dataset": "alpha", "query": "older"});
+    let r = complete(
+        &mut c,
+        prompt("run_stored_query"),
+        "arguments",
+        "",
+        ctx.clone(),
+    )
+    .await;
+    assert_eq!(r["values"], json!(["label=", "max=", "min="]));
+    let r = complete(
+        &mut c,
+        prompt("run_stored_query"),
+        "arguments",
+        "min=3, m",
+        ctx,
+    )
+    .await;
+    assert_eq!(r["values"], json!(["min=3, max="]));
+    // named graphs, by the typed start of their IRI
+    let ctx = json!({"dataset": "alpha"});
+    let r = complete(
+        &mut c,
+        prompt("explore_dataset"),
+        "graph",
+        "http://ex.org/",
+        ctx.clone(),
+    )
+    .await;
+    assert_eq!(
+        r["values"],
+        json!(["http://ex.org/g/one", "http://ex.org/g/two"])
+    );
+    let r = complete(&mut c, prompt("explore_dataset"), "graph", "", ctx.clone()).await;
+    assert_eq!(r["total"], 3);
+    // prefixes
+    let r = complete(&mut c, prompt("explain_term"), "term", "rd", ctx).await;
+    assert_eq!(r["values"], json!(["rdf:", "rdfs:"]));
+    // free text and unknown references
+    let r = complete(
+        &mut c,
+        prompt("answer_question"),
+        "question",
+        "Who",
+        json!({"dataset": "alpha"}),
+    )
+    .await;
+    assert_eq!(r["values"], json!([]));
+    let r = complete(&mut c, prompt("nope"), "dataset", "", json!({})).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    let r = complete(&mut c, prompt("explore_dataset"), "query", "", json!({})).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+
+    // the new prompts and the stored-query resource
+    let r = c
+        .request(
+            41,
+            "prompts/get",
+            json!({"_meta": m(), "name": "run_stored_query",
+                   "arguments": {"dataset": "alpha", "query": "older", "arguments": "min=3"}}),
+        )
+        .await;
+    let text = r["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("with the tool alpha__older"), "{text}");
+    assert!(text.contains("- max (integer, required)"), "{text}");
+    assert!(text.contains("Use these arguments: min=3"), "{text}");
+    let r = c
+        .request(
+            42,
+            "resources/read",
+            json!({"_meta": m(), "uri": "sparkles://alpha/queries/older"}),
+        )
+        .await;
+    let q: Value =
+        serde_json::from_str(r["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        (q["tool"].clone(), q["version"].clone()),
+        (json!("alpha__older"), json!(1))
+    );
+    let r = c.request(43, "resources/list", json!({"_meta": m()})).await;
+    let uris: Vec<&str> = r["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["uri"].as_str().unwrap())
+        .collect();
+    assert!(uris.contains(&"sparkles://alpha/queries/older"), "{uris:?}");
+}
+
+/// A server whose subscriptions look for changes every 20 ms.
+fn quick_server() -> McpServer {
+    server_with(
+        &[("t", &[FIXTURE])],
+        McpConfig {
+            watch_interval: Duration::from_millis(20),
+            ..McpConfig::default()
+        },
+    )
+}
+
+/// The next message that is not `notifications/subscriptions/acknowledged`.
+async fn next_change(c: &mut Client) -> Value {
+    loop {
+        let v = c
+            .recv_within(Duration::from_secs(10))
+            .await
+            .expect("no notification");
+        if v["method"] != "notifications/subscriptions/acknowledged" {
+            return v;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subscriptions_listen() {
+    let server = quick_server();
+    let ds = server.state.get("t").unwrap();
+    let mut c = Client::start(server.clone());
+    c.send(
+        json!({"jsonrpc": "2.0", "id": 9, "method": "subscriptions/listen", "params": {
+        "_meta": m(),
+        "notifications": {"toolsListChanged": true, "resourcesListChanged": true,
+            "resourceSubscriptions": ["sparkles://t/schema", "sparkles://elsewhere/schema"]}}}),
+    )
+    .await;
+    let ack = c.recv().await;
+    assert_eq!(
+        ack["method"], "notifications/subscriptions/acknowledged",
+        "{ack}"
+    );
+    // the acknowledgment comes before the subscription takes its first look
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // a stored query added changes the tool list
+    put_query(&ds, "everything", json!({"query": "ASK { ?s ?p ?o }"}));
+    let n = next_change(&mut c).await;
+    assert_eq!(n["method"], "notifications/tools/list_changed", "{n}");
+    // a commit updates the schema resource
+    sparkles::sparql::update::update(
+        &ds.store,
+        "INSERT DATA { <http://ex.org/carol> a <http://ex.org/Person> }",
+        &sparkles::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let n = next_change(&mut c).await;
+    assert_eq!(n["method"], "notifications/resources/updated", "{n}");
+    assert_eq!(n["params"]["uri"], "sparkles://t/schema");
+    // a dataset created changes the resource list
+    server.state.attach("u", DbType::Mem, None).unwrap();
+    let n = next_change(&mut c).await;
+    assert_eq!(n["method"], "notifications/resources/list_changed", "{n}");
+    // the stored query removed: the tool list again
+    ds.queries.delete("everything", None).unwrap();
+    let n = next_change(&mut c).await;
+    assert_eq!(n["method"], "notifications/tools/list_changed", "{n}");
+    // cancelled: no more notifications, and the stream's slot is free again
+    c.send(
+        json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 9}}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    put_query(&ds, "again", json!({"query": "ASK { ?s ?p ?o }"}));
+    while let Some(v) = c.recv_within(Duration::from_millis(300)).await {
+        assert_ne!(v["method"], "notifications/tools/list_changed", "{v}");
+    }
+    assert_eq!(
+        server.shared.subscriptions.available_permits(),
+        super::notify::MAX_SUBSCRIPTIONS
+    );
+    // the capabilities announce the notifications
+    let r = c
+        .request(10, "server/discover", json!({"_meta": m()}))
+        .await;
+    let caps = &r["result"]["capabilities"];
+    assert_eq!(caps["tools"]["listChanged"], true, "{caps}");
+    assert_eq!(caps["resources"]["subscribe"], true, "{caps}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_get_list_changes() {
+    let server = quick_server();
+    let ds = server.state.get("t").unwrap();
+    let mut c = Client::start(server);
+    let r = c
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {},
+                   "clientInfo": {"name": "t", "version": "1"}}),
+        )
+        .await;
+    let caps = &r["result"]["capabilities"];
+    assert_eq!(caps["tools"]["listChanged"], true, "{caps}");
+    // the legacy era has no subscriptions to resources
+    assert!(caps["resources"].get("subscribe").is_none(), "{caps}");
+    c.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    put_query(&ds, "everything", json!({"query": "ASK { ?s ?p ?o }"}));
+    let n = c
+        .recv_within(Duration::from_secs(10))
+        .await
+        .expect("no notification");
+    assert_eq!(n["method"], "notifications/tools/list_changed", "{n}");
+}
+
+/// `_meta` of a modern request from a client that supports tasks.
+fn m_tasks() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {
+            "extensions": {"io.modelcontextprotocol/tasks": {}}
+        }
+    })
+}
+
+/// Poll `tasks/get` until the task ends.
+async fn finished(c: &mut Client, id: &str) -> Value {
+    for i in 0..600 {
+        let r = c
+            .request(
+                500 + i,
+                "tasks/get",
+                json!({"_meta": m_tasks(), "taskId": id}),
+            )
+            .await;
+        let task = r["result"].clone();
+        if ["completed", "failed", "cancelled"].contains(&task["status"].as_str().unwrap_or("")) {
+            return task;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("task {id} did not end");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tasks() {
+    let server = server_with(
+        &[("t", &[&numbers(3000)])],
+        McpConfig {
+            task_after: Duration::from_millis(0),
+            ..McpConfig::default()
+        },
+    );
+    let mut c = Client::start(server.clone());
+    // the extension is announced
+    let r = c.request(1, "server/discover", json!({"_meta": m()})).await;
+    assert!(
+        r["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"].is_object(),
+        "{r}"
+    );
+    // a slow call becomes a task
+    let slow = "SELECT (COUNT(*) AS ?n) WHERE { ?a ex:v ?x . ?b ex:v ?y }";
+    let r = c
+        .request(
+            2,
+            "tools/call",
+            json!({"_meta": m_tasks(), "name": "sparql_query", "arguments": {"query": slow}}),
+        )
+        .await;
+    let res = &r["result"];
+    assert_eq!(res["resultType"], "task", "{r}");
+    let id = res["taskId"].as_str().unwrap().to_string();
+    assert_eq!(res["status"], "working");
+    let task = finished(&mut c, &id).await;
+    assert_eq!(task["status"], "completed", "{task}");
+    let text = task["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.ends_with("9000000"), "{text}");
+    // a task stopped with tasks/cancel
+    let slower = "SELECT * WHERE { ?a ex:v ?x . ?b ex:v ?y . ?c ex:v ?z }";
+    let r = c
+        .request(
+            3,
+            "tools/call",
+            json!({"_meta": m_tasks(), "name": "sparql_query",
+                   "arguments": {"query": slower, "timeoutSeconds": 60}}),
+        )
+        .await;
+    let id = r["result"]["taskId"].as_str().unwrap().to_string();
+    let r = c
+        .request(4, "tasks/cancel", json!({"_meta": m_tasks(), "taskId": id}))
+        .await;
+    assert!(r.get("error").is_none(), "{r}");
+    let task = finished(&mut c, &id).await;
+    assert_eq!(task["status"], "cancelled", "{task}");
+    // the engine stopped: every slot is free again
+    for _ in 0..100 {
+        if server.shared.slots.available_permits() == server.cfg().max_concurrent {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        server.shared.slots.available_permits(),
+        server.cfg().max_concurrent
+    );
+    // an unknown task
+    let r = c
+        .request(
+            5,
+            "tasks/get",
+            json!({"_meta": m_tasks(), "taskId": "nope"}),
+        )
+        .await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    // a client without the extension gets the result itself
+    let r = c
+        .request(
+            6,
+            "tools/call",
+            json!({"_meta": m(), "name": "sparql_query", "arguments": {"query": slow}}),
+        )
+        .await;
+    assert_eq!(r["result"]["resultType"], "complete", "{r}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tasks_belong_to_their_caller() {
+    let tasks = super::tasks::Tasks::default();
+    let work = tokio::spawn(async { rmcp::model::CallToolResult::success(Vec::new()) });
+    let task = tasks.start("alice".into(), work, Arc::default());
+    assert!(tasks.get("alice", &task.task_id).is_ok());
+    assert!(tasks.get("bob", &task.task_id).is_err());
+    assert!(tasks.cancel("bob", &task.task_id).is_err());
+}

@@ -10,6 +10,7 @@
 //! off unless allowed, and the default tool set cannot write.
 
 mod adapter;
+mod complete;
 mod context;
 mod draft;
 mod errors;
@@ -26,6 +27,7 @@ fn graphql_on(_: &Principal, _: &Dataset) -> bool {
     false
 }
 pub mod http;
+mod notify;
 mod paths;
 mod pins;
 mod render;
@@ -33,6 +35,7 @@ mod schema_history;
 mod schemas;
 mod search;
 mod stored;
+mod tasks;
 mod tools;
 mod update;
 #[cfg(any(feature = "shacl", feature = "shex"))]
@@ -121,6 +124,10 @@ pub struct McpArgs {
     /// Largest number of classes, and of predicates, a schema report may have
     #[arg(long, value_name = "N", default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
     pub schema_max_entries: usize,
+    /// How long a tool call of a client that supports tasks runs before it becomes a
+    /// task that the client polls, in milliseconds
+    #[arg(long, value_name = "MS", default_value_t = 2000)]
+    pub task_after_ms: u64,
 }
 
 /// Limits and switches of the MCP tools.
@@ -144,6 +151,11 @@ pub struct McpConfig {
     pub datasets: Vec<String>,
     /// offer the stored queries of the datasets as tools (C16)
     pub stored_queries: bool,
+    /// how often a subscription looks for changed tool and resource lists and resources
+    pub watch_interval: Duration,
+    /// how long a tool call of a client that supports tasks may run before it becomes a
+    /// task that the client polls
+    pub task_after: Duration,
 }
 
 impl Default for McpConfig {
@@ -159,6 +171,8 @@ impl Default for McpConfig {
             disabled: BTreeSet::new(),
             datasets: Vec::new(),
             stored_queries: true,
+            watch_interval: Duration::from_secs(2),
+            task_after: Duration::from_secs(2),
         }
     }
 }
@@ -194,6 +208,10 @@ pub struct Shared {
     /// one permit per concurrent tool call
     pub slots: Arc<Semaphore>,
     tools: Vec<schemas::ToolDef>,
+    /// tool calls that became tasks (the tasks extension), with their callers
+    pub tasks: tasks::Tasks,
+    /// one permit per open `subscriptions/listen` stream or legacy session watcher
+    pub subscriptions: Arc<Semaphore>,
 }
 
 /// The transport-neutral MCP server.
@@ -248,6 +266,8 @@ impl McpServer {
                 slots: Arc::new(Semaphore::new(cfg.max_concurrent.max(1))),
                 pins: pins::Pins::default(),
                 tools,
+                tasks: tasks::Tasks::default(),
+                subscriptions: Arc::new(Semaphore::new(notify::MAX_SUBSCRIPTIONS)),
                 cfg,
             }),
         }
@@ -321,12 +341,17 @@ impl McpServer {
         args: Map<String, Value>,
         call: Call,
     ) -> Result<Result<Outcome, ToolError>, UnknownTool> {
-        let offered =
-            self.offers(name) && (name == "sparql_update" || self.allows(&call.principal, name));
-        if !offered && self.stored_tool(&call.principal, name).is_none() {
+        if !self.known(&call.principal, name) {
             return Err(UnknownTool(name.to_string()));
         }
         Ok(self.run(name, args, call).await)
+    }
+
+    /// Whether `p` may call the tool `name`: an offered tool (the write tool checks for
+    /// itself which datasets `p` may write to) or one of its stored queries.
+    pub fn known(&self, p: &Principal, name: &str) -> bool {
+        (self.offers(name) && (name == "sparql_update" || self.allows(p, name)))
+            || self.stored_tool(p, name).is_some()
     }
 
     /// [`McpServer::call`] for a tool whether or not it is offered (resources are read
@@ -483,6 +508,8 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         disabled: args.disable_tool.into_iter().collect(),
         datasets: Vec::new(),
         stored_queries: !args.no_stored_queries,
+        task_after: Duration::from_millis(args.task_after_ms),
+        ..McpConfig::default()
     };
     let server = McpServer::new(st, cfg);
     let rt = tokio::runtime::Builder::new_multi_thread()

@@ -126,10 +126,13 @@ fn m() -> J {
 
 /// A modern request with the headers the transport requires, plus `extra`.
 async fn modern(app: &Router, method: &str, mut params: J, extra: &[(&str, &str)]) -> Reply {
-    params["_meta"] = m();
+    if params.get("_meta").is_none() {
+        params["_meta"] = m();
+    }
     let name = params
         .get("name")
         .or_else(|| params.get("uri"))
+        .or_else(|| params.get("taskId"))
         .and_then(J::as_str)
         .map(str::to_string);
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
@@ -217,6 +220,62 @@ async fn legacy(app: &Router, sid: &str, body: J, extra: &[(&str, &str)]) -> Rep
 }
 
 // ------------------------------------------------------------------ transport ------
+
+/// `subscriptions/listen` over HTTP: the answer is an SSE stream that carries the
+/// acknowledgment, then a notification when a stored query is added.
+#[tokio::test(flavor = "multi_thread")]
+async fn subscriptions_stream_over_http() {
+    use http_body_util::BodyExt;
+    let s = open(&[], true);
+    let body = json!({"jsonrpc": "2.0", "id": 7, "method": "subscriptions/listen",
+        "params": {"_meta": m(), "notifications": {"toolsListChanged": true}}});
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/$/mcp")
+        .extension(ConnectInfo(Peer::Tcp("127.0.0.2:1".parse().unwrap())));
+    for (k, v) in [
+        ACCEPT,
+        JSON_CT,
+        ("mcp-protocol-version", "2026-07-28"),
+        ("mcp-method", "subscriptions/listen"),
+    ] {
+        req = req.header(k, v);
+    }
+    let res = s
+        .app
+        .clone()
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = res.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(ct.starts_with("text/event-stream"), "{ct}");
+    let mut stream = res.into_body();
+    let mut seen = String::new();
+    let mut added = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !seen.contains("notifications/tools/list_changed") {
+        let frame = tokio::time::timeout_at(deadline, stream.frame())
+            .await
+            .expect("no notification")
+            .expect("the stream ended")
+            .unwrap();
+        if let Ok(data) = frame.into_data() {
+            seen.push_str(&String::from_utf8_lossy(&data));
+        }
+        if !added && seen.contains("notifications/subscriptions/acknowledged") {
+            // the subscription looks every 2 s; change the tools after its first look
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let ds = s.state.get("t").unwrap();
+            let d: sparkles::stored::Definition =
+                serde_json::from_value(json!({"query": "ASK { ?s ?p ?o }"})).unwrap();
+            ds.queries
+                .put("anything", d, sparkles::stored::Change::default())
+                .unwrap();
+            added = true;
+        }
+    }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a22_modern_call_returns_json() {
@@ -351,7 +410,7 @@ async fn legacy_sessions() {
     assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(
         init["result"]["capabilities"],
-        json!({"tools": {}, "resources": {}, "prompts": {}})
+        json!({"completions": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}, "prompts": {}, "resources": {"listChanged": true}, "tools": {"listChanged": true}})
     );
     let r = legacy(
         &s.app,
@@ -691,7 +750,7 @@ async fn a28_resources_and_prompts() {
     assert_eq!(list["cacheScope"], "private");
     let r = modern(&s.app, "resources/templates/list", json!({}), &[]).await;
     let templates = r.rpc()["result"]["resourceTemplates"].clone();
-    assert_eq!(templates.as_array().unwrap().len(), 2, "{templates}");
+    assert_eq!(templates.as_array().unwrap().len(), 3, "{templates}");
     // the schema resource is the describe_schema summary
     let r = modern(
         &s.app,
@@ -732,7 +791,15 @@ async fn a28_resources_and_prompts() {
         .iter()
         .map(|p| p["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names, ["explore_dataset", "answer_question"]);
+    assert_eq!(
+        names,
+        [
+            "explore_dataset",
+            "answer_question",
+            "run_stored_query",
+            "explain_term"
+        ]
+    );
     let r = modern(
         &s.app,
         "prompts/get",
@@ -985,6 +1052,87 @@ mod auth {
         // listings vary by caller: clients must not share them
         let r = modern(&s.app, "tools/list", json!({}), &[]).await;
         assert_eq!(r.rpc()["result"]["cacheScope"], "private");
+    }
+
+    /// Completions list only what the caller sees, and a task answers only its caller.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completions_and_tasks_follow_the_caller() {
+        let s = authed(&["--mcp-task-after-ms", "0"], &[], "");
+        let (bob, alice) = (b("bob"), b("alice"));
+        let datasets = |auth: String| {
+            let app = s.app.clone();
+            async move {
+                let r = modern(
+                    &app,
+                    "completion/complete",
+                    json!({"ref": {"type": "ref/prompt", "name": "explore_dataset"},
+                           "argument": {"name": "dataset", "value": ""}}),
+                    &[("authorization", &auth)],
+                )
+                .await;
+                r.rpc()["result"]["completion"]["values"].clone()
+            }
+        };
+        assert_eq!(
+            datasets(alice.clone()).await,
+            json!(["public", "secret", "team-a", "wiki"])
+        );
+        let bobs = datasets(bob.clone()).await;
+        assert!(
+            !bobs.as_array().unwrap().contains(&json!("secret")),
+            "{bobs}"
+        );
+        // alice's slow query becomes a task
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..3000 {
+            data.push_str(&format!("ex:s{i} ex:v {i} .\n"));
+        }
+        load(&s.state, "slow", &data);
+        let tasks_meta = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            }
+        });
+        let r = modern(
+            &s.app,
+            "tools/call",
+            json!({"_meta": tasks_meta, "name": "sparql_query", "arguments": {"dataset": "slow",
+                   "query": "SELECT (COUNT(*) AS ?n) WHERE { ?a ex:v ?x . ?b ex:v ?y }"}}),
+            &[("authorization", &alice)],
+        )
+        .await;
+        let res = r.rpc()["result"].clone();
+        assert_eq!(res["resultType"], "task", "{}", r.body);
+        let id = res["taskId"].as_str().unwrap().to_string();
+        let get = |auth: String| {
+            let (app, meta, id) = (s.app.clone(), tasks_meta.clone(), id.clone());
+            async move {
+                modern(
+                    &app,
+                    "tasks/get",
+                    json!({"_meta": meta, "taskId": id}),
+                    &[("authorization", &auth)],
+                )
+                .await
+                .rpc()
+            }
+        };
+        // bob cannot see it
+        let r = get(bob.clone()).await;
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+        // alice polls it to its end
+        let mut task = J::Null;
+        for _ in 0..600 {
+            task = get(alice.clone()).await["result"].clone();
+            if task["status"] != "working" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(task["status"], "completed", "{task}");
+        let text = task["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.ends_with("9000000"), "{text}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

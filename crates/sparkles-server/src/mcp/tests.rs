@@ -187,7 +187,7 @@ async fn a01_discover() {
     );
     assert_eq!(
         res["capabilities"],
-        json!({"tools": {}, "resources": {}, "prompts": {}})
+        json!({"completions": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}, "prompts": {}, "resources": {"listChanged": true, "subscribe": true}, "tools": {"listChanged": true}})
     );
     assert!(
         res["instructions"]
@@ -219,7 +219,7 @@ async fn a02_legacy_handshake() {
     assert_eq!(res["protocolVersion"], "2025-11-25");
     assert_eq!(
         res["capabilities"],
-        json!({"tools": {}, "resources": {}, "prompts": {}})
+        json!({"completions": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}, "prompts": {}, "resources": {"listChanged": true}, "tools": {"listChanged": true}})
     );
     assert_eq!(
         res["serverInfo"],

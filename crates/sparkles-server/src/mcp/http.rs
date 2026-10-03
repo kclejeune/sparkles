@@ -88,6 +88,10 @@ pub struct ServeArgs {
     /// sessions; such clients are served without one)
     #[arg(long, value_name = "N", default_value_t = 256)]
     pub mcp_max_sessions: usize,
+    /// How long an MCP tool call of a client that supports tasks runs before it becomes
+    /// a task that the client polls, in milliseconds
+    #[arg(long, value_name = "MS", default_value_t = 2000)]
+    pub mcp_task_after_ms: u64,
 }
 
 /// The endpoint's settings (`AppState::mcp`).
@@ -160,6 +164,8 @@ impl ServeArgs {
                     .collect::<BTreeSet<_>>(),
                 datasets: self.mcp_dataset.clone(),
                 stored_queries: !self.mcp_no_stored_queries,
+                task_after: std::time::Duration::from_millis(self.mcp_task_after_ms),
+                ..McpConfig::default()
             },
             max_sessions: self.mcp_max_sessions,
             shutdown: CancellationToken::new(),
