@@ -2,13 +2,17 @@
 
 This page compares Sparkles with Apache Jena (TDB2 and Fuseki), QLever, Fluree and
 Oxigraph, and lists every case where Sparkles loses or ties. All the comparisons were
-measured on 2026-10-02 on one machine, `forge`, with Sparkles at commit `4995963`. The
+measured on 2026-10-02 on one machine, `forge`, with Sparkles at commit `4995963`, except
+where a section names a later build. Those are the DBpedia figures
+[after the build and filter work](#after-the-build-and-filter-work) and the sections
+headed "Changes since the forge run". The
 sections under [Other measurements](#other-measurements) time Sparkles on its own, and
 most of them ran earlier on a different machine, as each section says.
 
-To reproduce the runs, use `mise run bench [people] [workdir]` or `scripts/bench.sh`. Add
-`--engines fluree` to re-measure one engine and merge its results into an existing run.
-Add `--answers-only` to re-check every engine's answers without timing anything.
+To reproduce the runs, use `mise run bench [people] [workdir]` or `scripts/bench.sh`. With
+`mise run bench`, `--engines fluree` re-measures one engine and merges its results into an
+existing run, and `--answers-only` re-checks every engine's answers without timing anything.
+`scripts/bench.sh` takes the same settings as the variables `ENGINES` and `ANSWERS_ONLY=1`.
 `mise run bench:watdiv [scale]` runs WatDiv, and `scripts/bench-text.sh` runs the
 full-text comparison.
 
@@ -38,11 +42,15 @@ query templates and on all 88 query instances. Its geometric mean is 4.95 ms, ag
 In the full-text comparison, Sparkles is the fastest on all 7 queries at 1.05M and on 6
 of 7 at 10.5M. At 10.5M, QLever counts the hits of a common word 1.11× faster.
 
-On English DBpedia at 1.24 billion triples, against QLever alone, Sparkles is faster on all
-29 queries whose answers agree. It is faster on one of the two throughput tests and ties
+On English DBpedia at 1.24 billion triples, against QLever alone and with the build
+described under [After the build and filter work](#after-the-build-and-filter-work),
+Sparkles is faster on all 29 queries whose answers agree. It is faster on one of the two throughput tests and ties
 on the other. It loads the data in 584 s against QLever's 1,674 s. Cold, QLever is faster
 on 17 of 31 queries, most of them point lookups and small joins
-([DBpedia at 1.24 billion triples](#dbpedia-at-124-billion-triples)).
+([DBpedia at 1.24 billion triples](#dbpedia-at-124-billion-triples)). The later
+[cold-read changes](#changes-since-the-forge-run-cold-reads) made Sparkles faster than
+QLever on 7 of the 8 cold point lookups measured again, and `country-population` is
+still slower.
 
 Sparkles uses more memory than QLever, and that is a choice. Its defaults spend memory on
 a 1 GiB decoded-block cache per dataset and on materialized intermediate results.
@@ -378,11 +386,14 @@ at 10.5M. Against each engine:
 | `range-topk` at 1.05M | QLever | 1.19× (7.4 against 6.2 ms) | The 10% of salaries written in non-canonical form, such as `"175000.50"`, are stored as vocabulary literals, which are read and tested. Sparkles is 1.33× faster at 10.5M (15.8 against 21.1 ms). |
 | `count-all`, `distinct-obj` and `star-lookup` at both sizes, `employee-docs` at 1.05M | Fluree | ties within 10%, 1.01–1.08× | Both engines answer from index statistics or a few index lookups. The times are 3.4–4.1 ms, which is mostly the request itself. |
 | `path-plus` at both sizes, `values-star` at 10.5M | Oxigraph | ties within 10%, 1.05–1.09× | The same. Oxigraph follows a single path or a few lookups quickly. |
-| Update latency, 1 triple | Oxigraph, QLever | 1.24× and 1.1× at 1.05M (4.2 against 3.4 and 3.8 ms), 1.32× and 1.26× at 10.5M (4.9 against 3.7 and 3.9 ms) | Sparkles fsyncs its WAL and publishes a new snapshot before it acknowledges. Oxigraph does not fsync, and QLever keeps updates in memory only. |
+| Update latency, 1 triple | Oxigraph, QLever, and a tie with Fluree at 10.5M | 1.23× and 1.1× at 1.05M (4.2 against 3.4 and 3.8 ms), 1.33× and 1.28× at 10.5M (4.9 against 3.7 and 3.9 ms). Fluree also took 4.9 ms at 10.5M. | Sparkles fsyncs its WAL and publishes a new snapshot before it acknowledges. Oxigraph does not fsync, and QLever keeps updates in memory only. |
 | Commit rate | Oxigraph, QLever, Fluree | 5,000 single-triple commits at 10.5M ran at 256 commits/s, against 1,046 for Oxigraph, 477 for QLever and 326 for Fluree. At 1.05M, Oxigraph ran 768 to Sparkles' 581. | Each commit waits for an fsync. Sparkles' median commit took 1.7 ms at 1.05M and 4.1 ms at 10.5M. The growth came from the writeback of the other engines' store copies, and commits have changed since (see [Changes since the forge run: commit latency](#changes-since-the-forge-run-commit-latency)). |
 | Queries after 5,000 commits | Fluree, QLever | `distinct-obj` 1.16× at 10.5M (4.6 against 4.0 ms). At 1.05M, `range-topk` 1.23× to QLever and `two-hop-count` 1.11× to Fluree. | Reads merge the in-memory delta until a compaction folds it into the index. See [Updates and mixed load](#updates-and-mixed-load). |
 | Queries after a restart with cold caches | Oxigraph, Fluree, QLever | Up to 4.1× on point lookups. See [Cold starts](#cold-starts). | Sparkles opens and decodes index blocks on first use. Reads have changed since (see [Changes since the forge run: cold reads](#changes-since-the-forge-run-cold-reads)). |
-| Server RSS after the run | QLever | 1.33× at 1.05M (380 against 286 MiB), 1.32× at 10.5M (892 against 676 MiB) | The decoded-block cache and materialized intermediates. Without the cache, the figures are 316 and 513 MiB. See [Memory and the speed it buys](#memory-and-the-speed-it-buys). |
+| Server RSS after the run | QLever | 1.33× at 1.05M (380 against 286 MiB), 1.32× at 10.5M (892 against 676 MiB) | The decoded-block cache and materialized intermediates. Less the block cache, the figures are 316 and 513 MiB, and a 10.5M server with the cache off ends at 319 MiB. See [Memory and the speed it buys](#memory-and-the-speed-it-buys). |
+| Server RSS after the DBpedia run | QLever | 4.1× (5,718 against 1,403 MiB) | Memory-mapped index pages that a query touched count toward Sparkles' RSS, and the 1 GiB block cache is in it too. See [DBpedia at 1.24 billion triples](#dbpedia-at-124-billion-triples). |
+| DBpedia cold queries | QLever | 17 of 31 queries, most of them point lookups and small joins | A cold server read whole read-ahead windows. Most of these lookups are faster since the [cold-read changes](#changes-since-the-forge-run-cold-reads). |
+| DBpedia `entity-facts-1` throughput | QLever | A tie. Three passes of Sparkles measured 1,426, 1,420 and 1,190 q/s, and QLever's one pass 1,216. | Run-to-run noise of small requests. |
 | Bulk load peak RSS at 10.5M | QLever | 1.07× (2,065 against 1,927 MiB) | Parallel parsing and in-memory sorting during the load. Sparkles loads 1.4× faster. |
 | Full-text `common-count` at 10.5M | QLever | 1.11× (14.1 against 12.7 ms) | Counting all 49,837 hits of a common word. Sparkles wins the other six text queries. |
 | Full-text index size | QLever | 1.23× at 10.5M (123.3 against 99.9 MB) | QLever's index covers every literal and is still smaller. Sparkles builds its index 3.3× faster. |
@@ -452,9 +463,11 @@ since 5,000 quads is below the threshold for an automatic compaction.
 | 10.5M: latency p50 / p99 (ms) | 4.14 / 5.98 | 61.47 / 102.52 | 2.01 / 4.86 | 1.69 / 15.78 | **0.94 / 1.70** |
 
 No engine failed a commit. After the churn, Sparkles was still the fastest on 25 of 28
-queries at 1.05M and 26 of 28 at 10.5M. It lost `range-topk` to QLever (1.23×) and
-`two-hop-count` to Fluree (1.11×) at 1.05M, and `distinct-obj` to Fluree at 10.5M
-(1.16×). It tied Fluree on `star-lookup` at 1.05M and `count-all` at 10.5M. QLever's
+queries at 1.05M and 26 of 28 at 10.5M. At 1.05M it lost `range-topk` to QLever (1.23×) and `two-hop-count` to Fluree (1.11×),
+and Fluree was 1% faster on `star-lookup`, a tie. At 10.5M it lost `distinct-obj` to
+Fluree (1.16×), and Fluree was 1% faster on `count-all`, a tie. Fluree also came within
+10% on `count-all`, `distinct-obj` and `employee-docs` at 1.05M and on `two-hop-count`
+at 10.5M, and QLever on `range-topk` at 10.5M. QLever's
 answer to `types-grouped` differed from the majority after the churn, so it was not
 ranked there.
 
@@ -683,7 +696,7 @@ runs explains why.
 Sparkles was faster on 27 of the 29 ranked queries and on both throughput tests. QLever
 loaded 1.37× faster and was faster on `label-regex`. `geo-box` was a tie. The changes
 described [below](#after-the-build-and-filter-work) have since made the load 2.9× faster
-than QLever's and `label-regex` twice as fast as QLever's.
+than QLever's and `label-regex` faster than QLever's (15.8 against 19.5 ms).
 
 | memory | sparkles | qlever |
 |---|---:|---:|
@@ -973,7 +986,7 @@ instances of the mean of 5 runs, after 1 warm-up.
 
 Most WatDiv instances are selective, and Sparkles and Fluree answer most of them within
 1 ms of the 3.5 ms cost of the request. Sparkles is the fastest on every one of the 88
-instances, but Fluree comes within 10% on 30 of them and Oxigraph on one, mostly in the
+instances, but Fluree comes within 10% on 31 of them, and Oxigraph on 5 of those 31, mostly in the
 L, S1 and S7 templates. Those are ties. The clear wins are the complex templates. C3 is a
 star of six patterns with 419,866 result rows, and Sparkles answers it in 71 ms against
 Fluree's 100 ms and QLever's 296 ms. `results/instances.md` in the WatDiv workdir lists every instance. WatDiv was
@@ -1102,8 +1115,9 @@ change a query's time only when they change its plan.
   load were not compared with other engines.
 * **Spatial queries and inference-time reasoning.** GeoSPARQL workloads were not compared
   with other engines. The sections below give the spatial index's commit cost and the
-  GeoSPARQL Compliance Benchmark results. Sparkles has no inference-time reasoning, so
-  backward-chaining workloads were not benchmarked.
+  GeoSPARQL Compliance Benchmark results. Sparkles' only query-time reasoning is RDFS on
+  read, and it has no backward chaining, so query-time reasoning was not compared with
+  other engines.
 * **Result-cache benefit.** All runs had result caches off. With the cache on, repeated
   queries are mostly served from memory, which is not a fair comparison.
 * **Other hardware.** Every comparison ran on one 20-thread machine with 15 GiB of RAM.
@@ -1248,7 +1262,7 @@ Before that change, when it synced every commit, the 1-triple insert took
 29.9 ± 0.8 ms with text search on and 8.9 ± 4.0 ms off.
 
 Access logging and Prometheus metrics are on by default. Compared with `--no-access-log
---no-metrics`, the sum of the 20 harness queries differs by 0.6% (1,248 vs 1,240 ms).
+--no-metrics`, the sum of the 20 queries the harness had then differs by 0.6% (1,248 vs 1,240 ms).
 That is within run-to-run noise, since single queries vary by up to ±50% in either
 direction at these sizes. The load test used `oha` with 16 connections and two
 alternating rounds of each configuration:
