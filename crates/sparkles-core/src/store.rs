@@ -28,7 +28,8 @@ mod patch_apply;
 mod preview;
 mod quota;
 mod schedule;
-#[cfg(test)]
+// the geometry tests are the only users
+#[cfg(all(test, feature = "geo"))]
 mod test_support;
 mod vector;
 pub(crate) use embed::embed_query_text;
