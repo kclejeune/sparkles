@@ -99,6 +99,17 @@ debug = 1
 [profile.dev.package."*"]
 opt-level = 2
 
+# The formatter's browser build (scripts/build-fmt-wasm.sh, nix/fmt-wasm.nix) is built for
+# size: opt-level "z", one codegen unit, fat LTO, no debug info, symbols stripped.
+[profile.fmt-wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"
+
 # spargebra 0.4.7 with left-associative `+ -` and `* /` (see vendor/spargebra/PATCHED.md)
 [patch.crates-io]
 spargebra = { path = "vendor/spargebra" }

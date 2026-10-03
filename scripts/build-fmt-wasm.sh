@@ -7,10 +7,10 @@
 #
 # Needs the wasm32-unknown-unknown target (rust-toolchain.toml lists it) and the
 # wasm-bindgen CLI of the version Cargo.lock pins for the wasm-bindgen crate (mise.toml's
-# `ui:wasm` task installs it). The build is for size: opt-level "z", one codegen unit,
-# fat LTO, no debug info, symbols stripped (a profile given on the command line, so the
-# workspace's release profile stays as it is). wasm-opt -Oz is not run: on this module it
-# saves about 10% raw but compresses worse (brotli 261 KB against 248 KB).
+# `ui:wasm` task installs it). The build is for size, with the `fmt-wasm` profile of the
+# workspace's Cargo.toml: opt-level "z", one codegen unit, fat LTO, no debug info, symbols
+# stripped. wasm-opt -Oz is not run: on this module it saves about 10% raw but compresses
+# worse (brotli 261 KB against 248 KB).
 #
 # Usage: scripts/build-fmt-wasm.sh [OUT_DIR]
 set -euo pipefail
@@ -28,14 +28,7 @@ if [ "$have" != "$want" ]; then
 fi
 
 cargo build --manifest-path "$root/Cargo.toml" -p sparkles-fmt-wasm \
-  --target wasm32-unknown-unknown --profile fmt-wasm \
-  --config 'profile.fmt-wasm.inherits="release"' \
-  --config 'profile.fmt-wasm.opt-level="z"' \
-  --config 'profile.fmt-wasm.lto=true' \
-  --config 'profile.fmt-wasm.codegen-units=1' \
-  --config 'profile.fmt-wasm.debug=false' \
-  --config 'profile.fmt-wasm.strip=true' \
-  --config 'profile.fmt-wasm.panic="abort"'
+  --target wasm32-unknown-unknown --profile fmt-wasm
 
 # into a fresh directory first, so a failed run leaves the previous module in place
 tmp=$(mktemp -d)
