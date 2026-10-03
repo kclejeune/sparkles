@@ -38,10 +38,10 @@ query templates and on all 88 query instances. Its geometric mean is 4.95 ms, ag
 In the full-text comparison, Sparkles is the fastest on all 7 queries at 1.05M and on 6
 of 7 at 10.5M. At 10.5M, QLever counts the hits of a common word 1.11× faster.
 
-On English DBpedia at 1.24 billion triples, against QLever alone, Sparkles is faster on 28
-of the 29 queries whose answers agree and on both throughput tests, and the last one,
-`geo-box`, is a tie. It loads the data in 584 s against QLever's 1,674 s. Cold, QLever is
-faster on 17 of 31 queries, most of them point lookups and small joins
+On English DBpedia at 1.24 billion triples, against QLever alone, Sparkles is faster on all
+29 queries whose answers agree. It is faster on one of the two throughput tests and ties
+on the other. It loads the data in 584 s against QLever's 1,674 s. Cold, QLever is faster
+on 17 of 31 queries, most of them point lookups and small joins
 ([DBpedia at 1.24 billion triples](#dbpedia-at-124-billion-triples)).
 
 Sparkles uses more memory than QLever, and that is a choice. Its defaults spend memory on
@@ -700,20 +700,34 @@ table above, whose standard deviation was 16 ms.
 
 **`export-1m`.** The export of a million triples as TSV decoded each term of each row
 from the vocabulary in row order. The objects of those triples are scattered over the
-8 GB vocabulary file, so a cold server took one page fault after another. The
-serializer now decodes 65,536 rows at a time. It sorts the chunk's distinct vocabulary
-ids, asks the kernel to read their pages ahead (`MADV_WILLNEED`), and decodes each
-front-coded block once, in id order and in parallel. The next chunk's pages are asked for
-while a chunk is written, so a warm export does not wait for those requests.
+8 GB vocabulary file, so a cold server took one page fault after another. A result of
+more than 65,536 rows is now serialized in chunks of that many rows. For each chunk the
+serializer sorts the vocabulary ids of its cells, asks the kernel to read their pages
+ahead (`MADV_WILLNEED`), and decodes each front-coded block once, in id order and in
+parallel. The next chunk's pages are asked for while a chunk is written, so a warm export
+does not wait for those requests. Smaller results are still decoded row by row: holding
+a chunk's terms costs more memory per request, and under 16 concurrent clients the
+10.5M `star-join` served 25% fewer requests a second that way. An export holds up to
+about 70 MiB more while it is written, which the peak RSS of `export-500k` at 1.05M shows
+(a rise of 103 MiB against 34 MiB before).
 
 | `export-1m` | warm (ms) | cold (ms) |
 |---|---:|---:|
 | before | 582 | 10,290 |
 | decoded in id order | 317 | 2,490 |
-| also reading ahead | **302** | **1,160** |
+| also reading ahead | **243** | **1,158** |
 
 These figures are the median of five warm runs and the mean of two cold runs of each
 build, timed with curl one after another on the same index.
+
+**The synthetic data.** `scripts/bench.sh` ran Sparkles alone at both sizes, the build of
+the first run and this build one after the other on `forge`, with 5 runs per query. At
+10.5M, the load took 3.69 s against 6.56 s, `export-500k` 92 against 189 ms,
+`order-by-full` 350 against 437 ms and `optional-chain` 76 against 108 ms. The three
+return large results, which are now decoded in id order. At 1.05M, the load took 0.44 s
+against 0.66 s and `export-500k` 91 against 182 ms. The other queries, the update
+latency and the throughput stayed within their noise: `star-join` with 16 clients served
+237 against 243 queries a second at 10.5M, and 1,197 against 1,233 at 1.05M.
 
 **The whole run again.** With the new index and build, the query step of
 `scripts/bench-billion.sh` ran again for Sparkles alone, with the same settings, and its
@@ -722,87 +736,89 @@ answers were checked against the stored ones. QLever's figures are those of the 
 | query | Sparkles before (ms) | Sparkles after (ms) | QLever (ms) |
 |---|---:|---:|---:|
 | **load** (s) | 2292.41 | **584.48** | 1673.78 |
-| abstract-contains | 36.9 ± 6.2 | **36.8 ± 0.9** | 223.9 ± 0.5 |
-| births-by-decade | 51.6 ± 2.2 | **47.8 ± 1.0** | 142.6 ± 14.8 |
-| category-people-1 | 11.3 ± 2.5 | **13.5 ± 1.2** | 53.0 ± 5.6 |
-| category-people-2 | 9.8 ± 2.8 | **10.3 ± 2.6** | 55.7 ± 3.4 |
-| category-tree | 271.8 ± 3.1 | **275.5 ± 4.3** | 2048.9 ± 25.9 |
-| class-counts | 5.6 ± 2.9 | **9.5 ± 1.1** | 98.2 ± 1.3 |
-| costar-birthplace | 52.1 ± 2.2 | **48.7 ± 0.6** | 129.8 ± 14.4 |
-| count-all | 9.8 ± 1.1 † | 10.9 ± 2.3 † | 2550.2 ± 21.3 † |
-| country-population | 10.3 ± 1.3 | **10.8 ± 1.1** | 21.3 ± 2.1 |
-| entity-facts-1 | 8.0 ± 2.0 | **5.2 ± 1.8** | 17.5 ± 1.7 |
-| entity-facts-2 | 9.1 ± 2.1 | **9.9 ± 1.8** | 14.4 ± 1.4 |
-| entity-summary-1 | 6.0 ± 1.4 | **8.6 ± 3.4** | 14.1 ± 2.6 |
-| entity-summary-2 | 7.2 ± 3.7 | **10.6 ± 1.3** | 12.8 ± 1.4 |
-| export-1m | 556.6 ± 2.3 | **323.7 ± 7.6** | 1445.5 ± 23.9 |
-| film-director-optional | 18.8 ± 1.8 | **18.3 ± 0.9** | 40.1 ± 6.6 |
-| geo-box | 147.9 ± 3.0 | 154.5 ± 11.1 | **148.2 ± 3.3** |
-| inlinks-count-1 | 9.4 ± 1.8 | **8.1 ± 2.8** | 18.2 ± 4.9 |
-| inlinks-count-2 | 7.9 ± 4.0 | **9.7 ± 1.2** | 14.2 ± 1.0 |
-| label-regex | 46.1 ± 16.0 | **9.1 ± 0.5** | 19.5 ± 5.9 |
-| outlink-classes-1 | 17.9 ± 12.6 | **20.7 ± 3.3** | 28.0 ± 0.9 |
-| outlink-classes-2 | 19.4 ± 11.6 | **13.2 ± 3.6** | 25.1 ± 3.3 |
-| people-no-birthdate | 55.6 ± 7.8 | **50.4 ± 2.7** | 62.9 ± 1.3 |
-| place-births-1 | 13.9 ± 1.5 | **17.5 ± 0.6** | 39.6 ± 2.8 |
-| place-births-2 | 12.6 ± 2.5 | **16.8 ± 0.9** | 45.7 ± 0.9 |
-| place-union-1 | 11.1 ± 0.4 | **11.7 ± 3.2** | 17.5 ± 0.9 |
-| place-union-2 | 10.2 ± 1.4 | **11.6 ± 1.9** | 16.5 ± 1.7 |
-| predicate-counts | 25.1 ± 3.0 † | 27.3 ± 2.2 † | 5680.4 ± 16.4 † |
-| redirect-target-1 | 9.4 ± 1.1 | **4.5 ± 0.2** | 23.4 ± 2.1 |
-| redirect-target-2 | 7.9 ± 1.4 | **11.4 ± 0.1** | 21.9 ± 1.3 |
-| sameas-subjects | 8.6 ± 0.4 | **9.7 ± 0.4** | 22.1 ± 1.3 |
-| top-linked | 602.5 ± 17.3 | **605.0 ± 15.6** | 5598.2 ± 41.2 |
-| **throughput** entity-facts-1, 16 clients (queries/s) | 1450 | **1426** | 1216 |
-| **throughput** place-births-1, 16 clients (queries/s) | 860 | **834** | 234 |
+| abstract-contains | 36.9 ± 6.2 | **35.9 ± 2.9** | 223.9 ± 0.5 |
+| births-by-decade | 51.6 ± 2.2 | **47.8 ± 1.9** | 142.6 ± 14.8 |
+| category-people-1 | 11.3 ± 2.5 | **13.5 ± 2.8** | 53.0 ± 5.6 |
+| category-people-2 | 9.8 ± 2.8 | **11.1 ± 2.2** | 55.7 ± 3.4 |
+| category-tree | 271.8 ± 3.1 | **266.9 ± 4.4** | 2048.9 ± 25.9 |
+| class-counts | 5.6 ± 2.9 | **9.6 ± 0.7** | 98.2 ± 1.3 |
+| costar-birthplace | 52.1 ± 2.2 | **49.8 ± 5.5** | 129.8 ± 14.4 |
+| count-all | 9.8 ± 1.1 † | 7.6 ± 3.2 † | 2550.2 ± 21.3 † |
+| country-population | 10.3 ± 1.3 | **10.4 ± 1.4** | 21.3 ± 2.1 |
+| entity-facts-1 | 8.0 ± 2.0 | **8.3 ± 1.5** | 17.5 ± 1.7 |
+| entity-facts-2 | 9.1 ± 2.1 | **11.2 ± 1.2** | 14.4 ± 1.4 |
+| entity-summary-1 | 6.0 ± 1.4 | **11.0 ± 1.0** | 14.1 ± 2.6 |
+| entity-summary-2 | 7.2 ± 3.7 | **9.7 ± 1.3** | 12.8 ± 1.4 |
+| export-1m | 556.6 ± 2.3 | **250.7 ± 5.2** | 1445.5 ± 23.9 |
+| film-director-optional | 18.8 ± 1.8 | **17.4 ± 3.6** | 40.1 ± 6.6 |
+| geo-box | 147.9 ± 3.0 | **138.1 ± 3.4** | 148.2 ± 3.3 |
+| inlinks-count-1 | 9.4 ± 1.8 | **12.0 ± 1.9** | 18.2 ± 4.9 |
+| inlinks-count-2 | 7.9 ± 4.0 | **5.3 ± 1.3** | 14.2 ± 1.0 |
+| label-regex | 46.1 ± 16.0 | **15.8 ± 1.9** | 19.5 ± 5.9 |
+| outlink-classes-1 | 17.9 ± 12.6 | **12.8 ± 3.0** | 28.0 ± 0.9 |
+| outlink-classes-2 | 19.4 ± 11.6 | **16.2 ± 2.0** | 25.1 ± 3.3 |
+| people-no-birthdate | 55.6 ± 7.8 | **50.4 ± 0.8** | 62.9 ± 1.3 |
+| place-births-1 | 13.9 ± 1.5 | **18.2 ± 2.1** | 39.6 ± 2.8 |
+| place-births-2 | 12.6 ± 2.5 | **14.8 ± 1.8** | 45.7 ± 0.9 |
+| place-union-1 | 11.1 ± 0.4 | **13.3 ± 1.0** | 17.5 ± 0.9 |
+| place-union-2 | 10.2 ± 1.4 | **11.8 ± 0.4** | 16.5 ± 1.7 |
+| predicate-counts | 25.1 ± 3.0 † | 28.9 ± 2.8 † | 5680.4 ± 16.4 † |
+| redirect-target-1 | 9.4 ± 1.1 | **8.9 ± 2.7** | 23.4 ± 2.1 |
+| redirect-target-2 | 7.9 ± 1.4 | **5.9 ± 1.4** | 21.9 ± 1.3 |
+| sameas-subjects | 8.6 ± 0.4 | **11.4 ± 0.7** | 22.1 ± 1.3 |
+| top-linked | 602.5 ± 17.3 | **561.3 ± 18.6** | 5598.2 ± 41.2 |
+| **throughput** entity-facts-1, 16 clients (queries/s) | 1450 | 1190 | **1216** |
+| **throughput** place-births-1, 16 clients (queries/s) | 860 | **871** | 234 |
 
-Sparkles is now faster on 28 of the 29 ranked queries and on both throughput tests.
-`geo-box` is a tie, 4% slower than QLever's. Some small queries, such as `place-births-1`
-and `place-births-2`, took a few ms more than in the first run. Timed with curl in one
-session, with the build of the first run and this build serving the same index
-alternately, these queries took the same time, 3.0–3.3 ms and 3.9–6.1 ms with both, so
-the change is in the machine or the curl processes, not in the queries. The server's RSS
-after the run was 5,643 MiB.
+Sparkles was faster than QLever on all 29 ranked queries in this pass and on the
+`place-births-1` throughput test. The `entity-facts-1` throughput is a tie: three passes
+of builds that differ only in how they serialize large results measured 1,426, 1,420 and
+1,190 queries a second, and QLever's one pass 1,216. The small queries vary by a few ms
+from run to run, because this script does not pin curl to a CPU and starting curl costs
+3.5 to 9 ms depending on the core. Timed with curl alone in one session, with the build
+of the first run and this build serving the same index alternately, `top-linked`,
+`place-births-2` and `category-people-1` took the same time with both. The server's RSS
+after the run was 5,718 MiB.
 
 | query (cold) | Sparkles before (ms) | Sparkles after (ms) | QLever (ms) |
 |---|---:|---:|---:|
-| abstract-contains | 1084.0 | **1090.7** | 4290.6 |
-| births-by-decade | 133.6 | **105.7** | 171.9 |
-| category-people-1 | 380.2 | 287.7 | **228.0** |
-| category-people-2 | 254.6 | 241.3 | **169.6** |
-| category-tree | 406.3 | **386.1** | 1889.6 |
-| class-counts | 52.1 | **25.1** | 164.5 |
-| costar-birthplace | 200.7 | **136.1** | 193.9 |
-| count-all | 5.8 | **7.2** | 4580.1 |
-| country-population | 117.9 | 129.1 | **35.9** |
-| entity-facts-1 | 58.8 | 49.1 | **25.3** |
-| entity-facts-2 | 59.7 | 51.4 | **39.1** |
-| entity-summary-1 | 64.1 | 37.8 | **20.2** |
-| entity-summary-2 | 36.3 | 32.7 | **26.8** |
-| export-1m | 11586.7 | **1325.7** | 4284.0 |
-| film-director-optional | 59.5 | **45.4** | 63.0 |
-| geo-box | 374.8 | 350.9 | **183.8** |
-| inlinks-count-1 | 42.4 | 30.6 | **23.8** |
-| inlinks-count-2 | 52.6 | 32.6 | **26.0** |
-| label-regex | 988.6 | 80.2 | **69.1** |
-| outlink-classes-1 | 157.3 | 99.6 | **62.2** |
-| outlink-classes-2 | 103.6 | 67.0 | **45.7** |
-| people-no-birthdate | 115.1 | 108.0 | **82.6** |
-| place-births-1 | 271.5 | 273.3 | **268.3** |
-| place-births-2 | 260.5 | **246.2** | 340.9 |
-| place-union-1 | 213.6 | **181.1** | 220.4 |
-| place-union-2 | 246.3 | 258.5 | **217.2** |
-| predicate-counts | 43.1 | **47.2** | 5888.9 |
-| redirect-target-1 | 58.8 | **40.0** | 42.8 |
-| redirect-target-2 | 71.4 | 40.0 | **32.1** |
-| sameas-subjects | 25.2 | **15.0** | 27.2 |
-| top-linked | 986.4 | **1158.9** | 6527.1 |
+| abstract-contains | 1084.0 | **1077.3** | 4290.6 |
+| births-by-decade | 133.6 | **121.7** | 171.9 |
+| category-people-1 | 380.2 | 293.2 | **228.0** |
+| category-people-2 | 254.6 | 241.4 | **169.6** |
+| category-tree | 406.3 | **385.3** | 1889.6 |
+| class-counts | 52.1 | **26.3** | 164.5 |
+| costar-birthplace | 200.7 | **140.0** | 193.9 |
+| count-all | 5.8 | **13.2** | 4580.1 |
+| country-population | 117.9 | 119.7 | **35.9** |
+| entity-facts-1 | 58.8 | 47.0 | **25.3** |
+| entity-facts-2 | 59.7 | 55.0 | **39.1** |
+| entity-summary-1 | 64.1 | 38.6 | **20.2** |
+| entity-summary-2 | 36.3 | 39.8 | **26.8** |
+| export-1m | 11586.7 | **1167.7** | 4284.0 |
+| film-director-optional | 59.5 | **52.8** | 63.0 |
+| geo-box | 374.8 | 349.5 | **183.8** |
+| inlinks-count-1 | 42.4 | 36.2 | **23.8** |
+| inlinks-count-2 | 52.6 | 35.6 | **26.0** |
+| label-regex | 988.6 | 85.5 | **69.1** |
+| outlink-classes-1 | 157.3 | 111.2 | **62.2** |
+| outlink-classes-2 | 103.6 | 81.2 | **45.7** |
+| people-no-birthdate | 115.1 | 108.7 | **82.6** |
+| place-births-1 | 271.5 | **246.2** | 268.3 |
+| place-births-2 | 260.5 | **283.8** | 340.9 |
+| place-union-1 | 213.6 | **215.0** | 220.4 |
+| place-union-2 | 246.3 | 229.0 | **217.2** |
+| predicate-counts | 43.1 | **51.3** | 5888.9 |
+| redirect-target-1 | 58.8 | 45.5 | **42.8** |
+| redirect-target-2 | 71.4 | 40.4 | **32.1** |
+| sameas-subjects | 25.2 | **25.2** | 27.2 |
+| top-linked | 986.4 | **976.0** | 6527.1 |
 
-Cold, Sparkles is faster on 14 of the 31 queries, against 11 before. Single cold runs
-vary: an earlier run of nearly the same build measured `entity-facts-1` at 18 ms and
-`place-births-1` at 85 ms, where this one measured 49 and 273 ms. The changes in
-`label-regex` and `export-1m` hold in every run. `export-1m` went from 11,587 to 1,326 ms
-against QLever's 4,284, and `label-regex` from 989 to 80 ms against QLever's 69.
+Cold, Sparkles was faster on 14 of the 31 queries, against 11 before. Single cold runs
+vary: another pass of nearly the same build measured `entity-facts-1` at 18 ms and
+`place-births-1` at 85 ms. The changes in `export-1m` and `label-regex` hold in every
+run. `export-1m` went from 11,587 to 1,168 ms against QLever's 4,284, and `label-regex`
+from 989 to 86 ms against QLever's 69.
 
 ## WatDiv
 
