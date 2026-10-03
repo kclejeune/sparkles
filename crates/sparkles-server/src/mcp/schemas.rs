@@ -17,6 +17,7 @@ pub fn all_tools() -> Vec<&'static str> {
         "describe_resource",
         "find_paths",
         "list_commits",
+        "list_changes",
     ];
     if cfg!(feature = "text") {
         v.push("search_text");
@@ -353,6 +354,33 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "readable":{"type":"array","description":"The commits whose state `at` and `atCommit` can read","items":{"type":"object","required":["from","to"],"properties":{"from":{"type":"integer"},"to":{"type":"integer"}}}},
                 "snapshots":{"type":"array","description":"Named snapshots, newest first (read with at=snapshot:<name>)","items":{"type":"object","required":["name","commit"],"properties":{"name":{"type":"string"},"commit":{"type":"integer"}}}}}}),
             ),
+        ),
+        read(
+            "list_changes",
+            "List recorded changes",
+            "The recorded history of a dataset: each quad added or removed by the commits in a range, with the commit's number, time, kind, author and message. Filter by subjects, predicates, objects, graphs and op to answer when a fact was added or removed, which commit last changed a resource, or which values a property took over time. It reads the change log, which reaches further back than the states atCommit can read.",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "dataset": ds(),
+                "subjects": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"IRIs, prefixed names or blank nodes"},
+                "predicates": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"IRIs or prefixed names"},
+                "objects": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"IRIs, prefixed names, blank nodes, or literals in N-Triples syntax (\"text\"@en, \"42\"^^<http://www.w3.org/2001/XMLSchema#integer>)"},
+                "graphs": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"`default` or graph IRIs (default: every graph you may read)"},
+                "from": {"type":["integer","string"],"description":"The first commit: a number, `commit:N`, `time:<RFC 3339>` or `snapshot:<name>` (default: the first)"},
+                "to": {"type":["integer","string"],"description":"The last commit (default: the head)"},
+                "op": {"enum":["add","remove"],"description":"Only additions or only removals"},
+                "order": {"enum":["asc","desc"],"default":"asc","description":"desc lists the newest commits first"},
+                "limit": {"type":"integer","minimum":1,"maximum":cfg.max_rows,"default":100.min(cfg.max_rows)},
+                "timeoutSeconds": to(cfg)}}),
+            Some(json!({"type":"object","required":["dataset","head","from","to","changes","truncated","unrecorded","prefixes"],"properties":{
+                "dataset":{"type":"string"},"head":{"type":"integer"},"from":{"type":"integer"},"to":{"type":"integer"},
+                "changes":{"type":"array","items":{"type":"object","required":["commit","timestamp","kind","op","quad"],"properties":{
+                    "commit":{"type":"integer"},"timestamp":{"type":"string"},"kind":{"type":"string"},
+                    "author":{"type":"string"},"message":{"type":"string"},
+                    "op":{"enum":["add","remove"]},"quad":{"type":"string","description":"s p o, and the graph unless it is the default graph"}}}},
+                "truncated":{"type":"boolean"},
+                "unrecorded":{"type":"array","description":"Commits in the range whose changes the log does not hold","items":{"type":"object","properties":{
+                    "from":{"type":"integer"},"to":{"type":"integer"},"reason":{"enum":["before-log","bulk","gap"]}}}},
+                "prefixes":prefixes()}})),
         ),
         read(
             "search_text",

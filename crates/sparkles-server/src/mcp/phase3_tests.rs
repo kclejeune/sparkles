@@ -90,6 +90,92 @@ async fn find_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn list_changes() {
+    let server = fixture_server();
+    let ds = server.state.get("t").unwrap();
+    let update = |u: &str| {
+        let opts = sparkles::sparql::QueryOptions {
+            write: sparkles::guard::WriteOptions {
+                message: Some("rename".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        sparkles::sparql::update::update(
+            &ds.store,
+            &format!("PREFIX ex: <http://ex.org/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {u}"),
+            &opts,
+        )
+        .unwrap();
+    };
+    update(
+        "DELETE DATA { ex:bob rdfs:label \"Bob\" } ; INSERT DATA { ex:bob rdfs:label \"Robert\" }",
+    );
+    update("INSERT DATA { ex:carol a ex:Person }");
+    let mut c = Client::start(server);
+    // the labels bob has had
+    let s = c
+        .structured(
+            "list_changes",
+            json!({"subjects": ["ex:bob"], "predicates": ["rdfs:label"]}),
+        )
+        .await;
+    let rows: Vec<(String, String, u64)> = s["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["op"].as_str().unwrap().to_string(),
+                c["quad"].as_str().unwrap().to_string(),
+                c["commit"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                "add".to_string(),
+                "ex:bob rdfs:label \"Bob\"".to_string(),
+                1
+            ),
+            (
+                "remove".to_string(),
+                "ex:bob rdfs:label \"Bob\"".to_string(),
+                2
+            ),
+            (
+                "add".to_string(),
+                "ex:bob rdfs:label \"Robert\"".to_string(),
+                2
+            ),
+        ],
+        "{s}"
+    );
+    assert_eq!(s["changes"][1]["message"], "rename");
+    assert_eq!(s["head"], 3);
+    // newest first, additions only, from commit 2 on, by object
+    let s = c
+        .structured(
+            "list_changes",
+            json!({"objects": ["ex:Person"], "op": "add", "from": 2, "order": "desc", "limit": 1}),
+        )
+        .await;
+    assert_eq!(
+        s["changes"][0]["quad"], "ex:carol rdf:type ex:Person",
+        "{s}"
+    );
+    assert_eq!(s["truncated"], false);
+    let s = c
+        .structured("list_changes", json!({"objects": ["\"Robert\""]}))
+        .await;
+    assert_eq!(s["changes"].as_array().unwrap().len(), 1, "{s}");
+    let (_, e) = c.error("list_changes", json!({"from": "yesterday"})).await;
+    assert_eq!(e["code"], "bad-argument");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn describe_modes() {
     let ttl = r#"@prefix ex: <http://ex.org/> .
 ex:alice ex:knows ex:bob ; ex:address [ ex:city "Paris" ] .

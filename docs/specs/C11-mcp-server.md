@@ -10,7 +10,7 @@
 > `dryRun` for `sparql_update` came with [C15](C15-write-previews.md), and the rest
 > shipped on 2026-10-03: past states from the dataset's history, `ifHead`, completions,
 > `subscriptions/listen`, the tasks extension and the stdio-to-HTTP bridge, together
-> with tools for path search, GraphQL, RDF Patch and DESCRIBE modes.
+> with tools for path search, history queries, GraphQL, RDF Patch and DESCRIBE modes.
 >
 > **User docs:** [API: MCP server](../API.md#mcp-server) ·
 > [Usage: MCP server](../USAGE.md#mcp-server-llm-agents) ·
@@ -1554,7 +1554,7 @@ revisit them.
   hour. Phase 3 added `notifications/tools/list_changed` (below).
 
 **Phase 3 shipped on 2026-10-03.** All of its items are in, and features that landed
-since the design added four tools or arguments.
+since the design added five tools or arguments.
 
 - **Past states.** The read tools take `at` beside `atCommit`. It is a commit number or a
   string, `commit:N`, `time:<RFC 3339>`, `snapshot:<name>` or `head`, parsed as the HTTP
@@ -1610,7 +1610,12 @@ since the design added four tools or arguments.
   `sparql_update` applies an RDF Patch given as `patch` instead of `update`, with a write
   grant on the `patch` endpoint. `describe_resource` takes `mode` (`cbd`, `scbd`,
   `outgoing`) and adds the resource's DESCRIBE in that mode, at most `maxTriples` triples.
-  History queries across commits (F06 Phase 3) had not merged, so no tool reads them.
+  `list_changes` runs the history query of `GET /{ds}/history`
+  ([F06 §11](F06-snapshots-and-point-in-time.md#11-phase-3-history-queries-and-the-change-log)),
+  which merged while this phase was built. It filters the recorded changes by subjects,
+  predicates, objects, graphs, commit range and kind, needs the grant of the `diff`
+  endpoint, and renders each change as a line of terms with its commit's number, time,
+  kind, author and message.
 
 **Deviations of Phase 3.**
 

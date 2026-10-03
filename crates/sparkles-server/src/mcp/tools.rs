@@ -48,6 +48,7 @@ pub fn run(
         "describe_resource" => t.describe_resource(args),
         "find_paths" => t.find_paths(args),
         "list_commits" => t.list_commits(args),
+        "list_changes" => t.list_changes(args),
         #[cfg(feature = "text")]
         "search_text" => t.search_text(args),
         "similar_entities" => t.similar_entities(args),

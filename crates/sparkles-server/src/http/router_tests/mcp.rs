@@ -1436,6 +1436,27 @@ mod auth {
         );
         let r = paths("gra").await;
         assert_eq!(r["structuredContent"]["paths"], json!([]), "{r}");
+        // the recorded history leaves out the graphs the caller may not read
+        let r = tool(
+            &s.app,
+            "list_changes",
+            json!({"dataset": "graphs"}),
+            &[("authorization", &gra)],
+        )
+        .await;
+        let quads: Vec<String> = r["structuredContent"]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["quad"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!quads.is_empty(), "{r}");
+        assert!(
+            quads
+                .iter()
+                .all(|q| !q.contains("b/1") && !q.contains("ex:b1")),
+            "{quads:?}"
+        );
         // validation reads every graph
         let r = tool(
             &s.app,

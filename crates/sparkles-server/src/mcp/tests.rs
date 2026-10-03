@@ -376,6 +376,21 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "limit": {"type":"integer","minimum":1,"maximum":100,"default":10},
                 "before": {"type":"integer","minimum":0,"description":"Only commits older than this seq"}}}),
         ),
+        (
+            "list_changes",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "dataset": ds,
+                "subjects": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"IRIs, prefixed names or blank nodes"},
+                "predicates": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"IRIs or prefixed names"},
+                "objects": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"IRIs, prefixed names, blank nodes, or literals in N-Triples syntax (\"text\"@en, \"42\"^^<http://www.w3.org/2001/XMLSchema#integer>)"},
+                "graphs": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"`default` or graph IRIs (default: every graph you may read)"},
+                "from": {"type":["integer","string"],"description":"The first commit: a number, `commit:N`, `time:<RFC 3339>` or `snapshot:<name>` (default: the first)"},
+                "to": {"type":["integer","string"],"description":"The last commit (default: the head)"},
+                "op": {"enum":["add","remove"],"description":"Only additions or only removals"},
+                "order": {"enum":["asc","desc"],"default":"asc","description":"desc lists the newest commits first"},
+                "limit": {"type":"integer","minimum":1,"maximum":1000,"default":100},
+                "timeoutSeconds": to}}),
+        ),
         #[cfg(feature = "text")]
         (
             "search_text",
@@ -462,6 +477,7 @@ async fn a03_tool_list() {
             "describe_resource",
             "find_paths",
             "list_commits",
+            "list_changes",
             #[cfg(feature = "text")]
             "search_text",
             "similar_entities",

@@ -28,6 +28,7 @@ use graphql::graphql_on;
 fn graphql_on(_: &Principal, _: &Dataset) -> bool {
     false
 }
+mod history;
 pub mod http;
 mod notify;
 mod paths;

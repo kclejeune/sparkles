@@ -1631,6 +1631,9 @@ The tools are read-only unless the operator turns on the write tool:
 * `find_paths` finds the shortest path, all shortest paths, the k shortest or all paths
   up to a length between two nodes, or from one node, as
   [`SERVICE path:search`](#finding-paths) does, and returns each path's edges.
+* `list_changes` lists the recorded changes of a range of commits, each quad added or
+  removed with its commit, time, author and message, filtered by subject, predicate,
+  object and graph. It answers when a fact changed and who changed it.
 * `graphql_query` runs read-only GraphQL on a dataset with a GraphQL schema installed.
   Called without a query, it returns the API schema to write queries against. It is
   listed only while such a dataset exists.
