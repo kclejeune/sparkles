@@ -168,6 +168,9 @@ mod validate;
 #[path = "format_tests.rs"]
 mod format;
 
+#[path = "phase3_tests.rs"]
+mod phase3;
+
 fn head(s: &McpServer, ds: &str) -> u64 {
     s.state.get(ds).unwrap().store.head_commit().seq
 }
@@ -342,7 +345,29 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "direction": {"enum":["both","outgoing","incoming"],"default":"both"},
                 "maxTriples": {"type":"integer","minimum":1,"maximum":500,"default":50,"description":"Per direction"},
                 "lang": {"type":"string","default":"en","description":"Preferred label language"},
+                "mode": {"enum":["cbd","scbd","outgoing"],"description":"Also return the resource's DESCRIBE in this mode as `description`: cbd (the concise bounded description), scbd (with the incoming triples too) or outgoing (its own triples), at most maxTriples triples"},
                 "reasoning": rs, "atCommit": at, "at": sel}}),
+        ),
+        (
+            "find_paths",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "dataset": ds,
+                "source": {"type":"string","description":"The first node: an IRI or prefixed name"},
+                "target": {"type":"string","description":"The last node: an IRI or prefixed name"},
+                "predicates": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"The predicates whose triples are edges (default: all)"},
+                "algorithm": {"enum":["shortest","allShortest","kShortest","all"],"default":"shortest"},
+                "direction": {"enum":["forward","backward","both"],"default":"forward","description":"Follow triples from subject to object, the other way, or both"},
+                "minLength": {"type":"integer","minimum":0,"description":"The fewest edges (default 1; the shortest modes take 0 or 1)"},
+                "maxLength": {"type":"integer","minimum":0,"description":"The most edges (required by algorithm=all)"},
+                "k": {"type":"integer","minimum":1,"maximum":100,"description":"Paths per pair for algorithm=kShortest"},
+                "limit": {"type":"integer","minimum":1,"maximum":100,"default":10,"description":"The most paths returned"},
+                "maxVisited": {"type":"integer","minimum":1,"description":"The most nodes one search may visit (default 10,000,000)"},
+                "weight": {"type":"string","description":"The property of an edge's RDF 1.2 reifier that holds its weight"},
+                "defaultWeight": {"type":"number","minimum":0,"description":"The weight of an edge without one (with weight)"},
+                "graph": {"type":"string","default":"default","description":"`default` or a named graph IRI to search in"},
+                "reasoning": rs,
+                "timeoutSeconds": to,
+                "atCommit": at, "at": sel}}),
         ),
         (
             "list_commits",
@@ -435,6 +460,7 @@ async fn a03_tool_list() {
             "sparql_query",
             "explain_query",
             "describe_resource",
+            "find_paths",
             "list_commits",
             #[cfg(feature = "text")]
             "search_text",

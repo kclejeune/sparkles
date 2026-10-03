@@ -46,6 +46,7 @@ pub fn run(
         "sparql_query" => t.sparql_query(args),
         "explain_query" => t.explain_query(args),
         "describe_resource" => t.describe_resource(args),
+        "find_paths" => t.find_paths(args),
         "list_commits" => t.list_commits(args),
         #[cfg(feature = "text")]
         "search_text" => t.search_text(args),
@@ -56,6 +57,8 @@ pub fn run(
         "validate_shex" => t.validate_shex(args),
         #[cfg(feature = "fmt")]
         "format" => t.format(args),
+        #[cfg(feature = "graphql")]
+        "graphql_query" => t.graphql_query(args),
         "sparql_update" => t.sparql_update(args),
         // a stored query of a dataset (`<dataset>__<query>`)
         name => t.stored_query(name, args),
@@ -387,6 +390,7 @@ struct DescribeResourceArgs {
     reasoning: Option<bool>,
     at_commit: Option<u64>,
     at: Option<Value>,
+    mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -585,7 +589,7 @@ impl Tools<'_> {
                     Some(v) => v.masked(&snap).and_then(|m| v.visible_quads(&m)).ok(),
                     None => Some(snap.len()),
                 };
-                json!({
+                let mut j = json!({
                     "name": ds.name,
                     "quads": quads,
                     "commit": snap.commit,
@@ -593,7 +597,12 @@ impl Tools<'_> {
                     "reasoning": reasoning,
                     "textSearch": ds.store.text_enabled(),
                     "writable": updates && p.can(&ds.name, crate::auth::Level::Write),
-                })
+                });
+                // graphql_query reads this dataset
+                if self.server.offers("graphql_query") && super::graphql_on(p, ds) {
+                    j["graphql"] = true.into();
+                }
+                j
             })
             .collect();
         Ok(Outcome::Structured(json!({
@@ -1170,6 +1179,53 @@ impl Tools<'_> {
 
     // --------------------------------------------------------- describe_resource ------
 
+    /// The `DESCRIBE` of the resource in `mode` (`cbd`, `scbd` or `outgoing`, as the
+    /// dataset's DESCRIBE setting and `?describe=` name them), at most `max` triples,
+    /// rendered `s p o` with the compact terms.
+    fn description(
+        &self,
+        q: &Queries,
+        mode: &str,
+        max: usize,
+        terms: &mut Terms,
+        ctx: &ErrorContext,
+    ) -> Result<Value, ToolError> {
+        let mode = sparql::describe::DescribeMode::parse(mode)
+            .map_err(|_| ToolError::bad_argument("mode must be cbd, scbd or outgoing"))?;
+        let mut opts = q.opts.clone();
+        opts.timeout = Some(remaining(q.deadline).map_err(|e| ctx.engine(e))?);
+        opts.initial_bindings = vec![("r".to_string(), q.resource.clone())];
+        // one triple more than shown tells whether the description goes on
+        opts.describe.mode = mode;
+        opts.describe.labels = false;
+        opts.describe.max_triples = Some(max as u64 + 1);
+        // the resource comes in as a binding (a blank node has no syntax in DESCRIBE)
+        let r = sparql::query(
+            q.snap.clone(),
+            "DESCRIBE ?d WHERE { BIND(?r AS ?d) }",
+            &opts,
+        )
+        .map_err(|e| ctx.engine(e))?;
+        let triples: Vec<Value> = r
+            .triples
+            .iter()
+            .take(max)
+            .map(|t| {
+                json!(format!(
+                    "{} {} {}",
+                    terms.term(&t.subject.clone().into()),
+                    terms.term(&Term::NamedNode(t.predicate.clone())),
+                    terms.term(&t.object)
+                ))
+            })
+            .collect();
+        Ok(json!({
+            "mode": mode.name(),
+            "triples": triples,
+            "truncated": r.triples.len() > max,
+        }))
+    }
+
     fn describe_resource(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: DescribeResourceArgs = parse(args)?;
         let max_triples = bounded("maxTriples", a.max_triples, 50, 1, 500)? as usize;
@@ -1293,6 +1349,9 @@ impl Tools<'_> {
                 })
                 .collect();
             out["incoming"] = side.json(triples, &mut terms);
+        }
+        if let Some(mode) = a.mode.as_deref() {
+            out["description"] = self.description(&q, mode, max_triples, &mut terms, &ctx)?;
         }
         out["prefixes"] = json!(terms.used());
         Ok(Outcome::Structured(out))

@@ -1266,6 +1266,28 @@ mod auth {
         .await;
         let c = &r["structuredContent"]["commits"][0];
         assert!(c["seq"].is_u64() && c.get("quads").is_none(), "{r}");
+        // path search reads the caller's view: b/1 holds the only a1 → b1 edge
+        let paths = |user: &str| {
+            let auth = b(user);
+            let app = s.app.clone();
+            async move {
+                tool(
+                    &app,
+                    "find_paths",
+                    json!({"dataset": "graphs", "source": "http://ex/a1", "target": "http://ex/b1", "graph": "http://ex/b/1"}),
+                    &[("authorization", &auth)],
+                )
+                .await
+            }
+        };
+        let r = paths("gfull").await;
+        assert_eq!(
+            r["structuredContent"]["paths"][0]["edges"],
+            json!(["ex:a1 ex:q ex:b1"]),
+            "{r}"
+        );
+        let r = paths("gra").await;
+        assert_eq!(r["structuredContent"]["paths"], json!([]), "{r}");
         // validation reads every graph
         let r = tool(
             &s.app,

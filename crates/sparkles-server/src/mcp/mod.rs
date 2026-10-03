@@ -15,7 +15,18 @@ mod draft;
 mod errors;
 #[cfg(feature = "fmt")]
 mod format;
+#[cfg(feature = "graphql")]
+mod graphql;
+#[cfg(feature = "graphql")]
+use graphql::graphql_on;
+
+/// Without GraphQL no dataset has a GraphQL API.
+#[cfg(not(feature = "graphql"))]
+fn graphql_on(_: &Principal, _: &Dataset) -> bool {
+    false
+}
 pub mod http;
+mod paths;
 mod pins;
 mod render;
 mod schema_history;
@@ -265,13 +276,24 @@ impl McpServer {
                 .any(|ds| p.can(&ds.name, Level::Write))
     }
 
+    /// Whether `p` may call the offered tool `name`: the write tool needs a dataset
+    /// `p` may write to, and `graphql_query` one with a GraphQL schema that `p` may
+    /// query. Tool listings leave out the others.
+    pub fn allows(&self, p: &Principal, name: &str) -> bool {
+        match name {
+            "sparql_update" => self.may_update(p),
+            #[cfg(feature = "graphql")]
+            "graphql_query" => self.graphql_available(p),
+            _ => true,
+        }
+    }
+
     /// The offered tools `p` may call, in `tools/list` order.
     pub fn tools_for(&self, p: &Principal) -> Vec<&schemas::ToolDef> {
-        let update = self.may_update(p);
         self.shared
             .tools
             .iter()
-            .filter(|t| t.name != "sparql_update" || update)
+            .filter(|t| self.allows(p, t.name))
             .collect()
     }
 
@@ -299,7 +321,9 @@ impl McpServer {
         args: Map<String, Value>,
         call: Call,
     ) -> Result<Result<Outcome, ToolError>, UnknownTool> {
-        if !self.offers(name) && self.stored_tool(&call.principal, name).is_none() {
+        let offered =
+            self.offers(name) && (name == "sparql_update" || self.allows(&call.principal, name));
+        if !offered && self.stored_tool(&call.principal, name).is_none() {
             return Err(UnknownTool(name.to_string()));
         }
         Ok(self.run(name, args, call).await)
