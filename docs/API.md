@@ -35,9 +35,12 @@ a page and the member that continues the listing.
 
 The common bodies have full schemas. They are the error body, the SPARQL results, dataset
 and server information, readiness, tasks, commits and receipts, whoami, tokens, schema
-pages and the formatter's request and result. Some admin bodies, such as those of
-backups, the search indexes, reasoning, write-time validation and history, are open
-objects that link to their section of this page.
+pages and the formatter's request and result. So do the most used admin bodies: history
+status, snapshots and history queries, stored queries, the configuration and status of
+the full-text, vector and spatial indexes, reasoning status, write-time validation, and
+backup repositories and backups. A test checks these against the bodies a server
+returns. The other admin bodies, such as diffs, the change feed, write previews and
+backup policies, are open objects that link to their section of this page.
 
 The UI's Server page links both documents. Any OpenAPI viewer can open them, for example
 Swagger UI or Redocly pointed at `http://localhost:3030/$/openapi.json`. The Rust client

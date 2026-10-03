@@ -1,12 +1,13 @@
 # X03: OpenAPI description, shell completions and man pages
 
-> **Status:** implemented in part (Phase 1)
+> **Status:** implemented in part (Phase 1, part of Phase 2)
 >
 > **Phases:** Phase 1 shipped. It covers the OpenAPI 3.1 description at
 > `GET /$/openapi.json` and `GET /$/openapi.yaml`, its checked-in copy, the test that
 > keeps it in step with the route table, `sparkles openapi`, shell completions, man pages
-> and their installation by the Nix package. Phase 2, which describes the remaining admin
-> types field by field, was not built.
+> and their installation by the Nix package. Of Phase 2, the most used admin types are
+> described member by member and checked against real responses. The other admin types
+> remain open objects.
 >
 > **User docs:** [API: OpenAPI description](../API.md#openapi-description) ·
 > [Usage: Shell completions and man pages](../USAGE.md#shell-completions-and-man-pages) ·
@@ -406,7 +407,30 @@ their routes to the description, and the test keeps it equal to the route table.
 2026-10-03 the checked-in copy describes 191 operations on 116 paths with 113 schemas,
 and it is 523 KB.
 
-**Not built.** Phase 2's schemas for backups, the search indexes, reasoning, write-time
-validation, history and the other open objects, and the response-validation test that
-would keep them honest. A "try it" page in the UI, and a bundled Swagger UI. Dynamic
-completion of dataset names, and Nushell completions.
+**Phase 2, the most used admin types** (2026-10-03). `openapi/schemas/admin.rs`
+describes 23 admin bodies member by member, following the TypeScript-style definitions
+of `docs/API.md`: `HistoryStatus`, `NamedSnapshot`, `SnapshotList` and `HistoryChanges`;
+`StoredQuery` and `StoredQueryList`; `TextConfig` and `TextStatus`; `VectorIndexConfig`
+(with its `embedding` object), `VectorIndexStatus` and `VectorStatus`; `GeoConfig` and
+`GeoStatus`; `ReasoningStatus`; `ValidationConfig` and `ValidationStatus`; and
+`RepositoryConfig`, `Repository`, `RepositoryList`, `TestReport`, `BackupSummary`,
+`Backup` and `BackupList`. A status that can be `{enabled: false}` or `{config: null}`
+is an `anyOf` of that form and the full one. Members the docs describe as free-form,
+such as a stored query's `parameters`, SHACL `shapes` and the last garbage collection's
+report, stay open objects inside the typed ones. The document now has 115 schemas, of
+which 37 are open objects.
+
+`openapi::contract_tests` is the response-validation test. It has a small JSON Schema
+validator for the keywords the description uses (`$ref`, `type` with `null`, `const`,
+`enum`, `properties`, `required`, `additionalProperties`, `items`, `allOf`, `anyOf` and
+`oneOf`), and a server with a persistent dataset that has a stored query, a snapshot, a
+vector index, write-time validation, and, in the builds that have them, a full-text
+index, a spatial index, RDFS inferences, an `fs` repository and a backup. Each admin
+route of those features answers `GET`, and the body must match its operation's `200`
+schema, as must the repository that `POST /$/repositories` creates and the backup's
+detail.
+
+**Not built.** Schemas for the remaining open objects, such as diffs, the change feed,
+write previews, ShEx reports, policies and the reasoning requests. A "try it" page in
+the UI, and a bundled Swagger UI. Dynamic completion of dataset names, and Nushell
+completions.

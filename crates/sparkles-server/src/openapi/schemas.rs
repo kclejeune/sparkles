@@ -1,11 +1,14 @@
 //! `components.schemas`: the bodies of the API as JSON Schema 2020-12.
 //!
-//! The common types are described member by member. Admin bodies that only `docs/API.md`
-//! describes in full are open objects (`open`) that link to their section; the OpenAPI
-//! description says so in its `info.description`.
+//! The common types are described member by member, and so are the most used admin
+//! bodies ([`admin`]). The other admin bodies, which only `docs/API.md` describes in
+//! full, are open objects (`open`) that link to their section; the OpenAPI description
+//! says so in its `info.description`.
 
 use super::{api_doc, sref};
 use serde_json::{Map, Value as J, json};
+
+mod admin;
 
 /// An object with these members, of which `required` must be present.
 fn obj(required: &[&str], props: J) -> J {
@@ -621,34 +624,6 @@ pub(super) fn schemas() -> Map<String, J> {
         ),
     );
     put(
-        "HistoryChanges",
-        open(
-            "`{dataset, datasetId, head, from, to, truncated, changes: [{op, subject, predicate, object, graph, commit, timestamp, kind, author?, message?}], unrecorded: [{from, to, reason}]}`",
-            "history-queries",
-        ),
-    );
-    put(
-        "NamedSnapshot",
-        open(
-            "A named snapshot: the commit it pins and its expiry.",
-            "named-snapshots-and-retention",
-        ),
-    );
-    put(
-        "SnapshotList",
-        open(
-            "`{dataset, datasetId, head, snapshots: NamedSnapshot[]}`",
-            "named-snapshots-and-retention",
-        ),
-    );
-    put(
-        "HistoryStatus",
-        open(
-            "The retention window, the kept generations and the history cache.",
-            "named-snapshots-and-retention",
-        ),
-    );
-    put(
         "DryRunReport",
         open(
             "The preview of a write run with `dryRun=true`: the commit it would make, its changes, validation, preconditions and storage.",
@@ -1009,17 +984,15 @@ pub(super) fn schemas() -> Map<String, J> {
         ),
     );
 
+    // ---------------------------------------------- admin bodies, member by member --
+    admin::put_all(&mut put);
+
     // ------------------------------------------------------ open admin bodies --
     for (name, desc, anchor) in [
         (
             "ReasonRequest",
             "`{profile: \"rdfs\" | \"owl-rl\" | \"rules\", rules?, vocabularies?, geoDefaultGeometry?}`",
             "datasets-admin",
-        ),
-        (
-            "ReasoningStatus",
-            "The materialized inferences of a dataset and whether they are current.",
-            "reasoning-status-and-diagnostics",
         ),
         (
             "AutoReasonRequest",
@@ -1032,34 +1005,9 @@ pub(super) fn schemas() -> Map<String, J> {
             "reasoning-status-and-diagnostics",
         ),
         (
-            "TextStatus",
-            "The full-text index's configuration and state, or `{enabled: false}`.",
-            "full-text-search",
-        ),
-        (
-            "TextConfig",
-            "The full-text index's configuration.",
-            "full-text-search",
-        ),
-        (
             "TextHits",
             "Full-text search hits, best first.",
             "full-text-search",
-        ),
-        (
-            "VectorStatus",
-            "`{budgetBytes, usedBytes, generation, indexes, predicates}`",
-            "vector-indexes",
-        ),
-        (
-            "VectorIndexStatus",
-            "One vector index: its configuration and state.",
-            "vector-indexes",
-        ),
-        (
-            "VectorIndexConfig",
-            "A vector index's configuration.",
-            "vector-indexes",
         ),
         (
             "VectorIndexCreated",
@@ -1072,16 +1020,6 @@ pub(super) fn schemas() -> Map<String, J> {
             "vector-indexes",
         ),
         (
-            "GeoStatus",
-            "The spatial index's configuration and state, or `{enabled: false}`.",
-            "geosparql",
-        ),
-        (
-            "GeoConfig",
-            "The spatial index's configuration.",
-            "geosparql",
-        ),
-        (
             "GeoConvertRequest",
             "`{literals: [{value, datatype}]}`, at most 10,000 literals.",
             "hulls-aggregates-jena-filter-functions-utm-and-conversion",
@@ -1090,16 +1028,6 @@ pub(super) fn schemas() -> Map<String, J> {
             "GeoConvertResult",
             "`{results: [...]}`, one per literal.",
             "hulls-aggregates-jena-filter-functions-utm-and-conversion",
-        ),
-        (
-            "ValidationStatus",
-            "`{language, config, status}`, or `{config: null}`.",
-            "write-time-validation",
-        ),
-        (
-            "ValidationConfig",
-            "A write-time validation configuration, SHACL or ShEx.",
-            "write-time-validation",
         ),
         (
             "RdfsStatus",
@@ -1122,16 +1050,6 @@ pub(super) fn schemas() -> Map<String, J> {
             "named-snapshots-and-retention",
         ),
         (
-            "StoredQuery",
-            "A stored query definition: `query`, `description`, `parameters`, `results`, `mcp`, and on reads `name`, `dataset`, `kind` and `version`.",
-            "stored-queries",
-        ),
-        (
-            "StoredQueryList",
-            "`{dataset, queries: [...]}`",
-            "stored-queries",
-        ),
-        (
             "StoredQueryVersions",
             "The kept versions of a stored query, newest first.",
             "stored-queries",
@@ -1143,26 +1061,6 @@ pub(super) fn schemas() -> Map<String, J> {
         ),
         ("ShexReport", "A ShEx validation result.", "shex-validation"),
         (
-            "Repository",
-            "A backup repository with its totals.",
-            "backup-types",
-        ),
-        (
-            "RepositoryList",
-            "`{repositories: (Repository | RepositoryBrief)[]}`",
-            "backup-routes",
-        ),
-        (
-            "RepositoryConfig",
-            "A repository's settings: name, type, location and limits.",
-            "backup-types",
-        ),
-        (
-            "TestReport",
-            "The result of a repository's connection test.",
-            "backup-types",
-        ),
-        (
             "VerifyRequest",
             "`{level?: \"exists\" | \"data\" | \"restore\"}`",
             "backup-routes",
@@ -1172,16 +1070,6 @@ pub(super) fn schemas() -> Map<String, J> {
             "LockList",
             "`{locks: Lock[]}`",
             "locks-and-garbage-collection",
-        ),
-        (
-            "BackupList",
-            "`{backups: BackupSummary[], next}` or, per dataset, `{dataset, datasetId, backups}`.",
-            "backup-routes",
-        ),
-        (
-            "Backup",
-            "A backup: the summary plus its manifest's files, blobs and upload statistics.",
-            "backup-types",
         ),
         (
             "BackupRequest",
