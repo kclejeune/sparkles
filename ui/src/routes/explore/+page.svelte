@@ -17,7 +17,7 @@
   import Icon from '$components/Icon.svelte';
   import SchemaDiffDialog from '$components/SchemaDiffDialog.svelte';
   import ShapesDraftDialog from '$components/ShapesDraftDialog.svelte';
-  import { coverage, objectKinds, valuesRange } from '$lib/schema-history';
+  import { coverage, objectKinds, shortenExpression, valuesRange } from '$lib/schema-history';
   import SimilarPanel from '$components/SimilarPanel.svelte';
   import TermView from '$components/TermView.svelte';
   import TextSearchView from '$components/TextSearchView.svelte';
@@ -1158,6 +1158,12 @@
                   title={s}>{classLabel(s)}</button
                 >{:else}<span class="faint">None (root class)</span>{/each}
             </div>
+            {#each cls.superExpressions ?? [] as x (x)}
+              <div class="mono small expr" title={x}>⊑ {shortenExpression(x, short)}</div>
+            {/each}
+            {#each cls.equivalentExpressions ?? [] as x (x)}
+              <div class="mono small expr" title={x}>≡ {shortenExpression(x, short)}</div>
+            {/each}
             {#if cls.cycle.length}
               <p class="faint small">
                 <Icon name="cycle" size={12} /> On a subClassOf cycle with {cls.cycle
@@ -1753,6 +1759,10 @@
   .facts dd {
     margin: 0;
     font-weight: 600;
+  }
+  .expr {
+    margin: 2px 0;
+    overflow-wrap: anywhere;
   }
   .profile-line {
     padding: 3px 0;

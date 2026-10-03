@@ -1295,7 +1295,38 @@ fn class_json(c: &ClassEntry, terms: &mut Terms) -> Value {
             .collect::<Vec<_>>()
             .into();
     }
+    let exprs: Vec<String> = c
+        .declared
+        .super_class_expressions
+        .iter()
+        .map(|x| class_expression(x, terms))
+        .collect();
+    if !exprs.is_empty() {
+        e["superClassExpressions"] = exprs.into();
+    }
     e
+}
+
+/// A class expression (Manchester Syntax, IRIs in angle brackets) with its IRIs written
+/// as the result's other IRIs are.
+fn class_expression(x: &str, terms: &mut Terms) -> String {
+    let mut out = String::with_capacity(x.len());
+    let mut rest = x;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        match rest[i + 1..].find('>') {
+            Some(j) if !rest[i + 1..i + 1 + j].contains([' ', '<']) => {
+                out.push_str(&terms.iri(&rest[i + 1..i + 1 + j]));
+                rest = &rest[i + 2 + j..];
+            }
+            _ => {
+                out.push('<');
+                rest = &rest[i + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// One source of the constraints layer: one line per property shape.

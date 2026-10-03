@@ -9,6 +9,7 @@ import {
   diffSummary,
   objectKinds,
   parseAt,
+  shortenExpression,
   valuesRange,
 } from './schema-history';
 
@@ -42,6 +43,17 @@ describe('class profiles', () => {
       '/$/schema/ds/profiles?graph=union&reasoning=false&class=ex%3AA',
     );
     expect(schemaProfilesPath('ds')).toBe('/$/schema/ds/profiles');
+  });
+});
+
+describe('class expressions', () => {
+  it('shortens IRIs', () => {
+    expect(
+      shortenExpression(
+        '<http://ex.org/p> some (<http://ex.org/A> or <http://www.w3.org/2001/XMLSchema#integer>[>= "1"^^<http://www.w3.org/2001/XMLSchema#integer>])',
+        short,
+      ),
+    ).toBe('ex:p some (ex:A or xsd:integer[>= "1"^^xsd:integer])');
   });
 });
 

@@ -717,6 +717,10 @@ export type SchemaClass = {
     superClasses: string[];
     equivalentClasses: string[];
     disjointWith: string[];
+    /** Anonymous superclasses in the OWL 2 Manchester Syntax, IRIs in angle brackets. */
+    superClassExpressions?: string[];
+    /** Anonymous equivalent classes, rendered the same way. */
+    equivalentClassExpressions?: string[];
     labels: Lit[];
     comments: Lit[];
   };
@@ -756,6 +760,9 @@ export type SchemaPredicate = {
     ranges: string[];
     superProperties: string[];
     inverseOf: string[];
+    /** Anonymous domains and ranges in the OWL 2 Manchester Syntax. */
+    domainExpressions?: string[];
+    rangeExpressions?: string[];
     labels: Lit[];
     comments: Lit[];
   };

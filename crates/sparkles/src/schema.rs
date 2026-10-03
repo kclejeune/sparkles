@@ -350,6 +350,13 @@ pub struct ClassDeclared {
     pub super_classes: Vec<String>,
     pub equivalent_classes: Vec<String>,
     pub disjoint_with: Vec<String>,
+    /// Anonymous superclasses: class expressions in the OWL 2 Manchester Syntax, with
+    /// IRIs in angle brackets.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub super_class_expressions: Vec<String>,
+    /// Anonymous equivalent classes, rendered the same way.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub equivalent_class_expressions: Vec<String>,
     pub labels: Vec<Lit>,
     pub comments: Vec<Lit>,
 }
@@ -448,6 +455,11 @@ pub struct PredicateDeclared {
     pub ranges: Vec<String>,
     pub super_properties: Vec<String>,
     pub inverse_of: Vec<String>,
+    /// Anonymous domains and ranges: class expressions in the OWL 2 Manchester Syntax.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub domain_expressions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub range_expressions: Vec<String>,
     pub labels: Vec<Lit>,
     pub comments: Vec<Lit>,
 }
@@ -1130,6 +1142,8 @@ struct ClassDecl {
     supers: BTreeSet<u64>,
     equivalents: BTreeSet<u64>,
     disjoint: BTreeSet<u64>,
+    super_exprs: BTreeSet<u64>,
+    equivalent_exprs: BTreeSet<u64>,
 }
 
 #[derive(Default)]
@@ -1140,6 +1154,8 @@ struct PropDecl {
     ranges: BTreeSet<u64>,
     supers: BTreeSet<u64>,
     inverse: BTreeSet<u64>,
+    domain_exprs: BTreeSet<u64>,
+    range_exprs: BTreeSet<u64>,
 }
 
 /// Distinct literal objects of `(s, p)` in the filtered graphs, sorted.
@@ -1400,6 +1416,13 @@ fn assemble(
             }
             let c = classes.entry(s).or_default();
             if !o_iri {
+                if is_blank(snap, o) {
+                    match rel {
+                        ClassRel::SubClassOf => c.super_exprs.insert(o),
+                        ClassRel::EquivalentClass => c.equivalent_exprs.insert(o),
+                        ClassRel::DisjointWith => false,
+                    };
+                }
                 continue;
             }
             match rel {
@@ -1425,7 +1448,14 @@ fn assemble(
                 anon_exprs.insert(o);
             }
             if !is_iri(snap, o) {
-                props.entry(s).or_default();
+                let e = props.entry(s).or_default();
+                if is_blank(snap, o) {
+                    match rel {
+                        PropRel::Domain => e.domain_exprs.insert(o),
+                        PropRel::Range => e.range_exprs.insert(o),
+                        _ => false,
+                    };
+                }
                 continue;
             }
             if matches!(rel, PropRel::SubPropertyOf | PropRel::InverseOf) {
@@ -1494,6 +1524,18 @@ fn assemble(
         snap,
         cache: FxHashMap::default(),
     };
+    let mut renderer = expressions::Renderer::new(src, declared, budget);
+    let mut render = |ids: &BTreeSet<u64>| -> Result<Vec<String>, SchemaError> {
+        let mut v = Vec::with_capacity(ids.len());
+        for &id in ids {
+            v.push(in_phase(renderer.render(id), || {
+                "rendering class expressions".into()
+            })?);
+        }
+        v.sort();
+        v.dedup();
+        Ok(v)
+    };
 
     let mut class_list = Vec::with_capacity(classes.len());
     for (id, c) in classes {
@@ -1515,6 +1557,8 @@ fn assemble(
                 super_classes: iris.all(&c.supers),
                 equivalent_classes: iris.all(&c.equivalents),
                 disjoint_with: iris.all(&c.disjoint),
+                super_class_expressions: render(&c.super_exprs)?,
+                equivalent_class_expressions: render(&c.equivalent_exprs)?,
                 labels,
                 comments,
             },
@@ -1558,6 +1602,8 @@ fn assemble(
                 ranges: iris.all(&p.ranges),
                 super_properties: iris.all(&p.supers),
                 inverse_of: iris.all(&p.inverse),
+                domain_expressions: render(&p.domain_exprs)?,
+                range_expressions: render(&p.range_exprs)?,
                 labels,
                 comments,
             },
@@ -1770,6 +1816,8 @@ fn strongly_connected(adj: &[Vec<usize>]) -> Vec<usize> {
 mod source;
 pub use source::SMALL_SELECTION_MAX;
 use source::Src;
+
+mod expressions;
 
 mod maintain;
 pub use maintain::{max_changes, update};

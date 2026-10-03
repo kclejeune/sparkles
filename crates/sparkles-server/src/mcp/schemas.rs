@@ -99,7 +99,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
     };
     let schema_class = json!({"type":"object","required":["iri","instances","declared"],"properties":{
         "iri":{"type":"string"},"label":{"type":"string"},"instances":{"type":"integer"},
-        "declared":strings(),"superClasses":strings()}});
+        "declared":strings(),"superClasses":strings(),"superClassExpressions":strings()}});
     let schema_predicate = json!({"type":"object","required":["iri","triples","distinctSubjects","distinctObjects","maxPerSubject","objects"],"properties":{
         "iri":{"type":"string"},"label":{"type":"string"},"triples":{"type":"integer"},
         "distinctSubjects":{"type":"integer"},"distinctObjects":{"type":"integer"},

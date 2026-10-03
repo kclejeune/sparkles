@@ -171,6 +171,9 @@ export type ClassInfo = {
   assertedSupers: string[];
   equivalents: string[];
   disjoint: string[];
+  /** Anonymous superclasses and equivalent classes (class expressions, as text). */
+  superExpressions?: string[];
+  equivalentExpressions?: string[];
   /** The other members of the subClassOf cycle the class is on (empty if none). */
   cycle: string[];
 };
@@ -388,6 +391,8 @@ export function schemaFromSummary(s: api.SchemaSummary): Schema {
       assertedSupers: c.declared.superClasses,
       equivalents: c.declared.equivalentClasses,
       disjoint: c.declared.disjointWith,
+      superExpressions: c.declared.superClassExpressions ?? [],
+      equivalentExpressions: c.declared.equivalentClassExpressions ?? [],
       cycle: cycleOf.get(c.iri) ?? [],
     });
   }

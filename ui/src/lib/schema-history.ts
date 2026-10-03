@@ -7,6 +7,11 @@ import { fmtInt } from './format';
 /** Shortens an IRI for display (a prefixed name or a local name). */
 export type Shorten = (iri: string) => string;
 
+/** A class expression with its `<IRI>`s shortened. */
+export function shortenExpression(text: string, short: Shorten): string {
+  return text.replace(/<([^<>\s]+)>/g, (_, iri: string) => short(iri));
+}
+
 /** "2 of 3 (67%)": the instances with a value among all instances of the class. */
 export function coverage(p: ProfileProperty, instances: number): string {
   if (instances <= 0) return fmtInt(p.instances);
