@@ -7,10 +7,12 @@
 > the `sparkles snapshot` CLI, `query --at` and `dump --at`. Phase 2 shipped except the
 > replay speedups and warm pins. It covers diffs, `Accept-Datetime`, `maxBytes`
 > retention, pin expiry and schedules, history for in-memory datasets, `at` on more
-> endpoints, history metrics, and the UI's snapshot panel and `at` selector. Phase 3 is
-> not built.
+> endpoints, history metrics, and the UI's snapshot panel and `at` selector. Phase 3
+> shipped the change log and history queries (§11). Full-text search at pins and pin
+> rebasing are deferred.
 >
 > **User docs:** [API: Point-in-time reads and snapshots](../API.md#point-in-time-reads-and-snapshots) ·
+> [API: History queries](../API.md#history-queries) ·
 > [Features](../FEATURES.md#storage-tdb2-equivalent) ·
 > [Benchmarks: Point-in-time reads](../BENCHMARKS.md#point-in-time-reads-105m-triples)
 >
@@ -1073,6 +1075,274 @@ Setup: `sparkles serve --data /tmp/s`, a fresh persistent dataset `ds`, and
 * **Not consulted:** Fluree, in any form. Nothing from Fluree's source repository,
   documentation, site, tests or talks was opened, searched or fetched.
 
+## 11. Phase 3: history queries and the change log
+
+This section was written on 2026-10-03, after Phase 2 and its follow-ups had shipped. It
+designs the three Phase 3 items of §6: history queries across commits, a change log that
+does not depend on the retained generations, and full-text search at pins.
+
+### 11.1 Goals
+
+* **History queries.** Users ask how the data changed: when a triple was added or
+  removed, which commit last changed a subject, and which values a predicate took over
+  time. The answer is a list of change events, each with its commit's number, time,
+  kind, author and message.
+* **Reach.** History must not end at the last compaction. With nothing pinned, Phase 1
+  and 2 can only see the current generation's commits, because compaction deletes the
+  older write-ahead logs.
+* **Cost.** Single-triple commit latency must not regress noticeably. The write-ahead
+  log is synced once per commit (CI), and that sync dominates the latency of a small
+  commit, so the new design must not add a second sync to the commit path.
+* **Standard surface.** Queries stay in SPARQL 1.1 syntax with RDF 1.2 triple terms,
+  which the parser already supports. There is no new keyword.
+* **Access control.** A caller sees the history only of what it may read. Graph views
+  ([C12](C12-graph-access-control.md)) and triple protections
+  ([C12b](C12b-triple-access-control.md)) apply to history rows, so the history of a
+  hidden triple is hidden too.
+
+### 11.2 Prior art
+
+These systems and standards were studied for their public, documented behavior:
+
+* **SQL:2011 system-versioned tables.** Every row version carries a system-time period,
+  and `FOR SYSTEM_TIME AS OF`, `FROM … TO`, `BETWEEN … AND` and `ALL` select versions.
+  Sparkles' `?at=` already covers `AS OF`. A history query is the `ALL` case reduced to
+  the moments where versions start and end.
+* **Datomic.** A database value can be read as of a time, since a time, or as a history
+  database that holds every assertion and retraction. Each datom carries its entity,
+  attribute, value, transaction and an `added` flag, and a transaction is itself an
+  entity with its time. A Sparkles change row has the same parts, with the quad as the
+  fact and `op` as the flag.
+* **Dolt.** Tables such as `dolt_diff_<table>` list row changes with the commit, its
+  author and date and a `diff_type` of added, modified or removed. `dolt_history_<table>`
+  lists every row at every commit. History is queried in plain SQL against these
+  tables. Sparkles exposes its change rows the same way, as a source that ordinary query
+  operators (joins, aggregates, filters) consume.
+* **TerminusDB.** Its history API lists the commits that changed a document. That is a
+  history query restricted to one subject.
+* **R43ples.** A revision is stored as an added set and a deleted set of triples per
+  graph, and queries name a revision with a SPARQL extension keyword. The change log
+  stores the same add and delete sets per commit. The keyword is not adopted, because a
+  standard parser rejects it.
+* **Quit Store.** It keeps an RDF dataset in Git and describes commits with PROV-O,
+  including a blame view of which commit added each statement. Its provenance graph is
+  data a query can join, which is the model here, but Sparkles does not materialize it
+  as a named graph.
+* **RDF 1.2 and SPARQL 1.2 reification.** `<< s p o >>` is a reifier: a resource that
+  `rdf:reifies` the triple term `<<( s p o )>>`. A change event is a natural reifier: it
+  is an occurrence of a triple, with its own properties.
+
+### 11.3 The change log
+
+**What it holds.** For every commit, the net quad changes relative to its parent, as
+vocabulary keys. Keys are the same in every generation, so the log is independent of
+compactions and bulk commits. A record also holds the commit's number, timestamp, kind,
+counts, author and message, so it stays readable after the catalog horizon prunes the
+commit's metadata.
+
+**Files.** A persistent dataset keeps `<root>/changes/`. It is a sequence of segments
+named by their first commit. Each segment starts with a 32-byte header naming the
+dataset, then holds framed records (length, CRC-32, body). A record is one of three
+kinds: the changes of a commit, a summary of a commit whose changes were not recorded,
+or a gap covering commits the log could not record. A segment that reaches
+`change_log_segment_bytes` (16 MiB) is sealed. Sealing writes an index file next to it
+and syncs both. The index lists the offset and timestamp of every record and a sorted
+array of (term hash, record number) pairs for the subject, predicate, object and graph
+of every change. The open segment keeps the same index in memory, and an open rebuilds
+it by reading the segment once. A dataset's own settings are in `changelog.json`.
+
+**Write path.** A commit through the write-ahead log appends its records and syncs as
+before. It then pushes its change list, still as the generation's ids, onto an
+in-memory queue, which costs a vector copy and a mutex. One background thread for the
+whole process takes queued commits after a 5 ms pause, turns the ids into keys, nets out
+a quad changed twice in one transaction, and appends the records without syncing. It
+syncs at most once a second. Like the write-ahead log, the open segment grows by zeros
+written ahead of its records, so a sync overwrites allocated blocks and needs no journal
+commit on file systems that update blocks in place. A history query appends whatever is queued before it
+reads, so it always sees every commit up to the state it reads.
+
+**Durability.** The write-ahead log stays the durable copy of each commit. The change
+log must be synced only where that copy could disappear:
+
+* before a compaction switches `CURRENT`, because the old generation's log goes then (the
+  sync runs before the final writer lock, since the new base is fixed at the start);
+* before a bulk commit switches `CURRENT`, for the same reason;
+* when the store closes.
+
+After a crash, an open reads the log, truncates a torn or damaged tail, and rebuilds a
+missing sealed index. It then appends the commits after the last recorded one from the
+current generation's write-ahead log. That log starts at or before the last synced
+record, because of the sync before every switch. Commits recovered this way have no
+author, because the write-ahead log does not hold one. Their messages come from the
+annotations file. A commit that no retained log holds is recorded as a gap.
+
+**Bulk commits** have no write-ahead log records. Their changes are computed when the
+two states are at hand, while the bulk commit holds the writer lock and before it is
+published. If the dataset was empty, every quad of the new generation is an addition. If
+both states together hold at most `change_log_bulk_max_quads` (1,000,000) quads, the two
+states are compared. Otherwise the commit is recorded as a summary with its counts. The
+first load of a large dataset is therefore not copied into the log. A crash after the
+switch and before the background writer records the bulk commit leaves a gap.
+
+**Retention.** Whole sealed segments are dropped, oldest first. `keepCommits` and
+`keepAge` keep the segments that hold any of the last N commits or any commit of the
+last D. `maxBytes` caps the total, and the size limit wins over the window. The default
+is on, with no window and 1 GiB. The open segment is never dropped. Retention runs when a
+segment is sealed and in the minute history upkeep, which applies the age limit.
+
+**Settings.** `StoreOptions::change_log` turns the log on for new and existing datasets
+(on by default). `change_log_max_bytes`, `change_log_segment_bytes` and
+`change_log_bulk_max_quads` set the limits. A dataset's `changelog.json` can turn it off
+or on and set `keepCommits`, `keepAge` and `maxBytes`. Turning it off removes the
+directory. Turning it on starts it at the next commit and records the commits before it
+as a gap. An in-memory dataset keeps the same records in memory, at most 64 MiB.
+
+**What the log is not.** It is not a second write-ahead log. Point-in-time reads still
+materialize states from the retained generations, and a state the generations no longer
+hold cannot be read even when the log has its changes. Rebuilding a state from the log
+would need a checkpoint to start from, which is alternative B of §5.2 in full, and it
+stays out of scope.
+
+### 11.4 History queries
+
+**SPARQL.** A history query is a `SERVICE` call to `urn:x-sparkles:history#changes`
+whose block holds one reified triple pattern. The reifier stands for a change event.
+
+```sparql
+PREFIX hist: <urn:x-sparkles:history#>
+SELECT ?value ?op ?commit ?time ?author WHERE {
+  SERVICE hist:changes {
+    << <http://example.org/alice> <http://example.org/name> ?value >>
+        hist:op ?op ; hist:commit ?commit ; hist:time ?time ; hist:author ?author .
+  }
+}
+```
+
+* The triple's constants are looked up in the log's index. Its variables are bound per
+  change. A blank node in the triple matches anything.
+* `hist:op` is `"add"` or `"remove"`, as an output or as a filter.
+* `hist:graph` binds the graph, and is unbound for the default graph. As a constant it
+  filters, and the IRI `hist:defaultGraph` selects the default graph. Without it, the
+  changes in every graph the caller may read are listed.
+* `hist:commit` (`xsd:integer`), `hist:time` (`xsd:dateTime`), `hist:kind`,
+  `hist:author` and `hist:message` describe the commit and are outputs only.
+* `hist:from` and `hist:to` bound the commits read, inclusively. Each takes a commit
+  number, an `xsd:dateTime` (the first commit at or after it, or the last at or before
+  it) or a selector string such as `"commit:42"`. `hist:to` defaults to the commit the
+  query reads, so a query with `?at=commit:42` sees the history up to commit 42, as an
+  `AS OF` read would.
+* `hist:limit` caps the changes, and `hist:order hist:descending` lists the newest
+  commits first. With both, "the last change to X" reads one record.
+* `hist:subject`, `hist:predicate` and `hist:object` give the triple without SPARQL 1.2
+  syntax.
+
+The call reads the change log only. It does not take bindings from the rest of its
+group, so a join with the current state happens after it (see the examples in
+[API](../API.md#history-queries)). Its results are never cached, because the log grows
+and retention trims it.
+
+The common questions are then ordinary SPARQL:
+
+* when a triple was added or removed: the triple with constants, and `hist:op` and
+  `hist:commit`;
+* which commit last changed a subject: `GROUP BY ?s` with `MAX(?commit)`, or
+  `hist:order hist:descending ; hist:limit 1` for one subject;
+* the values of a predicate over time: the predicate as a constant, the object as a
+  variable, ordered by commit.
+
+**HTTP.** `GET /{ds}/history` takes `subject`, `predicate`, `object` and `graph`
+(repeatable), `from` and `to` (the selectors of `at`), `op`, `order` and `limit`
+(default 1,000, at most `--max-rows`). It answers JSON with the changes and the commits
+whose changes are not recorded. It needs the `diff` grant, as the change feed does.
+`GET /$/history/{ds}` reports the log's state, and `PUT /$/history/{ds}` takes a
+`changeLog` object of settings.
+
+**CLI.** `sparkles history --loc DB` takes the same filters as flags and prints one line
+per change, or JSON lines.
+
+**Library.** `Store::history_changes(&HistoryQuery)` returns a `HistoryResult` with the
+changes, `unrecorded` ranges and a `truncated` flag.
+
+**Unrecorded commits.** A result names the commits in its range whose changes the log
+does not hold, with a reason: older than the log (`before-log`), a large bulk commit
+(`bulk`), or a gap (`gap`). SPARQL has no channel for that note, so a SPARQL history
+query skips such commits. The HTTP endpoint, the CLI and the library report them.
+
+**Diffs.** `Store::diff` reads the change log when the write-ahead logs cannot give the
+answer, either because an end is no longer readable or because a bulk commit or a
+collected generation lies between the two commits, and the log records every commit in
+between. Diffs therefore reach back past compactions.
+
+### 11.5 Access control
+
+History rows pass through the caller's view like diff and change feed rows. A change in a
+graph the caller may not read is left out, and so is a change that a protection depending
+only on the predicate and graph hides. A protection that depends on the data (classes or
+patterns) would need the state of every commit to decide, so a caller with such a
+protection gets `403` for history queries. The change feed does the same. Callers
+without such protections are unaffected.
+
+### 11.6 Full-text search at pins
+
+This stays deferred. The two options of §6 are a Tantivy index per pin, built when the pin
+is made, and a RAM index built on demand under a budget. Either costs a full text index
+build per pinned state, in time and in disk or memory. The common need behind it, finding
+past values of a property, is met by history queries with exact terms. `text:query` at a
+past commit keeps answering `501`.
+
+### 11.7 Rejected alternatives
+
+* **Syncing the change log in the commit path**, in its own file. It would add a second
+  `fdatasync` to every commit. On the development machine a small append and sync costs
+  about 0.3 ms, against a median single-triple commit of about 0.45 ms, so small commits
+  would be over half again as slow. The asynchronous writer with recovery from the WAL
+  gives the same durability at no cost to the commit.
+* **Writing keys into the write-ahead log.** The WAL is per generation and replays ids. A
+  global log of keys in it would change the WAL format, its replay and compaction's
+  catch-up, for no gain over a separate log.
+* **History as a materialized named graph** of reified statements (Quit Store's
+  provenance graph, made visible to every query). It would double storage and every
+  `GRAPH ?g` query would see it. A `SERVICE` call keeps history explicit.
+* **New query syntax**, such as R43ples' revision keyword or SQL's `FOR SYSTEM_TIME` as
+  a SPARQL clause. Standard parsers and tools would reject such queries.
+* **Answering history by replaying states** across the retained generations. It costs a
+  materialization per commit and ends where the generations do.
+* **Valid-time periods per quad** (one row per version with a start and an end) as the
+  primary output. Periods follow from the change rows by pairing each addition with the
+  next removal of the same quad, and their open ends need the state at the range's
+  edges. They are left to queries over the change rows.
+
+### 11.8 Acceptance tests
+
+* Every commit's recorded changes equal the difference between the states before and
+  after it, as WAL replay materializes them, for random histories with deletes of base
+  quads, re-inserts, changes undone within a transaction, blank nodes, graphs,
+  compactions and bulk commits. The same holds after a restart, in persistent and
+  in-memory stores.
+* A lookup by subject, predicate, object or graph returns exactly the changes a full scan
+  would, in commit order or newest first, with limits.
+* A crash at any point (the queue unwritten, a torn last record, a sealed segment without
+  its index, each compaction failpoint) loses no change.
+* Retention by count, age and size drops whole segments, and the result reports the
+  commits before the log.
+* Graph views and protections hide the history of what they hide, and data-dependent
+  protections are refused.
+* Diffs across collected generations equal the state differences.
+* Single-triple commit latency with the log on and off, and the log's disk use per
+  commit, are measured and recorded in the Outcome.
+
+### 11.9 Sources of this section
+
+* The Sparkles code and this spec, CI, C12, C12b and C13.
+* The W3C SPARQL 1.1 Query Language (`SERVICE`) and the RDF 1.2 Concepts and SPARQL 1.2
+  Query drafts (triple terms, reifiers and `rdf:reifies`), cited from general knowledge.
+* ISO/IEC 9075:2011 system-versioned tables, Datomic's documentation of `as-of`, `since`
+  and history databases, Dolt's documentation of its `dolt_diff_<table>`,
+  `dolt_history_<table>` and `dolt_log` system tables, TerminusDB's documentation of
+  document history, the R43ples paper (Graube, Hensel and Urbas, 2014) and the Quit Store
+  papers (Arndt, Naumann and Marx, 2017–2019), all cited from general knowledge for their
+  documented behavior. No code of these systems was read.
+
 ## Outcome
 
 **Delivered.** Phase 1 landed on 2026-09-30 in two commits: the engine (`d866c0c`) and the
@@ -1365,3 +1635,80 @@ both logs. The newest generation that covers a commit owns it, as before, so rea
 the retention window and diffs need no other change. The catalog keeps the generation a
 commit was made in. When a sealed generation has no commit of its own after its base,
 its end is read from its log.
+
+### Phase 3
+
+Phase 3 landed on 2026-10-03 as designed in §11. The engine has a `store::changelog`
+module (segments, the index, the background writer, recovery and retention) and a
+`store::history_query` module (`Store::history_changes`). SPARQL has the
+`hist:changes` service in `sparql::history_svc`. The server has `GET /{ds}/history`, the
+`changeLog` member of `/$/history/{ds}`, `--no-change-log` and `--change-log-mb`, and the
+CLI has `sparkles history`. The UI's history panel can list the changes of a subject or
+predicate, newest first, with their authors and messages, and its **Diff** button now
+works for commits whose state is gone when the change log has their changes.
+
+**Authors.** `WriteOptions` gained `author`. The server sets it to the authenticated
+caller (`user:bob`, `oidc:…`, or a minted token's owner) for SPARQL Update, Graph Store
+writes, uploads, RDF Patch and the MCP update tool. Without authentication there is no
+author. The author lives only in the change log, so commits recovered from the
+write-ahead log after a crash have none.
+
+**Measurements.** A release build ran `commit_latency_with_and_without_the_change_log`
+in `crates/sparkles/tests/history_log.rs` on a real disk while other builds were using
+the machine. Each run made 2,000 single-triple commits per store, six rounds per
+setting, alternating which setting went first, on top of a 10,000-quad base.
+
+| | Change log off | Change log on |
+|---|---:|---:|
+| Median commit | 0.50 ms | 0.45 ms |
+| 90th percentile | 0.93 ms | 0.76 ms |
+| 99th percentile | 4.3 ms | 3.8 ms |
+
+The difference is within the noise of the machine: earlier runs had stalls of one to
+five seconds in either setting, from other processes' disk traffic. A commit only queues
+its change list, so no difference is expected. The background writer appended 2,000
+queued commits in 3.9 ms, about 2 µs a commit.
+
+| Per single-triple commit | Bytes |
+|---|---:|
+| Write-ahead log | 66 |
+| Change log | 112 |
+
+The change log is larger than the write-ahead log because it stores the terms' keys,
+with each IRI written out once per record, and the commit's metadata. Unlike the
+write-ahead log, it is not removed by compaction, so the 1 GiB default holds about nine
+million such commits. A commit that changes many quads of a few subjects shares their
+keys within its record.
+
+An open that recovered 2,000 unwritten commits from the write-ahead log took 27 ms,
+against 18 ms for the next open. Listing the 4 changes of one subject in a log of 6,001
+commits took 2.4 ms. Most of that was decoding the 10,000-quad record of the bulk load
+that also names the subject. Listing all 16,000 changes took 19 ms.
+
+**Tests.** `crates/sparkles/tests/history_log.rs` checks every commit's recorded changes
+against the difference of the states around it, as WAL replay materializes them, for
+300 random commits with compactions, bulk loads, deletes of base quads, changes undone
+in a transaction and blank nodes, in persistent and in-memory stores and after a
+restart. It checks lookups by subject, predicate, object and graph against a brute-force
+list of every change, crashes with the queue unwritten, a torn record and a sealed
+segment without its index, retention by count, age and size, turning the log off and on,
+bulk commits recorded and summarized, authors and messages across a restart, time
+bounds, graph views and protections, diffs across collected generations, and the SPARQL
+service with its parameters and errors. The compaction crash test now also checks that a
+crash at each failpoint loses no recorded change. `http/diff_tests.rs` covers
+`GET /{ds}/history`, its errors, SPARQL over the protocol, `at`, and the settings, and
+an authentication test checks that the history follows graph grants, records the
+caller as the author and needs the `diff` grant.
+
+**Deviations.**
+
+- The open segment's index stays in memory, and sealed indexes are read on demand into a
+  cache of eight. Records are read one at a time through the index, so a query that
+  matches most of a large log reads it record by record.
+- SPARQL history queries skip unrecorded commits without saying so, as §11.4 allows.
+- The change feed (`/{ds}/changes`) still reads the write-ahead logs and still ends where
+  the readable history does. Diffs read the change log, but the feed does not.
+
+**Not built.** Full-text search at pins (§11.6) and pin rebasing remain deferred, as do
+periods per quad, a history query that takes bindings from the rest of its group, and
+point-in-time reads rebuilt from the change log.

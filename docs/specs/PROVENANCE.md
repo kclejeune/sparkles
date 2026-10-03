@@ -202,6 +202,21 @@ implementation landed.
   - a `sealed.json` per generation;
   - `Snapshot::version` in the cache key of historical snapshots;
   - `X-Sparkles-*` or product-specific selector syntaxes.
+- **Phase 3** (history queries and the change log, spec §11), written on 2026-10-03 from:
+  - the Sparkles code and the specs F06, CI, C12, C12b and C13;
+  - the W3C SPARQL 1.1 Query Language and the RDF 1.2 Concepts and SPARQL 1.2 Query
+    drafts (reifiers, triple terms, `rdf:reifies`), cited from general knowledge;
+  - the documented behavior of SQL:2011 system-versioned tables, Datomic's `as-of`,
+    `since` and history databases, Dolt's `dolt_diff_<table>`, `dolt_history_<table>`
+    and `dolt_log` system tables, TerminusDB's document history, the R43ples paper
+    (Graube, Hensel and Urbas, 2014) and the Quit Store papers (Arndt, Naumann and Marx),
+    all cited from general knowledge. No code of these systems was read.
+  - **Implementation:** from the spec plus Sparkles code only (2026-10-03). No new
+    dependencies.
+  - **Rejected** (spec §11.7): syncing the change log in the commit path; keys in the
+    write-ahead log; history as a materialized named graph; new query syntax (a revision
+    keyword or `FOR SYSTEM_TIME`); answering history by replaying states; per-quad
+    validity periods as the primary output.
 
 ## Authentication and dataset-level access control
 

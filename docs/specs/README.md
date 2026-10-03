@@ -73,7 +73,7 @@ there is no code yet.
 | [F03](F03-full-text-search.md) | BM25 full-text search over literals with Tantivy, through Jena's `text:query` | implemented in part (Phase 1, part of Phase 2) |
 | [F04](F04-vector-search.md) | `spk:vector` literals, similarity functions and exact top-k `spk:vectorSearch` | implemented in part (Phase 1) |
 | [F05](F05-snapshot-repositories.md) | Incremental, deduplicated backups to a file system or S3, restore, verification, policies and GC | implemented in part (Phase 1, most of Phase 2) |
-| [F06](F06-snapshots-and-point-in-time.md) | Point-in-time reads with `?at=`, named snapshots, a retention window and diffs between commits | implemented in part (Phases 1 and 2) |
+| [F06](F06-snapshots-and-point-in-time.md) | Point-in-time reads with `?at=`, named snapshots, a retention window, diffs between commits, a change log and history queries | implemented in part (Phases 1–3; full-text search at pins and pin rebasing deferred) |
 | [F07](F07-path-search.md) | Paths as solutions through `SERVICE path:search`: one, all or the k shortest paths, or every path up to a length, over chosen predicates and directions, with ends bound by the query and weights on reifiers | implemented (Phase 1) |
 | [F08](F08-embeddings-on-write.md) | Vectors computed from selected literals by an OpenAI-compatible embeddings endpoint after each commit, with catch-up, re-embedding, status and text queries | implemented in part (Phase 1) |
 | [F09](F09-branches-and-merges.md) | Branches that share their parent's index until they compact, `?branch=` and `/{ds}@{branch}`, three-way merges of quad sets with cell conflicts and resolutions, protected branches, and clones of branches | specified |
