@@ -25,6 +25,7 @@ use std::time::Duration;
 mod budgets;
 mod changes;
 mod conditional;
+mod describe;
 mod diff;
 mod dry_run;
 #[cfg(feature = "fmt")]
@@ -69,6 +70,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static("sparkles-diff-removed"),
         header::HeaderName::from_static(changes::SPARKLES_CHANGES_NEXT),
         header::HeaderName::from_static(queries::SPARKLES_QUERY_VERSION),
+        header::HeaderName::from_static(describe::SPARKLES_DESCRIBE_TRUNCATED),
         header::CONTENT_LOCATION,
         header::VARY,
         header::LINK,
@@ -200,6 +202,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let app = app.merge(crate::vector::routes());
     // RDFS on read (`/$/rdfs`)
     let app = app.merge(crate::rdfs::routes());
+    // DESCRIBE settings (`/$/describe`)
+    let app = app.merge(describe::routes());
     // backup repositories, per-dataset backups and backup policies
     #[cfg(feature = "backup")]
     let app = app.merge(crate::backup::http::routes());
@@ -906,6 +910,7 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
             Vec::new()
         },
         rdfs: ds.rdfs.read().clone(),
+        describe: ds.store.describe_settings(),
         ..Default::default()
     }
 }
@@ -1054,6 +1059,7 @@ pub(crate) async fn run_query(
     // budgets the request asked for, never above the server's
     let asked = budgets::Overrides::parse(&params)?;
     asked.apply(&mut opts);
+    opts.describe = describe::request_options(&ds, &params)?;
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
@@ -1103,6 +1109,7 @@ pub(crate) async fn run_query(
     let query_ms = r.timing.total_ms;
     let cells = r.len().saturating_mul(r.vars.len().max(3));
     let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
+    let truncated = r.describe_truncated;
     let sparkles_doc =
         sfmt == SolutionsFormat::Sparkles && (!is_graph || params_wants_sparkles(&headers));
     if let Some(l) = limit
@@ -1199,11 +1206,17 @@ pub(crate) async fn run_query(
             (body, report)
         }
     };
-    let resp = with_commit(
+    let mut resp = with_commit(
         ([(header::CONTENT_TYPE, ct)], body).into_response(),
         &ds,
         seq,
     );
+    if truncated {
+        resp.headers_mut().insert(
+            describe::SPARKLES_DESCRIBE_TRUNCATED,
+            header::HeaderValue::from_static("true"),
+        );
+    }
     let resp = history::history_headers(resp, resolved.as_ref(), &uri);
     // freshness is reported for the live state only
     let resp = match &resolved {

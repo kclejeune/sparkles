@@ -94,6 +94,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/history/{ds}", &["GET", "PUT"]),
     ("/$/validation/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/rdfs/{ds}", &["GET", "PUT", "DELETE"]),
+    ("/$/describe/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/quota/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/compaction/{ds}", &["GET", "PUT", "DELETE"]),
     // the formatter and the linter (feature `fmt`); `serve --format-endpoint` is checked
@@ -262,6 +263,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/history/{ds}"
         | "/$/validation/{ds}"
         | "/$/rdfs/{ds}"
+        | "/$/describe/{ds}"
         | "/$/quota/{ds}"
         | "/$/compaction/{ds}"
         | "/{ds}/prefixes"
@@ -292,7 +294,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/history/{ds}"
         | "/$/queries/{ds}/{name}"
         | "/$/validation/{ds}"
-        | "/$/rdfs/{ds}" => Dataset(Admin),
+        | "/$/rdfs/{ds}"
+        | "/$/describe/{ds}" => Dataset(Admin),
         // backups: the listing is filtered by the handler (names and types for dataset
         // admins); a backup's handlers also check that it belongs to `{ds}`, and a
         // restore needs admin on its target

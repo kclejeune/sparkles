@@ -3,10 +3,11 @@
 > **Status:** implemented in part
 >
 > **Phases:** Phase 1 shipped on 2026-10-02: `LATERAL`, property path ranges and
-> CONSTRUCT templates with `GRAPH`. Configurable DESCRIBE and the rest of ARQ's function
-> library are later phases and will extend this spec.
+> CONSTRUCT templates with `GRAPH`. Phase 2 shipped on 2026-10-02: configurable DESCRIBE
+> (§11). The rest of ARQ's function library is a later phase and will extend this spec.
 >
 > **User docs:** [API: ARQ syntax extensions](../API.md#arq-syntax-extensions) ·
+> [API: DESCRIBE](../API.md#describe) ·
 > [Features](../FEATURES.md#sparql-arq-equivalent) ·
 > [Comparison with Jena](../COMPARISON.md#vs-apache-jena--fuseki)
 >
@@ -328,6 +329,204 @@ The ARQ tests named here are in Jena's `jena-arq/testing/ARQ` and are ported to
 * The Sparkles code: the planner, the path operator, EXISTS decorrelation, the result
   writers and the formatter.
 
+## 11. Phase 2: configurable DESCRIBE
+
+This section was added for Phase 2. Its sources are Jena's `org.apache.jena.sparql.core.describe`
+package (`DescribeHandler`, `DescribeHandlerRegistry`, `DescribeBNodeClosure`), Jena's
+`Closure` and `QueryExecDataset.describe`, TDB2's `QueryEngineTDB`, Jena 6.2.0's `arq`
+command run on small datasets, and the W3C member submission *CBD - Concise Bounded
+Description* (Patrick Stickler, 2005) with its symmetric form.
+
+### 11.1 What Jena does
+
+SPARQL leaves the result of DESCRIBE to the implementation. ARQ collects the resources a
+query names and binds, and passes each one to the handlers of its
+`DescribeHandlerRegistry`. The default registry holds one handler,
+`DescribeBNodeClosure`. For a resource it computes the blank-node closure in the default
+graph: the resource's triples, then the triples of each blank-node object, recursively.
+It then finds the named graphs in which the resource is a subject, with
+`SELECT DISTINCT ?g { GRAPH ?g { ?s ?p ?o } }`, and computes the closure inside each of
+them on its own. All the triples go into one result graph. Literals are not described.
+
+Three details follow from the code, and Jena 6.2.0 confirms them on the data of the
+acceptance examples below.
+
+* A blank node is followed only inside the graph where it was found. With
+  `:m :p _:x` in graph `g3` and `_:x :q "v"` in graph `g4`, `DESCRIBE :m` does not
+  contain `_:x :q "v"`.
+* The default graph is `DatasetGraph.getDefaultGraph()`. In TDB2 that is the stored
+  default graph even when the dataset sets `unionDefaultGraph`, because only
+  `QueryEngineTDB` applies the union, when it evaluates the WHERE clause.
+* Reifiers are not followed. The annotation in `:a :p :b {| :source :wiki |}` is
+  missing from `DESCRIBE :a`.
+
+Sparkles followed the closure in the default graph only. Its descriptions therefore left
+out the triples of named graphs that Jena includes.
+
+Fuseki has no configuration for DESCRIBE. A handler is registered from Java code, and
+the assembler vocabulary has no term for it.
+
+### 11.2 Goals
+
+* The default answer equals Jena's, including the triples from named graphs.
+* Three modes, chosen per dataset and per request:
+  * `cbd`, the concise bounded description of the submission, which is the default;
+  * `scbd`, its symmetric form;
+  * `outgoing`, the resource's own triples.
+* Reifiers are handled as the submission's third rule asks.
+* Options add the labels of linked IRIs and limit the size and the depth of a
+  description.
+* The graph view of the caller (C12) and its triple protections (C12b) apply.
+* The setting is persisted with the dataset, can be changed over HTTP and from the CLI,
+  and is listed in the service description.
+
+Non-goals:
+* Handlers written by users. Sparkles has no plugin interface, and the three modes cover
+  the handlers that Jena users write most often.
+* New query syntax. A query-level option would have to go behind the `arq()` guard of §2,
+  but ARQ has no such syntax, and the request parameter covers the need.
+* The submission's inverse functional form, which needs OWL's inverse functional
+  properties.
+
+### 11.3 The modes
+
+Each mode is defined for one source graph, as the submission defines it.
+
+**`cbd`.** Start from the resource.
+1. Include every triple whose subject is the resource.
+2. For every included triple with a blank-node object, include the triples whose subject
+   is that blank node, recursively.
+3. For every included triple, include the description of each of its reifiers,
+   recursively.
+
+**`scbd`.** Include the `cbd` of the resource. Then include every triple whose object is
+the resource, and, for every included inbound triple with a blank-node subject, the
+triples whose object is that blank node, recursively. The reifiers of every included
+triple contribute their own symmetric description. Following the submission, a blank
+node reached backwards is not described forwards.
+
+**`outgoing`.** Include the triples whose subject is the resource, and nothing else.
+
+A reifier is either kind of statement node.
+* RDF 1.2: a node `r` with `r rdf:reifies <<( s p o )>>`. The annotation syntax writes
+  these.
+* RDF 1.1: a node `r` with `r rdf:subject s`, `r rdf:predicate p` and `r rdf:object o`.
+  This is the reification that the submission refers to.
+
+The `reifiers` option, on by default, switches the third rule off. That gives Jena's
+`DescribeBNodeClosure` exactly. A store without `rdf:reifies` or `rdf:subject` triples
+skips the lookups.
+
+### 11.4 Sources and graphs
+
+The description reads the query's dataset. The source graphs are the default graph and
+each named graph, and each source is described on its own, as in Jena. A blank node, an
+inbound blank-node subject or a reifier is followed inside the source where it was found.
+The triples of all the sources go into one result graph. A resource is looked up in
+every source. A blank node or reifier is looked up only in the source that led to it.
+
+The default graph is chosen as follows.
+* With `FROM`, `default-graph-uri` or the inference overlay of materialized reasoning,
+  the default graph is the merge of the listed graphs, and with
+  `FROM <urn:x-arq:UnionGraph>` it is the union of the named graphs.
+* Otherwise it is the stored default graph, as in TDB2, even in a store whose queries see
+  the union of the named graphs.
+
+The named graphs are those of `FROM NAMED` or `named-graph-uri` when the request gives
+them, and otherwise every named graph of the store. The graph of materialized inferences,
+`urn:x-sparkles:inferred`, is never a named source. Its triples reach a description
+through the default graph when the request reads inferences, so `reasoning=false` keeps
+them out.
+
+The access view needs no code of its own. The query context's dataset is already limited
+to the graphs the caller may read (C12), and its snapshot is masked by the caller's
+triple protections (C12b). In a union store, a view that may not read the stored default
+graph gets no default source.
+
+### 11.5 Options and limits
+
+| Option | Default | Meaning |
+|---|---|---|
+| `mode` | `cbd` | `cbd`, `scbd` or `outgoing` |
+| `labels` | `false` | Add the `rdfs:label` and `skos:prefLabel` triples of every IRI in the description, as subject or object, read from the source in which the IRI was found |
+| `reifiers` | `true` | Follow reifiers in `cbd` and `scbd` |
+| `maxTriples` | none | The most triples one DESCRIBE returns |
+| `maxDepth` | none | The most levels a description follows |
+
+The resource's own triples are level 1. Each blank node, inbound blank node or reifier
+followed adds a level, so `maxDepth: 1` with `cbd` gives `outgoing`. Labels do not
+count as a level. A node reached again at a lower level is described again, so that the
+order of the resources does not change what a depth limit includes.
+
+`maxTriples` bounds the whole result of one query. When it is reached, the description
+stops. The result keeps the triples found so far, the plan gets the warning
+`describe-truncated`, and the HTTP response gets the header
+`Sparkles-Describe-Truncated: true`. Stopping is more useful than failing for a hub
+resource under `scbd`, whose inbound triples can run into millions. The existing budgets
+apply too. The `rows` budget counts the triples of the description, and the timeout and
+cancellation are checked once per node.
+
+### 11.6 Configuration
+
+* **Engine.** `QueryOptions::describe` holds a `DescribeOptions`. `QueryResult` gains
+  `describe_truncated`.
+* **Dataset setting.** The `Store` keeps the dataset's options. A persistent store writes
+  them to `describe.json`, which holds the options that differ from the defaults and a
+  `format` number, and the defaults remove the file. `Dataset::query` uses the setting.
+* **HTTP.** `GET /$/describe/{ds}` returns the setting, `PUT` replaces it and `DELETE`
+  restores the defaults, with the read and admin permissions of the other dataset
+  settings. A query request takes `describe=cbd|scbd|outgoing`,
+  `describe-labels=true|false`, `describe-reifiers=true|false`, `describe-max-triples=N`
+  and `describe-max-depth=N`. The two limits of a request can only lower the dataset's,
+  like the budget parameters of C01.
+* **CLI.** `sparkles describe-settings` prints and changes the setting, with `--loc` or
+  `--server`, in the form of `sparkles compaction`. `sparkles query --describe MODE` and
+  `--describe-labels` change a local query.
+* **Service description.** The query service lists `spk:describeMode`,
+  `spk:describeLabels` and `spk:describeReifiers`, and the limits when they are set.
+* The MCP tools and stored queries use the dataset's setting.
+
+### 11.7 Acceptance examples
+
+The data is a TriG dataset with nested blank nodes, a cycle of blank nodes, inbound
+links from IRIs and blank nodes, an annotated triple, and named graphs. One named graph
+holds a triple about the resource, one holds an inbound link, and two share a blank
+node.
+
+* **A11.** With `reifiers: false`, ten DESCRIBE queries give Jena 6.2.0's answers. They
+  cover a resource with nested blank nodes and a named-graph triple, resources bound by
+  a WHERE clause (an IRI and a blank node), a resource found only in a named graph, a
+  blank node shared by two named graphs, a cycle of blank nodes, `DESCRIBE *`, several
+  resources and an unknown resource.
+* **A12.** `cbd` adds the annotation's reifier to the description of `:a`. A reifier of a
+  reifier's triple, and an RDF 1.1 reification, are included as well.
+* **A13.** `scbd` adds the inbound triples from the default graph and from named graphs,
+  and it follows an inbound blank node backwards but not forwards.
+* **A14.** `outgoing`, `labels`, `maxDepth` 1 to 3 and `maxTriples` give the triples
+  §11.5 defines, and a truncated result says so.
+* **A15.** `FROM`, `FROM NAMED` and the protocol's dataset choose the sources as §11.4
+  says. A union store gives the same answers as a store without the union.
+* **A16.** The differential tests of C12 and C12b run every DESCRIBE query in `cbd` and in
+  `scbd` with labels, in stores with and without a union default graph. A view answers
+  as a store of the graphs and triples it sees.
+* **A17.** The setting survives a restart, a request's mode and limits apply, malformed
+  values are a `400`, and the service description lists the setting.
+
+### 11.8 Rejected alternatives
+
+* **A handler registry.** Rust code cannot be registered at run time without a plugin
+  interface, and a configuration of handler names would offer no more than the modes do.
+* **Reifiers off by default.** That would match Jena exactly, but the CBD would then not
+  be the submission's CBD. Annotations are how RDF 1.2 data says where a triple came
+  from, and a description without them loses that. The switch keeps Jena's behaviour one
+  option away.
+* **Failing at `maxTriples`.** An error gives a client nothing to show for a hub
+  resource. Truncation with a header and a warning gives it a bounded description that
+  it can recognise as partial.
+* **Reading the union graph as the default graph in a union store.** It would cross from
+  one named graph into another along blank nodes, which Jena never does, and the stored
+  default graph would be left out.
+
 ## Outcome
 
 **Delivered.** Phase 1 landed on 2026-10-02 as designed in §2 to §6:
@@ -386,3 +585,63 @@ that other builds kept at a load of about 55:
 **Not built.** ARQ's other path forms (`:p^:q`, `distinct(…)`, `shortest(…)`,
 `multi(…)`), `SEMIJOIN`, `ANTIJOIN`, `LET`, `UNFOLD` and the `JSON` query form (§1
 non-goals), and parallel evaluation of `LATERAL` groups.
+
+**Phase 2, delivered.** Configurable DESCRIBE landed on 2026-10-02 as §11 designs it:
+- `sparql/describe.rs` with `DescribeMode` (`cbd`, `scbd`, `outgoing`) and
+  `DescribeOptions` (`labels`, `reifiers`, `maxTriples`, `maxDepth`), read from the
+  default graph and each named graph as separate sources, with RDF 1.2 reifiers and
+  RDF 1.1 reification;
+- `QueryOptions::describe`, `QueryResult::describe_truncated` and the plan warning
+  `describe-truncated`;
+- the dataset's setting in the `Store`, kept in `describe.json`, and used by
+  `Dataset::query`, the server's queries, stored queries and the MCP tools;
+- `GET`, `PUT` and `DELETE /$/describe/{ds}`, the request parameters, the response
+  header `Sparkles-Describe-Truncated`, the service description's `spk:describeMode`
+  and its options, and the OpenAPI description of all of them;
+- `sparkles describe-settings`, and `--describe` and `--describe-labels` on
+  `sparkles query`;
+- the Python bindings' dataset queries, which use the dataset's setting. Queries inside
+  a Python transaction use the defaults.
+
+**Phase 2, deviations and decisions.**
+- The default answer changed in two ways. Descriptions now include the triples of named
+  graphs, which Jena includes and Sparkles had left out. They also include the
+  descriptions of reifiers, which Jena leaves out. On data without reifiers the default
+  equals Jena's answer, and `reifiers: false` equals it on any data.
+- In a store with a union default graph, a description without a dataset used to read
+  every graph as one. It now reads the stored default graph and each named graph on its
+  own, as Jena does. The C12 and C12b differential tests had skipped DESCRIBE in union
+  stores, because the old reading included the stored default graph that a view's union
+  leaves out. They now run it.
+- `--describe` and `--describe-labels` on `sparkles query` apply to `--loc` and `--data`.
+  With `--server`, the command refuses them and the dataset's setting applies, so the
+  remote client was left unchanged.
+- Jena 6.2.0's `arq` command fails with a `NullPointerException` when a DESCRIBE query
+  has `FROM` or `FROM NAMED` (`DescribeBNodeClosure` gets no dataset). The rules of §11.4
+  for `FROM` are therefore checked against the design only, not against Jena.
+- A description's index scans check the `rows` budget, the deadline and cancellation
+  while they read, so a hub resource under `scbd` cannot hold unbounded memory before
+  `maxTriples` applies.
+- The setting's `GET` is not limited to callers who read the whole dataset, unlike the
+  RDFS and compaction settings, because it reveals nothing about the data.
+
+**Phase 2, tests.** `crates/sparkles/tests/describe.rs` has 12 tests for A11 to A15:
+Jena 6.2.0's answers to ten queries, the reifier cases, `scbd`, `outgoing`, labels, the
+depth and size limits, the query's dataset, a union store, the inference overlay, the
+options' parsing and the persisted setting. The differential tests of
+`graph_access.rs` and `triple_access.rs` run each DESCRIBE query in `cbd` and in `scbd`
+with labels, with and without a union default graph (A16). The server's tests cover the
+route, the request parameters, the header, the service description and a restart (A17),
+and `sparkles describe-settings` on a local database. The W3C SPARQL suites still pass
+482/328/157/269, and Jena's HTTP clients pass 138 of 138 checks, `QueryExecHTTP`'s
+DESCRIBE included.
+
+**Phase 2, cost.** The default mode reads the same index ranges as before. The scan of a
+resource's subject prefix returns its quads in every graph, and the named-graph sources
+filter them, so no extra scans are made. Reifier lookups run only when the store has
+`rdf:reifies` or `rdf:subject` triples, and they cost a dictionary lookup and a prefix
+scan per described triple. `scbd` adds one object-prefix scan per node.
+
+**Phase 2, not built.** Handlers registered by users, the inverse functional form of the
+submission, DESCRIBE options in Python, in Python transactions and in the remote
+client, and a UI control for the setting.

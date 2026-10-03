@@ -7,6 +7,7 @@ use sparkles::Error;
 use sparkles::access::{GraphAccess, GraphRule, Graphs};
 use sparkles::guard::WriteOptions;
 use sparkles::io::{RdfFormat, Source};
+use sparkles::sparql::describe::{DescribeMode, DescribeOptions};
 use sparkles::sparql::update::update;
 use sparkles::sparql::{QueryKind, QueryOptions, query};
 use sparkles::store::{ReplaceTarget, Store, StoreOptions};
@@ -241,6 +242,19 @@ const QUERIES: &[&str] = &[
        FILTER(geof:sfWithin(?w, \"POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))\"^^geo:wktLiteral)) }",
 ];
 
+/// The DESCRIBE settings a DESCRIBE query is checked with (one run for other queries).
+fn describe_variants(q: &str) -> Vec<DescribeOptions> {
+    let mut v = vec![DescribeOptions::default()];
+    if q.starts_with("DESCRIBE") {
+        v.push(DescribeOptions {
+            mode: DescribeMode::Scbd,
+            labels: true,
+            ..Default::default()
+        });
+    }
+    v
+}
+
 /// Which graphs a store of exactly a view's graphs keeps.
 type Keep = Box<dyn Fn(&str) -> bool>;
 
@@ -276,22 +290,27 @@ fn differential(union: bool) {
             ..Default::default()
         };
         for q in QUERIES {
-            // DESCRIBE in a store with a union default graph also reads the stored
-            // default graph, which a view's union of named graphs leaves out
-            if union && q.starts_with("DESCRIBE") {
-                continue;
+            for describe in describe_variants(q) {
+                let restricted = QueryOptions {
+                    describe: describe.clone(),
+                    ..restricted.clone()
+                };
+                let plain = QueryOptions {
+                    describe: describe.clone(),
+                    ..Default::default()
+                };
+                // fill the result cache without the view first: the view must not read it
+                let _ = answer(&full, q, &plain);
+                let got = answer(&full, q, &restricted);
+                let want = answer(&expected_store, q, &plain);
+                assert_eq!(got, want, "view {names:?}, union {union}: {q} {describe:?}");
+                // and again, from the cache
+                assert_eq!(
+                    answer(&full, q, &restricted),
+                    want,
+                    "cached, {names:?}: {q}"
+                );
             }
-            // fill the result cache without the view first: the view must not read it
-            let _ = answer(&full, q, &QueryOptions::default());
-            let got = answer(&full, q, &restricted);
-            let want = answer(&expected_store, q, &QueryOptions::default());
-            assert_eq!(got, want, "view {names:?}, union {union}: {q}");
-            // and again, from the cache
-            assert_eq!(
-                answer(&full, q, &restricted),
-                want,
-                "cached, {names:?}: {q}"
-            );
         }
     }
 }

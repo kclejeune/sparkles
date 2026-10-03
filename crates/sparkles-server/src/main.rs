@@ -15,6 +15,7 @@ mod compaction;
 mod compaction_cmd;
 mod compress;
 mod csv_cmd;
+mod describe_cmd;
 mod exposure;
 #[cfg(feature = "fmt")]
 mod fmt;
@@ -1104,6 +1105,13 @@ enum Cmd {
         /// RDFS on read with the schema in this graph of the database: `default` or an IRI
         #[arg(long, value_name = "GRAPH")]
         rdfs_graph: Option<String>,
+        /// How DESCRIBE describes a resource: cbd, scbd or outgoing (default: the
+        /// database's setting, see `describe-settings`)
+        #[arg(long, value_name = "MODE")]
+        describe: Option<String>,
+        /// DESCRIBE adds the rdfs:label and skos:prefLabel of the IRIs it links to
+        #[arg(long)]
+        describe_labels: bool,
         // where SERVICE may connect in a local run (a --server applies its own policy)
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
@@ -1154,6 +1162,9 @@ enum Cmd {
     /// Show or change a dataset's automatic compaction settings, on a local database or
     /// on a server
     Compaction(compaction_cmd::CompactionArgs),
+    /// Show or change how DESCRIBE describes a resource in a dataset (cbd, scbd or
+    /// outgoing, labels, reifiers and limits), on a local database or on a server
+    DescribeSettings(describe_cmd::DescribeArgs),
     /// Named snapshots (pins that keep a commit readable) and history retention
     Snapshot {
         #[command(subcommand)]
@@ -2465,6 +2476,8 @@ fn run() -> Result<()> {
             insecure_http,
             rdfs,
             rdfs_graph,
+            describe,
+            describe_labels,
             outbound,
         } => {
             let q = match (query, text) {
@@ -2473,6 +2486,12 @@ fn run() -> Result<()> {
                 _ => bail!("no query given"),
             };
             if loc.is_none() && data.is_empty() && server.is_some() {
+                if describe.is_some() || describe_labels {
+                    bail!(
+                        "--describe and --describe-labels apply to --loc and --data; a server \
+                         uses its dataset's setting (sparkles describe-settings)"
+                    );
+                }
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
                 #[cfg(feature = "auth")]
                 return remote::client::query(
@@ -2506,6 +2525,14 @@ fn run() -> Result<()> {
                 outbound,
                 prefixes: store.prefixes().into_iter().collect(),
                 rdfs: rdfs.map(Arc::new),
+                describe: {
+                    let mut d = store.describe_settings();
+                    if let Some(m) = &describe {
+                        d.mode = sparkles::sparql::describe::DescribeMode::parse(m)?;
+                    }
+                    d.labels |= describe_labels;
+                    d
+                },
                 ..Default::default()
             };
             let snap = match at {
@@ -2744,6 +2771,7 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::DescribeSettings(args) => describe_cmd::run(args, opts),
         Cmd::Compact { loc, if_due } => {
             let store = Store::open(&loc, opts)?;
             if if_due {

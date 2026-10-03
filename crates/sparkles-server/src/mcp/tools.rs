@@ -464,6 +464,15 @@ impl Tools<'_> {
                 .read()
                 .get(ds)
                 .and_then(|d| d.rdfs.read().clone()),
+            // the dataset's DESCRIBE setting, as over HTTP
+            describe: self
+                .server
+                .state
+                .datasets
+                .read()
+                .get(ds)
+                .map(|d| d.store.describe_settings())
+                .unwrap_or_default(),
             ..Default::default()
         };
         // SERVICE and LOAD are the principal's server permissions, and the graphs its

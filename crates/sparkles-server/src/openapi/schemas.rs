@@ -382,6 +382,42 @@ pub(super) fn schemas() -> Map<String, J> {
         ),
     );
     put(
+        "DescribeSetting",
+        obj(
+            &[],
+            json!({
+                "mode": string_enum(&["cbd", "scbd", "outgoing"]),
+                "labels": { "type": "boolean" },
+                "reifiers": { "type": "boolean" },
+                "maxTriples": nullable("integer"),
+                "maxDepth": nullable("integer"),
+            }),
+        ),
+    );
+    put(
+        "DescribeStatus",
+        obj(
+            &[
+                "mode",
+                "labels",
+                "reifiers",
+                "maxTriples",
+                "maxDepth",
+                "source",
+                "modes",
+            ],
+            json!({
+                "mode": string_enum(&["cbd", "scbd", "outgoing"]),
+                "labels": { "type": "boolean" },
+                "reifiers": { "type": "boolean" },
+                "maxTriples": nullable("integer"),
+                "maxDepth": nullable("integer"),
+                "source": string_enum(&["dataset", "default"]),
+                "modes": array(json!({ "type": "string" })),
+            }),
+        ),
+    );
+    put(
         "CompactionStatus",
         open(
             "The dataset's automatic compaction: its settings, state, measures and last run.",

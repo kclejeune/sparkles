@@ -1263,6 +1263,27 @@ implementation landed.
   - copying Jena's evaluation of `{0,}` as `{+}`;
   - ARQ's syntax off by default;
   - returning quads from `Dataset::construct`.
+- **Phase 2 spec** (§11, configurable DESCRIBE), written on 2026-10-02 independently
+  from:
+  - the Sparkles code, whose DESCRIBE followed the blank-node closure in the default
+    graph;
+  - Apache Jena's `jena-arq` sources (Apache-2.0): the `core.describe` package
+    (`DescribeHandler`, `DescribeHandlerRegistry`, `DescribeBNodeClosure`), `util.Closure`
+    and `QueryExecDataset.describe`, and TDB2's `QueryEngineTDB`, read for behaviour. No
+    code was copied;
+  - the output of Jena 6.2.0's `arq` command on a small TriG dataset;
+  - the W3C member submission *CBD - Concise Bounded Description* (2005), for the
+    concise bounded description and its symmetric form, and RDF 1.2 Concepts for
+    reifiers.
+
+  Fluree was not consulted.
+- **Phase 2 implementation** (2026-10-02): from the spec and the Sparkles code.
+  **Dependencies:** none new.
+- **Rejected in Phase 2** (spec §11.8):
+  - a registry of handlers;
+  - reifiers off by default;
+  - failing a query at `maxTriples`;
+  - the union graph as the default source in a union store.
 
 ## OpenAPI description, shell completions and man pages
 

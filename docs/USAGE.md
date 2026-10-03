@@ -356,6 +356,7 @@ sparkles load    --loc db people.csv --base http://ex.org/p/ --key id   # CSV an
 sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv, --explain, --time
 sparkles query   --data file.ttl --query q.rq # query files in memory (arq --data)
 sparkles query   --loc db --rdfs schema.ttl 'SELECT ...'   # RDFS on read (--rdfs-graph IRI|default)
+sparkles query   --loc db --describe scbd 'DESCRIBE <http://ex.org/a>'   # cbd|scbd|outgoing, --describe-labels
 sparkles update  --loc db 'INSERT DATA {...}' # also LOAD <http…>
 sparkles compact --loc db                     # merge updates into a new generation
 sparkles compact --loc db --if-due            # only when the compaction policy says so (for cron)
@@ -390,6 +391,7 @@ sparkles vector reembed --loc db --name docs  # embed every text again (a new mo
 sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes it, no flag prints it
 sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
 sparkles compaction --loc db --set deltaRatio=0.02     # automatic compaction settings; --default removes them
+sparkles describe-settings --loc db --set mode=scbd   # how DESCRIBE describes a resource; --default removes it
 ```
 
 `sparkles infer` updates the materialization that `reasoning.json` records when its
@@ -736,6 +738,28 @@ Each change is a new version with its time, author and message. The MCP server o
 every stored query as a tool named `<dataset>__<query>`, and the UI's query page lists
 them with a form for their parameters. [API.md](API.md#stored-queries) describes the
 definitions, the parameter types and the versions.
+
+### DESCRIBE modes
+
+A DESCRIBE query returns the concise bounded description of each resource by default.
+That is the resource's triples, the triples of the blank nodes they lead to, and the
+descriptions of the reifiers of those triples. It reads the default graph and each named
+graph in which the resource appears, as Jena does. A dataset's setting can choose the
+symmetric description (`scbd`), which adds the triples that point at the resource, or
+only the resource's own triples (`outgoing`). It can also add the labels of linked IRIs
+and limit the size and depth of a description:
+
+```sh
+sparkles describe-settings --loc db                                  # print the setting
+sparkles describe-settings --loc db --set mode=scbd --set labels=true
+sparkles describe-settings --loc db --set maxTriples=10000 --set maxDepth=4
+sparkles describe-settings --loc db --default                        # back to the defaults
+sparkles describe-settings --server URL --dataset db --set mode=outgoing
+```
+
+A request can choose another mode with `describe=scbd` and lower the limits with
+`describe-max-triples` and `describe-max-depth`. `sparkles query --describe MODE` does
+the same for a local query. [API.md](API.md#describe) describes the modes and options.
 
 ### Loading CSV and TSV
 
