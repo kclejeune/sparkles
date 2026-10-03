@@ -320,7 +320,7 @@ pub(super) fn samples<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Vec<Sample> {
     let mut out = Vec::new();
     let mut offset = 0u64;
     for (rank, k) in keys.enumerate() {
-        if rank as u64 % SAMPLE_EVERY == 0 {
+        if (rank as u64).is_multiple_of(SAMPLE_EVERY) {
             out.push((rank as u64, offset, k.into()));
         }
         offset += 4 + k.len() as u64;

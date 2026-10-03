@@ -285,6 +285,10 @@ pub fn write_solutions(
 const DECODE_ROWS: usize = 1 << 16;
 /// Sorted base-vocabulary ids decoded by one parallel task.
 const DECODE_TASK: usize = 2048;
+/// Distinct base-vocabulary ids from which a chunk's pages are asked for ahead: each
+/// request costs a system call even when the pages are in memory, which a small result
+/// would notice, and a small result reads few pages.
+const PREFETCH_MIN: usize = 16 * 1024;
 
 /// The terms of the distinct base-vocabulary ids in some rows of a result, decoded in id
 /// order: the vocabulary's front-coded blocks are visited once each and in file order,
@@ -311,7 +315,9 @@ impl Decoded {
             .collect();
         ids.par_sort_unstable();
         ids.dedup();
-        r.ctx.snap.generation.vocab.prefetch_sorted(&ids);
+        if ids.len() >= PREFETCH_MIN {
+            r.ctx.snap.generation.vocab.prefetch_sorted(&ids);
+        }
         ids
     }
 
