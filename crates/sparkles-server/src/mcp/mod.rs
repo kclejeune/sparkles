@@ -10,6 +10,8 @@
 //! off unless allowed, and the default tool set cannot write.
 
 mod adapter;
+#[cfg(feature = "auth")]
+mod bridge;
 mod complete;
 mod context;
 mod draft;
@@ -64,16 +66,29 @@ pub struct McpArgs {
     /// Database directory to serve, as [NAME=]PATH (repeatable; the name defaults to the
     /// directory's name). A database held by `sparkles serve` is refused: use that
     /// server instead.
-    #[arg(
-        long,
-        value_name = "[NAME=]PATH",
-        required_unless_present = "data",
-        conflicts_with = "data"
-    )]
+    #[arg(long, value_name = "[NAME=]PATH", conflicts_with = "data")]
+    #[cfg_attr(feature = "auth", arg(required_unless_present_any = ["data", "url"]))]
+    #[cfg_attr(not(feature = "auth"), arg(required_unless_present = "data"))]
     pub loc: Vec<String>,
     /// RDF files loaded into one in-memory dataset
     #[arg(long, value_name = "FILE", num_args = 1..)]
     pub data: Vec<PathBuf>,
+    /// Bridge stdio to the MCP endpoint (/$/mcp) of a running `sparkles serve --mcp` at
+    /// this URL instead of opening databases. The server's tools, limits and permissions
+    /// apply, and the bridge signs in with --token, SPARKLES_TOKEN or the saved
+    /// `sparkles auth login` of that server
+    #[cfg(feature = "auth")]
+    #[arg(long, value_name = "URL", conflicts_with_all = ["loc", "data"])]
+    pub url: Option<String>,
+    /// The API token the bridge sends (instead of SPARKLES_TOKEN or the saved login)
+    #[cfg(feature = "auth")]
+    #[arg(long, value_name = "TOKEN", requires = "url")]
+    pub token: Option<String>,
+    /// Allow --url over plain http to a host other than localhost (the token travels in
+    /// clear text)
+    #[cfg(feature = "auth")]
+    #[arg(long, requires = "url")]
+    pub insecure_http: bool,
     /// Name of the in-memory dataset of --data
     #[arg(long, default_value = "data")]
     pub name: String,
@@ -426,6 +441,10 @@ impl McpServer {
 
 /// `sparkles mcp`: serve the datasets over stdio until stdin closes.
 pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
+    #[cfg(feature = "auth")]
+    if let Some(url) = &args.url {
+        return bridge::run(url, args.token.clone(), args.insecure_http);
+    }
     if !(args.timeout.is_finite() && args.timeout > 0.0) {
         bail!("--timeout expects a positive number of seconds");
     }

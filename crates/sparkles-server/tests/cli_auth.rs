@@ -503,3 +503,157 @@ fn browser_login() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// `sparkles mcp --url`: a stdio bridge to the `/$/mcp` of a running server, signed in
+/// with the saved login or `--token`.
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_bridge() {
+    use std::sync::mpsc;
+    let home = tempfile::tempdir().unwrap();
+    // an API token that reads wiki
+    let o = run(sparkles(home.path()).args(["auth", "gen-token", "--name", "agent"]));
+    assert!(o.status.success());
+    let token = stdout(&o).trim().to_string();
+    let hash = regex::Regex::new(r#"hash = "([^"]+)""#)
+        .unwrap()
+        .captures(&stderr(&o))
+        .unwrap()[1]
+        .to_string();
+    let cfg = home.path().join("auth.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "version = 1\n[[tokens]]\nname = \"agent\"\nhash = \"{hash}\"\ndatasets = {{ wiki = \"read\" }}\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let port = free_port();
+    let child = Command::new(BIN)
+        .args([
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--mem",
+            "wiki",
+            "--mem",
+            "secret",
+            "--mcp",
+        ])
+        .arg("--data")
+        .arg(home.path().join("data"))
+        .arg("--auth-config")
+        .arg(&cfg)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}");
+    let _server = Server {
+        child,
+        url: url.clone(),
+        home: tempfile::tempdir().unwrap(),
+    };
+    let t0 = Instant::now();
+    while reqwest::blocking::get(format!("{url}/$/ping")).is_err() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "server did not start"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    // run the bridge with `args`, send `messages`, and collect the answers to the requests
+    let bridge = |args: &[&str], messages: Vec<serde_json::Value>| -> Vec<serde_json::Value> {
+        let mut child = sparkles(home.path())
+            .args(["mcp", "--url", &url])
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut answers = Vec::new();
+        for m in messages {
+            writeln!(stdin, "{m}").unwrap();
+            stdin.flush().unwrap();
+            if m.get("id").is_some() {
+                let line = rx.recv_timeout(Duration::from_secs(30)).expect("no answer");
+                answers.push(serde_json::from_str(&line).expect("stdout carries JSON-RPC"));
+            }
+        }
+        drop(stdin);
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        answers
+    };
+    let list = |id: u64| {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"_meta": meta, "name": "list_datasets", "arguments": {}}})
+    };
+    // not signed in: the answer says how to sign in
+    let a = bridge(&[], vec![list(1)]);
+    let msg = a[0]["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("sparkles auth login"), "{}", a[0]);
+    // with the token on the command line
+    let a = bridge(&["--token", &token], vec![list(2)]);
+    assert_eq!(a[0]["id"], 2);
+    assert_eq!(
+        a[0]["result"]["structuredContent"]["datasets"][0]["name"], "wiki",
+        "{}",
+        a[0]
+    );
+    assert_eq!(
+        a[0]["result"]["structuredContent"]["datasets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // with the saved login, and the legacy handshake with its session
+    let o = run(sparkles(home.path()).args(["auth", "login", "--server", &url, "--token", &token]));
+    assert!(o.status.success(), "{}", stderr(&o));
+    let a = bridge(
+        &[],
+        vec![
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "e2e", "version": "1"}}}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "sparql_query", "arguments": {"query": "ASK {}"}}}),
+        ],
+    );
+    assert_eq!(a[0]["result"]["protocolVersion"], "2025-11-25", "{}", a[0]);
+    let names: Vec<&str> = a[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"sparql_query"), "{names:?}");
+    let text = a[2]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.ends_with("true"), "{text}");
+}
