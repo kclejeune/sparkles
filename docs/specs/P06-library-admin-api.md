@@ -1185,13 +1185,13 @@ ds.schema.profiles(classes=["http://schema.org/Person"])
 ```
 
 Two names already exist as methods. `Dataset.snapshots()` returns a list and
-`Dataset.history()` returns a dict. Their properties return handles that are also
-callable. Calling one returns what the method returns today and emits a
-`DeprecationWarning` that names the handle method. The flat methods (`create_snapshot`,
-`delete_snapshot`, `set_retention`, `enable_text`, `rebuild_text`, `disable_text`,
-`text_status`, the vector index methods, `set_write_validation`, `write_validation`,
-`reason`, `clear_inferences`, `validate_shacl` and `validate_shex`) stay as aliases,
-marked deprecated in the stub with `warnings.deprecated`, and emit the same warning.
+`Dataset.history()` returns a dict. They become properties that return handles. The flat
+methods (`create_snapshot`, `delete_snapshot`, `set_retention`, `enable_text`,
+`rebuild_text`, `disable_text`, `text_status`, the vector index methods,
+`set_write_validation`, `write_validation`, `reason`, `clear_inferences`,
+`validate_shacl` and `validate_shex`) are removed in favour of the handle methods,
+because nothing has been published to PyPI (§13, question 5). The tests, the stub and the
+Python documentation change with them.
 
 ### 9.2 Additions
 
@@ -1308,8 +1308,8 @@ and the wheel measurements.
 * **A10.** `ds.settings().quota().set(1 << 20)` makes a load that would exceed 1 MiB fail
   with `Error::BudgetExceeded`, and after `reset()` the quota is
   `StoreOptions::max_disk_bytes` again.
-* **A11.** In Python, `ds.snapshots()` returns the same list as `ds.snapshots.list()` and
-  emits one `DeprecationWarning`, and `ds.snapshots.get("missing")` returns `None`.
+* **A11.** In Python, `ds.snapshots.list()` returns the dataset's snapshots,
+  `ds.snapshots.get("missing")` returns `None`, and `ds.create_snapshot` no longer exists.
 * **A12.** In Python, `ds.schema.diff(c1, c2)` between a commit before and a commit after
   adding `ex:Book` instances reports `ex:Book` as an added class, as `GET
   /$/schema/{ds}/diff?from=c1&to=c2` does.
@@ -1361,7 +1361,7 @@ and the wheel measurements.
 
 ## 13. Open questions
 
-1. **Default features.** Default: keep the facade's default empty, as the library's is
+1. **Default features.** Decided on 2026-10-03: keep the facade's default empty, as the library's is
    today, and offer `full`. The alternative turns on `text`, `reasoning`, `shacl` and
    `shex` by default, as P01 does for Python.
 2. **Lazy opening.** A catalog with many large datasets could open each on first use.
@@ -1369,13 +1369,14 @@ and the wheel measurements.
    open all in Phase 1, and decide in Phase 3 with a measurement of open times.
 3. **Renames and grants.** Grants in the auth configuration name datasets. A rename over
    HTTP could rewrite the grants, refuse while grants name the dataset, or keep the old
-   name as an alias. Default: refuse while a grant names the dataset, and say which grant.
+   name as an alias. Decided on 2026-10-03: refuse while a grant names the dataset, and say which grant.
 4. **Read-only access to a running server's datasets.** `sparkles check --data-dir` and
    similar tools could read stores that the server holds if stores could be opened read
    only. Default: no, and the tools use `--server`.
-5. **Removing Python's deprecated names.** Default: keep them through the 0.x releases
-   and remove them at 1.0.
-6. **Cloud backends in the wheel.** Default: `fs` and `s3`. GCS and Azure add their
+5. **Python's flat names.** Decided on 2026-10-03: nothing has been published to PyPI,
+   so Phase 2 renames them to the handle methods outright, with no deprecated aliases,
+   and updates the tests and documentation in the same change (§9.1).
+6. **Cloud backends in the wheel.** Decided on 2026-10-03: `fs` and `s3`. GCS and Azure add their
    clients to every wheel for few users, and a source build can turn them on.
 7. **MCP tools in the parity test.** The MCP tools are a third surface over the library.
    Default: add a third table, tool name to surface key, when the tools next change.
