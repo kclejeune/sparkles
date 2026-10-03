@@ -177,10 +177,14 @@ pub struct Optimizations {
     /// an index join with few keys asks the kernel to read every block it will visit
     /// before it decodes the first, so a cold server reads them in parallel
     pub prefetch_blocks: bool,
+    /// a FILTER tested on vocabulary keys whose `STRSTARTS` or start-anchored `REGEX`
+    /// fixes the start of the string rejects the base-vocabulary ids outside the id
+    /// ranges of the keys with that start, without reading their keys
+    pub filter_id_ranges: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 30] = [
+    pub const NAMES: [&str; 31] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -211,6 +215,7 @@ impl Optimizations {
         "probed_keys",
         "fused_star_costs",
         "prefetch_blocks",
+        "filter_id_ranges",
     ];
 
     /// Everything on.
@@ -245,6 +250,7 @@ impl Optimizations {
         probed_keys: true,
         fused_star_costs: true,
         prefetch_blocks: true,
+        filter_id_ranges: true,
     };
 
     /// Everything off: the generic operators only.
@@ -279,6 +285,7 @@ impl Optimizations {
         probed_keys: false,
         fused_star_costs: false,
         prefetch_blocks: false,
+        filter_id_ranges: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -313,6 +320,7 @@ impl Optimizations {
             "probed_keys" => &mut self.probed_keys,
             "fused_star_costs" => &mut self.fused_star_costs,
             "prefetch_blocks" => &mut self.prefetch_blocks,
+            "filter_id_ranges" => &mut self.filter_id_ranges,
             _ => return None,
         })
     }

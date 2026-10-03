@@ -76,7 +76,7 @@ impl Syntax {
 pub fn check(format: RdfFormat, bytes: &[u8], name: &str) -> crate::Result<()> {
     let (syntax, max) = Syntax::of(format);
     // most documents hold no triple term at all
-    if syntax == Syntax::Turtle && !bytes.windows(2).any(|w| w == b"<<") {
+    if syntax == Syntax::Turtle && memchr::memmem::find(bytes, b"<<").is_none() {
         return Ok(());
     }
     let mut scan = Scanner::new(syntax, max);
