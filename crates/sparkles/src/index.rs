@@ -572,6 +572,27 @@ impl PermIndex {
         })
     }
 
+    /// Ask the kernel to start reading the columns in `mask` of block `b` (and those
+    /// between them), unless the cache holds them decoded. A reader that knows the
+    /// blocks it will visit asks for all of them first, so that a cold server reads them
+    /// in parallel instead of one after another (see [`io_hints`]).
+    pub fn prefetch(&self, cache: &BlockCache, b: usize, mask: ColMask) {
+        let mask = mask & ALL_COLS;
+        if mask == 0 || !io_hints() || cache.has_cols(self, b, mask) {
+            return;
+        }
+        let (Some(data), Some(m)) = (self.data.as_ref(), self.blocks.get(b)) else {
+            return;
+        };
+        let first = mask.trailing_zeros() as usize;
+        let last = 7 - mask.leading_zeros() as usize;
+        let at = |c: usize| {
+            m.offset as usize + m.col_len[..c].iter().map(|&l| l as usize).sum::<usize>()
+        };
+        let (from, to) = (at(first), at(last + 1));
+        will_need(data, from, to - from);
+    }
+
     /// Decode one column of a block (columns are compressed separately).
     pub fn decode_col(&self, b: usize, c: usize) -> Result<Vec<u64>> {
         let m = &self.blocks[b];

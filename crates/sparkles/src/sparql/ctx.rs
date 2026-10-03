@@ -171,10 +171,13 @@ pub struct Optimizations {
     /// index joins that a fused star reads together are costed for the keys of the
     /// star's input, which a fused star probes in every pattern
     pub fused_star_costs: bool,
+    /// an index join with few keys asks the kernel to read every block it will visit
+    /// before it decodes the first, so a cold server reads them in parallel
+    pub prefetch_blocks: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 29] = [
+    pub const NAMES: [&str; 30] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -204,6 +207,7 @@ impl Optimizations {
         "characteristic_sets",
         "probed_keys",
         "fused_star_costs",
+        "prefetch_blocks",
     ];
 
     /// Everything on.
@@ -237,6 +241,7 @@ impl Optimizations {
         characteristic_sets: true,
         probed_keys: true,
         fused_star_costs: true,
+        prefetch_blocks: true,
     };
 
     /// Everything off: the generic operators only.
@@ -270,6 +275,7 @@ impl Optimizations {
         characteristic_sets: false,
         probed_keys: false,
         fused_star_costs: false,
+        prefetch_blocks: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -303,6 +309,7 @@ impl Optimizations {
             "characteristic_sets" => &mut self.characteristic_sets,
             "probed_keys" => &mut self.probed_keys,
             "fused_star_costs" => &mut self.fused_star_costs,
+            "prefetch_blocks" => &mut self.prefetch_blocks,
             _ => return None,
         })
     }
