@@ -766,3 +766,20 @@ grouping is 40 to 80 times faster.
 
 **Not built.** Publishing itself, PyPy and free-threaded wheels, and async wrappers. The
 macOS, Windows and aarch64 wheels have not been built outside the workflow.
+
+**Later additions.** On 2026-10-03 the bindings took the rest of the engine's syntaxes
+and inputs:
+
+* `RdfFormat` names Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON, and `load`,
+  `load_files`, `dump`, `parse`, `serialize` and `QueryTriples.serialize` read and write
+  them. Their reader and writer moved from the server crate into the core crate as
+  `sparkles::jena_formats`. An input in one of them is converted to N-Quads in memory
+  before it is parsed, so such a load does not stream.
+* `Dataset.load` reads CSV and TSV tables with the mapping of spec
+  [C05](C05-tabular-imports.md), through `mapping`, `template`, `key` and `base_iri`.
+* The query methods of datasets and transactions take `describe`, a DESCRIBE mode or a
+  dict of options over the dataset's setting. A transaction now uses the dataset's
+  setting, where it used the defaults before.
+
+`tests/test_formats_tables_describe.py` covers the three, and the stub test checks the
+new names and arguments.

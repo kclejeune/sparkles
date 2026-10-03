@@ -357,7 +357,9 @@ file extension (also behind a compression extension) or by `--syntax` and `--out
 names. `convert` transcodes such an input to N-Quads on a second thread while it streams,
 and `load` transcodes each file into a temporary N-Quads file before the load, as the
 server does with request bodies. The reader and writer are the server's
-(`http/jena_formats.rs`), and TriX's live in the core crate (`sparkles::trix`).
+(`http/jena_formats.rs`), and TriX's live in the core crate (`sparkles::trix`). The
+module later moved into the core crate as `sparkles::jena_formats`, so that the Python
+bindings read and write the same syntaxes.
 
 On 2026-10-03 `convert` learned to read directories and to tell a syntax from the
 content. `--recursive` reads the files below a directory, filtered by `--include` and

@@ -12,6 +12,9 @@ INFERRED_GRAPH: Final[str]
 
 _Path = Union[str, os.PathLike[str]]
 _Format = Union[RdfFormat, str]
+# a DESCRIBE mode ("cbd", "scbd", "outgoing"), or options: mode, labels, reifiers,
+# max_triples and max_depth (None or 0: no limit)
+_Describe = Union[str, Mapping[str, Union[str, bool, int, None]]]
 _Subject = Union[NamedNode, BlankNode]
 _Term = Union[NamedNode, BlankNode, Literal, Triple]
 _GraphName = Union[NamedNode, BlankNode, DefaultGraph]
@@ -153,6 +156,10 @@ class RdfFormat:
     N3: Final[RdfFormat]
     RDF_XML: Final[RdfFormat]
     JSON_LD: Final[RdfFormat]
+    TRIX: Final[RdfFormat]
+    RDF_THRIFT: Final[RdfFormat]
+    RDF_PROTOBUF: Final[RdfFormat]
+    RDF_JSON: Final[RdfFormat]
     @property
     def name(self) -> str: ...
     @property
@@ -396,6 +403,7 @@ class Transaction:
         max_memory_bytes: int | None = None,
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
+        describe: _Describe | None = None,
     ) -> _QueryResult: ...
     def update(
         self,
@@ -449,6 +457,9 @@ class Dataset:
         to_graph: NamedNode | str | None = None,
         compression: str | None = None,
         lenient: bool = False,
+        mapping: _Path | None = None,
+        template: _Path | None = None,
+        key: str | None = None,
     ) -> int: ...
     def load_files(self, paths: Iterable[_Path], *, to_graph: NamedNode | str | None = None) -> int: ...
     def query(
@@ -467,6 +478,7 @@ class Dataset:
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
         at: int | str | None = None,
+        describe: _Describe | None = None,
     ) -> _QueryResult: ...
     def select(
         self,
@@ -484,6 +496,7 @@ class Dataset:
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
         at: int | str | None = None,
+        describe: _Describe | None = None,
     ) -> QuerySolutions: ...
     def ask(
         self,
@@ -501,6 +514,7 @@ class Dataset:
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
         at: int | str | None = None,
+        describe: _Describe | None = None,
     ) -> bool: ...
     def construct(
         self,
@@ -518,6 +532,7 @@ class Dataset:
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
         at: int | str | None = None,
+        describe: _Describe | None = None,
     ) -> QueryTriples: ...
     def update(
         self,

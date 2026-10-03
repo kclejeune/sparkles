@@ -1680,6 +1680,9 @@ ds = Dataset("mydb")                               # a database directory, locke
 ds.load(path="data.ttl.gz")                        # format and compression from the name
 ds.load(text, "turtle", to_graph="http://ex.org/g")
 ds.load(open("data.nq.zst", "rb"), "nq")           # read as it is parsed, in one commit
+ds.load(path="data.trix")                          # Jena's TriX, RDF Thrift, RDF Protobuf, RDF/JSON
+ds.load(path="people.csv", base_iri="http://ex.org/p/", key="id")   # a CSV or TSV table
+ds.dump("dump.rt.gz")                              # RDF Thrift, gzipped
 
 rows = ds.query("""
     PREFIX foaf: <http://xmlns.com/foaf/0.1/>
@@ -1712,12 +1715,32 @@ CONSTRUCT and DESCRIBE. `select`, `ask` and `construct` check the query form and
 * `max_rows`, `max_memory_bytes` and `max_rows_produced` are budgets. A query past one
   raises `BudgetExceededError`.
 * `cancel` takes a `CancelToken`, and `at` reads a past state (see below).
+* `describe` changes how DESCRIBE describes a resource for this query. It takes a mode
+  (`"cbd"`, `"scbd"` or `"outgoing"`) or a dict of `mode`, `labels`, `reifiers`,
+  `max_triples` and `max_depth`, where `None` removes a limit. The options apply over the
+  dataset's setting ([DESCRIBE modes](#describe-modes)). A transaction's `query` takes
+  it too.
 
 `update` takes the same `timeout`, budgets and `cancel`. `apply_patch` applies an RDF
 Patch from a `str` or `bytes` as the server's patch endpoint does, and returns a
 `PatchStats` with the commit and the counts of the rows that took effect. A row is `None` at an unbound
 variable, and `row.get("name", default)` returns the default instead.
 `QuerySolutions.serialize` must come before the rows are iterated, and it consumes them.
+
+`RdfFormat` names oxrdfio's syntaxes and Jena's TriX (`RdfFormat.TRIX`), RDF Thrift
+(`RDF_THRIFT`), RDF Protobuf (`RDF_PROTOBUF`) and RDF/JSON (`RDF_JSON`). `load`, `dump`,
+`parse` and `serialize` take all of them, by name, extension or media type as well.
+An input in one of Jena's syntaxes is read into memory and converted to N-Quads before
+it is parsed, so it does not stream. RDF/JSON holds one graph, so `dump` writes the
+default graph, or `from_graph`.
+
+`load` reads a CSV or TSV table when the format is `"csv"` or `"tsv"`, or the path ends
+in `.csv`, `.tsv` or `.tab`, before any compression extension. The table is mapped as
+`sparkles load` maps it ([Loading CSV and TSV](#loading-csv-and-tsv)). `base_iri` is the
+default mapping's namespace and `key` names the column of each row's subject. `mapping`
+names a CSVW metadata file, and `template` a SPARQL CONSTRUCT query run for each row. A
+`-metadata.json` file next to the table is used when none of them is given. Warnings of
+the conversion are Python warnings.
 
 `sparkles.parse` parses as it reads, from a path, bytes or a file object, so the first
 quads come before the input has been read to the end. A syntax error is raised by the

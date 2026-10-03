@@ -601,7 +601,9 @@ non-goals), and parallel evaluation of `LATERAL` groups.
 - `sparkles describe-settings`, and `--describe` and `--describe-labels` on
   `sparkles query`;
 - the Python bindings' dataset queries, which use the dataset's setting. Queries inside
-  a Python transaction use the defaults.
+  a Python transaction use the defaults. Since 2026-10-03 a transaction uses the
+  dataset's setting as it was when the transaction began, and every Python query method
+  takes a `describe` argument, a mode or a dict of options over that setting.
 
 **Phase 2, deviations and decisions.**
 - The default answer changed in two ways. Descriptions now include the triples of named

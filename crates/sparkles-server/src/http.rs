@@ -35,7 +35,7 @@ mod fuseki;
 mod graphql;
 pub(crate) mod history;
 mod inline;
-pub(crate) mod jena_formats;
+pub(crate) use sparkles::jena_formats;
 #[cfg(feature = "fmt")]
 mod lint;
 mod patch;
