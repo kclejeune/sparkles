@@ -4,10 +4,10 @@
 //! store writes it.
 
 use oxrdf::{BlankNode, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
-use sparkles_core::Dataset;
-use sparkles_core::io::RdfFormat;
-use sparkles_core::sparql::QueryOptions;
-use sparkles_core::store::parse_bnode_label;
+use sparkles::Dataset;
+use sparkles::io::RdfFormat;
+use sparkles::sparql::QueryOptions;
+use sparkles::store::parse_bnode_label;
 
 const PREFIX: &str = "PREFIX ex: <http://ex.org/> ";
 

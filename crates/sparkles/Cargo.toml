@@ -1,0 +1,31 @@
+[package]
+name = "sparkles"
+description = "High-performance RDF/SPARQL database (Jena-compatible, QLever-style index): the embedded Dataset API over sparkles-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sparkles-core.workspace = true
+oxrdf.workspace = true
+oxrdfio.workspace = true
+spargebra.workspace = true
+rustc-hash.workspace = true
+regex.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+oxrdfio.workspace = true
+spargebra.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+# The engine's features under the same names. The default is empty, as the engine's is.
+[features]
+text = ["sparkles-core/text"]
+geo = ["sparkles-core/geo"]
+geo-proj4 = ["geo", "sparkles-core/geo-proj4"]
+geo-epsg = ["geo-proj4", "sparkles-core/geo-epsg"]
+zstd = ["sparkles-core/zstd"]
+brotli = ["sparkles-core/brotli"]
+failpoints = ["sparkles-core/failpoints"]

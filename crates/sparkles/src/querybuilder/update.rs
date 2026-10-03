@@ -93,7 +93,7 @@ enum Op {
 /// operation; call [`then`](Self::then) to start a new operation of the same kind.
 ///
 /// ```
-/// use sparkles_core::querybuilder::{UpdateBuilder, lit};
+/// use sparkles::querybuilder::{UpdateBuilder, lit};
 /// let u = UpdateBuilder::new()
 ///     .prefix("ex", "http://example.org/")
 ///     .delete("?p", "ex:status", "?old")

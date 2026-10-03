@@ -91,7 +91,7 @@ pub(crate) fn finish(text: String, errors: Vec<String>, update: bool) -> Result<
 /// Builds a `SELECT` query (Jena's `SelectBuilder`).
 ///
 /// ```
-/// use sparkles_core::querybuilder::{SelectBuilder, expr, var};
+/// use sparkles::querybuilder::{SelectBuilder, expr, var};
 /// let q = SelectBuilder::new()
 ///     .prefix("ex", "http://example.org/")
 ///     .select("?dept")
@@ -303,7 +303,7 @@ impl fmt::Display for AskBuilder {
 /// short form `CONSTRUCT WHERE { … }` is produced.
 ///
 /// ```
-/// use sparkles_core::querybuilder::ConstructBuilder;
+/// use sparkles::querybuilder::ConstructBuilder;
 /// let q = ConstructBuilder::new()
 ///     .prefix("ex", "http://example.org/")
 ///     .construct("?b", "ex:childOf", "?a")

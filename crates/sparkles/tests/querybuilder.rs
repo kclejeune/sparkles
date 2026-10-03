@@ -1,12 +1,12 @@
-//! Tests for the fluent SPARQL query builder (`sparkles_core::querybuilder`).
+//! Tests for the fluent SPARQL query builder (`sparkles::querybuilder`).
 
 use oxrdf::{Literal, NamedNode, Term, Triple};
-use sparkles_core::io::RdfFormat;
-use sparkles_core::querybuilder::{
+use sparkles::io::RdfFormat;
+use sparkles::querybuilder::{
     AskBuilder, ConstructBuilder, DescribeBuilder, GraphTarget, SelectBuilder, UpdateBuilder,
     WhereBuilder, expr, iri, lit, lit_lang, lit_typed, node, undef, var,
 };
-use sparkles_core::{Dataset, Error, Solutions};
+use sparkles::{Dataset, Error, Solutions};
 
 const EX: &str = "http://example.org/";
 

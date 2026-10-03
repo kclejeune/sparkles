@@ -23,7 +23,7 @@ doctest = false
 
 [dependencies]
 pyo3 = { version = "0.29", features = ["abi3-py310"] }
-sparkles = { path = "../sparkles-core", package = "sparkles-core", features = ["zstd", "brotli"] }
+sparkles = { path = "../sparkles", features = ["zstd", "brotli"] }
 sparkles-reasoner = { path = "../sparkles-reasoner", optional = true }
 sparkles-shacl = { path = "../sparkles-shacl", optional = true }
 sparkles-shex = { path = "../sparkles-shex", optional = true }

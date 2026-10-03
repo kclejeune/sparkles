@@ -28,6 +28,8 @@ mod patch_apply;
 mod preview;
 mod quota;
 mod schedule;
+#[cfg(test)]
+mod test_support;
 mod vector;
 pub(crate) use embed::embed_query_text;
 pub(crate) mod wal;

@@ -11,7 +11,8 @@ license = "Apache-2.0"
 repository = "https://github.com/kclejeune/sparkles"
 
 [workspace.dependencies]
-sparkles = { path = "crates/sparkles-core", package = "sparkles-core" }
+sparkles = { path = "crates/sparkles" }
+sparkles-core = { path = "crates/sparkles-core" }
 sparkles-reasoner = { path = "crates/sparkles-reasoner" }
 sparkles-shacl = { path = "crates/sparkles-shacl" }
 sparkles-shex = { path = "crates/sparkles-shex" }

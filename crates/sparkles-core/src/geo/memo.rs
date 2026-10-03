@@ -484,7 +484,7 @@ mod tests {
         let triple = |s: &str, lex: &str| {
             format!("<http://example.org/{s}> {AS_WKT} \"{lex}\"^^<{WKT_LITERAL}> .")
         };
-        let ds = crate::dataset::Dataset::memory();
+        let ds = crate::store::Store::in_memory(crate::store::StoreOptions::default());
         ds.load_str(&triple("a", "POINT(1 2)"), crate::io::RdfFormat::NTriples)
             .unwrap();
         let literal = |lex: &str| {
@@ -508,9 +508,7 @@ mod tests {
         let ctx = Ctx::new(ds.snapshot());
         arg(&ctx, "POINT(1 2)");
         assert_eq!(ctx.geo.len(), 1);
-        ds.store()
-            .enable_geo(crate::geo::GeoConfig::default())
-            .unwrap();
+        ds.enable_geo(crate::geo::GeoConfig::default()).unwrap();
         ds.update(&format!("INSERT DATA {{ {} }}", triple("b", "POINT(3 4)")))
             .unwrap();
         // with it, base and delta literals come from the column: the memo misses nothing

@@ -1,7 +1,5 @@
 //! Durable commit identity: ids, counts, receipts, replay, catalog repair, migration.
 
-use oxrdf::{GraphNameRef, NamedNodeRef, QuadRef, TermRef};
-use sparkles_core::Dataset;
 use sparkles_core::commit::{CommitKind, CommitRange};
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::QueryOptions;
@@ -597,36 +595,6 @@ fn in_memory_stores_keep_a_bounded_catalog() {
         before.commits.iter().map(|c| c.seq).collect::<Vec<_>>(),
         [4]
     );
-}
-
-#[test]
-fn library_receipts() {
-    let ds = Dataset::memory();
-    let s = ds
-        .update("INSERT DATA { <urn:a> <urn:p> <urn:o> }")
-        .unwrap();
-    let r = s.commit.unwrap();
-    assert!(r.committed && r.commit.seq == 1);
-    assert_eq!(ds.head_commit().seq, 1);
-    let q = QuadRef::new(
-        NamedNodeRef::new("urn:a").unwrap(),
-        NamedNodeRef::new("urn:p").unwrap(),
-        TermRef::NamedNode(NamedNodeRef::new("urn:o").unwrap()),
-        GraphNameRef::DefaultGraph,
-    );
-    let (_, r) = ds.transaction_receipt(|tx| tx.insert(q)).unwrap();
-    assert!(!r.committed && r.commit.seq == 1);
-    let (_, r) = ds.transaction_receipt(|tx| tx.remove(q)).unwrap();
-    assert!(r.committed);
-    assert_eq!(
-        (r.commit.seq, r.commit.deleted, r.commit.kind),
-        (2, 1, CommitKind::Transaction)
-    );
-    let json = serde_json::to_value(r).unwrap();
-    assert_eq!(json["commit"]["ref"], "commit:2");
-    assert_eq!(json["commit"]["parent"], 1);
-    assert_eq!(json["commit"]["kind"], "transaction");
-    assert_eq!(json["datasetId"], ds.dataset_id().to_string());
 }
 
 /// A dataset holds at most `max_prefixes` prefixes: a new one past it is refused, the

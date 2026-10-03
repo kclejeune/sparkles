@@ -15,7 +15,7 @@
 //! `and(or(a, b), c)` renders as `(a || b) && c`.
 //!
 //! ```
-//! use sparkles_core::querybuilder::{expr, var, lit};
+//! use sparkles::querybuilder::{expr, var, lit};
 //! let e = expr::and(expr::gt(var("age"), 30), expr::regex(var("name"), "^A"));
 //! assert_eq!(e.to_string(), r#"?age > 30 && REGEX(?name, "^A")"#);
 //! let e = expr::mul(expr::add(var("a"), 1), var("b"));

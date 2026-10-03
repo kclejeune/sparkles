@@ -449,28 +449,3 @@ fn the_dataset_setting_is_kept_in_describe_json() {
         Ok(_) => panic!("a malformed describe.json opens"),
     }
 }
-
-#[test]
-fn a_dataset_queries_with_its_setting() {
-    let ds = sparkles_core::Dataset::memory();
-    ds.load_str(
-        "<http://example.org/a> <http://example.org/p> [ <http://example.org/q> 1 ] .",
-        RdfFormat::Turtle,
-    )
-    .unwrap();
-    assert_eq!(
-        ds.construct("DESCRIBE <http://example.org/a>")
-            .unwrap()
-            .len(),
-        2
-    );
-    ds.store()
-        .set_describe_settings(Some(mode(DescribeMode::Outgoing)))
-        .unwrap();
-    assert_eq!(
-        ds.construct("DESCRIBE <http://example.org/a>")
-            .unwrap()
-            .len(),
-        1
-    );
-}

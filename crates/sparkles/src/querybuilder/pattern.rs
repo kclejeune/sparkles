@@ -12,7 +12,7 @@ use super::term::{IntoNode, Node};
 /// Nested groups are built with closures that receive a fresh `WhereBuilder`:
 ///
 /// ```
-/// use sparkles_core::querybuilder::{SelectBuilder, WhereBuilder, expr, var};
+/// use sparkles::querybuilder::{SelectBuilder, WhereBuilder, expr, var};
 /// let q = SelectBuilder::new()
 ///     .prefix("foaf", "http://xmlns.com/foaf/0.1/")
 ///     .select("?name")

@@ -3,9 +3,9 @@
 //! what a spawned thread, a tokio thread and a rayon thread get by default.
 
 use spargebra::nesting::{MAX_DEPTH, MAX_NESTING, measure};
-use sparkles_core::Dataset;
-use sparkles_core::io::RdfFormat;
-use sparkles_core::sparql::depth::query_depth;
+use sparkles::Dataset;
+use sparkles::io::RdfFormat;
+use sparkles::sparql::depth::query_depth;
 
 /// Run `f` on a thread with a 2 MiB stack.
 fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
@@ -159,7 +159,7 @@ fn binds(k: usize) -> String {
     q
 }
 
-fn refused<T>(r: sparkles_core::Result<T>, what: &str, limit: usize) {
+fn refused<T>(r: sparkles::Result<T>, what: &str, limit: usize) {
     match r {
         Err(e) => assert!(
             e.to_string()
@@ -259,14 +259,14 @@ fn a_large_basic_graph_pattern_runs_on_a_small_stack() {
 fn explain_is_refused_past_the_limit() {
     on_small_stack(|| {
         let ds = dataset();
-        let opts = sparkles_core::sparql::QueryOptions::default();
+        let opts = sparkles::sparql::QueryOptions::default();
         for (what, q) in nested_queries(100) {
-            sparkles_core::sparql::explain(ds.snapshot(), &q, &opts)
+            sparkles::sparql::explain(ds.snapshot(), &q, &opts)
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
         }
         for (what, q) in nested_queries(100_000) {
             refused(
-                sparkles_core::sparql::explain(ds.snapshot(), &q, &opts),
+                sparkles::sparql::explain(ds.snapshot(), &q, &opts),
                 what,
                 MAX_NESTING,
             );
@@ -347,7 +347,7 @@ fn updates_cannot_grow_a_triple_term_past_the_limit() {
             .unwrap();
         let wrap = "DELETE { <urn:s> <urn:q> ?o } INSERT { <urn:s> <urn:q> <<( <urn:s> <urn:p> ?o )>> } \
                     WHERE { <urn:s> <urn:q> ?o }";
-        for _ in 0..sparkles_core::nesting::MAX_TRIPLE_TERMS {
+        for _ in 0..sparkles::nesting::MAX_TRIPLE_TERMS {
             ds.update(wrap).unwrap();
         }
         let e = ds.update(wrap).unwrap_err().to_string();
@@ -393,7 +393,7 @@ fn rdf_xml(n: usize) -> String {
 
 #[test]
 fn nested_documents_are_refused_past_the_limit() {
-    use sparkles_core::nesting::{MAX_ELEMENTS, MAX_JSON_LD, MAX_TRIPLE_TERMS};
+    use sparkles::nesting::{MAX_ELEMENTS, MAX_JSON_LD, MAX_TRIPLE_TERMS};
     on_small_stack(|| {
         let jsonld = || RdfFormat::JsonLd {
             profile: oxrdfio::JsonLdProfileSet::empty(),

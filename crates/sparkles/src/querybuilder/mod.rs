@@ -24,9 +24,9 @@
 //!   query.
 //!
 //! ```
-//! use sparkles_core::Dataset;
-//! use sparkles_core::io::RdfFormat;
-//! use sparkles_core::querybuilder::{SelectBuilder, expr, lit, var};
+//! use sparkles::Dataset;
+//! use sparkles::io::RdfFormat;
+//! use sparkles::querybuilder::{SelectBuilder, expr, lit, var};
 //!
 //! let ds = Dataset::memory();
 //! ds.load_str(
@@ -61,7 +61,7 @@
 //! let bob = by_name.clone().set_var("?name", lit("Bob")).execute(&ds)?;
 //! assert_eq!(bob.iter().next().unwrap().get("age").unwrap().to_string(),
 //!            "\"25\"^^<http://www.w3.org/2001/XMLSchema#integer>");
-//! # Ok::<(), sparkles_core::Error>(())
+//! # Ok::<(), sparkles::Error>(())
 //! ```
 
 pub mod expr;

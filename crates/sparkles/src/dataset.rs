@@ -3,8 +3,8 @@
 //! read or modify quads directly — no server involved.
 //!
 //! ```
-//! use sparkles_core::Dataset;
-//! use sparkles_core::io::RdfFormat;
+//! use sparkles::Dataset;
+//! use sparkles::io::RdfFormat;
 //! use oxrdf::{NamedNode, Literal, Triple};
 //!
 //! let ds = Dataset::memory();

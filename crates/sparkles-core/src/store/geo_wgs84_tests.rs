@@ -3,11 +3,11 @@
 //! `spatial:` functions and the map view, and the same with the index as without it.
 
 use super::tests::{opts, rng};
-use crate::dataset::Dataset;
 use crate::geo::GeoConfig;
 use crate::geo::map::{BoxQuery, features_in_box};
 use crate::io::RdfFormat;
 use crate::store::Snapshot;
+use crate::store::Store;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -57,7 +57,7 @@ const WORLD_BOX: &str = "SELECT ?f { ?f spatial:intersectBox (-90 -180 90 180) }
 const ALL_GRAPHS: &str = "SELECT ?f { GRAPH ?g { ?f spatial:intersectBox (-90 -180 90 180) } }";
 
 /// The answers of a few queries, with the index and by scanning (the index paused).
-fn both(ds: &Dataset, q: &str) -> BTreeSet<String> {
+fn both(ds: &Store, q: &str) -> BTreeSet<String> {
     let snap = ds.snapshot();
     let indexed = features(snap.clone(), q);
     // the same snapshot with a view that is not ready: the searches scan
@@ -72,13 +72,13 @@ fn both(ds: &Dataset, q: &str) -> BTreeSet<String> {
 
 #[test]
 fn points_of_lat_long_pairs() {
-    let ds = Dataset::from_store(crate::store::Store::in_memory(opts()));
+    let ds = crate::store::Store::in_memory(opts());
     ds.load_str(DATA, RdfFormat::TriG).unwrap();
     ds.compact().unwrap();
     // off by default
-    ds.store().enable_geo(GeoConfig::default()).unwrap();
+    ds.enable_geo(GeoConfig::default()).unwrap();
     assert!(features(ds.snapshot(), WORLD_BOX).is_empty());
-    let s = ds.store().enable_geo(cfg()).unwrap();
+    let s = ds.enable_geo(cfg()).unwrap();
     assert_eq!(s.state, "ready");
     // a, b, c twice (two latitudes), h in its graph; not d (out of range), e and f
     assert_eq!((s.rows.wgs84, s.rows.base), (5, 5));
@@ -184,11 +184,11 @@ fn points_of_lat_long_pairs() {
     assert_eq!(both(&ds, WORLD_BOX), names(&["a", "b", "c", "e"]));
     up("INSERT DATA { ex:n pos:long 8 }");
     assert_eq!(both(&ds, WORLD_BOX), names(&["a", "b", "c", "e", "n"]));
-    let s = ds.store().geo_status().unwrap();
+    let s = ds.geo_status().unwrap();
     assert!(s.rows.wgs84 >= 7, "{:?}", s.rows);
     // a compaction folds them into the base
     ds.compact().unwrap();
-    let s = ds.store().geo_status().unwrap();
+    let s = ds.geo_status().unwrap();
     assert_eq!((s.rows.wgs84, s.rows.overlay, s.rows.tail), (6, 0, 0));
     assert_eq!(both(&ds, WORLD_BOX), names(&["a", "b", "c", "e", "n"]));
     assert_eq!(features(reader, WORLD_BOX), names(&["a", "b", "c"]));
@@ -199,17 +199,17 @@ fn points_in_the_index_files() {
     let dir = tempfile::tempdir().unwrap();
     let expected;
     {
-        let ds = Dataset::open_with(dir.path(), opts()).unwrap();
+        let ds = Store::open(dir.path(), opts()).unwrap();
         ds.load_str(DATA, RdfFormat::TriG).unwrap();
         ds.compact().unwrap();
-        ds.store().enable_geo(cfg()).unwrap();
+        ds.enable_geo(cfg()).unwrap();
         ds.update(&format!("{P}INSERT DATA {{ ex:e pos:long 1.5 }}"))
             .unwrap();
         expected = both(&ds, WORLD_BOX);
         assert!(expected.contains("e"));
     }
-    let ds = Dataset::open_with(dir.path(), opts()).unwrap();
-    let s = ds.store().wait_geo().unwrap();
+    let ds = Store::open(dir.path(), opts()).unwrap();
+    let s = ds.wait_geo().unwrap();
     assert!(s.files.unwrap().opened);
     assert_eq!((s.rows.wgs84, s.rows.base, s.rows.overlay), (6, 5, 1));
     assert_eq!(both(&ds, WORLD_BOX), expected);
@@ -226,7 +226,7 @@ fn points_in_the_index_files() {
 
 #[test]
 fn random_points_match_a_scan() {
-    let ds = Dataset::from_store(crate::store::Store::in_memory(opts()));
+    let ds = crate::store::Store::in_memory(opts());
     let mut seed = 11;
     let mut q = String::new();
     for i in 0..300 {
@@ -239,7 +239,7 @@ fn random_points_match_a_scan() {
     )
     .unwrap();
     ds.compact().unwrap();
-    ds.store().enable_geo(cfg()).unwrap();
+    ds.enable_geo(cfg()).unwrap();
     let mut found = 0;
     for c in 0..30 {
         let mut ops = vec![String::from("INSERT DATA { ex:x pos:lat 0 }")];
@@ -277,6 +277,6 @@ fn random_points_match_a_scan() {
         }
     }
     assert!(found > 100, "{found}");
-    let s = ds.store().geo_status().unwrap();
+    let s = ds.geo_status().unwrap();
     assert!(s.rows.overlay + s.rows.tail > 0, "{:?}", s.rows);
 }

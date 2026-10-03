@@ -2352,6 +2352,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparkles"
+version = "0.1.0"
+dependencies = [
+ "oxrdf",
+ "oxrdfio",
+ "regex",
+ "rustc-hash",
+ "spargebra",
+ "sparkles-core",
+ "uuid",
+]
+
+[[package]]
 name = "sparkles-core"
 version = "0.1.0"
 dependencies = [
@@ -2412,7 +2425,7 @@ dependencies = [
  "pyo3",
  "serde",
  "serde_json",
- "sparkles-core",
+ "sparkles",
  "sparkles-reasoner",
  "sparkles-shacl",
  "sparkles-shex",
@@ -2432,7 +2445,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "sparkles-core",
+ "sparkles",
  "thiserror 2.0.21",
  "tracing",
  "uuid",
@@ -2456,7 +2469,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "spargebra",
- "sparkles-core",
+ "sparkles",
  "tempfile",
  "tracing",
 ]
@@ -2479,7 +2492,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "spargebra",
- "sparkles-core",
+ "sparkles",
  "thiserror 2.0.21",
  "tracing",
 ]

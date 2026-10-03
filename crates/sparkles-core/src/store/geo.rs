@@ -866,7 +866,6 @@ fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
 #[cfg(all(test, feature = "geo"))]
 mod tests {
     use super::*;
-    use crate::dataset::Dataset;
     use crate::geo::IndexState;
     use crate::geo::search::{self, SearchStats};
     use crate::io::RdfFormat;
@@ -902,13 +901,13 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     /// An in-memory dataset holding the fixture in its base.
-    pub(super) fn fixture(o: StoreOptions) -> Dataset {
-        let ds = Dataset::from_store(Store::in_memory(o));
+    pub(super) fn fixture(o: StoreOptions) -> Store {
+        let ds = Store::in_memory(o);
         ds.load_str(FIXTURE, RdfFormat::TriG).unwrap();
         ds
     }
 
-    pub(super) fn update(ds: &Dataset, op: &str, triples: &str) {
+    pub(super) fn update(ds: &Store, op: &str, triples: &str) {
         ds.update(&format!(
             "PREFIX geo: <{GEO}> PREFIX ex: <{EX}> {op} DATA {{ {triples} }}"
         ))
@@ -953,7 +952,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    fn state(ds: &Dataset) -> IndexState {
+    fn state(ds: &Store) -> IndexState {
         ds.snapshot().geo.as_ref().unwrap().state()
     }
 
@@ -967,7 +966,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     #[test]
     fn status_after_load() {
         let ds = fixture(opts());
-        let s = ds.store().enable_geo(GeoConfig::default()).unwrap();
+        let s = ds.enable_geo(GeoConfig::default()).unwrap();
         assert_eq!(s.state, "ready");
         assert_eq!((s.rows.base, s.rows.overlay, s.rows.tail), (7, 0, 0));
         assert_eq!(s.literals, 7);
@@ -1003,8 +1002,8 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         assert_eq!(v.predicate_slot(wkt), Some(0));
         assert!(v.estimate(&[0], &[WORLD]) >= 6.0);
         assert!(v.levels() >= 1);
-        ds.store().disable_geo().unwrap();
-        assert!(ds.store().geo_status().is_none() && ds.snapshot().geo.is_none());
+        ds.disable_geo().unwrap();
+        assert!(ds.geo_status().is_none() && ds.snapshot().geo.is_none());
         // without an index, the same rows by a scan
         let (all2, st, _) = window(ds.snapshot(), WORLD, GraphFilter::All);
         assert_eq!(all, all2);
@@ -1014,7 +1013,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     #[test]
     fn commits_and_snapshots() {
         let ds = fixture(opts());
-        ds.store().enable_geo(GeoConfig::default()).unwrap();
+        ds.enable_geo(GeoConfig::default()).unwrap();
         let reader = ds.snapshot();
         update(
             &ds,
@@ -1043,7 +1042,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         assert_eq!(now, names(&["gA", "g5"]));
         assert!(!st.fallback);
         assert_eq!(near(reader), names(&["gA", "g1"]));
-        let s = ds.store().geo_status().unwrap();
+        let s = ds.geo_status().unwrap();
         assert_eq!((s.rows.base, s.rows.overlay, s.rows.tail), (7, 0, 2));
         assert_eq!(s.literals, 9);
         // deleting and inserting a quad again leaves one row
@@ -1054,7 +1053,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         // a compaction moves the rows into the base and keeps the epoch
         let epoch = ds.snapshot().geo.as_ref().unwrap().epoch;
         ds.compact().unwrap();
-        let s = ds.store().geo_status().unwrap();
+        let s = ds.geo_status().unwrap();
         assert_eq!(
             (s.state.as_str(), s.rows.base, s.rows.overlay, s.rows.tail),
             ("ready", 8, 0, 0)
@@ -1062,7 +1061,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         assert_eq!(ds.snapshot().geo.as_ref().unwrap().epoch, epoch);
         assert_eq!(near(ds.snapshot()), names(&["gA", "g5"]));
         // a rebuild bumps it
-        ds.store().rebuild_geo().unwrap();
+        ds.rebuild_geo().unwrap();
         assert_eq!(ds.snapshot().geo.as_ref().unwrap().epoch, epoch + 1);
         assert_eq!(near(ds.snapshot()), names(&["gA", "g5"]));
     }
@@ -1079,7 +1078,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     #[test]
     fn many_commits_match_a_scan() {
         let ds = fixture(opts());
-        ds.store().enable_geo(GeoConfig::default()).unwrap();
+        ds.enable_geo(GeoConfig::default()).unwrap();
         let mut seed = 7;
         let mut pts: Vec<(usize, f64, f64)> = Vec::new();
         for c in 0..100 {
@@ -1100,7 +1099,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
             q += &format!("ex:r{n} geo:asWKT \"POINT({x} {y})\"^^geo:wktLiteral . ");
         }
         update(&ds, "DELETE", &q);
-        let s = ds.store().geo_status().unwrap();
+        let s = ds.geo_status().unwrap();
         assert!(s.rows.overlay > 4096, "{:?}", s.rows);
         assert_eq!(s.rows.base, 7);
         let snap = ds.snapshot();
@@ -1122,8 +1121,8 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     #[test]
     fn paused_build_answers_by_scanning() {
         let ds = fixture(opts());
-        ds.store().pause_geo_build(true);
-        let s = ds.store().enable_geo(GeoConfig::default()).unwrap();
+        ds.pause_geo_build(true);
+        let s = ds.enable_geo(GeoConfig::default()).unwrap();
         assert_eq!(s.state, "building");
         assert!(matches!(state(&ds), IndexState::Building(_)));
         let (rows, st, _) = window(ds.snapshot(), WORLD, GraphFilter::All);
@@ -1136,8 +1135,8 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
             ex:g7 geo:hasSerialization "POINT(1.5 1.5)"^^geo:wktLiteral"#,
         );
         assert!(matches!(state(&ds), IndexState::Building(_)));
-        ds.store().pause_geo_build(false);
-        let s = ds.store().wait_geo().unwrap();
+        ds.pause_geo_build(false);
+        let s = ds.wait_geo().unwrap();
         assert_eq!(s.state, "ready");
         assert_eq!((s.rows.base, s.rows.overlay, s.rows.tail), (7, 2, 0));
         let (after, st, _) = window(ds.snapshot(), WORLD, GraphFilter::All);
@@ -1151,15 +1150,15 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     #[test]
     fn failures_fall_back_to_scans() {
         let ds = fixture(opts());
-        ds.store().enable_geo(GeoConfig::default()).unwrap();
-        ds.store().fail_next_geo_commit();
+        ds.enable_geo(GeoConfig::default()).unwrap();
+        ds.fail_next_geo_commit();
         update(
             &ds,
             "INSERT",
             r#"ex:g5 geo:asWKT "POINT(1 1)"^^geo:wktLiteral"#,
         );
         assert_eq!(state(&ds), IndexState::Failed);
-        let s = ds.store().geo_status().unwrap();
+        let s = ds.geo_status().unwrap();
         assert_eq!(s.state, "failed");
         let m = s.message.unwrap();
         assert!(m.contains("injected"), "{m}");
@@ -1173,7 +1172,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
             r#"ex:g6 geo:asWKT "POINT(2.2 2.2)"^^geo:wktLiteral"#,
         );
         assert_eq!(state(&ds), IndexState::Failed);
-        let s = ds.store().rebuild_geo().unwrap();
+        let s = ds.rebuild_geo().unwrap();
         assert_eq!(s.state, "ready");
         assert!(s.message.is_none());
         let (rows, st, _) = window(ds.snapshot(), NEAR, GraphFilter::All);
@@ -1187,7 +1186,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
             geo_budget_bytes: 300,
             ..opts()
         });
-        let s = ds.store().enable_geo(GeoConfig::default()).unwrap();
+        let s = ds.enable_geo(GeoConfig::default()).unwrap();
         assert_eq!(s.state, "over-budget");
         assert!(s.message.unwrap().contains("budget"));
         let (rows, st, _) = window(ds.snapshot(), WORLD, GraphFilter::All);
@@ -1203,8 +1202,8 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     #[test]
     fn transactions_see_their_own_rows() {
         let ds = fixture(opts());
-        ds.store().enable_geo(GeoConfig::default()).unwrap();
-        let mut txn = ds.store().write();
+        ds.enable_geo(GeoConfig::default()).unwrap();
+        let mut txn = ds.write();
         let quad = oxrdf::Quad::new(
             oxrdf::NamedNode::new_unchecked(format!("{EX}g5")),
             oxrdf::NamedNode::new_unchecked(format!("{GEO}asWKT")),
@@ -1231,9 +1230,9 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     fn reopen_replays_the_log_into_the_overlay() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let ds = Dataset::open_with(dir.path(), opts()).unwrap();
+            let ds = Store::open(dir.path(), opts()).unwrap();
             ds.load_str(FIXTURE, RdfFormat::TriG).unwrap();
-            ds.store().enable_geo(GeoConfig::default()).unwrap();
+            ds.enable_geo(GeoConfig::default()).unwrap();
             update(
                 &ds,
                 "INSERT",
@@ -1246,8 +1245,8 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
             );
             assert!(dir.path().join(crate::geo::CONFIG_FILE).exists());
         }
-        let ds = Dataset::open_with(dir.path(), opts()).unwrap();
-        let s = ds.store().wait_geo().unwrap();
+        let ds = Store::open(dir.path(), opts()).unwrap();
+        let s = ds.wait_geo().unwrap();
         assert_eq!(s.state, "ready");
         assert_eq!((s.rows.base, s.rows.overlay, s.rows.tail), (7, 1, 0));
         let (rows, st, _) = window(ds.snapshot(), NEAR, GraphFilter::All);
@@ -1256,21 +1255,20 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         // a past state has the configuration but no index
         let head = ds.head_commit().seq;
         let (past, _) = ds
-            .store()
             .snapshot_at(&crate::history::At::Commit(head - 1), &Default::default())
             .unwrap();
         assert_eq!(past.geo.as_ref().unwrap().state(), IndexState::Historical);
         let (rows, st, _) = window(past, NEAR, GraphFilter::All);
         assert!(st.fallback);
         assert_eq!(rows, names(&["gA", "g1", "g5"]));
-        ds.store().disable_geo().unwrap();
+        ds.disable_geo().unwrap();
         assert!(!dir.path().join(crate::geo::CONFIG_FILE).exists());
     }
 
     #[test]
     fn nearest_first() {
         let ds = fixture(opts());
-        ds.store().enable_geo(GeoConfig::default()).unwrap();
+        ds.enable_geo(GeoConfig::default()).unwrap();
         update(
             &ds,
             "INSERT",
@@ -1332,7 +1330,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     #[ignore]
     fn commit_latency() {
         let mut seed = 1;
-        let mut time = |ds: &Dataset, n: usize, geo: bool| {
+        let mut time = |ds: &Store, n: usize, geo: bool| {
             let mut q = String::new();
             for _ in 0..n {
                 let k = rng(&mut seed);
@@ -1356,8 +1354,8 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         };
         let plain = fixture(opts());
         let indexed = fixture(opts());
-        indexed.store().enable_geo(GeoConfig::default()).unwrap();
-        let mut runs = |ds: &Dataset, k: usize, n: usize, geo: bool| {
+        indexed.enable_geo(GeoConfig::default()).unwrap();
+        let mut runs = |ds: &Store, k: usize, n: usize, geo: bool| {
             median((0..k).map(|_| time(ds, n, geo)).collect())
         };
         let one_off = runs(&plain, 200, 1, false);

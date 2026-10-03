@@ -294,7 +294,6 @@ fn simplified(g: &georust::Geometry<f64>, eps: f64) -> georust::Geometry<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::Dataset;
     use crate::io::RdfFormat;
     use crate::store::{Store, StoreOptions};
 
@@ -350,12 +349,12 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
 
     #[test]
     fn features_in_a_box() {
-        let ds = Dataset::from_store(Store::in_memory(StoreOptions::default()));
+        let ds = Store::in_memory(StoreOptions::default());
         ds.load_str(DATA, RdfFormat::TriG).unwrap();
         let world = [-180.0, -90.0, 180.0, 90.0];
         // without an index: a scan, with the same answers as the index
         let scanned = features_in_box(&ds.snapshot(), &q(world)).unwrap();
-        ds.store().enable_geo(GeoConfig::default()).unwrap();
+        ds.enable_geo(GeoConfig::default()).unwrap();
         let v = features_in_box(&ds.snapshot(), &q(world)).unwrap();
         assert_eq!(v["type"], "FeatureCollection");
         assert_eq!(v["truncated"], false);

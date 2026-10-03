@@ -56,23 +56,25 @@ let
     cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ../Cargo.lock; };
   };
 
-  # The server's dependencies, and those of the engine's unit tests, which are built with
-  # the engine's own features and so are different builds of some crates.
+  # The server's dependencies, and those of the unit tests of the engine and the facade,
+  # which are built with the engine's own features and so are different builds of some
+  # crates.
   cargoArtifacts = craneLib.buildDepsOnly (
     commonArgs
     // {
       src = depsSrc;
       buildPhaseCargoCommand = "cargoWithProfile build --locked -p sparkles-server";
-      checkPhaseCargoCommand = "cargoWithProfile test --locked -p sparkles-core --lib --no-run";
+      checkPhaseCargoCommand = "cargoWithProfile test --locked -p sparkles-core -p sparkles --lib --no-run";
     }
   );
 
-  # Engine unit tests (the W3C suites need a Jena checkout and are not run here).
+  # The unit tests of the engine and the facade (the W3C suites need a Jena checkout and
+  # are not run here).
   tests = craneLib.cargoTest (
     commonArgs
     // {
       inherit src cargoArtifacts;
-      cargoTestExtraArgs = "-p sparkles-core --lib";
+      cargoTestExtraArgs = "-p sparkles-core -p sparkles --lib";
       doInstallCargoArtifacts = false;
     }
   );

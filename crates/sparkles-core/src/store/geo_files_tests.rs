@@ -3,11 +3,11 @@
 //! backups or clones.
 
 use super::tests::{EX, FIXTURE, GEO, NEAR, WORLD, opts, rng, unindexed, update, window};
-use crate::dataset::Dataset;
 use crate::geo::GeoConfig;
 use crate::geo::persist::{self, Header};
 use crate::io::RdfFormat;
 use crate::sparql::plan::GraphFilter;
+use crate::store::Store;
 use crate::store::{Snapshot, StoreOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ const QUERIES: [&str; 4] = [
 ];
 
 /// The answers of [`QUERIES`], each sorted.
-fn answers(ds: &Dataset) -> Vec<Vec<String>> {
+fn answers(ds: &Store) -> Vec<Vec<String>> {
     QUERIES
         .iter()
         .map(|q| {
@@ -42,11 +42,11 @@ fn answers(ds: &Dataset) -> Vec<Vec<String>> {
 }
 
 /// The fixture in the base of a persistent store at `dir`, with the index enabled.
-fn persistent(dir: &Path, cfg: GeoConfig) -> Dataset {
-    let ds = Dataset::open_with(dir, opts()).unwrap();
+fn persistent(dir: &Path, cfg: GeoConfig) -> Store {
+    let ds = Store::open(dir, opts()).unwrap();
     ds.load_str(FIXTURE, RdfFormat::TriG).unwrap();
     ds.compact().unwrap();
-    let s = ds.store().enable_geo(cfg).unwrap();
+    let s = ds.enable_geo(cfg).unwrap();
     assert_eq!(s.state, "ready");
     ds
 }
@@ -56,7 +56,7 @@ fn geo_dir(snap: &Snapshot) -> PathBuf {
 }
 
 /// The base of the current view.
-fn base(ds: &Dataset) -> Arc<crate::geo::index::GeoBase> {
+fn base(ds: &Store) -> Arc<crate::geo::index::GeoBase> {
     ds.snapshot()
         .geo
         .as_ref()
@@ -64,9 +64,9 @@ fn base(ds: &Dataset) -> Arc<crate::geo::index::GeoBase> {
         .expect("a ready index")
 }
 
-fn reopen(dir: &Path) -> Dataset {
-    let ds = Dataset::open_with(dir, opts()).unwrap();
-    let s = ds.store().wait_geo().unwrap();
+fn reopen(dir: &Path) -> Store {
+    let ds = Store::open(dir, opts()).unwrap();
+    let s = ds.wait_geo().unwrap();
     assert_eq!(s.state, "ready", "{s:?}");
     ds
 }
@@ -80,7 +80,7 @@ fn files_are_written_and_read_back() {
         assert!(gdir.join(f).exists(), "{f}");
     }
     assert!(!gdir.join("rtree.tmp").exists() && !gdir.join("column.tmp").exists());
-    let s = ds.store().geo_status().unwrap();
+    let s = ds.geo_status().unwrap();
     let files = s.files.unwrap();
     assert!(!files.opened && files.bytes > 0);
     assert_eq!(s.memory.mapped_bytes, files.bytes);
@@ -95,7 +95,7 @@ fn files_are_written_and_read_back() {
 
     // reopened: nothing is parsed, the answers are the same
     let ds = reopen(dir.path());
-    let s = ds.store().geo_status().unwrap();
+    let s = ds.geo_status().unwrap();
     assert!(s.files.unwrap().opened);
     assert_eq!(s.literals, 7);
     assert_eq!(
@@ -119,7 +119,6 @@ fn files_are_written_and_read_back() {
     );
     // a change of distance model keeps the files; a change of predicates does not
     let s = ds
-        .store()
         .enable_geo(GeoConfig {
             distance: crate::geo::DistanceModel::Haversine,
             ..GeoConfig::default()
@@ -127,7 +126,6 @@ fn files_are_written_and_read_back() {
         .unwrap();
     assert!(s.files.unwrap().opened);
     let s = ds
-        .store()
         .enable_geo(GeoConfig {
             predicates: vec![format!("{GEO}asWKT")],
             ..GeoConfig::default()
@@ -137,11 +135,11 @@ fn files_are_written_and_read_back() {
     assert_eq!(s.rows.base, 6);
     drop(ds);
     let ds = reopen(dir.path());
-    let s = ds.store().geo_status().unwrap();
+    let s = ds.geo_status().unwrap();
     assert!(s.files.unwrap().opened);
     assert_eq!(s.rows.base, 6);
     // disabling removes them
-    ds.store().disable_geo().unwrap();
+    ds.disable_geo().unwrap();
     assert!(!gdir.exists());
 }
 
@@ -238,7 +236,7 @@ fn damaged_files_are_rebuilt() {
             "{what}: {geo:?}"
         );
         let ds = reopen(dir.path());
-        let s = ds.store().geo_status().unwrap();
+        let s = ds.geo_status().unwrap();
         assert!(!s.files.unwrap().opened, "{what}: the files were used");
         assert_eq!(answers(&ds), expected, "{what}");
         drop(ds);
@@ -247,10 +245,7 @@ fn damaged_files_are_rebuilt() {
         let geo = report.checks.iter().find(|c| c.name == "geo").unwrap();
         assert!(geo.issues.is_empty(), "{what}: {geo:?}");
         let ds = reopen(dir.path());
-        assert!(
-            ds.store().geo_status().unwrap().files.unwrap().opened,
-            "{what}"
-        );
+        assert!(ds.geo_status().unwrap().files.unwrap().opened, "{what}");
         drop(ds);
     }
 }
@@ -265,9 +260,9 @@ fn compaction_parses_only_new_literals() {
             ..opts()
         };
         let ds = if persistent_store {
-            Dataset::open_with(dir.path(), o).unwrap()
+            Store::open(dir.path(), o).unwrap()
         } else {
-            Dataset::from_store(crate::store::Store::in_memory(o))
+            crate::store::Store::in_memory(o)
         };
         let mut seed = 3;
         let mut q = String::new();
@@ -278,7 +273,7 @@ fn compaction_parses_only_new_literals() {
         ds.load_str(&q, RdfFormat::NTriples).unwrap();
         ds.load_str(FIXTURE, RdfFormat::TriG).unwrap();
         ds.compact().unwrap();
-        ds.store().enable_geo(GeoConfig::default()).unwrap();
+        ds.enable_geo(GeoConfig::default()).unwrap();
         assert_eq!(base(&ds).column.parsed, 510);
         let old = ds.snapshot().generation.dir.clone();
         update(
@@ -352,7 +347,7 @@ fn store_update(st: &crate::store::Store, u: &str) {
 }
 
 /// The subjects in windows `NEAR` and `WORLD`, through the index, checked against a scan.
-fn windows(ds: &Dataset) -> Vec<std::collections::BTreeSet<String>> {
+fn windows(ds: &Store) -> Vec<std::collections::BTreeSet<String>> {
     let snap = ds.snapshot();
     [NEAR, WORLD]
         .iter()
@@ -377,7 +372,7 @@ fn a_compaction_builds_the_base_before_the_switch() {
     }
     update(&ds, "INSERT", &ins);
     // commits made during the build reach the new generation as its overlay
-    ds.store().set_failpoint(
+    ds.set_failpoint(
         "compact-built",
         Some(Arc::new(|st: &crate::store::Store| {
             store_update(
@@ -391,8 +386,8 @@ fn a_compaction_builds_the_base_before_the_switch() {
             );
         })),
     );
-    let r = ds.store().compact_with(&Default::default()).unwrap();
-    ds.store().set_failpoint("compact-built", None);
+    let r = ds.compact_with(&Default::default()).unwrap();
+    ds.set_failpoint("compact-built", None);
     assert_eq!(r.caught_up_commits, 2);
     let snap = ds.snapshot();
     let b = base(&ds);
@@ -412,7 +407,7 @@ fn a_compaction_builds_the_base_before_the_switch() {
     drop((b, snap, ds));
     // the files the build wrote are read back at open
     let ds = reopen(dir.path());
-    assert!(ds.store().geo_status().unwrap().files.unwrap().opened);
+    assert!(ds.geo_status().unwrap().files.unwrap().opened);
     assert_eq!(windows(&ds), found);
     assert_eq!(answers(&ds), expected);
 }
@@ -428,7 +423,7 @@ fn a_rebuild_during_the_compaction_builds_the_base_at_the_switch() {
     );
     let epoch = ds.snapshot().geo.as_ref().unwrap().epoch;
     // the base built with the generation is for the old epoch: the switch builds again
-    ds.store().set_failpoint(
+    ds.set_failpoint(
         "compact-indexed",
         Some(Arc::new(|st: &crate::store::Store| {
             st.rebuild_geo().unwrap();
@@ -438,10 +433,10 @@ fn a_rebuild_during_the_compaction_builds_the_base_at_the_switch() {
             );
         })),
     );
-    let r = ds.store().compact_with(&Default::default()).unwrap();
-    ds.store().set_failpoint("compact-indexed", None);
+    let r = ds.compact_with(&Default::default()).unwrap();
+    ds.set_failpoint("compact-indexed", None);
     assert_eq!(r.caught_up_commits, 1);
-    assert_eq!(ds.store().geo_status().unwrap().state, "ready");
+    assert_eq!(ds.geo_status().unwrap().state, "ready");
     assert_eq!(ds.snapshot().geo.as_ref().unwrap().epoch, epoch + 1);
     assert_eq!(base(&ds).generation, ds.snapshot().generation.uid);
     let found = windows(&ds);
@@ -450,14 +445,14 @@ fn a_rebuild_during_the_compaction_builds_the_base_at_the_switch() {
         "{found:?}"
     );
     // so does a disable: the new generation has no index
-    ds.store().set_failpoint(
+    ds.set_failpoint(
         "compact-indexed",
         Some(Arc::new(|st: &crate::store::Store| {
             st.disable_geo().unwrap()
         })),
     );
     ds.compact().unwrap();
-    ds.store().set_failpoint("compact-indexed", None);
+    ds.set_failpoint("compact-indexed", None);
     assert!(ds.snapshot().geo.is_none());
     assert!(!geo_dir(&ds.snapshot()).exists());
 }
@@ -465,17 +460,17 @@ fn a_rebuild_during_the_compaction_builds_the_base_at_the_switch() {
 #[test]
 fn a_build_racing_a_compaction_leaves_no_files_behind() {
     let dir = tempfile::tempdir().unwrap();
-    let ds = Dataset::open_with(dir.path(), opts()).unwrap();
+    let ds = Store::open(dir.path(), opts()).unwrap();
     ds.load_str(FIXTURE, RdfFormat::TriG).unwrap();
     ds.compact().unwrap();
-    ds.store().pause_geo_build(true);
-    ds.store().enable_geo(GeoConfig::default()).unwrap();
+    ds.pause_geo_build(true);
+    ds.enable_geo(GeoConfig::default()).unwrap();
     let old = ds.snapshot().generation.dir.clone().unwrap();
     // the compaction builds the new generation's base itself
     ds.compact().unwrap();
     assert!(!old.exists());
-    ds.store().pause_geo_build(false);
-    let s = ds.store().wait_geo().unwrap();
+    ds.pause_geo_build(false);
+    let s = ds.wait_geo().unwrap();
     assert_eq!(s.state, "ready");
     assert!(!old.exists());
     assert!(geo_dir(&ds.snapshot()).join(persist::COLUMN_FILE).exists());
@@ -483,9 +478,9 @@ fn a_build_racing_a_compaction_leaves_no_files_behind() {
     let snap = ds.snapshot();
     snap.generation.geo.retire();
     std::fs::remove_dir_all(geo_dir(&snap)).unwrap();
-    ds.store().rebuild_geo().unwrap();
+    ds.rebuild_geo().unwrap();
     assert!(!geo_dir(&snap).exists());
-    assert_eq!(ds.store().geo_status().unwrap().state, "ready");
+    assert_eq!(ds.geo_status().unwrap().state, "ready");
 }
 
 #[test]
@@ -493,7 +488,7 @@ fn backups_and_clones_hold_no_index_files() {
     let dir = tempfile::tempdir().unwrap();
     let ds = persistent(dir.path(), GeoConfig::default());
     assert!(geo_dir(&ds.snapshot()).exists());
-    let cap = ds.store().backup_capture("geo").unwrap();
+    let cap = ds.backup_capture("geo").unwrap();
     assert!(cap.files.iter().any(|f| f.path == "geo.json"));
     assert!(
         cap.files
@@ -507,12 +502,10 @@ fn backups_and_clones_hold_no_index_files() {
     cap.write_to(&to).unwrap();
     drop(cap);
     let r = reopen(&to);
-    assert!(!r.store().geo_status().unwrap().files.unwrap().opened);
+    assert!(!r.geo_status().unwrap().files.unwrap().opened);
     assert_eq!(answers(&r), answers(&ds));
     let cloned = tempfile::tempdir().unwrap();
-    ds.store()
-        .clone_to(cloned.path(), &Default::default())
-        .unwrap();
+    ds.clone_to(cloned.path(), &Default::default()).unwrap();
     let gens: Vec<_> = std::fs::read_dir(cloned.path())
         .unwrap()
         .flatten()
@@ -526,10 +519,10 @@ fn backups_and_clones_hold_no_index_files() {
 
 #[test]
 fn in_memory_stores_write_nothing() {
-    let ds = Dataset::from_store(crate::store::Store::in_memory(StoreOptions::default()));
+    let ds = crate::store::Store::in_memory(StoreOptions::default());
     ds.load_str(FIXTURE, RdfFormat::TriG).unwrap();
     ds.compact().unwrap();
-    let s = ds.store().enable_geo(GeoConfig::default()).unwrap();
+    let s = ds.enable_geo(GeoConfig::default()).unwrap();
     assert!(s.files.is_none() && s.memory.mapped_bytes == 0);
 }
 
@@ -546,15 +539,15 @@ fn read_only_stores_write_nothing() {
         ..opts()
     };
     let open = |o: StoreOptions| {
-        let ds = Dataset::open_with(dir.path(), o).unwrap();
-        assert_eq!(ds.store().wait_geo().unwrap().state, "ready");
+        let ds = Store::open(dir.path(), o).unwrap();
+        assert_eq!(ds.wait_geo().unwrap().state, "ready");
         ds
     };
     // built in memory, nothing written: not at open, a rebuild, a compaction or a disable
     let ds = open(ro.clone());
-    assert!(ds.store().geo_status().unwrap().files.is_none());
+    assert!(ds.geo_status().unwrap().files.is_none());
     assert_eq!(answers(&ds), expected);
-    ds.store().rebuild_geo().unwrap();
+    ds.rebuild_geo().unwrap();
     ds.compact().unwrap();
     assert!(!geo_dir(&ds.snapshot()).exists());
     assert_eq!(answers(&ds), expected);
@@ -564,15 +557,15 @@ fn read_only_stores_write_nothing() {
     let gdir = geo_dir(&ds.snapshot());
     drop(ds);
     let ds = open(ro.clone());
-    assert!(ds.store().geo_status().unwrap().files.unwrap().opened);
+    assert!(ds.geo_status().unwrap().files.unwrap().opened);
     drop(ds);
     let rtree = gdir.join(persist::RTREE_FILE);
     let mut b = std::fs::read(&rtree).unwrap();
     b[70] ^= 1;
     std::fs::write(&rtree, &b).unwrap();
     let ds = open(ro);
-    assert!(ds.store().geo_status().unwrap().files.is_none());
+    assert!(ds.geo_status().unwrap().files.is_none());
     assert_eq!(answers(&ds), expected);
-    ds.store().disable_geo().unwrap();
+    ds.disable_geo().unwrap();
     assert_eq!(std::fs::read(&rtree).unwrap(), b);
 }
