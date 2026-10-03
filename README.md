@@ -84,7 +84,9 @@ running queries.
   the resource's own triples, with labels and limits, per dataset or per request
   ([API](docs/API.md#describe)).
 * A SPARQL 1.1 Service Description per dataset ([API](docs/API.md#service-description)).
-* Federated `SERVICE` queries under an outbound network policy ([usage](docs/USAGE.md#outbound-requests-service-and-load)).
+* Federated `SERVICE` queries under an outbound network policy ([usage](docs/USAGE.md#outbound-requests-service-and-load)),
+  with the `loop:`, `bulk:` and `cache:` options of Jena's service enhancer
+  ([API](docs/API.md#service-options-loop-bulk-and-cache)).
 
 **Server and CLI**
 * Fuseki's endpoints, Graph Store Protocol, upload and `/$/` admin API. Sparkles adds

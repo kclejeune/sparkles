@@ -764,7 +764,8 @@ it as the distinct pairs of `p`. `PathEngineN` counts walks, so `multi(p)` is `p
   that each entailed link counts once. Inside a longer or unbounded range, a link that
   holds through a property and also through its subproperty counts twice.
 - A SERVICE inside a `LATERAL` that runs per row is sent as written, without the outer
-  values.
+  values. [G10](G10-service-enhancer.md) fixed this on 2026-10-03: the SERVICE pattern is
+  now sent with the row's values, respecting the scope of sub-selects.
 - The `Lateral` operator evaluates its groups one after another. Running them in
   parallel was left for later.
 

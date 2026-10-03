@@ -36,6 +36,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Linting](#linting)
 * [Backup repositories](#backup-repositories)
 * [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
+  * [Correlated, bulk and cached SERVICE](#correlated-bulk-and-cached-service)
 * [Finding paths](#finding-paths)
 * [Embeddings computed on write](#embeddings-computed-on-write)
 * [Checking a database](#checking-a-database)
@@ -412,6 +413,9 @@ happens to materialized inferences, and the limits.
 | `--outbound-max-mb N` | `256` | Largest outbound response, after decompression. |
 | `--outbound-request-max-mb N` | 4 × `--outbound-max-mb` (`1024`) | Bytes that all the SERVICE calls and LOADs of one query or update may receive together. Past it, the request gets `507`. |
 | `--outbound-request-timeout S` | 4 × `--outbound-timeout` (`240`) | Time that all the SERVICE calls and LOADs of one query or update may take, summed. |
+| `--service-bulk-size N` | `10` | Inputs per request of `SERVICE <loop:bulk:…>` (see [Correlated and cached SERVICE](#correlated-bulk-and-cached-service)). |
+| `--service-bulk-max N` | `100` | The most inputs per request of any bulk SERVICE. `bulk+n` is capped to it. |
+| `--service-cache-mb N` | `64` | The cache of remote results that `SERVICE <cache:…>` uses, per dataset. `0` turns it off. A global flag. |
 | `--load-dir DIR` | | Let `LOAD <file:…>` read the regular files under `DIR`, with symbolic links resolved and nothing outside it. Without this flag, the server refuses file loads. |
 | `--embedding-secret NAME=SOURCE` | | A secret that vector indexes may name as their embedding API key: `NAME=env:VARIABLE` or `NAME=file:PATH`, read when a request is made. Repeatable. See [Embeddings computed on write](#embeddings-computed-on-write). |
 | `--no-embedding` | | Compute no embeddings. No worker sends text to a provider, and searches cannot pass text. The configurations are kept. |
@@ -1375,6 +1379,32 @@ it. Without the flag, the server refuses file loads with `403`. `DIR` may not ho
 data directory. The local `sparkles update` reads any file its user can read. Library
 users set `QueryOptions::file_loads` to `FileLoads::Anywhere` (the default),
 `FileLoads::under(dir)` or `FileLoads::Disabled`.
+
+### Correlated, bulk and cached SERVICE
+
+A SERVICE that depends on the solutions before it runs once per solution with `loop:` in
+front of its IRI, as Jena's service enhancer does. `bulk+n:` sends `n` solutions in one
+request, and `cache:` keeps each solution's remote result for the next query:
+
+```sparql
+SELECT ?film ?label WHERE {
+  ?film a :Film ; :wikidata ?item .
+  SERVICE <loop:bulk+50:cache:https://query.wikidata.org/sparql> {
+    SELECT ?label { ?item rdfs:label ?label FILTER(lang(?label) = "en") } LIMIT 1
+  }
+}
+```
+
+Without `loop:`, the endpoint evaluates the sub-select once over all of its items, and
+every film gets the same label. With `loop:` and no `bulk`, it gets one request per film.
+With `bulk+50`, 1,000 films take 20 requests, and with `cache:` a second run takes none.
+The requests follow the outbound policy and its budgets like any SERVICE call.
+
+The cache belongs to the dataset, holds `--service-cache-mb` (64), and keeps each caller's
+entries apart. `cache+clear:` refreshes the entries a query reads, and
+`POST /$/cache/clear/{ds}` drops them all. `SERVICE <loop:> { … }` and
+`SERVICE <urn:x-arq:self> { … }` read the dataset itself without a request. The options
+and the request shapes are in [API.md](API.md#service-options-loop-bulk-and-cache).
 
 ## Finding paths
 
