@@ -28,13 +28,7 @@ pub fn backup_state(st: &AppState) -> Result<Arc<BackupState>, BackupError> {
 /// Cancellation and progress of task `h` for the engine; progress `p` is mapped to
 /// `lo + p × (hi − lo)`.
 fn ctl(h: &TaskHandle, lo: f32, hi: f32) -> Ctl {
-    let h2 = h.clone();
-    Ctl {
-        cancel: h.cancel_flag(),
-        progress: Some(Arc::new(move |p, m: &str| {
-            h2.progress(lo + p * (hi - lo), m)
-        })),
-    }
+    Ctl::from(&h.control().part(lo, hi))
 }
 
 /// Count an operation of repository `repo`.
@@ -179,13 +173,7 @@ fn create_now(
 
 /// Progress `p` of `ctl` reported as `lo + p × (hi − lo)`.
 fn scaled(ctl: &Ctl, lo: f32, hi: f32) -> Ctl {
-    let inner = ctl.progress.clone();
-    Ctl {
-        cancel: ctl.cancel.clone(),
-        progress: inner.map(|f| -> sparkles_backup::ProgressFn {
-            Arc::new(move |p, m: &str| f(lo + p * (hi - lo), m))
-        }),
-    }
+    Ctl::from(&ctl.control().part(lo, hi))
 }
 
 /// The capture of `ds`: of its files, or for an in-memory dataset of a temporary

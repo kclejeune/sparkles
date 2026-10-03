@@ -3769,7 +3769,7 @@ fn write_snapshot(
 }
 
 /// Progress callback: (fraction done in `[0, 1]`, message).
-pub type ProgressFn = Arc<dyn Fn(f32, &str) + Send + Sync>;
+pub use crate::task::ProgressFn;
 
 pub(crate) fn dir_size(p: &Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(p) else {

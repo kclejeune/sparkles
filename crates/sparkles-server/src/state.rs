@@ -1418,6 +1418,18 @@ impl TaskHandle {
         });
     }
 
+    /// The task as a library [`Control`](sparkles::task::Control): its cancel flag is
+    /// the one `DELETE /$/tasks/{id}` sets, and its progress reports become the task's
+    /// `progress` and `message`.
+    pub fn control(&self) -> sparkles::task::Control {
+        let h = self.clone();
+        sparkles::task::Control {
+            cancel: sparkles::task::Cancel::from_flag(self.cancel.clone()),
+            progress: sparkles::task::Progress::new(move |p, m| h.progress(p, m)),
+            deadline: None,
+        }
+    }
+
     /// Set by `DELETE /$/tasks/{id}` (for a cancellable task).
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.cancel.clone()

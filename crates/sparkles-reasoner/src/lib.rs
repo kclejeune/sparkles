@@ -119,7 +119,7 @@ impl FromStr for Profile {
 }
 
 /// Progress callback: (fraction done in `[0, 1]`, message).
-pub type ProgressFn = Arc<dyn Fn(f32, &str) + Send + Sync>;
+pub use sparkles_core::task::ProgressFn;
 
 /// Reasoning limits, cancellation and progress reporting.
 #[derive(Clone)]

@@ -22,6 +22,7 @@ pub mod sparql;
 pub mod store;
 pub mod stored;
 pub mod tabular;
+pub mod task;
 pub mod text;
 pub mod trix;
 pub mod validation;
