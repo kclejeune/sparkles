@@ -529,8 +529,9 @@ impl Store {
         let head = w.head;
         let generation = snap.generation.name.clone();
         let gen_no = crate::commit::generation_number(&generation);
+        // the end of the last commit: the file may hold preallocated zeros after it
         let wal_len = match &w.wal {
-            Some(wal) => wal.get_ref().metadata()?.len(),
+            Some(_) => w.wal_len,
             None => 0,
         };
         let dvocab_len = snap.generation.dvocab.flush()?;
@@ -880,10 +881,12 @@ mod tests {
         // a header and the records 0..=3
         assert_eq!(c.file("commits.bin").unwrap().len, 5 * 64);
         let wal = c.file("gen-0001/wal.log").unwrap();
+        // the end of the last commit, before the space preallocated after it
         let on_disk = std::fs::metadata(root.join("gen-0001/wal.log"))
             .unwrap()
             .len();
-        assert_eq!(wal.len, on_disk);
+        assert_eq!(wal.len, s.wal_bytes());
+        assert!(on_disk > wal.len);
         assert_eq!(wal.len % super::super::WAL_REC as u64, 0);
         let p = c.file("prefixes.json").unwrap();
         let mut b = vec![0u8; p.len as usize];

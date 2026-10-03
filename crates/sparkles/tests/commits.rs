@@ -208,6 +208,129 @@ fn an_unknown_wal_record_before_the_last_commit_is_not_a_torn_tail() {
     assert_eq!(std::fs::read(&path).unwrap(), good);
 }
 
+/// A store preallocates its WAL (`StoreOptions::wal_prealloc_bytes`): the file grows
+/// ahead of the commits by zero bytes, and its logical end is the last commit's.
+#[test]
+fn a_preallocated_wal_ends_at_its_last_commit() {
+    use sparkles::history::{At, HistoryOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    for i in 0..50 {
+        upd(&s, &format!("INSERT DATA {{ <urn:s{i}> <urn:p> {i} }}"));
+    }
+    let path = wal(&root);
+    // two records per commit: a data record and the commit record
+    assert_eq!(s.wal_bytes(), 50 * 2 * 33);
+    let on_disk = std::fs::metadata(&path).unwrap().len();
+    assert!(on_disk >= 64 << 10, "{on_disk} bytes");
+    // readers of the live log stop where it ends: past states and diffs
+    let (past, _) = s
+        .snapshot_at(&At::Commit(20), &HistoryOptions::default())
+        .unwrap();
+    assert_eq!(past.len(), 20);
+    let d = s
+        .diff(&At::Commit(10), &At::Head, &Default::default())
+        .unwrap();
+    assert_eq!((d.added, d.removed), (40, 0));
+    // the check of a live store reports the zeros as preallocated space
+    let r = sparkles::check::check(&root, &sparkles::check::CheckOptions { quick: false });
+    let r = r.unwrap();
+    let w = r.get("wal").unwrap();
+    assert_eq!(w.status, sparkles::check::Status::Ok, "{}", r.to_text());
+    assert!(w.summary.contains("preallocated"), "{}", w.summary);
+    // a crash leaves the zeros behind; a clean close does not
+    let crashed = std::fs::read(&path).unwrap();
+    drop(s);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 50 * 2 * 33);
+    std::fs::write(&path, &crashed).unwrap();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.head_commit().seq, 50);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 50 * 2 * 33);
+    assert_eq!(
+        upd(&s, "INSERT DATA { <urn:s50> <urn:p> 50 }").commit.seq,
+        51
+    );
+    assert_eq!(s.snapshot().len(), 51);
+    drop(s);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.head_commit().seq, 51);
+    assert_eq!(s.snapshot().len(), 51);
+}
+
+/// A commit that overwrites preallocated bytes can reach the disk in any order of its
+/// pages, so a crash can leave zeros in the middle of the last transaction, before its
+/// commit record. It was never acknowledged: open drops it like a torn tail. Zeros in
+/// an earlier transaction are damage, and open refuses the database.
+#[test]
+fn zeros_inside_the_last_transaction_are_a_torn_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        for i in 0..3 {
+            upd(
+                &s,
+                &format!(
+                    "INSERT DATA {{ <urn:a{i}> <urn:p> 1 . <urn:b{i}> <urn:p> 2 . <urn:c{i}> <urn:p> 3 }}"
+                ),
+            );
+        }
+    }
+    let path = wal(&root);
+    let full = std::fs::read(&path).unwrap();
+    // three transactions of three data records and a commit record
+    assert_eq!(full.len(), 3 * 4 * 33);
+    for zeroed in [8..9, 8..10, 9..11] {
+        let mut v = full.clone();
+        v[zeroed.start * 33..zeroed.end * 33].fill(0);
+        std::fs::write(&path, &v).unwrap();
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        assert_eq!(s.head_commit().seq, 2, "records {zeroed:?} zeroed");
+        assert_eq!(s.snapshot().len(), 6);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 2 * 4 * 33);
+        let r = upd(
+            &s,
+            "INSERT DATA { <urn:a2> <urn:p> 1 . <urn:b2> <urn:p> 2 . <urn:c2> <urn:p> 3 }",
+        );
+        assert_eq!(r.commit.seq, 3);
+    }
+    // the same records again (with a later timestamp)
+    let full = std::fs::read(&path).unwrap();
+    assert_eq!(full.len(), 3 * 4 * 33);
+    let mut v = full.clone();
+    v[4 * 33..5 * 33].fill(0);
+    std::fs::write(&path, &v).unwrap();
+    let e = Store::open(&root, StoreOptions::default()).err().unwrap();
+    assert!(e.to_string().contains("wal.log"), "{e}");
+    assert_eq!(std::fs::read(&path).unwrap(), v, "the WAL was modified");
+}
+
+#[test]
+fn without_preallocation_each_commit_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let opts = || StoreOptions {
+        wal_prealloc_bytes: 0,
+        ..Default::default()
+    };
+    let s = Store::open(&root, opts()).unwrap();
+    for i in 0..5 {
+        upd(&s, &format!("INSERT DATA {{ <urn:s{i}> <urn:p> {i} }}"));
+        assert_eq!(std::fs::metadata(wal(&root)).unwrap().len(), s.wal_bytes());
+    }
+    drop(s);
+    // a log preallocated by an earlier run is truncated at open and appended to
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    upd(&s, "INSERT DATA { <urn:s5> <urn:p> 5 }");
+    assert!(std::fs::metadata(wal(&root)).unwrap().len() > s.wal_bytes());
+    drop(s);
+    let s = Store::open(&root, opts()).unwrap();
+    upd(&s, "INSERT DATA { <urn:s6> <urn:p> 6 }");
+    assert_eq!(std::fs::metadata(wal(&root)).unwrap().len(), 7 * 2 * 33);
+    assert_eq!(s.snapshot().len(), 7);
+}
+
 fn ask(s: &Store, q: &str) -> bool {
     sparkles::sparql::query(s.snapshot(), q, &QueryOptions::default())
         .unwrap()

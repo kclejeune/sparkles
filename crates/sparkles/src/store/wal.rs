@@ -18,6 +18,88 @@
 use super::*;
 use std::io::{BufReader, Seek, SeekFrom};
 
+/// Open a generation's log for writing, positioned at the end of the file. It is not
+/// opened in append mode: a store that preallocates writes each commit at the log's
+/// logical end, which lies before the zero bytes that follow it.
+pub(crate) fn open_for_append(path: &Path) -> std::io::Result<File> {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    f.seek(SeekFrom::End(0))?;
+    Ok(f)
+}
+
+/// The smallest preallocation step: a small log grows by this much at a time.
+const PREALLOC_MIN: u64 = 64 << 10;
+
+/// Write a transaction's records `data` at byte `at` of the log file, its logical end,
+/// without syncing. `alloc` is the file's length. With preallocation (`prealloc` above 0,
+/// the largest step), a write past `alloc` also writes zero bytes after the records, so
+/// the file grows by a step, as long as the log at first and then by its own size up
+/// to `prealloc`. The commit's sync makes them durable with the records. The commits
+/// after it overwrite allocated bytes, and their `fdatasync` needs no journal commit
+/// on file systems that update blocks in place.
+pub(crate) fn write_commit(
+    file: &File,
+    at: u64,
+    alloc: &mut u64,
+    data: &[u8],
+    prealloc: u64,
+) -> std::io::Result<()> {
+    let end = at + data.len() as u64;
+    write_all_at(file, data, at)?;
+    if end <= *alloc {
+        return Ok(());
+    }
+    if prealloc == 0 {
+        *alloc = end;
+        return Ok(());
+    }
+    let step = (*alloc).max(PREALLOC_MIN).min(prealloc);
+    let to = (end + step).next_multiple_of(4096).min(end + prealloc);
+    let zeros = vec![0u8; ((to - end) as usize).min(1 << 20)];
+    let mut pos = end;
+    while pos < to {
+        let n = (to - pos).min(zeros.len() as u64) as usize;
+        write_all_at(file, &zeros[..n], pos)?;
+        pos += n as u64;
+    }
+    *alloc = to;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], at: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, buf, at)
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, mut buf: &[u8], mut at: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let n = std::os::windows::fs::FileExt::seek_write(file, buf, at)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        buf = &buf[n..];
+        at += n as u64;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_all_at(_: &File, _: &[u8], _: u64) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// Whether a record is all zero bytes: preallocated space past the log's last commit,
+/// or a part of the last transaction that did not reach the disk before a crash.
+#[inline]
+pub(crate) fn is_zero_record(rec: &[u8]) -> bool {
+    rec.iter().all(|&b| b == 0)
+}
+
 /// A position in a log: right after the last record of commit `seq`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WalPoint {
@@ -184,6 +266,8 @@ impl WalCursor {
             match rec[0] {
                 WAL_INSERT | WAL_DELETE => self.txn.extend_from_slice(&rec),
                 WAL_COMMIT => break,
+                // the log's end: its preallocated space, or a torn last transaction
+                _ if is_zero_record(&rec) => return Ok(None),
                 op => {
                     return Err(Error::Corrupt(format!(
                         "{}: unknown record type {op} at byte {}",

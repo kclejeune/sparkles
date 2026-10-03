@@ -18,6 +18,104 @@ use std::sync::Arc;
 
 pub const BLOCK_ROWS: usize = 32 * 1024;
 
+/// Read hints for the memory-mapped index and vocabulary files (on by default, `off` in
+/// `SPARKLES_IO_HINTS` turns them off for a process).
+///
+/// Without hints, Linux answers a page fault on a file mapping by reading the
+/// device's whole read-ahead window around the page, 128 KiB to several MiB. A point
+/// lookup on a cold server faults on a few pages of a vocabulary of tens of MiB, and a
+/// window around each of them, so a query that needs 30 terms read 40 MiB. With the
+/// hints, the vocabulary data is mapped for random access, so a fault reads its page
+/// alone, and the reads that cover many terms ask for their whole range ahead. An index
+/// file is mapped for random access too, and a block column about to be decoded asks
+/// the kernel for exactly its bytes and those of the block's later columns, in one
+/// request, before the decoder touches them.
+pub fn io_hints() -> bool {
+    IO_HINTS.get()
+}
+
+/// Turn the read hints of [`io_hints`] on or off for files mapped from now on, and for
+/// the ranges read from the files already mapped.
+pub fn set_io_hints(on: bool) {
+    IO_HINTS.set(on);
+}
+
+/// Whether vocabularies opened from now on use their sparse index (`vocab.idx`, see
+/// [`crate::vocab::Vocab`]) when they have one. On by default, `off` in
+/// `SPARKLES_SPARSE_VOCAB` turns it off for a process.
+pub fn sparse_vocab() -> bool {
+    SPARSE_VOCAB.get()
+}
+
+/// Turn the use of [`sparse_vocab`] on or off for vocabularies opened from now on.
+pub fn set_sparse_vocab(on: bool) {
+    SPARSE_VOCAB.set(on);
+}
+
+static IO_HINTS: EnvSwitch = EnvSwitch::new("SPARKLES_IO_HINTS");
+static SPARSE_VOCAB: EnvSwitch = EnvSwitch::new("SPARKLES_SPARSE_VOCAB");
+
+/// A process-wide switch, on unless its environment variable says `off`, `0` or
+/// `false`, and settable for tests and A/B runs.
+pub(crate) struct EnvSwitch {
+    var: &'static str,
+    /// 0 = not read from the environment yet, 1 = on, 2 = off
+    state: std::sync::atomic::AtomicU8,
+}
+
+impl EnvSwitch {
+    pub(crate) const fn new(var: &'static str) -> EnvSwitch {
+        EnvSwitch {
+            var,
+            state: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+    pub(crate) fn get(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.state.load(Relaxed) {
+            0 => {
+                let on = std::env::var(self.var).map_or(true, |v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false"
+                    )
+                });
+                self.set(on);
+                on
+            }
+            v => v == 1,
+        }
+    }
+    pub(crate) fn set(&self, on: bool) {
+        self.state
+            .store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Map a whole file read-only for random access (see [`io_hints`]).
+pub(crate) fn map_random(f: &File) -> std::io::Result<Mmap> {
+    // SAFETY: index and vocabulary files are immutable once written; generations are
+    // never modified in place.
+    let m = unsafe { Mmap::map(f)? };
+    #[cfg(unix)]
+    if io_hints() {
+        // a hint only: a kernel that refuses it reads as before
+        let _ = m.advise(memmap2::Advice::Random);
+    }
+    Ok(m)
+}
+
+/// Ask the kernel to start reading `len` bytes of `m` at `off` (see [`io_hints`]).
+#[inline]
+pub(crate) fn will_need(m: &Mmap, off: usize, len: usize) {
+    #[cfg(unix)]
+    if len > 0 && off + len <= m.len() && io_hints() {
+        let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+    }
+    #[cfg(not(unix))]
+    let _ = (m, off, len);
+}
+
 pub type Key = [u64; 4];
 
 /// Position of each component in a quad array `[s, p, o, g]`.
@@ -445,8 +543,7 @@ impl PermIndex {
         let rows = blocks.last().map_or(0, |b| b.row_start + b.rows as u64);
         let f = File::open(dir.join(format!("{}.dat", perm.name())))?;
         let data = if f.metadata()?.len() > 0 {
-            // SAFETY: generation files are immutable once written.
-            Some(unsafe { Mmap::map(&f)? })
+            Some(map_random(&f)?)
         } else {
             None
         };
@@ -475,6 +572,27 @@ impl PermIndex {
         })
     }
 
+    /// Ask the kernel to start reading the columns in `mask` of block `b` (and those
+    /// between them), unless the cache holds them decoded. A reader that knows the
+    /// blocks it will visit asks for all of them first, so that a cold server reads them
+    /// in parallel instead of one after another (see [`io_hints`]).
+    pub fn prefetch(&self, cache: &BlockCache, b: usize, mask: ColMask) {
+        let mask = mask & ALL_COLS;
+        if mask == 0 || !io_hints() || cache.has_cols(self, b, mask) {
+            return;
+        }
+        let (Some(data), Some(m)) = (self.data.as_ref(), self.blocks.get(b)) else {
+            return;
+        };
+        let first = mask.trailing_zeros() as usize;
+        let last = 7 - mask.leading_zeros() as usize;
+        let at = |c: usize| {
+            m.offset as usize + m.col_len[..c].iter().map(|&l| l as usize).sum::<usize>()
+        };
+        let (from, to) = (at(first), at(last + 1));
+        will_need(data, from, to - from);
+    }
+
     /// Decode one column of a block (columns are compressed separately).
     pub fn decode_col(&self, b: usize, c: usize) -> Result<Vec<u64>> {
         let m = &self.blocks[b];
@@ -483,6 +601,13 @@ impl PermIndex {
             .as_ref()
             .ok_or_else(|| Error::Corrupt("no data".into()))?;
         let off = m.offset as usize + m.col_len[..c].iter().map(|&l| l as usize).sum::<usize>();
+        // this column and the block's later ones, which a scan usually decodes next: one
+        // read on a cold file instead of a page fault per page
+        will_need(
+            data,
+            off,
+            m.col_len[c..].iter().map(|&l| l as usize).sum::<usize>(),
+        );
         let bytes = data.get(off..off + m.col_len[c] as usize).ok_or_else(|| {
             Error::Corrupt(format!(
                 "{}.dat: block {b} ends past the end of the file",

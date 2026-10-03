@@ -794,6 +794,34 @@ fn block_range(
     (b0, b1)
 }
 
+/// The most ranges a join prefetches the blocks of: past it, finding every range's
+/// blocks first costs more than the reads it would overlap.
+const PREFETCH_RANGES: usize = 16_384;
+
+/// Ask the kernel to read the blocks of `ranges` in `perm` that the cache lacks, all
+/// at once, before the reader decodes them one by one (`Optimizations::prefetch_blocks`):
+/// on a cold server their reads then overlap. `cols` are the key columns the reader
+/// decodes besides the ones that bound the ranges.
+fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask) {
+    if !ctx.opt.prefetch_blocks || ranges.len() > PREFETCH_RANGES || ranges.len() < 2 {
+        return;
+    }
+    let idx = ctx.snap.perm(perm);
+    let mask = cols | ranges.bound_mask() | (1 << perm.col_of(G));
+    let mut last = None;
+    for i in 0..ranges.len() {
+        let (lo, hi) = ranges.get(i);
+        let (b0, b1) = idx.key_block_range(&lo, &hi);
+        for b in b0..b1 {
+            // consecutive ranges often share a block
+            if last != Some(b) {
+                idx.prefetch(&ctx.snap.cache, b, mask);
+                last = Some(b);
+            }
+        }
+    }
+}
+
 /// Clusters of consecutive ranges read by one scan each: a range joins the cluster when
 /// its first block is no further than just past the cluster's blocks, and no delta
 /// change lies between it and the cluster (the scan would merge those row by row).
@@ -1212,6 +1240,8 @@ fn read_probes(
             };
             // tables in the walk's pattern order, then back in the probes' order
             let mut parts: Vec<Table> = order.iter().map(|&i| out[i].clone()).collect();
+            let mask = cols.iter().flatten().fold(0, |m, &c| m | (1 << c));
+            prefetch(ctx, Perm::Spo, &walk, mask);
             if gallop {
                 read_ranges_gallop(ctx, Perm::Spo, &walk, &cols, &rule, &mut parts, stats)?;
             } else {
@@ -1237,6 +1267,8 @@ fn read_probes(
             dedup: p.scan.dedup,
         };
         let cols = vec![p.scan.cols.iter().map(|c| c.0).collect::<Vec<_>>()];
+        let mask = cols[0].iter().fold(0, |m, &c| m | (1 << c));
+        prefetch(ctx, p.scan.perm, ranges, mask);
         let out = std::slice::from_mut(t);
         if gallop {
             read_ranges_gallop(ctx, p.scan.perm, ranges, &cols, &rule, out, stats)?;

@@ -992,6 +992,20 @@ impl Checker<'_> {
             }
             summary.push_str(", block first keys checked for order");
         }
+        match crate::vocab::verify_sparse_index(dir, &offsets, data) {
+            None => {}
+            Some(Ok(n)) => summary.push_str(&format!(", sparse index of {n} keys")),
+            // the server does without an index it cannot read, but would use one that
+            // reads well and names other keys
+            Some(Err((error, m))) => run.add(
+                if error {
+                    Issue::error(m)
+                } else {
+                    Issue::warning(m)
+                }
+                .file(format!("{name}/vocab.idx")),
+            ),
+        }
         VocabRun {
             millis: run.millis(),
             run,
@@ -1165,8 +1179,23 @@ impl Checker<'_> {
             (Some(o), Some(_)) => o == "baseline",
             _ => true,
         };
+        // zero bytes after the last record are space preallocated for the next commits
+        let zero = |r: &[u8]| r.iter().all(|&b| b == 0);
+        let logical = buf
+            .iter()
+            .rposition(|&b| b != 0)
+            .map_or(0, |p| (p + 1).next_multiple_of(WAL_REC).min(buf.len()));
+        let preallocated = buf.len() - logical;
+        let buf = &buf[..logical];
         let recs = buf.as_chunks::<WAL_REC>().0;
         let last_commit = recs.iter().rposition(|r| r[0] == WAL_COMMIT);
+        // the last transaction, where a crash can leave zeros before its commit record
+        let last_txn = last_commit.map(|l| {
+            recs[..l]
+                .iter()
+                .rposition(|r| r[0] == WAL_COMMIT)
+                .map_or(0, |p| p + 1)
+        });
         let (mut prev_seq, mut prev_ts) = (base_seq, base_ts);
         let mut commits: Vec<(u64, i64, u8)> = Vec::new();
         let (mut folded, mut data_recs) = (0usize, 0usize);
@@ -1300,6 +1329,18 @@ impl Checker<'_> {
                     good = (i + 1) * WAL_REC;
                     txn_start = i + 1;
                 }
+                _ if zero(rec) && last_txn.is_some_and(|t| i >= t) => {
+                    run.add(
+                        Issue::warning(format!(
+                            "record {i} is zeros inside the last transaction, which did not reach the disk whole: the tail from offset {good} is truncated on open"
+                        ))
+                        .file(&file)
+                        .offset(at)
+                        .row(i as u64),
+                    );
+                    torn = true;
+                    break;
+                }
                 op => {
                     if last_commit.is_some_and(|l| i < l) {
                         run.add(
@@ -1365,6 +1406,9 @@ impl Checker<'_> {
             ));
         }
         summary.push_str(&format!("; head {head}"));
+        if preallocated > 0 {
+            summary.push_str(&format!("; {preallocated} bytes preallocated"));
+        }
         if self.full || data_recs > 0 {
             summary.push_str(&format!("; {ids_checked} ids checked"));
         }

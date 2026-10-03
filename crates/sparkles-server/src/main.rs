@@ -101,6 +101,12 @@ struct Cli {
     /// (a database keeps the setting once it is on)
     #[arg(long, global = true)]
     commit_digests: bool,
+    /// The most a write-ahead log grows ahead of its commits at once, in KiB, as zero
+    /// bytes written and synced in advance (0: no preallocation; each commit appends).
+    /// A commit that overwrites preallocated bytes syncs its data without a file-system
+    /// journal commit, which on ext4 and XFS takes a fraction of the time
+    #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_WAL_PREALLOC_BYTES >> 10)]
+    wal_prealloc_kb: u64,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
@@ -1167,6 +1173,13 @@ enum Cmd {
         #[arg(long)]
         if_due: bool,
     },
+    /// Add the sparse vocabulary index (vocab.idx) to a database whose current index was
+    /// built before it existed, so that a cold server looks up a term with one read
+    /// instead of one per step of a binary search. A load or compaction writes it too.
+    VocabIndex {
+        #[arg(long)]
+        loc: PathBuf,
+    },
     /// Back up to a backup repository (create, list, show, delete, restore, verify,
     /// policy); without a subcommand, write a compressed N-Quads dump of --loc to --out
     /// (zstd unless --compress says otherwise)
@@ -1486,6 +1499,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         max_snapshots: cli.max_snapshots,
         max_prefixes: cli.max_prefixes,
         commit_digests: cli.commit_digests,
+        wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
         ..Default::default()
     }
 }
@@ -2722,6 +2736,14 @@ fn run() -> Result<()> {
         Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Quota(args) => quota_cmd::run(args, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
+        Cmd::VocabIndex { loc } => {
+            let store = Store::open(&loc, opts)?;
+            match store.add_vocab_index()? {
+                Some(n) => println!("wrote vocab.idx ({n} entries)"),
+                None => println!("the current index already has vocab.idx"),
+            }
+            Ok(())
+        }
         Cmd::Compact { loc, if_due } => {
             let store = Store::open(&loc, opts)?;
             if if_due {

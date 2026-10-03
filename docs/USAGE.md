@@ -319,6 +319,7 @@ happens to materialized inferences, and the limits.
 | `--load-dir DIR` | | Let `LOAD <file:…>` read the regular files under `DIR`, with symbolic links resolved and nothing outside it. Without this flag, the server refuses file loads. |
 | `--embedding-secret NAME=SOURCE` | | A secret that vector indexes may name as their embedding API key: `NAME=env:VARIABLE` or `NAME=file:PATH`, read when a request is made. Repeatable. See [Embeddings computed on write](#embeddings-computed-on-write). |
 | `--no-embedding` | | Compute no embeddings. No worker sends text to a provider, and searches cannot pass text. The configurations are kept. |
+| `--wal-prealloc-kb N` | `4096` | The most a write-ahead log grows ahead of its commits at once, as zero bytes written and synced in advance; `0` means each commit appends to the file. A commit that overwrites preallocated bytes syncs them without a file-system journal commit, which on ext4 and XFS is faster and no longer waits behind other files' writeback. The log ends at its last commit for readers, backups and the quota, and a close trims the zeros. A global flag. |
 | `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. |
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. A closure takes about 135 bytes per triple. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 
@@ -501,6 +502,10 @@ The other commands are:
 * `convert` (`riot`), `qparse`, `uparse`, `compare` (`rdfcompare`, `rdfdiff`), `iri`,
   `langtag`, `rsparql`, `rupdate` and `rset`, for files and endpoints
   ([below](#file-tools)).
+* `vocab-index`, which adds the sparse vocabulary index (`vocab.idx`) to a database
+  whose index was built before it existed. Loads and compactions write it. With it, a
+  server that starts with a cold page cache looks up a term with one read instead of one
+  per step of a binary search over the vocabulary.
 
 `sparkles help COMMAND` describes each one.
 
@@ -527,6 +532,11 @@ pages, so `man sparkles-serve` works after `nix profile install`.
 `sparkles openapi` prints the OpenAPI 3.1 description of the HTTP API, and
 `--format yaml` prints it as YAML. A running server serves the same document at
 `/$/openapi.json` ([API.md](API.md#openapi-description)).
+
+Two environment variables switch off read paths for comparisons.
+`SPARKLES_IO_HINTS=off` maps the index and vocabulary files without access hints, so
+that a page fault reads the device's whole read-ahead window and blocks are not read
+ahead. `SPARKLES_SPARSE_VOCAB=off` looks terms up without `vocab.idx`.
 
 `sparkles schema --loc db --format void` prints the schema report as a VoID description
 in Turtle, and `--format turtle` adds the declared RDFS/OWL schema. The server answers
@@ -1225,11 +1235,11 @@ clean, 1 when any check found an error, and 2 when there are warnings only.
 |---|---|
 | `layout` | `CURRENT` names an existing generation. `dataset.json`, the generation's `commit.json` (with the same dataset id) and `prefixes.json` parse. Leftovers of interrupted work are warnings: `*.tmp`, `text.new`/`text.old`, an old or unfinished `gen-NNNN`, or a set-aside catalog. |
 | `generation` | `meta.json` (index format) and `stats.json` parse and agree on the quad count. |
-| `vocabulary` | The front-coded vocabulary decodes, its keys strictly increase, and its size matches `meta.json`. Every vocabulary id in the permutations is below that size. |
+| `vocabulary` | The front-coded vocabulary decodes, its keys strictly increase, and its size matches `meta.json`. Every vocabulary id in the permutations is below that size. Every entry of the sparse index `vocab.idx` names the offset and first key of its block. An index that does not read as one for this vocabulary is a warning, because the server ignores it. |
 | `delta-vocabulary` | The update vocabulary is well formed and holds no duplicate. A torn tail is a warning. |
 | `perm.spo` … `perm.gspo` | Block metadata is contiguous, sorted and fits the file, and the row count matches `meta.json`. Every block decodes to its row count, and its first and last keys match the metadata. Keys strictly increase within and across blocks, and every id is valid for its position. |
 | `permutations` | The 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads. |
-| `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. So is a final transaction that names update-vocabulary terms the file lacks, which a crash during its commit can leave. Commit numbers continue from the generation's base commit, and ids resolve. |
+| `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. So is a final transaction that names update-vocabulary terms the file lacks, which a crash during its commit can leave, and one with zero records before its commit record. Zero bytes after the last commit are preallocated space, reported in the summary. Commit numbers continue from the generation's base commit, and ids resolve. |
 | `catalog` | `commits.bin` has valid record checksums, continuous records and the right dataset id, and agrees with the WAL. A lagging catalog, or damage that open can rebuild from the WAL, is a warning. Lost history before the generation is an error. |
 | `text` | `text.json` parses. The index opens read-only, and every committed segment file exists and matches its checksum. The index's commit is compared with the WAL. An index that is behind is a warning, because open catches it up or rebuilds it. |
 | `geo` | `geo.json` parses and is a valid configuration. The current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`) have a valid header and footer, belong to this generation and configuration, and match their index checksums. In full mode, the data checksums are checked too. A damaged file is a warning, because open rebuilds it. |

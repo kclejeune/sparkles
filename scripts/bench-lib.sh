@@ -100,6 +100,10 @@ copy_stores() {
     cp -a --reflink=auto "$src" "$STORE/${FILEOF[$e]}"
   done
   rm -rf "$STORE/sparkles-server"
+  # Without reflinks the copies are gigabytes of dirty pages at 10.5M triples. Their
+  # writeback would run during the first engine's commits, and every commit that syncs
+  # would wait behind it: Sparkles' median commit took 4 ms instead of 1 ms on forge.
+  sync
 }
 
 # Servers run inside a transient systemd scope limited to SERVER_MEM_MAX (for example 12G)
