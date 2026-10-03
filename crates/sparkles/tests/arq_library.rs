@@ -1,7 +1,7 @@
 //! The rest of Jena ARQ's query language (spec G06, Phase 3): `LET`, the composite
 //! datatypes with `FOLD` and `UNFOLD`, the property function library, `SEMIJOIN` and
-//! `ANTIJOIN`, and the path forms `distinct(…)` and `multi(…)`, against ARQ's tests and
-//! Jena 6.2.0's answers.
+//! `ANTIJOIN`, and the path forms `distinct(…)`, `multi(…)` and `:p^:q`, against ARQ's
+//! tests and Jena 6.2.0's answers.
 //!
 //! The cases cite their source: the tests of Jena's `jena-arq/testing/ARQ`
 //! (`Syntax-ARQ`) and the output of Jena 6.2.0's `arq` command for the same data and
@@ -371,8 +371,8 @@ fn semijoin_and_antijoin_match_arq() {
     assert!(plan.contains("\"SemiJoin\""), "{plan}");
 }
 
-/// arq 6.2.0 on `JOIN_DATA`: `distinct(…)` gives each pair once, and `multi(…)` counts
-/// the walks of its closures.
+/// arq 6.2.0 on `JOIN_DATA`: `distinct(…)` gives each pair once, `multi(…)` counts the
+/// walks of its closures, and `^` between two elements inverts the second.
 #[test]
 fn path_forms_match_arq() {
     let s = ttl(JOIN_DATA);
@@ -394,6 +394,14 @@ fn path_forms_match_arq() {
         "SELECT ?y { :a multi(:n+/:m?) ?y }",
         ":b \n :c \n :d \n :d \n :e \n :e",
     );
+    // ARQ's `:p^:q` is `:p/^:q`
+    check(&s, "SELECT ?x ?y { ?x :n^:m ?y }", ":a :a");
+    check(
+        &s,
+        "SELECT ?x ?y { ?x :n^:n ?y }",
+        ":a :a \n :a :a \n :b :b \n :b :c \n :c :b \n :c :c",
+    );
+    assert!(!parses_strict("SELECT * { ?s :n^:m ?o }"));
     assert!(!parses_strict("SELECT * { ?s distinct(:p) ?o }"));
     // ARQ parses shortest(…) but does not evaluate it
     let q = format!("{PREFIXES}SELECT * {{ ?s shortest(:n*) ?o }}");

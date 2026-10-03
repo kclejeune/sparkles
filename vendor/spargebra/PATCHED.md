@@ -129,9 +129,10 @@ The changes, all in `src/parser.rs` unless noted:
   `AntiJoinGraphPattern` elements are `GraphPattern::SemiJoin { left, right }` and
   `GraphPattern::AntiJoin { left, right }`, whose in-scope variables are those of
   `left`. ARQ's path primaries `distinct(path)`, `multi(path)` and `shortest(path)` are
-  `PropertyPathExpression::Distinct`, `Multi` and `Shortest`. All are behind the `arq()`
-  guard, and their SSE forms are Jena's `(semijoin …)`, `(antijoin …)`, `(distinct …)`,
-  `(multi …)` and `(shortest …)`.
+  `PropertyPathExpression::Distinct`, `Multi` and `Shortest`, and ARQ's `^` between two
+  path elements (`:p^:q`) is the sequence with the second one inverted (`:p/^:q`). All
+  are behind the `arq()` guard, and the SSE forms are Jena's `(semijoin …)`,
+  `(antijoin …)`, `(distinct …)`, `(multi …)` and `(shortest …)`.
 
 - **A nesting limit.** `SparqlParser::parse_query` and `parse_update` first scan the text
   once, without recursion (`src/nesting.rs`, called from `too_deep`). They refuse a text

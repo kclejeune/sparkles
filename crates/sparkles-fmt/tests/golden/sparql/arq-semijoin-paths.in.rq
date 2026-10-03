@@ -1,5 +1,6 @@
 PREFIX ex: <http://example.org/>
 select * {
   ?s ex:p ?o semijoin { ?s ex:q ?z } ANTIJOIN{?s ex:r ?r}
-  ?s DISTINCT(ex:n/ex:n) ?a . ?a multi( ex:n* ) ?b . ?b ex:m/distinct(ex:n|ex:m)+ ?c
+  ?s DISTINCT(ex:n/ex:n) ?a . ?a multi( ex:n* ) ?b . ?b ex:m/distinct(ex:n|ex:m)+ ?c .
+  ?c ex:n ^ ex:m ?d
 }

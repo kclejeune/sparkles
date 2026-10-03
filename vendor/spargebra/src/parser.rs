@@ -2060,11 +2060,15 @@ parser! {
         }
         rule PathAlternative_item() -> PropertyPathExpression = p:PathSequence() _ { p }
 
-        rule PathSequence() -> PropertyPathExpression = p:PathSequence_item() **<1,> ("/" _) {?
-            not_empty_fold(p.into_iter(), |a, b| {
+        rule PathSequence() -> PropertyPathExpression = first:PathSequence_item() rest:PathSequence_next()* {
+            rest.into_iter().fold(first, |a, b| {
                 PropertyPathExpression::Sequence(Box::new(a), Box::new(b))
             })
         }
+        // `/ elt`, or ARQ's `^ elt`: `:p^:q` is `:p/^:q`
+        rule PathSequence_next() -> PropertyPathExpression =
+            "/" _ p:PathSequence_item() { p } /
+            "^" _ arq() p:PathElt() _ { PropertyPathExpression::Reverse(Box::new(p)) }
         rule PathSequence_item() -> PropertyPathExpression = p:PathEltOrInverse() _ { p }
 
         rule PathElt() -> PropertyPathExpression = p:PathPrimary() _ o:PathElt_op()? {

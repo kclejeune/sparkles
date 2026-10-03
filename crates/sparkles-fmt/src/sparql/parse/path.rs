@@ -32,16 +32,23 @@ fn path_alternative(p: &mut Parser<'_>) -> bool {
     false
 }
 
-/// `PathSequence ::= PathEltOrInverse ( '/' PathEltOrInverse )*`
+/// `PathSequence ::= PathEltOrInverse ( '/' PathEltOrInverse | '^' PathElt )*`, where
+/// `^` between two elements is ARQ's (`:p^:q` is `:p/^:q`).
 fn path_sequence(p: &mut Parser<'_>) -> bool {
     let m = p.start(NodeKind::PathSequence);
     let plain = path_elt_or_inverse(p);
-    if !p.at(TokenKind::Slash) {
+    if !p.at(TokenKind::Slash) && !p.at(TokenKind::Hat) {
         m.abandon(p);
         return plain;
     }
-    while p.eat(TokenKind::Slash) {
-        path_elt_or_inverse(p);
+    loop {
+        if p.eat(TokenKind::Slash) {
+            path_elt_or_inverse(p);
+        } else if p.eat(TokenKind::Hat) {
+            path_elt(p);
+        } else {
+            break;
+        }
     }
     m.complete(p);
     false

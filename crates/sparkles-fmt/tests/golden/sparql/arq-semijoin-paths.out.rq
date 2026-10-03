@@ -12,4 +12,5 @@ WHERE {
   ?s distinct(ex:n/ex:n) ?a .
   ?a multi(ex:n*) ?b .
   ?b ex:m/distinct(ex:n|ex:m)+ ?c .
+  ?c ex:n^ex:m ?d .
 }
