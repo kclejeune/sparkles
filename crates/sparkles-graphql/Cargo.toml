@@ -1,0 +1,23 @@
+[package]
+name = "sparkles-graphql"
+description = "Read-only GraphQL adapter for Sparkles datasets (spec C03)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sparkles.workspace = true
+apollo-compiler = "1.33"
+oxrdf.workspace = true
+spargebra.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+parking_lot.workspace = true
+# the parsed-document cache (already in the tree)
+quick_cache = "0.7.0"
+serde_json_bytes = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+oxrdfio.workspace = true
