@@ -40,7 +40,9 @@ backups, the search indexes, reasoning, write-time validation and history, are o
 objects that link to their section of this page.
 
 The UI's Server page links both documents. Any OpenAPI viewer can open them, for example
-Swagger UI or Redocly pointed at `http://localhost:3030/$/openapi.json`.
+Swagger UI or Redocly pointed at `http://localhost:3030/$/openapi.json`. The Rust client
+([spec P02](specs/P02-rust-client.md)) is written by hand, and a test checks the routes,
+parameters and response schemas it uses against the checked-in copy.
 
 ```sh
 curl -s localhost:3030/'$/openapi.json' | jq '.paths | keys | length'

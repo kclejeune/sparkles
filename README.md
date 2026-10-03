@@ -92,6 +92,9 @@ running queries.
   are bound as terms and never spliced into the text ([API](docs/API.md#stored-queries)).
 * Jena's own HTTP clients, including `RDFConnectionFuseki` and its RDF Thrift, are tested
   against the server ([usage](docs/USAGE.md#fuseki-and-jena-clients)).
+* A Rust client, `sparkles-client`, for Sparkles and any SPARQL endpoint. It streams
+  results as `oxrdf` terms, returns the commit of each write, and retries as the server's
+  `Retry-After` directs ([usage](docs/USAGE.md#rust-client)).
 * A Jena-style CLI with `tdb2.*` and `arq` equivalents. The commands work on a database
   directory or on a remote server ([usage](docs/USAGE.md#command-line-tools)). File tools
   match Jena's `riot`, `qparse`, `uparse`, `rdfdiff`, `iri`, `langtag`, `rsparql`,
@@ -332,6 +335,23 @@ with Dataset("mydb") as ds:                      # or Dataset() in memory
 
 [docs/USAGE.md](docs/USAGE.md#python) covers the Python API.
 
+A remote server is reached from Rust with `crates/sparkles-client`, which has Jena's
+`RDFConnection` operations, async on tokio or blocking. It also works against Fuseki,
+QLever, Oxigraph and Wikidata.
+
+```rust
+use sparkles_client::Client;
+
+let ds = Client::new("http://localhost:3030")?.dataset("ds");
+let receipt = ds.update("INSERT DATA { <urn:a> <urn:p> 1 }").await?;   // commit in receipt.commit_seq
+let mut rows = ds.select("SELECT * { ?s ?p ?o }").await?;
+while let Some(row) = rows.next().await {
+    println!("{:?}", row?.get("s"));
+}
+```
+
+[docs/USAGE.md](docs/USAGE.md#rust-client) covers the client.
+
 ## Web UI
 
 <table>
@@ -366,7 +386,7 @@ with Dataset("mydb") as ds:                      # or Dataset() in memory
 | Document | Contents |
 |---|---|
 | [docs/FEATURES.md](docs/FEATURES.md) | Every feature with its status, and the known gaps. |
-| [docs/USAGE.md](docs/USAGE.md) | Running the server and CLI, with options, formatting, backups, outbound requests, integrity checks, MCP, embedding, the Python package and NixOS. |
+| [docs/USAGE.md](docs/USAGE.md) | Running the server and CLI, with options, formatting, backups, outbound requests, integrity checks, MCP, embedding, the Python package, the Rust client and NixOS. |
 | [docs/API.md](docs/API.md) | The HTTP API: Fuseki's endpoints and the `/$/` extensions. |
 | [docs/openapi.json](docs/openapi.json) | The OpenAPI 3.1 description of the HTTP API, as the server serves it at `/$/openapi.json`. |
 | [docs/COMPARISON.md](docs/COMPARISON.md) | How Sparkles compares with Jena/Fuseki, QLever, Fluree and Oxigraph, where it departs from Jena and QLever on purpose, and the optimizations it adopted from QLever. |
@@ -390,6 +410,7 @@ with Dataset("mydb") as ds:                      # or Dataset() in memory
 | `crates/sparkles-fmt-wasm` | The formatter, compiled to WebAssembly for the browser | — |
 | `crates/sparkles-server` | The axum HTTP server and the `sparkles` CLI | jena-fuseki2, jena-cmds |
 | `crates/sparkles-backup` | Backup repositories on a file system or S3, with incremental, deduplicated backups, restore and lifecycle policies | Fuseki `/$/backup` (N-Quads dumps only) |
+| `crates/sparkles-client` | The Rust client of remote Sparkles servers and other SPARQL endpoints, async or blocking | jena-rdfconnection (remote), `RDFLinkHTTP` |
 | `vendor/spargebra` | Oxigraph's SPARQL parser, vendored with fixes (`PATCHED.md`) | ARQ's JavaCC grammar |
 | `ui/` | The SvelteKit UI for management, queries and graph exploration | jena-fuseki-ui |
 

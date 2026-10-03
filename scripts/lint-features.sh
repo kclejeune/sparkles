@@ -46,6 +46,8 @@ for f in "${server[@]}"; do
 done
 run "sparkles [no features]" -p sparkles --all-targets
 run "sparkles-fmt [no features]" -p sparkles-fmt --all-targets
+# the Rust client without its blocking facade
+run "sparkles-client [no features]" -p sparkles-client --all-targets
 # the library without a repository backend (its tests need the `fs` one)
 run "sparkles-backup [no features, lib]" -p sparkles-backup --lib
 
