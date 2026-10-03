@@ -977,6 +977,39 @@ fn diffs_read_the_change_log_where_states_are_gone() {
     assert!(via_log > 0, "some diffs start at a collected state");
 }
 
+#[test]
+fn a_log_ahead_of_the_data_starts_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let old = dir.path().join("old");
+    let s = Store::open(&root, opts()).unwrap();
+    for i in 0..5 {
+        upd(&s, &format!("INSERT DATA {{ <urn:s{i}> <urn:p> {i} }}"));
+    }
+    s.flush_change_log().unwrap();
+    copy_dir(&root, &old);
+    for i in 5..10 {
+        upd(&s, &format!("INSERT DATA {{ <urn:s{i}> <urn:p> {i} }}"));
+    }
+    s.flush_change_log().unwrap();
+    // the newer log next to the older data, as a hand-made copy would leave it
+    std::fs::remove_dir_all(old.join("changes")).unwrap();
+    copy_dir(&root.join("changes"), &old.join("changes"));
+    let o = Store::open(&old, opts()).unwrap();
+    assert_eq!(o.head_commit().seq, 5);
+    let r = o.history_changes(&HistoryQuery::default()).unwrap();
+    let seqs: Vec<u64> = r.changes.iter().map(|c| c.commit.seq).collect();
+    assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+    // and new commits are recorded
+    upd(&o, "INSERT DATA { <urn:new> <urn:p> 1 }");
+    let r = o.history_changes(&HistoryQuery::default()).unwrap();
+    assert_eq!(
+        r.changes.last().unwrap().quad.subject.to_string(),
+        "<urn:new>"
+    );
+    assert_eq!(r.changes.last().unwrap().commit.seq, 6);
+}
+
 /// The directory benchmarks write to: `SPARKLES_BENCH_DIR`, or a temporary directory
 /// (which may be in memory, where syncs cost nothing).
 fn bench_dir() -> tempfile::TempDir {

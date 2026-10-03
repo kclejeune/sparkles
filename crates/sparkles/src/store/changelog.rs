@@ -1668,7 +1668,21 @@ impl Store {
             return Ok(());
         }
         let head = self.head_commit().seq;
-        let last = match log.last() {
+        let recorded = match log.last() {
+            Some(l) if l > head => {
+                // records past the head belong to a state this dataset no longer has
+                // (files copied from elsewhere): start over
+                tracing::warn!(
+                    last = l,
+                    head,
+                    "the change log is ahead of the data; it starts again"
+                );
+                log.remove_all()?;
+                None
+            }
+            l => l,
+        };
+        let last = match recorded {
             Some(l) => l,
             None => {
                 // a new log: it starts where the current generation's log does

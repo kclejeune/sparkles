@@ -53,9 +53,9 @@ running queries.
   ([API](docs/API.md#point-in-time-reads-and-snapshots)).
 * A change feed of commits and their changes, resumable from any readable commit, with
   long polling and server-sent events ([API](docs/API.md#change-feed)).
-* History queries in SPARQL and over HTTP: when a triple was added or removed, which
-  commit last changed a subject, and which values a property took, with each commit's
-  time, author and message. They read a change log that outlives compactions
+* History queries in SPARQL and over HTTP answer when a triple was added or removed,
+  which commit last changed a subject, and which values a property took, with each
+  commit's time, author and message. They read a change log that outlives compactions
   ([API](docs/API.md#history-queries)).
 * RDF Patch applied as one commit through Fuseki's `patch` operation, in the text and the
   binary form, with `H prev` as an optimistic concurrency check

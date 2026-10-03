@@ -2569,8 +2569,8 @@ curl -N -H 'Accept: text/event-stream' 'http://localhost:3030/ds/changes?after=4
 
 ### History queries
 
-A history query asks how the data changed: when a triple was added or removed, which
-commit last changed a subject, or which values a property took over time. It reads the
+A history query asks how the data changed, such as when a triple was added or removed,
+which commit last changed a subject, or which values a property took over time. It reads the
 **change log**, which records the net changes of every commit and outlives compactions,
 so history reaches further back than point-in-time reads. Each change is one quad added
 or removed, with its commit's number, time, kind, author and message. The design is in

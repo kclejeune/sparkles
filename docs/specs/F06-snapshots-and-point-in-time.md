@@ -1083,8 +1083,8 @@ does not depend on the retained generations, and full-text search at pins.
 
 ### 11.1 Goals
 
-* **History queries.** Users ask how the data changed: when a triple was added or
-  removed, which commit last changed a subject, and which values a predicate took over
+* **History queries.** Users ask how the data changed, such as when a triple was added
+  or removed, which commit last changed a subject, or which values a predicate took over
   time. The answer is a list of change events, each with its commit's number, time,
   kind, author and message.
 * **Reach.** History must not end at the last compaction. With nothing pinned, Phase 1
