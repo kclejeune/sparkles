@@ -280,7 +280,7 @@ pub fn draft(
 
 /// The ceilings of GraphQL requests (`serve`); a schema's `limits` may lower them.
 #[derive(clap::Args, Clone, Debug)]
-pub struct ServeArgs {
+pub struct GraphqlServeArgs {
     /// Deepest selection of a GraphQL request, outside introspection
     #[arg(long, default_value_t = 12)]
     graphql_max_depth: u32,
@@ -296,7 +296,7 @@ pub struct ServeArgs {
     graphql_max_first: u32,
 }
 
-impl ServeArgs {
+impl GraphqlServeArgs {
     pub fn limits(&self) -> sparkles_graphql::plan::Limits {
         sparkles_graphql::plan::Limits {
             max_depth: self.graphql_max_depth,

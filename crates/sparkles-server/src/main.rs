@@ -720,7 +720,7 @@ enum Cmd {
         // the ceilings of GraphQL requests
         #[cfg(feature = "graphql")]
         #[command(flatten)]
-        graphql: graphql::ServeArgs,
+        graphql: graphql::GraphqlServeArgs,
         /// Fuseki's Graph Store direct naming on every dataset: a request to
         /// /{ds}/{path} that names no endpoint reads or writes the graph whose IRI is
         /// the request URL
