@@ -340,9 +340,15 @@ impl Builder {
 
         // ---- 2. vocabulary merge -------------------------------------------------
         self.interrupted()?;
-        // each merging thread reads every batch's vocabulary, and the maps are open
-        let threads = self.opts.threads.max(1) as u64;
-        crate::disk::ensure_open_files((threads + 1) * batches.len() as u64 + 256)?;
+        // each merging thread reads every batch's vocabulary, and the maps are open: as
+        // many threads as the open-file limit allows, down to one, which needs as many
+        // files as a merge in one thread
+        let files = |t: usize| (t as u64 + 1) * batches.len() as u64 + 256;
+        let mut threads = self.opts.threads.max(1);
+        while threads > 1 && crate::disk::ensure_open_files(files(threads)).is_err() {
+            threads -= 1;
+        }
+        crate::disk::ensure_open_files(files(threads))?;
         let parts: Vec<vocabmerge::Partial> = batches
             .iter_mut()
             .map(|b| vocabmerge::Partial {
@@ -352,10 +358,9 @@ impl Builder {
                 samples: std::mem::take(&mut b.samples),
             })
             .collect();
-        let (terms, starts) =
-            vocabmerge::merge(&self.dir, &self.tmp, &parts, self.opts.threads, &|| {
-                self.interrupted()
-            })?;
+        let (terms, starts) = vocabmerge::merge(&self.dir, &self.tmp, &parts, threads, &|| {
+            self.interrupted()
+        })?;
         for p in parts {
             std::fs::remove_file(p.voc)?;
         }

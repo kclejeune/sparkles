@@ -102,7 +102,11 @@ pub(super) fn merge(
         let mut buf = Vec::new();
         let mut key = Vec::new();
         for (r, out) in rx.iter() {
-            done.insert(r, out?);
+            let out = out.inspect_err(|_| {
+                // the other threads take no further range
+                next.store(ranges, Ordering::Relaxed);
+            })?;
+            done.insert(r, out);
             while let Some((n, path)) = done.remove(&starts.len()) {
                 starts.push(w.len());
                 let mut f = BufReader::with_capacity(1 << 20, File::open(&path)?);
