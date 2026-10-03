@@ -373,9 +373,9 @@ at 10.5M. Against each engine:
 | `count-all`, `distinct-obj` and `star-lookup` at both sizes, `employee-docs` at 1.05M | Fluree | ties within 10%, 1.01–1.08× | Both engines answer from index statistics or a few index lookups. The times are 3.4–4.1 ms, which is mostly the request itself. |
 | `path-plus` at both sizes, `values-star` at 10.5M | Oxigraph | ties within 10%, 1.05–1.09× | The same. Oxigraph follows a single path or a few lookups quickly. |
 | Update latency, 1 triple | Oxigraph, QLever | 1.24× and 1.1× at 1.05M (4.2 against 3.4 and 3.8 ms), 1.32× and 1.26× at 10.5M (4.9 against 3.7 and 3.9 ms) | Sparkles fsyncs its WAL and publishes a new snapshot before it acknowledges. Oxigraph does not fsync, and QLever keeps updates in memory only. |
-| Commit rate | Oxigraph, QLever, Fluree | 5,000 single-triple commits at 10.5M ran at 256 commits/s, against 1,046 for Oxigraph, 477 for QLever and 326 for Fluree. At 1.05M, Oxigraph ran 768 to Sparkles' 581. | Each commit waits for an fsync. Sparkles' median commit took 1.7 ms at 1.05M and 4.1 ms at 10.5M, and the cause of that growth has not been investigated. |
+| Commit rate | Oxigraph, QLever, Fluree | 5,000 single-triple commits at 10.5M ran at 256 commits/s, against 1,046 for Oxigraph, 477 for QLever and 326 for Fluree. At 1.05M, Oxigraph ran 768 to Sparkles' 581. | Each commit waits for an fsync. Sparkles' median commit took 1.7 ms at 1.05M and 4.1 ms at 10.5M. The growth came from the writeback of the other engines' store copies, and commits have changed since (see [Changes since the forge run: commit latency](#changes-since-the-forge-run-commit-latency)). |
 | Queries after 5,000 commits | Fluree, QLever | `distinct-obj` 1.16× at 10.5M (4.6 against 4.0 ms). At 1.05M, `range-topk` 1.23× to QLever and `two-hop-count` 1.11× to Fluree. | Reads merge the in-memory delta until a compaction folds it into the index. See [Updates and mixed load](#updates-and-mixed-load). |
-| Queries after a restart with cold caches | Oxigraph, Fluree, QLever | Up to 4.1× on point lookups. See [Cold starts](#cold-starts). | Sparkles opens and decodes index blocks on first use. |
+| Queries after a restart with cold caches | Oxigraph, Fluree, QLever | Up to 4.1× on point lookups. See [Cold starts](#cold-starts). | Sparkles opens and decodes index blocks on first use. Reads have changed since (see [Changes since the forge run: cold reads](#changes-since-the-forge-run-cold-reads)). |
 | Server RSS after the run | QLever | 1.33× at 1.05M (380 against 286 MiB), 1.32× at 10.5M (892 against 676 MiB) | The decoded-block cache and materialized intermediates. Without the cache, the figures are 316 and 513 MiB. See [Memory and the speed it buys](#memory-and-the-speed-it-buys). |
 | Bulk load peak RSS at 10.5M | QLever | 1.07× (2,065 against 1,927 MiB) | Parallel parsing and in-memory sorting during the load. Sparkles loads 1.4× faster. |
 | Full-text `common-count` at 10.5M | QLever | 1.11× (14.1 against 12.7 ms) | Counting all 49,837 hits of a common word. Sparkles wins the other six text queries. |
@@ -458,6 +458,52 @@ The delta slows Sparkles' joins until the next compaction. At 10.5M, `star-join`
 QLever's 89. RSS after the run rose from 892 to 1,406 MiB, of which 719 MiB was block
 cache. Fluree's rose to 9,998 MiB.
 
+### Changes since the forge run: commit latency
+
+The growth of Sparkles' median commit from 1.7 ms at 1.05M to 4.1 ms at 10.5M did not come
+from the dataset. A profile of the churn at 10.5M found no per-commit work that grows
+with the base: a commit's CPU time was 0.3 to 0.5 ms at both sizes, mostly the HTTP
+request, the update's parse and the first decode of each index block a commit touches.
+The growth came from the benchmark. The `updates` mode copies every engine's store right
+before the first engine's churn, and on forge the copies are not reflinks. At 10.5M they
+are about 4 GB, so the Sparkles churn ran while the kernel wrote them back, and every
+`fdatasync` of an append waited for a file-system journal commit behind that writeback.
+On forge, with the copies made just before and Sparkles first, the churn reproduced the
+published figures: a median of 3.9 to 4.6 ms and 187 to 254 commits/s. When the store
+copy had been synced first, the same churn took a median of 1.1 ms at 860 commits/s.
+`copy_stores` in `scripts/bench-lib.sh` now syncs after copying, so that no engine pays
+for another's copies.
+
+Commits also no longer wait for journal commits. The write-ahead log now grows ahead of
+its commits by zero bytes that are written and synced in advance, at first 64 KiB at a
+time and then by its own size, up to 4 MiB (`--wal-prealloc-kb`; `0` turns it off). A
+commit then overwrites blocks that are already allocated, and ext4 and XFS sync them
+without a journal commit. Every acknowledged commit is still synced before its answer.
+Replay, readers, backups and the quota stop at the end of the last commit, a crash that
+leaves zeros inside the last transaction makes it a torn tail, and a close trims the
+zeros. A small Python loop that appends 400 bytes and calls `fdatasync` took a median of
+0.29 ms on the laptop when it was idle and 4.4 to 7.1 ms while other agents were building.
+Overwriting preallocated bytes took 0.13 ms and 0.15 to 0.56 ms.
+
+The A/B runs below alternated the two settings of the same build on forge. Another agent
+was measuring on forge for part of the time, so the absolute times vary between pairs,
+and a forge re-run of `MODE=updates` will give the comparable figures.
+
+| 10.5M, 5,000 commits, forge, median commit in ms | Pair 1 | Pair 2 | Pair 3 | Pair 4 | Pair 5 |
+|---|---:|---:|---:|---:|---:|
+| Copies of all stores made just before, preallocated | **2.40** | 5.41 | **2.78** | **2.77** | **2.86** |
+| Copies of all stores made just before, appended | 3.86 | **4.21** | 4.44 | 4.54 | 4.58 |
+| Store copy synced first, preallocated | **0.85** | 2.38 | **1.34** | **2.90** | **2.82** |
+| Store copy synced first, appended | 1.10 | **1.32** | 1.69 | 4.31 | 4.62 |
+
+With the copies' writeback running, the median of the five pairs was 2.78 ms and 278
+commits/s preallocated, against 4.44 ms and 195 commits/s appended. The preallocated log
+won four of the five pairs in each setting. Only the first pair ran on an idle forge.
+Group commit would let concurrent writers share one sync, but the
+`updates` mode sends one commit at a time and the `mixed` mode has one writer, so it was
+not built. On the laptop, where fsyncs took 0.3 ms while it was quiet, the churn showed no
+difference beyond the run-to-run noise.
+
 The `mixed` mode runs 16 concurrent `star-join` readers with `oha` for 30 s while one
 writer commits single-triple `INSERT DATA` requests as fast as it can. Every request opens
 a new connection. The other engines' figures come from the earlier, unpinned pass.
@@ -508,6 +554,68 @@ where a cold Sparkles server reads and decodes whole index blocks for a few rows
 queries that read many rows, Sparkles stays ahead when cold. At 10.5M, cold `star-join`
 took 97 ms against QLever's 366 ms, and cold `order-by-full` 481 ms against QLever's
 1,436 ms.
+
+### Changes since the forge run: cold reads
+
+A cold Sparkles server read far more than the rows it needed. Its index and vocabulary
+files are memory-mapped, and Linux answers a page fault on a file mapping by reading the
+device's whole read-ahead window around the page, 128 KiB on forge and 512 KiB on the
+laptop. At 10.5M, cold `star-lookup` read 42 MiB from disk to answer 34 rows. Most of it
+came from vocabulary lookups, where each step of a binary search over a 25 MiB file
+faulted in a window, and from turning result ids back into terms. Three changes address
+this, and each can be switched off for comparisons.
+
+* The vocabulary data and the index files are mapped for random access, so a fault reads
+  its page alone. A block column about to be decoded asks the kernel for exactly its
+  bytes and those of the block's later columns, and a pass over many sorted terms asks
+  for their range in 4 MiB windows. `SPARKLES_IO_HINTS=off` turns this off.
+* The vocabulary has a sparse index, `vocab.idx`, which holds the first key of every 128th
+  front-coded block. It is loaded at open, and a lookup then reads one range of the
+  offsets and one range of the data instead of one place per step of a binary search.
+  Loads and compactions write it, and `sparkles vocab-index` adds it to an older
+  database. It costs 66 KB at 10.5M and 8.4 MB of memory at 1.01B quads.
+  `SPARKLES_SPARSE_VOCAB=off` turns it off.
+* An index join with up to 16,384 keys asks for all the blocks it will read before it
+  decodes the first, so their reads overlap (`prefetch_blocks` in
+  `SPARKLES_DISABLE_OPTIMIZATIONS`).
+
+At 10.5M on the laptop, the bytes a cold server read for the first query fell as follows.
+The load average was 11 to 65 during these runs, so the times varied by up to 2× between
+runs of the same build, and the bytes read are the reliable measure here.
+
+| 10.5M, first query after a restart | Read before (KiB) | Read with all three (KiB) |
+|---|---:|---:|
+| Start, before the first query | 3,852 | 348 |
+| `star-lookup` | 41,880 to 44,868 | 6,756 |
+| `values-star` | 10,052 | 608 |
+| `employee-docs` | 13,792 | 2,588 |
+| `range-topk` | 15,116 | 5,716 |
+| `distinct-obj` | 3,776 | 228 |
+| `path-plus` | 512 to 1,032 | 120 |
+
+The 1.01B-quad DBpedia database on forge shows the effect on time, since forge's disk
+was idle apart from another agent's runs. The runs below alternated the old read path
+(`SPARKLES_IO_HINTS=off SPARKLES_SPARSE_VOCAB=off`), the new one and QLever, with the
+files evicted from the page cache before each start. Times are the median of two runs, and
+of three for the last two rows, which were measured again with the final build.
+
+| 1.01B, cold, ms | Sparkles before | Sparkles now | QLever | Read before → now (KiB) |
+|---|---:|---:|---:|---|
+| `entity-facts-1` | 31.2 | **14.2** | 29.0 | 11,932 → 648 |
+| `entity-facts-2` | 39.3 | **19.5** | 54.3 | 16,680 → 932 |
+| `entity-summary-1` | 25.2 | **6.1** | 28.9 | 9,880 → 312 |
+| `entity-summary-2` | 27.9 | **6.5** | 27.8 | 10,400 → 324 |
+| `redirect-target-2` | 32.3 | **13.5** | 44.6 | 10,508 → 1,076 |
+| `inlinks-count-1` | 26.2 | **9.5** | 25.6 | 8,268 → 360 |
+| `country-population` | 103.6 | 70.1 | **40.2** | 44,000 → 4,700 |
+| `outlink-classes-1` | 88.1 | **58.9** | 67.3 | 18,680 → 3,104 |
+
+Sparkles answered in 0.07 s after a start, having read 37 MB, and used 100 to 240 MiB
+afterwards. QLever took 5.2 s to start, read 930 MB doing so and used 1.45 GiB. The
+prefetch alone took `outlink-classes-1` from 69.6 to 58.9 ms (median of three) and
+`country-population` from 75.0 to 70.1 ms. `country-population` still loses to QLever. A
+warm page cache leaves 19 ms for its first run against 3 ms for the second, so part of
+its cold time is first-run work that the bytes read do not explain.
 
 ## WatDiv
 
