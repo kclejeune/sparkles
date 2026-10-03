@@ -115,8 +115,8 @@ mod tests {
         assert_eq!(
             candidates("127.0.0.1:3030", "/$/ready"),
             [
-                "https://127.0.0.1:3030/$/ready",
-                "http://127.0.0.1:3030/$/ready"
+                "http://127.0.0.1:3030/$/ready",
+                "https://127.0.0.1:3030/$/ready"
             ]
         );
         assert_eq!(
