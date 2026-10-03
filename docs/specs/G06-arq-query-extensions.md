@@ -614,8 +614,9 @@ non-goals), and parallel evaluation of `LATERAL` groups.
   stores, because the old reading included the stored default graph that a view's union
   leaves out. They now run it.
 - `--describe` and `--describe-labels` on `sparkles query` apply to `--loc` and `--data`.
-  With `--server`, the command refuses them and the dataset's setting applies, so the
-  remote client was left unchanged.
+  At first `--server` refused them. Since 2026-10-03 the remote client sends them as the
+  request parameters, along with the newer `--describe-reifiers`,
+  `--describe-max-triples` and `--describe-max-depth`.
 - Jena 6.2.0's `arq` command fails with a `NullPointerException` when a DESCRIBE query
   has `FROM` or `FROM NAMED` (`DescribeBNodeClosure` gets no dataset). The rules of §11.4
   for `FROM` are therefore checked against the design only, not against Jena.

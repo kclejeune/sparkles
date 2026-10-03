@@ -835,8 +835,11 @@ sparkles describe-settings --server URL --dataset db --set mode=outgoing
 ```
 
 A request can choose another mode with `describe=scbd` and lower the limits with
-`describe-max-triples` and `describe-max-depth`. `sparkles query --describe MODE` does
-the same for a local query. [API.md](API.md#describe) describes the modes and options.
+`describe-max-triples` and `describe-max-depth`. `sparkles query` takes the same options
+as `--describe MODE`, `--describe-labels`, `--describe-reifiers`, `--describe-max-triples
+N` and `--describe-max-depth N`. They apply to a local query, and with `--server` they
+travel to the server as the request parameters. [API.md](API.md#describe) describes the
+modes and options.
 
 ### GraphQL
 

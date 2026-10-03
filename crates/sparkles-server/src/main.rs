@@ -1120,6 +1120,17 @@ enum Cmd {
         /// DESCRIBE adds the rdfs:label and skos:prefLabel of the IRIs it links to
         #[arg(long)]
         describe_labels: bool,
+        /// DESCRIBE adds the reifiers of the triples it describes
+        #[arg(long)]
+        describe_reifiers: bool,
+        /// DESCRIBE writes at most this many triples per query (it can only lower the
+        /// dataset's limit)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        describe_max_triples: Option<u64>,
+        /// DESCRIBE follows blank nodes this many steps deep at most (it can only lower
+        /// the dataset's limit)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        describe_max_depth: Option<u32>,
         // where SERVICE may connect in a local run (a --server applies its own policy)
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
@@ -2489,6 +2500,9 @@ fn run() -> Result<()> {
             rdfs_graph,
             describe,
             describe_labels,
+            describe_reifiers,
+            describe_max_triples,
+            describe_max_depth,
             outbound,
         } => {
             let q = match (query, text) {
@@ -2497,13 +2511,25 @@ fn run() -> Result<()> {
                 _ => bail!("no query given"),
             };
             if loc.is_none() && data.is_empty() && server.is_some() {
-                if describe.is_some() || describe_labels {
-                    bail!(
-                        "--describe and --describe-labels apply to --loc and --data; a server \
-                         uses its dataset's setting (sparkles describe-settings)"
-                    );
-                }
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
+                // the server's DESCRIBE request parameters, over the dataset's setting
+                let mut params: Vec<(&str, String)> = Vec::new();
+                if let Some(m) = &describe {
+                    sparkles::sparql::describe::DescribeMode::parse(m)?;
+                    params.push(("describe", m.clone()));
+                }
+                if describe_labels {
+                    params.push(("describe-labels", "true".into()));
+                }
+                if describe_reifiers {
+                    params.push(("describe-reifiers", "true".into()));
+                }
+                if let Some(n) = describe_max_triples {
+                    params.push(("describe-max-triples", n.to_string()));
+                }
+                if let Some(n) = describe_max_depth {
+                    params.push(("describe-max-depth", n.to_string()));
+                }
                 #[cfg(feature = "auth")]
                 return remote::client::query(
                     server.as_deref(),
@@ -2513,6 +2539,7 @@ fn run() -> Result<()> {
                     &fmt,
                     timeout,
                     explain,
+                    &params,
                 );
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
@@ -2542,7 +2569,8 @@ fn run() -> Result<()> {
                         d.mode = sparkles::sparql::describe::DescribeMode::parse(m)?;
                     }
                     d.labels |= describe_labels;
-                    d
+                    d.reifiers |= describe_reifiers;
+                    d.lowered(describe_max_triples, describe_max_depth)
                 },
                 ..Default::default()
             };
