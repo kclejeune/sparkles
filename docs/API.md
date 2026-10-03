@@ -157,11 +157,17 @@ JSON object per line.
 | `sparkles_geo_rows` | gauge. Rows of the spatial index. | `dataset`, `part` = `base` \| `overlay` \| `tail` |
 | `sparkles_geo_build_seconds` | gauge. Duration of the last build of the index's base. | `dataset` |
 | `sparkles_geo_candidates_total`, `sparkles_geo_refined_total`, `sparkles_geo_matches_total`, `sparkles_geo_rechecked_total` | counter. Summed over the spatial operators of queries, in order: rows the index found, exact geometry tests, rows that passed them, and candidates the index could not place. | `dataset` |
+| `sparkles_embedding_requests_total`, `sparkles_embedding_inputs_total`, `sparkles_embedding_vectors_total` | counter. For a vector index that [computes its vectors](#embeddings-on-write): requests to its embeddings endpoint (retries included), inputs sent (cached inputs are not sent) and vectors written, since the dataset was opened. | `dataset`, `index` |
+| `sparkles_embedding_failures_total` | counter. Failed batches of kinds `transient` (after their retries), `auth`, `refused`, `fatal` and `write`. `rejected` counts inputs the provider refused or answered with an unusable vector, and `read` counts subjects whose text could not be read. | `dataset`, `index`, `kind` |
+| `sparkles_embedding_backlog` | gauge. Subjects (per graph) waiting to be embedded, the status's `backlog`. | `dataset`, `index` |
+| `sparkles_embedding_lag_commits` | gauge. Commits since the newest one whose text is all embedded, which is `headSeq − appliedSeq` of the status. | `dataset`, `index` |
 | `process_resident_memory_bytes` | gauge (Linux) | |
 
 Label values are bounded. `dataset` is an existing dataset name, or `$none` for requests
 that name no existing dataset. At most `--metrics-max-datasets` datasets (default 100) get
-their own label, and the others share `$other`. A (dataset, operation) pair appears after
+their own label, and the others share `$other`. In the embedding series, the indexes of
+the datasets that share `$other` add up their counters and backlogs by index name, and the
+largest lag stands for them all. A (dataset, operation) pair appears after
 its first request, and from then on with all nine outcomes. The `denied` outcome is a
 refusal by the auth layer. Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI
 assets are not counted. The validation series cover every validated write to a dataset
@@ -3347,6 +3353,8 @@ type EmbeddingStatus = {
 
 `paused` means that no worker runs for the dataset, as on a read-only server or a store
 opened by a local command. `disabled` means the server runs with `--no-embedding`.
+`/$/metrics` reports the same counters as `sparkles_embedding_*` series per dataset and
+index, with failures by kind (see [Metrics](#metrics)).
 
 **Data egress.** Sparkles sends text to a provider only for an index whose configuration
 names one, and only the selected literals and the texts of searches. Every request goes

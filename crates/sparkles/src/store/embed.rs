@@ -12,7 +12,10 @@ use crate::vector::embed::client::{self, CallError, Waits};
 use crate::vector::embed::worker::{
     Embedded, Item, Node, Pair, Pass, Prepared, RunningPass, Work, inputs_hash, pair_hash,
 };
-use crate::vector::embed::{Batch, EmbeddingConfig, EmbeddingScan, EmbeddingStatus, Environment};
+use crate::vector::embed::{
+    Batch, EmbeddingConfig, EmbeddingMetrics, EmbeddingScan, EmbeddingStatus, Environment,
+    FailureKind,
+};
 use oxrdf::Term;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
@@ -439,6 +442,24 @@ impl Store {
         })
     }
 
+    /// The embedding counters and gauges of every index that embeds, for metrics.
+    pub fn embedding_metrics(&self) -> Vec<EmbeddingMetrics> {
+        let head = self.snapshot().commit;
+        let works = self.embed.works.lock();
+        works
+            .values()
+            .map(|w| EmbeddingMetrics {
+                index: w.name.clone(),
+                requests: w.stats.requests,
+                inputs: w.stats.inputs,
+                vectors: w.stats.embedded,
+                failures: w.stats.failures,
+                backlog: w.queue.len() as u64,
+                lag: head.saturating_sub(w.applied(head)),
+            })
+            .collect()
+    }
+
     /// The worker's first step: start or continue a full pass, or take a batch of
     /// scheduled pairs and compute their inputs. Holds no lock a commit needs while it
     /// reads the store.
@@ -728,6 +749,7 @@ impl Store {
             match r {
                 Err(e) => {
                     w.stats.failed += 1;
+                    w.stats.fail(FailureKind::Read, 1);
                     w.error(format!("reading the text: {e}"), None);
                 }
                 Ok((inputs, n_vectors, subject)) => {
@@ -791,9 +813,20 @@ impl Store {
                 return;
             };
             w.stats.requests += requests;
+            w.stats.inputs += sent;
             match vectors {
                 Ok(v) => v,
                 Err(e) => {
+                    w.stats.fail(
+                        match &e {
+                            CallError::Transient(..) => FailureKind::Transient,
+                            CallError::Auth(_) => FailureKind::Auth,
+                            CallError::Refused(_) => FailureKind::Refused,
+                            CallError::Fatal(_) => FailureKind::Fatal,
+                            CallError::Rejected(_) => FailureKind::Rejected,
+                        },
+                        1,
+                    );
                     let wait = match &e {
                         CallError::Auth(_) | CallError::Fatal(_) | CallError::Refused(_) => {
                             AUTH_BACKOFF
@@ -847,6 +880,7 @@ impl Store {
                         Outcome::Failed(ph, h, n, msg, subject) => {
                             w.failed.insert(ph, h);
                             w.stats.failed += n;
+                            w.stats.fail(FailureKind::Rejected, n);
                             w.error(msg, Some(subject));
                         }
                         Outcome::Skipped => {}
@@ -860,6 +894,7 @@ impl Store {
                     Error::Rejected(_) | Error::Invalid(_) | Error::NotPermitted(_)
                 );
                 w.error(format!("writing the vectors: {e}"), None);
+                w.stats.fail(FailureKind::Write, 1);
                 if permanent {
                     for it in &batch.items {
                         w.failed

@@ -4,7 +4,7 @@
 
 use super::client::{self, CallError, Waits};
 use super::config::EmbeddingConfig;
-use super::{EmbeddingBatch, EmbeddingError, Environment, Fnv};
+use super::{EmbeddingBatch, EmbeddingError, Environment, FailureKind, Fnv};
 use crate::id::{Id, Tag};
 use crate::store::Snapshot;
 use parking_lot::{Condvar, Mutex};
@@ -242,8 +242,19 @@ pub(crate) struct Stats {
     pub embedded: u64,
     pub requests: u64,
     pub failed: u64,
+    /// inputs sent to the provider
+    pub inputs: u64,
+    /// failures by kind ([`FailureKind::ALL`]'s order), for the metrics
+    pub failures: [u64; FailureKind::ALL.len()],
     pub last_error: Option<EmbeddingError>,
     pub last_batch: Option<EmbeddingBatch>,
+}
+
+impl Stats {
+    /// Count `n` failures of `kind`.
+    pub fn fail(&mut self, kind: FailureKind, n: u64) {
+        self.failures[kind as usize] += n;
+    }
 }
 
 /// The embedding state of one index.

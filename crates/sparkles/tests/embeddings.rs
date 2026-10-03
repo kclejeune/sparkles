@@ -10,7 +10,7 @@ use sparkles::sparql::{QueryOptions, query};
 use sparkles::store::{Store, StoreOptions};
 use sparkles::vector::VectorIndexConfig;
 use sparkles::vector::embed::mock::MockProvider;
-use sparkles::vector::embed::{ApiKey, EmbeddingConfig, Environment, SecretSource};
+use sparkles::vector::embed::{ApiKey, EmbeddingConfig, Environment, FailureKind, SecretSource};
 use std::time::Duration;
 
 const EMB: &str = "http://example.org/emb";
@@ -228,6 +228,12 @@ fn outages_back_off_and_writes_go_on() {
     // writes are not held up
     run(&s, "INSERT DATA { ex:b rdfs:label \"beta\" }");
     assert_eq!(s.embedding_status("docs").unwrap().backlog, 2);
+    // the metrics count the failed batch by kind, and the commits not yet embedded
+    let m = &s.embedding_metrics()[0];
+    assert_eq!(m.index, "docs");
+    assert_eq!(m.failures[FailureKind::Transient as usize], 1, "{m:?}");
+    assert_eq!(m.failures.iter().sum::<u64>(), 1, "{m:?}");
+    assert_eq!((m.vectors, m.backlog, m.lag), (0, 2, 2), "{m:?}");
     mock.state().fail = None;
     s.retry_embedding();
     embed(&s);
@@ -240,6 +246,10 @@ fn outages_back_off_and_writes_go_on() {
         [expected("beta")]
     );
     assert_eq!(s.embedding_status("docs").unwrap().state, "idle");
+    let m = &s.embedding_metrics()[0];
+    assert_eq!((m.vectors, m.backlog, m.lag), (2, 0, 0), "{m:?}");
+    assert_eq!(m.inputs, 3, "{m:?}");
+    assert_eq!(m.requests, mock.state().requests, "{m:?}");
 }
 
 #[test]
@@ -262,6 +272,10 @@ fn rejected_inputs_fail_alone() {
     assert!(vectors(&s, "http://example.org/b", None).is_empty());
     let st = s.embedding_status("docs").unwrap();
     assert_eq!(st.failed, 1);
+    let m = &s.embedding_metrics()[0];
+    assert_eq!(m.failures[FailureKind::Rejected as usize], 1, "{m:?}");
+    assert_eq!(m.failures.iter().sum::<u64>(), 1, "{m:?}");
+    assert_eq!(m.vectors, 3, "{m:?}");
     assert_eq!(
         st.last_error.unwrap().subject.as_deref(),
         Some("<http://example.org/b>")

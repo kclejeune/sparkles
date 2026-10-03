@@ -287,6 +287,106 @@ pub fn spawn_embedders(st: Arc<crate::state::AppState>) {
     }
 }
 
+/// The embedding series of the indexes that embed (`sparkles_embedding_*`), by dataset
+/// label and index. Datasets past `--metrics-max-datasets` share `$other`: their counters
+/// and backlogs add up, and their lag is the largest.
+pub fn metrics(st: &crate::state::AppState, out: &mut String) {
+    use sparkles::vector::embed::FailureKind;
+    use std::collections::BTreeMap;
+    use std::fmt::Write;
+    let datasets: Vec<Arc<crate::state::Dataset>> = st.datasets.read().values().cloned().collect();
+    let mut all: BTreeMap<(String, String), sparkles::vector::embed::EmbeddingMetrics> =
+        BTreeMap::new();
+    for d in &datasets {
+        for m in d.store.embedding_metrics() {
+            let key = (st.metrics.dataset_label(Some(&d.name)), m.index.clone());
+            let a = all.entry(key).or_default();
+            a.requests += m.requests;
+            a.inputs += m.inputs;
+            a.vectors += m.vectors;
+            for (x, y) in a.failures.iter_mut().zip(m.failures) {
+                *x += y;
+            }
+            a.backlog += m.backlog;
+            a.lag = a.lag.max(m.lag);
+        }
+    }
+    if all.is_empty() {
+        return;
+    }
+    let label = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    };
+    let family = |o: &mut String, name: &str, kind: &str, help: &str| {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} {kind}");
+    };
+    type Pick = fn(&sparkles::vector::embed::EmbeddingMetrics) -> u64;
+    let simple: [(&str, &str, &str, Pick); 5] = [
+        (
+            "sparkles_embedding_requests_total",
+            "counter",
+            "Requests to the embeddings endpoint, retries included.",
+            |m| m.requests,
+        ),
+        (
+            "sparkles_embedding_inputs_total",
+            "counter",
+            "Inputs sent to the embeddings endpoint (cached inputs are not sent).",
+            |m| m.inputs,
+        ),
+        (
+            "sparkles_embedding_vectors_total",
+            "counter",
+            "Vectors the embedding worker wrote.",
+            |m| m.vectors,
+        ),
+        (
+            "sparkles_embedding_backlog",
+            "gauge",
+            "Subjects (per graph) waiting to be embedded.",
+            |m| m.backlog,
+        ),
+        (
+            "sparkles_embedding_lag_commits",
+            "gauge",
+            "Commits since the newest one whose text is all embedded.",
+            |m| m.lag,
+        ),
+    ];
+    for (name, kind, help, pick) in simple {
+        family(out, name, kind, help);
+        for ((ds, index), m) in &all {
+            let _ = writeln!(
+                out,
+                "{name}{{dataset=\"{}\",index=\"{}\"}} {}",
+                label(ds),
+                label(index),
+                pick(m)
+            );
+        }
+    }
+    family(
+        out,
+        "sparkles_embedding_failures_total",
+        "counter",
+        "Embedding failures by kind: failed batches (transient, auth, refused, fatal, write), inputs the provider refused or answered with an unusable vector (rejected), and pairs whose text could not be read (read).",
+    );
+    for ((ds, index), m) in &all {
+        for (k, n) in FailureKind::ALL.iter().zip(m.failures) {
+            let _ = writeln!(
+                out,
+                "sparkles_embedding_failures_total{{dataset=\"{}\",index=\"{}\",kind=\"{}\"}} {n}",
+                label(ds),
+                label(index),
+                k.name()
+            );
+        }
+    }
+}
+
 /// `POST /$/vector/{ds}/{name}/recall?samples=100&k=10&ef=`: recall@k of the graph
 /// against the exact search, with stored vectors as the queries.
 async fn recall(
