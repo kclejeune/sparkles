@@ -679,6 +679,12 @@ impl Lane {
     }
 }
 
+/// What a spur search of Yen's algorithm may not use.
+struct Bans<'b> {
+    nodes: &'b FxHashSet<u64>,
+    edges: &'b FxHashSet<Edge>,
+}
+
 /// The neighbours of each node (and direction) a search looked up.
 type Neighbours = FxHashMap<(u64, bool), Rc<[Step]>>;
 
@@ -686,7 +692,9 @@ type Neighbours = FxHashMap<(u64, bool), Rc<[Step]>>;
 struct Found {
     start: u64,
     end: u64,
+    /// the edges, when an output needs them (edge variables or weights)
     edges: Vec<Edge>,
+    len: usize,
     cost: f64,
 }
 
@@ -922,6 +930,10 @@ impl<'a> Engine<'a> {
         let Some(w) = self.spec.weight else {
             return Ok(1.0);
         };
+        // no reifier or no weight property in the store: every edge has the default
+        if w.is_none() || self.spec.reifies.is_none() {
+            return Ok(self.spec.default_weight);
+        }
         let key = e.triple();
         if let Some(&x) = self.weights.borrow().get(&key) {
             return Ok(x);
@@ -998,6 +1010,7 @@ impl<'a> Engine<'a> {
     /// for: when the tree's root is virtual it is expanded as that node, and when
     /// `close` is set a neighbour equal to it is recorded as the virtual id (the end of
     /// a cycle) and never expanded. Returns the nodes of the new level.
+    #[allow(clippy::too_many_arguments)]
     fn grow(
         &self,
         tree: &mut Tree,
@@ -1006,6 +1019,7 @@ impl<'a> Engine<'a> {
         all: bool,
         virt: u64,
         close: bool,
+        bans: Option<&Bans>,
     ) -> Result<Vec<u64>> {
         let mut scan: Vec<u64> = Vec::with_capacity(frontier.len());
         let mut virt_root = false;
@@ -1036,20 +1050,40 @@ impl<'a> Engine<'a> {
             if y == tree.root {
                 continue;
             }
+            if let Some(b) = bans {
+                let e = if tree.forward {
+                    Edge {
+                        from: x,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: x,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                if b.nodes.contains(&y) || b.edges.contains(&e) {
+                    continue;
+                }
+            }
             let parent = Parent {
                 node: x,
                 p: st.p,
                 rev: st.rev,
             };
-            match tree.first.get(&y) {
-                None => {
-                    tree.first.insert(y, (parent, depth + 1));
+            match tree.first.entry(y) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((parent, depth + 1));
                     next.push(y);
                 }
-                Some(&(_, l)) if all && l == depth + 1 => {
+                std::collections::hash_map::Entry::Occupied(o) if all && o.get().1 == depth + 1 => {
                     tree.extra.entry(y).or_default().push(parent);
                 }
-                Some(_) => {}
+                std::collections::hash_map::Entry::Occupied(_) => {}
             }
         }
         self.visit(next.len() as u64)?;
@@ -1060,13 +1094,35 @@ impl<'a> Engine<'a> {
     /// Unweighted shortest paths between one pair by bidirectional breadth-first
     /// search.
     fn bidirectional(&self, s: u64, t: u64, all: bool, cap: usize) -> Result<Vec<Vec<Edge>>> {
-        let cycle = s == t;
-        let tt = if cycle { VIRT } else { t };
+        let tt = if s == t { VIRT } else { t };
+        let real = |x: u64| if x == VIRT { s } else { x };
+        Ok(self
+            .bidi(s, tt, s, all, cap, None, self.spec.max_len)?
+            .into_iter()
+            .map(|p| p.into_iter().map(|e| e.map(real)).collect())
+            .collect())
+    }
+
+    /// Bidirectional breadth-first search from `s` to `tt`, which is the virtual id
+    /// when the path closes a cycle at `virt`. Paths keep the virtual id. `bans` are
+    /// the nodes and edges a spur search of Yen's algorithm may not use.
+    #[allow(clippy::too_many_arguments)]
+    fn bidi(
+        &self,
+        s: u64,
+        tt: u64,
+        virt: u64,
+        all: bool,
+        cap: usize,
+        bans: Option<&Bans>,
+        max: Option<u32>,
+    ) -> Result<Vec<Vec<Edge>>> {
+        let cycle = tt == VIRT;
         let mut f = Tree::new(s, true);
         let mut b = Tree::new(tt, false);
         let (mut ff, mut bf) = (vec![s], vec![tt]);
         let (mut fd, mut bd) = (0u32, 0u32);
-        let max = self.spec.max_len.unwrap_or(u32::MAX);
+        let max = max.unwrap_or(u32::MAX);
         self.visit(2)?;
         loop {
             if fd.saturating_add(bd) >= max || ff.is_empty() || bf.is_empty() {
@@ -1074,11 +1130,11 @@ impl<'a> Engine<'a> {
             }
             let forward = ff.len() <= bf.len();
             let (new, other) = if forward {
-                ff = self.grow(&mut f, &ff, fd, all, s, cycle)?;
+                ff = self.grow(&mut f, &ff, fd, all, virt, cycle, bans)?;
                 fd += 1;
                 (&ff, &b)
             } else {
-                bf = self.grow(&mut b, &bf, bd, all, s, false)?;
+                bf = self.grow(&mut b, &bf, bd, all, virt, false, bans)?;
                 bd += 1;
                 (&bf, &f)
             };
@@ -1087,7 +1143,6 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let mut out = Vec::new();
-            let real = |x: u64| if x == VIRT { s } else { x };
             for m in meet {
                 let left = cap.saturating_sub(out.len());
                 if left == 0 {
@@ -1097,7 +1152,7 @@ impl<'a> Engine<'a> {
                 let bp = b.paths(m, all, left);
                 'combine: for a in &fp {
                     for z in &bp {
-                        let mut e: Vec<Edge> = a.iter().chain(z).map(|e| e.map(real)).collect();
+                        let mut e: Vec<Edge> = a.iter().chain(z).copied().collect();
                         e.shrink_to_fit();
                         out.push(e);
                         if out.len() >= cap {
@@ -1137,7 +1192,7 @@ impl<'a> Engine<'a> {
             .unwrap_or_default();
         self.visit(1)?;
         while !frontier.is_empty() && depth < max {
-            frontier = self.grow(&mut tree, &frontier, depth, all, root, close)?;
+            frontier = self.grow(&mut tree, &frontier, depth, all, root, close, None)?;
             depth += 1;
             if targets.is_some() {
                 for y in &frontier {
@@ -1199,7 +1254,15 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let scan = if u == VIRT { virt } else { u };
-            for st in self.neighbours(scan, forward)?.iter() {
+            // a plain search expands each node once; Yen's spur searches revisit them
+            let steps: Rc<[Step]> = if banned_nodes.is_some() {
+                self.neighbours(scan, forward)?
+            } else {
+                let mut out = Vec::new();
+                self.expand(&[scan], forward, &mut out)?;
+                out.into_iter().map(|(_, s)| s).collect()
+            };
+            for st in steps.iter() {
                 let y = if close && st.node == virt {
                     VIRT
                 } else {
@@ -1266,8 +1329,8 @@ impl<'a> Engine<'a> {
         banned_edges: &FxHashSet<Edge>,
         budget: Option<u32>,
     ) -> Result<Option<(Vec<Edge>, f64)>> {
-        let close = to == VIRT;
         if self.spec.weighted() {
+            let close = to == VIRT;
             let targets: FxHashSet<u64> = [if close { virt } else { to }].into_iter().collect();
             let (tree, dist) = self.dijkstra(
                 from,
@@ -1284,63 +1347,18 @@ impl<'a> Engine<'a> {
             };
             return Ok(tree.paths(to, false, 1).pop().map(|p| (p, c)));
         }
-        // breadth-first, one parent per node
-        let mut parent: FxHashMap<u64, (u64, Step)> = FxHashMap::default();
-        let mut frontier = vec![from];
-        let mut depth = 0u32;
-        let max = budget.unwrap_or(u32::MAX);
-        self.visit(1)?;
-        while !frontier.is_empty() && depth < max {
-            let mut next = Vec::new();
-            for &x in &frontier {
-                if x == VIRT {
-                    continue;
-                }
-                for st in self.neighbours(x, true)?.iter() {
-                    let y = if close && st.node == virt {
-                        VIRT
-                    } else {
-                        st.node
-                    };
-                    if y == from || parent.contains_key(&y) || banned_nodes.contains(&y) {
-                        continue;
-                    }
-                    let e = Edge {
-                        from: x,
-                        to: y,
-                        p: st.p,
-                        rev: st.rev,
-                    };
-                    if banned_edges.contains(&e) {
-                        continue;
-                    }
-                    parent.insert(y, (x, *st));
-                    next.push(y);
-                }
-            }
-            self.visit(next.len() as u64)?;
-            depth += 1;
-            if parent.contains_key(&to) {
-                let mut edges = Vec::new();
-                let mut y = to;
-                while y != from {
-                    let (x, st) = parent[&y];
-                    edges.push(Edge {
-                        from: x,
-                        to: y,
-                        p: st.p,
-                        rev: st.rev,
-                    });
-                    y = x;
-                }
-                edges.reverse();
-                let c = edges.len() as f64;
-                return Ok(Some((edges, c)));
-            }
-            self.ctx.check()?;
-            frontier = next;
-        }
-        Ok(None)
+        // bidirectional breadth-first search around the banned nodes and edges
+        let bans = Bans {
+            nodes: banned_nodes,
+            edges: banned_edges,
+        };
+        Ok(self
+            .bidi(from, to, virt, false, 1, Some(&bans), budget)?
+            .pop()
+            .map(|p| {
+                let c = p.len() as f64;
+                (p, c)
+            }))
     }
 
     /// Simple paths in nondecreasing cost by Yen's algorithm; `accept` sees each one
@@ -1611,10 +1629,15 @@ pub fn run(
     let weighted = spec.weighted();
     let all = matches!(spec.algorithm, Algorithm::AllShortest);
     // add a path found from a source (`fwd`) or into a target
+    let (want_pairs, want_sources) = (Cell::new(true), Cell::new(true));
+    let need_edges = spec.per_edge() || weighted;
+    // a path known only by its length (one shortest path, no edge outputs, no weights)
+    let by_level = !need_edges && !all;
     let mut add = |found: &mut Vec<Found>,
                    start: u64,
                    end: u64,
                    edges: Vec<Edge>,
+                   len: Option<usize>,
                    fwd: bool|
      -> Result<bool> {
         if !eng.take() {
@@ -1622,16 +1645,24 @@ pub fn run(
         }
         let cost = eng.path_cost(&edges)?;
         let i = found.len() as u32;
+        let len = len.unwrap_or(edges.len());
+        let edges = if need_edges { edges } else { Vec::new() };
         eng.charge.add(edges.len() as u64 * 32 + 64)?;
         found.push(Found {
             start,
             end,
             edges,
+            len,
             cost,
         });
         if fwd {
-            by_pair.entry((start, end)).or_default().push(i);
-            by_source.entry(start).or_default().push(i);
+            // only the lookups some input row makes
+            if want_pairs.get() {
+                by_pair.entry((start, end)).or_default().push(i);
+            }
+            if want_sources.get() {
+                by_source.entry(start).or_default().push(i);
+            }
         } else {
             by_target.entry(end).or_default().push(i);
         }
@@ -1647,6 +1678,8 @@ pub fn run(
             break;
         }
         let tset: FxHashSet<u64> = targets.set.iter().copied().collect();
+        want_pairs.set(!targets.set.is_empty());
+        want_sources.set(targets.any);
         match spec.algorithm {
             Algorithm::Shortest | Algorithm::AllShortest if yen_shortest => {
                 if targets.any {
@@ -1657,7 +1690,7 @@ pub fn run(
                 for &t in &targets.set {
                     eng.begin();
                     if spec.min_len == 0 && s == t {
-                        if !add(&mut found, s, t, Vec::new(), true)? {
+                        if !add(&mut found, s, t, Vec::new(), None, true)? {
                             break 'sources;
                         }
                         continue;
@@ -1678,7 +1711,7 @@ pub fn run(
                         Ok(all)
                     })?;
                     for p in out {
-                        if !add(&mut found, s, t, p, true)? {
+                        if !add(&mut found, s, t, p, None, true)? {
                             break 'sources;
                         }
                     }
@@ -1690,11 +1723,11 @@ pub fn run(
                     let t = *targets.set.first().unwrap();
                     eng.begin();
                     if spec.min_len == 0 && s == t {
-                        add(&mut found, s, t, Vec::new(), true)?;
+                        add(&mut found, s, t, Vec::new(), None, true)?;
                         continue;
                     }
                     for p in eng.bidirectional(s, t, all, if all { cap(&eng) } else { 1 })? {
-                        if !add(&mut found, s, t, p, true)? {
+                        if !add(&mut found, s, t, p, None, true)? {
                             break 'sources;
                         }
                     }
@@ -1732,18 +1765,26 @@ pub fn run(
                 // the empty one, not a cycle
                 if spec.min_len == 0 && close {
                     ends.retain(|&m| m != VIRT);
-                    if !add(&mut found, s, s, Vec::new(), true)? {
+                    if !add(&mut found, s, s, Vec::new(), None, true)? {
                         break 'sources;
                     }
                 }
                 for m in ends {
                     let end = if m == VIRT { s } else { m };
+                    if by_level && !weighted {
+                        if let Some(&(_, level)) = tree.first.get(&m)
+                            && !add(&mut found, s, end, Vec::new(), Some(level as usize), true)?
+                        {
+                            break 'sources;
+                        }
+                        continue;
+                    }
                     for p in tree.paths(m, all, if all { cap(&eng) } else { 1 }) {
                         let p = p
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { s } else { x }))
                             .collect();
-                        if !add(&mut found, s, end, p, true)? {
+                        if !add(&mut found, s, end, p, None, true)? {
                             break 'sources;
                         }
                     }
@@ -1757,7 +1798,7 @@ pub fn run(
                     eng.begin();
                     let mut n = 0usize;
                     if spec.min_len == 0 && s == t {
-                        if !add(&mut found, s, t, Vec::new(), true)? {
+                        if !add(&mut found, s, t, Vec::new(), None, true)? {
                             break 'sources;
                         }
                         n += 1;
@@ -1776,7 +1817,7 @@ pub fn run(
                         Ok(n < spec.k && out.len() < cap(&eng))
                     })?;
                     for p in out {
-                        if !add(&mut found, s, t, p, true)? {
+                        if !add(&mut found, s, t, p, None, true)? {
                             break 'sources;
                         }
                     }
@@ -1786,7 +1827,7 @@ pub fn run(
                 eng.begin();
                 let mut stop = false;
                 eng.all_paths(s, true, (!targets.any).then_some(&tset), &mut |p, end| {
-                    if !add(&mut found, s, end, p.to_vec(), true)? {
+                    if !add(&mut found, s, end, p.to_vec(), None, true)? {
                         stop = true;
                         return Ok(false);
                     }
@@ -1816,7 +1857,7 @@ pub fn run(
                 } else {
                     eng.bfs(t, false, None, all, true)?
                 };
-                if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), false)? {
+                if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false)? {
                     break 'targets;
                 }
                 let mut starts: Vec<u64> = tree.first.keys().copied().collect();
@@ -1826,12 +1867,27 @@ pub fn run(
                 starts.sort_unstable_by_key(|&x| if x == VIRT { t } else { x });
                 for m in starts {
                     let start = if m == VIRT { t } else { m };
+                    if by_level && !weighted {
+                        if let Some(&(_, level)) = tree.first.get(&m)
+                            && !add(
+                                &mut found,
+                                start,
+                                t,
+                                Vec::new(),
+                                Some(level as usize),
+                                false,
+                            )?
+                        {
+                            break 'targets;
+                        }
+                        continue;
+                    }
                     for p in tree.paths(m, all, if all { cap(&eng) } else { 1 }) {
                         let p = p
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { t } else { x }))
                             .collect();
-                        if !add(&mut found, start, t, p, false)? {
+                        if !add(&mut found, start, t, p, None, false)? {
                             break 'targets;
                         }
                     }
@@ -1840,7 +1896,7 @@ pub fn run(
             Algorithm::All => {
                 let mut stop = false;
                 eng.all_paths(t, false, None, &mut |p, start| {
-                    if !add(&mut found, start, t, p.to_vec(), false)? {
+                    if !add(&mut found, start, t, p.to_vec(), None, false)? {
                         stop = true;
                         return Ok(false);
                     }
@@ -1882,12 +1938,13 @@ pub fn run(
         if weighted {
             Id::from_f64(f.cost).unwrap_or_else(|| ctx.intern_value(&Value::Double(f.cost.into())))
         } else {
-            int(f.edges.len())
+            int(f.len)
         }
     };
     let empty: Vec<u32> = Vec::new();
     let mut row = vec![Id::UNDEF; vars.len()];
     let mut path_row = vec![Id::UNDEF; vars.len()];
+    let mut r = vec![Id::UNDEF; vars.len()];
     for (i, key) in keys.iter().enumerate() {
         if i % 1024 == 0 {
             ctx.check()?;
@@ -1913,16 +1970,12 @@ pub fn run(
             set(src_c, Id(f.start), &mut path_row);
             set(tgt_c, Id(f.end), &mut path_row);
             set(pi_c, int(pid as usize), &mut path_row);
-            set(len_c, int(f.edges.len()), &mut path_row);
+            set(len_c, int(f.len), &mut path_row);
             set(cost_c, cost_id(f), &mut path_row);
-            let edge_rows: Vec<Option<(usize, &Edge)>> = if per_edge && !f.edges.is_empty() {
-                f.edges.iter().enumerate().map(Some).collect()
-            } else {
-                vec![None]
-            };
-            for er in edge_rows {
-                let mut r = path_row.clone();
-                if let Some((k, e)) = er {
+            let n_rows = if per_edge { f.edges.len().max(1) } else { 1 };
+            for k in 0..n_rows {
+                r.copy_from_slice(&path_row);
+                if per_edge && let Some(e) = f.edges.get(k) {
                     let (s, p, o) = e.triple();
                     set(ei_c, int(k), &mut r);
                     set(es_c, Id(s), &mut r);
