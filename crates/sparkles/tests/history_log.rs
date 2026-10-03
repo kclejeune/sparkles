@@ -383,9 +383,11 @@ fn a_crash_loses_no_recorded_change() {
     let crash2 = dir.path().join("crash2");
     copy_dir(&root, &crash2);
     let seg = open_segment(&crash2);
-    let len = std::fs::metadata(&seg).unwrap().len();
+    // the records end where the zeros written ahead of them begin
+    let bytes = std::fs::read(&seg).unwrap();
+    let end = bytes.iter().rposition(|&b| b != 0).unwrap() + 1;
     let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
-    f.set_len(len - 7).unwrap();
+    f.set_len(end as u64 - 7).unwrap();
     drop(f);
     {
         use std::io::Write;
@@ -1003,12 +1005,30 @@ fn commit_latency_with_and_without_the_change_log() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000);
-    let rounds = 4;
+    let rounds = 6;
     let dir = bench_dir();
+    let base = || -> Source {
+        // a base of 10,000 quads, so commits intern into a real vocabulary
+        let b: String = (0..10_000)
+            .map(|i| {
+                format!(
+                    "<http://example.org/s{i}> <http://example.org/p{}> \"value {i}\" .\n",
+                    i % 20
+                )
+            })
+            .collect();
+        Source::from_bytes(b.into_bytes(), RdfFormat::NTriples, None)
+    };
+    let edit = |i: usize, tag: &str| {
+        format!(
+            "INSERT DATA {{ <http://example.org/s{}> <http://example.org/updated> \"edit {i} of {tag}\" }}",
+            i % 10_000
+        )
+    };
+    // latency alone, the two settings interleaved so that drift on a shared machine hits
+    // both alike
     let mut lat: BTreeMap<bool, Vec<f64>> = BTreeMap::new();
-    let mut sizes = Vec::new();
     for round in 0..rounds {
-        // alternate the order, so drift on a shared machine hits both alike
         let order = if round % 2 == 0 {
             [true, false]
         } else {
@@ -1024,79 +1044,25 @@ fn commit_latency_with_and_without_the_change_log() {
                 },
             )
             .unwrap();
-            // a base of 10,000 quads, so commits intern into a real vocabulary
-            let base: String = (0..10_000)
-                .map(|i| {
-                    format!(
-                        "<http://example.org/s{i}> <http://example.org/p{}> \"value {i}\" .\n",
-                        i % 20
-                    )
-                })
-                .collect();
-            s.load(&[Source::from_bytes(
-                base.into_bytes(),
-                RdfFormat::NTriples,
-                None,
-            )])
-            .unwrap();
+            s.load(&[base()]).unwrap();
             s.flush_change_log().unwrap();
-            let bytes0 = s.change_log_status().map_or(0, |st| st.bytes);
-            let wal0 = s.wal_bytes();
-            let v = lat.entry(on).or_default();
+            let mut v = Vec::with_capacity(commits);
             for i in 0..commits {
-                let u = format!(
-                    "INSERT DATA {{ <http://example.org/s{}> <http://example.org/updated> \"edit {i} of round {round}\" }}",
-                    i % 10_000
-                );
+                let u = edit(i, &format!("round {round}"));
                 let t = std::time::Instant::now();
                 update(&s, &u, &QueryOptions::default()).unwrap();
                 v.push(t.elapsed().as_secs_f64() * 1e3);
             }
-            if on {
-                s.flush_change_log().unwrap();
-                let st = s.change_log_status().unwrap();
-                sizes.push((st.bytes - bytes0, s.wal_bytes() - wal0));
-                // write throughput: queue the commits, then write them in one go
-                s.change_log().unwrap().set_background(false);
-                for i in 0..commits {
-                    update(
-                        &s,
-                        &format!(
-                            "INSERT DATA {{ <http://example.org/q{i}> <http://example.org/p> {i} }}"
-                        ),
-                        &QueryOptions::default(),
-                    )
-                    .unwrap();
-                }
-                let t = std::time::Instant::now();
-                s.flush_change_log().unwrap();
-                let w = t.elapsed().as_secs_f64() * 1e3;
-                // recovery: queued commits lost in a crash come back from the WAL
-                for i in 0..commits {
-                    update(
-                        &s,
-                        &format!(
-                            "INSERT DATA {{ <http://example.org/r{i}> <http://example.org/p> {i} }}"
-                        ),
-                        &QueryOptions::default(),
-                    )
-                    .unwrap();
-                }
-                let crash = dir.path().join(format!("crash{round}"));
-                copy_dir(&root, &crash);
-                let t = std::time::Instant::now();
-                let c = Store::open(&crash, StoreOptions::default()).unwrap();
-                let open_ms = t.elapsed().as_secs_f64() * 1e3;
-                assert_eq!(
-                    c.change_log_status().unwrap().last,
-                    Some(c.head_commit().seq)
-                );
-                println!(
-                    "round {round}: wrote {commits} queued commits in {w:.1} ms ({:.1} µs each); reopened with {commits} to recover in {open_ms:.0} ms",
-                    w * 1e3 / commits as f64
-                );
-                s.change_log().unwrap().set_background(true);
-            }
+            let mean = v.iter().sum::<f64>() / v.len() as f64;
+            let max = v.iter().cloned().fold(0.0, f64::max);
+            println!(
+                "round {round}, change log {}: mean {mean:.3} ms, p50 {:.3} ms, max {max:.1} ms",
+                if on { "on " } else { "off" },
+                percentile(&mut v.clone(), 0.5)
+            );
+            lat.entry(on).or_default().extend(v);
+            drop(s);
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
     for (on, v) in &mut lat {
@@ -1110,13 +1076,76 @@ fn commit_latency_with_and_without_the_change_log() {
             percentile(v, 0.99),
         );
     }
-    for (bytes, wal) in &sizes {
-        println!(
-            "{commits} single-triple commits: change log +{bytes} bytes ({:.0} per commit), write-ahead log +{wal} bytes ({:.0} per commit)",
-            *bytes as f64 / commits as f64,
-            *wal as f64 / commits as f64
-        );
+    // disk per commit, write throughput and recovery, on a store of its own
+    let root = dir.path().join("extras");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    s.load(&[base()]).unwrap();
+    s.flush_change_log().unwrap();
+    let bytes0 = s.change_log_status().unwrap().bytes;
+    let wal0 = s.wal_bytes();
+    for i in 0..commits {
+        update(&s, &edit(i, "size"), &QueryOptions::default()).unwrap();
     }
+    s.flush_change_log().unwrap();
+    let (bytes, wal) = (
+        s.change_log_status().unwrap().bytes - bytes0,
+        s.wal_bytes() - wal0,
+    );
+    println!(
+        "{commits} single-triple commits: change log +{bytes} bytes ({:.0} per commit), write-ahead log +{wal} bytes ({:.0} per commit)",
+        bytes as f64 / commits as f64,
+        wal as f64 / commits as f64
+    );
+    // write throughput: queue the commits, then write them in one go
+    s.change_log().unwrap().set_background(false);
+    for i in 0..commits {
+        update(&s, &edit(i, "queue"), &QueryOptions::default()).unwrap();
+    }
+    let t = std::time::Instant::now();
+    s.flush_change_log().unwrap();
+    let w = t.elapsed().as_secs_f64() * 1e3;
+    // recovery: queued commits lost in a crash come back from the WAL
+    for i in 0..commits {
+        update(&s, &edit(i, "crash"), &QueryOptions::default()).unwrap();
+    }
+    let crash = dir.path().join("crash");
+    copy_dir(&root, &crash);
+    let t = std::time::Instant::now();
+    let c = Store::open(&crash, StoreOptions::default()).unwrap();
+    let open_ms = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(
+        c.change_log_status().unwrap().last,
+        Some(c.head_commit().seq)
+    );
+    drop(c);
+    let t = std::time::Instant::now();
+    drop(Store::open(&crash, StoreOptions::default()).unwrap());
+    let reopen_ms = t.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "wrote {commits} queued commits in {w:.1} ms ({:.1} µs each); an open that recovered {commits} commits took {open_ms:.0} ms, the next open {reopen_ms:.0} ms",
+        w * 1e3 / commits as f64
+    );
+    s.change_log().unwrap().set_background(true);
+    // queries: one subject through the index, and every change
+    let q = HistoryQuery {
+        subjects: vec![Term::NamedNode(
+            NamedNode::new("http://example.org/s42").unwrap(),
+        )],
+        ..Default::default()
+    };
+    s.history_changes(&q).unwrap();
+    let t = std::time::Instant::now();
+    let one = s.history_changes(&q).unwrap();
+    let one_ms = t.elapsed().as_secs_f64() * 1e3;
+    let t = std::time::Instant::now();
+    let all = s.history_changes(&HistoryQuery::default()).unwrap();
+    let all_ms = t.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "history of one subject: {} changes in {one_ms:.2} ms; every change ({} over {} commits) in {all_ms:.1} ms",
+        one.changes.len(),
+        all.changes.len(),
+        s.head_commit().seq
+    );
     // what a sync of its own per commit would cost: append a record and fdatasync
     let f = dir.path().join("sync-probe");
     let mut file = std::fs::OpenOptions::new()

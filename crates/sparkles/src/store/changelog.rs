@@ -82,6 +82,8 @@ const ROLE_O: u8 = b'o';
 const DEBOUNCE: Duration = Duration::from_millis(5);
 /// The background writer syncs at most this often.
 const SYNC_EVERY: Duration = Duration::from_secs(1);
+/// The most zeros written ahead of the open segment's records at once.
+const PREALLOC: u64 = 1 << 20;
 /// Sealed segment indexes kept in memory.
 const INDEX_CACHE: usize = 8;
 
@@ -682,6 +684,8 @@ struct Inner {
     segs: Vec<Segment>,
     /// the open segment's file
     file: Option<File>,
+    /// the open segment file's length: records, then zeros written ahead of them
+    alloc: u64,
     /// unsynced bytes were written
     dirty: bool,
     /// the newest commit covered (`None`: nothing recorded yet)
@@ -931,9 +935,14 @@ impl ChangeLog {
             )?),
             _ => None,
         };
+        let alloc = match &file {
+            Some(f) => f.metadata()?.len(),
+            None => 0,
+        };
         Ok(Some(Inner {
             segs,
             file,
+            alloc,
             dirty: false,
             last,
             failed: None,
@@ -1071,9 +1080,11 @@ impl ChangeLog {
         }
         let seg = inner.segs.last_mut().expect("started above");
         let offset = seg.bytes;
-        match &mut inner.file {
+        match &inner.file {
             Some(f) => {
-                f.write_all(&bytes)?;
+                // records overwrite zeros written ahead of them, so that a sync of
+                // the file needs no journal commit (as the write-ahead log does)
+                super::wal::write_commit(f, offset, &mut inner.alloc, &bytes, PREALLOC)?;
                 inner.dirty = true;
             }
             None => seg.mem.extend_from_slice(&bytes),
@@ -1120,6 +1131,7 @@ impl ChangeLog {
                     sync_dir(root)?;
                 }
                 seg.path = Some(path);
+                inner.alloc = SEG_HEADER as u64;
                 inner.file = Some(f);
             }
             None => seg.mem.extend_from_slice(&header),
@@ -1140,6 +1152,8 @@ impl ChangeLog {
             .unwrap_or_default();
         ix.seal();
         if let (Some(f), Some(idx)) = (&inner.file, seg.idx_path()) {
+            // a sealed segment ends with its last record
+            f.set_len(seg.bytes)?;
             f.sync_data()?;
             write_synced_atomic(&idx, &ix.encode(self.dataset_id, seg.first, seg.last))?;
             if let Some(dir) = &self.dir {
@@ -1506,6 +1520,7 @@ impl Inner {
         Inner {
             segs: Vec::new(),
             file: None,
+            alloc: 0,
             dirty: false,
             last: None,
             failed: None,
