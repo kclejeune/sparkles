@@ -23,6 +23,7 @@ mod embed;
 mod geo;
 mod history_query;
 mod mem_history;
+mod partial;
 mod patch_apply;
 mod preview;
 mod quota;
@@ -47,6 +48,7 @@ pub use compaction::{
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
 pub use history_query::{HistoryBound, HistoryChange, HistoryQuery, HistoryResult};
+pub use partial::PartialMode;
 pub use patch_apply::{PatchOptions, PatchOutcome, parse_commit_iri};
 pub use quota::{QUOTA_FILE, QuotaSource, QuotaStatus};
 

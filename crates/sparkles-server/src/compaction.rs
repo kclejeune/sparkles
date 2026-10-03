@@ -15,7 +15,7 @@ use axum::{Json, Router};
 use parking_lot::Mutex;
 use serde_json::{Value as J, json};
 use sparkles::store::{
-    CompactOptions, CompactReport, CompactionPolicy, CompactionSettings, Trigger,
+    CompactOptions, CompactReport, CompactionPolicy, CompactionSettings, PartialMode, Trigger,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -285,6 +285,7 @@ pub fn start_compaction(st: &Arc<AppState>, ds: Arc<Dataset>, trigger: Option<Tr
     let auto = trigger.is_some();
     let ac = &st.compaction;
     let opts = CompactOptions {
+        partial: Some(ac.policy_for(&ds).partial),
         threads: auto.then_some(ac.threads.max(1)),
         low_priority: auto,
         io_bytes_per_sec: if auto { ac.io_bytes_per_sec } else { None },
@@ -313,18 +314,31 @@ pub fn start_compaction(st: &Arc<AppState>, ds: Arc<Dataset>, trigger: Option<Tr
         Ok(match &rep.abandoned {
             Some(why) => format!("{prefix}abandoned: {why}"),
             None => format!(
-                "{prefix}compacted to {} in {:.2} s{}; carried over {} commits; the writer lock was held {:.1} ms",
+                "{prefix}compacted to {} in {:.2} s{}{}; carried over {} commits; the writer lock was held {:.1} ms",
                 rep.generation,
                 rep.total_ms / 1e3,
                 trigger
                     .as_ref()
                     .map(|t| format!(" ({})", t.detail))
                     .unwrap_or_default(),
+                partial_note(&rep),
                 rep.caught_up_commits,
                 rep.lock_ms
             ),
         })
     })
+}
+
+/// How much of the index a partial compaction rewrote ("" for a full one).
+pub fn partial_note(rep: &CompactReport) -> String {
+    if rep.mode != "partial" {
+        return String::new();
+    }
+    format!(
+        ", partially: {} of {} blocks rewritten",
+        rep.blocks_rewritten,
+        rep.blocks_rewritten + rep.blocks_copied
+    )
 }
 
 /// Keep what a compaction did, for the status and the metrics.
@@ -385,6 +399,14 @@ fn record(
             last["lockMs"] = rep.lock_ms.into();
             last["buildMs"] = rep.build_ms.into();
             last["caughtUpCommits"] = rep.caught_up_commits.into();
+            if rep.abandoned.is_none() {
+                last["mode"] = rep.mode.clone().into();
+                last["blocksRewritten"] = rep.blocks_rewritten.into();
+                last["blocksCopied"] = rep.blocks_copied.into();
+                if let Some(why) = &rep.full_reason {
+                    last["fullReason"] = why.clone().into();
+                }
+            }
             if let Some(why) = &rep.abandoned {
                 last["error"] = why.clone().into();
             } else {
@@ -686,6 +708,15 @@ pub struct AutoCompactArgs {
     /// Automatic compactions that may run at once on the server
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub auto_compact_max_running: usize,
+    /// Whether a compaction, automatic or not, may rewrite only the index blocks its
+    /// delta touches: auto (when the delta adds no terms and that is estimated to be
+    /// quicker), off or always (whenever the delta adds no terms)
+    #[arg(long, value_name = "MODE", default_value = "auto", value_parser = parse_partial)]
+    pub auto_compact_partial: PartialMode,
+}
+
+fn parse_partial(s: &str) -> Result<PartialMode, String> {
+    PartialMode::parse(s).ok_or_else(|| format!("expected auto, off or always, not {s:?}"))
 }
 
 impl AutoCompactArgs {
@@ -707,6 +738,7 @@ impl AutoCompactArgs {
                 idle_seconds: self.auto_compact_idle,
                 max_age_seconds: self.auto_compact_max_age,
                 min_interval_seconds: self.auto_compact_min_interval,
+                partial: self.auto_compact_partial,
             },
             threads: self
                 .auto_compact_threads

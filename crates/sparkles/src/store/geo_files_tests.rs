@@ -341,6 +341,127 @@ fn compaction_parses_only_new_literals() {
     }
 }
 
+/// Run a SPARQL update with the `geo:` and `ex:` prefixes on a store (in a failpoint).
+fn store_update(st: &crate::store::Store, u: &str) {
+    crate::sparql::update::update(
+        st,
+        &format!("PREFIX geo: <{GEO}> PREFIX ex: <{EX}> {u}"),
+        &Default::default(),
+    )
+    .unwrap_or_else(|e| panic!("{u}: {e}"));
+}
+
+/// The subjects in windows `NEAR` and `WORLD`, through the index, checked against a scan.
+fn windows(ds: &Dataset) -> Vec<std::collections::BTreeSet<String>> {
+    let snap = ds.snapshot();
+    [NEAR, WORLD]
+        .iter()
+        .map(|w| {
+            let found = window(snap.clone(), *w, GraphFilter::All).0;
+            assert_eq!(found, window(unindexed(&snap), *w, GraphFilter::All).0);
+            found
+        })
+        .collect()
+}
+
+#[test]
+fn a_compaction_builds_the_base_before_the_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = persistent(dir.path(), GeoConfig::default());
+    let rows0 = base(&ds).rows.len();
+    let mut seed = 11;
+    let mut ins = String::new();
+    for i in 0..300 {
+        let (x, y) = (rng(&mut seed) * 40.0, rng(&mut seed) * 40.0);
+        ins += &format!("ex:c{i} geo:asWKT \"POINT({x} {y})\"^^geo:wktLiteral . ");
+    }
+    update(&ds, "INSERT", &ins);
+    // commits made during the build reach the new generation as its overlay
+    ds.store().set_failpoint(
+        "compact-built",
+        Some(Arc::new(|st: &crate::store::Store| {
+            store_update(
+                st,
+                r#"INSERT DATA { ex:d1 geo:asWKT "POINT(1.2 1.2)"^^geo:wktLiteral .
+                ex:d2 geo:asWKT "POINT(39 39)"^^geo:wktLiteral }"#,
+            );
+            store_update(
+                st,
+                r#"DELETE DATA { ex:g1 geo:asWKT "POINT(2 2)"^^geo:wktLiteral }"#,
+            );
+        })),
+    );
+    let r = ds.store().compact_with(&Default::default()).unwrap();
+    ds.store().set_failpoint("compact-built", None);
+    assert_eq!(r.caught_up_commits, 2);
+    let snap = ds.snapshot();
+    let b = base(&ds);
+    assert_eq!(b.generation, snap.generation.uid);
+    // the base holds the state the build read, and the commits parsed its new literals
+    assert_eq!(b.rows.len(), rows0 + 300);
+    assert_eq!(b.column.parsed, 0);
+    assert_eq!(snap.geo.as_ref().unwrap().overlay.rows.len(), 2);
+    assert!(b.tree.as_ref().unwrap().is_mapped());
+    let found = windows(&ds);
+    assert!(
+        found[0].contains("d1") && !found[0].contains("g1"),
+        "{found:?}"
+    );
+    assert!(found[1].contains("d2"));
+    let expected = answers(&ds);
+    drop((b, snap, ds));
+    // the files the build wrote are read back at open
+    let ds = reopen(dir.path());
+    assert!(ds.store().geo_status().unwrap().files.unwrap().opened);
+    assert_eq!(windows(&ds), found);
+    assert_eq!(answers(&ds), expected);
+}
+
+#[test]
+fn a_rebuild_during_the_compaction_builds_the_base_at_the_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = persistent(dir.path(), GeoConfig::default());
+    update(
+        &ds,
+        "INSERT",
+        r#"ex:n1 geo:asWKT "POINT(1 1)"^^geo:wktLiteral"#,
+    );
+    let epoch = ds.snapshot().geo.as_ref().unwrap().epoch;
+    // the base built with the generation is for the old epoch: the switch builds again
+    ds.store().set_failpoint(
+        "compact-indexed",
+        Some(Arc::new(|st: &crate::store::Store| {
+            st.rebuild_geo().unwrap();
+            store_update(
+                st,
+                r#"INSERT DATA { ex:d1 geo:asWKT "POINT(1.2 1.2)"^^geo:wktLiteral }"#,
+            );
+        })),
+    );
+    let r = ds.store().compact_with(&Default::default()).unwrap();
+    ds.store().set_failpoint("compact-indexed", None);
+    assert_eq!(r.caught_up_commits, 1);
+    assert_eq!(ds.store().geo_status().unwrap().state, "ready");
+    assert_eq!(ds.snapshot().geo.as_ref().unwrap().epoch, epoch + 1);
+    assert_eq!(base(&ds).generation, ds.snapshot().generation.uid);
+    let found = windows(&ds);
+    assert!(
+        found[0].contains("n1") && found[0].contains("d1"),
+        "{found:?}"
+    );
+    // so does a disable: the new generation has no index
+    ds.store().set_failpoint(
+        "compact-indexed",
+        Some(Arc::new(|st: &crate::store::Store| {
+            st.disable_geo().unwrap()
+        })),
+    );
+    ds.compact().unwrap();
+    ds.store().set_failpoint("compact-indexed", None);
+    assert!(ds.snapshot().geo.is_none());
+    assert!(!geo_dir(&ds.snapshot()).exists());
+}
+
 #[test]
 fn a_build_racing_a_compaction_leaves_no_files_behind() {
     let dir = tempfile::tempdir().unwrap();

@@ -694,9 +694,10 @@ new index generation. A server compacts each dataset on its own when the delta g
 large, and `POST /$/compact/{ds}` still compacts on request. Both build the new
 generation from a snapshot while writes go on. The commits made during the build are
 carried into the new generation, and the writer lock is held only for the final switch,
-which takes a few milliseconds plus the spatial index's base, when the dataset has one.
-Queries see the same data before and after, and a query that started on the old
-generation finishes on it.
+which takes a few milliseconds. A dataset with a spatial index gets the new generation's
+index base built along with the generation, so its switch takes no longer. Queries see
+the same data before and after, and a query that started on the old generation finishes
+on it.
 
 **When.** A compaction is due when the first of these holds:
 
@@ -711,10 +712,24 @@ generation finishes on it.
 | `maxAgeSeconds` | 86,400 | The oldest commit not yet compacted is older than this, with any delta. |
 | `minIntervalSeconds` | 60 | No automatic compaction starts sooner than this after the previous one ended. |
 | `enabled` | `true` | Automatic compaction for the dataset. |
+| `partial` | `auto` | Whether a compaction may rewrite only the blocks its delta touches: `auto`, `off` or `always` (see below). It applies to manual compactions too. |
 
 A `0` turns off the size, idle and age triggers. The server's flags (`--auto-compact-*`,
 see [USAGE.md](USAGE.md#automatic-compaction)) give the defaults, and a dataset's own
 settings override them. `--no-auto-compact` turns it off for every dataset.
+
+**Partial compaction.** When the delta's quads use only terms the dataset already has, a
+compaction can copy the vocabulary and every index block the delta does not touch, and
+rewrite only the blocks that it does. Inline values (numbers, booleans, dates and blank
+nodes) never add terms. With `auto`, a compaction is partial when the delta adds no term,
+when it is estimated to take less time than a full rebuild, and when it would leave at
+most 1.25 times the blocks of a full rebuild. Only a delta that is large against the
+dataset makes a full rebuild quicker. With `always` a compaction is partial whenever the
+delta adds no term, and with `off` every compaction rebuilds the whole index. The
+statistics are updated from the delta. They equal a rebuild's, except that a dataset with
+more than 10,000 distinct characteristic sets can keep a different selection of the rare
+ones. Terms that no quad uses any more stay in the vocabulary until a full compaction.
+The server flag `--auto-compact-partial` gives the default.
 
 **When not.** A due compaction waits while the previous one ended less than
 `minIntervalSeconds` ago, or after a failed one (one minute, doubling up to an hour). It
@@ -754,6 +769,9 @@ type CompactionStatus = {
   last?: { automatic: boolean; trigger?: string; startedAt: string; finishedAt: string;
            seconds: number; outcome: "done" | "abandoned" | "cancelled" | "failed";
            generation?: string; lockMs?: number; buildMs?: number; caughtUpCommits?: number;
+           mode?: "full" | "partial";              // partial: only the touched blocks rewritten
+           blocksRewritten?: number; blocksCopied?: number;
+           fullReason?: string;    // why a compaction that could have been partial was not
            error?: string };       // the last compaction since the server started
   automaticRuns: number;
   failures: number;                // consecutive failed automatic compactions
@@ -762,10 +780,11 @@ type CompactionStatus = {
 
 `/$/stats/{ds}` includes the same object as `compaction`, and the dataset page of the UI
 shows it in its Storage panel. A compaction task's message starts with `auto:` when the
-policy started it, and names the trigger, the time, the commits it carried over and how
-long it held the writer lock. A compaction is cancellable with `DELETE /$/tasks/{id}`. A
-bulk commit during the build makes it moot, and it ends with `abandoned` in its message.
-An in-place restore cancels a running compaction of its dataset.
+policy started it, and names the trigger, the time, how many blocks a partial compaction
+rewrote, the commits it carried over and how long it held the writer lock. A compaction
+is cancellable with `DELETE /$/tasks/{id}`. A bulk commit during the build makes it moot,
+and it ends with `abandoned` in its message. An in-place restore cancels a running
+compaction of its dataset.
 
 The request counters behind `FusekiCounters`, which also feed the `fuseki_requests*`
 families of `--metrics-fuseki-names`, are kept while metrics are on. With `--no-metrics`

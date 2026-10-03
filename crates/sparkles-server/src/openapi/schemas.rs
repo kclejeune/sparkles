@@ -432,7 +432,7 @@ pub(super) fn schemas() -> Map<String, J> {
     put(
         "CompactionPolicy",
         open(
-            "Compaction settings: `minDeltaQuads`, `deltaRatio`, `maxDeltaQuads`, `maxDeltaMb`, `maxWalMb`, `idleSeconds`, `maxAgeSeconds`, `minIntervalSeconds` and `enabled`.",
+            "Compaction settings: `minDeltaQuads`, `deltaRatio`, `maxDeltaQuads`, `maxDeltaMb`, `maxWalMb`, `idleSeconds`, `maxAgeSeconds`, `minIntervalSeconds`, `enabled` and `partial` (`auto`, `off` or `always`).",
             "automatic-compaction",
         ),
     );

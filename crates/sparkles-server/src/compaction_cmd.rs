@@ -14,7 +14,7 @@ pub struct CompactionArgs {
     #[arg(long, required_unless_present = "server", conflicts_with = "server")]
     pub loc: Option<PathBuf>,
     /// Set a setting: enabled, minDeltaQuads, deltaRatio, maxDeltaQuads, maxDeltaMb,
-    /// maxWalMb, idleSeconds, maxAgeSeconds or minIntervalSeconds (repeatable)
+    /// maxWalMb, idleSeconds, maxAgeSeconds, minIntervalSeconds or partial (repeatable)
     #[arg(long, value_name = "KEY=VALUE", conflicts_with = "default")]
     pub set: Vec<String>,
     /// Remove the dataset's own settings, so that the server's apply

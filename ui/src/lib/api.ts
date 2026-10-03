@@ -156,6 +156,8 @@ export type CompactionPolicy = {
   idleSeconds: number;
   maxAgeSeconds: number;
   minIntervalSeconds: number;
+  /** Whether a compaction may rewrite only the index blocks its delta touches. */
+  partial: 'auto' | 'off' | 'always';
 };
 
 /** How DESCRIBE describes a resource: `cbd`, `scbd` or `outgoing`. */
@@ -215,6 +217,12 @@ export type CompactionStatus = {
     lockMs?: number;
     buildMs?: number;
     caughtUpCommits?: number;
+    /** `partial` when the compaction rewrote only the blocks its delta touched. */
+    mode?: 'full' | 'partial';
+    blocksRewritten?: number;
+    blocksCopied?: number;
+    /** Why a compaction that could have been partial rewrote everything. */
+    fullReason?: string;
     error?: string;
   };
   automaticRuns: number;

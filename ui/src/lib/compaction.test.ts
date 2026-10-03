@@ -16,6 +16,7 @@ const base: CompactionStatus = {
     idleSeconds: 300,
     maxAgeSeconds: 86400,
     minIntervalSeconds: 60,
+    partial: 'auto' as const,
   },
   own: {},
   state: 'idle',
@@ -72,6 +73,12 @@ describe('automatic compaction', () => {
     expect(lastCompaction({ ...base, last })).toBe(
       'last automatic compaction took 2.04 s, writer lock 3.3 ms',
     );
+    expect(
+      lastCompaction({
+        ...base,
+        last: { ...last, mode: 'partial', blocksRewritten: 12, blocksCopied: 2228 },
+      }),
+    ).toBe('last automatic compaction took 2.04 s, writer lock 3.3 ms, rewrote 12 of 2240 blocks');
     expect(
       lastCompaction({
         ...base,

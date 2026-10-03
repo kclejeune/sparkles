@@ -12,6 +12,7 @@
 //! dataset's own settings ([`CompactionSettings`]) live in `compaction.json`. The server
 //! runs the policy; the C13 spec has the design.
 
+use super::partial::{self, PartialMode};
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64};
@@ -58,6 +59,9 @@ pub struct CompactionPolicy {
     pub max_age_seconds: u64,
     /// no automatic compaction starts sooner than this after the previous one ended
     pub min_interval_seconds: u64,
+    /// whether a compaction may rewrite only the blocks the delta touches
+    #[serde(default)]
+    pub partial: PartialMode,
 }
 
 impl Default for CompactionPolicy {
@@ -72,6 +76,7 @@ impl Default for CompactionPolicy {
             idle_seconds: 300,
             max_age_seconds: 86_400,
             min_interval_seconds: 60,
+            partial: PartialMode::Auto,
         }
     }
 }
@@ -98,10 +103,12 @@ pub struct CompactionSettings {
     pub max_age_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_interval_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialMode>,
 }
 
 /// The setting names, as JSON keys and `key=value` arguments.
-pub const SETTING_NAMES: [&str; 9] = [
+pub const SETTING_NAMES: [&str; 10] = [
     "enabled",
     "minDeltaQuads",
     "deltaRatio",
@@ -111,6 +118,7 @@ pub const SETTING_NAMES: [&str; 9] = [
     "idleSeconds",
     "maxAgeSeconds",
     "minIntervalSeconds",
+    "partial",
 ];
 
 impl CompactionSettings {
@@ -177,6 +185,13 @@ impl CompactionSettings {
             "idleSeconds" => self.idle_seconds = Some(n()?),
             "maxAgeSeconds" => self.max_age_seconds = Some(n()?),
             "minIntervalSeconds" => self.min_interval_seconds = Some(n()?),
+            "partial" => {
+                self.partial = Some(PartialMode::parse(value).ok_or_else(|| {
+                    Error::invalid(format!(
+                        "partial: expected auto, off or always, not {value:?}"
+                    ))
+                })?)
+            }
             _ => {
                 return Err(Error::invalid(format!(
                     "unknown compaction setting {key:?} (the settings are {})",
@@ -214,6 +229,7 @@ impl CompactionPolicy {
             min_interval_seconds: own
                 .min_interval_seconds
                 .unwrap_or(self.min_interval_seconds),
+            partial: own.partial.unwrap_or(self.partial),
         }
     }
 
@@ -460,6 +476,13 @@ pub struct CompactOptions {
     /// stops the build ([`Error::Cancelled`]) when set
     pub cancel: Option<Arc<AtomicBool>>,
     pub progress: Option<crate::builder::ProgressFn>,
+    /// whether it may rewrite only the blocks the delta touches (`None`: the dataset's
+    /// own setting, else [`PartialMode::Auto`])
+    pub partial: Option<PartialMode>,
+    /// build the spatial index base under the writer lock at the switch, as before it
+    /// was built with the generation (for measurements)
+    #[doc(hidden)]
+    pub geo_at_switch: bool,
 }
 
 /// What a compaction did.
@@ -476,6 +499,15 @@ pub struct CompactReport {
     /// why it published nothing (a bulk commit rebuilt the dataset meanwhile)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abandoned: Option<String>,
+    /// `full`, or `partial` when it rewrote only the blocks the delta touched
+    pub mode: String,
+    /// why a compaction that could have been partial rebuilt everything
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_reason: Option<String>,
+    /// blocks of the old permutations that a partial compaction rewrote, and those it
+    /// copied as they were
+    pub blocks_rewritten: u64,
+    pub blocks_copied: u64,
     /// how long the switch held the writer lock
     pub lock_ms: f64,
     pub build_ms: f64,
@@ -617,6 +649,43 @@ impl CatchUp {
                 sync_commit(w.get_ref(), &self.gen_.dvocab)
             }
             None => Ok(()),
+        }
+    }
+}
+
+/// How a compaction wrote the new generation.
+enum How {
+    /// in full, and why not partially
+    Full(String),
+    Partial {
+        rewritten: u64,
+        copied: u64,
+    },
+}
+
+impl How {
+    fn mode(&self) -> &'static str {
+        match self {
+            How::Full(_) => "full",
+            How::Partial { .. } => "partial",
+        }
+    }
+    fn full_reason(&self) -> Option<String> {
+        match self {
+            How::Full(why) => Some(why.clone()),
+            How::Partial { .. } => None,
+        }
+    }
+    fn rewritten(&self) -> u64 {
+        match self {
+            How::Full(_) => 0,
+            How::Partial { rewritten, .. } => *rewritten,
+        }
+    }
+    fn copied(&self) -> u64 {
+        match self {
+            How::Full(_) => 0,
+            How::Partial { copied, .. } => *copied,
         }
     }
 }
@@ -866,13 +935,40 @@ impl Store {
         }
         self.failpoint("compact-started");
         let tb = Instant::now();
-        let meta = self.build_compacted(&snap0, &dir, next_bnode, o)?;
-        let build = tb.elapsed();
+        let pool = build_pool(o, self.opts.build.threads)?;
+        let mode = o
+            .partial
+            .unwrap_or_else(|| self.compaction.settings.lock().partial.unwrap_or_default());
+        let (meta, how) = match &pool {
+            Some(p) => p.install(|| self.build_new(&snap0, &dir, next_bnode, o, mode)),
+            None => self.build_new(&snap0, &dir, next_bnode, o, mode),
+        }?;
+        let mut build = tb.elapsed();
         self.failpoint("compact-built");
         let persistent = self.root.is_some();
         let mut gen_ = Generation::open(&dir, &name, persistent)?;
         gen_._tmp = tmp;
         let gen_ = Arc::new(gen_);
+        // the spatial index base of the new generation, built now rather than at the
+        // switch: it depends on the generation alone, and the switch adds the overlay of
+        // the commits carried over
+        let geo = if o.geo_at_switch {
+            None
+        } else {
+            let tg = Instant::now();
+            let base_only = self.base_snapshot(&gen_, base.seq);
+            let stop = || cancelled();
+            let pre = match &pool {
+                Some(p) => p.install(|| self.prebuild_geo(&base_only, &snap0, &stop)),
+                None => self.prebuild_geo(&base_only, &snap0, &stop),
+            };
+            build += tg.elapsed();
+            pre
+        };
+        self.failpoint("compact-indexed");
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
         let mut cu = CatchUp {
             gen_: gen_.clone(),
             cache: self.cache.clone(),
@@ -902,6 +998,7 @@ impl Store {
         let abandoned = |why: String| CompactReport {
             generation: self.snapshot().generation.name.clone(),
             abandoned: Some(why),
+            mode: how.mode().into(),
             build_ms: build.as_secs_f64() * 1e3,
             total_ms: t0.elapsed().as_secs_f64() * 1e3,
             ..Default::default()
@@ -1003,7 +1100,7 @@ impl Store {
             mask: None,
             change_log: self.changelog.clone(),
         };
-        self.rebuild_geo_locked(&mut new_snap, &view);
+        self.switch_geo_locked(&mut new_snap, &view, geo);
         let quads = new_snap.len();
         self.current.store(Arc::new(new_snap));
         self.commits.send_replace(view.commit);
@@ -1047,10 +1144,60 @@ impl Store {
             base_commit: base.seq,
             caught_up_commits: cu.commits,
             abandoned: None,
+            mode: how.mode().into(),
+            full_reason: how.full_reason(),
+            blocks_rewritten: how.rewritten(),
+            blocks_copied: how.copied(),
             lock_ms: lock.as_secs_f64() * 1e3,
             build_ms: build.as_secs_f64() * 1e3,
             total_ms: t0.elapsed().as_secs_f64() * 1e3,
         })
+    }
+
+    /// Write the generation of `snap` to `dir`: partially when `mode` allows it and the
+    /// delta suits it, else in full.
+    fn build_new(
+        &self,
+        snap: &Snapshot,
+        dir: &Path,
+        next_bnode: u64,
+        o: &CompactOptions,
+        mode: PartialMode,
+    ) -> Result<(IndexMeta, How)> {
+        let why = match mode {
+            PartialMode::Off => "partial compaction is off".to_string(),
+            _ => match partial::plan(snap) {
+                Err(why) => why,
+                Ok(plan)
+                    if let Some(why) = (mode == PartialMode::Auto)
+                        .then(|| plan.auto_refusal())
+                        .flatten() =>
+                {
+                    why
+                }
+                Ok(plan) => {
+                    if let Some(p) = &o.progress {
+                        p(&format!(
+                            "partial compaction: rewriting {} of {} blocks",
+                            plan.rewritten, plan.blocks
+                        ));
+                    }
+                    let interrupt = self.compaction_interrupt(o, dir);
+                    let meta =
+                        partial::write(snap, &plan, dir, next_bnode, self.prefixes(), &interrupt)?;
+                    interrupt()?;
+                    return Ok((
+                        meta,
+                        How::Partial {
+                            rewritten: plan.rewritten,
+                            copied: plan.blocks - plan.rewritten,
+                        },
+                    ));
+                }
+            },
+        };
+        let meta = self.build_compacted(snap, dir, next_bnode, o)?;
+        Ok((meta, How::Full(why)))
     }
 
     /// Build the generation of `snap` in `dir`, under the build limits of `o`.
@@ -1067,32 +1214,38 @@ impl Store {
             bopts.threads = t.max(1);
         }
         let interrupt = self.compaction_interrupt(o, dir);
-        let build = || -> Result<IndexMeta> {
-            let mut builder = Builder::new(dir, bopts.clone())?.with_interrupt(interrupt.clone());
-            if let Some(p) = &o.progress {
-                builder = builder.with_progress(p.clone());
-            }
-            write_snapshot(&builder, snap, None, |_| Ok(true), &[])?;
-            builder.add_prefixes(self.prefixes());
-            let meta = builder.finish()?;
-            interrupt()?;
-            Ok(meta)
-        };
-        if o.threads.is_none() && !o.low_priority {
-            return build();
+        let mut builder = Builder::new(dir, bopts)?.with_interrupt(interrupt.clone());
+        if let Some(p) = &o.progress {
+            builder = builder.with_progress(p.clone());
         }
-        let low = o.low_priority;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(bopts.threads)
-            .thread_name(|i| format!("compact-{i}"))
-            .start_handler(move |_| {
-                if low {
-                    lower_priority();
-                }
-            })
-            .build()
-            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-        pool.install(build)
+        write_snapshot(&builder, snap, None, |_| Ok(true), &[])?;
+        builder.add_prefixes(self.prefixes());
+        let meta = builder.finish()?;
+        interrupt()?;
+        Ok(meta)
+    }
+
+    /// A snapshot of `gen_` alone, with an empty delta, at commit `seq` (what a
+    /// compaction's new generation holds before the commits carried over).
+    fn base_snapshot(&self, gen_: &Arc<Generation>, seq: u64) -> Snapshot {
+        Snapshot {
+            generation: gen_.clone(),
+            delta: Delta::default(),
+            version: 0,
+            cache: self.cache.clone(),
+            results: self.results.clone(),
+            dvocab_len: gen_.dvocab.len(),
+            commit: seq,
+            text: None,
+            geo: None,
+            union_default_graph: self.opts.union_default_graph,
+            geo_op_vertices: self.opts.geo_op_vertices,
+            delta_stats: Default::default(),
+            counts: Default::default(),
+            historical: false,
+            mask: None,
+            change_log: None,
+        }
     }
 
     /// What stops or paces a compaction's build: its cancel flag, the free-space reserve,
@@ -1124,6 +1277,26 @@ impl Store {
             Ok(())
         })
     }
+}
+
+/// The thread pool a compaction builds in: its own when `o` limits the threads or
+/// lowers their priority (`None`: the global pool). `threads` is the default count.
+fn build_pool(o: &CompactOptions, threads: usize) -> Result<Option<rayon::ThreadPool>> {
+    if o.threads.is_none() && !o.low_priority {
+        return Ok(None);
+    }
+    let low = o.low_priority;
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(o.threads.unwrap_or(threads).max(1))
+        .thread_name(|i| format!("compact-{i}"))
+        .start_handler(move |_| {
+            if low {
+                lower_priority();
+            }
+        })
+        .build()
+        .map(Some)
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))
 }
 
 /// Remove the unfinished builds of compactions that a crash interrupted: directories

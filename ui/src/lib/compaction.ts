@@ -50,5 +50,9 @@ export function lastCompaction(c: CompactionStatus): string | null {
   if (l.outcome !== 'done')
     return `last ${who} compaction ${l.outcome}${l.error ? `: ${l.error}` : ''}`;
   const lock = l.lockMs == null ? '' : `, writer lock ${l.lockMs.toFixed(1)} ms`;
-  return `last ${who} compaction took ${l.seconds.toFixed(2)} s${lock}`;
+  const partial =
+    l.mode === 'partial' && l.blocksRewritten != null && l.blocksCopied != null
+      ? `, rewrote ${l.blocksRewritten} of ${l.blocksRewritten + l.blocksCopied} blocks`
+      : '';
+  return `last ${who} compaction took ${l.seconds.toFixed(2)} s${lock}${partial}`;
 }
