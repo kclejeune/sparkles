@@ -20,6 +20,7 @@ mod diff;
 mod embed;
 mod geo;
 mod mem_history;
+mod patch_apply;
 mod preview;
 mod quota;
 mod schedule;
@@ -37,6 +38,7 @@ pub use compaction::{
     CompactionSettings, SETTING_NAMES, Trigger, TriggerKind,
 };
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions};
+pub use patch_apply::{PatchOptions, PatchOutcome, parse_commit_iri};
 pub use quota::{QUOTA_FILE, QuotaSource, QuotaStatus};
 
 use crate::builder::{BuildOptions, Builder, IndexMeta, Slot, Stats};
@@ -3933,6 +3935,14 @@ impl WriteTxn<'_> {
             return Ok(Id::vocab(i));
         }
         Ok(Id::delta(self.base.generation.dvocab.insert(key)?))
+    }
+
+    /// The id of a term key the store or this transaction has, without adding it.
+    pub fn lookup_key(&self, key: &[u8]) -> Option<Id> {
+        if let Ok(i) = self.base.generation.vocab.find(key) {
+            return Some(Id::vocab(i));
+        }
+        self.base.generation.dvocab.find(key).map(Id::delta)
     }
 
     pub fn new_bnode(&mut self) -> Id {

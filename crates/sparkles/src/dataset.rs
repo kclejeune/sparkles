@@ -223,6 +223,22 @@ impl Dataset {
         crate::sparql::update::update(&self.store, update, opts)
     }
 
+    /// Apply an RDF Patch, in the text form or (`binary`) the RDF Thrift form, as one
+    /// commit (see [`Store::apply_patch`]).
+    pub fn apply_patch(
+        &self,
+        patch: impl std::io::Read,
+        binary: bool,
+    ) -> Result<crate::store::PatchOutcome> {
+        self.store.apply_patch(
+            patch,
+            &crate::store::PatchOptions {
+                binary,
+                ..Default::default()
+            },
+        )
+    }
+
     // --------------------------------------------------------------- quads/graphs ------
 
     /// The default graph.
