@@ -131,10 +131,10 @@ pub(super) async fn history(
             j["timestamp"] = json!(c.commit.timestamp());
             j["kind"] = json!(c.commit.kind.name());
             if let Some(a) = &c.commit.author {
-                j["author"] = json!(a);
+                j["author"] = json!(&**a);
             }
             if let Some(m) = &c.commit.message {
-                j["message"] = json!(m);
+                j["message"] = json!(&**m);
             }
             j
         })

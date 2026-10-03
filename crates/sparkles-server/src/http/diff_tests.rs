@@ -611,17 +611,29 @@ async fn diff_errors_tags_and_budgets() {
     .await;
     assert!(r.status.is_success());
     // the compaction is a background task, slow on a loaded machine
+    let mut gone = false;
     for _ in 0..6000 {
-        if get(&s.app, "/h/diff?from=commit:1&to=commit:3")
-            .await
-            .status
-            == StatusCode::GONE
-        {
-            return;
+        if get(&s.app, "/h/sparql?at=1&query=ASK%7B%7D").await.status == StatusCode::GONE {
+            gone = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("commit 1 stayed readable after compaction");
+    assert!(gone, "commit 1 stayed readable after compaction");
+    // the change log still has the changes of commit 3, whose parent state is gone
+    let r = get(&s.app, "/h/diff?from=commit:2&to=commit:3").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["method"], "log");
+    // without it, a diff of a gone commit is 410
+    let r = put_json(
+        &s.app,
+        "/$/history/h",
+        r#"{"changeLog": {"enabled": false}}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = get(&s.app, "/h/diff?from=commit:2&to=commit:3").await;
+    assert_eq!(r.status, StatusCode::GONE, "{}", r.text());
 }
 
 #[tokio::test]

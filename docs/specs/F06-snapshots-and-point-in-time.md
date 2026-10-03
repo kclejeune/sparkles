@@ -1182,7 +1182,8 @@ published. If the dataset was empty, every quad of the new generation is an addi
 both states together hold at most `change_log_bulk_max_quads` (1,000,000) quads, the two
 states are compared. Otherwise the commit is recorded as a summary with its counts. The
 first load of a large dataset is therefore not copied into the log. A crash after the
-switch and before the background writer records the bulk commit leaves a gap.
+switch and before the background writer records the bulk commit leaves that commit
+unrecorded, unless a retained generation still holds the state before it.
 
 **Retention.** Whole sealed segments are dropped, oldest first. `keepCommits` and
 `keepAge` keep the segments that hold any of the last N commits or any commit of the
