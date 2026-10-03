@@ -21,7 +21,7 @@ This is a clean-room spec. Its sources are the Sparkles code, the public documen
 PyO3 and maturin, the Python packaging PEPs, and the documented Python APIs of pyoxigraph
 (MIT OR Apache-2.0) and rdflib (BSD-3-Clause). pyoxigraph and rdflib were used as prior art
 for the shape of the API and for the term model Python users expect. No code was copied
-from either project. Fluree was not consulted.
+from either project.
 
 The bindings depend on these parts of Sparkles:
 
@@ -766,3 +766,15 @@ grouping is 40 to 80 times faster.
 
 **Not built.** Publishing itself, PyPy and free-threaded wheels, and async wrappers. The
 macOS, Windows and aarch64 wheels have not been built outside the workflow.
+
+### Later additions
+
+Other features added methods to the bindings after Phase 2, on 2026-10-02.
+`validate_shacl` reads shapes in the SHACL Compact Syntax with `format="shaclc"`
+([G03](G03-shaclc.md#outcome)). `QueryTriples` gained a `quads` attribute for CONSTRUCT
+templates with `GRAPH` ([G06](G06-arq-query-extensions.md#outcome)), and dataset queries
+use the dataset's DESCRIBE setting. `Dataset.embed` and `reembed_vector_index` serve the
+embeddings of [F08](F08-embeddings-on-write.md), and `Dataset.apply_patch` applies an RDF
+Patch as one commit and returns its `PatchStats` ([F10](F10-replication.md)). The
+bindings still read and write only the W3C RDF syntaxes, not Jena's TriX, RDF Thrift, RDF
+Protobuf or RDF/JSON.

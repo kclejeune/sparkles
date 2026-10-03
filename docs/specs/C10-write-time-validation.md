@@ -1083,8 +1083,7 @@ with strategy `incremental`, in < 5 ms.
     and applications", *IEEE Data Eng. Bull.* 18(2) (1995);
   * J. Corman, J. L. Reutter, O. Savković, "Semantics and validation of recursive SHACL",
     ISWC 2018.
-* **Not consulted:** Fluree in any form, including its code, docs, tests, site and talks.
-  TopBraid documentation was not consulted either.
+* TopBraid documentation was not consulted.
 
 ## Outcome
 

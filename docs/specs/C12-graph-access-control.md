@@ -628,8 +628,6 @@ predicates, plus a full-text index and vectors. The users are:
 - **SPARQL 1.1** Query (RDF datasets, `FROM`, `FROM NAMED`, `GRAPH`), Update (`WITH`,
   `USING`, `CLEAR`, `DROP`, `LOAD`, `ADD`, `MOVE`, `COPY`), Protocol and Graph Store
   Protocol: cited from working knowledge.
-- **Not consulted:** anything from Fluree, including its policy language, source,
-  documentation and design notes.
 
 ## Outcome
 
@@ -724,6 +722,10 @@ server-sent events), RDF Patch diffs, warm snapshot pins and `spk:hybridSearch` 
   which take the view.
 - `spk:hybridSearch` plans its text and vector searches with the active graph's filter,
   so the fusion ranks visible hits only. The differential test includes it.
+
+The GraphQL endpoint of [C03](C03-graphql.md) came later still. It added the `graphql`
+endpoint name, which a grant that lists `query` also covers, and its queries run with the
+caller's view like SPARQL queries.
 
 **Not built.** Graph restrictions on token scopes, validation of a view (§5.5), and a
 `/$/stats` answer for the visible graphs remain open questions 1–3. Full-text scores

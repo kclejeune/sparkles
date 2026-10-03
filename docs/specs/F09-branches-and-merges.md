@@ -11,7 +11,7 @@
 > backups of branches. Phase 3 adds cross-server clones, relinking a branch to a newer
 > base, virtual merge bases and cherry-picks.
 >
-> **User docs:** none yet.
+> **User docs:** none, because nothing is built.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end will record how it lands.
@@ -34,7 +34,7 @@ conflicts and their resolution draws on the public documentation of Dolt, lakeFS
 Project Nessie, and the idea of a branch as a cheap layer over immutable data on
 TerminusDB's and lakeFS's documentation and on Datomic's speculative databases. The
 quad-level merge rule is the three-way merge of sets from the literature on diff3 and
-on replicated sets. §10 lists the sources. Fluree was not consulted.
+on replicated sets. §10 lists the sources.
 
 ## 1. Summary, goals, non-goals
 
@@ -1321,8 +1321,7 @@ holds the database.
     2014, for versioned RDF stores that merge quad sets;
   - W3C RDF 1.2 Concepts (blank-node scope), RDF Dataset Canonicalization (RDFC-1.0),
     the SPARQL 1.1 Protocol, and Apache Jena's RDF Patch documentation.
-- **Not consulted:** Fluree, in any form. Nothing from its source repository,
-  documentation, site, tests or talks was opened, searched or fetched, and the project's
-  notes that describe Fluree's features were not used.
 
 ## Outcome
+
+Nothing is built.

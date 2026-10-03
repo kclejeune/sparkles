@@ -471,8 +471,6 @@ class) and `docs` (class `ex:Doc` with `?s ex:owner ?user`). Users `tadmin` (adm
   and permit-overrides combining algorithms), cited from working knowledge.
 - **SPARQL 1.1** Query (`VALUES`, group graph patterns), Update and Protocol, and RDF
   Schema (`rdf:type`, `rdfs:subClassOf`), cited from working knowledge.
-- **Not consulted:** anything from Fluree, including its policy language, source,
-  documentation and design notes.
 
 ## Outcome
 
@@ -574,3 +572,6 @@ for `COUNT(*)`), and scans through blocks with hidden quads merge them like any 
 quads, which costs up to twice the time where the hidden quads are spread over the
 subjects a query reads (the managers' class counts, paths, filters and joins). Queries
 over hidden predicates get faster, since there is less to read.
+
+The GraphQL endpoint of [C03](C03-graphql.md), which came later, runs its queries with
+the caller's view, so protections hide triples from it as they do from SPARQL.

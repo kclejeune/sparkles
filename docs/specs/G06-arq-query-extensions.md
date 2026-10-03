@@ -1,6 +1,6 @@
 # G06: Jena ARQ's query language extensions
 
-> **Status:** implemented in part
+> **Status:** implemented in part (Phases 1–2)
 >
 > **Phases:** Phase 1 shipped on 2026-10-02: `LATERAL`, property path ranges and
 > CONSTRUCT templates with `GRAPH`. Phase 2 shipped on 2026-10-02: configurable DESCRIBE
@@ -18,7 +18,7 @@ This spec draws on the Sparkles code, the grammar and engine sources of Apache J
 ARQ (`jena-arq`, Apache-2.0) for syntax and behaviour, ARQ's test suites
 (`jena-arq/testing/ARQ` and the unit tests of `org.apache.jena.sparql.path`), Jena
 6.2.0's `arq` command run on small graphs, the SPARQL 1.1 and 1.2 Query specifications
-and the SPARQL community proposal SEP-0006 for `LATERAL`. Fluree was not consulted.
+and the SPARQL community proposal SEP-0006 for `LATERAL`.
 
 ## 1. Summary
 

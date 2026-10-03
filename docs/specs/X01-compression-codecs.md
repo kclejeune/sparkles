@@ -1,6 +1,6 @@
 # X01: Compression codecs (zstd, brotli, LZ4, gzip)
 
-> **Status:** implemented in part
+> **Status:** implemented in part (Phase 1)
 >
 > **Phases:** Phase 1 shipped. It covers the codec module, compressed inputs and request
 > bodies, codecs for dumps and backups, configurable response compression, precompressed

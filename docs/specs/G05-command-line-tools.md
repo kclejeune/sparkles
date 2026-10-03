@@ -14,7 +14,7 @@
 
 This spec draws on the Sparkles code, the command sources of Apache Jena (`jena-cmds`,
 `jena-langtag` and `jena-iri3986`, Apache-2.0) for behaviour and flags, and the
-standards listed in §9. Fluree was not consulted.
+standards listed in §9.
 
 ## 1. Summary
 
@@ -385,6 +385,7 @@ suites are unchanged (482/328/157/269).
 with 55 MiB peak memory, which does not grow with the input. Release builds were not
 measured.
 
-**Not built.** `rdfpatch` and `schemagen` (§1 non-goals). `rdfpatch` came later with
-the patch reader of [F10](F10-replication.md#outcome). Jena's `--rdfs` and
-`--formatted` flags of `riot`. A configurable severity per rule.
+**Not built.** `schemagen`, a §1 non-goal, was not built. `rdfpatch`, the other §1
+non-goal, came later with the patch reader of [F10](F10-replication.md#outcome), and it
+prints the rows of RDF Patch files and counts them. Jena's `--rdfs` and `--formatted`
+flags of `riot` and a configurable severity per rule were not built.

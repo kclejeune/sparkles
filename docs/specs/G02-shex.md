@@ -1575,8 +1575,7 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
   * RFC 9110;
   * Tarjan's SCC algorithm (1972);
   * Brzozowski derivatives (1964).
-* **Not consulted:** Fluree in any form: its code, docs, tests, site or talks. shex.js
-  and PyShEx source were not read.
+* **Not read:** the shex.js and PyShEx sources.
 
 ## Appendix: provenance entry (for [PROVENANCE.md](PROVENANCE.md))
 
@@ -1594,8 +1593,7 @@ This is the entry as drafted with the spec, before implementation. The published
   sources (Apache-2.0), read for behaviour and CLI surface, no code copied; rudof 0.3.24
   (MIT OR Apache-2.0), inspected for licensing, dependency weight, API and conformance,
   not used as a dependency; and papers by Staworko et al. (ICDT 2015), Boneva, Labra Gayo
-  and Prud'hommeaux (ISWC 2017) and Labra Gayo et al. (2015, RBE derivatives). Fluree
-  was not consulted.
+  and Prud'hommeaux (ISWC 2017) and Labra Gayo et al. (2015, RBE derivatives).
 - **Implementation:** not started.
   - **Planned dependencies:** none new; `sparkles-shex` uses workspace crates only.
   - **Test data:** shexTest is read from the Jena checkout or `SPARKLES_SHEX_TESTS`,
@@ -1676,7 +1674,8 @@ third-party crates were added.
 * `--schema` and `--shape-map` imply `--lang shex`.
 * The MCP tools are on by default. They are read-only, use `maxResults` 20 and refuse
   imports.
-* The UI gets no write-time validation panel in this phase.
+* The UI gets no write-time validation panel in this phase. The dataset page's
+  Write-time validation panel came later, and it shows ShEx guards as well as SHACL ones.
 
 **Conformance at landing.** Sparkles passes 100 % of the syntax, negative-syntax,
 negative-structure, representation and ShExR tests. It passes 99.9 % of the validation
@@ -1686,7 +1685,7 @@ listed in `known-failures.txt`.
 current numbers. SHACL stayed at 98/98 + 20/20 through the shared-code moves.
 
 **Performance.** `mise run bench:shex` and `bench:shex-write` exist, but
-[BENCHMARKS.md](../BENCHMARKS.md) publishes no ShEx numbers yet, so the §9 targets are
+[BENCHMARKS.md](../BENCHMARKS.md) publishes no ShEx numbers, so the §9 targets are
 unverified.
 
 **Incremental guard validation** landed on 2026-10-02 with C10 Phase 2. The guard keeps

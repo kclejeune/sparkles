@@ -1218,8 +1218,7 @@ ex:carol ex:WORKS_FOR ex:acme ~ ex:job2 {| ex:role "Advisor" |} .
 - The Sparkles code: `sparql::QueryOptions`, `execute_query`, `sparql::stats`,
   `sparql::aggext`, the vendored `spargebra` algebra and property paths, the prefixes
   store, and the specs C01, C02, C08, C09, C11, C12, C16 and F06.
-- Fluree was not consulted.
 
 ## Outcome
 
-Not built yet.
+Nothing is built.

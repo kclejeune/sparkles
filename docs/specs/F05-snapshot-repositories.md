@@ -11,10 +11,11 @@
 > chunking, repository copy, server backups).
 >
 > **User docs:** [API: Backup repositories](../API.md#backup-repositories) ·
+> [Usage: Backup repositories](../USAGE.md#backup-repositories) ·
 > [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) ·
 > [Benchmarks: Backup repositories](../BENCHMARKS.md#backup-repositories-105m-triples)
 >
-> This is the design as written before implementation; the [Outcome](#outcome) section at
+> This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
 
 This spec was written clean-room. It builds on durable commit identity
@@ -1761,11 +1762,8 @@ service. Open question 7 covers an in-process emulator instead.
   * `s3s-fs` (Apache-2.0);
   * the MinIO license (AGPL-3.0; external test process only);
   * RFC 9110, RFC 3339, RFC 9562, the IANA time zone database.
-* **Not consulted:** Fluree, in any form. Neither a checkout of Fluree's source
-  repository nor Fluree's documentation, site, tests or talks were opened, searched or
-  fetched. **No Elasticsearch or Kibana source code** was opened, searched or fetched.
-  Only the public user documentation pages listed above were read, and only for
-  behavior.
+* No Elasticsearch or Kibana source code was opened, searched or fetched. Only the
+  public user documentation pages listed above were read, and only for behavior.
 
 ## Outcome
 
@@ -1813,7 +1811,7 @@ measured 10.5M quads with an `fs` repository on the same disk. A full backup too
 (534 MB/s, against a target of < 5 s). An incremental backup after 1,000 single-quad
 commits took 0.34 s and added 55.3 KB (targets < 1 s and < 200 KB). A restore with a
 quick check took 0.79 s (target < 10 s), and a `data`-level verify 0.08 s. S3, cold
-caches and databases larger than memory are not measured yet.
+caches and databases larger than memory were not measured.
 
 **Backups of in-memory datasets** were added later. An in-memory dataset is backed up
 through a temporary database that `Store::memory_backup_capture` builds in
@@ -1854,7 +1852,7 @@ cancellation), a round trip through an `fs` repository with a `restore`-level ve
 server's create, verify and restore with SHACL validation, the validation files of both
 languages, and policy runs.
 
-**Not built:** the items listed under Phases at the top.
+**Not built.** The items listed under Phases at the top were not built.
 
 **Follow-up: Phase 3 encryption and chunking are specified in F11.** Client-side
 encryption and content-defined chunking now have their own design in

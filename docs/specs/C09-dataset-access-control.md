@@ -2083,9 +2083,7 @@ These tests run against a real listener on 127.0.0.1, with `HOME` and
 - **Forward-auth header names** (oauth2-proxy, Authelia, Tailscale serve, Cloudflare
   Access): cited from working knowledge of each product's public documentation, to be
   verified when implementing.
-- **Not consulted:** anything from Fluree (source, documentation, policy or design
-  documents, website, blog or talks). No Fluree checkout was opened or searched. No
-  project planning notes other than the specs listed above were read.
+- No project planning notes other than the specs listed above were read.
 
 ## Outcome
 
@@ -2180,7 +2178,7 @@ active stolen cookie. Access tokens cannot mint Sparkles tokens, which §12.4 di
 settle. Device grants approved before a restart reissue the token's secret instead of
 storing it, because a token at rest would violate §1.1.
 
-**Not built.** Client certificates (mutual TLS), OCSP stapling, token introspection
-(RFC 7662) for opaque access tokens, front-channel logout, and Access's identity endpoint
-for groups. Endpoint-level permissions and graph-level ACLs (Phase 3) were built later,
+**Not built.** Sparkles has no client certificates (mutual TLS), OCSP stapling, token
+introspection (RFC 7662) for opaque access tokens or front-channel logout, and it does
+not read groups from Access's identity endpoint. Endpoint-level permissions and graph-level ACLs (Phase 3) were built later,
 as [C12](C12-graph-access-control.md) describes.

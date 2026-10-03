@@ -4,13 +4,15 @@
 >
 > **Phases:** Phase 1 shipped. It covers point-in-time reads with `?at=`, named
 > snapshots, the `keepCommits`/`keepAge` retention window, `/$/snapshots`, `/$/history`,
-> the `sparkles snapshot` CLI, `query --at` and `dump --at`. Phase 2 shipped except the
-> replay speedups and warm pins. It covers diffs, `Accept-Datetime`, `maxBytes`
-> retention, pin expiry and schedules, history for in-memory datasets, `at` on more
-> endpoints, history metrics, and the UI's snapshot panel and `at` selector. Phase 3 is
-> not built.
+> the `sparkles snapshot` CLI, `query --at` and `dump --at`. Phase 2 shipped. It covers
+> diffs, `Accept-Datetime`, `maxBytes` retention, pin expiry and schedules, history for
+> in-memory datasets, `at` on more endpoints, history metrics, and the UI's snapshot
+> panel and `at` selector. The replay speedups and warm pins of Phase 2 came after the
+> rest, together with RDF Patch output for diffs and a change feed. Phase 3 is not
+> built.
 >
 > **User docs:** [API: Point-in-time reads and snapshots](../API.md#point-in-time-reads-and-snapshots) ·
+> [Usage: History, snapshots and clones](../USAGE.md#history-snapshots-and-clones) ·
 > [Features](../FEATURES.md#storage-tdb2-equivalent) ·
 > [Benchmarks: Point-in-time reads](../BENCHMARKS.md#point-in-time-reads-105m-triples)
 >
@@ -1070,8 +1072,6 @@ Setup: `sparkles serve --data /tmp/s`, a fresh persistent dataset `ds`, and
   (`immutable`), RFC 6648 (`X-` prefix), RFC 9651 (Integer header items, via CI), and
   Apache Jena's RDF Patch format (Apache-2.0). The RDF Patch format matters only for
   Open question 3 and is still to be checked against the Jena documentation.
-* **Not consulted:** Fluree, in any form. Nothing from Fluree's source repository,
-  documentation, site, tests or talks was opened, searched or fetched.
 
 ## Outcome
 
@@ -1350,9 +1350,10 @@ gaps and the commit watch. `http/diff_tests.rs` covers the patch formats, the fe
 JSON and patches, long polling, server-sent events with `Last-Event-ID`, the budget,
 `410` and warm pins over HTTP. Unit tests cover the index and the Thrift encoding.
 
-**Still not built.** Sparkles writes RDF Patch but does not apply it, so there is no
-`/patch` endpoint. The feed is per dataset, not per graph. Clones into an in-memory
-dataset and Phase 3 remain later work.
+**Still not built.** The feed is per dataset, not per graph, and Phase 3 remains later
+work. Applying RDF Patch came later with [F10](F10-replication.md) Phase 1, at
+`/{ds}/patch`. Clones into an in-memory dataset came with
+[C06](C06-clone-to-sandbox.md).
 
 ### Compaction during writes
 

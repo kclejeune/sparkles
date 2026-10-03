@@ -306,7 +306,6 @@ variables.
 - The Sparkles code: `QueryOptions::initial_bindings`, the query endpoint, `auth`,
   `mcp`, `guard::config` and the backup file lists; and the specs CI, C01, C09, C11 and
   C12.
-- Fluree was not consulted.
 
 ## Outcome
 

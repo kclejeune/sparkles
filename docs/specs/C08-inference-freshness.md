@@ -645,7 +645,6 @@ finding.
   not re-fetched.
 - Apache Jena documentation on `rb:violation`-style validation in rule reasoners. Cited
   from working knowledge, only as a rejected alternative, and not re-fetched.
-- Fluree was not consulted: no code, documentation or product pages.
 
 ## 11. Phase 4: input graphs, imports and RDFS on read
 

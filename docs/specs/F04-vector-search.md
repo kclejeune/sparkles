@@ -1,6 +1,6 @@
 # F04: Vector similarity search
 
-> **Status:** implemented in part
+> **Status:** implemented in part (Phases 1, 1b and 2, part of Phase 3)
 >
 > **Phases:** Phases 1, 1b and 2 shipped. They cover `spk:vector` literals, the
 > similarity functions, `spk:vectorSearch` with variable queries, `candidates:join` and
@@ -843,7 +843,6 @@ GRAPH ex:g2 { ex:a ex:emb "[1, 0, 0]"^^spk:vector . }
   - RFC 8259 §6;
   - IEEE 754-2019 binary32;
   - Malkov & Yashunin, arXiv:1603.09320.
-- **Not consulted**: anything from Fluree (source, docs, website, blog or talks).
 
 ## Outcome
 
@@ -1075,7 +1074,7 @@ subjects, `GRAPH ?g`, subjects with several hits, the `maxHits` budget and every
 computes its vectors after each commit, and `spk:vectorSearch` and `spk:hybridSearch`
 then accept a text as their query.
 
-**Not built.** Quantization, and the rest of Phase 3: background catch-up of the graph with
-overlay inserts, keeping the graph across compactions, rewriting `ORDER BY spk:cosine(…)
-LIMIT k`, and a compact datatype. A hybrid call with a variable vector query or with
-`candidates:join` is not built either.
+**Not built.** Quantization and the rest of Phase 3 were not built. That rest is
+background catch-up of the graph with overlay inserts, keeping the graph across
+compactions, rewriting `ORDER BY spk:cosine(…) LIMIT k`, and a compact datatype. A
+hybrid call with a variable vector query or with `candidates:join` is not built either.

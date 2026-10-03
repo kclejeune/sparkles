@@ -534,7 +534,6 @@ most the final source count. The source ends with all 100 inserts.
   and were not re-fetched.
 - The Linux `ioctl_ficlone(2)` and `copy_file_range(2)` man pages, for the Phase 2
   reflink fallback. Cited from working knowledge.
-- Fluree was **not** consulted: no code, documentation or product pages.
 
 ## Outcome
 

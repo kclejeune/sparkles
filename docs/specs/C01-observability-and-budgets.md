@@ -884,9 +884,7 @@ Expect `outcome="cancelled"` = 1 and `sparkles_requests_active{operation="query"
     and no validation of incoming ids.
   - `tracing-subscriber` 0.3.23 `Cargo.toml`: `json` pulls in `tracing-serde`, `serde`
     and `serde_json`.
-- **Fluree was not consulted.** No Fluree code, tests, documentation, website or other
-  material was opened, searched or relied on. The project's earlier feature-review notes
-  were not read.
+- The project's earlier feature-review notes were not read.
 
 ## Outcome
 

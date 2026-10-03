@@ -482,7 +482,6 @@ parameter, are a non-goal for this phase.
 - The Sparkles code: `io::Source`, `Store::load_with`, the server's transcoding of
   Jena's binary formats, `upload`, `BodyBudget`, `sparql::execute_query` and `xsd`, and
   the specs C01 and C15.
-- Fluree was not consulted.
 
 ## Outcome
 

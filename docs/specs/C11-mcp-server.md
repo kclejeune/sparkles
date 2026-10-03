@@ -1,12 +1,13 @@
 # C11: MCP server
 
-> **Status:** implemented in part
+> **Status:** implemented in part (Phases 1–2)
 >
 > **Phases:** Phase 1 shipped: `sparkles mcp` over stdio with six read-only tools,
 > snapshot pins and cancellation. Phase 2's `search_text` and `similar_entities` shipped
 > with it, and `validate_shacl`, `validate_shex` and `format` were added later. The rest
 > of Phase 2 shipped on 2026-10-02: the HTTP transport (`/$/mcp`), `sparql_update`,
-> resources and prompts. The auth integration of §4.9 shipped with it. The other Phase 3
+> resources and prompts. The auth integration of §4.9 shipped with it. Of Phase 3,
+> `dryRun` for `sparql_update` came with [C15](C15-write-previews.md). The other Phase 3
 > items were not built.
 >
 > **User docs:** [API: MCP server](../API.md#mcp-server) ·
@@ -1440,9 +1441,7 @@ If day 2 slips, `explain_query` warnings beyond `unknown-term` move to Phase 2.
   - `docs/API.md` and `README.md` (the auth note);
   - the specs [C01](C01-observability-and-budgets.md), [C02](C02-schema-discovery.md),
     [C06](C06-clone-to-sandbox.md) (style) and [PROVENANCE](PROVENANCE.md).
-- **Fluree was not consulted.** No Fluree code, tests, documentation, website, MCP
-  server or "memory" feature material was opened, searched or relied on. No planning
-  document other than the specs listed above was read.
+- No planning document other than the specs listed above was read.
 
 ## Outcome
 
@@ -1529,19 +1528,26 @@ revisit them.
    built. The server accepts only its own API tokens, which its OIDC provider does not
    issue, so metadata would send clients to an authorization server whose tokens are
    refused. Clients send an API token as a bearer header, and the token's dataset grants
-   act as its scopes.
+   act as its scopes. [C09](C09-dataset-access-control.md) later added the OIDC
+   provider's access tokens as bearer credentials, which the endpoint accepts like any
+   route, but the metadata, audience validation and scope challenges are still not
+   built.
 4. A body that is not JSON gets `400` with `-32700` from the endpoint, ahead of rmcp's
    `415`.
 5. There is no `--allow-load`, and the `sparkles_mcp_tool_*` metrics and the access log's
    `mcp_tool` field were not built.
 
-**Not built.** The Phase 3 items other than auth were not built: `atCommit` over
-retained commits, `dryRun` and `ifHead` for `sparql_update`, `subscriptions/listen`, the
-tasks extension, completions and the stdio-to-HTTP bridge. MCP has no measurements in
+**Not built.** The Phase 3 items other than auth and `dryRun` were not built. These are
+`atCommit` over retained commits, `ifHead` for `sparql_update`, `subscriptions/listen`,
+the tasks extension, completions and the stdio-to-HTTP bridge. MCP has no measurements in
 [BENCHMARKS](../BENCHMARKS.md).
 
-**Later additions (2026-10-02).** Two features of other specs added tools.
+**Later additions (2026-10-02).** Features of other specs added tools.
 
+- `sparql_update` takes `dryRun` and `changes`, which preview an update without
+  committing it ([C15](C15-write-previews.md)).
+- `diff_schema` compares the schema reports of two commits, and `describe_schema` takes
+  `section: "profiles"` for class profiles ([C02](C02-schema-discovery.md#outcome)).
 - `draft_shapes` drafts SHACL shapes or a ShEx schema from a dataset's data
   ([C02 §11](C02-schema-discovery.md#11-phase-4-shapes-drafted-from-the-data)). It counts
   as the `info` endpoint of C12 and reads the caller's visible graphs.

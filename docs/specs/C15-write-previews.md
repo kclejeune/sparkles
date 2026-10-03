@@ -1,6 +1,6 @@
 # C15: Write previews (dry runs)
 
-> **Status:** implemented.
+> **Status:** implemented
 >
 > **Phases:** One phase shipped on 2026-10-02. It added dry runs of updates, Graph Store
 > writes, uploads and the MCP update tool, and made Graph Store `PUT` log only the
@@ -18,8 +18,7 @@ write-time validation ([C10](C10-write-time-validation.md), [G02](G02-shex.md)),
 quotas, entity tags and graph-level access control ([C12](C12-graph-access-control.md)).
 The sources were the SPARQL 1.1 Update, Protocol and Graph Store Protocol standards,
 RFC 9110, the public documentation of Kubernetes' server-side dry run and of RDF4J's
-transaction API, Apache Jena's RDF Patch documentation, and the Sparkles code. Fluree was
-not consulted.
+transaction API, Apache Jena's RDF Patch documentation, and the Sparkles code.
 
 ## 1. Summary, goals, non-goals
 
@@ -620,7 +619,6 @@ writes one WAL insert record, and its receipt says `inserted: 1, deleted: 0`.
 * Cited from general knowledge, not fetched: SPARQL 1.1 Update and Protocol, RFC 9110,
   RFC 4918, RFC 6648, RFC 7240, Apache Jena's RDF Patch documentation, RDF4J's SHACL
   validation at `prepare()`.
-* **Not consulted**: Fluree in any form, including its code, docs, tests, site and talks.
 
 ## Outcome
 
@@ -714,6 +712,9 @@ documentation.
 a sort of the transaction's log on the WAL path, and a state comparison on the bulk
 path. No separate benchmark was run.
 
-**Not built.** The open questions of §9 keep their defaults: dry runs are refused on
+**Later.** Applying RDF Patch ([F10](F10-replication.md)) came after this spec and takes
+the same flags, so a patch can be previewed like any other write.
+
+**Not built.** The open questions of §9 keep their defaults. Dry runs are refused on
 read-only servers, a bulk dry run builds its generation, only dry runs roll their
 vocabulary back, and the CLI has no `--dry-run`. The UI does not offer previews.

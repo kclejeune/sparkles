@@ -1,6 +1,6 @@
 # X03: OpenAPI description, shell completions and man pages
 
-> **Status:** implemented in part
+> **Status:** implemented in part (Phase 1)
 >
 > **Phases:** Phase 1 shipped. It covers the OpenAPI 3.1 description at
 > `GET /$/openapi.json` and `GET /$/openapi.yaml`, its checked-in copy, the test that
@@ -19,7 +19,7 @@ This is internal engineering, not derived from any other database product. The s
 are the OpenAPI Specification 3.1.1, JSON Schema 2020-12, YAML 1.2, the SPARQL 1.1
 Protocol and Graph Store Protocol, RFC 9110, RFC 6265, RFC 9512, the documentation of
 `clap_complete` and `clap_mangen`, the nixpkgs manual's section on `installShellFiles`,
-and the Sparkles code and API reference (§10). Fluree was not consulted.
+and the Sparkles code and API reference (§10).
 
 ## 1. Summary, goals, non-goals
 
@@ -399,6 +399,12 @@ data. `clap_complete` takes 84 KB, and `clap_mangen` with `roff` 66 KB. Embeddin
 checked-in copy instead would save about 0.35 MB of code but make the served document
 only as current as the copy, so it was not done. The tradeoff is binary size for a
 description computed from the code that serves it.
+
+**Later growth.** The figures above are from the landing. The features that landed
+since then, such as GraphQL, RDF Patch, DESCRIBE settings and automatic compaction, added
+their routes to the description, and the test keeps it equal to the route table. On
+2026-10-03 the checked-in copy describes 191 operations on 116 paths with 113 schemas,
+and it is 523 KB.
 
 **Not built.** Phase 2's schemas for backups, the search indexes, reasoning, write-time
 validation, history and the other open objects, and the response-validation test that

@@ -647,7 +647,6 @@ was built, on 2026-10-02.
   vocabulary of the Phase 2 Turtle export. It is cited from working knowledge.
 - The Apache Jena convention of `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph`, as
   Sparkles' SHACL endpoint already implements it.
-- Fluree was not consulted. No Fluree code, documentation or product pages were read.
 
 ## 11. Phase 4: shapes drafted from the data
 
@@ -879,9 +878,10 @@ modules.
 The open questions were settled as the spec proposed. `graph` defaults to `default`,
 built-in entries are listed with a `builtin` flag, and `/$/stats` was left alone.
 
-**Deviations.** Durable commit identity landed, but the report did not gain
-`snapshot.commit` or `datasetId`. Cursors still bind to the in-memory
-`snapshot.version`, so they do not survive a restart. §4.5 and open question 5 describe
+**Deviations.** Durable commit identity landed, but the Phase 1 report did not gain
+`snapshot.commit` or `datasetId`. Phase 3 later added `snapshot.commit`, as the end of
+this section says. Cursors still bind to the in-memory `snapshot.version`, so they do
+not survive a restart. §4.5 and open question 5 describe
 the commit-bound alternative.
 
 **Later use.** The MCP server's schema tools are built on `sparkles::schema`
