@@ -1557,7 +1557,7 @@ fn memory_budget_applies_to_cached_results_and_updates() {
 
 /// Results serialized from chunks of rows decoded in id order (with blank nodes, inline
 /// literals, unbound values and terms added by updates) match the terms decoded one by
-/// one, across chunk boundaries and with a row limit.
+/// one, across chunk boundaries, with a row limit and for a result of one chunk.
 #[test]
 fn serialized_terms_match_terms_decoded_one_by_one() {
     use results::SolutionsFormat;
@@ -1593,7 +1593,7 @@ fn serialized_terms_match_terms_decoded_one_by_one() {
         "SELECT ?s ?o ?x { ?s ?p ?o OPTIONAL { ?s <http://ex.org/q> ?x } }",
     );
     assert!(r.table.len() > 70_000);
-    for send in [None, Some(66_000)] {
+    for send in [None, Some(66_000), Some(1_000)] {
         let mut got = Vec::new();
         results::write_solutions(&r, SolutionsFormat::Tsv, &mut got, send).unwrap();
         let vars: Vec<oxrdf::Variable> = r
