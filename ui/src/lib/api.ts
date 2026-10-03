@@ -1457,6 +1457,7 @@ export type CommitKind =
   | 'reason-clear'
   | 'transaction'
   | 'embed'
+  | 'patch'
   | 'unknown';
 
 /** One commit: the state after a write that changed data. */

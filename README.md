@@ -53,6 +53,9 @@ running queries.
   ([API](docs/API.md#point-in-time-reads-and-snapshots)).
 * A change feed of commits and their changes, resumable from any readable commit, with
   long polling and server-sent events ([API](docs/API.md#change-feed)).
+* RDF Patch applied as one commit through Fuseki's `patch` operation, in the text and the
+  binary form, with `H prev` as an optimistic concurrency check
+  ([API](docs/API.md#applying-rdf-patch)).
 * Commit messages, optional change digests, and Graph Store entity tags with `If-Match`
   writes checked under the writer lock ([API](docs/API.md#entity-tags-and-conditional-requests)).
 * Dry runs of updates, Graph Store writes and uploads. A dry run reports the commit, the
@@ -92,7 +95,7 @@ running queries.
 * A Jena-style CLI with `tdb2.*` and `arq` equivalents. The commands work on a database
   directory or on a remote server ([usage](docs/USAGE.md#command-line-tools)). File tools
   match Jena's `riot`, `qparse`, `uparse`, `rdfdiff`, `iri`, `langtag`, `rsparql`,
-  `rupdate` and `rset` ([usage](docs/USAGE.md#file-tools)).
+  `rupdate`, `rset` and `rdfpatch` ([usage](docs/USAGE.md#file-tools)).
 
 **Reasoning**
 * RDFS, OWL 2 RL and Jena's rule syntax, materialized by semi-naive forward chaining.
@@ -165,7 +168,7 @@ running queries.
 
 | Engine | What it is | Where Sparkles stands |
 |---|---|---|
-| [Apache Jena / Fuseki](https://jena.apache.org/) | The reference Java stack. It has ARQ, TDB2 on B+trees, Fuseki, on-the-fly inference, jena-text and GeoSPARQL. | Sparkles has the same protocols, endpoints, admin API and CLI model, on sorted columnar indexes. It is faster on every benchmark query at 10.5M triples, by a median of 78×. Reasoning is materialized, apart from RDFS on read. Sparkles writes RDF Patch but cannot apply it. It has ARQ's statistical aggregates, `LATERAL`, path ranges, CONSTRUCT with `GRAPH` and most of its function library, but not its property-function libraries, `LET` or `FOLD`, and there is no ontology API. |
+| [Apache Jena / Fuseki](https://jena.apache.org/) | The reference Java stack. It has ARQ, TDB2 on B+trees, Fuseki, on-the-fly inference, jena-text and GeoSPARQL. | Sparkles has the same protocols, endpoints, admin API and CLI model, on sorted columnar indexes. It is faster on every benchmark query at 10.5M triples, by a median of 78×. Reasoning is materialized, apart from RDFS on read. Sparkles writes RDF Patch and applies it through Fuseki's `patch` operation. It has ARQ's statistical aggregates, `LATERAL`, path ranges, CONSTRUCT with `GRAPH` and most of its function library, but not its property-function libraries, `LET` or `FOLD`, and there is no ontology API. |
 | [QLever](https://github.com/ad-freiburg/qlever) | A C++ engine for billions of triples, with lazy, streaming execution. | Sparkles uses the same index and execution architecture and adds exact term identity, MVCC updates, the Graph Store Protocol, reasoning and SHACL. It is faster on all 28 benchmark queries at 10.5M triples and on all 20 WatDiv templates, and it uses about a third more memory. It has been measured only up to 11M triples, and it materializes intermediate results. |
 | [Oxigraph](https://github.com/oxigraph/oxigraph) | A Rust database and toolkit on RocksDB, with Python and WebAssembly packages. | Sparkles uses Oxigraph's parsers, SPARQL parser and datatypes, with its own storage and planner. It is faster on every benchmark query at 10.5M triples, by a median of 85×. It fsyncs its writes, so Oxigraph's single-triple updates are faster. It adds reasoning, validation, search, authentication and a UI. It has Rust and Python APIs and no WebAssembly build. |
 | [Fluree](https://github.com/fluree/db) | A versioned, permissioned ledger with clustering, licensed under BUSL-1.1. JSON-LD is its main interface. | Sparkles passes the W3C SPARQL suites in full and is compatible with Fuseki. It has point-in-time reads, snapshots, diffs and protections of triples in its configuration, but no branches, history queries, policies stored in the data or clustering. It is faster on every benchmark query that Fluree completes at 10.5M triples, by a median of 9.8×, but only by 1–5% on a few counts and point lookups. |
@@ -261,7 +264,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | Command | What it does |
 |---|---|
 | `serve` | Run the SPARQL server with the web UI. |
-| `load`, `query`, `update`, `dump` | Bulk load, query and update, locally or on a `--server`. `dump` exports N-Quads. |
+| `load`, `query`, `update`, `patch`, `dump` | Bulk load, query, update and apply RDF Patch, locally or on a `--server`. `dump` exports N-Quads. |
 | `csv` | Convert CSV and TSV tables to RDF, or print the CSVW metadata of the default mapping. `load` maps and loads them directly. |
 | `compact`, `compaction`, `clone`, `stats`, `log`, `check` | Merge updates, set a dataset's automatic compaction, copy a dataset, show statistics or the commit history, and verify a database. |
 | `snapshot`, `diff` | Manage named snapshots, pin schedules, history retention and the commit catalog's horizon, and show the quads added and removed between two commits, also as RDF Patch. |
@@ -276,6 +279,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `fmt`, `lsp` | Run the formatter or its language server. |
 | `convert` (`riot`), `compare` (`rdfdiff`), `qparse`, `uparse`, `iri`, `langtag` | Convert, validate and count RDF files, compare them up to blank-node isomorphism, print a query's algebra or plan, and check IRIs and language tags. |
 | `rsparql`, `rupdate`, `rset` | Query and update any SPARQL endpoint, and convert result sets. |
+| `rdfpatch` | Print the rows of RDF Patch files and count them. |
 | `completions`, `man`, `openapi` | Print shell completions for bash, zsh, fish, elvish or PowerShell, write man pages, or print the OpenAPI description of the HTTP API. |
 
 [docs/USAGE.md](docs/USAGE.md#command-line-tools) describes each one.

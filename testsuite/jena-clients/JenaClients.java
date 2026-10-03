@@ -46,6 +46,10 @@ import org.apache.jena.rdf.model.ModelFactory;
 import org.apache.jena.rdfconnection.RDFConnection;
 import org.apache.jena.rdfconnection.RDFConnectionFuseki;
 import org.apache.jena.rdfconnection.RDFConnectionRemote;
+import org.apache.jena.rdfpatch.RDFPatch;
+import org.apache.jena.rdfpatch.RDFPatchOps;
+import org.apache.jena.rdfpatch.binary.RDFChangesWriterBinary;
+import org.apache.jena.rdfpatch.changes.RDFChangesCollector;
 import org.apache.jena.riot.Lang;
 import org.apache.jena.riot.RDFDataMgr;
 import org.apache.jena.riot.RDFFormat;
@@ -112,6 +116,7 @@ public class JenaClients {
         compression(ds);
         directNaming(ds);
         shacl(ds);
+        patches();
         validators();
         adminTasks();
         adminLifecycle();
@@ -904,6 +909,89 @@ public class JenaClients {
         ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
             sh:property [ sh:path ex:age ; sh:minCount 1 ; sh:datatype xsd:integer ] .
         """;
+
+    // ------------------------------------------------------------- RDF Patch ----
+
+    /** A patch made with Jena's change collector: adds in two graphs, a blank node, a
+     *  delete and prefix rows, in one transaction. */
+    static RDFPatch jenaPatch() {
+        RDFChangesCollector c = new RDFChangesCollector();
+        c.start();
+        c.header("id", NodeFactory.createURI("uuid:3c9e1c5e-325e-11ec-abcc-a70bbba0dfb1"));
+        c.txnBegin();
+        c.addPrefix(null, "ex", "http://example.org/");
+        Node g = NodeFactory.createURI("http://example.org/g");
+        Node s = NodeFactory.createURI("http://example.org/s");
+        Node p = NodeFactory.createURI("http://example.org/p");
+        Node b = NodeFactory.createBlankNode("b1");
+        c.add(null, s, p, NodeFactory.createLiteralString("one"));
+        c.add(g, s, p, NodeFactory.createLiteralLang("deux", "fr"));
+        c.add(null, s, p, b);
+        c.add(null, b, p, NodeFactory.createLiteralDT("42", org.apache.jena.datatypes.xsd.XSDDatatype.XSDinteger));
+        c.add(null, s, p, NodeFactory.createURI("http://example.org/gone"));
+        c.delete(null, s, p, NodeFactory.createURI("http://example.org/gone"));
+        c.txnCommit();
+        c.finish();
+        return c.getRDFPatch();
+    }
+
+    /** The patch applied by Jena to an empty dataset. */
+    static DatasetGraph appliedByJena(RDFPatch patch) {
+        DatasetGraph dsg = DatasetGraphFactory.createTxnMem();
+        RDFPatchOps.applyChange(dsg, patch);
+        return dsg;
+    }
+
+    static DatasetGraph fetched(String ds) {
+        try ( RDFConnection c = RDFConnectionRemote.newBuilder().destination(ds).build() ) {
+            return c.fetchDataset().asDatasetGraph();
+        }
+    }
+
+    static void patches() {
+        RDFPatch patch = jenaPatch();
+        check("patch: a patch written by Jena's text writer, POST /jp/patch", () -> {
+            expect2xx(postForm("/$/datasets", "dbName=jp&dbType=tdb2"), "create /jp");
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            RDFPatchOps.write(out, patch);
+            Resp r = send("POST", "/jp/patch", WebContent.contentTypePatch, out.toByteArray());
+            expectStatus(200, r, "patch");
+            expectIso(appliedByJena(patch), fetched(server + "/jp"), "the dataset Jena would have");
+            Resp p = get("/jp/prefixes?prefix=ex");
+            expect(p.body().contains("http://example.org/"), "the PA row's prefix: " + p.body());
+        });
+        check("patch: a patch written by Jena's binary writer, PATCH /jq/patch", () -> {
+            expect2xx(postForm("/$/datasets", "dbName=jq&dbType=mem"), "create /jq");
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            RDFChangesWriterBinary.write(patch, out);
+            Resp r = send("PATCH", "/jq/patch", WebContent.contentTypePatchThrift, out.toByteArray());
+            expectStatus(200, r, "patch");
+            expectIso(appliedByJena(patch), fetched(server + "/jq"), "the dataset Jena would have");
+        });
+        check("patch: POST /jq with a patch body is dispatched as Fuseki dispatches it", () -> {
+            String text = "A <http://example.org/t> <http://example.org/p> \"t\" .\n";
+            Resp r = send("POST", "/jq", WebContent.contentTypePatch, utf8(text));
+            expectStatus(200, r, "patch");
+            try ( RDFConnection c = RDFConnectionRemote.newBuilder().destination(server + "/jq").build() ) {
+                expect(c.queryAsk("ASK { <http://example.org/t> ?p \"t\" }"), "the added triple");
+            }
+        });
+        check("patch: TA aborts, and other methods are 405", () -> {
+            Resp r = send("POST", "/jq/patch", WebContent.contentTypePatch,
+                          utf8("TX .\nA <http://example.org/z> <http://example.org/p> 1 .\nTA .\n"));
+            expectStatus(200, r, "abort");
+            expect(r.body().contains("\"aborted\":true"), "aborted: " + r.body());
+            expectStatus(405, get("/jq/patch"), "GET");
+        });
+        check("patch: /$/datasets/jq lists the patch service", () -> {
+            Resp r = get("/$/datasets/jq");
+            expect(r.body().contains("\"patch\""), "srv.type patch: " + r.body());
+        });
+        check("patch: delete /jp and /jq", () -> {
+            expect2xx(send("DELETE", "/$/datasets/jp", null, null), "delete /jp");
+            expect2xx(send("DELETE", "/$/datasets/jq", null, null), "delete /jq");
+        });
+    }
 
     static void shacl(String ds) {
         check("shacl: POST /jc/shacl?graph=default", () -> {

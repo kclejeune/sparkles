@@ -378,5 +378,6 @@ suites are unchanged (482/328/157/269).
 with 55 MiB peak memory, which does not grow with the input. Release builds were not
 measured.
 
-**Not built.** `rdfpatch` and `schemagen` (§1 non-goals). Jena's `--rdfs` and
+**Not built.** `rdfpatch` and `schemagen` (§1 non-goals). `rdfpatch` came later with
+the patch reader of [F10](F10-replication.md#outcome). Jena's `--rdfs` and
 `--formatted` flags of `riot`. A configurable severity per rule.

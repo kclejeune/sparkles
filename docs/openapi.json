@@ -1126,6 +1126,8 @@
               "reason",
               "reason-clear",
               "transaction",
+              "embed",
+              "patch",
               "unknown"
             ],
             "type": "string"

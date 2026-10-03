@@ -1071,7 +1071,13 @@ implementation landed.
 
   Fluree was not consulted, and the descriptions of Fluree in the project's planning notes
   and comparison table were not used.
-- **Implementation:** not started.
+- **Implementation:** Phase 1 from the spec plus Sparkles code only (2026-10-02), with no
+  new dependency. The patch reader was written from the row grammar and the RDF Thrift
+  schema (`BinaryRDF.thrift`), not from Jena's reader. The tests port the patches of
+  `jena-rdfpatch`'s `TestPatchIO_Text`, `AbstractTestPatchIO` and
+  `testing/files/syntax-1.rdfp` (Apache-2.0), and the fixtures in
+  `crates/sparkles/tests/patch` were written by Jena 6.2.0's patch writers. Phases 2 and 3
+  are deferred.
 - **Rejected** (spec §10):
   - physical replication of WAL bytes and generation files;
   - the public change feed as the replication protocol;

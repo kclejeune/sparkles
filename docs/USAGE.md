@@ -107,7 +107,7 @@ header, so session cookies get `Secure` and the `__Host-` prefix, and origin che
 ### Endpoints and operations
 
 A dataset `ds` has the Fuseki-style endpoints `/ds/sparql`, `/ds/update`, `/ds/data`
-(GSP) and `/ds/upload`. The server also has `/$/datasets`, `/$/stats/ds`,
+(GSP), `/ds/upload` and `/ds/patch` (RDF Patch). The server also has `/$/datasets`, `/$/stats/ds`,
 `/$/compact/ds`, `/$/backup/ds` and `/$/tasks` (see [API.md](API.md)). `--mem NAME` adds
 an in-memory dataset, and `--loc NAME=PATH` serves an existing database.
 
@@ -163,6 +163,18 @@ work too: `POST /$/datasets?dbName=ds&dbType=tdb2`, a `config.ttl` body on
 `GET /$/stats`, `POST /$/datasets/ds?state=offline` and the `/$/validate/*` services.
 [API.md](API.md#datasets-admin) lists where Sparkles differs, such as the assembler
 settings it refuses.
+
+Fuseki's `patch` operation is `/ds/patch`, which applies an RDF Patch in one commit.
+It takes `POST` and `PATCH`, the text form `application/rdf-patch`, and also the binary
+form `application/rdf-patch+thrift` that Fuseki refuses. A `POST` of a patch to `/ds`
+works too. A patch whose `prev` header names a commit of the dataset applies only while
+that commit is the head, so a chain of patches from `/ds/diff` or `/ds/changes` stops at
+the first gap. [API.md](API.md#applying-rdf-patch) has the details.
+
+```sh
+curl -X POST http://localhost:3030/ds/patch -H 'Content-Type: application/rdf-patch' \
+  --data-binary @changes.rdfp
+```
 
 Fuseki's direct Graph Store naming, where the request URL names the graph, is off by
 default. `sparkles serve --gsp-direct-naming` turns it on for every dataset, so that
@@ -353,6 +365,7 @@ sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv,
 sparkles query   --data file.ttl --query q.rq # query files in memory (arq --data)
 sparkles query   --loc db --rdfs schema.ttl 'SELECT ...'   # RDFS on read (--rdfs-graph IRI|default)
 sparkles update  --loc db 'INSERT DATA {...}' # also LOAD <http…>
+sparkles patch   --loc db changes.rdfp        # apply RDF Patch files, one commit per file
 sparkles compact --loc db                     # merge updates into a new generation
 sparkles compact --loc db --if-due            # only when the compaction policy says so (for cron)
 sparkles dump    --loc db > dump.nq
@@ -415,7 +428,13 @@ read the dataset can measure an index's recall from its card. The **Similar** pa
 controls for k, the metric, `ef` and exact search, and it shows how the server ran each
 search.
 
-`sparkles update` and `sparkles load` take `--message TEXT`, which is stored with the
+`sparkles patch` applies RDF Patch files to a database, one commit per file, as the
+patch endpoint applies them, and prints each commit as `sparkles update` does. `-` reads
+standard input. A file ending in `.trp` is in the binary form and any other in the text
+form, as Jena names them, unless `--format text|binary` says otherwise. With `--server URL
+--dataset NAME` the files go to the server's `/{ds}/patch` instead.
+
+`sparkles update`, `sparkles load` and `sparkles patch` take `--message TEXT`, which is stored with the
 commit they make and shown by `sparkles log` and `/$/commits`. With `--server`, the
 message travels in the `Sparkles-Commit-Message` header, and each file that `load` sends
 becomes its own commit with the same message. A message is at most 1024 bytes of UTF-8
@@ -558,8 +577,9 @@ and the UI's schema browser shows it as SHACL chips next to the observed counts
 
 These commands work on files and endpoints rather than databases. They match Jena's
 `riot`, `qparse`, `uparse`, `rdfdiff`, `rdfcompare`, `iri`, `langtag`, `rsparql`,
-`rupdate` and `rset`, and `convert` and `compare` answer to Jena's names as aliases. The
-design is in [spec G05](specs/G05-command-line-tools.md).
+`rupdate`, `rset` and `rdfpatch`, and `convert` and `compare` answer to Jena's names as
+aliases. The design is in [spec G05](specs/G05-command-line-tools.md), and `rdfpatch` is
+in [spec F10](specs/F10-replication.md).
 
 ```sh
 sparkles convert data.ttl.gz --output nt      # stream to N-Triples (default output: N-Quads)
@@ -580,6 +600,7 @@ sparkles langtag en-us zh-yue-HK en--ltr      # subtags, canonical case, warning
 sparkles rsparql --service https://query.wikidata.org/sparql --query q.rq --results csv
 sparkles rupdate --service http://localhost:3030/ds/update 'INSERT DATA {...}'
 sparkles rset results.srj --results text      # JSON, XML or TSV results to another format
+sparkles rdfpatch changes.rdfp                # the rows of RDF Patch files, and their counts
 ```
 
 `convert` reads files, or standard input when no file is given or a file is `-`. It takes
@@ -633,6 +654,12 @@ The other formats are `json`, `xml`, `csv`, `tsv`, and for graphs `ttl`, `nt`, `
 credentials, which are refused over plain http to a host other than localhost unless
 `--insecure-http` is given. `--default-graph-uri`, `--named-graph-uri` and, for
 `rupdate`, `--using-graph-uri` and `--using-named-graph-uri` set the protocol's dataset.
+
+`rdfpatch` reads RDF Patch files, or standard input for `-`, and writes their rows back
+in the text form, or in the binary form with `--binary-out`. As Jena's `rdfpatch` does, it
+prints the counts of data rows, prefix rows and transaction rows of each file to standard
+error. The input form follows the file extension, `.trp` for binary, or `--format`. An
+error exits with status 1 and names the line and column, or the row of a binary patch.
 
 ### Drafting shapes from the data
 
@@ -1384,6 +1411,8 @@ ds.ask("ASK { ?s ?p ?o }")                         # True or False
 for t in ds.construct("CONSTRUCT WHERE { ?s ?p ?o }"):
     print(t.subject, t.predicate, t.object)
 ds.update("INSERT DATA { <http://ex.org/a> <http://ex.org/p> 1 }").inserted   # 1
+ds.apply_patch(open("changes.rdfp").read()).commit   # an RDF Patch in one commit
+ds.apply_patch(open("changes.trp", "rb").read(), binary=True)   # the RDF Thrift form
 
 ds.select(query).serialize("results.srj")          # SPARQL results: json, xml, csv or tsv
 ds.construct(query).serialize(format="turtle")     # bytes of Turtle
@@ -1402,7 +1431,9 @@ CONSTRUCT and DESCRIBE. `select`, `ask` and `construct` check the query form and
   raises `BudgetExceededError`.
 * `cancel` takes a `CancelToken`, and `at` reads a past state (see below).
 
-`update` takes the same `timeout`, budgets and `cancel`. A row is `None` at an unbound
+`update` takes the same `timeout`, budgets and `cancel`. `apply_patch` applies an RDF
+Patch from a `str` or `bytes` as the server's patch endpoint does, and returns a
+`PatchStats` with the commit and the counts of the rows that took effect. A row is `None` at an unbound
 variable, and `row.get("name", default)` returns the default instead.
 `QuerySolutions.serialize` must come before the rows are iterated, and it consumes them.
 

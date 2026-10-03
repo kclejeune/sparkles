@@ -2,7 +2,7 @@
 //! patch files to a local database and through a server, and printing their rows.
 
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
 
@@ -140,6 +140,7 @@ fn port() -> u16 {
 #[cfg(feature = "auth")]
 #[test]
 fn patch_through_a_server() {
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
     let d = tempfile::tempdir().unwrap();
     let dir = d.path();

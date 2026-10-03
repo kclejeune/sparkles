@@ -1,16 +1,17 @@
 # F10: Applying RDF Patch, replication and read replicas
 
-> **Status:** specified
+> **Status:** implemented in part (Phase 1). Phases 2 and 3 are deferred.
 >
 > **Phases:** Phase 1 applies RDF Patch to a dataset, as Fuseki's `patch` operation does,
-> in the text and binary forms, with `H prev` as an optimistic concurrency check. Phase 2
-> adds read replicas that follow a primary over HTTP, keep its commit ids, bootstrap
-> from a copy of a generation or from a backup, and can be promoted by hand. Phase 3
-> covers continuous archiving to a backup repository, synchronous replication, write
-> forwarding and automated failover. Nothing is built.
+> in the text and binary forms, with `H prev` as an optimistic concurrency check. It is
+> built. Phase 2 adds read replicas that follow a primary over HTTP, keep its commit ids,
+> bootstrap from a copy of a generation or from a backup, and can be promoted by hand.
+> Phase 3 covers continuous archiving to a backup repository, synchronous replication,
+> write forwarding and automated failover. Both wait until the rest of the planned work
+> is done.
 >
-> **User docs:** there are none. Phase 1 adds "Applying RDF Patch" to
-> [the API](../API.md), and Phase 2 adds "Replication".
+> **User docs:** [Applying RDF Patch](../API.md#applying-rdf-patch) in the API reference,
+> and `sparkles patch` and `sparkles rdfpatch` in [the usage guide](../USAGE.md).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -1368,6 +1369,98 @@ less time on the replica than making them took on the primary. The numbers go to
 
 ## Outcome
 
-Nothing has been built. This section will record what was delivered, where it departed
-from the design and why, the decisions the maintainer made, the tests and measurements at
-landing, and what was deferred.
+**Phase 1 delivered on 2026-10-02** as applying RDF Patch, a Jena and Fuseki compatibility
+feature. Phases 2 and 3 are deferred. The maintainer decided during Phase 1 that
+replication waits until all other planned work is done, so the apply path was built for
+patches from clients and was not shaped for replicas that keep a primary's commit ids.
+The work landed in six commits after the spec. `44dc19e` added the reader, `e0366f4` the
+engine's apply path and the commit kind, `8121894` the endpoint, `7d170ba` the commands,
+`d7f135c` the Python method, and a last commit the documentation, the UI's commit kind
+and the Jena client checks.
+
+* **Reader.** `sparkles::patch` gained `PatchReader`, `PatchRow`, `PatchError` and
+  `binary_for_path`, in `patch/read.rs` and `patch/thrift.rs`. The text reader has its own
+  streaming tokenizer for the row grammar of Jena's `RDFPatchReaderText`. It reads IRIs,
+  `_:label` and `<_:label>` blank nodes, literals in single, double and long quotes with
+  language tags, base directions and datatypes, Turtle numbers, `true` and `false`, triple
+  terms, comments and `TB`. It reports line and column. The binary reader decodes
+  `RDF_Patch_Row` structs in the Thrift compact protocol, skips unknown fields by their
+  wire type, reads strings in pieces so that a length the body cannot hold fails at its
+  end, and bounds nesting. It accepts the value forms `valInteger`, `valDouble` and
+  `valDecimal`. Prefixed names and variables are term errors. `PatchWriter` gained
+  `header_term`, `prefix`, `row` and `flush`, so every row the reader returns writes back
+  in either form.
+* **Engine.** `Store::apply_patch` and `Dataset::apply_patch` are in
+  `store/patch_apply.rs`, apart from the WAL code. The patch runs in one `WriteTxn` of the
+  new `CommitKind::Patch`, code 12, so write-time validation, quotas, free-disk checks,
+  graph-limited writes, protections of triples, dry runs, cancellation and deadlines apply
+  as they do to any write. `Error::Patch` carries the kind (`Syntax`, `Term` or
+  `PrevMismatch`), the row, the line and column or the byte offset, and for a mismatch the
+  commit IRI, the expected commit and the head. `WriteTxn::lookup_key` finds a term
+  without adding it, so a `D` row of unknown terms adds nothing to the vocabulary.
+* **Server.** `http/patch.rs` serves `POST` and `PATCH /{ds}/patch` and the dispatch of a
+  `POST /{ds}` by its content type. The endpoint name `patch` joined C12's list, the
+  access log and metrics gained the operation `patch`, Fuseki's metric names gained the
+  `patch` endpoint, dataset descriptions list the `patch` service at the dataset URL and
+  `patch`, and the assembler accepts `fuseki:patch`. The route counts as an update for the
+  rate limiter. CORS allows `PATCH`. The OpenAPI description has `patchPost` and `patch`
+  and the `PatchResult` schema.
+* **Commands and Python.** `sparkles patch` applies files to `--loc` or sends them to
+  `--server`, one commit per file. `sparkles rdfpatch` prints rows and Jena's counts.
+  `Dataset.apply_patch(data, binary=False, *, message=None)` returns a `PatchStats`.
+
+**Deviations from the design.**
+
+- The command is `sparkles rdfpatch`, since the file tools of G05 are flattened into the
+  top-level commands. It also takes `--format` for the input and `--binary-out`.
+- The CORS layer answers `OPTIONS` on every route, so `OPTIONS /{ds}/patch` lists the
+  CORS methods, `PATCH` among them, and not Fuseki's `Allow`. The `405` answers to the
+  other methods carry `Allow: OPTIONS,POST,PATCH`.
+- `prev` in the headers at the start of the patch becomes the write's precondition, which
+  is checked under the writer lock and reported by a dry run. A `prev` after the first
+  other row is checked against the head when it is read. The blank-node rule is decided by
+  the leading headers alone. A lineage is only the dataset's own id, because the lineages
+  of §4.7 belong to Phase 2.
+- Prefix rows are checked as `PUT /{ds}/prefixes` checks a prefix before the data
+  commits, including whether the map would pass `--max-prefixes`, and are applied once it
+  has committed. A new prefix that another request's change has left no room for in
+  between is skipped with a warning instead of failing a committed patch.
+- A patch of `A` rows alone, with at least `bulk_threshold` rows, takes the bulk path and
+  rebuilds the index. Its `inserted` is then the commit's net count.
+- `If-Match` is not read on patch requests. `prev` is the patch's own precondition.
+- `PatchOutcome` also has `inserted` and `deleted`, which the response needs. The rows of
+  `PatchRow::PrefixSet` and `PrefixRemove` drop a graph term, as the design's signature
+  has them.
+- Python maps syntax errors to `RdfSyntaxError`, term errors to `InvalidInputError` and a
+  `prev` mismatch to `ConflictError`, and `apply_patch` takes `message`.
+
+**Tests at landing.**
+
+- `patch/tests_read.rs` ports the patches of Jena's `TestPatchIO_Text`,
+  `AbstractTestPatchIO` and `testing/files/syntax-1.rdfp` (Apache-2.0), round-trips every
+  row kind through the writer in both forms, and checks syntax and term errors with their
+  positions and the binary decoder's bounds. `tests/patch/` holds a patch that Jena 6.2's
+  text and binary writers wrote, with the program that wrote it, and both forms read to
+  the same rows.
+- `tests/patch.rs` covers P1 to P9, P11 and P14 on the engine: P7 applies the diff of a
+  history with blank nodes, named graphs, triple terms and directional literals to an
+  empty dataset in both forms and compares canonical dumps. It also covers the bulk path
+  and crash safety. A patch commit replays with its kind and blank-node counter after a
+  restart, and a torn tail of one is dropped, after which the next commit takes its
+  number.
+- `http/patch_tests.rs` covers P1, P2, P4, P5, P6, P9 to P12 and P14 over HTTP, with
+  a SHACL guard that rejects a patch. `router_tests::auth::graphs` covers P13: a write
+  outside the caller's graphs, prefix rows from a limited caller, a reader, a grant limited
+  to `update`, and the dispatch on `/{ds}`. `tests/cli_patch.rs` covers P15, the binary
+  form, several files, messages, errors, and `--server`. The Python suite applies text and
+  binary patches.
+- `mise run test:jena-clients` writes a patch with Jena's `RDFChangesCollector`, sends it
+  through Jena's text and binary writers to `/{ds}/patch` and `/{ds}`, and compares the
+  datasets with the one `RDFPatchOps.applyChange` makes. All 144 checks pass.
+- GATES
+
+**Not built.** Phases 2 and 3: roles, replicas, the commit stream, captures, holds,
+`minCommit`, promotion and lineages, archiving, synchronous replication and failover.
+Open questions 3 (a commit per transaction), 4 (idempotent patches by `H id`), 13 (a
+parameter for the blank-node rule) and 14 (refusing graph terms on prefix rows) keep the
+designed defaults.
