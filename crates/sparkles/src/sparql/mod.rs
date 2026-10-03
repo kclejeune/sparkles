@@ -13,6 +13,7 @@ pub mod exec;
 mod exists;
 pub mod expr;
 mod exprcache;
+mod fnformat;
 mod fnlib;
 pub mod geojoin;
 pub mod geopf;

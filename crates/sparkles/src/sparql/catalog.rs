@@ -41,6 +41,9 @@ pub const FN_FUNCTIONS: &[&str] = &[
     "not",
     "boolean",
     "error",
+    "format-number",
+    "collation-key",
+    "apply",
     "dateTime",
     "year-from-dateTime",
     "month-from-dateTime",
@@ -105,6 +108,15 @@ pub const AFN_FUNCTIONS: &[&str] = &[
     "date",
     "timezone",
     "adjust-to-timezone",
+    "sprintf",
+    "system-timezone",
+    "nowtz",
+    "version",
+    "collation",
+    "eval",
+    "print",
+    "execTime",
+    "wait",
 ];
 
 /// Sparkles' vector functions (`spk:`, `urn:x-sparkles:`).
