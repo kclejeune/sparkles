@@ -1,11 +1,11 @@
 //! The source of a backup: a capture of a live store ([`Source::from`] a
-//! `sparkles::store::BackupCapture`), or of a closed database directory (the CLI with
+//! `sparkles_core::store::BackupCapture`), or of a closed database directory (the CLI with
 //! a stopped database, and tests).
 
 use crate::BackupError;
 use crate::error::Result;
-use sparkles::commit::CommitInfo;
-use sparkles::store::{BackupCapture, CapturedFile, LeaseGuard, Store, StoreOptions};
+use sparkles_core::commit::CommitInfo;
+use sparkles_core::store::{BackupCapture, CapturedFile, LeaseGuard, Store, StoreOptions};
 use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
@@ -92,8 +92,8 @@ impl Source {
 mod tests {
     use super::*;
     use crate::Code;
-    use sparkles::sparql::QueryOptions;
-    use sparkles::sparql::update::update;
+    use sparkles_core::sparql::QueryOptions;
+    use sparkles_core::sparql::update::update;
 
     fn db(dir: &Path) -> (Uuid, u64) {
         let s = Store::open(dir, StoreOptions::default()).unwrap();
@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(src.dataset_id, id);
         assert_eq!(src.commit.seq, head);
         assert_eq!(src.generation, "gen-0001");
-        assert_eq!(src.index_format, sparkles::builder::FORMAT_VERSION);
+        assert_eq!(src.index_format, sparkles_core::builder::FORMAT_VERSION);
         assert_eq!(src.lease.generation(), 1);
         let current = src.file("CURRENT").unwrap();
         assert_eq!(Source::read_file(current).unwrap(), b"gen-0001");
@@ -178,7 +178,7 @@ mod tests {
             CreateOptions, OpenEnv, RepoConfig, Repository, RestoreOptions, VerifyLevel,
             VerifyOptions,
         };
-        use sparkles::store::MemoryCaptureOptions;
+        use sparkles_core::store::MemoryCaptureOptions;
         let tmp = tempfile::tempdir().unwrap();
         let s = Store::in_memory(StoreOptions::default());
         for i in 0..50 {

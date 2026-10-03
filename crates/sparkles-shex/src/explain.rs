@@ -11,7 +11,7 @@ use crate::neigh::{self, Neigh};
 use crate::typing::{Env, Read, Worker};
 use crate::{PrefixMap, ShexFailure};
 use oxrdf::Term;
-use sparkles::id::Id;
+use sparkles_core::id::Id;
 use std::cell::RefCell;
 
 /// The most failures recorded per result.
@@ -103,7 +103,7 @@ impl Explainer<'_, '_, '_> {
             }
             Se::Nc(n) => {
                 let f = match env.absent.get(node.payload() as usize) {
-                    Some(t) if node.tag() == sparkles::id::Tag::Local => {
+                    Some(t) if node.tag() == sparkles_core::id::Tag::Local => {
                         env.nc.explain_term(*n, t)?
                     }
                     _ => env.nc.explain(*n, node)?,

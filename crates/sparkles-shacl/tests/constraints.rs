@@ -1,10 +1,10 @@
 //! The constraints layer of the schema report (`sparkles_shacl::constraints`): the
 //! property shapes that apply to the instances of each target class.
 
-use sparkles::guard::{GuardMode, Severity};
-use sparkles::io::{RdfFormat, Source};
-use sparkles::schema::constraints::{ClassConstraints, Enforcement, SourceKind};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::guard::{GuardMode, Severity};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::schema::constraints::{ClassConstraints, Enforcement, SourceKind};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_shacl::Shapes;
 use sparkles_shacl::constraints::{Checked, class_constraints, graphs_source};
 

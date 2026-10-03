@@ -444,7 +444,7 @@ async fn a_changed_prefix_is_stored_from_scratch() {
     bytes[0] ^= 0xff;
     bytes.extend_from_slice(b"more");
     wal.len = bytes.len() as u64;
-    wal.src = sparkles::store::FileSource::Bytes(std::sync::Arc::from(bytes.as_slice()));
+    wal.src = sparkles_core::store::FileSource::Bytes(std::sync::Arc::from(bytes.as_slice()));
     repo.create(src, &opts("b2", "ds")).await.unwrap();
     let m = repo.manifest("b2").await.unwrap();
     let f = m

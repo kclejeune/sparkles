@@ -10,9 +10,9 @@
 //! their first failure; and the latency of single-node validation against the
 //! non-recursive `ex:Org` shape.
 
-use sparkles::io::Source;
-use sparkles::store::{Store, StoreOptions};
-use sparkles::validation::DataGraph;
+use sparkles_core::io::Source;
+use sparkles_core::store::{Store, StoreOptions};
+use sparkles_core::validation::DataGraph;
 use sparkles_shex::{
     NoImports, ResultMap, Schema, ShapeLabel, ShapeMap, ShexFailure, Status, ValidateOptions,
     compile, validate, validate_node,

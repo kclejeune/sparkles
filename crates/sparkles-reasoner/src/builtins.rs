@@ -3,7 +3,7 @@
 use crate::engine::{Eval, Slot};
 use crate::terms::{Kind, Terms};
 use oxrdf::{Literal, NamedNode, Term};
-use sparkles::sparql::value::{self, NumOp, Value};
+use sparkles_core::sparql::value::{self, NumOp, Value};
 use std::cmp::Ordering;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -377,7 +377,7 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             return;
         }
         AddOne => {
-            let one = sparkles::id::Id::from_i64(1).unwrap().0;
+            let one = sparkles_core::id::Id::from_i64(1).unwrap().0;
             if let Some(r) = arith(t, Sum, a(0), one) {
                 ev.bind_and_continue(bi.args[1], r, k, b);
             }
@@ -458,7 +458,7 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else {
                 return;
             };
-            let n = sparkles::id::Id::from_i64(ms.len() as i64).unwrap().0;
+            let n = sparkles_core::id::Id::from_i64(ms.len() as i64).unwrap().0;
             ev.bind_and_continue(bi.args[1], n, k, b);
             return;
         }
@@ -468,11 +468,11 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             };
             let (lex, dt) = (l.value(), l.datatype().as_str());
             let iri = if bi.kind == GeoSfType {
-                sparkles::geo::types::sf_type(lex, dt)
-                    .map(|n| format!("{}{n}", sparkles::geo::vocab::SF))
+                sparkles_core::geo::types::sf_type(lex, dt)
+                    .map(|n| format!("{}{n}", sparkles_core::geo::vocab::SF))
             } else {
-                sparkles::geo::types::gml_type(lex, dt)
-                    .map(|n| format!("{}{n}", sparkles::geo::types::GML_ONT))
+                sparkles_core::geo::types::gml_type(lex, dt)
+                    .map(|n| format!("{}{n}", sparkles_core::geo::types::GML_ONT))
             };
             if let Some(iri) = iri {
                 let v = t.id_for(&Term::NamedNode(NamedNode::new_unchecked(iri)));

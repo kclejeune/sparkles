@@ -8,9 +8,9 @@
 #![cfg(feature = "s3")]
 
 use object_store::ObjectStoreExt;
-use sparkles::outbound::OutboundPolicy;
 use sparkles_backup::repo::build_store_with;
 use sparkles_backup::{Credentials, RepoConfig, RepoType};
+use sparkles_core::outbound::OutboundPolicy;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

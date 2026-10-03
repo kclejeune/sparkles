@@ -12,6 +12,7 @@ repository = "https://github.com/kclejeune/sparkles"
 
 [workspace.dependencies]
 sparkles = { path = "crates/sparkles" }
+sparkles-core = { path = "crates/sparkles-core" }
 sparkles-reasoner = { path = "crates/sparkles-reasoner" }
 sparkles-shacl = { path = "crates/sparkles-shacl" }
 sparkles-shex = { path = "crates/sparkles-shex" }
@@ -52,7 +53,7 @@ sha2 = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.10"
 percent-encoding = "2"
-# CSV and TSV imports (sparkles::tabular)
+# CSV and TSV imports (sparkles_core::tabular)
 csv = "1"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["multipart"] }
@@ -85,8 +86,8 @@ lsp-server = "0.10"
 lsp-types = "0.97"
 # the formatter built for the browser (crates/sparkles-fmt-wasm)
 wasm-bindgen = "0.2"
-# GeoSPARQL (feature `geo` of crates/sparkles); the `geo` crate is renamed so it does not
-# clash with the `sparkles::geo` module
+# GeoSPARQL (feature `geo` of crates/sparkles-core); the `geo` crate is renamed so it does
+# not clash with the `sparkles_core::geo` module
 georust = { package = "geo", version = "0.33", default-features = false }
 geo-index = { version = "0.4", default-features = false }
 geographiclib-rs = "0.2"

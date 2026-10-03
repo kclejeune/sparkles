@@ -17,9 +17,9 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use sparkles::sparql::QueryOptions;
-use sparkles::sparql::update::update;
-use sparkles::store::{FileKind, Store, StoreOptions};
+use sparkles_core::sparql::QueryOptions;
+use sparkles_core::sparql::update::update;
+use sparkles_core::store::{FileKind, Store, StoreOptions};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -216,7 +216,7 @@ pub async fn put_backup(repo: &Repository, root: &Path, name: &str) -> Manifest 
         },
         commit: ManifestCommit::from(&head),
         generation,
-        index_format: sparkles::builder::FORMAT_VERSION,
+        index_format: sparkles_core::builder::FORMAT_VERSION,
         created: t0,
         completed: crate::now_rfc3339(),
         millis: 1,

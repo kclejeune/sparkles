@@ -1,9 +1,9 @@
 //! Inconsistency diagnostics over data and materialized inferences.
 
 use serde_json::{Value as J, json};
-use sparkles::io::{RdfFormat, Source};
-use sparkles::sparql::QueryOptions;
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::sparql::QueryOptions;
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::diagnostics::{
     Basis, CheckStatus, Closure, DiagnoseOptions, DiagnosticsReport, ReportStatus, diagnose,
 };
@@ -58,7 +58,7 @@ fn uri(s: &str) -> J {
 
 fn update(s: &Store, u: &str) {
     let text = format!("PREFIX ex: <http://ex.org/>\n{u}");
-    sparkles::sparql::update::update(s, &text, &QueryOptions::default()).unwrap();
+    sparkles_core::sparql::update::update(s, &text, &QueryOptions::default()).unwrap();
 }
 
 #[test]

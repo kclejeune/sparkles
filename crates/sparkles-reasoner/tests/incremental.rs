@@ -3,9 +3,9 @@
 //! across compaction, bulk loads, restarts and edits of the inferred graph.
 
 use oxrdf::{GraphName, NamedNode, Quad, Term, Triple};
-use sparkles::index::Perm;
-use sparkles::io::{RdfFormat, Source};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::index::Perm;
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::{
     Cache, Extras, INFERRED_GRAPH, Incremental, Method, Profile, ReasonOptions, ReasonReport,
     infer, materialize_incremental,
@@ -105,7 +105,7 @@ fn base(s: &Store) -> Vec<Triple> {
     let snap = s.snapshot();
     let mut out = Vec::new();
     for k in snap
-        .scan_keys(Perm::Gspo, &[sparkles::id::Id::DEFAULT_GRAPH.0])
+        .scan_keys(Perm::Gspo, &[sparkles_core::id::Id::DEFAULT_GRAPH.0])
         .unwrap()
     {
         let q = snap.quad_to_terms(&Perm::Gspo.to_quad(&k)).unwrap();

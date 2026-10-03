@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as J;
 use uuid::Uuid;
 
-pub use sparkles::store::FileKind;
+pub use sparkles_core::store::FileKind;
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -459,7 +459,7 @@ pub struct ManifestDataset {
     pub kind: String,
 }
 
-/// The full commit object of the captured commit (as `sparkles::commit::CommitInfo`
+/// The full commit object of the captured commit (as `sparkles_core::commit::CommitInfo`
 /// serializes).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestCommit {
@@ -479,8 +479,8 @@ pub struct ManifestCommit {
     pub reconstructed: bool,
 }
 
-impl From<&sparkles::commit::CommitInfo> for ManifestCommit {
-    fn from(c: &sparkles::commit::CommitInfo) -> ManifestCommit {
+impl From<&sparkles_core::commit::CommitInfo> for ManifestCommit {
+    fn from(c: &sparkles_core::commit::CommitInfo) -> ManifestCommit {
         ManifestCommit {
             seq: c.seq,
             parent: c.parent(),
@@ -706,7 +706,7 @@ pub struct BackupVerify {
     pub missing: Vec<String>,
     /// ids of blobs whose content does not hash to their id
     pub corrupt: Vec<String>,
-    /// the `sparkles::check` report (level `restore`)
+    /// the `sparkles_core::check` report (level `restore`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<J>,
 }
@@ -1180,10 +1180,10 @@ mod tests {
 
     #[test]
     fn manifest_commit_matches_commit_info() {
-        let c = sparkles::commit::CommitInfo {
+        let c = sparkles_core::commit::CommitInfo {
             seq: 4,
             timestamp_ms: 1_790_000_000_000,
-            kind: sparkles::commit::CommitKind::Update,
+            kind: sparkles_core::commit::CommitKind::Update,
             inserted: 1,
             deleted: 0,
             quads: 3,

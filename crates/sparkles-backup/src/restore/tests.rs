@@ -3,7 +3,7 @@ use crate::fixture::{self, Flaky};
 use crate::layout;
 use crate::{BlobRef, CheckLevel, VerifyLevel};
 use object_store::{ObjectStoreExt, PutPayload};
-use sparkles::store::StoreOptions;
+use sparkles_core::store::StoreOptions;
 use std::cell::Cell;
 use std::sync::atomic::Ordering::SeqCst;
 
@@ -347,7 +347,7 @@ async fn hostile_manifests_are_refused_before_anything_is_written() {
 #[tokio::test]
 async fn a_newer_index_format_is_refused() {
     let (dir, repo, mut m) = setup().await;
-    m.index_format = sparkles::builder::FORMAT_VERSION + 1;
+    m.index_format = sparkles_core::builder::FORMAT_VERSION + 1;
     fixture::put_manifest(&repo, &m).await;
     let e = repo
         .restore("b1", &dir.path().join("t"), &RestoreOptions::default())
@@ -671,7 +671,7 @@ fn swap_dir_rolls_back_when_the_second_rename_fails() {
 #[tokio::test(flavor = "multi_thread")]
 async fn backups_under_concurrent_writes_restore_to_their_commits() {
     use crate::{CreateOptions, Source};
-    use sparkles::history::At;
+    use sparkles_core::history::At;
     use std::sync::atomic::AtomicBool;
 
     let dir = tempfile::tempdir().unwrap();

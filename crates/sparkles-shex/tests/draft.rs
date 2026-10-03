@@ -1,10 +1,10 @@
-//! The ShEx schemas drafted from the data (`sparkles::schema::draft`): at support 1 every
+//! The ShEx schemas drafted from the data (`sparkles_core::schema::draft`): at support 1 every
 //! association of the draft's shape map conforms, and below 1 only instances that a
 //! drafted constraint excludes fail.
 
-use sparkles::schema::draft::{DraftOptions, ShapesDraft};
-use sparkles::schema::draft_shapes;
-use sparkles::store::Store;
+use sparkles_core::schema::draft::{DraftOptions, ShapesDraft};
+use sparkles_core::schema::draft_shapes;
+use sparkles_core::store::Store;
 use sparkles_shex::{NoImports, ResultMap, ShapeMap, Status, ValidateOptions};
 
 #[path = "../../sparkles-shacl/tests/draft_fixture/mod.rs"]

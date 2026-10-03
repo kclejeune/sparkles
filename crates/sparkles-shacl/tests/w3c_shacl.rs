@@ -25,8 +25,8 @@
 //! ignoring messages, with blank nodes matched by a consistent bijection.
 
 use oxrdf::{Graph, NamedNode, Term, TermRef, Triple};
-use sparkles::io::{RdfFormat, Source};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_shacl::{PropertyPath, Shapes, ValidateOptions, ValidationReport, ValidationResult};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -151,7 +151,7 @@ fn store_graph(store: &Store) -> Graph {
     let snap = store.snapshot();
     let mut g = Graph::new();
     snap.for_each_quad(|q| {
-        if q[3] == sparkles::id::Id::DEFAULT_GRAPH
+        if q[3] == sparkles_core::id::Id::DEFAULT_GRAPH
             && let Some(q) = snap.quad_to_terms(q)
         {
             g.insert(&Triple::new(q.subject, q.predicate, q.object));

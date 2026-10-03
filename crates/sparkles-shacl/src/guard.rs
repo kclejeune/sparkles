@@ -2,7 +2,7 @@
 //! commit against a shapes graph, configured per dataset in `<db>/validation.json`.
 //!
 //! * `reject`: a commit that would leave results at or above the threshold is not
-//!   written (the store reports [`sparkles::Error::Rejected`]).
+//!   written (the store reports [`sparkles_core::Error::Rejected`]).
 //! * `warn`: the commit is written; its receipt carries the findings.
 //!
 //! Enabling `reject` requires the current data to pass, and every later commit is
@@ -32,27 +32,27 @@ use oxrdf::{NamedNode, Term};
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use sparkles::commit::CommitKind;
-pub use sparkles::guard::config::{
+use sparkles_core::commit::CommitKind;
+pub use sparkles_core::guard::config::{
     Baseline, BaselinePolicy, CONFIG_FILE, CheckRecord, Counters, DataGraphSel, STATUS_FILE,
 };
-use sparkles::guard::config::{
+use sparkles_core::guard::config::{
     CheckHistory, DecisionCounts, INFERRED_GRAPH as INFERRED, StatusFile, sha256_hex, write_atomic,
 };
-use sparkles::guard::{
+use sparkles_core::guard::{
     Candidate, Changes, CommitGuard, GuardLanguage, GuardMode, GuardStatus, Severity,
     SeverityCounts, Strategy, ValidationSummary, WriteOptions,
 };
-use sparkles::id::Id;
-use sparkles::sparql::ctx::{DEFAULT_GRAPH_IRI, UNION_GRAPH_IRI};
-use sparkles::store::{Snapshot, Store};
+use sparkles_core::id::Id;
+use sparkles_core::sparql::ctx::{DEFAULT_GRAPH_IRI, UNION_GRAPH_IRI};
+use sparkles_core::store::{Snapshot, Store};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// A shapes file copied into the database directory.
-pub const SHAPES_FILE: &str = sparkles::guard::config::SHACL_SHAPES_FILE;
+pub const SHAPES_FILE: &str = sparkles_core::guard::config::SHACL_SHAPES_FILE;
 
 /// Write-time SHACL validation of one dataset (`validation.json`, format 2 with
 /// `"language": "shacl"`; format 1 files, without `language`, are read too).
@@ -424,7 +424,7 @@ impl ShaclGuard {
         snap: &Arc<Snapshot>,
         shapes: &Shapes,
         o: &WriteOptions,
-    ) -> sparkles::Result<Option<State>> {
+    ) -> sparkles_core::Result<Option<State>> {
         let Some(mut vo) = self.cfg.validate_options(snap) else {
             return Ok(None);
         };
@@ -451,7 +451,7 @@ impl ShaclGuard {
         sel: &[Sel],
         ids_of: Option<&Snapshot>,
         deadline: Instant,
-    ) -> sparkles::Result<Vec<ShapeRun>> {
+    ) -> sparkles_core::Result<Vec<ShapeRun>> {
         match st {
             None => Ok((0..shapes.len()).map(|_| ShapeRun::default()).collect()),
             Some(st) => {
@@ -473,7 +473,7 @@ impl ShaclGuard {
         o: &WriteOptions,
         reason: Option<Fallback>,
         commit: u64,
-    ) -> sparkles::Result<Checked> {
+    ) -> sparkles_core::Result<Checked> {
         let t0 = Instant::now();
         let deadline = self.deadline(t0, o);
         let shapes = &loaded.shapes;
@@ -555,7 +555,7 @@ impl ShaclGuard {
         loaded: &Loaded,
         exact: &Exact,
         changes: &[[Id; 3]],
-    ) -> sparkles::Result<Result<Checked, Fallback>> {
+    ) -> sparkles_core::Result<Result<Checked, Fallback>> {
         let t0 = Instant::now();
         let deadline = self.deadline(t0, c.opts);
         let (shapes, model) = (&loaded.shapes, &loaded.model);
@@ -699,7 +699,7 @@ impl ShaclGuard {
 
     /// Validate a write to the data graph with unchanged shapes: incrementally when the
     /// guard knows the state of the head exactly, in full otherwise.
-    fn check_data(&self, c: &Candidate<'_>, loaded: &Loaded) -> sparkles::Result<Checked> {
+    fn check_data(&self, c: &Candidate<'_>, loaded: &Loaded) -> sparkles_core::Result<Checked> {
         let seq = c.base.commit + 1;
         let base = Arc::new(c.base.clone());
         let full = |reason| {
@@ -773,7 +773,7 @@ fn class_changes(
     states: [Option<&State>; 2],
     changes: &[[Id; 3]],
     tuning: &Tuning,
-) -> sparkles::Result<Option<Vec<[Id; 3]>>> {
+) -> sparkles_core::Result<Option<Vec<[Id; 3]>>> {
     let Some(sub) = view.lookup_iri(crate::vocab::rdfs::SUB_CLASS_OF.as_str()) else {
         return Ok(Some(Vec::new()));
     };
@@ -801,13 +801,13 @@ fn class_changes(
 }
 
 /// An error of the validation engine as a store error.
-fn engine_error(e: anyhow::Error) -> sparkles::Error {
+fn engine_error(e: anyhow::Error) -> sparkles_core::Error {
     let msg = format!("{e:#}");
-    match e.downcast::<sparkles::Error>() {
+    match e.downcast::<sparkles_core::Error>() {
         Ok(e) => e,
-        Err(_) if msg.contains("timed out") => sparkles::Error::Timeout,
-        Err(_) if msg.contains("cancel") => sparkles::Error::Cancelled,
-        Err(_) => sparkles::Error::Invalid(format!("SHACL validation failed: {msg}")),
+        Err(_) if msg.contains("timed out") => sparkles_core::Error::Timeout,
+        Err(_) if msg.contains("cancel") => sparkles_core::Error::Cancelled,
+        Err(_) => sparkles_core::Error::Invalid(format!("SHACL validation failed: {msg}")),
     }
 }
 
@@ -995,7 +995,7 @@ fn baseline_of(s: &ValidationSummary, commit: u64) -> Baseline {
 }
 
 impl CommitGuard for ShaclGuard {
-    fn check(&self, c: &Candidate<'_>) -> sparkles::Result<ValidationSummary> {
+    fn check(&self, c: &Candidate<'_>) -> sparkles_core::Result<ValidationSummary> {
         let seq = c.base.commit + 1;
         // a dry run validates like a write and records nothing: no counters, no history,
         // no state for the next commit
@@ -1204,7 +1204,7 @@ pub fn configured_shapes(store: &Store) -> Result<Option<(ValidationConfig, Shap
     let Some(root) = store.root() else {
         return Ok(None);
     };
-    if sparkles::guard::config::config_language(root)? != Some(GuardLanguage::Shacl) {
+    if sparkles_core::guard::config::config_language(root)? != Some(GuardLanguage::Shacl) {
         return Ok(None);
     }
     let Some(cfg) = read_config(root)? else {
@@ -1275,7 +1275,7 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
         store.set_guard(None);
         store.set_guard_required(false);
         if let Some(r) = &root {
-            sparkles::guard::config::remove_files(r, &[])?;
+            sparkles_core::guard::config::remove_files(r, &[])?;
             StatusFile::remove(r)?;
         }
         drop(txn);
@@ -1295,14 +1295,14 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
     {
         return Ok(SetOutcome::NotConforming(summary));
     }
-    cfg.updated = Some(sparkles::guard::config::now_rfc3339());
+    cfg.updated = Some(sparkles_core::guard::config::now_rfc3339());
     // written as format 2, whatever was given
     cfg.format = 2;
     cfg.language = Some(GuardLanguage::Shacl);
     let mut persist = None;
     if let Some(r) = &root {
         // a ShEx configuration this one replaces leaves nothing behind
-        sparkles::guard::config::remove_files(r, &[CONFIG_FILE, SHAPES_FILE])?;
+        sparkles_core::guard::config::remove_files(r, &[CONFIG_FILE, SHAPES_FILE])?;
         StatusFile::remove(r)?;
         if let Some(text) = cfg.shapes.inline.take() {
             // the shapes file is Turtle, whatever the syntax given

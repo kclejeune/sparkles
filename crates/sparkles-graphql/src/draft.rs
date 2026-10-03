@@ -302,10 +302,10 @@ pub fn read_shapes(g: &Graph) -> (Vec<DraftType>, Vec<String>) {
 
 /// What C02's drafted shapes say, with the observations behind them.
 pub fn read_observed(
-    d: &sparkles::schema::draft::ShapesDraft,
+    d: &sparkles_core::schema::draft::ShapesDraft,
     big: &dyn Fn(&str, &str) -> bool,
 ) -> Vec<DraftType> {
-    use sparkles::schema::draft::ConstraintValue as V;
+    use sparkles_core::schema::draft::ConstraintValue as V;
     let commit = d.snapshot.commit;
     d.shapes
         .iter()

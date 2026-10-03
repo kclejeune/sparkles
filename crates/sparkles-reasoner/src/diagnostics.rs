@@ -15,10 +15,10 @@ use crate::INFERRED_GRAPH;
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{BlankNode, Literal, NamedNode, Term, Triple};
 use serde_json::{Value as J, json};
-use sparkles::Error;
-use sparkles::sparql::QueryOptions;
-use sparkles::sparql::results::term_json;
-use sparkles::store::Snapshot;
+use sparkles_core::Error;
+use sparkles_core::sparql::QueryOptions;
+use sparkles_core::sparql::results::term_json;
+use sparkles_core::store::Snapshot;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -599,7 +599,7 @@ pub fn diagnose(snap: Arc<Snapshot>, opts: &DiagnoseOptions) -> anyhow::Result<D
         .map_err(|bad| anyhow::anyhow!("unknown diagnostics check '{bad}'"))?;
     let limit = opts.limit.clamp(1, MAX_LIMIT);
     let deadline = opts.timeout.map(|t| Instant::now() + t);
-    let mut prefixes: BTreeMap<String, String> = sparkles::io::standard_prefixes();
+    let mut prefixes: BTreeMap<String, String> = sparkles_core::io::standard_prefixes();
     prefixes.extend(opts.prefixes.iter().cloned());
     let names = Names::new(&prefixes);
     let mut outcomes = Vec::new();
@@ -665,7 +665,7 @@ pub fn diagnose(snap: Arc<Snapshot>, opts: &DiagnoseOptions) -> anyhow::Result<D
     };
     Ok(DiagnosticsReport {
         commit: snap.commit,
-        computed_at: sparkles::builder::now_rfc3339(),
+        computed_at: sparkles_core::builder::now_rfc3339(),
         inferences: opts.inferences,
         graphs: opts.graphs.clone(),
         closure: opts.closure,
@@ -693,7 +693,7 @@ impl Run<'_> {
         &self,
         inferences: bool,
         bindings: Vec<(String, Term)>,
-    ) -> sparkles::Result<QueryOptions> {
+    ) -> sparkles_core::Result<QueryOptions> {
         let timeout = match self.deadline {
             Some(d) => Some(
                 d.checked_duration_since(Instant::now())
@@ -734,9 +734,9 @@ impl Run<'_> {
         text: &str,
         inferences: bool,
         bindings: Vec<(String, Term)>,
-    ) -> sparkles::Result<Vec<Row>> {
+    ) -> sparkles_core::Result<Vec<Row>> {
         let opts = self.options(inferences, bindings)?;
-        let r = sparkles::sparql::query(self.snap.clone(), text, &opts)?;
+        let r = sparkles_core::sparql::query(self.snap.clone(), text, &opts)?;
         let vars = r.vars.clone();
         Ok(r.rows()
             .into_iter()
@@ -750,7 +750,7 @@ impl Run<'_> {
     }
 
     /// The deduplicated findings (at most `limit`) and whether more remain.
-    fn findings(&self, limit: usize) -> sparkles::Result<(Vec<Finding>, bool)> {
+    fn findings(&self, limit: usize) -> sparkles_core::Result<(Vec<Finding>, bool)> {
         let text = format!("{}\nLIMIT {}", self.text, 2 * limit + 2);
         let rows = self.select(&text, self.inferences, Vec::new())?;
         let full = rows.len() >= 2 * limit + 2;
@@ -786,7 +786,7 @@ impl Run<'_> {
     }
 
     /// The same query with the row's bindings, over the asserted data only.
-    fn holds_asserted(&self, row: &Row) -> sparkles::Result<bool> {
+    fn holds_asserted(&self, row: &Row) -> sparkles_core::Result<bool> {
         let text = format!("{}\nLIMIT 1", self.text);
         let bindings = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         Ok(!self.select(&text, false, bindings)?.is_empty())
@@ -831,7 +831,7 @@ impl Run<'_> {
         })
     }
 
-    fn finding(&self, rows: &[Row], basis: Basis) -> sparkles::Result<Option<Finding>> {
+    fn finding(&self, rows: &[Row], basis: Basis) -> sparkles_core::Result<Option<Finding>> {
         let row = &rows[0];
         let get = |v: &str| row.get(v).cloned();
         let sorted = |a: Term, b: Term| {
@@ -1192,7 +1192,7 @@ impl Run<'_> {
     }
 
     /// A chain of `rdfs:subClassOf` steps from `c` to owl:Nothing (at most 32 steps).
-    fn path_to_nothing(&self, c: &Term) -> sparkles::Result<Vec<Term>> {
+    fn path_to_nothing(&self, c: &Term) -> sparkles_core::Result<Vec<Term>> {
         const STEP: &str = "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX owl: <http://www.w3.org/2002/07/owl#>
 SELECT ?m WHERE { ?c rdfs:subClassOf ?m . ?m rdfs:subClassOf* owl:Nothing . FILTER(?m != ?c) }";

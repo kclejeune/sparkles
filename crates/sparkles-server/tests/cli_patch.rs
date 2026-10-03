@@ -28,7 +28,7 @@ const P: &str = "TX .\nA <urn:a> <urn:p> \"1\" .\nA <urn:b> <urn:p> <urn:c> <urn
 fn jena(name: &str) -> std::path::PathBuf {
     Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../sparkles/tests/patch"
+        "/../sparkles-core/tests/patch"
     ))
     .join(name)
 }

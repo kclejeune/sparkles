@@ -5,8 +5,8 @@
 use crate::ast::SemAct;
 use oxrdf::Term;
 use rustc_hash::FxHashMap;
-use sparkles::id::Id;
-use sparkles::store::Snapshot;
+use sparkles_core::id::Id;
+use sparkles_core::store::Snapshot;
 use std::sync::Arc;
 
 /// The extension IRI of the built-in Test extension.
@@ -360,7 +360,7 @@ fn run_test(code: Option<&str>, site: Site<'_>, cx: &mut ActCtx<'_>) -> bool {
 mod tests {
     use super::*;
     use oxrdf::{Literal, NamedNode};
-    use sparkles::store::{Store, StoreOptions};
+    use sparkles_core::store::{Store, StoreOptions};
 
     fn act(name: &str, code: Option<&str>) -> SemAct {
         SemAct {

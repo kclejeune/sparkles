@@ -32,8 +32,8 @@ use crate::shapes::{Candidates, Constraint, ShapeId, Shapes, Target};
 use crate::vocab::{rdf, rdfs};
 use oxrdf::{NamedNode, Term};
 use rustc_hash::{FxHashMap, FxHashSet};
-use sparkles::id::Id;
-use sparkles::store::Snapshot;
+use sparkles_core::id::Id;
+use sparkles_core::store::Snapshot;
 
 /// Why a write, or a shape, is validated in full (the `reason` label of
 /// `sparkles_validation_fallbacks_total`).

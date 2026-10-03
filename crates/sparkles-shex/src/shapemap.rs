@@ -18,10 +18,10 @@ use rustc_hash::FxHashSet;
 use spargebra::Query;
 use spargebra::algebra::GraphPattern;
 use spargebra::term::Variable;
-use sparkles::id::{Id, Tag};
-use sparkles::sparql::ctx::DEFAULT_GRAPH_IRI;
-use sparkles::store::parse_bnode_label;
-use sparkles::validation::DataGraph;
+use sparkles_core::id::{Id, Tag};
+use sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI;
+use sparkles_core::store::parse_bnode_label;
+use sparkles_core::validation::DataGraph;
 use std::time::Instant;
 
 /// Parse the compact syntax (see [`ShapeMap::parse`]).
@@ -695,7 +695,7 @@ pub fn label_kind(schema: &CompiledSchema, label: &ShapeLabel) -> Result<PairKin
 /// Check the query of a `SPARQL` selector, and parse it: a SELECT query that projects a
 /// variable and has no SERVICE. It has no prefixes or base IRI but its own.
 pub fn selector_query(q: &str) -> Result<Query, String> {
-    let parsed = sparkles::sparql::parse_query(q, None, &[])
+    let parsed = sparkles_core::sparql::parse_query(q, None, &[])
         .map_err(|e| format!("invalid SPARQL selector query: {e}"))?;
     let Query::Select { pattern, .. } = &parsed else {
         return Err("a SPARQL selector's query is a SELECT query".into());
@@ -750,7 +750,7 @@ fn has_service(p: &GraphPattern) -> bool {
 /// store ids. The query's default graph is the data graph (and it has no named graphs);
 /// it runs with the budgets of [`ValidateOptions::selector_query`], the validation's
 /// cancel flag and what is left of its time, and never runs SERVICE. Timeouts,
-/// cancellation and budgets are [`sparkles::Error`]s; other failures [`SchemaError`]s.
+/// cancellation and budgets are [`sparkles_core::Error`]s; other failures [`SchemaError`]s.
 fn sparql_nodes(
     q: &str,
     data: &DataGraph,
@@ -780,7 +780,7 @@ fn sparql_nodes(
         return Ok(Vec::new());
     }
     let base = opts.selector_query.clone().unwrap_or_default();
-    let qo = sparkles::sparql::QueryOptions {
+    let qo = sparkles_core::sparql::QueryOptions {
         timeout: deadline.map(|d| d.saturating_duration_since(Instant::now())),
         cancel: opts.cancel.clone(),
         default_graph_uris,
@@ -794,16 +794,17 @@ fn sparql_nodes(
         no_cache: true,
         ..base
     };
-    let failed = |e: sparkles::Error| -> anyhow::Error {
+    let failed = |e: sparkles_core::Error| -> anyhow::Error {
         match e {
-            sparkles::Error::Timeout
-            | sparkles::Error::Cancelled
-            | sparkles::Error::BudgetExceeded(_) => e.into(),
+            sparkles_core::Error::Timeout
+            | sparkles_core::Error::Cancelled
+            | sparkles_core::Error::BudgetExceeded(_) => e.into(),
             e => SchemaError::new(format!("the SPARQL selector failed: {e}")).into(),
         }
     };
-    let mut r = sparkles::sparql::execute_query(snap.clone(), &parsed, &qo, 0.0).map_err(failed)?;
-    sparkles::sparql::select_star_order(q, &mut r);
+    let mut r =
+        sparkles_core::sparql::execute_query(snap.clone(), &parsed, &qo, 0.0).map_err(failed)?;
+    sparkles_core::sparql::select_star_order(q, &mut r);
     let Some(col) = r
         .vars
         .iter()
@@ -915,8 +916,8 @@ pub fn expand(
 mod tests {
     use super::*;
     use crate::ir::{Ir, PairKindInfo, SeId};
-    use sparkles::io::{RdfFormat, Source};
-    use sparkles::store::{Store, StoreOptions};
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
 
     const EX: &str = "http://ex.org/";
 
@@ -1237,7 +1238,7 @@ mod tests {
         txn.commit().unwrap();
         let snap = store.snapshot();
         let data = DataGraph::new(snap.clone(), None, &[], &[]).unwrap();
-        let label = sparkles::store::bnode_for(b);
+        let label = sparkles_core::store::bnode_for(b);
         let text = format!("_:{}@ex:Person", label.as_str());
         let map = parse(&text, &schema_prefixes(), None).unwrap();
         let (fixed, warnings) =
@@ -1366,7 +1367,7 @@ mod tests {
 
         // budgets, the timeout and failures
         let opts = ValidateOptions {
-            selector_query: Some(sparkles::sparql::QueryOptions {
+            selector_query: Some(sparkles_core::sparql::QueryOptions {
                 max_rows: Some(1),
                 ..Default::default()
             }),
@@ -1375,8 +1376,8 @@ mod tests {
         let e = run(person, &data, &opts).unwrap_err();
         assert!(
             matches!(
-                e.downcast_ref::<sparkles::Error>(),
-                Some(sparkles::Error::BudgetExceeded(_))
+                e.downcast_ref::<sparkles_core::Error>(),
+                Some(sparkles_core::Error::BudgetExceeded(_))
             ),
             "{e:#}"
         );
@@ -1385,8 +1386,8 @@ mod tests {
         let e = expand(&map, &data, &schema, &Default::default(), past).unwrap_err();
         assert!(
             matches!(
-                e.downcast_ref::<sparkles::Error>(),
-                Some(sparkles::Error::Timeout)
+                e.downcast_ref::<sparkles_core::Error>(),
+                Some(sparkles_core::Error::Timeout)
             ),
             "{e:#}"
         );

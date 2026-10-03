@@ -2,7 +2,7 @@ use super::*;
 use crate::fixture;
 use crate::layout::{self, lock_key, manifest_key};
 use crate::{Ctl, LockHolder, LockObject, RestoreOptions};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::store::{Store, StoreOptions};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;

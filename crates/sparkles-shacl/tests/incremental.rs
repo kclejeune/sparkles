@@ -5,12 +5,14 @@
 //! against full validations of the states before and after it.
 
 use serde_json::Value as J;
-use sparkles::Error;
-use sparkles::guard::{GuardMode, GuardStatus, Severity, SeverityCounts, Strategy, WriteOptions};
-use sparkles::io::{RdfFormat, Source};
-use sparkles::sparql::QueryOptions;
-use sparkles::sparql::update::update;
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::Error;
+use sparkles_core::guard::{
+    GuardMode, GuardStatus, Severity, SeverityCounts, Strategy, WriteOptions,
+};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::sparql::QueryOptions;
+use sparkles_core::sparql::update::update;
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_shacl::guard::{
     self, BaselinePolicy, DataGraphSel, SetOutcome, ShaclGuard, ShapesSource, ValidationConfig,
 };

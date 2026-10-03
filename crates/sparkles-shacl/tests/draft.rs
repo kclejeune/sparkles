@@ -1,11 +1,11 @@
-//! Shapes drafted from the data (`sparkles::schema::draft`) checked by validating them:
+//! Shapes drafted from the data (`sparkles_core::schema::draft`) checked by validating them:
 //! at support 1 the data conforms, and below 1 each drafted constraint excludes exactly
 //! the focus nodes the validator reports for it.
 
-use sparkles::io::RdfFormat;
-use sparkles::schema::draft::{ConstraintDraft, DraftOptions, ShapesDraft};
-use sparkles::schema::{GraphSelection, draft_shapes};
-use sparkles::store::Store;
+use sparkles_core::io::RdfFormat;
+use sparkles_core::schema::draft::{ConstraintDraft, DraftOptions, ShapesDraft};
+use sparkles_core::schema::{GraphSelection, draft_shapes};
+use sparkles_core::store::Store;
 use sparkles_shacl::{Shapes, ValidateOptions, ValidationReport, validate};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -136,12 +136,12 @@ fn constraints_and_counts() {
     let c = constraint(&d, "Person", &knows, "class");
     assert_eq!(
         c.value,
-        sparkles::schema::draft::ConstraintValue::Iri(format!("{EX}Person"))
+        sparkles_core::schema::draft::ConstraintValue::Iri(format!("{EX}Person"))
     );
     let c = constraint(&d, "Person", &knows, "nodeKind");
     assert_eq!(
         c.value,
-        sparkles::schema::draft::ConstraintValue::Iri(
+        sparkles_core::schema::draft::ConstraintValue::Iri(
             "http://www.w3.org/ns/shacl#BlankNodeOrIRI".into()
         )
     );
@@ -218,9 +218,11 @@ fn graph_views_limit_the_draft() {
     o.schema.graph = GraphSelection::Union;
     let all = draft_shapes(&s.snapshot(), &o).unwrap();
     assert!(all.shacl.contains("secret"), "{}", all.shacl);
-    let only_default =
-        sparkles::access::Graphs::Only(sparkles::access::GraphRule::new(["default"], &[]));
-    o.schema.graphs = Some(std::sync::Arc::new(sparkles::access::GraphAccess {
+    let only_default = sparkles_core::access::Graphs::Only(sparkles_core::access::GraphRule::new(
+        ["default"],
+        &[],
+    ));
+    o.schema.graphs = Some(std::sync::Arc::new(sparkles_core::access::GraphAccess {
         read: only_default.clone(),
         write: only_default,
         triples: None,

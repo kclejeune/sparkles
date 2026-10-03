@@ -1,5 +1,5 @@
 //! Data graph access over a store [`Snapshot`]: the shared data graph of
-//! [`sparkles::validation`] (index scans restricted to the graphs that make it up), plus
+//! [`sparkles_core::validation`] (index scans restricted to the graphs that make it up), plus
 //! term resolution for shape constants that are not in the store (local ids) and the
 //! subclass closure of `sh:class`.
 
@@ -8,14 +8,14 @@ use crate::vocab::{rdf, rdfs};
 use anyhow::{Result, bail};
 use oxrdf::{Graph, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
-use sparkles::id::{Id, Tag};
-use sparkles::index::{Key, Perm};
-use sparkles::sparql::value::Value;
-use sparkles::store::{Chunk, Snapshot};
-use sparkles::validation::{self, graph_id};
+use sparkles_core::id::{Id, Tag};
+use sparkles_core::index::{Key, Perm};
+use sparkles_core::sparql::value::Value;
+use sparkles_core::store::{Chunk, Snapshot};
+use sparkles_core::validation::{self, graph_id};
 use std::sync::{Arc, RwLock};
 
-/// The data graph ([`sparkles::validation::DataGraph`], whose scans it derefs to) plus
+/// The data graph ([`sparkles_core::validation::DataGraph`], whose scans it derefs to) plus
 /// the id mapping of a shapes graph's terms.
 pub(crate) struct DataGraph {
     graph: validation::DataGraph,

@@ -39,9 +39,9 @@ use anyhow::Context as _;
 use incremental::Fallback;
 use oxrdf::{NamedNode, NamedOrBlankNode, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
-use sparkles::id::{Id, Tag};
-use sparkles::index::Perm;
-use sparkles::store::{Chunk, Snapshot, Store};
+use sparkles_core::id::{Id, Tag};
+use sparkles_core::index::Perm;
+use sparkles_core::store::{Chunk, Snapshot, Store};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -174,7 +174,7 @@ pub struct ReasonReport {
     pub warnings: Vec<String>,
     /// the commit that wrote the inferences, or the unchanged head (at which the data
     /// was read) when the run changed nothing; `None` for [`infer`] (a dry run)
-    pub receipt: Option<sparkles::commit::Receipt>,
+    pub receipt: Option<sparkles_core::commit::Receipt>,
     /// how the run materialized
     pub method: Method,
     /// why a run asked to update a previous materialization ran in full
@@ -506,23 +506,23 @@ fn lock_with_changes<'s>(
     inc: Incremental<'_>,
     inputs: &Inputs,
 ) -> (
-    sparkles::store::WriteTxn<'s>,
+    sparkles_core::store::WriteTxn<'s>,
     Option<Result<maintain::RawChanges, String>>,
     Resolved,
 ) {
-    let locked = |txn: sparkles::store::WriteTxn<'s>| {
+    let locked = |txn: sparkles_core::store::WriteTxn<'s>| {
         let r = inputs::resolve(txn.base(), inputs);
         (txn, r)
     };
     let Some(since) = inc.since else {
-        let (txn, r) = locked(store.write_as(sparkles::commit::CommitKind::Reason));
+        let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
         return (txn, None, r);
     };
     for _ in 0..3 {
         let live = store.snapshot();
         let graphs = inputs::resolve(&live, inputs).graph_set();
         let raw = maintain::changes(store, since, &live, inc.cache, &graphs);
-        let (txn, r) = locked(store.write_as(sparkles::commit::CommitKind::Reason));
+        let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
         let raw = if r.graph_set() != graphs {
             Err("the input graphs changed while the changes were read".into())
         } else if txn.base().commit == live.commit {
@@ -536,7 +536,7 @@ fn lock_with_changes<'s>(
         };
         return (txn, Some(raw), r);
     }
-    let (txn, r) = locked(store.write_as(sparkles::commit::CommitKind::Reason));
+    let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
     (
         txn,
         Some(Err(
@@ -578,7 +578,7 @@ struct Written {
 #[allow(clippy::too_many_arguments)]
 fn finish(
     store: &Store,
-    txn: sparkles::store::WriteTxn<'_>,
+    txn: sparkles_core::store::WriteTxn<'_>,
     snap: &Arc<Snapshot>,
     profile: &Profile,
     digest: u64,
@@ -660,7 +660,7 @@ fn finish(
 
 /// Map a derived triple's local ids to store ids, interning the terms.
 fn store_ids(
-    txn: &mut sparkles::store::WriteTxn<'_>,
+    txn: &mut sparkles_core::store::WriteTxn<'_>,
     terms: &Terms,
     stored: &mut FxHashMap<u64, Id>,
     t: &[u64; 3],
@@ -689,7 +689,7 @@ fn store_ids(
 
 /// Replace the inferred graph with the valid derived triples of a full run.
 fn write_full(
-    txn: &mut sparkles::store::WriteTxn<'_>,
+    txn: &mut sparkles_core::store::WriteTxn<'_>,
     snap: &Snapshot,
     d: &Derivation,
     opts: &ReasonOptions,
@@ -757,7 +757,7 @@ fn write_full(
 #[allow(clippy::too_many_arguments)]
 fn update_closure(
     store: &Store,
-    txn: &mut sparkles::store::WriteTxn<'_>,
+    txn: &mut sparkles_core::store::WriteTxn<'_>,
     snap: &Arc<Snapshot>,
     profile: &Profile,
     extras: &Extras,
@@ -873,7 +873,7 @@ fn update_closure(
 /// Bring the inferred graph in line with the closure for the triples that may have
 /// changed: a triple belongs there when it is live, derived (not explicit) and valid RDF.
 fn write_changes<'a>(
-    txn: &mut sparkles::store::WriteTxn<'_>,
+    txn: &mut sparkles_core::store::WriteTxn<'_>,
     snap: &Snapshot,
     c: &incremental::Closure,
     candidates: impl Iterator<Item = &'a [u64; 3]>,
@@ -938,7 +938,7 @@ pub fn materialize(
 /// Remove [`INFERRED_GRAPH`]. Returns the number of triples removed.
 pub fn clear(store: &Store) -> anyhow::Result<u64> {
     maintain::remove_saved(store);
-    let mut txn = store.write_as(sparkles::commit::CommitKind::ReasonClear);
+    let mut txn = store.write_as(sparkles_core::commit::CommitKind::ReasonClear);
     let snap = txn.base().clone();
     let Some(g) = snap.lookup_iri(INFERRED_GRAPH) else {
         return Ok(0);

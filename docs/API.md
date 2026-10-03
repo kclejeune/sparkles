@@ -4658,7 +4658,7 @@ dataset's index status is not available over HTTP (`405`). Its other `/$/geo/con
 routes and `sparkles geo-index --loc DB --status` still work.
 
 **Conformance.** Oxigraph's GeoSPARQL test suite runs with the W3C harness
-(`cargo test -p sparkles --features geo --test w3c geosparql`). 37 of its 44 cases pass.
+(`cargo test -p sparkles-core --features geo --test w3c geosparql`). 37 of its 44 cases pass.
 The 7 others are listed with the reason in
 `testsuite/geosparql/oxigraph/expected-failures.txt`. They fail because EPSG:4326 is
 supported with its latitude-first axes, and because unclosed polygon rings are malformed
@@ -5250,7 +5250,7 @@ Jena answers a triple pattern by its shape:
 A schema without `rdfs:subClassOf`, `rdfs:domain` and `rdfs:range` answers type
 patterns from stored triples. Fixtures run the same queries over the same data and three
 schemas in Jena 6.2 and in Sparkles, and compare the answers
-([tests](../crates/sparkles/tests/rdfs_jena.rs)). Two differences remain. Jena may return
+([tests](../crates/sparkles-core/tests/rdfs_jena.rs)). Two differences remain. Jena may return
 a derived triple more than once, and Sparkles returns it once per graph. Jena picks the
 shape from what its evaluation has bound when it reads a pattern, and Sparkles from the
 pattern as written. The answers then differ only for literals with a range type and for

@@ -1,7 +1,7 @@
 use oxrdf::Term;
-use sparkles::io::{RdfFormat, Source};
-use sparkles::sparql::{QueryOptions, query};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::sparql::{QueryOptions, query};
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::{INFERRED_GRAPH, Profile, ReasonOptions, ReasonReport, clear, materialize};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -615,7 +615,7 @@ fn rematerialize_updates_and_clear() {
         "no-op rematerialization should not commit"
     );
     // remove a base triple: stale inferences disappear
-    sparkles::sparql::update::update(
+    sparkles_core::sparql::update::update(
         &s,
         "DELETE DATA { <http://ex.org/B> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/C> }",
         &Default::default(),

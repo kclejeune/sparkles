@@ -3,10 +3,10 @@
 //! location mapping, and fetched from files and over HTTP.
 
 use oxrdf::{GraphName, NamedNode, Quad, Term, Triple};
-use sparkles::index::Perm;
-use sparkles::io::{RdfFormat, Source};
-use sparkles::sparql::QueryOptions;
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::index::Perm;
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::sparql::QueryOptions;
+use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::{
     Cache, Extras, GraphRef, INFERRED_GRAPH, ImportMode, Incremental, Inputs, LocationMapping,
     Method, Profile, ReasonOptions, ReasonReport, fetch_imports, infer, materialize_incremental,
@@ -285,7 +285,7 @@ fn ttl(s: &Store, graph: Option<&str>, text: &str) {
 
 fn update(s: &Store, u: &str) {
     let u = format!("PREFIX ex: <{EX}> PREFIX rdfs: <{RDFS}> PREFIX owl: <{OWL}> {u}");
-    sparkles::sparql::update::update(s, &u, &QueryOptions::default()).unwrap();
+    sparkles_core::sparql::update::update(s, &u, &QueryOptions::default()).unwrap();
 }
 
 fn has(s: &Store, t: &str) -> bool {
@@ -555,7 +555,7 @@ fn imports_fetched_from_files() {
     assert!(f.warnings[0].contains("could not be fetched"), "{f:?}");
     // file loads the options refuse fail the fetch
     let refused = QueryOptions {
-        file_loads: sparkles::sparql::FileLoads::Disabled,
+        file_loads: sparkles_core::sparql::FileLoads::Disabled,
         ..Default::default()
     };
     update(
@@ -612,7 +612,7 @@ fn imports_fetched_over_http() {
     assert!(format!("{e:#}").contains("owl:imports"), "{e:#}");
     assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 0);
     let allowed = QueryOptions {
-        outbound: sparkles::outbound::OutboundPolicy {
+        outbound: sparkles_core::outbound::OutboundPolicy {
             allow_private: true,
             ..Default::default()
         },

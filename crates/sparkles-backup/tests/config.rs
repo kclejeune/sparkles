@@ -269,11 +269,11 @@ fn endpoints_under_an_outbound_policy() {
         conditional_writes: true,
         ..Default::default()
     };
-    let strict = sparkles::outbound::OutboundPolicy::default();
+    let strict = sparkles_core::outbound::OutboundPolicy::default();
     let e = sparkles_backup::repo::build_store_with(&c, Some(&strict)).unwrap_err();
     assert_eq!(e.code(), Code::InvalidConfig);
     assert!(e.message().contains("outbound policy"), "{}", e.message());
-    let open = sparkles::outbound::OutboundPolicy {
+    let open = sparkles_core::outbound::OutboundPolicy {
         allow_private: true,
         ..Default::default()
     };

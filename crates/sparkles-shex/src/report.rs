@@ -4,7 +4,7 @@
 use crate::{PrefixMap, ResultMap, ShapeLabel, ShapeResult, Status};
 use oxrdf::{BlankNode, NamedNode, Term};
 use serde_json::{Value as J, json};
-use sparkles::sparql::results::term_json;
+use sparkles_core::sparql::results::term_json;
 
 /// An IRI as a prefixed name with the longest namespace of `prefixes` whose remainder
 /// is a plain local name, or as `<iri>`.

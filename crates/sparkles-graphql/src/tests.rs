@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
-use sparkles::io::{RdfFormat, Source};
-use sparkles::store::{Store, StoreOptions};
+use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::store::{Store, StoreOptions};
 
 const DATA: &str = r#"
 @prefix ex: <http://example.org/> .
@@ -266,7 +266,7 @@ fn languages_numbers_and_lookups() {
 fn multiple_values_and_errors() {
     let c = compiled(SDL);
     let s = store();
-    sparkles::sparql::update::update(
+    sparkles_core::sparql::update::update(
         &s,
         "INSERT DATA { <http://example.org/p3> <http://example.org/name> \"Cyrus\" }",
         &Default::default(),
@@ -364,7 +364,7 @@ fn explained_sparql_returns_the_group_rows() {
     assert!(plan.len() >= 4, "{b:#}");
     for g in plan {
         let text = g["sparql"].as_str().unwrap();
-        let r = sparkles::sparql::query(s.snapshot(), text, &Default::default())
+        let r = sparkles_core::sparql::query(s.snapshot(), text, &Default::default())
             .unwrap_or_else(|e| panic!("{text}: {e}"));
         assert_eq!(r.len() as u64, g["rows"].as_u64().unwrap(), "{text}");
     }

@@ -11,12 +11,12 @@
 //!   components (ASK / SELECT validators), with pre-binding of `$this`, `$value`,
 //!   `$currentShape`, `$shapesGraph` and parameters.
 //!
-//! The data graph is read directly from a store [`Snapshot`](sparkles::store::Snapshot)
+//! The data graph is read directly from a store [`Snapshot`](sparkles_core::store::Snapshot)
 //! through index scans; nothing is copied into memory.
 //!
 //! ```no_run
-//! # use sparkles::store::{Store, StoreOptions};
-//! # use sparkles::io::RdfFormat;
+//! # use sparkles_core::store::{Store, StoreOptions};
+//! # use sparkles_core::io::RdfFormat;
 //! # fn main() -> anyhow::Result<()> {
 //! let store = Store::in_memory(StoreOptions::default());
 //! let shapes = sparkles_shacl::Shapes::parse(
@@ -48,9 +48,9 @@ pub mod vocab;
 pub use path::PropertyPath;
 pub use report::{ValidationReport, ValidationResult};
 pub use shapes::{Constraint, NodeKind, Shape, Shapes, Target};
-pub use sparkles::io::RdfFormat;
+pub use sparkles_core::io::RdfFormat;
 pub use syntax::ShapesSyntax;
 pub use validate::{TooManyResults, ValidateOptions, validate, validate_node};
 
-/// Lexical validity of an XSD literal (as used by `sh:datatype`; see [`sparkles::xsd`]).
-pub use sparkles::xsd::is_valid as is_valid_literal;
+/// Lexical validity of an XSD literal (as used by `sh:datatype`; see [`sparkles_core::xsd`]).
+pub use sparkles_core::xsd::is_valid as is_valid_literal;
