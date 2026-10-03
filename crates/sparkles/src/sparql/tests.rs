@@ -1555,6 +1555,71 @@ fn memory_budget_applies_to_cached_results_and_updates() {
     assert!(st.mem_peak_bytes >= 3 * 8);
 }
 
+/// Results serialized from chunks of rows decoded in id order (with blank nodes, inline
+/// literals, unbound values and terms added by updates) match the terms decoded one by
+/// one, across chunk boundaries and with a row limit.
+#[test]
+fn serialized_terms_match_terms_decoded_one_by_one() {
+    use results::SolutionsFormat;
+    let mut nt = String::new();
+    for i in 0..70_000 {
+        nt.push_str(&format!(
+            "<http://ex.org/s{}> <http://ex.org/p{}> \"v{}\"@en .\n",
+            i,
+            i % 7,
+            i % 50_000
+        ));
+        if i % 1000 == 0 {
+            nt.push_str(&format!(
+                "_:b{i} <http://ex.org/q> \"{i}\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n"
+            ));
+        }
+    }
+    let s = Store::in_memory(Default::default());
+    s.load(&[crate::io::Source::from_bytes(
+        nt.into_bytes(),
+        crate::io::RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    update::update(
+        &s,
+        "INSERT DATA { <http://ex.org/new> <http://ex.org/p1> \"fresh\" }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let r = q(
+        &s,
+        "SELECT ?s ?o ?x { ?s ?p ?o OPTIONAL { ?s <http://ex.org/q> ?x } }",
+    );
+    assert!(r.table.len() > 70_000);
+    for send in [None, Some(66_000)] {
+        let mut got = Vec::new();
+        results::write_solutions(&r, SolutionsFormat::Tsv, &mut got, send).unwrap();
+        let vars: Vec<oxrdf::Variable> = r
+            .vars
+            .iter()
+            .map(|v| oxrdf::Variable::new_unchecked(v.clone()))
+            .collect();
+        let mut ser =
+            sparesults::QueryResultsSerializer::from_format(sparesults::QueryResultsFormat::Tsv)
+                .serialize_solutions_to_writer(Vec::new(), vars.clone())
+                .unwrap();
+        let n = send.unwrap_or(r.table.len());
+        for row in r.rows().into_iter().take(n) {
+            ser.serialize(
+                row.iter()
+                    .zip(&vars)
+                    .filter_map(|(t, v)| t.as_ref().map(|t| (v.as_ref(), t.as_ref()))),
+            )
+            .unwrap();
+        }
+        let want = ser.finish().unwrap();
+        assert_eq!(got.len(), want.len());
+        assert!(got == want);
+    }
+}
+
 #[test]
 fn limited_writer_enforces_the_result_size() {
     use crate::error::{BudgetKind, Error};

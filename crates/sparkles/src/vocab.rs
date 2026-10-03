@@ -215,6 +215,51 @@ impl Vocab {
         }
     }
 
+    /// Ask the kernel to read ahead, asynchronously, the pages of the front-coded blocks
+    /// that hold these ids (sorted ascending): first those of their offsets, then those
+    /// of the blocks. Pages in memory are left as they are. A cold decode of scattered
+    /// ids then finds its pages read by many requests at once, instead of one page fault
+    /// at a time. Nearby pages are asked for in one range.
+    pub fn prefetch_sorted(&self, ids: &[u64]) {
+        const GAP: usize = 64 << 10;
+        fn advise(m: &Mmap, ranges: impl Iterator<Item = (usize, usize)>) {
+            let mut cur: Option<(usize, usize)> = None;
+            for (s, e) in ranges {
+                let e = e.min(m.len());
+                if s >= e {
+                    continue;
+                }
+                cur = match cur {
+                    Some((cs, ce)) if s <= ce + GAP => Some((cs, ce.max(e))),
+                    Some((cs, ce)) => {
+                        let _ = m.advise_range(memmap2::Advice::WillNeed, cs, ce - cs);
+                        Some((s, e))
+                    }
+                    None => Some((s, e)),
+                };
+            }
+            if let Some((cs, ce)) = cur {
+                let _ = m.advise_range(memmap2::Advice::WillNeed, cs, ce - cs);
+            }
+        }
+        let (Bytes::Map(data), Bytes::Map(offsets)) = (&self.data, &self.offsets) else {
+            return;
+        };
+        let mut blocks: Vec<usize> = ids
+            .iter()
+            .take_while(|&&id| id < self.len)
+            .map(|&id| id as usize / FC_BLOCK)
+            .collect();
+        blocks.dedup();
+        advise(offsets, blocks.iter().map(|&b| (b * 8, b * 8 + 16)));
+        advise(
+            data,
+            blocks
+                .iter()
+                .map(|&b| (self.block_offset(b), self.block_offset(b + 1))),
+        );
+    }
+
     /// Binary search: `Ok(id)` if present, `Err(insertion point)` otherwise.
     pub fn find(&self, key: &[u8]) -> std::result::Result<u64, u64> {
         let nb = self.num_blocks();

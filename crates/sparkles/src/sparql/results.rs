@@ -2,10 +2,12 @@
 
 use super::{QueryKind, QueryResult};
 use crate::error::{Budget, BudgetKind, Error, Result};
+use crate::id::{Id, Tag};
 use oxrdf::{Term, Variable};
 use oxrdfio::{RdfFormat, RdfSerializer};
 use serde_json::{Value as J, json};
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -244,19 +246,98 @@ pub fn write_solutions(
         .serialize_solutions_to_writer(w, vars.clone())
         .map_err(io)?;
     let n = send.map_or(r.table.len(), |s| s.min(r.table.len()));
-    for i in 0..n {
-        let terms: Vec<(usize, Term)> = r
+    let chunk = |start: usize| start..n.min(start + DECODE_ROWS);
+    std::thread::scope(|sc| -> Result<()> {
+        let mut ids = Decoded::ids(r, chunk(0));
+        let mut start = 0;
+        while start < n {
+            let end = n.min(start + DECODE_ROWS);
+            let d = Decoded::new(r, std::mem::take(&mut ids));
+            // the next chunk's pages are asked for while this one is written
+            let ahead = (end < n).then(|| sc.spawn(move || Decoded::ids(r, chunk(end))));
+            for i in start..end {
+                let terms: Vec<(usize, Cow<'_, Term>)> = r
+                    .table
+                    .cols
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(c, col)| d.term(r, col[i]).map(|t| (c, t)))
+                    .collect();
+                s.serialize(
+                    terms
+                        .iter()
+                        .map(|(c, t)| (vars[*c].as_ref(), t.as_ref().as_ref())),
+                )
+                .map_err(io)?;
+            }
+            if let Some(h) = ahead {
+                ids = h.join().unwrap_or_else(|_| Decoded::ids(r, chunk(end)));
+            }
+            start = end;
+        }
+        Ok(())
+    })?;
+    s.finish().map_err(io)?;
+    Ok(())
+}
+
+/// Result rows decoded at a time for serialization.
+const DECODE_ROWS: usize = 1 << 16;
+/// Sorted base-vocabulary ids decoded by one parallel task.
+const DECODE_TASK: usize = 2048;
+
+/// The terms of the distinct base-vocabulary ids in some rows of a result, decoded in id
+/// order: the vocabulary's front-coded blocks are visited once each and in file order,
+/// by parallel tasks, instead of once per row and column in row order. Their pages are
+/// asked of the kernel ahead of the decoding, the next chunk's while a chunk is written.
+/// A cold vocabulary is then read by many requests at once, mostly in ascending runs of
+/// pages, rather than one random page fault at a time.
+struct Decoded {
+    /// sorted by id
+    terms: Vec<(u64, Term)>,
+}
+
+impl Decoded {
+    /// The sorted distinct base-vocabulary ids in `rows`, with their pages asked for.
+    fn ids(r: &QueryResult, rows: std::ops::Range<usize>) -> Vec<u64> {
+        use rayon::prelude::*;
+        let mut ids: Vec<u64> = r
             .table
             .cols
             .iter()
-            .enumerate()
-            .filter_map(|(c, col)| r.term(col[i]).map(|t| (c, t)))
+            .flat_map(|c| c[rows.clone()].iter())
+            .filter(|id| id.tag() == Tag::Vocab)
+            .map(|id| id.payload())
             .collect();
-        s.serialize(terms.iter().map(|(c, t)| (vars[*c].as_ref(), t.as_ref())))
-            .map_err(io)?;
+        ids.par_sort_unstable();
+        ids.dedup();
+        r.ctx.snap.generation.vocab.prefetch_sorted(&ids);
+        ids
     }
-    s.finish().map_err(io)?;
-    Ok(())
+
+    /// Decode sorted distinct base-vocabulary `ids`.
+    fn new(r: &QueryResult, ids: Vec<u64>) -> Decoded {
+        use rayon::prelude::*;
+        let vocab = &r.ctx.snap.generation.vocab;
+        let terms = ids
+            .par_chunks(DECODE_TASK)
+            .flat_map_iter(|c| {
+                let mut out = Vec::with_capacity(c.len());
+                vocab.get_sorted(c, |id, k| out.push((id, crate::id::key_to_term(k))));
+                out
+            })
+            .collect();
+        Decoded { terms }
+    }
+
+    fn term<'a>(&'a self, r: &QueryResult, id: Id) -> Option<Cow<'a, Term>> {
+        if id.tag() == Tag::Vocab
+            && let Ok(i) = self.terms.binary_search_by_key(&id.payload(), |(x, _)| *x)
+        {
+            return Some(Cow::Borrowed(&self.terms[i].1));
+        }
+        r.term(id).map(Cow::Owned)
+    }
 }
 
 /// Serialize CONSTRUCT / DESCRIBE results.
