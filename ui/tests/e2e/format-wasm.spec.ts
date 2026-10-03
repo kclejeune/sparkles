@@ -39,14 +39,12 @@ const textOf = async (editor: ReturnType<typeof queryEditor>) =>
 const QUERY = 'select ?s where { ?s ?p ?o filter(?o>1&&?o<10) } limit 5';
 const FORMATTED = 'SELECT ?s\nWHERE {\n  ?s ?p ?o .\n  FILTER(?o > 1 && ?o < 10)\n}\nLIMIT 5\n';
 
-test('formats in the browser when the build has the module, loading it on first use', async ({
-  page,
-}) => {
+test('formats in the browser when the build has the module, loading it once', async ({ page }) => {
   const seen = watch(page);
   await page.goto('/ui/query');
   const editor = queryEditor(page);
+  // the editor lints while typing, which loads the module before the first format
   await setText(page, editor, QUERY);
-  expect(seen.module, 'the module loads only when something is formatted').toEqual([]);
 
   await page.keyboard.press('Shift+Alt+F');
   await expect.poll(() => textOf(editor)).toBe(FORMATTED);
