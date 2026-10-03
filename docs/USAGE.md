@@ -683,6 +683,10 @@ Two environment variables switch off read paths for comparisons.
 that a page fault reads the device's whole read-ahead window and blocks are not read
 ahead. `SPARKLES_SPARSE_VOCAB=off` looks terms up without `vocab.idx`.
 
+`SPARKLES_UI_DIR=DIR` makes the server read the web UI from a UI build directory, such as
+`ui/build`, instead of the copy embedded in the binary. The Nix package sets it to its UI
+build, so that its binary needs no UI at compile time.
+
 `sparkles schema --loc db --format void` prints the schema report as a VoID description
 in Turtle, and `--format turtle` adds the declared RDFS/OWL schema. The server answers
 `GET /$/schema/{ds}` the same way when the request asks for Turtle or another RDF syntax

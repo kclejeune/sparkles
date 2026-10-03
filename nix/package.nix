@@ -4,16 +4,19 @@
 #
 # The build is in two layers (crane). `cargoArtifacts` compiles the dependencies from the
 # manifests and Cargo.lock alone, with every workspace source replaced by a stub, so it is
-# rebuilt only when a Cargo.toml or Cargo.lock changes. The package and the unit tests
+# rebuilt only when a Cargo.toml or Cargo.lock changes. The binary and the unit tests
 # (`passthru.tests`, the flake's `sparkles-tests` check) start from its target directory
-# and compile only the workspace crates. The UI is copied in by the package alone, so a UI
-# change rebuilds neither the dependencies nor the tests, and `sparkles` and
-# `sparkles-cli` share both.
+# and compile only the workspace crates. The binary embeds no UI. With `ui`, the package
+# wraps it so that the server reads the UI from the UI's store path at run time
+# (`SPARKLES_UI_DIR`), so a UI change rebuilds only the wrapper, and `sparkles` and
+# `sparkles-cli` share the binary.
 {
   lib,
   stdenv,
+  stdenvNoCC,
   craneLib,
   installShellFiles,
+  makeBinaryWrapper,
   ui ? null,
 }:
 let
@@ -73,58 +76,73 @@ let
       doInstallCargoArtifacts = false;
     }
   );
+
+  meta = {
+    description = "High-performance RDF/SPARQL database with a Jena/Fuseki-compatible CLI and server";
+    homepage = "https://github.com/kclejeune/sparkles";
+    license = lib.licenses.asl20;
+    mainProgram = "sparkles";
+    platforms = lib.platforms.unix;
+  };
+
+  # The binary, without the UI (build.rs embeds a placeholder page). It is the same
+  # derivation for `sparkles` and `sparkles-cli`.
+  bin = craneLib.buildPackage (
+    commonArgs
+    // {
+      pname = "sparkles-cli";
+      inherit src cargoArtifacts;
+
+      cargoExtraArgs = "--locked -p sparkles-server";
+      # the unit tests are their own derivation (`tests`)
+      doCheck = false;
+
+      # shell completions and man pages (`sparkles completions`, `sparkles man`)
+      nativeBuildInputs = [ installShellFiles ];
+
+      # the licenses and notices of the linked crates (Apache-2.0 asks for NOTICE files to
+      # travel with the binary); `mise run licenses` regenerates the file
+      postInstall = ''
+        install -Dm644 THIRD_PARTY_LICENSES.md $out/share/doc/sparkles/THIRD_PARTY_LICENSES.md
+      ''
+      # completions, man pages and the OpenAPI description come from the binary itself, so
+      # only a build that can run it installs them
+      + lib.optionalString (stdenv.buildPlatform.canExecute stdenv.hostPlatform) ''
+        installShellCompletion --cmd sparkles \
+          --bash <($out/bin/sparkles completions bash) \
+          --zsh <($out/bin/sparkles completions zsh) \
+          --fish <($out/bin/sparkles completions fish)
+        $out/bin/sparkles man --dir man
+        installManPage man/*.1
+        $out/bin/sparkles openapi > $out/share/doc/sparkles/openapi.json
+      '';
+
+      passthru = { inherit cargoArtifacts tests; };
+
+      inherit meta;
+    }
+  );
 in
-craneLib.buildPackage (
-  commonArgs
-  // {
-    pname = if ui == null then "sparkles-cli" else "sparkles";
-    inherit src cargoArtifacts;
-
-    cargoExtraArgs = "--locked -p sparkles-server";
-    # the unit tests are their own derivation (`tests`)
-    doCheck = false;
-
-    # shell completions and man pages (`sparkles completions`, `sparkles man`)
-    nativeBuildInputs = [ installShellFiles ];
-
-    # The UI is embedded at compile time from ui/build (build.rs writes a placeholder
-    # page when it is missing).
-    preBuild = lib.optionalString (ui != null) ''
-      mkdir -p ui
-      cp -r ${ui} ui/build
-      chmod -R u+w ui/build
-    '';
-
-    # the licenses and notices of the linked crates (Apache-2.0 asks for NOTICE files to
-    # travel with the binary), and of the npm packages in the embedded UI (written by the UI
-    # build; the check `ui-licenses` compares them with THIRD_PARTY_LICENSES-UI.md);
-    # `mise run licenses` regenerates both files
-    postInstall = ''
-      install -Dm644 THIRD_PARTY_LICENSES.md $out/share/doc/sparkles/THIRD_PARTY_LICENSES.md
-    ''
-    + lib.optionalString (ui != null) ''
+if ui == null then
+  bin
+else
+  # The binary with the UI: a wrapper that points `SPARKLES_UI_DIR` at the UI build, and
+  # the licenses of the npm packages in it (written by the UI build; the check
+  # `ui-licenses` compares them with THIRD_PARTY_LICENSES-UI.md)
+  stdenvNoCC.mkDerivation {
+    pname = "sparkles";
+    inherit version;
+    nativeBuildInputs = [ makeBinaryWrapper ];
+    buildCommand = ''
+      mkdir -p $out/bin
+      cp -rs --no-preserve=mode ${bin}/share $out/share
+      makeBinaryWrapper ${bin}/bin/sparkles $out/bin/sparkles \
+        --set-default SPARKLES_UI_DIR ${ui}
       install -Dm644 ${ui}/licenses.txt $out/share/doc/sparkles/THIRD_PARTY_LICENSES-UI.md
-    ''
-    # completions, man pages and the OpenAPI description come from the binary itself, so
-    # only a build that can run it installs them
-    + lib.optionalString (stdenv.buildPlatform.canExecute stdenv.hostPlatform) ''
-      installShellCompletion --cmd sparkles \
-        --bash <($out/bin/sparkles completions bash) \
-        --zsh <($out/bin/sparkles completions zsh) \
-        --fish <($out/bin/sparkles completions fish)
-      $out/bin/sparkles man --dir man
-      installManPage man/*.1
-      $out/bin/sparkles openapi > $out/share/doc/sparkles/openapi.json
     '';
-
-    passthru = { inherit cargoArtifacts tests; };
-
-    meta = {
-      description = "High-performance RDF/SPARQL database with a Jena/Fuseki-compatible CLI and server";
-      homepage = "https://github.com/kclejeune/sparkles";
-      license = lib.licenses.asl20;
-      mainProgram = "sparkles";
-      platforms = lib.platforms.unix;
+    passthru = {
+      inherit cargoArtifacts tests ui;
+      unwrapped = bin;
     };
+    inherit meta;
   }
-)
