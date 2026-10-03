@@ -391,8 +391,14 @@ The document was also checked outside the test suite at landing. Redocly CLI's
 that have no 4xx response, such as `/$/ping`. `openapi-typescript` 7 generated types
 from it without errors. The YAML form, read back with `yq`, equals the JSON form.
 
-**Measurements.** The JSON copy is 454 KB and the YAML form 317 KB. Building the
-document takes about a millisecond and happens once per process.
+**Measurements.** The JSON copy is 454 KB and the YAML form 317 KB. The server builds
+the document on the first request and keeps both forms, about 0.8 MB of memory. In the
+release binary of the Nix package, whose code and data take 58 MB, the functions that
+build the description take 0.8 MB. The `json!` literals expand to code rather than
+data. `clap_complete` takes 84 KB, and `clap_mangen` with `roff` 66 KB. Embedding the
+checked-in copy instead would save about 0.35 MB of code but make the served document
+only as current as the copy, so it was not done. The tradeoff is binary size for a
+description computed from the code that serves it.
 
 **Not built.** Phase 2's schemas for backups, the search indexes, reasoning, write-time
 validation, history and the other open objects, and the response-validation test that
