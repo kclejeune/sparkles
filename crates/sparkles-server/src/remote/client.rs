@@ -2,7 +2,7 @@
 //! `load` against a server.
 
 use super::credentials::ServerCreds;
-use super::{Credentials, JsonBody, Remote, login, normalize};
+use super::{JsonBody, Remote, login, normalize};
 use anyhow::{Context, Result, bail};
 use reqwest::Method;
 use serde_json::{Value as J, json};
@@ -74,12 +74,12 @@ pub fn login(
         principal: Some(principal.clone()),
         expires: who["expires"].as_str().map(str::to_string),
     };
-    let mut all = Credentials::load()?;
+    let mut all = super::credentials::load()?;
     all.servers.insert(base.clone(), creds.clone());
     if all.default_server.is_none() || set_default {
         all.default_server = Some(base.clone());
     }
-    all.save()?;
+    super::credentials::save(&all)?;
     let mut detail = Vec::new();
     if let Some(id) = &creds.token_id {
         detail.push(format!("token {id}"));
@@ -99,7 +99,7 @@ pub fn login(
 /// `sparkles auth logout`: revoke the token on the server and forget it.
 pub fn logout(server: Option<&str>, insecure: bool) -> Result<()> {
     let r = Remote::open(server, insecure)?;
-    let mut all = Credentials::load()?;
+    let mut all = super::credentials::load()?;
     if !all.servers.contains_key(&r.base) {
         bail!("not logged in to {}", r.base);
     }
@@ -111,14 +111,14 @@ pub fn logout(server: Option<&str>, insecure: bool) -> Result<()> {
     if all.default_server.as_deref() == Some(r.base.as_str()) {
         all.default_server = all.servers.keys().next().cloned();
     }
-    all.save()?;
+    super::credentials::save(&all)?;
     println!("Logged out of {}", r.base);
     Ok(())
 }
 
 /// `sparkles auth status`
 pub fn status(server: Option<&str>, insecure: bool) -> Result<()> {
-    let all = Credentials::load()?;
+    let all = super::credentials::load()?;
     let servers: Vec<String> = match server {
         Some(s) => vec![normalize(s, insecure)?],
         None => all.servers.keys().cloned().collect(),

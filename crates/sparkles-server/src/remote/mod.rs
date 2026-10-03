@@ -8,20 +8,13 @@ pub mod client;
 pub mod credentials;
 pub mod login;
 
-pub use credentials::Credentials;
-
-/// `scheme://host[:port][/path]`, lowercase host, no trailing slash. Plain `http` is
-/// refused for hosts other than loopback unless `insecure` (tokens are bearer secrets).
+/// `scheme://host[:port][/path]`, lowercase host, no trailing slash: the key of the
+/// credentials file, normalized by the Rust client's rules so that both find the same
+/// login. Plain `http` is refused for hosts other than loopback unless `insecure` (tokens
+/// are bearer secrets).
 pub fn normalize(url: &str, insecure: bool) -> Result<String> {
-    let with_scheme = if url.contains("://") {
-        url.to_string()
-    } else {
-        format!("https://{url}")
-    };
-    let u = reqwest::Url::parse(&with_scheme).with_context(|| format!("invalid URL '{url}'"))?;
-    if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() {
-        bail!("invalid server URL '{url}' (expected http(s)://host[:port])");
-    }
+    let s = sparkles_client::credentials::normalize(url, true)?;
+    let u = reqwest::Url::parse(&s).with_context(|| format!("invalid URL '{url}'"))?;
     let host = u.host_str().unwrap_or_default();
     let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
     if u.scheme() == "http" && !loopback && !insecure {
@@ -29,11 +22,6 @@ pub fn normalize(url: &str, insecure: bool) -> Result<String> {
             "refusing plain http to {host}: tokens would travel in clear text (use https, or --insecure-http)"
         );
     }
-    let mut s = format!("{}://{host}", u.scheme());
-    if let Some(p) = u.port() {
-        s.push_str(&format!(":{p}"));
-    }
-    s.push_str(u.path().trim_end_matches('/'));
     Ok(s)
 }
 
@@ -48,7 +36,7 @@ impl Remote {
     /// The server from `--server` (or `SPARKLES_SERVER`), else the saved default; the
     /// token from `SPARKLES_TOKEN`, else the credentials file.
     pub fn open(server: Option<&str>, insecure: bool) -> Result<Remote> {
-        let creds = Credentials::load()?;
+        let creds = credentials::load()?;
         let raw = match server {
             Some(s) => s.to_string(),
             None => creds

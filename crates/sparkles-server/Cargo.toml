@@ -75,6 +75,8 @@ zeroize = { version = "1", optional = true }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"], optional = true }
 reqwest = { workspace = true, optional = true }
 rpassword = { version = "7", optional = true }
+# the credentials file of `sparkles auth login`, shared with the Rust client
+sparkles-client = { workspace = true, optional = true }
 # MCP server (`sparkles mcp` on stdio, `serve --mcp` at `/$/mcp`): the official Rust SDK,
 # without its tool macros
 rmcp = { version = "~3.5", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"], optional = true }
@@ -105,6 +107,8 @@ aws-lc-rs = "1"
 # the formatter's test-only fault switch (`SPARKLES_FMT_FAULT`), so the tests can show that
 # `sparkles fmt` and `POST /$/format` refuse output that fails the safety checks
 sparkles-fmt = { workspace = true, features = ["fault-injection"] }
+# the Rust client, tested against this crate's binary (tests/rust_client.rs)
+sparkles-client = { workspace = true, features = ["blocking"] }
 
 [features]
 default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "otel", "auth", "mcp", "backup", "fmt", "tls"]
@@ -132,6 +136,7 @@ auth = [
     "dep:rpassword",
     "dep:jsonwebtoken",
     "dep:reqwest",
+    "dep:sparkles-client",
 ]
 # native TLS: `serve --tls-cert FILE --tls-key FILE`
 tls = ["dep:rustls", "dep:tokio-rustls"]
