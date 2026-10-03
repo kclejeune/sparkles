@@ -12,6 +12,7 @@
 //! dataset's own settings ([`CompactionSettings`]) live in `compaction.json`. The server
 //! runs the policy; the C13 spec has the design.
 
+use super::partial::{self, PartialMode};
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64};
@@ -58,6 +59,9 @@ pub struct CompactionPolicy {
     pub max_age_seconds: u64,
     /// no automatic compaction starts sooner than this after the previous one ended
     pub min_interval_seconds: u64,
+    /// whether a compaction may rewrite only the blocks the delta touches
+    #[serde(default)]
+    pub partial: PartialMode,
 }
 
 impl Default for CompactionPolicy {
@@ -72,6 +76,7 @@ impl Default for CompactionPolicy {
             idle_seconds: 300,
             max_age_seconds: 86_400,
             min_interval_seconds: 60,
+            partial: PartialMode::Auto,
         }
     }
 }
@@ -98,10 +103,12 @@ pub struct CompactionSettings {
     pub max_age_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_interval_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialMode>,
 }
 
 /// The setting names, as JSON keys and `key=value` arguments.
-pub const SETTING_NAMES: [&str; 9] = [
+pub const SETTING_NAMES: [&str; 10] = [
     "enabled",
     "minDeltaQuads",
     "deltaRatio",
@@ -111,6 +118,7 @@ pub const SETTING_NAMES: [&str; 9] = [
     "idleSeconds",
     "maxAgeSeconds",
     "minIntervalSeconds",
+    "partial",
 ];
 
 impl CompactionSettings {
@@ -177,6 +185,13 @@ impl CompactionSettings {
             "idleSeconds" => self.idle_seconds = Some(n()?),
             "maxAgeSeconds" => self.max_age_seconds = Some(n()?),
             "minIntervalSeconds" => self.min_interval_seconds = Some(n()?),
+            "partial" => {
+                self.partial = Some(PartialMode::parse(value).ok_or_else(|| {
+                    Error::invalid(format!(
+                        "partial: expected auto, off or always, not {value:?}"
+                    ))
+                })?)
+            }
             _ => {
                 return Err(Error::invalid(format!(
                     "unknown compaction setting {key:?} (the settings are {})",
@@ -214,6 +229,7 @@ impl CompactionPolicy {
             min_interval_seconds: own
                 .min_interval_seconds
                 .unwrap_or(self.min_interval_seconds),
+            partial: own.partial.unwrap_or(self.partial),
         }
     }
 
@@ -460,6 +476,9 @@ pub struct CompactOptions {
     /// stops the build ([`Error::Cancelled`]) when set
     pub cancel: Option<Arc<AtomicBool>>,
     pub progress: Option<crate::builder::ProgressFn>,
+    /// whether it may rewrite only the blocks the delta touches (`None`: the dataset's
+    /// own setting, else [`PartialMode::Auto`])
+    pub partial: Option<PartialMode>,
     /// build the spatial index base under the writer lock at the switch, as before it
     /// was built with the generation (for measurements)
     #[doc(hidden)]
@@ -480,6 +499,15 @@ pub struct CompactReport {
     /// why it published nothing (a bulk commit rebuilt the dataset meanwhile)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abandoned: Option<String>,
+    /// `full`, or `partial` when it rewrote only the blocks the delta touched
+    pub mode: String,
+    /// why a compaction that could have been partial rebuilt everything
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_reason: Option<String>,
+    /// blocks of the old permutations that a partial compaction rewrote, and those it
+    /// copied as they were
+    pub blocks_rewritten: u64,
+    pub blocks_copied: u64,
     /// how long the switch held the writer lock
     pub lock_ms: f64,
     pub build_ms: f64,
@@ -621,6 +649,43 @@ impl CatchUp {
                 sync_commit(w.get_ref(), &self.gen_.dvocab)
             }
             None => Ok(()),
+        }
+    }
+}
+
+/// How a compaction wrote the new generation.
+enum How {
+    /// in full, and why not partially
+    Full(String),
+    Partial {
+        rewritten: u64,
+        copied: u64,
+    },
+}
+
+impl How {
+    fn mode(&self) -> &'static str {
+        match self {
+            How::Full(_) => "full",
+            How::Partial { .. } => "partial",
+        }
+    }
+    fn full_reason(&self) -> Option<String> {
+        match self {
+            How::Full(why) => Some(why.clone()),
+            How::Partial { .. } => None,
+        }
+    }
+    fn rewritten(&self) -> u64 {
+        match self {
+            How::Full(_) => 0,
+            How::Partial { rewritten, .. } => *rewritten,
+        }
+    }
+    fn copied(&self) -> u64 {
+        match self {
+            How::Full(_) => 0,
+            How::Partial { copied, .. } => *copied,
         }
     }
 }
@@ -871,9 +936,12 @@ impl Store {
         self.failpoint("compact-started");
         let tb = Instant::now();
         let pool = build_pool(o, self.opts.build.threads)?;
-        let meta = match &pool {
-            Some(p) => p.install(|| self.build_compacted(&snap0, &dir, next_bnode, o)),
-            None => self.build_compacted(&snap0, &dir, next_bnode, o),
+        let mode = o
+            .partial
+            .unwrap_or_else(|| self.compaction.settings.lock().partial.unwrap_or_default());
+        let (meta, how) = match &pool {
+            Some(p) => p.install(|| self.build_new(&snap0, &dir, next_bnode, o, mode)),
+            None => self.build_new(&snap0, &dir, next_bnode, o, mode),
         }?;
         let mut build = tb.elapsed();
         self.failpoint("compact-built");
@@ -930,6 +998,7 @@ impl Store {
         let abandoned = |why: String| CompactReport {
             generation: self.snapshot().generation.name.clone(),
             abandoned: Some(why),
+            mode: how.mode().into(),
             build_ms: build.as_secs_f64() * 1e3,
             total_ms: t0.elapsed().as_secs_f64() * 1e3,
             ..Default::default()
@@ -1075,10 +1144,71 @@ impl Store {
             base_commit: base.seq,
             caught_up_commits: cu.commits,
             abandoned: None,
+            mode: how.mode().into(),
+            full_reason: how.full_reason(),
+            blocks_rewritten: how.rewritten(),
+            blocks_copied: how.copied(),
             lock_ms: lock.as_secs_f64() * 1e3,
             build_ms: build.as_secs_f64() * 1e3,
             total_ms: t0.elapsed().as_secs_f64() * 1e3,
         })
+    }
+
+    /// Write the generation of `snap` to `dir`: partially when `mode` allows it and the
+    /// delta suits it, else in full.
+    fn build_new(
+        &self,
+        snap: &Snapshot,
+        dir: &Path,
+        next_bnode: u64,
+        o: &CompactOptions,
+        mode: PartialMode,
+    ) -> Result<(IndexMeta, How)> {
+        let why = match mode {
+            PartialMode::Off => "partial compaction is off".to_string(),
+            _ => match partial::plan(snap) {
+                Err(why) => why,
+                Ok(plan)
+                    if mode == PartialMode::Auto && plan.share() > partial::MAX_REWRITE_SHARE =>
+                {
+                    format!(
+                        "it would rewrite {:.0}% of the blocks, more than {:.0}%",
+                        plan.share() * 100.0,
+                        partial::MAX_REWRITE_SHARE * 100.0
+                    )
+                }
+                Ok(plan)
+                    if mode == PartialMode::Auto
+                        && plan.fragmentation() > partial::MAX_FRAGMENTATION =>
+                {
+                    format!(
+                        "it would leave {} blocks where a full build writes {}",
+                        plan.blocks_after, plan.blocks_full
+                    )
+                }
+                Ok(plan) => {
+                    if let Some(p) = &o.progress {
+                        p(&format!(
+                            "partial compaction: rewriting {} of {} blocks",
+                            plan.rewritten, plan.blocks
+                        ));
+                    }
+                    let interrupt = self.compaction_interrupt(o, dir);
+                    let meta =
+                        partial::write(snap, &plan, dir, next_bnode, self.prefixes(), &interrupt)?;
+                    interrupt()?;
+                    return Ok((
+                        meta,
+                        How::Partial {
+                            rewritten: plan.rewritten,
+                            copied: plan.blocks - plan.rewritten,
+                        },
+                    ));
+                }
+            },
+        };
+        let meta = self.build_compacted(snap, dir, next_bnode, o)?;
+        Ok((meta, How::Full(why)))
     }
 
     /// Build the generation of `snap` in `dir`, under the build limits of `o`.

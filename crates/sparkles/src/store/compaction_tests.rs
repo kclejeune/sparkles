@@ -82,6 +82,38 @@ fn churn(s: &Store, i: usize) {
     upd(s, &u);
 }
 
+/// Write `i` of a sequence like [`churn`]'s that uses only terms of the vocabulary of a
+/// store loaded with [`nt`] (and integers, which are inline), so that a partial
+/// compaction can fold it: new and deleted quads, types, a named graph, blank nodes and
+/// several quads in one commit.
+fn churn_known(s: &Store, i: usize) {
+    let u = match i % 6 {
+        0 => format!("INSERT DATA {{ <urn:s{i}> <urn:q> {} }}", 1000 + i),
+        1 => format!("DELETE DATA {{ <urn:s{i}> <urn:q> {} }}", i % 100),
+        2 => format!(
+            "INSERT DATA {{ <urn:s{i}> a <urn:C{}> . GRAPH <urn:s2> {{ <urn:s{i}> <urn:q> 7 }} }} ; DELETE DATA {{ <urn:s{}> <urn:p{}> \"v{}\" }}",
+            (i + 1) % 5,
+            i + 1,
+            (i + 1) % 7,
+            i + 1
+        ),
+        3 => format!(
+            "DELETE DATA {{ <urn:s{}> <urn:q> {} }}",
+            i - 3,
+            1000 + i - 3
+        ),
+        4 => format!(
+            "INSERT DATA {{ _:b <urn:q> {i} . GRAPH <urn:s2> {{ _:b <urn:p1> \"v{i}\" }} }}"
+        ),
+        _ => format!(
+            "INSERT DATA {{ <urn:s{}> <urn:q> {} }}",
+            i - 4,
+            (i - 4) % 100
+        ),
+    };
+    upd(s, &u);
+}
+
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {
@@ -365,6 +397,17 @@ fn queries_answer_the_same_after_a_compaction() {
 
 #[test]
 fn a_crash_at_any_point_recovers() {
+    crash_at_each_point(churn, PartialMode::Off);
+}
+
+#[test]
+fn a_crash_during_a_partial_compaction_recovers() {
+    crash_at_each_point(churn_known, PartialMode::Always);
+}
+
+/// Crash a compaction at each of its points, with commits made by `churn` before and
+/// during the build, and check what a reopen recovers.
+fn crash_at_each_point(churn: fn(&Store, usize), mode: PartialMode) {
     for point in [
         "compact-started",
         "compact-built",
@@ -377,6 +420,11 @@ fn a_crash_at_any_point_recovers() {
         let root = dir.path().join("db");
         let crash = dir.path().join("crash");
         let s = Store::open(&root, StoreOptions::default()).unwrap();
+        s.set_compaction_settings(Some(CompactionSettings {
+            partial: Some(mode),
+            ..Default::default()
+        }))
+        .unwrap();
         s.load(&[nt(1500, 0)]).unwrap();
         s.compact().unwrap();
         for i in 0..30 {
@@ -384,7 +432,7 @@ fn a_crash_at_any_point_recovers() {
         }
         s.set_failpoint(
             "compact-built",
-            Some(Arc::new(|st: &Store| {
+            Some(Arc::new(move |st: &Store| {
                 for i in 30..130 {
                     churn(st, i);
                 }
@@ -418,7 +466,14 @@ fn a_crash_at_any_point_recovers() {
                 })),
             );
         }
-        s.compact().unwrap();
+        let r = s.compact_with(&CompactOptions::default()).unwrap();
+        let expected = if mode == PartialMode::Off {
+            "full"
+        } else {
+            "partial"
+        };
+        assert_eq!(r.mode, expected, "{point}: {r:?}");
+        assert_eq!(r.caught_up_commits, 100, "{point}");
         if point == "after" {
             *state.lock() = Some((s.head_commit().seq, dump(&s)));
             copy_dir(&root, &crash);
@@ -876,6 +931,419 @@ fn full_text_search_sees_the_commits_carried_over() {
     drop(s);
     let s = Store::open(&root, StoreOptions::default()).unwrap();
     assert_eq!(hits(&s), 2);
+}
+
+/// A store at `root` loaded with `n` subjects of [`nt`], whose compactions are partial as
+/// `mode` says.
+fn partial_store(root: &Path, n: usize, mode: PartialMode) -> Store {
+    let s = Store::open(root, StoreOptions::default()).unwrap();
+    s.set_compaction_settings(Some(CompactionSettings {
+        partial: Some(mode),
+        ..Default::default()
+    }))
+    .unwrap();
+    s.load(&[nt(n, 0)]).unwrap();
+    s
+}
+
+/// The statistics of the current generation with their ids written as terms, which
+/// compares two generations whose vocabularies differ.
+fn stats_terms(s: &Store) -> serde_json::Value {
+    let snap = s.snapshot();
+    let st = &snap.generation.stats;
+    let t = |id: u64| {
+        let id = if Id(id).tag() as u8 == 0xF {
+            Id::vocab(id & crate::id::PAYLOAD_MASK)
+        } else {
+            Id(id)
+        };
+        snap.term(id)
+            .map_or_else(|| format!("{id:?}"), |t| format!("class or term {t}"))
+    };
+    serde_json::json!({
+        "quads": st.quads,
+        "subjects": st.distinct_subjects,
+        "predicates": st.distinct_predicates,
+        "objects": st.distinct_objects,
+        "perPredicate": st.predicates.iter().map(|p| (t(p.p), p.count, p.distinct_subjects, p.distinct_objects)).collect::<Vec<_>>(),
+        "graphs": st.graphs.iter().map(|(g, n)| (t(*g), *n)).collect::<Vec<_>>(),
+        "classes": st.classes.iter().map(|(c, n)| (t(*c), *n)).collect::<Vec<_>>(),
+        "charsets": st.charsets.iter().map(|c| (c.preds.iter().map(|p| t(*p)).collect::<Vec<_>>(), c.subjects, c.triples.clone())).collect::<Vec<_>>(),
+        "charsetOthers": st.charset_others,
+    })
+}
+
+/// Queries whose answers must not depend on how a generation was written.
+const DIFF_QUERIES: [&str; 8] = [
+    "SELECT ?p (COUNT(*) AS ?n) { ?s ?p ?o } GROUP BY ?p ORDER BY ?p",
+    "SELECT ?c (COUNT(DISTINCT ?s) AS ?n) { ?s a ?c } GROUP BY ?c ORDER BY ?c",
+    "SELECT (COUNT(DISTINCT ?s) AS ?n) (COUNT(DISTINCT ?o) AS ?m) { ?s ?p ?o }",
+    "SELECT ?g (COUNT(*) AS ?n) { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g ORDER BY ?g",
+    "SELECT ?s ?o { ?s <urn:q> ?o FILTER(?o > 50 && ?o < 100060) } ORDER BY ?s ?o LIMIT 500",
+    "SELECT ?s ?c ?v { ?s a ?c ; <urn:p3> ?v } ORDER BY DESC(?s) LIMIT 200",
+    "SELECT (COUNT(*) AS ?n) { ?s <urn:q> ?o . ?s a <urn:C2> }",
+    "ASK { <urn:s5> <urn:q> 100007 }",
+];
+
+fn diff_answers(s: &Store) -> Vec<String> {
+    DIFF_QUERIES
+        .iter()
+        .map(|q| {
+            let r = crate::sparql::query(s.snapshot(), q, &QueryOptions::default())
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+            format!("{:?}", r.rows())
+        })
+        .collect()
+}
+
+/// Compact `p` (partially) and `f` (in full), which took the same commits, and compare
+/// them: the quads, query answers, statistics, `sparkles check` and a reopen.
+fn compare_partial_and_full(p: Store, f: Store, round: &str) -> (Store, Store) {
+    let rp = p.compact_with(&CompactOptions::default()).unwrap();
+    let rf = f.compact_with(&CompactOptions::default()).unwrap();
+    assert_eq!(rp.mode, "partial", "{round}: {rp:?}");
+    assert_eq!(rf.mode, "full", "{round}: {rf:?}");
+    assert_eq!(rp.quads, rf.quads, "{round}");
+    assert!(p.snapshot().delta.is_empty());
+    assert_eq!(dump(&p), dump(&f), "{round}");
+    assert_eq!(diff_answers(&p), diff_answers(&f), "{round}");
+    assert_eq!(stats_terms(&p), stats_terms(&f), "{round}");
+    let mut out = Vec::new();
+    for s in [p, f] {
+        let root = s.root.clone().unwrap();
+        let rep = crate::check::check(&root, &Default::default()).unwrap();
+        assert_eq!(
+            rep.status,
+            crate::check::Status::Ok,
+            "{round}: {}",
+            rep.to_text()
+        );
+        let (head, d) = (s.head_commit(), dump(&s));
+        drop(s);
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        assert_eq!((s.head_commit(), dump(&s)), (head, d), "{round}");
+        out.push(s);
+    }
+    let f = out.pop().unwrap();
+    (out.pop().unwrap(), f)
+}
+
+#[test]
+fn a_partial_compaction_matches_a_full_one() {
+    let dir = tempfile::tempdir().unwrap();
+    // 90,000 quads: three blocks per permutation
+    let n = 30_000;
+    let mut p = partial_store(&dir.path().join("p"), n, PartialMode::Always);
+    let mut f = partial_store(&dir.path().join("f"), n, PartialMode::Off);
+    let both = |p: &Store, f: &Store, u: &str| {
+        upd(p, u);
+        upd(f, u);
+    };
+    let blocks = |s: &Store| -> Vec<usize> {
+        let snap = s.snapshot();
+        Perm::ALL
+            .iter()
+            .map(|&x| snap.perm(x).blocks.len())
+            .collect()
+    };
+    // one subject gains 40,000 quads, so that its block splits; the subjects s10000 to
+    // s19999 lose every quad, which empties blocks; types, a named graph and a blank
+    // node change
+    let mut ins = String::new();
+    for j in 0..40_000 {
+        ins += &format!("<urn:s5> <urn:q> {} . ", 100_000 + j);
+    }
+    both(&p, &f, &format!("INSERT DATA {{ {ins} }}"));
+    both(
+        &p,
+        &f,
+        "DELETE { ?s ?p ?o } WHERE { ?s ?p ?o FILTER(STRSTARTS(STR(?s), \"urn:s1\") && STRLEN(STR(?s)) = 10) }",
+    );
+    both(
+        &p,
+        &f,
+        "INSERT DATA { <urn:s7> a <urn:C3> . <urn:s8> a <urn:C4> . _:x <urn:q> 3 . _:x a <urn:C1> . GRAPH <urn:s3> { <urn:s4> <urn:q> 1 . <urn:s5> <urn:p1> \"v6\" } } ; DELETE DATA { <urn:s9> a <urn:C4> }",
+    );
+    (p, f) = compare_partial_and_full(p, f, "concentrated");
+    let b = blocks(&p);
+    assert!(b[Perm::Spo.index()] >= 3, "{b:?}");
+    // changes spread over every block, on top of the partial generation
+    let mut ins = String::new();
+    let mut del = String::new();
+    for i in (0..n).filter(|i| !(10_000..20_000).contains(i)) {
+        if i % 7 == 0 {
+            ins += &format!("<urn:s{i}> <urn:q> {} . ", 200_000 + i);
+        }
+        if i % 11 == 0 {
+            del += &format!("<urn:s{i}> <urn:p{}> \"v{i}\" . ", i % 7);
+        }
+    }
+    both(
+        &p,
+        &f,
+        &format!("INSERT DATA {{ {ins} }} ; DELETE DATA {{ {del} }}"),
+    );
+    (p, f) = compare_partial_and_full(p, f, "spread");
+    // everything goes, then a few quads of known terms come back
+    both(&p, &f, "DELETE WHERE { ?s ?p ?o }");
+    both(&p, &f, "DELETE WHERE { GRAPH ?g { ?s ?p ?o } }");
+    (p, f) = compare_partial_and_full(p, f, "emptied");
+    assert_eq!(blocks(&p), vec![0; 7]);
+    both(
+        &p,
+        &f,
+        "INSERT DATA { <urn:s1> <urn:q> 5 . <urn:s2> a <urn:C0> . GRAPH <urn:s3> { <urn:s1> <urn:p1> \"v1\" } }",
+    );
+    let (p, _f) = compare_partial_and_full(p, f, "refilled");
+    assert_eq!(p.snapshot().len(), 3);
+}
+
+#[test]
+fn the_automatic_choice_and_its_reasons() {
+    let dir = tempfile::tempdir().unwrap();
+    // 300,000 quads: ten blocks per permutation
+    let s = partial_store(&dir.path().join("db"), 100_000, PartialMode::Auto);
+    // a few changes to known terms touch few blocks
+    upd(
+        &s,
+        "INSERT DATA { <urn:s5> <urn:q> 100001 } ; DELETE DATA { <urn:s6> <urn:q> 6 }",
+    );
+    let r = s.compact_with(&CompactOptions::default()).unwrap();
+    assert_eq!(
+        (r.mode.as_str(), r.full_reason.as_deref()),
+        ("partial", None)
+    );
+    assert!(
+        r.blocks_rewritten > 0 && r.blocks_rewritten * 4 < r.blocks_copied,
+        "{r:?}"
+    );
+    // a new term needs a full build
+    upd(&s, "INSERT DATA { <urn:new> <urn:q> 1 }");
+    let r = s.compact_with(&CompactOptions::default()).unwrap();
+    assert_eq!(r.mode, "full");
+    assert!(r.full_reason.unwrap().contains("not in the vocabulary"));
+    // changes in every block rebuild everything, unless partial is forced
+    let mut ins = String::new();
+    for i in (0..100_000).step_by(1_000) {
+        ins += &format!(
+            "<urn:s{i}> <urn:q> {} . <urn:s{i}> a <urn:C{}> . ",
+            500_000 + i,
+            (i + 1) % 5
+        );
+    }
+    upd(&s, &format!("INSERT DATA {{ {ins} }}"));
+    let r = s.compact_with(&CompactOptions::default()).unwrap();
+    assert_eq!(r.mode, "full");
+    assert!(r.full_reason.unwrap().contains("% of the blocks"));
+    upd(&s, "DELETE DATA { <urn:s0> <urn:q> 500000 }");
+    upd(&s, &format!("DELETE DATA {{ {ins} }}"));
+    let r = s
+        .compact_with(&CompactOptions {
+            partial: Some(PartialMode::Always),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(r.mode, "partial");
+    // and never when it is off
+    upd(&s, "INSERT DATA { <urn:s5> <urn:q> 100002 }");
+    let r = s
+        .compact_with(&CompactOptions {
+            partial: Some(PartialMode::Off),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        (r.mode.as_str(), r.full_reason.as_deref()),
+        ("full", Some("partial compaction is off"))
+    );
+}
+
+#[test]
+fn commits_during_a_partial_build_are_carried_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = partial_store(&root, 3000, PartialMode::Always);
+    let control = Arc::new(Store::in_memory(StoreOptions::default()));
+    control.load(&[nt(3000, 0)]).unwrap();
+    for i in 0..60 {
+        churn_known(&s, i);
+        churn_known(&control, i);
+    }
+    let head0 = s.head_commit().seq;
+    let seen: Arc<Mutex<Vec<State>>> = Default::default();
+    s.set_failpoint(
+        "compact-built",
+        Some(Arc::new({
+            let (control, seen) = (control.clone(), seen.clone());
+            move |st: &Store| {
+                for i in 60..360 {
+                    // new terms too: the build read the delta before them
+                    if i % 50 == 0 {
+                        upd(
+                            st,
+                            &format!("INSERT DATA {{ <urn:n{i}> <urn:new> \"new {i}\" }}"),
+                        );
+                        upd(
+                            &control,
+                            &format!("INSERT DATA {{ <urn:n{i}> <urn:new> \"new {i}\" }}"),
+                        );
+                    }
+                    churn_known(st, i);
+                    churn_known(&control, i);
+                    if i % 61 == 0 {
+                        seen.lock().push((st.head_commit().seq, dump(st)));
+                    }
+                }
+            }
+        })),
+    );
+    let r = s.compact_with(&CompactOptions::default()).unwrap();
+    s.set_failpoint("compact-built", None);
+    assert_eq!(r.mode, "partial", "{r:?}");
+    assert_eq!(r.base_commit, head0);
+    assert_eq!(r.caught_up_commits, s.head_commit().seq - head0);
+    assert_eq!(dump(&s), dump(&control));
+    for (seq, d) in seen.lock().iter() {
+        assert_eq!(&dump_at(&s, *seq), d, "commit {seq}");
+    }
+    let rep = crate::check::check(&root, &Default::default()).unwrap();
+    assert_eq!(rep.status, crate::check::Status::Ok, "{}", rep.to_text());
+    let head = s.head_commit();
+    drop(s);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.head_commit(), head);
+    assert_eq!(dump(&s), dump(&control));
+    // the carried new terms make the next compaction a full one
+    let r = s.compact_with(&CompactOptions::default()).unwrap();
+    assert_eq!(r.mode, "full");
+    assert_eq!(dump(&s), dump(&control));
+}
+
+/// Partial against full compaction of the benchmark's 10.5M-triple data set, with
+/// deltas of 1,000, 10,000 and 100,000 quads that are concentrated in a few subjects or
+/// spread over all of them. Each delta is 90% new `foaf:knows` links and 10% deleted
+/// `foaf:age` quads, all of known terms. `SPARKLES_BENCH_NT` is the data (`data.nt` of
+/// `mise run bench`) and `SPARKLES_BENCH_DIR` a directory on disk for the stores. Run
+/// it in release mode: `cargo test --release -p sparkles --lib -- --ignored
+/// --nocapture partial_compaction_at_scale`.
+#[test]
+#[ignore]
+fn partial_compaction_at_scale() {
+    let (Ok(nt), Ok(work)) = (
+        std::env::var("SPARKLES_BENCH_NT"),
+        std::env::var("SPARKLES_BENCH_DIR"),
+    ) else {
+        println!("set SPARKLES_BENCH_NT and SPARKLES_BENCH_DIR");
+        return;
+    };
+    let work = PathBuf::from(work);
+    let base = work.join("base");
+    if !base.join("CURRENT").exists() {
+        let _ = std::fs::remove_dir_all(&base);
+        let t = std::time::Instant::now();
+        let s = Store::open(&base, StoreOptions::default()).unwrap();
+        s.load(&[Source::from_path(Path::new(&nt), None).unwrap()])
+            .unwrap();
+        println!(
+            "loaded {} quads in {:.1} s",
+            s.snapshot().len(),
+            t.elapsed().as_secs_f64()
+        );
+    }
+    let person = |n: u64| format!("<http://example.org/person/{n}>");
+    let knows = "<http://xmlns.com/foaf/0.1/knows>";
+    let age = "<http://xmlns.com/foaf/0.1/age>";
+    println!(
+        "{:<20} {:>7} {:>8} {:>9} {:>9} {:>9} {:>7}  auto",
+        "delta", "forced", "mode", "rewritten", "build ms", "total ms", "lock ms"
+    );
+    for size in [1_000u64, 10_000, 100_000] {
+        for concentrated in [true, false] {
+            let label = format!(
+                "{size} {}",
+                if concentrated {
+                    "concentrated"
+                } else {
+                    "spread"
+                }
+            );
+            for mode in [PartialMode::Always, PartialMode::Off] {
+                let run = work.join("run");
+                let _ = std::fs::remove_dir_all(&run);
+                copy_dir(&base, &run);
+                let s = Store::open(&run, StoreOptions::default()).unwrap();
+                let mut seed = 0x5eed_u64 + size;
+                let mut rnd = |m: u64| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed >> 33) % m
+                };
+                let (ins, del) = (size * 9 / 10, size / 10);
+                let mut u = String::from("INSERT DATA { ");
+                for j in 0..ins {
+                    let (sub, obj) = if concentrated {
+                        (500_000 + j % 10, 600_000 + j / 10)
+                    } else {
+                        (rnd(1_000_000), rnd(1_000_000))
+                    };
+                    u += &format!("{} {knows} {} . ", person(sub), person(obj));
+                }
+                u += "}";
+                upd(&s, &u);
+                let mut u = format!("DELETE {{ ?s {age} ?a }} WHERE {{ VALUES ?s {{ ");
+                for j in 0..del {
+                    let sub = if concentrated {
+                        700_000 + j
+                    } else {
+                        rnd(1_000_000)
+                    };
+                    u += &person(sub);
+                    u += " ";
+                }
+                u += &format!("}} ?s {age} ?a }}");
+                upd(&s, &u);
+                let snap = s.snapshot();
+                let auto = match crate::store::partial::plan(&snap) {
+                    Err(why) => format!("full: {why}"),
+                    Ok(p) => format!(
+                        "{} ({:.1}% of blocks, {:.3}x)",
+                        if p.share() > crate::store::partial::MAX_REWRITE_SHARE
+                            || p.fragmentation() > crate::store::partial::MAX_FRAGMENTATION
+                        {
+                            "full"
+                        } else {
+                            "partial"
+                        },
+                        p.share() * 100.0,
+                        p.fragmentation()
+                    ),
+                };
+                drop(snap);
+                let r = s
+                    .compact_with(&CompactOptions {
+                        partial: Some(mode),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                println!(
+                    "{label:<20} {:>7} {:>8} {:>9} {:>9.0} {:>9.0} {:>7.1}  {auto}",
+                    mode.as_str(),
+                    r.mode,
+                    format!(
+                        "{}/{}",
+                        r.blocks_rewritten,
+                        r.blocks_rewritten + r.blocks_copied
+                    ),
+                    r.build_ms,
+                    r.total_ms,
+                    r.lock_ms
+                );
+                drop(s);
+                let _ = std::fs::remove_dir_all(&run);
+            }
+        }
+    }
 }
 
 /// A feature with a point geometry and a label: three quads.

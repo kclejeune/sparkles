@@ -497,6 +497,34 @@ impl PermWriter {
         Ok(())
     }
 
+    /// End the current block here, however few rows it holds (a block of a partial
+    /// compaction, see [`crate::store`]'s compaction).
+    pub(crate) fn end_block(&mut self) -> Result<()> {
+        self.flush_block()
+    }
+
+    /// Append block `m` as it is encoded (`bytes`, its four columns) after the current
+    /// block, which is ended first. Its keys must follow the keys pushed before.
+    pub(crate) fn push_raw(&mut self, m: &BlockMeta, bytes: &[u8]) -> Result<()> {
+        self.flush_block()?;
+        debug_assert!(self.last.is_none_or(|l| l < m.first), "blocks out of order");
+        debug_assert_eq!(
+            bytes.len() as u64,
+            m.col_len.iter().map(|&l| l as u64).sum::<u64>()
+        );
+        self.data.write_all(bytes)?;
+        BlockMeta {
+            offset: self.pos,
+            row_start: self.rows,
+            ..m.clone()
+        }
+        .write(&mut self.meta);
+        self.pos += bytes.len() as u64;
+        self.rows += m.rows as u64;
+        self.last = Some(m.last);
+        Ok(())
+    }
+
     pub fn finish(mut self, dir: &Path, perm: Perm) -> Result<u64> {
         self.flush_block()?;
         self.data.flush()?;
@@ -558,6 +586,21 @@ impl PermIndex {
 
     pub fn disk_bytes(&self) -> u64 {
         self.data.as_ref().map_or(0, |d| d.len() as u64) + (self.blocks.len() * META_BYTES) as u64
+    }
+
+    /// The encoded bytes of block `b` (its four columns).
+    pub(crate) fn raw_block(&self, b: usize) -> Result<&[u8]> {
+        let m = &self.blocks[b];
+        let len: usize = m.col_len.iter().map(|&l| l as usize).sum();
+        self.data
+            .as_ref()
+            .and_then(|d| d.get(m.offset as usize..m.offset as usize + len))
+            .ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "{}.dat: block {b} ends past the end of the file",
+                    self.perm.name()
+                ))
+            })
     }
 
     pub fn decode_block(&self, b: usize) -> Result<Block> {
