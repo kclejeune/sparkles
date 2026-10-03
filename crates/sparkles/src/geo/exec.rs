@@ -334,8 +334,8 @@ fn holds(
 /// functions parse it (through the query's memo; a literal too long for the index is
 /// read all the same, as the index's searches hand it out too).
 fn load(ctx: &Ctx, id: Id, src: &Src) -> Option<GeomRef> {
-    use super::memo::{MemoKey, max_vertices, parse_value};
-    match src {
+    use super::memo::{MemoKey, max_vertices, note_crs, parse_value};
+    let g = match src {
         Src::Entry(e) => e.geom(&ctx.snap).ok(),
         Src::Literal => {
             let v = ctx.value(id)?;
@@ -343,7 +343,9 @@ fn load(ctx: &Ctx, id: Id, src: &Src) -> Option<GeomRef> {
             ctx.geo
                 .get_or_parse(MemoKey::Id(id), || parse_value(&v, max))
         }
-    }
+    }?;
+    note_crs(ctx, &g);
+    Some(g)
 }
 
 /// Test each distinct candidate literal once (in parallel for many); `None` where it
@@ -984,7 +986,9 @@ fn knn(
                         if refined.is_multiple_of(CHECK_EVERY as u64) {
                             ctx.check()?;
                         }
-                        let d = h.entry.geom(&ctx.snap).ok().and_then(|g| tester.check(&g));
+                        let d = super::memo::noted(ctx, h.entry.geom(&ctx.snap))
+                            .ok()
+                            .and_then(|g| tester.check(&g));
                         seen.insert(h.o, d);
                         d
                     }

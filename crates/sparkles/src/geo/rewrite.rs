@@ -268,8 +268,11 @@ impl<'a> Relate<'a> {
             .or_insert_with(|| {
                 let v = ctx.value(lit)?;
                 let max = max_vertices(ctx);
-                ctx.geo
-                    .get_or_parse(MemoKey::Id(lit), || parse_value(&v, max))
+                let g = ctx
+                    .geo
+                    .get_or_parse(MemoKey::Id(lit), || parse_value(&v, max))?;
+                super::memo::note_crs(ctx, &g);
+                Some(g)
             })
             .clone()
     }
@@ -389,7 +392,7 @@ impl<'a> Relate<'a> {
                 &mut st,
                 &mut |hits| {
                     for h in hits {
-                        if let Ok(g) = h.entry.geom(&ctx.snap) {
+                        if let Ok(g) = super::memo::noted(ctx, h.entry.geom(&ctx.snap)) {
                             known.push((h.o, g));
                         }
                     }
@@ -455,7 +458,7 @@ impl<'a> Relate<'a> {
                                 o: h.o,
                                 g: h.g,
                             });
-                            if let Ok(g) = h.entry.geom(&ctx.snap) {
+                            if let Ok(g) = super::memo::noted(ctx, h.entry.geom(&ctx.snap)) {
                                 found.push((h.o, g));
                             }
                         }

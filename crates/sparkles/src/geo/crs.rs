@@ -179,9 +179,17 @@ impl CrsId {
 
     /// Every built-in CRS.
     pub fn all() -> impl Iterator<Item = CrsId> {
-        (0..UTM_FIRST + 2 * UTM_ZONES).map(CrsId)
+        (0..BUILTIN).map(CrsId)
+    }
+
+    /// The index of a registered CRS among the registered ones (`None`: built in).
+    pub fn registered_index(self) -> Option<usize> {
+        usize::from(self.0).checked_sub(usize::from(BUILTIN))
     }
 }
+
+/// How many CRSs are built in: [`BASE`] and the UTM zones. Registered ids follow.
+const BUILTIN: u8 = UTM_FIRST + 2 * UTM_ZONES;
 
 /// The CRS of a geometry: a built-in one, or an IRI this build does not know (valid,
 /// but only planar operations between geometries of that same CRS work).
@@ -262,6 +270,11 @@ struct Registered {
     /// registered on first use from the build's EPSG table (`geo-epsg`), so the same in
     /// every process of this build
     auto: bool,
+    /// how the definition's datum relates to WGS 84
+    accuracy: Accuracy,
+    /// how messages name the CRS: `EPSG:27700 (OSGB 1936 / British National Grid)` for one
+    /// from the EPSG table, the IRI in angle brackets otherwise
+    label: String,
     #[cfg(feature = "geo-proj4")]
     proj: proj4rs::Proj,
 }
@@ -297,47 +310,52 @@ impl std::error::Error for RegisterError {}
 
 /// Register the projected CRS `iri` with the proj4 definition `proj4`, whose literals
 /// write northing first when `lat_first`. Registering the same definition again returns
-/// the same id. A built-in CRS, a different definition for a registered IRI, a geographic
-/// definition (`+proj=longlat`: geographic CRSs other than the built-in WGS 84 ones are
-/// not supported) and a definition `proj4rs` cannot read are refused.
+/// the same id. These are refused: a built-in CRS, a different definition for a
+/// registered IRI, a geographic definition (`+proj=longlat`, since geographic CRSs other
+/// than the built-in WGS 84 ones are not supported), a definition whose datum shift needs
+/// grid files (`+nadgrids`, or `+datum=NAD27`), and one `proj4rs` cannot read. A
+/// definition with a Helmert shift (`+towgs84`) is accepted, and [`approximation`]
+/// describes it.
 pub fn register(iri: &str, proj4: &str, lat_first: bool) -> Result<CrsId, RegisterError> {
-    register_as(iri, proj4, lat_first, false)
+    let label = format!("<{}>", iri.trim());
+    register_as(iri, proj4, lat_first, None, label)
+        .map_err(|m| RegisterError(format!("CRS <{iri}>: {m}")))
 }
 
+/// [`register`], with the reason of a refusal on its own. `auto` is the EPSG code of a
+/// definition from the build's table.
 fn register_as(
     iri: &str,
     proj4: &str,
     lat_first: bool,
-    auto: bool,
-) -> Result<CrsId, RegisterError> {
-    let err = |m: String| Err(RegisterError(format!("CRS <{iri}>: {m}")));
+    auto: Option<u16>,
+    label: String,
+) -> Result<CrsId, String> {
     if oxiri::Iri::parse(iri.trim()).is_err() && !iri.contains(':') {
-        return err("not an IRI".into());
+        return Err("not an IRI".into());
     }
     let n = normalize(iri).into_owned();
     if builtin(&n).is_some() {
-        return err("is built in".into());
+        return Err("is built in".into());
     }
     let proj4 = proj4.trim();
-    let mut reg = registry()
-        .write()
-        .map_err(|_| RegisterError("registry poisoned".into()))?;
+    let mut reg = registry().write().map_err(|_| "registry poisoned")?;
     if let Some(&id) = reg.ids.get(&n) {
-        let r = &REGISTERED[usize::from(id.0) - TABLE.len()]
+        let r = &REGISTERED[id.registered_index().expect("registered")]
             .get()
             .expect("registered");
         return if r.proj4 == proj4 && r.def.lat_first == lat_first {
             Ok(id)
         } else {
-            err("is registered with another definition".into())
+            Err("is registered with another definition".into())
         };
     }
     if reg.n >= MAX_REGISTERED {
-        return err(format!("more than {MAX_REGISTERED} CRSs are registered"));
+        return Err(format!("more than {MAX_REGISTERED} CRSs are registered"));
     }
+    let accuracy = datum_accuracy(proj4)?;
     let i = reg.n;
-    let id =
-        CrsId(u8::try_from(TABLE.len() + i).map_err(|_| RegisterError("too many CRSs".into()))?);
+    let id = CrsId(u8::try_from(usize::from(BUILTIN) + i).map_err(|_| "too many CRSs")?);
     let r = Registered {
         def: CrsDef {
             iri: Cow::Owned(n.clone()),
@@ -346,23 +364,180 @@ fn register_as(
             projection: Projection::Registered(i as u8),
         },
         proj4: proj4.to_string(),
-        auto,
+        auto: auto.is_some(),
+        accuracy,
+        label,
         #[cfg(feature = "geo-proj4")]
-        proj: proj::read(proj4).map_err(|m| RegisterError(format!("CRS <{iri}>: {m}")))?,
+        proj: proj::read(proj4)?,
     };
     #[cfg(not(feature = "geo-proj4"))]
     {
         let _ = (r, id, &mut reg);
-        err("this build has no proj4 support (cargo feature \"geo-proj4\")".into())
+        Err("this build has no proj4 support (cargo feature \"geo-proj4\")".into())
     }
     #[cfg(feature = "geo-proj4")]
     {
         if REGISTERED[i].set(r).is_err() {
-            return err("registered concurrently".into());
+            return Err("registered concurrently".into());
         }
         reg.n += 1;
         reg.ids.insert(n, id);
         Ok(id)
+    }
+}
+
+// ---------------------------------------------------------------- datum accuracy --
+
+/// How the coordinates of a registered CRS relate to WGS 84, the datum every transform
+/// goes through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Accuracy {
+    /// The datum is WGS 84, or a GRS 80 datum (ETRS89, NAD83, GDA94 and others) that
+    /// Sparkles takes as WGS 84. Transforms are exact up to the projection formulas.
+    Exact,
+    /// The definition shifts its datum to WGS 84 by a 3- or 7-parameter Helmert
+    /// transformation (`+towgs84`, or a proj4 datum that implies one). Transformed
+    /// coordinates are approximate, typically within a few metres.
+    Helmert,
+    /// The definition is on another ellipsoid and gives no datum shift. Its coordinates
+    /// are taken as WGS 84 ones, which can be tens or hundreds of metres off.
+    NoDatumShift,
+}
+
+/// The proj4 datums whose definitions in `proj4rs` are Helmert shifts.
+const HELMERT_DATUMS: [&str; 14] = [
+    "ggrs87",
+    "potsdam",
+    "carthage",
+    "hermannskogel",
+    "ire65",
+    "nzgd49",
+    "osgb36",
+    "ch1903",
+    "osni52",
+    "rassadiran",
+    "s_jtsk",
+    "beduaram",
+    "gunung_segara",
+    "rnb72",
+];
+
+/// How a proj4 definition's datum relates to WGS 84, by the precedence `proj4rs` gives
+/// the parameters (`+nadgrids`, then `+towgs84`, then `+datum`). A definition whose shift
+/// needs grid files is refused, with the reason.
+pub fn datum_accuracy(proj4: &str) -> Result<Accuracy, String> {
+    let params: Vec<(String, &str)> = proj4
+        .split_whitespace()
+        .map(|t| {
+            let t = t.strip_prefix('+').unwrap_or(t);
+            let (k, v) = t.split_once('=').unwrap_or((t, ""));
+            (k.to_ascii_lowercase(), v)
+        })
+        .collect();
+    let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| *v);
+    let num = |k: &str| get(k).and_then(|v| v.parse::<f64>().ok());
+    let datum = get("datum").map(str::to_ascii_lowercase);
+    // the ellipsoid of WGS 84 or GRS 80 (whose datums Sparkles takes as WGS 84)
+    let wgs84_ellipsoid = if let Some(e) = get("ellps") {
+        e.eq_ignore_ascii_case("WGS84") || e.eq_ignore_ascii_case("GRS80")
+    } else if let Some(d) = &datum {
+        d == "wgs84" || d == "nad83"
+    } else if let Some(a) = num("a") {
+        a == WGS84_A
+            && match (num("b"), num("rf")) {
+                (Some(b), _) => (b - 6_356_752.314).abs() < 0.01,
+                (None, Some(rf)) => (rf - 298.257_2).abs() < 1e-3,
+                (None, None) => false,
+            }
+    } else {
+        // `proj4rs` defaults to WGS 84
+        get("r").is_none()
+    };
+    if let Some(grids) = get("nadgrids") {
+        let named: Vec<&str> = grids
+            .split(',')
+            .map(|g| g.trim().trim_start_matches('@'))
+            .filter(|g| !g.is_empty() && *g != "null")
+            .collect();
+        if !named.is_empty() {
+            return Err(format!(
+                "its datum shift needs the grid file{} {}, and Sparkles has no grid files",
+                if named.len() == 1 { "" } else { "s" },
+                named.join(", ")
+            ));
+        }
+        // the null grid: no shift, the coordinates are WGS 84 ones (the Web Mercator
+        // definitions on a sphere of WGS 84's semi-major axis among them)
+        return Ok(if wgs84_ellipsoid || num("a") == Some(WGS84_A) {
+            Accuracy::Exact
+        } else {
+            Accuracy::NoDatumShift
+        });
+    }
+    if let Some(t) = get("towgs84") {
+        let zero = t.split(',').all(|v| v.trim().parse::<f64>() == Ok(0.0));
+        return Ok(if zero && wgs84_ellipsoid {
+            Accuracy::Exact
+        } else {
+            Accuracy::Helmert
+        });
+    }
+    match datum.as_deref() {
+        Some("wgs84" | "nad83") => Ok(Accuracy::Exact),
+        Some("nad27") => Err("its datum, NAD27, needs the grid files conus, alaska, \
+             ntv2_0.gsb and ntv1_can.dat to shift to WGS 84, and Sparkles has no grid files"
+            .into()),
+        Some(d) if HELMERT_DATUMS.contains(&d) => Ok(Accuracy::Helmert),
+        // a datum `proj4rs` does not know, which it refuses
+        Some(_) => Ok(Accuracy::Helmert),
+        None if wgs84_ellipsoid => Ok(Accuracy::Exact),
+        None => Ok(Accuracy::NoDatumShift),
+    }
+}
+
+/// How the registered CRS `id` relates to WGS 84 (built-in CRSs are exact).
+pub fn accuracy(id: CrsId) -> Accuracy {
+    id.registered_index()
+        .and_then(|i| REGISTERED[i].get())
+        .map_or(Accuracy::Exact, |r| r.accuracy)
+}
+
+/// Why transforms through `id` are approximate, for the plan's warnings (`None`:
+/// exact).
+pub fn approximation(id: CrsId) -> Option<String> {
+    let r = REGISTERED[id.registered_index()?].get()?;
+    match r.accuracy {
+        Accuracy::Exact => None,
+        Accuracy::Helmert => Some(format!(
+            "{} shifts its datum to WGS 84 by a Helmert transformation (+towgs84), which \
+             is approximate: coordinates transformed to or from other CRSs are typically \
+             within a few metres of the official ones",
+            r.label
+        )),
+        Accuracy::NoDatumShift => Some(format!(
+            "{} gives no datum shift to WGS 84, so its coordinates are taken as WGS 84 \
+             ones: coordinates transformed to or from other CRSs can be tens or hundreds of \
+             metres off",
+            r.label
+        )),
+    }
+}
+
+/// Why the EPSG CRS `iri` names is not available, when it is in the build's EPSG table
+/// but was refused (`None`: available, or not an EPSG code of the table).
+pub fn refusal(iri: &str) -> Option<String> {
+    #[cfg(feature = "geo-epsg")]
+    {
+        let n = normalize(iri);
+        if builtin(&n).is_some() {
+            return None;
+        }
+        epsg::refusal(&n)
+    }
+    #[cfg(not(feature = "geo-epsg"))]
+    {
+        let _ = iri;
+        None
     }
 }
 
@@ -488,27 +663,58 @@ mod proj {
 #[cfg(feature = "geo-epsg")]
 mod epsg {
     use super::{CrsId, EPSG_PREFIX, register_as};
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
 
-    /// Codes the table lacks, or whose definition cannot be registered (geographic
-    /// CRSs among them), so they are not tried again.
-    static MISSES: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    /// Codes that resolve to no CRS, so they are not tried again: those the table lacks
+    /// (`None`), and those whose definition was refused, with the reason (geographic
+    /// CRSs, and those whose datum shift needs grid files, among them).
+    static MISSES: LazyLock<Mutex<HashMap<u16, Option<String>>>> = LazyLock::new(Default::default);
 
     pub(super) fn resolve(n: &str) -> Option<CrsId> {
         let code: u16 = n.strip_prefix(EPSG_PREFIX)?.parse().ok()?;
-        if MISSES.lock().ok()?.contains(&code) {
+        if MISSES.lock().ok()?.contains_key(&code) {
             return None;
         }
-        let id = definition(n, code);
-        if id.is_none()
-            && let Ok(mut m) = MISSES.lock()
-        {
-            m.push(code);
+        match definition(n, code) {
+            Ok(id) => Some(id),
+            Err(why) => {
+                if let Ok(mut m) = MISSES.lock() {
+                    m.insert(code, why);
+                }
+                None
+            }
         }
-        id
     }
 
-    fn definition(n: &str, code: u16) -> Option<CrsId> {
-        let def = crs_definitions::from_code(code)?;
+    /// Why the table's CRS of the normalized IRI `n` was refused.
+    pub(super) fn refusal(n: &str) -> Option<String> {
+        let code: u16 = n.strip_prefix(EPSG_PREFIX)?.parse().ok()?;
+        if !MISSES.lock().ok()?.contains_key(&code) {
+            // not tried yet (a registered CRS is found, and a miss is recorded)
+            resolve(n)?;
+        }
+        MISSES.lock().ok()?.get(&code).cloned().flatten()
+    }
+
+    /// `EPSG:27700 (OSGB 1936 / British National Grid)`: the code and the name the
+    /// definition's WKT gives.
+    pub(super) fn label(code: u16, wkt: &str) -> String {
+        match wkt.split('"').nth(1).filter(|n| !n.is_empty()) {
+            Some(name) => format!("EPSG:{code} ({name})"),
+            None => format!("EPSG:{code}"),
+        }
+    }
+
+    /// Register the table's definition of `code` (`Err(None)`: not in the table).
+    fn definition(n: &str, code: u16) -> Result<CrsId, Option<String>> {
+        let def = crs_definitions::from_code(code).ok_or(None)?;
+        let label = label(code, def.wkt);
+        if def.proj4.trim().is_empty() {
+            return Err(Some(format!(
+                "{label} is not supported: the EPSG table has no proj4 definition of it"
+            )));
+        }
         // the projected axes as the definition's WKT gives them, easting first otherwise
         let lat_first = {
             let wkt = def.wkt;
@@ -519,7 +725,8 @@ mod epsg {
                     .is_some_and(|a| a.contains("NORTH") || a.contains("North"))
             })
         };
-        register_as(n, def.proj4, lat_first, true).ok()
+        register_as(n, def.proj4, lat_first, Some(code), label.clone())
+            .map_err(|why| Some(format!("{label} is not supported: {why}")))
     }
 }
 
@@ -948,6 +1155,196 @@ mod tests {
                 registry_fingerprint() == before
             }
         );
+    }
+
+    /// The datum handling of proj4 definitions.
+    #[test]
+    fn datum_accuracies() {
+        use Accuracy::*;
+        for (def, want) in [
+            ("+proj=utm +zone=32 +datum=WGS84 +units=m", Exact),
+            (
+                "+proj=utm +zone=32 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0",
+                Exact,
+            ),
+            ("+proj=aea +lat_1=29.5 +lat_2=45.5 +datum=NAD83", Exact),
+            ("+proj=laea +lat_0=52 +lon_0=10 +ellps=GRS80", Exact),
+            ("+proj=merc +lon_0=0", Exact),
+            (
+                "+proj=merc +a=6378137 +b=6378137 +nadgrids=@null +wktext +no_defs",
+                Exact,
+            ),
+            ("+proj=tmerc +a=6378137 +rf=298.257222101 +k=0.9996", Exact),
+            ("+proj=tmerc +lat_0=49 +lon_0=-2 +datum=OSGB36", Helmert),
+            (
+                "+proj=sterea +ellps=bessel +towgs84=565.2369,50.0087,465.658,-0.406857,0.350733,-1.87035,4.0812",
+                Helmert,
+            ),
+            (
+                "+proj=somerc +ellps=bessel +towgs84=674.374,15.056,405.346",
+                Helmert,
+            ),
+            ("+proj=lcc +ellps=intl +towgs84=0,0,0,0,0,0,0", Helmert),
+            (
+                "+proj=utm +zone=17 +datum=NAD27 +towgs84=-8,160,176",
+                Helmert,
+            ),
+            (
+                "+proj=tmerc +lon_0=-62 +ellps=clrk80 +units=m",
+                NoDatumShift,
+            ),
+            ("+proj=laea +a=6370997 +b=6370997", NoDatumShift),
+            ("+proj=merc +R=6371000", NoDatumShift),
+        ] {
+            assert_eq!(datum_accuracy(def), Ok(want), "{def}");
+        }
+        let e = datum_accuracy("+proj=utm +zone=17 +datum=NAD27 +units=m").unwrap_err();
+        assert!(e.contains("NAD27") && e.contains("grid files"), "{e}");
+        let e = datum_accuracy(
+            "+proj=nzmg +datum=nzgd49 +towgs84=59.47,-5.04,187.44,0.47,-0.1,1.024,-4.5993 +nadgrids=nzgd2kgrid0005.gsb",
+        )
+        .unwrap_err();
+        assert!(e.contains("grid file nzgd2kgrid0005.gsb"), "{e}");
+        let e = datum_accuracy("+proj=tmerc +nadgrids=@a.gsb,b.gsb").unwrap_err();
+        assert!(e.contains("grid files a.gsb, b.gsb"), "{e}");
+        assert!(accuracy(CRS84) == Exact && accuracy(WEB_MERCATOR) == Exact);
+        assert_eq!(approximation(CRS84), None);
+    }
+
+    /// A projected CRS from the EPSG table against PROJ 9.9: `(lon, lat)` on ETRS89 or
+    /// RGF93 (taken as WGS 84) and the easting and northing PROJ gives.
+    #[cfg(feature = "geo-epsg")]
+    fn check_points(code: &str, points: &[((f64, f64), (f64, f64))], tolerance: f64) {
+        let id = lookup(code).unwrap_or_else(|| panic!("{code}: {:?}", refusal(code)));
+        for &((lon, lat), (e, n)) in points {
+            let (x, y) = from_lonlat(id, lon, lat).unwrap();
+            let off = (x - e).hypot(y - n);
+            assert!(
+                off < tolerance,
+                "{code} {lon} {lat}: {x} {y} is {off} m off"
+            );
+            eprintln!("{code} {lon} {lat}: {off:.3} m from the reference");
+            // the round trip, to about a centimetre (the inverse Helmert shift iterates)
+            let (lo, la) = to_lonlat(id, x, y).unwrap();
+            assert!(
+                (lo - lon).abs() < 1e-7 && (la - lat).abs() < 1e-7,
+                "{code}: {lo} {la}"
+            );
+        }
+    }
+
+    /// EPSG codes against reference values. PROJ 9.9 (`cs2cs`, with `PROJ_NETWORK=ON`)
+    /// gave them, through the national grids where they exist: OSTN15 for the British
+    /// National Grid and RDNAPTRANS 2018 for RD New.
+    #[cfg(feature = "geo-epsg")]
+    #[test]
+    fn epsg_reference_points() {
+        // Lambert-93 and ETRS89 / UTM 32N are on GRS 80 datums: exact to the millimetre
+        check_points(
+            "EPSG:2154",
+            &[((2.3488, 48.8534), (652_216.6260, 6_861_681.5000))],
+            0.005,
+        );
+        check_points(
+            "EPSG:25832",
+            &[((8.6821, 50.1109), (477_269.5084, 5_551_009.5748))],
+            0.005,
+        );
+        for c in ["EPSG:2154", "EPSG:25832"] {
+            let id = lookup(c).unwrap();
+            assert_eq!(accuracy(id), Accuracy::Exact, "{c}");
+            assert_eq!(approximation(id), None, "{c}");
+        }
+        // the British National Grid shifts OSGB36 by a 7-parameter Helmert
+        // transformation: within 5 m of OSTN15 (Greenwich, Edinburgh, Land's End)
+        check_points(
+            "EPSG:27700",
+            &[
+                ((0.0, 51.4779), (538_985.2278, 177_334.1875)),
+                ((-3.1883, 55.9533), (325_897.3207, 674_001.7423)),
+                ((-5.7147, 50.0657), (134_266.4944, 25_011.1472)),
+            ],
+            5.0,
+        );
+        // RD New shifts Amersfoort by one too: within 1 m of RDNAPTRANS 2018
+        // (Amsterdam, Eindhoven)
+        check_points(
+            "EPSG:28992",
+            &[
+                ((4.8924, 52.3731), (121_304.1846, 487_362.1723)),
+                ((5.4697, 51.4416), (160_735.8921, 383_614.7969)),
+            ],
+            1.0,
+        );
+        for c in ["EPSG:27700", "EPSG:28992"] {
+            let id = lookup(c).unwrap();
+            assert_eq!(accuracy(id), Accuracy::Helmert, "{c}");
+            let w = approximation(id).unwrap();
+            assert!(w.contains("Helmert") && w.contains(&c[5..]), "{w}");
+        }
+        assert!(
+            approximation(lookup("EPSG:27700").unwrap())
+                .unwrap()
+                .starts_with("EPSG:27700 (OSGB 1936 / British National Grid)")
+        );
+        // a definition without a datum shift (Anguilla 1957)
+        let id = lookup("EPSG:2000").unwrap();
+        assert_eq!(accuracy(id), Accuracy::NoDatumShift);
+        // definitions whose shift needs grids are refused, and the reason is kept
+        for (c, why) in [
+            ("EPSG:26717", "NAD27"),
+            ("urn:ogc:def:crs:EPSG::27200", "nzgd2kgrid0005.gsb"),
+            ("EPSG:4258", "geographic"),
+        ] {
+            assert_eq!(lookup(c), None, "{c}");
+            let r = refusal(c).unwrap_or_else(|| panic!("{c}"));
+            assert!(
+                r.contains(why) && r.contains("is not supported"),
+                "{c}: {r}"
+            );
+        }
+        assert!(
+            refusal("EPSG:26717")
+                .unwrap()
+                .starts_with("EPSG:26717 (NAD27 / UTM zone 17N) is not supported")
+        );
+        // codes outside the table, built-in ones and registered ones have no refusal
+        for c in ["EPSG:1", "EPSG:4326", "EPSG:32631", "EPSG:27700"] {
+            assert_eq!(refusal(c), None, "{c}");
+        }
+    }
+
+    /// Every definition of the EPSG table either reads with a known accuracy or is
+    /// refused for a reason. Prints the counts the docs give.
+    #[cfg(feature = "geo-epsg")]
+    #[test]
+    fn epsg_table_census() {
+        let mut counts = std::collections::BTreeMap::<&str, u32>::new();
+        for code in 0..=u16::MAX {
+            let Some(def) = crs_definitions::from_code(code) else {
+                continue;
+            };
+            let kind = match datum_accuracy(def.proj4) {
+                Err(e) => {
+                    assert!(e.contains("grid file"), "{code}: {e}");
+                    "refused: grid files"
+                }
+                Ok(a) => match proj::read(def.proj4) {
+                    Err(_) if def.proj4.contains("+proj=longlat") => "refused: geographic",
+                    Err(_) if def.proj4.contains("+proj=geocent") => "refused: geocentric",
+                    Err(_) => "refused: unreadable",
+                    Ok(_) => match a {
+                        Accuracy::Exact => "exact",
+                        Accuracy::Helmert => "Helmert",
+                        Accuracy::NoDatumShift => "no datum shift",
+                    },
+                },
+            };
+            *counts.entry(kind).or_default() += 1;
+        }
+        eprintln!("EPSG table: {counts:?}");
+        assert!(counts["refused: grid files"] > 200);
+        assert!(counts["exact"] > 3000 && counts["Helmert"] > 1000);
     }
 
     #[test]

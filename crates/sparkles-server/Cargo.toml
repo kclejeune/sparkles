@@ -111,7 +111,7 @@ sparkles-fmt = { workspace = true, features = ["fault-injection"] }
 sparkles-client = { workspace = true, features = ["blocking"] }
 
 [features]
-default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "otel", "auth", "mcp", "backup", "fmt", "tls"]
+default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "geo-epsg", "otel", "auth", "mcp", "backup", "fmt", "tls"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
@@ -123,8 +123,9 @@ text = ["sparkles/text"]
 # GeoSPARQL (`geof:` functions, `spatial:` property functions, `/$/geo`, `sparkles geo-index`),
 # with projected CRSs an operator defines by proj4 strings (`--geo-crs`)
 geo = ["sparkles/geo", "sparkles/geo-proj4"]
-# GeoSPARQL: resolve EPSG codes through the EPSG-derived proj4 table of crs-definitions
-# (not in the default build: the EPSG terms of use)
+# GeoSPARQL: resolve EPSG codes through the EPSG-derived proj4 table of crs-definitions.
+# On by default; the binary then carries EPSG-derived data under the EPSG terms of use
+# (see THIRD_PARTY_LICENSES.md)
 geo-epsg = ["geo", "sparkles/geo-epsg"]
 # authentication and dataset-level authorization (`serve --auth-config`, `sparkles auth`)
 auth = [

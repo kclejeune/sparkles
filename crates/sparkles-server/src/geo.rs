@@ -492,6 +492,13 @@ pub fn register_crs_file(path: &std::path::Path) -> Result<()> {
     let n = sparkles::geo::crs::register_file(&text)
         .with_context(|| format!("--geo-crs: {}", path.display()))?;
     tracing::info!("GeoSPARQL: {n} CRSs registered from {}", path.display());
+    // the definitions whose datum shift is approximate (queries warn about them too)
+    use sparkles::geo::crs;
+    for (iri, _, _) in crs::registered() {
+        if let Some(why) = crs::lookup(&iri).and_then(crs::approximation) {
+            tracing::warn!("--geo-crs: {why}");
+        }
+    }
     Ok(())
 }
 

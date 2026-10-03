@@ -391,7 +391,7 @@ impl Side {
         if let Some(&i) = self.by_id.get(&o) {
             return Some(i);
         }
-        let g = hits[0].entry.geom(&ctx.snap).ok()?;
+        let g = super::memo::noted(ctx, hits[0].entry.geom(&ctx.snap)).ok()?;
         let b = item_box(&g)?;
         let item = self.items.len() as u32;
         self.items.push(JoinItem {
@@ -588,7 +588,7 @@ fn probe(
                         if st.refined.is_multiple_of(CHECK_TESTS) {
                             ctx.check()?;
                         }
-                        let Ok(geom) = g[0].entry.geom(&ctx.snap) else {
+                        let Ok(geom) = super::memo::noted(ctx, g[0].entry.geom(&ctx.snap)) else {
                             continue;
                         };
                         let ok = match (prepared, outer_is_left) {
