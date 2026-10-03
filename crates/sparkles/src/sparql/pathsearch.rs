@@ -560,6 +560,9 @@ struct Tree {
     first: FxHashMap<u64, (Parent, u32)>,
     /// further parents of the same level or cost
     extra: FxHashMap<u64, Vec<Parent>>,
+    /// the nodes reached, with their level, in the order the search finished them: by
+    /// level and id (breadth first) or by cost (Dijkstra)
+    order: Vec<(u64, u32)>,
 }
 
 impl Tree {
@@ -569,6 +572,7 @@ impl Tree {
             forward,
             first: FxHashMap::default(),
             extra: FxHashMap::default(),
+            order: Vec::new(),
         }
     }
     fn contains(&self, x: u64) -> bool {
@@ -1088,6 +1092,7 @@ impl<'a> Engine<'a> {
         }
         self.visit(next.len() as u64)?;
         next.sort_unstable();
+        tree.order.extend(next.iter().map(|&y| (y, depth + 1)));
         Ok(next)
     }
 
@@ -1237,6 +1242,9 @@ impl<'a> Engine<'a> {
         while let Some(Reverse((OrdF64(d), u))) = heap.pop() {
             if !settled.insert(u) {
                 continue;
+            }
+            if u != root {
+                tree.order.push((u, 0));
             }
             self.visit(1)?;
             n += 1;
@@ -1750,10 +1758,9 @@ pub fn run(
                 } else {
                     eng.bfs(s, true, (!targets.any).then_some(&tset), all, close)?
                 };
+                // every node reached, nearest first, or the targets in id order
                 let mut ends: Vec<u64> = if targets.any {
-                    let mut v: Vec<u64> = tree.first.keys().copied().collect();
-                    v.sort_unstable_by_key(|&x| if x == VIRT { s } else { x });
-                    v
+                    tree.order.iter().map(|e| e.0).collect()
                 } else {
                     targets
                         .set
@@ -1860,11 +1867,10 @@ pub fn run(
                 if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false)? {
                     break 'targets;
                 }
-                let mut starts: Vec<u64> = tree.first.keys().copied().collect();
+                let mut starts: Vec<u64> = tree.order.iter().map(|e| e.0).collect();
                 if spec.min_len == 0 {
                     starts.retain(|&m| m != VIRT);
                 }
-                starts.sort_unstable_by_key(|&x| if x == VIRT { t } else { x });
                 for m in starts {
                     let start = if m == VIRT { t } else { m };
                     if by_level && !weighted {
