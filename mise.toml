@@ -92,7 +92,7 @@ pnpm e2e
 '''
 
 [tasks."ui:e2e:mock"]
-description = "UI end-to-end tests (Playwright) against the mock backend, for pages whose server side is not built yet (backups); extra args go to `playwright test`"
+description = "UI end-to-end tests (Playwright) against the mock backend, for pages and states that are hard to reach on a real server; extra args go to `playwright test`"
 depends = ["ui:e2e:browsers"]
 dir = "ui"
 run = "pnpm e2e:mock"
@@ -165,7 +165,7 @@ depends = ["ui:check", "ui:build"]
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks."lint:features"]
-description = "Clippy (warnings are errors) over feature combinations: the server with no optional feature, each default feature alone, mcp with shacl and with shex; the library crates with their features off"
+description = "Clippy (warnings are errors) over feature combinations: the server with no optional feature, each default feature alone (geo-epsg included), and the pairs that share code such as mcp with shacl, shex or fmt and graphql with shacl; the library crates with their features off"
 # ui:build first, as for lint: the server embeds ui/build
 depends = ["ui:build"]
 run = "scripts/lint-features.sh"
@@ -344,7 +344,7 @@ flag "--warmup <n>" default="2" help="warm-up runs per query"
 flag "--skip-load" help="reuse the stores and text indexes from a previous run in the same workdir"
 flag "--answers-only" help="only check answers across engines and rebuild the summary"
 flag "--engines <list>" default="sparkles jena qlever" help="engines to (re-)measure; others' results are kept"
-flag "--queries <list>" help="only these queries (default: all 6)"
+flag "--queries <list>" help="only these queries (default: all 7)"
 flag "--data <file>" help="reuse a generated dataset, e.g. target/bench/data.nt"
 flag "--port-base <n>" default="3940" help="the servers listen on the three ports after it"
 '''

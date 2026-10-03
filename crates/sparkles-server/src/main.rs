@@ -964,8 +964,8 @@ enum Cmd {
     /// (--fix applies the safe fixes)
     #[cfg(feature = "fmt")]
     Lint(fmt::lint::LintArgs),
-    /// A language server for editors (stdio): formatting and syntax diagnostics for the
-    /// languages `sparkles fmt` formats
+    /// A language server for editors (stdio): formatting, syntax diagnostics, lint findings
+    /// and their quick fixes for the languages `sparkles fmt` formats
     #[cfg(feature = "fmt")]
     Lsp(lsp::LspArgs),
     /// Build, rebuild or inspect a database's full-text index
