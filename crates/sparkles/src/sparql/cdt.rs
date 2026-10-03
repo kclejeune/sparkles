@@ -806,9 +806,18 @@ fn map_arg(t: &Term) -> EvalResult<Map> {
     parse_map(typed(t, MAP)?).ok_or(TypeError)
 }
 
-fn elem_val(e: &Elem) -> EvalResult<Val> {
+/// An element as a value. A literal whose lexical form its value does not keep, such as
+/// `01` or `1.50`, stays that term, so `sameTerm` and `STR` see the form the list holds.
+fn elem_val(e: &Elem, ctx: &Ctx) -> EvalResult<Val> {
     match e {
-        Elem::Term(t) => Ok(Val::V(Value::from_term(t))),
+        Elem::Term(t) => {
+            let v = Value::from_term(t);
+            if matches!(t, Term::Literal(_)) && v.to_term() != *t {
+                Ok(Val::Dec(ctx.intern_term(t), v))
+            } else {
+                Ok(Val::V(v))
+            }
+        }
         Elem::Null => Err(TypeError),
     }
 }
@@ -927,19 +936,19 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                     if i < 1 || i as usize > l.len() {
                         return Err(TypeError);
                     }
-                    elem_val(&l[i as usize - 1])
+                    elem_val(&l[i as usize - 1], ctx)
                 }
                 Term::Literal(l) if l.datatype().as_str() == MAP => {
                     let k = key_of(term(1)?).ok_or(TypeError)?;
                     let m = parse_map(l.value()).ok_or(TypeError)?;
-                    elem_val(map_get(&m, &k).ok_or(TypeError)?)
+                    elem_val(map_get(&m, &k).ok_or(TypeError)?, ctx)
                 }
                 _ => Err(TypeError),
             }
         }
         "head" => {
             arity(1, 1)?;
-            elem_val(list_arg(&term(0)?)?.first().ok_or(TypeError)?)
+            elem_val(list_arg(&term(0)?)?.first().ok_or(TypeError)?, ctx)
         }
         "tail" => {
             arity(1, 1)?;

@@ -1917,8 +1917,8 @@ elements and a map's entries in key order. Jena writes a map's entries in hash o
 its lexical forms can differ from Sparkles' while the values are equal. A blank node
 label inside a literal names a blank node of the query that reads it. Jena's loader also
 matches it with the blank nodes of the data file the literal came from, which Sparkles
-does not. Jena's SPARQL-CDTs tests run in the W3C harness: 642 of 655 pass, and the 13
-others are those blank nodes and two that keep `"01"^^xsd:integer` apart from `1`.
+does not. Jena's SPARQL-CDTs tests run in the W3C harness: 644 of 655 pass, and the 11
+others are those blank nodes.
 
 The formatter, the editor's highlighting and the query builder know `LATERAL`, ranges
 and CONSTRUCT with `GRAPH`, and the formatter and the editor know the other forms too.

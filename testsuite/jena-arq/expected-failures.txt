@@ -1,11 +1,6 @@
 # Jena's ARQ tests whose answers Sparkles gives otherwise on purpose, one per line, with
 # the reason after the name.
 #
-# Sparkles keeps a number as its value, so "01"^^xsd:integer is stored and returned as
-# "1"^^xsd:integer, and DISTINCT sees one term where Jena sees two.
-SPARQL-CDTs/fold/manifest#fold-list-distinct-07 non-canonical integer
-SPARQL-CDTs/fold/manifest#fold-list-distinct-08 non-canonical integer
-#
 # A blank node label inside a CDT literal names a blank node of the query that reads the
 # literal. Jena's loader also relates it to the blank nodes of the file that holds the
 # literal, and keeps the blank nodes of different files and queries apart.
