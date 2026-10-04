@@ -376,7 +376,9 @@ async fn read_only_servers_refuse_branch_mutations() {
     };
     let mut async_merge = json("owner");
     async_merge.push(("prefer".into(), "respond-async".into()));
-    let cases: Vec<(&str, &str, Vec<(String, String)>, &str)> = vec![
+    // method, path, headers, body
+    type Case<'a> = (&'a str, &'a str, Vec<(String, String)>, &'a str);
+    let cases: Vec<Case> = vec![
         (
             "POST",
             "/$/branches/br",
