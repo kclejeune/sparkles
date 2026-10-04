@@ -59,6 +59,7 @@ mod ui;
 mod validation_cmd;
 mod validation_common;
 mod vector;
+mod vector_cmd;
 mod write_validation;
 
 use anyhow::{Context, Result, bail};
@@ -1183,7 +1184,7 @@ enum Cmd {
     },
     /// Vector indexes for spk:vectorSearch: create, drop, rebuild, list, status (locally
     /// with --loc, or with --server)
-    Vector(vector::VectorArgs),
+    Vector(vector_cmd::VectorArgs),
     /// Build, rebuild or inspect a database's spatial index (GeoSPARQL)
     GeoIndex {
         #[arg(long)]
@@ -2376,7 +2377,7 @@ fn run() -> Result<()> {
             sparkles::vector::embed::set_environment(sparkles::vector::embed::Environment {
                 enabled: !no_embedding,
                 outbound: st.outbound.clone(),
-                secrets: vector::parse_secrets(&embedding_secret)?,
+                secrets: vector_cmd::parse_secrets(&embedding_secret)?,
             });
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
             st.schema_max_entries = schema_max_entries;
@@ -3015,7 +3016,7 @@ fn run() -> Result<()> {
         Cmd::Patch(a) => patch_cmd::run(a, opts, no_validate),
         #[cfg(feature = "auth")]
         Cmd::Auth { cmd } => auth::cli::run(cmd),
-        Cmd::Vector(a) => vector::cli(a, opts),
+        Cmd::Vector(a) => vector_cmd::cli(a, opts),
         Cmd::GeoIndex {
             loc,
             predicate,
