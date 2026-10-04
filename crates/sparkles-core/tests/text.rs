@@ -1010,6 +1010,142 @@ fn concurrent_searches_match_their_snapshots() {
     );
 }
 
+/// Query options with the subject restriction of text searches on or off.
+fn pushdown(on: bool) -> QueryOptions {
+    let mut o = sparkles_core::sparql::Optimizations::ALL;
+    o.text_subject_pushdown = on;
+    QueryOptions {
+        optimizations: Some(o),
+        no_cache: true,
+        ..Default::default()
+    }
+}
+
+fn run(s: &Store, q: &str, o: &QueryOptions) -> sparkles_core::sparql::QueryResult {
+    query(s.snapshot(), &format!("{P}{q}"), o).unwrap_or_else(|e| panic!("{q}: {e}"))
+}
+
+fn texts(r: &sparkles_core::sparql::QueryResult) -> Vec<String> {
+    let mut v: Vec<String> = r
+        .rows()
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|t| t.map_or("-".into(), |t| t.to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Whether a plan entry's description contains `needle`.
+fn plan_has(p: &sparkles_core::sparql::PlanInfo, needle: &str) -> bool {
+    p.description.contains(needle) || p.children.iter().any(|c| plan_has(c, needle))
+}
+
+#[test]
+fn joins_search_only_the_subjects_of_a_small_side() {
+    let s = mem();
+    for q in [
+        "SELECT ?s ?sc ?l { ?s a ex:Book . (?s ?sc ?l) text:query \"brown OR fox\" }",
+        "SELECT ?s ?l ?p { ?s a ex:Book . (?s ?sc ?l [] ?p) text:query (\"brown\" \"lang:en\") }",
+        "SELECT ?s { VALUES ?s { ex:b2 ex:b3 } ?s text:query \"brown OR renard\" }",
+        // a limit or a rank is taken over every hit: no restriction
+        "SELECT ?s { ?s a ex:Book . ?s text:query (\"brown OR fox\" 1) }",
+        "SELECT ?s ?r { ?s a ex:Book . (?s ?sc [] [] [] ?r) text:query \"brown OR fox\" }",
+        // the left side leaves the subject unbound in a row
+        "SELECT ?s { { ?s a ex:Book } UNION { BIND(1 AS ?x) } ?s text:query \"brown\" }",
+    ] {
+        let (on, off) = (run(&s, q, &pushdown(true)), run(&s, q, &pushdown(false)));
+        assert_eq!(texts(&on), texts(&off), "{q}");
+        assert!(!plan_has(&off.plan, "subjects of the join"), "{q}");
+    }
+    let r = run(
+        &s,
+        "SELECT ?s ?sc { ?s a ex:Book . (?s ?sc) text:query \"brown OR fox\" }",
+        &pushdown(true),
+    );
+    assert_eq!(texts(&r).len(), 3, "{:?}", texts(&r));
+    assert!(
+        plan_has(&r.plan, "searched the 2 subjects of the join's left side"),
+        "{:#?}",
+        r.plan
+    );
+    let r = run(
+        &s,
+        "SELECT ?s { ?s a ex:Book . ?s text:query (\"brown OR fox\" 1) }",
+        &pushdown(true),
+    );
+    assert!(!plan_has(&r.plan, "subjects of the join"));
+}
+
+#[test]
+fn query_strings_bound_by_the_group() {
+    let s = mem();
+    let o = QueryOptions::default();
+    // one search per value; a language tag on a value acts as lang:; a value that is not
+    // a string or does not parse matches nothing
+    let r = run(
+        &s,
+        "SELECT ?q ?s { VALUES ?q { \"fox\" \"bears\" \"renard\"@fr 7 \"(\" <http://example.org/x> } ?s text:query ?q }",
+        &o,
+    );
+    assert_eq!(
+        texts(&r),
+        [
+            "\"bears\" <http://example.org/b2>",
+            "\"bears\" <http://example.org/b2>",
+            "\"fox\" <http://example.org/b1>",
+            "\"renard\"@fr <http://example.org/b3>",
+        ]
+    );
+    assert!(plan_has(&r.plan, "[4 searches"), "{:#?}", r.plan);
+    // bound by a triple pattern, with constant predicates, limit and other outputs
+    sparkles_core::sparql::update::update(
+        &s,
+        &format!("{P}INSERT DATA {{ ex:k1 ex:word \"brown\" . ex:k2 ex:word \"socks\" }}"),
+        &o,
+    )
+    .unwrap();
+    let r = run(
+        &s,
+        "SELECT ?k ?s ?l { ?k ex:word ?q . (?s ?sc ?l) text:query (rdfs:label ?q 1) }",
+        &o,
+    );
+    assert_eq!(texts(&r).len(), 1, "{:?}", texts(&r));
+    assert!(texts(&r)[0].starts_with("<http://example.org/k1>"));
+    let r = run(
+        &s,
+        "SELECT ?k ?s { ?k ex:word ?q . GRAPH ?g { ?s text:query ?q } }",
+        &o,
+    );
+    assert_eq!(
+        texts(&r),
+        ["<http://example.org/k2> <http://example.org/b4>"]
+    );
+    let r = run(&s, "SELECT ?s { BIND(\"fox\" AS ?q) ?s text:query ?q }", &o);
+    assert_eq!(texts(&r), ["<http://example.org/b1>"]);
+    // the rows of a value with their subjects bound search only those subjects
+    let q = "SELECT ?s ?l { VALUES (?s ?q) { (ex:b1 \"brown\") (ex:b2 \"brown\") (ex:b3 \"brown\") } (?s ?sc ?l) text:query ?q }";
+    let (on, off) = (run(&s, q, &pushdown(true)), run(&s, q, &pushdown(false)));
+    assert_eq!(texts(&on), texts(&off));
+    assert_eq!(texts(&on).len(), 3, "{:?}", texts(&on));
+    assert!(plan_has(&on.plan, "1 restricted"), "{:#?}", on.plan);
+    // errors: unbound, too many values, other arguments variables
+    let e = err(&s, "SELECT ?s { ?s text:query (rdfs:label ?q) }");
+    assert!(e.contains("not bound by the rest of the group"), "{e}");
+    let values: String = (0..1001).map(|i| format!("\"w{i}\" ")).collect();
+    let e = err(
+        &s,
+        &format!("SELECT ?s {{ VALUES ?q {{ {values} }} ?s text:query ?q }}"),
+    );
+    assert!(e.contains("1000"), "{e}");
+    let e = err(&s, "SELECT ?s { BIND(3 AS ?n) ?s text:query (\"fox\" ?n) }");
+    assert!(e.contains("must be constants"), "{e}");
+}
+
 /// Rough write-path timing with full-text search on and off (not a benchmark: run it
 /// alone, optimized, with `--ignored --nocapture`).
 #[test]

@@ -199,6 +199,9 @@ pub(super) fn hybrid_leaf(
     };
     let (ts, tscore, vs, vscore) = (hidden("ts"), hidden("tsc"), hidden("vs"), hidden("vsc"));
     let mut call = super::textpf::decode(vec![ts.clone(), tscore.clone()], text_args)?;
+    if call.query_var.is_some() {
+        return Err(bad("arguments must be constants"));
+    }
     if call.highlight.is_some() {
         return Err(bad("the text list takes no highlight: option"));
     }

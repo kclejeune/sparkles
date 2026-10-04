@@ -4,6 +4,7 @@
 //! ```sparql
 //! ?s text:query "query"                          # or "query"@lang
 //! (?s ?score ?literal ?g ?prop ?rank) text:query (pred* "query" limit "lang:xx")
+//! ?s text:query (rdfs:label ?q 10)               # ?q bound by the rest of the group
 //! ```
 //!
 //! SPARQL parses `( … )` into `rdf:first` / `rdf:rest` chains of blank nodes. This module
@@ -32,7 +33,10 @@ pub struct TextCall {
     pub rank: Option<TermPattern>,
     /// predicates to search (empty: every indexed predicate)
     pub predicates: Vec<NamedNode>,
+    /// the query string (empty when `query_var` is set)
     pub query: String,
+    /// a variable query string, bound by the rest of the group: one search per value
+    pub query_var: Option<TermPattern>,
     pub lang: Option<String>,
     /// `Some(n)` keeps the top `n` hits
     pub limit: Option<usize>,
@@ -239,12 +243,14 @@ pub fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<Text
         }
         (l.datatype() == xsd::STRING).then(|| (l.value().to_string(), None))
     };
+    let mut query_var = None;
     let (query, mut lang) = match args.next() {
         Some(TermPattern::Literal(l)) => {
             string(&l).ok_or_else(|| bad("query string must be a string literal"))?
         }
-        Some(TermPattern::Variable(_) | TermPattern::BlankNode(_)) => {
-            return Err(bad("arguments must be constants"));
+        Some(v @ (TermPattern::Variable(_) | TermPattern::BlankNode(_))) => {
+            query_var = Some(v);
+            (String::new(), None)
         }
         Some(_) => return Err(bad("query string must be a string literal")),
         None => return Err(bad("malformed argument list")),
@@ -268,7 +274,7 @@ pub fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<Text
         let TermPattern::Literal(l) = a else {
             return Err(match a {
                 TermPattern::Variable(_) | TermPattern::BlankNode(_) => {
-                    bad("arguments must be constants")
+                    bad("arguments other than the query string must be constants")
                 }
                 _ => bad("malformed argument list"),
             });
@@ -301,6 +307,7 @@ pub fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<Text
         rank,
         predicates,
         query,
+        query_var,
         lang,
         limit,
         highlight,
@@ -355,6 +362,15 @@ mod tests {
 
         let (calls, _) = extract(&bgp("SELECT * { ?s text:query \"renard\"@fr }")).unwrap();
         assert_eq!(calls[0].lang.as_deref(), Some("fr"));
+
+        // a variable query string, with the other arguments constant
+        let (calls, _) = extract(&bgp(
+            "SELECT * { ?s text:query (rdfs:label ?q 5 \"lang:en\") }",
+        ))
+        .unwrap();
+        let c = &calls[0];
+        assert!(matches!(&c.query_var, Some(TermPattern::Variable(v)) if v.as_str() == "q"));
+        assert_eq!((c.limit, c.lang.as_deref()), (Some(5), Some("en")));
     }
 
     #[test]
@@ -362,7 +378,8 @@ mod tests {
         for q in [
             "SELECT * { ?s text:query 42 }",
             "SELECT * { (?s 1) text:query \"x\" }",
-            "SELECT * { ?s text:query (?q) }",
+            "SELECT * { ?s text:query (?q ?n) }",
+            "SELECT * { ?s text:query (\"x\" ?n) }",
             "SELECT * { ?s text:query (\"x\" 1 2 3) }",
             "SELECT * { ?s text:query (\"x\" 1 2) }",
             "SELECT * { ?s text:query (\"x\" \"highlight:\" \"highlight:\") }",

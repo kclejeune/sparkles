@@ -3826,6 +3826,23 @@ SELECT ?s ?score ?label WHERE {
 * **Evaluation.** The search runs once within the active graph, and `GRAPH`, `FROM` and
   `reasoning=false` apply inside the search. `limit` is therefore the top n of that scope,
   before any join.
+* **Query strings from the data.** The query string can be a variable that the rest of
+  the group binds, as in `?k ex:keyword ?q . ?s text:query (rdfs:label ?q 10)`. The
+  search then runs once for each distinct value, with the call's limit applying to each
+  search, and each row of the group is joined with the hits of its own value. A value
+  with a language tag searches that language, as `lang:` does. A value that is not a
+  string, or that does not parse, matches nothing, while the same constant is a `400`.
+  The other arguments must still be constants. A query variable that nothing in the
+  group binds is a `400`, and more than 1,000 distinct values are a `507`. EXPLAIN
+  reports the number of searches.
+* **Joins with few subjects.** When a call without a limit and without a rank output is
+  joined with a side that binds its subject in every row to at most 4,096 distinct
+  values, the search only looks for hits of those subjects. Scores do not change,
+  because BM25 statistics are taken over the whole index. EXPLAIN shows this as
+  `searched the N subjects of the join's left side`. A call whose query string is a
+  variable restricts each search to the subjects of its rows in the same way. The
+  `text_subject_pushdown` optimization turns this off (see
+  `QueryOptions::optimizations` and `SPARKLES_DISABLE_OPTIMIZATIONS`).
 * **Analyzer.** Tokens are split on non-alphanumeric characters, lowercased and
   ASCII-folded, so `café` matches `cafe`.
 * **Languages.** An index can also stem the literals of chosen languages, as jena-text

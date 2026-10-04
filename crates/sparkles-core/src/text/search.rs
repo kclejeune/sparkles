@@ -25,6 +25,20 @@ use tantivy::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, Term};
 
 /// Evaluate a `text:query` call against the snapshot's text view.
 pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
+    search_in(ctx, spec, vars, None, false)
+}
+
+/// [`search`] restricted to hits whose subject is one of `subjects`, when given (the
+/// subjects of a join's other side). The restriction is a filter of the search, so it
+/// changes no score. With `lenient`, a query string that does not parse matches
+/// nothing instead of failing the query (a value bound by the data, not a constant).
+pub fn search_in(
+    ctx: &Ctx,
+    spec: &TextSpec,
+    vars: &[VarId],
+    subjects: Option<&[Id]>,
+    lenient: bool,
+) -> Result<Table> {
     let snap = &ctx.snap;
     if snap.historical {
         return Err(Error::HistoryUnsupported(format!(
@@ -53,10 +67,13 @@ pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
     // a language with an analyzer searches its stemmed text; fuzzy terms expand against
     // the searcher's terms of that field
     let (field, analyzer) = sh.fields.text_for(spec.lang.as_deref());
-    let parsed = super::lucene::parse(&spec.query, &resolved.searcher, field, analyzer)
-        .map_err(|e| Error::invalid(format!("text:query: {e}")))?;
+    let parsed = match super::lucene::parse(&spec.query, &resolved.searcher, field, analyzer) {
+        Ok(p) => p,
+        Err(_) if lenient => return Ok(Table::empty(vars.to_vec())),
+        Err(e) => return Err(Error::invalid(format!("text:query: {e}"))),
+    };
     let matchers = parsed.matchers;
-    let Some(query) = scoped(snap, spec, &sh.fields, parsed.query) else {
+    let Some(query) = scoped(snap, spec, &sh.fields, parsed.query, subjects) else {
         return Ok(Table::empty(vars.to_vec()));
     };
     let out = Outputs::new(spec, vars, resolved, &sh.ids, snap.mask.is_some());
@@ -145,13 +162,14 @@ pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
     Ok(t)
 }
 
-/// The parsed query restricted to the call's predicates, language, subject and graphs;
-/// `None` when nothing can match (a subject the index cannot hold).
+/// The parsed query restricted to the call's predicates, language, subject, the given
+/// subjects and graphs; `None` when nothing can match (a subject the index cannot hold).
 fn scoped(
     snap: &Snapshot,
     spec: &TextSpec,
     f: &super::imp::Fields,
     text: Box<dyn Query>,
+    subjects: Option<&[Id]>,
 ) -> Option<Box<dyn Query>> {
     let mut filters: Vec<(Occur, Box<dyn Query>)> = Vec::new();
     let str_terms = |field: Field, vals: &mut dyn Iterator<Item = String>| -> Box<dyn Query> {
@@ -183,6 +201,18 @@ fn scoped(
                 IndexRecordOption::Basic,
             )),
         ));
+    }
+    if let Some(ids) = subjects {
+        // literals and other terms that cannot be subjects have no key
+        let keys: Vec<Term> = ids
+            .iter()
+            .filter_map(|&id| term_key(snap, id))
+            .map(|k| Term::from_field_bytes(f.s, &k))
+            .collect();
+        if keys.is_empty() {
+            return None;
+        }
+        filters.push((Occur::Must, Box::new(TermSetQuery::new(keys))));
     }
     let default_term = || Term::from_field_text(f.g, DEFAULT_GRAPH_IRI);
     match &spec.graph {

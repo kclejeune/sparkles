@@ -571,7 +571,7 @@ pub use imp::TextIndex;
 #[cfg(feature = "text")]
 pub(crate) use imp::read_config as imp_read_config;
 #[cfg(feature = "text")]
-pub use search::search;
+pub use search::{search, search_in};
 
 #[cfg(not(feature = "text"))]
 /// Placeholder: full-text search is not compiled in.
@@ -582,6 +582,17 @@ pub fn search(
     _ctx: &crate::sparql::ctx::Ctx,
     _spec: &crate::sparql::plan::TextSpec,
     _vars: &[crate::sparql::table::VarId],
+) -> Result<crate::sparql::table::Table> {
+    Err(not_built())
+}
+
+#[cfg(not(feature = "text"))]
+pub fn search_in(
+    _ctx: &crate::sparql::ctx::Ctx,
+    _spec: &crate::sparql::plan::TextSpec,
+    _vars: &[crate::sparql::table::VarId],
+    _subjects: Option<&[crate::id::Id]>,
+    _lenient: bool,
 ) -> Result<crate::sparql::table::Table> {
     Err(not_built())
 }
