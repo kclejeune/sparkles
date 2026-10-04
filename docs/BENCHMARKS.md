@@ -56,7 +56,9 @@ Some results are worse than in the run of 2026-10-02 at commit `4995963`.
 [Changes against the run of 2026-10-02](#changes-against-the-run-of-2026-10-02) lists
 them. The largest are `group-avg`, which takes 71.5 against 56.4 ms at 10.5M, and cold
 `star-join` at 10.5M, which takes 315 against 97 ms. Both come from the change that made
-cold point lookups faster.
+cold point lookups faster. Commit `a7d42ca`, made after this run, fixes `group-avg`. With
+it, local A/B runs measure the query at the CPU time it had before the change. The cold
+scans are not fixed yet.
 
 Sparkles uses more memory than QLever, and that is a choice. Its defaults spend memory on
 a 1 GiB decoded-block cache per dataset and on materialized intermediate results.
@@ -475,7 +477,10 @@ settings. Most queries moved by less than their noise. These moved by more:
   against 8.9 ± 0.3 ms at 1.05M. Alternating the two builds on one server confirmed it:
   55 against 71 ms. The cause is the [cold-read change](#cold-reads), and with either
   `SPARKLES_IO_HINTS=off` or `SPARKLES_SPARSE_VOCAB=off` the query takes 52 ms again. No
-  other warm query changed by more than 20% with `SPARKLES_IO_HINTS=off`.
+  other warm query changed by more than 20% with `SPARKLES_IO_HINTS=off`. Commit
+  `a7d42ca`, made after this run, asks for read-ahead once per group of 128 blocks
+  instead of at every lookup. In local A/B runs it brings the query back to the CPU time
+  it had before the change.
 * **Slower cold.** The same change made cold `star-join` 3.2× slower at 10.5M (315
   against 97 ms) and cold `contains`, `regex-iri` and `lang-filter` 1.2–1.4× slower,
   while it made the cold point lookups faster ([Cold reads](#cold-reads)).
@@ -641,8 +646,9 @@ blocks lose, because a fault on a mapping meant for random access no longer read
 | `regex-iri` | **38.1** | 53.2 |
 | `lang-filter` | **38.6** | 48.6 |
 
-The change also costs a warm query. `group-avg` takes 71 ms by default and 52 ms with
-either setting off, on the same server and data. No other warm query of the 10.5M suite
+The change also cost a warm query in this run. `group-avg` took 71 ms by default and
+52 ms with either setting off, on the same server and data. Commit `a7d42ca` fixed it
+after the run. No other warm query of the 10.5M suite
 changed by more than 20% with `SPARKLES_IO_HINTS=off`.
 
 At 10.5M on the laptop (2026-10-02, before commit `98a75c1a`), the bytes a cold server
