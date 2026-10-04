@@ -160,7 +160,7 @@ impl McpServer {
             if !p.can_at(&ds.name, Endpoint::Query, Level::Read) {
                 continue;
             }
-            for (name, stored) in ds.queries.list() {
+            for (name, stored) in ds.dataset.queries().list() {
                 if !stored.definition.mcp {
                     continue;
                 }

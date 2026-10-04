@@ -81,7 +81,11 @@ impl McpServer {
             }
             p => {
                 let query = p.strip_prefix(Kind::Query.path())?.strip_prefix('/')?;
-                let version = ds.queries.get(query, None).map(|s| s.version.version);
+                let version = ds
+                    .dataset
+                    .queries()
+                    .get(query, None)
+                    .map(|s| s.version.version);
                 Some(hash(&(instance, version)))
             }
         }

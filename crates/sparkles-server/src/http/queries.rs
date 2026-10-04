@@ -53,7 +53,8 @@ pub(crate) fn stored_json(ds: &Dataset, name: &str, s: &Stored) -> J {
 pub(super) async fn list(st: St, Path(ds_name): Path<String>) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &ds_name)?;
     let queries: Vec<J> = ds
-        .queries
+        .dataset
+        .queries()
         .list()
         .into_iter()
         .map(|(name, s)| {
@@ -67,7 +68,7 @@ pub(super) async fn list(st: St, Path(ds_name): Path<String>) -> ApiResult<Json<
         })
         .collect();
     let mut out = json!({ "dataset": ds.name, "queries": queries });
-    if let Some(e) = ds.queries.broken() {
+    if let Some(e) = ds.dataset.queries().error() {
         out["warning"] = e.into();
     }
     Ok(Json(out))
@@ -93,7 +94,8 @@ pub(super) async fn get_query(
     let ds = dataset(&st, &ds_name)?;
     let version = version_param(&Params::from_query(&uri))?;
     let s = ds
-        .queries
+        .dataset
+        .queries()
         .get(&name, version)
         .ok_or_else(|| not_found(&ds.name, &name))?;
     let mut r = Json(stored_json(&ds, &name, &s)).into_response();
@@ -109,7 +111,8 @@ pub(super) async fn versions(
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &ds_name)?;
     let v = ds
-        .queries
+        .dataset
+        .queries()
         .versions(&name)
         .ok_or_else(|| not_found(&ds.name, &name))?;
     Ok(Json(
@@ -202,7 +205,7 @@ pub(super) async fn put_query(
             "message must be at most 1024 bytes without control characters",
         ));
     }
-    let if_version = precondition(&headers, ds.queries.get(&name, None).is_some())?;
+    let if_version = precondition(&headers, ds.dataset.queries().get(&name, None).is_some())?;
     let author = (!p.name.is_empty()).then(|| p.name.to_string());
     blocking(move || {
         let change = Change {
@@ -213,7 +216,7 @@ pub(super) async fn put_query(
             dataset_commit: Some(ds.store.snapshot().commit),
             if_version,
         };
-        let saved = ds.queries.put(&name, def, change)?;
+        let saved = ds.dataset.queries().put(&name, def, change)?;
         let status = if saved.created {
             StatusCode::CREATED
         } else {
@@ -239,10 +242,10 @@ pub(super) async fn delete_query(
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let ds = dataset(&st, &ds_name)?;
-    let exists = ds.queries.get(&name, None).is_some();
+    let exists = ds.dataset.queries().get(&name, None).is_some();
     let if_version = precondition(&headers, exists)?.filter(|v| *v > 0);
     blocking(move || {
-        if ds.queries.delete(&name, if_version)? {
+        if ds.dataset.queries().delete(&name, if_version)? {
             Ok(StatusCode::NO_CONTENT.into_response())
         } else {
             Err(not_found(&ds.name, &name))
@@ -318,14 +321,12 @@ pub(super) async fn run(
         }
     }
     let version = version_param(&params)?;
-    let stored = ds
-        .queries
-        .get(&name, version)
-        .ok_or_else(|| not_found(&ds.name, &name))?;
+    let queries = ds.dataset.queries();
+    if queries.get(&name, version).is_none() {
+        return Err(not_found(&ds.name, &name));
+    }
     let given = values(&params, json_body)?;
-    let mut prefixes = sparkles::io::standard_prefixes();
-    prefixes.extend(ds.store.prefixes());
-    let bindings = stored.definition.bind(&given, &prefixes)?;
+    let (stored, bindings) = queries.bind(&name, version, &given)?;
     // the definition's result format, unless the request names one
     let accept = headers
         .get(header::ACCEPT)
