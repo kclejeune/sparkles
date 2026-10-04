@@ -376,6 +376,9 @@ pub struct Ctx {
     /// blank nodes given to the query from outside (initial bindings) that are not
     /// stored ones: a fresh blank node per label
     outside_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
+    /// the blank nodes that labels inside the composite literals of the query text name
+    /// (see [`Ctx::query_literal`])
+    literal_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
     pub deadline: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
     pub dataset: DatasetSpec,
@@ -441,6 +444,7 @@ impl Ctx {
             next_bnode: AtomicU64::new(0),
             bnode_memo: Default::default(),
             outside_bnodes: Default::default(),
+            literal_bnodes: Default::default(),
             deadline: None,
             cancel: Arc::new(AtomicBool::new(false)),
             dataset: DatasetSpec::default(),
@@ -677,6 +681,31 @@ impl Ctx {
         }
         let key = id::term_key(t);
         self.intern_key(&key)
+    }
+
+    /// A literal written in the query text. A blank node label inside a composite literal
+    /// (`cdt:List`, `cdt:Map`) names a blank node of this query, the same one for the
+    /// same label in all the query's literals, as Jena has it. It never names a stored
+    /// node, also when it looks like a stored node's label. The literal is written again
+    /// with the labels of those nodes, so the functions that read it find them.
+    pub fn query_literal<'l>(&self, l: &'l oxrdf::Literal) -> std::borrow::Cow<'l, oxrdf::Literal> {
+        match super::cdt::relabel_literal(l, &mut |b| {
+            let id = *self
+                .literal_bnodes
+                .lock()
+                .entry(b.to_string())
+                .or_insert_with(|| self.fresh_bnode());
+            id::bnode_label(id.payload())
+        }) {
+            Some(l) => std::borrow::Cow::Owned(l),
+            None => std::borrow::Cow::Borrowed(l),
+        }
+    }
+
+    /// [`Ctx::intern_term`] for a literal written in the query text (see
+    /// [`Ctx::query_literal`]).
+    pub fn intern_query_literal(&self, l: &oxrdf::Literal) -> Id {
+        self.intern_term(&Term::Literal(self.query_literal(l).into_owned()))
     }
 
     /// The id of a term given to the query from outside, such as an initial binding. A

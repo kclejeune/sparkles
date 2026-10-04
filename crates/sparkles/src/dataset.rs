@@ -930,24 +930,33 @@ impl Transaction<'_> {
     /// [`insert`](Self::insert), except that a blank node whose label names a stored
     /// node (`b…`, as [`find`](Self::find) and the dataset's reads hand it out) is that
     /// node rather than a new one. Other labels are scoped to the transaction as in
-    /// `insert`, and a `b…` label that names no stored node is such a label.
+    /// `insert`, and a `b…` label that names no stored node is such a label. The labels
+    /// inside a composite literal (`cdt:List`, `cdt:Map`) are linked the same way.
     pub fn insert_linked(&mut self, quad: QuadRef<'_>) -> Result<bool> {
-        let mut link = |b: oxrdf::BlankNodeRef<'_>| {
-            if self.labels.contains_key(b.as_str()) {
+        let mut link = |b: &str| {
+            if self.labels.contains_key(b) {
                 return;
             }
-            if let Some(id) = crate::store::parse_bnode_label(b.as_str())
+            if let Some(id) = crate::store::parse_bnode_label(b)
                 && self.txn.bnode_allocated(id)
             {
-                self.labels.insert(b.as_str().to_string(), id);
+                self.labels.insert(b.to_string(), id);
             }
         };
         if let oxrdf::NamedOrBlankNodeRef::BlankNode(b) = quad.subject {
-            link(b);
+            link(b.as_str());
         }
-        each_blank_node(quad.object, &mut link);
+        each_blank_node(quad.object, &mut |b| link(b.as_str()));
+        if let oxrdf::TermRef::Literal(l) = quad.object
+            && crate::sparql::cdt::is_cdt(l.datatype().as_str())
+        {
+            crate::sparql::cdt::relabel_literal(&l.into_owned(), &mut |b| {
+                link(b);
+                b.to_string()
+            });
+        }
         if let GraphNameRef::BlankNode(b) = quad.graph_name {
-            link(b);
+            link(b.as_str());
         }
         self.insert(quad)
     }
@@ -1512,6 +1521,46 @@ mod tests {
             want.sort_by_key(|q| q.to_string());
             assert_eq!(got, want);
         }
+    }
+
+    /// The labels inside a composite literal name the nodes the transaction's labels
+    /// name, a stored node's label included when the insert links stored nodes.
+    #[test]
+    fn transactions_scope_labels_inside_composite_literals() {
+        let ds = Dataset::memory();
+        ds.load_str("_:a <http://ex.org/p> \"1\" .", RdfFormat::NTriples)
+            .unwrap();
+        let NamedOrBlankNode::BlankNode(b) =
+            ds.find(None, None, None, None).unwrap()[0].subject.clone()
+        else {
+            panic!("not a blank node")
+        };
+        let list = |label: &str| {
+            Term::Literal(oxrdf::Literal::new_typed_literal(
+                format!("[_:{label}]"),
+                NamedNode::new_unchecked(crate::sparql::cdt::LIST),
+            ))
+        };
+        let x = NamedOrBlankNode::from(oxrdf::BlankNode::new_unchecked("x"));
+        ds.transaction(|tx| {
+            tx.insert(Quad::new(x.clone(), n("l"), list("x"), GraphName::DefaultGraph).as_ref())?;
+            tx.insert_linked(
+                Quad::new(n("s"), n("m"), list(b.as_str()), GraphName::DefaultGraph).as_ref(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let same = |q: &str| {
+            let r = ds.query(q).unwrap();
+            matches!(&r.rows()[0][0], Some(Term::Literal(l)) if l.value() == "true")
+        };
+        let cdt = "PREFIX cdt: <http://w3id.org/awslabs/neptune/SPARQL-CDTs/> ";
+        assert!(same(&format!(
+            "{cdt}SELECT (sameTerm(?s, cdt:head(?l)) AS ?x) {{ ?s <http://ex.org/l> ?l }}"
+        )));
+        assert!(same(&format!(
+            "{cdt}SELECT (sameTerm(?s, cdt:head(?l)) AS ?x) {{ ?s <http://ex.org/p> ?o . <http://ex.org/s> <http://ex.org/m> ?l }}"
+        )));
     }
 
     #[test]

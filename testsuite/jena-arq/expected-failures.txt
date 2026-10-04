@@ -1,17 +1,2 @@
 # Jena's ARQ tests whose answers Sparkles gives otherwise on purpose, one per line, with
 # the reason after the name.
-#
-# A blank node label inside a CDT literal names a blank node of the query that reads the
-# literal. Jena's loader also relates it to the blank nodes of the file that holds the
-# literal, and keeps the blank nodes of different files and queries apart.
-SPARQL-CDTs/bnodes/manifest#bnodes-turtle-05 blank node shared with the data file
-SPARQL-CDTs/bnodes/manifest#bnodes-turtle-06 blank node shared with the data file
-SPARQL-CDTs/bnodes/manifest#bnodes-turtle-15 blank node shared with the data file
-SPARQL-CDTs/bnodes/manifest#bnodes-turtle-16 blank node shared with the data file
-SPARQL-CDTs/bnodes/manifest#bnodes-turtle-19 blank node shared with the data file
-SPARQL-CDTs/bnodes/manifest#bnodes-turtle-25 blank node shared with the data file
-SPARQL-CDTs/bnodes/manifest#bnodes-turtle-26 blank node shared with the data file
-SPARQL-CDTs/bnodes/manifest#bnodes-turtle-45 blank node shared with the data file
-SPARQL-CDTs/bnodes/manifest#bnodes-turtle-46 blank node shared with the data file
-SPARQL-CDTs/bnodes/manifest#bnodes-turtle-sparql-01 blank node kept apart from the query's
-SPARQL-CDTs/bnodes/manifest#bnodes-turtle-sparql-02 blank node kept apart from the query's
