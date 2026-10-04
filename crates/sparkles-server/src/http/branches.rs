@@ -167,8 +167,10 @@ pub(crate) const SPARKLES_BRANCH: &str = "sparkles-branch";
 /// Response header: that branch's id.
 pub(crate) const SPARKLES_BRANCH_ID: &str = "sparkles-branch-id";
 
-/// The branch a request chose (request extension, set before routing).
+/// The branch a request chose (request extension, set before routing). The grant check
+/// reads it, so a build without the `auth` feature never does.
 #[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "auth"), allow(dead_code))]
 pub(crate) struct SelectedBranch(pub String);
 
 tokio::task_local! {
