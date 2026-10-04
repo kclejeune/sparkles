@@ -5815,7 +5815,9 @@ string, "schema": { "classesWithSuperclasses", "propertiesWithSuperproperties",
 "propertiesWithDomains", "propertiesWithRanges", "skipped" } }`. Dataset info has the
 same `source` and `graph` under `rdfs`. A persistent dataset keeps the setting in
 `rdfs.json`, and an uploaded schema's triples in `rdfs-schema.nt`. `sparkles query
---rdfs-graph GRAPH` takes the schema from a graph of the database.
+--loc`, `sparkles queries run` and the library's queries follow `rdfs.json` too.
+`sparkles query --rdfs FILE` or `--rdfs-graph GRAPH` sets the schema for one query
+instead, and `--rdfs-graph` takes it from a graph of the database.
 
 The semantics are those of Jena's `MatchRDFS`, which covers a subset of RDFS:
 

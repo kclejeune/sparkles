@@ -512,6 +512,12 @@ sparkles describe-settings --loc db --set mode=scbd   # how DESCRIBE describes a
 sparkles ping    127.0.0.1:3030               # GET /$/ready over HTTP, then HTTPS; exit 0 on 200 (health checks)
 ```
 
+`sparkles query --loc` runs a query as the server runs one on the dataset. RDFS on read
+follows the database's `rdfs.json`, the materialized inferences of `sparkles infer` are
+part of the default graph while `reasoning.json` records them, and DESCRIBE follows
+`describe.json`. `--rdfs` or `--rdfs-graph` sets RDFS on read for the one query instead.
+`sparkles queries run` follows the same settings.
+
 `sparkles dump` writes N-Quads by default. `--format`, or the extension of `--out`, picks
 another syntax: TriG, N-Triples, Turtle, JSON-LD, RDF/XML, TriX, RDF Thrift (`rt`), RDF
 Protobuf (`rpb`) or RDF/JSON (`rj`). A compression extension after it, as in
@@ -2032,7 +2038,7 @@ ds.dump(std::io::stdout(), RdfFormat::TriG)?;
 | `Txn.executeWrite` | `Dataset::transaction` |
 | `jena-querybuilder` `SelectBuilder` & co. | `sparkles::querybuilder` |
 | `QueryExec.substitution` / `setVar` | `QueryOptions::initial_bindings` / builder `set_var` |
-| reasoners (`InfModel`) | `sparkles_reasoner::materialize` (crate `sparkles-reasoner`) |
+| reasoners (`InfModel`) | `ds.reasoning().run` (feature `reasoning`) |
 | `ShaclValidator` | `sparkles_shacl::validate` (crate `sparkles-shacl`) |
 | `ShexValidator` | `sparkles_shex::validate` (crate `sparkles-shex`) |
 
@@ -2041,6 +2047,27 @@ guard that the database's `validation.json` configures, loads RDFS on read, and 
 the stored queries, the GraphQL configuration and the reasoning record. When the guard
 cannot be installed, for example because the build lacks the `shacl` or `shex` feature,
 writes fail with `Error::GuardMissing`, and `Dataset::guard_error` says why.
+
+Queries run with the dataset's query defaults, as they do on the server. RDFS on read
+applies when the dataset has it set. The graph of materialized inferences,
+`urn:x-sparkles:inferred`, is part of the default graph while the dataset has a
+reasoning record. DESCRIBE follows the dataset's setting. `Dataset::query`, `select`,
+`ask` and `construct` use these defaults. `Dataset::query_with`, a transaction's
+`query_with`, `explain` and `ds.queries().run` fill each default that their
+`QueryOptions` leave unset, and every field the options set wins. A field is unset when
+it has its `Default` value, so `rdfs` is `None`, `default_graph_extra` is empty, and
+`describe` is `DescribeOptions::default()`. To turn a default off for one query, start
+from `ds.query_options()`, which returns the defaults and marks them as applied, and
+change the field. Updates take their options as given.
+
+```rust
+let q = "ASK { <urn:s> a <urn:parent> }";
+ds.ask(q)?;                                        // with RDFS on read and the inferences
+let mut opts = ds.query_options();
+opts.default_graph_extra.clear();                  // without the inferences
+opts.rdfs = None;                                  // and without RDFS on read
+ds.query_with(q, &opts)?;
+```
 
 A dataset's administration goes through handles that `Dataset` returns. Each handle is
 cheap to clone and can move to another thread. Settings have `get`, `set` and `reset`,
@@ -2058,6 +2085,9 @@ ds.settings().quota().set(2 << 30)?;               // reset() returns to the def
 ds.indexes().vector().list();                      // also text() and geo()
 ds.queries().run("by-author", &params, &Default::default())?;
 ds.reasoning().rdfs().set(NewSchema::Graph("http://ex.org/schema".into()))?;
+ds.reasoning().run(&Default::default())?;          // materialize RDFS (feature reasoning)
+let report = ds.schema().report(&Default::default())?;   // classes(), predicates(), summary()
+let stats = ds.stats(&Default::default())?;        // the counts of GET /$/stats/{ds}
 let ctl = Control { progress: Progress::new(|f, msg| eprintln!("{f:.2} {msg}")), ..Control::none() };
 ds.compact_with(&Default::default(), &ctl)?;
 ```
@@ -2066,9 +2096,11 @@ The handles that need another crate sit behind the `sparkles` crate's Cargo feat
 `reasoning`, `shacl`, `shex`, `graphql`, `backup` and `fmt` turn on the reasoner's
 calls, the validators, the GraphQL configuration, `ds.backups(&repo)` with
 `sparkles::backup`, and `sparkles::fmt`. The feature `full` turns on what the server
-has. The default is empty. Some operations of the HTTP API, such as the schema report,
-dataset statistics and reasoning runs, have no library call yet.
+has. The default is empty. The operations on the catalog of datasets, backup creation,
+restores and the registry of backup repositories have no library call yet.
 [Spec P06](specs/P06-library-admin-api.md) lists what is still to come.
+`sparkles::terms` checks IRIs and language tags, and `sparkles::io::check_data` finds
+the first syntax error of RDF data, as the server's validators do.
 
 `Dataset::store()` and the `store`, `index` and `builder` modules give lower-level
 access: ids, snapshots, raw index scans and the bulk `Builder`. `mise run doc` builds
@@ -2135,7 +2167,8 @@ CONSTRUCT and DESCRIBE. `select`, `ask` and `construct` check the query form and
 * `bindings` pre-binds variables, as in `bindings={"s": NamedNode("http://ex.org/a")}`.
 * `default_graph` and `named_graphs` replace the query's dataset, like the SPARQL
   protocol's `default-graph-uri` and `named-graph-uri`.
-* `include_inferred=True` adds the reasoner's inferences to the default graph.
+* `include_inferred=True` adds the reasoner's inferences to the default graph. RDFS on
+  read applies whenever the dataset has it set, as on the server.
 * `prefixes` declares prefixes, `base_iri` sets the base, and `timeout` is in seconds.
 * `max_rows`, `max_memory_bytes` and `max_rows_produced` are budgets. A query past one
   raises `BudgetExceededError`.

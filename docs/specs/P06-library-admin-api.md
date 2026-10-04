@@ -1,8 +1,8 @@
 # P06: Library administration API and parity
 
-> **Status:** implemented in part (steps 1 to 4 and 7 of Phase 1)
+> **Status:** implemented in part (steps 1 to 5 and 7 of Phase 1)
 >
-> **Phases:** Steps 1 to 4 and 7 of Phase 1 (§8.1) shipped. The engine is the
+> **Phases:** Steps 1 to 5 and 7 of Phase 1 (§8.1) shipped. The engine is the
 > `sparkles-core` package in `crates/sparkles-core`, and `crates/sparkles` is the
 > `sparkles` facade over it. `sparkles::task::Control` carries cancellation, progress and a deadline, and the
 > server's tasks build one from each task. `Dataset::open` sets a dataset up as the
@@ -10,18 +10,24 @@
 > reasoning record and clone origin, and the server's datasets hold a `sparkles::Dataset`.
 > `Dataset` has handles for snapshots, history, indexes, settings, schema, stored
 > queries, reasoning, validation, GraphQL and backups, and `Error::code()` names each
-> error. The parity test of §7.1 maps every operation, with 39 marked pending. The
-> local commands `quota`, `queries`, `compaction`, `describe-settings`, `validation`,
-> `geo-index` and `vector` open a `Dataset` and call its handles (step 7), and `clone`
-> waits for the catalog. The rest of Phase 1 moves the server's handlers onto the
-> handles (step 5), adds the `Catalog` (step 6), moves `clone` and makes the parity test
+> error. The server's handlers call those handles for the history, the indexes, the
+> settings, the schema, the stored queries, reasoning, the write guard, GraphQL, the
+> statistics and the stateless validators (step 5). `Dataset` holds the dataset's query
+> defaults, RDFS on read, the inferred graph and DESCRIBE, and every library query, the
+> local `sparkles query` and the server start from them. The parity test of §7.1 maps
+> every operation, with 16 marked pending, all for step 6. The local commands `quota`,
+> `queries`, `compaction`, `describe-settings`, `validation`, `geo-index` and `vector`
+> open a `Dataset` and call its handles (step 7), and `clone` waits for the catalog. The
+> rest of Phase 1 adds the `Catalog` (step 6), moves `clone` and makes the parity test
 > strict (step 8). Phase 2 closes the Python bindings' gaps, and Phase 3 adds dataset
 > renames and catalog commands. None of these is built.
 >
 > **User docs:** the "Embedding the library" section of [USAGE](../USAGE.md) describes
-> what `Dataset::open` sets up and the handles. Its "Stored queries" section says that
-> `sparkles queries run` follows the dataset's RDFS on read and DESCRIBE setting. The
-> HTTP API, the other commands and the file formats have not changed.
+> what `Dataset::open` sets up, the handles and the query defaults with their override
+> rule. Its "Stored queries" section and its notes on the local tools say that
+> `sparkles queries run` and `sparkles query --loc` follow the dataset's RDFS on read,
+> materialized inferences and DESCRIBE setting. The HTTP API, the other commands and the
+> file formats have not changed.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end records how it lands.
@@ -1438,7 +1444,7 @@ and the wheel measurements.
 
 ## Outcome
 
-Phase 1 is in progress. Steps 1 to 4 and step 7 have shipped, and the notes below
+Phase 1 is in progress. Steps 1 to 5 and step 7 have shipped, and the notes below
 record where they depart from the design. Step 7 leaves `sparkles clone` for after
 step 6.
 
@@ -1492,10 +1498,9 @@ step 6.
   `sparkles-backup` dependency has its default features, so `backup` includes S3.
 * **`Error::Locked` is not added yet.** `Error::code()` and `Error::Component` exist.
   The directory lock's error changes with the catalog lock in step 6.
-* **RDFS on read applies where the caller asks.** `Dataset::open` loads the setting,
-  and the server passes it to each query as before. `Dataset::query` does not read it,
-  because that would take a lock on the library's query path. A program passes
-  `ds.reasoning().rdfs().get()` as `QueryOptions::rdfs`.
+* **RDFS on read was left to the caller in step 4.** `Dataset::query` read only the
+  DESCRIBE setting, so a program had to pass `ds.reasoning().rdfs().get()` itself. Step
+  5 replaced this with the dataset's query defaults, which the notes on step 5 describe.
 * **The binding table of §7.2 comes with step 8.** `crates/sparkles/bindings.toml` and
   its checks land when the parity test becomes strict.
 * **Performance.** The query and update paths take no new lock. A server handler that
@@ -1515,13 +1520,12 @@ The notes below record step 7, which moved the local commands onto the handles.
 * **`clone` waits for the catalog.** `sparkles clone` depends on the catalog of step 6,
   so it moves after that step.
 * **The handles grew where a command needed more.** `DescribeSetting::status` returns a
-  `DescribeStatus`, the body of `GET /$/describe/{ds}`, and the server's describe
-  handler serializes it through the old helper in `describe_cmd.rs`.
-  `CompactionSetting::effective` applies a base policy, and `CompactionSetting::status`
-  returns a `CompactionStatus` with the policy in force, the dataset's own settings,
-  the measures in seconds, the state and the trigger. The server's compaction status
-  adds its scheduler's fields to the same values, and it still builds them itself until
-  step 5 moves that handler. `StoredQueries::run_version` runs an older version, and
+  `DescribeStatus`, the body of `GET /$/describe/{ds}`, which the server's
+  describe handler serializes since step 5. `CompactionSetting::effective` applies a
+  base policy, and `CompactionSetting::status` returns a `CompactionStatus` with the
+  policy in force, the dataset's own settings, the measures in seconds, the state and
+  the trigger. Since step 5 the server's compaction status takes those values from it
+  and adds its scheduler's fields. `StoredQueries::run_version` runs an older version, and
   `StoredQueries::error` says why `queries.json` could not be read.
   `VectorIndexes::wait_all` waits for every index's build, and
   `VectorIndexes::set_embedding_environment` lets the embedding workers reach their
@@ -1534,9 +1538,9 @@ The notes below record step 7, which moved the local commands onto the handles.
   run a stored query with the engine's defaults. It now passes the dataset's RDFS on
   read and DESCRIBE setting, as `/{ds}/queries/{name}` does, so a stored DESCRIBE query
   follows `describe.json` and a query over a class matches its subclasses when
-  `rdfs.json` is set. `crates/sparkles-server/tests/cli_queries.rs` tests both. The
-  inferred graph is not added to the default graph, as before, and that follows the
-  query defaults that step 5 gives `Dataset`.
+  `rdfs.json` is set. `crates/sparkles-server/tests/cli_queries.rs` tests both. Since
+  step 5 the run takes the dataset's query defaults, so the materialized inferences are
+  part of the default graph too, and the command no longer passes the settings itself.
 * **Reading stored queries takes no lock.** `queries list`, `get` and `versions` read
   `queries.json` with `sparkles::stored::Catalog` instead of opening a `Dataset`.
   `Dataset::open` takes the directory's exclusive lock, and these commands have always
@@ -1555,3 +1559,110 @@ The notes below record step 7, which moved the local commands onto the handles.
   features, `--off` used to print `validation off` and leave `validation.json` in place.
   It now fails with the handle's `Unsupported` error. The default build has both
   features.
+
+The notes below record step 5, which moved the server's handlers onto the handles, and
+the fix of the library's query defaults that came with it.
+
+* **The query defaults live in `Dataset`.** `Dataset::query` applied the DESCRIBE
+  setting but not RDFS on read, and `query_with`, a transaction's `query_with` and
+  stored query runs passed the caller's options to the engine as they were. A dataset
+  with RDFS on read set therefore answered `ASK { <urn:s> a <urn:parent> }` with false
+  in the library and true over HTTP. `Dataset::query_options` now returns the dataset's
+  defaults. They are RDFS on read when it is set, `urn:x-sparkles:inferred` in
+  `default_graph_extra` while the dataset has a reasoning record, and the DESCRIBE
+  setting. `Dataset::query`, `select`, `ask` and `construct` run with them.
+* **An explicit field wins over a default.** `QueryOptions` gained `defaults_applied`.
+  When it is false, as in `QueryOptions::default()`, `Dataset::with_query_defaults`
+  fills each default field that the options leave at its `Default` value. A `None` in
+  `rdfs`, an empty `default_graph_extra` and a default `describe` take the dataset's
+  values, and a field the caller set wins. `query_options` returns options with the
+  flag set, which a caller changes to turn a default off for one query, for example by
+  clearing `default_graph_extra`. `query_with`, a transaction's `query_with`,
+  `explain`, `StoredQueries::run`, `TextIndex::search` and `GraphQl::execute` go
+  through `with_query_defaults`. The engine does not read the flag. The flag exists
+  because the value types cannot say unset. `rdfs: None` cannot also mean off, and an
+  empty `default_graph_extra` cannot also mean no inferences. Updates take their
+  options as given, because the defaults change only what queries read.
+* **Every query path starts from the defaults.** The server's `query_options` and the
+  MCP tools' options build on `Dataset::query_options`, and `reasoning=false` clears
+  `default_graph_extra`. `sparkles query --loc` opens a `Dataset` over the database,
+  or over the branch that `--branch` names, and builds on its defaults, so it now
+  follows `rdfs.json` and reads the inferences as the server does. Its `--rdfs` and
+  `--rdfs-graph` still set RDFS on read for one query. `sparkles queries run` passes no
+  settings of its own. The Python binding applies RDFS on read and the DESCRIBE
+  setting from the defaults and keeps `include_inferred` for the inferences, which
+  P01 makes opt-in. The JVM binding builds its own options over a snapshot and is
+  unchanged. `crates/sparkles/tests/query_defaults.rs`, the router test
+  `query_defaults` and `crates/sparkles-server/tests/cli_query_defaults.rs` check RDFS
+  on read and the inferences across the library query, a stored query, a transaction
+  query, the local query and HTTP.
+* **The cost of the defaults.** A library query reads the RDFS setting and the
+  reasoning record under their read locks and clones the options when it fills a
+  default. Options that the server builds have `defaults_applied` set, so its queries
+  clone nothing more.
+* **The handlers call the handles.** The history, snapshot, change feed, diff and
+  history query handlers call `ds.snapshots()` and `ds.history()`, and the periodic
+  history upkeep calls `History::tick`. The full-text, vector and spatial index
+  handlers call `ds.indexes()`. The compaction, DESCRIBE, quota, retention and change
+  log handlers call `ds.settings()`. The schema handlers call `ds.schema()`, the stored
+  query handlers `ds.queries()`, the reasoning and RDFS handlers `ds.reasoning()`, the
+  write guard handlers and `serve --validate` `ds.validation().guard()`, and the
+  GraphQL handlers `ds.graphql()`. The statistics handler calls `Dataset::stats_of`,
+  and `/$/validate/data`, `iri` and `langtag` call `sparkles::io::check_data`,
+  `sparkles::terms::check_iri` and `check_langtag`. The MCP tools for schema reports,
+  constraints, GraphQL, stored queries and snapshots use the same handles.
+* **The handles grew where a handler needed more.** `History::annotation` and
+  `ChangeLogSetting::status` serve the commit listing and the history body. `TextIndex`
+  and `GeoIndex` gained `enabled`. `TextIndex::search` takes a `TextSearch` and returns
+  `TextHits`, with the HTML snippets the endpoint gives. `Schema::report` takes a
+  `ReportRequest` with the selection, the state, the timeout, the page size and the
+  cursor, and returns a `ReportOutcome` whose `classes`, `predicates` and `summary`
+  give the pages, with how the report came about in `Computed`. `Schema::report_at`
+  reads a state the caller opened, `diff`, `void`, `profiles_at`, `draft_shapes_at`,
+  `constraints` and `constraints_at` complete it, and `ShapesRequest` moved from the
+  server. `StoredQueries::bind` checks parameters for a caller that runs the query its
+  own way, as the server's streaming endpoint does. `Reasoning` gained `status`,
+  `freshness_at`, `run`, `run_with` and `diagnostics`, with `ReasonRequest`,
+  `ReasonOutcome`, `ReasoningStatus`, `Freshness` and `Diagnostics` in
+  `sparkles::reasoning`, and `ReasoningRecord::rerun` rebuilds a recorded run.
+  `GraphQl` gained `put`, `draft`, `compiled`, `sdl`, `execute` and `execute_with`, and
+  `sparkles::handles::graphql` holds `Backing`, `DraftRequest` and `draft_of`, which
+  `sparkles graphql` uses too. `Dataset::stats` and `stats_of` return a `DatasetStats`.
+* **Errors keep their HTTP statuses.** A schema discovery error that the engine has no
+  variant for becomes a `schema` component error with the code `no-such-graph`,
+  `timeout` or `too-many-entries` and the `SchemaError` as its source, which
+  `handles::schema_error_of` returns. The server maps it to `404`, `408` and `413` as
+  before, with the phase in the timeout's message. A GraphQL mapping schema that does
+  not compile is a `graphql` component error with the code `invalid-schema`, whose
+  source is the `PutError`, so the server still lists each error's line. A reasoning
+  run that yields to a waiting write is a `reasoner` component error with the code
+  `superseded`.
+* **The yielding of automatic reasoning runs moved with the run.**
+  `ReasonRequest::yield_to_writers` makes the run stop once a write waits for the lock
+  the run holds. The server's automatic runs set it as before. The task still adds the
+  `auto:` prefix to its messages, and still saves the registry after the run.
+* **`DatasetStats` holds the data's counts only.** The statistics body's `quota`,
+  `reasoning`, `geo`, `compaction` and Fuseki counters come from their own handles and
+  the server, which add them to the serialized `DatasetStats`. This keeps the JSON of
+  each in one place, since the quota body names the dataset and the reasoning status
+  has the server's automatic re-run timing.
+* **`check_data` returns the first error.** Parsing stops at the first syntax error,
+  as the validator always did, so `sparkles::io::check_data` returns an
+  `Option<DataIssue>` instead of a list. `DataSyntax::from_name` reads Jena's syntax
+  names. The server's IRI and language tag checks moved from `tools::terms` to
+  `sparkles::terms`, which the server re-exports for `sparkles iri`, `sparkles
+  langtag` and `convert --check`.
+* **What stays in the server.** Point-in-time reads still resolve `?at=` with the
+  server's `snapshot_for`, because a branch's dataset falls back to its upstream for a
+  commit the two share, and the library's `Dataset` does not know its branch. The SHACL
+  and ShEx validation endpoints still call `sparkles-shacl` and `sparkles-shex` on
+  that state, since `Validation::shacl` and `shex` read the head. The compaction task
+  keeps its own progress messages. `sparkles infer` keeps its own run, because
+  `--no-validate` opens the store without a guard, and it uses the library's record
+  helpers. Backup creation goes with step 6.
+* **`CommitRef` reads `commit:N`.** `/$/commits/{ds}/{reference}` took `commit:7`,
+  which the library's `CommitRef` did not, so `CommitRef` now reads it. The route
+  still refuses a commit IRI, as before.
+* **The facade has new dependencies.** `base64` encodes the schema cursors, whose form
+  did not change, and `oxiri` and `oxilangtag` serve `sparkles::terms`. The lock files
+  of `crates/sparkles-py` and `crates/sparkles-ffi` list them.
