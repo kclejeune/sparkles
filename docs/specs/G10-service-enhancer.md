@@ -335,7 +335,7 @@ of `n` employs persons 1 to `n - d + 1`):
 - The cache's statistics are in the JSON statistics only. The Prometheus and
   OpenTelemetry series of the result cache have no service cache counterpart.
 
-**Tests.** `crates/sparkles/tests/service_enhancer.rs` runs an endpoint in process over
+**Tests.** `crates/sparkles-core/tests/service_enhancer.rs` runs an endpoint in process over
 a second store and records the queries it receives. Its seven tests cover A1 to A7, and
 port `testLoopJoinWithScope`, `testStdJoinWithScope`, `testScopeSimple` and the five
 result-limit cases of `AbstractTestServiceEnhancerResultSetLimits` in three modes. Unit tests cover the option

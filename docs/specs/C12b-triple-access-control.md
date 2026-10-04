@@ -442,7 +442,7 @@ class) and `docs` (class `ex:Doc` with `?s ex:owner ?user`). Users `tadmin` (adm
 
 ## 14. Sources
 
-- **Sparkles repository:** `crates/sparkles/src/access.rs`, `store.rs` (`Delta`,
+- **Sparkles repository:** `crates/sparkles-core/src/access.rs`, `store.rs` (`Delta`,
   `Snapshot`, `WriteTxn`), `sparql/` (`mod.rs`, `stats.rs`, `cache.rs`, `update.rs`,
   `rdfs.rs`), `text/search.rs`, `geo/index.rs`, `vector/search.rs`, `store/diff.rs`,
   `store/changes.rs`, `schema.rs`, and `crates/sparkles-server/src/auth/`; the specs
@@ -508,7 +508,7 @@ class) and `docs` (class `ex:Doc` with `?s ex:owner ?user`). Users `tadmin` (adm
 
 **Tests at landing.**
 
-- `crates/sparkles/tests/triple_access.rs` compares 56 queries through random views
+- `crates/sparkles-core/tests/triple_access.rs` compares 56 queries through random views
   with a store holding exactly the visible triples, which the test works out from the
   rules' definitions without the engine. Each case draws random data (a compacted base
   and a delta of inserts and deletes over five graphs, including the inferred graph), one

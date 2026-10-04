@@ -885,6 +885,7 @@ impl ChangeLog {
                 let aside =
                     dir.with_file_name(format!("{CHANGES_DIR}.stale-{}", crate::commit::now_ms()));
                 tracing::warn!(
+                    target: "sparkles::store::changelog",
                     dir = %dir.display(),
                     "the change log does not belong to this dataset; set aside as {}",
                     aside.display()
@@ -925,6 +926,7 @@ impl ChangeLog {
                         seg.last_ts = ix.recs.iter().map(|r| r.ts).max().unwrap_or(i64::MIN);
                         if good < buf.len() {
                             tracing::warn!(
+                                target: "sparkles::store::changelog",
                                 "{}: damaged change log records from byte {good} are ignored",
                                 path.display()
                             );
@@ -1022,7 +1024,7 @@ impl ChangeLog {
                     continue;
                 }
                 if let Err(e) = self.append_pending(&mut inner, p) {
-                    tracing::warn!(error = %e, "the change log stopped recording");
+                    tracing::warn!(target: "sparkles::store::changelog", error = %e, "the change log stopped recording");
                     inner.failed = Some(e.to_string());
                 }
             }
@@ -1715,7 +1717,7 @@ fn worker() -> &'static Worker {
                         if let Some(log) = w.upgrade()
                             && let Err(e) = log.flush(false)
                         {
-                            tracing::warn!(error = %e, "change log write failed");
+                            tracing::warn!(target: "sparkles::store::changelog", error = %e, "change log write failed");
                         }
                     }
                 }
@@ -1758,6 +1760,7 @@ impl Store {
                 // records past the head belong to a state this dataset no longer has
                 // (files copied from elsewhere): start over
                 tracing::warn!(
+                    target: "sparkles::store::changelog",
                     last = l,
                     head,
                     "the change log is ahead of the data; it starts again"
@@ -1844,6 +1847,7 @@ impl Store {
         }
         log.flush(true)?;
         tracing::info!(
+            target: "sparkles::store::changelog",
             commits = n,
             ms = t0.elapsed().as_secs_f64() * 1e3,
             "recovered the change log from the write-ahead log"

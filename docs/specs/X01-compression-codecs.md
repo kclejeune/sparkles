@@ -59,7 +59,7 @@ Non-goals:
 
 ## 3. The codec module
 
-`crates/sparkles/src/codec.rs`:
+`crates/sparkles-core/src/codec.rs`:
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

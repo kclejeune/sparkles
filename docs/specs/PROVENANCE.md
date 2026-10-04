@@ -1277,7 +1277,7 @@ implementation landed.
   schema (`BinaryRDF.thrift`), not from Jena's reader. The tests port the patches of
   `jena-rdfpatch`'s `TestPatchIO_Text`, `AbstractTestPatchIO` and
   `testing/files/syntax-1.rdfp` (Apache-2.0), and the fixtures in
-  `crates/sparkles/tests/patch` were written by Jena 6.2.0's patch writers. Phases 2 and 3
+  `crates/sparkles-core/tests/patch` were written by Jena 6.2.0's patch writers. Phases 2 and 3
   are deferred.
 - **Rejected** (spec §10):
   - physical replication of WAL bytes and generation files;
@@ -1379,7 +1379,7 @@ implementation landed.
   - ARQ's test suites `testing/ARQ/Syntax-Lateral`, `testing/ARQ/Lateral` and the
     `syntax-quad-construct-*` tests of `testing/ARQ/Syntax-ARQ`, and the unit tests
     `TestPath` and `TestPathQuery`, whose cases are ported with citations to
-    `crates/sparkles/tests/arq_syntax.rs`;
+    `crates/sparkles-core/tests/arq_syntax.rs`;
   - the output of Jena 6.2.0's `arq` command on small graphs;
   - SPARQL 1.1 and 1.2 Query and the SPARQL 1.2 community proposal SEP-0006.
 - **Implementation** (2026-10-02): from the spec and the Sparkles code. The `LATERAL`
@@ -1449,7 +1449,7 @@ implementation landed.
   - the module's tests `TestServiceEnhancerMisc`,
     `AbstractTestServiceEnhancerResultSetLimits` and
     `TestServiceEnhancerBatchQueryRewriter`, whose data and cases are ported with
-    citations to `crates/sparkles/tests/service_enhancer.rs`;
+    citations to `crates/sparkles-core/tests/service_enhancer.rs`;
   - the module's documentation page in `jena-site`
     (`source/documentation/query/service_enhancer.md`);
   - SPARQL 1.1 Query and SPARQL 1.1 Federated Query.

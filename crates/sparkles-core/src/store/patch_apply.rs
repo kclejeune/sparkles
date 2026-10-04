@@ -454,7 +454,7 @@ impl Store {
                                 self.opts.max_prefixes
                             )));
                         }
-                        tracing::warn!("the patch's prefix {p:?} was not added: no room left");
+                        tracing::warn!(target: "sparkles::store::patch_apply", "the patch's prefix {p:?} was not added: no room left");
                         continue;
                     }
                     next.insert(p.clone(), iri.clone());

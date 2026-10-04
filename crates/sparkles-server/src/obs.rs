@@ -21,6 +21,7 @@ use parking_lot::RwLock;
 use serde_json::{Value as J, json};
 use sparkles::BudgetKind;
 use sparkles::sparql::Timing;
+use sparkles::store::{REBUILD_BUCKETS, RebuildHistogram, RebuildReason};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -202,6 +203,8 @@ pub struct RequestReport {
     /// uncompressed body size
     pub response_bytes: Option<u64>,
     pub mem_peak_bytes: Option<u64>,
+    /// queries and updates: the rows every operator produced (the `rows-produced` work)
+    pub rows_produced: Option<u64>,
     /// the limit class that refused the request (outcome `rate_limited`)
     pub limit_class: Option<crate::ratelimit::Class>,
     /// write-time validation status and time (from the `Sparkles-Validation` header)
@@ -535,6 +538,7 @@ fn access_event(
                 total_ms = ms(elapsed.as_secs_f64() * 1000.0),
                 response_bytes = r.response_bytes,
                 mem_peak_bytes = r.mem_peak_bytes,
+                rows_produced = r.rows_produced,
                 validation = r.validation,
                 validation_ms = r.validation_ms,
                 graphql_operation = r.graphql.as_ref().and_then(|g| g.operation.as_deref()),
@@ -630,7 +634,25 @@ pub struct DsMetrics {
     /// engine executions per GraphQL request, by [`GROUP_BUCKETS`]
     graphql_groups: [AtomicU64; GROUP_BUCKETS.len() + 1],
     graphql_groups_sum: AtomicU64,
+    /// rows produced by the operators of queries and updates
+    rows_produced: AtomicU64,
+    /// queries by their estimated memory peak, by [`MEMORY_BUCKETS`], not cumulative
+    mem_peak: [AtomicU64; MEMORY_BUCKETS.len() + 1],
+    mem_peak_sum: AtomicU64,
 }
+
+/// Upper bounds in bytes of the `sparkles_query_memory_peak_bytes` histogram, without
+/// `+Inf`: 1 MiB to 16 GiB in steps of ×4.
+const MEMORY_BUCKETS: [u64; 8] = [
+    1 << 20,
+    1 << 22,
+    1 << 24,
+    1 << 26,
+    1 << 28,
+    1 << 30,
+    1 << 32,
+    1 << 34,
+];
 
 /// Upper bounds of the `sparkles_graphql_groups` histogram, without `+Inf`.
 const GROUP_BUCKETS: [u64; 7] = [1, 2, 4, 8, 16, 32, 64];
@@ -712,6 +734,19 @@ impl Metrics {
             && let Some(n) = r.rows
         {
             ds.result_rows.fetch_add(n, Ordering::Relaxed);
+        }
+        if let Some(n) = r.rows_produced {
+            ds.rows_produced.fetch_add(n, Ordering::Relaxed);
+        }
+        if op == Op::Query
+            && let Some(b) = r.mem_peak_bytes
+        {
+            let i = MEMORY_BUCKETS
+                .iter()
+                .position(|m| b <= *m)
+                .unwrap_or(MEMORY_BUCKETS.len());
+            ds.mem_peak[i].fetch_add(1, Ordering::Relaxed);
+            ds.mem_peak_sum.fetch_add(b, Ordering::Relaxed);
         }
         if let Some(g) = r.geo_work {
             for (c, n) in ds.geo_work.iter().zip(g) {
@@ -825,7 +860,14 @@ struct LanguageCounters {
     results: [AtomicU64; 3],
     /// validations that fell back to full validation, by reason
     fallbacks: [AtomicU64; 7],
+    /// validations by the focus nodes they validated, per strategy, by [`FOCUS_BUCKETS`]
+    /// (not cumulative), and the sum of the focus nodes
+    focus: [[AtomicU64; FOCUS_BUCKETS.len() + 1]; 2],
+    focus_sum: [AtomicU64; 2],
 }
+
+/// Upper bounds of the `sparkles_validation_focus_nodes` histogram, without `+Inf`.
+const FOCUS_BUCKETS: [u64; 7] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000];
 
 impl ValidationMetrics {
     pub fn new(dataset: &str) -> ValidationMetrics {
@@ -882,6 +924,14 @@ impl sparkles::guard::GuardObserver for ValidationMetrics {
             Strategy::None => return,
         };
         m.duration[strategy].observe(elapsed);
+        if let Some(n) = s.focus_nodes {
+            let i = FOCUS_BUCKETS
+                .iter()
+                .position(|b| n <= *b)
+                .unwrap_or(FOCUS_BUCKETS.len());
+            m.focus[strategy][i].fetch_add(1, Ordering::Relaxed);
+            m.focus_sum[strategy].fetch_add(n, Ordering::Relaxed);
+        }
         if let Some(i) = s
             .fallback
             .as_deref()
@@ -942,6 +992,8 @@ struct ValidationTotals {
     duration: [([u64; 17], u64); 2],
     results: [u64; 3],
     fallbacks: [u64; 7],
+    /// bucket counts (not cumulative) and the sum of focus nodes, per strategy
+    focus: [([u64; FOCUS_BUCKETS.len() + 1], u64); 2],
 }
 
 /// Validation counters by dataset label and language, for the language of a dataset's
@@ -984,6 +1036,12 @@ fn add_totals(t: &mut ValidationTotals, m: &LanguageCounters) {
     for (a, c) in t.fallbacks.iter_mut().zip(&m.fallbacks) {
         *a += c.load(Ordering::Relaxed);
     }
+    for (((buckets, sum), h), s) in t.focus.iter_mut().zip(&m.focus).zip(&m.focus_sum) {
+        for (a, c) in buckets.iter_mut().zip(h) {
+            *a += c.load(Ordering::Relaxed);
+        }
+        *sum += s.load(Ordering::Relaxed);
+    }
 }
 
 /// Scrape-time state of one dataset label (summed over datasets sharing `$other`).
@@ -1007,6 +1065,8 @@ struct DsGauges {
     rcache_entries: u64,
     rcache_hits: u64,
     rcache_misses: u64,
+    /// published rebuilds per [`RebuildReason::ALL`]
+    rebuilds: [RebuildHistogram; 2],
 }
 
 fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
@@ -1045,6 +1105,13 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         g.rcache_entries += r.entries() as u64;
         g.rcache_hits += r.hits();
         g.rcache_misses += r.misses();
+        for (h, reason) in g.rebuilds.iter_mut().zip(RebuildReason::ALL) {
+            let d = d.store.rebuilds(reason);
+            for (a, b) in h.buckets.iter_mut().zip(d.buckets) {
+                *a += b;
+            }
+            h.sum_seconds += d.sum_seconds;
+        }
     }
     out
 }
@@ -1245,6 +1312,53 @@ pub fn render_prometheus(st: &AppState) -> String {
     }
     family(
         &mut o,
+        "sparkles_rows_produced_total",
+        "counter",
+        "Rows produced by all operators of queries and updates (the rows-produced work).",
+    );
+    for (ds, m) in &series {
+        let _ = writeln!(
+            o,
+            "sparkles_rows_produced_total{{dataset=\"{}\"}} {}",
+            escape_label(ds),
+            m.rows_produced.load(Ordering::Relaxed)
+        );
+    }
+    family(
+        &mut o,
+        "sparkles_query_memory_peak_bytes",
+        "histogram",
+        "Estimated peak memory of queries in bytes.",
+    );
+    for (ds, m) in &series {
+        let total: u64 = m.mem_peak.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        if total == 0 {
+            continue;
+        }
+        let ds = escape_label(ds);
+        let mut acc = 0;
+        for (i, c) in m.mem_peak.iter().enumerate() {
+            acc += c.load(Ordering::Relaxed);
+            let le = MEMORY_BUCKETS
+                .get(i)
+                .map_or("+Inf".to_string(), |b| b.to_string());
+            let _ = writeln!(
+                o,
+                "sparkles_query_memory_peak_bytes_bucket{{dataset=\"{ds}\",le=\"{le}\"}} {acc}"
+            );
+        }
+        let _ = writeln!(
+            o,
+            "sparkles_query_memory_peak_bytes_sum{{dataset=\"{ds}\"}} {}",
+            m.mem_peak_sum.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            o,
+            "sparkles_query_memory_peak_bytes_count{{dataset=\"{ds}\"}} {total}"
+        );
+    }
+    family(
+        &mut o,
         "sparkles_budget_exceeded_total",
         "counter",
         "Requests that exceeded a budget (rows, memory, result-bytes, decompressed-bytes, outbound-bytes, validation-work).",
@@ -1346,6 +1460,38 @@ pub fn render_prometheus(st: &AppState) -> String {
             let _ = writeln!(
                 o,
                 "sparkles_validation_results_total{{dataset=\"{ds}\",language=\"{lang}\",severity=\"{severity}\"}} {n}"
+            );
+        }
+    }
+    family(
+        &mut o,
+        "sparkles_validation_focus_nodes",
+        "histogram",
+        "Focus nodes that each write-time validation validated, by strategy.",
+    );
+    for ((ds, lang), t) in &validation {
+        let ds = escape_label(ds);
+        for (strategy, (buckets, sum)) in STRATEGIES.iter().zip(&t.focus) {
+            let total: u64 = buckets.iter().sum();
+            if total == 0 {
+                continue;
+            }
+            let labels = format!("dataset=\"{ds}\",language=\"{lang}\",strategy=\"{strategy}\"");
+            let mut acc = 0;
+            for (i, n) in buckets.iter().enumerate() {
+                acc += n;
+                let le = FOCUS_BUCKETS
+                    .get(i)
+                    .map_or("+Inf".to_string(), |b| b.to_string());
+                let _ = writeln!(
+                    o,
+                    "sparkles_validation_focus_nodes_bucket{{{labels},le=\"{le}\"}} {acc}"
+                );
+            }
+            let _ = writeln!(o, "sparkles_validation_focus_nodes_sum{{{labels}}} {sum}");
+            let _ = writeln!(
+                o,
+                "sparkles_validation_focus_nodes_count{{{labels}}} {total}"
             );
         }
     }
@@ -1465,6 +1611,58 @@ pub fn render_prometheus(st: &AppState) -> String {
                     g.delta_deletes
                 );
             }
+        }
+    }
+    family(
+        &mut o,
+        "sparkles_rebuilds_total",
+        "counter",
+        "New generations published since the dataset was opened, by reason: compact or bulk (a bulk commit).",
+    );
+    for (ds, g) in &gauges {
+        let ds = escape_label(ds);
+        for (h, reason) in g.rebuilds.iter().zip(RebuildReason::ALL) {
+            let _ = writeln!(
+                o,
+                "sparkles_rebuilds_total{{dataset=\"{ds}\",reason=\"{}\"}} {}",
+                reason.as_str(),
+                h.count()
+            );
+        }
+    }
+    family(
+        &mut o,
+        "sparkles_rebuild_duration_seconds",
+        "histogram",
+        "Duration of the rebuilds that published a new generation, in seconds.",
+    );
+    for (ds, g) in &gauges {
+        let ds = escape_label(ds);
+        for (h, reason) in g.rebuilds.iter().zip(RebuildReason::ALL) {
+            if h.count() == 0 {
+                continue;
+            }
+            let labels = format!("dataset=\"{ds}\",reason=\"{}\"", reason.as_str());
+            let mut acc = 0;
+            for (i, n) in h.buckets.iter().enumerate() {
+                acc += n;
+                let le = REBUILD_BUCKETS
+                    .get(i)
+                    .map_or("+Inf".to_string(), |b| b.to_string());
+                let _ = writeln!(
+                    o,
+                    "sparkles_rebuild_duration_seconds_bucket{{{labels},le=\"{le}\"}} {acc}"
+                );
+            }
+            let _ = writeln!(
+                o,
+                "sparkles_rebuild_duration_seconds_sum{{{labels}}} {}",
+                h.sum_seconds
+            );
+            let _ = writeln!(
+                o,
+                "sparkles_rebuild_duration_seconds_count{{{labels}}} {acc}"
+            );
         }
     }
     family(

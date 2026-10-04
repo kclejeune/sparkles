@@ -255,7 +255,7 @@ impl Builder {
         if let Some(p) = &self.progress {
             p(msg);
         }
-        tracing::info!("{msg}");
+        tracing::info!(target: "sparkles::builder", "{msg}");
     }
 
     pub fn add_prefixes(&self, p: BTreeMap<String, String>) {

@@ -456,13 +456,13 @@ impl Store {
             {
                 Ok(f) => f,
                 Err(e) => {
-                    tracing::error!("vector indexes of {}: {e}", root.display());
+                    tracing::error!(target: "sparkles::store::vector", "vector indexes of {}: {e}", root.display());
                     return;
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
-                tracing::error!("vector indexes of {}: {e}", root.display());
+                tracing::error!(target: "sparkles::store::vector", "vector indexes of {}: {e}", root.display());
                 return;
             }
         };
@@ -596,6 +596,7 @@ impl Store {
                         let rows = b.segment.rows() as u64;
                         install(b);
                         tracing::info!(
+                            target: "sparkles::store::vector",
                             "vector index {}: {rows} rows ready in {:?}",
                             entry.name,
                             t0.elapsed()
@@ -612,7 +613,7 @@ impl Store {
                         );
                     }
                     Ok(Ok(Outcome::OverBudget(m))) => {
-                        tracing::warn!("vector index {}: {m}", entry.name);
+                        tracing::warn!(target: "sparkles::store::vector", "vector index {}: {m}", entry.name);
                         // searches scan exactly, as without a configuration
                         let _i = entry.info.lock();
                         if !superseded() {
@@ -625,7 +626,7 @@ impl Store {
                         entry.done.notify_all();
                     }
                     Ok(Err(e)) => {
-                        tracing::error!("vector index {} build failed: {e}", entry.name);
+                        tracing::error!(target: "sparkles::store::vector", "vector index {} build failed: {e}", entry.name);
                         entry.finish(epoch, "failed", Some(format!("build failed: {e}")), None);
                     }
                     Err(p) => {
@@ -634,13 +635,13 @@ impl Store {
                             .map(|s| s.to_string())
                             .or_else(|| p.downcast_ref::<String>().cloned())
                             .unwrap_or_else(|| "panic".into());
-                        tracing::error!("vector index {} build failed: {m}", entry.name);
+                        tracing::error!(target: "sparkles::store::vector", "vector index {} build failed: {m}", entry.name);
                         entry.finish(epoch, "failed", Some(format!("build failed: {m}")), None);
                     }
                 }
             });
         if let Err(e) = spawned {
-            tracing::error!("cannot start the vector index build: {e}");
+            tracing::error!(target: "sparkles::store::vector", "cannot start the vector index build: {e}");
             failed.finish(epoch, "failed", Some(format!("build failed: {e}")), None);
         }
     }

@@ -1314,14 +1314,14 @@ less time on the replica than making them took on the primary. The numbers go to
 ## 12. Sources
 
 * **Sparkles repository, read for this spec:**
-  * `crates/sparkles/src/patch.rs`, the RDF Patch writer and its Thrift encoding;
-  * `crates/sparkles/src/store.rs`, the `WriteTxn` commit path (`commit_inner`,
+  * `crates/sparkles-core/src/patch.rs`, the RDF Patch writer and its Thrift encoding;
+  * `crates/sparkles-core/src/store.rs`, the `WriteTxn` commit path (`commit_inner`,
     `publish_log`, the WAL record, `sync_commit`, the compaction tap), blank-node labels
     (`bnode_for`, `parse_bnode_label`), `StoreOptions::bulk_threshold`,
     `index_config_files`;
-  * `crates/sparkles/src/store/wal.rs`, `store/changes.rs`, `store/backup.rs` by name;
-  * `crates/sparkles/src/guard.rs`, `WriteOptions`;
-  * `crates/sparkles/src/commit.rs`, the commit kinds, `reidentify`, `ForkedFrom`, the
+  * `crates/sparkles-core/src/store/wal.rs`, `store/changes.rs`, `store/backup.rs` by name;
+  * `crates/sparkles-core/src/guard.rs`, `WriteOptions`;
+  * `crates/sparkles-core/src/commit.rs`, the commit kinds, `reidentify`, `ForkedFrom`, the
     WAL flags;
   * `crates/sparkles-server/src/http/changes.rs`, the change feed;
   * `docs/API.md`, the change feed, blank nodes, permissions, graph-level access control,

@@ -383,7 +383,7 @@ pass, `appliedSeq` stays below the commit that started it.
 
 ## 5. Design sketch
 
-- `crates/sparkles/src/vector/embed/` holds the configuration and its validation
+- `crates/sparkles-core/src/vector/embed/` holds the configuration and its validation
   (`config.rs`), the OpenAI-compatible client (`client.rs`), the per-store worker state
   with its queue, record and status (`worker.rs`), and the process-wide environment: the
   outbound policy, the named secrets and the on-off switch.
@@ -501,8 +501,8 @@ text's bytes, with an index `docs` on `ex:emb`, dimension 8, embedding `rdfs:lab
   fields of §2.1, validated with the index and stored in `vector.json`. The index's
   predicate cannot be a source, a query source cannot also set `classes` or `languages`,
   and changing the object keeps the index's build. The engine code is in
-  `crates/sparkles/src/vector/embed/` (configuration, client, worker state and a mock
-  endpoint) and `crates/sparkles/src/store/embed.rs` (scheduling, passes, the prepare and
+  `crates/sparkles-core/src/vector/embed/` (configuration, client, worker state and a mock
+  endpoint) and `crates/sparkles-core/src/store/embed.rs` (scheduling, passes, the prepare and
   apply steps, status and text queries).
 * **Scheduling.** `publish_log` calls a hook after it publishes a commit. The hook
   matches the commit's log against the source predicates and `rdf:type` with a listed
@@ -563,7 +563,7 @@ Embedding commits make materialized inferences stale like any commit to a watche
 Query texts have no quota of their own beyond the rate limits.
 
 **Tests at landing.**
-* `crates/sparkles/tests/embeddings.rs`: inserts, changes and deletions, languages,
+* `crates/sparkles-core/tests/embeddings.rs`: inserts, changes and deletions, languages,
   classes, graphs and combined inputs, query sources, outages and backoff, rejected
   inputs, restarts with the record, `reembed` and a new model, bulk loads, text
   searches, secrets, the outbound policy, `--no-embedding`, configuration errors, and

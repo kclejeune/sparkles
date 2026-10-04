@@ -930,11 +930,26 @@
         "type": "object"
       },
       "AutoReasonRequest": {
-        "additionalProperties": true,
-        "description": "`{enabled, debounceSeconds?, maxDelaySeconds?}`",
+        "description": "The dataset's own setting for automatic re-runs.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reasoning-status-and-diagnostics"
         },
+        "properties": {
+          "debounceSeconds": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "maxDelaySeconds": {
+            "minimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
         "type": "object"
       },
       "Backup": {
@@ -1210,11 +1225,21 @@
         "type": "object"
       },
       "BackupFiles": {
-        "additionalProperties": true,
-        "description": "Fuseki's list of N-Quads backup files, `{backups: string[]}`.",
+        "description": "Fuseki's list of N-Quads backup files in `<data>/backups`, sorted.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#datasets-admin"
         },
+        "properties": {
+          "backups": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "backups"
+        ],
         "type": "object"
       },
       "BackupList": {
@@ -1268,11 +1293,25 @@
         }
       },
       "BackupRequest": {
-        "additionalProperties": true,
-        "description": "`{repository, name?, note?}`",
+        "description": "A backup to make now.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-routes"
         },
+        "properties": {
+          "name": {
+            "description": "The backup's name; generated when left out.",
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository"
+        ],
         "type": "object"
       },
       "BackupSummary": {
@@ -1482,11 +1521,110 @@
         "type": "object"
       },
       "ChangeFeed": {
-        "additionalProperties": true,
         "description": "The commits after `after`, oldest first, with their changes, and `next`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#change-feed"
         },
+        "properties": {
+          "after": {
+            "description": "The commit the page starts after.",
+            "type": "integer"
+          },
+          "commits": {
+            "items": {
+              "properties": {
+                "added": {
+                  "description": "Left out of an incomplete commit for a caller limited to some graphs.",
+                  "type": "integer"
+                },
+                "changes": {
+                  "items": {
+                    "$ref": "#/components/schemas/ChangedQuad"
+                  },
+                  "type": "array"
+                },
+                "commit": {
+                  "$ref": "#/components/schemas/Commit"
+                },
+                "complete": {
+                  "description": "False for a commit whose changes are not listed: over the rows budget, or a bulk commit the change log holds only the counts of.",
+                  "type": "boolean"
+                },
+                "removed": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "commit",
+                "complete"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "head": {
+            "$ref": "#/components/schemas/Commit"
+          },
+          "next": {
+            "description": "The commit to ask after next.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "dataset",
+          "datasetId",
+          "after",
+          "next",
+          "head",
+          "commits"
+        ],
+        "type": "object"
+      },
+      "ChangedQuad": {
+        "description": "A quad added or removed.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#diffs-between-commits"
+        },
+        "properties": {
+          "graph": {
+            "description": "`null` for the default graph.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "object": {
+            "type": "string"
+          },
+          "op": {
+            "description": "`+` added, `-` removed.",
+            "enum": [
+              "+",
+              "-"
+            ],
+            "type": "string"
+          },
+          "predicate": {
+            "type": "string"
+          },
+          "subject": {
+            "description": "In N-Triples syntax, as are the other terms.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "subject",
+          "predicate",
+          "object",
+          "graph"
+        ],
         "type": "object"
       },
       "ClassEntry": {
@@ -1650,6 +1788,10 @@
           "quads": {
             "type": "integer"
           },
+          "reconstructed": {
+            "const": true,
+            "description": "Read back from the change log."
+          },
           "ref": {
             "examples": [
               "commit:42"
@@ -1750,27 +1892,538 @@
         "type": "object"
       },
       "CompactionPolicy": {
-        "additionalProperties": true,
-        "description": "Compaction settings: `minDeltaQuads`, `deltaRatio`, `maxDeltaQuads`, `maxDeltaMb`, `maxWalMb`, `idleSeconds`, `maxAgeSeconds`, `minIntervalSeconds`, `enabled` and `partial` (`auto`, `off` or `always`).",
+        "additionalProperties": false,
+        "description": "The settings a dataset overrides. `0` turns off the size, idle and age triggers it is the limit of. An unknown setting is a `400`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#automatic-compaction"
+        },
+        "properties": {
+          "deltaRatio": {
+            "type": "number"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "format": {
+            "description": "Ignored. Stored settings carry it.",
+            "type": "integer"
+          },
+          "idleSeconds": {
+            "type": "integer"
+          },
+          "maxAgeSeconds": {
+            "type": "integer"
+          },
+          "maxDeltaMb": {
+            "type": "integer"
+          },
+          "maxDeltaQuads": {
+            "type": "integer"
+          },
+          "maxWalMb": {
+            "type": "integer"
+          },
+          "minDeltaQuads": {
+            "type": "integer"
+          },
+          "minIntervalSeconds": {
+            "type": "integer"
+          },
+          "partial": {
+            "enum": [
+              "auto",
+              "off",
+              "always"
+            ],
+            "type": "string"
+          }
         },
         "type": "object"
       },
       "CompactionStatus": {
-        "additionalProperties": true,
         "description": "The dataset's automatic compaction: its settings, state, measures and last run.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#automatic-compaction"
         },
+        "properties": {
+          "automaticRuns": {
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "deferred": {
+            "enum": [
+              "min-interval",
+              "backoff",
+              "bulk-load",
+              "reasoning",
+              "clone",
+              "backup",
+              "restore",
+              "history",
+              "disk",
+              "running-limit",
+              "slots"
+            ],
+            "type": "string"
+          },
+          "deferredDetail": {
+            "type": "string"
+          },
+          "enabled": {
+            "description": "The server's switch, the dataset's own and a writable server.",
+            "type": "boolean"
+          },
+          "failures": {
+            "description": "Consecutive failed automatic compactions.",
+            "type": "integer"
+          },
+          "last": {
+            "properties": {
+              "automatic": {
+                "type": "boolean"
+              },
+              "blocksCopied": {
+                "type": "integer"
+              },
+              "blocksRewritten": {
+                "type": "integer"
+              },
+              "buildMs": {
+                "type": "number"
+              },
+              "caughtUpCommits": {
+                "type": "integer"
+              },
+              "error": {
+                "type": "string"
+              },
+              "finishedAt": {
+                "type": "string"
+              },
+              "fullReason": {
+                "type": "string"
+              },
+              "generation": {
+                "type": "string"
+              },
+              "lockMs": {
+                "type": "number"
+              },
+              "mode": {
+                "enum": [
+                  "full",
+                  "partial"
+                ],
+                "type": "string"
+              },
+              "outcome": {
+                "enum": [
+                  "done",
+                  "abandoned",
+                  "cancelled",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              "seconds": {
+                "type": "number"
+              },
+              "startedAt": {
+                "type": "string"
+              },
+              "trigger": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "automatic",
+              "startedAt",
+              "finishedAt",
+              "seconds",
+              "outcome"
+            ],
+            "type": "object"
+          },
+          "measures": {
+            "properties": {
+              "baseQuads": {
+                "type": "integer"
+              },
+              "deltaBytes": {
+                "type": "integer"
+              },
+              "deltaQuads": {
+                "type": "integer"
+              },
+              "generation": {
+                "type": "string"
+              },
+              "idleSeconds": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "oldestChangeSeconds": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "threshold": {
+                "description": "The delta size of the `deltaRatio` trigger.",
+                "type": "integer"
+              },
+              "walBytes": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "generation",
+              "baseQuads",
+              "deltaQuads",
+              "deltaBytes",
+              "walBytes",
+              "idleSeconds",
+              "oldestChangeSeconds",
+              "threshold"
+            ],
+            "type": "object"
+          },
+          "own": {
+            "additionalProperties": false,
+            "description": "The settings the dataset overrides.",
+            "properties": {
+              "deltaRatio": {
+                "type": "number"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "idleSeconds": {
+                "type": "integer"
+              },
+              "maxAgeSeconds": {
+                "type": "integer"
+              },
+              "maxDeltaMb": {
+                "type": "integer"
+              },
+              "maxDeltaQuads": {
+                "type": "integer"
+              },
+              "maxWalMb": {
+                "type": "integer"
+              },
+              "minDeltaQuads": {
+                "type": "integer"
+              },
+              "minIntervalSeconds": {
+                "type": "integer"
+              },
+              "partial": {
+                "enum": [
+                  "auto",
+                  "off",
+                  "always"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "policy": {
+            "description": "The settings in effect.",
+            "properties": {
+              "deltaRatio": {
+                "type": "number"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "idleSeconds": {
+                "type": "integer"
+              },
+              "maxAgeSeconds": {
+                "type": "integer"
+              },
+              "maxDeltaMb": {
+                "type": "integer"
+              },
+              "maxDeltaQuads": {
+                "type": "integer"
+              },
+              "maxWalMb": {
+                "type": "integer"
+              },
+              "minDeltaQuads": {
+                "type": "integer"
+              },
+              "minIntervalSeconds": {
+                "type": "integer"
+              },
+              "partial": {
+                "enum": [
+                  "auto",
+                  "off",
+                  "always"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "deltaRatio",
+              "enabled",
+              "idleSeconds",
+              "maxAgeSeconds",
+              "maxDeltaMb",
+              "maxDeltaQuads",
+              "maxWalMb",
+              "minDeltaQuads",
+              "minIntervalSeconds",
+              "partial"
+            ],
+            "type": "object"
+          },
+          "serverEnabled": {
+            "description": "False under `--no-auto-compact`.",
+            "type": "boolean"
+          },
+          "state": {
+            "enum": [
+              "off",
+              "idle",
+              "due",
+              "deferred",
+              "running"
+            ],
+            "type": "string"
+          },
+          "task": {
+            "description": "The running compaction task.",
+            "type": "string"
+          },
+          "trigger": {
+            "type": "string"
+          },
+          "triggerKind": {
+            "enum": [
+              "max-delta",
+              "ratio",
+              "delta-bytes",
+              "wal-bytes",
+              "idle",
+              "age"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset",
+          "enabled",
+          "serverEnabled",
+          "policy",
+          "own",
+          "state",
+          "measures",
+          "automaticRuns",
+          "failures"
+        ],
         "type": "object"
       },
       "ConstraintsLayer": {
-        "additionalProperties": true,
         "description": "The SHACL constraints layer of a schema report.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#constraints-layer"
         },
+        "properties": {
+          "sources": {
+            "items": {
+              "properties": {
+                "classes": {
+                  "items": {
+                    "properties": {
+                      "class": {
+                        "type": "string"
+                      },
+                      "closed": {
+                        "type": "boolean"
+                      },
+                      "otherPaths": {
+                        "description": "Property shapes whose path is not a single predicate.",
+                        "type": "integer"
+                      },
+                      "properties": {
+                        "items": {
+                          "properties": {
+                            "class": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "datatype": {
+                              "type": "string"
+                            },
+                            "enforcement": {
+                              "enum": [
+                                "reject-on-write",
+                                "warn-on-write",
+                                "validated-on-request"
+                              ],
+                              "type": "string"
+                            },
+                            "maxCount": {
+                              "type": "integer"
+                            },
+                            "minCount": {
+                              "type": "integer"
+                            },
+                            "nodeKind": {
+                              "type": "string"
+                            },
+                            "other": {
+                              "description": "The components of the other constraints, such as `sh:PatternConstraintComponent`.",
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "path": {
+                              "type": "string"
+                            },
+                            "severity": {
+                              "description": "An IRI, `sh:Violation` unless the shape says otherwise.",
+                              "type": "string"
+                            },
+                            "shape": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "path",
+                            "severity",
+                            "enforcement"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "shapes": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "class",
+                      "shapes",
+                      "closed",
+                      "properties",
+                      "otherPaths"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "file": {
+                  "const": true,
+                  "description": "The guard also has shapes from a file or given inline."
+                },
+                "graphs": {
+                  "description": "The shapes graphs read, `default` for the default graph.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "kind": {
+                  "enum": [
+                    "guard",
+                    "graphs"
+                  ],
+                  "type": "string"
+                },
+                "mode": {
+                  "enum": [
+                    "reject",
+                    "warn"
+                  ],
+                  "type": "string"
+                },
+                "otherTargets": {
+                  "description": "Active shapes whose targets are not classes.",
+                  "type": "integer"
+                },
+                "shapes": {
+                  "type": "integer"
+                },
+                "threshold": {
+                  "enum": [
+                    "violation",
+                    "warning",
+                    "info"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "graphs",
+                "shapes",
+                "otherTargets",
+                "classes"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sources"
+        ],
+        "type": "object"
+      },
+      "ConstraintsReport": {
+        "description": "The constraints layer alone, without counting anything.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#constraints-layer"
+        },
+        "properties": {
+          "constraints": {
+            "$ref": "#/components/schemas/ConstraintsLayer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "schemaFormat": {
+            "const": 1
+          },
+          "snapshot": {
+            "properties": {
+              "generation": {
+                "type": "string"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "version",
+              "generation"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "schemaFormat",
+          "dataset",
+          "snapshot",
+          "constraints"
+        ],
         "type": "object"
       },
       "CreateDataset": {
@@ -2264,27 +2917,474 @@
         "type": "object"
       },
       "DiagnosticsReport": {
-        "additionalProperties": true,
-        "description": "OWL 2 RL inconsistency checks.",
+        "description": "OWL 2 RL inconsistency checks and their findings.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reasoning-status-and-diagnostics"
         },
+        "properties": {
+          "checks": {
+            "items": {
+              "properties": {
+                "error": {
+                  "type": "string"
+                },
+                "findings": {
+                  "type": "integer"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "millis": {
+                  "type": "integer"
+                },
+                "rules": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "severity": {
+                  "enum": [
+                    "inconsistency",
+                    "warning"
+                  ],
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "violations",
+                    "none",
+                    "truncated",
+                    "timeout",
+                    "error"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "rules",
+                "severity",
+                "status",
+                "findings",
+                "millis"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "commit": {
+            "description": "The commit checked.",
+            "type": "integer"
+          },
+          "computedAt": {
+            "type": "string"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "diagnosticsFormat": {
+            "const": 1
+          },
+          "findings": {
+            "items": {
+              "properties": {
+                "basis": {
+                  "enum": [
+                    "asserted",
+                    "uses-inferences"
+                  ],
+                  "type": "string"
+                },
+                "check": {
+                  "type": "string"
+                },
+                "evidence": {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/RdfTerm"
+                      },
+                      {
+                        "items": {
+                          "$ref": "#/components/schemas/RdfTerm"
+                        },
+                        "type": "array"
+                      }
+                    ]
+                  },
+                  "type": "object"
+                },
+                "focus": {
+                  "$ref": "#/components/schemas/RdfTerm"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "rule": {
+                  "type": "string"
+                },
+                "severity": {
+                  "enum": [
+                    "inconsistency",
+                    "warning"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "check",
+                "rule",
+                "severity",
+                "focus",
+                "evidence",
+                "basis",
+                "message"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "note": {
+            "description": "The report never claims consistency.",
+            "type": "string"
+          },
+          "scope": {
+            "properties": {
+              "closure": {
+                "enum": [
+                  "subclass",
+                  "none"
+                ],
+                "type": "string"
+              },
+              "graph": {
+                "enum": [
+                  "default",
+                  "graphs"
+                ],
+                "type": "string"
+              },
+              "graphs": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "inferences": {
+                "properties": {
+                  "commitsSince": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "included": {
+                    "type": "boolean"
+                  },
+                  "profile": {
+                    "type": "string"
+                  },
+                  "stale": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "included"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "graph",
+              "inferences",
+              "closure"
+            ],
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "violations-found",
+              "none-found",
+              "incomplete"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "diagnosticsFormat",
+          "dataset",
+          "commit",
+          "computedAt",
+          "scope",
+          "status",
+          "note",
+          "checks",
+          "findings"
+        ],
         "type": "object"
       },
       "Diff": {
-        "additionalProperties": true,
         "description": "The net change between two states: counts, and the quads with `quads=true`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#diffs-between-commits"
         },
+        "properties": {
+          "added": {
+            "type": "integer"
+          },
+          "compared": {
+            "description": "Quads compared state against state. Left out for a caller limited to some graphs.",
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "from": {
+            "properties": {
+              "commit": {
+                "$ref": "#/components/schemas/Commit"
+              },
+              "selector": {
+                "description": "The state as asked for, such as `commit:4` or `head`.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "selector",
+              "commit"
+            ],
+            "type": "object"
+          },
+          "logChanges": {
+            "description": "Changes read from the write-ahead logs. Left out for a caller limited to some graphs.",
+            "type": "integer"
+          },
+          "method": {
+            "enum": [
+              "same",
+              "log",
+              "compare"
+            ],
+            "type": "string"
+          },
+          "quads": {
+            "description": "With `quads=true`: removals first, then additions, up to `limit`.",
+            "items": {
+              "$ref": "#/components/schemas/ChangedQuad"
+            },
+            "type": "array"
+          },
+          "removed": {
+            "type": "integer"
+          },
+          "to": {
+            "properties": {
+              "commit": {
+                "$ref": "#/components/schemas/Commit"
+              },
+              "selector": {
+                "description": "The state as asked for, such as `commit:4` or `head`.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "selector",
+              "commit"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dataset",
+          "datasetId",
+          "from",
+          "to",
+          "added",
+          "removed",
+          "method"
+        ],
         "type": "object"
       },
       "DryRunReport": {
-        "additionalProperties": true,
         "description": "The preview of a write run with `dryRun=true`: the commit it would make, its changes, validation, preconditions and storage.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#write-previews"
         },
+        "properties": {
+          "budget": {
+            "type": "string"
+          },
+          "changes": {
+            "properties": {
+              "limit": {
+                "type": "integer"
+              },
+              "quads": {
+                "items": {
+                  "$ref": "#/components/schemas/ChangedQuad"
+                },
+                "type": "array"
+              },
+              "total": {
+                "type": "integer"
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "total",
+              "limit",
+              "truncated",
+              "quads"
+            ],
+            "type": "object"
+          },
+          "code": {
+            "type": "string"
+          },
+          "commit": {
+            "$ref": "#/components/schemas/Commit",
+            "description": "The commit the write would create, without `timestamp` and `digest`, or the head when it would create none."
+          },
+          "committed": {
+            "const": false
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "dryRun": {
+            "const": true
+          },
+          "error": {
+            "description": "The error the write would get.",
+            "type": "string"
+          },
+          "graphs": {
+            "items": {
+              "properties": {
+                "deleted": {
+                  "type": "integer"
+                },
+                "graph": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "inserted": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "graph",
+                "inserted",
+                "deleted"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "head": {
+            "description": "The commit the write ran against.",
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "outcome": {
+            "enum": [
+              "commit",
+              "no-change",
+              "precondition-failed",
+              "rejected",
+              "storage-refused"
+            ],
+            "type": "string"
+          },
+          "precondition": {
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "passed",
+                  "failed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          "requested": {
+            "type": "integer"
+          },
+          "storage": {
+            "properties": {
+              "budget": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string"
+              },
+              "error": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "integer"
+              },
+              "projected": {
+                "type": "integer"
+              },
+              "status": {
+                "enum": [
+                  "fits",
+                  "refused"
+                ],
+                "type": "string"
+              },
+              "used": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          "validation": {
+            "$ref": "#/components/schemas/ValidationSummary"
+          },
+          "wouldCommit": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dryRun",
+          "dataset",
+          "datasetId",
+          "committed",
+          "wouldCommit",
+          "outcome",
+          "head",
+          "commit",
+          "graphs",
+          "storage"
+        ],
         "type": "object"
       },
       "Error": {
@@ -2501,18 +3601,87 @@
         "type": "object"
       },
       "FusekiStats": {
-        "additionalProperties": true,
-        "description": "Fuseki's request counters, `{datasets: {\"/ds\": FusekiCounters}}`.",
+        "description": "Fuseki's request counters.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#datasets-admin"
         },
+        "properties": {
+          "datasets": {
+            "additionalProperties": {
+              "properties": {
+                "Requests": {
+                  "type": "integer"
+                },
+                "RequestsBad": {
+                  "type": "integer"
+                },
+                "RequestsGood": {
+                  "type": "integer"
+                },
+                "endpoints": {
+                  "additionalProperties": {
+                    "properties": {
+                      "Requests": {
+                        "type": "integer"
+                      },
+                      "RequestsBad": {
+                        "type": "integer"
+                      },
+                      "RequestsGood": {
+                        "type": "integer"
+                      },
+                      "description": {
+                        "type": "string"
+                      },
+                      "operation": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "Requests",
+                      "RequestsGood",
+                      "RequestsBad",
+                      "operation",
+                      "description"
+                    ],
+                    "type": "object"
+                  },
+                  "description": "The endpoints that had a request, by name. The dataset URL is `_1`, `_2`, …, and a name with two operations appears once per operation as `{name}_{operation}`.",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "Requests",
+                "RequestsGood",
+                "RequestsBad",
+                "endpoints"
+              ],
+              "type": "object"
+            },
+            "description": "The counters of each dataset the caller may read, keyed by its path, such as `/ds`.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "datasets"
+        ],
         "type": "object"
       },
       "GcRequest": {
-        "additionalProperties": true,
-        "description": "`{dryRun?, graceHours?}`",
+        "description": "A garbage collection of a repository.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-routes"
+        },
+        "properties": {
+          "dryRun": {
+            "default": false,
+            "type": "boolean"
+          },
+          "graceHours": {
+            "default": 24,
+            "description": "Unreferenced blobs younger than this are kept.",
+            "type": "number"
+          }
         },
         "type": "object"
       },
@@ -2584,19 +3753,83 @@
         "type": "object"
       },
       "GeoConvertRequest": {
-        "additionalProperties": true,
-        "description": "`{literals: [{value, datatype}]}`, at most 10,000 literals.",
+        "description": "Geometry literals to convert to GeoJSON.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion"
         },
+        "properties": {
+          "literals": {
+            "items": {
+              "properties": {
+                "datatype": {
+                  "examples": [
+                    "http://www.opengis.net/ont/geosparql#wktLiteral"
+                  ],
+                  "type": "string"
+                },
+                "value": {
+                  "description": "The lexical form.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value",
+                "datatype"
+              ],
+              "type": "object"
+            },
+            "maxItems": 10000,
+            "type": "array"
+          }
+        },
+        "required": [
+          "literals"
+        ],
         "type": "object"
       },
       "GeoConvertResult": {
-        "additionalProperties": true,
-        "description": "`{results: [...]}`, one per literal.",
+        "description": "One result per literal, in order: its geometry, or why it has none.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion"
         },
+        "properties": {
+          "results": {
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "geometry": {
+                      "additionalProperties": true,
+                      "description": "A GeoJSON geometry in CRS84.",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "geometry"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ],
         "type": "object"
       },
       "GeoStatus": {
@@ -2901,10 +4134,124 @@
         "type": "object"
       },
       "HistoryRequest": {
-        "additionalProperties": true,
-        "description": "`{keepCommits?, keepAge?, maxBytes?, schedules?, catalog?}`",
+        "description": "The retention window, and optionally the pin schedules, the catalog horizon and the change log settings.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#named-snapshots-and-retention"
+        },
+        "properties": {
+          "catalog": {
+            "description": "Replaces the commit catalog's horizon when present.",
+            "properties": {
+              "keepAge": {
+                "description": "Seconds, or a duration such as `90s`, `30m`, `12h`, `7d` or `2w`.",
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ]
+              },
+              "keepCommits": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "changeLog": {
+            "additionalProperties": false,
+            "description": "Replaces the change log settings when present. `null` restores the server's.",
+            "properties": {
+              "enabled": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "keepAge": {
+                "description": "Seconds, or a duration such as `90s`, `30m`, `12h`, `7d` or `2w`.",
+                "type": [
+                  "string",
+                  "integer",
+                  "null"
+                ]
+              },
+              "keepCommits": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "maxBytes": {
+                "description": "Bytes, or a size such as `512MiB` or `10GiB`.",
+                "type": [
+                  "integer",
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "keepAge": {
+            "description": "Seconds, or a duration such as `90s`, `30m`, `12h`, `7d` or `2w`.",
+            "type": [
+              "string",
+              "integer",
+              "null"
+            ]
+          },
+          "keepCommits": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "maxBytes": {
+            "description": "Bytes, or a size such as `512MiB` or `10GiB`.",
+            "type": [
+              "integer",
+              "string",
+              "null"
+            ]
+          },
+          "schedules": {
+            "description": "Replaces the pin schedules when present. `null` removes them.",
+            "items": {
+              "properties": {
+                "every": {
+                  "description": "Seconds, or a duration.",
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                },
+                "keepLast": {
+                  "type": "integer"
+                },
+                "prefix": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "prefix",
+                "every",
+                "keepLast"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
         },
         "type": "object"
       },
@@ -3260,11 +4607,87 @@
         "type": "object"
       },
       "LockList": {
-        "additionalProperties": true,
-        "description": "`{locks: Lock[]}`",
+        "description": "The locks held in a repository.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#locks-and-garbage-collection"
         },
+        "properties": {
+          "locks": {
+            "items": {
+              "properties": {
+                "created": {
+                  "type": "string"
+                },
+                "holder": {
+                  "properties": {
+                    "host": {
+                      "type": "string"
+                    },
+                    "pid": {
+                      "type": "integer"
+                    },
+                    "server": {
+                      "description": "A hash of the holder's data directory, empty for the CLI.",
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "host",
+                    "pid",
+                    "server",
+                    "version"
+                  ],
+                  "type": "object"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "shared",
+                    "exclusive"
+                  ],
+                  "type": "string"
+                },
+                "lastModified": {
+                  "description": "The storage server's time of the lock's last refresh.",
+                  "type": "string"
+                },
+                "operation": {
+                  "enum": [
+                    "create",
+                    "restore",
+                    "verify",
+                    "delete",
+                    "gc"
+                  ],
+                  "type": "string"
+                },
+                "stale": {
+                  "description": "Not refreshed for 30 minutes: ignored, and removed by garbage collection.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "operation",
+                "holder",
+                "created",
+                "lastModified",
+                "stale"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "locks"
+        ],
         "type": "object"
       },
       "LoginRequest": {
@@ -3299,11 +4722,300 @@
         "type": "object"
       },
       "MetricsSnapshot": {
-        "additionalProperties": true,
         "description": "The counters of `/$/metrics` as JSON (`?format=json`).",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#metrics"
         },
+        "properties": {
+          "active": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "Requests in progress, by operation.",
+            "type": "object"
+          },
+          "bucketBounds": {
+            "description": "Histogram upper bounds in seconds, without +Inf.",
+            "items": {
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "datasets": {
+            "items": {
+              "properties": {
+                "blockCache": {
+                  "properties": {
+                    "bytes": {
+                      "type": "integer"
+                    },
+                    "capacityBytes": {
+                      "type": "integer"
+                    },
+                    "entries": {
+                      "type": "integer"
+                    },
+                    "hits": {
+                      "type": "integer"
+                    },
+                    "misses": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "bytes",
+                    "capacityBytes",
+                    "entries",
+                    "hits",
+                    "misses"
+                  ],
+                  "type": "object"
+                },
+                "budgetExceeded": {
+                  "oneOf": [
+                    {
+                      "additionalProperties": {
+                        "type": "integer"
+                      },
+                      "description": "Requests over a budget, by budget.",
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "deltaDeletes": {
+                  "type": "integer"
+                },
+                "deltaInserts": {
+                  "type": "integer"
+                },
+                "diskBytes": {
+                  "type": "integer"
+                },
+                "geo": {
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "buildSeconds": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "candidates": {
+                          "type": "integer"
+                        },
+                        "enabled": {
+                          "type": "boolean"
+                        },
+                        "matches": {
+                          "type": "integer"
+                        },
+                        "rechecked": {
+                          "type": "integer"
+                        },
+                        "refined": {
+                          "type": "integer"
+                        },
+                        "rows": {
+                          "properties": {
+                            "base": {
+                              "type": "integer"
+                            },
+                            "overlay": {
+                              "type": "integer"
+                            },
+                            "tail": {
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "base",
+                            "overlay",
+                            "tail"
+                          ],
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "enabled",
+                        "rows",
+                        "buildSeconds",
+                        "candidates",
+                        "refined",
+                        "matches",
+                        "rechecked"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "name": {
+                  "type": "string"
+                },
+                "quads": {
+                  "type": "integer"
+                },
+                "quotaBytes": {
+                  "description": "0 means unlimited.",
+                  "type": "integer"
+                },
+                "rateLimited": {
+                  "oneOf": [
+                    {
+                      "additionalProperties": {
+                        "type": "integer"
+                      },
+                      "description": "Rate-limited requests, by class.",
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "resultCache": {
+                  "properties": {
+                    "bytes": {
+                      "type": "integer"
+                    },
+                    "capacityBytes": {
+                      "type": "integer"
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "entries": {
+                      "type": "integer"
+                    },
+                    "hits": {
+                      "type": "integer"
+                    },
+                    "misses": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "enabled",
+                    "bytes",
+                    "capacityBytes",
+                    "entries",
+                    "hits",
+                    "misses"
+                  ],
+                  "type": "object"
+                },
+                "resultRows": {
+                  "type": "integer"
+                },
+                "walBytes": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "name",
+                "quads",
+                "deltaInserts",
+                "deltaDeletes",
+                "walBytes",
+                "diskBytes",
+                "quotaBytes",
+                "resultRows",
+                "budgetExceeded",
+                "rateLimited",
+                "blockCache",
+                "resultCache",
+                "geo"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "formatVersion": {
+            "const": 1
+          },
+          "limits": {
+            "$ref": "#/components/schemas/Limits"
+          },
+          "processResidentBytes": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "requests": {
+            "items": {
+              "properties": {
+                "buckets": {
+                  "description": "Cumulative counts. The last one, for +Inf, equals `count`.",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "type": "array"
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "dataset": {
+                  "type": "string"
+                },
+                "operation": {
+                  "type": "string"
+                },
+                "outcomes": {
+                  "additionalProperties": {
+                    "type": "integer"
+                  },
+                  "description": "Completed requests, by outcome.",
+                  "type": "object"
+                },
+                "responseBytes": {
+                  "type": "integer"
+                },
+                "sumSeconds": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "dataset",
+                "operation",
+                "outcomes",
+                "count",
+                "sumSeconds",
+                "buckets",
+                "responseBytes"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "uptimeSeconds": {
+            "type": "number"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "formatVersion",
+          "version",
+          "uptimeSeconds",
+          "ready",
+          "processResidentBytes",
+          "limits",
+          "bucketBounds",
+          "active",
+          "requests",
+          "datasets"
+        ],
         "type": "object"
       },
       "NamedSnapshot": {
@@ -3507,35 +5219,430 @@
         "type": "object"
       },
       "Policy": {
-        "additionalProperties": true,
-        "description": "A backup policy with its state.",
+        "description": "A backup policy: its settings, where it is defined, and its scheduler state.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#lifecycle-policies"
         },
+        "properties": {
+          "catchUp": {
+            "default": "one",
+            "description": "What happens to instants missed while the server was down.",
+            "enum": [
+              "one",
+              "none"
+            ],
+            "type": "string"
+          },
+          "datasets": {
+            "default": [
+              "*"
+            ],
+            "description": "Names or `*` globs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "default": true,
+            "type": "boolean"
+          },
+          "gcAfterRetention": {
+            "default": false,
+            "description": "Collect the repository after retention deleted something, at most once a day.",
+            "type": "boolean"
+          },
+          "name": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "type": "string"
+          },
+          "nameTemplate": {
+            "default": "{policy}-{dataset}-{time}",
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "retention": {
+            "properties": {
+              "expireAfter": {
+                "description": "A duration such as `30d`. `null` sets no age limit.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "maxCount": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "minCount": {
+                "default": 1,
+                "description": "The newest backups kept whatever their age.",
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "schedule": {
+            "description": "A cron expression with 5 or 6 fields, or `every <duration>`.",
+            "type": "string"
+          },
+          "skipUnchanged": {
+            "default": false,
+            "description": "Skip a dataset whose head is its last policy backup's commit.",
+            "type": "boolean"
+          },
+          "source": {
+            "enum": [
+              "api",
+              "config"
+            ],
+            "type": "string"
+          },
+          "state": {
+            "properties": {
+              "consecutiveFailures": {
+                "type": "integer"
+              },
+              "lastRun": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PolicyRun"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "lastScheduledFor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "lastSuccess": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "nextRun": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "runningTask": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "nextRun",
+              "lastScheduledFor",
+              "lastRun",
+              "lastSuccess",
+              "consecutiveFailures",
+              "runningTask"
+            ],
+            "type": "object"
+          },
+          "timezone": {
+            "default": "UTC",
+            "description": "An IANA time zone.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "repository",
+          "datasets",
+          "schedule",
+          "timezone",
+          "nameTemplate",
+          "retention",
+          "skipUnchanged",
+          "gcAfterRetention",
+          "catchUp",
+          "enabled",
+          "source",
+          "state"
+        ],
         "type": "object"
       },
       "PolicyConfig": {
-        "additionalProperties": true,
-        "description": "A backup policy's settings: datasets, repository, schedule and retention.",
+        "description": "A backup policy's settings. `name` is required on create, and a replacement may leave it out but cannot change it.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#lifecycle-policies"
         },
+        "properties": {
+          "catchUp": {
+            "default": "one",
+            "description": "What happens to instants missed while the server was down.",
+            "enum": [
+              "one",
+              "none"
+            ],
+            "type": "string"
+          },
+          "datasets": {
+            "default": [
+              "*"
+            ],
+            "description": "Names or `*` globs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "default": true,
+            "type": "boolean"
+          },
+          "gcAfterRetention": {
+            "default": false,
+            "description": "Collect the repository after retention deleted something, at most once a day.",
+            "type": "boolean"
+          },
+          "name": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "type": "string"
+          },
+          "nameTemplate": {
+            "default": "{policy}-{dataset}-{time}",
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "retention": {
+            "properties": {
+              "expireAfter": {
+                "description": "A duration such as `30d`. `null` sets no age limit.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "maxCount": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "minCount": {
+                "default": 1,
+                "description": "The newest backups kept whatever their age.",
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "schedule": {
+            "description": "A cron expression with 5 or 6 fields, or `every <duration>`.",
+            "type": "string"
+          },
+          "skipUnchanged": {
+            "default": false,
+            "description": "Skip a dataset whose head is its last policy backup's commit.",
+            "type": "boolean"
+          },
+          "timezone": {
+            "default": "UTC",
+            "description": "An IANA time zone.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "schedule"
+        ],
         "type": "object"
       },
       "PolicyList": {
-        "additionalProperties": true,
-        "description": "`{policies: Policy[]}`",
+        "description": "The backup policies.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#lifecycle-policies"
         },
+        "properties": {
+          "policies": {
+            "items": {
+              "$ref": "#/components/schemas/Policy"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "policies"
+        ],
+        "type": "object"
+      },
+      "PolicyRun": {
+        "description": "One run of a backup policy.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-types"
+        },
+        "properties": {
+          "datasets": {
+            "items": {
+              "properties": {
+                "addedBytes": {
+                  "type": "integer"
+                },
+                "backup": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "dataset": {
+                  "type": "string"
+                },
+                "millis": {
+                  "type": "integer"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "result": {
+                  "enum": [
+                    "ok",
+                    "failed",
+                    "skipped"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "dataset",
+                "backup",
+                "result"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "finished": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "gc": {
+            "oneOf": [
+              {
+                "properties": {
+                  "task": {
+                    "description": "The `backup-gc` task the run started.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "task"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "policy": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why a scheduled run was skipped.",
+            "type": "string"
+          },
+          "result": {
+            "enum": [
+              "ok",
+              "partial",
+              "failed",
+              "skipped"
+            ],
+            "type": "string"
+          },
+          "retention": {
+            "oneOf": [
+              {
+                "properties": {
+                  "deleted": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "error": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "deleted"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "scheduledFor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started": {
+            "type": "string"
+          },
+          "trigger": {
+            "enum": [
+              "schedule",
+              "catch-up",
+              "manual"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "policy",
+          "trigger",
+          "scheduledFor",
+          "started",
+          "finished",
+          "result",
+          "datasets",
+          "retention",
+          "gc"
+        ],
         "type": "object"
       },
       "PolicyRuns": {
-        "additionalProperties": true,
-        "description": "`{runs: PolicyRun[]}`",
+        "description": "A policy's runs, newest first.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-routes"
         },
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/PolicyRun"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "runs"
+        ],
         "type": "object"
       },
       "PredicateEntry": {
@@ -3697,20 +5804,98 @@
         "type": "object"
       },
       "RdfsRequest": {
-        "additionalProperties": true,
-        "description": "`{graph: IRI | \"default\"}`; a schema document in an RDF syntax is sent with its own media type.",
+        "description": "The graph that holds the schema. A schema document in an RDF syntax is sent with its own media type instead.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#rdfs-on-read"
         },
+        "properties": {
+          "graph": {
+            "description": "A graph IRI, or `default`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "graph"
+        ],
         "type": "object"
       },
       "RdfsStatus": {
-        "additionalProperties": true,
-        "description": "The dataset's RDFS-on-read setting, or `{enabled: false}`.",
+        "anyOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "const": false
+              }
+            },
+            "required": [
+              "enabled"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "enabled": {
+                "const": true
+              },
+              "graph": {
+                "description": "`source: graph`: the schema graph, or `default`.",
+                "type": "string"
+              },
+              "schema": {
+                "properties": {
+                  "classesWithSuperclasses": {
+                    "type": "integer"
+                  },
+                  "propertiesWithDomains": {
+                    "type": "integer"
+                  },
+                  "propertiesWithRanges": {
+                    "type": "integer"
+                  },
+                  "propertiesWithSuperproperties": {
+                    "type": "integer"
+                  },
+                  "skipped": {
+                    "description": "Schema triples with a blank node or a literal, which are left out.",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "classesWithSuperclasses",
+                  "propertiesWithSuperproperties",
+                  "propertiesWithDomains",
+                  "propertiesWithRanges",
+                  "skipped"
+                ],
+                "type": "object"
+              },
+              "source": {
+                "enum": [
+                  "upload",
+                  "graph"
+                ],
+                "type": "string"
+              },
+              "warnings": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "enabled",
+              "source",
+              "schema"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "The dataset's RDFS-on-read setting and the schema it gives at the head, or `{enabled: false}`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#rdfs-on-read"
-        },
-        "type": "object"
+        }
       },
       "ReadyInfo": {
         "properties": {
@@ -3777,10 +5962,111 @@
         "type": "object"
       },
       "ReasonRequest": {
-        "additionalProperties": true,
-        "description": "`{profile: \"rdfs\" | \"owl-rl\" | \"rules\", rules?, vocabularies?, geoDefaultGeometry?}`",
+        "description": "A reasoning run: the profile, its rules and extras, and the input graphs.",
         "externalDocs": {
-          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#datasets-admin"
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#input-graphs-and-imports"
+        },
+        "properties": {
+          "dataGraphs": {
+            "description": "`default` or graph IRIs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "full": {
+            "description": "A full run instead of an incremental one.",
+            "type": "boolean"
+          },
+          "geoDefaultGeometry": {
+            "type": "boolean"
+          },
+          "imports": {
+            "enum": [
+              "none",
+              "dataset",
+              "fetch"
+            ],
+            "type": "string"
+          },
+          "locationMapping": {
+            "items": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "altName": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "altName"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "properties": {
+                    "altPrefix": {
+                      "type": "string"
+                    },
+                    "prefix": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "prefix",
+                    "altPrefix"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "ontologyGraphs": {
+            "description": "`default` or graph IRIs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "profile": {
+            "default": "rdfs",
+            "examples": [
+              "rdfs",
+              "rdfs-simple",
+              "owl-rl",
+              "rules"
+            ],
+            "type": "string"
+          },
+          "refreshImports": {
+            "description": "Load again the imports that earlier runs fetched.",
+            "type": "boolean"
+          },
+          "rerun": {
+            "description": "Re-run the recorded profile, rules, extras and input graphs.",
+            "type": "boolean"
+          },
+          "rules": {
+            "description": "The rules of the `rules` profile, in Jena's rule syntax.",
+            "type": "string"
+          },
+          "vocabularies": {
+            "description": "Built-in vocabularies added to the profile.",
+            "examples": [
+              [
+                "geosparql"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
         },
         "type": "object"
       },
@@ -4018,11 +6304,47 @@
         "type": "object"
       },
       "RecallReport": {
-        "additionalProperties": true,
-        "description": "`{k, samples, ef, recall, hnswMs, exactMs}`",
+        "description": "Recall@k of the graph search against the exact search.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#vector-indexes"
         },
+        "properties": {
+          "ef": {
+            "description": "The graph search's width.",
+            "type": "integer"
+          },
+          "exactMs": {
+            "description": "Mean milliseconds per exact search.",
+            "type": "number"
+          },
+          "hnswMs": {
+            "description": "Mean milliseconds per search through the graph.",
+            "type": "number"
+          },
+          "k": {
+            "type": "integer"
+          },
+          "recall": {
+            "description": "Recall@k against the exact search, `null` when the index has no vector to sample.",
+            "maximum": 1,
+            "minimum": 0,
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "samples": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "k",
+          "samples",
+          "ef",
+          "recall",
+          "hnswMs",
+          "exactMs"
+        ],
         "type": "object"
       },
       "Receipt": {
@@ -4402,19 +6724,81 @@
         "type": "object"
       },
       "RestoreRequest": {
-        "additionalProperties": true,
         "description": "Where and how to restore a backup.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#restore"
         },
+        "properties": {
+          "check": {
+            "default": "quick",
+            "description": "The `sparkles check` run before the dataset is published.",
+            "enum": [
+              "quick",
+              "full",
+              "none"
+            ],
+            "type": "string"
+          },
+          "identity": {
+            "default": "auto",
+            "enum": [
+              "auto",
+              "new",
+              "keep"
+            ],
+            "type": "string"
+          },
+          "keepReplaced": {
+            "default": false,
+            "description": "In place: keep the old files.",
+            "type": "boolean"
+          },
+          "replace": {
+            "default": false,
+            "description": "Replace the registered dataset `target` in place.",
+            "type": "boolean"
+          },
+          "target": {
+            "description": "The dataset to create, or to replace. `{ds}` by default.",
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "RetentionResult": {
-        "additionalProperties": true,
-        "description": "`{dryRun, delete, keep, errors?}`",
+        "description": "What a policy's retention deleted and kept.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-routes"
         },
+        "properties": {
+          "delete": {
+            "description": "The backups deleted, or with `dryRun` those that would be. A deletion that failed stays here.",
+            "items": {
+              "$ref": "#/components/schemas/BackupSummary"
+            },
+            "type": "array"
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "errors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "keep": {
+            "items": {
+              "$ref": "#/components/schemas/BackupSummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dryRun",
+          "delete",
+          "keep"
+        ],
         "type": "object"
       },
       "Revoked": {
@@ -4429,19 +6813,66 @@
         "type": "object"
       },
       "SchedulePreview": {
-        "additionalProperties": true,
-        "description": "`{next: string[], description, …}`",
+        "description": "The next runs of a schedule.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-routes"
         },
+        "properties": {
+          "description": {
+            "examples": [
+              "at 02:30 every day (Europe/Berlin)"
+            ],
+            "type": "string"
+          },
+          "next": {
+            "description": "The next instants, RFC 3339 in UTC.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "sample": {
+            "description": "`nameTemplate` rendered for `dataset` at the first instant.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "next",
+          "description"
+        ],
         "type": "object"
       },
       "SchedulePreviewRequest": {
-        "additionalProperties": true,
-        "description": "`{schedule, timezone?, count?, nameTemplate?, dataset?}`",
+        "description": "A schedule to preview.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-routes"
         },
+        "properties": {
+          "count": {
+            "default": 5,
+            "description": "How many instants to list.",
+            "maximum": 20,
+            "type": "integer"
+          },
+          "dataset": {
+            "description": "The dataset of the sample name, `ds` by default.",
+            "type": "string"
+          },
+          "nameTemplate": {
+            "description": "A template to render a sample name with.",
+            "type": "string"
+          },
+          "schedule": {
+            "type": "string"
+          },
+          "timezone": {
+            "default": "UTC",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schedule"
+        ],
         "type": "object"
       },
       "SchemaSummary": {
@@ -4454,7 +6885,7 @@
             "$ref": "#/components/schemas/ClassPage"
           },
           "constraints": {
-            "type": "object"
+            "$ref": "#/components/schemas/ConstraintsLayer"
           },
           "dataset": {
             "type": "string"
@@ -4567,20 +6998,550 @@
         "type": "object"
       },
       "ShexReport": {
-        "additionalProperties": true,
-        "description": "A ShEx validation result.",
+        "description": "A ShEx validation result, in shape-map order.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#shex-validation"
         },
+        "properties": {
+          "conforms": {
+            "description": "Every association conforms.",
+            "type": "boolean"
+          },
+          "counts": {
+            "properties": {
+              "conformant": {
+                "type": "integer"
+              },
+              "nonconformant": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "conformant",
+              "nonconformant"
+            ],
+            "type": "object"
+          },
+          "millis": {
+            "type": "integer"
+          },
+          "results": {
+            "items": {
+              "properties": {
+                "appinfo": {
+                  "properties": {
+                    "failures": {
+                      "description": "Up to 8 failures.",
+                      "items": {
+                        "anyOf": [
+                          {
+                            "properties": {
+                              "constraint": {
+                                "type": "string"
+                              },
+                              "kind": {
+                                "enum": [
+                                  "nodeKind",
+                                  "datatype",
+                                  "facet",
+                                  "valueSet"
+                                ],
+                                "type": "string"
+                              },
+                              "value": {
+                                "$ref": "#/components/schemas/RdfTerm"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "value",
+                              "constraint"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "count": {
+                                "type": "integer"
+                              },
+                              "inverse": {
+                                "type": "boolean"
+                              },
+                              "kind": {
+                                "const": "cardinality"
+                              },
+                              "max": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "min": {
+                                "type": "integer"
+                              },
+                              "predicate": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "predicate",
+                              "inverse",
+                              "min",
+                              "max",
+                              "count"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "kind": {
+                                "enum": [
+                                  "closed",
+                                  "extra"
+                                ],
+                                "type": "string"
+                              },
+                              "predicate": {
+                                "type": "string"
+                              },
+                              "value": {
+                                "$ref": "#/components/schemas/RdfTerm"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "predicate",
+                              "value"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "detail": {
+                                "type": "string"
+                              },
+                              "kind": {
+                                "const": "noMatch"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "detail"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "kind": {
+                                "const": "reference"
+                              },
+                              "shape": {
+                                "type": "string"
+                              },
+                              "value": {
+                                "$ref": "#/components/schemas/RdfTerm"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "shape",
+                              "value"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "kind": {
+                                "enum": [
+                                  "not",
+                                  "external"
+                                ],
+                                "type": "string"
+                              },
+                              "shape": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "shape"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "extension": {
+                                "type": "string"
+                              },
+                              "kind": {
+                                "const": "semAct"
+                              },
+                              "message": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "extension",
+                              "message"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "type": "array"
+                    },
+                    "prints": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "failures"
+                  ],
+                  "type": "object"
+                },
+                "node": {
+                  "$ref": "#/components/schemas/RdfTerm"
+                },
+                "reason": {
+                  "description": "The first failure, in one line.",
+                  "type": "string"
+                },
+                "shape": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RdfTerm"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "const": "start"
+                        }
+                      },
+                      "required": [
+                        "type"
+                      ],
+                      "type": "object"
+                    }
+                  ]
+                },
+                "status": {
+                  "enum": [
+                    "conformant",
+                    "nonconformant"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "node",
+                "shape",
+                "status"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "stats": {
+            "properties": {
+              "evaluations": {
+                "type": "integer"
+              },
+              "pairs": {
+                "type": "integer"
+              },
+              "waves": {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "pairs",
+              "evaluations",
+              "waves"
+            ],
+            "type": "object"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "conforms",
+          "counts",
+          "results",
+          "warnings",
+          "millis"
+        ],
         "type": "object"
       },
       "ShexRequest": {
-        "additionalProperties": true,
-        "description": "The JSON envelope of a ShEx validation: `{schema, schemaFormat?, map, externs?, imports?, base?}`.",
+        "additionalProperties": false,
+        "description": "The JSON envelope of a ShEx validation: the schema and everything that goes with it.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#shex-validation"
         },
+        "properties": {
+          "base": {
+            "type": "string"
+          },
+          "externs": {
+            "description": "Definitions of the schema's EXTERNAL shapes.",
+            "type": "string"
+          },
+          "imports": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Bodies of imported schemas, by IRI.",
+            "type": "object"
+          },
+          "map": {
+            "description": "A compact shape map, or a JSON one.",
+            "type": [
+              "string",
+              "array",
+              "object"
+            ]
+          },
+          "schema": {
+            "description": "The schema text.",
+            "type": "string"
+          },
+          "schemaFormat": {
+            "enum": [
+              "shexc",
+              "shexj",
+              "shexr"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema"
+        ],
         "type": "object"
+      },
+      "ShexResultMap": {
+        "description": "The ShapeMap draft's JSON result map (`format=shapemap`).",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#shex-validation"
+        },
+        "items": {
+          "properties": {
+            "appinfo": {
+              "properties": {
+                "failures": {
+                  "description": "Up to 8 failures.",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "properties": {
+                          "constraint": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "enum": [
+                              "nodeKind",
+                              "datatype",
+                              "facet",
+                              "valueSet"
+                            ],
+                            "type": "string"
+                          },
+                          "value": {
+                            "$ref": "#/components/schemas/RdfTerm"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "value",
+                          "constraint"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "properties": {
+                          "count": {
+                            "type": "integer"
+                          },
+                          "inverse": {
+                            "type": "boolean"
+                          },
+                          "kind": {
+                            "const": "cardinality"
+                          },
+                          "max": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "min": {
+                            "type": "integer"
+                          },
+                          "predicate": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "predicate",
+                          "inverse",
+                          "min",
+                          "max",
+                          "count"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "closed",
+                              "extra"
+                            ],
+                            "type": "string"
+                          },
+                          "predicate": {
+                            "type": "string"
+                          },
+                          "value": {
+                            "$ref": "#/components/schemas/RdfTerm"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "predicate",
+                          "value"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "properties": {
+                          "detail": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "const": "noMatch"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "detail"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "properties": {
+                          "kind": {
+                            "const": "reference"
+                          },
+                          "shape": {
+                            "type": "string"
+                          },
+                          "value": {
+                            "$ref": "#/components/schemas/RdfTerm"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "shape",
+                          "value"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "not",
+                              "external"
+                            ],
+                            "type": "string"
+                          },
+                          "shape": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "shape"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "properties": {
+                          "extension": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "const": "semAct"
+                          },
+                          "message": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "extension",
+                          "message"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "type": "array"
+                },
+                "prints": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "failures"
+              ],
+              "type": "object"
+            },
+            "node": {
+              "description": "In compact syntax.",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "shape": {
+              "description": "`<iri>`, `_:label` or `START`.",
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "conformant",
+                "nonconformant"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "node",
+            "shape",
+            "status"
+          ],
+          "type": "object"
+        },
+        "type": "array"
       },
       "SnapshotList": {
         "description": "A dataset's named snapshots.",
@@ -4613,10 +7574,39 @@
         "type": "object"
       },
       "SnapshotRequest": {
-        "additionalProperties": true,
-        "description": "`{name, at?, note?, expires?, warm?}`",
+        "description": "A named snapshot to create. Each member can also be a query parameter.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#named-snapshots-and-retention"
+        },
+        "properties": {
+          "at": {
+            "description": "A point-in-time selector; the head by default.",
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "expires": {
+            "description": "An RFC 3339 time, a duration from now, or seconds.",
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "name": {
+            "description": "Required, here or in the query string.",
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "warm": {
+            "description": "Keep the snapshot materialized.",
+            "type": [
+              "boolean",
+              "string"
+            ]
+          }
         },
         "type": "object"
       },
@@ -4919,11 +7909,59 @@
         "type": "object"
       },
       "StoredQueryVersions": {
-        "additionalProperties": true,
         "description": "The kept versions of a stored query, newest first.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-queries"
         },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "properties": {
+                "author": {
+                  "type": "string"
+                },
+                "created": {
+                  "type": "string"
+                },
+                "datasetCommit": {
+                  "description": "The dataset's head when the version was saved.",
+                  "type": "integer"
+                },
+                "digest": {
+                  "description": "Hex SHA-256 over the parent's digest and the definition.",
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "parent": {
+                  "type": "integer"
+                },
+                "version": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "version",
+                "created",
+                "digest"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "name",
+          "versions"
+        ],
         "type": "object"
       },
       "Task": {
@@ -5147,11 +8185,64 @@
         "type": "object"
       },
       "TextHits": {
-        "additionalProperties": true,
         "description": "Full-text search hits, best first.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#full-text-search"
         },
+        "properties": {
+          "commit": {
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "hits": {
+            "items": {
+              "properties": {
+                "g": {
+                  "$ref": "#/components/schemas/RdfTerm"
+                },
+                "literal": {
+                  "$ref": "#/components/schemas/RdfTerm",
+                  "description": "The literal, or with highlighting its fragments."
+                },
+                "p": {
+                  "$ref": "#/components/schemas/RdfTerm"
+                },
+                "s": {
+                  "$ref": "#/components/schemas/RdfTerm"
+                },
+                "score": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "snippet": {
+                  "description": "With highlighting: the fragments as HTML, escaped, with the matches in `<mark>`.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "s",
+                "score",
+                "literal"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limited": {
+            "description": "As many hits as the limit.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "limited",
+          "hits"
+        ],
         "type": "object"
       },
       "TextStatus": {
@@ -5722,11 +8813,249 @@
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#write-time-validation"
         }
       },
+      "ValidationSummary": {
+        "description": "What write-time validation found about a write.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#write-time-validation"
+        },
+        "properties": {
+          "blocking": {
+            "description": "Results at or above the threshold.",
+            "type": "integer"
+          },
+          "bySeverity": {
+            "properties": {
+              "info": {
+                "type": "integer"
+              },
+              "violation": {
+                "type": "integer"
+              },
+              "warning": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "violation",
+              "warning",
+              "info"
+            ],
+            "type": "object"
+          },
+          "conforms": {
+            "type": "boolean"
+          },
+          "fallback": {
+            "description": "Why the write, or a shape, was validated in full.",
+            "type": "string"
+          },
+          "focusNodes": {
+            "description": "The focus nodes an incremental validation validated.",
+            "type": "integer"
+          },
+          "head": {
+            "description": "Rejections: the commit the write ran against.",
+            "type": "integer"
+          },
+          "introduced": {
+            "description": "Grandfather mode: the blocking results the write introduced.",
+            "type": "integer"
+          },
+          "kind": {
+            "description": "Rejections: the kind of the commit the write would have made.",
+            "type": "string"
+          },
+          "language": {
+            "enum": [
+              "shacl",
+              "shex"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "millis": {
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "reject",
+              "warn",
+              "off"
+            ],
+            "type": "string"
+          },
+          "results": {
+            "description": "The first `limit` results, blocking first.",
+            "items": {
+              "additionalProperties": true,
+              "description": "A SHACL result, or a ShEx result-map entry.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "shapesError": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "warned",
+              "rejected",
+              "skipped",
+              "bypassed"
+            ],
+            "type": "string"
+          },
+          "strategy": {
+            "enum": [
+              "full",
+              "incremental",
+              "none"
+            ],
+            "type": "string"
+          },
+          "threshold": {
+            "enum": [
+              "violation",
+              "warning",
+              "info"
+            ],
+            "type": "string"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "language",
+          "status",
+          "mode",
+          "strategy",
+          "threshold",
+          "conforms",
+          "blocking",
+          "total",
+          "bySeverity",
+          "limit",
+          "truncated",
+          "millis",
+          "results"
+        ],
+        "type": "object"
+      },
       "ValidatorResult": {
-        "additionalProperties": true,
-        "description": "The JSON answer of a Fuseki validator.",
+        "additionalProperties": false,
+        "description": "The JSON answer of a Fuseki validator: `{input, formatted, algebra}` or `{input, errors}` for queries, updates and data, `{iris}` for IRIs and `{langtags}` for language tags.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#validators"
+        },
+        "properties": {
+          "algebra": {
+            "description": "Queries: the algebra in SSE.",
+            "type": "string"
+          },
+          "errors": {
+            "items": {
+              "properties": {
+                "parse-error": {
+                  "type": "string"
+                },
+                "parse-error-column": {
+                  "type": "integer"
+                },
+                "parse-error-line": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "parse-error"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "formatted": {
+            "type": "string"
+          },
+          "input": {
+            "description": "The query, update or data.",
+            "type": "string"
+          },
+          "iris": {
+            "items": {
+              "properties": {
+                "errors": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "warning": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "iri",
+                "errors",
+                "warning"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "langtags": {
+            "items": {
+              "properties": {
+                "errors": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "extension": {
+                  "type": "string"
+                },
+                "formatted": {
+                  "type": "string"
+                },
+                "input": {
+                  "type": "string"
+                },
+                "language": {
+                  "type": "string"
+                },
+                "privateuse": {
+                  "type": "string"
+                },
+                "region": {
+                  "type": "string"
+                },
+                "script": {
+                  "type": "string"
+                },
+                "variant": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "input",
+                "errors"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
         },
         "type": "object"
       },
@@ -5882,11 +9211,22 @@
         "type": "object"
       },
       "VectorIndexCreated": {
-        "additionalProperties": true,
-        "description": "`{index: VectorIndexStatus, task: Task}`",
+        "description": "The index as created, and the task that builds it.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#vector-indexes"
         },
+        "properties": {
+          "index": {
+            "$ref": "#/components/schemas/VectorIndexStatus"
+          },
+          "task": {
+            "$ref": "#/components/schemas/Task"
+          }
+        },
+        "required": [
+          "index",
+          "task"
+        ],
         "type": "object"
       },
       "VectorIndexStatus": {
@@ -6346,10 +9686,21 @@
         "type": "object"
       },
       "VerifyRequest": {
-        "additionalProperties": true,
-        "description": "`{level?: \"exists\" | \"data\" | \"restore\"}`",
+        "description": "How deep a verification goes.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-routes"
+        },
+        "properties": {
+          "level": {
+            "default": "exists",
+            "description": "`restore` verifies one backup only.",
+            "enum": [
+              "exists",
+              "data",
+              "restore"
+            ],
+            "type": "string"
+          }
         },
         "type": "object"
       },
@@ -6544,7 +9895,7 @@
     "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md"
   },
   "info": {
-    "description": "The HTTP API of Sparkles, a SPARQL server compatible with Apache Jena Fuseki. `docs/API.md` is the reference, and each operation links to its section.\n\n**Authentication.** Without `sparkles serve --auth-config` the server needs no credentials, and every caller may do everything. With it, each operation lists the schemes it accepts, and `x-sparkles-permission` names the permission it needs: `public`, `any caller`, `signed in`, `web session`, a dataset level (`read`, `write`, `admin`) or a server permission (`metrics`, `federate`, `server-admin`). A caller without a level on a dataset gets `404`, as for a missing dataset. Session and proxy principals send `X-Sparkles-CSRF` on unsafe requests. Trusted proxy headers are honored only from configured proxies and are not listed as schemes.\n\n**Errors.** Every non-2xx response has the `Error` body, with the `requestId` of the response's `X-Request-Id`. A budget error (`507`) adds `budget`, `limit` and `requested`.\n\n**Pagination.** Listings that page say so in `x-sparkles-pagination`. Schema listings take `limit` and an opaque `cursor` and answer `{items, total, next}`. Commit listings take `limit` with `before` or `after`. Backup listings take `limit` and `before`. A null `next` ends the listing.\n\n**Conditional requests.** Graph Store reads carry a weak `ETag` naming the commit read. `If-Match` and `If-None-Match` make writes conditional, and a failed condition answers `412`. Responses of queries and writes carry `Sparkles-Commit` and `Sparkles-Dataset-Id`.\n\n**Coverage.** Every route of the server is described with its methods, parameters and media types. The common bodies are described member by member, and so are the admin bodies of history, stored queries, the search indexes, reasoning, validation and backups. The other admin bodies (diffs, the change feed, write previews, backup policies) are open objects that link to their section of the reference.",
+    "description": "The HTTP API of Sparkles, a SPARQL server compatible with Apache Jena Fuseki. `docs/API.md` is the reference, and each operation links to its section.\n\n**Authentication.** Without `sparkles serve --auth-config` the server needs no credentials, and every caller may do everything. With it, each operation lists the schemes it accepts, and `x-sparkles-permission` names the permission it needs: `public`, `any caller`, `signed in`, `web session`, a dataset level (`read`, `write`, `admin`) or a server permission (`metrics`, `federate`, `server-admin`). A caller without a level on a dataset gets `404`, as for a missing dataset. Session and proxy principals send `X-Sparkles-CSRF` on unsafe requests. Trusted proxy headers are honored only from configured proxies and are not listed as schemes.\n\n**Errors.** Every non-2xx response has the `Error` body, with the `requestId` of the response's `X-Request-Id`. A budget error (`507`) adds `budget`, `limit` and `requested`.\n\n**Pagination.** Listings that page say so in `x-sparkles-pagination`. Schema listings take `limit` and an opaque `cursor` and answer `{items, total, next}`. Commit listings take `limit` with `before` or `after`. Backup listings take `limit` and `before`. A null `next` ends the listing.\n\n**Conditional requests.** Graph Store reads carry a weak `ETag` naming the commit read. `If-Match` and `If-None-Match` make writes conditional, and a failed condition answers `412`. Responses of queries and writes carry `Sparkles-Commit` and `Sparkles-Dataset-Id`.\n\n**Coverage.** Every route of the server is described with its methods, parameters and media types. Every named schema is described member by member. Members the reference calls free-form, such as SHACL results and GeoJSON geometries, are open objects inside them, and a few answers, such as class profiles and MCP messages, are plain objects.",
     "license": {
       "identifier": "Apache-2.0",
       "name": "Apache-2.0"
@@ -13398,7 +16749,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ConstraintsLayer"
+                  "$ref": "#/components/schemas/ConstraintsReport"
                 }
               }
             },
@@ -20470,10 +23821,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ShexReport"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ShexReport"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ShexResultMap"
+                    }
+                  ]
                 }
               },
-              "text/turtle": {
+              "text/plain": {
                 "schema": {
                   "type": "string"
                 }

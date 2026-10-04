@@ -364,7 +364,7 @@ their `u64` return types.
 
 ### 5.1 New and changed modules
 
-* **`crates/sparkles/src/commit.rs`** is new. It holds `CommitKind` with its u8 codes and
+* **`crates/sparkles-core/src/commit.rs`** is new. It holds `CommitKind` with its u8 codes and
   JSON names, `CommitInfo`, `Receipt` and `CommitPage`. It formats RFC 3339 timestamps
   with milliseconds, extending `builder::now_rfc3339`. It also holds `DatasetFile` for
   `dataset.json`, `GenCommitFile` for `gen-NNNN/commit.json`, and `Catalog`, which has a
@@ -729,10 +729,10 @@ while `sparkles serve` holds the lock → succeeds and lists seqs 1, 0.
 
 * Sparkles repository (read): `README.md`, `docs/API.md`, `docs/AUDIT.md`, the
   project's feature-ordering notes (this feature's scope and dependants),
-  `crates/sparkles/src/store.rs` (generations, WAL format, replay, `publish_log`,
+  `crates/sparkles-core/src/store.rs` (generations, WAL format, replay, `publish_log`,
   `rebuild_locked` publication order, `write_atomic`/`sync_dir`),
-  `crates/sparkles/src/dataset.rs`, `crates/sparkles/src/sparql/update.rs`
-  (`UpdateStats`, per-op counting), `crates/sparkles/src/builder.rs` (`IndexMeta`,
+  `crates/sparkles/src/dataset.rs`, `crates/sparkles-core/src/sparql/update.rs`
+  (`UpdateStats`, per-op counting), `crates/sparkles-core/src/builder.rs` (`IndexMeta`,
   `now_rfc3339`), `crates/sparkles-reasoner/src/lib.rs` (reason/clear transactions),
   `crates/sparkles-server/src/{http.rs,main.rs,state.rs}` (current update/GSP/upload
   responses, CORS, CLI), `ui/src/lib/api.ts`, `ui/src/routes/query/+page.svelte`,
@@ -797,7 +797,7 @@ into a new lineage, mint a new id and record `forkedFrom`. Default response bodi
 unchanged (question 2). The non-decreasing clock clamp and v4 UUIDs are as proposed. The
 catalog is not pruned.
 
-**Tests at landing.** `crates/sparkles/tests/commits.rs` covers the root commit, net
+**Tests at landing.** `crates/sparkles-core/tests/commits.rs` covers the root commit, net
 counting, restart and replay, a lost catalog tail, a torn WAL tail, compaction and bulk
 commits, migration, the monotone clock and the library API. Router tests cover receipts,
 headers, the catalog routes, paging and errors. The W3C SPARQL results did not change.
@@ -858,7 +858,7 @@ requests, the `Sparkles-Commit-Message` header and `--message`.
 - Messages are single lines. The rule against control characters rejects newlines in the
   library as well as over HTTP, where a header cannot carry them.
 
-**Phase 3 tests.** `crates/sparkles/tests/annotations.rs` covers messages through
+**Phase 3 tests.** `crates/sparkles-core/tests/annotations.rs` covers messages through
 updates, replaces and bulk loads, their survival across reopen, lost and torn
 annotations, digest values and chaining, the sticky setting, failed preconditions and
 concurrent writers with one precondition. `http/conditional_tests.rs` covers tags per
@@ -895,6 +895,6 @@ question 5.
   commit. See [F06 Outcome](F06-snapshots-and-point-in-time.md#outcome) for the feed,
   its formats and its budgets.
 
-**Tests.** `crates/sparkles/tests/annotations.rs` prunes a catalog with messages and
+**Tests.** `crates/sparkles-core/tests/annotations.rs` prunes a catalog with messages and
 digests on, through a pin, a reopen, an offline read, `sparkles check` and a backup
 restore. `http/diff_tests.rs` covers the horizon over HTTP.

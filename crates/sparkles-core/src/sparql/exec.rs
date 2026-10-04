@@ -2966,7 +2966,7 @@ pub(super) fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<E
 pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bool>> {
     let t0 = Instant::now();
     let dec = decode_for(ctx, t, &exprs.iter().collect::<Vec<_>>());
-    tracing::debug!("decoded values in {:?}", t0.elapsed());
+    tracing::debug!(target: "sparkles::sparql::exec", "decoded values in {:?}", t0.elapsed());
     let t0 = Instant::now();
     let map = t.var_map(ctx.nvars());
     let test = |i: usize| {
@@ -2980,7 +2980,7 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
     };
     let par = t.len() > PAR_THRESHOLD && exprs.iter().all(Expr::parallel);
     let keep = map_rows(ctx, t.len(), par, test)?;
-    tracing::debug!("filter evaluated {} rows in {:?}", t.len(), t0.elapsed());
+    tracing::debug!(target: "sparkles::sparql::exec", "filter evaluated {} rows in {:?}", t.len(), t0.elapsed());
     Ok(keep)
 }
 
@@ -4810,6 +4810,7 @@ pub(super) fn fetch(
         .unwrap_or_default();
     // a client span: its context is what the outbound headers hook propagates
     let span = tracing::info_span!(
+        target: "sparkles::sparql::exec",
         "sparql.service",
         otel.kind = "client",
         http.request.method = "POST",

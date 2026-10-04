@@ -642,7 +642,7 @@ left out of the index and the server rebuilds it when it opens the database.
 The other commands are:
 
 * `schema` ([below](#constraints-next-to-the-counts));
-* `shacl`, `shex validate|parse` and `validation`, for validation on request and
+* `shacl`, `shacl parse`, `shex validate|parse` and `validation`, for validation on request and
   write-time validation ([below](#validating-with-shacl-and-shex));
 * `queries`, for stored queries ([below](#stored-queries));
 * `describe-settings`, for a dataset's DESCRIBE mode ([below](#describe-modes));
@@ -892,6 +892,7 @@ installs a guard that validates every later write to a database before it commit
 sparkles shacl --loc db --shapes shapes.ttl                  # a Turtle report; --format json|text
 sparkles shacl --data data.ttl --shapes shapes.shaclc --graph union
 sparkles shex validate --loc db --schema people.shex --shape-map '{FOCUS a ex:Person}@ex:PersonShape'
+sparkles shacl parse shapes.ttl > shapes.shaclc              # Turtle to SHACLC; --out turtle|nt|jsonld|rdfxml
 sparkles shex parse people.shex --out shexr > people.ttl     # ShExC to ShExR, ShExJ or ShExC
 sparkles validation --loc db --mode reject --shapes shapes.ttl
 sparkles validation --loc db --mode warn --schema people.shex --shape-map '{FOCUS a ex:Person}@ex:PersonShape'
@@ -923,6 +924,15 @@ Shapes files may be in any RDF syntax or in the SHACL Compact Syntax. `sparkles 
 and `sparkles validation` read a file ending in `.shaclc` or `.shc` as SHACLC, and the
 database keeps write-time shapes as Turtle whatever syntax they came in
 ([API.md](API.md#shacl-compact-syntax-shaclc)).
+
+`sparkles shacl parse FILE…` converts shapes files between syntaxes, like Jena's `shacl
+parse`. It checks that each file is well-formed SHACL and prints it in the syntax of
+`--out`, which is `shaclc` by default and can also be `turtle`, `nt`, `jsonld` or
+`rdfxml`. Several files are printed one after another, each after a `# FILE` line. `-`
+reads stdin, which is Turtle unless `--in` names another syntax. A graph with triples that
+SHACLC cannot express, such as labels on shapes, fails with `--out shaclc` and names the
+triples. A SHACLC file without `BASE` is read without a base IRI, so the output has no
+`owl:Ontology` triple for the file's location, and `--base` sets one.
 
 With the default support of 1, every constraint holds for every instance, so the current
 data conforms. With `--support 0.95`, a constraint is drafted when 95% of the instances
