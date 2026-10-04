@@ -1294,6 +1294,51 @@ impl Store {
         Ok(info)
     }
 
+    /// The bytes of this store's own directory: a branch's, or for `main` the
+    /// dataset's less its branches.
+    pub fn branch_own_bytes(&self) -> u64 {
+        match (&self.root, &self.branching.ident) {
+            (Some(r), Some(_)) => dir_size(r),
+            (Some(r), None) => dir_size(r).saturating_sub(dir_size(&r.join(BRANCHES_DIR))),
+            _ => 0,
+        }
+    }
+
+    /// The bytes the dataset keeps on disk only for its branches: generations that are
+    /// no longer current where they were built and that a branch's link still reads,
+    /// and the directories of retired branches (0 without branches).
+    pub fn branch_held_bytes(&self) -> u64 {
+        let Ok(set) = self.owned_set() else { return 0 };
+        let t = set.table.lock().clone();
+        let mut dirs: HashSet<PathBuf> = HashSet::new();
+        for e in t.all() {
+            for h in &e.holds {
+                let dir = if h.branch_id == set.dataset_id {
+                    set.root.join(&h.generation)
+                } else {
+                    set.branch_root(h.branch_id).join(&h.generation)
+                };
+                let current = dir.parent().and_then(|p| {
+                    std::fs::read_to_string(p.join("CURRENT"))
+                        .ok()
+                        .map(|c| c.trim().to_string())
+                });
+                if current.as_deref() != Some(h.generation.as_str()) {
+                    dirs.insert(dir);
+                }
+            }
+        }
+        for r in &t.retired {
+            dirs.insert(set.branch_root(r.id));
+        }
+        // a held generation inside a retired branch's directory counts once
+        let retired: Vec<PathBuf> = t.retired.iter().map(|r| set.branch_root(r.id)).collect();
+        dirs.iter()
+            .filter(|d| !retired.iter().any(|r| d.starts_with(r) && *d != r))
+            .map(|d| dir_size(d))
+            .sum()
+    }
+
     /// Change a branch's protection (any branch, `main` included).
     pub fn set_branch_protected(&self, name: &str, on: bool) -> Result<BranchInfo> {
         self.update_entry(name, |m, e| match e {

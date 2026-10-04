@@ -86,6 +86,7 @@ pub fn synthetic(files: Vec<(&str, FileKind, Vec<u8>)>) -> Source {
             unvalidated: false,
         },
         generation: "gen-0001".into(),
+        branches_omitted: 0,
         index_format: sparkles_core::builder::FORMAT_VERSION,
         files: files
             .into_iter()

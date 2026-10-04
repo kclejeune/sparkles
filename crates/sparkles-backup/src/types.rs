@@ -13,6 +13,10 @@ use uuid::Uuid;
 
 pub use sparkles_core::store::FileKind;
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -447,6 +451,9 @@ pub struct Backup {
     /// what the backup uploaded and reused
     pub stats: ManifestStats,
     pub derived: Derived,
+    /// the dataset's branches other than `main` that the backup left out
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub branches_omitted: u64,
 }
 
 /// The dataset of a manifest.
@@ -542,6 +549,9 @@ pub struct Manifest {
     /// reserved for client-side encryption; this format requires `null`
     #[serde(default)]
     pub encryption: Option<J>,
+    /// the dataset's branches other than `main`, which a backup does not copy
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub branches_omitted: u64,
 }
 
 impl Manifest {
@@ -586,6 +596,7 @@ impl Manifest {
             files: self.files.clone(),
             stats: self.stats.clone(),
             derived: self.derived.clone(),
+            branches_omitted: self.branches_omitted,
         }
     }
 }

@@ -235,6 +235,7 @@ pub async fn put_backup(repo: &Repository, root: &Path, name: &str) -> Manifest 
             }),
         },
         encryption: None,
+        branches_omitted: 0,
     };
     put_manifest(repo, &m).await;
     m

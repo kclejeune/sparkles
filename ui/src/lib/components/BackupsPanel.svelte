@@ -127,6 +127,13 @@
         {restoredFrom.seq}{restoredFrom.datasetId !== info?.id ? ', another lineage' : ''}).
       </p>
     {/if}
+    {#if (info?.branches ?? 1) > 1}
+      <p class="restored faint">
+        Backups copy the main branch only. {info!.branches! - 1 === 1
+          ? 'The other branch is'
+          : `The other ${info!.branches! - 1} branches are`} not backed up.
+      </p>
+    {/if}
     {#if error}
       <div class="panel-body"><div class="error-box">{error}</div></div>
     {:else if !loaded}

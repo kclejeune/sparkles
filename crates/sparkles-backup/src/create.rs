@@ -271,6 +271,7 @@ impl Repository {
             files,
             lease,
             in_memory,
+            branches_omitted,
             ..
         } = src;
         let mut files = files;
@@ -471,6 +472,7 @@ impl Repository {
                 }),
             },
             encryption: None,
+            branches_omitted,
         };
         ctl.check()?;
         ctl.report(0.97, "writing the manifest");

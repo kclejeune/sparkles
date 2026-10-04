@@ -1343,6 +1343,14 @@ A dry run answers `200` at once. In the library, a merge under a `Control` repor
 and a cancel that comes while it commits leaves the target at its old head with no merge
 record.
 
+**A32. Gauges and backups.** With `dev` open and one commit ahead, `GET /$/metrics`
+gives `sparkles_branch_quads` for `main` (2) and `dev` (3), `sparkles_branch_delta_quads`,
+`sparkles_branch_wal_bytes` and `sparkles_branch_disk_bytes` with a `branch` label,
+`sparkles_branches` 2 and `sparkles_branch_held_bytes` 0. After `main` compacts, the
+held bytes are those of the generation `dev`'s link reads, and they are 0 again once
+`dev` compacts. A backup of `main` records `branchesOmitted: 1` in its manifest, and the
+dataset page's Backups panel says that the other branch is not backed up.
+
 ## 10. Open questions
 
 1. **Exempt predicates.** Should `cell` scope exempt some predicates by default, such as

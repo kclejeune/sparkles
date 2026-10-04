@@ -49,19 +49,78 @@ pub(crate) fn metrics(st: &AppState, out: &mut String) {
         let _ = writeln!(o, "# TYPE {name} {kind}");
     };
     let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
-    let mut gauges: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    let mut gauges: std::collections::BTreeMap<String, (u64, u64, u64)> = Default::default();
+    // per branch: quads, delta inserts and deletes, log bytes, own disk bytes
+    type Per = std::collections::BTreeMap<(String, String), [u64; 5]>;
+    let mut per: Per = Default::default();
+    let cap = st.metrics.max_datasets().max(1);
     for d in datasets.iter().filter(|d| d.kind == DbType::Persistent) {
-        let linked = d.store.branch_set().map_or(0, |s| {
-            s.open_stores()
-                .iter()
-                .filter(|b| b.snapshot().generation.linked().is_some())
-                .count() as u64
-        });
-        let g = gauges
-            .entry(st.metrics.dataset_label(Some(&d.name)))
-            .or_default();
+        let open = d
+            .store
+            .branch_set()
+            .map(|s| s.open_stores())
+            .unwrap_or_default();
+        let linked = open
+            .iter()
+            .filter(|b| b.snapshot().generation.linked().is_some())
+            .count() as u64;
+        let ds = st.metrics.dataset_label(Some(&d.name));
+        let g = gauges.entry(ds.clone()).or_default();
         g.0 += d.store.branch_count() as u64;
         g.1 += linked;
+        g.2 += d.store.branch_held_bytes();
+        // main, then the open branches by name; past the cap they add up under $other
+        let mut stores: Vec<(String, &sparkles::store::Store)> =
+            open.iter().map(|b| (b.branch_name(), b.as_ref())).collect();
+        stores.sort_by(|a, b| a.0.cmp(&b.0));
+        stores.insert(0, (MAIN.to_string(), &d.store));
+        for (i, (name, s)) in stores.into_iter().enumerate() {
+            let label = if i < cap { name } else { "$other".to_string() };
+            let snap = s.snapshot();
+            let e = per.entry((ds.clone(), label)).or_default();
+            e[0] += snap.len();
+            e[1] += snap.delta.inserts() as u64;
+            e[2] += snap.delta.deletes() as u64;
+            e[3] += s.wal_bytes();
+            e[4] += s.branch_own_bytes();
+        }
+    }
+    if !per.is_empty() {
+        for (i, (name, help)) in [
+            ("sparkles_branch_quads", "Quads on each branch."),
+            (
+                "sparkles_branch_delta_quads",
+                "Inserted and deleted quads of each branch not yet compacted into its index.",
+            ),
+            (
+                "sparkles_branch_wal_bytes",
+                "Size of each branch's write-ahead log.",
+            ),
+            (
+                "sparkles_branch_disk_bytes",
+                "Size of each branch's own directory (main's: the dataset's, less its branches).",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            family(out, name, "gauge", help);
+            for ((ds, b), v) in &per {
+                let labels = format!("dataset=\"{}\",branch=\"{}\"", label(ds), label(b));
+                match i {
+                    0 => {
+                        let _ = writeln!(out, "{name}{{{labels}}} {}", v[0]);
+                    }
+                    1 => {
+                        let _ = writeln!(out, "{name}{{{labels},kind=\"insert\"}} {}", v[1]);
+                        let _ = writeln!(out, "{name}{{{labels},kind=\"delete\"}} {}", v[2]);
+                    }
+                    n => {
+                        let _ = writeln!(out, "{name}{{{labels}}} {}", v[n + 1]);
+                    }
+                }
+            }
+        }
     }
     if !gauges.is_empty() {
         family(
@@ -70,7 +129,7 @@ pub(crate) fn metrics(st: &AppState, out: &mut String) {
             "gauge",
             "Branches per dataset, main included.",
         );
-        for (ds, (n, _)) in &gauges {
+        for (ds, (n, _, _)) in &gauges {
             let _ = writeln!(out, "sparkles_branches{{dataset=\"{}\"}} {n}", label(ds));
         }
         family(
@@ -79,10 +138,23 @@ pub(crate) fn metrics(st: &AppState, out: &mut String) {
             "gauge",
             "Open branches that still read their upstream's index files.",
         );
-        for (ds, (_, n)) in &gauges {
+        for (ds, (_, n, _)) in &gauges {
             let _ = writeln!(
                 out,
                 "sparkles_branch_linked{{dataset=\"{}\"}} {n}",
+                label(ds)
+            );
+        }
+        family(
+            out,
+            "sparkles_branch_held_bytes",
+            "gauge",
+            "Bytes kept on disk only for branches: upstream generations their links read, and retired branches.",
+        );
+        for (ds, (_, _, n)) in &gauges {
+            let _ = writeln!(
+                out,
+                "sparkles_branch_held_bytes{{dataset=\"{}\"}} {n}",
                 label(ds)
             );
         }

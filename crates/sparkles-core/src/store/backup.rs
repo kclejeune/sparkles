@@ -199,6 +199,8 @@ pub struct BackupCapture {
     /// a capture of an in-memory store ([`Store::memory_backup_capture`]): the files
     /// are a temporary database built from its snapshot, removed with the lease
     pub in_memory: bool,
+    /// the dataset's branches other than `main`, which a backup leaves out
+    pub branches_omitted: u64,
 }
 
 impl BackupCapture {
@@ -513,6 +515,7 @@ impl Store {
                 release: Some(Box::new(move || drop(tmp))),
             },
             in_memory: true,
+            branches_omitted: 0,
         })
     }
 
@@ -649,6 +652,7 @@ impl Store {
             lock_hold,
             lease,
             in_memory: false,
+            branches_omitted: self.branch_count().saturating_sub(1) as u64,
         }))
     }
 

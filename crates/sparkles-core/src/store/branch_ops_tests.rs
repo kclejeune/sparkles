@@ -710,3 +710,24 @@ fn a31_merges_report_progress_and_stop_when_cancelled() {
     );
     assert_eq!(seen.lock().last().map(String::as_str), Some("1 committed"));
 }
+
+#[test]
+fn a32_held_bytes_and_backups_count_the_branches() {
+    let (_dir, s) = setup();
+    s.compact().unwrap();
+    assert_eq!(s.branch_held_bytes(), 0);
+    assert_eq!(s.backup_capture("t").unwrap().branches_omitted, 0);
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    apply(&s.branch("dev").unwrap(), "+<urn:c> <urn:p> <urn:x> .");
+    // while main's generation is current, nothing is held for the branch alone
+    assert_eq!(s.branch_held_bytes(), 0);
+    s.compact().unwrap();
+    let held = s.branch_held_bytes();
+    assert!(held > 0, "dev's link holds main's old generation");
+    assert!(s.branch("dev").unwrap().branch_own_bytes() > 0);
+    assert!(s.branch_own_bytes() > 0);
+    assert_eq!(s.backup_capture("t").unwrap().branches_omitted, 1);
+    // once dev rebuilds, the old generation is held by its base pin only
+    s.branch("dev").unwrap().compact().unwrap();
+    assert_eq!(s.branch_held_bytes(), 0);
+}

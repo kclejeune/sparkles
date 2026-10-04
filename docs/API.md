@@ -3056,6 +3056,17 @@ and a protected branch refuses it.
 
 ### Storage, history and access
 
+A backup to a [backup repository](#backup-repositories) copies `main` only. Its
+manifest records the number of other branches it left out in `branchesOmitted`, which
+`GET` of the backup shows.
+
+The metrics `sparkles_branch_quads`, `sparkles_branch_delta_quads`,
+`sparkles_branch_wal_bytes` and `sparkles_branch_disk_bytes` carry `dataset` and
+`branch` labels, for `main` and every open branch. Past `--metrics-max-datasets` branches
+of one dataset, the rest add up under `branch="$other"`. `sparkles_branch_held_bytes`
+counts, per dataset, the bytes kept only for branches: upstream generations that a
+branch's link reads and that are no longer current, and retired branches.
+
 A linked branch holds the upstream generations it reads, and `GET /$/history/{ds}` lists
 such a hold as `branch:NAME` in `heldBy`. Each branch also keeps its starting commit
 readable, listed as `branch-base:NAME`, so a merge back is always possible. The automatic

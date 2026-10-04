@@ -538,3 +538,25 @@ async fn a31_merges_as_tasks() {
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
 }
+
+#[tokio::test]
+async fn a32_per_branch_gauges() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_st, app) = setup(dir.path()).await;
+    json_req(&app, "POST", "/$/branches/ds", json!({ "name": "dev" })).await;
+    update(&app, "ds@dev", "INSERT DATA { <urn:c> <urn:p> 1 }").await;
+    let (r, _) = get(&app, "/$/metrics").await;
+    assert_eq!(r.status, StatusCode::OK);
+    let text = r.text();
+    for line in [
+        "sparkles_branch_quads{dataset=\"ds\",branch=\"main\"} 2",
+        "sparkles_branch_quads{dataset=\"ds\",branch=\"dev\"} 3",
+        "sparkles_branch_delta_quads{dataset=\"ds\",branch=\"dev\",kind=\"insert\"} 3",
+        "sparkles_branch_held_bytes{dataset=\"ds\"} 0",
+        "sparkles_branches{dataset=\"ds\"} 2",
+    ] {
+        assert!(text.contains(line), "{line} not in:\n{text}");
+    }
+    assert!(text.contains("sparkles_branch_disk_bytes{dataset=\"ds\",branch=\"dev\"}"));
+    assert!(text.contains("sparkles_branch_wal_bytes{dataset=\"ds\",branch=\"dev\"}"));
+}

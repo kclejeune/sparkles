@@ -935,6 +935,10 @@ fn backups(put: &mut dyn FnMut(&str, J)) {
             json!({ "text": or_null(obj(&["rebuildOnRestore"], json!({ "rebuildOnRestore": boolean() }))) }),
         ),
     );
+    f.insert(
+        "branchesOmitted".into(),
+        json!({ "type": "integer", "description": "The dataset's branches other than main, which the backup did not copy (absent when there were none)." }),
+    );
     let mut required = summary_required.to_vec();
     required.extend(["format", "generation", "files"]);
     put(

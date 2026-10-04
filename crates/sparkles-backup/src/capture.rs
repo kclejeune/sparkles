@@ -29,6 +29,8 @@ pub struct Source {
     pub lease: LeaseGuard,
     /// the source is an in-memory dataset (the manifest's `dataset.type` is `mem`)
     pub in_memory: bool,
+    /// the dataset's branches other than `main`, which the backup leaves out
+    pub branches_omitted: u64,
 }
 
 impl From<BackupCapture> for Source {
@@ -42,6 +44,7 @@ impl From<BackupCapture> for Source {
             lock_hold: c.lock_hold,
             lease: c.lease,
             in_memory: c.in_memory,
+            branches_omitted: c.branches_omitted,
         }
     }
 }

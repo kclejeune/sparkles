@@ -993,6 +993,10 @@
           "addedBytes": {
             "type": "integer"
           },
+          "branchesOmitted": {
+            "description": "The dataset's branches other than main, which the backup did not copy (absent when there were none).",
+            "type": "integer"
+          },
           "commit": {
             "properties": {
               "quads": {
