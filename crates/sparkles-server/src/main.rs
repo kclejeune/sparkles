@@ -4117,6 +4117,16 @@ fn print_diagnostics(r: &sparkles_reasoner::diagnostics::DiagnosticsReport, j: &
     );
 }
 
+/// The dataset of an existing database directory, set up as the server sets it up
+/// (`sparkles::Dataset::open_with`). A directory that is not a database is an error,
+/// and nothing is created.
+pub(crate) fn open_dataset(loc: &std::path::Path, opts: StoreOptions) -> Result<sparkles::Dataset> {
+    if !loc.join("CURRENT").exists() {
+        bail!("{} is not a database directory", loc.display());
+    }
+    Ok(sparkles::Dataset::open_with(loc, opts)?)
+}
+
 /// A database directory, or the given files loaded into an in-memory store.
 fn open_or_load(
     loc: Option<PathBuf>,
