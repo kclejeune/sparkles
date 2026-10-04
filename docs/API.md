@@ -166,6 +166,7 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_validation_total` | counter | `dataset`, `language` = `shacl` \| `shex`, `status` = `passed` \| `warned` \| `rejected` \| `skipped` \| `bypassed` \| `timeout` \| `error` |
 | `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `language`, `strategy` = `full` \| `incremental` |
 | `sparkles_validation_results_total` | counter. Results found by validated writes. ShEx counts nonconformant associations as `violation`. | `dataset`, `language`, `severity` = `violation` \| `warning` \| `info` |
+| `sparkles_validation_focus_nodes` | histogram (1 … 1,000,000, ×10). The focus nodes each validated write validated, as in the summary's `focusNodes`. A strategy has series once it has a validation. | `dataset`, `language`, `strategy` = `full` \| `incremental` |
 | `sparkles_validation_fallbacks_total` | counter. Validated writes that ran a full validation, or validated some shapes in full. | `dataset`, `language`, `reason` = `baseline` \| `shapes` \| `subclass` \| `sparql` \| `recursive` \| `bulk` \| `budget` |
 | `sparkles_rebuilds_total` | counter. New generations published since the dataset was opened. `compact` counts the compactions that published, and `bulk` the bulk commits, such as a large load, that wrote the data into a new generation. | `dataset`, `reason` = `compact` \| `bulk` |
 | `sparkles_rebuild_duration_seconds` | histogram (0.1 s … 3600 s). The duration of those rebuilds. A reason has series once it has a rebuild. | `dataset`, `reason` |

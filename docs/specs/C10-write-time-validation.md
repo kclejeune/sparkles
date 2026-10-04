@@ -9,7 +9,9 @@
 > a status panel on the dataset page. Phase 3 shipped: localizable SHACL-SPARQL,
 > `sh:targetWhere`, the refinement of F3, the `unvalidated` catalog flag,
 > `serve --validate` and mixed shapes sources. ShEx later became a second guard language
-> ([G02](G02-shex.md)), and its guard is incremental too.
+> ([G02](G02-shex.md)), and its guard is incremental too. The focus-node histogram of
+> §2.6 came last. The panel's configuration form and a results table for a `422` on the
+> query page are not built.
 >
 > **User docs:** [API: Write-time validation](../API.md#write-time-validation) ·
 > [API: Metrics](../API.md#metrics) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
@@ -1175,10 +1177,22 @@ validator's numbers are in
   as long as with validation off, against 1.3 to 4.4 s before. At 10.5M triples they took
   9 to 20 ms, against 9.8 to 14.8 s before.
 
-**Not built in Phase 2.** The `sparkles_validation_focus_nodes` histogram was not added.
-Summaries carry `focusNodes` instead. The panel has no configuration form, and the query
-page shows a `422` as an error rather than a results table. The open questions of §10
-keep their Phase 1 defaults.
+**Not built in Phase 2.** The `sparkles_validation_focus_nodes` histogram was not added
+at first, and summaries carried `focusNodes` instead. The panel has no configuration
+form, and the query page shows a `422` as an error rather than a results table. The open
+questions of §10 keep their Phase 1 defaults.
+
+**The focus-node histogram (2026-10-03).** `sparkles_validation_focus_nodes` landed as
+§2.6 lists it, with the `language` label the other validation series gained with ShEx.
+Each validated write observes the `focusNodes` of its summary under its strategy, so a
+full validation counts every focus node of the validated shapes and an incremental one
+the affected nodes. Skipped and bypassed writes, timeouts and failures validate no
+counted set and are not observed. The buckets are powers of ten from 1 to 1,000,000,
+because F7 caps an incremental validation at 50,000 focus nodes and a full validation can
+reach millions. `obs_tests::validation_metrics_count_writes_by_status_and_severity`
+checks that two incremental writes of one new person each land in the first bucket. The
+configuration form of the panel and the `422` results table on the query page are still
+not built.
 
 **Phase 3 shipped on 2026-10-02.**
 

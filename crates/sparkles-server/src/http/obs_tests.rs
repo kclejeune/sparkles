@@ -1039,6 +1039,19 @@ async fn validation_metrics_count_writes_by_status_and_severity() {
             r#"sparkles_validation_duration_seconds_bucket{dataset="ds",language="shacl",strategy="incremental",le="+Inf"}"#,
             2.0,
         ),
+        // each write validated its one new person
+        (
+            r#"sparkles_validation_focus_nodes_count{dataset="ds",language="shacl",strategy="incremental"}"#,
+            2.0,
+        ),
+        (
+            r#"sparkles_validation_focus_nodes_bucket{dataset="ds",language="shacl",strategy="incremental",le="1"}"#,
+            2.0,
+        ),
+        (
+            r#"sparkles_validation_focus_nodes_sum{dataset="ds",language="shacl",strategy="incremental"}"#,
+            2.0,
+        ),
         (
             r#"sparkles_validation_fallbacks_total{dataset="ds",language="shacl",reason="baseline"}"#,
             0.0,

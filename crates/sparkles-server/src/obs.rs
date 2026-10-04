@@ -860,7 +860,14 @@ struct LanguageCounters {
     results: [AtomicU64; 3],
     /// validations that fell back to full validation, by reason
     fallbacks: [AtomicU64; 7],
+    /// validations by the focus nodes they validated, per strategy, by [`FOCUS_BUCKETS`]
+    /// (not cumulative), and the sum of the focus nodes
+    focus: [[AtomicU64; FOCUS_BUCKETS.len() + 1]; 2],
+    focus_sum: [AtomicU64; 2],
 }
+
+/// Upper bounds of the `sparkles_validation_focus_nodes` histogram, without `+Inf`.
+const FOCUS_BUCKETS: [u64; 7] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000];
 
 impl ValidationMetrics {
     pub fn new(dataset: &str) -> ValidationMetrics {
@@ -917,6 +924,14 @@ impl sparkles::guard::GuardObserver for ValidationMetrics {
             Strategy::None => return,
         };
         m.duration[strategy].observe(elapsed);
+        if let Some(n) = s.focus_nodes {
+            let i = FOCUS_BUCKETS
+                .iter()
+                .position(|b| n <= *b)
+                .unwrap_or(FOCUS_BUCKETS.len());
+            m.focus[strategy][i].fetch_add(1, Ordering::Relaxed);
+            m.focus_sum[strategy].fetch_add(n, Ordering::Relaxed);
+        }
         if let Some(i) = s
             .fallback
             .as_deref()
@@ -977,6 +992,8 @@ struct ValidationTotals {
     duration: [([u64; 17], u64); 2],
     results: [u64; 3],
     fallbacks: [u64; 7],
+    /// bucket counts (not cumulative) and the sum of focus nodes, per strategy
+    focus: [([u64; FOCUS_BUCKETS.len() + 1], u64); 2],
 }
 
 /// Validation counters by dataset label and language, for the language of a dataset's
@@ -1018,6 +1035,12 @@ fn add_totals(t: &mut ValidationTotals, m: &LanguageCounters) {
     }
     for (a, c) in t.fallbacks.iter_mut().zip(&m.fallbacks) {
         *a += c.load(Ordering::Relaxed);
+    }
+    for (((buckets, sum), h), s) in t.focus.iter_mut().zip(&m.focus).zip(&m.focus_sum) {
+        for (a, c) in buckets.iter_mut().zip(h) {
+            *a += c.load(Ordering::Relaxed);
+        }
+        *sum += s.load(Ordering::Relaxed);
     }
 }
 
@@ -1437,6 +1460,38 @@ pub fn render_prometheus(st: &AppState) -> String {
             let _ = writeln!(
                 o,
                 "sparkles_validation_results_total{{dataset=\"{ds}\",language=\"{lang}\",severity=\"{severity}\"}} {n}"
+            );
+        }
+    }
+    family(
+        &mut o,
+        "sparkles_validation_focus_nodes",
+        "histogram",
+        "Focus nodes that each write-time validation validated, by strategy.",
+    );
+    for ((ds, lang), t) in &validation {
+        let ds = escape_label(ds);
+        for (strategy, (buckets, sum)) in STRATEGIES.iter().zip(&t.focus) {
+            let total: u64 = buckets.iter().sum();
+            if total == 0 {
+                continue;
+            }
+            let labels = format!("dataset=\"{ds}\",language=\"{lang}\",strategy=\"{strategy}\"");
+            let mut acc = 0;
+            for (i, n) in buckets.iter().enumerate() {
+                acc += n;
+                let le = FOCUS_BUCKETS
+                    .get(i)
+                    .map_or("+Inf".to_string(), |b| b.to_string());
+                let _ = writeln!(
+                    o,
+                    "sparkles_validation_focus_nodes_bucket{{{labels},le=\"{le}\"}} {acc}"
+                );
+            }
+            let _ = writeln!(o, "sparkles_validation_focus_nodes_sum{{{labels}}} {sum}");
+            let _ = writeln!(
+                o,
+                "sparkles_validation_focus_nodes_count{{{labels}}} {total}"
             );
         }
     }
