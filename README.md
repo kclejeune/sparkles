@@ -17,25 +17,22 @@ Rust, Python and JVM APIs, a Fuseki-compatible server and CLI, and a web UI.
 
 ![The query editor with results](docs/images/query.png)
 
-## Why Sparkles
+## Philosophy
 
-* **Fuseki clients keep working.** Sparkles implements the SPARQL 1.1 Query, Update and
-  Graph Store protocols, Fuseki's endpoints and `/$/` admin API, Jena's formats and
-  dataset semantics, and TDB2's model of bulk loads, transactions, compaction and
-  backups. It passes the W3C SPARQL suites in full, and Jena's own HTTP clients are
-  tested against it.
-* **QLever's speed, with updates.** Terms are 64-bit ids with numbers and dates inline,
-  indexes are sorted and compressed permutations, and a cost-based planner drives
-  column-at-a-time execution. Sparkles adds MVCC transactions, a write-ahead log and
-  online compaction. It is the fastest of five engines on every benchmark query at 10.5M
-  triples, and loads English DBpedia (1.24 billion triples) 2.8× faster than QLever.
-* **History you can query and branch.** Every commit has a durable id. Queries can read
-  any retained commit, time or named snapshot, and Sparkles diffs two commits, streams a
-  change feed, answers SPARQL history queries, and keeps branches that merge three ways.
-* **One server for the whole stack.** Reasoning, SHACL and ShEx validation, full-text,
-  vector, path and spatial search, GraphQL, an MCP server for LLM agents, and access
-  control down to single triples all run in the engine, on the same snapshots and
-  budgets as SPARQL.
+1. **Jena-compatible where users can see it.** Anything that talks to Fuseki should keep
+   working. Sparkles implements the SPARQL 1.1 Query, Update and Graph Store protocols,
+   Fuseki's endpoints and `/$/` admin API, Jena's formats and dataset semantics, and
+   TDB2's model of bulk loads, transactions, compaction and backups.
+2. **QLever-style internals where performance matters.** Terms are 64-bit ids with
+   numbers and dates stored inline, indexes are sorted and compressed permutations, and
+   a cost-based planner drives column-at-a-time execution. Sparkles adds MVCC
+   transactions, a write-ahead log and online compaction.
+3. **Reuse the Rust RDF ecosystem.** The term model, parsers, SPARQL algebra and XSD
+   values come from the Oxigraph project's crates. Sparkles adds the storage, planner,
+   executor, server, reasoner and UI.
+4. **Library first.** The engine is a library with no HTTP server. The server, the CLI
+   and the Python and JVM bindings are built on its public API, so an embedded program
+   gets the same features as the server.
 
 ## Features
 
@@ -88,6 +85,18 @@ Rust, Python and JVM APIs, a Fuseki-compatible server and CLI, and a web UI.
   ([API](docs/API.md#path-search)).
 * GeoSPARQL 1.1 with a spatial index, Jena's `spatial:` functions, spatial joins and
   nearest-neighbour search ([API](docs/API.md#geosparql)).
+
+**Libraries and bindings**
+* A Rust library with the whole engine. Its `Dataset` API covers queries, updates,
+  transactions and loads, and its handles cover snapshots, history, indexes, reasoning,
+  validation and backups ([usage](docs/USAGE.md#embedding-the-library)).
+* A Python package with a pyoxigraph-style API and an rdflib store plugin
+  ([usage](docs/USAGE.md#python)).
+* A JVM library, `sparkles-jena`, that gives Jena programs a `DatasetGraph` backed by
+  Sparkles, so TDB2 code runs on it with a one-line change
+  ([usage](docs/USAGE.md#jvm-apache-jena)).
+* Node.js and TypeScript bindings are planned ([spec P05](docs/specs/P05-node-bindings.md)).
+* A Rust client for Sparkles and any SPARQL endpoint ([usage](docs/USAGE.md#rust-client)).
 
 **Server and integrations**
 * Fuseki's endpoints and admin API, plus endpoints for commits, schema, clones,
@@ -195,15 +204,8 @@ ds.update(r#"INSERT DATA { <http://ex/carol> <http://xmlns.com/foaf/0.1/name> "C
 `Dataset` also has a query builder, transactions, and handles for snapshots, history,
 indexes, reasoning, validation and backups ([usage](docs/USAGE.md#embedding-the-library)).
 
-The same engine is available from other languages:
-
-* **Python.** `crates/sparkles-py` is a package with a pyoxigraph-style API and an
-  rdflib store plugin ([usage](docs/USAGE.md#python)).
-* **JVM.** `sparkles-jena` in `jvm/` is a Jena `DatasetGraph` backed by Sparkles. TDB2
-  code runs on it after changing the line that opens the dataset, and queries run in
-  Sparkles' engine ([usage](docs/USAGE.md#jvm-apache-jena)).
-* **Remote.** `crates/sparkles-client` is a Rust client with Jena's `RDFConnection`
-  operations, for Sparkles or any SPARQL endpoint ([usage](docs/USAGE.md#rust-client)).
+The Python package ([usage](docs/USAGE.md#python)) and the JVM library
+([usage](docs/USAGE.md#jvm-apache-jena)) run the same engine:
 
 ```python
 from sparkles import Dataset
