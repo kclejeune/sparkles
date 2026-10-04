@@ -214,7 +214,7 @@ path as a query. The global flag `--vector-mb N` (default 4096) sets the memory 
 ### 2.6 Rust library API
 
 ```rust
-pub mod vector {                                   // crates/sparkles/src/vector/
+pub mod vector {                                   // crates/sparkles-core/src/vector/
     pub const DATATYPE: &str = "urn:x-sparkles:vector";
     pub fn parse(lex: &str) -> Result<Vec<f32>, VectorError>;   // §4.1 grammar
     pub fn canonical(v: &[f32]) -> String;                      // §4.1 canonical form
@@ -501,7 +501,7 @@ refused. Configured segments are pinned.
 ## 5. Design sketch
 
 **Modules.**
-- `crates/sparkles/src/vector/mod.rs` holds lexical parsing and formatting, `Metric` and
+- `crates/sparkles-core/src/vector/mod.rs` holds lexical parsing and formatting, `Metric` and
   the kernel. It has no dependencies and is always compiled.
 - `vector/segment.rs` holds packed partitions.
 - `vector/search.rs` holds exact top-k and the overlay.
@@ -805,7 +805,7 @@ GRAPH ex:g2 { ex:a ex:emb "[1, 0, 0]"^^spk:vector . }
 - **Sparkles repository** (read only):
   - `README.md` and `docs/API.md`: endpoints, error mapping, and the decisions on exact
     term identity and the pure-Rust preference.
-  - `crates/sparkles/src/`:
+  - `crates/sparkles-core/src/`:
     - `id.rs`: tags and inline doubles (the basis of the f32 widening fact);
     - `vocab.rs`: base and delta vocabularies, key layout;
     - `store.rs`: generations, the delta and the `apply` invariants, the WAL,
@@ -930,14 +930,14 @@ Phases 1b and 2 landed on 2026-10-02.
 * Vector search results are not cached.
 
 **Tests at landing.**
-* `crates/sparkles/tests/vectors.rs`: the §7 examples, bound queries, `candidates:join`
+* `crates/sparkles-core/tests/vectors.rs`: the §7 examples, bound queries, `candidates:join`
   and `distinct:subject`.
-* `crates/sparkles/tests/vector_index.rs`: recall@10 against the exact search on fixed
+* `crates/sparkles-core/tests/vector_index.rs`: recall@10 against the exact search on fixed
   seeds (at least 0.95 at ef = 64), equal scores on both paths, random inserts, deletes
   and re-inserts after a build, past states, files across reopens and damage, builds
   while writes go on, and configuration errors.
 * Unit tests of the grammar, kernel, graph, file format and configuration in
-  `crates/sparkles/src/vector/`.
+  `crates/sparkles-core/src/vector/`.
 * The server's router tests and `crates/sparkles-server/tests/cli_vector.rs` cover the
   HTTP API and the CLI, locally and against a server.
 
@@ -1064,7 +1064,7 @@ option handling are shared. It then reads both result tables, keeps the best sco
 subject, ranks, and fuses. `text:query` gained a rank output for the same purpose, the
 sixth slot of its subject list (F03). The plan shows one `HybridSearch` node whose
 counters are `textHits`, `vectorHits`, `vectorMethod` and `fused`. Results are not
-cached, as for vector searches. Tests in `crates/sparkles/tests/hybrid.rs` cover the
+cached, as for vector searches. Tests in `crates/sparkles-core/tests/hybrid.rs` cover the
 fusion against hand-computed scores, subjects missing from one list, ties in each
 ranking and in the fused score, depths, limits and options, euclidean ranking, constant
 subjects, `GRAPH ?g`, subjects with several hits, the `maxHits` budget and every error.

@@ -261,11 +261,11 @@ graphs. Responses follow Fuseki, which builds a dataset from every CONSTRUCT:
 * `vendor/spargebra`: the `arq()` guard and `with_arq_syntax`, `Range` in
   `PropertyPathExpression` with its SPARQL and SSE output, the template grammar, and
   `GraphTemplate`. PATCHED.md lists the changes.
-* `crates/sparkles/src/sparql/plan.rs`: `Lateral` and `Range` in the planner, the
+* `crates/sparkles-core/src/sparql/plan.rs`: `Lateral` and `Range` in the planner, the
   rewrite of ranges, the scoped constant table and the `GRAPH ?g` fix.
-* `crates/sparkles/src/sparql/lateral.rs`: the decorrelation test and the operator.
-* `crates/sparkles/src/sparql/exec.rs`: the counting path mode.
-* `crates/sparkles/src/sparql/mod.rs`: CONSTRUCT quads. `results.rs`: their output.
+* `crates/sparkles-core/src/sparql/lateral.rs`: the decorrelation test and the operator.
+* `crates/sparkles-core/src/sparql/exec.rs`: the counting path mode.
+* `crates/sparkles-core/src/sparql/mod.rs`: CONSTRUCT quads. `results.rs`: their output.
 * The pattern walkers (`depth`, `rdfs`, `exists`, scope validation, stored queries, the
   MCP tools, SHACL and ShEx helpers) handle the new algebra.
 * `crates/sparkles-fmt`: the CST rules and printing. `ui/src/lib/sparql-lang.ts`: the
@@ -274,7 +274,7 @@ graphs. Responses follow Fuseki, which builds a dataset from every CONSTRUCT:
 ## 8. Acceptance examples
 
 The ARQ tests named here are in Jena's `jena-arq/testing/ARQ` and are ported to
-`crates/sparkles/tests/arq_syntax.rs` with their data and expected results.
+`crates/sparkles-core/tests/arq_syntax.rs` with their data and expected results.
 
 * **A1.** The positive and negative tests of `Syntax-Lateral` and the
   `syntax-quad-construct-*` tests of `Syntax-ARQ` parse or fail as in ARQ.
@@ -769,7 +769,7 @@ it as the distinct pairs of `p`. `PathEngineN` counts walks, so `multi(p)` is `p
 - The `Lateral` operator evaluates its groups one after another. Running them in
   parallel was left for later.
 
-**Tests.** `crates/sparkles/tests/arq_syntax.rs` ports ARQ's `Syntax-Lateral` (13
+**Tests.** `crates/sparkles-core/tests/arq_syntax.rs` ports ARQ's `Syntax-Lateral` (13
 cases), `Lateral` (7) and `syntax-quad-construct-*` (13) tests, the range cases of
 `TestPath` and `TestPathQuery`, and Jena 6.2.0's answers to 35 queries on small graphs for
 ranges and `LATERAL` (A1 to A9). It found that a sub-select that does not project an
@@ -833,7 +833,7 @@ non-goals), and parallel evaluation of `LATERAL` groups.
 - The setting's `GET` is not limited to callers who read the whole dataset, unlike the
   RDFS and compaction settings, because it reveals nothing about the data.
 
-**Phase 2, tests.** `crates/sparkles/tests/describe.rs` has 12 tests for A11 to A15:
+**Phase 2, tests.** `crates/sparkles-core/tests/describe.rs` has 12 tests for A11 to A15:
 Jena 6.2.0's answers to ten queries, the reifier cases, `scbd`, `outgoing`, labels, the
 depth and size limits, the query's dataset, a union store, the inference overlay, the
 options' parsing and the persisted setting. The differential tests of

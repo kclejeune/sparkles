@@ -872,6 +872,7 @@ impl Catalog {
         let dropped = valid_len - records.len();
         if dropped > 0 {
             tracing::warn!(
+                target: "sparkles::commit",
                 "{}: dropped {dropped} commit records beyond the head {head}",
                 path.display()
             );
@@ -887,6 +888,7 @@ impl Catalog {
             if path.exists() {
                 let aside = path.with_extension(format!("bin.corrupt-{}", now_ms()));
                 tracing::warn!(
+                    target: "sparkles::commit",
                     "{}: history before commit {} is missing; keeping the old catalog as {}",
                     path.display(),
                     base.seq,
@@ -978,7 +980,7 @@ impl Catalog {
         };
         #[cfg(any(test, feature = "failpoints"))]
         if self.fail_writes {
-            tracing::error!("commit catalog: write failed (failpoint); will retry");
+            tracing::error!(target: "sparkles::commit", "commit catalog: write failed (failpoint); will retry");
             return;
         }
         let mut buf = Vec::with_capacity(self.pending.len() * REC);
@@ -988,6 +990,7 @@ impl Catalog {
         match f.write_all(&buf).and_then(|_| f.flush()) {
             Ok(()) => self.pending.clear(),
             Err(e) => tracing::error!(
+                target: "sparkles::commit",
                 "commit catalog {}: {e}; will retry",
                 self.path.as_deref().unwrap_or(Path::new("?")).display()
             ),

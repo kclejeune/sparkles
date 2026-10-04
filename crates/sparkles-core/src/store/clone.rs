@@ -622,7 +622,9 @@ fn share_file(
         match std::fs::hard_link(from, to) {
             Ok(()) => return Ok(CloneMethod::Link),
             // another file system, or links not supported: fall back
-            Err(e) => tracing::debug!("hard link {} failed: {e}", from.display()),
+            Err(e) => {
+                tracing::debug!(target: "sparkles::store::clone", "hard link {} failed: {e}", from.display())
+            }
         }
     }
     if *reflink {
@@ -656,7 +658,7 @@ fn reflink_file(from: &Path, to: &Path) -> Result<bool> {
     let e = std::io::Error::last_os_error();
     drop(dst);
     std::fs::remove_file(to)?;
-    tracing::debug!("reflink of {} failed: {e}", from.display());
+    tracing::debug!(target: "sparkles::store::clone", "reflink of {} failed: {e}", from.display());
     Ok(false)
 }
 

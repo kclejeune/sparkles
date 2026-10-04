@@ -101,7 +101,9 @@ pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) {
         match selectivity(ctx, spec, f, &vars, &text) {
             Ok(Some(s)) => ctx.set_sampled(text, s),
             Ok(None) => {}
-            Err(e) => tracing::debug!("no sampled selectivity for {text}: {e}"),
+            Err(e) => {
+                tracing::debug!(target: "sparkles::sparql::sample", "no sampled selectivity for {text}: {e}")
+            }
         }
     }
 }

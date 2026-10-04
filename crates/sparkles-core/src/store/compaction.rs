@@ -415,6 +415,8 @@ pub(crate) struct Track {
     pub reserved: AtomicU32,
     /// the dataset's own settings
     pub settings: Mutex<CompactionSettings>,
+    /// the published rebuilds since the store was opened
+    pub rebuilds: RebuildStats,
 }
 
 impl Track {
@@ -427,6 +429,7 @@ impl Track {
             running: AtomicBool::new(false),
             reserved: AtomicU32::new(0),
             settings: Mutex::new(CompactionSettings::default()),
+            rebuilds: RebuildStats::default(),
         }
     }
 
@@ -446,10 +449,85 @@ impl Track {
             .store(oldest.unwrap_or(NONE), Ordering::Relaxed);
     }
 
-    /// A bulk commit was made at `ts` (its generation holds it).
-    pub fn bulk_committed(&self, base_seq: u64, ts: i64) {
+    /// A bulk commit was made at `ts` (its generation holds it), after a rebuild of
+    /// `took`.
+    pub fn bulk_committed(&self, base_seq: u64, ts: i64, took: Duration) {
         self.last_commit_ms.store(ts, Ordering::Relaxed);
         self.rebased(base_seq, None);
+        self.rebuilds.record(RebuildReason::Bulk, took);
+    }
+}
+
+/// Upper bounds, in seconds, of the rebuild duration histogram, without `+Inf`.
+pub const REBUILD_BUCKETS: [f64; 13] = [
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0,
+];
+
+/// What made a new generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebuildReason {
+    /// a compaction, background or not
+    Compact,
+    /// a bulk commit, which writes its data into a new generation
+    Bulk,
+}
+
+impl RebuildReason {
+    pub const ALL: [RebuildReason; 2] = [RebuildReason::Compact, RebuildReason::Bulk];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RebuildReason::Compact => "compact",
+            RebuildReason::Bulk => "bulk",
+        }
+    }
+}
+
+/// The published rebuilds of one reason since the store was opened, by duration.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RebuildHistogram {
+    /// rebuilds per bucket of [`REBUILD_BUCKETS`], not cumulative; the last is `+Inf`
+    pub buckets: [u64; REBUILD_BUCKETS.len() + 1],
+    pub sum_seconds: f64,
+}
+
+impl RebuildHistogram {
+    pub fn count(&self) -> u64 {
+        self.buckets.iter().sum()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RebuildCounter {
+    buckets: [AtomicU64; REBUILD_BUCKETS.len() + 1],
+    sum_micros: AtomicU64,
+}
+
+/// Rebuild counts and durations per [`RebuildReason`], kept in memory.
+#[derive(Default)]
+pub(crate) struct RebuildStats([RebuildCounter; 2]);
+
+impl RebuildStats {
+    pub fn record(&self, reason: RebuildReason, d: Duration) {
+        let c = &self.0[reason as usize];
+        let s = d.as_secs_f64();
+        let i = REBUILD_BUCKETS
+            .iter()
+            .position(|b| s <= *b)
+            .unwrap_or(REBUILD_BUCKETS.len());
+        c.buckets[i].fetch_add(1, Ordering::Relaxed);
+        c.sum_micros.fetch_add(
+            u64::try_from(d.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn get(&self, reason: RebuildReason) -> RebuildHistogram {
+        let c = &self.0[reason as usize];
+        RebuildHistogram {
+            buckets: std::array::from_fn(|i| c.buckets[i].load(Ordering::Relaxed)),
+            sum_seconds: c.sum_micros.load(Ordering::Relaxed) as f64 / 1e6,
+        }
     }
 }
 
@@ -736,6 +814,12 @@ impl Store {
     }
 
     /// What the compaction policy looks at, measured without the writer lock.
+    /// The rebuilds this store published since it was opened, with their durations:
+    /// compactions and bulk commits. They are counted in memory only.
+    pub fn rebuilds(&self, reason: RebuildReason) -> RebuildHistogram {
+        self.compaction.rebuilds.get(reason)
+    }
+
     pub fn compaction_measures(&self) -> CompactionMeasures {
         let snap = self.snapshot();
         let now = self.now_ms();
@@ -1142,6 +1226,9 @@ impl Store {
         self.commits.send_replace(view.commit);
         self.vectors_switched(&view);
         self.compaction.rebased(base.seq, cu.oldest_ms);
+        self.compaction
+            .rebuilds
+            .record(RebuildReason::Compact, t0.elapsed());
         let mut retired = Vec::new();
         if let (Some(root), Some(h), Some(old)) = (&self.root, &self.history, &view.generation.dir)
             && old.starts_with(root)
@@ -1353,7 +1440,7 @@ pub(crate) fn remove_interrupted(root: &Path, dataset_id: uuid::Uuid, current: u
         let ours = std::fs::read_to_string(e.path().join(BUILDING_FILE))
             .is_ok_and(|id| id.trim() == dataset_id.to_string());
         if ours && let Err(err) = crate::history::delete_generation(root, &e.path()) {
-            tracing::warn!("could not remove the interrupted compaction {name}: {err}");
+            tracing::warn!(target: "sparkles::store::compaction", "could not remove the interrupted compaction {name}: {err}");
         }
     }
 }

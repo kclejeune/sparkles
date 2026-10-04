@@ -610,7 +610,7 @@ predicates, plus a full-text index and vectors. The users are:
 
 ## 13. Sources
 
-- **Sparkles repository:** `crates/sparkles/src/sparql/` (`mod.rs`, `ctx.rs`, `plan.rs`,
+- **Sparkles repository:** `crates/sparkles-core/src/sparql/` (`mod.rs`, `ctx.rs`, `plan.rs`,
   `exec.rs`, `stats.rs`, `cache.rs`, `update.rs`), `store.rs` (`WriteTxn`), `store/diff.rs`,
   `schema.rs`, `validation.rs`, and `crates/sparkles-server/src/` (`auth/`, `http.rs`,
   `http/`, `mcp/`); the specs C09, C10, C11, F03, F04 and F06.
@@ -667,7 +667,7 @@ predicates, plus a full-text index and vectors. The users are:
 
 **Tests at landing.**
 
-- `crates/sparkles/tests/graph_access.rs` checks that 47 queries through five views give
+- `crates/sparkles-core/tests/graph_access.rs` checks that 47 queries through five views give
   exactly the answers of a store that holds only the view's graphs. The queries cover
   `GRAPH ?g`, `FROM` and `FROM NAMED` of hidden graphs, the union graph, property paths,
   counts with and without patterns, grouped counts, `DESCRIBE`, `CONSTRUCT`, `EXISTS`,

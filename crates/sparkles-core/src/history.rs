@@ -866,6 +866,7 @@ pub(crate) fn scan_generations(
                 out.push((no, name, c, origin == "baseline"))
             }
             _ => tracing::warn!(
+                target: "sparkles::history",
                 "{}: not a generation of this dataset; left alone",
                 e.path().display()
             ),

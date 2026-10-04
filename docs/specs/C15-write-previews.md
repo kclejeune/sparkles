@@ -604,8 +604,8 @@ writes one WAL insert record, and its receipt says `inserted: 1, deleted: 0`.
 ## 10. Sources
 
 * Sparkles repository (read): `README.md`, `docs/API.md`, the specs CI, C10, C12, G02,
-  `crates/sparkles/src/{store.rs,guard.rs,vocab.rs,commit.rs,patch.rs,error.rs}`,
-  `crates/sparkles/src/store/{quota.rs,diff.rs}`, `crates/sparkles/src/sparql/update.rs`,
+  `crates/sparkles-core/src/{store.rs,guard.rs,vocab.rs,commit.rs,patch.rs,error.rs}`,
+  `crates/sparkles-core/src/store/{quota.rs,diff.rs}`, `crates/sparkles-core/src/sparql/update.rs`,
   `crates/sparkles-shacl/src/guard.rs`, `crates/sparkles-shex/src/guard.rs`,
   `crates/sparkles-server/src/{http.rs,http/validation.rs,http/conditional.rs,http/diff.rs}`
   and `crates/sparkles-server/src/mcp/update.rs`.
@@ -673,7 +673,7 @@ documentation.
 
 **Tests at landing.**
 
-- `crates/sparkles/tests/dry_run.rs` previews 600 random updates on in-memory and
+- `crates/sparkles-core/tests/dry_run.rs` previews 600 random updates on in-memory and
   persistent stores, before and after a compaction, then makes each one. The update
   mixes `INSERT DATA`, `DELETE DATA`, `DELETE … INSERT … WHERE`, `DELETE WHERE`,
   `CLEAR`, copies between graphs, new terms and blank nodes. For each, the head, the

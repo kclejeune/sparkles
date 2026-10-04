@@ -223,6 +223,7 @@ impl Store {
         #[cfg(not(feature = "geo"))]
         if root.join(crate::geo::CONFIG_FILE).exists() {
             tracing::warn!(
+                target: "sparkles::store::geo",
                 "{}: a spatial index is configured but this build has no `geo` feature",
                 root.display()
             );
@@ -236,7 +237,7 @@ impl Store {
                 Ok(Some(c)) => c,
                 Ok(None) => return,
                 Err(e) => {
-                    tracing::error!("spatial index of {}: {e}", root.display());
+                    tracing::error!(target: "sparkles::store::geo", "spatial index of {}: {e}", root.display());
                     return;
                 }
             };
@@ -271,7 +272,7 @@ impl Store {
                     Err(p) => Some(panic_message(&*p)),
                 };
                 if let Some(m) = failure {
-                    tracing::error!("spatial index update failed, queries run without it: {m}");
+                    tracing::error!(target: "sparkles::store::geo", "spatial index update failed, queries run without it: {m}");
                     idx.note(format!("update failed: {m}; rebuild the index"));
                     v = v.without_rows(ViewState::Failed);
                 } else if v.bytes() > idx.budget {
@@ -608,7 +609,7 @@ impl Store {
                 idx.finish(epoch, message, last);
             });
         if let Err(e) = spawned {
-            tracing::error!("cannot start the spatial index build: {e}");
+            tracing::error!(target: "sparkles::store::geo", "cannot start the spatial index build: {e}");
             failed.finish(epoch, Some(format!("build failed: {e}")), None);
         }
     }
@@ -636,6 +637,7 @@ fn base_for(
             Err((_, Problem::Missing)) => {}
             Err((f, p)) => {
                 tracing::warn!(
+                    target: "sparkles::store::geo",
                     "spatial index file {}: {p}; it is built again",
                     dir.join(f).display()
                 );
@@ -674,6 +676,7 @@ fn base_for(
         }
         Some(Err(e)) => {
             tracing::warn!(
+                target: "sparkles::store::geo",
                 "cannot write the spatial index files of {}: {e}; the index stays in memory",
                 snap.generation.name
             );
@@ -707,11 +710,11 @@ fn finish_view(
                 "the index needs more than its budget of {} bytes (--geo-mb); queries run without it",
                 b.limit
             );
-            tracing::warn!("spatial index: {m}");
+            tracing::warn!(target: "sparkles::store::geo", "spatial index: {m}");
             return (pending(ViewState::OverBudget), Some(m), None);
         }
         Ok(Err(e)) => {
-            tracing::error!("spatial index build failed: {e}");
+            tracing::error!(target: "sparkles::store::geo", "spatial index build failed: {e}");
             return (
                 pending(ViewState::Failed),
                 Some(format!("build failed: {e}")),
@@ -720,7 +723,7 @@ fn finish_view(
         }
         Err(p) => {
             let m = panic_message(&*p);
-            tracing::error!("spatial index build failed: {m}");
+            tracing::error!(target: "sparkles::store::geo", "spatial index build failed: {m}");
             return (
                 pending(ViewState::Failed),
                 Some(format!("build failed: {m}")),

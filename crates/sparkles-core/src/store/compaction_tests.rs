@@ -623,6 +623,38 @@ fn only_one_compaction_runs_at_a_time() {
 }
 
 #[test]
+fn rebuilds_are_counted_by_reason() {
+    let s = Store::in_memory(StoreOptions {
+        bulk_threshold: 50,
+        ..Default::default()
+    });
+    assert_eq!(s.rebuilds(RebuildReason::Bulk).count(), 0);
+    // the first load and a large one are bulk commits; a small update goes to the delta
+    s.load(&[nt(10, 0)]).unwrap();
+    s.load(&[nt(100, 10)]).unwrap();
+    upd(&s, "INSERT DATA { <urn:x> <urn:y> 1 }");
+    let bulk = s.rebuilds(RebuildReason::Bulk);
+    assert_eq!(bulk.count(), 2, "{bulk:?}");
+    assert_eq!(s.rebuilds(RebuildReason::Compact).count(), 0);
+    s.compact().unwrap();
+    let c = s.rebuilds(RebuildReason::Compact);
+    assert_eq!(c.count(), 1, "{c:?}");
+    assert!(c.sum_seconds > 0.0);
+    // a quick rebuild lands in the first bucket
+    assert_eq!(c.buckets[0], 1);
+    // a dry run publishes nothing and counts nothing
+    let dry = crate::guard::WriteOptions {
+        dry_run: Some(crate::preview::DryRun::default()),
+        ..Default::default()
+    };
+    match s.load_with(&[nt(100, 200)], CommitKind::Load, &dry) {
+        Err(Error::DryRun(p)) => assert!(p.commit.unwrap().bulk),
+        r => panic!("not a dry run: {r:?}"),
+    }
+    assert_eq!(s.rebuilds(RebuildReason::Bulk).count(), 2);
+}
+
+#[test]
 fn named_snapshots_and_history_stay_readable() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");

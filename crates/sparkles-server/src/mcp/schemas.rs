@@ -215,12 +215,13 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         read(
             "draft_shapes",
             "Draft shapes from the data",
-            "Draft SHACL shapes (or a ShEx schema with its shape map) from the data: one shape per class with the observed cardinalities, node kinds, datatypes, classes, small value sets and languages. A constraint is drafted when at least `support` of the instances it applies to satisfy it; at support 1 the current data conforms. `excluding` lists the constraints that would reject existing instances, with their counts. The draft is text to review, nothing is installed.",
+            "Draft SHACL shapes in Turtle or SHACLC (or a ShEx schema with its shape map) from the data: one shape per class with the observed cardinalities, node kinds, datatypes, classes, small value sets and languages. A constraint is drafted when at least `support` of the instances it applies to satisfy it; at support 1 the current data conforms. `excluding` lists the constraints that would reject existing instances, with their counts. The draft is text to review, nothing is installed.",
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds(),
                 "graph": graph(),
                 "reasoning": {"type":"boolean","default":false,"description":"Include materialized inferences (write-time validation leaves them out by default)"},
                 "language": {"enum":["shacl","shex"],"default":"shacl"},
+                "shapesFormat": {"enum":["turtle","shaclc"],"default":"turtle","description":"The syntax of `shacl`: Turtle, or the SHACL Compact Syntax (SHACL drafts only)"},
                 "support": {"type":"number","exclusiveMinimum":0,"maximum":1,"default":1},
                 "classes": {"type":"array","items":{"type":"string"},"description":"Draft only these classes (IRIs or prefixed names)"},
                 "minInstances": {"type":"integer","minimum":1,"default":1},
@@ -238,6 +239,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                     "properties":{"type":"integer"},"constraints":{"type":"integer"},
                     "excluding":{"type":"array","items":{"type":"object","required":["path","component","excluded"],"properties":{
                         "path":{"type":"string"},"component":{"type":"string"},"excluded":{"type":"integer"}}}}}}},
+                "shapesFormat":{"enum":["turtle","shaclc"]},
                 "shacl":{"type":"string"},"shex":{"type":"string"},"shapeMap":{"type":"string"}}})),
         ),
         read(

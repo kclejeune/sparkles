@@ -138,6 +138,7 @@ impl Annotations {
                     // another dataset's (or an unreadable) file: set it aside, start over
                     let aside = root.join(format!("{FILE}.stale-{}", crate::commit::now_ms()));
                     tracing::warn!(
+                        target: "sparkles::annotations",
                         file = %path.display(),
                         dataset = ?found.map(|f| f.0),
                         "commit annotations do not belong to this dataset; set aside as {}",

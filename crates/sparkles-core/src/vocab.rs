@@ -92,6 +92,7 @@ impl Sparse {
         let s = Self::decode(&buf, blocks, data_len);
         if s.is_none() {
             tracing::warn!(
+                target: "sparkles::vocab",
                 "{} does not match its vocabulary; terms are looked up without it",
                 path.display()
             );
@@ -277,6 +278,7 @@ impl Vocab {
                 || s.offsets[last] != v.block_offset(last * IDX_BLOCKS) as u64)
         {
             tracing::warn!(
+                target: "sparkles::vocab",
                 "{} does not match its vocabulary; terms are looked up without it",
                 dir.join("vocab.idx").display()
             );

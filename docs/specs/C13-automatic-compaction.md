@@ -762,7 +762,7 @@ The defaults are those of §2.1 and §2.3.
   `--no-auto-compact`, and an option left `null` keeps the server's default. The VM test
   checks a policy on one node and compaction turned off on the other.
 
-**Tests.** `crates/sparkles/src/store/compaction_tests.rs` covers commits during the
+**Tests.** `crates/sparkles-core/src/store/compaction_tests.rs` covers commits during the
 build in persistent and in-memory stores (300 commits of inserts, deletes, blank nodes,
 named graphs and multi-quad changes, compared with a store that never compacted, with
 past states read from the new log), a reopen that replays them with `sparkles check`
