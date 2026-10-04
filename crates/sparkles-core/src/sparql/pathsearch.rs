@@ -15,6 +15,9 @@
 //! the paths of that row's (source, target) pair. Paths are simple: no node repeats,
 //! except that the last node may be the first (a cycle). Edges are read from the
 //! permutations directly: `PSO`/`POS` per predicate, or `SPO`/`OSP` for every predicate.
+//! A predicate can have a direction of its own, as in `path:predicate (ex:p
+//! path:backward)`. Edges can instead come from a nested pattern in the block, whose
+//! solutions bind `path:start` and `path:end` (the leaf's last child).
 //!
 //! The searches: bidirectional breadth-first search for one unweighted pair, one
 //! breadth-first search per source (or per target) for several or unbound ends,
@@ -32,7 +35,7 @@ use crate::store::Chunk;
 use oxrdf::Term;
 use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::GraphPattern;
-use spargebra::term::{NamedNodePattern, TermPattern};
+use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use std::cell::{Cell, RefCell};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -98,7 +101,13 @@ pub struct PathSearchSpec {
     pub target: PathEnd,
     /// predicate ids; `None` means every predicate (an empty list: no edges)
     pub predicates: Option<Vec<u64>>,
+    /// the direction of each predicate of `predicates` (in the same order)
+    pub directions: Vec<Direction>,
+    /// the direction of every predicate, and of the edges of a nested pattern
     pub direction: Direction,
+    /// edges from a nested pattern (the leaf's last child): the variables of an edge's
+    /// start and end
+    pub edge_pattern: Option<(VarId, VarId)>,
     pub min_len: u32,
     pub max_len: Option<u32>,
     /// paths per pair in `kShortest`
@@ -116,6 +125,8 @@ pub struct PathSearchSpec {
     pub edge_s: Option<VarId>,
     pub edge_p: Option<VarId>,
     pub edge_o: Option<VarId>,
+    /// the edge as a triple term `<<( s p o )>>`
+    pub edge: Option<VarId>,
     pub length: Option<VarId>,
     pub cost: Option<VarId>,
     pub graph: GraphFilter,
@@ -133,6 +144,7 @@ impl PathSearchSpec {
             || self.edge_s.is_some()
             || self.edge_p.is_some()
             || self.edge_o.is_some()
+            || self.edge.is_some()
     }
 
     fn weighted(&self) -> bool {
@@ -142,17 +154,130 @@ impl PathSearchSpec {
 
 // ----------------------------------------------------------------- planning ------
 
-/// A `SERVICE path:search { … }` call as a leaf.
+/// The parts of a search's block: the configuration triples (those with a `path:`
+/// predicate, list arguments taken out), and the rest, the pattern of the edges if any.
+fn split_block(inner: &GraphPattern) -> Result<(Vec<TriplePattern>, Option<GraphPattern>)> {
+    // a FILTER of the block filters the pattern of the edges
+    if let GraphPattern::Filter { expr, inner } = inner {
+        let (config, pattern) = split_block(inner)?;
+        let Some(pattern) = pattern else {
+            return Err(bad(
+                "a FILTER in the block needs a nested pattern of edges to filter",
+            ));
+        };
+        let filtered = GraphPattern::Filter {
+            expr: expr.clone(),
+            inner: Box::new(pattern),
+        };
+        return Ok((config, Some(filtered)));
+    }
+    fn parts<'g>(gp: &'g GraphPattern, out: &mut Vec<&'g GraphPattern>) {
+        match gp {
+            GraphPattern::Join { left, right } => {
+                parts(left, out);
+                parts(right, out);
+            }
+            _ => out.push(gp),
+        }
+    }
+    let mut all = Vec::new();
+    parts(inner, &mut all);
+    let mut config = Vec::new();
+    let mut rest: Vec<GraphPattern> = Vec::new();
+    for gp in all {
+        let GraphPattern::Bgp { patterns } = gp else {
+            rest.push(gp.clone());
+            continue;
+        };
+        let mut patterns = patterns.clone();
+        let is_param = |t: &TriplePattern| matches!(&t.predicate, NamedNodePattern::NamedNode(n) if n.as_str().starts_with(NS));
+        // a list argument's rdf:first / rdf:rest triples are part of its parameter
+        let heads: Vec<TermPattern> = patterns
+            .iter()
+            .filter(|t| is_param(t))
+            .map(|t| t.object.clone())
+            .filter(|o| matches!(o, TermPattern::BlankNode(_)))
+            .collect();
+        let mut lists = Vec::new();
+        for h in heads {
+            if let Some(items) = super::textpf::take_list(&mut patterns, &h, "path:search")? {
+                lists.push((h, items));
+            }
+        }
+        let mut edges = Vec::new();
+        for t in patterns {
+            if is_param(&t) {
+                let o = lists
+                    .iter()
+                    .find(|(h, _)| *h == t.object)
+                    .map(|(_, items)| items);
+                config.push(match o {
+                    // the list, as one object the parameter decodes
+                    Some(items) => TriplePattern {
+                        object: list_term(items),
+                        ..t
+                    },
+                    None => t,
+                });
+            } else {
+                edges.push(t);
+            }
+        }
+        if !edges.is_empty() {
+            rest.push(GraphPattern::Bgp { patterns: edges });
+        }
+    }
+    let pattern = rest.into_iter().reduce(|l, r| GraphPattern::Join {
+        left: Box::new(l),
+        right: Box::new(r),
+    });
+    Ok((config, pattern))
+}
+
+/// A list argument kept in one term until its parameter decodes it: a triple term whose
+/// subject is a marker blank node, predicate `rdf:first` and object the first element,
+/// nested in the subject for the next elements.
+fn list_term(items: &[TermPattern]) -> TermPattern {
+    let mut t = TermPattern::BlankNode(spargebra::term::BlankNode::new_unchecked(LIST_END));
+    for item in items.iter().rev() {
+        t = TermPattern::Triple(Box::new(TriplePattern {
+            subject: t,
+            predicate: NamedNodePattern::NamedNode(oxrdf::vocab::rdf::FIRST.into_owned()),
+            object: item.clone(),
+        }));
+    }
+    t
+}
+
+/// The elements of a list kept by [`list_term`], or `None` when `t` is not one.
+fn list_items(t: &TermPattern) -> Option<Vec<TermPattern>> {
+    let mut items = Vec::new();
+    let mut t = t;
+    loop {
+        match t {
+            TermPattern::BlankNode(b) if b.as_str() == LIST_END => return Some(items),
+            TermPattern::Triple(tp) if matches!(&tp.predicate, NamedNodePattern::NamedNode(n) if *n == oxrdf::vocab::rdf::FIRST) =>
+            {
+                items.push(tp.object.clone());
+                t = &tp.subject;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The label of the marker that ends a list kept by [`list_term`].
+const LIST_END: &str = "sparklesPathListEnd";
+
+/// A `SERVICE path:search { … }` call as a leaf (with its nested pattern of edges as its
+/// child).
 pub(super) fn path_search_leaf(
-    p: &Planner<'_>,
+    p: &mut Planner<'_>,
     inner: &GraphPattern,
     g: &ActiveGraph,
 ) -> Result<Node> {
-    let GraphPattern::Bgp { patterns } = inner else {
-        return Err(bad(
-            "the block must hold only configuration triples (path:source, path:target, …)",
-        ));
-    };
+    let (patterns, edge_gp) = split_block(inner)?;
+    let patterns = &patterns;
     if patterns.is_empty() {
         return Err(bad("missing path:source and path:target"));
     }
@@ -161,13 +286,15 @@ pub(super) fn path_search_leaf(
     let mut algorithm = None;
     let (mut source, mut target) = (None, None);
     let mut preds: Option<Vec<u64>> = None;
+    let mut dirs: Vec<Option<Direction>> = Vec::new();
     let mut pred_names = Vec::new();
     let mut direction = None;
+    let (mut start, mut end_var) = (None, None);
     let (mut min_len, mut max_len, mut k, mut limit, mut max_visited) =
         (None, None, None, None, None);
     let (mut weight, mut default_weight) = (None, None);
-    let mut outs: [Option<VarId>; 7] = [None; 7];
-    const OUT_NAMES: [&str; 7] = [
+    let mut outs: [Option<VarId>; 8] = [None; 8];
+    const OUT_NAMES: [&str; 8] = [
         "pathIndex",
         "edgeIndex",
         "edgeSubject",
@@ -175,6 +302,7 @@ pub(super) fn path_search_leaf(
         "edgeObject",
         "length",
         "cost",
+        "edge",
     ];
     fn once<T>(slot: &mut Option<T>, v: T, name: &str) -> Result<()> {
         if slot.replace(v).is_some() {
@@ -182,6 +310,21 @@ pub(super) fn path_search_leaf(
         }
         Ok(())
     }
+    let direction_of = |t: &TermPattern, name: &str| -> Result<Direction> {
+        Ok(match t {
+            TermPattern::NamedNode(n) => match n.as_str().strip_prefix(NS) {
+                Some("forward") => Direction::Forward,
+                Some("backward") => Direction::Backward,
+                Some("both") => Direction::Both,
+                _ => {
+                    return Err(bad(format!(
+                        "unknown direction {n} in path:{name} (path:forward, path:backward or path:both)"
+                    )));
+                }
+            },
+            _ => return Err(bad(format!("path:{name} takes a path: IRI"))),
+        })
+    };
     let iri_in_ns = |t: &TermPattern, name: &str| -> Result<String> {
         match t {
             TermPattern::NamedNode(n) if n.as_str().starts_with(NS) => {
@@ -278,17 +421,33 @@ pub(super) fn path_search_leaf(
                 once(&mut direction, d, name)?;
             }
             "predicate" => {
-                let TermPattern::NamedNode(n) = o else {
-                    return Err(bad("path:predicate takes an IRI"));
+                // an IRI, or a list of an IRI and its own direction
+                let (n, d) = match (o, list_items(o)) {
+                    (TermPattern::NamedNode(n), _) => (n.clone(), None),
+                    (_, Some(items)) => match items.as_slice() {
+                        [TermPattern::NamedNode(n), d] => (n.clone(), Some(direction_of(d, name)?)),
+                        _ => {
+                            return Err(bad(
+                                "path:predicate takes an IRI, or a list of an IRI and a direction such as (ex:p path:backward)",
+                            ));
+                        }
+                    },
+                    _ => return Err(bad("path:predicate takes an IRI")),
                 };
-                pred_names.push(n.as_str().to_string());
+                if pred_names.iter().any(|(x, _)| x == n.as_str()) {
+                    return Err(bad(format!("path:predicate {n} is given twice")));
+                }
+                pred_names.push((n.as_str().to_string(), d));
                 let list = preds.get_or_insert_with(Vec::new);
                 if let Some(id) = ctx.snap.lookup_iri(n.as_str())
                     && !list.contains(&id.0)
                 {
                     list.push(id.0);
+                    dirs.push(d);
                 }
             }
+            "start" => once(&mut start, output(o, name)?, name)?,
+            "end" => once(&mut end_var, output(o, name)?, name)?,
             "minLength" => once(&mut min_len, integer(o, name)?, name)?,
             "maxLength" => once(&mut max_len, integer(o, name)?, name)?,
             "k" => once(&mut k, integer(o, name)?, name)?,
@@ -324,6 +483,43 @@ pub(super) fn path_search_leaf(
     }
     let source = source.ok_or_else(|| bad("missing path:source"))?;
     let target = target.ok_or_else(|| bad("missing path:target"))?;
+    // edges from a nested pattern: its variables of an edge's ends, no predicates
+    let edge_pattern = match (&edge_gp, start, end_var) {
+        (None, None, None) => None,
+        (Some(_), Some(s), Some(e)) if s != e => {
+            if !pred_names.is_empty() {
+                return Err(bad(
+                    "path:predicate and a nested pattern of edges cannot be combined; put the predicates in the pattern",
+                ));
+            }
+            for (i, what) in [(3, "path:edgePredicate"), (7, "path:edge")] {
+                if outs[i].is_some() {
+                    return Err(bad(format!(
+                        "{what} needs edges from predicates; the edges of a nested pattern have no triple"
+                    )));
+                }
+            }
+            if weight.is_some() {
+                return Err(bad(
+                    "path:weight needs edges from predicates; the edges of a nested pattern have no triple",
+                ));
+            }
+            Some((s, e))
+        }
+        (Some(_), Some(_), Some(_)) => {
+            return Err(bad("path:start and path:end need two variables"));
+        }
+        (Some(_), _, _) => {
+            return Err(bad(
+                "a nested pattern of edges needs path:start and path:end, the variables of each edge's ends",
+            ));
+        }
+        (None, _, _) => {
+            return Err(bad(
+                "path:start and path:end name the variables of a nested pattern of edges, and the block has none",
+            ));
+        }
+    };
     let algorithm = algorithm.unwrap_or(Algorithm::Shortest);
     let min_len =
         u32::try_from(min_len.unwrap_or(1)).map_err(|_| bad("path:minLength is too large"))?;
@@ -390,6 +586,7 @@ pub(super) fn path_search_leaf(
         ));
     }
     let direction = direction.unwrap_or(Direction::Forward);
+    let directions: Vec<Direction> = dirs.iter().map(|d| d.unwrap_or(direction)).collect();
     let end = |e: &PathEnd| match e {
         PathEnd::Var(v) => format!("?{}", ctx.var_name(*v)),
         PathEnd::Const(id) => ctx
@@ -401,12 +598,19 @@ pub(super) fn path_search_leaf(
         algorithm.name(),
         end(&source),
         end(&target),
-        if pred_names.is_empty() {
+        if edge_pattern.is_some() {
+            "the nested pattern".to_string()
+        } else if pred_names.is_empty() {
             "every predicate".to_string()
         } else {
             pred_names
                 .iter()
-                .map(|p| format!("<{p}>"))
+                .map(|(p, d)| match d {
+                    None => format!("<{p}>"),
+                    Some(Direction::Forward) => format!("<{p}>(forward)"),
+                    Some(Direction::Backward) => format!("<{p}>(backward)"),
+                    Some(Direction::Both) => format!("<{p}>(both)"),
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         },
@@ -431,12 +635,37 @@ pub(super) fn path_search_leaf(
             .as_ref()
             .map_or(String::new(), |(w, _)| format!(" weight=<{w}>")),
     );
-    let edge_vars = [outs[1], outs[2], outs[3], outs[4]];
+    let edge_vars = [outs[1], outs[2], outs[3], outs[4], outs[7]];
+    // the pattern's own variables stay inside it
+    let edges_node = match &edge_gp {
+        Some(gp) if edge_pattern.is_some() => {
+            let n = p.plan(gp, g, Vec::new())?;
+            for (v, name) in [
+                (edge_pattern.unwrap().0, "start"),
+                (edge_pattern.unwrap().1, "end"),
+            ] {
+                if !n.vars.contains(&v) {
+                    return Err(bad(format!(
+                        "path:{name} ?{} is not a variable of the nested pattern",
+                        ctx.var_name(v)
+                    )));
+                }
+            }
+            Some(n)
+        }
+        _ => None,
+    };
     let spec = PathSearchSpec {
         algorithm,
         source,
         target,
-        predicates: preds,
+        predicates: if edge_pattern.is_some() {
+            Some(Vec::new())
+        } else {
+            preds
+        },
+        directions,
+        edge_pattern,
         direction,
         min_len,
         max_len,
@@ -451,12 +680,17 @@ pub(super) fn path_search_leaf(
         edge_s: outs[2],
         edge_p: outs[3],
         edge_o: outs[4],
+        edge: outs[7],
         length: outs[5],
         cost: outs[6],
         graph,
     };
     let est = 100.0;
     let mut n = Node::leaf(Kind::PathSearch(Box::new(spec)), vars, est, desc);
+    if let Some(e) = edges_node {
+        n.cost += e.cost;
+        n.children.push(e);
+    }
     // a path of length zero has no edge
     if min_len == 0 {
         n.certain.retain(|v| !edge_vars.contains(&Some(*v)));
@@ -492,16 +726,19 @@ pub(super) fn attach(p: &Planner<'_>, left: Node, search: Node) -> Result<Node> 
     let mut certain = left.certain.clone();
     certain.extend(search.certain.iter().copied());
     let est = (left.est * 10.0).max(1.0);
+    // the input first, then the nested pattern of edges if any
+    let mut children = vec![left];
+    children.extend(search.children);
     Ok(Node {
         dist: vars.iter().map(|&v| (v, est)).collect(),
-        cost: left.cost + est * 100.0,
+        cost: children[0].cost + est * 100.0,
         vars,
         certain,
         sorted: Vec::new(),
         est,
         desc: search.desc,
         kind: search.kind,
-        children: vec![left],
+        children,
     })
 }
 
@@ -660,13 +897,55 @@ impl Ord for OrdF64 {
     }
 }
 
-/// One index range that holds edges: `perm` with the predicate fixed or not.
+/// One index range that holds edges: `perm` with the predicate fixed or not, or the
+/// edges of a nested pattern (`pattern`).
 #[derive(Clone, Copy)]
 struct Lane {
     perm: Perm,
     p: Option<u64>,
-    /// the lane is read by the subject of its triples (else by the object)
+    /// the lane is read by the subject of its triples (else by the object), or by the
+    /// start of a pattern's edges (else by the end)
     subject_side: bool,
+    pattern: bool,
+}
+
+/// A lane of the neighbours on one side, whether its triples run against the path, and
+/// whether it skips self-loops (the second side of a predicate followed both ways reads
+/// them from the first).
+#[derive(Clone, Copy)]
+struct Side {
+    lane: Lane,
+    rev: bool,
+    skip_self: bool,
+}
+
+/// The edges of a nested pattern, by their start and by their end (sorted, distinct).
+#[derive(Default)]
+struct PatternEdges {
+    by_start: FxHashMap<u64, Vec<u64>>,
+    by_end: FxHashMap<u64, Vec<u64>>,
+}
+
+impl PatternEdges {
+    fn of(t: &Table, (s, e): (VarId, VarId)) -> PatternEdges {
+        let mut out = PatternEdges::default();
+        let (Some(sc), Some(ec)) = (t.col_of(s), t.col_of(e)) else {
+            return out;
+        };
+        for i in 0..t.len() {
+            let (a, b) = (t.cols[sc][i], t.cols[ec][i]);
+            if a.is_undef() || b.is_undef() {
+                continue;
+            }
+            out.by_start.entry(a.0).or_default().push(b.0);
+            out.by_end.entry(b.0).or_default().push(a.0);
+        }
+        for v in out.by_start.values_mut().chain(out.by_end.values_mut()) {
+            v.sort_unstable();
+            v.dedup();
+        }
+        out
+    }
 }
 
 impl Lane {
@@ -707,8 +986,10 @@ struct Engine<'a> {
     ctx: &'a Ctx,
     spec: &'a PathSearchSpec,
     dedup: bool,
-    subject_lanes: Vec<Lane>,
-    object_lanes: Vec<Lane>,
+    /// the lanes of a node's successors and of its predecessors
+    succ: Vec<Side>,
+    pred: Vec<Side>,
+    pattern: PatternEdges,
     cache: RefCell<Neighbours>,
     weights: RefCell<FxHashMap<(u64, u64, u64), f64>>,
     charge: Charge<'a>,
@@ -722,36 +1003,77 @@ struct Engine<'a> {
 }
 
 impl<'a> Engine<'a> {
-    fn new(ctx: &'a Ctx, spec: &'a PathSearchSpec) -> Result<Engine<'a>> {
-        let lanes = |subject_side: bool| -> Vec<Lane> {
-            let perm = match (spec.predicates.is_some(), subject_side) {
+    fn new(ctx: &'a Ctx, spec: &'a PathSearchSpec, edges: Option<&Table>) -> Result<Engine<'a>> {
+        // (subject lane, object lane, direction) of each predicate, of every predicate,
+        // or of the nested pattern's edges
+        let lane = |p: Option<u64>, subject_side: bool, pattern: bool| {
+            let perm = match (p.is_some(), subject_side) {
                 (true, true) => Perm::Pso,
                 (true, false) => Perm::Pos,
                 (false, true) => Perm::Spo,
                 (false, false) => Perm::Osp,
             };
-            match &spec.predicates {
-                Some(ps) => ps
-                    .iter()
-                    .map(|&p| Lane {
-                        perm,
-                        p: Some(p),
-                        subject_side,
-                    })
-                    .collect(),
-                None => vec![Lane {
-                    perm,
-                    p: None,
-                    subject_side,
-                }],
+            Lane {
+                perm,
+                p,
+                subject_side,
+                pattern,
             }
+        };
+        let groups: Vec<(Lane, Lane, Direction)> = match (&spec.edge_pattern, &spec.predicates) {
+            (Some(_), _) => vec![(
+                lane(None, true, true),
+                lane(None, false, true),
+                spec.direction,
+            )],
+            (None, Some(ps)) => ps
+                .iter()
+                .zip(&spec.directions)
+                .map(|(&p, &d)| (lane(Some(p), true, false), lane(Some(p), false, false), d))
+                .collect(),
+            (None, None) => vec![(
+                lane(None, true, false),
+                lane(None, false, false),
+                spec.direction,
+            )],
+        };
+        // each predicate's first side, then the second sides of those followed both ways
+        // (the order of the lanes before directions per predicate)
+        let (mut succ, mut pred) = (Vec::new(), Vec::new());
+        let side = |lane: Lane, rev: bool, skip_self: bool| Side {
+            lane,
+            rev,
+            skip_self,
+        };
+        for &(s, o, d) in &groups {
+            match d {
+                Direction::Forward | Direction::Both => {
+                    succ.push(side(s, false, false));
+                    pred.push(side(o, false, false));
+                }
+                Direction::Backward => {
+                    succ.push(side(o, true, false));
+                    pred.push(side(s, true, false));
+                }
+            }
+        }
+        for &(s, o, d) in &groups {
+            if d == Direction::Both {
+                succ.push(side(o, true, true));
+                pred.push(side(s, true, true));
+            }
+        }
+        let pattern = match (edges, spec.edge_pattern) {
+            (Some(t), Some(vars)) => PatternEdges::of(t, vars),
+            _ => PatternEdges::default(),
         };
         Ok(Engine {
             ctx,
             spec,
             dedup: spec.graph.multi(),
-            subject_lanes: lanes(true),
-            object_lanes: lanes(false),
+            succ,
+            pred,
+            pattern,
             cache: Default::default(),
             weights: Default::default(),
             charge: ctx.charge(0)?,
@@ -783,36 +1105,46 @@ impl<'a> Engine<'a> {
         self.charge.add(n * NODE_BYTES)
     }
 
-    /// The (lane, rev) pairs that give the neighbours of a node: its successors on a
-    /// path when `succ`, else its predecessors.
-    fn sides(&self, succ: bool) -> Vec<(&[Lane], bool)> {
-        use Direction::*;
-        let (s, o) = (&self.subject_lanes[..], &self.object_lanes[..]);
-        match (self.spec.direction, succ) {
-            (Forward, true) => vec![(s, false)],
-            (Forward, false) => vec![(o, false)],
-            (Backward, true) => vec![(o, true)],
-            (Backward, false) => vec![(s, true)],
-            (Both, true) => vec![(s, false), (o, true)],
-            (Both, false) => vec![(o, false), (s, true)],
-        }
-    }
-
     /// The neighbours of every node of a sorted, duplicate-free frontier, as
-    /// (node, neighbour) pairs.
+    /// (node, neighbour) pairs: its successors on a path when `succ`, else its
+    /// predecessors.
     fn expand(&self, frontier: &[u64], succ: bool, out: &mut Vec<(u64, Step)>) -> Result<()> {
         if frontier.is_empty() {
             return Ok(());
         }
-        let sides = self.sides(succ);
-        let both = sides.len() > 1;
-        for (i, (lanes, rev)) in sides.into_iter().enumerate() {
-            for lane in lanes {
-                // with both directions a self-loop is one edge, read from the first side
-                self.scan_lane(lane, frontier, rev, both && i == 1, out)?;
+        let sides = if succ { &self.succ } else { &self.pred };
+        for s in sides {
+            // with both directions a self-loop is one edge, read from the first side
+            if s.lane.pattern {
+                self.pattern_lane(&s.lane, frontier, s.rev, s.skip_self, out);
+            } else {
+                self.scan_lane(&s.lane, frontier, s.rev, s.skip_self, out)?;
             }
         }
         self.ctx.check()
+    }
+
+    /// [`scan_lane`](Self::scan_lane) for the edges of a nested pattern.
+    fn pattern_lane(
+        &self,
+        lane: &Lane,
+        frontier: &[u64],
+        rev: bool,
+        skip_self: bool,
+        out: &mut Vec<(u64, Step)>,
+    ) {
+        let map = if lane.subject_side {
+            &self.pattern.by_start
+        } else {
+            &self.pattern.by_end
+        };
+        for &x in frontier {
+            for &node in map.get(&x).map_or(&[][..], Vec::as_slice) {
+                if !(skip_self && node == x) {
+                    out.push((x, Step { node, p: 0, rev }));
+                }
+            }
+        }
     }
 
     fn scan_lane(
@@ -1590,6 +1922,7 @@ pub fn run(
     ctx: &Ctx,
     spec: &PathSearchSpec,
     input: Option<Table>,
+    edges: Option<Table>,
     vars: &[VarId],
 ) -> Result<(Table, serde_json::Map<String, serde_json::Value>)> {
     let input = input.unwrap_or_else(Table::unit);
@@ -1629,7 +1962,8 @@ pub fn run(
             }
         }
     }
-    let eng = Engine::new(ctx, spec)?;
+    let eng = Engine::new(ctx, spec, edges.as_ref())?;
+    drop(edges);
     let mut found: Vec<Found> = Vec::new();
     let mut by_pair: FxHashMap<(u64, u64), Vec<u32>> = FxHashMap::default();
     let mut by_source: FxHashMap<u64, Vec<u32>> = FxHashMap::default();
@@ -1939,6 +2273,23 @@ pub fn run(
         pos(spec.length),
         pos(spec.cost),
     );
+    let edge_c = pos(spec.edge);
+    // the triple term of each edge, built once
+    let mut terms: FxHashMap<(u64, u64, u64), Id> = FxHashMap::default();
+    let mut triple_term = |(s, p, o): (u64, u64, u64)| -> Id {
+        *terms.entry((s, p, o)).or_insert_with(|| {
+            let parts = (ctx.term(Id(s)), ctx.term(Id(p)), ctx.term(Id(o)));
+            let (Some(s), Some(Term::NamedNode(p)), Some(o)) = parts else {
+                return Id::UNDEF;
+            };
+            let s = match s {
+                Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                _ => return Id::UNDEF,
+            };
+            ctx.intern_term(&Term::Triple(Box::new(oxrdf::Triple::new(s, p, o))))
+        })
+    };
     let int = |n: usize| Id::from_i64(n as i64).unwrap_or(Id::UNDEF);
     let cost_id = |f: &Found| -> Id {
         if weighted {
@@ -1987,6 +2338,9 @@ pub fn run(
                     set(es_c, Id(s), &mut r);
                     set(ep_c, Id(p), &mut r);
                     set(eo_c, Id(o), &mut r);
+                    if edge_c.is_some() {
+                        set(edge_c, triple_term((s, p, o)), &mut r);
+                    }
                 }
                 // join with the input row: equal values or one side unbound
                 let mut ok = true;

@@ -506,11 +506,17 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t
         }
         Kind::PathSearch(spec) => {
-            let input = match n.children.len() {
-                0 => None,
-                _ => Some(child(0, &mut infos)?),
+            // the input when the search reads its group, then the nested pattern of edges
+            let reads_input = n.children.len() > spec.edge_pattern.is_some() as usize;
+            let input = match reads_input {
+                false => None,
+                true => Some(child(0, &mut infos)?),
             };
-            let (t, c) = super::pathsearch::run(ctx, spec, input, &n.vars)?;
+            let edges = match spec.edge_pattern {
+                Some(_) => Some(child(n.children.len() - 1, &mut infos)?),
+                None => None,
+            };
+            let (t, c) = super::pathsearch::run(ctx, spec, input, edges, &n.vars)?;
             counters = Some(c);
             t
         }

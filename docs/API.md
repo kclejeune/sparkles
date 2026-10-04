@@ -4322,15 +4322,17 @@ ORDER BY ?path ?i
 
 The block holds triples with one subject, usually `[]`, whose predicates are the
 parameters below. An unknown parameter, or one given twice that takes one value, fails
-with `400`.
+with `400`. The block can also hold a nested pattern whose solutions are the edges, as
+described under "Edges from a pattern" below.
 
 | Parameter | Value | Default | Meaning |
 |---|---|---|---|
 | `path:source` | a variable or a constant | required | The first node of each path. |
 | `path:target` | a variable or a constant | required | The last node of each path. |
 | `path:algorithm` | `path:shortest`, `path:allShortest`, `path:kShortest` or `path:all` | `path:shortest` | One shortest path per pair, every shortest path, the `k` shortest paths (Yen's algorithm), or every path up to `path:maxLength`. |
-| `path:predicate` | an IRI, repeatable | every predicate | The predicates whose triples are edges. |
-| `path:direction` | `path:forward`, `path:backward` or `path:both` | `path:forward` | Follow a triple from subject to object, from object to subject, or both ways. |
+| `path:predicate` | an IRI, or a list of an IRI and a direction, repeatable | every predicate | The predicates whose triples are edges. `(ex:parent path:backward)` follows that predicate in its own direction. |
+| `path:direction` | `path:forward`, `path:backward` or `path:both` | `path:forward` | Follow a triple from subject to object, from object to subject, or both ways. It applies to the predicates without a direction of their own, and to the edges of a nested pattern. |
+| `path:start`, `path:end` | variables | | The variables of a nested pattern that give each edge's start and end. |
 | `path:minLength` | an integer | 1 | The fewest edges. 0 adds the empty path from a node to itself. The shortest modes take 0 or 1. |
 | `path:maxLength` | an integer | none | The most edges. `path:all` requires it. |
 | `path:k` | a positive integer | none | The paths per pair of `path:kShortest`, which requires it. |
@@ -4340,7 +4342,8 @@ with `400`.
 | `path:defaultWeight` | a non-negative number | 1 | The weight of an edge without one. |
 | `path:pathIndex` | a variable | | The path's number in the result, from 0. |
 | `path:edgeIndex` | a variable | | The edge's position in its path, from 0. |
-| `path:edgeSubject`, `path:edgePredicate`, `path:edgeObject` | variables | | The edge's triple as stored. |
+| `path:edgeSubject`, `path:edgePredicate`, `path:edgeObject` | variables | | The edge's triple as stored. For the edges of a nested pattern, the start and end, and no predicate. |
+| `path:edge` | a variable | | The edge's triple as a triple term, `<<( s p o )>>`. |
 | `path:length` | a variable | | The number of edges, an `xsd:integer`. |
 | `path:cost` | a variable | | The sum of the weights, an `xsd:double`. Without `path:weight` it is the length. |
 
@@ -4349,8 +4352,8 @@ with `400`.
   `?s foaf:knows+ ?s` would, and the empty path only with `path:minLength 0`. Two
   triples between the same nodes with different predicates make two different paths.
   Literals can end a path.
-* **Rows.** With any of `path:edgeIndex`, `path:edgeSubject`, `path:edgePredicate` and
-  `path:edgeObject`, the call returns one row per edge. Without them it returns one row
+* **Rows.** With any of `path:edgeIndex`, `path:edgeSubject`, `path:edgePredicate`,
+  `path:edgeObject` and `path:edge`, the call returns one row per edge. Without them it returns one row
   per path. A path of length 0 has one row with the edge variables unbound. The source
   and target variables are bound to each path's ends.
 * **Sources and targets from the query.** When `path:source` or `path:target` is a
@@ -4373,6 +4376,32 @@ with `400`.
   reifier gives no weight.
 * **Without predicates** every triple is an edge, `rdf:type` included, so a search
   without `path:predicate` usually visits far more nodes than one with them.
+* **Directions per predicate.** `path:predicate ex:knows, (ex:parent path:backward)`
+  follows `ex:knows` from subject to object and `ex:parent` from object to subject, so
+  `ex:a ex:knows ex:b . ex:c ex:parent ex:b` gives the path `a b c`. The edge variables
+  still give each triple as stored. A list with anything other than an IRI and one of
+  the three directions fails with `400`.
+* **Edges from a pattern.** Instead of predicates, the block can hold a graph pattern
+  whose solutions are the edges, as QLever's and GraphDB's path services allow.
+  `path:start` and `path:end` name the pattern's variables of an edge's two ends:
+
+  ```sparql
+  SERVICE path:search {
+    [] path:source ex:alice ; path:target ?t ; path:start ?x ; path:end ?y ;
+       path:length ?len .
+    { ?x foaf:knows ?y } UNION { ?y ex:parent ?x }
+  }
+  ```
+
+  The pattern is evaluated once in the active graph, and each distinct pair of its
+  `?x` and `?y` values is one edge. It can be a group, a `UNION`, a subquery, and a
+  `FILTER` in the block filters it. Its other variables stay inside it. `path:direction`
+  applies to these edges, and `path:edgeSubject` and `path:edgeObject` give their start
+  and end. Such edges have no triple, so `path:predicate`, `path:edgePredicate`,
+  `path:edge` and `path:weight` cannot be combined with a pattern, and fail with `400`,
+  as does a pattern without `path:start` and `path:end` or one that does not bind them.
+  The search then reads a table of the pattern's edges instead of the indexes, so it
+  costs the pattern's evaluation and is best for edges no predicate list can describe.
 * **Budgets.** Besides `path:maxVisited`, a search counts against the query's timeout,
   memory budget and row limits. `path:allShortest` and `path:all` can find
   exponentially many paths, which `path:limit` bounds.
