@@ -7,6 +7,9 @@ use super::*;
 use crate::auth::{Endpoint, on_branch};
 use sparkles::store::{CommitGraphOptions, GraphCursor};
 
+/// A branch's reconstructable ranges, and its snapshots with the commits they pin.
+type Extras = (Vec<(u64, u64)>, Vec<(u64, String)>);
+
 /// Commits per page by default, and at most.
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
@@ -75,8 +78,7 @@ pub(crate) async fn get(
     let g = blocking(move || Ok(d.store.commit_graph(&o)?)).await?;
 
     // what a point-in-time read can see on each branch, and the snapshots that pin commits
-    let mut extras: std::collections::HashMap<String, (Vec<(u64, u64)>, Vec<(u64, String)>)> =
-        Default::default();
+    let mut extras: std::collections::HashMap<String, Extras> = Default::default();
     for b in &g.branches {
         if let Ok(bd) = st.branch_dataset(&ds, &b.name) {
             let h = bd.store.history();

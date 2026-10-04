@@ -213,10 +213,7 @@ impl Store {
             };
             let mut s = top;
             let mut n = 0;
-            loop {
-                let Some(c) = run.store.commit(s) else {
-                    break;
-                };
+            while let Some(c) = run.store.commit(s) {
                 if n == limit {
                     more = true;
                     break;
@@ -229,7 +226,7 @@ impl Store {
                 s -= 1;
             }
         }
-        picked.sort_by(|a, b| b.0.cmp(&a.0));
+        picked.sort_by_key(|p| std::cmp::Reverse(p.0));
         if picked.len() > limit {
             picked.truncate(limit);
             more = true;
