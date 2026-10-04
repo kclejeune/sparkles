@@ -2784,6 +2784,11 @@ including `main`.
 | PATCH | `/$/branches/{ds}/{name}` | Changes `name`, `protected` or `note` (`null` removes the note). |
 | DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits, and `?reparent=true` one that other branches start from. Answers `204`. |
 
+A read-only server (`serve --read-only`) refuses every route that changes branches with
+`403` and the update endpoint's error. That covers the `POST`, `PATCH` and `DELETE` routes
+above, and the `POST` routes of merges, reverts and cherry-picks, dry runs and
+asynchronous merges included. The `GET` routes and the previews still answer.
+
 ```ts
 type Branch = {
   name: string; id: string; ordinal: number;

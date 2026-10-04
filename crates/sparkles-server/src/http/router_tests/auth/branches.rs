@@ -299,3 +299,183 @@ async fn a28_renames_reverts_and_cherry_picks_follow_branch_grants() {
     let r = update_as(app, "br@feature", &devs, INSERT).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
+
+/// The branch listing, each branch's description and the head of `br`, without the
+/// sizes of the branches' files, which change as they are opened.
+async fn branch_state(app: &Router, st: &AppState, auth: &str) -> (Vec<J>, u64) {
+    fn without_sizes(mut b: J) -> J {
+        b.as_object_mut().unwrap().remove("storage");
+        b
+    }
+    let r = get_as(app, "/$/branches/br", Some(auth)).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let mut list = r.json();
+    let all: Vec<J> = list["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .cloned()
+        .map(without_sizes)
+        .collect();
+    list["branches"] = J::Array(all);
+    let mut infos = vec![list];
+    for name in ["main", "dev", "dev2"] {
+        let r = get_as(app, &format!("/$/branches/br/{name}"), Some(auth)).await;
+        assert_eq!(r.status, StatusCode::OK, "{name}");
+        infos.push(without_sizes(r.json()));
+    }
+    (infos, head(st, "br"))
+}
+
+/// A read-only server refuses every branch mutation as it refuses an update, whoever
+/// asks, and changes no branch, head or setting.
+#[tokio::test]
+async fn read_only_servers_refuse_branch_mutations() {
+    let mut s = build(Fixture {
+        extra: users(),
+        ..Default::default()
+    });
+    s.state.attach("br", DbType::Persistent, None).unwrap();
+    for name in ["dev", "dev2"] {
+        let r = post_json(
+            &s.app,
+            "owner",
+            "/$/branches/br",
+            &format!(r#"{{"name":"{name}"}}"#),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED);
+    }
+    let r = update_as(&s.app, "br@dev", &b("owner"), INSERT).await;
+    assert_eq!(r.status, StatusCode::OK);
+    s.fixture.read_only = true;
+    let s = s.restart();
+    // reopened from its directory
+    if s.state.get("br").is_none() {
+        s.state.attach("br", DbType::Persistent, None).unwrap();
+    }
+    let app = &s.app;
+    assert!(s.state.read_only);
+    let owner = b("owner");
+    let before = branch_state(app, &s.state, &owner).await;
+    // the update endpoint's answer, which every branch mutation gives
+    let r = update_as(app, "br", &owner, INSERT).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    // without the request's own id
+    let shape = |mut v: J| {
+        v.as_object_mut().unwrap().remove("requestId");
+        v
+    };
+    let refusal = shape(r.json());
+    assert_eq!(refusal["error"], "server is read-only");
+    let json = |user: &str| {
+        vec![
+            ("authorization".to_string(), b(user)),
+            ("content-type".to_string(), "application/json".to_string()),
+        ]
+    };
+    let mut async_merge = json("owner");
+    async_merge.push(("prefer".into(), "respond-async".into()));
+    let cases: Vec<(&str, &str, Vec<(String, String)>, &str)> = vec![
+        (
+            "POST",
+            "/$/branches/br",
+            json("owner"),
+            r#"{"name":"dev3"}"#,
+        ),
+        (
+            "POST",
+            "/$/branches/br",
+            json("devs"),
+            r#"{"name":"dev4","from":"dev"}"#,
+        ),
+        (
+            "PATCH",
+            "/$/branches/br",
+            json("owner"),
+            r#"{"exemptPredicates":["urn:p"]}"#,
+        ),
+        (
+            "PATCH",
+            "/$/branches/br/dev",
+            json("devs"),
+            r#"{"note":"changed"}"#,
+        ),
+        (
+            "PATCH",
+            "/$/branches/br/dev",
+            json("owner"),
+            r#"{"protected":true}"#,
+        ),
+        (
+            "PATCH",
+            "/$/branches/br/dev2",
+            json("devs"),
+            r#"{"name":"dev5"}"#,
+        ),
+        ("DELETE", "/$/branches/br/dev2", json("devs"), ""),
+        (
+            "DELETE",
+            "/$/branches/br/dev?reparent=true",
+            json("devs"),
+            "",
+        ),
+        ("DELETE", "/$/branches/br/dev?force=true", json("owner"), ""),
+        ("POST", "/$/merge/br", json("owner"), r#"{"source":"dev"}"#),
+        ("POST", "/$/merge/br", async_merge, r#"{"source":"dev"}"#),
+        (
+            "POST",
+            "/$/merge/br",
+            json("devs"),
+            r#"{"source":"dev","target":"dev2"}"#,
+        ),
+        (
+            "POST",
+            "/$/merge/br",
+            json("owner"),
+            r#"{"source":"dev","squash":true}"#,
+        ),
+        (
+            "POST",
+            "/$/merge/br",
+            json("owner"),
+            r#"{"source":"dev","ff":"replay"}"#,
+        ),
+        (
+            "POST",
+            "/$/merge/br",
+            json("owner"),
+            r#"{"source":"dev","dryRun":true}"#,
+        ),
+        ("POST", "/$/revert/br?branch=dev&commit=1", json("devs"), ""),
+        (
+            "POST",
+            "/$/cherry-pick/br?source=dev&commit=1&branch=dev2",
+            json("devs"),
+            "",
+        ),
+    ];
+    for (method, uri, headers, body) in &cases {
+        let h: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let r = call(app, method, uri, &h, body).await;
+        assert_eq!(
+            r.status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} {body}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+        assert_eq!(shape(r.json()), refusal, "{method} {uri} {body}");
+    }
+    assert_eq!(branch_state(app, &s.state, &owner).await, before);
+    // reads and previews still work
+    let r = get_as(app, "/$/merge/br?source=dev", Some(&owner)).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+}

@@ -453,6 +453,15 @@ fn invalid(code: &str, msg: impl Into<String>) -> ApiError {
     )
 }
 
+/// The answer of every mutating branch route on a read-only server, as the update
+/// endpoint gives it.
+fn writable(st: &AppState) -> ApiResult<()> {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    Ok(())
+}
+
 /// The dataset's own object, for the branch routes (which name branches themselves).
 pub(super) fn main_dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
     let ds = st
@@ -598,6 +607,7 @@ pub(crate) async fn patch_settings(
     Extension(p): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult {
+    writable(&st)?;
     let ds = main_dataset(&st, &name)?;
     check(&p, &name, MAIN, Level::Admin, None)?;
     let v: J = serde_json::from_slice(&body)
@@ -659,6 +669,7 @@ pub(crate) async fn create(
     Extension(p): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult {
+    writable(&st)?;
     let ds = main_dataset(&st, &name)?;
     let b: CreateBody = serde_json::from_slice(&body)
         .map_err(|e| invalid("invalid-branch", format!("invalid request body: {e}")))?;
@@ -704,6 +715,7 @@ pub(crate) async fn patch_branch(
     Extension(p): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult {
+    writable(&st)?;
     let ds = main_dataset(&st, &name)?;
     let v: J = serde_json::from_slice(&body)
         .map_err(|e| invalid("invalid-branch", format!("invalid request body: {e}")))?;
@@ -818,6 +830,7 @@ pub(crate) async fn delete_branch(
     Extension(p): Extension<Principal>,
     uri: Uri,
 ) -> ApiResult {
+    writable(&st)?;
     let ds = main_dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let flag = |k: &str| matches!(params.get(k), Some("true" | "1" | ""));
@@ -1212,6 +1225,7 @@ pub(crate) async fn merge(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult {
+    writable(&st)?;
     let ds = main_dataset(&st, &name)?;
     let v: J = serde_json::from_slice(&body)
         .map_err(|e| invalid("invalid-merge", format!("invalid request body: {e}")))?;
@@ -1301,6 +1315,7 @@ pub(crate) async fn revert(
     uri: Uri,
     body: Bytes,
 ) -> ApiResult {
+    writable(&st)?;
     let ds = main_dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let (v, ask) = pick_options(&st, &body, false)?;
@@ -1553,6 +1568,7 @@ pub(crate) async fn cherry_pick(
     uri: Uri,
     body: Bytes,
 ) -> ApiResult {
+    writable(&st)?;
     let ds = main_dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let (v, ask) = pick_options(&st, &body, false)?;
