@@ -111,7 +111,7 @@ pub(super) async fn put_quota(
         }
     };
     blocking(move || {
-        ds.store.set_quota(Some(max))?;
+        ds.dataset.settings().quota().set(max)?;
         Ok(Json(quota_json(&ds)))
     })
     .await
@@ -126,7 +126,7 @@ pub(super) async fn delete_quota(State(st): St, Path(name): Path<String>) -> Api
     let ds = dataset(&st, &name)?;
     blocking(move || {
         if ds.kind == DbType::Persistent {
-            ds.store.set_quota(None)?;
+            ds.dataset.settings().quota().reset()?;
         }
         Ok(Json(quota_json(&ds)))
     })
@@ -136,7 +136,7 @@ pub(super) async fn delete_quota(State(st): St, Path(name): Path<String>) -> Api
 /// `{dataset, maxBytes, source, defaultMaxBytes, usedBytes}`; `maxBytes` and
 /// `defaultMaxBytes` are `null` when unlimited.
 pub(super) fn quota_json(ds: &Dataset) -> J {
-    let mut j = serde_json::to_value(ds.store.quota()).unwrap_or(J::Null);
+    let mut j = serde_json::to_value(ds.dataset.settings().quota().get()).unwrap_or(J::Null);
     if let Some(o) = j.as_object_mut() {
         o.insert("dataset".into(), ds.name.clone().into());
     }

@@ -113,7 +113,7 @@ enum Decision {
 impl AutoCompact {
     /// The policy that applies to `ds`: the server's with the dataset's own settings.
     pub fn policy_for(&self, ds: &Dataset) -> CompactionPolicy {
-        self.policy.with(&ds.store.compaction_settings())
+        self.policy.with(&ds.dataset.settings().compaction().get())
     }
 
     fn running_auto(states: &HashMap<String, DsState>) -> usize {
@@ -139,7 +139,7 @@ fn decide(st: &AppState, ds: &Dataset, s: &DsState, running_auto: usize, now: In
     if s.task.is_some() {
         return Decision::Running;
     }
-    let m = ds.store.compaction_measures();
+    let m = ds.dataset.settings().compaction().measures();
     let Some(trigger) = policy.verdict(&m) else {
         return Decision::Idle;
     };
@@ -436,8 +436,8 @@ pub fn cancel(st: &AppState, name: &str) {
 pub fn status_json(st: &AppState, ds: &Dataset) -> J {
     let ac = &st.compaction;
     let policy = ac.policy_for(ds);
-    let own = ds.store.compaction_settings();
-    let m = ds.store.compaction_measures();
+    let own = ds.dataset.settings().compaction().get();
+    let m = ds.dataset.settings().compaction().measures();
     let states = ac.states.lock();
     let s = states.get(&ds.key());
     let enabled = ac.enabled && policy.enabled && !st.read_only;
@@ -520,7 +520,7 @@ async fn put_settings(
     let s = CompactionSettings::from_json(&j)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     blocking(move || {
-        ds.store.set_compaction_settings(Some(s))?;
+        ds.dataset.settings().compaction().set(s)?;
         Ok(Json(status_json(&st, &ds)))
     })
     .await
@@ -533,7 +533,7 @@ async fn delete_settings(State(st): St, Path(name): Path<String>) -> ApiResult<J
     }
     let ds = dataset(&st, &name)?;
     blocking(move || {
-        ds.store.set_compaction_settings(None)?;
+        ds.dataset.settings().compaction().reset()?;
         Ok(Json(status_json(&st, &ds)))
     })
     .await
@@ -567,7 +567,7 @@ pub fn metrics(st: &AppState, out: &mut String) {
     let mut all: BTreeMap<String, Agg> = BTreeMap::new();
     for d in &datasets {
         let p = st.compaction.policy_for(d);
-        let m = d.store.compaction_measures();
+        let m = d.dataset.settings().compaction().measures();
         let on = st.compaction.enabled && p.enabled && !st.read_only;
         let a = all
             .entry(st.metrics.dataset_label(Some(&d.name)))

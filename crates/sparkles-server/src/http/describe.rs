@@ -13,7 +13,7 @@ pub(super) const SPARKLES_DESCRIBE_TRUNCATED: &str = "sparkles-describe-truncate
 
 /// The setting as `GET /$/describe/{ds}` reports it.
 pub(crate) fn status_json(ds: &Dataset) -> J {
-    crate::describe_cmd::status(&ds.store.describe_settings())
+    crate::describe_cmd::status(&ds.dataset.settings().describe().get())
 }
 
 async fn get_setting(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
@@ -42,7 +42,7 @@ async fn put_setting(
     let s =
         DescribeOptions::from_json(&j).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     blocking(move || {
-        ds.store.set_describe_settings(Some(s))?;
+        ds.dataset.settings().describe().set(s)?;
         tracing::info!("/{}: DESCRIBE setting changed", ds.name);
         Ok(Json(status_json(&ds)))
     })
@@ -56,7 +56,7 @@ async fn delete_setting(State(st): St, Path(name): Path<String>) -> ApiResult<Js
     }
     let ds = dataset(&st, &name)?;
     blocking(move || {
-        ds.store.set_describe_settings(None)?;
+        ds.dataset.settings().describe().reset()?;
         Ok(Json(status_json(&ds)))
     })
     .await
@@ -74,7 +74,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 /// and `describe-max-depth` over it. The limits of a request can only lower the
 /// dataset's. A malformed value is a `400`.
 pub(super) fn request_options(ds: &Dataset, params: &Params) -> ApiResult<DescribeOptions> {
-    let mut o = ds.store.describe_settings();
+    let mut o = ds.dataset.settings().describe().get();
     let bad = |e: sparkles::Error| err(StatusCode::BAD_REQUEST, e.to_string());
     if let Some(m) = params.get("describe") {
         o.mode = DescribeMode::parse(m).map_err(bad)?;

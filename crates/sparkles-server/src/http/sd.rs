@@ -168,7 +168,7 @@ pub(super) async fn describe(
     let reasoning = ds.reasoning.read().clone();
     let federate = st.allow_service && p.has(ServerPerm::Federate);
     let read_only = st.read_only;
-    let describe = ds.store.describe_settings();
+    let describe = ds.dataset.settings().describe().get();
     blocking(move || {
         let f = facts(&ds, &p, reasoning.is_some())?;
         let enc = |s: &str| utf8_percent(s);

@@ -1087,7 +1087,7 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         g.delta_deletes += snap.delta.deletes() as u64;
         g.wal_bytes += d.store.wal_bytes();
         // measured at most once a second, like the quota checks of commits
-        let quota = d.store.quota();
+        let quota = d.dataset.settings().quota().get();
         g.disk_bytes += quota.used_bytes;
         g.quota_bytes += quota.max_bytes.unwrap_or(0);
         g.cache_bytes += c.bytes();
