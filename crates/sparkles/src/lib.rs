@@ -9,7 +9,12 @@ pub use sparkles_core::{
     tabular, task, text, trix, validation, vector, vocab, xsd,
 };
 
+#[cfg(feature = "backup")]
+pub mod backup;
 pub mod dataset;
+#[cfg(feature = "fmt")]
+pub mod fmt;
+pub mod handles;
 pub mod querybuilder;
 pub mod reasoning;
 pub mod write_guard;

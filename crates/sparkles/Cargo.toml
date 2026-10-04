@@ -23,6 +23,10 @@ sparkles-reasoner = { workspace = true, optional = true }
 sparkles-shacl = { workspace = true, optional = true }
 sparkles-shex = { workspace = true, optional = true }
 sparkles-graphql = { workspace = true, optional = true }
+sparkles-backup = { workspace = true, optional = true }
+sparkles-fmt = { workspace = true, optional = true }
+# the runtime that the blocking backup calls run on (feature `backup`)
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 oxrdfio.workspace = true
@@ -47,3 +51,26 @@ shacl = ["dep:sparkles-shacl"]
 shex = ["dep:sparkles-shex"]
 # the GraphQL configuration of a dataset
 graphql = ["dep:sparkles-graphql"]
+# backup repositories: `ds.backups(&repo)` and `sparkles::backup` (file systems and S3,
+# the backup crate's defaults)
+backup = ["dep:sparkles-backup", "dep:tokio"]
+backup-s3 = ["backup", "sparkles-backup/s3"]
+backup-gcs = ["backup", "sparkles-backup/gcs"]
+backup-azure = ["backup", "sparkles-backup/azure"]
+# the formatter and linter: `sparkles::fmt`
+fmt = ["dep:sparkles-fmt"]
+# what the server has: every feature but geo-epsg and the cloud backends other than S3
+full = [
+    "text",
+    "geo",
+    "geo-proj4",
+    "zstd",
+    "brotli",
+    "reasoning",
+    "shacl",
+    "shex",
+    "backup",
+    "backup-s3",
+    "graphql",
+    "fmt",
+]

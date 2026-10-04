@@ -75,6 +75,57 @@ pub enum Error {
     /// was written.
     #[error("{0}")]
     Patch(Box<crate::patch::PatchError>),
+    /// An error of a component outside the engine (a backup repository, the reasoner,
+    /// the GraphQL adapter), with the component's own stable code. Its `source` is the
+    /// component's error, which a program can downcast for the details.
+    #[error("{0}")]
+    Component(Box<ComponentError>),
+}
+
+/// The error of a component outside the engine (see [`Error::Component`]).
+#[derive(Debug)]
+pub struct ComponentError {
+    /// `backup`, `reasoner`, `graphql`, …
+    pub component: &'static str,
+    /// the component's stable kebab-case code, such as `repository-locked`
+    pub code: String,
+    pub message: String,
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl ComponentError {
+    pub fn new(
+        component: &'static str,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> ComponentError {
+        ComponentError {
+            component,
+            code: code.into(),
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// The same error with the component's original error as its source.
+    pub fn with_source(mut self, e: impl std::error::Error + Send + Sync + 'static) -> Self {
+        self.source = Some(Box::new(e));
+        self
+    }
+}
+
+impl std::fmt::Display for ComponentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ComponentError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
 }
 
 /// Which budget a request exceeded.
@@ -212,6 +263,40 @@ pub fn human_bytes(b: u64) -> String {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
+    /// A stable kebab-case name of the error, the same in every binding: `cancelled`,
+    /// `not-found`, `conflict`, `guard-missing` and so on, and a component error's own
+    /// code. The server maps codes to HTTP statuses and the bindings to their exception
+    /// classes.
+    pub fn code(&self) -> &str {
+        match self {
+            Error::Io(_) => "io",
+            Error::SparqlSyntax(_) => "sparql-syntax",
+            Error::RdfParse(_) => "rdf-parse",
+            Error::Timeout => "timeout",
+            Error::Cancelled => "cancelled",
+            Error::BudgetExceeded(_) => "budget-exceeded",
+            Error::Unsupported(_) => "unsupported",
+            Error::Invalid(_) => "invalid",
+            Error::Corrupt(_) => "corrupt",
+            Error::Service(_) => "service",
+            Error::Poisoned => "poisoned",
+            Error::TextUnavailable(_) => "text-unavailable",
+            Error::NotFound(_) => "not-found",
+            Error::HistoryGone(_) => "history-gone",
+            Error::HistoryUnsupported(_) => "history-unsupported",
+            Error::Conflict(_) => "conflict",
+            Error::Rejected(_) => "rejected",
+            Error::GuardMissing(_) => "guard-missing",
+            Error::NotPermitted(_) => "not-permitted",
+            Error::StorageFull(_) => "storage-full",
+            Error::PreconditionFailed(_) => "precondition-failed",
+            Error::WriterBusy => "writer-busy",
+            Error::DryRun(_) => "dry-run",
+            Error::Patch(_) => "patch",
+            Error::Component(c) => &c.code,
+        }
+    }
+
     pub fn invalid(s: impl Into<String>) -> Error {
         Error::Invalid(s.into())
     }

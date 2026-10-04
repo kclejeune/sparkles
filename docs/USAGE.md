@@ -1870,6 +1870,40 @@ ds.dump(std::io::stdout(), RdfFormat::TriG)?;
 | `ShaclValidator` | `sparkles_shacl::validate` (crate `sparkles-shacl`) |
 | `ShexValidator` | `sparkles_shex::validate` (crate `sparkles-shex`) |
 
+Opening a database sets it up as the server does. `Dataset::open` installs the write
+guard that the database's `validation.json` configures, loads RDFS on read, and opens
+the stored queries, the GraphQL configuration and the reasoning record. When the guard
+cannot be installed, for example because the build lacks the `shacl` or `shex` feature,
+writes fail with `Error::GuardMissing`, and `Dataset::guard_error` says why.
+
+A dataset's administration goes through handles that `Dataset` returns. Each handle is
+cheap to clone and can move to another thread. Settings have `get`, `set` and `reset`,
+and long-running calls take a `sparkles::task::Control`, which carries a cancel flag, a
+progress callback and a deadline.
+
+```rust
+use sparkles::history::{At, SnapshotOptions};
+use sparkles::reasoning::rdfs::NewSchema;
+use sparkles::task::{Control, Progress};
+
+let (snap, _created) = ds.snapshots().create("before", &At::Head, &SnapshotOptions::default())?;
+let diff = ds.history().diff(&At::Snapshot("before".into()), &At::Head, &Default::default())?;
+ds.settings().quota().set(2 << 30)?;               // reset() returns to the default
+ds.indexes().vector().list();                      // also text() and geo()
+ds.queries().run("by-author", &params, &Default::default())?;
+ds.reasoning().rdfs().set(NewSchema::Graph("http://ex.org/schema".into()))?;
+let ctl = Control { progress: Progress::new(|f, msg| eprintln!("{f:.2} {msg}")), ..Control::none() };
+ds.compact_with(&Default::default(), &ctl)?;
+```
+
+The handles that need another crate sit behind the `sparkles` crate's Cargo features.
+`reasoning`, `shacl`, `shex`, `graphql`, `backup` and `fmt` turn on the reasoner's
+calls, the validators, the GraphQL configuration, `ds.backups(&repo)` with
+`sparkles::backup`, and `sparkles::fmt`. The feature `full` turns on what the server
+has. The default is empty. Some operations of the HTTP API, such as the schema report,
+dataset statistics and reasoning runs, have no library call yet.
+[Spec P06](specs/P06-library-admin-api.md) lists what is still to come.
+
 `Dataset::store()` and the `store`, `index` and `builder` modules give lower-level
 access: ids, snapshots, raw index scans and the bulk `Builder`. `mise run doc` builds
 the API documentation of the library crates.

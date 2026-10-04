@@ -659,9 +659,92 @@ impl Dataset {
         Ok(n)
     }
 
+    /// Remove one prefix; whether it was defined.
+    pub fn remove_prefix(&self, prefix: &str) -> Result<bool> {
+        self.inner.store.remove_prefix(prefix)
+    }
+
+    /// Replace the content of `target` (a graph, the default graph, or every graph) with
+    /// the quads of `sources`, in one commit. The sources are parsed before anything is
+    /// cleared.
+    pub fn replace(
+        &self,
+        target: crate::store::ReplaceTarget,
+        sources: &[Source],
+    ) -> Result<Receipt> {
+        Ok(self
+            .inner
+            .store
+            .replace_as(target, sources, CommitKind::GspPut)?
+            .1)
+    }
+
+    /// Remove every quad of every graph; the quads removed.
+    pub fn clear(&self) -> Result<u64> {
+        Ok(self.update("CLEAR SILENT ALL")?.deleted)
+    }
+
+    /// Serialize one graph's triples (the default graph for
+    /// [`GraphNameRef::DefaultGraph`]) in a triple format; the triples written.
+    pub fn dump_graph(
+        &self,
+        graph: GraphNameRef<'_>,
+        w: impl Write,
+        format: RdfFormat,
+    ) -> Result<u64> {
+        let ser = crate::io::with_prefixes(
+            oxrdfio::RdfSerializer::from_format(format),
+            self.inner.store.prefixes(),
+        );
+        let mut out = ser.for_writer(w);
+        let mut n = 0;
+        for q in self.quads(Some(graph), None, None, None) {
+            let q = q?;
+            out.serialize_triple(TripleRef::new(&q.subject, &q.predicate, &q.object))?;
+            n += 1;
+        }
+        out.finish()?;
+        Ok(n)
+    }
+
+    /// The plan of a query without running it, as text and as the plan's summary.
+    pub fn explain(
+        &self,
+        query: &str,
+        opts: &QueryOptions,
+    ) -> Result<(String, crate::sparql::PlanInfo)> {
+        crate::sparql::explain(self.snapshot(), query, opts)
+    }
+
+    /// Drop the cached query results.
+    pub fn clear_cache(&self) {
+        self.inner.store.result_cache().clear();
+    }
+
     /// Merge updates into a freshly built index generation (TDB2 compaction).
     pub fn compact(&self) -> Result<()> {
         self.inner.store.compact()
+    }
+
+    /// [`compact`](Self::compact) with options, cancelled by `ctl` (the generation is
+    /// then unchanged) and reporting the build's phases to its progress, ending at 1.0.
+    pub fn compact_with(
+        &self,
+        opts: &crate::store::CompactOptions,
+        ctl: &crate::task::Control,
+    ) -> Result<crate::store::CompactReport> {
+        ctl.check()?;
+        let progress = ctl.progress.clone();
+        let mut o = opts.clone();
+        o.cancel = Some(ctl.cancel.flag());
+        if progress.is_some() {
+            progress.report(0.0, "compacting");
+            let p = progress.clone();
+            o.progress = Some(Arc::new(move |m: &str| p.report(0.0, m)));
+        }
+        let r = self.inner.store.compact_with(&o)?;
+        progress.report(1.0, "compacted");
+        Ok(r)
     }
 
     /// Write a compressed N-Quads backup into `dir` (zstd, or gzip in builds without zstd);

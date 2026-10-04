@@ -147,9 +147,10 @@ tls = ["dep:rustls", "dep:tokio-rustls"]
 mcp = ["dep:rmcp", "dep:tokio-util"]
 # backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
 # `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
-backup = ["dep:sparkles-backup", "dep:toml", "dep:uuid"]
+backup = ["dep:sparkles-backup", "dep:toml", "dep:uuid", "sparkles/backup"]
 # the formatter: `sparkles fmt`, `sparkles lsp` and `POST /$/format`
 fmt = [
+    "sparkles/fmt",
     "dep:sparkles-fmt",
     "dep:ignore",
     "dep:similar",
