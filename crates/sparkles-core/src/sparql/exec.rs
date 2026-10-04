@@ -551,6 +551,12 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             };
             super::history_svc::run(ctx, spec, input.as_ref(), &n.vars)?
         }
+        Kind::HybridSearch(spec) if !n.children.is_empty() => {
+            let input = child(0, &mut infos)?;
+            let (t, c) = super::hybrid::search_bound(ctx, spec, &input, &mut note)?;
+            counters = Some(c);
+            t
+        }
         Kind::HybridSearch(spec) => {
             let (t, c) = super::hybrid::search(ctx, spec, &n.vars)?;
             counters = Some(c);
@@ -2406,7 +2412,7 @@ pub(super) fn join_tables(
 }
 
 /// The join of two tables, with a note on how the rows were matched.
-fn join_noted(
+pub(super) fn join_noted(
     ctx: &Ctx,
     l: &Table,
     r: &Table,

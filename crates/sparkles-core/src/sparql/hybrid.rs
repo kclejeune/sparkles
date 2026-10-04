@@ -14,9 +14,14 @@
 //! subject's rank is one more than the number of subjects with a better score, so tied
 //! subjects share a rank. The fused score of a subject is the sum of `w / (k + rank)`
 //! over the lists that hold it, and the result is the `limit` best subjects.
+//!
+//! The text query string and the vector query can be variables that the rest of the
+//! group binds, and the vector list can take `candidates:join`. The call then runs over
+//! its group: once per distinct pair of query values, and each row joins with the
+//! fused rows of its own pair.
 
 use super::ctx::Ctx;
-use super::plan::{ActiveGraph, Kind, Node, PathEnd, Planner, TextSpec, VectorSpec};
+use super::plan::{ActiveGraph, Kind, Node, PathEnd, Planner, TextSpec, VectorQuery, VectorSpec};
 use super::table::{Table, VarId};
 use super::value::Value;
 use crate::error::{Error, Result};
@@ -66,6 +71,100 @@ pub struct HybridSpec {
     pub vector_rank: Option<VarId>,
     /// `GRAPH ?g { … }` around the call: fusion is per subject and graph
     pub graph_var: Option<VarId>,
+}
+
+impl HybridSpec {
+    /// Whether the call reads the rest of its group (child 0): a variable query string,
+    /// a variable vector query or `candidates:join`.
+    pub fn needs_input(&self) -> bool {
+        self.text.as_ref().is_some_and(|t| t.query_var.is_some())
+            || self.vector.as_ref().is_some_and(|v| v.needs_input())
+    }
+
+    /// The variables the call itself binds.
+    pub fn output_vars(&self) -> Vec<VarId> {
+        let mut vars = Vec::new();
+        for x in [
+            match self.subject {
+                PathEnd::Var(v) => Some(v),
+                PathEnd::Const(_) => None,
+            },
+            self.score,
+            self.text_rank,
+            self.vector_rank,
+            self.graph_var,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !vars.contains(&x) {
+                vars.push(x);
+            }
+        }
+        vars
+    }
+
+    fn text_query_var(&self) -> Option<VarId> {
+        self.text.as_ref().and_then(|t| t.query_var)
+    }
+
+    fn vector_query_var(&self) -> Option<VarId> {
+        match self.vector.as_ref().map(|v| &v.query) {
+            Some(VectorQuery::Var(v)) => Some(*v),
+            _ => None,
+        }
+    }
+}
+
+/// The call attached to the rest of its group, which binds its query variables (and its
+/// subject, for `candidates:join`).
+pub(super) fn attach(p: &Planner<'_>, left: Node, search: Node) -> Result<Node> {
+    let Kind::HybridSearch(spec) = &search.kind else {
+        unreachable!("a hybrid search");
+    };
+    let unbound = |v: VarId, what: &str| {
+        Err(bad(format!(
+            "the {what} ?{} is not bound by the rest of the group",
+            p.ctx.var_name(v)
+        )))
+    };
+    if let Some(v) = spec.text_query_var()
+        && !left.vars.contains(&v)
+    {
+        return unbound(v, "text query variable");
+    }
+    if let Some(v) = spec.vector_query_var()
+        && !left.vars.contains(&v)
+    {
+        return unbound(v, "vector query variable");
+    }
+    if spec.vector.as_ref().is_some_and(|v| v.candidates) {
+        match spec.subject {
+            PathEnd::Var(s) if left.vars.contains(&s) => {}
+            PathEnd::Var(s) => return unbound(s, "subject of candidates:join, which is"),
+            PathEnd::Const(_) => return Err(bad("candidates:join needs a variable subject")),
+        }
+    }
+    let mut vars = left.vars.clone();
+    for v in &search.vars {
+        if !vars.contains(v) {
+            vars.push(*v);
+        }
+    }
+    let mut certain = left.certain.clone();
+    certain.extend(search.vars.iter().copied());
+    let est = (left.est * spec.limit as f64).max(1.0);
+    Ok(Node {
+        dist: vars.iter().map(|&v| (v, est)).collect(),
+        cost: left.cost + search.cost + est,
+        vars,
+        certain,
+        sorted: Vec::new(),
+        est,
+        desc: search.desc,
+        kind: search.kind,
+        children: vec![left],
+    })
 }
 
 /// Take a call's nested list arguments (the text and vector lists) out of the remaining
@@ -199,9 +298,6 @@ pub(super) fn hybrid_leaf(
     };
     let (ts, tscore, vs, vscore) = (hidden("ts"), hidden("tsc"), hidden("vs"), hidden("vsc"));
     let mut call = super::textpf::decode(vec![ts.clone(), tscore.clone()], text_args)?;
-    if call.query_var.is_some() {
-        return Err(bad("arguments must be constants"));
-    }
     if call.highlight.is_some() {
         return Err(bad("the text list takes no highlight: option"));
     }
@@ -233,14 +329,7 @@ pub(super) fn hybrid_leaf(
     };
     let vector_vars = vector_node.vars.clone();
     let vector = match vector_node.kind {
-        Kind::VectorSearch(spec) => {
-            if spec.needs_input() {
-                return Err(bad(
-                    "the vector query must be a vector literal or an entity, and candidates:join is not supported",
-                ));
-            }
-            Some(spec)
-        }
+        Kind::VectorSearch(spec) => Some(spec),
         _ => None,
     };
     let graph_var = p.graph_filter(g).and_then(|(_, gv)| gv);
@@ -362,48 +451,222 @@ fn ranks(
     Ok(out)
 }
 
-/// Evaluate a `spk:hybridSearch` call.
-pub(super) fn search(
+type Counters = serde_json::Map<String, serde_json::Value>;
+
+/// The text ranking of `t`, a text search of the call (`lenient`: a query string bound
+/// by the data, which matches nothing when it does not parse).
+fn text_ranks(
     ctx: &Ctx,
     spec: &HybridSpec,
-    vars: &[VarId],
-) -> Result<(Table, serde_json::Map<String, serde_json::Value>)> {
+    t: &TextSpec,
+    lenient: bool,
+    counters: &mut Counters,
+) -> Result<FxHashMap<Key, usize>> {
+    let table = crate::text::search_in(ctx, t, &spec.text_vars, None, lenient)?;
+    add_count(counters, "textHits", table.len());
+    ranks(
+        ctx,
+        &table,
+        spec.text_s,
+        spec.text_score,
+        spec.graph_var,
+        false,
+    )
+}
+
+/// The vector ranking of `v`, run over `input` when it reads its group.
+fn vector_ranks(
+    ctx: &Ctx,
+    spec: &HybridSpec,
+    v: &VectorSpec,
+    input: Option<Table>,
+    counters: &mut Counters,
+) -> Result<FxHashMap<Key, usize>> {
+    let (table, c) = super::exec::vector_search(ctx, v, input, &spec.vector_vars)?;
+    add_count(counters, "vectorHits", table.len());
+    if let Some(m) = c.get("method") {
+        counters.insert("vectorMethod".into(), m.clone());
+    }
+    ranks(
+        ctx,
+        &table,
+        spec.vector_s,
+        spec.vector_score,
+        spec.graph_var,
+        spec.vector_lower_better,
+    )
+}
+
+fn add_count(counters: &mut Counters, name: &str, n: usize) {
+    let before = counters.get(name).and_then(|x| x.as_u64()).unwrap_or(0);
+    counters.insert(name.into(), (before + n as u64).into());
+}
+
+/// Evaluate a `spk:hybridSearch` call.
+pub(super) fn search(ctx: &Ctx, spec: &HybridSpec, vars: &[VarId]) -> Result<(Table, Counters)> {
     let mut counters = serde_json::Map::new();
     let text = match &spec.text {
-        Some(t) => {
-            let table = crate::text::search(ctx, t, &spec.text_vars)?;
-            counters.insert("textHits".into(), table.len().into());
-            ranks(
-                ctx,
-                &table,
-                spec.text_s,
-                spec.text_score,
-                spec.graph_var,
-                false,
-            )?
-        }
+        Some(t) => text_ranks(ctx, spec, t, false, &mut counters)?,
         None => FxHashMap::default(),
     };
     ctx.check()?;
     let vector = match &spec.vector {
-        Some(v) => {
-            let (table, c) = super::exec::vector_search(ctx, v, None, &spec.vector_vars)?;
-            counters.insert("vectorHits".into(), table.len().into());
-            if let Some(m) = c.get("method") {
-                counters.insert("vectorMethod".into(), m.clone());
-            }
-            ranks(
-                ctx,
-                &table,
-                spec.vector_s,
-                spec.vector_score,
-                spec.graph_var,
-                spec.vector_lower_better,
-            )?
-        }
+        Some(v) => vector_ranks(ctx, spec, v, None, &mut counters)?,
         None => FxHashMap::default(),
     };
     ctx.check()?;
+    let t = fuse(ctx, spec, &text, &vector, vars, &mut counters)?;
+    Ok((t, counters))
+}
+
+/// The most distinct pairs of query values a call over its group runs.
+const MAX_QUERIES: usize = 1000;
+
+/// Evaluate a call over the rows of its group: one fusion per distinct pair of text and
+/// vector query values, with `candidates:join` among the subjects of its rows, each joined
+/// with the input rows of that pair.
+pub(super) fn search_bound(
+    ctx: &Ctx,
+    spec: &HybridSpec,
+    input: &Table,
+    note: &mut Option<String>,
+) -> Result<(Table, Counters)> {
+    let mut counters = serde_json::Map::new();
+    let (qt, qv) = (spec.text_query_var(), spec.vector_query_var());
+    let candidates = spec.vector.as_ref().is_some_and(|v| v.candidates);
+    let col = |v: Option<VarId>| v.and_then(|v| input.col_of(v));
+    let (ct, cv) = (col(qt), col(qv));
+    let cs = match spec.subject {
+        PathEnd::Var(s) if candidates => input.col_of(s),
+        _ => None,
+    };
+    // the rows of each pair of query values (a row without a needed value has none)
+    let mut groups: FxHashMap<(Id, Id), Vec<usize>> = FxHashMap::default();
+    let mut order = Vec::new();
+    for r in 0..input.len() {
+        let t = ct.map_or(Id::UNDEF, |c| input.get(r, c));
+        let v = cv.map_or(Id::UNDEF, |c| input.get(r, c));
+        if (qt.is_some() && t == Id::UNDEF) || (qv.is_some() && v == Id::UNDEF) {
+            continue;
+        }
+        groups
+            .entry((t, v))
+            .or_insert_with(|| {
+                order.push((t, v));
+                Vec::new()
+            })
+            .push(r);
+    }
+    if order.len() > MAX_QUERIES {
+        return Err(Error::BudgetExceeded(crate::Budget {
+            kind: crate::BudgetKind::Rows,
+            limit: MAX_QUERIES as u64,
+            requested: order.len() as u64,
+        }));
+    }
+    // a ranking that depends on no input row is computed once
+    let fixed_text = match (&spec.text, qt) {
+        (Some(t), None) => Some(text_ranks(ctx, spec, t, false, &mut counters)?),
+        (None, _) => Some(FxHashMap::default()),
+        _ => None,
+    };
+    let fixed_vector = match (&spec.vector, qv, candidates) {
+        (Some(v), None, false) => Some(vector_ranks(ctx, spec, v, None, &mut counters)?),
+        (None, ..) => Some(FxHashMap::default()),
+        _ => None,
+    };
+    let own = spec.output_vars();
+    let mut hvars = own.clone();
+    for v in [qt, qv].into_iter().flatten() {
+        if !hvars.contains(&v) {
+            hvars.push(v);
+        }
+    }
+    let mut hits = Table::new(hvars.clone());
+    for (t, v) in order {
+        ctx.check()?;
+        let rows = &groups[&(t, v)];
+        let text = match (&fixed_text, &spec.text) {
+            (Some(r), _) => r.clone(),
+            (None, Some(ts)) => match bound_text(ctx, ts, t) {
+                Some(one) => text_ranks(ctx, spec, &one, true, &mut counters)?,
+                None => FxHashMap::default(),
+            },
+            (None, None) => FxHashMap::default(),
+        };
+        let vector = match (&fixed_vector, &spec.vector) {
+            (Some(r), _) => r.clone(),
+            (None, Some(vs)) => {
+                // the search's own input: the query value and the candidate subjects
+                let mut sub_vars = Vec::new();
+                if let Some(q) = qv {
+                    sub_vars.push(q);
+                }
+                if cs.is_some() {
+                    sub_vars.push(spec.vector_s);
+                }
+                let mut sub = Table::new(sub_vars);
+                let mut row = Vec::with_capacity(2);
+                for &r in rows {
+                    row.clear();
+                    if qv.is_some() {
+                        row.push(v);
+                    }
+                    if let Some(c) = cs {
+                        row.push(input.get(r, c));
+                    }
+                    sub.push_row(&row);
+                }
+                vector_ranks(ctx, spec, vs, Some(sub), &mut counters)?
+            }
+            (None, None) => FxHashMap::default(),
+        };
+        let mut fused = fuse(ctx, spec, &text, &vector, &own, &mut counters)?;
+        for (var, id) in [(qt, t), (qv, v)] {
+            if let Some(var) = var
+                && !own.contains(&var)
+                && fused.col_of(var).is_none()
+            {
+                fused.vars.push(var);
+                fused.cols.push(vec![id; fused.len()]);
+            }
+        }
+        hits.append(fused);
+        ctx.check_rows(hits.len())?;
+    }
+    let searches = groups.len();
+    let t = super::exec::join_noted(ctx, input, &hits, false, note)?;
+    *note = Some(format!("[{searches} fusions]"));
+    counters.insert("fusions".into(), searches.into());
+    Ok((t, counters))
+}
+
+/// The text search of a bound query string: `None` when the value is not a string.
+fn bound_text(ctx: &Ctx, ts: &TextSpec, value: Id) -> Option<TextSpec> {
+    let Some(oxrdf::Term::Literal(l)) = ctx.term(value) else {
+        return None;
+    };
+    let lang = match l.language() {
+        Some(t) => Some(t.to_ascii_lowercase()),
+        None if l.datatype() == xsd::STRING => None,
+        None => return None,
+    };
+    let mut one = ts.clone();
+    one.query = l.value().to_string();
+    one.query_var = None;
+    one.lang = ts.lang.clone().or(lang);
+    Some(one)
+}
+
+/// The fused rows of two rankings, best first, at most the call's limit.
+fn fuse(
+    ctx: &Ctx,
+    spec: &HybridSpec,
+    text: &FxHashMap<Key, usize>,
+    vector: &FxHashMap<Key, usize>,
+    vars: &[VarId],
+    counters: &mut Counters,
+) -> Result<Table> {
     let [wt, wv] = spec.weights;
     let rrf = |w: f64, r: Option<&usize>| r.map_or(0.0, |&r| w / (spec.rrf_k + r as f64));
     let mut fused: Vec<(Key, f64, Option<usize>, Option<usize>)> = text
@@ -418,7 +681,7 @@ pub(super) fn search(
             (*k, rrf(wt, rt) + rrf(wv, rv), rt.copied(), rv.copied())
         })
         .collect();
-    counters.insert("fused".into(), fused.len().into());
+    add_count(counters, "fused", fused.len());
     // best first; ties break by term id, as in spk:vectorSearch
     fused.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     fused.truncate(spec.limit);
@@ -467,5 +730,5 @@ pub(super) fn search(
             t.push_row(&row);
         }
     }
-    Ok((t, counters))
+    Ok(t)
 }

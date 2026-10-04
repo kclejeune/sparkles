@@ -2382,6 +2382,7 @@ impl<'a> Planner<'a> {
             nodes.into_iter().partition(|n| match &n.kind {
                 Kind::VectorSearch(s) => s.needs_input(),
                 Kind::TextSearch(s) => s.needs_input(),
+                Kind::HybridSearch(s) => s.needs_input(),
                 Kind::SpatialPf(s) => s.needs_input(),
                 Kind::PathSearch(s) => s.needs_input(),
                 Kind::PropertyFn(s) => s.needs_input(),
@@ -2446,6 +2447,7 @@ impl<'a> Planner<'a> {
                 Kind::HistoryChanges(_) => super::history_svc::attach(self, result, d)?,
                 Kind::PropertyFn(_) => super::arqpf::attach(result, d),
                 Kind::TextSearch(_) => self.attach_text(result, d)?,
+                Kind::HybridSearch(_) => super::hybrid::attach(self, result, d)?,
                 _ => self.attach_vector(result, d)?,
             };
             let (now, later): (Vec<Expr>, Vec<Expr>) =
