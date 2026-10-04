@@ -184,6 +184,9 @@ pub struct VectorSpec {
     pub distinct_subject: bool,
     /// `candidates:join`: only subjects the rest of the group binds
     pub candidates: bool,
+    /// the `k` best rows of an ORDER BY over one pattern (see `vectortopk`): child 0 is
+    /// the pattern, whose generic plan runs when fewer than `k` rows have a score
+    pub order_fallback: bool,
 }
 
 impl VectorSpec {
@@ -1692,6 +1695,7 @@ impl<'a> Planner<'a> {
             mode,
             distinct_subject,
             candidates,
+            order_fallback: false,
         };
         let mut n = Node::leaf(Kind::VectorSearch(Box::new(spec)), vars, k as f64, desc);
         n.cost = k as f64 * 16.0;
@@ -3878,7 +3882,10 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
             if let Kind::OrderBy { limit, .. } = &mut n.kind {
                 *limit = Some(k);
             }
-            ordered_topk(super::geojoin::spatial_knn(n, ctx), ctx)
+            ordered_topk(
+                super::geojoin::spatial_knn(super::vectortopk::vector_topk(n, ctx), ctx),
+                ctx,
+            )
         }
         (mut n, Some(k))
             if matches!(n.kind, Kind::Project(_))
@@ -3888,8 +3895,10 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
                 *limit = Some(k);
             }
             let order = n.children.pop().unwrap();
-            n.children
-                .push(ordered_topk(super::geojoin::spatial_knn(order, ctx), ctx));
+            n.children.push(ordered_topk(
+                super::geojoin::spatial_knn(super::vectortopk::vector_topk(order, ctx), ctx),
+                ctx,
+            ));
             n
         }
         (n, _) => n,

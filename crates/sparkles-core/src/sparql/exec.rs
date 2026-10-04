@@ -496,6 +496,30 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t
         }
         Kind::TextSearch(spec) => crate::text::search(ctx, spec, &n.vars)?,
+        Kind::VectorSearch(spec) if spec.order_fallback => {
+            // the k best rows of an ORDER BY: the generic plan when fewer than k rows
+            // have a score, or when the search cannot run
+            let searched = match vector_search(ctx, spec, None, &n.vars) {
+                Ok((t, c)) if t.len() >= spec.k => Some((t, c)),
+                Ok(_) => None,
+                Err(Error::BudgetExceeded(_) | Error::Invalid(_)) => None,
+                Err(e) => return Err(e),
+            };
+            match searched {
+                Some((t, c)) => {
+                    infos.push(describe(ctx, &n.children[0]));
+                    counters = Some(c);
+                    t
+                }
+                None => {
+                    note = Some(format!(
+                        "[fewer than {} rows have a score: ran the generic plan]",
+                        spec.k
+                    ));
+                    child(0, &mut infos)?
+                }
+            }
+        }
         Kind::VectorSearch(spec) => {
             let input = match n.children.len() {
                 0 => None,

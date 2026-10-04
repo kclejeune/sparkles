@@ -184,10 +184,13 @@ pub struct Optimizations {
     /// a hash join whose right side is a `text:query` call without a limit searches only
     /// the subjects of a small left side
     pub text_subject_pushdown: bool,
+    /// ORDER BY DESC(spk:cosine(?v, C)) LIMIT k (or spk:dot) over one pattern reads the
+    /// k best rows by an exact vector search
+    pub vector_topk: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 32] = [
+    pub const NAMES: [&str; 33] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -220,6 +223,7 @@ impl Optimizations {
         "prefetch_blocks",
         "filter_id_ranges",
         "text_subject_pushdown",
+        "vector_topk",
     ];
 
     /// Everything on.
@@ -256,6 +260,7 @@ impl Optimizations {
         prefetch_blocks: true,
         filter_id_ranges: true,
         text_subject_pushdown: true,
+        vector_topk: true,
     };
 
     /// Everything off: the generic operators only.
@@ -292,6 +297,7 @@ impl Optimizations {
         prefetch_blocks: false,
         filter_id_ranges: false,
         text_subject_pushdown: false,
+        vector_topk: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -328,6 +334,7 @@ impl Optimizations {
             "prefetch_blocks" => &mut self.prefetch_blocks,
             "filter_id_ranges" => &mut self.filter_id_ranges,
             "text_subject_pushdown" => &mut self.text_subject_pushdown,
+            "vector_topk" => &mut self.vector_topk,
             _ => return None,
         })
     }
