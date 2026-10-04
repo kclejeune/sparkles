@@ -139,6 +139,9 @@ tasks.processResources {
 
 tasks.jar {
     from(ffi.output)
+    // the project's license, and the notices of the crates the native library links
+    from(repoRoot.resolve("LICENSE")) { into("META-INF") }
+    from(layout.projectDirectory.file("THIRD_PARTY_LICENSES.md")) { into("META-INF") }
     manifest {
         attributes(
             "Implementation-Title" to "sparkles-jena",

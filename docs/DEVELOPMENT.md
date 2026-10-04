@@ -524,7 +524,11 @@ only when `Cargo.lock` does. Ship it with binaries. The Nix packages install it 
 The script also writes `crates/sparkles-py/THIRD_PARTY_LICENSES.md` for the Python wheel
 from that crate's own lock. It lists the crates the extension module links, which are the
 engine's and PyO3's. maturin puts it in the wheel's `licenses/` directory with the
-project's `LICENSE`, as `pyproject.toml` declares. `licenses:check` checks both files.
+project's `LICENSE`, as `pyproject.toml` declares. It writes
+`jvm/sparkles-jena/THIRD_PARTY_LICENSES.md` for the JVM library from the lock of
+`crates/sparkles-ffi`, and the jar carries it in `META-INF` with the project's `LICENSE`.
+Crates that state MPL-2.0 without a license file, such as UniFFI's, get the MPL-2.0 text
+that another crate ships. `licenses:check` checks all three files.
 
 [`THIRD_PARTY_LICENSES-UI.md`](../THIRD_PARTY_LICENSES-UI.md) does the same for the npm
 packages whose code or fonts end up in the embedded web UI. These are CodeMirror,
