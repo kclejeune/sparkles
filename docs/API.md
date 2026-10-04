@@ -3080,6 +3080,7 @@ type CommitGraph = {
     branch: string; branchId: string;           // the branch that made the commit
     parents: { branch: string | null; branchId: string; seq: number }[];
     mergedFrom?: { branch: string | null; branchId: string; seq: number };
+    replayedFrom?: { branch: string | null; branchId: string; seq: number };
   })[];
   next: string | null;                          // the URL of the next (older) page
 };
@@ -3089,7 +3090,8 @@ Commits are sorted by time, then by the branch's ordinal, then by number. Commit
 numbers count per branch, so a commit is known by its branch id and number. The first
 parent of a commit is the previous commit of its branch. For a branch's first commit,
 it is the commit the branch started from, named by the branch that made it. A merge
-commit has the merged commit as its second parent, also given in `mergedFrom`. A
+commit has the merged commit as its second parent, also given in `mergedFrom`, and a
+commit of a replayed fast-forward the commit it replays, also given in `replayedFrom`. A
 parent can name a deleted branch, with `branch: null`, or a branch the caller may not
 read. Such a parent never appears in the list. Commits whose metadata is no longer
 retained are left out. Each commit carries `reconstructable` and `snapshots` as in

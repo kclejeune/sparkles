@@ -664,6 +664,7 @@ pub(super) fn schemas() -> Map<String, J> {
                         "branchId": { "type": "string" },
                         "parents": array(commit_ref()),
                         "mergedFrom": commit_ref(),
+                        "replayedFrom": commit_ref(),
                         "reconstructable": { "type": "boolean" },
                         "snapshots": array(json!({ "type": "string" })),
                     },

@@ -70,6 +70,9 @@ pub struct GraphCommit {
     pub parents: Vec<NamedCommitRef>,
     /// a merge commit's merged commit
     pub merged_from: Option<NamedCommitRef>,
+    /// for a commit of a replayed fast-forward, the source commit it replays (also its
+    /// second parent)
+    pub replayed_from: Option<NamedCommitRef>,
     pub annotation: Option<Annotation>,
 }
 
@@ -255,13 +258,17 @@ impl Store {
                     });
                     parents.push(set.named(r));
                 }
-                let merged_from = run
-                    .store
-                    .merge_record(c.seq)
-                    .map(|m| set.named(set.normalize(m.source)));
-                if let Some(m) = &merged_from {
+                let rec = run.store.merge_record(c.seq);
+                let second = rec.map(|m| set.named(set.normalize(m.source)));
+                if let Some(m) = &second {
                     parents.push(m.clone());
                 }
+                let replay = rec.is_some_and(|m| m.flags & super::branching::MERGE_REPLAYED != 0);
+                let (merged_from, replayed_from) = if replay {
+                    (None, second)
+                } else {
+                    (second, None)
+                };
                 GraphCommit {
                     annotation: run.store.annotation(c.seq),
                     commit: c,
@@ -269,6 +276,7 @@ impl Store {
                     branch_id: id,
                     parents,
                     merged_from,
+                    replayed_from,
                 }
             })
             .collect();

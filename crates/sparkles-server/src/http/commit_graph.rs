@@ -121,6 +121,9 @@ pub(crate) async fn get(
             if let Some(m) = &c.merged_from {
                 j["mergedFrom"] = commit_ref(m);
             }
+            if let Some(m) = &c.replayed_from {
+                j["replayedFrom"] = commit_ref(m);
+            }
             if let Some((ranges, pins)) = extras.get(&c.branch) {
                 let s = c.commit.seq;
                 j["reconstructable"] = json!(ranges.iter().any(|&(a, b)| a <= s && s <= b));

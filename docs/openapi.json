@@ -2173,6 +2173,23 @@
                 "reconstructable": {
                   "type": "boolean"
                 },
+                "replayedFrom": {
+                  "properties": {
+                    "branch": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "branchId": {
+                      "type": "string"
+                    },
+                    "seq": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                },
                 "snapshots": {
                   "items": {
                     "type": "string"
