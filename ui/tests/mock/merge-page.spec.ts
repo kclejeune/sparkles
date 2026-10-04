@@ -76,9 +76,10 @@ test('the merge page resolves conflicts per row and per subject, then merges', a
 
   // the changes those choices make
   const lines = changes(page).getByLabel('Changes of the merge');
+  await expect(lines).toContainText('− <urn:a> <urn:height> "2"^^');
   await expect(lines).toContainText('+ <urn:a> <urn:height> "3"^^');
   await expect(lines).toContainText('+ <urn:b> <urn:height> "3"^^');
-  await expect(lines).not.toContainText('- <urn:b> <urn:height>');
+  await expect(lines).not.toContainText('− <urn:b> <urn:height>');
 
   const before = await mainHead(request, 'orchard');
   await page.getByRole('button', { name: 'Merge into main' }).click();
