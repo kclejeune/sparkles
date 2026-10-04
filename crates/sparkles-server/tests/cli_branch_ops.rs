@@ -149,3 +149,39 @@ fn a27_replay() {
         "{text}"
     );
 }
+
+#[test]
+fn a28_a29_rename_and_delete_with_reparent() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    update(dir, "main", "INSERT DATA { <urn:a> <urn:age> 30 }");
+    ok(dir, &["branch", "create", "--loc", "db", "dev"]);
+    update(dir, "dev", "INSERT DATA { <urn:c> <urn:p> 1 }");
+    let o = ok(dir, &["branch", "rename", "--loc", "db", "dev", "work"]);
+    assert!(
+        err(&o).contains("renamed branch dev to work"),
+        "{}",
+        err(&o)
+    );
+    assert!(subjects(dir, "work").contains("urn:c"));
+    let o = run(dir, &["query", "--loc", "db", "--branch", "dev", "ASK {}"]);
+    assert!(!o.status.success());
+    ok(
+        dir,
+        &["branch", "create", "--loc", "db", "feat", "--from", "work"],
+    );
+    let o = run(dir, &["branch", "delete", "--loc", "db", "work"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("re-parent"), "{}", err(&o));
+    ok(
+        dir,
+        &["branch", "delete", "--loc", "db", "work", "--reparent"],
+    );
+    let o = ok(dir, &["branch", "list", "--loc", "db"]);
+    let text = out(&o);
+    assert!(
+        text.contains("(deleted)@2") && !text.contains("work"),
+        "{text}"
+    );
+    assert!(subjects(dir, "feat").contains("urn:c"));
+}

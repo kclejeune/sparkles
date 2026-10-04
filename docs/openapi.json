@@ -1525,6 +1525,10 @@
             },
             "type": "object"
           },
+          "grantsChanged": {
+            "description": "After a rename: the configured grants that cover one of the two names and not the other.",
+            "type": "integer"
+          },
           "head": {
             "type": [
               "integer",
@@ -1646,6 +1650,10 @@
       },
       "BranchPatch": {
         "properties": {
+          "name": {
+            "description": "A new name: the branch keeps its id, commits and storage.",
+            "type": "string"
+          },
           "note": {
             "type": [
               "string",
@@ -12680,7 +12688,7 @@
     },
     "/$/branches/{ds}/{name}": {
       "delete": {
-        "description": "Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it.",
+        "description": "Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it, unless `reparent=true`. With `reparent=true` those branches take the deleted branch's upstream as theirs, and its storage stays while their history needs it.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#branches-and-merges"
         },
@@ -12696,6 +12704,14 @@
             "description": "Delete a branch with unmerged commits.",
             "in": "query",
             "name": "force",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Delete a branch that other branches start from, and re-parent them.",
+            "in": "query",
+            "name": "reparent",
             "schema": {
               "type": "boolean"
             }
@@ -12792,7 +12808,7 @@
         "x-sparkles-permission": "read"
       },
       "patch": {
-        "description": "`protected` needs admin on the branch. A protected branch takes changes through merges only.",
+        "description": "`name` renames the branch: it keeps its id, commits, storage and children, and the old name answers `404` afterwards. A rename needs write on the old and the new name, admin when the branch is protected, and grants without graph restrictions. Its answer carries `Location` and `grantsChanged`, the number of configured grants that cover one of the two names and not the other. `protected` needs admin on the branch. A protected branch takes changes through merges only.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#branches-and-merges"
         },
@@ -12861,7 +12877,7 @@
             "cloudflareAccess": []
           }
         ],
-        "summary": "Protect a branch or change its note",
+        "summary": "Rename, protect or annotate a branch",
         "tags": [
           "Branches"
         ],

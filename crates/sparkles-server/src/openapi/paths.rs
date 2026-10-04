@@ -1305,8 +1305,8 @@ fn branches(p: &mut Paths) {
         .errors(&[404]),
     );
     p.add(
-        op(PATCH, "/$/branches/{ds}/{name}", "updateBranch", "Branches", "Protect a branch or change its note")
-            .doc("`protected` needs admin on the branch. A protected branch takes changes through merges only.")
+        op(PATCH, "/$/branches/{ds}/{name}", "updateBranch", "Branches", "Rename, protect or annotate a branch")
+            .doc("`name` renames the branch: it keeps its id, commits, storage and children, and the old name answers `404` afterwards. A rename needs write on the old and the new name, admin when the branch is protected, and grants without graph restrictions. Its answer carries `Location` and `grantsChanged`, the number of configured grants that cover one of the two names and not the other. `protected` needs admin on the branch. A protected branch takes changes through merges only.")
             .see("branches-and-merges")
             .json_body(true, "BranchPatch")
             .json("200", "The branch.", "Branch")
@@ -1314,9 +1314,10 @@ fn branches(p: &mut Paths) {
     );
     p.add(
         op(DELETE, "/$/branches/{ds}/{name}", "deleteBranch", "Branches", "Delete a branch")
-            .doc("Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it.")
+            .doc("Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it, unless `reparent=true`. With `reparent=true` those branches take the deleted branch's upstream as theirs, and its storage stays while their history needs it.")
             .see("branches-and-merges")
             .query("force", boolean(), "Delete a branch with unmerged commits.")
+            .query("reparent", boolean(), "Delete a branch that other branches start from, and re-parent them.")
             .resp("204", "Deleted.", None)
             .errors(&[400, 403, 404, 409]),
     );

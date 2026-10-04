@@ -134,6 +134,16 @@ impl Default for BranchOptions {
     }
 }
 
+/// Options of [`Store::delete_branch_with`](crate::store::Store::delete_branch_with).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteOptions {
+    /// delete it also with commits its upstream does not have
+    pub force: bool,
+    /// delete it also when other branches were created from it: they take its upstream
+    /// as theirs, and its storage stays while their history needs it
+    pub reparent: bool,
+}
+
 /// What counts as one value when both sides changed it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]

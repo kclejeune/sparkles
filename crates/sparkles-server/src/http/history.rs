@@ -66,7 +66,7 @@ pub(super) fn snapshot_for(
     let (snap, r) = match ds.store.snapshot_at(at, &o) {
         // a commit a branch shares with its upstream is read there
         Err(e) if sparkles::branch::inherited_commit(&e).is_some() => match ds.main() {
-            Some(main) => main.store.branch_snapshot_at(ds.branch_name(), at, &o)?,
+            Some(main) => main.store.branch_snapshot_at(&ds.branch_name(), at, &o)?,
             None => return Err(e),
         },
         r => r?,

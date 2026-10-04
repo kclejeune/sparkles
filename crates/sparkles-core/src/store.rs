@@ -1499,6 +1499,7 @@ impl Store {
         };
         match ctx {
             Some(c) => {
+                *branching.name.get_mut() = c.ident.name.clone();
                 branching.ident = Some(c.ident);
                 branching.set = branching::SetRef::Member(c.set);
                 branching.protected = AtomicBool::new(c.protected);
@@ -1796,7 +1797,7 @@ impl Store {
             code: "inherited-commit",
             message: format!(
                 "{at} on branch {} is a commit of the history it shares with its upstream; read it there",
-                i.name
+                self.branch_name()
             ),
             conflicts: None,
             candidates: Vec::new(),

@@ -58,17 +58,20 @@ impl std::ops::Deref for Dataset {
 
 /// Which branch a branch's dataset object serves.
 pub struct BranchOf {
-    pub name: String,
+    /// the branch's name, which a rename changes
+    pub name: RwLock<String>,
     /// the dataset (its `main`)
     pub main: std::sync::Weak<Dataset>,
 }
 
 impl Dataset {
     /// The branch this object serves (`main` for the dataset itself).
-    pub fn branch_name(&self) -> &str {
+    pub fn branch_name(&self) -> String {
         self.branch
             .as_ref()
-            .map_or(sparkles::branch::MAIN, |b| b.name.as_str())
+            .map_or(sparkles::branch::MAIN.to_string(), |b| {
+                b.name.read().clone()
+            })
     }
 
     /// The dataset's own object (`main`), for a branch's.
@@ -80,7 +83,7 @@ impl Dataset {
     /// the dataset's name, and `name@branch` for a branch other than `main`.
     pub fn key(&self) -> String {
         match &self.branch {
-            Some(b) => format!("{}@{}", self.name, b.name),
+            Some(b) => format!("{}@{}", self.name, b.name.read()),
             None => self.name.clone(),
         }
     }
@@ -651,6 +654,18 @@ impl AppState {
         Ok(ds)
     }
 
+    /// After branch `old` of `main` was renamed `new`: its dataset object, if one is
+    /// open, serves the new name, and the old one names nothing.
+    pub fn renamed_branch(&self, main: &Arc<Dataset>, old: &str, new: &str) {
+        let mut m = main.branches.lock();
+        if let Some(d) = m.remove(old) {
+            if let Some(b) = &d.branch {
+                *b.name.write() = new.to_string();
+            }
+            m.insert(new.to_string(), d);
+        }
+    }
+
     /// A branch's dataset object: the library opens the state the branch's directory
     /// configures, as for any dataset.
     fn branch_dataset_uncached(
@@ -671,7 +686,7 @@ impl AppState {
             None,
         );
         Arc::get_mut(&mut ds).expect("just made").branch = Some(BranchOf {
-            name: branch.to_string(),
+            name: RwLock::new(branch.to_string()),
             main: Arc::downgrade(main),
         });
         Ok(ds)

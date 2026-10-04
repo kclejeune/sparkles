@@ -145,6 +145,17 @@ pub enum BranchCmd {
         /// Delete it even with commits its upstream does not have
         #[arg(long)]
         force: bool,
+        /// Delete it also when other branches were created from it: they take its
+        /// upstream, and its storage stays while their history needs it
+        #[arg(long)]
+        reparent: bool,
+    },
+    /// Rename a branch; it keeps its id, commits and storage
+    Rename {
+        #[command(flatten)]
+        target: Target,
+        name: String,
+        new_name: String,
     },
     /// Protect a branch (it takes changes through merges only), or stop (--off)
     Protect {
@@ -242,15 +253,51 @@ pub fn run_branch(cmd: BranchCmd, opts: StoreOptions) -> Result<()> {
             target,
             name,
             force,
+            reparent,
         } => {
             match &target.loc {
-                Some(loc) => Store::open(loc, opts)?.delete_branch(&name, force)?,
+                Some(loc) => Store::open(loc, opts)?.delete_branch_with(
+                    &name,
+                    &sparkles::branch::DeleteOptions { force, reparent },
+                )?,
                 None => {
-                    let q = if force { "?force=true" } else { "" };
+                    let q = match (force, reparent) {
+                        (false, false) => "",
+                        (true, false) => "?force=true",
+                        (false, true) => "?reparent=true",
+                        (true, true) => "?force=true&reparent=true",
+                    };
                     remote_send(&target, "DELETE", &format!("/{name}{q}"), None)?;
                 }
             }
             eprintln!("deleted branch {name}");
+            Ok(())
+        }
+        BranchCmd::Rename {
+            target,
+            name,
+            new_name,
+        } => {
+            match &target.loc {
+                Some(loc) => {
+                    Store::open(loc, opts)?.rename_branch(&name, &new_name)?;
+                }
+                None => {
+                    let j = remote_send(
+                        &target,
+                        "PATCH",
+                        &format!("/{name}"),
+                        Some(json!({ "name": new_name })),
+                    )?;
+                    if let Some(n) = j["grantsChanged"].as_u64().filter(|n| *n > 0) {
+                        eprintln!(
+                            "note: {n} configured grant{} cover only one of the two names; the server log lists them",
+                            if n == 1 { "" } else { "s" }
+                        );
+                    }
+                }
+            }
+            eprintln!("renamed branch {name} to {new_name}");
             Ok(())
         }
         BranchCmd::Protect { target, name, off } => {

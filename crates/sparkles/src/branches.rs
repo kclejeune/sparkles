@@ -107,6 +107,18 @@ impl Dataset {
         self.store().preview_cherry_pick(source, commit, target, o)
     }
 
+    /// Rename branch `name` to `new` (see
+    /// [`Store::rename_branch`](crate::store::Store::rename_branch)).
+    pub fn rename_branch(&self, name: &str, new: &str) -> Result<BranchInfo> {
+        self.store().rename_branch(name, new)
+    }
+
+    /// Delete branch `name` with options, which can re-parent the branches created from
+    /// it (see [`Store::delete_branch_with`](crate::store::Store::delete_branch_with)).
+    pub fn delete_branch_with(&self, name: &str, o: &crate::branch::DeleteOptions) -> Result<()> {
+        self.store().delete_branch_with(name, o)
+    }
+
     /// Delete branch `name`, also with unmerged commits when `force`.
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
         self.store().delete_branch(name, force)

@@ -183,3 +183,96 @@ async fn a16_grants_limited_to_branches() {
         r.status
     );
 }
+
+async fn patch_json(app: &Router, user: &str, uri: &str, body: &str) -> R {
+    let h = json_call(user);
+    let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    call(app, "PATCH", uri, &h, body).await
+}
+
+#[tokio::test]
+async fn a28_renames_reverts_and_cherry_picks_follow_branch_grants() {
+    let s = build(Fixture {
+        extra: users(),
+        ..Default::default()
+    });
+    s.state.attach("br", DbType::Persistent, None).unwrap();
+    let app = &s.app;
+    for name in ["dev", "dev2"] {
+        let r = post_json(
+            app,
+            "owner",
+            "/$/branches/br",
+            &format!(r#"{{"name":"{name}"}}"#),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED);
+    }
+    let devs = b("devs");
+    let r = update_as(app, "br@dev", &devs, INSERT).await;
+    assert_eq!(r.status, StatusCode::OK);
+    // devs may revert and cherry-pick on its branches, not on main
+    let r = post_json(app, "devs", "/$/revert/br?branch=dev&commit=1", "").await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = post_json(app, "devs", "/$/revert/br?commit=1", "").await;
+    assert_eq!(
+        r.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = post_json(
+        app,
+        "devs",
+        "/$/cherry-pick/br?source=dev&commit=1&branch=dev2",
+        "",
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = post_json(app, "devs", "/$/cherry-pick/br?source=dev&commit=1", "").await;
+    assert_eq!(
+        r.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // devs may rename within its grant, and no grant changes what it covers
+    let r = patch_json(app, "devs", "/$/branches/br/dev2", r#"{"name":"dev3"}"#).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["name"], "dev3");
+    assert_eq!(r.json()["grantsChanged"], 0);
+    // not out of it
+    let r = patch_json(app, "devs", "/$/branches/br/dev3", r#"{"name":"other"}"#).await;
+    assert_eq!(
+        r.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // the owner may, and is told that devs' grant no longer covers the branch
+    let r = patch_json(app, "owner", "/$/branches/br/dev", r#"{"name":"feature"}"#).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["grantsChanged"], 1);
+    let r = update_as(app, "br@feature", &devs, INSERT).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}

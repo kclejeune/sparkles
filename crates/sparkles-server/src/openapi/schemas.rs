@@ -600,6 +600,7 @@ pub(super) fn schemas() -> Map<String, J> {
                     },
                 },
                 "broken": { "type": "boolean" },
+                "grantsChanged": { "type": "integer", "description": "After a rename: the configured grants that cover one of the two names and not the other." },
             }),
         ),
     );
@@ -632,6 +633,7 @@ pub(super) fn schemas() -> Map<String, J> {
         obj(
             &[],
             json!({
+                "name": { "type": "string", "description": "A new name: the branch keeps its id, commits and storage." },
                 "protected": { "type": "boolean" },
                 "note": { "type": ["string", "null"] },
             }),

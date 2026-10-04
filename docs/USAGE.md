@@ -1145,8 +1145,11 @@ dev       57  main@42     15      19  linked (2.1 MiB)  schema migration
 It reads the files when a server holds the database, and then shows heads and starting
 points without the ahead and behind counts. `branch create` takes `--from BRANCH` and
 `--at REF` to start elsewhere than `main`'s head, and `--protected` to refuse every write
-but merges. `branch protect NAME [--off]`, `branch show NAME` and `branch delete NAME
-[--force]` complete the set, and every branch command works against a server with
+but merges. `branch protect NAME [--off]`, `branch show NAME`, `branch rename NAME NEW` and `branch
+delete NAME [--force] [--reparent]` complete the set. A rename keeps the branch's
+commits and storage, and the old name stops working. `--reparent` deletes a branch that
+other branches start from: they take its upstream, and its storage stays while their
+history needs it, and every branch command works against a server with
 `--server URL --dataset NAME`.
 
 `merge` prints the result, or the conflicts that stopped it:

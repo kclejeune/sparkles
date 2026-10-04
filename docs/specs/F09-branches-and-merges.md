@@ -1297,6 +1297,33 @@ When `dev` merged `main` after `main` moved, the base is not on `dev`'s own line
 `409 cannot-replay`, and an ordinary merge goes through. `ff: "replay"` with
 `squash: true` → `400 invalid-merge`. `sparkles merge --loc db dev --replay` exits 0.
 
+**A28. Renames.** `dev` at `main` 2 inserts c, and `feat` is created from `dev`.
+`PATCH /$/branches/ds/dev {"name":"work"}` → `200` with `Location:
+/$/branches/ds/work`, the same id and `grantsChanged: 0`. Q on `/ds@work` equals Q on
+the old `dev`, `/ds@dev/sparql` → `404 no-such-branch`, an update of `work` answers
+`Sparkles-Branch: work`, `feat` reports `upstream: "work"`, the commit listing of `work`
+names `work`, the history's holds read `branch:work`, `branch.json` names `work`, and the
+server's dataset object of the branch is kept under `ds@work`. Renaming to `feat` or
+`main` → `409 branch-exists`, renaming `main` → `400`, and the name `dev` can be used
+again. A token whose grant covers `dev*` can rename `dev2` to `dev3`, not to `other`
+(`403`). After the owner renames `dev` to `feature`, `grantsChanged` is 1 and that token
+gets `404` for `br@feature`. A crash after the table names `work` and before `branch.json`
+does reopens with the branch named `work` and `branch.json` rewritten.
+`sparkles branch rename --loc db dev work` works.
+
+**A29. Re-parenting.** `dev` at `main` 2 inserts c (commit 3), `feat` from `dev` 3
+inserts f, and `dev` inserts d. `DELETE /$/branches/ds/dev` → `409 has-children`.
+`?reparent=true` → `409 unmerged`, because d is in no other history, and with
+`&force=true` → `204`. The listing shows `main` and `feat`, `feat` has `upstream: "main"`
+and `from: {branch: null, branchId: <dev's id>, seq: 3}`, its quads are unchanged, its
+commit listing names commit 3 `branch: null`, and a read of it at commit 3 works.
+`branches.json` has format 2 and lists `dev` under `retired`, and `dev`'s directory
+remains. Compactions of `main` and a restart keep `feat` readable, a merge of `feat` into
+`main` brings c and f, and the name `dev` can be used again. Deleting `feat` removes
+the retired directory as well, and the table returns to format 1. A crash after the
+table retires `dev` reopens with the same state, and a crash while the last child's
+removal renames directories reopens with no branch directory left.
+
 ## 10. Open questions
 
 1. **Exempt predicates.** Should `cell` scope exempt some predicates by default, such as

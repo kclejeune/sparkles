@@ -176,6 +176,43 @@ fn summarize(g: &Grants) -> String {
 }
 
 impl Policy {
+    /// The grants whose branch patterns cover one of branches `old` and `new` of
+    /// dataset `ds` but not the other, as `who: dataset branches` lines: a rename from
+    /// `old` to `new` changes who they let reach the branch.
+    pub fn branch_grants_changing(&self, ds: &str, old: &str, new: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut look = |who: String, g: &Grants| {
+            for r in &g.restricted {
+                if let Some(bs) = &r.branches
+                    && super::glob(&r.dataset, ds)
+                {
+                    let a = bs.iter().any(|p| super::glob(p, old));
+                    let b = bs.iter().any(|p| super::glob(p, new));
+                    if a != b {
+                        out.push(format!(
+                            "{who}: the grant on {} for branches {}",
+                            r.dataset,
+                            bs.join(", ")
+                        ));
+                    }
+                }
+            }
+        };
+        look("anonymous".into(), &self.anonymous);
+        for (n, u) in &self.users {
+            look(format!("user {n}"), &u.grants);
+        }
+        for (n, g) in &self.roles {
+            look(format!("role {n}"), g);
+        }
+        for t in self.static_tokens.values() {
+            look(format!("token {}", t.id), &t.grants);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     pub fn build(cfg: &FileConfig) -> Result<Policy> {
         let protections = (!cfg.protections.is_empty()).then(|| {
             Arc::new(super::Protections {

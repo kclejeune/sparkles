@@ -5,6 +5,7 @@
 use super::branch_tests::{apply, code, dump, has, int, merge, merged, setup};
 use super::*;
 use crate::branch::{BranchOptions, MergeOptions, MergeOutcome};
+use crate::history::At;
 
 #[test]
 fn a24_squash_merges_record_no_second_parent() {
@@ -312,4 +313,294 @@ fn a27_replay_needs_the_base_in_the_sources_own_history() {
     // an ordinary merge goes through
     merged(merge(&s, "dev", "main", &Default::default()));
     assert_eq!(dump(&s), dump(&dev));
+}
+
+/// The names of the directories under `ds/branches`.
+fn branch_dirs(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir.join("ds/branches"))
+        .map(|rd| {
+            rd.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+fn table(dir: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(dir.join("ds/branches.json")).unwrap()).unwrap()
+}
+
+fn holds_of(s: &Store) -> Vec<String> {
+    let mut v: Vec<String> = s
+        .history()
+        .generations
+        .iter()
+        .flat_map(|g| g.held_by.iter().map(|h| h.to_string()))
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+#[test]
+fn a28_renames_keep_the_branch_and_its_children() {
+    let (dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let id = s.branch_id_of("dev").unwrap();
+    apply(&s.branch("dev").unwrap(), "+<urn:c> <urn:p> <urn:x> .");
+    s.create_branch(
+        "feat",
+        &BranchOptions {
+            from: "dev".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = dump(&s.branch("dev").unwrap());
+    let info = s.rename_branch("dev", "work").unwrap();
+    assert_eq!((info.name.as_str(), info.id), ("work", id));
+    assert_eq!(code(&s.branch("dev").err().unwrap()), "no-such-branch");
+    let work = s.branch("work").unwrap();
+    assert_eq!(work.branch_name(), "work");
+    assert_eq!(dump(&work), before);
+    assert_eq!(
+        s.branch_info("feat").unwrap().upstream.as_deref(),
+        Some("work")
+    );
+    assert_eq!(
+        s.branch_info("feat")
+            .unwrap()
+            .from
+            .unwrap()
+            .branch
+            .as_deref(),
+        Some("work")
+    );
+    assert!(
+        holds_of(&s).contains(&"branch:work".to_string()),
+        "{:?}",
+        holds_of(&s)
+    );
+    assert!(!holds_of(&s).iter().any(|h| h.ends_with(":dev")));
+    let log = s.branch_commits("work", CommitRange::Latest, 1).unwrap();
+    assert_eq!(log[0].branch.as_deref(), Some("work"));
+    let bf =
+        super::branching::read_branch_file(&dir.path().join("ds/branches").join(id.to_string()))
+            .unwrap()
+            .unwrap();
+    assert_eq!(bf.name, "work");
+    // writes and merges under the new name
+    apply(&work, "+<urn:d> <urn:p> <urn:x> .");
+    merged(merge(&s, "work", "main", &Default::default()));
+    assert!(has(&s, "urn:d"));
+    // refusals
+    assert_eq!(
+        code(&s.rename_branch("work", "feat").unwrap_err()),
+        "branch-exists"
+    );
+    assert_eq!(
+        code(&s.rename_branch("work", "main").unwrap_err()),
+        "branch-exists"
+    );
+    assert_eq!(
+        code(&s.rename_branch("main", "x").unwrap_err()),
+        "invalid-branch"
+    );
+    assert_eq!(
+        code(&s.rename_branch("work", "head").unwrap_err()),
+        "invalid-branch"
+    );
+    assert_eq!(
+        code(&s.rename_branch("nope", "x").unwrap_err()),
+        "no-such-branch"
+    );
+    // the old name is free again
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    assert_ne!(s.branch_id_of("dev").unwrap(), id);
+    drop(work);
+    drop(s);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    assert_eq!(s.branch_id_of("work").unwrap(), id);
+    assert!(has(&s.branch("work").unwrap(), "urn:d"));
+}
+
+#[test]
+fn a28_a_crash_in_a_rename_leaves_one_name() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let (dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let id = s.branch_id_of("dev").unwrap();
+    apply(&s.branch("dev").unwrap(), "+<urn:c> <urn:p> <urn:x> .");
+    s.set_failpoint(
+        "branch-rename-committed",
+        Some(Arc::new(|_: &Store| panic!("crash"))),
+    );
+    let r = catch_unwind(AssertUnwindSafe(|| s.rename_branch("dev", "work")));
+    assert!(r.is_err());
+    drop(s);
+    let bdir = dir.path().join("ds/branches").join(id.to_string());
+    // the table committed the rename; the identity file had not followed yet
+    assert_eq!(
+        super::branching::read_branch_file(&bdir)
+            .unwrap()
+            .unwrap()
+            .name,
+        "dev"
+    );
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    assert_eq!(s.branch_id_of("work").unwrap(), id);
+    assert_eq!(code(&s.branch("dev").err().unwrap()), "no-such-branch");
+    assert!(has(&s.branch("work").unwrap(), "urn:c"));
+    assert_eq!(
+        super::branching::read_branch_file(&bdir)
+            .unwrap()
+            .unwrap()
+            .name,
+        "work"
+    );
+}
+
+/// main 1–2; `dev` from main 2 inserts c (3); `feat` from dev 3 inserts f (4); dev
+/// inserts d (4).
+fn family() -> (tempfile::TempDir, Store, uuid::Uuid) {
+    let (dir, s) = setup();
+    s.compact().unwrap();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev_id = s.branch_id_of("dev").unwrap();
+    apply(&s.branch("dev").unwrap(), "+<urn:c> <urn:p> <urn:x> .");
+    s.create_branch(
+        "feat",
+        &BranchOptions {
+            from: "dev".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    apply(&s.branch("feat").unwrap(), "+<urn:f> <urn:p> <urn:x> .");
+    apply(&s.branch("dev").unwrap(), "+<urn:d> <urn:p> <urn:x> .");
+    (dir, s, dev_id)
+}
+
+#[test]
+fn a29_deleting_a_branch_re_parents_its_children() {
+    let (dir, s, dev_id) = family();
+    let feat_dump = dump(&s.branch("feat").unwrap());
+    assert_eq!(
+        code(&s.delete_branch("dev", true).unwrap_err()),
+        "has-children"
+    );
+    let re = crate::branch::DeleteOptions {
+        force: false,
+        reparent: true,
+    };
+    // d (dev's commit 4) is in no other history; c is in feat's
+    assert_eq!(
+        code(&s.delete_branch_with("dev", &re).unwrap_err()),
+        "unmerged"
+    );
+    let re = crate::branch::DeleteOptions {
+        force: true,
+        reparent: true,
+    };
+    s.delete_branch_with("dev", &re).unwrap();
+    let names: Vec<String> = s.branches().unwrap().into_iter().map(|b| b.name).collect();
+    assert_eq!(names, ["main", "feat"]);
+    assert_eq!(code(&s.branch("dev").err().unwrap()), "no-such-branch");
+    let feat = s.branch_info("feat").unwrap();
+    assert_eq!(feat.upstream.as_deref(), Some("main"));
+    assert_eq!(feat.from.as_ref().unwrap().branch, None);
+    assert_eq!(feat.from.as_ref().unwrap().branch_id, dev_id);
+    assert_eq!(feat.ahead, 2, "c and f");
+    // the retired branch's storage stays
+    assert!(branch_dirs(dir.path()).contains(&dev_id.to_string()));
+    assert_eq!(table(dir.path())["format"], 2);
+    assert_eq!(table(dir.path())["retired"][0]["id"], dev_id.to_string());
+    assert_eq!(dump(&s.branch("feat").unwrap()), feat_dump);
+    let log = s.branch_commits("feat", CommitRange::Latest, 10).unwrap();
+    let owners: Vec<(u64, Option<String>)> = log
+        .iter()
+        .map(|c| (c.commit.seq, c.branch.clone()))
+        .collect();
+    assert_eq!(
+        owners,
+        [
+            (4, Some("feat".into())),
+            (3, None),
+            (2, Some("main".into())),
+            (1, Some("main".into())),
+            (0, Some("main".into()))
+        ]
+    );
+    // reads of a commit of the retired branch, and main's compactions, keep working
+    let (snap, _) = s
+        .branch_snapshot_at("feat", &At::Commit(3), &Default::default())
+        .unwrap();
+    assert!(
+        super::branch_tests::dump_snap(&snap)
+            .iter()
+            .any(|l| l.contains("urn:c"))
+    );
+    s.compact().unwrap();
+    s.compact().unwrap();
+    // the name is free again
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    assert_ne!(s.branch_id_of("dev").unwrap(), dev_id);
+    drop(s);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    assert_eq!(dump(&s.branch("feat").unwrap()), feat_dump);
+    // a merge into main brings c and f
+    merged(merge(&s, "feat", "main", &Default::default()));
+    assert!(has(&s, "urn:c") && has(&s, "urn:f") && !has(&s, "urn:d"));
+    // deleting the last child lets the retired branch go
+    s.delete_branch("feat", false).unwrap();
+    assert!(!branch_dirs(dir.path()).contains(&dev_id.to_string()));
+    assert_eq!(table(dir.path())["format"], 1);
+    assert!(table(dir.path()).get("retired").is_none());
+}
+
+#[test]
+fn a29_a_crash_in_a_deletion_that_re_parents() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let re = crate::branch::DeleteOptions {
+        force: true,
+        reparent: true,
+    };
+    // after the table names dev retired
+    let (dir, s, dev_id) = family();
+    let feat_dump = dump(&s.branch("feat").unwrap());
+    s.set_failpoint(
+        "branch-delete-committed",
+        Some(Arc::new(|_: &Store| panic!("crash"))),
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| s.delete_branch_with("dev", &re))).is_err());
+    drop(s);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    assert_eq!(code(&s.branch("dev").err().unwrap()), "no-such-branch");
+    assert_eq!(dump(&s.branch("feat").unwrap()), feat_dump);
+    assert!(branch_dirs(dir.path()).contains(&dev_id.to_string()));
+    // the last child goes, and the retired branch with it, crashing mid-removal
+    let feat_id = s.branch_id_of("feat").unwrap();
+    s.set_failpoint(
+        "branch-delete-renamed",
+        Some(Arc::new(|_: &Store| panic!("crash"))),
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| s.delete_branch("feat", true))).is_err());
+    drop(s);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    assert!(
+        branch_dirs(dir.path()).is_empty(),
+        "{:?}",
+        branch_dirs(dir.path())
+    );
+    assert_eq!(s.branches().unwrap().len(), 1);
+    let t = table(dir.path());
+    assert_eq!(t["format"], 1);
+    let gone: Vec<String> = t["deleted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(gone.contains(&dev_id.to_string()) && gone.contains(&feat_id.to_string()));
 }

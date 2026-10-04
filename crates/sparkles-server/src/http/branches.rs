@@ -568,13 +568,19 @@ pub(crate) async fn patch_branch(
         .ok_or_else(|| invalid("invalid-branch", "the body is a JSON object"))?;
     if let Some(k) = obj
         .keys()
-        .find(|k| !matches!(k.as_str(), "protected" | "note"))
+        .find(|k| !matches!(k.as_str(), "protected" | "note" | "name"))
     {
         return Err(invalid(
             "invalid-branch",
-            format!("unknown field {k}: protected and note can change"),
+            format!("unknown field {k}: name, protected and note can change"),
         ));
     }
+    let rename = match obj.get("name") {
+        None => None,
+        Some(J::String(n)) if *n == branch => None,
+        Some(J::String(n)) => Some(n.clone()),
+        Some(_) => return Err(invalid("invalid-branch", "name: a string")),
+    };
     let protected = match obj.get("protected") {
         None => None,
         Some(J::Bool(b)) => Some(*b),
@@ -591,17 +597,73 @@ pub(crate) async fn patch_branch(
     } else {
         check(&p, &name, &branch, Level::Write, Some(Endpoint::Branches))?;
     }
+    if let Some(new) = &rename {
+        // a rename moves the branch out of the grants of its old name and into those of
+        // the new one: write on both, admin for a protected branch, whole datasets
+        if ds
+            .store
+            .branch_info(&branch)
+            .map(|i| i.protected)
+            .unwrap_or(false)
+        {
+            check(&p, &name, &branch, Level::Admin, None)?;
+        }
+        let q = on_branch(&name, new);
+        if p.level_at(&q, Endpoint::Branches)
+            .is_none_or(|l| l < Level::Write)
+        {
+            return Err(forbidden(format!(
+                "write access to branch {new} of /{name} required"
+            )));
+        }
+        whole(&p, &name, &branch)?;
+        whole(&p, &name, new)?;
+    }
+    let d = ds.clone();
+    let (b, r) = (branch.clone(), rename.clone());
     let info = blocking(move || {
+        let b = match &r {
+            Some(new) => d.store.rename_branch(&b, new)?.name,
+            None => b,
+        };
         if let Some(on) = protected {
-            ds.store.set_branch_protected(&branch, on)?;
+            d.store.set_branch_protected(&b, on)?;
         }
         if let Some(note) = note {
-            ds.store.set_branch_note(&branch, note)?;
+            d.store.set_branch_note(&b, note)?;
         }
-        Ok(ds.store.branch_info(&branch)?)
+        Ok(d.store.branch_info(&b)?)
     })
     .await?;
-    Ok(Json(branch_json(&info)).into_response())
+    let mut j = branch_json(&info);
+    let Some(new) = rename else {
+        return Ok(Json(j).into_response());
+    };
+    st.renamed_branch(&ds, &branch, &new);
+    // grants name branches in the configuration, which a rename leaves as written
+    let changing = grants_changing(&st, &name, &branch, &new);
+    if !changing.is_empty() {
+        tracing::warn!(
+            "/{name}: renaming branch {branch} to {new} changes what {} grant{} cover: {}",
+            changing.len(),
+            if changing.len() == 1 { "" } else { "s" },
+            changing.join("; ")
+        );
+    }
+    j["grantsChanged"] = json!(changing.len());
+    let loc = format!("/$/branches/{name}/{new}");
+    Ok(([(header::LOCATION, loc)], Json(j)).into_response())
+}
+
+/// The configured grants that cover one of branches `old` and `new` of `ds` but not
+/// the other.
+fn grants_changing(st: &AppState, ds: &str, old: &str, new: &str) -> Vec<String> {
+    #[cfg(feature = "auth")]
+    if let Some(a) = &st.auth {
+        return a.policy().branch_grants_changing(ds, old, new);
+    }
+    let _ = (st, ds, old, new);
+    Vec::new()
 }
 
 /// `DELETE /$/branches/{ds}/{name}`: delete a branch (`?force=true` with unmerged
@@ -614,7 +676,11 @@ pub(crate) async fn delete_branch(
 ) -> ApiResult {
     let ds = main_dataset(&st, &name)?;
     let params = Params::from_query(&uri);
-    let force = matches!(params.get("force"), Some("true" | "1" | ""));
+    let flag = |k: &str| matches!(params.get(k), Some("true" | "1" | ""));
+    let o = sparkles::branch::DeleteOptions {
+        force: flag("force"),
+        reparent: flag("reparent"),
+    };
     check(&p, &name, &branch, Level::Write, Some(Endpoint::Branches))?;
     if branch != MAIN {
         let protected = ds
@@ -628,7 +694,7 @@ pub(crate) async fn delete_branch(
     }
     let d = ds.clone();
     let b = branch.clone();
-    blocking(move || Ok(d.store.delete_branch(&b, force)?)).await?;
+    blocking(move || Ok(d.store.delete_branch_with(&b, &o)?)).await?;
     ds.branches.lock().remove(&branch);
     Ok(StatusCode::NO_CONTENT.into_response())
 }

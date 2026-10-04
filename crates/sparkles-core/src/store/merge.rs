@@ -748,6 +748,8 @@ pub(crate) struct Writing {
     pub what: String,
 }
 
+// short-lived, returned once per attempt
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Step {
     Done(MergeOutcome),
     /// the target's head moved: plan again

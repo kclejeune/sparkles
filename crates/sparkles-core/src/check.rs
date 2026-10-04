@@ -1794,7 +1794,8 @@ impl Checker<'_> {
 
     // --------------------------------------------------------------- reasoning ------
 
-    /// The branch table (`branches.json`): every listed branch has its directory, which
+    /// The branch table (`branches.json`): every listed or retired branch has its
+    /// directory, which
     /// names this dataset, distinct ordinals below the next one, and a linked
     /// generation whose upstream files hold what its link names; merge records with
     /// valid checksums.
@@ -1820,7 +1821,11 @@ impl Checker<'_> {
         }
         let next = t["nextOrdinal"].as_u64().unwrap_or(1);
         let mut ordinals = std::collections::BTreeSet::new();
-        let entries = t["branches"].as_array().cloned().unwrap_or_default();
+        let mut entries = t["branches"].as_array().cloned().unwrap_or_default();
+        let n = entries.len();
+        // retired branches keep their directories for the branches created from them
+        let retired = t["retired"].as_array().cloned().unwrap_or_default();
+        entries.extend(retired.iter().cloned());
         let mut linked = 0usize;
         for e in &entries {
             let name = e["name"].as_str().unwrap_or("?");
@@ -1895,10 +1900,13 @@ impl Checker<'_> {
                 }
             }
         }
-        let n = entries.len();
         let summary = format!(
-            "{n} branch{} besides main, {linked} linked; ordinals below {next}",
-            if n == 1 { "" } else { "es" }
+            "{n} branch{} besides main, {linked} linked{}; ordinals below {next}",
+            if n == 1 { "" } else { "es" },
+            match retired.len() {
+                0 => String::new(),
+                r => format!(", {r} retired"),
+            }
         );
         self.checks.push(run.done(summary));
     }

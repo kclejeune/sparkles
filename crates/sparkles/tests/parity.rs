@@ -276,9 +276,11 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("updateBranch", "branches.update", |ds| {
             ds.set_branch_protected("dev", true);
             ds.set_branch_note("dev", None);
+            ds.rename_branch("dev", "work");
         }),
         op!("deleteBranch", "branches.delete", |ds| {
             ds.delete_branch("dev", false);
+            ds.delete_branch_with("dev", &Default::default());
         }),
         op!("previewMerge", "branches.preview_merge", |ds| {
             ds.preview_merge("dev", "main", &Default::default());

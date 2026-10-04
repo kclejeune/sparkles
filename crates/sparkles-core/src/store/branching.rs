@@ -117,6 +117,8 @@ pub(crate) struct MainEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TableFile {
+    /// 1, or 2 while the table lists retired branches, which an older build that reads
+    /// format 1 would remove
     pub format: u32,
     pub dataset_id: uuid::Uuid,
     pub next_ordinal: u32,
@@ -124,6 +126,12 @@ pub(crate) struct TableFile {
     pub main: MainEntry,
     #[serde(default)]
     pub branches: Vec<Entry>,
+    /// Deleted branches whose storage other branches still need: their starting points
+    /// and log segments lie in the history of branches created from them. A retired
+    /// branch has no name that requests reach, holds what it held, and goes once no
+    /// branch, listed or retired, starts from it or reads its files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<Entry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deleted: Vec<Tombstone>,
 }
@@ -136,6 +144,7 @@ impl TableFile {
             next_ordinal: 1,
             main: MainEntry::default(),
             branches: Vec::new(),
+            retired: Vec::new(),
             deleted: Vec::new(),
         }
     }
@@ -146,6 +155,41 @@ impl TableFile {
 
     fn by_id(&self, id: uuid::Uuid) -> Option<&Entry> {
         self.branches.iter().find(|e| e.id == id)
+    }
+
+    /// A listed or a retired branch.
+    fn any_by_id(&self, id: uuid::Uuid) -> Option<&Entry> {
+        self.by_id(id)
+            .or_else(|| self.retired.iter().find(|e| e.id == id))
+    }
+
+    /// The listed and the retired branches.
+    fn all(&self) -> impl Iterator<Item = &Entry> {
+        self.branches.iter().chain(self.retired.iter())
+    }
+
+    /// Whether a listed or retired branch starts from branch `id` or reads its files.
+    fn has_dependents(&self, id: uuid::Uuid) -> bool {
+        self.all().any(|c| {
+            c.id != id && (c.from.branch_id == id || c.holds.iter().any(|h| h.branch_id == id))
+        })
+    }
+
+    /// Retired branches that nothing depends on any more, moved to the tombstones:
+    /// their ids, whose directories can go.
+    fn prune_retired(&mut self) -> Vec<uuid::Uuid> {
+        let mut gone = Vec::new();
+        while let Some(i) = self.retired.iter().position(|r| !self.has_dependents(r.id)) {
+            let r = self.retired.remove(i);
+            self.deleted.push(Tombstone {
+                name: r.name.clone(),
+                id: r.id,
+                ordinal: r.ordinal,
+                from: r.from,
+            });
+            gone.push(r.id);
+        }
+        gone
     }
 }
 
@@ -181,9 +225,9 @@ fn read_table(root: &Path) -> Result<Option<TableFile>> {
     };
     let t: TableFile = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
-    if t.format != 1 {
+    if t.format != 1 && t.format != 2 {
         return Err(Error::Corrupt(format!(
-            "{} has format {}, this build reads 1",
+            "{} has format {}, this build reads 1 and 2",
             path.display(),
             t.format
         )));
@@ -192,10 +236,27 @@ fn read_table(root: &Path) -> Result<Option<TableFile>> {
 }
 
 fn write_table(root: &Path, t: &TableFile) -> Result<()> {
+    let mut t = t.clone();
+    t.format = if t.retired.is_empty() { 1 } else { 2 };
     write_atomic(
         &root.join(BRANCHES_FILE),
-        &serde_json::to_vec_pretty(t).expect("the table serializes"),
+        &serde_json::to_vec_pretty(&t).expect("the table serializes"),
     )
+}
+
+/// Write the name in branch `root`'s identity file, if it differs (after a rename).
+fn sync_branch_file(root: &Path, name: &str) -> Result<()> {
+    let Some(mut b) = read_branch_file(root)? else {
+        return Ok(());
+    };
+    if b.name != name {
+        b.name = name.to_string();
+        write_atomic(
+            &root.join(BRANCH_FILE),
+            &serde_json::to_vec_pretty(&b).expect("serializes"),
+        )?;
+    }
+    Ok(())
 }
 
 /// Write the branch table of a new dataset (a clone) whose data may hold blank nodes of
@@ -373,6 +434,10 @@ pub(crate) enum SetRef {
 #[derive(Default)]
 pub(crate) struct Branching {
     pub ident: Option<Ident>,
+    /// the branch's name, which a rename changes (empty for `main`)
+    pub name: parking_lot::RwLock<String>,
+    /// the branch was deleted and is kept only for the branches created from it
+    pub retired: AtomicBool,
     pub set: SetRef,
     /// writes other than merges are refused
     pub protected: AtomicBool,
@@ -449,10 +514,16 @@ impl BranchSet {
             Some(t) => t,
             None => TableFile::new(dataset_id),
         };
+        let mut table = table;
+        // retired branches nothing needs any more (a crash after the deletion that
+        // freed them): their directories go below, as unlisted ones
+        if !table.prune_retired().is_empty() {
+            write_table(root, &table)?;
+        }
         let mut broken = HashSet::new();
         let dir = root.join(BRANCHES_DIR);
         if dir.is_dir() {
-            let listed: HashSet<String> = table.branches.iter().map(|e| e.id.to_string()).collect();
+            let listed: HashSet<String> = table.all().map(|e| e.id.to_string()).collect();
             for e in std::fs::read_dir(&dir)? {
                 let e = e?;
                 let name = e.file_name().to_string_lossy().into_owned();
@@ -477,7 +548,7 @@ impl BranchSet {
             }
             sync_dir(&dir)?;
         }
-        for e in &table.branches {
+        for e in table.all() {
             if !dir.join(e.id.to_string()).join(BRANCH_FILE).exists() {
                 tracing::error!(target: "sparkles::store::branching",
                     "branch {} ({}) is listed but its directory is missing; its holds are kept",
@@ -485,6 +556,14 @@ impl BranchSet {
                     e.id
                 );
                 broken.insert(e.id);
+                continue;
+            }
+            // a rename commits with the table: the identity file follows it
+            if let Err(err) = sync_branch_file(&dir.join(e.id.to_string()), &e.name) {
+                tracing::warn!(target: "sparkles::store::branching",
+                    "branch {}: could not write its new name to {BRANCH_FILE}: {err}",
+                    e.name
+                );
             }
         }
         Ok(Arc::new_cyclic(|me| BranchSet {
@@ -539,6 +618,7 @@ impl BranchSet {
 
     /// Give every open store of the dataset the holds the table places on it.
     fn refresh_holds(&self, main: &Store) {
+        // retired stores too: branches created from them read their files
         let stores: Vec<Arc<Store>> = self.stores.lock().values().cloned().collect();
         main.install_branch_holds(self);
         for s in stores {
@@ -555,13 +635,14 @@ impl BranchSet {
         if let Some(s) = self.stores.lock().get(&id) {
             return Ok(s.clone());
         }
-        let (entry, next_ordinal) = {
+        let (entry, next_ordinal, retired) = {
             let t = self.table.lock();
             let e = t
-                .by_id(id)
+                .any_by_id(id)
                 .cloned()
                 .ok_or_else(|| branch::no_such_branch(&id.to_string()))?;
-            (e, t.next_ordinal as u64)
+            let retired = t.by_id(id).is_none();
+            (e, t.next_ordinal as u64, retired)
         };
         if self.broken.lock().contains(&id) {
             return Err(BranchError::error(
@@ -590,7 +671,8 @@ impl BranchSet {
             set: self.me.clone(),
             cache: self.cache.clone(),
             quota: self.quota.clone(),
-            protected: entry.protected,
+            // a retired branch takes no more commits
+            protected: entry.protected || retired,
             next_ordinal,
             share,
         };
@@ -599,13 +681,34 @@ impl BranchSet {
             self.opts.clone(),
             ctx,
         )?);
+        store.branching.retired.store(retired, Ordering::Relaxed);
         self.stores.lock().insert(id, store.clone());
         Ok(store)
     }
 
-    /// The open branch stores.
+    /// The open stores of the listed branches (not `main`, nor retired branches).
     pub fn open_stores(&self) -> Vec<Arc<Store>> {
-        self.stores.lock().values().cloned().collect()
+        self.stores
+            .lock()
+            .values()
+            .filter(|s| !s.branching.retired.load(Ordering::Relaxed))
+            .cloned()
+            .collect()
+    }
+
+    /// The nearest listed branch that branch `id` descends from through starting
+    /// points: its upstream, or the upstream of a retired branch it started from (the
+    /// dataset id for `main`; `None` for `main` itself and unknown branches).
+    pub(crate) fn upstream_of(&self, id: uuid::Uuid) -> Option<uuid::Uuid> {
+        let t = self.table.lock();
+        let mut cur = self.start_of(&t, id)?.branch_id;
+        for _ in 0..1024 {
+            if cur == self.dataset_id || t.by_id(cur).is_some() {
+                return Some(cur);
+            }
+            cur = self.start_of(&t, cur)?.branch_id;
+        }
+        None
     }
 
     fn entry(&self, name: &str) -> Result<Entry> {
@@ -621,7 +724,7 @@ impl BranchSet {
         if id == self.dataset_id {
             return None;
         }
-        t.by_id(id)
+        t.any_by_id(id)
             .map(|e| e.from.into())
             .or_else(|| t.deleted.iter().find(|d| d.id == id).map(|d| d.from.into()))
     }
@@ -690,7 +793,7 @@ impl BranchSet {
     /// The merges branch `id` made, ensuring the branch's store is open so that its
     /// records are known (a record above the head is dropped at open).
     fn merges_of(&self, id: uuid::Uuid) -> Result<Vec<MergeRec>> {
-        if id != self.dataset_id && self.table.lock().by_id(id).is_some() {
+        if id != self.dataset_id && self.table.lock().any_by_id(id).is_some() {
             self.open_store(id)?;
         }
         Ok(self.merges.read().get(&id).cloned().unwrap_or_default())
@@ -771,7 +874,7 @@ pub(crate) type Holds = (Vec<(u32, Hold)>, Vec<(u64, Hold)>);
 fn holds_in(t: &TableFile, id: uuid::Uuid) -> Holds {
     let mut gens = Vec::new();
     let mut pins = Vec::new();
-    for e in &t.branches {
+    for e in t.all() {
         for h in e.holds.iter().filter(|h| h.branch_id == id) {
             gens.push((
                 commit::generation_number(&h.generation),
@@ -925,11 +1028,11 @@ impl BranchStore<'_> {
 
 impl Store {
     /// The name of this store's branch (`main` for a dataset's own store).
-    pub fn branch_name(&self) -> &str {
-        self.branching
-            .ident
-            .as_ref()
-            .map_or(MAIN, |i| i.name.as_str())
+    pub fn branch_name(&self) -> String {
+        match &self.branching.ident {
+            Some(_) => self.branching.name.read().clone(),
+            None => MAIN.to_string(),
+        }
     }
 
     /// The id of this store's branch: the dataset id for `main`.
@@ -970,7 +1073,7 @@ impl Store {
     /// embedding worker's commits pass.
     pub(crate) fn check_protected(&self, kind: CommitKind) -> Result<()> {
         if self.branch_protected() && !matches!(kind, CommitKind::Merge | CommitKind::Embed) {
-            return Err(branch::protected(self.branch_name()));
+            return Err(branch::protected(&self.branch_name()));
         }
         Ok(())
     }
@@ -1026,7 +1129,7 @@ impl Store {
             return Ok(BranchStore::Main(self));
         }
         let set = self.owned_set()?;
-        if set.table.lock().by_id(id).is_none() {
+        if set.table.lock().any_by_id(id).is_none() {
             return Err(BranchError::error(
                 BranchErrorKind::Gone,
                 "merge-base-gone",
@@ -1106,7 +1209,8 @@ impl Store {
             });
         }
         let e = set.entry(name)?;
-        let upstream_name = set.name_of(e.from.branch_id);
+        let upstream_id = set.upstream_of(e.id);
+        let upstream_name = upstream_id.and_then(|u| set.name_of(u));
         let created_ms = commit::parse_rfc3339_ms(&e.created).unwrap_or(0);
         let mut info = BranchInfo {
             name: e.name.clone(),
@@ -1165,7 +1269,7 @@ impl Store {
                 seq: head.seq,
             };
             let them = CommitRef {
-                branch_id: e.from.branch_id,
+                branch_id: upstream_id.unwrap_or(e.from.branch_id),
                 seq: up_head,
             };
             let f = set.frontiers(&[me, them])?;
@@ -1578,49 +1682,75 @@ impl Store {
     /// other branches start from it, and, unless `force`, while it has commits its
     /// upstream does not descend from.
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
+        self.delete_branch_with(
+            name,
+            &branch::DeleteOptions {
+                force,
+                reparent: false,
+            },
+        )
+    }
+
+    /// Delete branch `name`. With `o.reparent`, a branch that other branches were
+    /// created from is deleted too: its name goes, and the branches created from it
+    /// take its upstream as theirs. Its storage stays, *retired*, as long as their
+    /// history and linked generations need it. Without `o.force`, the deletion is
+    /// refused while the branch has commits that neither its upstream descends from nor
+    /// a re-parented branch keeps in its history.
+    pub fn delete_branch_with(&self, name: &str, o: &branch::DeleteOptions) -> Result<()> {
         if name == MAIN {
             return Err(branch::invalid_branch("branch main cannot be deleted"));
         }
         let set = self.owned_set()?.clone();
         let root = self.root.clone().expect("a branch set has a root");
         let e = set.entry(name)?;
-        {
+        // the branches that start from it or read its files
+        let (children, kept) = {
             let t = set.table.lock();
-            if let Some(c) = t.branches.iter().find(|c| c.from.branch_id == e.id) {
-                return Err(branch::conflict(
-                    "has-children",
-                    format!("branch {} was created from {name}; delete it first", c.name),
-                ));
-            }
-            if t.branches
-                .iter()
-                .any(|c| c.holds.iter().any(|h| h.branch_id == e.id))
-            {
-                return Err(branch::conflict(
-                    "has-children",
-                    format!("another branch reads {name}'s files"),
-                ));
-            }
+            let children: Vec<String> = t
+                .all()
+                .filter(|c| {
+                    c.id != e.id
+                        && (c.from.branch_id == e.id || c.holds.iter().any(|h| h.branch_id == e.id))
+                })
+                .map(|c| c.name.clone())
+                .collect();
+            // the newest of its commits a child's history keeps
+            let kept = t
+                .all()
+                .filter(|c| c.from.branch_id == e.id)
+                .map(|c| c.from.seq)
+                .max()
+                .unwrap_or(0);
+            (children, kept)
+        };
+        if !children.is_empty() && !o.reparent {
+            return Err(branch::conflict(
+                "has-children",
+                format!(
+                    "branch {} was created from {name} or reads its files; delete it first, or re-parent it",
+                    children[0]
+                ),
+            ));
         }
-        if !force && !set.broken.lock().contains(&e.id) {
+        if !o.force && !set.broken.lock().contains(&e.id) {
             let store = set.open_store(e.id)?;
             let head = store.head_commit().seq;
             if head > e.from.seq {
-                let up_head = match set.name_of(e.from.branch_id) {
-                    Some(up) => self.branch(&up)?.head_commit().seq,
-                    None => 0,
-                };
+                let up = set.upstream_of(e.id).unwrap_or(self.dataset_id);
+                let up_head = self.branch_by_id(up)?.head_commit().seq;
                 let f = set.frontiers(&[CommitRef {
-                    branch_id: e.from.branch_id,
+                    branch_id: up,
                     seq: up_head,
                 }])?;
                 let merged = f[0].get(&e.id).copied().unwrap_or(0);
-                if merged < head {
+                let safe = merged.max(kept).max(e.from.seq);
+                if safe < head {
                     return Err(branch::conflict(
                         "unmerged",
                         format!(
                             "branch {name} has {} its upstream does not have; merge it or delete with force",
-                            match head - merged.max(e.from.seq) {
+                            match head - safe {
                                 1 => "1 commit".to_string(),
                                 n => format!("{n} commits"),
                             }
@@ -1629,30 +1759,53 @@ impl Store {
                 }
             }
         }
-        // the commit point: the table without the entry
+        let retire = !children.is_empty();
+        // the commit point: the table without the name
         let mut t = set.table.lock();
         let mut next = t.clone();
         next.branches.retain(|b| b.id != e.id);
-        next.deleted.push(Tombstone {
-            name: e.name.clone(),
-            id: e.id,
-            ordinal: e.ordinal,
-            from: e.from,
-        });
+        if retire {
+            next.retired.push(e.clone());
+        } else {
+            next.deleted.push(Tombstone {
+                name: e.name.clone(),
+                id: e.id,
+                ordinal: e.ordinal,
+                from: e.from,
+            });
+        }
+        let pruned = next.prune_retired();
         write_table(&root, &next)?;
         *t = next;
         drop(t);
-        let store = set.stores.lock().remove(&e.id);
-        set.merges.write().remove(&e.id);
-        set.broken.lock().remove(&e.id);
-        drop(store);
+        self.failpoint("branch-delete-committed");
+        if retire {
+            // its store stays for the branches created from it, read-only
+            if let Some(s) = set.stores.lock().get(&e.id) {
+                s.branching.retired.store(true, Ordering::Relaxed);
+                s.branching.protected.store(true, Ordering::Relaxed);
+            }
+        }
+        let mut gone: Vec<uuid::Uuid> = pruned;
+        if !retire {
+            gone.insert(0, e.id);
+        }
+        for id in &gone {
+            let store = set.stores.lock().remove(id);
+            set.merges.write().remove(id);
+            set.broken.lock().remove(id);
+            drop(store);
+        }
         set.refresh_holds(self);
-        let dir = set.branch_root(e.id);
-        let doomed = dir.with_extension("deleting");
-        if dir.exists() {
-            std::fs::rename(&dir, &doomed)?;
-            sync_dir(&root.join(BRANCHES_DIR))?;
-            std::fs::remove_dir_all(&doomed)?;
+        for id in &gone {
+            let dir = set.branch_root(*id);
+            let doomed = dir.with_extension("deleting");
+            if dir.exists() {
+                std::fs::rename(&dir, &doomed)?;
+                sync_dir(&root.join(BRANCHES_DIR))?;
+                self.failpoint("branch-delete-renamed");
+                std::fs::remove_dir_all(&doomed)?;
+            }
         }
         // the generations only the branch held can go
         let head = self.head_commit().seq;
@@ -1667,8 +1820,67 @@ impl Store {
             );
         }
         self.quota.invalidate();
-        tracing::info!(target: "sparkles::store::branching", branch = name, id = %e.id, force, "deleted a branch");
+        tracing::info!(target: "sparkles::store::branching",
+            branch = name,
+            id = %e.id,
+            force = o.force,
+            retired = retire,
+            "deleted a branch"
+        );
         Ok(())
+    }
+
+    /// Rename branch `name` to `new`. The branch keeps its id, commits, storage and
+    /// open store, and the branches created from it keep it as their upstream. Requests
+    /// that name the old name answer `404 no-such-branch` afterwards.
+    pub fn rename_branch(&self, name: &str, new: &str) -> Result<BranchInfo> {
+        if name == MAIN {
+            return Err(branch::invalid_branch("branch main cannot be renamed"));
+        }
+        branch::check_name(new)?;
+        let set = self.owned_set()?.clone();
+        let root = self.root.clone().expect("a branch set has a root");
+        let id = {
+            let mut t = set.table.lock();
+            if t.by_name(new).is_some() {
+                return Err(branch::conflict(
+                    "branch-exists",
+                    format!("branch {new} exists"),
+                ));
+            }
+            let mut next = t.clone();
+            let e = next
+                .branches
+                .iter_mut()
+                .find(|e| e.name == name)
+                .ok_or_else(|| branch::no_such_branch(name))?;
+            e.name = new.to_string();
+            let id = e.id;
+            // the commit point
+            write_table(&root, &next)?;
+            *t = next;
+            id
+        };
+        self.failpoint("branch-rename-committed");
+        if let Some(s) = set.stores.lock().get(&id) {
+            *s.branching.name.write() = new.to_string();
+        }
+        // the holds' names, as history listings show them
+        set.refresh_holds(self);
+        // the identity file follows; an open after a crash here writes it
+        if let Err(e) = sync_branch_file(&set.branch_root(id), new) {
+            tracing::warn!(target: "sparkles::store::branching",
+                branch = new,
+                "could not write the new name to {BRANCH_FILE}: {e}"
+            );
+        }
+        tracing::info!(target: "sparkles::store::branching",
+            from = name,
+            to = new,
+            id = %id,
+            "renamed a branch"
+        );
+        self.branch_info(new)
     }
 
     /// After a rebuild of a linked branch: once its linked generation is gone from its
@@ -1702,7 +1914,7 @@ impl Store {
             next.branches[i].holds.clear();
             if let Err(e) = write_table(&set.root, &next) {
                 tracing::warn!(target: "sparkles::store::branching",
-                    branch = ident.name,
+                    branch = self.branch_name(),
                     "could not release the branch's holds: {e}"
                 );
                 return;
@@ -1710,9 +1922,10 @@ impl Store {
             *t = next;
         }
         tracing::info!(target: "sparkles::store::branching",
-            branch = ident.name,
+            branch = self.branch_name(),
             "the branch owns its index and released its holds"
         );
+        let _ = ident;
         // the upstream stores collect at their next collection point
         for s in set.open_stores() {
             s.install_branch_holds(&set);
@@ -1810,21 +2023,27 @@ impl Store {
         at: &At,
         o: &crate::history::HistoryOptions,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
-        let store = self.branch(name)?;
+        self.snapshot_following(self.branch(name)?, at, o)
+    }
+
+    /// [`branch_snapshot_at`](Self::branch_snapshot_at) from `store`: an inherited
+    /// commit is read on the branch that made it, retired branches included.
+    fn snapshot_following(
+        &self,
+        store: BranchStore<'_>,
+        at: &At,
+        o: &crate::history::HistoryOptions,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
         match store.snapshot_at(at, o) {
             Err(e) => match branch::inherited_commit(&e) {
                 Some(c) => {
-                    let set = self.owned_set()?;
-                    let owner = set.normalize(c);
+                    let owner = self.owned_set()?.normalize(c);
                     let up = self.branch_by_id(owner.branch_id)?;
-                    let up_name = set.name_of(owner.branch_id).unwrap_or_default();
+                    drop(store);
                     match at {
                         // the upstream resolves a time before the branch started
-                        At::Time(_) => self.branch_snapshot_at(&up_name, at, o),
-                        _ => {
-                            drop(up);
-                            self.branch_snapshot_at(&up_name, &At::Commit(c.seq), o)
-                        }
+                        At::Time(_) => self.snapshot_following(up, at, o),
+                        _ => self.snapshot_following(up, &At::Commit(c.seq), o),
                     }
                 }
                 None => Err(e),
@@ -1840,16 +2059,22 @@ impl Store {
         name: &str,
         at: &At,
     ) -> Result<(crate::history::Resolved, uuid::Uuid)> {
-        let store = self.branch(name)?;
+        self.resolve_following(self.branch(name)?, at)
+    }
+
+    fn resolve_following(
+        &self,
+        store: BranchStore<'_>,
+        at: &At,
+    ) -> Result<(crate::history::Resolved, uuid::Uuid)> {
         match store.resolve(at) {
             Err(e) => match branch::inherited_commit(&e) {
                 Some(c) => {
-                    let set = self.owned_set()?;
-                    let owner = set.normalize(c);
-                    let up_name = set.name_of(owner.branch_id).unwrap_or_default();
+                    let owner = self.owned_set()?.normalize(c);
+                    let up = self.branch_by_id(owner.branch_id)?;
                     match at {
-                        At::Time(_) => self.branch_resolve(&up_name, at),
-                        _ => self.branch_resolve(&up_name, &At::Commit(c.seq)),
+                        At::Time(_) => self.resolve_following(up, at),
+                        _ => self.resolve_following(up, &At::Commit(c.seq)),
                     }
                 }
                 None => Err(e),

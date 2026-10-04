@@ -2780,8 +2780,8 @@ including `main`.
 | GET | `/$/branches/{ds}` | `{dataset, datasetId, branches: Branch[]}`, `main` first, then by name. Only the branches the caller may read are listed. |
 | POST | `/$/branches/{ds}` | Creates a branch from JSON `{name, from?, at?, protected?, note?}`. `from` defaults to `main` and `at` to its head. Answers `201` with `Location` and the `Branch`. |
 | GET | `/$/branches/{ds}/{name}` | The `Branch`, or `404 no-such-branch`. |
-| PATCH | `/$/branches/{ds}/{name}` | Changes `protected` or `note` (`null` removes the note). |
-| DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits. Answers `204`. |
+| PATCH | `/$/branches/{ds}/{name}` | Changes `name`, `protected` or `note` (`null` removes the note). |
+| DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits, and `?reparent=true` one that other branches start from. Answers `204`. |
 
 ```ts
 type Branch = {
@@ -2810,7 +2810,30 @@ gives a workflow where every change reaches it through a branch and a merge.
 
 Deleting a branch is refused with `409 unmerged` while it has commits its upstream does
 not have, unless `force=true` is given, and with `409 has-children` while other branches
-start from it. Deleting `main` answers `400`. A dataset has at most `--max-branches`
+start from it. Deleting `main` answers `400`.
+
+**Renaming.** `PATCH /$/branches/{ds}/{name}` with `{"name": "NEW"}` renames a branch.
+It keeps its id, its commits, its storage and the branches created from it, which name
+it as their upstream from then on, and its open state on the server carries over. The
+old name answers `404 no-such-branch` afterwards, in the path form and in `branch=`
+alike, and can be used for a new branch. The answer carries `Location` with the new
+name. `main` cannot be renamed, and a new name that exists answers `409 branch-exists`.
+A rename needs `write` on the old and the new name through the `branches` endpoint,
+`admin` when the branch is protected, and grants without graph restrictions. Grants name
+branches in the configuration file, which a rename leaves as written, so a grant whose
+`branches` cover only one of the two names covers the branch before or after the rename
+but not both. The answer counts such grants in `grantsChanged`, and the server log lists
+them, so an operator can update the configuration and reload it.
+
+**Re-parenting.** With `?reparent=true`, deleting a branch that other branches start
+from is allowed. Its name goes, the branches created from it take its upstream as
+theirs, and their `from` keeps the deleted branch's id with `branch: null`. Their
+history still reaches back through the deleted branch's commits, which commit listings
+show with `branch: null`, so the deleted branch's storage stays on disk, retired, and
+keeps holding what its link reads. It goes once no branch starts from it or reads its
+files. `unmerged` then counts only the commits that neither the upstream descends from
+nor a re-parented branch keeps in its history. A table that lists retired branches has
+format 2, which older versions refuse to open rather than remove the retired storage. A dataset has at most `--max-branches`
 branches including `main`, 64 by default, and creating another answers
 `409 branch-limit`.
 
