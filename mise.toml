@@ -398,12 +398,12 @@ scripts/bench-watdiv.sh "$usage_scale" "$(realpath -m "$usage_workdir")"
 '''
 
 [tasks."bench:billion"]
-description = "Real-data benchmark on English DBpedia 2022.12 at a chosen scale, up to 1.24B triples: Sparkles vs QLever (also Jena, Oxigraph); downloads and indexes are cached"
+description = "Real-data benchmark on English DBpedia 2022.12 at a chosen scale, up to 1.24B triples: Sparkles vs QLever (also Jena, Oxigraph, Fluree); downloads and indexes are cached"
 depends = ["build"]
 usage = '''
 arg "[scale]" default="50m" help="triples to load (10m, 50m, 250m, 1b…) or full"
 flag "--workdir <dir>" default="target/bench-billion" help="downloads, normalized data, and per scale the indexes and results/ (summary.md)"
-flag "--engines <list>" default="sparkles qlever" help="engines: sparkles, qlever, jena (TDB2 xloader + Fuseki), oxigraph"
+flag "--engines <list>" default="sparkles qlever" help="engines: sparkles, qlever, jena (TDB2 xloader + Fuseki), oxigraph, fluree"
 flag "--steps <list>" default="fetch prepare slice load queries report" help="steps to run"
 flag "--reload" help="rebuild the engines' indexes at this scale"
 flag "--runs <n>" default="5" help="measured runs per query"
