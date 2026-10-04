@@ -198,3 +198,118 @@ fn a26_cherry_picks_merge_a_commit_over_its_parent() {
         "branch-protected"
     );
 }
+
+/// Insert `<s> <urn:p> <urn:x>` on `store` as `author`, with `message`.
+fn insert_as(store: &Store, s: &str, author: &str, message: &str) -> Receipt {
+    let mut t = store.write_with(
+        CommitKind::Update,
+        crate::guard::WriteOptions {
+            author: Some(author.into()),
+            message: Some(message.into()),
+            ..Default::default()
+        },
+    );
+    let q = t
+        .encode_quad(
+            &Quad::new(
+                named(s),
+                named("urn:p"),
+                named("urn:x"),
+                GraphName::DefaultGraph,
+            ),
+            &mut Default::default(),
+        )
+        .unwrap();
+    t.insert(q).unwrap();
+    t.commit().unwrap()
+}
+
+#[test]
+fn a27_replayed_fast_forwards_keep_each_commit() {
+    let (_dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    insert_as(&dev, "urn:c", "ann", "add c");
+    apply(&dev, "-<urn:b> <urn:name> \"B\" .");
+    let replay = MergeOptions {
+        replay: true,
+        ..Default::default()
+    };
+    let p = s.preview_merge("dev", "main", &replay).unwrap();
+    assert_eq!(p.replayed.len(), 2);
+    assert!(p.replayed.iter().all(|r| r.receipt.is_none()));
+    assert_eq!(s.head_commit().seq, 2);
+    let r = merged(merge(&s, "dev", "main", &replay));
+    assert!(r.fast_forward);
+    assert_eq!((r.inserted, r.deleted), (1, 1));
+    let seqs: Vec<(u64, u64)> = r
+        .replayed
+        .iter()
+        .map(|c| (c.from.seq, c.receipt.as_ref().unwrap().commit.seq))
+        .collect();
+    assert_eq!(seqs, [(3, 3), (4, 4)]);
+    assert_eq!(dump(&s), dump(&dev));
+    let c3 = s.commit(3).unwrap();
+    assert_eq!(c3.kind, CommitKind::Update);
+    assert_eq!(s.annotation(3).unwrap().message.as_deref(), Some("add c"));
+    assert_eq!(s.commit_author(3).as_deref(), Some("ann"));
+    assert_eq!(s.commit(4).unwrap().kind, CommitKind::Transaction);
+    let log = s.branch_commits("main", CommitRange::Latest, 2).unwrap();
+    let from: Vec<(u64, u64)> = log
+        .iter()
+        .map(|c| (c.commit.seq, c.replayed_from.as_ref().unwrap().seq))
+        .collect();
+    assert_eq!(from, [(4, 4), (3, 3)]);
+    assert!(log.iter().all(|c| c.merged_from.is_none()));
+    assert_eq!(s.branch_info("dev").unwrap().ahead, 0);
+    assert!(matches!(
+        merge(&s, "dev", "main", &replay),
+        MergeOutcome::UpToDate(_)
+    ));
+    // later commits replay on top, onto a protected main too
+    s.set_branch_protected("main", true).unwrap();
+    apply(&dev, "+<urn:e> <urn:p> <urn:x> .");
+    let r = merged(merge(&s, "dev", "main", &replay));
+    assert_eq!(r.replayed.len(), 1);
+    assert_eq!(r.replayed[0].from.seq, 5);
+    assert_eq!(dump(&s), dump(&dev));
+    s.set_branch_protected("main", false).unwrap();
+    // a target with changes of its own is no fast-forward
+    apply(&s, "+<urn:m> <urn:p> <urn:x> .");
+    apply(&dev, "+<urn:f> <urn:p> <urn:x> .");
+    assert_eq!(
+        code(&s.merge("dev", "main", &replay).unwrap_err()),
+        "not-fast-forward"
+    );
+    let both = MergeOptions {
+        replay: true,
+        squash: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        code(&s.merge("dev", "main", &both).unwrap_err()),
+        "invalid-merge"
+    );
+}
+
+#[test]
+fn a27_replay_needs_the_base_in_the_sources_own_history() {
+    let (_dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&dev, "+<urn:c> <urn:p> <urn:x> .");
+    apply(&s, "+<urn:m> <urn:p> <urn:x> .");
+    // dev takes main's commit: the base is then main's head, not on dev's own line
+    merged(merge(&s, "main", "dev", &Default::default()));
+    let replay = MergeOptions {
+        replay: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        code(&s.merge("dev", "main", &replay).unwrap_err()),
+        "cannot-replay"
+    );
+    // an ordinary merge goes through
+    merged(merge(&s, "dev", "main", &Default::default()));
+    assert_eq!(dump(&s), dump(&dev));
+}

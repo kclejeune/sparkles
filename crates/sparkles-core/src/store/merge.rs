@@ -50,7 +50,7 @@ fn toggle(t: &mut Toggles, k: QuadKey, added: bool) {
     }
 }
 
-fn gone(e: Error) -> Error {
+pub(crate) fn gone(e: Error) -> Error {
     match e {
         Error::HistoryGone(g) => BranchError::error(
             BranchErrorKind::Gone,
@@ -119,7 +119,7 @@ fn key_id(txn: &mut WriteTxn<'_>, key: &[u8], add: bool) -> Result<Option<Id>> {
 }
 
 /// The quad ids of a quad key (`None` when deleting a quad whose terms the store lacks).
-fn quad_ids(txn: &mut WriteTxn<'_>, k: &QuadKey, add: bool) -> Result<Option<[Id; 4]>> {
+pub(crate) fn quad_ids(txn: &mut WriteTxn<'_>, k: &QuadKey, add: bool) -> Result<Option<[Id; 4]>> {
     let mut ids = [Id::UNDEF; 4];
     // the key is [g, s, p, o], ids are [s, p, o, g]
     for (i, slot) in [3usize, 0, 1, 2].into_iter().enumerate() {
@@ -331,6 +331,11 @@ impl Store {
             ));
         }
         check_options(o)?;
+        if o.replay && o.squash {
+            return Err(branch::invalid_merge(
+                "a merge either squashes or replays the source's commits",
+            ));
+        }
         let src = self.branch(source)?;
         let tgt = self.branch(target)?;
         let (sid, tid) = (src.dataset_id, tgt.dataset_id);
@@ -413,6 +418,9 @@ impl Store {
                 ));
             }
             report.fast_forward = ff;
+            if o.replay {
+                return self.replay(&set, &tgt, report, base, sc, tc, o, preview);
+            }
             report.squashed = o.squash;
             let what =
                 format!("merging {source} (commit {s_head}) into {target} (commit {t_head})");

@@ -225,6 +225,8 @@ pub(crate) struct MergeRec {
 
 /// A merge that was a fast-forward.
 pub(crate) const MERGE_FAST_FORWARD: u32 = 1;
+/// A commit that replays the source commit, in a replayed fast-forward.
+pub(crate) const MERGE_REPLAYED: u32 = 2;
 
 const MERGE_REC: usize = 48;
 
@@ -1786,7 +1788,14 @@ impl Store {
                 commit: c,
                 branch: set.name_of(bid),
                 branch_id: bid,
-                merged_from: store.merge_record(seq).map(|m| set.named(m.source)),
+                merged_from: store
+                    .merge_record(seq)
+                    .filter(|m| m.flags & MERGE_REPLAYED == 0)
+                    .map(|m| set.named(m.source)),
+                replayed_from: store
+                    .merge_record(seq)
+                    .filter(|m| m.flags & MERGE_REPLAYED != 0)
+                    .map(|m| set.named(m.source)),
                 annotation: store.annotation(seq),
             });
         }
@@ -1858,6 +1867,8 @@ pub struct BranchCommit {
     pub branch: Option<String>,
     pub branch_id: uuid::Uuid,
     pub merged_from: Option<NamedCommitRef>,
+    /// for a commit of a replayed fast-forward, the commit it replays
+    pub replayed_from: Option<NamedCommitRef>,
     pub annotation: Option<crate::annotations::Annotation>,
 }
 

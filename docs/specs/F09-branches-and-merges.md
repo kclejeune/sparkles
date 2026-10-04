@@ -1285,6 +1285,18 @@ has. A merge of `dev` afterwards inserts c only and reports no conflict. A commi
 `main` → `403 branch-protected`. `&branch=qa` applies a commit to `qa`.
 `sparkles cherry-pick --loc db dev 3` exits 0.
 
+**A27. Replayed fast-forwards.** `dev` at `main` 2 inserts c as `ann` with the message
+`add c` (commit 3), then deletes b (commit 4). `GET /$/merge/ds?source=dev&ff=replay`
+lists two commits to replay. `POST /$/merge/ds {"source":"dev","ff":"replay"}` → `200`,
+`replayed: [{from: dev 3, commit: 3}, {from: dev 4, commit: 4}]`, and `main`'s commits 3
+and 4 have the kinds of `dev`'s, commit 3 the message `add c` and the author `ann`, and
+each lists `replayedFrom` and no `mergedFrom`. Q on `main` equals Q on `dev`, and `dev`
+is 0 ahead. A second replay → `upToDate: true`. A later commit of `dev` replays alone,
+onto a protected `main` too. After `main` commits on its own → `409 not-fast-forward`.
+When `dev` merged `main` after `main` moved, the base is not on `dev`'s own line →
+`409 cannot-replay`, and an ordinary merge goes through. `ff: "replay"` with
+`squash: true` → `400 invalid-merge`. `sparkles merge --loc db dev --replay` exits 0.
+
 ## 10. Open questions
 
 1. **Exempt predicates.** Should `cell` scope exempt some predicates by default, such as

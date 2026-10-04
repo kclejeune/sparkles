@@ -34,6 +34,7 @@ mod partial;
 mod patch_apply;
 mod preview;
 mod quota;
+mod replay;
 mod schedule;
 // the geometry tests are the only users
 #[cfg(all(test, feature = "geo"))]
@@ -4558,7 +4559,8 @@ impl WriteTxn<'_> {
         if self.guard.poisoned {
             return Err(Error::Poisoned);
         }
-        if self.is_dirty() || self.force {
+        // a commit with a merge record (a merge, or a commit a merge replays) passes
+        if (self.is_dirty() || self.force) && self.merge.is_none() {
             self.store.check_protected(self.kind)?;
         }
         self.check_requested_all()?;

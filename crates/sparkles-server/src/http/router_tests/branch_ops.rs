@@ -202,3 +202,51 @@ async fn a26_cherry_picks() {
         assert_eq!(r.status, status, "{path}: {}", r.text());
     }
 }
+
+#[tokio::test]
+async fn a27_replayed_fast_forwards() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_st, app) = setup(dir.path()).await;
+    json_req(&app, "POST", "/$/branches/ds", json!({ "name": "dev" })).await;
+    update(&app, "ds@dev", "INSERT DATA { <urn:c> <urn:p> 1 }").await;
+    update(&app, "ds@dev", "DELETE DATA { <urn:b> <urn:name> \"B\" }").await;
+    let (r, _) = get(&app, "/$/merge/ds?source=dev&ff=replay").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["replayed"].as_array().unwrap().len(), 2);
+    assert_eq!(r.json()["replayed"][0]["commit"], J::Null);
+    let (r, h) = json_req(
+        &app,
+        "POST",
+        "/$/merge/ds",
+        json!({ "source": "dev", "ff": "replay" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let m = r.json();
+    assert_eq!(m["replayed"][0]["from"]["seq"], 3);
+    assert_eq!(m["replayed"][1]["commit"], 4);
+    assert_eq!(m["commit"]["kind"], "update");
+    assert_eq!(commit_header(&h), 4);
+    assert_eq!(
+        subjects(&app, "/ds/sparql").await,
+        subjects(&app, "/ds@dev/sparql").await
+    );
+    let (r, _) = get(&app, "/$/commits/ds?limit=2").await;
+    let cs = r.json()["commits"].clone();
+    assert_eq!(cs[0]["kind"], "update");
+    assert_eq!(cs[0]["replayedFrom"]["branch"], "dev");
+    assert_eq!(cs[0]["replayedFrom"]["seq"], 4);
+    assert!(cs[0].get("mergedFrom").is_none());
+    // a target with changes of its own
+    update(&app, "ds", "INSERT DATA { <urn:m> <urn:p> 1 }").await;
+    update(&app, "ds@dev", "INSERT DATA { <urn:e> <urn:p> 1 }").await;
+    let (r, _) = json_req(
+        &app,
+        "POST",
+        "/$/merge/ds",
+        json!({ "source": "dev", "ff": "replay" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["code"], "not-fast-forward");
+}

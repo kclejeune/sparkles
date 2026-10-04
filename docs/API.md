@@ -2652,6 +2652,7 @@ type Commit = {
   branch?: string | null;               // in listings of a persistent dataset: who made it
   branchId?: string;
   mergedFrom?: { branch: string | null; branchId: string; seq: number };  // merge commits
+  replayedFrom?: { branch: string | null; branchId: string; seq: number };  // replayed commits
 };
 ```
 
@@ -2727,6 +2728,7 @@ each commit carries the branch that made it:
 | `branch` | The name of the branch that made the commit, or `null` when that branch was deleted. |
 | `branchId` | The id of that branch. |
 | `mergedFrom` | For a merge commit, the merged commit as `{branch, branchId, seq}`. |
+| `replayedFrom` | For a commit of a replayed fast-forward, the source commit it replays. |
 
 Merge commits have kind `merge`. Creating or deleting a branch makes no commit.
 
@@ -2822,7 +2824,7 @@ branches including `main`, 64 by default, and creating another answers
 ```ts
 type MergeRequest = {
   source: string; target?: string;              // target defaults to "main"
-  ff?: "auto" | "only";                         // default "auto"
+  ff?: "auto" | "only" | "replay";              // default "auto"
   squash?: boolean;                             // one commit without a second parent
   conflicts?: "cell" | "subject" | "quad";      // default "cell"
   onConflict?: "fail" | "ours" | "theirs" | "union";   // default "fail"
@@ -2844,7 +2846,9 @@ type MergeResult = {
   base: { branch: string; seq: number } | null;
   changes: { inserted: number; deleted: number };
   conflicts: { found: number; resolved: number };
-  commit: Commit | null;                        // the merge commit
+  commit: Commit | null;                        // the merge commit, or a replay's last
+  replayed?: { from: { branch: string | null; branchId: string; seq: number };
+               commit: number | null }[];       // with ff: "replay"
   inferences: { excluded: number; stale: boolean } | null;
   validation?: object;                          // the write guard's summary
 };
@@ -2858,6 +2862,23 @@ merge other than a fast-forward answers `409 not-fast-forward`. A merge is one c
 kind `merge` on the target, also when the target already holds every change of the
 source in another history. When the source's changes are already in the target, the
 merge writes nothing and answers `upToDate: true`.
+
+**Replayed fast-forwards.** With `ff: "replay"`, a merge whose target holds the state of
+the merge base replays the source's commits after the base one by one, each as its own
+commit on the target with the original's kind, message and author, instead of making
+one merge commit. The author comes from the [change log](#change-feed), so it is kept
+when the log recorded it. Each replayed commit gets a new time, and it records the
+commit it replays, which listings show as `replayedFrom`, so the target descends from
+the source afterwards. `replayed` lists the source commits and the commits they became,
+and `commit` is the last of them. The target holds the base's state when it has no
+commits since the base, or only commits whose net changes cancel out, such as earlier
+replays and merges from the same source. A target with changes of its own answers
+`409 not-fast-forward`, and a source whose own first-parent history does not pass
+through the merge base, because it merged the target after the target moved, answers
+`409 cannot-replay`. A replay commits as it goes. When the target moves during the
+replay, or the merge is cancelled, the replay stops after the commits it made, each of
+which is complete, and a later merge goes on from there. A protected target accepts a
+replay, as it accepts other merges.
 
 **Squash merges.** With `squash: true`, the merge applies the same changes as one commit
 of kind `merge` that records no second parent. The commit carries no `mergedFrom`, and

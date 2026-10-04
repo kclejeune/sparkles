@@ -526,6 +526,10 @@ pub struct MergeArgs {
     /// Apply the changes as one commit that records no second parent
     #[arg(long)]
     pub squash: bool,
+    /// Replay the source's commits one by one, each with its kind, message and author
+    /// (the target must hold the merge base's state)
+    #[arg(long, conflicts_with_all = ["squash", "ff_only"])]
+    pub replay: bool,
     /// What counts as one value when both sides changed it: cell, subject or quad
     #[arg(long, default_value = "cell")]
     pub conflicts: String,
@@ -602,6 +606,15 @@ fn report_json(r: &MergeReport) -> J {
         "changes": { "inserted": r.inserted, "deleted": r.deleted },
         "conflicts": { "found": r.conflicts_found, "resolved": r.conflicts_resolved },
         "commit": r.commit.as_ref().filter(|c| c.committed).map(|c| c.commit.seq),
+        "replayed": (!r.replayed.is_empty()).then(|| {
+            r.replayed
+                .iter()
+                .map(|c| json!({
+                    "from": { "branch": c.from.branch, "seq": c.from.seq },
+                    "commit": c.receipt.as_ref().map(|rc| rc.commit.seq),
+                }))
+                .collect::<Vec<J>>()
+        }),
         "inferences": r.inferences_excluded.map(|n| json!({ "excluded": n })),
     })
 }
@@ -622,6 +635,7 @@ fn local_merge(loc: &Path, a: &MergeArgs, res: Option<&J>, opts: StoreOptions) -
     let mut o = MergeOptions {
         ff_only: a.ff_only,
         squash: a.squash,
+        replay: a.replay,
         scope: ConflictScope::parse(&a.conflicts)
             .with_context(|| format!("--conflicts: cell, subject or quad, not {}", a.conflicts))?,
         on_conflict: match a.on_conflict.as_str() {
@@ -727,7 +741,7 @@ fn remote_merge(a: &MergeArgs, res: Option<J>) -> Result<Out> {
     let mut body = json!({
         "source": a.source,
         "target": a.into,
-        "ff": if a.ff_only { "only" } else { "auto" },
+        "ff": if a.replay { "replay" } else if a.ff_only { "only" } else { "auto" },
         "squash": a.squash,
         "conflicts": a.conflicts,
         "onConflict": a.on_conflict,
@@ -749,6 +763,7 @@ fn remote_merge(a: &MergeArgs, res: Option<J>) -> Result<Out> {
             .append_pair("conflicts", &a.conflicts)
             .append_pair("onConflict", &a.on_conflict)
             .append_pair("squash", if a.squash { "true" } else { "false" })
+            .append_pair("ff", if a.replay { "replay" } else { "auto" })
             .finish();
         r.req(reqwest::Method::GET, &format!("/$/merge/{ds}?{q}"))
             .send()
@@ -809,7 +824,10 @@ fn print_merge(out: &Out, a: &MergeArgs) -> Result<()> {
     match out {
         Out::Done(j) if j["upToDate"] == true => println!("already up to date, nothing merged"),
         Out::Done(j) => {
-            let what = if j["squashed"] == true {
+            let replayed = j["replayed"].as_array().map_or(0, Vec::len);
+            let what = if replayed > 0 {
+                "replay"
+            } else if j["squashed"] == true {
                 "squash"
             } else if j["fastForward"] == true {
                 "fast-forward"

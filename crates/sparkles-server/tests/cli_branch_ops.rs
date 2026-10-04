@@ -126,3 +126,26 @@ fn a26_cherry_pick() {
     );
     assert!(subjects(dir, "qa").contains("urn:c"));
 }
+
+#[test]
+fn a27_replay() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    update(dir, "main", "INSERT DATA { <urn:a> <urn:age> 30 }");
+    ok(dir, &["branch", "create", "--loc", "db", "dev"]);
+    update(dir, "dev", "INSERT DATA { <urn:c> <urn:p> 1 }");
+    update(dir, "dev", "INSERT DATA { <urn:d> <urn:p> 1 }");
+    let o = ok(dir, &["merge", "--loc", "db", "dev", "--replay"]);
+    assert!(
+        out(&o).contains("merged (replay): +2 -0 as commit 3"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(subjects(dir, "main"), subjects(dir, "dev"));
+    let o = ok(dir, &["log", "--loc", "db", "--format", "json"]);
+    let text = out(&o);
+    assert!(
+        text.contains("\"seq\": 3") || text.contains("\"seq\":3"),
+        "{text}"
+    );
+}

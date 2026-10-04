@@ -717,10 +717,11 @@ fn merge_options(st: &AppState, v: &J, preview: bool) -> ApiResult<MergeAsk> {
     match s("ff").as_deref() {
         None | Some("auto") => {}
         Some("only") => o.ff_only = true,
+        Some("replay") => o.replay = true,
         Some(x) => {
             return Err(invalid(
                 "invalid-merge",
-                format!("ff: auto or only, not {x}"),
+                format!("ff: auto, only or replay, not {x}"),
             ));
         }
     }
@@ -814,6 +815,15 @@ fn merge_json(r: &MergeReport, stale: Option<bool>) -> J {
         "changes": { "inserted": r.inserted, "deleted": r.deleted },
         "conflicts": { "found": r.conflicts_found, "resolved": r.conflicts_resolved },
         "commit": commit,
+        "replayed": (!r.replayed.is_empty()).then(|| {
+            r.replayed
+                .iter()
+                .map(|c| json!({
+                    "from": commit_ref(&c.from),
+                    "commit": c.receipt.as_ref().map(|rc| rc.commit.seq),
+                }))
+                .collect::<Vec<J>>()
+        }),
         "inferences": r.inferences_excluded.map(|n| json!({
             "excluded": n,
             "stale": stale.unwrap_or(false),

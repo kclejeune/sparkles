@@ -1335,7 +1335,7 @@ fn branches(p: &mut Paths) {
     );
     p.add(
         op(POST, "/$/merge/{ds}", "merge", "Branches", "Merge a branch")
-            .doc("Merges `source` into `target` as one commit of kind `merge`: a fast-forward when the target has not moved since the merge base, a three-way merge of quad sets otherwise. With `squash: true` the changes are one commit of kind `merge` that records no second parent, so the target does not descend from the source, and a squash that changes nothing makes no commit. Conflicts that resolutions and `onConflict` leave answer `409` with the conflict report, and nothing is written. `dryRun: true` answers the write preview of the merge commit with the merge fields under `merge`.")
+            .doc("Merges `source` into `target` as one commit of kind `merge`: a fast-forward when the target has not moved since the merge base, a three-way merge of quad sets otherwise. With `ff: \"replay\"` and a target that holds the merge base's state, each commit of the source after the base is replayed as its own commit on the target with its kind, message and author, and records the commit it replays. With `squash: true` the changes are one commit of kind `merge` that records no second parent, so the target does not descend from the source, and a squash that changes nothing makes no commit. Conflicts that resolutions and `onConflict` leave answer `409` with the conflict report, and nothing is written. `dryRun: true` answers the write preview of the merge commit with the merge fields under `merge`.")
             .see("merges")
             .json_body(true, "MergeRequest")
             .json("200", "The merge.", "MergeResult")

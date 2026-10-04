@@ -644,7 +644,7 @@ pub(super) fn schemas() -> Map<String, J> {
             json!({
                 "source": { "type": "string" },
                 "target": { "type": "string", "description": "Default `main`." },
-                "ff": string_enum(&["auto", "only"]),
+                "ff": string_enum(&["auto", "only", "replay"]),
                 "squash": { "type": "boolean", "description": "Apply the changes as one commit that records no second parent." },
                 "conflicts": string_enum(&["cell", "subject", "quad"]),
                 "onConflict": string_enum(&["fail", "ours", "theirs", "union"]),
@@ -709,7 +709,12 @@ pub(super) fn schemas() -> Map<String, J> {
                 "changes": { "type": "object", "properties": { "inserted": { "type": "integer" }, "deleted": { "type": "integer" } } },
                 "conflicts": { "type": "object", "properties": { "found": { "type": "integer" }, "resolved": { "type": "integer" } } },
                 "conflictCount": { "type": "integer", "description": "A preview's conflicts that remain." },
-                "commit": { "description": "The merge commit.", "oneOf": [sref("Commit"), { "type": "null" }] },
+                "commit": { "description": "The merge commit, or the last commit of a replay.", "oneOf": [sref("Commit"), { "type": "null" }] },
+                "replayed": {
+                    "type": ["array", "null"],
+                    "description": "With `ff: \"replay\"`, the source commits replayed, in order, each with the commit it became (`null` in a preview).",
+                    "items": { "type": "object", "properties": { "from": commit_ref(), "commit": { "type": ["integer", "null"] } } },
+                },
                 "inferences": { "type": ["object", "null"] },
             },
         }),

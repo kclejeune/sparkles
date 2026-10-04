@@ -1923,6 +1923,10 @@ async fn list_commits(
                 j["mergedFrom"] =
                     json!({ "branch": m.branch, "branchId": m.branch_id, "seq": m.seq });
             }
+            if let Some(m) = &c.replayed_from {
+                j["replayedFrom"] =
+                    json!({ "branch": m.branch, "branchId": m.branch_id, "seq": m.seq });
+            }
             list.push(j);
         }
         page.commits = lineage.iter().map(|c| c.commit).collect();

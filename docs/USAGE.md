@@ -1167,7 +1167,9 @@ cells, such as `[{"graph": null, "subject": "<http://ex.org/a>", "predicate":
 "<http://ex.org/age>", "take": "objects", "objects": ["33"]}]`. `--expect-source N` and
 `--expect-target N` refuse the merge when either head moved since the report was read.
 `--conflicts subject` treats a whole subject as one value, and `--conflicts quad` never
-reports a conflict. `--squash` applies the changes as one commit that records no second
+reports a conflict. `--replay` makes a fast-forward
+that replays the source's commits one by one, each with its kind, message and author.
+`--squash` applies the changes as one commit that records no second
 parent, so the source stays ahead of the target and keeps its own history to itself.
 `--dry-run` shows what the merge would do. The exit status is 0 after
 a merge or when the target is already up to date, 2 when conflicts stopped the merge,

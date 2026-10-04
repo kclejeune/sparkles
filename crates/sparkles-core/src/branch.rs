@@ -220,6 +220,9 @@ pub struct MergeOptions {
     /// apply the source's changes as one commit that records no second parent, so the
     /// target does not descend from the source afterwards
     pub squash: bool,
+    /// when the target holds the merge base's state, replay the source's commits one by
+    /// one, each with its kind, message and author, instead of one merge commit
+    pub replay: bool,
     pub scope: ConflictScope,
     /// the rule for every conflict no resolution covers (`None`: fail)
     pub on_conflict: Option<Take>,
@@ -240,6 +243,8 @@ pub struct MergeOptions {
     pub limit: usize,
     pub cancel: Option<Arc<AtomicBool>>,
     pub deadline: Option<Instant>,
+    /// where the merge reports how far it got
+    pub progress: crate::task::Progress,
 }
 
 /// The objects of one side of a conflicting group, in N-Triples.
@@ -305,6 +310,18 @@ pub struct MergeReport {
     /// the conflicts that remain (previews only)
     #[serde(skip)]
     pub conflicts: Option<ConflictReport>,
+    /// a replayed fast-forward: the source commits replayed, in order
+    #[serde(skip)]
+    pub replayed: Vec<ReplayedCommit>,
+}
+
+/// One commit of a replayed fast-forward.
+#[derive(Clone, Debug)]
+pub struct ReplayedCommit {
+    /// the source commit replayed
+    pub from: NamedCommitRef,
+    /// the commit it became on the target (`None` in a preview)
+    pub receipt: Option<crate::commit::Receipt>,
 }
 
 impl MergeReport {
@@ -329,6 +346,7 @@ impl MergeReport {
             commit: None,
             inferences_excluded: None,
             conflicts: None,
+            replayed: Vec::new(),
         }
     }
 }
