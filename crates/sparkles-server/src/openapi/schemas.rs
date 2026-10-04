@@ -269,6 +269,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "dbName": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+$" },
                 "dbType": { "type": "string", "enum": ["persistent", "mem", "tdb2", "tdb"], "default": "persistent" },
                 "geo": { "description": "`true` for a spatial index with the defaults, or a `GeoConfig`.", "oneOf": [{ "type": "boolean" }, { "type": "object" }] },
+                "text": { "description": "`true` for full-text search with the defaults, or a `TextConfig`.", "oneOf": [{ "type": "boolean" }, { "type": "object" }] },
             }),
         ),
     );

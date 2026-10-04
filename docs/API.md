@@ -546,7 +546,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | Method | Path                         | Description |
 |--------|------------------------------|-------------|
 | GET    | `/$/datasets`                | `{ "datasets": [DatasetInfo] }` |
-| POST   | `/$/datasets`                | Creates a dataset. The form or JSON body has `dbName`, `dbType` = `persistent` \| `mem`, and optionally `geo`. Fuseki's `dbType` values `tdb2` and `tdb` mean `persistent`, and `dbName` and `dbType` may also be query parameters. `geo` = `true` adds a spatial index with the defaults. In a JSON body `geo` can also be a `GeoConfig` (see [GeoSPARQL](#geosparql)). An invalid one is a `400`, and a build without the `geo` feature returns `501`. A body in an RDF syntax is a Fuseki service description; see [Assembler bodies](#assembler-bodies). `201` on success, `409` if the dataset exists. |
+| POST   | `/$/datasets`                | Creates a dataset. The form or JSON body has `dbName`, `dbType` = `persistent` \| `mem`, and optionally `geo` and `text`. Fuseki's `dbType` values `tdb2` and `tdb` mean `persistent`, and `dbName` and `dbType` may also be query parameters. `geo` = `true` adds a spatial index with the defaults, and `text` = `true` enables full-text search with the defaults. In a JSON body `geo` can also be a `GeoConfig` (see [GeoSPARQL](#geosparql)) and `text` a `TextConfig` (see [Full-text search](#full-text-search)). An invalid one is a `400` and creates no dataset, and a build without the `geo` or `text` feature returns `501`. A body in an RDF syntax is a Fuseki service description; see [Assembler bodies](#assembler-bodies). `201` on success, `409` if the dataset exists. |
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | POST   | `/$/datasets/{ds}?state=offline\|active` | Fuseki's dataset state. An offline dataset answers `503 {code: "dataset-offline"}` on its own endpoints (`/{ds}/…`) and keeps its admin routes. The state is not persisted, so a restart brings every dataset back. `400` without `state` or for another value. Needs `admin` on the dataset. |
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. |
@@ -3927,6 +3927,11 @@ their default analyzers, such as `["en", "fr"]`, or a map from a primary languag
 an analyzer name, such as `{"en": "english", "gl": "portuguese"}`. `--language all` and
 `--language en` set it from the CLI. An index without `languages` keeps the schema and
 configuration it had before languages existed and is not rebuilt.
+
+A dataset can also have full-text search from the start. `POST /$/datasets` takes
+`text` = `true` for the defaults, or a `TextConfig` in a JSON body, and the index exists
+before the dataset's first write. The UI's new dataset dialog has a checkbox for it and
+an optional list of predicates.
 
 Dataset info (`/$/datasets`) has `text: null | { state, docs }`. The configuration lives
 in the database directory, in `text.json`, with the index in `text/`. The CLI commands
