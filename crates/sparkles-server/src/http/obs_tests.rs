@@ -268,6 +268,77 @@ async fn metrics_count_requests_by_dataset_operation_and_outcome() {
 }
 
 #[tokio::test]
+async fn metrics_count_work_memory_peaks_and_rebuilds() {
+    let s = server();
+    // the fixture's load into an empty dataset was a bulk commit
+    let m = metrics(&s.app).await;
+    for (series, v) in [
+        (
+            r#"sparkles_rebuilds_total{dataset="ds",reason="bulk"}"#,
+            1.0,
+        ),
+        (
+            r#"sparkles_rebuilds_total{dataset="ds",reason="compact"}"#,
+            0.0,
+        ),
+        (
+            r#"sparkles_rebuild_duration_seconds_count{dataset="ds",reason="bulk"}"#,
+            1.0,
+        ),
+        (r#"sparkles_rows_produced_total{dataset="ds"}"#, 0.0),
+    ] {
+        assert_eq!(sample(&m, series), Some(v), "{series}\n{m}");
+    }
+    // a histogram has series once it has observations
+    assert!(
+        !m.contains(r#"sparkles_rebuild_duration_seconds_count{dataset="ds",reason="compact"}"#)
+    );
+    assert!(!m.contains("sparkles_query_memory_peak_bytes_count"), "{m}");
+
+    assert_eq!(get(&s.app, ALL).await.status, StatusCode::OK);
+    let rq = Request::post("/ds/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(
+            "DELETE { ?s <http://xmlns.com/foaf/0.1/age> ?a } \
+             WHERE { ?s <http://xmlns.com/foaf/0.1/age> ?a FILTER(?a > 100) }",
+        ))
+        .unwrap();
+    assert_eq!(send(&s.app, rq).await.status, StatusCode::OK);
+    let ds = s.state.datasets.read()["ds"].clone();
+    ds.store.compact().unwrap();
+    let m = metrics(&s.app).await;
+    // the query's 9 rows at least, and the rows of the update's WHERE
+    let produced = sample(&m, r#"sparkles_rows_produced_total{dataset="ds"}"#).unwrap();
+    assert!(produced >= 11.0, "{m}");
+    for (series, v) in [
+        (
+            r#"sparkles_query_memory_peak_bytes_count{dataset="ds"}"#,
+            1.0,
+        ),
+        // a small query's estimate is under 1 MiB
+        (
+            r#"sparkles_query_memory_peak_bytes_bucket{dataset="ds",le="1048576"}"#,
+            1.0,
+        ),
+        (
+            r#"sparkles_rebuilds_total{dataset="ds",reason="compact"}"#,
+            1.0,
+        ),
+        (
+            r#"sparkles_rebuild_duration_seconds_bucket{dataset="ds",reason="compact",le="+Inf"}"#,
+            1.0,
+        ),
+    ] {
+        assert_eq!(sample(&m, series), Some(v), "{series}\n{m}");
+    }
+    let sum = sample(
+        &m,
+        r#"sparkles_rebuild_duration_seconds_sum{dataset="ds",reason="compact"}"#,
+    );
+    assert!(sum.unwrap() > 0.0, "{m}");
+}
+
+#[tokio::test]
 async fn health_and_metrics_traffic_is_not_counted() {
     let s = server();
     for _ in 0..5 {
@@ -881,6 +952,9 @@ fn access_log_has_one_structured_line_per_request() {
     assert_eq!(f["outcome"], "ok");
     assert_eq!(f["status"], 200);
     assert_eq!(f["rows"], 9);
+    // the scan produced the 9 rows, and the projection passed them on
+    assert!(f["rows_produced"].as_u64().unwrap() >= 9, "{l}");
+    assert!(f["mem_peak_bytes"].is_number(), "{l}");
     assert!(f["parse_ms"].is_number() && f["exec_ms"].is_number(), "{l}");
     assert!(
         f["total_ms"].is_number() && f["response_bytes"].is_number(),
@@ -963,6 +1037,19 @@ async fn validation_metrics_count_writes_by_status_and_severity() {
         ),
         (
             r#"sparkles_validation_duration_seconds_bucket{dataset="ds",language="shacl",strategy="incremental",le="+Inf"}"#,
+            2.0,
+        ),
+        // each write validated its one new person
+        (
+            r#"sparkles_validation_focus_nodes_count{dataset="ds",language="shacl",strategy="incremental"}"#,
+            2.0,
+        ),
+        (
+            r#"sparkles_validation_focus_nodes_bucket{dataset="ds",language="shacl",strategy="incremental",le="1"}"#,
+            2.0,
+        ),
+        (
+            r#"sparkles_validation_focus_nodes_sum{dataset="ds",language="shacl",strategy="incremental"}"#,
             2.0,
         ),
         (

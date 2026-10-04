@@ -29,7 +29,7 @@ section lists them.
 The design depends on these parts of Sparkles:
 
 * the embedded API in `crates/sparkles/src/dataset.rs` and the `Store` in
-  `crates/sparkles/src/store.rs` with its modules in `store/`;
+  `crates/sparkles-core/src/store.rs` with its modules in `store/`;
 * the core modules `sparkles::history`, `sparkles::schema`, `sparkles::stored`,
   `sparkles::guard`, `sparkles::geo`, `sparkles::text` and `sparkles::vector`;
 * the crates `sparkles-backup`, `sparkles-reasoner`, `sparkles-shacl`, `sparkles-shex`,
@@ -318,6 +318,16 @@ The satellite crates depend on `sparkles-core` and change their `sparkles::` pat
 `sparkles_core::` in one mechanical commit. A satellite that depended on the facade would
 form a cycle. P04's planned `sparkles::embed` module, which holds the transaction worker
 shared by the bindings, belongs in the facade as well.
+
+Log targets keep their names too. A `tracing` event without a `target:` takes its module
+path, which the move changed from `sparkles::store` to `sparkles_core::store`. That broke
+filters such as `RUST_LOG=sparkles::store=debug` and renamed the targets in JSON logs.
+Every event and span in the core now names its target, the module path it had in the
+`sparkles` package. A test in `crates/sparkles-core/tests/log_targets.rs` fails on a new
+event without one, and checks that a `sparkles::store` directive enables a store event.
+Rewriting `sparkles::` directives when the server builds its filter would have fixed
+filtering but not the names in JSON logs or OTLP records, and a crate-wide macro cannot
+compute `sparkles::` plus the rest of `module_path!()` as the constant a target must be.
 
 ### 3.2 Cargo features
 

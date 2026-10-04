@@ -21,6 +21,7 @@ struct DraftArgs {
     graph: Option<String>,
     reasoning: Option<bool>,
     language: Option<Language>,
+    shapes_format: Option<ShapesFormat>,
     support: Option<f64>,
     classes: Option<Vec<String>>,
     min_instances: Option<u64>,
@@ -39,9 +40,21 @@ enum Language {
     Shex,
 }
 
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ShapesFormat {
+    Turtle,
+    Shaclc,
+}
+
 impl Tools<'_> {
     pub(super) fn draft_shapes(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: DraftArgs = parse(args)?;
+        if a.language == Some(Language::Shex) && a.shapes_format.is_some() {
+            return Err(ToolError::bad_argument(
+                "shapesFormat applies to SHACL drafts, not ShEx",
+            ));
+        }
         let support = a.support.unwrap_or(1.0);
         if !(support > 0.0 && support <= 1.0) {
             return Err(ToolError::bad_argument("support must be in (0, 1]"));
@@ -145,7 +158,17 @@ impl Tools<'_> {
             "shapes": shapes,
         });
         match language {
-            Language::Shacl => out["shacl"] = Value::String(draft.shacl),
+            Language::Shacl => {
+                let format = a.shapes_format.unwrap_or(ShapesFormat::Turtle);
+                out["shapesFormat"] = json!(match format {
+                    ShapesFormat::Turtle => "turtle",
+                    ShapesFormat::Shaclc => "shaclc",
+                });
+                out["shacl"] = Value::String(match format {
+                    ShapesFormat::Turtle => draft.shacl,
+                    ShapesFormat::Shaclc => draft.shaclc,
+                });
+            }
             Language::Shex => {
                 out["shex"] = Value::String(draft.shex);
                 out["shapeMap"] = Value::String(draft.shape_map);

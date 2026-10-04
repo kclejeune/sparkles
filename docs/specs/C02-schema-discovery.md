@@ -186,7 +186,7 @@ kinds and `max/subject`. It exits with status 2 on a budget error.
 ### 2.3 Rust API
 
 ```rust
-// crates/sparkles/src/schema.rs
+// crates/sparkles-core/src/schema.rs
 pub struct SchemaOptions {
     pub graph: GraphSelection, pub declared_graph: Option<GraphSelection>,
     pub include_inferred: bool, pub declared_from_inferred: bool,
@@ -351,7 +351,7 @@ classes list, with self-loops removed.
 
 ## 5. Design sketch
 
-The work lives in a new module, `crates/sparkles/src/schema.rs` (`pub mod schema` in
+The work lives in a new module, `crates/sparkles-core/src/schema.rs` (`pub mod schema` in
 `lib.rs`). It uses only these `Snapshot` APIs: `scan`, `distinct_first`, `count`, `key`,
 `term`, `lookup_iri` and `graph_ids`.
 
@@ -629,11 +629,11 @@ was built, on 2026-10-02.
   - `ui/src/lib/explore.ts`: the current queries, LIMITs, `reduceSupers` and cycle
     promotion.
   - `ui/src/routes/explore/+page.svelte`: the schema tab.
-  - `crates/sparkles/src/store.rs`: `Snapshot::{scan, count, estimate, distinct_first,
+  - `crates/sparkles-core/src/store.rs`: `Snapshot::{scan, count, estimate, distinct_first,
     predicate_stat}` and the delta semantics.
-  - `crates/sparkles/src/builder.rs`: `Stats`, `PredicateStat` and the class collector.
-  - `crates/sparkles/src/index.rs`: the `Perm` key orders.
-  - `crates/sparkles/src/id.rs`: tags and the key encoding.
+  - `crates/sparkles-core/src/builder.rs`: `Stats`, `PredicateStat` and the class collector.
+  - `crates/sparkles-core/src/index.rs`: the `Perm` key orders.
+  - `crates/sparkles-core/src/id.rs`: tags and the key encoding.
   - `crates/sparkles-server/src/http.rs`: the `stats` handler, parameter conventions and
     the error format.
   - `crates/sparkles-shacl/src/lib.rs` and `shapes.rs`: `Shapes::from_store` and

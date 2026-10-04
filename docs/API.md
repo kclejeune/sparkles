@@ -33,14 +33,15 @@ permission is `public`, `any caller`, `signed in`, `web session`, a dataset leve
 Listings that page carry `x-sparkles-pagination`, which names the parameters that select
 a page and the member that continues the listing.
 
-The common bodies have full schemas. They are the error body, the SPARQL results, dataset
-and server information, readiness, tasks, commits and receipts, whoami, tokens, schema
-pages and the formatter's request and result. So do the most used admin bodies: history
-status, snapshots and history queries, stored queries, the configuration and status of
-the full-text, vector and spatial indexes, reasoning status, write-time validation, and
-backup repositories and backups. A test checks these against the bodies a server
-returns. The other admin bodies, such as diffs, the change feed, write previews and
-backup policies, are open objects that link to their section of this page.
+Every named schema of the description is complete, from the error body, the SPARQL
+results and the dataset information to diffs, the change feed, write previews, the
+metrics snapshot, Fuseki's services, reasoning diagnostics, ShEx reports and backup
+policies. Members that this page calls free-form stay open objects inside them, such as
+the results of a validation summary, a stored query's parameters and a GeoJSON geometry.
+A few answers are still plain objects described inline: the JSON form of drafted shapes,
+class profiles, schema diffs, the linter's result, MCP's JSON-RPC messages and the
+explanation of a query. A test sends requests to a server and checks their JSON bodies
+and the answers against the schemas.
 
 The UI's Server page links both documents. Any OpenAPI viewer can open them, for example
 Swagger UI or Redocly pointed at `http://localhost:3030/$/openapi.json`. The Rust client
@@ -122,7 +123,8 @@ of the request carries it.
   `proxy:…` or `anonymous`, never a credential. `auth` is `none`, `basic`, `bearer`,
   `session` or `proxy`. A failed login adds `auth_error`.
 * Where known, `rows`, `parse_ms`, `plan_ms`, `exec_ms`, `serialize_ms`, `total_ms`,
-  `response_bytes` and `mem_peak_bytes`.
+  `response_bytes` and `mem_peak_bytes`. Queries and updates also have `rows_produced`,
+  the rows their operators produced.
 * For writes to a validated dataset, `validation` (the status from the
   `Sparkles-Validation` header) and `validation_ms`.
 
@@ -131,6 +133,14 @@ A request whose client disconnects is logged with `status=499` and `outcome=canc
 Query and update text is logged only at DEBUG under `sparkles::query`
 (`RUST_LOG=sparkles::query=debug`), cut to 2048 characters. `--log-format json` writes one
 JSON object per line.
+
+The engine logs under the target `sparkles::` followed by its module path, for example
+`sparkles::store`, `sparkles::store::changelog`, `sparkles::text` or `sparkles::sparql::exec`.
+These names did not change when the engine moved into the `sparkles-core` package, so
+`RUST_LOG=sparkles::store=debug` enables the store's events. A directive matches every
+target that starts with it, so the default filter of `sparkles serve`,
+`sparkles=info,sparkles_server=info,tower_http=warn`, covers the engine, the server and the
+validators (`sparkles_shacl`, `sparkles_shex`).
 
 ### Metrics
 
@@ -144,6 +154,8 @@ JSON object per line.
 | `sparkles_requests_active` | gauge | `operation` |
 | `sparkles_response_bytes_total` | counter (uncompressed) | `dataset`, `operation` |
 | `sparkles_result_rows_total` | counter | `dataset` |
+| `sparkles_rows_produced_total` | counter. The rows every operator of a query or an update produced, the work that `--max-rows-produced` limits. | `dataset` |
+| `sparkles_query_memory_peak_bytes` | histogram (1 MiB … 16 GiB, ×4). The estimated memory peak of each query, the measure that `--query-memory-mb` limits. | `dataset` |
 | `sparkles_budget_exceeded_total` | counter | `dataset`, `budget` |
 | `sparkles_dataset_quads`, `sparkles_wal_bytes`, `sparkles_disk_bytes` | gauge | `dataset` |
 | `sparkles_dataset_quota_bytes` | gauge. The storage quota of a persistent dataset, `0` when unlimited. | `dataset` |
@@ -155,7 +167,10 @@ JSON object per line.
 | `sparkles_validation_total` | counter | `dataset`, `language` = `shacl` \| `shex`, `status` = `passed` \| `warned` \| `rejected` \| `skipped` \| `bypassed` \| `timeout` \| `error` |
 | `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `language`, `strategy` = `full` \| `incremental` |
 | `sparkles_validation_results_total` | counter. Results found by validated writes. ShEx counts nonconformant associations as `violation`. | `dataset`, `language`, `severity` = `violation` \| `warning` \| `info` |
+| `sparkles_validation_focus_nodes` | histogram (1 … 1,000,000, ×10). The focus nodes each validated write validated, as in the summary's `focusNodes`. A strategy has series once it has a validation. | `dataset`, `language`, `strategy` = `full` \| `incremental` |
 | `sparkles_validation_fallbacks_total` | counter. Validated writes that ran a full validation, or validated some shapes in full. | `dataset`, `language`, `reason` = `baseline` \| `shapes` \| `subclass` \| `sparql` \| `recursive` \| `bulk` \| `budget` |
+| `sparkles_rebuilds_total` | counter. New generations published since the dataset was opened. `compact` counts the compactions that published, and `bulk` the bulk commits, such as a large load, that wrote the data into a new generation. | `dataset`, `reason` = `compact` \| `bulk` |
+| `sparkles_rebuild_duration_seconds` | histogram (0.1 s … 3600 s). The duration of those rebuilds. A reason has series once it has a rebuild. | `dataset`, `reason` |
 | `sparkles_compactions_total` | counter. Compactions since the server started. | `dataset`, `mode` = `auto` \| `manual`, `outcome` = `done` \| `abandoned` \| `cancelled` \| `failed` |
 | `sparkles_compaction_seconds`, `sparkles_compaction_lock_seconds` | summary (`_sum`, `_count`). The duration of the compactions that published a generation, and how long their switch held the writer lock. | `dataset` |
 | `sparkles_compaction_lock_seconds_max` | gauge. The longest switch since the server started. | `dataset` |
@@ -841,8 +856,9 @@ page. They read no dataset.
 | `/$/validate/data` | `data`, `languageSyntax` (Jena's names: `N-Quads`, the default, `Turtle`, `N-Triples`, `TriG`, `RDF/XML`, `JSON-LD`, `N3`, `RDF/JSON`, `TriX`) | `{input}`, or `{input, errors}` with the first syntax error |
 | `/$/validate/langtag` | `langtag` or `lang` (repeatable) | `{langtags: [{input, errors, formatted, language, script?, region?, variant?, extension?, privateuse?}]}` |
 
-`errors` is `[{"parse-error": string, "parse-error-line"?: number, "parse-error-column"?:
-number}]`, as in Fuseki. `formatted` is the formatter's output (the parser's serialization
+For queries, updates and data, `errors` is `[{"parse-error": string, "parse-error-line"?:
+number, "parse-error-column"?: number}]`, as in Fuseki. For IRIs and language tags it is a
+list of messages. `formatted` is the formatter's output (the parser's serialization
 in a build without the `fmt` feature), and `algebra` is the SPARQL algebra in SSE. Fuseki
 also gives the algebra in quad form and optimized, which Sparkles does not. Fuseki's
 language tag validator answers in HTML only. A missing parameter is a `400`.
@@ -4107,7 +4123,7 @@ exactly.
 | PUT | `/$/vector/{ds}/{name}` | Creates (`201`) or replaces (`200`) the index. The body is its configuration, and the response is `{ index, task }`, where the task follows the build. `409` when another index has the predicate. |
 | DELETE | `/$/vector/{ds}/{name}` | Drops the index and its files, with `204`. |
 | POST | `/$/vector/{ds}/{name}/rebuild` | Builds the index again from RDF. Returns `202` and a task. |
-| POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. |
+| POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. `recall` is `null` when no vector was sampled, for example while the index has no graph to search. |
 
 A `VectorIndexStatus` is
 `{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
@@ -5673,7 +5689,9 @@ The CLI equivalent is `sparkles shacl --loc DB --shapes shapes.ttl [--graph defa
 [--format ttl|json|text|nt|jsonld|rdfxml] [--no-inferences]`, or `--data FILE…` in place
 of `--loc` to validate files in memory. The shapes file's syntax comes from its name, and
 `.shaclc` and `.shc` files are SHACLC. Like Jena's `shacl validate`, it exits with status
-1 when the data does not conform.
+1 when the data does not conform. `sparkles shacl parse FILE… [--in SYNTAX] [--out
+shaclc|turtle|nt|jsonld|rdfxml] [--base IRI]` checks shapes files and prints them in
+another syntax, like Jena's `shacl parse`.
 
 ### SHACL Compact Syntax (SHACLC)
 
@@ -5691,8 +5709,10 @@ drafted shapes are shown:
 | `PUT /$/validation/{ds}` | `"shapes": { "inline": "…", "format": "text/shaclc" }` |
 | `GET /$/schema/{ds}/shapes` | `format=shaclc` or `Accept: text/shaclc` |
 | `sparkles shacl`, `sparkles validation` | `--shapes FILE.shaclc` or `FILE.shc` |
+| `sparkles shacl parse` | reads `FILE.shaclc` or `FILE.shc`, and writes SHACLC with `--out shaclc`, the default |
 | `sparkles schema --draft-shapes` | `--format shaclc` |
 | MCP `validate_shacl` | `shapesFormat: "shaclc"` |
+| MCP `draft_shapes` | `shapesFormat: "shaclc"` |
 | Python `Dataset.validate_shacl` | `format="shaclc"` |
 
 ```
@@ -7307,7 +7327,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable, graphql?}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}`. `graphql: true` marks a dataset that `graphql_query` reads. |
 | `describe_schema` | `section` (`summary`\|`classes`\|`predicates`\|`constraints`\|`profiles`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor`, `subjectClasses`, `shapes`, `classes` (IRIs, with `profiles`) | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?, superClassExpressions?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?, subjectClasses?: ["ex:Person 120", …, "untyped 3"]}], constraints?: [{source, graphs, mode?, threshold?, classes: [{class, closed?, properties: [{path, constraints: "min 1 · max 1 · datatype xsd:string", enforcement}]}]}], next, prefixes}`. The summary lists the largest classes and predicates. `classes` and `predicates` page through all entries in IRI order. `subjectClasses: true` adds the ten classes of each predicate's subjects with the most triples. `constraints` lists the [constraints layer](#constraints-layer), from the write-time SHACL validation or from the sources in `shapes`. `profiles` lists the [class profiles](#class-profiles) of the classes with the most instances, or of those in `classes`: `profiles: [{class, instances, properties: [{predicate, instances, triples, valuesPerInstance: "1..2", objects: {iri?, "xsd:string"?: n, …}, objectClasses?}], incoming}]`, with at most 25 properties and 10 incoming predicates per class. |
 | `diff_schema` | `from` (a commit, or `time:…` / `snapshot:…`), `to` (the head), `graph`, `reasoning`, `limit` (50, at most 500 entries per list), `timeoutSeconds` | `{dataset, from, to, graph, reasoning, counts, report: [Change], classes: {added: [iri], removed: [iri], changed: [{iri, changes: [Change]}]}, predicates: {…}, truncated, prefixes}`: the [schema diff](#schema-diffs) between two readable states. `404` for a commit beyond the head and `410` for one whose history is gone. |
-| `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, in SHACL Turtle or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
+| `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `shapesFormat` (`turtle`\|`shaclc`, for SHACL), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shapesFormat?, shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, as SHACL in Turtle or SHACLC, or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
 | `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | One text block: a table or a JSON document (below). No `structuredContent`. |
 | `explain_query` | `query` (required), `includeAlgebra` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. |
 | `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`), `mode` (`cbd`\|`scbd`\|`outgoing`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, description?, prefixes}`. Each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others. With `mode`, `description` is `{mode, triples: ["s p o"], truncated}`: the resource's [DESCRIBE](#describe) in that mode, at most `maxTriples` triples. |

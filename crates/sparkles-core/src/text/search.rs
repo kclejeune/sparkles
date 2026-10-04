@@ -491,6 +491,7 @@ impl<'a> Outputs<'a> {
         }
         if stale_hits > 0 {
             tracing::warn!(
+                target: "sparkles::text::search",
                 "text:query skipped {stale_hits} hits whose terms are not in the snapshot"
             );
         }

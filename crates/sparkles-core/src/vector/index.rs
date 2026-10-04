@@ -528,6 +528,7 @@ pub(crate) fn build_index(
             Err(Problem::Missing) => {}
             Err(p) => {
                 tracing::warn!(
+                    target: "sparkles::vector::index",
                     "vector index file {}: {p}; it is built again",
                     path.display()
                 );
@@ -664,6 +665,7 @@ pub(crate) fn build_index(
                 return Ok(Outcome::Ready(Arc::new(b)));
             }
             Some(Err(e)) => tracing::warn!(
+                target: "sparkles::vector::index",
                 "cannot write vector index file {}: {e}; the index stays in memory",
                 path.display()
             ),

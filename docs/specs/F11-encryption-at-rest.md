@@ -1378,19 +1378,19 @@ they hold.
 ## 15. Sources
 
 * **Sparkles repository, read for this spec:**
-  * `crates/sparkles/src/index.rs`: the permutation file format, `BLOCK_ROWS`,
+  * `crates/sparkles-core/src/index.rs`: the permutation file format, `BLOCK_ROWS`,
     `BlockMeta`, `PermIndex::open` (memory-mapped `.dat`, `.meta` read whole) and
     `BlockCache` (decoded columns by permutation, block and column);
-  * `crates/sparkles/src/vocab.rs`: the front-coded, memory-mapped `Vocab`, `FC_BLOCK`,
+  * `crates/sparkles-core/src/vocab.rs`: the front-coded, memory-mapped `Vocab`, `FC_BLOCK`,
     `get`, `get_sorted`, `find`, and `DeltaVocab` (length-prefixed log, torn tails,
     `rollback`, `flush`);
-  * `crates/sparkles/src/store.rs` and `store/wal.rs`: the 33-byte WAL records, the
+  * `crates/sparkles-core/src/store.rs` and `store/wal.rs`: the 33-byte WAL records, the
     commit path, `WalIndex` and `WalPoint`;
-  * `crates/sparkles/src/builder.rs`: the spill files in `tmp/`;
-  * `crates/sparkles/src/vector/persist.rs` and `geo/persist.rs`: the `.spkv` and
+  * `crates/sparkles-core/src/builder.rs`: the spill files in `tmp/`;
+  * `crates/sparkles-core/src/vector/persist.rs` and `geo/persist.rs`: the `.spkv` and
     `.spkg` layouts and their in-place mapping;
-  * `crates/sparkles/src/text/lazydir.rs`: the Tantivy directory wrapper;
-  * `crates/sparkles/src/annotations.rs`, `commit.rs`, `stored.rs`,
+  * `crates/sparkles-core/src/text/lazydir.rs`: the Tantivy directory wrapper;
+  * `crates/sparkles-core/src/annotations.rs`, `commit.rs`, `stored.rs`,
     `store/compaction.rs` and `disk.rs`: `annotations.bin`, the catalog's magic,
     `queries.json`, `compaction.json` and the free-space checks;
   * `crates/sparkles-backup/src/blob.rs`, `layout.rs` and `manifest.rs`: the blob header

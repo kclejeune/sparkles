@@ -7,7 +7,8 @@
 > Phase 2 shipped with it: the JSON metrics snapshot, the Server page panels,
 > `meta.memory` and `requestId` in error bodies. Per-request budget overrides, the
 > `rows_produced` work budget, `--shutdown-grace` and per-dataset storage quotas came
-> later. From Phase 3, OpenTelemetry export with `traceparent` propagation, per-class
+> later, and so did the Phase 2 metrics of §4.5 and `rows_produced` in the access log.
+> From Phase 3, OpenTelemetry export with `traceparent` propagation, per-class
 > concurrency caps and the `--metrics-addr` listener shipped, and Fuseki's metric names
 > followed as an option. The rest of Phases 2 and 3 is not built. [Outcome](#outcome)
 > has the details.
@@ -857,8 +858,8 @@ Expect `outcome="cancelled"` = 1 and `sparkles_requests_active{operation="query"
   - `docs/BENCHMARKS.md`: result sizes and memory notes.
   - The project's feature order (internal planning notes).
   - `crates/sparkles-server/src/{main.rs,http.rs,state.rs,http/router_tests.rs}`.
-  - `crates/sparkles/src/{error.rs,store.rs,index.rs}`.
-  - `crates/sparkles/src/sparql/{ctx.rs,exec.rs,mod.rs,cache.rs,table.rs,results.rs,update.rs}`.
+  - `crates/sparkles-core/src/{error.rs,store.rs,index.rs}`.
+  - `crates/sparkles-core/src/sparql/{ctx.rs,exec.rs,mod.rs,cache.rs,table.rs,results.rs,update.rs}`.
   - `ui/src/lib/{api.ts,app.svelte.ts}`, `ui/src/routes/server/+page.svelte`, `ui/mock/`.
   - `scripts/bench.sh`: only the Sparkles invocation and the query list were read.
 - **Apache Jena** (Apache-2.0):
@@ -970,8 +971,35 @@ triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is n
 `ASK {}` and star-join throughput under `oha` do not change. The numbers are in
 [Benchmarks](../BENCHMARKS.md#full-text-index-and-observability-105m-triples).
 
+**Phase 2 metrics** (2026-10-03). The four metrics of §4.5 landed, with
+`rows_produced` in the access log.
+- `sparkles_rows_produced_total{dataset}` sums the `rows_produced` of queries and
+  updates, and the access log line of each has a `rows_produced` field. Both come from
+  the request report, which now carries the count the engine already returned.
+- `sparkles_query_memory_peak_bytes{dataset}` is a histogram of the estimated memory peak
+  of each query, with buckets from 1 MiB to 16 GiB in steps of ×4. Updates are not
+  observed, because the name says query. A dataset has the series once it has a query.
+- `sparkles_rebuilds_total{dataset,reason}` and
+  `sparkles_rebuild_duration_seconds{dataset,reason}` count the generations a store
+  published, with `reason` `compact` or `bulk`. The spec put a `StoreMetrics` in
+  `Store::rebuild_locked`, but compactions no longer go through it, since they build in
+  the background in `compact_with`. The counters live in the compaction tracker that the
+  store already keeps, which records a bulk commit where it marks the generation's new
+  base and a compaction where it switches to the new generation. `Store::rebuilds(reason)`
+  reads them. Dry runs, abandoned compactions and failed builds publish nothing and count
+  nothing. The counts are in memory and start at zero when a dataset is opened. The
+  server sums them into `$other` like its other scrape-time series.
+  The `compact` reason counts the same compactions as
+  `sparkles_compactions_total{outcome="done"}`, which C13 added. It is kept because it
+  shares the rebuild histogram with bulk commits.
+- `obs_tests::metrics_count_work_memory_peaks_and_rebuilds` and
+  `compaction_tests::rebuilds_are_counted_by_reason` cover them, and the access log test
+  checks the new field. The JSON snapshot of `/$/metrics?format=json` does not have the
+  new series, and neither do the OTLP metrics, which are read from that snapshot.
+
 **Not built.** These parts were not built:
 
-- bind-before-open startup with the `opening`, `failed` and `degraded` states;
+- bind-before-open startup with the `opening`, `failed` and `degraded` states, which
+  changes how the server's state attaches datasets;
 - a server-wide query memory pool;
-- `rows_produced` in the access log and as a metric of its own.
+- the new Phase 2 metrics in the JSON snapshot and as OTLP metrics.

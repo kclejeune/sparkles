@@ -295,6 +295,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "graph": {"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"},
                 "reasoning": {"type":"boolean","default":false,"description":"Include materialized inferences (write-time validation leaves them out by default)"},
                 "language": {"enum":["shacl","shex"],"default":"shacl"},
+                "shapesFormat": {"enum":["turtle","shaclc"],"default":"turtle","description":"The syntax of `shacl`: Turtle, or the SHACL Compact Syntax (SHACL drafts only)"},
                 "support": {"type":"number","exclusiveMinimum":0,"maximum":1,"default":1},
                 "classes": {"type":"array","items":{"type":"string"},"description":"Draft only these classes (IRIs or prefixed names)"},
                 "minInstances": {"type":"integer","minimum":1,"default":1},
@@ -596,7 +597,24 @@ async fn draft_shapes_tool() {
     assert_eq!(s["shapes"][0]["excluding"], json!([]));
     let shacl = s["shacl"].as_str().unwrap();
     assert!(shacl.contains("sh:targetClass ex:Person"), "{shacl}");
+    assert_eq!(s["shapesFormat"], "turtle");
     assert!(s.get("shex").is_none());
+    let s = c
+        .structured("draft_shapes", json!({"shapesFormat": "shaclc"}))
+        .await;
+    assert_eq!(s["shapesFormat"], "shaclc");
+    let shaclc = s["shacl"].as_str().unwrap();
+    assert!(shaclc.contains("-> ex:Person {"), "{shaclc}");
+    #[cfg(feature = "shacl")]
+    sparkles_shacl::compact::parse(shaclc, None).unwrap_or_else(|e| panic!("{e}\n{shaclc}"));
+    let (text, meta) = c
+        .error(
+            "draft_shapes",
+            json!({"language": "shex", "shapesFormat": "shaclc"}),
+        )
+        .await;
+    assert!(text.contains("shapesFormat"), "{text}");
+    assert_eq!(meta["code"], "bad-argument");
     let s = c
         .structured(
             "draft_shapes",

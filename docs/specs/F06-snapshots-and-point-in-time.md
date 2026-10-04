@@ -257,7 +257,7 @@ reconstructable: 40..57   retained: gen-0003 (1.2 GiB, snapshot:release-1)
 ### 2.7 Rust library API
 
 ```rust
-// crates/sparkles/src/history.rs (new)
+// crates/sparkles-core/src/history.rs (new)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum At { Head, Commit(u64), Time(i64 /* ms */), Snapshot(String) }
 impl std::str::FromStr for At { type Err = Error; }          // §2.1 grammar
@@ -1025,24 +1025,24 @@ Setup: `sparkles serve --data /tmp/s`, a fresh persistent dataset `ds`, and
 ## 10. Sources
 
 * **Sparkles repository, read for this spec:**
-  * `crates/sparkles/src/store.rs`: generations, `Generation::open`, `Delta`, `Snapshot`,
+  * `crates/sparkles-core/src/store.rs`: generations, `Generation::open`, `Delta`, `Snapshot`,
     `Store::open` WAL replay and catalog repair, `rebuild_locked` publication order and
     old-generation removal, `publish_log`, `write_atomic` / `write_synced` / `sync_dir`,
     `clone_to`, `dump_nquads`, `wal_bytes`;
-  * `crates/sparkles/src/commit.rs`: `CommitInfo`, `Catalog` (open, append, sync, get,
+  * `crates/sparkles-core/src/commit.rs`: `CommitInfo`, `Catalog` (open, append, sync, get,
     page), `commit.json`, `dataset.json`, `rfc3339_ms` / `parse_rfc3339_ms`, WAL v2
     record sealing;
-  * `crates/sparkles/src/text.rs`: `TextView.seq`, the `search` staleness check,
+  * `crates/sparkles-core/src/text.rs`: `TextView.seq`, the `search` staleness check,
     `unavailable`;
-  * `crates/sparkles/src/vector.rs`: `GenerationVectors`, the per-generation budget;
-  * `crates/sparkles/src/index.rs`: `BlockCache` keyed by `PermIndex::uid`,
+  * `crates/sparkles-core/src/vector/mod.rs`: `GenerationVectors`, the per-generation budget;
+  * `crates/sparkles-core/src/index.rs`: `BlockCache` keyed by `PermIndex::uid`,
     `BLOCK_ROWS`, `META_BYTES`, `PermIndex::open`;
-  * `crates/sparkles/src/vocab.rs`: `Vocab::open`, `DeltaVocab::open` (tail truncation,
+  * `crates/sparkles-core/src/vocab.rs`: `Vocab::open`, `DeltaVocab::open` (tail truncation,
     append handle);
-  * `crates/sparkles/src/sparql/cache.rs`: `raw_key`;
-  * `crates/sparkles/src/sparql/mod.rs`: `query` signature;
-  * `crates/sparkles/src/schema.rs`: `snapshot_identity`;
-  * `crates/sparkles/src/error.rs`;
+  * `crates/sparkles-core/src/sparql/cache.rs`: `raw_key`;
+  * `crates/sparkles-core/src/sparql/mod.rs`: `query` signature;
+  * `crates/sparkles-core/src/schema.rs`: `snapshot_identity`;
+  * `crates/sparkles-core/src/error.rs`;
   * `crates/sparkles/src/dataset.rs`: the public API list;
   * `crates/sparkles-server/src/http.rs`: routes, `ApiError` mapping, `query_endpoint`,
     `gsp` GET, `with_commit`, `list_commits` / `get_commit`, `query_options`,
@@ -1429,7 +1429,7 @@ graph. Large bodies stream. A diff between two `commit:` selectors gets a weak e
 
 **Diff performance.** A release build measured these times on one run, with other builds
 running on the machine. The dataset had a bulk-built base of 1,000,000 quads, then 20,000
-commits of 5 inserts each (`diff_performance` in `crates/sparkles/tests/diff.rs`).
+commits of 5 inserts each (`diff_performance` in `crates/sparkles-core/tests/diff.rs`).
 
 | Diff | Path | Time |
 |---|---|---|
@@ -1491,7 +1491,7 @@ state with "at commit 42 · 3 h ago".
   `501`. `maxBytes` does not apply to it, and its history status lists no generations.
 - The Graph Store sends no `Cache-Control: immutable`, as in Phase 1.
 
-**Phase 2 tests.** `crates/sparkles/tests/diff.rs` checks diffs against the two
+**Phase 2 tests.** `crates/sparkles-core/tests/diff.rs` checks diffs against the two
 materialized states for random commit sequences with deletes and re-inserts, across
 compactions, bulk commits and a collected generation, for one graph and all, in
 persistent and in-memory stores. It also covers the rows budget, pin expiry, schedules
@@ -1577,7 +1577,7 @@ stream lasts at most five minutes and ends when the server drains.
 
 **Performance.** Two measurements were taken on a machine that other builds were using,
 so they vary by tens of percent. `history_performance` in
-`crates/sparkles/tests/history.rs` repeats the setup of A23 in the engine with a
+`crates/sparkles-core/tests/history.rs` repeats the setup of A23 in the engine with a
 1,000,000-quad base and 50,000 single-quad commits in one generation, reading with
 `snapshot_at`. A release build gave:
 
@@ -1656,7 +1656,7 @@ author. The author lives only in the change log, so commits recovered from the
 write-ahead log after a crash have none.
 
 **Measurements.** A release build ran `commit_latency_with_and_without_the_change_log`
-in `crates/sparkles/tests/history_log.rs` on a real disk while other builds were using
+in `crates/sparkles-core/tests/history_log.rs` on a real disk while other builds were using
 the machine. Each run made 2,000 single-triple commits per store, six rounds per
 setting, alternating which setting went first, on top of a 10,000-quad base.
 
@@ -1687,7 +1687,7 @@ against 18 ms for the next open. Listing the 4 changes of one subject in a log o
 commits took 2.4 ms. Most of that was decoding the 10,000-quad record of the bulk load
 that also names the subject. Listing all 16,000 changes took 19 ms.
 
-**Tests.** `crates/sparkles/tests/history_log.rs` checks every commit's recorded changes
+**Tests.** `crates/sparkles-core/tests/history_log.rs` checks every commit's recorded changes
 against the difference of the states around it, as WAL replay materializes them, for
 300 random commits with compactions, bulk loads, deletes of base quads, changes undone
 in a transaction and blank nodes, in persistent and in-memory stores and after a

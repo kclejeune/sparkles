@@ -1,13 +1,14 @@
 # X03: OpenAPI description, shell completions and man pages
 
-> **Status:** implemented in part (Phase 1, part of Phase 2)
+> **Status:** implemented (Phases 1 and 2)
 >
 > **Phases:** Phase 1 shipped. It covers the OpenAPI 3.1 description at
 > `GET /$/openapi.json` and `GET /$/openapi.yaml`, its checked-in copy, the test that
 > keeps it in step with the route table, `sparkles openapi`, shell completions, man pages
-> and their installation by the Nix package. Of Phase 2, the most used admin types are
-> described member by member and checked against real responses. The other admin types
-> remain open objects.
+> and their installation by the Nix package. Phase 2 shipped too. Every named schema is
+> described member by member, and a contract test checks real requests and responses
+> against them. A "try it" page, dynamic completion of dataset names and Nushell
+> completions are not built.
 >
 > **User docs:** [API: OpenAPI description](../API.md#openapi-description) ·
 > [Usage: Shell completions and man pages](../USAGE.md#shell-completions-and-man-pages) ·
@@ -430,7 +431,60 @@ route of those features answers `GET`, and the body must match its operation's `
 schema, as must the repository that `POST /$/repositories` creates and the backup's
 detail.
 
-**Not built.** Schemas for the remaining open objects, such as diffs, the change feed,
-write previews, ShEx reports, policies and the reasoning requests. A "try it" page in
-the UI, and a bundled Swagger UI. Dynamic completion of dataset names, and Nushell
-completions.
+**Phase 2, the remaining admin types** (2026-10-03). The 37 open objects are now typed.
+They live in four new modules next to `schemas/admin.rs`, with the shared builders in
+`schemas/kit.rs`:
+- `schemas/server.rs` has `MetricsSnapshot`, `FusekiStats`, `BackupFiles`,
+  `ValidatorResult`, `CompactionStatus` and `CompactionPolicy`.
+- `schemas/changes.rs` has `Diff`, `ChangeFeed` and the shared `ChangedQuad`,
+  `DryRunReport` with the new `ValidationSummary`, `ConstraintsLayer` with the new
+  `ConstraintsReport`, `HistoryRequest`, `SnapshotRequest` and `StoredQueryVersions`.
+- `schemas/features.rs` has `ReasonRequest`, `AutoReasonRequest`, `DiagnosticsReport`,
+  `TextHits`, `VectorIndexCreated`, `RecallReport`, `GeoConvertRequest`,
+  `GeoConvertResult`, `RdfsStatus`, `RdfsRequest`, `ShexRequest`, `ShexReport` and the new
+  `ShexResultMap`.
+- `schemas/policies.rs` has `BackupRequest`, `RestoreRequest`, `VerifyRequest`,
+  `GcRequest`, `LockList`, `PolicyConfig`, `Policy`, `PolicyList`, the new `PolicyRun`,
+  `PolicyRuns`, `SchedulePreviewRequest`, `SchedulePreview` and `RetentionResult`.
+
+Each schema follows the code that writes or reads the body, and `docs/API.md` where it
+agrees. A schema is closed (`additionalProperties: false`) only where the code refuses
+unknown members, as `CompactionPolicy`, `ShexRequest` and the change log settings of
+`HistoryRequest` do, or where the answer is one of a fixed set of shapes, as for the
+Fuseki validators and the spatial conversion. The checked-in copy now has 120 schemas
+and none is an open object. Members that the reference calls free-form stay open
+objects inside the typed schemas. They are the results of a `ValidationSummary`, the
+GeoJSON geometry of a conversion, a stored query's parameters and the SHACL `shapes` of
+a validation configuration. A few answers are still plain inline objects rather than
+named schemas: the JSON form of drafted shapes, class profiles, schema diffs, the
+linter's result, MCP's JSON-RPC messages, the pending device login and `DELETE
+/$/reason/{ds}`. They were not in the list of §8.
+
+Three path descriptions changed with the schemas. `GET /$/schema/{ds}/constraints`
+answers `ConstraintsReport`, the layer with its dataset and snapshot, where it named the
+bare layer. `POST /{ds}/shex` answers `ShexReport` or, with `format=shapemap`, the
+`ShexResultMap` array, and its other form is `text/plain`, not `text/turtle`.
+`SchemaSummary.constraints` refers to `ConstraintsLayer`.
+
+The contract test grew. A helper sends a request, checks a JSON request body against the
+operation's request schema, and checks the answer against the schema of the status it
+got, following response references such as `TaskStarted`. The test now also covers the
+JSON metrics, Fuseki's statistics, backup file list and all five validators, compaction
+status and settings, a diff with quads, the change feed, stored query versions, recall,
+history settings, snapshot creation, RDFS on read, a write preview, the constraints
+layer, diagnostics, automatic reasoning, a full-text search with highlighting, a spatial
+conversion with a malformed literal, and ShEx in both JSON forms. With the `backup`
+feature it makes a second backup, verifies it, collects garbage in a dry run, lists the
+locks, restores into a new dataset, and creates, previews, runs, lists, applies the
+retention of, replaces and reads a policy, waiting for each task to finish.
+
+The test found one difference between the docs and the code. `recall` in a recall
+report is `null` when no vector was sampled, and `docs/API.md` now says so. The test
+also showed that `Commit` is not the whole truth for callers limited to some graphs,
+whose commits leave out `inserted`, `deleted`, `quads` and `exact`. The schema keeps
+those members required, because the Rust client's `Commit` type reads them, and a
+limited caller is the only one that sees the difference.
+
+**Not built.** A "try it" page in the UI, and a bundled Swagger UI. Dynamic completion
+of dataset names, and Nushell completions. Named schemas for the inline answers listed
+above.

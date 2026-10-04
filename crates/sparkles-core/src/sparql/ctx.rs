@@ -364,7 +364,7 @@ impl Default for Optimizations {
         static DEFAULT: std::sync::OnceLock<Optimizations> = std::sync::OnceLock::new();
         *DEFAULT.get_or_init(|| match std::env::var("SPARKLES_DISABLE_OPTIMIZATIONS") {
             Ok(v) => Optimizations::ALL.disable(&v).unwrap_or_else(|e| {
-                tracing::warn!("SPARKLES_DISABLE_OPTIMIZATIONS: {e}");
+                tracing::warn!(target: "sparkles::sparql::ctx", "SPARKLES_DISABLE_OPTIMIZATIONS: {e}");
                 Optimizations::ALL
             }),
             Err(_) => Optimizations::ALL,

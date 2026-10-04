@@ -1490,12 +1490,14 @@ mod imp {
             };
             let reusable = root.filter(|r| r.join("text").exists()).and_then(|r| {
                 let (index, fields, dir) = open_index(r, &config)
-                    .inspect_err(|e| tracing::warn!("{e}; rebuilding"))
+                    .inspect_err(
+                        |e| tracing::warn!(target: "sparkles::text::imp", "{e}; rebuilding"),
+                    )
                     .ok()?;
                 if dir.is_marked()
                     && let Err(e) = verify(&index)
                 {
-                    tracing::warn!("{e}; rebuilding");
+                    tracing::warn!(target: "sparkles::text::imp", "{e}; rebuilding");
                     return None;
                 }
                 let meta = index.load_metas().ok()?;
@@ -1520,6 +1522,7 @@ mod imp {
                 let t = ti(live, epoch);
                 if seq < snap.commit {
                     tracing::info!(
+                        target: "sparkles::text::imp",
                         "full-text index is at commit {seq}, the data at {}: catching up from the WAL",
                         snap.commit
                     );
@@ -1530,10 +1533,12 @@ mod imp {
                     .and_then(|v| t.checkpoint().map(|()| v))
                 {
                     Ok(view) => return Ok((TextIndex::start(t), view)),
-                    Err(e) => tracing::warn!("full-text index: {e}; rebuilding"),
+                    Err(e) => {
+                        tracing::warn!(target: "sparkles::text::imp", "full-text index: {e}; rebuilding")
+                    }
                 }
             } else if root.is_some_and(|r| r.join("text").exists()) {
-                tracing::info!("full-text index is missing, damaged or behind the WAL; rebuilding");
+                tracing::info!(target: "sparkles::text::imp", "full-text index is missing, damaged or behind the WAL; rebuilding");
             }
             // an empty placeholder until the rebuild below swaps the real one in
             let (index, fields) = new_index(None, &config)?;
@@ -1561,7 +1566,9 @@ mod imp {
                         }
                     }
                 })
-                .inspect_err(|e| tracing::warn!("full-text commit tick: {e}"))
+                .inspect_err(
+                    |e| tracing::warn!(target: "sparkles::text::imp", "full-text commit tick: {e}"),
+                )
                 .ok();
             TextIndex {
                 inner,
@@ -1746,7 +1753,7 @@ mod imp {
         /// Mark the index stale after a failure: staged operations are dropped, and the
         /// views of the open batch cannot search.
         fn fail_locked(&self, live: &mut Live, e: &Error) {
-            tracing::error!("{e}; the full-text index is stale until it is rebuilt");
+            tracing::error!(target: "sparkles::text::imp", "{e}; the full-text index is stale until it is rebuilt");
             if let Ok(w) = live.writer() {
                 let _ = w.rollback();
             }
@@ -1911,6 +1918,7 @@ mod imp {
             live.last = Slot::sealed(live.reader.searcher(), Default::default());
             self.checkpoint_locked(live)?;
             tracing::info!(
+                target: "sparkles::text::imp",
                 "full-text index after a bulk commit: {added} documents added and {deleted} removed in {:?}",
                 t0.elapsed()
             );
@@ -2134,7 +2142,7 @@ mod imp {
             let mut live = self.live.lock();
             // the views of the old index's open batch get its searcher
             if let Err(e) = self.seal_locked(&mut live) {
-                tracing::warn!("full-text index: {e}; replaced by the rebuild");
+                tracing::warn!(target: "sparkles::text::imp", "full-text index: {e}; replaced by the rebuild");
                 if let Some(slot) = live.open.take() {
                     let _ = slot.0.set(None);
                 }
@@ -2179,6 +2187,7 @@ mod imp {
                 docs,
             });
             tracing::info!(
+                target: "sparkles::text::imp",
                 "full-text index rebuilt: {docs} documents in {:?}",
                 t0.elapsed()
             );
@@ -2248,7 +2257,7 @@ mod imp {
                 let _ = ticker.join();
             }
             if let Err(e) = self.inner.close() {
-                tracing::warn!("full-text index checkpoint on close: {e}");
+                tracing::warn!(target: "sparkles::text::imp", "full-text index checkpoint on close: {e}");
             }
         }
     }
