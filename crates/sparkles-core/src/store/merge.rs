@@ -492,7 +492,8 @@ impl Store {
             self.toggles(set, base, theirs, &dopts)?
         };
         let snap = tgt.snapshot();
-        let plan = plan_merge(&snap, t_o, t_t, o)?;
+        let exempt = exempt_keys(set, o);
+        let plan = plan_merge(&snap, t_o, t_t, o, &exempt)?;
         report.inserted = plan.changes.values().filter(|i| **i).count() as u64;
         report.deleted = plan.changes.len() as u64 - report.inserted;
         report.conflicts_found = plan.found;
@@ -758,11 +759,22 @@ pub(crate) enum Step {
 
 /// Group the toggles, find conflicts, apply resolutions and the rule, and keep blank
 /// nodes whole.
+/// The keys of the predicates exempt from conflicts: the dataset's and the merge's.
+fn exempt_keys(set: &BranchSet, o: &MergeOptions) -> FxHashSet<Arc<[u8]>> {
+    set.exempt()
+        .iter()
+        .map(|p| p.as_str())
+        .chain(o.exempt.iter().map(|p| p.as_str()))
+        .map(|iri| crate::id::iri_key(iri).into())
+        .collect()
+}
+
 fn plan_merge(
     snap: &Snapshot,
     mut t_o: Toggles,
     mut t_t: Toggles,
     o: &MergeOptions,
+    exempt: &FxHashSet<Arc<[u8]>>,
 ) -> Result<Plan> {
     let mut excluded = None;
     if !o.include_inferences {
@@ -778,15 +790,22 @@ fn plan_merge(
         .iter()
         .map(|r| keyed(r, scope))
         .collect::<Result<_>>()?;
+    // the quads of exempt predicates take the quad-level result, outside the groups
+    let is_exempt = |k: &QuadKey| scope != ConflictScope::Quad && exempt.contains(&k[2]);
+    let quad_level: Vec<(QuadKey, bool)> = t_t
+        .iter()
+        .filter(|(k, _)| is_exempt(k) && !t_o.contains_key(*k))
+        .map(|(k, a)| (k.clone(), *a))
+        .collect();
     let mut groups: std::collections::BTreeMap<GroupKey, Sides> = Default::default();
-    for (k, a) in &t_o {
+    for (k, a) in t_o.iter().filter(|(k, _)| !is_exempt(k)) {
         groups
             .entry(group_of(k, scope))
             .or_default()
             .0
             .push((k.clone(), *a));
     }
-    for (k, a) in &t_t {
+    for (k, a) in t_t.iter().filter(|(k, _)| !is_exempt(k)) {
         groups
             .entry(group_of(k, scope))
             .or_default()
@@ -800,6 +819,7 @@ fn plan_merge(
         remaining: Vec::new(),
         excluded,
     };
+    plan.changes.extend(quad_level);
     // inserts a side made that the result leaves out, for the blank-node rule
     let mut dropped_theirs: Vec<QuadKey> = Vec::new();
     let mut dropped_ours: Vec<QuadKey> = Vec::new();

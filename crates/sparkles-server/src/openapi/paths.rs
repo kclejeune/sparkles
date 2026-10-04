@@ -1285,6 +1285,14 @@ fn branches(p: &mut Paths) {
         .errors(&[501]),
     );
     p.add(
+        op(PATCH, "/$/branches/{ds}", "updateBranchSettings", "Branches", "Change the dataset's merge settings")
+            .doc("`exemptPredicates`: the predicates whose cells never conflict in the dataset's merges, reverts and cherry-picks. Both sides' changes to them are kept, as with the `quad` scope. Needs admin on `main`.")
+            .see("merges")
+            .json_body(true, "BranchSettings")
+            .json("200", "The settings.", "BranchSettings")
+            .errors(&[400, 403, 501]),
+    );
+    p.add(
         op(POST, "/$/branches/{ds}", "createBranch", "Branches", "Create a branch")
             .doc("Creates a branch from a commit of another branch. The branch shares the index files of the generation that holds the commit until it compacts, so creating one writes a few kilobytes. Needs read on the source branch and write on the new one, from grants without graph restrictions.")
             .see("branches-and-merges")
@@ -1330,6 +1338,7 @@ fn branches(p: &mut Paths) {
             .query("conflicts", json!({ "type": "string", "enum": ["cell", "subject", "quad"] }), "What counts as one value (default `cell`).")
             .query("onConflict", json!({ "type": "string", "enum": ["fail", "ours", "theirs", "union"] }), "The rule for conflicts.")
             .query("squash", boolean(), "Preview a squash merge.")
+            .query("exempt", s(), "A predicate IRI exempt from conflicts in this merge; repeatable.")
             .query("limit", int(), "The most conflict cells listed (default 100, at most 10000).")
             .json("200", "The preview.", "MergeResult")
             .errors(&[400, 404, 409, 410, 507]),

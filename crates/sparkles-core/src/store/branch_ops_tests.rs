@@ -604,3 +604,63 @@ fn a29_a_crash_in_a_deletion_that_re_parents() {
         .collect();
     assert!(gone.contains(&dev_id.to_string()) && gone.contains(&feat_id.to_string()));
 }
+
+#[test]
+fn a30_exempt_predicates_never_conflict() {
+    let (dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    let label = "http://www.w3.org/2000/01/rdf-schema#label";
+    apply(&s, &format!("+<urn:a> <{label}> \"ours\" ."));
+    apply(&dev, &format!("+<urn:a> <{label}> \"theirs\" ."));
+    apply(&dev, "+<urn:a> <urn:other> <urn:x> .");
+    let MergeOutcome::Conflicts(c) = merge(&s, "dev", "main", &Default::default()) else {
+        panic!("labels conflict by default");
+    };
+    assert_eq!(c.conflicts, 1);
+    // per merge
+    let o = MergeOptions {
+        exempt: vec![named(label)],
+        ..Default::default()
+    };
+    let p = s.preview_merge("dev", "main", &o).unwrap();
+    assert!(p.conflicts.is_none());
+    assert_eq!((p.inserted, p.conflicts_found), (2, 0));
+    // per dataset, kept in the branch table
+    assert!(s.merge_exempt().unwrap().is_empty());
+    let set = s.set_merge_exempt(&[named(label), named(label)]).unwrap();
+    assert_eq!(set, [named(label)]);
+    drop(dev);
+    drop(s);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    assert_eq!(s.merge_exempt().unwrap(), [named(label)]);
+    merged(merge(&s, "dev", "main", &Default::default()));
+    assert!(has(&s, "\"ours\"") && has(&s, "\"theirs\""));
+    // an exempt cell takes both sides' changes in the subject scope too
+    let dev = s.branch("dev").unwrap();
+    apply(
+        &s,
+        &format!(
+            "-<urn:a> <urn:age> {} .\n+<urn:a> <urn:age> {} .",
+            int(30),
+            int(31)
+        ),
+    );
+    apply(
+        &dev,
+        &format!(
+            "-<urn:a> <urn:age> {} .\n+<urn:a> <urn:age> {} .",
+            int(30),
+            int(32)
+        ),
+    );
+    let o = MergeOptions {
+        exempt: vec![named("urn:age")],
+        scope: crate::branch::ConflictScope::Subject,
+        ..Default::default()
+    };
+    merged(merge(&s, "dev", "main", &o));
+    assert_eq!(super::branch_tests::ages(&s), ["31", "32"]);
+    s.set_merge_exempt(&[]).unwrap();
+    assert!(s.merge_exempt().unwrap().is_empty());
+}

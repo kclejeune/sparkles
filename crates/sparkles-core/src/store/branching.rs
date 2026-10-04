@@ -132,6 +132,9 @@ pub(crate) struct TableFile {
     /// branch, listed or retired, starts from it or reads its files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired: Vec<Entry>,
+    /// predicates whose cells never conflict in this dataset's merges (IRIs)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deleted: Vec<Tombstone>,
 }
@@ -145,6 +148,7 @@ impl TableFile {
             main: MainEntry::default(),
             branches: Vec::new(),
             retired: Vec::new(),
+            exempt: Vec::new(),
             deleted: Vec::new(),
         }
     }
@@ -596,6 +600,16 @@ impl BranchSet {
     /// Remember the dataset's own store's current state (at its open).
     pub(crate) fn set_main(&self, current: &Arc<ArcSwap<Snapshot>>) {
         *self.main_current.lock() = Arc::downgrade(current);
+    }
+
+    /// The predicates exempt from conflicts in every merge of the dataset.
+    pub(crate) fn exempt(&self) -> Vec<NamedNode> {
+        self.table
+            .lock()
+            .exempt
+            .iter()
+            .filter_map(|p| NamedNode::new(p.clone()).ok())
+            .collect()
     }
 
     pub(crate) fn main_protected(&self) -> bool {
@@ -1287,6 +1301,30 @@ impl Store {
             None => m.protected = on,
         })?;
         self.branch_info(name)
+    }
+
+    /// The predicates whose cells never conflict in this dataset's merges: both sides'
+    /// changes to them are kept, as with the quad scope.
+    pub fn merge_exempt(&self) -> Result<Vec<NamedNode>> {
+        Ok(self.owned_set()?.exempt())
+    }
+
+    /// Set the predicates exempt from conflicts in this dataset's merges (empty: none).
+    pub fn set_merge_exempt(&self, predicates: &[NamedNode]) -> Result<Vec<NamedNode>> {
+        if predicates.len() > 1024 {
+            return Err(branch::invalid_merge("at most 1024 exempt predicates"));
+        }
+        let set = self.owned_set()?;
+        let root = self.root.as_ref().expect("a branch set has a root");
+        let mut t = set.table.lock();
+        let mut next = t.clone();
+        next.exempt = predicates.iter().map(|p| p.as_str().to_string()).collect();
+        next.exempt.sort();
+        next.exempt.dedup();
+        write_table(root, &next)?;
+        *t = next;
+        drop(t);
+        Ok(set.exempt())
     }
 
     /// Change a branch's note (`None` removes it).

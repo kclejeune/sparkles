@@ -1169,7 +1169,10 @@ and `--resolve FILE.json` reads a JSON array of resolutions for single graphs, s
 cells, such as `[{"graph": null, "subject": "<http://ex.org/a>", "predicate":
 "<http://ex.org/age>", "take": "objects", "objects": ["33"]}]`. `--expect-source N` and
 `--expect-target N` refuse the merge when either head moved since the report was read.
-`--conflicts subject` treats a whole subject as one value, and `--conflicts quad` never
+`--exempt IRI`, once per predicate,
+keeps both sides' changes to that predicate instead of reporting a conflict, and `branch
+exempt --loc db IRI…` sets the dataset's own list of such predicates (`--clear` empties
+it). `--conflicts subject` treats a whole subject as one value, and `--conflicts quad` never
 reports a conflict. `--replay` makes a fast-forward
 that replays the source's commits one by one, each with its kind, message and author.
 `--squash` applies the changes as one commit that records no second

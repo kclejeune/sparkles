@@ -407,3 +407,65 @@ async fn a29_deletions_that_re_parent() {
     let (r, _) = get(&app, "/$/branches/ds/dev").await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn a30_exempt_predicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_st, app) = setup(dir.path()).await;
+    json_req(&app, "POST", "/$/branches/ds", json!({ "name": "dev" })).await;
+    let label = "http://www.w3.org/2000/01/rdf-schema#label";
+    update(
+        &app,
+        "ds",
+        &format!("INSERT DATA {{ <urn:a> <{label}> \"ours\" }}"),
+    )
+    .await;
+    update(
+        &app,
+        "ds@dev",
+        &format!("INSERT DATA {{ <urn:a> <{label}> \"theirs\" }}"),
+    )
+    .await;
+    let (r, _) = json_req(&app, "POST", "/$/merge/ds", json!({ "source": "dev" })).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    let q = format!(
+        "/$/merge/ds?source=dev&exempt={}",
+        percent_encoding::utf8_percent_encode(label, percent_encoding::NON_ALPHANUMERIC)
+    );
+    let (r, _) = get(&app, &q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["conflicts"]["found"], 0);
+    // the dataset's list
+    let (r, _) = json_req(
+        &app,
+        "PATCH",
+        "/$/branches/ds",
+        json!({ "exemptPredicates": [format!("<{label}>")] }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["exemptPredicates"], json!([label]));
+    let (r, _) = get(&app, "/$/branches/ds").await;
+    assert_eq!(r.json()["exemptPredicates"], json!([label]));
+    let (r, _) = json_req(&app, "POST", "/$/merge/ds", json!({ "source": "dev" })).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for (body, status) in [
+        (
+            json!({ "exemptPredicates": ["not an iri"] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (json!({ "other": 1 }), StatusCode::BAD_REQUEST),
+        (json!({ "exemptPredicates": [] }), StatusCode::OK),
+    ] {
+        let (r, _) = json_req(&app, "PATCH", "/$/branches/ds", body.clone()).await;
+        assert_eq!(r.status, status, "{body}: {}", r.text());
+    }
+    let (r, _) = json_req(
+        &app,
+        "POST",
+        "/$/merge/ds",
+        json!({ "source": "dev", "exempt": "x" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}

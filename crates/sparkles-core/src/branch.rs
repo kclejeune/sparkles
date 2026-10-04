@@ -237,6 +237,10 @@ pub struct MergeOptions {
     /// the rule for every conflict no resolution covers (`None`: fail)
     pub on_conflict: Option<Take>,
     pub resolutions: Vec<Resolution>,
+    /// predicates whose cells never conflict: both sides' changes are kept, as with the
+    /// quad scope (added to the dataset's own list,
+    /// [`Store::merge_exempt`](crate::store::Store::merge_exempt))
+    pub exempt: Vec<NamedNode>,
     /// the source head the caller saw
     pub expect_source: Option<u64>,
     /// the target head the caller saw

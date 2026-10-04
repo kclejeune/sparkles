@@ -612,6 +612,21 @@ pub(super) fn schemas() -> Map<String, J> {
                 "dataset": { "type": "string" },
                 "datasetId": { "type": "string" },
                 "branches": array(sref("Branch")),
+                "exemptPredicates": array(json!({ "type": "string" })),
+            }),
+        ),
+    );
+    put(
+        "BranchSettings",
+        obj(
+            &[],
+            json!({
+                "dataset": { "type": "string" },
+                "exemptPredicates": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Predicate IRIs whose cells never conflict in the dataset's merges.",
+                },
             }),
         ),
     );
@@ -648,6 +663,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "target": { "type": "string", "description": "Default `main`." },
                 "ff": string_enum(&["auto", "only", "replay"]),
                 "squash": { "type": "boolean", "description": "Apply the changes as one commit that records no second parent." },
+                "exempt": { "type": "array", "items": { "type": "string" }, "description": "Predicate IRIs whose cells never conflict in this merge, besides the dataset's." },
                 "conflicts": string_enum(&["cell", "subject", "quad"]),
                 "onConflict": string_enum(&["fail", "ours", "theirs", "union"]),
                 "resolutions": array(json!({
@@ -682,6 +698,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "conflicts": string_enum(&["cell", "subject", "quad"]),
                 "onConflict": string_enum(&["fail", "ours", "theirs", "union"]),
                 "resolutions": array(json!({ "type": "object", "description": "As in a MergeRequest." })),
+                "exempt": { "type": "array", "items": { "type": "string" } },
                 "expect": {
                     "type": "object",
                     "properties": { "target": { "type": "integer" } },

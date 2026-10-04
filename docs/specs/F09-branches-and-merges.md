@@ -1324,6 +1324,15 @@ the retired directory as well, and the table returns to format 1. A crash after 
 table retires `dev` reopens with the same state, and a crash while the last child's
 removal renames directories reopens with no branch directory left.
 
+**A30. Exempt predicates.** `main` and `dev` each add a different `rdfs:label` to
+`<urn:a>`. A merge → `409 merge-conflict` on that cell.
+`GET /$/merge/ds?source=dev&exempt=<rdfs:label>` reports no conflict and two inserted
+quads. `PATCH /$/branches/ds {"exemptPredicates":["<…#label>"]}` → `200`, the list
+survives a restart and shows in `GET /$/branches/ds`, and the merge then keeps both
+labels. With `<urn:age>` exempt and the `subject` scope, ages changed to 31 and 32 on the
+two sides give both. A list entry that is not an IRI → `400`. `sparkles merge --exempt
+IRI` and `sparkles branch exempt` do the same.
+
 ## 10. Open questions
 
 1. **Exempt predicates.** Should `cell` scope exempt some predicates by default, such as

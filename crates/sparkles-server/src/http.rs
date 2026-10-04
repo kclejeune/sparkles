@@ -161,7 +161,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/commits/{ds}/{reference}", get(get_commit))
         .route(
             "/$/branches/{ds}",
-            get(branches::list).post(branches::create),
+            get(branches::list)
+                .post(branches::create)
+                .patch(branches::patch_settings),
         )
         .route(
             "/$/branches/{ds}/{name}",

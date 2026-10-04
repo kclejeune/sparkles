@@ -2777,7 +2777,8 @@ including `main`.
 
 | Method | Path | Result |
 |--------|------|--------|
-| GET | `/$/branches/{ds}` | `{dataset, datasetId, branches: Branch[]}`, `main` first, then by name. Only the branches the caller may read are listed. |
+| GET | `/$/branches/{ds}` | `{dataset, datasetId, branches: Branch[], exemptPredicates}`, `main` first, then by name. Only the branches the caller may read are listed. |
+| PATCH | `/$/branches/{ds}` | Sets `exemptPredicates`, the dataset's predicates exempt from conflicts. Needs `admin` on `main`. |
 | POST | `/$/branches/{ds}` | Creates a branch from JSON `{name, from?, at?, protected?, note?}`. `from` defaults to `main` and `at` to its head. Answers `201` with `Location` and the `Branch`. |
 | GET | `/$/branches/{ds}/{name}` | The `Branch`, or `404 no-such-branch`. |
 | PATCH | `/$/branches/{ds}/{name}` | Changes `name`, `protected` or `note` (`null` removes the note). |
@@ -2855,6 +2856,7 @@ type MergeRequest = {
   expect?: { source?: number; target?: number };       // the heads the caller saw
   base?: { branchId: string; seq: number };     // to choose among several merge bases
   inferences?: "exclude" | "include";           // default "exclude"
+  exempt?: string[];                            // predicates that never conflict here
   message?: string; dryRun?: boolean; limit?: number;
 };
 type Resolution = {
@@ -2919,6 +2921,17 @@ the RDF counterpart of a cell in a table. A cell conflicts when both sides chang
 and the two changed cells differ. The `subject` scope groups by graph and subject, which
 catches a subject deleted on one side and edited on the other. The `quad` scope never
 reports a conflict. Two sides that made the same change do not conflict.
+
+**Exempt predicates.** Some predicates gain values on both sides as a matter of course,
+such as `rdf:type`, `rdfs:label` and `skos:altLabel`, and their cells would conflict in
+every merge. The cells of an exempt predicate never conflict: the merge keeps both
+sides' changes to them, as the `quad` scope does for every cell, in the `cell` and the
+`subject` scope alike. `exempt` lists such predicates for one merge, revert or
+cherry-pick, as IRIs with or without angle brackets, and the preview takes `exempt`
+once per predicate. `PATCH /$/branches/{ds}` with `{"exemptPredicates": [...]}` sets
+the dataset's own list, which every merge of the dataset adds to its own, and needs
+`admin` on `main`. `GET /$/branches/{ds}` shows the list. No predicate is exempt by
+default.
 
 `onConflict` resolves every remaining conflict one way: `ours` keeps the target's
 state, `theirs` takes the source's, and `union` keeps both sides' changes. `resolutions`

@@ -119,6 +119,19 @@ impl Dataset {
         self.store().delete_branch_with(name, o)
     }
 
+    /// The predicates whose cells never conflict in this dataset's merges.
+    pub fn merge_exempt(&self) -> Result<Vec<oxrdf::NamedNode>> {
+        self.store().merge_exempt()
+    }
+
+    /// Set the predicates whose cells never conflict in this dataset's merges.
+    pub fn set_merge_exempt(
+        &self,
+        predicates: &[oxrdf::NamedNode],
+    ) -> Result<Vec<oxrdf::NamedNode>> {
+        self.store().set_merge_exempt(predicates)
+    }
+
     /// Delete branch `name`, also with unmerged commits when `force`.
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
         self.store().delete_branch(name, force)

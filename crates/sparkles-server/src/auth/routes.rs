@@ -85,7 +85,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/commits/{ds}", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
     // branches and merges: the handlers check each branch a request names
-    ("/$/branches/{ds}", &["GET", "POST"]),
+    ("/$/branches/{ds}", &["GET", "POST", "PATCH"]),
     ("/$/branches/{ds}/{name}", &["GET", "PATCH", "DELETE"]),
     ("/$/merge/{ds}", &["GET", "POST"]),
     ("/$/revert/{ds}", &["GET", "POST"]),

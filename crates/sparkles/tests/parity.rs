@@ -267,6 +267,10 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("listBranches", "branches.list", |ds| {
             ds.branches();
         }),
+        op!("updateBranchSettings", "branches.settings", |ds| {
+            ds.merge_exempt();
+            ds.set_merge_exempt(&[]);
+        }),
         op!("getBranch", "branches.get", |ds| {
             ds.branch_info("dev");
         }),

@@ -185,3 +185,42 @@ fn a28_a29_rename_and_delete_with_reparent() {
     );
     assert!(subjects(dir, "feat").contains("urn:c"));
 }
+
+#[test]
+fn a30_exempt_predicates() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let label = "http://www.w3.org/2000/01/rdf-schema#label";
+    update(dir, "main", "INSERT DATA { <urn:a> <urn:age> 30 }");
+    ok(dir, &["branch", "create", "--loc", "db", "dev"]);
+    update(
+        dir,
+        "main",
+        &format!("INSERT DATA {{ <urn:a> <{label}> \"ours\" }}"),
+    );
+    update(
+        dir,
+        "dev",
+        &format!("INSERT DATA {{ <urn:a> <{label}> \"theirs\" }}"),
+    );
+    let o = run(dir, &["merge", "--loc", "db", "dev", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(2), "{}{}", out(&o), err(&o));
+    let o = ok(
+        dir,
+        &[
+            "merge",
+            "--loc",
+            "db",
+            "dev",
+            "--dry-run",
+            "--exempt",
+            label,
+        ],
+    );
+    assert!(out(&o).contains("would merge"), "{}", out(&o));
+    let o = ok(dir, &["branch", "exempt", "--loc", "db", label]);
+    assert_eq!(out(&o).trim(), format!("<{label}>"));
+    ok(dir, &["merge", "--loc", "db", "dev"]);
+    let o = ok(dir, &["branch", "exempt", "--loc", "db", "--clear"]);
+    assert!(out(&o).contains("no predicates"), "{}", out(&o));
+}

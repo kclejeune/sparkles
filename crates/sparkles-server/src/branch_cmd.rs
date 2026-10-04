@@ -150,6 +150,16 @@ pub enum BranchCmd {
         #[arg(long)]
         reparent: bool,
     },
+    /// Show or set the predicates whose cells never conflict in the dataset's merges
+    Exempt {
+        #[command(flatten)]
+        target: Target,
+        /// Predicate IRIs (replace the list)
+        predicates: Vec<String>,
+        /// Empty the list
+        #[arg(long, conflicts_with = "predicates")]
+        clear: bool,
+    },
     /// Rename a branch; it keeps its id, commits and storage
     Rename {
         #[command(flatten)]
@@ -271,6 +281,56 @@ pub fn run_branch(cmd: BranchCmd, opts: StoreOptions) -> Result<()> {
                 }
             }
             eprintln!("deleted branch {name}");
+            Ok(())
+        }
+        BranchCmd::Exempt {
+            target,
+            predicates,
+            clear,
+        } => {
+            let set = clear || !predicates.is_empty();
+            let list: Vec<String> = match &target.loc {
+                Some(loc) => {
+                    let s = Store::open(loc, opts)?;
+                    let ps = if set {
+                        let ps = predicates
+                            .iter()
+                            .map(|p| {
+                                let p = p.trim_start_matches('<').trim_end_matches('>');
+                                oxrdf::NamedNode::new(p).with_context(|| format!("not an IRI: {p}"))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        s.set_merge_exempt(&ps)?
+                    } else {
+                        s.merge_exempt()?
+                    };
+                    ps.into_iter().map(|p| p.into_string()).collect()
+                }
+                None => {
+                    let j = if set {
+                        remote_send(
+                            &target,
+                            "PATCH",
+                            "",
+                            Some(json!({ "exemptPredicates": predicates })),
+                        )?
+                    } else {
+                        remote_get(&target, "")?
+                    };
+                    j["exemptPredicates"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|p| p.as_str().map(str::to_string))
+                        .collect()
+                }
+            };
+            if list.is_empty() {
+                println!("no predicates are exempt from conflicts");
+            }
+            for p in list {
+                println!("<{p}>");
+            }
             Ok(())
         }
         BranchCmd::Rename {
@@ -586,6 +646,9 @@ pub struct MergeArgs {
     /// A JSON array of resolutions ({graph, subject?, predicate?, take, objects?})
     #[arg(long, value_name = "FILE.json")]
     pub resolve: Option<PathBuf>,
+    /// A predicate whose cells never conflict in this merge (repeatable)
+    #[arg(long, value_name = "IRI")]
+    pub exempt: Vec<String>,
     /// The source head the conflicts were read at
     #[arg(long)]
     pub expect_source: Option<u64>,
@@ -698,6 +761,7 @@ fn local_merge(loc: &Path, a: &MergeArgs, res: Option<&J>, opts: StoreOptions) -
         expect_source: a.expect_source,
         expect_target: a.expect_target,
         include_inferences: a.include_inferences,
+        exempt: exempt_predicates(&a.exempt)?,
         ..Default::default()
     };
     if let Some(m) = &a.message {
@@ -790,6 +854,7 @@ fn remote_merge(a: &MergeArgs, res: Option<J>) -> Result<Out> {
         "target": a.into,
         "ff": if a.replay { "replay" } else if a.ff_only { "only" } else { "auto" },
         "squash": a.squash,
+        "exempt": a.exempt,
         "conflicts": a.conflicts,
         "onConflict": a.on_conflict,
         "inferences": if a.include_inferences { "include" } else { "exclude" },
@@ -949,6 +1014,9 @@ pub struct PickArgs {
     /// A JSON array of resolutions ({graph, subject?, predicate?, take, objects?})
     #[arg(long, value_name = "FILE.json")]
     pub resolve: Option<PathBuf>,
+    /// A predicate whose cells never conflict here (repeatable)
+    #[arg(long, value_name = "IRI")]
+    pub exempt: Vec<String>,
     /// The head of the branch the conflicts were read at
     #[arg(long)]
     pub expect_target: Option<u64>,
@@ -1071,6 +1139,7 @@ fn pick_options(a: &PickArgs, res: Option<&J>) -> Result<MergeOptions> {
         },
         expect_target: a.expect_target,
         include_inferences: a.include_inferences,
+        exempt: exempt_predicates(&a.exempt)?,
         ..Default::default()
     };
     if let Some(m) = &a.message {
@@ -1149,6 +1218,7 @@ fn remote_pick(pick: &Pick, branch: &str, a: &PickArgs, res: Option<J>) -> Resul
         }
     };
     let mut body = json!({
+        "exempt": a.exempt,
         "conflicts": a.conflicts,
         "onConflict": a.on_conflict,
         "inferences": if a.include_inferences { "include" } else { "exclude" },
@@ -1193,4 +1263,14 @@ fn remote_pick(pick: &Pick, branch: &str, a: &PickArgs, res: Option<J>) -> Resul
 #[cfg(not(feature = "auth"))]
 fn remote_pick(_: &Pick, _: &str, _: &PickArgs, _: Option<J>) -> Result<Out> {
     bail!("--server: built without the remote client (cargo feature \"auth\")")
+}
+
+/// The IRIs of `--exempt`, as `<iri>` or plain.
+fn exempt_predicates(ps: &[String]) -> Result<Vec<oxrdf::NamedNode>> {
+    ps.iter()
+        .map(|p| {
+            let p = p.trim_start_matches('<').trim_end_matches('>');
+            oxrdf::NamedNode::new(p).with_context(|| format!("--exempt: not an IRI: {p}"))
+        })
+        .collect()
 }

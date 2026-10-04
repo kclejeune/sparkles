@@ -474,12 +474,78 @@ pub(crate) async fn list(
         .map(branch_json)
         .collect();
     let ds = main_dataset(&st, &name)?;
+    let exempt: Vec<String> = ds
+        .store
+        .merge_exempt()?
+        .into_iter()
+        .map(|p| p.into_string())
+        .collect();
     Ok(Json(json!({
         "dataset": name,
         "datasetId": ds.store.dataset_id(),
         "branches": branches,
+        "exemptPredicates": exempt,
     }))
     .into_response())
+}
+
+/// IRIs of predicates, as `<iri>` or plain.
+fn predicates(v: &J, what: &str) -> ApiResult<Vec<oxrdf::NamedNode>> {
+    let bad = || {
+        invalid(
+            "invalid-merge",
+            format!("{what}: an array of predicate IRIs"),
+        )
+    };
+    v.as_array()
+        .ok_or_else(bad)?
+        .iter()
+        .map(|p| {
+            let s = p.as_str().ok_or_else(bad)?;
+            let s = s
+                .strip_prefix('<')
+                .and_then(|s| s.strip_suffix('>'))
+                .unwrap_or(s);
+            oxrdf::NamedNode::new(s)
+                .map_err(|_| invalid("invalid-merge", format!("{what}: not an IRI: {s}")))
+        })
+        .collect()
+}
+
+/// `PATCH /$/branches/{ds}`: the dataset's branch settings, `exemptPredicates`, the
+/// predicates whose cells never conflict in its merges. Needs admin on `main`.
+pub(crate) async fn patch_settings(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult {
+    let ds = main_dataset(&st, &name)?;
+    check(&p, &name, MAIN, Level::Admin, None)?;
+    let v: J = serde_json::from_slice(&body)
+        .map_err(|e| invalid("invalid-branch", format!("invalid request body: {e}")))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| invalid("invalid-branch", "the body is a JSON object"))?;
+    if let Some(k) = obj.keys().find(|k| *k != "exemptPredicates") {
+        return Err(invalid(
+            "invalid-branch",
+            format!("unknown field {k}: exemptPredicates can change"),
+        ));
+    }
+    let preds = match obj.get("exemptPredicates") {
+        Some(x) => Some(predicates(x, "exemptPredicates")?),
+        None => None,
+    };
+    let exempt = blocking(move || {
+        Ok(match preds {
+            Some(ps) => ds.store.set_merge_exempt(&ps)?,
+            None => ds.store.merge_exempt()?,
+        })
+    })
+    .await?;
+    let exempt: Vec<String> = exempt.into_iter().map(|p| p.into_string()).collect();
+    Ok(Json(json!({ "dataset": name, "exemptPredicates": exempt })).into_response())
 }
 
 /// `GET /$/branches/{ds}/{name}`.
@@ -815,6 +881,9 @@ fn merge_options(st: &AppState, v: &J, preview: bool) -> ApiResult<MergeAsk> {
             })?)
         }
     }
+    if let Some(x) = v.get("exempt") {
+        o.exempt = predicates(x, "exempt")?;
+    }
     if let Some(rs) = v.get("resolutions") {
         let rs = rs
             .as_array()
@@ -1027,6 +1096,10 @@ fn query_options(params: &Params, own: &[&str]) -> ApiResult<J> {
     }
     if let Some(x) = params.get("squash") {
         v.insert("squash".into(), matches!(x, "true" | "1" | "").into());
+    }
+    let exempt = params.all("exempt");
+    if !exempt.is_empty() {
+        v.insert("exempt".into(), exempt.into());
     }
     if let Some(l) = params.get("limit") {
         v.insert(
