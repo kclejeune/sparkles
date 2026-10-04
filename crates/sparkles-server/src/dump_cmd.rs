@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use oxrdfio::RdfFormat;
 use sparkles::codec::{Codec, FinishWrite};
 use sparkles::id::Id;
-use sparkles::store::{Store, StoreOptions};
+use sparkles::store::StoreOptions;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -138,7 +138,7 @@ fn local(
     mut w: Box<dyn FinishWrite>,
     opts: StoreOptions,
 ) -> Result<()> {
-    let store = Store::open(loc, opts)?;
+    let store = crate::branch_cmd::open_db(loc, opts)?;
     let at =
         a.at.as_deref()
             .map(str::parse::<sparkles::history::At>)
@@ -352,7 +352,7 @@ mod tests {
     fn db() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let loc = dir.path().join("db");
-        let store = Store::open(&loc, StoreOptions::default()).unwrap();
+        let store = sparkles::store::Store::open(&loc, StoreOptions::default()).unwrap();
         store.set_prefix("ex", "http://e/").unwrap();
         sparkles::sparql::update::update(
             &store,

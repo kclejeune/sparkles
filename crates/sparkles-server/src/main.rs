@@ -8,6 +8,7 @@ mod alloc;
 mod auth;
 #[cfg(feature = "backup")]
 mod backup;
+mod branch_cmd;
 mod check_cmd;
 mod cli_docs;
 mod clone;
@@ -136,6 +137,10 @@ struct Cli {
     /// {"<IRI>": {"proj4": "+proj=…", "axis": "en" | "ne"}}
     #[arg(long, global = true, env = "SPARKLES_GEO_CRS", value_name = "FILE")]
     geo_crs: Option<PathBuf>,
+    /// The branch to work on, for query, update, load, dump, log, diff, snapshot,
+    /// compact, stats and clone (default: main)
+    #[arg(long, global = true, value_name = "NAME")]
+    branch: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -289,7 +294,7 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             expires,
             warm,
         } => {
-            let store = Store::open(&loc, opts)?;
+            let store = branch_cmd::open_db(&loc, opts)?;
             let at: At = at.as_deref().unwrap_or("head").parse()?;
             let expires = match expires {
                 None => None,
@@ -320,7 +325,7 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             );
         }
         SnapshotCmd::List { loc, format } => {
-            let store = Store::open(&loc, opts)?;
+            let store = branch_cmd::open_db(&loc, opts)?;
             let snaps = store.snapshots();
             if format == "json" {
                 let j: Vec<serde_json::Value> = snaps
@@ -358,14 +363,14 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             }
         }
         SnapshotCmd::Delete { loc, name } => {
-            let store = Store::open(&loc, opts)?;
+            let store = branch_cmd::open_db(&loc, opts)?;
             if !store.delete_snapshot(&name)? {
                 bail!("no snapshot '{name}'");
             }
             println!("deleted {name}");
         }
         SnapshotCmd::History { loc, format } => {
-            let store = Store::open(&loc, opts)?;
+            let store = branch_cmd::open_db(&loc, opts)?;
             print_history(&store.history(), &format)?;
         }
         SnapshotCmd::Retain {
@@ -375,7 +380,7 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             max_bytes,
             off,
         } => {
-            let store = Store::open(&loc, opts)?;
+            let store = branch_cmd::open_db(&loc, opts)?;
             let r = if off {
                 Retention::default()
             } else {
@@ -399,7 +404,7 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             keep_last,
             remove,
         } => {
-            let store = Store::open(&loc, opts)?;
+            let store = branch_cmd::open_db(&loc, opts)?;
             let mut all = store.schedules();
             if let Some(p) = remove {
                 let before = all.len();
@@ -427,7 +432,7 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             }
         }
         SnapshotCmd::Gc { loc } => {
-            let store = Store::open(&loc, opts)?;
+            let store = branch_cmd::open_db(&loc, opts)?;
             let t = store.history_tick()?;
             for n in &t.created {
                 println!("created {n}");
@@ -447,7 +452,7 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             keep_age,
             off,
         } => {
-            let store = Store::open(&loc, opts)?;
+            let store = branch_cmd::open_db(&loc, opts)?;
             let c = if off {
                 sparkles::history::CatalogHorizon::default()
             } else {
@@ -603,7 +608,7 @@ fn diff_cmd(
     if !matches!(format, "diff" | "json" | "count" | "patch" | "patch-binary") {
         bail!("unknown format {format:?}: use diff, json, count, patch or patch-binary");
     }
-    let store = Store::open(loc, opts)?;
+    let store = branch_cmd::open_db(loc, opts)?;
     let graph = match graph {
         None => None,
         Some("default") => Some(oxrdf::GraphName::DefaultGraph),
@@ -1447,6 +1452,13 @@ enum Cmd {
         #[arg(long, default_value = "auto")]
         mode: String,
     },
+    /// The branches of a database: list, create, show, delete, protect
+    Branch {
+        #[command(subcommand)]
+        cmd: branch_cmd::BranchCmd,
+    },
+    /// Merge a branch into another (main by default); exits 2 when conflicts stopped it
+    Merge(branch_cmd::MergeArgs),
     /// Print database statistics
     Stats {
         #[arg(long)]
@@ -2061,12 +2073,16 @@ fn validation_stats(store: &Store) -> Option<String> {
 
 /// Open a database for a CLI write, with its write-time validation installed (unless
 /// `--no-validate`, which skips it and says so).
-fn open_for_write(loc: &std::path::Path, opts: StoreOptions, no_validate: bool) -> Result<Store> {
+fn open_for_write(
+    loc: &std::path::Path,
+    opts: StoreOptions,
+    no_validate: bool,
+) -> Result<branch_cmd::Db> {
     let mut opts = opts;
     if no_validate {
         opts.unvalidated_writes = true;
     }
-    let store = Store::open(loc, opts)?;
+    let store = branch_cmd::open_db(loc, opts)?;
     if no_validate {
         if store.guard_required() {
             eprintln!("warning: --no-validate: write-time validation is skipped");
@@ -2079,6 +2095,26 @@ fn open_for_write(loc: &std::path::Path, opts: StoreOptions, no_validate: bool) 
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    branch_cmd::set_branch(cli.branch.clone());
+    // the commands that work on a branch of a database
+    if branch_cmd::branch().is_some()
+        && !matches!(
+            cli.cmd,
+            Cmd::Query { .. }
+                | Cmd::Update { .. }
+                | Cmd::Load { .. }
+                | Cmd::Dump(_)
+                | Cmd::Log { .. }
+                | Cmd::Diff { .. }
+                | Cmd::Snapshot { .. }
+                | Cmd::Compact { .. }
+                | Cmd::Stats { .. }
+                | Cmd::Clone { .. }
+                | Cmd::Patch(_)
+        )
+    {
+        bail!("this command does not take --branch");
+    }
     // bulk loads merge a file per batch, and a server holds the files of every dataset
     sparkles::disk::raise_open_file_limit();
     // progress logging for long-running commands, quiet output for query tools
@@ -2697,13 +2733,13 @@ fn run() -> Result<()> {
                 return remote::client::load(
                     server.as_deref(),
                     insecure_http,
-                    ds,
+                    &ds,
                     graph.as_deref(),
                     files,
                     message.as_deref(),
                 );
                 #[cfg(not(feature = "auth"))]
-                return no_remote(ds, insecure_http);
+                return no_remote(&ds, insecure_http);
             };
             if files.is_empty() {
                 bail!("no files given");
@@ -2800,7 +2836,7 @@ fn run() -> Result<()> {
                 return remote::client::query(
                     server.as_deref(),
                     insecure_http,
-                    ds,
+                    &ds,
                     &q,
                     &fmt,
                     timeout,
@@ -2808,7 +2844,7 @@ fn run() -> Result<()> {
                     &params,
                 );
                 #[cfg(not(feature = "auth"))]
-                return no_remote(ds, insecure_http);
+                return no_remote(&ds, insecure_http);
             }
             let outbound = outbound.local_policy()?;
             let store = open_or_load(loc, &data, opts)?;
@@ -2930,12 +2966,12 @@ fn run() -> Result<()> {
                 return remote::client::update(
                     server.as_deref(),
                     insecure_http,
-                    ds,
+                    &ds,
                     &u,
                     message.as_deref(),
                 );
                 #[cfg(not(feature = "auth"))]
-                return no_remote(ds, insecure_http);
+                return no_remote(&ds, insecure_http);
             };
             let outbound = outbound.local_policy()?;
             let store = open_for_write(&loc, opts, no_validate)?;
@@ -3017,7 +3053,14 @@ fn run() -> Result<()> {
             after,
             at,
             format,
-        } => print_log(&loc, limit, before, after, at.as_deref(), &format),
+        } => {
+            // a branch's own commits, from its directory's files
+            let loc = match branch_cmd::branch() {
+                Some(b) => branch_cmd::branch_dir(&loc, b)?,
+                None => loc,
+            };
+            print_log(&loc, limit, before, after, at.as_deref(), &format)
+        }
         Cmd::Dump(args) => dump_cmd::run(args, opts),
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
         Cmd::Queries { cmd } => queries_cmd::run(cmd, opts),
@@ -3085,7 +3128,7 @@ fn run() -> Result<()> {
                     })
                 })
                 .transpose()?;
-            let store = Store::open(&loc, opts)?;
+            let store = branch_cmd::open_db(&loc, opts)?;
             if if_due {
                 let policy =
                     sparkles::store::CompactionPolicy::default().with(&store.compaction_settings());
@@ -3172,7 +3215,7 @@ fn run() -> Result<()> {
             if to.exists() && std::fs::read_dir(&to)?.next().is_some() {
                 bail!("{} exists and is not empty", to.display());
             }
-            let store = Store::open(&loc, opts)?;
+            let store = branch_cmd::open_db(&loc, opts)?;
             let t = Instant::now();
             clone::sweep_cli_leftovers(&to);
             let mut tmp = to.as_os_str().to_owned();
@@ -3206,8 +3249,16 @@ fn run() -> Result<()> {
             format,
             quick,
         } => check_cmd::run(loc, data, &format, quick),
+        Cmd::Branch { cmd } => branch_cmd::run_branch(cmd, opts),
+        Cmd::Merge(a) => {
+            let code = branch_cmd::run_merge(a, opts)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Cmd::Stats { loc } => {
-            let store = Store::open(&loc, opts)?;
+            let store = branch_cmd::open_db(&loc, opts)?;
             let s = store.snapshot();
             let g = &s.generation;
             println!("generation      {}", g.name);
@@ -3923,11 +3974,14 @@ fn print_reasoning_status(loc: &std::path::Path, store: &Store, format: &str) ->
 
 /// SIGINT (Ctrl-C) or, on Unix, SIGTERM.
 /// The `--dataset` of a remote command (`--server` without `--loc`).
-fn remote_dataset<'a>(server: Option<&str>, dataset: Option<&'a str>) -> Result<&'a str> {
+/// The dataset of a `--server` command, with the global `--branch` in the path form
+/// (`ds@branch`) that every dataset endpoint takes.
+fn remote_dataset(server: Option<&str>, dataset: Option<&str>) -> Result<String> {
     if server.is_none() {
         bail!("give --loc (a local database) or --server URL --dataset NAME");
     }
-    dataset.context("--dataset NAME is required with --server")
+    let ds = dataset.context("--dataset NAME is required with --server")?;
+    Ok(branch_cmd::remote_name(ds))
 }
 
 #[cfg(not(feature = "auth"))]
@@ -4034,10 +4088,17 @@ fn print_diagnostics(r: &sparkles_reasoner::diagnostics::DiagnosticsReport, j: &
 }
 
 /// A database directory, or the given files loaded into an in-memory store.
-fn open_or_load(loc: Option<PathBuf>, data: &[PathBuf], opts: StoreOptions) -> Result<Store> {
+fn open_or_load(
+    loc: Option<PathBuf>,
+    data: &[PathBuf],
+    opts: StoreOptions,
+) -> Result<branch_cmd::Db> {
     Ok(match loc {
-        Some(l) => Store::open(&l, opts)?,
+        Some(l) => branch_cmd::open_db(&l, opts)?,
         None => {
+            if branch_cmd::branch().is_some() {
+                bail!("--branch needs a database (--loc)");
+            }
             let s = Store::in_memory(opts);
             let sources = data
                 .iter()
@@ -4046,7 +4107,7 @@ fn open_or_load(loc: Option<PathBuf>, data: &[PathBuf], opts: StoreOptions) -> R
             if !sources.is_empty() {
                 s.load(&sources)?;
             }
-            s
+            s.into()
         }
     })
 }

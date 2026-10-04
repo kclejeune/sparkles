@@ -66,13 +66,13 @@ pub fn run(a: PatchArgs, opts: StoreOptions, no_validate: bool) -> Result<()> {
         return crate::remote::client::patch(
             a.server.as_deref(),
             a.insecure_http,
-            ds,
+            &ds,
             &a.files,
             a.format.as_deref(),
             message.as_deref(),
         );
         #[cfg(not(feature = "auth"))]
-        return crate::no_remote(ds, a.insecure_http);
+        return crate::no_remote(&ds, a.insecure_http);
     };
     let store = crate::open_for_write(&loc, opts, no_validate)?;
     let many = a.files.len() > 1;
