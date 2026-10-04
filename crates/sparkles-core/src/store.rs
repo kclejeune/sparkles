@@ -4251,7 +4251,12 @@ impl WriteTxn<'_> {
             results: Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)),
             dvocab_len: self.base.generation.dvocab.len(),
             commit: self.base.commit,
-            text: self.base.text.clone(),
+            // the full-text index does not cover this transaction's changes either, and
+            // a search has no plan without it: refused once there are changes
+            text: match &self.base.text {
+                Some(t) if self.is_dirty() => Some(Arc::new(t.with_uncommitted_changes())),
+                t => t.clone(),
+            },
             // the index does not cover this transaction's changes: plans without it
             geo: self.base.geo.as_ref().map(|v| Arc::new(v.for_txn())),
             union_default_graph: self.base.union_default_graph,

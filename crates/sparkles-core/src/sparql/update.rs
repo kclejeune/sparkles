@@ -62,7 +62,8 @@ pub fn update_as(
 /// The operations see the transaction's earlier changes, and the transaction commits or
 /// discards them with the rest of its work. The request's timeout and cancellation apply
 /// to its own operations. `opts.write` does not apply, because the transaction was
-/// opened with write options of its own.
+/// opened with write options of its own. A `text:query` call fails once the
+/// transaction has changed data, because the full-text index covers committed data only.
 pub fn update_in(txn: &mut WriteTxn<'_>, u: &str, opts: &QueryOptions) -> Result<UpdateStats> {
     let t0 = Instant::now();
     let parsed = parse_update(u, opts)?;

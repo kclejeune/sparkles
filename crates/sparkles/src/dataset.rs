@@ -1008,13 +1008,17 @@ impl Transaction<'_> {
             .map(|id| crate::store::bnode_for(*id))
     }
 
-    /// Run a SPARQL query that sees this transaction's changes.
+    /// Run a SPARQL query that sees this transaction's changes. The full-text index
+    /// covers committed data only, so a `text:query` call returns
+    /// [`Error::Unsupported`](crate::Error::Unsupported) once the transaction has
+    /// changed data.
     pub fn query_with(&self, query: &str, opts: &QueryOptions) -> Result<QueryResult> {
         crate::sparql::query(Arc::new(self.txn.view()), query, opts)
     }
 
     /// Run a SPARQL Update request in this transaction. Its operations see the
-    /// transaction's changes, and they commit or roll back with it.
+    /// transaction's changes, and they commit or roll back with it. A `text:query` call
+    /// fails once the transaction has changed data, as in [`Transaction::query_with`].
     pub fn update_with(&mut self, update: &str, opts: &QueryOptions) -> Result<UpdateStats> {
         crate::sparql::update::update_in(&mut self.txn, update, opts)
     }

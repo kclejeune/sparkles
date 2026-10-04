@@ -51,6 +51,9 @@ pub fn search_in(
             "dataset has no full-text index; enable it with `sparkles text-index` or --text",
         ));
     };
+    if view.uncommitted {
+        return Err(super::uncommitted_changes());
+    }
     if view.seq != snap.commit {
         return Err(unavailable("dataset", "stale", view.seq, snap.commit));
     }

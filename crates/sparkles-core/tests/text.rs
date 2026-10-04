@@ -281,6 +281,81 @@ fn updates_are_visible_to_the_next_query() {
     assert_eq!(r.len(), 3);
 }
 
+/// A write transaction searches the committed index until it changes data. After a
+/// change the index no longer matches what the transaction sees, so a search is refused
+/// instead of returning hits that miss its inserts and keep its deletes. After the
+/// commit the search sees the changes.
+#[test]
+fn transactions_refuse_text_searches_after_a_change() {
+    use sparkles_core::sparql::update::update_in;
+    let text_q = "SELECT ?s { ?s text:query \"fox\" }";
+    let plain_q = "SELECT ?s { ?s rdfs:label \"fox\" }";
+    let o = QueryOptions::default();
+    for (change, during, after) in [
+        (
+            "INSERT DATA { ex:new rdfs:label \"fox\" }",
+            vec!["new", "old"],
+            vec!["new", "old"],
+        ),
+        ("DELETE DATA { ex:old rdfs:label \"fox\" }", vec![], vec![]),
+        (
+            "DELETE DATA { ex:old rdfs:label \"fox\" } ; INSERT DATA { ex:new rdfs:label \"fox\" }",
+            vec!["new"],
+            vec!["new"],
+        ),
+    ] {
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            b"<http://example.org/old> <http://www.w3.org/2000/01/rdf-schema#label> \"fox\" .\n"
+                .to_vec(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        s.enable_text(TextConfig::default()).unwrap();
+        let view = |txn: &sparkles_core::store::WriteTxn<'_>| std::sync::Arc::new(txn.view());
+        let mut txn = s.write();
+        // no change yet: the committed index is the transaction's state
+        assert_eq!(rows_at(view(&txn), text_q), ["old"], "{change}");
+        assert_eq!(rows_at(view(&txn), plain_q), ["old"], "{change}");
+        // a search in the WHERE of the first operation runs before any change
+        update_in(
+            &mut txn,
+            &format!("{P}INSERT {{ ?s ex:seen true }} WHERE {{ ?s text:query \"fox\" }}"),
+            &o,
+        )
+        .unwrap();
+        update_in(&mut txn, &format!("{P}{change}"), &o).unwrap();
+        // ordinary queries see the change
+        assert_eq!(sorted(rows_at(view(&txn), plain_q)), during, "{change}");
+        // searches are refused
+        let e = query(view(&txn), &format!("{P}{text_q}"), &o)
+            .err()
+            .unwrap_or_else(|| panic!("{change}: the search ran"));
+        assert!(
+            matches!(e, sparkles_core::Error::Unsupported(_))
+                && e.to_string().contains("write transaction"),
+            "{change}: {e}"
+        );
+        // so are the searches of later update operations
+        let e = update_in(
+            &mut txn,
+            &format!("{P}DELETE {{ ?s ex:seen true }} WHERE {{ ?s text:query \"fox\" }}"),
+            &o,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{change}: the update's search ran"));
+        assert!(e.to_string().contains("write transaction"), "{change}: {e}");
+        txn.commit().unwrap();
+        // after the commit, both see the change
+        assert_eq!(sorted(rows(&s, plain_q)), after, "{change}");
+        assert_eq!(sorted(rows(&s, text_q)), after, "{change}");
+        // a new transaction searches again
+        let txn = s.write();
+        assert_eq!(sorted(rows_at(view(&txn), text_q)), after, "{change}");
+    }
+}
+
 #[test]
 fn persistence_compaction_bulk_and_recovery() {
     let dir = tempfile::tempdir().unwrap();

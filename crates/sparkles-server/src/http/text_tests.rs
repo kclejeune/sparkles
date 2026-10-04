@@ -78,3 +78,60 @@ async fn text_search_returns_hits_with_snippets() {
         assert!(j["error"].as_str().unwrap().contains(needle), "{uri}: {j}");
     }
 }
+
+/// An update operation after a change cannot search the index, which does not cover the
+/// change: `501`, and the request changes nothing. The first operation still searches.
+#[tokio::test]
+async fn updates_refuse_searches_after_their_own_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    st.attach("c", DbType::Mem, None).unwrap();
+    let ds = st.get("c").unwrap();
+    ds.store
+        .load(&[sparkles::io::Source::from_bytes(
+            b"<urn:old> <http://www.w3.org/2000/01/rdf-schema#label> \"fox\" .\n".to_vec(),
+            sparkles::io::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    ds.store.enable_text(Default::default()).unwrap();
+    let app = router(st.clone());
+    let update = |text: &'static str| {
+        let app = app.clone();
+        async move {
+            let res = app
+                .oneshot(
+                    Request::post("/c/update")
+                        .header("content-type", "application/sparql-update")
+                        .body(Body::from(text))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    let head = ds.store.head_commit().seq;
+    let (status, body) = update(
+        "PREFIX text: <http://jena.apache.org/text#> \
+         INSERT DATA { <urn:new> <http://www.w3.org/2000/01/rdf-schema#label> \"fox\" } ; \
+         INSERT { ?s <urn:seen> true } WHERE { ?s text:query \"fox\" }",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert!(body.contains("write transaction"), "{body}");
+    assert_eq!(ds.store.head_commit().seq, head);
+    let (status, body) = update(
+        "PREFIX text: <http://jena.apache.org/text#> \
+         INSERT { ?s <urn:seen> true } WHERE { ?s text:query \"fox\" }",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ds.store.head_commit().seq, head + 1);
+}

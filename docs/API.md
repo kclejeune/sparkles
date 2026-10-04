@@ -4299,6 +4299,16 @@ SELECT ?s ?score ?label WHERE {
 * **Evaluation.** The search runs once within the active graph, and `GRAPH`, `FROM` and
   `reasoning=false` apply inside the search. `limit` is therefore the top n of that scope,
   before any join.
+* **Transactions.** The index covers committed data only. A search in a write transaction
+  that has not changed data yet reads the committed index, which is then the
+  transaction's state. Once the transaction has changed data, a search is refused with
+  `501` (`Error::Unsupported` in the library), because its hits would miss the
+  transaction's inserts and keep its deletes. This applies to the later operations of an
+  update request, such as `INSERT DATA {…} ; DELETE {…} WHERE { ?s text:query "x" }`, and
+  to the queries of an open library transaction. The `WHERE` of an update's first
+  operation runs before any change, so it can search. Spatial queries in a transaction
+  are planned without the spatial index and evaluate the GeoSPARQL functions directly.
+  Vector searches read the transaction's changes, so neither is refused.
 * **Query strings from the data.** The query string can be a variable that the rest of
   the group binds, as in `?k ex:keyword ?q . ?s text:query (rdfs:label ?q 10)`. The
   search then runs once for each distinct value, with the call's limit applying to each

@@ -497,6 +497,36 @@ pub struct TextView {
     /// the index that seals the batch on demand
     #[cfg(feature = "text")]
     pub(crate) owner: std::sync::Weak<imp::Inner>,
+    /// the view of a write transaction that has changed data since `seq`, which the
+    /// index does not cover: searches are refused
+    #[cfg_attr(not(feature = "text"), allow(dead_code))]
+    pub(crate) uncommitted: bool,
+}
+
+impl TextView {
+    /// This view for a write transaction with uncommitted changes.
+    pub(crate) fn with_uncommitted_changes(&self) -> TextView {
+        TextView {
+            seq: self.seq,
+            epoch: self.epoch,
+            #[cfg(feature = "text")]
+            slot: self.slot.clone(),
+            #[cfg(feature = "text")]
+            index: self.index.clone(),
+            #[cfg(feature = "text")]
+            owner: self.owner.clone(),
+            uncommitted: true,
+        }
+    }
+}
+
+/// The error of a search in a write transaction after it changed data.
+#[cfg_attr(not(feature = "text"), allow(dead_code))]
+pub(crate) fn uncommitted_changes() -> Error {
+    Error::Unsupported(
+        "text:query cannot run in a write transaction after the transaction has changed data,          because the full-text index covers committed data only: search before the first          change or after the commit"
+            .into(),
+    )
 }
 
 impl std::fmt::Debug for TextView {
@@ -1729,6 +1759,7 @@ mod imp {
                 slot,
                 index: live.shared.clone(),
                 owner: Arc::downgrade(self),
+                uncommitted: false,
             })
         }
 

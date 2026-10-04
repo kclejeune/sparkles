@@ -2221,7 +2221,9 @@ is never held in memory at once. A transaction rolls back when its block raises,
 it is garbage-collected without `commit()`. Queries on the dataset read the last commit,
 not the open transaction. A write on the dataset from the thread that holds the
 transaction raises `ConflictError` instead of waiting for itself. Writes from other
-threads wait.
+threads wait. The full-text index covers committed data only, so `text:query` in a
+transaction raises once the transaction has changed data
+([API](API.md#full-text-search)).
 
 An update in a transaction that fails after it began to change data may have done part
 of its work. The transaction is then aborted. Later writes raise `InvalidInputError`, and
