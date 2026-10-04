@@ -199,7 +199,7 @@ running queries.
 | Engine | What it is | Where Sparkles stands |
 |---|---|---|
 | [Apache Jena / Fuseki](https://jena.apache.org/) | The reference Java stack. It has ARQ, TDB2 on B+trees, Fuseki, on-the-fly inference, jena-text and GeoSPARQL. | Sparkles has the same protocols, endpoints, admin API and CLI model, on sorted columnar indexes. It is faster on every benchmark query at 10.5M triples, by a median of 60×. Reasoning is materialized, apart from RDFS on read. Sparkles writes RDF Patch and applies it through Fuseki's `patch` operation. It has ARQ's query language, its function and property function libraries, and its `cdt:` lists and maps, but no JavaScript functions, and there is no ontology API. |
-| [QLever](https://github.com/ad-freiburg/qlever) | A C++ engine for billions of triples, with lazy, streaming execution. | Sparkles uses the same index and execution architecture and adds exact term identity, MVCC updates, the Graph Store Protocol, reasoning and SHACL. It is faster on all 28 benchmark queries at 10.5M triples and on 19 of the 20 WatDiv templates, and its server uses about 40% more memory at 10.5M. On English DBpedia (1.24 billion triples) it loads 2.8× faster, is faster warm on 28 of the 29 queries whose answers agree and ties on the 29th, and is faster cold on 26 of 31 ([BENCHMARKS.md](docs/BENCHMARKS.md#dbpedia-at-124-billion-triples)). It materializes intermediate results. |
+| [QLever](https://github.com/ad-freiburg/qlever) | A C++ engine for billions of triples, with lazy, streaming execution. | Sparkles uses the same index and execution architecture and adds exact term identity, MVCC updates, the Graph Store Protocol, reasoning and SHACL. It is faster on all 28 benchmark queries at 10.5M triples and on all 20 WatDiv templates, and its server uses about 40% more memory at 10.5M. On English DBpedia (1.24 billion triples) it loads 2.8× faster, is faster warm on 28 of the 29 queries whose answers agree and ties on the 29th, and is faster cold on 26 of 31 ([BENCHMARKS.md](docs/BENCHMARKS.md#dbpedia-at-124-billion-triples)). It materializes intermediate results. |
 | [Oxigraph](https://github.com/oxigraph/oxigraph) | A Rust database and toolkit on RocksDB, with Python and WebAssembly packages. | Sparkles uses Oxigraph's parsers, SPARQL parser and datatypes, with its own storage and planner. It is faster on every benchmark query at 10.5M triples, by a median of 87×. It fsyncs its writes and Oxigraph does not, and Oxigraph commits a stream of single-triple updates 2.7× faster. It adds reasoning, validation, search, authentication and a UI. It has Rust and Python APIs and no WebAssembly build. |
 | [Fluree](https://github.com/fluree/db) | A versioned, permissioned ledger with clustering, licensed under BUSL-1.1. JSON-LD is its main interface. | Sparkles passes the W3C SPARQL suites in full and is compatible with Fuseki. It has point-in-time reads, snapshots, diffs, history queries and protections of triples in its configuration, but no branches, policies stored in the data or clustering. It is faster on every benchmark query that Fluree completes at 10.5M triples, by a median of 7.7×, but only by 4–7% on a few counts and point lookups. |
 
@@ -340,9 +340,9 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 
 ## Library usage
 
-The `sparkles` crate (`crates/sparkles`) is the embeddable library. It has no HTTP or async
-dependencies and re-exports the engine of `crates/sparkles-core`. The CLI and server are
-built on its public API.
+The `sparkles` crate (`crates/sparkles`) is the embeddable library. It re-exports the
+engine of `crates/sparkles-core`, and with its default features it has no HTTP server or
+async runtime. The CLI and server are built on its public API.
 
 ```rust
 use sparkles::Dataset;
@@ -357,10 +357,13 @@ for row in &ds.select(q)? {
 ds.update(r#"INSERT DATA { <http://ex/carol> <http://xmlns.com/foaf/0.1/name> "Carol" }"#)?;
 ```
 
-Besides `Dataset`, the library has a fluent query builder (`sparkles::querybuilder`),
-term-level graph access and transactions. The reasoner and the SHACL and ShEx validators
-are separate crates. [docs/USAGE.md](docs/USAGE.md#embedding-the-library) maps each of
-them to its Jena equivalent.
+Besides queries and updates, `Dataset` has a fluent query builder
+(`sparkles::querybuilder`), term-level graph access and transactions. Its handles manage
+snapshots and history, the search indexes, settings, the schema report, stored queries,
+reasoning, validation, GraphQL and backups, as the server's admin API does. The reasoner,
+the validators, backups and GraphQL are cargo features, off by default and all on with
+`full`. [docs/USAGE.md](docs/USAGE.md#embedding-the-library) maps each part to its Jena
+equivalent.
 
 The same engine is a Python package, built from `crates/sparkles-py` with
 `mise run py:build`. Its API follows pyoxigraph's and accepts rdflib terms. It also
