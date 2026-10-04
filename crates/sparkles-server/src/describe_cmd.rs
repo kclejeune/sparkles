@@ -4,9 +4,9 @@
 
 use anyhow::{Result, bail};
 use clap::Args;
-use serde_json::{Value as J, json};
-use sparkles::sparql::describe::{DescribeMode, DescribeOptions};
-use sparkles::store::{Store, StoreOptions};
+use serde_json::Value as J;
+use sparkles::sparql::describe::DescribeOptions;
+use sparkles::store::StoreOptions;
 use std::path::PathBuf;
 
 #[derive(Args, Debug)]
@@ -55,32 +55,20 @@ fn apply_sets(mut own: DescribeOptions, sets: &[String]) -> Result<DescribeOptio
     Ok(own)
 }
 
-/// The setting as `GET /$/describe/{ds}` reports it: every option, limits `null` when
-/// there are none, and whether the dataset has a setting of its own.
+/// The setting as `GET /$/describe/{ds}` reports it
+/// ([`DescribeStatus`](sparkles::handles::DescribeStatus)).
 pub(crate) fn status(o: &DescribeOptions) -> J {
-    json!({
-        "mode": o.mode.name(),
-        "labels": o.labels,
-        "reifiers": o.reifiers,
-        "maxTriples": o.max_triples,
-        "maxDepth": o.max_depth,
-        "source": if o.is_default() { "default" } else { "dataset" },
-        "modes": DescribeMode::ALL.iter().map(|m| m.name()).collect::<Vec<_>>(),
-    })
+    serde_json::to_value(sparkles::handles::DescribeStatus::of(o)).unwrap_or_default()
 }
 
 fn local(loc: &std::path::Path, a: &DescribeArgs, opts: StoreOptions) -> Result<J> {
-    if !loc.join("CURRENT").exists() {
-        bail!("{} is not a database directory", loc.display());
-    }
-    let store = Store::open(loc, opts)?;
+    let describe = crate::open_dataset(loc, opts)?.settings().describe();
     if a.default {
-        store.set_describe_settings(None)?;
+        describe.reset()?;
     } else if !a.set.is_empty() {
-        let own = apply_sets(store.describe_settings(), &a.set)?;
-        store.set_describe_settings(Some(own))?;
+        describe.set(apply_sets(describe.get(), &a.set)?)?;
     }
-    Ok(status(&store.describe_settings()))
+    Ok(serde_json::to_value(describe.status())?)
 }
 
 #[cfg(feature = "auth")]
@@ -136,6 +124,7 @@ fn print(j: &J, format: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sparkles::store::Store;
 
     #[test]
     fn sets_change_the_local_setting_and_default_removes_it() {

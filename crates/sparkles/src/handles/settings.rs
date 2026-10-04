@@ -5,7 +5,7 @@
 use crate::Dataset;
 use crate::error::Result;
 use crate::history::{CatalogHorizon, HistoryStatus, Retention, Schedule};
-use crate::sparql::describe::DescribeOptions;
+use crate::sparql::describe::{DescribeMode, DescribeOptions};
 use crate::store::{
     ChangeLogSettings, ChangeLogStatus, CompactionMeasures, CompactionSettings, QuotaStatus,
 };
@@ -97,6 +97,58 @@ impl DescribeSetting {
 
     pub fn reset(&self) -> Result<()> {
         self.ds.store().set_describe_settings(None)
+    }
+
+    /// The setting as `GET /$/describe/{ds}` reports it.
+    pub fn status(&self) -> DescribeStatus {
+        DescribeStatus::of(&self.get())
+    }
+}
+
+/// Whether a setting is the dataset's own or the defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum SettingSource {
+    /// the defaults apply
+    Default,
+    /// the dataset has a setting of its own
+    Dataset,
+}
+
+/// The DESCRIBE setting as `GET /$/describe/{ds}` reports it: every option, limits
+/// `null` when there are none, whether the dataset has a setting of its own, and the
+/// modes there are.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct DescribeStatus {
+    pub mode: DescribeMode,
+    pub labels: bool,
+    pub reifiers: bool,
+    pub max_triples: Option<u64>,
+    pub max_depth: Option<u32>,
+    pub source: SettingSource,
+    pub modes: Vec<DescribeMode>,
+}
+
+impl DescribeStatus {
+    /// The status of the options `o`. They are the dataset's own unless they are the
+    /// defaults.
+    pub fn of(o: &DescribeOptions) -> DescribeStatus {
+        DescribeStatus {
+            mode: o.mode,
+            labels: o.labels,
+            reifiers: o.reifiers,
+            max_triples: o.max_triples,
+            max_depth: o.max_depth,
+            source: if o.is_default() {
+                SettingSource::Default
+            } else {
+                SettingSource::Dataset
+            },
+            modes: DescribeMode::ALL.to_vec(),
+        }
     }
 }
 
