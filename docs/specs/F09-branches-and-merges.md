@@ -1626,6 +1626,14 @@ A24–A30. The Phase 1 test A18 now waits for the change log's background writer
 sets the quota. It had read the dataset's usage before the writer appended the load, so
 a later walk counted 221,184 more bytes and refused the commit on a busy machine.
 
+**Performance of Phase 2.** The default branch's paths gained one check in the commit
+path, whether a commit carries a merge record. Four interleaved runs each of
+`scripts/bench.sh 100000` with `ENGINES=sparkles`, against `main` at 6b82cf67 on a
+machine that other builds kept at a load of about 7, gave server CPU time of 10.00 s
+against 9.98 s per run, wall time of 22.8 s against 22.7 s, and query medians at 1.01
+times the old build's as a geometric mean over 30 series. Eight interleaved loads of the
+1.05M triples took 1.87 s of user CPU against 1.89 s. All of these are within the noise.
+
 **Deviations of Phase 2.**
 
 * **Commit kinds.** Reverts and cherry-picks have kinds of their own, `revert` (code 14)
