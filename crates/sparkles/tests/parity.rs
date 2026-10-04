@@ -508,7 +508,7 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("backup", "getBackup", "backups.get", |ds| {
             ds.backups(&any()).get("b");
         }),
-        pending!("createBackup", "phase 1 step 5"),
+        pending!("createBackup", "phase 1 step 6"),
         op_if!("backup", "deleteBackup", "backups.delete", |ds| {
             ds.backups(&any()).delete("b");
         }),
@@ -594,12 +594,24 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("validateUpdatePost", "sparql.parse_update", |_| {
             sparkles::sparql::update::parse_update("CLEAR DEFAULT", &Default::default());
         }),
-        pending!("validateData", "phase 1 step 5"),
-        pending!("validateDataPost", "phase 1 step 5"),
-        pending!("validateIri", "phase 1 step 5"),
-        pending!("validateIriPost", "phase 1 step 5"),
-        pending!("validateLangtag", "phase 1 step 5"),
-        pending!("validateLangtagPost", "phase 1 step 5"),
+        op!("validateData", "io.check_data", |_| {
+            sparkles::io::check_data(any(), "", None);
+        }),
+        op!("validateDataPost", "io.check_data", |_| {
+            sparkles::io::check_data(any(), "", None);
+        }),
+        op!("validateIri", "terms.check_iri", |_| {
+            sparkles::terms::check_iri("http://ex.org/");
+        }),
+        op!("validateIriPost", "terms.check_iri", |_| {
+            sparkles::terms::check_iri("http://ex.org/");
+        }),
+        op!("validateLangtag", "terms.check_langtag", |_| {
+            sparkles::terms::check_langtag("en");
+        }),
+        op!("validateLangtagPost", "terms.check_langtag", |_| {
+            sparkles::terms::check_langtag("en");
+        }),
         op_if!("fmt", "format", "fmt.format", |_| {
             sparkles::fmt::format("", any(), &any());
         }),

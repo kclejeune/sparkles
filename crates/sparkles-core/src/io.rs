@@ -502,6 +502,80 @@ pub fn standard_prefixes() -> BTreeMap<String, String> {
     .collect()
 }
 
+/// A syntax that [`check_data`] reads: one of oxrdfio's, or one of Jena's that
+/// [`crate::jena_formats`] reads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DataSyntax {
+    Rdf(RdfFormat),
+    Jena(crate::jena_formats::JenaFormat),
+}
+
+impl DataSyntax {
+    /// A syntax by Jena's name, in any case: `Turtle`, `TTL`, `N-Triples`, `NT`,
+    /// `N-Quads`, `NQ`, `TriG`, `RDF/XML`, `JSON-LD`, `N3`, `RDF/JSON` or `TriX`.
+    pub fn from_name(name: &str) -> Option<DataSyntax> {
+        use crate::jena_formats::JenaFormat;
+        let n = name.to_ascii_lowercase();
+        Some(DataSyntax::Rdf(match n.as_str() {
+            "turtle" | "ttl" => RdfFormat::Turtle,
+            "n-triples" | "ntriples" | "n-triple" | "nt" => RdfFormat::NTriples,
+            "n-quads" | "nquads" | "nq" => RdfFormat::NQuads,
+            "trig" => RdfFormat::TriG,
+            "rdf/xml" | "rdfxml" | "rdf" => RdfFormat::RdfXml,
+            "json-ld" | "jsonld" => RdfFormat::JsonLd {
+                profile: oxrdfio::JsonLdProfileSet::empty(),
+            },
+            "n3" => RdfFormat::N3,
+            "rdf/json" | "rdfjson" | "rj" => return Some(DataSyntax::Jena(JenaFormat::RdfJson)),
+            "trix" => return Some(DataSyntax::Jena(JenaFormat::TriX)),
+            _ => return None,
+        }))
+    }
+}
+
+/// A syntax error of RDF data, with its 1-based line and column when the parser gives
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct DataIssue {
+    pub message: String,
+    pub line: Option<u64>,
+    pub column: Option<u64>,
+}
+
+/// The first syntax error of `text` in `syntax`, with relative IRIs resolved against
+/// `base`, or `None` when the data parses. Parsing stops at the first error.
+pub fn check_data(syntax: DataSyntax, text: &str, base: Option<&str>) -> Option<DataIssue> {
+    match syntax {
+        DataSyntax::Rdf(f) => {
+            let mut parser = RdfParser::from_format(f);
+            if let Some(b) = base {
+                parser = parser.with_base_iri(b).ok()?;
+            }
+            for q in parser.for_slice(text.as_bytes()) {
+                if let Err(e) = q {
+                    let at = e.location().map(|l| l.start);
+                    return Some(DataIssue {
+                        message: e.to_string(),
+                        line: at.map(|p| p.line + 1),
+                        column: at.map(|p| p.column + 1),
+                    });
+                }
+            }
+            None
+        }
+        DataSyntax::Jena(j) => {
+            crate::jena_formats::transcode(j, text.as_bytes(), true, std::io::sink())
+                .err()
+                .map(|e| DataIssue {
+                    message: e.to_string(),
+                    line: None,
+                    column: None,
+                })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

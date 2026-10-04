@@ -145,7 +145,7 @@ pub(super) async fn update(uri: Uri, headers: HeaderMap, AdminBody(body): AdminB
 
 /// `/$/validate/iri?iri=…` (repeatable): errors for an invalid IRI, a warning for a
 /// relative one, and the scheme and normalization warnings of `sparkles iri` (spec G05
-/// §4.1).
+/// §4.1, [`sparkles::terms::check_iri`]).
 pub(super) async fn iri(uri: Uri, headers: HeaderMap, AdminBody(body): AdminBody) -> ApiResult {
     let r = request(&uri, &headers, &body);
     let iris = r.params.all("iri");
@@ -155,20 +155,8 @@ pub(super) async fn iri(uri: Uri, headers: HeaderMap, AdminBody(body): AdminBody
     let report: Vec<J> = iris
         .iter()
         .map(|s| {
-            let (mut errors, mut warnings) = (Vec::<String>::new(), Vec::<String>::new());
-            match oxiri::Iri::parse(s.as_str()) {
-                Ok(_) => {}
-                Err(e) => match oxiri::IriRef::parse(s.as_str()) {
-                    Ok(_) => warnings.push(format!("Relative IRI: {s}")),
-                    Err(_) => errors.push(format!("Bad IRI: {e}")),
-                },
-            }
-            if errors.is_empty() {
-                let mut issues = Vec::new();
-                crate::tools::terms::iri_warnings(s, &mut issues);
-                warnings.extend(issues.into_iter().map(|i| i.message));
-            }
-            json!({ "iri": s, "errors": errors, "warning": warnings })
+            let c = sparkles::terms::check_iri(s);
+            json!({ "iri": s, "errors": c.errors, "warning": c.warnings })
         })
         .collect();
     Ok(respond(&r, "IRI Validator", json!({ "iris": report })))
@@ -194,63 +182,18 @@ pub(super) async fn data(uri: Uri, headers: HeaderMap, AdminBody(body): AdminBod
     Ok(respond(&r, "RDF Data Validator", doc))
 }
 
-enum DataSyntax {
-    Rdf(oxrdfio::RdfFormat),
-    Jena(super::super::jena_formats::JenaFormat),
-}
+use sparkles::io::DataSyntax;
 
+/// The syntax of a Jena name (see [`DataSyntax::from_name`]).
 fn data_syntax(name: &str) -> Option<DataSyntax> {
-    use oxrdfio::RdfFormat;
-    let n = name.to_ascii_lowercase();
-    Some(DataSyntax::Rdf(match n.as_str() {
-        "turtle" | "ttl" => RdfFormat::Turtle,
-        "n-triples" | "ntriples" | "n-triple" | "nt" => RdfFormat::NTriples,
-        "n-quads" | "nquads" | "nq" => RdfFormat::NQuads,
-        "trig" => RdfFormat::TriG,
-        "rdf/xml" | "rdfxml" | "rdf" => RdfFormat::RdfXml,
-        "json-ld" | "jsonld" => RdfFormat::JsonLd {
-            profile: oxrdfio::JsonLdProfileSet::empty(),
-        },
-        "n3" => RdfFormat::N3,
-        "rdf/json" | "rdfjson" | "rj" => {
-            return Some(DataSyntax::Jena(
-                super::super::jena_formats::JenaFormat::RdfJson,
-            ));
-        }
-        "trix" => {
-            return Some(DataSyntax::Jena(
-                super::super::jena_formats::JenaFormat::TriX,
-            ));
-        }
-        _ => return None,
-    }))
+    DataSyntax::from_name(name)
 }
 
-/// The `errors` array of the data's first syntax error, if any.
+/// The `errors` array of the data's first syntax error, if any
+/// ([`sparkles::io::check_data`]).
 fn parse_data(format: DataSyntax, data: &str) -> Option<J> {
-    match format {
-        DataSyntax::Rdf(f) => {
-            let parser = oxrdfio::RdfParser::from_format(f)
-                .with_base_iri(BASE)
-                .ok()?;
-            for q in parser.for_slice(data.as_bytes()) {
-                if let Err(e) = q {
-                    let at = e.location().map(|l| l.start);
-                    return Some(parse_errors(
-                        &e.to_string(),
-                        at.map(|p| p.line + 1),
-                        at.map(|p| p.column + 1),
-                    ));
-                }
-            }
-            None
-        }
-        DataSyntax::Jena(j) => {
-            super::super::jena_formats::transcode(j, data.as_bytes(), true, std::io::sink())
-                .err()
-                .map(|e| parse_errors(&e.to_string(), None, None))
-        }
-    }
+    sparkles::io::check_data(format, data, Some(BASE))
+        .map(|e| parse_errors(&e.message, e.line, e.column))
 }
 
 /// `/$/validate/langtag?langtag=…` (also `lang=`, repeatable): BCP 47 well-formedness,
@@ -270,42 +213,33 @@ pub(super) async fn langtag(uri: Uri, headers: HeaderMap, AdminBody(body): Admin
     ))
 }
 
+/// Fuseki's report of a language tag ([`sparkles::terms::check_langtag`]).
 fn langtag_report(t: &str) -> J {
+    let c = sparkles::terms::check_langtag(t);
     let mut o = serde_json::Map::new();
     o.insert("input".into(), t.into());
-    let problem = if t.is_empty() {
-        Some("Empty string for language tag".to_string())
-    } else if t.chars().any(char::is_whitespace) {
-        Some("Language tag contains white space".to_string())
-    } else {
-        oxilangtag::LanguageTag::parse(t.to_string())
-            .err()
-            .map(|e| format!("Invalid language tag: {e}"))
-    };
-    match problem {
+    match c.error {
         Some(p) => {
             o.insert("errors".into(), json!([p]));
         }
         None => {
-            let tag = oxilangtag::LanguageTag::parse(t.to_string()).expect("checked");
             o.insert("errors".into(), json!([]));
             o.insert(
                 "formatted".into(),
-                crate::tools::terms::canonical_case(t)
-                    .unwrap_or_else(|| t.to_string())
-                    .into(),
+                c.canonical.unwrap_or_else(|| t.to_string()).into(),
             );
-            o.insert("language".into(), tag.primary_language().into());
-            let mut put = |k: &str, v: Option<&str>| {
-                if let Some(v) = v.filter(|v| !v.is_empty()) {
+            o.insert("language".into(), c.language.into());
+            for (k, v) in [
+                ("script", c.script),
+                ("region", c.region),
+                ("variant", c.variant),
+                ("extension", c.extension),
+                ("privateuse", c.private_use),
+            ] {
+                if let Some(v) = v {
                     o.insert(k.into(), v.into());
                 }
-            };
-            put("script", tag.script());
-            put("region", tag.region());
-            put("variant", tag.variant());
-            put("extension", tag.extension());
-            put("privateuse", tag.private_use());
+            }
         }
     }
     J::Object(o)
