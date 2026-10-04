@@ -3885,9 +3885,18 @@ SELECT ?s ?score ?label WHERE {
   the text of its own snapshot, including the writes just before it. A write only stages
   its documents. The index commit, which writes a new segment, happens at the next text
   query that needs it, about once a second, or as soon as about 16,000 changes are
-  staged. A burst of writes therefore shares one index commit. If an index is behind,
-  after a failed update or during a rebuild, text queries return `503` until it is
-  rebuilt. They never return stale results.
+  staged. A burst of writes therefore shares one index commit. If an index is behind
+  after a failed update, text queries return `503` until it is rebuilt. They never
+  return stale results.
+* **Rebuilds.** `POST /$/text/{ds}/rebuild` builds a new index from a snapshot while
+  writes go on and the current index answers searches. The commits made meanwhile are
+  then applied to the new index, which takes the current one's place, so writes wait
+  only for that last step. A compaction or bulk commit during the build renumbers the
+  store's terms, and the index is then built again with writes waiting. A full rebuild
+  reads only the quads whose object is a literal. A bulk commit, such as a large load,
+  updates the index by the documents it adds and removes when they are few next to the
+  index, and rebuilds it otherwise. Enabling or reconfiguring an index builds it with
+  writes waiting.
 * **Durability.** Index commits are not fsynced. The write-ahead log is the durable
   record. The index is checkpointed (synced) about once a second while writes continue,
   before compaction and on close. After a crash, an index with unsynced changes, marked
@@ -3909,7 +3918,7 @@ SELECT ?s ?score ?label WHERE {
 | GET | `/$/text/{ds}` | `TextStatus` (below), or `{ "enabled": false }` |
 | PUT | `/$/text/{ds}` | Enables or reconfigures the index. The body is a `TextConfig`, and an empty body means the defaults. Returns `202` with the build `Task` (`kind: "text-rebuild"`). |
 | DELETE | `/$/text/{ds}` | Disables and deletes the index (`204`). |
-| POST | `/$/text/{ds}/rebuild` | Rebuilds the index from the current data. Returns `202` with a `Task`, `409` if a rebuild is running, or `400` if the index is not enabled. |
+| POST | `/$/text/{ds}/rebuild` | Rebuilds the index from the current data while writes go on (see Rebuilds above). Returns `202` with a `Task`, `409` if a rebuild is running, or `400` if the index is not enabled. |
 | GET, POST | `/{ds}/text?q=&predicate=&lang=&graph=&limit=&highlight=` | Searches the index and returns `TextHits` (below), best first. `q` is a query string, `predicate` may repeat, `graph` searches one named graph instead of the default graph, `limit` is 1 to 1000 (20 by default), and `highlight=false` leaves out the snippets. It needs `read` on the dataset. `400` for a missing `q` or a bad parameter, as for `text:query`. |
 
 ```ts

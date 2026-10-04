@@ -2481,8 +2481,15 @@ impl Store {
                 tracing::warn!("full-text index after a bulk commit: {e}; rebuilding");
                 None
             });
-            snap.text = match incremental.map_or_else(|| ti.rebuild(snap), Ok) {
-                Ok(v) => Some(v),
+            // an online rebuild that runs meanwhile builds the index again once it is
+            // done, since the generation changed: until then the index is behind
+            let view = match incremental {
+                Some(v) => Ok(Some(v)),
+                None => ti.try_rebuild(snap),
+            };
+            snap.text = match view {
+                Ok(Some(v)) => Some(v),
+                Ok(None) => old.text.clone(),
                 Err(e) => {
                     tracing::error!("full-text rebuild after a bulk commit failed: {e}");
                     old.text.clone()
@@ -2497,6 +2504,9 @@ impl Store {
     /// state. The configuration is kept in `text.json`.
     #[cfg(feature = "text")]
     pub fn enable_text(&self, cfg: crate::text::TextConfig) -> Result<crate::text::TextStatus> {
+        // an online rebuild of the current index finishes first (it builds in `text.new`)
+        let current = self.text.load_full();
+        let _rebuild = current.as_ref().map(|t| t.lock_rebuild());
         let _w = self.writer.lock();
         self.text.store(None);
         if let Some(root) = &self.root {
@@ -2518,6 +2528,8 @@ impl Store {
     /// Turn full-text search off and delete its index.
     #[cfg(feature = "text")]
     pub fn disable_text(&self) -> Result<()> {
+        let current = self.text.load_full();
+        let _rebuild = current.as_ref().map(|t| t.lock_rebuild());
         let _w = self.writer.lock();
         self.text.store(None);
         let mut s = (*self.snapshot()).clone();
@@ -2534,20 +2546,47 @@ impl Store {
         Ok(())
     }
 
-    /// Rebuild the full-text index from the current state (writes wait meanwhile).
+    /// Rebuild the full-text index from the current state. The index is built while
+    /// writes go on and the current index serves searches; the commits made meanwhile
+    /// are then applied to it, and it takes the current index's place. Writes wait only
+    /// for that last step, unless a compaction or bulk commit changed the store's
+    /// generation meanwhile: the index is then built again with writes waiting.
     #[cfg(feature = "text")]
     pub fn rebuild_text(&self) -> Result<crate::text::TextStatus> {
-        let _w = self.writer.lock();
         let ti = self
             .text
             .load_full()
             .ok_or_else(|| Error::invalid("full-text search is not enabled"))?;
-        let snap = self.snapshot();
-        let view = ti.rebuild(&snap)?;
-        let mut s = (*snap).clone();
+        // before the writer lock, which a rebuild holding this waits for
+        let guard = ti.lock_rebuild();
+        let start = {
+            let _w = self.writer.lock();
+            ti.start_journal(&guard);
+            self.snapshot()
+        };
+        let built = ti.build(&guard, &start)?;
+        let _w = self.writer.lock();
+        if !self
+            .text
+            .load()
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &ti))
+        {
+            return Err(Error::invalid(
+                "full-text search was disabled or reconfigured during the rebuild",
+            ));
+        }
+        let head = self.snapshot();
+        let view = if head.generation.uid == start.generation.uid {
+            ti.install(&guard, built, &head)?
+        } else {
+            drop(built);
+            ti.rebuild_held(&guard, &head)?
+        };
+        let mut s = (*head).clone();
         s.text = Some(view.clone());
         self.current.store(Arc::new(s));
-        Ok(ti.status(Some(&view), snap.commit))
+        Ok(ti.status(Some(&view), head.commit))
     }
 
     /// Full-text status (`None`: not enabled).

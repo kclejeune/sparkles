@@ -893,6 +893,40 @@ mod imp {
         fail_next_commit: AtomicBool,
         /// the tick seals and checkpoints (off only in tests)
         ticks: AtomicBool,
+        /// the quads of the commits since an online rebuild's snapshot, while one runs
+        journal: Mutex<Option<Vec<[Id; 4]>>>,
+        /// held for the whole of a rebuild, so that two never build at once
+        rebuilding: Mutex<()>,
+    }
+
+    /// An online rebuild in progress: other rebuilds wait, and commits are kept in the
+    /// journal until it is installed or dropped.
+    pub struct RebuildGuard<'a> {
+        inner: &'a Arc<Inner>,
+        _guard: parking_lot::MutexGuard<'a, ()>,
+    }
+
+    impl RebuildGuard<'_> {
+        fn take(&self) -> Vec<[Id; 4]> {
+            self.inner.journal.lock().take().unwrap_or_default()
+        }
+    }
+
+    impl Drop for RebuildGuard<'_> {
+        fn drop(&mut self) {
+            *self.inner.journal.lock() = None;
+        }
+    }
+
+    /// An index built from a snapshot, not yet in use (see [`TextIndex::build`]).
+    pub struct Built {
+        index: Index,
+        fields: Fields,
+        dir: Option<PathBuf>,
+        /// the epoch the index gets once installed
+        epoch: u64,
+        docs: u64,
+        started: Instant,
     }
 
     /// A dataset's full-text index.
@@ -1434,6 +1468,8 @@ mod imp {
                     last_rebuild: Mutex::new(None),
                     fail_next_commit: Default::default(),
                     ticks: AtomicBool::new(true),
+                    journal: Default::default(),
+                    rebuilding: Default::default(),
                 })
             };
             let reusable = root.filter(|r| r.join("text").exists()).and_then(|r| {
@@ -1486,7 +1522,8 @@ mod imp {
             // an empty placeholder until the rebuild below swaps the real one in
             let (index, fields) = new_index(None, &config)?;
             let t = ti(live_of(index, fields, &config, None, 0)?, 0);
-            let view = t.rebuild(snap)?;
+            let built = t.build(snap)?;
+            let view = t.install(built, snap, &[])?;
             Ok((TextIndex::start(t), view))
         }
 
@@ -1536,6 +1573,9 @@ mod imp {
             prev: Option<&Arc<TextView>>,
         ) -> Option<Arc<TextView>> {
             let inner = &self.inner;
+            if let Some(j) = inner.journal.lock().as_mut() {
+                j.extend(log.iter().map(|(_, q)| *q));
+            }
             if !inner.healthy() {
                 return prev.cloned();
             }
@@ -1566,7 +1606,65 @@ mod imp {
         /// Rebuild the whole index from `snap` and return its view. On disk, the new
         /// index is built in `text.new/` and swapped in.
         pub fn rebuild(&self, snap: &Snapshot) -> Result<Arc<TextView>> {
-            self.inner.rebuild(snap)
+            let _one = self.inner.rebuilding.lock();
+            let built = self.inner.build(snap)?;
+            self.inner.install(built, snap, &[])
+        }
+
+        /// Wait for any other rebuild of the index to finish, then hold off others until
+        /// the returned guard is dropped. Take it before the store's writer lock: a
+        /// rebuild holds it while it waits for that lock.
+        pub fn lock_rebuild(&self) -> RebuildGuard<'_> {
+            RebuildGuard {
+                inner: &self.inner,
+                _guard: self.inner.rebuilding.lock(),
+            }
+        }
+
+        /// [`rebuild`](Self::rebuild), unless another rebuild runs (`None`): for callers
+        /// that hold the store's writer lock.
+        pub fn try_rebuild(&self, snap: &Snapshot) -> Result<Option<Arc<TextView>>> {
+            let Some(_one) = self.inner.rebuilding.try_lock() else {
+                return Ok(None);
+            };
+            let built = self.inner.build(snap)?;
+            self.inner.install(built, snap, &[]).map(Some)
+        }
+
+        /// The first step of an online rebuild, under the store's writer lock: from now
+        /// on the quads of each commit are kept, for [`install`](Self::install).
+        pub fn start_journal(&self, _guard: &RebuildGuard<'_>) {
+            *self.inner.journal.lock() = Some(Vec::new());
+        }
+
+        /// Build an index from `snap`, while writes go on and the current index serves
+        /// searches.
+        pub fn build(&self, _guard: &RebuildGuard<'_>, snap: &Snapshot) -> Result<Built> {
+            self.inner.build(snap)
+        }
+
+        /// Finish an online rebuild under the store's writer lock: bring the built index
+        /// from its snapshot to `head` by the quads the commits since then changed, both
+        /// of one generation, and put it in place of the current index. Returns `head`'s
+        /// view.
+        pub fn install(
+            &self,
+            guard: &RebuildGuard<'_>,
+            built: Built,
+            head: &Snapshot,
+        ) -> Result<Arc<TextView>> {
+            let journal = guard.take();
+            self.inner.install(built, head, &journal)
+        }
+
+        /// Rebuild from `snap` with the guard of a rebuild already held.
+        pub fn rebuild_held(
+            &self,
+            _guard: &RebuildGuard<'_>,
+            snap: &Snapshot,
+        ) -> Result<Arc<TextView>> {
+            let built = self.inner.build(snap)?;
+            self.inner.install(built, snap, &[])
         }
 
         /// After a bulk commit from `old` to `new` (states of different generations):
@@ -1612,10 +1710,14 @@ mod imp {
         }
 
         fn payload(&self, seq: u64) -> String {
+            self.payload_with(seq, self.epoch.load(Ordering::SeqCst))
+        }
+
+        fn payload_with(&self, seq: u64, epoch: u64) -> String {
             serde_json::to_string(&Payload {
                 format: FORMAT,
                 seq,
-                epoch: self.epoch.load(Ordering::SeqCst),
+                epoch,
                 config: config_hash(&self.config),
             })
             .unwrap()
@@ -1920,7 +2022,9 @@ mod imp {
             self.checkpoint_locked(&mut live)
         }
 
-        fn rebuild(self: &Arc<Self>, snap: &Snapshot) -> Result<Arc<TextView>> {
+        /// Build the index of `snap` in `text.new/` (in memory for an in-memory store),
+        /// with several writer threads, and commit it. The current index is not touched.
+        fn build(self: &Arc<Self>, snap: &Snapshot) -> Result<Built> {
             let t0 = std::time::Instant::now();
             let new_dir = self.root.as_ref().map(|r| r.join("text.new"));
             let (index, fields) = new_index(new_dir.as_deref(), &self.config)?;
@@ -1928,6 +2032,7 @@ mod imp {
                 .map_or(1, |n| n.get())
                 .min(8);
             let mut docs = 0u64;
+            let epoch = self.epoch.load(Ordering::SeqCst) + 1;
             {
                 let mut writer: IndexWriter<TantivyDocument> = index
                     .writer_with_num_threads(threads, threads * (64 << 20))
@@ -1943,13 +2048,73 @@ mod imp {
                     Ok(())
                 };
                 for_each_candidate(snap, &self.config, &mut add)?;
-                self.epoch.fetch_add(1, Ordering::SeqCst);
-                let payload = self.payload(snap.commit);
+                let payload = self.payload_with(snap.commit, epoch);
                 let mut prepared = writer.prepare_commit().map_err(text_err)?;
                 prepared.set_payload(&payload);
                 prepared.commit().map_err(text_err)?;
                 writer.wait_merging_threads().map_err(text_err)?;
             }
+            Ok(Built {
+                index,
+                fields,
+                dir: new_dir,
+                epoch,
+                docs,
+                started: t0,
+            })
+        }
+
+        /// Put a built index in place of the current one, after bringing it from its
+        /// snapshot to `head` by the quads in `journal` (ids of `head`'s generation):
+        /// each document of such a quad is replaced, or removed when `head` does not
+        /// have the quad.
+        fn install(
+            self: &Arc<Self>,
+            built: Built,
+            head: &Snapshot,
+            journal: &[[Id; 4]],
+        ) -> Result<Arc<TextView>> {
+            let Built {
+                index,
+                fields,
+                dir: new_dir,
+                epoch,
+                docs,
+                started: t0,
+            } = built;
+            if !journal.is_empty() {
+                let mut writer: IndexWriter<TantivyDocument> = index
+                    .writer_with_num_threads(1, 32 << 20)
+                    .map_err(text_err)?;
+                // writes wait for this step: the index's own writer merges later
+                writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+                let mut terms = Terms::default();
+                let mut seen = FxHashSet::default();
+                for q in journal {
+                    if !seen.insert(*q) {
+                        continue;
+                    }
+                    let Some(Doc {
+                        key,
+                        doc: Some(doc),
+                        ..
+                    }) = terms.document(head, &fields, &self.config, q)
+                    else {
+                        continue;
+                    };
+                    writer.delete_term(Term::from_field_bytes(fields.key, &key));
+                    if head.contains(q)? {
+                        writer.add_document(doc).map_err(text_err)?;
+                    }
+                }
+                let payload = self.payload_with(head.commit, epoch);
+                let mut prepared = writer.prepare_commit().map_err(text_err)?;
+                prepared.set_payload(&payload);
+                prepared.commit().map_err(text_err)?;
+                writer.wait_merging_threads().map_err(text_err)?;
+            }
+            let snap = head;
+            self.epoch.store(epoch, Ordering::SeqCst);
             let mut live = self.live.lock();
             // the views of the old index's open batch get its searcher
             if let Err(e) = self.seal_locked(&mut live) {

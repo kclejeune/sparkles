@@ -1139,6 +1139,88 @@ fn bulk_commits_update_the_index_by_their_changes() {
     assert_eq!(count(&s, "seal"), "40000");
 }
 
+/// A rebuild builds the new index while writes go on, then applies the writes made
+/// meanwhile: the result is the index of the final state, and writes did not wait for
+/// the build.
+#[test]
+fn rebuilds_run_while_writes_go_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let s =
+        std::sync::Arc::new(Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap());
+    let mut base = String::new();
+    for i in 0..20_000 {
+        base.push_str(&format!(
+            "<http://example.org/n{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"number {i} walrus\" .\n"
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        base.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    s.enable_text(TextConfig::default()).unwrap();
+    for (round, word) in [(0, "orca"), (1, "dolphin")] {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let t = {
+            let (s, done) = (s.clone(), done.clone());
+            std::thread::spawn(move || {
+                let r = s.rebuild_text();
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                r
+            })
+        };
+        // writes during the build: new literals, and removed ones
+        let mut during = 0;
+        let mut i = 0;
+        while !done.load(std::sync::atomic::Ordering::SeqCst) || i < 5 {
+            sparkles_core::sparql::update::update(
+                &s,
+                &format!(
+                    "{P}INSERT DATA {{ ex:r{round}x{i} rdfs:label \"{word} {i}\" }} ; \
+                     DELETE DATA {{ <http://example.org/n{}> rdfs:label \"number {} walrus\" }}",
+                    round * 1000 + i,
+                    round * 1000 + i
+                ),
+                &QueryOptions::default(),
+            )
+            .unwrap();
+            if !done.load(std::sync::atomic::Ordering::SeqCst) {
+                during += 1;
+            }
+            i += 1;
+            // and a compaction in the second round, which changes the generation
+            if round == 1 && i == 2 {
+                s.compact().unwrap();
+            }
+        }
+        let st = t.join().unwrap().unwrap();
+        assert_eq!(st.state, "ready");
+        if round == 0 {
+            assert!(
+                during >= 2,
+                "writes waited for the build ({during} during it)"
+            );
+        }
+        let docs = s.text_status().unwrap().docs;
+        let found = rows(
+            &s,
+            &format!("SELECT (COUNT(*) AS ?n) {{ ?s text:query \"{word}\" }}"),
+        );
+        assert_eq!(found, [i.to_string()], "round {round}");
+        // the same as a rebuild with nothing going on
+        s.rebuild_text().unwrap();
+        assert_eq!(s.text_status().unwrap().docs, docs, "round {round}");
+        assert_eq!(
+            rows(&s, "SELECT (COUNT(*) AS ?n) { ?s text:query \"walrus\" }"),
+            rows(
+                &s,
+                "SELECT (COUNT(*) AS ?n) { ?s rdfs:label ?l FILTER(CONTAINS(?l, \"walrus\")) }"
+            )
+        );
+    }
+}
+
 /// Query options with the subject restriction of text searches on or off.
 fn pushdown(on: bool) -> QueryOptions {
     let mut o = sparkles_core::sparql::Optimizations::ALL;

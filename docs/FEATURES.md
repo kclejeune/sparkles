@@ -169,7 +169,7 @@ These are features other RDF stores have and Sparkles does not have yet.
 * **Search.** Full-text search has no multi-field documents, and its stemmers are
   Tantivy's Snowball stemmers rather than Lucene's analyzers. CJK text is cut into
   bigrams, with no dictionary-based segmentation.
-  A full-text rebuild holds the writer lock until it finishes. A vector index has no quantization,
+  Enabling or reconfiguring a full-text index builds it while writes wait. A vector index has no quantization,
   so its packed vectors take 4 bytes per dimension. Its graph is not carried across
   compactions and is built again for each new generation.
 * **Query languages.** There is no openCypher frontend and no JSON query language. The
