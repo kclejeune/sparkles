@@ -3127,12 +3127,14 @@ names and `*` patterns; without the list, it covers every branch. Reading a bran
 and `write` on the new name, and a merge needs `read` on the source and `write` on the
 target. Creating branches and merging act on whole datasets, so they need grants without
 graph restrictions. Protecting a branch, and deleting a protected one, need `admin` on
-it. The endpoint names `branches` and `merge` limit a grant to the branch routes and to
-merges.
+it. A revert needs `write` on its branch, a cherry-pick `read` on the source and
+`write` on its branch, and a rename `write` on both names. The endpoint names `branches`
+and `merge` limit a grant to the branch routes and to merges, reverts and cherry-picks.
 
-`sparkles branch` and `sparkles merge` do the same from the command line, on a local
-database or a server, and `--branch NAME` chooses the branch of `query`, `update`,
-`load`, `dump`, `log`, `diff`, `snapshot`, `compact`, `stats`, `clone` and `patch` (see
+`sparkles branch`, `sparkles merge`, `sparkles revert` and `sparkles cherry-pick` do the
+same from the command line, on a local database or a server, and `--branch NAME`
+chooses the branch of `query`, `update`, `load`, `dump`, `log`, `diff`, `snapshot`,
+`compact`, `stats`, `clone`, `patch`, `revert` and `cherry-pick` (see
 [USAGE](USAGE.md#branches-and-merges)).
 
 ## Point-in-time reads and snapshots

@@ -7,11 +7,14 @@
 > `?branch=` and the path form, per-branch commits and history, three-way merges of quad
 > sets with cell and subject conflicts and resolutions, deletion, holds and quotas,
 > access control by branch, the HTTP API, the CLI, and the UI's branch selector,
-> Branches panel and conflict-free Merge button. Of Phase 2, the UI's merge page and the
-> History panel's commit graph, with `GET /$/commit-graph/{ds}`, have shipped. The rest
-> of Phase 2 (Python, squash merges, reverts, replayed fast-forwards, renames, in-memory
-> branches and backups of branches) and Phase 3 (cross-server clones, relinking, virtual
-> merge bases and cherry-picks) are not built.
+> Branches panel and conflict-free Merge button. Of Phase 2, the UI's merge page, the
+> History panel's commit graph with `GET /$/commit-graph/{ds}`, squash merges, reverts,
+> replayed fast-forwards, renames, deletions that re-parent, predicates exempt from
+> conflicts, merges as tasks, per-branch gauges and the backup manifest's count of
+> left-out branches have shipped, and so have cherry-picks from Phase 3. Python,
+> in-memory branches, backups of branches and indexes built from the upstream's files
+> (Phase 2), and cross-server clones, relinking and virtual merge bases (Phase 3) are not
+> built.
 >
 > **User docs:** [API: Branches and merges](../API.md#branches-and-merges) ·
 > [Usage: Branches and merges](../USAGE.md#branches-and-merges) ·
@@ -1077,7 +1080,8 @@ These are estimates for Phase 1 to confirm, on a 10.5M-quad dataset.
   generation by replaying the upstream's changes from its starting commit in reverse,
   which keeps it sharing storage for longer.
 - Virtual merge bases for criss-cross histories.
-- Cherry-picks, which are merges of one commit with its parent as base.
+- Cherry-picks, which are merges of one commit with its parent as base. They shipped
+  with Phase 2, since they mirror reverts.
 - Merges that keep conflicts on the server for long reviews, if the stateless model
   proves too limited in use.
 
@@ -1366,6 +1370,8 @@ dataset page's Backups panel says that the other branch is not backed up.
 1. **Exempt predicates.** Should `cell` scope exempt some predicates by default, such as
    `rdf:type`, `rdfs:label` and `skos:altLabel`, whose cells often gain values on both
    sides? Default: no exemptions in Phase 1, and per-merge exemptions in Phase 2.
+   Answered in Phase 2: no predicate is exempt by default, and exemptions are given per
+   merge and per dataset.
 2. **Configuration.** Branches copy the configuration at creation. Should the validation
    shapes instead be shared, so `main`'s guard applies on every branch? Default: copy,
    so a branch can try new shapes.
@@ -1536,10 +1542,10 @@ with 10,000 merges was not measured.
   preview and puts the merge fields under `merge`.
 * **Grants.** `branches` is a field of `[[grants]]` entries. A grant limited to branches
   alone, without graphs or endpoints, may be `admin`.
-* **Not built.** Per-branch gauges with a `branch` label and
-  `sparkles_branch_held_bytes`, the backup manifest's count of left-out branches and the
-  Backups panel's note, and the raised minimum version in `dataset.json` (§5.1) remain.
-  The full-text, spatial and vector indexes of a branch are built when the branch opens.
+* **Not built.** The raised minimum version in `dataset.json` (§5.1) remains. The
+  full-text, spatial and vector indexes of a branch are built when the branch opens.
+  Per-branch gauges, `sparkles_branch_held_bytes`, the backup manifest's count of
+  left-out branches and the Backups panel's note came with Phase 2.
 
 The open questions kept their defaults: no exempt predicates, configuration copied at
 creation, base pins always kept, no `/` in names, the `@` path form, branches of
@@ -1584,3 +1590,74 @@ The mock server gained resolutions, dry runs, the commit graph, diffs of the com
 records, and a small write guard read from `sh:targetClass` and `sh:minCount`, so the
 mock end-to-end tests cover both features. The real-server end-to-end tests cover a
 resolved merge, a guard refusal and the graph.
+
+**Phase 2: merge kinds, renames, re-parenting, exemptions and tasks.** These landed on
+2026-10-04, with cherry-picks from Phase 3.
+
+* **Engine.** `store/merge.rs` splits a merge into resolving the heads and the merge
+  base, and a shared three-way step that every kind of merge uses. Squash merges set
+  `MergeOptions::squash`. `Store::revert` and `Store::cherry_pick` are three-way merges
+  of a commit's parent over the commit and of a commit over its parent, and
+  `store/replay.rs` replays a source's commits for `ff: "replay"`.
+  `Store::rename_branch`, `Store::delete_branch_with`, `Store::merge_exempt` and
+  `Store::set_merge_exempt` are in `store/branching.rs`. `MergeOptions` gains
+  `squash`, `replay`, `exempt`, `progress` and `with_control`, and the facade adds
+  `Dataset::revert`, `cherry_pick`, their previews, `rename_branch`,
+  `delete_branch_with`, `merge_exempt`, `set_merge_exempt` and `merge_with`.
+* **HTTP.** `POST /$/merge/{ds}` takes `squash`, `ff: "replay"` and `exempt`.
+  `GET` and `POST` of `/$/revert/{ds}?branch=&commit=` and
+  `/$/cherry-pick/{ds}?source=&commit=&branch=` preview and make reverts and
+  cherry-picks, with the merge options in an optional JSON body. `PATCH
+  /$/branches/{ds}/{name}` takes `name`, `DELETE` takes `reparent=true`, and `PATCH
+  /$/branches/{ds}` sets `exemptPredicates`. A merge, revert or cherry-pick with `Prefer:
+  respond-async` runs as a task.
+* **CLI.** `sparkles merge --squash`, `--replay` and `--exempt`, `sparkles revert N`,
+  `sparkles cherry-pick SOURCE N`, `sparkles branch rename`, `sparkles branch delete
+  --reparent` and `sparkles branch exempt`.
+* **Metrics.** `sparkles_branch_quads`, `sparkles_branch_delta_quads`,
+  `sparkles_branch_wal_bytes`, `sparkles_branch_disk_bytes` and
+  `sparkles_branch_held_bytes`.
+
+Tests cover A24–A32. The library tests run all of them, with failpoint crash tests for a
+rename after its table write, for a deletion that re-parents after its table write, and
+for the removal of a retired branch's directory. The router tests run A24–A32, with
+grants limited to branches for renames, reverts and cherry-picks, and the CLI tests run
+A24–A30. The Phase 1 test A18 now waits for the change log's background writer before it
+sets the quota. It had read the dataset's usage before the writer appended the load, so
+a later walk counted 221,184 more bytes and refused the commit on a busy machine.
+
+**Deviations of Phase 2.**
+
+* **Commit kinds.** Reverts and cherry-picks have kinds of their own, `revert` (code 14)
+  and `cherry-pick` (code 15), and record no second parent. A protected branch refuses
+  them, since their changes do not come through a merge, and accepts squash merges and
+  replays.
+* **Cherry-picks.** The route mirrors reverts: `POST /$/cherry-pick/{ds}?source=&commit=&branch=`,
+  where `branch` is the branch that receives the commit in both routes. The CLI's
+  `revert` and `cherry-pick` write to the branch of the global `--branch`.
+* **Squash merges** make no commit when they change nothing, since they record no second
+  parent, and answer `upToDate: true`.
+* **Replayed fast-forwards** need a target whose state equals the merge base's, which
+  holds also after earlier replays and merges from the same source, and a merge base on
+  the source's own first-parent history, or they answer `409 cannot-replay`. Each
+  replayed commit records the commit it replays with a merge record flagged as a replay,
+  shown as `replayedFrom`. Replayed commits get new times, and their authors come from
+  the change log. A replay commits as it goes, so a cancel or a moving target stops it
+  after complete commits.
+* **Renames** leave the grants of the configuration file as written. The answer counts
+  the grants whose `branches` cover only one of the two names, and the server log lists
+  them. A rename commits with `branches.json`, and an open rewrites a stale
+  `branch.json`.
+* **Re-parenting** keeps the deleted branch, retired, in a `retired` list of
+  `branches.json`, which then has format 2. Children keep its id as their starting
+  point, and listings name it `branch: null`. Their upstream becomes the nearest listed
+  ancestor.
+* **Exempt predicates** live in `branches.json`, and a merge adds its own to the
+  dataset's.
+* **Gauges.** The per-branch values are new `sparkles_branch_*` families with `dataset`
+  and `branch` labels, not a `branch` label on the per-dataset families, which keep their
+  series. `sparkles_branch_held_bytes` counts upstream generations that links read and
+  retired branches, not generations kept by base pins.
+* **Not built.** A rename button in the UI's Branches panel, since another change is
+  reworking that panel. Python, in-memory branches, backups of branches and indexes
+  built from the upstream's files remain for later work.

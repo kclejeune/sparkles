@@ -44,9 +44,9 @@ Rust, Python and JVM APIs, a Fuseki-compatible server and CLI, and a web UI.
   when a triple was added or which values a property took
   ([API](docs/API.md#point-in-time-reads-and-snapshots)).
 * Branches that share their upstream's index until they compact, so creating one writes
-  a few kilobytes, with fast-forward and three-way merges, conflict resolution on the
-  web UI's merge page, and a commit graph of every branch
-  ([API](docs/API.md#branches-and-merges)).
+  a few kilobytes, with fast-forward, squash, replayed and three-way merges, reverts and
+  cherry-picks, renames, conflict resolution on the web UI's merge page, and a commit
+  graph of every branch ([API](docs/API.md#branches-and-merges)).
 * RDF Patch applied as one commit, entity tags with `If-Match` writes, commit messages,
   and dry runs of any write that report its changes, validation and quota effect
   ([API](docs/API.md#write-previews)).
@@ -215,7 +215,7 @@ sparkles fmt     --check queries/ shapes/     # format SPARQL and RDF files
 | `serve` | Run the server with the web UI. |
 | `load`, `query`, `update`, `patch`, `dump`, `csv` | Load, query, update, apply RDF Patch, export, and import CSV and TSV. |
 | `compact`, `clone`, `stats`, `log`, `check` | Merge updates, copy a dataset, show statistics and the commit history, and verify a database. |
-| `snapshot`, `diff`, `history`, `branch`, `merge` | Named snapshots and retention, diffs between commits, the changes of a term across commits, and branches. |
+| `snapshot`, `diff`, `history`, `branch`, `merge`, `revert`, `cherry-pick` | Named snapshots and retention, diffs between commits, the changes of a term across commits, and branches. |
 | `backup`, `repo` | Back up to a file system or S3, restore, and run backup policies. |
 | `infer`, `shacl`, `shex`, `validation`, `schema` | Reason, validate, set write-time guards, and report or draft the schema. |
 | `text-index`, `vector`, `geo-index`, `queries`, `graphql` | Manage the search indexes, stored queries and the GraphQL schema. |

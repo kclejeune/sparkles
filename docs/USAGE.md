@@ -1200,7 +1200,7 @@ sparkles cherry-pick --loc db --branch qa dev 57
 ```
 
 `--branch NAME` works with `query`, `update`, `load`, `dump`, `log`, `diff`, `snapshot`,
-`compact`, `stats`, `clone` and `patch`. With `--server`, these commands send the
+`compact`, `stats`, `clone`, `patch`, `revert` and `cherry-pick`. With `--server`, these commands send the
 dataset's name in the path form, `ds@NAME`. The web UI has a branch menu next to the
 dataset's name, and its Branches panel creates, protects, deletes and merges branches.
 
