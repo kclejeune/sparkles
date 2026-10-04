@@ -964,6 +964,66 @@ fn ordered_top_k_reads_a_piece_until_it_cannot_win() {
     }
 }
 
+/// `OFFSET n LIMIT u64::MAX` saturates instead of overflowing, through the plain slice,
+/// the limited execution of a slice, the top-k sort and the ordered top-k scan.
+#[test]
+fn the_largest_limit_and_offset_saturate() {
+    const MAX: u64 = u64::MAX;
+    let s = Store::in_memory(StoreOptions::default());
+    load(
+        &s,
+        "@prefix ex: <http://ex.org/> . ex:a ex:v 1 . ex:b ex:v 2 . ex:c ex:v 3 .",
+        RdfFormat::Turtle,
+    );
+    for opt in [Optimizations::ALL, Optimizations::NONE] {
+        let rows = |q: &str| solutions(&run(&s, q, opt));
+        // the plain slice
+        assert_eq!(
+            rows(&format!(
+                "SELECT ?x {{ VALUES ?x {{ 1 2 }} }} OFFSET 1 LIMIT {MAX}"
+            )),
+            ["\"2\"^^<http://www.w3.org/2001/XMLSchema#integer>"]
+        );
+        // top-k: ORDER BY with a LIMIT
+        assert_eq!(
+            rows(&format!(
+                "SELECT ?x {{ VALUES ?x {{ 2 1 }} }} ORDER BY ?x OFFSET 1 LIMIT {MAX}"
+            )),
+            ["\"2\"^^<http://www.w3.org/2001/XMLSchema#integer>"]
+        );
+        // a slice over a scan, executed with a row budget
+        assert_eq!(
+            rows(&format!("SELECT ?s {{ ?s ex:v ?v }} OFFSET 2 LIMIT {MAX}")).len(),
+            1
+        );
+        assert!(
+            rows(&format!(
+                "SELECT ?s {{ ?s ex:v ?v }} OFFSET {MAX} LIMIT {MAX}"
+            ))
+            .is_empty()
+        );
+        assert!(
+            rows(&format!(
+                "SELECT ?x {{ VALUES ?x {{ 1 2 }} }} ORDER BY ?x OFFSET {MAX} LIMIT {MAX}"
+            ))
+            .is_empty()
+        );
+    }
+    // the ordered top-k scan
+    let r = topk_check(
+        &s,
+        &format!("SELECT ?s ?v {{ ?s ex:v ?v }} ORDER BY DESC(?v) OFFSET 1 LIMIT {MAX}"),
+    );
+    assert!(has_op(&r.plan, "IndexTopK"), "{:#?}", r.plan);
+    assert_eq!(
+        solutions(&r),
+        [
+            "<http://ex.org/a> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            "<http://ex.org/b> \"2\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+        ]
+    );
+}
+
 /// The `[read N rows]` note of the ordered scan in an executed plan.
 fn topk_rows_read(p: &PlanInfo) -> Option<u64> {
     if p.operator == "IndexTopK" {

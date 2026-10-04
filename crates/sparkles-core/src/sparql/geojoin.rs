@@ -802,7 +802,7 @@ mod on {
         }
         // the template: a batch of the scan's rows joined with the other patterns, the
         // filters among them, then the operators above the joins
-        let batch = (2 * k).max(64) as f64;
+        let batch = k.saturating_mul(2).max(64) as f64;
         let mut ph = Node::leaf(
             Kind::Values(Table::new(scan_node.vars.clone())),
             scan_node.vars.clone(),

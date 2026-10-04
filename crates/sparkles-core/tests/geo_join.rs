@@ -292,6 +292,22 @@ fn nearest_neighbours_come_first() {
          ORDER BY ?d LIMIT 5"
     );
     assert_eq!(rows(&same(&snap, &q)).len(), 5);
+    // the largest LIMIT saturates the search's batch size instead of overflowing
+    let q = format!(
+        "SELECT ?g ?d {{ ?g geo:asWKT ?w BIND(geof:metricDistance(?w, {GA}) AS ?d) \
+         FILTER(BOUND(?d)) }} ORDER BY ?d OFFSET 1 LIMIT {}",
+        u64::MAX
+    );
+    let all = format!(
+        "SELECT ?g ?d {{ ?g geo:asWKT ?w BIND(geof:metricDistance(?w, {GA}) AS ?d) \
+         FILTER(BOUND(?d)) }}"
+    );
+    let r = same(&snap, &q);
+    assert!(find(&r.plan, "SpatialKnn").is_some(), "{:#?}", r.plan);
+    assert_eq!(
+        rows(&r).len(),
+        rows(&run(&snap, &all, &opts(false))).len() - 1
+    );
 }
 
 #[test]

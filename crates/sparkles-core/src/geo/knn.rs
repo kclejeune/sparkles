@@ -178,7 +178,7 @@ pub fn spatial_knn(
     }
     let need = spec.k.saturating_sub(errors);
     if need > 0 {
-        let batch = (2 * spec.k).max(64);
+        let batch = spec.k.saturating_mul(2).max(64);
         let mut pending: Vec<[Id; 3]> = Vec::new();
         // the `need` smallest keys so far (the largest on top)
         let mut best: BinaryHeap<Key> = BinaryHeap::new();

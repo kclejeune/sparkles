@@ -154,7 +154,7 @@ impl Table {
 
     pub fn slice(mut self, offset: usize, limit: Option<usize>) -> Table {
         let start = offset.min(self.len);
-        let end = limit.map_or(self.len, |l| (start + l).min(self.len));
+        let end = limit.map_or(self.len, |l| start.saturating_add(l).min(self.len));
         if start == 0 && end == self.len {
             return self;
         }

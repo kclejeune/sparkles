@@ -1722,7 +1722,7 @@ fn ordered_topk(ctx: &Ctx, spec: &OrderedTopK, out: &[VarId]) -> Result<Option<(
                 exact: p.exact,
                 best_high: up != spec.asc,
                 kept: Table::new(vars.clone()),
-                want: spec.k.max(16) * 2,
+                want: spec.k.max(16).saturating_mul(2),
                 done: false,
             }),
         }
