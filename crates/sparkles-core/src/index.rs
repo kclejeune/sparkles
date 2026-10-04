@@ -109,8 +109,18 @@ pub(crate) fn map_random(f: &File) -> std::io::Result<Mmap> {
 #[inline]
 pub(crate) fn will_need(m: &Mmap, off: usize, len: usize) {
     #[cfg(unix)]
-    if len > 0 && off + len <= m.len() && io_hints() {
-        let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+    if len > 0 && off <= m.len() && len <= m.len() - off && io_hints() {
+        // Linux caps a WILLNEED request's read-ahead. A single hint for an export's
+        // tens of MiB leaves its tail to synchronous faults on a Random mapping.
+        // Issue bounded requests so the entire requested range is covered.
+        const WINDOW: usize = 256 << 10;
+        for start in (off..off + len).step_by(WINDOW) {
+            let _ = m.advise_range(
+                memmap2::Advice::WillNeed,
+                start,
+                WINDOW.min(off + len - start),
+            );
+        }
     }
     #[cfg(not(unix))]
     let _ = (m, off, len);

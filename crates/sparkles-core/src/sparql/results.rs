@@ -250,6 +250,11 @@ pub fn write_solutions(
         // a result of one chunk is decoded row by row: under concurrent load that keeps
         // less memory live per request than a chunk's table of terms, and in the 10.5M
         // benchmark it served 25% more requests a second
+        // Medium answers can contain thousands of scattered vocabulary pages. Keep
+        // row-by-row decoding's small working set, but overlap those cold reads.
+        if n >= 256 && crate::index::io_hints() {
+            prefetch_answer(r, n);
+        }
         for i in 0..n {
             let terms: Vec<(usize, Term)> = r
                 .table
@@ -301,6 +306,18 @@ pub fn write_solutions(
     Ok(())
 }
 
+// Keep prefetch preparation out of the generic serializer's row loop and stack frame.
+#[inline(never)]
+fn prefetch_answer(r: &QueryResult, n: usize) {
+    let ids = r.table.cols.iter().flat_map(|col| {
+        col[..n]
+            .iter()
+            .filter(|id| id.tag() == Tag::Vocab)
+            .map(|id| id.payload())
+    });
+    r.ctx.snap.generation.vocab.prefetch_terms(ids);
+}
+
 /// Result rows decoded at a time for serialization.
 const DECODE_ROWS: usize = 1 << 16;
 /// Sorted base-vocabulary ids decoded by one parallel task.
@@ -332,6 +349,7 @@ struct Cells {
     start: usize,
     rows: usize,
     pairs: Vec<(u64, u32)>,
+    prefetched: bool,
 }
 
 impl Decoded {
@@ -362,6 +380,7 @@ impl Decoded {
             start: rows.start,
             rows: n,
             pairs,
+            prefetched: ahead,
         }
     }
 
@@ -377,17 +396,22 @@ impl Decoded {
             slot[cell as usize] = (ids.len() - 1) as u32;
         }
         let vocab = &r.ctx.snap.generation.vocab;
+        let ahead = !cells.prefetched;
         // ids past the vocabulary (none in a consistent snapshot) end the decoding: they
         // are a suffix, whose cells fall back to decoding one by one
         let terms = if ids.len() < PAR_DECODE_MIN {
             let mut terms = Vec::with_capacity(ids.len());
-            vocab.get_sorted(&ids, |_, k| terms.push(crate::id::key_to_term(k)));
+            vocab.get_sorted_with_ahead(&ids, |_, k| terms.push(crate::id::key_to_term(k)), ahead);
             terms
         } else {
             ids.par_chunks(DECODE_TASK)
                 .flat_map_iter(|c| {
                     let mut out = Vec::with_capacity(c.len());
-                    vocab.get_sorted(c, |_, k| out.push(crate::id::key_to_term(k)));
+                    vocab.get_sorted_with_ahead(
+                        c,
+                        |_, k| out.push(crate::id::key_to_term(k)),
+                        ahead,
+                    );
                     out
                 })
                 .collect()

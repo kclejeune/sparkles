@@ -34,7 +34,7 @@ use super::expr::Expr;
 use super::plan::{Kind, Node, ScanSpec};
 use super::table::{Table, VarId};
 use crate::error::Result;
-use crate::id::Id;
+use crate::id::{Id, Tag};
 use crate::index::{ColMask, Key, bound_cols, pad};
 use crate::store::{Chunk, Snapshot};
 
@@ -193,6 +193,14 @@ fn test(ctx: &Ctx, rows: &[(Key, f64)], cols: &[(usize, VarId)], f: &Expr) -> Re
         let mut uniq: Vec<Id> = rows.iter().map(|(k, _)| Id(k[*kc])).collect();
         uniq.sort_unstable();
         uniq.dedup();
+        // Sampled values are scattered even when the eventual scan is dense.
+        // Overlap their cold vocabulary reads instead of faulting once per value.
+        let ids: Vec<u64> = uniq
+            .iter()
+            .filter(|id| id.tag() == Tag::Vocab)
+            .map(|id| id.payload())
+            .collect();
+        ctx.snap.generation.vocab.prefetch_sorted(&ids);
         let (hit, _) = super::exprcache::filter_values(ctx, &uniq, *v, exprs)?;
         return Ok(rows
             .iter()

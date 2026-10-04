@@ -218,14 +218,28 @@ struct Ahead {
     /// the data before this offset has been asked for
     until: usize,
     end: usize,
+    /// Offset pages must arrive before the data offsets are read from them.
+    offsets_until: usize,
 }
 
 impl Ahead {
-    const WINDOW: usize = 4 << 20;
+    const WINDOW: usize = 1 << 20;
 
-    /// The pass reads the data at `pos` next.
+    /// The pass reads `block` next.
     #[inline]
-    fn at(&mut self, v: &Vocab, pos: usize) {
+    fn at(&mut self, v: &Vocab, block: usize) {
+        if self.end == 0 {
+            return;
+        }
+        const OFFSETS_WINDOW: usize = 64 << 10;
+        let offset = block * 8;
+        if offset + OFFSETS_WINDOW / 2 >= self.offsets_until {
+            let from = offset.max(self.offsets_until);
+            let to = (offset + OFFSETS_WINDOW).min(v.offsets.as_slice().len());
+            v.offsets.will_need(from, to);
+            self.offsets_until = to;
+        }
+        let pos = v.block_offset(block);
         if self.until < self.end && pos + Self::WINDOW / 2 >= self.until {
             let from = pos.max(self.until);
             let to = (pos + Self::WINDOW).min(self.end);
@@ -246,6 +260,9 @@ pub struct Vocab {
     first_triple: u64,
     /// the sparse index of the blocks' first keys, when the generation has one
     sparse: Option<Sparse>,
+    /// Bulk decodes hint a block once per mapping, not on every warm export.
+    /// Like sparse lookup hints, these are advisory. Evicted pages still fault in.
+    prefetched: Box<[AtomicU64]>,
 }
 
 impl Vocab {
@@ -257,6 +274,7 @@ impl Vocab {
             first_iri: 0,
             first_triple: 0,
             sparse: None,
+            prefetched: Box::new([]),
         }
     }
 
@@ -288,6 +306,9 @@ impl Vocab {
             first_iri: 0,
             first_triple: 0,
             sparse,
+            prefetched: (0..blocks.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
         };
         // a cheap test that the index belongs to these files: its first and last data
         // offsets (`sparkles check` compares every entry)
@@ -392,8 +413,24 @@ impl Vocab {
 
     /// Decode many ids (sorted ascending, deduplicated), touching each front-coded
     /// block once: `f(id, key)`.
-    pub fn get_sorted(&self, ids: &[u64], mut f: impl FnMut(u64, &[u8])) {
-        let mut ahead = self.ahead_for(ids);
+    pub fn get_sorted(&self, ids: &[u64], f: impl FnMut(u64, &[u8])) {
+        self.get_sorted_with_ahead(ids, f, true);
+    }
+
+    /// A serializer that already prefetched these blocks does not need dense hints
+    /// or a per-block bitmap check on its decode's hot path.
+    #[inline]
+    pub(crate) fn get_sorted_with_ahead(
+        &self,
+        ids: &[u64],
+        mut f: impl FnMut(u64, &[u8]),
+        read_ahead: bool,
+    ) {
+        let mut ahead = if read_ahead {
+            self.ahead_for(ids)
+        } else {
+            Ahead::default()
+        };
         let mut i = 0;
         while i < ids.len() {
             let id = ids[i];
@@ -401,7 +438,7 @@ impl Vocab {
                 break;
             }
             let b = (id as usize) / FC_BLOCK;
-            ahead.at(self, self.block_offset(b));
+            ahead.at(self, b);
             let end = ((b + 1) * FC_BLOCK) as u64;
             let j = i + ids[i..].partition_point(|&x| x < end);
             let wanted = &ids[i..j];
@@ -424,6 +461,9 @@ impl Vocab {
     /// ids then finds its pages read by many requests at once, instead of one page fault
     /// at a time. Nearby pages are asked for in one range.
     pub fn prefetch_sorted(&self, ids: &[u64]) {
+        if !crate::index::io_hints() {
+            return;
+        }
         const GAP: usize = 64 << 10;
         fn advise(m: &Mmap, ranges: impl Iterator<Item = (usize, usize)>) {
             let mut cur: Option<(usize, usize)> = None;
@@ -435,14 +475,14 @@ impl Vocab {
                 cur = match cur {
                     Some((cs, ce)) if s <= ce + GAP => Some((cs, ce.max(e))),
                     Some((cs, ce)) => {
-                        let _ = m.advise_range(memmap2::Advice::WillNeed, cs, ce - cs);
+                        crate::index::will_need(m, cs, ce - cs);
                         Some((s, e))
                     }
                     None => Some((s, e)),
                 };
             }
             if let Some((cs, ce)) = cur {
-                let _ = m.advise_range(memmap2::Advice::WillNeed, cs, ce - cs);
+                crate::index::will_need(m, cs, ce - cs);
             }
         }
         let (Bytes::Map(data), Bytes::Map(offsets)) = (&self.data, &self.offsets) else {
@@ -454,13 +494,74 @@ impl Vocab {
             .map(|&id| id as usize / FC_BLOCK)
             .collect();
         blocks.dedup();
+        let mut word_at = usize::MAX;
+        let mut seen = 0;
+        blocks.retain(|&b| {
+            let at = b / 64;
+            let word = &self.prefetched[at];
+            if word_at != at {
+                word_at = at;
+                seen = word.load(AtomicOrdering::Relaxed);
+            }
+            let bit = 1u64 << (b % 64);
+            if seen & bit != 0 {
+                return false;
+            }
+            seen |= bit;
+            word.fetch_or(bit, AtomicOrdering::Relaxed) & bit == 0
+        });
         advise(offsets, blocks.iter().map(|&b| (b * 8, b * 8 + 16)));
         advise(
             data,
-            blocks
-                .iter()
-                .map(|&b| (self.block_offset(b), self.block_offset(b + 1))),
+            blocks.iter().map(|&b| {
+                let end = if b + 1 < self.num_blocks() {
+                    self.block_offset(b + 1)
+                } else {
+                    data.len()
+                };
+                (self.block_offset(b), end)
+            }),
         );
+    }
+
+    /// Overlap the vocabulary reads of a medium-sized result decoded in row order.
+    /// With a sparse index, use its in-memory offsets and hint each group once, as
+    /// `find` does. Warm requests then avoid sorting their cells or repeating hints.
+    pub(crate) fn prefetch_terms(&self, ids: impl Iterator<Item = u64>) {
+        if !crate::index::io_hints()
+            || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
+        {
+            return;
+        }
+        let Some(s) = &self.sparse else {
+            let mut ids: Vec<u64> = ids.collect();
+            ids.sort_unstable();
+            ids.dedup();
+            self.prefetch_sorted(&ids);
+            return;
+        };
+        let mut groups = Vec::new();
+        let mut last = usize::MAX;
+        for id in ids.filter(|&id| id < self.len) {
+            let g = id as usize / (FC_BLOCK * IDX_BLOCKS);
+            // Row-ordered columns often stay in one group for hundreds of cells.
+            // Even a warm bitmap load need not be repeated for adjacent cells.
+            if g != last && s.first_hint(g) {
+                groups.push(g);
+            }
+            last = g;
+        }
+        groups.sort_unstable();
+        for g in groups {
+            let lo = g * IDX_BLOCKS;
+            let hi = ((g + 1) * IDX_BLOCKS).min(self.num_blocks());
+            self.offsets.will_need(lo * 8, (hi + 1) * 8);
+            let end = s
+                .offsets
+                .get(g + 1)
+                .map_or(self.data.as_slice().len(), |&o| o as usize);
+            self.data.will_need(s.offsets[g] as usize, end);
+        }
     }
 
     /// Binary search: `Ok(id)` if present, `Err(insertion point)` otherwise.
@@ -562,7 +663,11 @@ impl Vocab {
         if end.saturating_sub(start) > ids.len() * DENSE {
             return off;
         }
-        Ahead { until: start, end }
+        Ahead {
+            until: start,
+            end,
+            offsets_until: 0,
+        }
     }
 
     /// Iterate all keys in order.
@@ -570,9 +675,10 @@ impl Vocab {
         let mut ahead = Ahead {
             until: 0,
             end: self.data.as_slice().len(),
+            offsets_until: 0,
         };
         for b in 0..self.num_blocks() {
-            ahead.at(self, self.block_offset(b));
+            ahead.at(self, b);
             self.scan_block(b, |i, k| {
                 f((b * FC_BLOCK + i) as u64, k);
                 true
@@ -1131,6 +1237,43 @@ mod tests {
         assert_eq!(got.len(), ids.len());
         for (i, k) in got {
             assert_eq!(v.get(i).unwrap(), k);
+        }
+    }
+
+    #[test]
+    fn prefetch_preserves_terms_with_partial_last_block_and_without_sparse_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = write_keys(dir.path(), 3 * FC_BLOCK * IDX_BLOCKS + 77);
+        for sparse in [true, false] {
+            let mut v = Vocab::open(dir.path()).unwrap();
+            if !sparse {
+                v.sparse = None;
+            }
+            let last = v.len() - 1;
+            // Unsorted, repeated, out-of-range and final-block ids are all possible
+            // in a row-oriented answer. Hinting must not affect its decoded terms.
+            let ids = [last, 0, 2048, last, v.len(), u64::MAX];
+            v.prefetch_terms(ids.into_iter());
+            v.prefetch_terms(ids.into_iter());
+            let mut sorted: Vec<u64> = (0..v.len()).step_by(7).chain(ids).collect();
+            sorted.sort_unstable();
+            v.prefetch_sorted(&sorted);
+            sorted.dedup();
+            let expected: Vec<_> = sorted
+                .iter()
+                .copied()
+                .filter(|&id| id < v.len())
+                .map(|id| (id, keys[id as usize].clone()))
+                .collect();
+            for read_ahead in [true, false] {
+                let mut got = Vec::new();
+                v.get_sorted_with_ahead(
+                    &sorted,
+                    |id, key| got.push((id, key.to_vec())),
+                    read_ahead,
+                );
+                assert_eq!(got, expected);
+            }
         }
     }
 

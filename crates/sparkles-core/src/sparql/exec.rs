@@ -3109,6 +3109,28 @@ fn order_by(
     limit: Option<usize>,
     report: &mut ExprReport,
 ) -> Result<(Table, Option<String>)> {
+    // Small sorts do not use decode_for's bulk value columns. Their dictionary
+    // keys can still span hundreds of cold pages (e.g. country populations).
+    if (256..4096).contains(&t.len()) && crate::index::io_hints() {
+        let mut cols: Vec<usize> = keys
+            .iter()
+            .filter_map(|(e, _)| match e {
+                Expr::Var(v) => t.col_of(*v),
+                _ => None,
+            })
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        let mut ids: Vec<u64> = cols
+            .into_iter()
+            .flat_map(|c| t.cols[c].iter())
+            .filter(|id| id.tag() == crate::id::Tag::Vocab)
+            .map(|id| id.payload())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ctx.snap.generation.vocab.prefetch_sorted(&ids);
+    }
     let mut notes = Vec::new();
     if let Some(k) = limit
         && ctx.opt.topk_prefilter
