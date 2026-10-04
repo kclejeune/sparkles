@@ -3591,138 +3591,19 @@ async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
     let opts = query_options(&st, &ds, &params);
     blocking(move || {
         let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
-        let gen_ = &snap.generation;
-        let term = |id: u64| {
-            snap.term(Id(id)).map(|t| match t {
-                oxrdf::Term::NamedNode(n) => n.into_string(),
-                t => t.to_string(),
-            })
-        };
-        // graphs
-        let mut graphs = Vec::new();
-        for g in snap.distinct_first(Perm::Gspo)? {
-            let n = snap.count(Perm::Gspo, &[g])?;
-            let name = if g == Id::DEFAULT_GRAPH.0 {
-                J::Null
-            } else {
-                term(g).map_or(J::Null, J::String)
-            };
-            graphs.push(json!({ "name": name, "quads": n }));
-            if graphs.len() >= 1000 {
-                break;
-            }
-        }
-        // predicates: exact counts; distinct S/O from build statistics
-        let mut preds: Vec<(u64, u64)> = Vec::new();
-        for p in snap.distinct_first(Perm::Pso)? {
-            preds.push((p, snap.count(Perm::Pso, &[p])?));
-            if preds.len() >= 10_000 {
-                break;
-            }
-        }
-        preds.sort_by_key(|p| std::cmp::Reverse(p.1));
-        let predicates: Vec<J> = preds
-            .iter()
-            .take(100)
-            .map(|&(p, count)| {
-                let ps = gen_.stats.predicate(p);
-                json!({
-                    "iri": term(p).unwrap_or_default(),
-                    "count": count,
-                    "distinctSubjects": ps.map_or(0, |s| s.distinct_subjects),
-                    "distinctObjects": ps.map_or(0, |s| s.distinct_objects),
-                })
-            })
-            .collect();
-        // classes: distinct subjects typed with each class over every graph, as the
-        // build statistics count them; after updates, from one ordered pass over
-        // POS[rdf:type], where a subject typed in several graphs counts once
-        let mut classes: Vec<(u64, u64)> = if snap.delta.is_empty() {
-            gen_.stats.classes.clone()
-        } else {
-            let mut v: Vec<(u64, u64)> = Vec::new();
-            if let Some(t) = snap.lookup_iri(oxrdf::vocab::rdf::TYPE.as_str()) {
-                let mut prev: Option<(u64, u64)> = None;
-                let mut visit = |k: &sparkles::index::Key| {
-                    if prev == Some((k[1], k[2])) {
-                        return;
-                    }
-                    match v.last_mut() {
-                        Some((c, n)) if *c == k[1] => *n += 1,
-                        _ => v.push((k[1], 1)),
-                    }
-                    prev = Some((k[1], k[2]));
-                };
-                snap.scan(Perm::Pos, &[t.0], |c| {
-                    match c {
-                        sparkles::store::Chunk::Block(b, s, e) => {
-                            (s..e).for_each(|i| visit(&b.key(i)))
-                        }
-                        sparkles::store::Chunk::Row(k) => visit(&k),
-                    }
-                    Ok(true)
-                })?;
-            }
-            v
-        };
-        classes.sort_by_key(|c| std::cmp::Reverse(c.1));
-        let classes: Vec<J> = classes
-            .iter()
-            .take(100)
-            .map(|&(c, n)| json!({ "iri": term(c).unwrap_or_default(), "instances": n }))
-            .collect();
-        let cache = ds.store.cache();
-        let rcache = ds.store.result_cache();
-        let h = ds.store.history();
-        let resp = Json(json!({
-            "name": ds.name,
-            "commit": snap.commit,
-            "at": resolved.as_ref().map(|r| r.at.to_string()),
-            "history": {
-                "bytes": h.bytes,
-                "generations": h.generations.iter().filter(|g| !g.current).count(),
-                "snapshots": h.snapshots,
-                "oldestReconstructable": h.oldest_reconstructable(),
-            },
-            "quads": snap.len(),
-            "baseQuads": gen_.meta.quads,
-            "deltaInserts": snap.delta.inserts(),
-            "deltaDeletes": snap.delta.deletes(),
-            "terms": gen_.vocab.len() + gen_.dvocab.len(),
-            "generation": gen_.name,
-            "graphs": graphs,
-            "predicates": predicates,
-            "classes": classes,
-            "diskBytes": ds.store.disk_bytes(),
-            "quota": (ds.kind == DbType::Persistent).then(|| budgets::quota_json(&ds)),
-            "reasoning": reasoning,
-            "datasets": fuseki,
-            "geo": crate::geo::status_json(&ds),
-            "compaction": crate::compaction::status_json(&st, &ds),
-            "cache": {
-                "entries": cache.entries(),
-                "bytes": cache.bytes(),
-                "hits": cache.hits(),
-                "misses": cache.misses(),
-            },
-            "resultCache": {
-                "enabled": rcache.enabled(),
-                "entries": rcache.entries(),
-                "bytes": rcache.bytes(),
-                "hits": rcache.hits(),
-                "misses": rcache.misses(),
-            },
-            "serviceCache": {
-                "enabled": rcache.service.enabled(),
-                "entries": rcache.service.entries(),
-                "bytes": rcache.service.bytes(),
-                "capacityBytes": rcache.service.capacity(),
-                "hits": rcache.service.hits(),
-                "misses": rcache.service.misses(),
-            },
-        }))
-        .into_response();
-        let resp = with_commit(resp, &ds, snap.commit);
+        let stats = ds.dataset.stats_of(&snap, resolved.as_ref())?;
+        let mut body = serde_json::to_value(&stats).unwrap_or_default();
+        // what the server adds: the name it serves the dataset under, its quota, the
+        // reasoning, spatial index and compaction status, and Fuseki's counters
+        body["name"] = ds.name.clone().into();
+        body["quota"] = (ds.kind == DbType::Persistent)
+            .then(|| budgets::quota_json(&ds))
+            .into();
+        body["reasoning"] = reasoning;
+        body["datasets"] = fuseki;
+        body["geo"] = crate::geo::status_json(&ds);
+        body["compaction"] = crate::compaction::status_json(&st, &ds);
+        let resp = with_commit(Json(body).into_response(), &ds, snap.commit);
         Ok(history::history_headers(resp, resolved.as_ref(), &uri))
     })
     .await

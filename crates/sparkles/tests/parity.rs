@@ -86,8 +86,12 @@ fn entries() -> Vec<(&'static str, Entry)> {
         pending!("listBackupFiles", "phase 1 step 6"),
         pending!("listBackupFilesPost", "phase 1 step 6"),
         server_only!("setDatasetState", Http),
-        pending!("getDatasetStats", "phase 1 step 5"),
-        pending!("getDatasetStatsPost", "phase 1 step 5"),
+        op!("getDatasetStats", "dataset.stats", |ds| {
+            ds.stats(&Default::default());
+        }),
+        op!("getDatasetStatsPost", "dataset.stats", |ds| {
+            ds.stats(&Default::default());
+        }),
         op!("clearCache", "dataset.clear_cache", |ds| ds.clear_cache()),
         op!("compactDataset", "dataset.compact_with", |ds| {
             ds.compact_with(&Default::default(), &Control::none());

@@ -19,6 +19,7 @@ pub mod fmt;
 pub mod handles;
 pub mod querybuilder;
 pub mod reasoning;
+pub mod stats;
 pub mod write_guard;
 
 pub use dataset::{Dataset, DatasetOptions, GraphView, QuadIter, Solution, Solutions, Transaction};

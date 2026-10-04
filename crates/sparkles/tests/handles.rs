@@ -586,6 +586,33 @@ fn graphql_drafts_installs_and_runs() {
     assert!(gql.reset(None).unwrap());
 }
 
+#[test]
+fn stats_count_graphs_predicates_and_classes() {
+    let (_dir, ds) = persistent();
+    ds.update(
+        "INSERT DATA { <http://ex.org/a> a <http://ex.org/A> . GRAPH <http://ex.org/g> { <http://ex.org/b> a <http://ex.org/A> } }",
+    )
+    .unwrap();
+    let s = ds.stats(&Default::default()).unwrap();
+    assert_eq!(s.commit, ds.head_commit().seq);
+    assert_eq!(s.quads, 4);
+    assert_eq!(s.graphs.len(), 2);
+    assert_eq!(s.classes[0].iri, "http://ex.org/A");
+    assert_eq!(s.classes[0].instances, 2);
+    assert!(s.at.is_none());
+    let past = ds
+        .stats(&sparkles::stats::StatsOptions {
+            at: Some(At::Commit(ds.head_commit().seq - 1)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(past.quads, 2);
+    assert!(past.at.is_some());
+    let j = serde_json::to_value(&s).unwrap();
+    assert_eq!(j["baseQuads"].as_u64(), Some(s.base_quads));
+    assert!(j["resultCache"]["enabled"].is_boolean());
+}
+
 #[cfg(feature = "graphql")]
 fn sparkles_graphql_request(q: &str) -> sparkles::handles::graphql::Request {
     sparkles::handles::graphql::Request {
