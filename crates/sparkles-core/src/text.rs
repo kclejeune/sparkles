@@ -33,6 +33,8 @@ mod lazydir;
 #[cfg(feature = "text")]
 mod lucene;
 #[cfg(feature = "text")]
+mod porter;
+#[cfg(feature = "text")]
 mod search;
 #[cfg(feature = "text")]
 mod sloppy;
@@ -118,8 +120,9 @@ pub struct TextConfig {
 }
 
 /// A language analyzer: Tantivy's Snowball stemmer for the language, after the stop
-/// words of the language are removed (where Tantivy has a list for it), or `cjk`, the
-/// bigrams of Chinese, Japanese and Korean text.
+/// words of the language are removed (where Tantivy has a list for it), `porter`, the
+/// English stop words and Porter's stemmer as in Lucene's English analyzer, or `cjk`,
+/// the bigrams of Chinese, Japanese and Korean text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Analyzer {
@@ -144,6 +147,10 @@ pub enum Analyzer {
     /// overlapping bigrams of Han, Hiragana, Katakana and Hangul, as Lucene's
     /// `CJKAnalyzer` makes them (no stemmer, no dictionary)
     Cjk,
+    /// English with the Porter stemmer of Lucene's `EnglishAnalyzer` (and so of
+    /// jena-text), where `english` uses the Snowball English stemmer; no tag has it by
+    /// default
+    Porter,
 }
 
 impl Analyzer {
@@ -192,7 +199,7 @@ impl Analyzer {
         Self::ALL
             .iter()
             .map(|(_, a)| *a)
-            .chain([Analyzer::Cjk])
+            .chain([Analyzer::Cjk, Analyzer::Porter])
             .find(|a| a.name() == name)
     }
 
@@ -217,6 +224,7 @@ impl Analyzer {
             Analyzer::Tamil => "tamil",
             Analyzer::Turkish => "turkish",
             Analyzer::Cjk => "cjk",
+            Analyzer::Porter => "porter",
         }
     }
 }
@@ -717,7 +725,7 @@ mod imp {
         for a in Analyzer::ALL
             .map(|(_, a)| a)
             .into_iter()
-            .chain([Analyzer::Cjk])
+            .chain([Analyzer::Cjk, Analyzer::Porter])
         {
             index
                 .tokenizers()
@@ -737,6 +745,14 @@ mod imp {
                 return TextAnalyzer::builder(super::cjk::CjkTokenizer)
                     .filter(RemoveLongFilter::limit(MAX_TOKEN))
                     .filter(LowerCaser)
+                    .build();
+            }
+            Analyzer::Porter => {
+                return TextAnalyzer::builder(SimpleTokenizer::default())
+                    .filter(RemoveLongFilter::limit(MAX_TOKEN))
+                    .filter(LowerCaser)
+                    .filter(StopWordFilter::new(L::English).expect("English stop words"))
+                    .filter(super::porter::PorterStemmer)
                     .build();
             }
             Analyzer::Arabic => L::Arabic,

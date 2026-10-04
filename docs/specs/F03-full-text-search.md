@@ -13,8 +13,8 @@
 > `spk:hybridSearch` ([F04](F04-vector-search.md#outcome)). On 2026-10-03 `text` on
 > dataset creation, online rebuilds with a journal, variable query strings with
 > bound-subject pushdown, incremental bulk maintenance and rebuilds over the literal
-> range shipped. A background rebuild at open, facets, search at historical snapshots
-> and an opt-in stale mode are not built.
+> range shipped, and so did a `porter` analyzer for English. A background rebuild at
+> open, facets, search at historical snapshots and an opt-in stale mode are not built.
 >
 > **User docs:** [API: Full-text search](../API.md#full-text-search) · [Features](../FEATURES.md#sparql-arq-equivalent) · [Benchmarks: Full-text index and observability](../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
 >
@@ -813,7 +813,7 @@ reads a word the analyzer splits, and a phrase keeps them in order. `text_lang.r
 searches Japanese, Chinese and Korean literals by words, phrases, folded widths and
 half-width Katakana, and unit tests cover the bigrams, offsets and width folding.
 
-**Not built.** Online rebuilds with a journal, `text` on dataset creation, Lucene's Porter
+**Not built at first.** Online rebuilds with a journal, `text` on dataset creation, Lucene's Porter
 and light stemmers, dictionary-based CJK segmentation, and the rest of Phase 3 apart from
 hybrid retrieval.
 
@@ -865,6 +865,16 @@ hybrid retrieval.
   object once, since the quads come in object order. The new document order uncovered
   a bug in the sloppy phrase scorer, which could seek a word's postings backwards, and
   that is fixed.
+* *Porter's stemmer.* The `porter` analyzer stems English as Lucene's
+  `EnglishAnalyzer`, and so jena-text, does: the English stop words, then Porter's
+  algorithm in the form of his reference implementations, with their two departures
+  from the paper in step 2 (`bli` to `ble` and `logi` to `log`). It is written for
+  Sparkles in `text/porter.rs` from the 1980 paper and adds no crate. No tag takes it by
+  default, so an index selects it with `"languages": {"en": "porter"}`, and the English
+  differences of the comparison above, such as `relativity`, which Porter stems to
+  `rel` and Snowball to `relat`, go away for such an index. The tokens still come from
+  the standard tokenizer, which splits a possessive `'s` off where Lucene removes it.
+  Lucene's light stemmers for French, Spanish, Italian and Portuguese are not built.
 * *Tests.* `crates/sparkles-core/tests/text.rs` covers a rebuild against the index that
   maintenance kept, bulk loads and replacements that update the index by their changes
   and survive a reopen, a rebuild running while writes go on (with a compaction during

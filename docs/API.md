@@ -3873,6 +3873,11 @@ SELECT ?s ?score ?label WHERE {
     `pt`, `ro`, `ru`, `es`, `sv`, `ta` and `tr`, and `zh`, `ja` and `ko` for `cjk`.
     `"all"` names the 18 stemmed languages, so CJK is listed on its own, as in
     `["en", "zh", "ja", "ko"]`.
+  * `porter` stems English with Porter's algorithm after the English stop words, as
+    Lucene's English analyzer, and so jena-text, does, where `english` uses the
+    Snowball English stemmer. The two differ on words such as `relativity`, which
+    Porter stems to `rel`, as it does `relative`, and Snowball to `relat`. No tag takes
+    it by default: `{"en": "porter"}` selects it.
   * `cjk` segments Chinese, Japanese and Korean text without a dictionary, as Lucene's
     `CJKAnalyzer` does. A run of Han, Hiragana, Katakana or Hangul characters becomes its
     overlapping pairs of characters, so `東京都` is indexed as `東京` and `京都`, and a
