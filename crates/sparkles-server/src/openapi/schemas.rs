@@ -1,14 +1,19 @@
 //! `components.schemas`: the bodies of the API as JSON Schema 2020-12.
 //!
-//! The common types are described member by member, and so are the most used admin
-//! bodies ([`admin`]). The other admin bodies, which only `docs/API.md` describes in
-//! full, are open objects (`open`) that link to their section; the OpenAPI description
-//! says so in its `info.description`.
+//! Every body is described member by member: the common types here, the admin bodies in
+//! [`admin`], [`server`], [`changes`], [`features`] and [`policies`]. Members that
+//! `docs/API.md` calls free-form, such as SHACL results and GeoJSON geometries, stay
+//! open objects inside the typed ones.
 
 use super::{api_doc, sref};
 use serde_json::{Map, Value as J, json};
 
 mod admin;
+mod changes;
+mod features;
+mod kit;
+mod policies;
+mod server;
 
 /// An object with these members, of which `required` must be present.
 fn obj(required: &[&str], props: J) -> J {
@@ -17,16 +22,6 @@ fn obj(required: &[&str], props: J) -> J {
         o["required"] = json!(required);
     }
     o
-}
-
-/// An object described in full only in `docs/API.md` (at `anchor`); any member is allowed.
-fn open(description: &str, anchor: &str) -> J {
-    json!({
-        "type": "object",
-        "additionalProperties": true,
-        "description": description,
-        "externalDocs": { "url": api_doc(anchor) },
-    })
 }
 
 fn array(items: J) -> J {
@@ -160,13 +155,6 @@ pub(super) fn schemas() -> Map<String, J> {
                     "deltaQuads": { "type": "integer" },
                 }))),
             }),
-        ),
-    );
-    put(
-        "MetricsSnapshot",
-        open(
-            "The counters of `/$/metrics` as JSON (`?format=json`).",
-            "metrics",
         ),
     );
     put(
@@ -357,13 +345,6 @@ pub(super) fn schemas() -> Map<String, J> {
         }),
     );
     put(
-        "FusekiStats",
-        open(
-            "Fuseki's request counters, `{datasets: {\"/ds\": FusekiCounters}}`.",
-            "datasets-admin",
-        ),
-    );
-    put(
         "Prefixes",
         obj(
             &["prefixes"],
@@ -424,24 +405,6 @@ pub(super) fn schemas() -> Map<String, J> {
                 "modes": array(json!({ "type": "string" })),
             }),
         ),
-    );
-    put(
-        "CompactionStatus",
-        open(
-            "The dataset's automatic compaction: its settings, state, measures and last run.",
-            "automatic-compaction",
-        ),
-    );
-    put(
-        "CompactionPolicy",
-        open(
-            "Compaction settings: `minDeltaQuads`, `deltaRatio`, `maxDeltaQuads`, `maxDeltaMb`, `maxWalMb`, `idleSeconds`, `maxAgeSeconds`, `minIntervalSeconds`, `enabled` and `partial` (`auto`, `off` or `always`).",
-            "automatic-compaction",
-        ),
-    );
-    put(
-        "ValidatorResult",
-        open("The JSON answer of a Fuseki validator.", "validators"),
     );
 
     // ------------------------------------------------------------------ schema --
@@ -535,17 +498,10 @@ pub(super) fn schemas() -> Map<String, J> {
                 "hierarchy": { "type": "object" },
                 "classes": sref("ClassPage"),
                 "predicates": sref("PredicatePage"),
-                "constraints": { "type": "object" },
+                "constraints": sref("ConstraintsLayer"),
             },
             "externalDocs": { "url": api_doc("schema-discovery") },
         }),
-    );
-    put(
-        "ConstraintsLayer",
-        open(
-            "The SHACL constraints layer of a schema report.",
-            "constraints-layer",
-        ),
     );
 
     // ----------------------------------------------------------------- commits --
@@ -567,6 +523,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "generation": { "type": "string" },
                 "bulk": { "type": "boolean" },
                 "exact": { "type": "boolean" },
+                "reconstructed": { "const": true, "description": "Read back from the change log." },
                 "unvalidated": { "const": true },
                 "message": { "type": "string" },
                 "digest": { "type": "string" },
@@ -612,27 +569,6 @@ pub(super) fn schemas() -> Map<String, J> {
                 "datasetId": { "type": "string" },
                 "commit": sref("Commit"),
             }),
-        ),
-    );
-    put(
-        "Diff",
-        open(
-            "The net change between two states: counts, and the quads with `quads=true`.",
-            "diffs-between-commits",
-        ),
-    );
-    put(
-        "ChangeFeed",
-        open(
-            "The commits after `after`, oldest first, with their changes, and `next`.",
-            "change-feed",
-        ),
-    );
-    put(
-        "DryRunReport",
-        open(
-            "The preview of a write run with `dryRun=true`: the commit it would make, its changes, validation, preconditions and storage.",
-            "write-previews",
         ),
     );
 
@@ -992,134 +928,10 @@ pub(super) fn schemas() -> Map<String, J> {
     // ---------------------------------------------- admin bodies, member by member --
     admin::put_all(&mut put);
 
-    // ------------------------------------------------------ open admin bodies --
-    for (name, desc, anchor) in [
-        (
-            "ReasonRequest",
-            "`{profile: \"rdfs\" | \"owl-rl\" | \"rules\", rules?, vocabularies?, geoDefaultGeometry?}`",
-            "datasets-admin",
-        ),
-        (
-            "AutoReasonRequest",
-            "`{enabled, debounceSeconds?, maxDelaySeconds?}`",
-            "reasoning-status-and-diagnostics",
-        ),
-        (
-            "DiagnosticsReport",
-            "OWL 2 RL inconsistency checks.",
-            "reasoning-status-and-diagnostics",
-        ),
-        (
-            "TextHits",
-            "Full-text search hits, best first.",
-            "full-text-search",
-        ),
-        (
-            "VectorIndexCreated",
-            "`{index: VectorIndexStatus, task: Task}`",
-            "vector-indexes",
-        ),
-        (
-            "RecallReport",
-            "`{k, samples, ef, recall, hnswMs, exactMs}`",
-            "vector-indexes",
-        ),
-        (
-            "GeoConvertRequest",
-            "`{literals: [{value, datatype}]}`, at most 10,000 literals.",
-            "hulls-aggregates-jena-filter-functions-utm-and-conversion",
-        ),
-        (
-            "GeoConvertResult",
-            "`{results: [...]}`, one per literal.",
-            "hulls-aggregates-jena-filter-functions-utm-and-conversion",
-        ),
-        (
-            "RdfsStatus",
-            "The dataset's RDFS-on-read setting, or `{enabled: false}`.",
-            "rdfs-on-read",
-        ),
-        (
-            "RdfsRequest",
-            "`{graph: IRI | \"default\"}`; a schema document in an RDF syntax is sent with its own media type.",
-            "rdfs-on-read",
-        ),
-        (
-            "HistoryRequest",
-            "`{keepCommits?, keepAge?, maxBytes?, schedules?, catalog?}`",
-            "named-snapshots-and-retention",
-        ),
-        (
-            "SnapshotRequest",
-            "`{name, at?, note?, expires?, warm?}`",
-            "named-snapshots-and-retention",
-        ),
-        (
-            "StoredQueryVersions",
-            "The kept versions of a stored query, newest first.",
-            "stored-queries",
-        ),
-        (
-            "ShexRequest",
-            "The JSON envelope of a ShEx validation: `{schema, schemaFormat?, map, externs?, imports?, base?}`.",
-            "shex-validation",
-        ),
-        ("ShexReport", "A ShEx validation result.", "shex-validation"),
-        (
-            "VerifyRequest",
-            "`{level?: \"exists\" | \"data\" | \"restore\"}`",
-            "backup-routes",
-        ),
-        ("GcRequest", "`{dryRun?, graceHours?}`", "backup-routes"),
-        (
-            "LockList",
-            "`{locks: Lock[]}`",
-            "locks-and-garbage-collection",
-        ),
-        (
-            "BackupRequest",
-            "`{repository, name?, note?}`",
-            "backup-routes",
-        ),
-        (
-            "RestoreRequest",
-            "Where and how to restore a backup.",
-            "restore",
-        ),
-        (
-            "Policy",
-            "A backup policy with its state.",
-            "lifecycle-policies",
-        ),
-        ("PolicyList", "`{policies: Policy[]}`", "lifecycle-policies"),
-        (
-            "PolicyConfig",
-            "A backup policy's settings: datasets, repository, schedule and retention.",
-            "lifecycle-policies",
-        ),
-        (
-            "SchedulePreviewRequest",
-            "`{schedule, timezone?, count?, nameTemplate?, dataset?}`",
-            "backup-routes",
-        ),
-        (
-            "SchedulePreview",
-            "`{next: string[], description, …}`",
-            "backup-routes",
-        ),
-        (
-            "RetentionResult",
-            "`{dryRun, delete, keep, errors?}`",
-            "backup-routes",
-        ),
-        ("PolicyRuns", "`{runs: PolicyRun[]}`", "backup-routes"),
-        (
-            "BackupFiles",
-            "Fuseki's list of N-Quads backup files, `{backups: string[]}`.",
-            "datasets-admin",
-        ),
-    ] {
-        put(name, open(desc, anchor));
-    }
+    // ------------------------------------------------- the other bodies --
+    server::put_all(&mut put);
+    changes::put_all(&mut put);
+    features::put_all(&mut put);
+    policies::put_all(&mut put);
     s
 }
