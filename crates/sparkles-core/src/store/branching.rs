@@ -467,7 +467,7 @@ impl BranchSet {
                     Ok(Some(b)) if b.dataset_id == dataset_id => {
                         std::fs::remove_dir_all(&path)?;
                     }
-                    _ => tracing::warn!(
+                    _ => tracing::warn!(target: "sparkles::store::branching",
                         "{}: not a branch of this dataset; left alone",
                         path.display()
                     ),
@@ -477,7 +477,7 @@ impl BranchSet {
         }
         for e in &table.branches {
             if !dir.join(e.id.to_string()).join(BRANCH_FILE).exists() {
-                tracing::error!(
+                tracing::error!(target: "sparkles::store::branching",
                     "branch {} ({}) is listed but its directory is missing; its holds are kept",
                     e.name,
                     e.id
@@ -1359,7 +1359,7 @@ impl Store {
                 .store(t.next_ordinal as u64, Ordering::Relaxed);
         }
         drop(up_store);
-        tracing::info!(
+        tracing::info!(target: "sparkles::store::branching",
             branch = name,
             id = %id,
             from = o.from,
@@ -1665,7 +1665,7 @@ impl Store {
             );
         }
         self.quota.invalidate();
-        tracing::info!(branch = name, id = %e.id, force, "deleted a branch");
+        tracing::info!(target: "sparkles::store::branching", branch = name, id = %e.id, force, "deleted a branch");
         Ok(())
     }
 
@@ -1699,7 +1699,7 @@ impl Store {
             let mut next = t.clone();
             next.branches[i].holds.clear();
             if let Err(e) = write_table(&set.root, &next) {
-                tracing::warn!(
+                tracing::warn!(target: "sparkles::store::branching",
                     branch = ident.name,
                     "could not release the branch's holds: {e}"
                 );
@@ -1707,7 +1707,7 @@ impl Store {
             }
             *t = next;
         }
-        tracing::info!(
+        tracing::info!(target: "sparkles::store::branching",
             branch = ident.name,
             "the branch owns its index and released its holds"
         );

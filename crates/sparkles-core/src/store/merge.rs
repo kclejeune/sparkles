@@ -280,7 +280,7 @@ impl Store {
         let t0 = std::time::Instant::now();
         let r = self.merge_inner(source, target, o, false);
         match &r {
-            Ok(MergeOutcome::Merged(m)) => tracing::info!(
+            Ok(MergeOutcome::Merged(m)) => tracing::info!(target: "sparkles::store::merge",
                 source,
                 target,
                 base = ?m.base.as_ref().map(|b| b.seq),
@@ -291,7 +291,7 @@ impl Store {
                 ms = t0.elapsed().as_secs_f64() * 1e3,
                 "merged"
             ),
-            Ok(MergeOutcome::Conflicts(c)) => tracing::info!(
+            Ok(MergeOutcome::Conflicts(c)) => tracing::info!(target: "sparkles::store::merge",
                 source,
                 target,
                 conflicts = c.conflicts,
