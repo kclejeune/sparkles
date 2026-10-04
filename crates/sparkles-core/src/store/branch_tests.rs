@@ -1238,6 +1238,12 @@ fn a18_the_first_rebuild_of_a_linked_branch_keeps_the_quota() {
     s.create_branch("dev", &BranchOptions::default()).unwrap();
     let dev = s.branch("dev").unwrap();
     apply(&dev, "+<urn:new> <urn:p> <urn:x> .");
+    // the change logs' background writer records the load and the branch's commit
+    // after them: wait for it, and measure the directory afresh, or a later walk finds
+    // more bytes than the quota was set from
+    s.flush_change_log().unwrap();
+    dev.flush_change_log().unwrap();
+    s.quota.invalidate();
     let used = s.disk_usage();
     s.set_quota(Some(used + (64 << 10))).unwrap();
     let b = dev.compaction_blocker(false).expect("the quota blocks it");
