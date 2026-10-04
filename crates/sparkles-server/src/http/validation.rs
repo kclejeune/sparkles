@@ -85,21 +85,15 @@ pub(super) fn rejection(r: &sparkles::guard::Rejection) -> ApiError {
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod handlers {
     use super::*;
-    use crate::write_validation::{Validation, none_json};
+    use crate::write_validation::none_json;
     use sparkles::guard::GuardLanguage;
+    use sparkles::handles::GuardOutcome;
 
     fn status_json(ds: &Dataset) -> J {
-        match ds.validation.read().as_ref() {
+        match ds.dataset.validation().guard().get() {
             Some(g) => g.json(),
             None => none_json(),
         }
-    }
-
-    /// The outcome of setting a configuration, in either language.
-    enum Outcome {
-        Installed(Validation),
-        NotConforming(sparkles::guard::ValidationSummary),
-        Removed,
     }
 
     /// The language a `PUT` body asks for: `language`, or SHACL without one.
@@ -124,16 +118,10 @@ mod handlers {
 
     /// Set a SHACL configuration (format 1 or 2; written as format 2).
     #[cfg(feature = "shacl")]
-    fn set_shacl(ds: &Dataset, j: J) -> ApiResult<Outcome> {
-        use sparkles_shacl::guard::{self, SetOutcome, ValidationConfig};
-        let cfg: ValidationConfig = serde_json::from_value(j).map_err(invalid)?;
-        Ok(
-            match guard::set_config(&ds.store, Some(cfg)).map_err(config_error)? {
-                SetOutcome::Installed(g, _) => Outcome::Installed(Validation::Shacl(g)),
-                SetOutcome::NotConforming(s) => Outcome::NotConforming(s),
-                SetOutcome::Removed => Outcome::Removed,
-            },
-        )
+    fn set_shacl(ds: &Dataset, j: J) -> ApiResult<GuardOutcome> {
+        let cfg: sparkles_shacl::guard::ValidationConfig =
+            serde_json::from_value(j).map_err(invalid)?;
+        Ok(ds.dataset.validation().guard().set_shacl(cfg)?)
     }
 
     /// Set a ShEx configuration (format 2). The schema's imports resolve as for
@@ -141,8 +129,8 @@ mod handlers {
     /// http(s) through the outbound policy; there are no inline import bodies or
     /// externs, so an EXTERNAL shape is an error.
     #[cfg(feature = "shex")]
-    fn set_shex(st: &AppState, ds: &Dataset, mut j: J) -> ApiResult<Outcome> {
-        use sparkles_shex::guard::{self, SetOutcome, ShexValidationConfig};
+    fn set_shex(st: &AppState, ds: &Dataset, mut j: J) -> ApiResult<GuardOutcome> {
+        use sparkles_shex::guard::{self, ShexValidationConfig};
         if let Some(o) = j.as_object_mut() {
             o.entry("format").or_insert(json!(guard::CONFIG_FORMAT));
         }
@@ -157,13 +145,7 @@ mod handlers {
             outbound: Some((st.outbound.clone(), budget)),
             ..Default::default()
         };
-        Ok(
-            match guard::set_config(&ds.store, Some(cfg), &resolver).map_err(config_error)? {
-                SetOutcome::Installed(g, _) => Outcome::Installed(Validation::Shex(g)),
-                SetOutcome::NotConforming(s) => Outcome::NotConforming(s),
-                SetOutcome::Removed => Outcome::Removed,
-            },
-        )
+        Ok(ds.dataset.validation().guard().set_shex(cfg, &resolver)?)
     }
 
     pub(in crate::http) async fn get(
@@ -205,21 +187,14 @@ mod handlers {
                 }
             };
             match outcome {
-                Outcome::Installed(g) => {
-                    *ds.validation.write() = Some(g);
-                    Ok(Json(status_json(&ds)).into_response())
-                }
-                Outcome::NotConforming(s) => Err(ApiError(
+                GuardOutcome::NotConforming(s) => Err(ApiError(
                     StatusCode::CONFLICT,
                     json!({
                         "error": "dataset does not conform; fix the data or use mode 'warn' first",
                         "validation": s,
                     }),
                 )),
-                Outcome::Removed => {
-                    *ds.validation.write() = None;
-                    Ok(Json(status_json(&ds)).into_response())
-                }
+                _ => Ok(Json(status_json(&ds)).into_response()),
             }
         })
         .await
@@ -232,24 +207,10 @@ mod handlers {
         let ds = dataset(&st, &name)?;
         blocking(move || {
             // either language's removal takes every validation file away
-            #[cfg(feature = "shacl")]
-            sparkles_shacl::guard::set_config(&ds.store, None).map_err(config_error)?;
-            #[cfg(all(feature = "shex", not(feature = "shacl")))]
-            sparkles_shex::guard::set_config(&ds.store, None, &sparkles_shex::NoImports)
-                .map_err(config_error)?;
-            *ds.validation.write() = None;
+            ds.dataset.validation().guard().reset()?;
             Ok(StatusCode::NO_CONTENT.into_response())
         })
         .await
-    }
-
-    /// Errors of setting a configuration: engine errors keep their status, anything
-    /// else (a bad field, shapes that do not parse) is 400.
-    fn config_error(e: anyhow::Error) -> ApiError {
-        match e.downcast::<Error>() {
-            Ok(e) => ApiError::from(e),
-            Err(e) => err(StatusCode::BAD_REQUEST, format!("{e:#}")),
-        }
     }
 }
 

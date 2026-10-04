@@ -55,7 +55,7 @@ pub use settings::{
 pub use settings::{
     CompactionReadings, CompactionState, CompactionStatus, DescribeStatus, SettingSource,
 };
-pub use validation::{GuardSetting, Validation};
+pub use validation::{GuardOutcome, GuardSetting, Validation};
 
 use crate::Dataset;
 

@@ -128,28 +128,18 @@ pub fn validate_at_startup(st: &crate::state::AppState, spec: &str) -> Result<St
         Some(l) => serde_json::from_value(l.clone())
             .with_context(|| format!("unknown language {l} (\"shacl\" or \"shex\")"))?,
     };
-    enum Set {
-        Installed(Validation, ValidationSummary),
-        NotConforming(ValidationSummary),
-        Removed,
-    }
+    use sparkles::handles::GuardOutcome;
+    let guard = ds.dataset.validation().guard();
     let set = match language {
         #[cfg(feature = "shacl")]
         GuardLanguage::Shacl => {
-            use sparkles_shacl::guard::{SetOutcome, ValidationConfig, set_config};
-            let cfg: ValidationConfig =
+            let cfg: sparkles_shacl::guard::ValidationConfig =
                 serde_json::from_value(j).context("invalid SHACL validation configuration")?;
-            match set_config(&ds.store, Some(cfg))? {
-                SetOutcome::Installed(g, s) => Set::Installed(Validation::Shacl(g), s),
-                SetOutcome::NotConforming(s) => Set::NotConforming(s),
-                SetOutcome::Removed => Set::Removed,
-            }
+            guard.set_shacl(cfg)?
         }
         #[cfg(feature = "shex")]
         GuardLanguage::Shex => {
-            use sparkles_shex::guard::{
-                CONFIG_FORMAT, SetOutcome, ShexValidationConfig, set_config,
-            };
+            use sparkles_shex::guard::{CONFIG_FORMAT, ShexValidationConfig};
             if let Some(o) = j.as_object_mut() {
                 o.entry("format").or_insert(json!(CONFIG_FORMAT));
             }
@@ -162,11 +152,7 @@ pub fn validate_at_startup(st: &crate::state::AppState, spec: &str) -> Result<St
                 outbound: Some((st.outbound.clone(), budget)),
                 ..Default::default()
             };
-            match set_config(&ds.store, Some(cfg), &resolver)? {
-                SetOutcome::Installed(g, s) => Set::Installed(Validation::Shex(g), s),
-                SetOutcome::NotConforming(s) => Set::NotConforming(s),
-                SetOutcome::Removed => Set::Removed,
-            }
+            guard.set_shex(cfg, &resolver)?
         }
         #[allow(unreachable_patterns)]
         l => bail!("--validate: built without the `{}` feature", l.name()),
@@ -176,9 +162,8 @@ pub fn validate_at_startup(st: &crate::state::AppState, spec: &str) -> Result<St
         _ => format!("{} results, {} blocking", s.total, s.blocking),
     };
     Ok(match set {
-        Set::Installed(v, s) => {
+        GuardOutcome::Installed(s) => {
             let mode = mode_name(s.mode);
-            *ds.validation.write() = Some(v);
             format!(
                 "write-time {} validation on /{name} ({mode}): {} in {} ms",
                 s.language.title(),
@@ -186,19 +171,16 @@ pub fn validate_at_startup(st: &crate::state::AppState, spec: &str) -> Result<St
                 s.millis
             )
         }
-        Set::NotConforming(s) if path.is_some() => bail!(
+        GuardOutcome::NotConforming(s) if path.is_some() => bail!(
             "--validate {spec}: /{name} does not pass ({}); fix the data or use mode \"warn\" first",
             counts(&s)
         ),
-        Set::NotConforming(s) => format!(
+        GuardOutcome::NotConforming(s) => format!(
             "write-time {} validation on /{name}: the data does not pass ({}); writes that touch it are rejected until it is fixed",
             s.language.title(),
             counts(&s)
         ),
-        Set::Removed => {
-            *ds.validation.write() = None;
-            format!("write-time validation on /{name} is off")
-        }
+        _ => format!("write-time validation on /{name} is off"),
     })
 }
 
