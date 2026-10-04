@@ -4752,9 +4752,8 @@ pub(super) fn vector_search(
                         Some(text_vector(ctx, pred, l.value())?.to_vec())
                     }
                     Some(oxrdf::Term::Literal(l)) => {
-                        match (l.datatype().as_str() == vector::DATATYPE)
-                            .then(|| vector::parse(l.value()).ok())
-                            .flatten()
+                        match vector::parse_typed(l.value(), l.datatype().as_str())
+                            .and_then(|v| v.ok())
                         {
                             Some(v) => Some(v),
                             // a literal that is not a vector matches nothing

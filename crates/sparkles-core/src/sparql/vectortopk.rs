@@ -148,10 +148,7 @@ fn vector_call(e: &Expr, ctx: &Ctx) -> Option<(Metric, VarId, Vec<f32>)> {
     let Some(oxrdf::Term::Literal(l)) = ctx.term(id) else {
         return None;
     };
-    if l.datatype().as_str() != vector::DATATYPE {
-        return None;
-    }
-    let q = vector::parse(l.value()).ok()?;
+    let q = vector::parse_typed(l.value(), l.datatype().as_str())?.ok()?;
     // a zero vector has no cosine: every row's key is an error
     if metric == Metric::Cosine && vector::norm(&q) == 0.0 {
         return None;

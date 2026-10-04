@@ -1547,8 +1547,10 @@ impl<'a> Planner<'a> {
             _ => return Err(shape()),
         };
         let query = match args.next() {
-            Some(TermPattern::Literal(l)) if l.datatype().as_str() == vector::DATATYPE => {
-                let v = vector::parse(l.value()).map_err(Error::invalid)?;
+            Some(TermPattern::Literal(l)) if vector::is_datatype(l.datatype().as_str()) => {
+                let v = vector::parse_typed(l.value(), l.datatype().as_str())
+                    .expect("a vector datatype")
+                    .map_err(Error::invalid)?;
                 VectorQuery::Vector(v.into())
             }
             Some(TermPattern::Literal(l))

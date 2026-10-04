@@ -12,6 +12,7 @@ import {
   indexConfig,
   indexForm,
   isVectorLiteral,
+  literalText,
   metricInfo,
   needsBuild,
   overlayShare,
@@ -24,6 +25,7 @@ import {
   searchMode,
   searchModeText,
   similarHits,
+  VECTOR_B64_DATATYPE,
   VECTOR_DATATYPE,
   vectorErrorHint,
   vectorPredicates,
@@ -37,6 +39,23 @@ describe('vector literals', () => {
     expect(isVectorLiteral({ type: 'literal', value: '[1, 2]' })).toBe(false);
     expect(isVectorLiteral({ type: 'uri', value: VECTOR_DATATYPE })).toBe(false);
     expect(isVectorLiteral(null)).toBe(false);
+  });
+
+  it('reads the compact datatype', () => {
+    const b64 = {
+      type: 'literal' as const,
+      value: 'zczMPc3MTD6amZk+',
+      datatype: VECTOR_B64_DATATYPE,
+    };
+    expect(isVectorLiteral(b64)).toBe(true);
+    const v = parseVector(b64.value, VECTOR_B64_DATATYPE)!;
+    expect(v.map((x) => +x.toFixed(6))).toEqual([0.1, 0.2, 0.3]);
+    expect(literalText(b64)).toBe('vector(3) [0.1, 0.2, 0.3]');
+    for (const bad of ['', 'AAA', 'AAAA', 'zczM Pc3M', 'AAAAAAA=', 'AACAfw=='])
+      expect(parseVector(bad, VECTOR_B64_DATATYPE), bad).toBeNull();
+    // the JSON form is not read as base64, nor the other way round
+    expect(parseVector('[1]', VECTOR_B64_DATATYPE)).toBeNull();
+    expect(parseVector('AACAPw==')).toBeNull();
   });
 
   it('parses JSON arrays of finite numbers only', () => {

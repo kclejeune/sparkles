@@ -2,8 +2,10 @@
 //! top-k search (`spk:vectorSearch`) and configured indexes with an HNSW graph.
 //!
 //! A vector is an ordinary RDF literal, `"[0.1, 0.2, 0.3]"^^<urn:x-sparkles:vector>`:
-//! a JSON array of 1..=16384 finite numbers, each mapped to the nearest `f32`. The
-//! literal stays authoritative (Sparkles never rewrites it).
+//! a JSON array of 1..=16384 finite numbers, each mapped to the nearest `f32`. A compact
+//! form, `"zczMPc3MTD6amZk+"^^<urn:x-sparkles:vectorB64>`, holds the base64 of the
+//! values as little-endian binary32. Both datatypes are vectors everywhere. The literal
+//! stays authoritative (Sparkles never rewrites it).
 //!
 //! Search reads packed `f32` segments of a generation's base index. Without a
 //! configuration they are packed per (predicate, dimension) on a predicate's first
@@ -15,6 +17,100 @@
 
 /// Datatype IRI of vector literals.
 pub const DATATYPE: &str = "urn:x-sparkles:vector";
+/// Datatype IRI of compact vector literals: the base64 (RFC 4648, with padding) of the
+/// values as little-endian IEEE 754 binary32.
+pub const DATATYPE_B64: &str = "urn:x-sparkles:vectorB64";
+
+/// Whether `dt` is one of the two vector datatypes.
+pub fn is_datatype(dt: &str) -> bool {
+    dt == DATATYPE || dt == DATATYPE_B64
+}
+
+/// The vector of a literal of either vector datatype (`None` for another datatype).
+pub fn parse_typed(lex: &str, dt: &str) -> Option<std::result::Result<Vec<f32>, String>> {
+    match dt {
+        DATATYPE => Some(parse(lex)),
+        DATATYPE_B64 => Some(parse_b64(lex)),
+        _ => None,
+    }
+}
+
+/// Parse a compact vector's lexical form: base64 of 1..=16384 little-endian binary32
+/// values, all finite. The error names the offset of the first problem.
+pub fn parse_b64(lex: &str) -> std::result::Result<Vec<f32>, String> {
+    if lex.len() > 1 << 20 {
+        return Err("lexical form longer than 1 MiB".into());
+    }
+    let at =
+        |i: usize, what: &str| format!("malformed spk:vectorB64 literal at offset {i}: {what}");
+    let b = lex.as_bytes();
+    if b.is_empty() || b.len() % 4 != 0 {
+        return Err(at(b.len(), "the length is not a positive multiple of 4"));
+    }
+    let val = |i: usize, c: u8| -> std::result::Result<u32, String> {
+        Ok(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return Err(at(i, "not a base64 character")),
+        } as u32)
+    };
+    let mut bytes = Vec::with_capacity(b.len() / 4 * 3);
+    for (q, chunk) in b.chunks(4).enumerate() {
+        let i = q * 4;
+        let last = i + 4 == b.len();
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return Err(at(i + 4 - pad, "misplaced '='"));
+        }
+        let mut n = 0u32;
+        for (j, &c) in chunk[..4 - pad].iter().enumerate() {
+            n |= val(i + j, c)? << (18 - 6 * j);
+        }
+        // the bits a padded group leaves over must be zero (a canonical encoding)
+        if (pad == 1 && n & 0xff != 0) || (pad == 2 && n & 0xffff != 0) {
+            return Err(at(i + 3 - pad, "non-zero padding bits"));
+        }
+        let three = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        bytes.extend_from_slice(&three[..3 - pad]);
+    }
+    if bytes.len() % 4 != 0 {
+        return Err(at(b.len(), "not a whole number of 4-byte values"));
+    }
+    let out: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if out.len() > MAX_DIM {
+        return Err(at(0, "more than 16384 elements"));
+    }
+    if let Some(i) = out.iter().position(|x| !x.is_finite()) {
+        return Err(at(i * 4 / 3 * 4 / 4, "a value that is not finite"));
+    }
+    Ok(out)
+}
+
+/// The compact lexical form of a vector (base64 of little-endian binary32).
+pub fn canonical_b64(v: &[f32]) -> String {
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for j in 0..4 {
+            if j <= c.len() {
+                out.push(ALPHA[(n >> (18 - 6 * j) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
 /// Namespace of the vector functions and property function.
 pub const NS: &str = "urn:x-sparkles:";
 /// The top-k search property function.
@@ -233,16 +329,19 @@ pub fn score(m: Metric, a: &[f32], a_norm: f32, b: &[f32], b_norm: f32) -> Optio
     s.is_finite().then_some(s)
 }
 
-/// The vector of a stored literal key (`"lex 0xFF ^urn:x-sparkles:vector`), if it is a
-/// well-typed vector literal.
+/// The vector of a stored literal key (`"lex 0xFF ^urn:x-sparkles:vector`, or the
+/// compact datatype), if it is a well-typed vector literal.
 pub fn from_key(key: &[u8]) -> Option<Vec<f32>> {
     let rest = key.strip_prefix(b"\"")?;
     let sep = rest.iter().rposition(|&b| b == 0xFF)?;
-    let dt = rest[sep + 1..].strip_prefix(b"^")?;
-    if dt != DATATYPE.as_bytes() {
-        return None;
-    }
-    parse(std::str::from_utf8(&rest[..sep]).ok()?).ok()
+    let dt = std::str::from_utf8(rest[sep + 1..].strip_prefix(b"^")?).ok()?;
+    parse_typed(std::str::from_utf8(&rest[..sep]).ok()?, dt)?.ok()
+}
+
+/// Whether a stored key is a literal of one of the vector datatypes (well-typed or not).
+pub fn is_vector_key(key: &[u8]) -> bool {
+    key.first() == Some(&b'"')
+        && (key.ends_with(DATATYPE.as_bytes()) || key.ends_with(DATATYPE_B64.as_bytes()))
 }
 
 pub mod config;
@@ -275,6 +374,51 @@ mod tests {
         assert!(parse("[1, x]").unwrap_err().contains("offset 4"));
         let v = [1.0f32, 0.1, 1e-7, -0.0];
         assert_eq!(parse(&canonical(&v)).unwrap(), v);
+    }
+
+    #[test]
+    fn compact_grammar() {
+        // 0.1, 0.2, 0.3 as little-endian binary32
+        assert_eq!(parse_b64("zczMPc3MTD6amZk+").unwrap(), [0.1, 0.2, 0.3]);
+        for v in [
+            vec![1.0f32],
+            vec![1.0, -2.5],
+            vec![0.1, 1e-7, -0.0, 3.0e38],
+            (0..300).map(|i| (i as f32).sin()).collect(),
+        ] {
+            let lex = canonical_b64(&v);
+            assert_eq!(parse_b64(&lex).unwrap(), v, "{lex}");
+            assert_eq!(parse_typed(&lex, DATATYPE_B64).unwrap().unwrap(), v);
+        }
+        // three bytes are not a value; NaN and infinity are not finite
+        let nan = canonical_b64(&[f32::NAN]);
+        for bad in [
+            "",
+            "AAA",
+            "AAAA",
+            "AAAAAAA=",
+            "zczMPc3MTD6amZk",
+            "zczM Pc3M",
+            "zczMPc3MTD6amZk*",
+            "A===",
+            "AAAA=AAA",
+            &nan,
+            &canonical_b64(&[f32::INFINITY]),
+        ] {
+            assert!(parse_b64(bad).is_err(), "{bad:?}");
+        }
+        assert!(parse_b64("AAA=").is_err() && parse_b64("AB==").is_err());
+        assert!(parse_typed("[1]", "http://example.org/x").is_none());
+        let key = [
+            b"\"".as_slice(),
+            b"AACAPw==",
+            &[0xFF],
+            b"^",
+            DATATYPE_B64.as_bytes(),
+        ]
+        .concat();
+        assert_eq!(from_key(&key), Some(vec![1.0]));
+        assert!(is_vector_key(&key));
     }
 
     #[test]

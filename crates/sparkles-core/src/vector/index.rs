@@ -4,7 +4,7 @@
 use super::config::{VectorIndexConfig, VectorSkipped};
 use super::hnsw::{self, Graph};
 use super::persist::{self, Identity, Mapped, Out, Problem, Slice};
-use super::{DATATYPE, Metric, from_key, graph_dist, norm};
+use super::{Metric, from_key, graph_dist, norm};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::Perm;
@@ -368,7 +368,7 @@ fn pack(
         let mut raw: Vec<(u64, Vec<u8>)> = Vec::with_capacity(objs.len());
         snap.generation.vocab.get_sorted(&payloads, |pl, key| {
             // only literals of the vector datatype
-            if key.ends_with(DATATYPE.as_bytes()) && key.first() == Some(&b'"') {
+            if super::is_vector_key(key) {
                 raw.push((pl, key.to_vec()));
             }
         });

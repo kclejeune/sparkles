@@ -519,3 +519,73 @@ fn order_by_similarity_on_random_vectors() {
     let plan = same_both_ways(&s, &q);
     assert!(plan_has(&plan, "the best rows of ORDER BY"));
 }
+
+/// The compact datatype `spk:vectorB64` is a vector wherever `spk:vector` is: in the
+/// functions, as stored vectors (also next to JSON ones under one predicate), as a
+/// query, and in the ORDER BY rewrite.
+#[test]
+fn compact_vectors() {
+    use sparkles_core::vector::{canonical_b64, parse_b64};
+    let b64 = |v: &[f32]| format!("\"{}\"^^spk:vectorB64", canonical_b64(v));
+    let s = Store::in_memory(StoreOptions::default());
+    let ttl = format!(
+        "@prefix ex: <http://example.org/> . @prefix spk: <urn:x-sparkles:> .\n\
+         ex:a ex:emb {} . ex:b ex:emb \"[0.8, 0.6, 0]\"^^spk:vector . ex:c ex:emb {} .\n\
+         ex:d ex:emb \"AAAA\"^^spk:vectorB64 . ex:e ex:emb {} .",
+        b64(&[1.0, 0.0, 0.0]),
+        b64(&[0.0, 1.0, 0.0]),
+        b64(&[1.0, 2.0]),
+    );
+    s.load(&[Source::from_bytes(
+        ttl.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    assert_eq!(
+        parse_b64(&canonical_b64(&[0.5, -1.5])).unwrap(),
+        [0.5, -1.5]
+    );
+    // the functions read both forms alike
+    let one = b64(&[1.0, 0.0, 0.0]);
+    assert_eq!(
+        rows(
+            &s,
+            &format!(
+                "SELECT (spk:cosine({one}, \"[0.8,0.6,0]\"^^spk:vector) AS ?c) (spk:dimension({one}) AS ?d) {{}}"
+            )
+        ),
+        ["0.8 3"]
+    );
+    assert_eq!(
+        rows(
+            &s,
+            "SELECT (spk:dimension(\"AAAA\"^^spk:vectorB64) AS ?d) {}"
+        ),
+        ["-"]
+    );
+    // a search over both forms, from either form
+    for q in ["\"[1,0,0]\"^^spk:vector".to_string(), one.clone()] {
+        assert_eq!(
+            rows(
+                &s,
+                &format!(
+                    "SELECT ?s ?score {{ (?s ?score) spk:vectorSearch (ex:emb {q} 5) }} ORDER BY DESC(?score)"
+                )
+            ),
+            ["a 1", "b 0.8", "c 0"],
+            "{q}"
+        );
+    }
+    // the ORDER BY rewrite, from a compact constant
+    let q = format!("SELECT ?s {{ ?s ex:emb ?v }} ORDER BY DESC(spk:cosine(?v, {one})) LIMIT 2");
+    let plan = same_both_ways(&s, &q);
+    assert!(plan_has(&plan, "the best rows of ORDER BY"));
+    assert_eq!(rows(&s, &q), ["a", "b"]);
+    // a malformed compact query is refused like a malformed JSON one
+    let e = err(
+        &s,
+        "SELECT ?s { ?s spk:vectorSearch (ex:emb \"AAA=\"^^spk:vectorB64) }",
+    );
+    assert!(e.contains("spk:vectorB64"), "{e}");
+}
