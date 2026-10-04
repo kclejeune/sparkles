@@ -617,7 +617,6 @@ mod on {
             Kind::Scan(_)
             | Kind::RangeScan(..)
             | Kind::Values(_)
-            | Kind::TextSearch(_)
             | Kind::VectorSearch(_)
             | Kind::HybridSearch(_)
             | Kind::SpatialScan(_)
@@ -625,7 +624,7 @@ mod on {
                 leaves.push(n.clone());
                 true
             }
-            Kind::SpatialPf(_) if n.children.is_empty() => {
+            Kind::SpatialPf(_) | Kind::TextSearch(_) if n.children.is_empty() => {
                 leaves.push(n.clone());
                 true
             }

@@ -1562,6 +1562,27 @@ predicates when you can, because a search without them follows every triple, inc
 the limit with `path:maxVisited`, or narrow the search with `path:maxLength` or
 predicates.
 
+A predicate can be followed in its own direction. A family tree stored with
+`ex:parent` from child to parent and `ex:sibling` both ways is searched from an
+ancestor down to a person with `path:predicate (ex:parent path:backward), (ex:sibling
+path:both)`. When the edges are not single triples, a nested pattern can give them.
+`path:start` and `path:end` name its variables of each edge's ends, and this search
+follows co-authorship, two people who wrote the same paper:
+
+```sparql
+SELECT ?len WHERE {
+  SERVICE path:search {
+    [] path:source <http://example.org/person/1> ; path:target <http://example.org/person/2> ;
+       path:start ?x ; path:end ?y ; path:length ?len .
+    ?x <http://example.org/authorOf> ?doc . ?y <http://example.org/authorOf> ?doc .
+    FILTER(?x != ?y)
+  }
+}
+```
+
+The pattern is evaluated once, before the search, so it suits edges that a predicate
+list cannot describe rather than large graphs that predicates can.
+
 Paths are computed per query and nothing is indexed ahead of time. On the 10.5M-triple
 benchmark data, the shortest path between two people 17 edges apart takes about 3 ms,
 where `ASK { … foaf:knows+ … }` for the same pair takes about 125 ms, because the search

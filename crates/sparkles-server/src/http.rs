@@ -1577,6 +1577,39 @@ async fn text_search(
     .await
 }
 
+/// The `text` option of `POST /$/datasets`: `true` (the defaults), a `TextConfig`, or
+/// absent / `false` / `null` for none.
+#[cfg(feature = "text")]
+fn text_create_option(v: &J) -> ApiResult<Option<sparkles::text::TextConfig>> {
+    match v {
+        J::Null | J::Bool(false) => Ok(None),
+        J::Bool(true) => Ok(Some(Default::default())),
+        J::Object(_) => serde_json::from_value(v.clone()).map(Some).map_err(|e| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("invalid text configuration: {e}"),
+            )
+        }),
+        _ => Err(err(
+            StatusCode::BAD_REQUEST,
+            "text must be true, false or a configuration object",
+        )),
+    }
+}
+
+/// Without the `text` feature, any request for full-text search is `501`.
+#[cfg(not(feature = "text"))]
+fn text_create_option(v: &J) -> ApiResult<Option<()>> {
+    match v {
+        J::Null | J::Bool(false) => Ok(None),
+        J::Bool(true) | J::Object(_) => Err(sparkles::text::not_built().into()),
+        _ => Err(err(
+            StatusCode::BAD_REQUEST,
+            "text must be true, false or a configuration object",
+        )),
+    }
+}
+
 #[cfg(not(feature = "text"))]
 async fn text_search() -> ApiResult {
     Err(sparkles::text::not_built().into())
@@ -3216,7 +3249,7 @@ async fn create_dataset(
             )
         })?),
     };
-    let (name, kind, geo) = if let Some(format) = assembler {
+    let (name, kind, geo, text) = if let Some(format) = assembler {
         let server = fuseki::assembler::Server {
             union_default_graph: st.store_opts.union_default_graph,
             gsp_direct_naming: st.gsp_direct_naming,
@@ -3227,7 +3260,7 @@ async fn create_dataset(
             DbType::Mem => "mem",
             DbType::Persistent => "persistent",
         };
-        (spec.name, kind.to_string(), None)
+        (spec.name, kind.to_string(), None, None)
     } else if ct == "application/json" {
         let v: J = serde_json::from_slice(&body)
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -3235,23 +3268,25 @@ async fn create_dataset(
             v["dbName"].as_str().unwrap_or_default().to_string(),
             v["dbType"].as_str().unwrap_or("persistent").to_string(),
             crate::geo::create_option(&v["geo"])?,
+            text_create_option(&v["text"])?,
         )
     } else {
         params.extend_form(&body);
-        let geo = match params.get("geo") {
-            None | Some("false") => J::Null,
-            Some("true") => J::Bool(true),
-            Some(_) => {
-                return Err(err(
-                    StatusCode::BAD_REQUEST,
-                    "geo must be true or false (a configuration needs a JSON body)",
-                ));
-            }
+        // `geo` and `text` take true or false here; a configuration needs a JSON body
+        let flag = |k: &str| match params.get(k) {
+            None | Some("false") => Ok(J::Null),
+            Some("true") => Ok(J::Bool(true)),
+            Some(_) => Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("{k} must be true or false (a configuration needs a JSON body)"),
+            )),
         };
+        let (geo, text) = (flag("geo")?, flag("text")?);
         (
             params.get("dbName").unwrap_or_default().to_string(),
             params.get("dbType").unwrap_or("persistent").to_string(),
             crate::geo::create_option(&geo)?,
+            text_create_option(&text)?,
         )
     };
     let name = name.trim_start_matches('/').to_string();
@@ -3288,10 +3323,20 @@ async fn create_dataset(
     let st2 = st.clone();
     let ds = blocking(move || {
         let ds = st2.create(&name, kind)?;
-        // a new dataset with a spatial index, or none at all
-        if let Some(cfg) = geo
-            && let Err(e) = ds.store.enable_geo(cfg)
-        {
+        // a new dataset with its spatial and full-text indexes, or none at all
+        let enabled = (|| -> sparkles::Result<()> {
+            if let Some(cfg) = geo {
+                ds.store.enable_geo(cfg)?;
+            }
+            #[cfg(feature = "text")]
+            if let Some(cfg) = text {
+                ds.store.enable_text(cfg)?;
+            }
+            #[cfg(not(feature = "text"))]
+            let _ = text;
+            Ok(())
+        })();
+        if let Err(e) = enabled {
             drop(ds);
             st2.delete(&name)?;
             return Err(e.into());

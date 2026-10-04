@@ -2452,6 +2452,17 @@
                 "type": "object"
               }
             ]
+          },
+          "text": {
+            "description": "`true` for full-text search with the defaults, or a `TextConfig`.",
+            "oneOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "object"
+              }
+            ]
           }
         },
         "required": [

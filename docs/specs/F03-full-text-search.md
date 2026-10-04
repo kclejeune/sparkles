@@ -1,6 +1,7 @@
 # F03: Full-text search (Tantivy, `text:query`)
 
-> **Status:** implemented in part (Phase 1, most of Phase 2, part of Phase 3)
+> **Status:** implemented in part (Phases 1 and 2 apart from a background rebuild at
+> open, most of Phase 3)
 >
 > **Phases:** Phase 1 shipped. It covers the `text` cargo feature, `text:query`, per-quad
 > documents kept current in the commit path, catch-up or rebuild at open,
@@ -9,8 +10,11 @@
 > Explore). Later, Lucene's query syntax replaced the planned Sparkles grammar, and
 > highlighting with snippets and stemming per language shipped. Of Phase 3, the fast
 > fields shipped with index format 2, and hybrid retrieval with vector search shipped as
-> `spk:hybridSearch` ([F04](F04-vector-search.md#outcome)). Online rebuilds, `text` on
-> dataset creation and the other Phase 3 items are not built.
+> `spk:hybridSearch` ([F04](F04-vector-search.md#outcome)). On 2026-10-03 `text` on
+> dataset creation, online rebuilds with a journal, variable query strings with
+> bound-subject pushdown, incremental bulk maintenance and rebuilds over the literal
+> range shipped, and so did a `porter` analyzer for English. A background rebuild at
+> open, facets, search at historical snapshots and an opt-in stale mode are not built.
 >
 > **User docs:** [API: Full-text search](../API.md#full-text-search) · [Features](../FEATURES.md#sparql-arq-equivalent) · [Benchmarks: Full-text index and observability](../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
 >
@@ -809,6 +813,88 @@ reads a word the analyzer splits, and a phrase keeps them in order. `text_lang.r
 searches Japanese, Chinese and Korean literals by words, phrases, folded widths and
 half-width Katakana, and unit tests cover the bigrams, offsets and width folding.
 
-**Not built.** Online rebuilds with a journal, `text` on dataset creation, Lucene's Porter
+**Not built at first.** Online rebuilds with a journal, `text` on dataset creation, Lucene's Porter
 and light stemmers, dictionary-based CJK segmentation, and the rest of Phase 3 apart from
 hybrid retrieval.
+
+**Phase 2 and 3 additions (2026-10-03).**
+* *`text` on dataset creation.* `POST /$/datasets` takes `text`, `true` or a
+  `TextConfig` in a JSON body and `true` or `false` in a form, as `geo` already was.
+  A bad configuration is a `400` that leaves no dataset behind, and a build without
+  the feature answers `501`. The UI's new dataset dialog has an "Enable full-text
+  search" checkbox with an optional list of predicates, and the mock server accepts the
+  option too.
+* *Online rebuilds.* `POST /$/text/{ds}/rebuild` no longer holds the writer lock while
+  the index is built. Under the lock, the rebuild starts a journal and takes a
+  snapshot. It builds the new index from that snapshot with writes going on, while the
+  current index keeps answering searches and every commit adds its quads to the
+  journal. Under the lock again, it applies the journal to the new index, deleting each
+  quad's document and adding it again when the head still has the quad, and swaps the
+  index in. That commit has no merge policy, so writes do not wait for segment merges.
+  The journal holds ids, so a compaction or bulk commit during the build, which
+  renumbers them, makes the rebuild build again with writes waiting. A lock per index
+  keeps two rebuilds apart, and enabling or disabling the index waits for a running
+  rebuild. A bulk commit during a rebuild updates the current index by its changes, or
+  leaves it behind until the rebuild ends. Reconfiguring an index still builds it with
+  writes waiting.
+* *Variable arguments.* The query string can be a variable that the rest of the group
+  binds. The call is then planned like a vector search with a variable query: a node
+  over the rest of its group that runs one search per distinct value (at most 1,000,
+  else `507`) and joins each input row with the hits of its value. A value's language
+  tag acts as `lang:`. A bound value that is not a string, or does not parse, matches
+  nothing, as an unusable `spatial:` binding does, where the same constant is a `400`.
+  The predicates, limit, `lang:` and highlighting must still be constants.
+* *Bound-subject pushdown.* Without a limit and without a rank output, a search's hits
+  outside the subjects of the join's other side are dropped by the join, so the search
+  can leave them out. When a hash join's left side binds the call's subject in every
+  row to at most 4,096 distinct values, the executor runs the search with a
+  `TermSetQuery` of those subjects' keys as a filter that does not score. A call with a
+  variable query string restricts each search to the subjects of its rows in the same
+  way. The optimization is `text_subject_pushdown`.
+* *Incremental bulk maintenance.* After a bulk commit, the index is brought from the
+  state before it to the state after it by the documents that differ. The keys of the
+  documents before are collected and sorted, the candidates after are compared with
+  them, new documents are added and the keys left over are deleted, and the change is
+  committed and synced at once, since the new generation's WAL does not hold it. When
+  the commit adds more than one document per 8 that the index holds (at least 20,000),
+  the single writer thread of this path would be slower than a rebuild with up to 8, so
+  it gives up and the index is rebuilt.
+* *Rebuilds over the literal range.* With every predicate indexed, a rebuild no longer
+  reads every quad and looks up every object's key. It reads the OPS ranges of the base
+  vocabulary's keys that start with `"` and of the delta vocabulary, and decodes each
+  object once, since the quads come in object order. The new document order uncovered
+  a bug in the sloppy phrase scorer, which could seek a word's postings backwards, and
+  that is fixed.
+* *Porter's stemmer.* The `porter` analyzer stems English as Lucene's
+  `EnglishAnalyzer`, and so jena-text, does: the English stop words, then Porter's
+  algorithm in the form of his reference implementations, with their two departures
+  from the paper in step 2 (`bli` to `ble` and `logi` to `log`). It is written for
+  Sparkles in `text/porter.rs` from the 1980 paper and adds no crate. No tag takes it by
+  default, so an index selects it with `"languages": {"en": "porter"}`, and the English
+  differences of the comparison above, such as `relativity`, which Porter stems to
+  `rel` and Snowball to `relat`, go away for such an index. The tokens still come from
+  the standard tokenizer, which splits a possessive `'s` off where Lucene removes it.
+  Lucene's light stemmers for French, Spanish, Italian and Portuguese are not built.
+* *Tests.* `crates/sparkles-core/tests/text.rs` covers a rebuild against the index that
+  maintenance kept, bulk loads and replacements that update the index by their changes
+  and survive a reopen, a rebuild running while writes go on (with a compaction during
+  it in a second round), pushdown against the same queries without it, and query
+  strings from `VALUES`, triple patterns and `BIND`. The server's router tests create
+  datasets with `text` in JSON and form bodies, and a Playwright test enables full-text
+  search from the new dataset dialog.
+* *Performance.* The runs below were interleaved on a 16-core machine that other
+  builds kept at a load average between 20 and 75. On 10.5M triples with every
+  predicate indexed (1.54M documents), a rebuild took a median of 7.2 s of wall time
+  and 24.2 s of CPU over 11 runs, against 12.6 s and 30.3 s when it read every quad. A
+  bulk load of 315,519 triples into that store took a median of 23.6 s of CPU, against
+  45.8 s with a rebuild after it. Its text step added 46,200 documents in 3.3 to 6.8 s,
+  where the rebuild took 11.1 to 24.3 s. During each of 12 rebuilds started over HTTP
+  on the same store, between 988 and 4,404 single-triple writes ran, with a median
+  latency of 2 to 14 ms. The slowest write of a rebuild waited 0.4 to 6.5 s, for the
+  last step, whose directory syncs are slow while other builds load the disk. With the
+  old rebuild, one write waited for the whole rebuild, 11.6 to 50.5 s. The searches of
+  `scripts/bench-text.sh` on 1.05M triples did not change with pushdown on or off, since
+  none is a join of a search without a limit. Searching the names of one
+  organization's employees for `ada`, with 2 hits, took a median of 3.9 ms against
+  6.1 ms over 30 runs, and the titles of one organization's authors for `theory` 5.6 ms
+  and 2.0 ms of CPU against 20.6 ms and 9.7 ms.

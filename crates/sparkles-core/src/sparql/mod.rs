@@ -37,6 +37,7 @@ pub mod table;
 pub mod textpf;
 pub mod update;
 pub mod value;
+mod vectortopk;
 
 use crate::error::{Error, Result};
 use crate::id::Id;

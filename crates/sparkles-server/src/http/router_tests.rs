@@ -983,6 +983,91 @@ async fn full_text_endpoints() {
     );
 }
 
+#[cfg(feature = "text")]
+#[tokio::test]
+async fn datasets_created_with_full_text_search() {
+    let s = server();
+    let get = |p: &str| Request::get(p.to_string()).body(Body::empty()).unwrap();
+    let create = |ct: &str, body: &str| {
+        Request::post("/$/datasets")
+            .header(header::CONTENT_TYPE, ct)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let json = "application/json";
+    let r = send(
+        &s.app,
+        create(json, r#"{"dbName":"t1","dbType":"mem","text":true}"#),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(
+        r.json()["text"],
+        serde_json::json!({ "state": "ready", "docs": 0 })
+    );
+    // a configuration, and a form flag
+    let cfg = r#"{"dbName":"t2","dbType":"mem","text":{"predicates":["http://www.w3.org/2000/01/rdf-schema#label"]}}"#;
+    let r = send(&s.app, create(json, cfg)).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let st = send(&s.app, get("/$/text/t2")).await.json();
+    assert_eq!(
+        st["config"]["predicates"],
+        serde_json::json!(["http://www.w3.org/2000/01/rdf-schema#label"])
+    );
+    let form = "application/x-www-form-urlencoded";
+    let r = send(&s.app, create(form, "dbName=t3&dbType=mem&text=true")).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(
+        send(&s.app, get("/$/text/t3")).await.json()["state"],
+        "ready"
+    );
+    // the new index follows writes at once
+    let r = send(
+        &s.app,
+        Request::post("/t3/update")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from(
+                r#"INSERT DATA { <urn:a> <urn:p> "a brown fox" }"#,
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let q = "/t3/sparql?query=PREFIX%20text%3A%20%3Chttp%3A%2F%2Fjena.apache.org%2Ftext%23%3E%20SELECT%20%3Fs%20%7B%20%3Fs%20text%3Aquery%20%22fox%22%20%7D";
+    let rows = send(
+        &s.app,
+        Request::get(q)
+            .header(header::ACCEPT, "application/sparql-results+json")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .json();
+    assert_eq!(rows["results"]["bindings"][0]["s"]["value"], "urn:a");
+    // without the option, no index
+    let r = send(&s.app, create(json, r#"{"dbName":"t4","dbType":"mem"}"#)).await;
+    assert!(r.json()["text"].is_null());
+    // a bad option creates nothing
+    for (name, ct, body) in [
+        ("t5", json, r#"{"dbName":"t5","dbType":"mem","text":3}"#),
+        (
+            "t6",
+            json,
+            r#"{"dbName":"t6","dbType":"mem","text":{"predicates":7}}"#,
+        ),
+        ("t7", form, "dbName=t7&dbType=mem&text=yes"),
+    ] {
+        let r = send(&s.app, create(ct, body)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{name}: {}", r.text());
+        assert_eq!(
+            send(&s.app, get(&format!("/$/datasets/{name}")))
+                .await
+                .status,
+            StatusCode::NOT_FOUND
+        );
+    }
+}
+
 #[cfg(feature = "shacl")]
 #[tokio::test]
 async fn shacl_reports_name_the_commit_they_validated() {

@@ -33,6 +33,8 @@ mod lazydir;
 #[cfg(feature = "text")]
 mod lucene;
 #[cfg(feature = "text")]
+mod porter;
+#[cfg(feature = "text")]
 mod search;
 #[cfg(feature = "text")]
 mod sloppy;
@@ -118,8 +120,9 @@ pub struct TextConfig {
 }
 
 /// A language analyzer: Tantivy's Snowball stemmer for the language, after the stop
-/// words of the language are removed (where Tantivy has a list for it), or `cjk`, the
-/// bigrams of Chinese, Japanese and Korean text.
+/// words of the language are removed (where Tantivy has a list for it), `porter`, the
+/// English stop words and Porter's stemmer as in Lucene's English analyzer, or `cjk`,
+/// the bigrams of Chinese, Japanese and Korean text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Analyzer {
@@ -144,6 +147,10 @@ pub enum Analyzer {
     /// overlapping bigrams of Han, Hiragana, Katakana and Hangul, as Lucene's
     /// `CJKAnalyzer` makes them (no stemmer, no dictionary)
     Cjk,
+    /// English with the Porter stemmer of Lucene's `EnglishAnalyzer` (and so of
+    /// jena-text), where `english` uses the Snowball English stemmer; no tag has it by
+    /// default
+    Porter,
 }
 
 impl Analyzer {
@@ -192,7 +199,7 @@ impl Analyzer {
         Self::ALL
             .iter()
             .map(|(_, a)| *a)
-            .chain([Analyzer::Cjk])
+            .chain([Analyzer::Cjk, Analyzer::Porter])
             .find(|a| a.name() == name)
     }
 
@@ -217,6 +224,7 @@ impl Analyzer {
             Analyzer::Tamil => "tamil",
             Analyzer::Turkish => "turkish",
             Analyzer::Cjk => "cjk",
+            Analyzer::Porter => "porter",
         }
     }
 }
@@ -571,7 +579,7 @@ pub use imp::TextIndex;
 #[cfg(feature = "text")]
 pub(crate) use imp::read_config as imp_read_config;
 #[cfg(feature = "text")]
-pub use search::search;
+pub use search::{search, search_in};
 
 #[cfg(not(feature = "text"))]
 /// Placeholder: full-text search is not compiled in.
@@ -582,6 +590,17 @@ pub fn search(
     _ctx: &crate::sparql::ctx::Ctx,
     _spec: &crate::sparql::plan::TextSpec,
     _vars: &[crate::sparql::table::VarId],
+) -> Result<crate::sparql::table::Table> {
+    Err(not_built())
+}
+
+#[cfg(not(feature = "text"))]
+pub fn search_in(
+    _ctx: &crate::sparql::ctx::Ctx,
+    _spec: &crate::sparql::plan::TextSpec,
+    _vars: &[crate::sparql::table::VarId],
+    _subjects: Option<&[crate::id::Id]>,
+    _lenient: bool,
 ) -> Result<crate::sparql::table::Table> {
     Err(not_built())
 }
@@ -607,6 +626,12 @@ mod imp {
         AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
     };
     use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+
+    /// A bulk commit is applied to the index document by document when it adds at most
+    /// one document per `BULK_SHARE` the index holds, or `BULK_MIN`; more are faster to
+    /// index by a rebuild, which runs several writer threads.
+    const BULK_SHARE: usize = 8;
+    const BULK_MIN: usize = 20_000;
 
     /// The index format. Format 2 keeps each document's terms in columns (fast fields),
     /// where format 1 kept them in the doc store. An index of another format is rebuilt
@@ -700,7 +725,7 @@ mod imp {
         for a in Analyzer::ALL
             .map(|(_, a)| a)
             .into_iter()
-            .chain([Analyzer::Cjk])
+            .chain([Analyzer::Cjk, Analyzer::Porter])
         {
             index
                 .tokenizers()
@@ -720,6 +745,14 @@ mod imp {
                 return TextAnalyzer::builder(super::cjk::CjkTokenizer)
                     .filter(RemoveLongFilter::limit(MAX_TOKEN))
                     .filter(LowerCaser)
+                    .build();
+            }
+            Analyzer::Porter => {
+                return TextAnalyzer::builder(SimpleTokenizer::default())
+                    .filter(RemoveLongFilter::limit(MAX_TOKEN))
+                    .filter(LowerCaser)
+                    .filter(StopWordFilter::new(L::English).expect("English stop words"))
+                    .filter(super::porter::PorterStemmer)
                     .build();
             }
             Analyzer::Arabic => L::Arabic,
@@ -876,6 +909,40 @@ mod imp {
         fail_next_commit: AtomicBool,
         /// the tick seals and checkpoints (off only in tests)
         ticks: AtomicBool,
+        /// the quads of the commits since an online rebuild's snapshot, while one runs
+        journal: Mutex<Option<Vec<[Id; 4]>>>,
+        /// held for the whole of a rebuild, so that two never build at once
+        rebuilding: Mutex<()>,
+    }
+
+    /// An online rebuild in progress: other rebuilds wait, and commits are kept in the
+    /// journal until it is installed or dropped.
+    pub struct RebuildGuard<'a> {
+        inner: &'a Arc<Inner>,
+        _guard: parking_lot::MutexGuard<'a, ()>,
+    }
+
+    impl RebuildGuard<'_> {
+        fn take(&self) -> Vec<[Id; 4]> {
+            self.inner.journal.lock().take().unwrap_or_default()
+        }
+    }
+
+    impl Drop for RebuildGuard<'_> {
+        fn drop(&mut self) {
+            *self.inner.journal.lock() = None;
+        }
+    }
+
+    /// An index built from a snapshot, not yet in use (see [`TextIndex::build`]).
+    pub struct Built {
+        index: Index,
+        fields: Fields,
+        dir: Option<PathBuf>,
+        /// the epoch the index gets once installed
+        epoch: u64,
+        docs: u64,
+        started: Instant,
     }
 
     /// A dataset's full-text index.
@@ -1190,6 +1257,69 @@ mod imp {
         }
     }
 
+    /// The quads of `snap` that can be documents under `cfg`: those of the configured
+    /// predicates, or with every predicate those whose object is a literal.
+    fn for_each_candidate(
+        snap: &Snapshot,
+        cfg: &TextConfig,
+        mut f: impl FnMut(&[Id; 4]) -> Result<()>,
+    ) -> Result<()> {
+        use crate::index::Perm;
+        match &cfg.predicates {
+            PredicateSet::Only(ps) => {
+                for p in ps {
+                    let Some(pid) = snap.lookup_iri(p) else {
+                        continue;
+                    };
+                    snap.scan(Perm::Pso, &[pid.0], |c| {
+                        match c {
+                            crate::store::Chunk::Block(b, s, e) => {
+                                for i in s..e {
+                                    f(&Perm::Pso.to_quad(&b.key(i)))?;
+                                }
+                            }
+                            crate::store::Chunk::Row(k) => f(&Perm::Pso.to_quad(&k))?,
+                        }
+                        Ok(true)
+                    })?;
+                }
+                Ok(())
+            }
+            PredicateSet::All => for_each_literal_quad(snap, f),
+        }
+    }
+
+    /// The quads whose object is a literal of the vocabulary, the only ones that can be
+    /// documents, in OPS order: the base vocabulary's keys that start with `"`, then
+    /// every delta id (the delta vocabulary is not sorted, so its IRIs are read too).
+    fn for_each_literal_quad(
+        snap: &Snapshot,
+        mut f: impl FnMut(&[Id; 4]) -> Result<()>,
+    ) -> Result<()> {
+        use crate::index::Perm;
+        let (lo, hi) = snap.generation.vocab.prefix_range(b"\"");
+        let mut ranges = Vec::with_capacity(2);
+        if lo < hi {
+            ranges.push((Id::vocab(lo).0, Id::vocab(hi - 1).0));
+        }
+        ranges.push((Id::delta(0).0, Id::local(0).0 - 1));
+        for (a, b) in ranges {
+            let (from, to) = ([a, 0, 0, 0], [b, u64::MAX, u64::MAX, u64::MAX]);
+            snap.scan_between(Perm::Ops, from, to, |c| {
+                match c {
+                    crate::store::Chunk::Block(b, s, e) => {
+                        for i in s..e {
+                            f(&Perm::Ops.to_quad(&b.key(i)))?;
+                        }
+                    }
+                    crate::store::Chunk::Row(k) => f(&Perm::Ops.to_quad(&k))?,
+                }
+                Ok(true)
+            })?;
+        }
+        Ok(())
+    }
+
     struct Doc {
         key: [u8; 16],
         /// see [`doc_hash`]
@@ -1206,6 +1336,8 @@ mod imp {
     struct Terms {
         preds: rustc_hash::FxHashMap<Id, Option<(String, Vec<u8>, bool)>>,
         graphs: rustc_hash::FxHashMap<Id, Option<(String, Vec<u8>, bool)>>,
+        /// the last object and its key: a rebuild reads quads in object order
+        last_o: Option<(Id, Option<Arc<[u8]>>)>,
     }
 
     impl Terms {
@@ -1218,10 +1350,30 @@ mod imp {
             cfg: &TextConfig,
             q: &[Id; 4],
         ) -> Option<Doc> {
+            self.document_or_key(snap, f, cfg, q, true)
+        }
+
+        /// [`document`](Self::document), or with `build` false only the key and hash: an
+        /// in-scope quad then gets an empty document.
+        fn document_or_key(
+            &mut self,
+            snap: &Snapshot,
+            f: &Fields,
+            cfg: &TextConfig,
+            q: &[Id; 4],
+            build: bool,
+        ) -> Option<Doc> {
             if !matches!(q[2].tag(), Tag::Vocab | Tag::Delta) {
                 return None;
             }
-            let o = snap.key(q[2])?;
+            let o = match &self.last_o {
+                Some((id, o)) if *id == q[2] => o.clone()?,
+                _ => {
+                    let o: Option<Arc<[u8]>> = snap.key(q[2]).map(|k| Arc::from(&*k));
+                    self.last_o = Some((q[2], o.clone()));
+                    o?
+                }
+            };
             let (lex, lang) = string_literal(&o)?;
             if self.preds.len() >= MEMO_MAX {
                 self.preds.clear();
@@ -1264,6 +1416,13 @@ mod imp {
                     key,
                     hash,
                     doc: None,
+                });
+            }
+            if !build {
+                return Some(Doc {
+                    key,
+                    hash,
+                    doc: Some(TantivyDocument::default()),
                 });
             }
             let mut d = TantivyDocument::default();
@@ -1325,6 +1484,8 @@ mod imp {
                     last_rebuild: Mutex::new(None),
                     fail_next_commit: Default::default(),
                     ticks: AtomicBool::new(true),
+                    journal: Default::default(),
+                    rebuilding: Default::default(),
                 })
             };
             let reusable = root.filter(|r| r.join("text").exists()).and_then(|r| {
@@ -1382,7 +1543,8 @@ mod imp {
             // an empty placeholder until the rebuild below swaps the real one in
             let (index, fields) = new_index(None, &config)?;
             let t = ti(live_of(index, fields, &config, None, 0)?, 0);
-            let view = t.rebuild(snap)?;
+            let built = t.build(snap)?;
+            let view = t.install(built, snap, &[])?;
             Ok((TextIndex::start(t), view))
         }
 
@@ -1434,6 +1596,9 @@ mod imp {
             prev: Option<&Arc<TextView>>,
         ) -> Option<Arc<TextView>> {
             let inner = &self.inner;
+            if let Some(j) = inner.journal.lock().as_mut() {
+                j.extend(log.iter().map(|(_, q)| *q));
+            }
             if !inner.healthy() {
                 return prev.cloned();
             }
@@ -1464,7 +1629,77 @@ mod imp {
         /// Rebuild the whole index from `snap` and return its view. On disk, the new
         /// index is built in `text.new/` and swapped in.
         pub fn rebuild(&self, snap: &Snapshot) -> Result<Arc<TextView>> {
-            self.inner.rebuild(snap)
+            let _one = self.inner.rebuilding.lock();
+            let built = self.inner.build(snap)?;
+            self.inner.install(built, snap, &[])
+        }
+
+        /// Wait for any other rebuild of the index to finish, then hold off others until
+        /// the returned guard is dropped. Take it before the store's writer lock: a
+        /// rebuild holds it while it waits for that lock.
+        pub fn lock_rebuild(&self) -> RebuildGuard<'_> {
+            RebuildGuard {
+                inner: &self.inner,
+                _guard: self.inner.rebuilding.lock(),
+            }
+        }
+
+        /// [`rebuild`](Self::rebuild), unless another rebuild runs (`None`): for callers
+        /// that hold the store's writer lock.
+        pub fn try_rebuild(&self, snap: &Snapshot) -> Result<Option<Arc<TextView>>> {
+            let Some(_one) = self.inner.rebuilding.try_lock() else {
+                return Ok(None);
+            };
+            let built = self.inner.build(snap)?;
+            self.inner.install(built, snap, &[]).map(Some)
+        }
+
+        /// The first step of an online rebuild, under the store's writer lock: from now
+        /// on the quads of each commit are kept, for [`install`](Self::install).
+        pub fn start_journal(&self, _guard: &RebuildGuard<'_>) {
+            *self.inner.journal.lock() = Some(Vec::new());
+        }
+
+        /// Build an index from `snap`, while writes go on and the current index serves
+        /// searches.
+        pub fn build(&self, _guard: &RebuildGuard<'_>, snap: &Snapshot) -> Result<Built> {
+            self.inner.build(snap)
+        }
+
+        /// Finish an online rebuild under the store's writer lock: bring the built index
+        /// from its snapshot to `head` by the quads the commits since then changed, both
+        /// of one generation, and put it in place of the current index. Returns `head`'s
+        /// view.
+        pub fn install(
+            &self,
+            guard: &RebuildGuard<'_>,
+            built: Built,
+            head: &Snapshot,
+        ) -> Result<Arc<TextView>> {
+            let journal = guard.take();
+            self.inner.install(built, head, &journal)
+        }
+
+        /// Rebuild from `snap` with the guard of a rebuild already held.
+        pub fn rebuild_held(
+            &self,
+            _guard: &RebuildGuard<'_>,
+            snap: &Snapshot,
+        ) -> Result<Arc<TextView>> {
+            let built = self.inner.build(snap)?;
+            self.inner.install(built, snap, &[])
+        }
+
+        /// After a bulk commit from `old` to `new` (states of different generations):
+        /// bring the index to `new` by the documents that differ, and return `new`'s
+        /// view. `None` when that would not pay: the index does not reflect `old`, or
+        /// the commit adds too many documents for one writer thread, and a rebuild is
+        /// then cheaper. Nothing has changed in that case.
+        pub fn apply_bulk(&self, old: &Snapshot, new: &Snapshot) -> Result<Option<Arc<TextView>>> {
+            if !self.inner.healthy() {
+                return Ok(None);
+            }
+            self.inner.apply_bulk(old, new)
         }
 
         pub fn status(&self, view: Option<&TextView>, store_seq: u64) -> TextStatus {
@@ -1498,10 +1733,14 @@ mod imp {
         }
 
         fn payload(&self, seq: u64) -> String {
+            self.payload_with(seq, self.epoch.load(Ordering::SeqCst))
+        }
+
+        fn payload_with(&self, seq: u64, epoch: u64) -> String {
             serde_json::to_string(&Payload {
                 format: FORMAT,
                 seq,
-                epoch: self.epoch.load(Ordering::SeqCst),
+                epoch,
                 config: config_hash(&self.config),
             })
             .unwrap()
@@ -1597,6 +1836,93 @@ mod imp {
                 self.seal_locked(live)?;
             }
             Ok(self.view_in(live, snap.commit, slot))
+        }
+
+        /// See [`TextIndex::apply_bulk`]. The documents of `old` are known by their keys,
+        /// and `new`'s candidates are compared against them: a document of `new` whose
+        /// key is not among them is added, and the keys of `old` that `new` does not
+        /// have are deleted. The change is committed and synced at once, because the
+        /// write-ahead log of the new generation does not hold it.
+        fn apply_bulk(
+            self: &Arc<Self>,
+            old: &Snapshot,
+            new: &Snapshot,
+        ) -> Result<Option<Arc<TextView>>> {
+            let t0 = Instant::now();
+            let mut live = self.live.lock();
+            let live = &mut *live;
+            self.settle_locked(live)?;
+            if live.applied != old.commit {
+                return Ok(None);
+            }
+            let fields = live.shared.fields.clone();
+            let cfg = &self.config;
+            let mut keys: Vec<[u8; 16]> = Vec::new();
+            let mut terms = Terms::default();
+            for_each_candidate(old, cfg, |q| {
+                if let Some(Doc {
+                    key, doc: Some(_), ..
+                }) = terms.document_or_key(old, &fields, cfg, q, false)
+                {
+                    keys.push(key);
+                }
+                Ok(())
+            })?;
+            keys.sort_unstable();
+            keys.dedup();
+            // past this many additions one writer thread is slower than a rebuild
+            let most = (keys.len() / BULK_SHARE).max(BULK_MIN);
+            let mut kept = vec![false; keys.len()];
+            let mut terms = Terms::default();
+            let (mut added, mut too_many) = (0usize, false);
+            let writer = live.writer()?;
+            for_each_candidate(new, cfg, |q| {
+                if too_many {
+                    return Ok(());
+                }
+                let Some(Doc {
+                    key, doc: Some(_), ..
+                }) = terms.document_or_key(new, &fields, cfg, q, false)
+                else {
+                    return Ok(());
+                };
+                match keys.binary_search(&key) {
+                    Ok(i) => kept[i] = true,
+                    Err(_) => {
+                        if added == most {
+                            too_many = true;
+                            return Ok(());
+                        }
+                        if let Some(Doc { doc: Some(d), .. }) = terms.document(new, &fields, cfg, q)
+                        {
+                            writer.add_document(d).map_err(text_err)?;
+                            added += 1;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            if too_many {
+                writer.rollback().map_err(text_err)?;
+                return Ok(None);
+            }
+            let mut deleted = 0usize;
+            for (key, _) in keys.iter().zip(&kept).filter(|(_, k)| !**k) {
+                writer.delete_term(Term::from_field_bytes(fields.key, key));
+                deleted += 1;
+            }
+            live.applied = new.commit;
+            live.staged = added + deleted;
+            self.commit_locked(live)?;
+            live.uncertain.clear();
+            live.last = Slot::sealed(live.reader.searcher(), Default::default());
+            self.checkpoint_locked(live)?;
+            tracing::info!(
+                target: "sparkles::text::imp",
+                "full-text index after a bulk commit: {added} documents added and {deleted} removed in {:?}",
+                t0.elapsed()
+            );
+            Ok(Some(self.view_in(live, new.commit, live.last.clone())))
         }
 
         /// Commit the writer and reload the reader. The payload names the applied commit,
@@ -1720,7 +2046,9 @@ mod imp {
             self.checkpoint_locked(&mut live)
         }
 
-        fn rebuild(self: &Arc<Self>, snap: &Snapshot) -> Result<Arc<TextView>> {
+        /// Build the index of `snap` in `text.new/` (in memory for an in-memory store),
+        /// with several writer threads, and commit it. The current index is not touched.
+        fn build(self: &Arc<Self>, snap: &Snapshot) -> Result<Built> {
             let t0 = std::time::Instant::now();
             let new_dir = self.root.as_ref().map(|r| r.join("text.new"));
             let (index, fields) = new_index(new_dir.as_deref(), &self.config)?;
@@ -1728,6 +2056,7 @@ mod imp {
                 .map_or(1, |n| n.get())
                 .min(8);
             let mut docs = 0u64;
+            let epoch = self.epoch.load(Ordering::SeqCst) + 1;
             {
                 let mut writer: IndexWriter<TantivyDocument> = index
                     .writer_with_num_threads(threads, threads * (64 << 20))
@@ -1742,35 +2071,74 @@ mod imp {
                     }
                     Ok(())
                 };
-                match &self.config.predicates {
-                    PredicateSet::Only(ps) => {
-                        use crate::index::Perm;
-                        for p in ps {
-                            let Some(pid) = snap.lookup_iri(p) else {
-                                continue;
-                            };
-                            snap.scan(Perm::Pso, &[pid.0], |c| {
-                                match c {
-                                    crate::store::Chunk::Block(b, s, e) => {
-                                        for i in s..e {
-                                            add(&Perm::Pso.to_quad(&b.key(i)))?;
-                                        }
-                                    }
-                                    crate::store::Chunk::Row(k) => add(&Perm::Pso.to_quad(&k))?,
-                                }
-                                Ok(true)
-                            })?;
-                        }
-                    }
-                    PredicateSet::All => snap.for_each_quad(&mut add)?,
-                }
-                self.epoch.fetch_add(1, Ordering::SeqCst);
-                let payload = self.payload(snap.commit);
+                for_each_candidate(snap, &self.config, &mut add)?;
+                let payload = self.payload_with(snap.commit, epoch);
                 let mut prepared = writer.prepare_commit().map_err(text_err)?;
                 prepared.set_payload(&payload);
                 prepared.commit().map_err(text_err)?;
                 writer.wait_merging_threads().map_err(text_err)?;
             }
+            Ok(Built {
+                index,
+                fields,
+                dir: new_dir,
+                epoch,
+                docs,
+                started: t0,
+            })
+        }
+
+        /// Put a built index in place of the current one, after bringing it from its
+        /// snapshot to `head` by the quads in `journal` (ids of `head`'s generation):
+        /// each document of such a quad is replaced, or removed when `head` does not
+        /// have the quad.
+        fn install(
+            self: &Arc<Self>,
+            built: Built,
+            head: &Snapshot,
+            journal: &[[Id; 4]],
+        ) -> Result<Arc<TextView>> {
+            let Built {
+                index,
+                fields,
+                dir: new_dir,
+                epoch,
+                docs,
+                started: t0,
+            } = built;
+            if !journal.is_empty() {
+                let mut writer: IndexWriter<TantivyDocument> = index
+                    .writer_with_num_threads(1, 32 << 20)
+                    .map_err(text_err)?;
+                // writes wait for this step: the index's own writer merges later
+                writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+                let mut terms = Terms::default();
+                let mut seen = FxHashSet::default();
+                for q in journal {
+                    if !seen.insert(*q) {
+                        continue;
+                    }
+                    let Some(Doc {
+                        key,
+                        doc: Some(doc),
+                        ..
+                    }) = terms.document(head, &fields, &self.config, q)
+                    else {
+                        continue;
+                    };
+                    writer.delete_term(Term::from_field_bytes(fields.key, &key));
+                    if head.contains(q)? {
+                        writer.add_document(doc).map_err(text_err)?;
+                    }
+                }
+                let payload = self.payload_with(head.commit, epoch);
+                let mut prepared = writer.prepare_commit().map_err(text_err)?;
+                prepared.set_payload(&payload);
+                prepared.commit().map_err(text_err)?;
+                writer.wait_merging_threads().map_err(text_err)?;
+            }
+            let snap = head;
+            self.epoch.store(epoch, Ordering::SeqCst);
             let mut live = self.live.lock();
             // the views of the old index's open batch get its searcher
             if let Err(e) = self.seal_locked(&mut live) {

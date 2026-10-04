@@ -798,3 +798,221 @@ fn random_weighted_graphs_against_brute_force() {
         }
     }
 }
+
+/// The nodes of a path given as stored triples, walked from `src`: `ex:p0` triples
+/// forward and `ex:p1` triples backward.
+fn walk(src: usize, path: &[E]) -> Vec<usize> {
+    let mut nodes = vec![src];
+    for &(s, p, o) in path {
+        nodes.push(if p == 0 { o } else { s });
+    }
+    nodes
+}
+
+#[test]
+fn directions_per_predicate_edges_as_triple_terms_and_nested_patterns() {
+    let s = store_of(
+        "ex:a ex:knows ex:b . ex:c ex:parent ex:b . ex:c ex:knows ex:d . ex:a ex:parent ex:d .",
+    );
+    // knows forward, parent backward: a → b (knows), b → c (c parent b), c → d (knows)
+    let q = |preds: &str| {
+        format!(
+            "SELECT ?i ?s ?p ?o ?e WHERE {{ SERVICE path:search {{ [] path:source ex:a ; path:target ex:d ; \
+             {preds} ; path:algorithm path:all ; path:maxLength 3 ; path:edgeIndex ?i ; \
+             path:edgeSubject ?s ; path:edgePredicate ?p ; path:edgeObject ?o ; path:edge ?e }} }} ORDER BY ?i"
+        )
+    };
+    let r = rows(&s, &q("path:predicate ex:knows, (ex:parent path:backward)"));
+    let got: Vec<String> = r
+        .iter()
+        .map(|x| format!("{} {} {}", x["s"], x["p"], x["o"]))
+        .collect();
+    assert_eq!(got, ["a knows b", "c parent b", "c knows d"]);
+    assert_eq!(
+        r[1]["e"],
+        "<<( <http://ex/c> <http://ex/parent> <http://ex/b> )>>"
+    );
+    // the list's direction wins over path:direction, which applies to the others
+    let r = rows(
+        &s,
+        &q("path:predicate (ex:knows path:forward), ex:parent ; path:direction path:backward"),
+    );
+    assert_eq!(r.len(), 3);
+    // the edge as a triple term joins with the data
+    let r = rows(
+        &s,
+        "SELECT ?e WHERE { SERVICE path:search { [] path:source ex:a ; path:target ex:b ; \
+         path:predicate ex:knows ; path:edge ?e } FILTER(isTRIPLE(?e) && SUBJECT(?e) = ex:a) }",
+    );
+    assert_eq!(r.len(), 1);
+    // edges from a nested pattern: the same path, with its edges' ends
+    let nested = |pattern: &str| {
+        format!(
+            "SELECT ?i ?s ?o WHERE {{ SERVICE path:search {{ [] path:source ex:a ; path:target ex:d ; \
+             path:algorithm path:all ; path:maxLength 3 ; path:start ?x ; path:end ?y ; \
+             path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o . {pattern} }} }} ORDER BY ?i"
+        )
+    };
+    for pattern in [
+        "{ ?x ex:knows ?y } UNION { ?y ex:parent ?x }",
+        "{ SELECT ?x ?y WHERE { { ?x ex:knows ?y } UNION { ?y ex:parent ?x } } }",
+    ] {
+        let r = rows(&s, &nested(pattern));
+        let got: Vec<String> = r.iter().map(|x| format!("{} {}", x["s"], x["o"])).collect();
+        assert_eq!(got, ["a b", "b c", "c d"], "{pattern}");
+    }
+    // a filter in the pattern removes edges
+    let r = rows(
+        &s,
+        &nested("{ ?x ex:knows ?y } UNION { ?y ex:parent ?x } FILTER(?x != ex:b)"),
+    );
+    assert!(r.is_empty());
+    // errors
+    for (q, needle) in [
+        (
+            nested("").replace(" . }", " }"),
+            "path:start and path:end name the variables of a nested pattern",
+        ),
+        (
+            "SELECT * { SERVICE path:search { [] path:source ex:a ; path:target ?t . ?x ex:knows ?y } }"
+                .to_string(),
+            "needs path:start and path:end",
+        ),
+        (
+            nested("{ ?x ex:knows ?y }")
+                .replace("path:start ?x", "path:start ?x ; path:predicate ex:knows"),
+            "cannot be combined",
+        ),
+        (
+            nested("{ ?x ex:knows ?y }")
+                .replace("path:edgeIndex ?i", "path:edge ?e ; path:edgeIndex ?i"),
+            "path:edge needs edges from predicates",
+        ),
+        (
+            nested("{ ?z ex:knows ?y }"),
+            "path:start ?x is not a variable of the nested pattern",
+        ),
+        (q("path:predicate (ex:knows ex:parent)"), "unknown direction"),
+        (
+            q("path:predicate (ex:knows)"),
+            "a list of an IRI and a direction",
+        ),
+        (
+            q("path:predicate ex:knows, (ex:knows path:backward)"),
+            "given twice",
+        ),
+    ] {
+        let e = error(&s, &q);
+        assert!(e.contains(needle), "{q}: {e}");
+    }
+}
+
+/// The co-author example of USAGE.md: edges that are joins, in the block's own triples,
+/// with a FILTER of the block.
+#[test]
+fn edges_from_a_join_in_the_block() {
+    let s = store_of(
+        "ex:p1 ex:authorOf ex:d1 . ex:p3 ex:authorOf ex:d1 . ex:p3 ex:authorOf ex:d2 . \
+         ex:p2 ex:authorOf ex:d2 . ex:p4 ex:authorOf ex:d3 .",
+    );
+    let q = |target: &str| {
+        format!(
+            "SELECT ?len WHERE {{ SERVICE path:search {{ [] path:source ex:p1 ; path:target {target} ; \
+             path:start ?x ; path:end ?y ; path:length ?len . \
+             ?x ex:authorOf ?doc . ?y ex:authorOf ?doc . FILTER(?x != ?y) }} }}"
+        )
+    };
+    assert_eq!(rows(&s, &q("ex:p2"))[0]["len"], "2");
+    assert!(rows(&s, &q("ex:p4")).is_empty());
+    // without the FILTER every author is an edge to itself, and a search from a node to
+    // itself finds that cycle
+    let r = rows(
+        &s,
+        "SELECT ?len WHERE { SERVICE path:search { [] path:source ex:p1 ; path:target ex:p1 ; \
+         path:start ?x ; path:end ?y ; path:length ?len . \
+         ?x ex:authorOf ?doc . ?y ex:authorOf ?doc } }",
+    );
+    assert_eq!(r[0]["len"], "1");
+}
+
+/// Directions per predicate and edges from a nested pattern on random graphs, against
+/// paths enumerated by brute force: `ex:p0` forward and `ex:p1` backward.
+#[test]
+fn random_graphs_with_mixed_directions() {
+    let mut r = Rng(0x00d1_2ec7_1015);
+    for case in 0..8 {
+        let n = 5 + r.below(4);
+        let m = n + r.below(2 * n);
+        let mut triples: BTreeSet<E> = BTreeSet::new();
+        for _ in 0..m {
+            triples.insert((r.below(n), r.below(2), r.below(n)));
+        }
+        let ttl: String = triples
+            .iter()
+            .map(|(a, p, b)| format!("ex:n{a} ex:p{p} ex:n{b} .\n"))
+            .collect();
+        let s = store_of(&ttl);
+        let mut adj: BTreeMap<usize, Vec<(usize, usize, E)>> = BTreeMap::new();
+        for &(a, p, b) in &triples {
+            let (from, to) = if p == 0 { (a, b) } else { (b, a) };
+            adj.entry(from).or_default().push((p, to, (a, p, b)));
+        }
+        let src = r.below(n);
+        let want: BTreeSet<Vec<E>> = brute(&adj, src, 4).into_iter().map(|(_, p)| p).collect();
+        let want_nodes: BTreeSet<Vec<usize>> = want.iter().map(|p| walk(src, p)).collect();
+        let num = |x: &str| {
+            x.trim_start_matches(|c: char| !c.is_ascii_digit())
+                .parse::<usize>()
+                .unwrap()
+        };
+        let by_path = |rs: Vec<BTreeMap<String, String>>, with_p: bool| {
+            let mut by: BTreeMap<String, BTreeMap<usize, E>> = BTreeMap::new();
+            for row in rs {
+                let p = if with_p { num(&row["p"]) } else { 0 };
+                by.entry(row["path"].clone()).or_default().insert(
+                    row["i"].parse().unwrap(),
+                    (num(&row["s"]), p, num(&row["o"])),
+                );
+            }
+            by.into_values()
+                .map(|v| v.into_values().collect::<Vec<E>>())
+                .collect::<Vec<_>>()
+        };
+        let common = format!(
+            "path:source ex:n{src} ; path:target ?t ; path:algorithm path:all ; path:maxLength 4 ; \
+             path:pathIndex ?path ; path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o"
+        );
+        let got: BTreeSet<Vec<E>> = by_path(
+            rows(
+                &s,
+                &format!(
+                    "SELECT * WHERE {{ SERVICE path:search {{ [] {common} ; path:edgePredicate ?p ; \
+                     path:predicate ex:p0, (ex:p1 path:backward) }} }}"
+                ),
+            ),
+            true,
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(got, want, "case {case}: directions per predicate");
+        // the nested pattern's edges are the (start, end) pairs: compare node sequences
+        let got: BTreeSet<Vec<usize>> = by_path(
+            rows(
+                &s,
+                &format!(
+                    "SELECT * WHERE {{ SERVICE path:search {{ [] {common} ; path:start ?x ; path:end ?y . \
+                     {{ ?x ex:p0 ?y }} UNION {{ ?y ex:p1 ?x }} }} }}"
+                ),
+            ),
+            false,
+        )
+        .into_iter()
+        .map(|p| {
+            let mut nodes = vec![p[0].0];
+            nodes.extend(p.iter().map(|e| e.2));
+            nodes
+        })
+        .collect();
+        assert_eq!(got, want_nodes, "case {case}: nested pattern");
+    }
+}

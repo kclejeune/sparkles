@@ -57,10 +57,12 @@
       title={expanded ? 'Collapse' : term.value}
       aria-expanded={expanded}
       onclick={() => (expanded = !expanded)}
-      >{expanded ? term.value : abbreviateVector(term.value)}</button
+      >{expanded ? term.value : abbreviateVector(term.value, 3, term.datatype)}</button
     >
   {:else}
-    <span class="t-literal lit" title={term.value}>{abbreviateVector(term.value)}</span>
+    <span class="t-literal lit" title={term.value}
+      >{abbreviateVector(term.value, 3, term.datatype)}</span
+    >
   {/if}
 {:else if term.type === 'literal'}
   <span class="t-literal lit">{term.value}</span>{#if term['xml:lang']}<span class="meta"

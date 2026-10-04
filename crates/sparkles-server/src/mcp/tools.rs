@@ -1531,7 +1531,7 @@ fn predicate_json(p: &PredicateEntry, terms: &mut Terms) -> Value {
     }
     let mut vector = false;
     for g in &o.objects.literals {
-        vector |= g.datatype == sparkles::vector::DATATYPE;
+        vector |= sparkles::vector::is_datatype(&g.datatype);
         let mut name = terms.iri(&g.datatype);
         if let Some(langs) = g.languages.as_ref().filter(|l| !l.is_empty()) {
             let tags: Vec<String> = langs

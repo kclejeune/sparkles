@@ -264,7 +264,14 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
                 infos.push(describe(ctx, &n.children[1]));
                 Table::empty(n.vars.clone())
             } else {
-                let r = child(1, &mut infos)?;
+                let r = match text_pushdown(ctx, &l, &n.children[1])? {
+                    Some((r, info)) => {
+                        infos.push(info);
+                        held.add(r.mem_bytes())?;
+                        r
+                    }
+                    None => child(1, &mut infos)?,
+                };
                 match algo {
                     JoinAlgo::Cross => cross(ctx, &l, &r)?,
                     JoinAlgo::Merge => join_noted(ctx, &l, &r, true, &mut note)?,
@@ -482,7 +489,37 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             };
             super::arqpf::run(ctx, spec, input.as_ref(), &n.vars)?
         }
+        Kind::TextSearch(spec) if !n.children.is_empty() => {
+            let input = child(0, &mut infos)?;
+            let (t, c) = text_bound(ctx, spec, &input, &mut note)?;
+            counters = Some(c);
+            t
+        }
         Kind::TextSearch(spec) => crate::text::search(ctx, spec, &n.vars)?,
+        Kind::VectorSearch(spec) if spec.order_fallback => {
+            // the k best rows of an ORDER BY: the generic plan when fewer than k rows
+            // have a score, or when the search cannot run
+            let searched = match vector_search(ctx, spec, None, &n.vars) {
+                Ok((t, c)) if t.len() >= spec.k => Some((t, c)),
+                Ok(_) => None,
+                Err(Error::BudgetExceeded(_) | Error::Invalid(_)) => None,
+                Err(e) => return Err(e),
+            };
+            match searched {
+                Some((t, c)) => {
+                    infos.push(describe(ctx, &n.children[0]));
+                    counters = Some(c);
+                    t
+                }
+                None => {
+                    note = Some(format!(
+                        "[fewer than {} rows have a score: ran the generic plan]",
+                        spec.k
+                    ));
+                    child(0, &mut infos)?
+                }
+            }
+        }
         Kind::VectorSearch(spec) => {
             let input = match n.children.len() {
                 0 => None,
@@ -493,11 +530,17 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t
         }
         Kind::PathSearch(spec) => {
-            let input = match n.children.len() {
-                0 => None,
-                _ => Some(child(0, &mut infos)?),
+            // the input when the search reads its group, then the nested pattern of edges
+            let reads_input = n.children.len() > spec.edge_pattern.is_some() as usize;
+            let input = match reads_input {
+                false => None,
+                true => Some(child(0, &mut infos)?),
             };
-            let (t, c) = super::pathsearch::run(ctx, spec, input, &n.vars)?;
+            let edges = match spec.edge_pattern {
+                Some(_) => Some(child(n.children.len() - 1, &mut infos)?),
+                None => None,
+            };
+            let (t, c) = super::pathsearch::run(ctx, spec, input, edges, &n.vars)?;
             counters = Some(c);
             t
         }
@@ -507,6 +550,12 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
                 _ => Some(child(0, &mut infos)?),
             };
             super::history_svc::run(ctx, spec, input.as_ref(), &n.vars)?
+        }
+        Kind::HybridSearch(spec) if !n.children.is_empty() => {
+            let input = child(0, &mut infos)?;
+            let (t, c) = super::hybrid::search_bound(ctx, spec, &input, &mut note)?;
+            counters = Some(c);
+            t
         }
         Kind::HybridSearch(spec) => {
             let (t, c) = super::hybrid::search(ctx, spec, &n.vars)?;
@@ -2363,7 +2412,7 @@ pub(super) fn join_tables(
 }
 
 /// The join of two tables, with a note on how the rows were matched.
-fn join_noted(
+pub(super) fn join_noted(
     ctx: &Ctx,
     l: &Table,
     r: &Table,
@@ -4481,6 +4530,160 @@ fn text_vector(ctx: &Ctx, pred: Id, text: &str) -> Result<std::sync::Arc<[f32]>>
 /// Top-k vector search (`spk:vectorSearch`). With `input` (a variable query or
 /// `candidates:join`), the search runs once per distinct query and joins with the input
 /// rows; else it is a leaf.
+/// Distinct subjects of a join's left side at most, for which the text search on its
+/// right side is restricted to those subjects (a filter of the search).
+const TEXT_PUSHDOWN_SUBJECTS: usize = 4096;
+
+/// The distinct values of column `c` of `t` (in first-seen order), or `None` when there
+/// are more than `max` or a row leaves the column unbound.
+fn distinct_bound(
+    t: &Table,
+    c: usize,
+    rows: &mut dyn Iterator<Item = usize>,
+    max: usize,
+) -> Option<Vec<Id>> {
+    let mut seen: rustc_hash::FxHashSet<Id> = Default::default();
+    let mut out = Vec::new();
+    for r in rows {
+        let id = t.get(r, c);
+        if id == Id::UNDEF {
+            return None;
+        }
+        if seen.insert(id) {
+            if out.len() == max {
+                return None;
+            }
+            out.push(id);
+        }
+    }
+    Some(out)
+}
+
+/// A hash join's right side that is a `text:query` call without a limit or rank, when
+/// the left side binds its subject to few distinct values in every row: the search for
+/// those subjects only, with its plan entry. The join then drops nothing more than it
+/// would have dropped from the unrestricted search.
+fn text_pushdown(ctx: &Ctx, l: &Table, right: &Node) -> Result<Option<(Table, PlanInfo)>> {
+    let Kind::TextSearch(spec) = &right.kind else {
+        return Ok(None);
+    };
+    if !ctx.opt.text_subject_pushdown || !right.children.is_empty() {
+        return Ok(None);
+    }
+    let Some(sv) = spec.subjects_pushable() else {
+        return Ok(None);
+    };
+    let Some(c) = l.col_of(sv) else {
+        return Ok(None);
+    };
+    let Some(subjects) = distinct_bound(l, c, &mut (0..l.len()), TEXT_PUSHDOWN_SUBJECTS) else {
+        return Ok(None);
+    };
+    let start = Instant::now();
+    let t = crate::text::search_in(ctx, spec, &right.vars, Some(&subjects), false)?;
+    let mut info = describe(ctx, right);
+    info.description = format!(
+        "{} [searched the {} subjects of the join's left side]",
+        right.desc,
+        subjects.len()
+    );
+    info.actual_rows = t.len() as i64;
+    info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
+    Ok(Some((t, info)))
+}
+
+/// The most distinct query strings a `text:query` call with a variable query runs.
+const MAX_TEXT_QUERIES: usize = 1000;
+
+/// A `text:query` call whose query string is a variable that its input binds: one
+/// search per distinct value, joined with the input rows of that value. A value that is
+/// not a string, or does not parse, matches nothing. Without a limit or rank, the search
+/// for a value is restricted to the subjects of its rows when they are few.
+fn text_bound(
+    ctx: &Ctx,
+    spec: &super::plan::TextSpec,
+    input: &Table,
+    note: &mut Option<String>,
+) -> Result<(Table, Counters)> {
+    let qv = spec
+        .query_var
+        .expect("a text search over its group has a query variable");
+    let svars = spec.output_vars();
+    let mut hvars = svars.clone();
+    hvars.push(qv);
+    let mut hits = Table::new(hvars);
+    let col = input.col_of(qv).ok_or_else(|| {
+        Error::invalid("text:query: the query variable is not bound by the rest of the group")
+    })?;
+    let mut by_value: rustc_hash::FxHashMap<Id, Vec<usize>> = Default::default();
+    let mut order: Vec<Id> = Vec::new();
+    for r in 0..input.len() {
+        let id = input.get(r, col);
+        if id == Id::UNDEF {
+            continue;
+        }
+        by_value
+            .entry(id)
+            .or_insert_with(|| {
+                order.push(id);
+                Vec::new()
+            })
+            .push(r);
+    }
+    if order.len() > MAX_TEXT_QUERIES {
+        return Err(Error::BudgetExceeded(crate::Budget {
+            kind: crate::BudgetKind::Rows,
+            limit: MAX_TEXT_QUERIES as u64,
+            requested: order.len() as u64,
+        }));
+    }
+    let subject_col = spec
+        .subjects_pushable()
+        .filter(|_| ctx.opt.text_subject_pushdown)
+        .and_then(|sv| input.col_of(sv));
+    let (mut searches, mut restricted) = (0u64, 0u64);
+    for id in order {
+        ctx.check()?;
+        let Some(oxrdf::Term::Literal(l)) = ctx.term(id) else {
+            continue;
+        };
+        let lang = match l.language() {
+            Some(t) => Some(t.to_ascii_lowercase()),
+            None if l.datatype() == oxrdf::vocab::xsd::STRING => None,
+            None => continue,
+        };
+        let mut one = spec.clone();
+        one.query = l.value().to_string();
+        one.query_var = None;
+        one.lang = spec.lang.clone().or(lang);
+        let subjects = subject_col.and_then(|c| {
+            let rows = &by_value[&id];
+            distinct_bound(input, c, &mut rows.iter().copied(), TEXT_PUSHDOWN_SUBJECTS)
+        });
+        restricted += subjects.is_some() as u64;
+        let mut t = crate::text::search_in(ctx, &one, &svars, subjects.as_deref(), true)?;
+        searches += 1;
+        t.vars.push(qv);
+        t.cols.push(vec![id; t.len()]);
+        hits.append(t);
+        ctx.check_rows(hits.len())?;
+    }
+    let t = join_noted(ctx, input, &hits, false, note)?;
+    *note = Some(format!(
+        "[{searches} searches{}]",
+        if restricted > 0 {
+            format!(", {restricted} restricted to the subjects of their rows")
+        } else {
+            String::new()
+        }
+    ));
+    let mut c = Counters::new();
+    c.insert("searches".into(), searches.into());
+    c.insert("restricted".into(), restricted.into());
+    c.insert("hits".into(), (hits.len() as u64).into());
+    Ok((t, c))
+}
+
 pub(super) fn vector_search(
     ctx: &Ctx,
     spec: &super::plan::VectorSpec,
@@ -4555,9 +4758,8 @@ pub(super) fn vector_search(
                         Some(text_vector(ctx, pred, l.value())?.to_vec())
                     }
                     Some(oxrdf::Term::Literal(l)) => {
-                        match (l.datatype().as_str() == vector::DATATYPE)
-                            .then(|| vector::parse(l.value()).ok())
-                            .flatten()
+                        match vector::parse_typed(l.value(), l.datatype().as_str())
+                            .and_then(|v| v.ok())
                         {
                             Some(v) => Some(v),
                             // a literal that is not a vector matches nothing

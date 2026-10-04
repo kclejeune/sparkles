@@ -12,11 +12,20 @@ import {
   sparqlIri,
   SPK,
   toSparql,
+  VECTOR_B64_DATATYPE,
   VECTOR_DATATYPE,
 } from './rdf';
 
 // The literal helpers live in rdf.ts (term display uses them); re-exported here.
-export { abbreviateVector, isVectorLiteral, literalText, parseVector, SPK, VECTOR_DATATYPE };
+export {
+  abbreviateVector,
+  isVectorLiteral,
+  literalText,
+  parseVector,
+  SPK,
+  VECTOR_B64_DATATYPE,
+  VECTOR_DATATYPE,
+};
 
 export type Metric = 'cosine' | 'dot' | 'euclidean';
 export const METRICS: Metric[] = ['cosine', 'dot', 'euclidean'];
@@ -34,7 +43,9 @@ export function vectorPredicates(props: { p: string; o: Term }[]): VectorPredica
       iri,
       vectors,
       dimensions: [
-        ...new Set(vectors.map((v) => parseVector(v.value)?.length).filter((n) => n != null)),
+        ...new Set(
+          vectors.map((v) => parseVector(v.value, v.datatype)?.length).filter((n) => n != null),
+        ),
       ] as number[],
     }))
     .sort((a, b) => a.iri.localeCompare(b.iri));
