@@ -1,12 +1,13 @@
 // Mock of branches and merges (docs/specs/F09-branches-and-merges.md) for UI development:
-// `/$/branches/{ds}[/{name}]`, `/$/merge/{ds}`, and the branch a request chooses with
-// `?branch=` or the path form `/{ds}@{branch}/…`.
+// `/$/branches/{ds}[/{name}]`, `/$/merge/{ds}`, `/$/commit-graph/{ds}`, and the branch a
+// request chooses with `?branch=` or the path form `/{ds}@{branch}/…`.
 //
 // A branch is a copy of the dataset object with its own store and commits, so the rest of
 // the mock serves it unchanged. It inherits the commits of the branch it started from, and
 // it keeps the state of its merge base with its upstream for three-way merges. The mock
 // merges a branch with its upstream only, in either direction, with cell conflicts
-// (graph, subject, predicate). It cannot read past states, so a branch created at an
+// (graph, subject, predicate), resolutions and dry runs. A merge passes a small write
+// guard that `PUT /$/validation/{ds}` sets (see `putGuard`). It cannot read past states, so a branch created at an
 // older commit starts from the current data of its source.
 
 import { randomUUID } from 'node:crypto';
@@ -160,8 +161,95 @@ const objects = (m, cell) =>
     .map((q) => String(q.object))
     .sort();
 
-/** Plan the merge of `source` into `target` (one is the other's upstream). */
-function planMerge(ds, source, target) {
+/** A quad from N-Triples terms (`graph` null for the default graph). */
+function quadOf(s, p, o, g) {
+  const st = new ox.Store();
+  st.load(`${s} ${p} ${o}${g ? ` ${g}` : ''} .\n`, { format: 'application/n-quads' });
+  return st.match()[0];
+}
+
+const SH = 'http://www.w3.org/ns/shacl#';
+
+/**
+ * The mock's write guard: the shapes of `PUT /$/validation/{ds}` with `mode: "reject"`,
+ * read as "every instance of `sh:targetClass` has a value for each `sh:path` with a
+ * `sh:minCount` of at least 1". Only merges check it.
+ */
+function guardRules(text) {
+  const st = new ox.Store();
+  st.load(text, { format: 'text/turtle' });
+  return st
+    .query(
+      `SELECT ?shape ?cls ?path WHERE { ?shape <${SH}targetClass> ?cls ; <${SH}property> ?ps .
+       ?ps <${SH}path> ?path ; <${SH}minCount> ?m FILTER(?m >= 1) }`,
+    )
+    .map((b) => ({ shape: b.get('shape'), cls: b.get('cls'), path: b.get('path') }));
+}
+
+const termJson = (t) =>
+  t.termType === 'BlankNode' ? { type: 'bnode', value: t.value } : { type: 'uri', value: t.value };
+
+/** The guard's report on `store`, or null when it conforms or there is no guard. */
+function guardReport(b, store, kind) {
+  if (!b.guard) return null;
+  const results = [];
+  for (const r of b.guard.rules) {
+    const rows = store.query(
+      `SELECT ?x WHERE { ?x a <${r.cls.value}> FILTER NOT EXISTS { ?x <${r.path.value}> ?v } }`,
+    );
+    for (const row of rows)
+      results.push({
+        focusNode: termJson(row.get('x')),
+        resultPath: termJson(r.path),
+        value: null,
+        sourceShape: termJson(r.shape),
+        sourceConstraintComponent: { type: 'uri', value: `${SH}MinCountConstraintComponent` },
+        severity: { type: 'uri', value: `${SH}Violation` },
+        messages: ['Less than 1 values'],
+      });
+  }
+  if (!results.length) return null;
+  return {
+    language: 'shacl',
+    status: 'rejected',
+    blocking: results.length,
+    total: results.length,
+    limit: 100,
+    truncated: false,
+    results,
+    head: head(b).seq,
+    kind,
+  };
+}
+
+/** `PUT /$/validation/{ds}` in the mock: `{mode, shapes: {inline}}` sets the guard. */
+export async function putGuard(b, raw) {
+  let o;
+  try {
+    o = JSON.parse(raw || '{}');
+  } catch {
+    return [400, { error: 'invalid JSON' }];
+  }
+  if (o.mode === 'off') {
+    b.guard = null;
+    return [200, { mode: 'off', shapeCount: 0 }];
+  }
+  const text = o.shapes?.inline;
+  if (typeof text !== 'string') return [400, { error: 'shapes.inline is required' }];
+  try {
+    const rules = guardRules(text);
+    b.guard = { mode: o.mode ?? 'reject', rules };
+    return [200, { mode: b.guard.mode, shapeCount: rules.length }];
+  } catch (e) {
+    return [400, { error: `the shapes do not parse: ${e}` }];
+  }
+}
+
+/**
+ * Plan the merge of `source` into `target` (one is the other's upstream) with the
+ * request's `resolutions` and `onConflict`.
+ */
+function planMerge(ds, source, target, o = {}) {
   const child =
     source.upstream === target.branchName
       ? source
@@ -193,28 +281,87 @@ function planMerge(ds, source, target) {
   const both = new Set(
     [...ours.values()].map(cellOf).filter((c) => [...theirs.values()].some((q) => cellOf(q) === c)),
   );
-  const cells = [];
+  const found = [];
   for (const cell of both) {
-    const o = objects(O, cell);
+    const o2 = objects(O, cell);
     const t = objects(T, cell);
-    if (o.join('\n') === t.join('\n')) continue;
+    if (o2.join('\n') === t.join('\n')) continue;
     const [g, s, p] = cell.split('\u0000');
-    cells.push({
+    found.push({
+      cell,
       graph: g || null,
       subject: s,
       predicate: p,
       base: objects(B, cell),
-      ours: o,
+      ours: o2,
       theirs: t,
     });
   }
-  const apply = [...theirs].filter(([k]) => !ours.has(k));
-  const inserted = apply.filter(([k]) => T.has(k)).length;
+  // resolutions: the most specific one that covers a cell wins
+  const res = Array.isArray(o.resolutions) ? o.resolutions : [];
+  const covers = (r, c) =>
+    (r.graph ?? null) === c.graph &&
+    (!r.subject || r.subject === c.subject) &&
+    (!r.predicate || r.predicate === c.predicate);
+  for (const r of res)
+    if (!found.some((c) => covers(r, c)))
+      return {
+        error: [
+          400,
+          {
+            error: `a resolution covers no conflict: ${JSON.stringify(r)}`,
+            code: 'invalid-merge',
+          },
+        ],
+      };
+  const rule = o.onConflict && o.onConflict !== 'fail' ? o.onConflict : null;
+  const remaining = [];
+  const decided = [];
+  for (const c of found) {
+    const r = res
+      .filter((x) => covers(x, c))
+      .sort(
+        (a, b) =>
+          Number(!!b.subject) + Number(!!b.predicate) - Number(!!a.subject) - Number(!!a.predicate),
+      )[0];
+    const take = r?.take ?? rule;
+    if (!take) {
+      remaining.push(c);
+      continue;
+    }
+    const objs =
+      take === 'ours'
+        ? c.ours
+        : take === 'theirs'
+          ? c.theirs
+          : take === 'base'
+            ? c.base
+            : take === 'union'
+              ? [...new Set([...c.ours, ...c.theirs])].sort()
+              : (r?.objects ?? []);
+    decided.push([c, objs]);
+  }
+  // the changes: the source's outside the conflicting cells, then the decided cells
+  const conflicting = new Set(found.map((c) => c.cell));
+  const changes = [];
+  for (const [k, q] of theirs) {
+    if (ours.has(k) || conflicting.has(cellOf(q))) continue;
+    changes.push({ op: T.has(k) ? '+' : '-', quad: q });
+  }
+  for (const [c, objs] of decided) {
+    const keep = new Set(objs);
+    for (const q of O.values())
+      if (cellOf(q) === c.cell && !keep.has(String(q.object))) changes.push({ op: '-', quad: q });
+    const have = new Set(objects(O, c.cell));
+    for (const ob of objs)
+      if (!have.has(ob))
+        changes.push({ op: '+', quad: quadOf(c.subject, c.predicate, ob, c.graph) });
+  }
+  const inserted = changes.filter((x) => x.op === '+').length;
   return {
     child,
-    apply,
-    T,
-    cells,
+    changes: upToDate ? [] : changes,
+    cells: remaining.map(({ cell, ...c }) => (void cell, c)),
     report: {
       upToDate,
       fastForward: !upToDate && ours.size === 0,
@@ -223,12 +370,31 @@ function planMerge(ds, source, target) {
       base: baseRef,
       changes: upToDate
         ? { inserted: 0, deleted: 0 }
-        : { inserted, deleted: apply.length - inserted },
-      conflicts: { found: cells.length, resolved: 0 },
+        : { inserted, deleted: changes.length - inserted },
+      conflicts: { found: found.length, resolved: decided.length },
       commit: null,
       inferences: null,
     },
   };
+}
+
+/** A change of a merge as the diff JSON lists it. */
+const changeJson = ({ op, quad: q }) => ({
+  op,
+  subject: String(q.subject),
+  predicate: String(q.predicate),
+  object: String(q.object),
+  graph: q.graph.termType === 'DefaultGraph' ? null : String(q.graph),
+});
+
+/** The target's state after a planned merge, in a copy. */
+function afterMerge(target, plan) {
+  const st = copyStore(target.store);
+  for (const { op, quad } of plan.changes) {
+    if (op === '+') st.add(quad);
+    else st.delete(quad);
+  }
+  return st;
 }
 
 function conflictReport(plan) {
@@ -293,7 +459,14 @@ export function createBranch(
 }
 
 export async function handleBranches(req, res, url, seg, ctx) {
-  if (seg[0] !== '$' || (seg[1] !== 'branches' && seg[1] !== 'merge')) return false;
+  if (seg[0] !== '$') return false;
+  if (seg[1] === 'validation' && req.method === 'PUT') {
+    const b = seg[2] ? ctx.datasets.get(seg[2]) : undefined;
+    if (!b) return (ctx.fail(res, 404, `No such dataset: ${seg[2] ?? ''}`), true);
+    const raw = (await ctx.readBody(req)).toString('utf8');
+    return (ctx.send(res, ...(await putGuard(b, raw))), true);
+  }
+  if (seg[1] !== 'branches' && seg[1] !== 'merge' && seg[1] !== 'commit-graph') return false;
   const { send, fail } = ctx;
   const ds = seg[2] ? ctx.datasets.get(seg[2]) : undefined;
   if (!ds) return (fail(res, 404, `No such dataset: ${seg[2] ?? ''}`), true);
@@ -310,6 +483,11 @@ export async function handleBranches(req, res, url, seg, ctx) {
       return null;
     }
   };
+
+  if (seg[1] === 'commit-graph') {
+    if (req.method !== 'GET') return (fail(res, 405, 'method not allowed'), true);
+    return (send(res, ...commitGraph(ds, url)), true);
+  }
 
   if (seg[1] === 'branches') {
     const name = seg[3];
@@ -402,7 +580,7 @@ export async function handleBranches(req, res, url, seg, ctx) {
   if (!target) return err([404, { error: `no such branch: ${o.target}`, code: 'no-such-branch' }]);
   if (source === target)
     return err([400, { error: 'a branch cannot be merged into itself', code: 'invalid-merge' }]);
-  const plan = planMerge(ds, source, target);
+  const plan = planMerge(ds, source, target, req.method === 'POST' ? o : {});
   if (plan.error) return err(plan.error);
   if (req.method === 'GET') {
     const preview = { merged: false, ...plan.report };
@@ -421,7 +599,6 @@ export async function handleBranches(req, res, url, seg, ctx) {
       409,
       { error: 'a branch moved since the heads in expect were read', code: 'head-moved' },
     ]);
-  if (report.upToDate) return (send(res, 200, { merged: false, ...report }), true);
   if (plan.cells.length) {
     const r = conflictReport(plan);
     return err([
@@ -435,11 +612,50 @@ export async function handleBranches(req, res, url, seg, ctx) {
       },
     ]);
   }
-  for (const [k, q] of plan.apply) {
-    if (plan.T.has(k)) target.store.add(q);
-    else target.store.delete(q);
+  const validation = report.upToDate
+    ? null
+    : guardReport(target, afterMerge(target, plan), 'merge');
+  if (o.dryRun) {
+    const listed = Math.max(0, Math.min(Number(o.changes) || 0, 10000));
+    const quads = plan.changes.slice(0, listed).map(changeJson);
+    const outcome = validation ? 'rejected' : plan.changes.length ? 'commit' : 'no-change';
+    return (
+      send(res, 200, {
+        dryRun: true,
+        dataset: ds.name,
+        datasetId: ds.id,
+        committed: false,
+        wouldCommit: outcome === 'commit',
+        outcome,
+        head: report.target.seq,
+        ...(listed
+          ? {
+              changes: {
+                total: plan.changes.length,
+                limit: listed,
+                truncated: quads.length < plan.changes.length,
+                quads,
+              },
+            }
+          : {}),
+        ...(validation ? { validation, error: rejection(validation) } : {}),
+        merge: { merged: false, ...report },
+      }),
+      true
+    );
+  }
+  if (report.upToDate) return (send(res, 200, { merged: false, ...report }), true);
+  if (validation) return err([422, { error: rejection(validation), validation }]);
+  for (const { op, quad } of plan.changes) {
+    if (op === '+') target.store.add(quad);
+    else target.store.delete(quad);
   }
   const commit = ctx.addCommit(target, 'merge', report.changes.inserted, report.changes.deleted);
+  recordChanges(
+    commit,
+    plan.changes.filter((c) => c.op === '+').map((c) => String(c.quad)),
+    plan.changes.filter((c) => c.op === '-').map((c) => String(c.quad)),
+  );
   commit.mergedFrom = {
     branch: source.branchName,
     branchId: source.branchId,
@@ -458,5 +674,157 @@ export async function handleBranches(req, res, url, seg, ctx) {
     upstreamSeq: child === source ? commit.seq : report.source.seq,
   };
   send(res, 200, { merged: true, ...report, commit });
+  return true;
+}
+
+/** The error message of a merge the guard refuses. */
+const rejection = (v) =>
+  `SHACL validation failed: ${v.blocking} blocking result${v.blocking === 1 ? '' : 's'} (threshold violation); nothing was committed`;
+
+/** A cursor of the commit graph: `TIMESTAMP_MS.ORDINAL.SEQ`. */
+const cursorOf = (k) => k.join('.');
+const before = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+
+/** `GET /$/commit-graph/{ds}`: the own commits of the branches, newest first, in pages. */
+function commitGraph(ds, url) {
+  const all = [
+    ds,
+    ...[...ds.branchSet.values()].sort((a, b) => a.branchName.localeCompare(b.branchName)),
+  ];
+  const asked = url.searchParams
+    .getAll('branches')
+    .flatMap((v) => v.split(','))
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const n of asked)
+    if (!branchOf(ds, n)) return [404, { error: `no such branch: ${n}`, code: 'no-such-branch' }];
+  const list = asked.length ? all.filter((b) => asked.includes(b.branchName)) : all;
+  const limitArg = url.searchParams.get('limit');
+  const limit = limitArg == null ? 100 : Number(limitArg);
+  if (!(limit >= 1 && limit <= 1000))
+    return [400, { error: 'limit: 1 to 1000', code: 'bad-request' }];
+  const b4 = url.searchParams.get('before');
+  const cur = b4 ? b4.split('.').map(Number) : null;
+  if (cur && (cur.length !== 3 || cur.some((n) => !Number.isFinite(n))))
+    return [400, { error: `invalid commit graph cursor '${b4}'`, code: 'bad-request' }];
+  const byId = new Map(all.map((b) => [b.branchId, b]));
+  /** A commit on the branch that made it: seqs at or below a branch's start are its upstream's. */
+  const normalize = (r) => {
+    let c = r;
+    for (let i = 0; i < 64; i++) {
+      const b = byId.get(c.branchId);
+      if (!b?.from || c.seq > b.from.seq) return c;
+      c = { ...b.from, seq: c.seq };
+    }
+    return c;
+  };
+  const named = (r) => ({
+    branch: byId.get(r.branchId)?.branchName ?? null,
+    branchId: r.branchId,
+    seq: r.seq,
+  });
+  const keyed = [];
+  for (const b of list)
+    for (const c of b.commits) {
+      const k = [Date.parse(c.timestamp), b.ordinal, c.seq];
+      if (!cur || before(k, cur) < 0) keyed.push([k, b, c]);
+    }
+  keyed.sort((a, b) => before(b[0], a[0]));
+  const page = keyed.slice(0, limit);
+  const commits = page.map(([, b, c]) => {
+    const parents = [];
+    if (b.commits.some((x) => x.seq === c.seq - 1) || (!b.from && c.seq > 0))
+      parents.push({ branch: b.branchName, branchId: b.branchId, seq: c.seq - 1 });
+    else if (b.from) parents.push(named(normalize(b.from)));
+    if (c.mergedFrom) parents.push(named(normalize(c.mergedFrom)));
+    return { ...c, branch: b.branchName, branchId: b.branchId, parents, reconstructable: true };
+  });
+  const last = page.at(-1);
+  const params = (n) =>
+    `before=${n}&limit=${limit}${asked.length ? `&branches=${asked.join(',')}` : ''}`;
+  return [
+    200,
+    {
+      dataset: ds.name,
+      datasetId: ds.id,
+      branches: list.map((b) => ({
+        name: b.branchName,
+        id: b.branchId,
+        ordinal: b.ordinal,
+        head: head(b).seq,
+        modified: head(b).timestamp,
+        from: b.from ?? null,
+        upstream: b.upstream ?? null,
+        created: b.created,
+      })),
+      commits,
+      next:
+        keyed.length > limit && last
+          ? `/$/commit-graph/${ds.name}?${params(cursorOf(last[0]))}`
+          : null,
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// the changes of commits, for `GET /{ds}/diff`
+
+/** The changes each commit made (`[{op, quad}]`), by commit object. */
+const changesOf = new WeakMap();
+
+/** Remember what `commit` changed: the N-Quads lines (without " .") it added and removed. */
+export function recordChanges(commit, added, removed) {
+  const parse = (lines) => {
+    if (!lines.length) return [];
+    const st = new ox.Store();
+    st.load(lines.map((l) => `${l} .`).join('\n'), { format: 'application/n-quads' });
+    return st.match();
+  };
+  changesOf.set(commit, [
+    ...parse(removed).map((quad) => ({ op: '-', quad })),
+    ...parse(added).map((quad) => ({ op: '+', quad })),
+  ]);
+}
+
+/**
+ * `GET /{ds}/diff?from=&to=&quads=true`: the net change between two commits of a branch,
+ * from the changes the mock recorded (none for the seeded history).
+ */
+export function handleDiff(req, res, url, seg, ctx) {
+  if (seg[0] === '$' || seg[1] !== 'diff' || seg.length !== 2 || req.method !== 'GET') return false;
+  const ds = ctx.datasets.get(seg[0]);
+  if (!ds) return false;
+  const list = allCommits(ds);
+  const h = head(ds).seq;
+  const sel = (v, d) =>
+    v == null || v === '' || v === 'head' ? d : Number(String(v).replace(/^commit:/, ''));
+  const to = sel(url.searchParams.get('to'), h);
+  const from = sel(url.searchParams.get('from'), to - 1);
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to > h)
+    return (ctx.fail(res, 400, 'the mock compares commit numbers of the branch only'), true);
+  const net = new Map();
+  for (const c of list.filter((x) => x.seq > from && x.seq <= to))
+    for (const ch of changesOf.get(c) ?? []) {
+      const k = String(ch.quad);
+      const had = net.get(k);
+      if (had && had.op !== ch.op) net.delete(k);
+      else net.set(k, ch);
+    }
+  const changes = [...net.values()].sort((a, b) => (a.op === b.op ? 0 : a.op === '-' ? -1 : 1));
+  const at = (seq) => list.find((c) => c.seq === seq) ?? { seq, ref: `commit:${seq}` };
+  const limit = Number(url.searchParams.get('limit') ?? 1000);
+  const added = changes.filter((c) => c.op === '+').length;
+  ctx.send(res, 200, {
+    dataset: ds.name,
+    datasetId: ds.id,
+    from: { selector: String(from), commit: at(from) },
+    to: { selector: String(to), commit: at(to) },
+    added,
+    removed: changes.length - added,
+    method: 'log',
+    ...(url.searchParams.get('quads') === 'true'
+      ? { quads: changes.slice(0, limit).map(changeJson) }
+      : {}),
+  });
   return true;
 }

@@ -1,7 +1,7 @@
 // Branches and merges against the mock: the branch selector keeps the branch in the URL
 // and every request of the dataset page names it, the Branches panel creates, protects
-// and deletes branches, the Merge button merges a branch without conflicts and shows the
-// report and the command for one with conflicts, and History marks the merge commit.
+// and deletes branches, the Merge button merges a branch without conflicts and opens the
+// merge page for one with conflicts, and History marks the merge commit.
 // The tests work on a dataset of their own, `ledger`, which has a branch `dev` one commit
 // ahead of main.
 
@@ -178,7 +178,7 @@ test('an update on a branch through the query page, merged with the Merge button
   await dialog.getByRole('button', { name: 'Close', exact: true }).last().click();
 });
 
-test('a merge with conflicts shows the report and the command, and merges nothing', async ({
+test('a merge with conflicts opens the merge page, and merges nothing on its own', async ({
   page,
   request,
 }) => {
@@ -197,21 +197,20 @@ test('a merge with conflicts shows the report and the command, and merges nothin
   const head = await mainHead();
   await page.goto('/ui/datasets/ledger');
   await row(page, 'clash').getByRole('button', { name: 'Merge clash' }).click();
-  const dialog = page.getByRole('dialog');
-  const report = dialog.getByRole('alert');
-  await expect(report).toContainText('1 conflict.');
-  await expect(report.getByRole('row').nth(1)).toContainText('<urn:acct:1> <urn:balance>');
-  await expect(report.getByRole('row').nth(1)).toContainText('"100"^^');
-  await expect(report.getByRole('row').nth(1)).toContainText('"90"^^');
-  await expect(report.getByRole('row').nth(1)).toContainText('"150"^^');
+  await expect(page).toHaveURL(/\/ui\/datasets\/ledger\/merge\?source=clash&target=main$/);
+  const conflicts = page.getByRole('region', { name: 'Conflicts' });
+  await expect(conflicts).toContainText('<urn:acct:1>');
+  await expect(conflicts).toContainText('"100"^^');
+  await expect(conflicts).toContainText('"90"^^');
+  await expect(conflicts).toContainText('"150"^^');
+  await expect(page.getByRole('button', { name: 'Merge into main' })).toBeDisabled();
   const origin = new URL(page.url()).origin;
-  await expect(report).toContainText(
+  await page.getByText('The same from the command line').click();
+  await expect(page.locator('details.cli')).toContainText(
     `sparkles merge --server ${origin} --dataset ledger clash --into main --on-conflict theirs`,
   );
-  await expect(report).toContainText('--resolve FILE.json');
-  await expect(dialog.getByRole('button', { name: 'Merge into main' })).toHaveCount(0);
-  await dialog.getByRole('button', { name: 'Close', exact: true }).last().click();
-  await expect(dialog).toBeHidden();
   expect(await mainHead()).toBe(head);
+  await page.getByRole('link', { name: 'Cancel' }).click();
+  await expect(page).toHaveURL(/\/ui\/datasets\/ledger$/);
   await expect(history(page).getByRole('row').nth(1)).not.toContainText('merge');
 });

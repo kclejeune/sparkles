@@ -1,15 +1,12 @@
 <script lang="ts">
+  // The Branches panel's Merge button: a preview of the merge, and the merge when there are
+  // no conflicts. A merge with conflicts opens the merge page, which resolves them.
+  import { goto } from '$app/navigation';
+  import { resolve } from '$app/paths';
   import * as api from '$lib/api';
-  import { app, toasts } from '$lib/app.svelte';
-  import {
-    cellPlace,
-    MAIN,
-    mergeChanges,
-    mergeCommands,
-    ntShort,
-    remainingConflicts,
-  } from '$lib/branches';
-  import { fmtInt } from '$lib/format';
+  import { toasts } from '$lib/app.svelte';
+  import { MAIN, mergeChanges, remainingConflicts } from '$lib/branches';
+  import { mergeHref } from '$lib/merge-page';
   import { LatestRun } from '$lib/supersede';
   import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
@@ -36,15 +33,18 @@
   let target = $state(MAIN);
   let preview = $state<api.MergeOutcome | null>(null);
   let error = $state<string | null>(null);
-  /** A merge refused because of conflicts (the report of `POST`). */
-  let refused = $state<api.MergeOutcome | null>(null);
   let note = $state<string | null>(null);
   let loading = $state(false);
   let merging = $state(false);
   const runs = new LatestRun();
 
   const targets = $derived(branches.filter((b) => b.name !== source));
-  const prefixes = $derived(app.prefixes(name));
+
+  /** Resolve the conflicts on the merge page. */
+  function openPage() {
+    open = false;
+    goto(mergeHref(resolve('/datasets/[name]', { name }), source, target));
+  }
 
   // a new source starts at its upstream
   $effect(() => {
@@ -59,12 +59,12 @@
   async function load() {
     const owns = runs.claim('preview');
     loading = true;
-    refused = null;
     try {
       const p = await api.mergePreview(name, source, target);
       if (!owns()) return;
       preview = p;
       error = null;
+      if (remainingConflicts(p) > 0) openPage();
     } catch (e) {
       if (!owns()) return;
       preview = null;
@@ -78,13 +78,8 @@
     if (open && source && target) void load();
   });
 
-  /** The report on show: a refused merge's, or the preview's when it has conflicts. */
-  const report = $derived(refused ?? (preview && remainingConflicts(preview) > 0 ? preview : null));
-  const conflicts = $derived(report ? remainingConflicts(report) : 0);
-  const commands = $derived(
-    mergeCommands({ server: location.origin, dataset: name, source, target }),
-  );
-  const canMerge = $derived(!!preview && !preview.upToDate && !report && !loading && !merging);
+  const conflicts = $derived(preview ? remainingConflicts(preview) > 0 : false);
+  const canMerge = $derived(!!preview && !preview.upToDate && !conflicts && !loading && !merging);
 
   async function merge() {
     if (!preview) return;
@@ -108,23 +103,13 @@
       open = false;
       onmerged?.(r);
     } catch (e) {
-      if (e instanceof api.ApiError && e.code === 'merge-conflict' && e.body)
-        refused = e.body as api.MergeOutcome;
+      if (e instanceof api.ApiError && e.code === 'merge-conflict') openPage();
       else if (e instanceof api.ApiError && e.code === 'head-moved') {
         note = `${source} or ${target} changed since the preview. Check the new preview and merge again.`;
         void load();
       } else error = api.errorMessage(e);
     } finally {
       merging = false;
-    }
-  }
-
-  async function copy(text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      toasts.push('success', 'Copied the command', undefined, 1400);
-    } catch (e) {
-      toasts.error('Could not copy', e);
     }
   }
 </script>
@@ -146,9 +131,11 @@
         <span class="muted">{error}</span>
       </div>
     {:else if preview}
-      {@const p = report ?? preview}
+      {@const p = preview}
       {#if note}<p class="moved"><Icon name="info" size={13} /> {note}</p>{/if}
-      {#if preview.upToDate && !refused}
+      {#if conflicts}
+        <p class="faint row"><span class="spinner"></span> Opening the merge page…</p>
+      {:else if preview.upToDate}
         <p class="uptodate">
           <Icon name="check" size={14} />
           {target} already has every change of {source}. There is nothing to merge.
@@ -174,75 +161,11 @@
             </div>
           {/if}
         </dl>
-        {#if preview.fastForward && !report}
+        {#if preview.fastForward}
           <p class="faint">
             {target} has not changed since {source} started, so this is a fast-forward.
           </p>
         {/if}
-      {/if}
-
-      {#if report}
-        <div class="conflicts" role="alert">
-          <p>
-            <Icon name="alert" size={14} />
-            <strong>{fmtInt(conflicts)} conflict{conflicts === 1 ? '' : 's'}.</strong>
-            Both branches changed these values differently, so nothing is merged.
-          </p>
-          <div class="cells">
-            <table class="data">
-              <thead>
-                <tr>
-                  <th>Where</th>
-                  <th>Base</th>
-                  <th>Ours <span class="faint mono">({target})</span></th>
-                  <th>Theirs <span class="faint mono">({source})</span></th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each report.cells ?? [] as c, i (i)}
-                  <tr>
-                    <td class="mono place">{cellPlace(c, prefixes)}</td>
-                    <td class="mono"
-                      >{#each c.base as o, j (j)}<div>{ntShort(o, prefixes)}</div>{:else}<span
-                          class="faint">none</span
-                        >{/each}</td
-                    >
-                    <td class="mono"
-                      >{#each c.ours as o, j (j)}<div>{ntShort(o, prefixes)}</div>{:else}<span
-                          class="faint">none</span
-                        >{/each}</td
-                    >
-                    <td class="mono"
-                      >{#each c.theirs as o, j (j)}<div>{ntShort(o, prefixes)}</div>{:else}<span
-                          class="faint">none</span
-                        >{/each}</td
-                    >
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          </div>
-          {#if report.truncated}
-            <p class="faint">
-              The list shows the first {fmtInt(report.cells?.length ?? 0)} conflicts.
-            </p>
-          {/if}
-          <p>
-            Resolve them from the command line, taking every value from {source}, or with a file of
-            resolutions:
-          </p>
-          {#each commands as cmd (cmd)}
-            <div class="cmd">
-              <pre class="mono">{cmd}</pre>
-              <button
-                class="btn ghost icon sm"
-                aria-label="Copy the command"
-                title="Copy"
-                onclick={() => copy(cmd)}><Icon name="copy" size={12} /></button
-              >
-            </div>
-          {/each}
-        </div>
       {/if}
     {/if}
   </div>
@@ -300,50 +223,5 @@
   }
   .moved {
     color: var(--warn);
-  }
-  .conflicts {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 8px;
-  }
-  .conflicts > p:first-child {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-    color: var(--danger);
-  }
-  .cells {
-    max-height: 260px;
-    overflow: auto;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-  }
-  .cells table {
-    font-size: 12px;
-  }
-  .cells td {
-    vertical-align: top;
-    overflow-wrap: anywhere;
-    min-width: 90px;
-  }
-  .cells td.place {
-    min-width: 140px;
-  }
-  .cmd {
-    display: flex;
-    align-items: flex-start;
-    gap: 6px;
-  }
-  .cmd pre {
-    flex: 1;
-    min-width: 0;
-    margin: 0;
-    padding: 6px 8px;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    font-size: 11.5px;
-    background: var(--surface-2);
-    border-radius: var(--r);
   }
 </style>

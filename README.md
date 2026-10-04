@@ -44,7 +44,8 @@ Rust, Python and JVM APIs, a Fuseki-compatible server and CLI, and a web UI.
   when a triple was added or which values a property took
   ([API](docs/API.md#point-in-time-reads-and-snapshots)).
 * Branches that share their upstream's index until they compact, so creating one writes
-  a few kilobytes, with fast-forward and three-way merges and conflict resolution
+  a few kilobytes, with fast-forward and three-way merges, conflict resolution on the
+  web UI's merge page, and a commit graph of every branch
   ([API](docs/API.md#branches-and-merges)).
 * RDF Patch applied as one commit, entity tags with `If-Match` writes, commit messages,
   and dry runs of any write that report its changes, validation and quota effect

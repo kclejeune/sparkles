@@ -2056,6 +2056,156 @@
         ],
         "type": "object"
       },
+      "CommitGraph": {
+        "properties": {
+          "branches": {
+            "items": {
+              "properties": {
+                "created": {
+                  "type": "string"
+                },
+                "from": {
+                  "description": "The commit the branch started from (`null` for `main`).",
+                  "properties": {
+                    "branch": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "branchId": {
+                      "type": "string"
+                    },
+                    "seq": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "head": {
+                  "type": "integer"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "modified": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "ordinal": {
+                  "type": "integer"
+                },
+                "upstream": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "name",
+                "id",
+                "head",
+                "from",
+                "upstream"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "commits": {
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Commit"
+                }
+              ],
+              "properties": {
+                "branch": {
+                  "description": "The branch that made the commit.",
+                  "type": "string"
+                },
+                "branchId": {
+                  "type": "string"
+                },
+                "mergedFrom": {
+                  "properties": {
+                    "branch": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "branchId": {
+                      "type": "string"
+                    },
+                    "seq": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                },
+                "parents": {
+                  "items": {
+                    "properties": {
+                      "branch": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "branchId": {
+                        "type": "string"
+                      },
+                      "seq": {
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "reconstructable": {
+                  "type": "boolean"
+                },
+                "snapshots": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "type": "array"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "next": {
+            "description": "The URL of the next page.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "dataset",
+          "datasetId",
+          "branches",
+          "commits",
+          "next"
+        ],
+        "type": "object"
+      },
       "CommitList": {
         "additionalProperties": true,
         "properties": {
@@ -13307,6 +13457,90 @@
         "tags": [
           "Branches"
         ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/commit-graph/{ds}": {
+      "get": {
+        "description": "The own commits of several branches, newest first by time, each with the branch that made it and its parents: the previous commit, or the starting commit for a branch's first commit, and a merge commit's merged commit. The answer also lists each branch's head, upstream and starting commit. Only the branches the caller may read are drawn.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#commit-graph"
+        },
+        "operationId": "getCommitGraph",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The branches to draw, comma-separated or repeated (default every branch the caller may read).",
+            "in": "query",
+            "name": "branches",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The page size.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The cursor of the next page, as `next` gives it.",
+            "in": "query",
+            "name": "before",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitGraph"
+                }
+              }
+            },
+            "description": "One page of the graph."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get the commit graph",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-pagination": {
+          "next": "next",
+          "parameters": [
+            "limit",
+            "before"
+          ],
+          "style": "cursor"
+        },
         "x-sparkles-permission": "read"
       }
     },

@@ -454,7 +454,7 @@ fn invalid(code: &str, msg: impl Into<String>) -> ApiError {
 }
 
 /// The dataset's own object, for the branch routes (which name branches themselves).
-fn main_dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
+pub(super) fn main_dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
     let ds = st
         .get(name)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")))?;
@@ -472,7 +472,13 @@ fn main_dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
 
 /// A branch the caller may see at `lvl` (through endpoint `e`, when given), or the
 /// answer for one that does not exist.
-fn check(p: &Principal, ds: &str, name: &str, lvl: Level, e: Option<Endpoint>) -> ApiResult<()> {
+pub(super) fn check(
+    p: &Principal,
+    ds: &str,
+    name: &str,
+    lvl: Level,
+    e: Option<Endpoint>,
+) -> ApiResult<()> {
     let q = on_branch(ds, name);
     let have = match e {
         Some(e) => p.level_at(&q, e),
@@ -501,7 +507,7 @@ fn whole(p: &Principal, ds: &str, name: &str) -> ApiResult<()> {
     Ok(())
 }
 
-fn commit_ref(c: &NamedCommitRef) -> J {
+pub(super) fn commit_ref(c: &NamedCommitRef) -> J {
     json!({ "branch": c.branch, "branchId": c.branch_id, "seq": c.seq })
 }
 

@@ -132,6 +132,29 @@ async fn a16_grants_limited_to_branches() {
         .map(|b| b["name"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(names, ["dev", "dev2"]);
+    // so does the commit graph, which draws only those branches
+    let r = get_as(app, "/$/commit-graph/br", Some(&devs)).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let g = r.json();
+    let drawn: Vec<&str> = g["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(drawn, ["dev", "dev2"]);
+    assert!(
+        g["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["branch"] == "dev" || c["branch"] == "dev2"),
+        "{g}"
+    );
+    let r = get_as(app, "/$/commit-graph/br?branches=other", Some(&devs)).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = get_as(app, "/$/commit-graph/br?branches=main", Some(&devs)).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
     // a merge into main needs write on main
     let r = post_json(app, "devs", "/$/merge/br", r#"{"source":"dev"}"#).await;
     assert_eq!(

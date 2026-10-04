@@ -305,6 +305,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("cherryPick", "branches.cherry_pick", |ds| {
             ds.cherry_pick("dev", 3, "main", &Default::default());
         }),
+        op!("getCommitGraph", "branches.commit_graph", |ds| {
+            ds.commit_graph(&Default::default());
+        }),
         // ----------------------------------------------------------- search indexes
         op!("getTextIndex", "indexes.text.status", |ds| {
             ds.indexes().text().status();

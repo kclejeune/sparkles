@@ -9,6 +9,7 @@
 use crate::Dataset;
 use crate::Result;
 use crate::branch::{BranchInfo, BranchOptions, MergeOptions, MergeOutcome, MergeReport};
+use crate::store::{CommitGraph, CommitGraphOptions};
 
 impl Dataset {
     /// The dataset bound to branch `name`: reads and writes go to that branch. `main`
@@ -149,6 +150,12 @@ impl Dataset {
     /// Delete branch `name`, also with unmerged commits when `force`.
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
         self.store().delete_branch(name, force)
+    }
+
+    /// A page of the commit graph of several branches, newest first (see
+    /// [`Store::commit_graph`](crate::store::Store::commit_graph)).
+    pub fn commit_graph(&self, o: &CommitGraphOptions) -> Result<CommitGraph> {
+        self.store().commit_graph(o)
     }
 }
 

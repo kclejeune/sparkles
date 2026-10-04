@@ -90,6 +90,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/merge/{ds}", &["GET", "POST"]),
     ("/$/revert/{ds}", &["GET", "POST"]),
     ("/$/cherry-pick/{ds}", &["GET", "POST"]),
+    ("/$/commit-graph/{ds}", &["GET"]),
     ("/$/vector/{ds}", &["GET"]),
     ("/$/vector/{ds}/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/vector/{ds}/{name}/rebuild", &["POST"]),
@@ -245,7 +246,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/branches/{ds}/{name}"
         | "/$/merge/{ds}"
         | "/$/revert/{ds}"
-        | "/$/cherry-pick/{ds}" => Dataset(Read),
+        | "/$/cherry-pick/{ds}"
+        | "/$/commit-graph/{ds}" => Dataset(Read),
         "/$/ready/{ds}"
         | "/$/stats/{ds}"
         | "/$/schema/{ds}"
@@ -1048,7 +1050,8 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             let branch_routes = route.starts_with("/$/branches/")
                 || route.starts_with("/$/merge/")
                 || route.starts_with("/$/revert/")
-                || route.starts_with("/$/cherry-pick/");
+                || route.starts_with("/$/cherry-pick/")
+                || route.starts_with("/$/commit-graph/");
             let have = if branch_routes {
                 p.level_any_branch(&ds)
             } else {

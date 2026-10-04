@@ -3054,6 +3054,48 @@ with `picked: {branch, seq}` in place of `reverted`. The default message is
 the branch, through the `merge` endpoint and from grants without graph restrictions,
 and a protected branch refuses it.
 
+### Commit graph
+
+`GET /$/commit-graph/{ds}` lists the commits of several branches in one page, newest
+first, for drawing them as a graph. Each branch contributes its own commits, the ones
+after its starting commit, so every commit appears once, on the branch that made it.
+The UI's History panel draws this list in its Graph view.
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `branches` | every branch the caller may read | The branches to draw, comma-separated or repeated. A branch the caller may not read answers `404 no-such-branch` or `403`. |
+| `limit` | 100 | Commits per page, from 1 to 1,000. |
+| `before` | none | The cursor of the next page. `next` gives the URL with it. |
+
+```ts
+type CommitGraph = {
+  dataset: string; datasetId: string;
+  branches: {
+    name: string; id: string; ordinal: number;
+    head: number; modified: string;             // the head commit and its time
+    from: { branch: string | null; branchId: string; seq: number } | null;  // null for main
+    upstream: string | null; created: string;
+  }[];
+  commits: (Commit & {
+    branch: string; branchId: string;           // the branch that made the commit
+    parents: { branch: string | null; branchId: string; seq: number }[];
+    mergedFrom?: { branch: string | null; branchId: string; seq: number };
+  })[];
+  next: string | null;                          // the URL of the next (older) page
+};
+```
+
+Commits are sorted by time, then by the branch's ordinal, then by number. Commit
+numbers count per branch, so a commit is known by its branch id and number. The first
+parent of a commit is the previous commit of its branch. For a branch's first commit,
+it is the commit the branch started from, named by the branch that made it. A merge
+commit has the merged commit as its second parent, also given in `mergedFrom`. A
+parent can name a deleted branch, with `branch: null`, or a branch the caller may not
+read. Such a parent never appears in the list. Commits whose metadata is no longer
+retained are left out. Each commit carries `reconstructable` and `snapshots` as in
+`/$/commits`, and a caller whose grants cover some graphs only gets the commits
+without their counts.
+
 ### Storage, history and access
 
 A backup to a [backup repository](#backup-repositories) copies `main` only. Its

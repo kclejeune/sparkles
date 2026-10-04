@@ -1,7 +1,8 @@
 // Branches and merges against the server without auth, on persistent datasets of their own
 // (in-memory datasets have no branches): a branch made in the Branches panel, an update on
 // it through the query page's Branch field, the Merge button, and the merge commit in
-// History. A merge with conflicts shows the server's report and merges nothing.
+// History. A merge with conflicts opens the merge page, where a choice resolves the
+// conflict and the merge goes through.
 
 import type { APIRequestContext, Page } from '@playwright/test';
 import { expect, open } from './fixtures';
@@ -103,36 +104,44 @@ open(
   },
 );
 
-open('a merge with conflicts shows the report and merges nothing', async ({ page, request }) => {
-  await dataset(request, 'clashy', '<urn:acct:1> <urn:balance> 100');
-  const created = await request.post('/$/branches/clashy', { data: { name: 'clash' } });
-  expect(created.status(), await created.text()).toBe(201);
-  const change = (to: number) =>
-    `DELETE DATA { <urn:acct:1> <urn:balance> 100 } ; INSERT DATA { <urn:acct:1> <urn:balance> ${to} }`;
-  await update(request, 'clashy@clash', change(150));
-  await update(request, 'clashy', change(90));
-  const head = async () => (await (await request.get('/$/branches/clashy/main')).json()).head;
-  const before = await head();
+open(
+  'a merge with conflicts opens the merge page, which resolves and merges',
+  async ({ page, request }) => {
+    await dataset(request, 'clashy', '<urn:acct:1> <urn:balance> 100');
+    const created = await request.post('/$/branches/clashy', { data: { name: 'clash' } });
+    expect(created.status(), await created.text()).toBe(201);
+    const change = (to: number) =>
+      `DELETE DATA { <urn:acct:1> <urn:balance> 100 } ; INSERT DATA { <urn:acct:1> <urn:balance> ${to} }`;
+    await update(request, 'clashy@clash', change(150));
+    await update(request, 'clashy', change(90));
+    const head = async () => (await (await request.get('/$/branches/clashy/main')).json()).head;
+    const before = await head();
 
-  await page.goto('/ui/datasets/clashy');
-  await row(page, 'clash').getByRole('button', { name: 'Merge clash' }).click();
-  const dialog = page.getByRole('dialog');
-  const report = dialog.getByRole('alert');
-  await expect(report).toContainText('1 conflict.');
-  const cell = report.getByRole('row').nth(1);
-  await expect(cell).toContainText('<urn:acct:1> <urn:balance>');
-  await expect(cell).toContainText('"100"^^xsd:integer');
-  await expect(cell).toContainText('"90"^^xsd:integer');
-  await expect(cell).toContainText('"150"^^xsd:integer');
-  await expect(report).toContainText('--dataset clashy clash --into main --on-conflict theirs');
-  await expect(dialog.getByRole('button', { name: 'Merge into main' })).toHaveCount(0);
-  await dialog.getByRole('button', { name: 'Close', exact: true }).last().click();
-  expect(await head()).toBe(before);
+    await page.goto('/ui/datasets/clashy');
+    await row(page, 'clash').getByRole('button', { name: 'Merge clash' }).click();
+    await expect(page).toHaveURL(/\/ui\/datasets\/clashy\/merge\?source=clash&target=main$/);
+    const conflicts = page.getByRole('region', { name: 'Conflicts' });
+    await expect(conflicts).toContainText('Default graph · 1 conflict');
+    const cell = conflicts.getByRole('row').filter({ hasText: '<urn:balance>' });
+    await expect(cell).toContainText('"100"^^xsd:integer');
+    await expect(cell).toContainText('"90"^^xsd:integer');
+    await expect(cell).toContainText('"150"^^xsd:integer');
+    await expect(page.getByRole('button', { name: 'Merge into main' })).toBeDisabled();
+    expect(await head()).toBe(before);
 
-  // deleting the branch asks for a forced delete
-  await row(page, 'clash').getByRole('button', { name: 'Delete branch clash' }).click();
-  await expect(dialog).toContainText('clash has 1 commit that main does not have.');
-  await dialog.getByRole('button', { name: 'Delete anyway' }).click();
-  await expect(dialog).toBeHidden();
-  await expect(row(page, 'clash')).toHaveCount(0);
-});
+    await cell.getByRole('radio', { name: 'Theirs' }).click();
+    const lines = page.getByRole('region', { name: 'Changes' }).getByLabel('Changes of the merge');
+    await expect(lines).toContainText('− <urn:acct:1> <urn:balance> "90"^^');
+    await expect(lines).toContainText('+ <urn:acct:1> <urn:balance> "150"^^');
+    await page.getByRole('button', { name: 'Merge into main' }).click();
+    await expect(page.getByText('Merged clash into main')).toBeVisible({ timeout: 15_000 });
+    await expect(page).toHaveURL(/\/ui\/datasets\/clashy$/);
+    expect(await head()).toBe(before + 1);
+    const balance = await request.get(
+      `/clashy/sparql?query=${encodeURIComponent('ASK { <urn:acct:1> <urn:balance> 150 }')}`,
+      { headers: { Accept: 'application/sparql-results+json' } },
+    );
+    expect((await balance.json()).boolean).toBe(true);
+    await expect(history(page).getByRole('row').nth(1)).toContainText('merge');
+  },
+);

@@ -7,10 +7,11 @@
 > `?branch=` and the path form, per-branch commits and history, three-way merges of quad
 > sets with cell and subject conflicts and resolutions, deletion, holds and quotas,
 > access control by branch, the HTTP API, the CLI, and the UI's branch selector,
-> Branches panel and conflict-free Merge button. Phase 2 (the merge page, Python,
-> squash merges, reverts, replayed fast-forwards, renames, in-memory branches and
-> backups of branches) and Phase 3 (cross-server clones, relinking, virtual merge bases
-> and cherry-picks) are not built.
+> Branches panel and conflict-free Merge button. Of Phase 2, the UI's merge page and the
+> History panel's commit graph, with `GET /$/commit-graph/{ds}`, have shipped. The rest
+> of Phase 2 (Python, squash merges, reverts, replayed fast-forwards, renames, in-memory
+> branches and backups of branches) and Phase 3 (cross-server clones, relinking, virtual
+> merge bases and cherry-picks) are not built.
 >
 > **User docs:** [API: Branches and merges](../API.md#branches-and-merges) ·
 > [Usage: Branches and merges](../USAGE.md#branches-and-merges) ·
@@ -429,6 +430,14 @@ branch set, which every branch store of a dataset shares.
   heads it showed as `expect`, and it shows the validation report when the target's
   guard refuses the result. In Phase 1 the panel's Merge button merges only when there
   are no conflicts, and it otherwise shows the report and the equivalent CLI command.
+- **Commit graph (Phase 2).** A Graph toggle in the History panel draws the commits of
+  every branch the caller may read in time order, one lane per branch, as
+  `git log --graph` does. Fork edges start at each branch's starting commit, and merge
+  edges at each merge commit's merged commit. Long runs of commits on one branch fold
+  into a segment that expands. The graph pages, and a commit shows its changes and a
+  link to query at it. `GET /$/commit-graph/{ds}` serves it: the commits of several
+  branches with their parents, newest first, with each branch's head, upstream and
+  starting commit.
 
 ### 2.10 Python (Phase 2)
 
@@ -1045,6 +1054,7 @@ These are estimates for Phase 1 to confirm, on a 10.5M-quad dataset.
 **Phase 2.**
 
 - The merge page of the UI with per-cell resolution.
+- The commit graph of the History panel, and `GET /$/commit-graph/{ds}` (§2.9).
 - Python (§2.10).
 - Squash merges, which apply the changes as one commit without recording a second parent.
 - Reverts, which are merges of a commit's parent with the commit as base:
@@ -1535,3 +1545,42 @@ The open questions kept their defaults: no exempt predicates, configuration copi
 creation, base pins always kept, no `/` in names, the `@` path form, branches of
 branches with a depth limit of 4, backups of `main` only, branch stores open until the
 server stops, no extra RDF Patch header, and the dataset's quota for all branches.
+
+**Phase 2: the merge page and the commit graph.** Both landed on 2026-10-04.
+
+* **Merge page.** `/datasets/[name]/merge?source=&target=` reads the preview with up to
+  1,000 conflict cells and shows the merge base, the counts and the conflicts. The
+  conflicts are grouped by graph, then by subject, with the base, ours and theirs objects
+  side by side. Each row takes Ours, Theirs, Base or Both, and a subject's menu sets
+  all its rows at once. A row's own choice wins over its subject's, which is how the
+  server orders resolutions too. A rule for every conflict without a choice becomes
+  `onConflict`, so a truncated report can still be merged. The changes come from a
+  dry run of the merge with the choices made so far, which lists up to 500 changed
+  quads. The dry run also runs the target's guard, so the page warns before the merge
+  when validation would refuse it. Conflicts without a choice keep the target's
+  values in that list. The merge sends the previewed heads as `expect`. On
+  `head-moved` the page reads the branches again and keeps the choices for the cells
+  still in conflict, and on `422` it shows the guard's results. The Branches panel's
+  Merge button opens the page as soon as its preview finds conflicts. The page sends
+  the existing preview and merge requests unchanged. Its options sit next to the commit
+  message, where squash and revert controls can join them. `take: "objects"` is left to
+  the CLI, since it needs values typed in.
+* **Commit graph.** `GET /$/commit-graph/{ds}` and `Store::commit_graph` page the own
+  commits of several branches by `(timestamp, ordinal, seq)`, newest first. A cursor of
+  that key finds where each branch's run continues with a binary search, so a page
+  costs at most `limit` catalog reads per branch. Each commit lists its parents: the
+  previous commit, or the normalized starting commit for a branch's first commit, and a
+  merge commit's merged commit. The route draws the branches the caller may read through
+  the `info` endpoint, as `/$/commits` does, and a branch it names that the caller cannot
+  see answers `404`. The UI gives each branch with own commits a lane in a depth-first
+  walk from `main`, with siblings that started later nearer their upstream, so fork edges
+  cross no lane in use at their row. A branch without own commits shows its name on the
+  commit it started from. Runs of four or more commits of one branch that are not heads,
+  merges or parents of forks and merges fold into a segment. Only the rows in view are
+  drawn, and the graph loads 200 commits per page. Lane colours are the term colours,
+  which have light and dark variants.
+
+The mock server gained resolutions, dry runs, the commit graph, diffs of the commits it
+records, and a small write guard read from `sh:targetClass` and `sh:minCount`, so the
+mock end-to-end tests cover both features. The real-server end-to-end tests cover a
+resolved merge, a guard refusal and the graph.

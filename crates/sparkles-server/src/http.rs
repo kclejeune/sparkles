@@ -25,6 +25,7 @@ use std::time::Duration;
 pub(crate) mod branches;
 mod budgets;
 mod changes;
+mod commit_graph;
 mod conditional;
 mod describe;
 mod diff;
@@ -183,6 +184,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/$/cherry-pick/{ds}",
             get(branches::preview_cherry_pick).post(branches::cherry_pick),
         )
+        .route("/$/commit-graph/{ds}", get(commit_graph::get))
         .route("/{ds}", any(dataset_root))
         .route("/{ds}/sparql", any(query_endpoint))
         .route("/{ds}/query", any(query_endpoint))

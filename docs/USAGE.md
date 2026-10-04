@@ -1204,6 +1204,23 @@ sparkles cherry-pick --loc db --branch qa dev 57
 dataset's name in the path form, `ds@NAME`. The web UI has a branch menu next to the
 dataset's name, and its Branches panel creates, protects, deletes and merges branches.
 
+The panel's Merge button merges a branch without conflicts after a preview. When the
+merge has conflicts, the button opens the merge page,
+`/ui/datasets/NAME/merge?source=dev&target=main`. The page shows the merge base and the
+counts, and it lists the conflicts grouped by graph and subject, with the base, ours and
+theirs objects side by side. You choose a side for each row or for all the rows of a
+subject, or set a rule for every conflict without a choice. The page then lists the
+changes those choices make as signed N-Quads lines. The merge sends the heads the page
+showed, so a branch that moved in the meantime makes the page read both branches again
+instead of merging. When the target's write-time validation refuses the result, the page
+shows the guard's report and nothing is written.
+
+The History panel's Graph button draws the commits of every branch in time order, one
+lane per branch, as `git log --graph` does. Each branch's lane starts from the commit
+it was created from, and a merge commit links to the commit it merged. Long runs of
+commits on one branch fold into a segment that opens on a click. Clicking a commit shows
+its changes and a link that opens the query page at that commit.
+
 A branch costs almost nothing while it stays linked. Its memory then holds the upstream's
 delta at the starting commit, and its first compaction builds a full index, about what a
 clone costs. `--max-branches` (64) limits the branches of a dataset, and the dataset's

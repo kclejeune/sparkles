@@ -15,7 +15,6 @@
   } from '$lib/commits';
   import { fmtInt, fmtRelative } from '$lib/format';
   import {
-    diffLine,
     diffSummary,
     historyBy,
     historyLine,
@@ -26,7 +25,10 @@
     validAt,
   } from '$lib/history';
   import { MAIN, onBranch } from '$lib/branches';
+  import { load, save } from '$lib/storage';
   import { LatestRun } from '$lib/supersede';
+  import CommitGraph from './CommitGraph.svelte';
+  import DiffLines from './DiffLines.svelte';
   import Icon from './Icon.svelte';
 
   let {
@@ -44,6 +46,15 @@
   } = $props();
 
   const target = $derived(onBranch(name, branch));
+  /** The graph of every branch, in place of the list (persistent datasets). */
+  const GRAPH_KEY = 'sparkles.history.graph';
+  let graphOn = $state(load(GRAPH_KEY, false));
+  const canGraph = $derived(info?.type !== 'mem');
+  const graph = $derived(graphOn && canGraph);
+  function toggleGraph() {
+    graphOn = !graphOn;
+    save(GRAPH_KEY, graphOn);
+  }
   const branchName = $derived(branch ?? MAIN);
 
   /** A link to the dataset page on another branch. */
@@ -62,6 +73,9 @@
   let now = $state(Date.now());
   // a reload (refresh, other dataset) supersedes pages still loading
   const runs = new LatestRun();
+
+  /** Bumped by the Reload button, for the graph. */
+  let graphKick = $state(0);
 
   async function reload() {
     const owns = runs.claim('history');
@@ -222,11 +236,23 @@
       <span class="badge iri" title="Head commit">head {page.head}</span>
     {/if}
     <span class="spacer"></span>
+    {#if canGraph}
+      <button
+        class="btn sm"
+        class:ghost={!graph}
+        aria-pressed={graph}
+        title="Show the commits of every branch as a graph"
+        onclick={toggleGraph}><Icon name="branch" size={12} /> Graph</button
+      >
+    {/if}
     <button
       class="btn ghost icon sm"
       title="Reload"
       aria-label="Reload history"
-      onclick={reload}
+      onclick={() => {
+        graphKick++;
+        void reload();
+      }}
       disabled={loading}
     >
       {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={13} />{/if}
@@ -274,6 +300,8 @@
         <span class="muted">{api.errorMessage(error)}</span>
       </div>
     </div>
+  {:else if graph}
+    <CommitGraph {name} {branch} {now} refreshKey={refreshKey + graphKick} />
   {:else if page}
     {#each notes as n (n)}
       <p class="note faint"><Icon name="info" size={13} /> {n}</p>
@@ -428,18 +456,8 @@
               <span class="mono">{diffSummary(diff)}</span>
               {#if diff.method === 'compare'}· compared state against state{/if}
             </p>
-            {#if diff.quads?.length}
-              <pre class="diff-lines">{#each diff.quads as q, i (i)}<span
-                    class:ins={q.op === '+'}
-                    class:del={q.op === '-'}>{diffLine(q)}{'\n'}</span
-                  >{/each}</pre>
-              {#if diff.added + diff.removed > diff.quads.length}
-                <p class="faint diff-sum">
-                  Showing the first {fmtInt(diff.quads.length)} of {fmtInt(
-                    diff.added + diff.removed,
-                  )} changes.
-                </p>
-              {/if}
+            {#if diff.quads}
+              <DiffLines quads={diff.quads} total={diff.added + diff.removed} />
             {/if}
           {/if}
         </div>

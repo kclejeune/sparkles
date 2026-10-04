@@ -486,3 +486,95 @@ async fn a10_validation_refuses_a_merge_and_a_dry_run_reports_it() {
     assert_eq!(p["merge"]["fastForward"], true);
     assert_eq!(head(app.clone()).await, before);
 }
+
+#[tokio::test]
+async fn the_commit_graph_of_every_branch_in_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_st, app) = setup(dir.path()).await;
+    json_req(&app, "POST", "/$/branches/ds", json!({ "name": "dev" })).await;
+    update(&app, "ds@dev", "INSERT DATA { <urn:c> <urn:p> 1 }").await;
+    json_req(
+        &app,
+        "POST",
+        "/$/branches/ds",
+        json!({ "name": "fix", "from": "dev" }),
+    )
+    .await;
+    update(&app, "ds@fix", "INSERT DATA { <urn:x> <urn:p> 1 }").await;
+    update(&app, "ds", "INSERT DATA { <urn:d> <urn:p> 1 }").await;
+    let (r, _) = json_req(&app, "POST", "/$/merge/ds", json!({ "source": "dev" })).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+
+    let (r, _) = get(&app, "/$/commit-graph/ds").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let g = r.json();
+    let names: Vec<&str> = g["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["main", "dev", "fix"]);
+    let fix = &g["branches"][2];
+    assert_eq!(fix["upstream"], "dev");
+    assert_eq!(fix["from"]["branch"], "dev");
+    assert_eq!(fix["from"]["seq"], 3);
+    assert_eq!(fix["head"], 4);
+    assert_eq!(g["branches"][0]["from"], J::Null);
+    let commits = g["commits"].as_array().unwrap();
+    // main 0–4 (4 is the merge), dev 3, fix 4
+    assert_eq!(commits.len(), 7, "{g:#}");
+    let merge = commits
+        .iter()
+        .find(|c| c["kind"] == "merge")
+        .expect("the merge commit");
+    assert_eq!(merge["branch"], "main");
+    assert_eq!(merge["mergedFrom"]["branch"], "dev");
+    assert_eq!(merge["parents"].as_array().unwrap().len(), 2);
+    assert_eq!(merge["parents"][1], merge["mergedFrom"]);
+    let fork = commits
+        .iter()
+        .find(|c| c["branch"] == "fix")
+        .expect("fix's commit");
+    assert_eq!(fork["parents"][0]["branch"], "dev");
+    assert_eq!(fork["parents"][0]["seq"], 3);
+    assert_eq!(fork["reconstructable"], true);
+    assert_eq!(g["next"], J::Null);
+
+    // pages of three follow `next`, and give the same commits in the same order
+    let mut seen = Vec::new();
+    let mut url = "/$/commit-graph/ds?limit=3".to_string();
+    for _ in 0..5 {
+        let (r, _) = get(&app, &url).await;
+        assert_eq!(r.status, StatusCode::OK, "{url}: {}", r.text());
+        let p = r.json();
+        for c in p["commits"].as_array().unwrap() {
+            seen.push((c["branch"].clone(), c["seq"].clone()));
+        }
+        match p["next"].as_str() {
+            Some(n) => url = n.to_string(),
+            None => break,
+        }
+    }
+    let all: Vec<_> = commits
+        .iter()
+        .map(|c| (c["branch"].clone(), c["seq"].clone()))
+        .collect();
+    assert_eq!(seen, all);
+
+    // some branches only
+    let (r, _) = get(&app, "/$/commit-graph/ds?branches=dev,fix&limit=1").await;
+    let p = r.json();
+    assert_eq!(p["branches"].as_array().unwrap().len(), 2);
+    assert!(
+        p["next"].as_str().unwrap().contains("branches=dev,fix"),
+        "{p:#}"
+    );
+    let (r, _) = get(&app, "/$/commit-graph/ds?branches=nope").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    assert_eq!(r.json()["code"], "no-such-branch");
+    let (r, _) = get(&app, "/$/commit-graph/ds?before=x").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let (r, _) = get(&app, "/$/commit-graph/ds?limit=0").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
