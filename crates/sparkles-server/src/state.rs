@@ -127,7 +127,11 @@ pub struct AutoSetting {
 pub struct Dataset {
     pub name: String,
     pub kind: DbType,
-    pub store: Store,
+    pub store: StoreHandle,
+    /// the branch this dataset object serves (`None`: `main`, the dataset itself)
+    pub branch: Option<BranchOf>,
+    /// the dataset objects of the branches other than `main`, opened on first use
+    pub branches: Mutex<BTreeMap<String, Arc<Dataset>>>,
     pub reasoning: RwLock<Option<ReasoningInfo>>,
     /// not part of the persisted registry (e.g. `--loc` on the command line)
     pub ephemeral: bool,
@@ -155,6 +159,60 @@ pub struct Dataset {
 }
 
 pub use crate::write_validation::Validation;
+
+/// A dataset's store: its own, or a branch's, which the dataset's branch set keeps open.
+/// It lives in its dataset's `Arc` and is never moved, so the own store stays inline.
+#[allow(clippy::large_enum_variant)]
+pub enum StoreHandle {
+    Own(Store),
+    Branch(Arc<Store>),
+}
+
+impl std::ops::Deref for StoreHandle {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        match self {
+            StoreHandle::Own(s) => s,
+            StoreHandle::Branch(s) => s,
+        }
+    }
+}
+
+impl From<Store> for StoreHandle {
+    fn from(s: Store) -> StoreHandle {
+        StoreHandle::Own(s)
+    }
+}
+
+/// Which branch a branch's dataset object serves.
+pub struct BranchOf {
+    pub name: String,
+    /// the dataset (its `main`)
+    pub main: std::sync::Weak<Dataset>,
+}
+
+impl Dataset {
+    /// The branch this object serves (`main` for the dataset itself).
+    pub fn branch_name(&self) -> &str {
+        self.branch
+            .as_ref()
+            .map_or(sparkles::branch::MAIN, |b| b.name.as_str())
+    }
+
+    /// The dataset's own object (`main`), for a branch's.
+    pub fn main(&self) -> Option<Arc<Dataset>> {
+        self.branch.as_ref().and_then(|b| b.main.upgrade())
+    }
+
+    /// The name the server's per-dataset state (compaction, tasks) keeps it under:
+    /// the dataset's name, and `name@branch` for a branch other than `main`.
+    pub fn key(&self) -> String {
+        match &self.branch {
+            Some(b) => format!("{}@{}", self.name, b.name),
+            None => self.name.clone(),
+        }
+    }
+}
 
 /// Default of `serve --reason-cache-triples`.
 pub const DEFAULT_REASON_CACHE_TRIPLES: usize = 10_000_000;
@@ -752,7 +810,55 @@ impl AppState {
             }
         };
         let reasoning = store.root().and_then(read_reasoning_file);
-        Ok(self.dataset_of(name, kind, store, reasoning, loc.is_some(), None))
+        Ok(self.dataset_of(name, kind, store.into(), reasoning, loc.is_some(), None))
+    }
+
+    /// The object of branch `branch` of dataset `main` (`main` itself for `main`),
+    /// opened on first use and kept.
+    pub fn branch_dataset(
+        &self,
+        main: &Arc<Dataset>,
+        branch: &str,
+    ) -> sparkles::Result<Arc<Dataset>> {
+        if branch == sparkles::branch::MAIN {
+            return Ok(main.clone());
+        }
+        let id = main.store.branch_id_of(branch)?;
+        // a cached object of a branch deleted and made again under the same name is stale
+        if let Some(d) = main.branches.lock().get(branch)
+            && d.store.branch_id() == id
+        {
+            return Ok(d.clone());
+        }
+        let ds = self.branch_dataset_uncached(main, branch)?;
+        main.branches.lock().insert(branch.to_string(), ds.clone());
+        Ok(ds)
+    }
+
+    fn branch_dataset_uncached(
+        &self,
+        main: &Arc<Dataset>,
+        branch: &str,
+    ) -> sparkles::Result<Arc<Dataset>> {
+        let store = main
+            .store
+            .branch(branch)?
+            .shared()
+            .expect("a branch other than main has its own store");
+        let reasoning = store.root().and_then(read_reasoning_file);
+        let mut ds = self.dataset_of(
+            &main.name,
+            main.kind,
+            StoreHandle::Branch(store),
+            reasoning,
+            main.ephemeral,
+            None,
+        );
+        Arc::get_mut(&mut ds).expect("just made").branch = Some(BranchOf {
+            name: branch.to_string(),
+            main: Arc::downgrade(main),
+        });
+        Ok(ds)
     }
 
     /// The dataset `name` around `store`, with its validation, RDFS-on-read setting
@@ -761,7 +867,7 @@ impl AppState {
         &self,
         name: &str,
         kind: DbType,
-        store: Store,
+        store: StoreHandle,
         reasoning: Option<ReasoningInfo>,
         ephemeral: bool,
         mem_origin: Option<serde_json::Value>,
@@ -788,6 +894,8 @@ impl AppState {
             name: name.to_string(),
             kind,
             store,
+            branch: None,
+            branches: Mutex::new(BTreeMap::new()),
             reasoning: RwLock::new(reasoning),
             ephemeral,
             schema_cache: Mutex::new(None),
@@ -854,6 +962,32 @@ impl AppState {
 
     pub fn get(&self, name: &str) -> Option<Arc<Dataset>> {
         self.datasets.read().get(name).cloned()
+    }
+
+    /// Every dataset, and the open branches of each (for the background upkeep:
+    /// compaction and history ticks).
+    pub fn datasets_and_branches(&self) -> Vec<Arc<Dataset>> {
+        let mains: Vec<Arc<Dataset>> = self.datasets.read().values().cloned().collect();
+        let mut out = Vec::with_capacity(mains.len());
+        for m in mains {
+            let names: Vec<String> = m
+                .store
+                .branch_set()
+                .map(|s| {
+                    s.open_stores()
+                        .iter()
+                        .map(|b| b.branch_name().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(m.clone());
+            for n in names {
+                if let Ok(b) = self.branch_dataset(&m, &n) {
+                    out.push(b);
+                }
+            }
+        }
+        out
     }
 
     pub fn create(&self, name: &str, kind: DbType) -> Result<Arc<Dataset>> {
@@ -1020,7 +1154,14 @@ impl AppState {
     ) -> Result<Arc<Dataset>> {
         let name = reservation.name.clone();
         let _guard = self.manage.lock();
-        let ds = self.dataset_of(&name, DbType::Mem, store, reasoning, false, Some(origin));
+        let ds = self.dataset_of(
+            &name,
+            DbType::Mem,
+            store.into(),
+            reasoning,
+            false,
+            Some(origin),
+        );
         self.datasets.write().insert(name.clone(), ds.clone());
         if let Err(e) = self.save_registry_locked() {
             self.datasets.write().remove(&name);

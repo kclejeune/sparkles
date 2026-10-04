@@ -84,6 +84,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/queries/{name}", &["GET", "POST"]),
     ("/$/commits/{ds}", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
+    // branches and merges: the handlers check each branch a request names
+    ("/$/branches/{ds}", &["GET", "POST"]),
+    ("/$/branches/{ds}/{name}", &["GET", "PATCH", "DELETE"]),
+    ("/$/merge/{ds}", &["GET", "POST"]),
     ("/$/vector/{ds}", &["GET"]),
     ("/$/vector/{ds}/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/vector/{ds}/{name}/rebuild", &["POST"]),
@@ -234,6 +238,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/datasets" => Server(ServerPerm::ServerAdmin),
         "/$/datasets/{ds}" if get => Dataset(Read),
         "/$/datasets/{ds}" => Dataset(Admin),
+        // visible on some branch: the handlers check the branches a request names
+        "/$/branches/{ds}" | "/$/branches/{ds}/{name}" | "/$/merge/{ds}" => Dataset(Read),
         "/$/ready/{ds}"
         | "/$/stats/{ds}"
         | "/$/schema/{ds}"
@@ -936,7 +942,12 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             );
         }
     };
-    let p = authed.principal;
+    // grants are checked on the branch the request chose
+    let branch = req
+        .extensions()
+        .get::<crate::http::branches::SelectedBranch>()
+        .map(|b| b.0.clone());
+    let p = authed.principal.on_branch(branch.as_deref());
     let clear = authed.clear_cookie.then(|| {
         auth.cookie_mode(req.headers())
             .set(super::SESSION_COOKIE, "", 0)
@@ -1026,9 +1037,20 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         }
         Need::Dataset(lvl) => {
             let ds = ds_of(&route, req.uri()).unwrap_or_default();
-            let have = p.level(&ds);
+            // the branch routes need the dataset visible on some branch; their handlers
+            // check each branch a request names
+            let branch_routes = route.starts_with("/$/branches/") || route.starts_with("/$/merge/");
+            let have = if branch_routes {
+                p.level_any_branch(&ds)
+            } else {
+                p.level(&ds)
+            };
             // through the route's endpoint, for grants limited to some endpoints
-            let e = endpoint(&route, &method, req.uri(), req.headers());
+            let e = if branch_routes {
+                None
+            } else {
+                endpoint(&route, &method, req.uri(), req.headers())
+            };
             let through = match e {
                 Some(e) => p.level_at(&ds, e),
                 None => have,
@@ -1036,6 +1058,29 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             if through.is_none_or(|h| h < lvl) {
                 if p.is_anonymous() {
                     return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
+                }
+                // a branch the grants do not cover answers as one that does not exist;
+                // everyone who sees the dataset knows its main exists
+                let visible = st.get(&ds).is_some() && p.level_any_branch(&ds).is_some();
+                if have.is_none() && visible {
+                    match branch.as_deref() {
+                        Some(b) if b != sparkles::branch::MAIN => {
+                            let body = serde_json::json!({
+                                "error": format!("no such branch: {b}"),
+                                "code": "no-such-branch",
+                            });
+                            let mut r =
+                                (StatusCode::NOT_FOUND, axum::Json(body.clone())).into_response();
+                            r.extensions_mut().insert(crate::http::ErrorJson(body));
+                            return finish(deny(Denied::Hidden, r, &p));
+                        }
+                        _ => {
+                            count(Denied::Forbidden);
+                            let msg =
+                                format!("{} access to branch main of /{ds} required", lvl.as_str());
+                            return finish(forbidden(&p, &msg));
+                        }
+                    }
                 }
                 if have.is_none() || st.get(&ds).is_none() {
                     // the same body as the handlers' own 404

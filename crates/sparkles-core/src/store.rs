@@ -11,6 +11,9 @@
 //!   `CURRENT` (TDB2 `Data-NNNN` compaction).
 
 mod backup;
+#[cfg(test)]
+mod branch_tests;
+mod branching;
 mod changelog;
 mod changes;
 mod clone;
@@ -22,7 +25,9 @@ mod diff;
 mod embed;
 mod geo;
 mod history_query;
+mod link;
 mod mem_history;
+mod merge;
 mod partial;
 mod patch_apply;
 mod preview;
@@ -38,6 +43,9 @@ pub use backup::{
     BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard, MEMORY_CAPTURE_PREFIX,
     MemoryCaptureOptions,
 };
+pub use branching::{
+    BRANCHES_DIR, BRANCHES_FILE, BranchCommit, BranchSet, BranchStore, read_branch_table,
+};
 pub use changelog::{
     CHANGE_LOG_FILE, CHANGES_DIR, ChangeCommit, ChangeLog, ChangeLogSettings, ChangeLogStatus,
     Unrecorded, UnrecordedReason,
@@ -51,6 +59,8 @@ pub use compaction::{
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
 pub use history_query::{HistoryBound, HistoryChange, HistoryQuery, HistoryResult};
+pub use link::Linked;
+pub use merge::{INFERRED_GRAPH, conflict_error};
 pub use partial::PartialMode;
 pub use patch_apply::{PatchOptions, PatchOutcome, parse_commit_iri};
 pub use quota::{QUOTA_FILE, QuotaSource, QuotaStatus};
@@ -101,6 +111,8 @@ pub struct Generation {
     pub charsets: std::sync::OnceLock<crate::sparql::charsets::CharIndex>,
     /// where commits end in this generation's write-ahead log (`None` until built)
     pub(crate) wal_index: Mutex<Option<wal::WalIndex>>,
+    /// a branch's linked generation: the upstream files it reads and its base delta
+    pub(crate) link: Option<Arc<link::Linked>>,
 }
 
 impl Generation {
@@ -120,6 +132,7 @@ impl Generation {
             counts: Default::default(),
             charsets: Default::default(),
             wal_index: Mutex::new(None),
+            link: None,
         }
     }
 
@@ -172,6 +185,7 @@ impl Generation {
             counts: Default::default(),
             charsets: Default::default(),
             wal_index: Mutex::new(None),
+            link: None,
         })
     }
 
@@ -898,6 +912,11 @@ pub struct StoreOptions {
     /// holds at most this many quads, or when both states together hold at most this
     /// many; a larger one is recorded with its counts only.
     pub change_log_bulk_max_quads: u64,
+    /// Branches per dataset, `main` included ([`Store::create_branch`] refuses more).
+    pub max_branches: usize,
+    /// The most upstream log segments a branch's linked generation chains. A branch
+    /// created from a commit whose chain would be longer is built as its own generation.
+    pub max_branch_depth: usize,
 }
 
 /// Default of [`StoreOptions::change_log_max_bytes`]: 1 GiB.
@@ -943,6 +962,8 @@ impl Default for StoreOptions {
             change_log_max_bytes: DEFAULT_CHANGE_LOG_MAX_BYTES,
             change_log_segment_bytes: 16 << 20,
             change_log_bulk_max_quads: 1_000_000,
+            max_branches: crate::branch::DEFAULT_MAX_BRANCHES,
+            max_branch_depth: crate::branch::DEFAULT_MAX_BRANCH_DEPTH,
         }
     }
 }
@@ -1066,12 +1087,15 @@ pub struct Store {
     writers_waiting: AtomicUsize,
     /// the newest published commit, for waiters on new commits (change feeds)
     commits: tokio::sync::watch::Sender<u64>,
-    /// the storage quota and the measured size of the directory
-    quota: quota::Quota,
+    /// the storage quota and the measured size of the directory (a branch store shares
+    /// its dataset's)
+    quota: Arc<quota::Quota>,
     /// what the compaction policy looks at, and the dataset's own compaction settings
     compaction: compaction::Track,
     /// the dataset's DESCRIBE setting (`describe.json` of a persistent store)
     describe: parking_lot::RwLock<crate::sparql::describe::DescribeOptions>,
+    /// the branch this store is, and the dataset's branches
+    branching: branching::Branching,
     /// test hooks by failpoint name
     #[cfg(any(test, feature = "failpoints"))]
     failpoints: Mutex<BTreeMap<&'static str, backup::Failpoint>>,
@@ -1214,7 +1238,8 @@ impl Store {
             writers_waiting: Default::default(),
             wal_end: AtomicU64::new(0),
             commits: tokio::sync::watch::Sender::new(0),
-            quota: quota::Quota::open(None, None).expect("no file to read in memory"),
+            quota: Arc::new(quota::Quota::open(None, None).expect("no file to read in memory")),
+            branching: Default::default(),
             compaction: compaction::Track::new(0, None, Some(root.timestamp_ms)),
             describe: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
@@ -1228,6 +1253,29 @@ impl Store {
 
     /// Open (or create) a persistent store rooted at `root`.
     pub fn open(root: &Path, opts: StoreOptions) -> Result<Store> {
+        if branching::read_branch_file(root)?.is_some() {
+            return Err(crate::branch::invalid_branch(format!(
+                "{} is a branch of a dataset; open the dataset's directory and choose the branch",
+                root.display()
+            )));
+        }
+        Self::open_inner(root, opts, None)
+    }
+
+    /// Open the store of a branch (by the dataset's [`BranchSet`]).
+    pub(crate) fn open_branch(
+        root: &Path,
+        opts: StoreOptions,
+        ctx: branching::OpenCtx,
+    ) -> Result<Store> {
+        Self::open_inner(root, opts, Some(ctx))
+    }
+
+    fn open_inner(
+        root: &Path,
+        opts: StoreOptions,
+        ctx: Option<branching::OpenCtx>,
+    ) -> Result<Store> {
         std::fs::create_dir_all(root)?;
         let lock = lock_dir(root)?;
         let current_file = root.join("CURRENT");
@@ -1270,15 +1318,40 @@ impl Store {
             write_atomic(&current_file, name.as_bytes())?;
         }
         let name = std::fs::read_to_string(&current_file)?.trim().to_string();
-        let gen_ = Generation::open(&root.join(&name), &name, true)?;
         let gen_no = commit::generation_number(&name);
-        let cache = Arc::new(BlockCache::new(opts.cache_bytes));
+        let cache = match &ctx {
+            Some(c) => c.cache.clone(),
+            None => Arc::new(BlockCache::new(opts.cache_bytes)),
+        };
+        let gen_dir = root.join(&name);
+        let mut gen_ = match link::read_link(&gen_dir)? {
+            Some(f) if ctx.is_some() => {
+                Generation::open_linked(&gen_dir, &name, root, f, false, &cache)?
+            }
+            Some(_) => {
+                return Err(Error::Corrupt(format!(
+                    "{} is a linked generation outside a branch",
+                    gen_dir.display()
+                )));
+            }
+            None => Generation::open(&gen_dir, &name, true)?,
+        };
+        if let Some(c) = &ctx {
+            for g in &c.share {
+                gen_.share_blocks_with(g);
+            }
+        }
         let results = Arc::new(crate::sparql::cache::ResultCache::with_service(
             opts.result_cache_bytes,
             opts.result_cache_min_ms,
             opts.service_cache_bytes,
         ));
         let mut next_bnode = gen_.meta.next_bnode;
+        // a branch numbers its blank nodes in its own range
+        let bnode_floor = ctx
+            .as_ref()
+            .map_or(0, |c| crate::branch::bnode_range_start(c.ident.ordinal));
+        next_bnode = next_bnode.max(bnode_floor);
         // prefixes.json holds the whole map once written (so removals persist); the
         // generation's own prefixes are used until then
         let mut prefixes = gen_.meta.prefixes.clone();
@@ -1331,9 +1404,9 @@ impl Store {
                 (c, true)
             }
         };
-        // replay the WAL
+        // replay the WAL (a linked generation's onto the delta of its starting commit)
         let wal_path = root.join(&name).join("wal.log");
-        let mut delta = Delta::default();
+        let mut delta = gen_.base_delta();
         let mut version = 0;
         let gen_ = Arc::new(gen_);
         let mut replayed: Vec<CommitInfo> = Vec::new();
@@ -1341,7 +1414,8 @@ impl Store {
         let text_on = cfg!(feature = "text") && root.join("text.json").exists();
         let mut wal_text: Vec<(u64, Vec<[Id; 4]>)> = Vec::new();
         // quads of the base plus WAL transactions folded into a baseline commit
-        let mut base_quads = gen_.meta.quads;
+        let mut base_quads =
+            (gen_.meta.quads + delta.inserts() as u64).saturating_sub(delta.deletes() as u64);
         let mut wal_len = 0u64;
         let mut wal_index = wal::WalIndex::new(base.seq, fold_legacy);
         if wal_path.exists() {
@@ -1357,6 +1431,7 @@ impl Store {
                 next_bnode,
                 keep_touched: text_on,
                 path: &wal_path,
+                start: gen_.base_delta(),
             };
             let r = replay_wal(&from, &buf, &mut |_, _| Ok(()))?;
             if r.good != buf.len() {
@@ -1371,7 +1446,7 @@ impl Store {
             version = r.version;
             replayed = r.commits;
             base_quads = r.base_quads;
-            next_bnode = r.next_bnode;
+            next_bnode = r.next_bnode.max(bnode_floor);
             wal_text = r.touched;
         }
         let mut base = base;
@@ -1407,6 +1482,28 @@ impl Store {
             dataset_id,
             Store::log_limits(&opts),
         )?);
+        let quota = match &ctx {
+            Some(c) => c.quota.clone(),
+            None => Arc::new(quota::Quota::open(Some(root), opts.max_disk_bytes)?),
+        };
+        let mut branching = branching::Branching {
+            merges: Mutex::new(branching::MergeLog::open(root, head.seq)?),
+            ..Default::default()
+        };
+        match ctx {
+            Some(c) => {
+                branching.ident = Some(c.ident);
+                branching.set = branching::SetRef::Member(c.set);
+                branching.protected = AtomicBool::new(c.protected);
+                branching.next_ordinal = AtomicU64::new(c.next_ordinal);
+            }
+            None => {
+                let set = BranchSet::load(root, dataset_id, &opts, cache.clone(), quota.clone())?;
+                branching.protected = AtomicBool::new(set.main_protected());
+                branching.next_ordinal = AtomicU64::new(set.next_ordinal());
+                branching.set = branching::SetRef::Owner(set);
+            }
+        }
         let store = Store {
             root: Some(root.to_path_buf()),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
@@ -1459,7 +1556,8 @@ impl Store {
             writers_waiting: Default::default(),
             wal_end: AtomicU64::new(wal_len),
             commits: tokio::sync::watch::Sender::new(head.seq),
-            quota: quota::Quota::open(Some(root), opts.max_disk_bytes)?,
+            quota,
+            branching,
             compaction: compaction::Track::new(
                 base.seq,
                 replayed.first().map(|c| c.timestamp_ms),
@@ -1471,6 +1569,13 @@ impl Store {
             opts,
         };
         *store.compaction.settings.lock() = compaction::read_settings(root)?;
+        // the merges this store made, and the holds branches place on it, before anything
+        // is collected
+        if let Some(set) = store.branching.set() {
+            let recs = store.branching.merges.lock().recs.clone();
+            set.note_merges(store.dataset_id, &recs, true);
+            store.install_branch_holds(&set);
+        }
         store.collect_history(gen_no, head.seq);
         if let Err(e) = store.recover_change_log() {
             // history queries report the commits it could not record
@@ -1526,6 +1631,7 @@ impl Store {
         let Some(root) = &self.root else {
             return Vec::new();
         };
+        self.refresh_branch_holds(h);
         collect_generations(
             root,
             self.now_ms(),
@@ -1535,6 +1641,17 @@ impl Store {
             head,
             self.opts.history_max_generations,
         )
+    }
+
+    /// Bring the holds branches place on this store up to date in `h` (the dataset's
+    /// branch table is the truth; the history state keeps a copy for collectors that
+    /// run without the store).
+    fn refresh_branch_holds(&self, h: &mut crate::history::HistoryState) {
+        if let Some(set) = self.branching.set() {
+            let (gens, pins) = set.holds_on(self.dataset_id);
+            h.branch_gens = gens;
+            h.branch_pins = pins;
+        }
     }
 
     /// What a backup lease guard needs to collect history after it drops the lease.
@@ -1594,6 +1711,10 @@ impl Store {
                 let cat = self.catalog.lock();
                 match cat.at_time(*ms) {
                     Some(c) => c.seq,
+                    None if self.branching.ident.is_some() => {
+                        drop(cat);
+                        return Err(self.inherited(at, 0));
+                    }
                     None => {
                         let first = cat.first().map_or(String::new(), |c| {
                             format!(" (history starts at {})", c.timestamp())
@@ -1622,6 +1743,20 @@ impl Store {
                 head.seq
             )));
         }
+        // a branch shares the commits before its starting commit with its upstream
+        if let Some(i) = &self.branching.ident {
+            let before = match at {
+                At::Time(ms) => self
+                    .catalog
+                    .lock()
+                    .get(i.from.seq)
+                    .is_some_and(|c| c.timestamp_ms > *ms),
+                _ => seq < i.from.seq,
+            };
+            if before {
+                return Err(self.inherited(at, seq));
+            }
+        }
         let meta = self.catalog.lock().get(seq);
         let Some(commit) = meta else {
             let snapshot = match at {
@@ -1639,6 +1774,40 @@ impl Store {
             head: head.seq,
             historical: seq != self.snapshot().commit,
         })
+    }
+
+    /// The error for a commit a branch store shares with its upstream: reads of it are
+    /// served by the upstream (see [`Store::branch_snapshot_at`]).
+    fn inherited(&self, at: &crate::history::At, seq: u64) -> Error {
+        let i = self.branching.ident.as_ref().expect("a branch store");
+        let mut e = crate::branch::BranchError {
+            kind: crate::branch::BranchErrorKind::NotFound,
+            code: "inherited-commit",
+            message: format!(
+                "{at} on branch {} is a commit of the history it shares with its upstream; read it there",
+                i.name
+            ),
+            conflicts: None,
+            candidates: Vec::new(),
+            inherited: None,
+        };
+        let seq = match at {
+            crate::history::At::Time(ms) => {
+                // the upstream resolves the time
+                e.inherited = Some(crate::branch::CommitRef {
+                    branch_id: i.from.branch_id,
+                    seq: i.from.seq,
+                });
+                let _ = ms;
+                return Error::Branch(Box::new(e));
+            }
+            _ => seq,
+        };
+        e.inherited = Some(crate::branch::CommitRef {
+            branch_id: i.from.branch_id,
+            seq,
+        });
+        Error::Branch(Box::new(e))
     }
 
     /// The state at `at`: the live snapshot when it names the current state, otherwise
@@ -1823,7 +1992,17 @@ impl Store {
             h.open.insert(0, e);
             return Ok(g);
         }
-        let g = Arc::new(Generation::open_sealed(&entry.dir, &entry.name)?);
+        let g = match (link::read_link(&entry.dir)?, &self.root) {
+            (Some(f), Some(root)) => Arc::new(Generation::open_linked(
+                &entry.dir,
+                &entry.name,
+                root,
+                f,
+                true,
+                &self.cache,
+            )?),
+            _ => Arc::new(Generation::open_sealed(&entry.dir, &entry.name)?),
+        };
         h.open.insert(0, (owner, g.clone()));
         h.open.truncate(2);
         Ok(g)
@@ -1872,7 +2051,7 @@ impl Store {
             }
         }
         let (_, from, start) = best;
-        let mut delta = start.cloned().unwrap_or_default();
+        let mut delta = start.cloned().unwrap_or_else(|| generation.base_delta());
         if from.offset <= target.offset {
             wal::apply_forward(
                 &path,
@@ -1898,7 +2077,7 @@ impl Store {
             Err(wal::Backward::Failed(e)) => Err(e),
             Err(wal::Backward::Legacy) => {
                 // a legacy transaction has no number in the log: replay from the base
-                let mut delta = Delta::default();
+                let mut delta = generation.base_delta();
                 wal::apply_forward(
                     &path,
                     generation,
@@ -2272,7 +2451,8 @@ impl Store {
                 materialize_seconds: 0.0,
             };
         };
-        let h = hist.lock();
+        let mut h = hist.lock();
+        self.refresh_branch_holds(&mut h);
         let now = self.now_ms();
         let needed = {
             let cat = self.catalog.lock();
@@ -2873,6 +3053,8 @@ impl Store {
             base_check: None,
             opts,
             writable: Default::default(),
+            force: false,
+            merge: None,
         }
     }
 
@@ -3214,6 +3396,9 @@ impl Store {
         bulk: Option<BulkCommit>,
         check: Option<(crate::guard::Changes<'_>, &crate::guard::WriteOptions)>,
     ) -> Result<(u64, Receipt)> {
+        if let Some(b) = &bulk {
+            self.check_protected(b.kind)?;
+        }
         let before = snap.len();
         // the head state before a bulk commit, whose changes the change log records
         let prior = self.snapshot();
@@ -3536,6 +3721,8 @@ impl Store {
         if bulk.is_none() {
             annotation = self.annotation(head.seq).unwrap_or_default();
         }
+        // a linked branch that rebuilt no longer reads its upstream's files
+        self.release_link_if_rebuilt();
         // a new generation (and maybe one fewer old one): measure the directory again
         self.quota.invalidate();
         let receipt = Receipt {
@@ -3854,6 +4041,10 @@ pub struct WriteTxn<'s> {
     requested: Option<Vec<[Id; 4]>>,
     /// the protections applied at the state the transaction started from
     base_check: Option<crate::access::triples::WriteCheck>,
+    /// commit even without a net change (a merge commit records its second parent)
+    force: bool,
+    /// the merge record written with the commit
+    merge: Option<branching::MergeRec>,
 }
 
 impl Drop for WriteTxn<'_> {
@@ -4113,9 +4304,20 @@ impl WriteTxn<'_> {
     /// [`new_bnode`](Self::new_bnode) or a load numbered before now. Any other blank node
     /// id could still be given to a new node.
     pub fn bnode_allocated(&self, id: Id) -> bool {
-        id.tag() == crate::id::Tag::BNode
-            && id.payload() & Id::LOCAL_BNODE_BIT == 0
-            && id.payload() < self.guard.next_bnode
+        let p = id.payload();
+        if id.tag() != crate::id::Tag::BNode || p & Id::LOCAL_BNODE_BIT != 0 {
+            return false;
+        }
+        let next = self.guard.next_bnode;
+        let (ord, own) = (
+            crate::branch::bnode_ordinal(p),
+            crate::branch::bnode_ordinal(next),
+        );
+        // a node of another branch's range came with a merge or a starting commit
+        if ord != own {
+            return ord < self.store.branching.next_ordinal.load(Ordering::Relaxed);
+        }
+        p < next
     }
 
     /// Encode a parsed quad; blank node labels are scoped by `labels` (fresh ids).
@@ -4282,6 +4484,9 @@ impl WriteTxn<'_> {
         if self.guard.poisoned {
             return Err(Error::Poisoned);
         }
+        if self.is_dirty() || self.force {
+            self.store.check_protected(self.kind)?;
+        }
         self.check_requested_all()?;
         // a write cancelled (its client gone) or past its deadline publishes nothing
         self.opts.check()?;
@@ -4289,7 +4494,7 @@ impl WriteTxn<'_> {
             if let Some(dr) = self.opts.dry_run.clone() {
                 return Err(Error::DryRun(Box::new(self.preview_log(&dr)?)));
             }
-            if self.net_ins == 0 && self.net_del == 0 {
+            if self.net_ins == 0 && self.net_del == 0 && !self.force {
                 // no net change: no commit, nothing to validate
                 return self.publish_log(None);
             }
@@ -4343,7 +4548,7 @@ impl WriteTxn<'_> {
     ) -> Result<Receipt> {
         let gen_ = &self.base.generation;
         let head = self.guard.head;
-        if self.net_ins == 0 && self.net_del == 0 {
+        if self.net_ins == 0 && self.net_del == 0 && !self.force {
             // nothing changed (or every change was undone): no commit, nothing published
             return Ok(Receipt {
                 dataset_id: self.store.dataset_id,
@@ -4376,6 +4581,16 @@ impl WriteTxn<'_> {
             .annotate(&c, message, || Some(self.change_lines()))?;
         let next_bnode = self.guard.next_bnode;
         let prealloc = self.wal_prealloc();
+        // a merge's record is durable before its commit (open drops one above the head)
+        if let Some(m) = self.merge.as_mut() {
+            m.seq = c.seq;
+            let rec = *m;
+            if let Err(e) = self.store.branching.merges.lock().append(rec) {
+                let _ = self.store.annotations.lock().undo(c.seq);
+                return Err(e);
+            }
+            self.store.failpoint("merge-recorded");
+        }
         let w = &mut *self.guard;
         if let Some(wal) = w.wal.as_mut() {
             let mut data = Vec::with_capacity(self.log.len() * WAL_REC);
@@ -4409,6 +4624,7 @@ impl WriteTxn<'_> {
             if let Err(e) = written {
                 w.poisoned = true;
                 let _ = self.store.annotations.lock().undo(c.seq);
+                let _ = self.store.branching.merges.lock().undo(c.seq);
                 return Err(e);
             }
             // the bytes the file grew by: the records past its end and any zeros after,
@@ -4450,6 +4666,11 @@ impl WriteTxn<'_> {
         self.store.catalog.lock().append(c);
         self.store.forget_annotations();
         self.store.compaction.committed(c.timestamp_ms);
+        if let Some(m) = self.merge
+            && let Some(set) = self.store.branching.set()
+        {
+            set.note_merges(self.store.dataset_id, &[m], false);
+        }
         let version = self.base.version + 1;
         let mut snap = Snapshot {
             generation: gen_.clone(),
@@ -4935,6 +5156,8 @@ pub(crate) struct ReplayFrom<'a> {
     pub keep_touched: bool,
     /// for error messages
     pub path: &'a Path,
+    /// the delta the generation's base holds (empty except for a linked generation)
+    pub start: Delta,
 }
 
 /// What a WAL replay yields.
@@ -4979,10 +5202,11 @@ pub(crate) fn replay_wal(
     });
     let dvocab_len = from.generation.dvocab.len();
     let mut out = Replay {
-        delta: Delta::default(),
+        delta: from.start.clone(),
         version: 0,
         commits: Vec::new(),
-        base_quads: from.generation.meta.quads,
+        base_quads: (from.generation.meta.quads + from.start.inserts() as u64)
+            .saturating_sub(from.start.deletes() as u64),
         next_bnode: from.next_bnode,
         good: 0,
         touched: Vec::new(),

@@ -179,7 +179,7 @@ fn decide(st: &AppState, ds: &Dataset, s: &DsState, running_auto: usize, now: In
         ("backup-restore", "restore"),
         ("clone", "clone"),
     ] {
-        if let Some(id) = st.active_task(kind, &ds.name) {
+        if let Some(id) = st.active_task(kind, &ds.key()) {
             return defer(reason, format!("a {kind} task ({id}) is running"));
         }
     }
@@ -208,13 +208,13 @@ fn decide(st: &AppState, ds: &Dataset, s: &DsState, running_auto: usize, now: In
 
 /// One pass of the scheduler: start the compactions that are due and may run.
 pub fn tick(st: &Arc<AppState>, now: Instant) {
-    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<Arc<Dataset>> = st.datasets_and_branches();
     let mut start = Vec::new();
     {
         let mut states = st.compaction.states.lock();
-        states.retain(|n, _| datasets.iter().any(|d| &d.name == n));
+        states.retain(|n, _| datasets.iter().any(|d| &d.key() == n));
         for ds in &datasets {
-            let s = states.entry(ds.name.clone()).or_default();
+            let s = states.entry(ds.key()).or_default();
             if let Some((id, _)) = &s.task
                 && !task_active(st, id)
             {
@@ -223,7 +223,7 @@ pub fn tick(st: &Arc<AppState>, now: Instant) {
         }
         let mut running = AutoCompact::running_auto(&states);
         for ds in &datasets {
-            let s = states.get_mut(&ds.name).expect("added above");
+            let s = states.get_mut(&ds.key()).expect("added above");
             let d = decide(st, ds, s, running, now);
             s.seen = match d {
                 Decision::Off => Seen {
@@ -259,7 +259,7 @@ pub fn tick(st: &Arc<AppState>, now: Instant) {
         }
     }
     for (ds, t) in start {
-        tracing::info!("auto-compact /{}: {}", ds.name, t.detail);
+        tracing::info!("auto-compact /{}: {}", ds.key(), t.detail);
         start_compaction(st, ds, Some(t));
     }
 }
@@ -291,7 +291,7 @@ pub fn start_compaction(st: &Arc<AppState>, ds: Arc<Dataset>, trigger: Option<Tr
         io_bytes_per_sec: if auto { ac.io_bytes_per_sec } else { None },
         ..Default::default()
     };
-    let name = ds.name.clone();
+    let name = ds.key();
     let id = st.next_task_id();
     st.compaction
         .states
@@ -309,7 +309,7 @@ pub fn start_compaction(st: &Arc<AppState>, ds: Arc<Dataset>, trigger: Option<Tr
             cancel: Some(h.cancel_flag()),
             ..opts
         });
-        record(&state, &ds.name, trigger.as_ref(), started, t0.elapsed(), &r);
+        record(&state, &ds.key(), trigger.as_ref(), started, t0.elapsed(), &r);
         let rep = r?;
         Ok(match &rep.abandoned {
             Some(why) => format!("{prefix}abandoned: {why}"),
@@ -437,7 +437,7 @@ pub fn status_json(st: &AppState, ds: &Dataset) -> J {
     let own = ds.store.compaction_settings();
     let m = ds.store.compaction_measures();
     let states = ac.states.lock();
-    let s = states.get(&ds.name);
+    let s = states.get(&ds.key());
     let enabled = ac.enabled && policy.enabled && !st.read_only;
     let running = s.and_then(|s| s.task.as_ref()).is_some() || m.compacting;
     // between two passes, a verdict of its own (the scheduler may not have run yet)

@@ -256,6 +256,10 @@ pub enum Hold {
     Lease(String),
     /// a clone copying the generation's files (a lease, by the clone's name)
     Clone(String),
+    /// a branch whose linked generation reads the generation's files (by branch name)
+    Branch(String),
+    /// a branch's starting commit, kept readable for merges (by branch name)
+    BranchBase(String),
 }
 
 impl std::fmt::Display for Hold {
@@ -266,6 +270,8 @@ impl std::fmt::Display for Hold {
             Hold::Retention => write!(f, "retention"),
             Hold::Lease(n) => write!(f, "backup:{n}"),
             Hold::Clone(n) => write!(f, "clone:{n}"),
+            Hold::Branch(n) => write!(f, "branch:{n}"),
+            Hold::BranchBase(n) => write!(f, "branch-base:{n}"),
         }
     }
 }
@@ -534,6 +540,10 @@ pub(crate) struct HistoryState {
     pub misses: u64,
     pub materializations: u64,
     pub materialize_nanos: u64,
+    /// generations that branches' linked generations read (by generation number)
+    pub branch_gens: Vec<(u32, Hold)>,
+    /// commits branches keep readable (their starting commits)
+    pub branch_pins: Vec<(u64, Hold)>,
 }
 
 impl HistoryState {
@@ -552,6 +562,8 @@ impl HistoryState {
             misses: 0,
             materializations: 0,
             materialize_nanos: 0,
+            branch_gens: Vec::new(),
+            branch_pins: Vec::new(),
         }
     }
 
@@ -562,6 +574,8 @@ impl HistoryState {
         let mut h = HistoryState::new(self.pins.clone(), self.retention);
         h.leases = self.leases.clone();
         h.gens = self.gens.clone();
+        h.branch_gens = self.branch_gens.clone();
+        h.branch_pins = self.branch_pins.clone();
         h
     }
 
@@ -612,6 +626,9 @@ impl HistoryState {
         for (name, pin) in &self.pins {
             p.push((pin.seq, pin.seq, Hold::Snapshot(name.clone())));
         }
+        for (seq, hold) in &self.branch_pins {
+            p.push((*seq, *seq, hold.clone()));
+        }
         if let Some(n) = self.retention.keep_commits
             && n > 0
         {
@@ -650,7 +667,7 @@ impl HistoryState {
         id
     }
 
-    /// The leases on generation `no`, as holds.
+    /// The leases on generation `no`, and the branches that read it, as holds.
     pub fn lease_holds(&self, no: u32) -> impl Iterator<Item = Hold> + '_ {
         self.leases
             .values()
@@ -662,6 +679,12 @@ impl HistoryState {
                     Hold::Lease(l.label.clone())
                 }
             })
+            .chain(
+                self.branch_gens
+                    .iter()
+                    .filter(move |(g, _)| *g == no)
+                    .map(|(_, h)| h.clone()),
+            )
     }
 
     /// The non-current generations to keep, with what holds each: a generation is

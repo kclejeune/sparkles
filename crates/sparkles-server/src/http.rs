@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+pub(crate) mod branches;
 mod budgets;
 mod changes;
 mod conditional;
@@ -60,6 +61,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut exposed = vec![
         header::HeaderName::from_static(SPARKLES_COMMIT),
         header::HeaderName::from_static(SPARKLES_DATASET_ID),
+        header::HeaderName::from_static(branches::SPARKLES_BRANCH),
+        header::HeaderName::from_static(branches::SPARKLES_BRANCH_ID),
         crate::obs::X_REQUEST_ID.clone(),
         header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
         header::HeaderName::from_static(history::SPARKLES_AT),
@@ -156,6 +159,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/queries/{name}", get(queries::run).post(queries::run))
         .route("/$/commits/{ds}", get(list_commits))
         .route("/$/commits/{ds}/{reference}", get(get_commit))
+        .route(
+            "/$/branches/{ds}",
+            get(branches::list).post(branches::create),
+        )
+        .route(
+            "/$/branches/{ds}/{name}",
+            get(branches::get_branch)
+                .patch(branches::patch_branch)
+                .delete(branches::delete_branch),
+        )
+        .route(
+            "/$/merge/{ds}",
+            get(branches::preview).post(branches::merge),
+        )
         .route("/{ds}", any(dataset_root))
         .route("/{ds}/sparql", any(query_endpoint))
         .route("/{ds}/query", any(query_endpoint))
@@ -265,32 +282,42 @@ pub fn router(state: Arc<AppState>) -> Router {
         )),
         None => app,
     };
-    app.layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        crate::auth::middleware,
-    ))
-    // outside the auth layer: names the client, and charges its failed credential checks
-    // to it (an address that failed too often has its password checks refused)
-    .layer(axum::middleware::from_fn_with_state(
-        state.rate_limit.clone(),
-        crate::ratelimit::admit,
-    ))
-    .layer(cors)
-    .layer(axum::middleware::from_fn(security_headers))
-    .layer(
-        tower_http::trace::TraceLayer::new_for_http()
-            .make_span_with(crate::obs::MakeSpan)
-            .on_request(())
-            // the access log is written by `obs::observe`
-            .on_response(()),
-    )
-    .layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        crate::obs::observe,
-    ))
-    .layer(axum::middleware::from_fn(crate::alloc::track))
-    .layer(axum::middleware::map_request(authority_host))
-    .with_state(state)
+    let app: Router = app
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::middleware,
+        ))
+        // outside the auth layer: names the client, and charges its failed credential checks
+        // to it (an address that failed too often has its password checks refused)
+        .layer(axum::middleware::from_fn_with_state(
+            state.rate_limit.clone(),
+            crate::ratelimit::admit,
+        ))
+        .layer(cors)
+        .layer(axum::middleware::from_fn(security_headers))
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http()
+                .make_span_with(crate::obs::MakeSpan)
+                .on_request(())
+                // the access log is written by `obs::observe`
+                .on_response(()),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::obs::observe,
+        ))
+        .layer(axum::middleware::from_fn(crate::alloc::track))
+        .layer(axum::middleware::map_request(authority_host))
+        .with_state(state.clone());
+    // the branch a request chooses, before the routes above see it: the path form
+    // `/{ds}@{branch}/…` is routed as `/{ds}/…` (an outer router sends every request
+    // through this layer to them)
+    Router::new()
+        .fallback_service(app)
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            branches::select,
+        ))
 }
 
 /// HTTP/2 requests carry their host as the `:authority` pseudo-header, not `Host`: it is
@@ -515,6 +542,9 @@ impl From<Error> for ApiError {
                 StatusCode::PRECONDITION_FAILED
             }
             Error::Patch(_) => StatusCode::BAD_REQUEST,
+            Error::Branch(b) => {
+                StatusCode::from_u16(b.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            }
             // a write handler answers a dry run with its preview before errors are mapped
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -526,6 +556,7 @@ impl From<Error> for ApiError {
             Error::StorageFull(_) => json!({ "error": msg, "code": "storage-full" }),
             Error::PreconditionFailed(_) => json!({ "error": msg, "code": "precondition-failed" }),
             Error::Patch(p) => json!({ "error": msg, "code": p.kind.code() }),
+            Error::Branch(b) => branches::error_body(&b),
             Error::Conflict(_) if msg.starts_with("history-limit") => {
                 json!({ "error": msg, "code": "history-limit" })
             }
@@ -586,8 +617,14 @@ impl From<anyhow::Error> for ApiError {
 pub(crate) type ApiResult<T = Response> = Result<T, ApiError>;
 
 pub(crate) fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
-    st.get(name)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")))
+    let ds = st
+        .get(name)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")))?;
+    // the branch the request chose (`?branch=`, `/{ds}@{branch}/…`)
+    match branches::current() {
+        Some(b) if b != sparkles::branch::MAIN => Ok(st.branch_dataset(&ds, &b)?),
+        _ => Ok(ds),
+    }
 }
 
 /// Run `f` on a blocking thread, inside the request's span (so engine events carry the
@@ -1609,7 +1646,8 @@ const SPARKLES_DATASET_ID: &str = "sparkles-dataset-id";
 fn with_commit(mut r: Response, ds: &Dataset, seq: u64) -> Response {
     let h = r.headers_mut();
     h.insert(SPARKLES_COMMIT, seq.into());
-    if let Ok(v) = header::HeaderValue::from_str(&ds.store.dataset_id().to_string()) {
+    // the dataset's id, also on a branch (whose own id is in `Sparkles-Branch-Id`)
+    if let Ok(v) = header::HeaderValue::from_str(&ds.store.owner_dataset_id().to_string()) {
         h.insert(SPARKLES_DATASET_ID, v);
     }
     r
@@ -1788,6 +1826,85 @@ async fn list_commits(
         _ => None,
     };
     let (oldest, reconstructable, mut commits) = history::commit_list_extras(&ds, &page.commits);
+    // a persistent dataset's history follows its branch: the branch's own commits,
+    // then those it shares with its upstream, each with the branch that made it
+    let mut page = page;
+    if ds.kind == DbType::Persistent {
+        let main = ds.main().unwrap_or_else(|| ds.clone());
+        let branch = ds.branch_name().to_string();
+        let lineage = {
+            let main = main.clone();
+            blocking(move || Ok(main.store.branch_commits(&branch, range, limit)?)).await?
+        };
+        let mut by_owner: std::collections::HashMap<uuid::Uuid, (J, Vec<J>)> = Default::default();
+        let mut list = Vec::with_capacity(lineage.len());
+        for c in &lineage {
+            let e = by_owner.entry(c.branch_id).or_insert_with(|| {
+                let owner = match &c.branch {
+                    Some(b) => st.branch_dataset(&main, b).ok(),
+                    None => None,
+                };
+                match owner {
+                    Some(o) => {
+                        let (_, r, _) = history::commit_list_extras(&o, &[]);
+                        (r, Vec::new())
+                    }
+                    None => (json!([]), Vec::new()),
+                }
+            });
+            let inside = e.0.as_array().is_some_and(|rs| {
+                rs.iter().any(|r| {
+                    let a = r.get(0).and_then(J::as_u64).or_else(|| r["from"].as_u64());
+                    let b = r.get(1).and_then(J::as_u64).or_else(|| r["to"].as_u64());
+                    a.zip(b)
+                        .is_some_and(|(a, b)| a <= c.commit.seq && c.commit.seq <= b)
+                })
+            });
+            let mut j = json!(sparkles::commit::AnnotatedCommit {
+                commit: &c.commit,
+                annotation: c.annotation.as_ref(),
+            });
+            j["reconstructable"] = json!(inside);
+            if c.branch_id == ds.store.branch_id()
+                && let Some(own) = commits
+                    .iter()
+                    .find(|x| x["seq"].as_u64() == Some(c.commit.seq))
+            {
+                j["reconstructable"] = own["reconstructable"].clone();
+                if let Some(s) = own.get("snapshots") {
+                    j["snapshots"] = s.clone();
+                }
+            }
+            j["branch"] = json!(c.branch);
+            j["branchId"] = json!(c.branch_id);
+            if let Some(m) = &c.merged_from {
+                j["mergedFrom"] =
+                    json!({ "branch": m.branch, "branchId": m.branch_id, "seq": m.seq });
+            }
+            list.push(j);
+        }
+        page.commits = lineage.iter().map(|c| c.commit).collect();
+        commits = list;
+    }
+    let next = if ds.kind == DbType::Persistent {
+        match (range, page.commits.last()) {
+            (CommitRange::After(_), Some(last)) if last.seq < head.seq => Some(format!(
+                "/$/commits/{name}?after={}&limit={limit}",
+                last.seq
+            )),
+            (CommitRange::Latest | CommitRange::Before(_), Some(last))
+                if last.seq > 0 && page.commits.len() >= limit =>
+            {
+                Some(format!(
+                    "/$/commits/{name}?before={}&limit={limit}",
+                    last.seq
+                ))
+            }
+            _ => None,
+        }
+    } else {
+        next
+    };
     if p.restricted(&ds.name) {
         commits.iter_mut().for_each(redact_commit_json);
     }
@@ -3074,6 +3191,7 @@ fn dataset_info(st: &AppState, ds: &Dataset) -> J {
         "id": ds.store.dataset_id(),
         "head": head.seq,
         "modified": head.timestamp(),
+        "branches": ds.store.branch_count(),
         "text": text_summary(ds),
         "geo": crate::geo::summary(ds),
         "rdfs": crate::rdfs::info_json(ds),
@@ -3108,7 +3226,11 @@ fn visible_datasets(st: &AppState, p: &Principal) -> Vec<J> {
     let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
     datasets
         .iter()
-        .filter(|d| p.can(&d.name, Level::Read))
+        // a dataset is listed when some branch of it is readable
+        .filter(|d| {
+            p.level_any_branch(&d.name)
+                .is_some_and(|l| l >= Level::Read)
+        })
         .map(|d| dataset_info_for(st, d, p))
         .collect()
 }

@@ -236,6 +236,11 @@ impl Store {
                 }
             }
         }
+        // the branch ordinals the copied blank nodes may carry are not given out again
+        let next_ordinal = self.branching.next_ordinal.load(Ordering::Relaxed);
+        if next_ordinal > 1 {
+            super::branching::write_initial_table(dir, id, next_ordinal)?;
+        }
         // CURRENT last: the commit point of the new database
         write_atomic(&dir.join("CURRENT"), name.as_bytes())?;
         sync_dir(dir)?;
@@ -330,7 +335,10 @@ impl Store {
             let w = self.writer.lock();
             let snap = self.snapshot();
             let lease = match (&self.root, &self.history) {
-                (Some(root), Some(h)) if share && snap.delta.is_empty() => {
+                // a linked generation's base files are its upstream's: rebuilt
+                (Some(root), Some(h))
+                    if share && snap.delta.is_empty() && snap.generation.link.is_none() =>
+                {
                     let no = commit::generation_number(&snap.generation.name);
                     let label = if opts.label.is_empty() {
                         "clone"

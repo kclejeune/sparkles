@@ -63,7 +63,14 @@ pub(super) fn snapshot_for(
         cancel: opts.cancel.clone(),
         deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
     };
-    let (snap, r) = ds.store.snapshot_at(at, &o)?;
+    let (snap, r) = match ds.store.snapshot_at(at, &o) {
+        // a commit a branch shares with its upstream is read there
+        Err(e) if sparkles::branch::inherited_commit(&e).is_some() => match ds.main() {
+            Some(main) => main.store.branch_snapshot_at(ds.branch_name(), at, &o)?,
+            None => return Err(e),
+        },
+        r => r?,
+    };
     Ok((snap, Some(r)))
 }
 
@@ -644,9 +651,9 @@ pub(crate) fn spawn_tick(st: Arc<AppState>, every: std::time::Duration) {
         tick.tick().await;
         loop {
             tick.tick().await;
-            let all: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+            let all: Vec<Arc<Dataset>> = st.datasets_and_branches();
             for ds in all {
-                let name = ds.name.clone();
+                let name = ds.key();
                 match tokio::task::spawn_blocking(move || ds.store.history_tick()).await {
                     Ok(Ok(r)) => {
                         for n in &r.created {

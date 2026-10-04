@@ -59,7 +59,7 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client"], optional = true }
 opentelemetry-appender-tracing = { version = "0.33", default-features = false, optional = true }
 tracing-opentelemetry = { version = "0.34", default-features = false, optional = true }
-uuid = { workspace = true, optional = true }
+uuid.workspace = true
 # the UI's Content Security Policy (hashes of inline scripts); API token hashes
 sha2.workspace = true
 # native TLS (feature `tls`): rustls with the aws-lc-rs provider, already in the tree
@@ -147,7 +147,7 @@ tls = ["dep:rustls", "dep:tokio-rustls"]
 mcp = ["dep:rmcp", "dep:tokio-util"]
 # backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
 # `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
-backup = ["dep:sparkles-backup", "dep:toml", "dep:uuid"]
+backup = ["dep:sparkles-backup", "dep:toml"]
 # the formatter: `sparkles fmt`, `sparkles lsp` and `POST /$/format`
 fmt = [
     "dep:sparkles-fmt",
@@ -170,5 +170,4 @@ otel = [
   "dep:opentelemetry-otlp",
   "dep:opentelemetry-appender-tracing",
   "dep:tracing-opentelemetry",
-  "dep:uuid",
 ]

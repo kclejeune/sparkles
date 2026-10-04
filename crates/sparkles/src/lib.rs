@@ -4,8 +4,8 @@
 //! and the [`querybuilder`] are defined here.
 
 pub use sparkles_core::{
-    access, annotations, builder, check, codec, commit, disk, error, geo, guard, history, id,
-    index, io, jena_formats, nesting, outbound, patch, preview, schema, sparql, store, stored,
+    access, annotations, branch, builder, check, codec, commit, disk, error, geo, guard, history,
+    id, index, io, jena_formats, nesting, outbound, patch, preview, schema, sparql, store, stored,
     tabular, text, trix, validation, vector, vocab, xsd,
 };
 

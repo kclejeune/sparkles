@@ -1,5 +1,6 @@
 pub mod access;
 pub mod annotations;
+pub mod branch;
 pub mod builder;
 pub mod check;
 pub mod codec;

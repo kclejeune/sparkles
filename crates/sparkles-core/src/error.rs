@@ -75,6 +75,10 @@ pub enum Error {
     /// was written.
     #[error("{0}")]
     Patch(Box<crate::patch::PatchError>),
+    /// A branch or merge request that failed (see [`crate::branch::BranchError`] for
+    /// its code and status); nothing was written.
+    #[error("{0}")]
+    Branch(Box<crate::branch::BranchError>),
 }
 
 /// Which budget a request exceeded.
