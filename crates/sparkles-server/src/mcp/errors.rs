@@ -169,6 +169,28 @@ impl ErrorContext<'_> {
 
     pub fn schema(&self, e: SchemaError) -> ToolError {
         match e {
+            SchemaError::Cancelled => self.engine(Error::Cancelled),
+            SchemaError::Store(e) => self.engine(e),
+            e => self.schema_outcome(&e),
+        }
+    }
+
+    /// [`schema`](Self::schema) for an error of the library's schema handle, which
+    /// carries the schema discovery error as its source.
+    pub fn schema_call(&self, e: Error) -> ToolError {
+        match sparkles::handles::schema_error_of(&e) {
+            Some(
+                se @ (SchemaError::NoSuchGraph(_)
+                | SchemaError::Timeout { .. }
+                | SchemaError::TooManyEntries { .. }),
+            ) => self.schema_outcome(se),
+            _ => self.engine(e),
+        }
+    }
+
+    /// A missing graph, a timeout or too many entries.
+    fn schema_outcome(&self, e: &SchemaError) -> ToolError {
+        match e {
             SchemaError::NoSuchGraph(g) => {
                 ToolError::new("unknown-graph", 404, format!("no graph <{g}>"))
                     .hint("graph=union covers all graphs")
@@ -182,12 +204,8 @@ impl ErrorContext<'_> {
                 ),
             )
             .hint("narrow graph to one named graph, or use sparql_query with GROUP BY"),
-            SchemaError::Cancelled => self.engine(Error::Cancelled),
-            e @ SchemaError::TooManyEntries { .. } => {
-                ToolError::new("too-many-entries", 413, e.to_string())
-                    .hint("use sparql_query with GROUP BY")
-            }
-            SchemaError::Store(e) => self.engine(e),
+            e => ToolError::new("too-many-entries", 413, e.to_string())
+                .hint("use sparql_query with GROUP BY"),
         }
     }
 }

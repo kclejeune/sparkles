@@ -367,11 +367,28 @@ fn entries() -> Vec<(&'static str, Entry)> {
             sparkles::geo::convert::convert(&[]);
         }),
         // ------------------------------------------------------------------- schema
-        pending!("getSchema", "phase 1 step 5"),
-        pending!("listSchemaClasses", "phase 1 step 5"),
-        pending!("listSchemaPredicates", "phase 1 step 5"),
-        pending!("getSchemaConstraints", "phase 1 step 5"),
-        pending!("getSchemaDiff", "phase 1 step 5"),
+        op!("getSchema", "schema.report", |ds| {
+            ds.schema().report(&Default::default()).map(|r| {
+                r.summary("ds");
+            });
+        }),
+        op!("listSchemaClasses", "schema.classes", |ds| {
+            ds.schema().report(&Default::default()).map(|r| {
+                r.classes();
+            });
+        }),
+        op!("listSchemaPredicates", "schema.predicates", |ds| {
+            ds.schema().report(&Default::default()).map(|r| {
+                r.predicates();
+            });
+        }),
+        op!("getSchemaConstraints", "schema.constraints", |ds| {
+            ds.schema().constraints(&Default::default());
+        }),
+        op!("getSchemaDiff", "schema.diff", |ds| {
+            ds.schema()
+                .diff(&sparkles::history::At::Commit(1), &Default::default());
+        }),
         op!("getClassProfiles", "schema.profiles", |ds| {
             ds.schema().profiles(&Default::default());
         }),

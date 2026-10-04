@@ -13,7 +13,7 @@ use axum::response::IntoResponse;
 use sparkles::schema::draft::{
     DEFAULT_MAX_COUNT, DEFAULT_MAX_IN, DraftOptions, TRACKED_VALUES, default_base,
 };
-use sparkles::schema::{GraphSelection, SchemaOptions, draft_shapes};
+use sparkles::schema::{GraphSelection, SchemaOptions};
 use std::time::{Duration, Instant};
 
 /// What a draft request answers with.
@@ -164,17 +164,11 @@ pub(in crate::http) async fn shapes(
     opts.prefixes = prefixes.into_iter().collect();
     blocking(move || {
         opts.schema.deadline = Some(Instant::now() + timeout);
-        let snap = match &at {
-            None => ds.store.snapshot(),
-            Some(at) => {
-                let o = sparkles::history::HistoryOptions {
-                    cancel: None,
-                    deadline: opts.schema.deadline,
-                };
-                ds.store.snapshot_at(at, &o)?.0
-            }
-        };
-        let draft = draft_shapes(&snap, &opts).map_err(|e| schema_error(e, timeout))?;
+        let draft = ds
+            .dataset
+            .schema()
+            .draft_shapes_at(&opts, at.as_ref())
+            .map_err(|e| schema_error(e, timeout))?;
         Ok(match format {
             Format::Json => Json(draft).into_response(),
             Format::Turtle => (

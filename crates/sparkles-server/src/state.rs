@@ -96,8 +96,6 @@ pub use crate::write_validation::Validation;
 /// Default of `serve --reason-cache-triples`.
 pub const DEFAULT_REASON_CACHE_TRIPLES: usize = sparkles::reasoning::DEFAULT_CLOSURE_CACHE_TRIPLES;
 
-pub use sparkles::dataset::SchemaCacheEntry;
-
 #[derive(Serialize, Deserialize, Default)]
 struct Registry {
     datasets: Vec<RegistryEntry>,

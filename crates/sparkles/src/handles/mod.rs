@@ -44,7 +44,10 @@ pub use indexes::{
 };
 pub use queries::StoredQueries;
 pub use reasoning::{RdfsSetting, Reasoning};
-pub use schema::Schema;
+pub use schema::{
+    Computed, ConstraintsRequest, ReportOutcome, ReportRequest, Schema, ShapesRequest,
+    schema_error_of,
+};
 pub use settings::{
     ChangeLogSetting, CompactionSetting, DescribeSetting, HistorySettings, HistoryUpdate,
     QuotaSetting, RetentionSetting, Settings,

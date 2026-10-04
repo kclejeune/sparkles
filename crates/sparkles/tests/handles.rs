@@ -282,3 +282,101 @@ fn text_search_marks_the_matches() {
         .unwrap();
     assert!(plain.limited && plain.hits[0].snippet.is_none());
 }
+
+#[test]
+fn schema_reports_are_kept_paged_and_compared() {
+    use sparkles::handles::{Computed, ReportRequest};
+    let (_dir, ds) = persistent();
+    ds.update(
+        "INSERT DATA { <http://ex.org/a> a <http://ex.org/A> . <http://ex.org/b> a <http://ex.org/B> . <http://ex.org/c> a <http://ex.org/C> }",
+    )
+    .unwrap();
+    let schema = ds.schema();
+    let first = schema
+        .report(&ReportRequest {
+            limit: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(first.computed, Computed::Full);
+    let page = first.classes();
+    assert_eq!((page.items.len(), page.total), (2, 3));
+    let next = page.next.clone().unwrap();
+    assert_eq!(
+        serde_json::to_value(first.summary("ds")).unwrap()["dataset"],
+        "ds"
+    );
+    // the next page reads the kept report
+    let second = schema
+        .report(&ReportRequest {
+            limit: 2,
+            cursor: Some(next.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(second.computed, Computed::Cached);
+    let rest = second.classes();
+    assert_eq!(rest.items.len(), 1);
+    assert!(rest.next.is_none());
+    // a cursor of another selection, and a malformed one, are refused
+    let other = ReportRequest {
+        cursor: Some(next.clone()),
+        options: sparkles::schema::SchemaOptions {
+            subject_classes: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(matches!(
+        schema.report(&other),
+        Err(sparkles::Error::Invalid(_))
+    ));
+    let bad = ReportRequest {
+        cursor: Some("nonsense".into()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        schema.report(&bad),
+        Err(sparkles::Error::Invalid(_))
+    ));
+    // after a write, a report brought up to date from the changes
+    ds.update("INSERT DATA { <http://ex.org/d> a <http://ex.org/D> }")
+        .unwrap();
+    let later = schema.report(&ReportRequest::default()).unwrap();
+    assert!(
+        matches!(later.computed, Computed::Updated(_)),
+        "{:?}",
+        later.computed
+    );
+    assert_eq!(later.report.classes.len(), 4);
+    // the old cursor's report is gone
+    let stale = ReportRequest {
+        limit: 2,
+        cursor: Some(next),
+        ..Default::default()
+    };
+    assert!(matches!(
+        schema.report(&stale),
+        Err(sparkles::Error::Conflict(_))
+    ));
+    let (diff, _) = schema
+        .diff(
+            &At::Commit(ds.head_commit().seq - 1),
+            &ReportRequest::default(),
+        )
+        .unwrap();
+    assert_eq!(diff.classes.added.len(), 1);
+    // a missing graph keeps the schema error as the source
+    let missing = ReportRequest {
+        options: sparkles::schema::SchemaOptions {
+            graph: sparkles::schema::GraphSelection::parse("http://ex.org/none").unwrap(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let e = schema.report(&missing).unwrap_err();
+    assert_eq!(e.code(), "no-such-graph");
+    assert!(sparkles::handles::schema_error_of(&e).is_some());
+    let layer = schema.constraints(&Default::default()).unwrap();
+    assert!(layer.is_empty());
+}

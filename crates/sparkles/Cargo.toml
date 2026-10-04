@@ -18,6 +18,8 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+# the cursors of the schema report's lists (base64url JSON)
+base64 = "0.23"
 # the satellites behind the features of the same names
 sparkles-reasoner = { workspace = true, optional = true }
 sparkles-shacl = { workspace = true, optional = true }

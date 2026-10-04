@@ -3,16 +3,15 @@
 //! reports of two states, `sparkles::schema::compare`).
 
 use super::super::{ApiResult, Params, St, blocking, dataset};
-use super::{Computed, bad, parse, report, schema_error};
+use super::{bad, parse, schema_error};
 use crate::auth::Principal;
 use axum::Extension;
 use axum::Json;
 use axum::extract::Path;
 use axum::http::{HeaderMap, Uri, header};
 use axum::response::IntoResponse;
-use sparkles::history::{At, HistoryOptions};
+use sparkles::history::At;
 use sparkles::schema::{self, ProfileOptions};
-use std::sync::Arc;
 use std::time::Instant;
 
 /// The class IRIs of `class=` parameters (repeatable; angle brackets optional).
@@ -44,21 +43,15 @@ pub(in crate::http) async fn profiles(
     let classes = classes(&params)?;
     blocking(move || {
         let mut opts = ProfileOptions {
-            schema: req.opts,
+            schema: req.report.options,
             classes,
         };
         opts.schema.deadline = Some(Instant::now() + req.timeout);
-        let snap = match &req.at {
-            None => ds.store.snapshot(),
-            Some(at) => {
-                let o = HistoryOptions {
-                    cancel: None,
-                    deadline: opts.schema.deadline,
-                };
-                ds.store.snapshot_at(at, &o)?.0
-            }
-        };
-        let profiles = schema::profiles(&snap, &opts).map_err(|e| schema_error(e, req.timeout))?;
+        let profiles = ds
+            .dataset
+            .schema()
+            .profiles_at(&opts, req.report.at.as_ref())
+            .map_err(|e| schema_error(e, req.timeout))?;
         Ok(Json(profiles).into_response())
     })
     .await
@@ -109,19 +102,13 @@ pub(in crate::http) async fn diff(
     };
     let mut req = parse(&st, &ds, &uri, &p)?;
     blocking(move || {
-        let deadline = Instant::now() + req.timeout;
-        let o = HistoryOptions {
-            cancel: None,
-            deadline: Some(deadline),
-        };
         // the older state is computed for this request and not cached
-        let (old_snap, _) = ds.store.snapshot_at(&from, &o)?;
-        let mut opts = req.opts.clone();
-        opts.deadline = Some(deadline);
-        let old = schema::discover(&old_snap, &opts).map_err(|e| schema_error(e, req.timeout))?;
-        req.at = to;
-        let (new, _, how): (Arc<schema::SchemaReport>, _, Computed) = report(&ds, &mut req)?;
-        let d = schema::compare(&old, &new);
+        req.report.at = to;
+        let (d, how) = ds
+            .dataset
+            .schema()
+            .diff(&from, &req.report)
+            .map_err(|e| schema_error(e, req.timeout))?;
         let mut resp = if text {
             (
                 [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -131,7 +118,7 @@ pub(in crate::http) async fn diff(
         } else {
             Json(d).into_response()
         };
-        if let Ok(v) = header::HeaderValue::from_str(&how.header()) {
+        if let Ok(v) = header::HeaderValue::from_str(&how.to_string()) {
             resp.headers_mut().insert(super::COMPUTED_HEADER, v);
         }
         Ok(resp)

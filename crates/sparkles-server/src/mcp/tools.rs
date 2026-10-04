@@ -5,7 +5,7 @@ use super::errors::{ErrorContext, ToolError};
 use super::render::{self, Prefixes, QueryPage, RowSource, Terms};
 use super::{Call, McpServer, Outcome};
 use crate::http::INFERRED_GRAPH;
-use crate::state::{Dataset, SchemaCacheEntry};
+use crate::state::Dataset;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
@@ -18,9 +18,7 @@ use spargebra::{Query, SparqlParser};
 use sparkles::commit::CommitRange;
 use sparkles::error::Error;
 use sparkles::history::{At, HistoryOptions};
-use sparkles::schema::{
-    self, ClassEntry, GraphSelection, PredicateEntry, SchemaOptions, SchemaReport,
-};
+use sparkles::schema::{ClassEntry, GraphSelection, PredicateEntry, SchemaOptions, SchemaReport};
 use sparkles::sparql::{self, PlanInfo, QueryKind, QueryOptions};
 use sparkles::store::Snapshot;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -735,7 +733,6 @@ impl Tools<'_> {
             graph.clone(),
             reasoning,
             subject_classes,
-            selection,
             timeout,
             &ctx,
         )?;
@@ -833,14 +830,15 @@ impl Tools<'_> {
                     .call
                     .principal
                     .view(&ds.name, crate::auth::Endpoint::Info);
-                let layer = crate::http::constraints_layer(&ds, &snap, &shapes, view.as_deref())
-                    .map_err(|e| {
-                        let code = match e.status {
-                            404 => "unknown-graph",
-                            501 => "unsupported",
-                            _ => "invalid-shapes",
-                        };
-                        ToolError::new(code, e.status, e.message)
+                let layer = ds
+                    .dataset
+                    .schema()
+                    .constraints_at(&snap, &shapes, view.as_deref())
+                    .map_err(|e| match e {
+                        Error::NotFound(m) => ToolError::new("unknown-graph", 404, m),
+                        Error::Unsupported(m) => ToolError::new("unsupported", 501, m),
+                        Error::Invalid(m) => ToolError::new("invalid-shapes", 400, m),
+                        e => ctx.engine(e),
                     })?
                     .unwrap_or_default();
                 out["constraints"] = layer
@@ -900,24 +898,15 @@ impl Tools<'_> {
         graph: GraphSelection,
         reasoning: bool,
         subject_classes: bool,
-        selection: u64,
         timeout: Duration,
         ctx: &ErrorContext,
     ) -> Result<Arc<SchemaReport>, ToolError> {
         self.info_endpoint(&ds.name)?;
-        let identity = schema::snapshot_identity(snap);
         // a caller limited to some graphs gets a report of those, outside the cache
         let graphs = self
             .call
             .principal
             .view(&ds.name, crate::auth::Endpoint::Info);
-        if graphs.is_none()
-            && let Some(e) = ds.schema_cache.lock().as_ref()
-            && e.identity == identity
-            && e.selection == selection
-        {
-            return Ok(e.report.clone());
-        }
         let deadline = self.call.arrived + timeout;
         let opts = SchemaOptions {
             graph,
@@ -929,26 +918,15 @@ impl Tools<'_> {
             cancel: Some(self.call.cancel.clone()),
             max_entries: self.server.state.schema_max_entries,
             term_totals: false,
-            graphs: graphs.clone(),
+            graphs,
             subject_classes,
         };
-        let updated = match graphs {
-            None => crate::http::schema::maintained(ds, snap, selection, &opts)
-                .map_err(|e| ctx.schema(e))?,
-            Some(_) => None,
-        };
-        let report = Arc::new(match updated {
-            Some((r, _)) => r,
-            None => schema::discover(snap, &opts).map_err(|e| ctx.schema(e))?,
-        });
-        if graphs.is_none() {
-            *ds.schema_cache.lock() = Some(SchemaCacheEntry {
-                identity,
-                selection,
-                report: report.clone(),
-                mark: (!ds.store.is_persistent()).then(|| snap.mark()),
-            });
-        }
+        // the dataset's kept report, brought up to date, or a new one
+        let (report, _) = ds
+            .dataset
+            .schema()
+            .report_at(snap, &opts)
+            .map_err(|e| ctx.schema_call(e))?;
         Ok(report)
     }
 

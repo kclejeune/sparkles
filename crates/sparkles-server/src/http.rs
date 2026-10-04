@@ -45,8 +45,6 @@ mod patch;
 mod queries;
 pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
-#[cfg(feature = "mcp")]
-pub(crate) use schema::constraints::build as constraints_layer;
 mod sd;
 mod shex;
 mod stream;
