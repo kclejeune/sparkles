@@ -376,6 +376,22 @@ with Dataset("mydb") as ds:                      # or Dataset() in memory
 
 [docs/USAGE.md](docs/USAGE.md#python) covers the Python API.
 
+On the JVM, the `sparkles-jena` library gives Apache Jena programs a `DatasetGraph` backed
+by the engine, built from `jvm/` with `mise run jvm:build`. Code written for TDB2 runs on
+it after a change to the line that opens the dataset. Jena's transactions, Model API and
+`QueryExecution` work on it, and queries run in Sparkles' engine unless they call a
+function that only Java has.
+
+```java
+try (DatasetGraphSparkles dsg = SparklesDatasets.open(Path.of("mydb"))) {
+    dsg.loadFiles(List.of(Path.of("data.ttl.gz")));
+    Txn.executeRead(dsg, () -> ResultSetFormatter.out(
+        QueryExecution.dataset(DatasetFactory.wrap(dsg)).query("SELECT * { ?s ?p ?o } LIMIT 10").select()));
+}
+```
+
+[docs/USAGE.md](docs/USAGE.md#jvm-apache-jena) covers the JVM library.
+
 A remote server is reached from Rust with `crates/sparkles-client`, which has Jena's
 `RDFConnection` operations, async on tokio or blocking. It also works against Fuseki,
 QLever, Oxigraph and Wikidata.
@@ -427,7 +443,7 @@ while let Some(row) = rows.next().await {
 | Document | Contents |
 |---|---|
 | [docs/FEATURES.md](docs/FEATURES.md) | Every feature with its status, and the known gaps. |
-| [docs/USAGE.md](docs/USAGE.md) | Running the server and CLI, with options, formatting, backups, outbound requests, integrity checks, MCP, embedding, the Python package, the Rust client, Docker and NixOS. |
+| [docs/USAGE.md](docs/USAGE.md) | Running the server and CLI, with options, formatting, backups, outbound requests, integrity checks, MCP, embedding, the Python package, the JVM library for Apache Jena, the Rust client, Docker and NixOS. |
 | [docs/API.md](docs/API.md) | The HTTP API: Fuseki's endpoints and the `/$/` extensions. |
 | [docs/openapi.json](docs/openapi.json) | The OpenAPI 3.1 description of the HTTP API, as the server serves it at `/$/openapi.json`. |
 | [docs/COMPARISON.md](docs/COMPARISON.md) | How Sparkles compares with Jena/Fuseki, QLever, Fluree and Oxigraph, where it departs from Jena and QLever on purpose, and the optimizations it adopted from QLever. |
@@ -455,6 +471,8 @@ while let Some(row) = rows.next().await {
 | `crates/sparkles-client` | The Rust client of remote Sparkles servers and other SPARQL endpoints, async or blocking | jena-rdfconnection (remote), `RDFLinkHTTP` |
 | `crates/sparkles-graphql` | The read-only GraphQL adapter, with the mapping schema, schema drafts and the compilation of requests to SPARQL algebra | — |
 | `crates/sparkles-py` | The Python package, built with PyO3 and maturin in its own cargo workspace | — |
+| `crates/sparkles-ffi` | The native library of the JVM bindings, exported through UniFFI in its own cargo workspace | — |
+| `jvm/` | The Gradle build of `sparkles-jena`, the Kotlin library that implements Jena's `DatasetGraph` and query engines on Sparkles, and a Java sample | jena-tdb2's `DatasetGraphTDB` and `QueryEngineTDB` |
 | `vendor/spargebra` | Oxigraph's SPARQL parser, vendored with fixes (`PATCHED.md`) | ARQ's JavaCC grammar |
 | `ui/` | The SvelteKit UI for management, queries and graph exploration | jena-fuseki-ui |
 

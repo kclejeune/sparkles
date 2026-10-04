@@ -165,3 +165,19 @@ tasks.test {
         showStandardStreams = false
     }
 }
+
+// The performance check of P04 §5.4, not part of `check`:
+// ./gradlew :sparkles-jena:perfCheck -Pdata=DATA.nt -Pqueries=QUERIES.tsv [-Piterations=10] [-Ptdb2=false]
+tasks.register<JavaExec>("perfCheck") {
+    description = "Times queries through Jena on Sparkles, through the native library alone, and on TDB2"
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass = "io.github.kclejeune.sparkles.jena.PerfCheck"
+    maxHeapSize = "8g"
+    jvmArgs("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn")
+    args(
+        providers.gradleProperty("data").orElse("data.nt").get(),
+        providers.gradleProperty("queries").orElse("queries.tsv").get(),
+        providers.gradleProperty("iterations").orElse("10").get(),
+        if (providers.gradleProperty("tdb2").orElse("true").get() == "false") "notdb" else "tdb",
+    )
+}

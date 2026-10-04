@@ -31,6 +31,10 @@ public object Sparkles {
     @JvmField
     public val MAX_ROWS_PRODUCED: Symbol = Symbol.create(NS + "maxRowsProduced")
 
+    /** Neither read nor write Sparkles' result cache (a Boolean), as for benchmarks. */
+    @JvmField
+    public val NO_CACHE: Symbol = Symbol.create(NS + "noCache")
+
     /** The fallback mode of one query: a [SparklesFallback] or its name. */
     @JvmField
     public val FALLBACK: Symbol = Symbol.create(NS + "fallback")

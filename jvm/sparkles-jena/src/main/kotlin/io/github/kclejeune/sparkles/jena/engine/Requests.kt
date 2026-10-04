@@ -72,5 +72,6 @@ internal fun requestOptions(dsg: DatasetGraphSparkles, context: Context, input: 
         allowPrivateNetwork = dsg.options.outboundPolicy == SparklesOutbound.OPEN,
         bindingNames = names,
         bindingValues = if (names.isEmpty()) ByteArray(0) else encodeTerms(values),
+        noCache = context.isTrue(Sparkles.NO_CACHE),
     )
 }

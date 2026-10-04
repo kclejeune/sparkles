@@ -30,7 +30,7 @@ lib="target/$dir/libsparkles_ffi.so"
 
 out=target/jvm/uniffi
 rm -rf "$out"
-target/debug/uniffi-bindgen generate --library "$lib" --language kotlin --no-format \
+target/debug/uniffi-bindgen generate --library "$lib" --language kotlin --no-format --metadata-no-deps \
   --config "$crate/bindgen.toml" --out-dir "$out" > /dev/null
 
 if [ "${1:-}" = --print-properties ]; then

@@ -40,6 +40,8 @@ pub struct QueryOpts {
     /// order (tag 0 leaves a variable unbound)
     pub binding_names: Vec<String>,
     pub binding_values: Vec<u8>,
+    /// neither read nor write the result cache
+    pub no_cache: bool,
 }
 
 impl QueryOpts {
@@ -54,6 +56,7 @@ impl QueryOpts {
             max_rows_produced: self.max_rows_produced,
             allow_service: self.allow_service,
             cancel: Some(cancel),
+            no_cache: self.no_cache,
             ..Default::default()
         };
         o.outbound.allow_private = self.allow_private_network;

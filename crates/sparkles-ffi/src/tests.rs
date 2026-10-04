@@ -23,6 +23,7 @@ fn qopts() -> QueryOpts {
         allow_private_network: true,
         binding_names: Vec::new(),
         binding_values: Vec::new(),
+        no_cache: false,
     }
 }
 

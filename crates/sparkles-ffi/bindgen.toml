@@ -1,4 +1,6 @@
-# Where uniffi-bindgen finds this crate's uniffi.toml, so that it needs no `cargo metadata`
-# (the Nix build runs it offline): `uniffi-bindgen generate --config bindgen.toml …`
+# The global configuration of uniffi-bindgen for this crate. It names where the crate's
+# uniffi.toml is, so that the generator can run with --metadata-no-deps and needs no
+# resolved dependency graph, as in the offline Nix build:
+#   uniffi-bindgen generate --library <lib> --language kotlin --metadata-no-deps --config bindgen.toml …
 [crate-roots]
 sparkles_ffi = "."

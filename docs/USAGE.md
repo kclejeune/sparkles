@@ -3,7 +3,8 @@
 This guide covers operating the `sparkles` binary. It describes running the server, the
 command-line tools, automatic compaction, the formatter and linter, backups, outbound
 requests, path search, integrity checks, the MCP server, embedding the library, the
-Python package, the Rust client, Docker and deploying on NixOS. [API.md](API.md)
+Python package, the JVM library for Apache Jena, the Rust client, Docker and deploying on
+NixOS. [API.md](API.md)
 specifies the HTTP API.
 [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
 
@@ -43,6 +44,14 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
 * [Embedding the library](#embedding-the-library)
 * [Python](#python)
+* [JVM (Apache Jena)](#jvm-apache-jena)
+  * [Opening a Jena dataset](#opening-a-jena-dataset)
+  * [Jena transactions](#jena-transactions)
+  * [Jena queries and updates](#jena-queries-and-updates)
+  * [Loads, receipts and the TDB2 import](#loads-receipts-and-the-tdb2-import)
+  * [Blank node labels](#blank-node-labels)
+  * [Jena exceptions](#jena-exceptions)
+  * [Differences from TDB2](#differences-from-tdb2)
 * [Rust client](#rust-client)
 * [Docker](#docker)
 * [Deploying on NixOS](#deploying-on-nixos)
@@ -2177,6 +2186,201 @@ stops a running query or update and raises `KeyboardInterrupt`. On the main thre
 request runs on a helper thread while the main thread waits and handles signals, which
 adds a few microseconds to each request. A `CancelToken` passed as `cancel=` stops the
 requests it was given from any thread.
+
+## JVM (Apache Jena)
+
+The `sparkles-jena` library embeds the same engine in a JVM process behind Apache Jena's
+own interfaces. `SparklesDatasets.open` returns a `DatasetGraph`, and code written for
+TDB2 runs on it after a change to the line that opens the dataset. Jena's `Model`,
+RIOT, `Txn`, `QueryExecution` and `UpdateExecution` APIs work on it. Queries and updates
+run in Sparkles' planner and executor, and a query that uses a function registered only
+in Java runs in ARQ instead.
+
+The library is written in Kotlin and is meant to be used from Java. It needs Java 17 or
+later, and it is built and tested against Jena 5.6. Testing with Jena 6, which needs
+Java 21, is planned. The native part is the
+`crates/sparkles-ffi` crate, which the library calls through UniFFI and JNA. The library
+is not published to Maven Central. Build the jar from the repository:
+
+```sh
+mise run jvm:build            # jvm/sparkles-jena/build/libs/sparkles-jena-0.1.0.jar
+nix build .#sparkles-jena     # or the flake's package, in result/share/java
+```
+
+The jar holds the native library for the platform it was built on, and the build has
+been tested on Linux x86_64. It extracts the library into the temporary directory on
+first use. The system property `sparkles.native.dir` chooses another directory, and
+`sparkles.native.path` names a library file to load instead, such as one built for
+another platform with `cargo build --release --manifest-path crates/sparkles-ffi/Cargo.toml`.
+On Java 24 and later, the JVM warns when JNA loads native code unless the program runs
+with `--enable-native-access=ALL-UNNAMED`.
+
+The library depends on `jena-arq`, JNA, the Kotlin standard library and JSpecify. The
+TDB2 import also needs `jena-tdb2` on the classpath. [Spec P04](specs/P04-jvm-bindings.md)
+is the design, and `jvm/sample-java` is a Java program written against the public API.
+
+### Opening a Jena dataset
+
+```java
+import io.github.kclejeune.sparkles.jena.*;
+
+try (DatasetGraphSparkles dsg = SparklesDatasets.open(Path.of("DB"))) {
+    Dataset ds = DatasetFactory.wrap(dsg);
+    dsg.loadFiles(List.of(Path.of("data.ttl.gz")));         // one bulk commit
+    Txn.executeWrite(ds, () -> ds.getDefaultModel().add(s, p, o));
+    Txn.executeRead(ds, () -> {
+        try (QueryExecution qe = QueryExecution.dataset(ds)
+                .query("SELECT ?s WHERE { ?s a <http://ex.org/T> }").build()) {
+            ResultSetFormatter.out(qe.execSelect());
+        }
+    });
+    CommitReceipt r = dsg.lastReceipt();                     // the last commit of this thread
+}
+```
+
+`SparklesDatasets.open(path)` opens or creates a database directory, and
+`SparklesDatasets.memory()` makes an in-memory dataset. Two opens of one directory in a
+JVM share the native dataset, and its directory lock is released when the last of them
+is closed. Another process that has the directory open makes `open` throw
+`SparklesDatasetLockedException`.
+
+`SparklesOptions.builder()` sets the options of a dataset, and `SparklesOptions.DEFAULT`
+holds the defaults.
+
+| Option | Default | Effect |
+|---|---|---|
+| `unionDefaultGraph` | false | Queries and updates see the union of the named graphs as their default graph. |
+| `fallback` | `AUTO` | `NEVER` makes a query that needs ARQ fail, and `ALWAYS` runs every query in ARQ. |
+| `blankNodeLabels` | `DATASET` | `TRANSACTION` scopes the labels that Jena makes to the transaction that writes them. |
+| `autocommit` | false | A write outside a transaction commits on its own instead of throwing. |
+| `readOnly` | false | Every write fails. |
+| `outboundPolicy` | `OPEN` | `SERVER` applies the server's rules to SERVICE and `LOAD`, which refuse private addresses. |
+| `termCacheSize` | 262,144 | The most distinct terms that one result keeps decoded at a time. |
+
+### Jena transactions
+
+A dataset has many readers and one writer, as TDB2 does. Jena's `begin`, `commit`,
+`abort`, `end` and `promote` keep their meaning. A read transaction reads one commit for
+its whole length. A write transaction runs on a worker thread that holds the writer
+lock, so a transaction may move between threads, as a virtual thread does. `add` and
+`delete` collect their changes in a buffer, which goes to the worker in batches of 4,096
+operations, before every read in the transaction, and at the commit.
+
+A write in a `READ_PROMOTE` transaction promotes it. The promotion succeeds only if no
+commit has landed since the transaction began, and otherwise the write throws
+`JenaTransactionException`. In a `READ_COMMITTED_PROMOTE` transaction, the promotion waits
+for the writer lock and continues from the newest commit. A write outside a transaction
+throws `JenaTransactionException`, as in TDB2, unless the dataset was opened with
+`autocommit(true)`. Each such write is then a commit of its own, which is slow for many
+writes.
+
+An iterator from `find` inside a transaction throws `JenaTransactionException` once the
+transaction has ended. Outside a transaction, an iterator reads the commit that was the
+newest when it was made. Close or exhaust iterators, because an open one keeps its
+commit's data alive.
+
+### Jena queries and updates
+
+A query through `QueryExecution` or `QueryExec` runs in Sparkles when the dataset is a
+`DatasetGraphSparkles` or a plain wrapper of one. Its solutions come back to Jena in
+batches. Jena builds the result of a CONSTRUCT, ASK or DESCRIBE query from those
+solutions, as it does for TDB2. Timeouts and `abort()` cancel the native query.
+
+A query runs in ARQ over the dataset's `find()` when it uses something that Sparkles
+cannot see. The first case is a function that Jena's `FunctionRegistry` knows and
+Sparkles does not, or a `java:` function. The second is a property function or a custom
+aggregate that is registered in Jena and unknown to Sparkles. The third is a dataset
+description that names `urn:x-arq:UnionGraph` or `urn:x-arq:DefaultGraph`. A query that
+Sparkles rejects as a syntax error or as unsupported also runs in ARQ. Functions that
+both know, such as `afn:localname` and the `geof:` functions, run in Sparkles. Each
+fallback is logged at debug level with its reason, and `dsg.stats()` counts the queries
+by where they ran.
+
+An update request through `UpdateExecution` or `UpdateExec` outside a transaction is one
+commit. Inside a write transaction it joins the transaction. `INSERT DATA` and
+`DELETE DATA` go to the transaction as quad batches. The other operations run in
+Sparkles as one request, except an operation that needs Java, which runs in ARQ in its
+place in the request. When an operation fails after it began to change data, Sparkles
+aborts the transaction, and `commit()` then throws `JenaTransactionException`.
+
+These context symbols apply to a query or update. They can be set in the global context,
+in the dataset's `getContext()` or on one execution.
+
+| Symbol | Meaning |
+|---|---|
+| `Sparkles.UNION_DEFAULT_GRAPH`, TDB2's `tdb2:unionDefaultGraph` | The default graph is the union of the named graphs. |
+| `Sparkles.FALLBACK` | The fallback mode, as a `SparklesFallback` or its name. |
+| `Sparkles.INCLUDE_INFERRED` | The reasoner's `urn:x-sparkles:inferred` graph is part of the default graph. |
+| `Sparkles.MAX_ROWS`, `MAX_MEMORY_BYTES`, `MAX_ROWS_PRODUCED` | The request's budgets. |
+| `Sparkles.NO_CACHE` | The request neither reads nor fills the result cache. |
+| `ARQ.httpServiceAllowed` | `false` refuses SERVICE. |
+
+The union default graph has TDB2's scope. It changes what queries and updates see as the
+default graph, while `getDefaultGraph()` and `find` on the default graph still reach the
+stored default graph.
+
+### Loads, receipts and the TDB2 import
+
+`loadFiles(paths)` and `loadFiles(paths, graph)` load files with Sparkles' parsers in one
+commit, taking each file's format from its extension. `load(InputStream, Lang)` loads data
+from a stream the same way. `bulkSink()` returns a `StreamRDF` for Jena's parsers. It sends
+quads in batches of 65,536 to one write transaction and commits at `finish()`. These run
+outside a Jena transaction and throw `JenaTransactionException` when the thread is in
+one. `lastReceipt()` returns the receipt of the last commit the thread made on the
+dataset, and `headCommit()` returns the newest commit.
+
+`SparklesDatasets.importTdb2(tdbDir, sparklesDir)` copies a TDB2 database into an empty
+Sparkles database in one commit. It reads the TDB2 database with Jena's own code, so
+literals come back as TDB2 stored them, and it copies the prefixes. It returns an
+`ImportReport` with the counts, the receipt and the time taken.
+
+### Blank node labels
+
+A stored blank node's label is `b` followed by a hexadecimal number, and that label names
+the node in every read and write. A label that Jena made, such as the label of
+`NodeFactory.createBlankNode()`, is mapped to the stored node when its transaction
+commits. Later transactions find the node by that label, and reads return the label. The
+mapping costs about 150 bytes of memory per label and lasts while the dataset is open, so
+after a restart the node has its `b…` label. `blankNodeLabels(BlankNodeLabels.TRANSACTION)`
+turns the mapping off, which suits programs that write many new blank nodes through `add`.
+Bulk loads never add to the mapping.
+
+### Jena exceptions
+
+Each error of the engine becomes the exception that Jena raises in the same situation, and
+each also implements `SparklesError`, which gives the engine's kind and message.
+
+| Exception | Base class | Raised for |
+|---|---|---|
+| `SparklesQueryParseException` | `QueryParseException` | a query or update that Sparkles cannot parse |
+| `SparklesRiotException` | `RiotException` | data that does not parse |
+| `QueryCancelledException` | | a timeout or a cancelled query |
+| `SparklesBudgetExceededException` | `QueryExecException` | a request past a budget, with the budget, limit and amount |
+| `SparklesUnsupportedException` | `QueryExecException` | a feature this build lacks |
+| `SparklesTransactionException` | `JenaTransactionException` | a write conflict, or a transaction aborted by a failed update |
+| `SparklesStorageException`, `SparklesDatasetLockedException` | `JenaException` | corruption, a full disk, a directory open in another process |
+
+The other classes are `SparklesInvalidException`, `SparklesWriteRejectedException`,
+`SparklesNotFoundException`, `SparklesNotPermittedException` and
+`SparklesInternalException`.
+
+### Differences from TDB2
+
+* TDB2 stores many literals by value, so `"01"^^xsd:integer` reads back as
+  `"1"^^xsd:integer`. Sparkles keeps the lexical form a literal was written with. Value
+  comparisons and `=` in SPARQL agree on both.
+* Sparkles makes no commit for a write transaction that changed nothing, so such a
+  transaction does not make a later promotion fail, as it does in TDB2.
+* Prefixes are saved at once and outside the write transaction, so a prefix set in a
+  transaction that aborts stays.
+* A failed SPARQL Update aborts the transaction it ran in. TDB2 keeps the partial changes
+  and leaves the decision to the caller.
+* Sparkles stores RDF triples only. A triple whose predicate is a blank node or a literal,
+  or whose subject is a literal, fails at the next flush of the write buffer.
+* Graph listeners see changes made through the `Graph` and `Model` APIs, and not those of
+  SPARQL Update in Sparkles or of bulk loads, as in TDB2.
+* A query keeps its whole result in native memory while Jena reads it. That memory is
+  outside the Java heap and `-Xmx`, and `Sparkles.MAX_MEMORY_BYTES` bounds it.
 
 ## Rust client
 
