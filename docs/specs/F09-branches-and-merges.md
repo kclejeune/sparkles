@@ -1351,21 +1351,40 @@ the CLI and the UI, each with its tests.
   global `--branch` of `query`, `update`, `load`, `dump`, `log`, `diff`, `snapshot`,
   `compact`, `stats`, `clone` and `patch`. `sparkles check` verifies the branch table,
   the links and the merge records.
-* **UI.** A branch menu in the dataset header, a Branch field on the query page, the
-  Branches panel with the conflict-free Merge button, and merge commits in History.
+* **UI.** A branch menu in the dataset header keeps the choice in `?branch=`, and every
+  panel of the dataset page works on the chosen branch. The query page has a Branch
+  field next to At. The Branches panel creates, protects and deletes branches, warns
+  before deleting one with unmerged commits, and merges a branch without conflicts after
+  a preview, sending the previewed heads as `expect`. A conflicting merge shows the cells
+  and the equivalent `sparkles merge` command. History marks merge commits and the branch
+  of inherited commits. In-memory datasets show no branch controls.
 
-Tests cover A1–A22. The library tests run A1, A3–A9, A11–A15, A17, A20 and A21, with
-failpoint crash tests for creation and for a merge between its record and its log
-(A15). The router tests run A1–A5, A7, A10–A12, A14, A16, A19 and A20, and the CLI tests
-run A22. A21 runs 40 random histories in CI (`SPARKLES_A21_RUNS` raises it), each with
-inserts, deletes, blank nodes, named graphs, compactions, bulk commits, branch creation
-and merges in both directions, and checks every merge against the three-way rule
-applied to dumps.
+Tests cover A1–A22. The library tests run A1, A3–A9, A11–A15, A17, A18, A20 and A21,
+with failpoint crash tests for creation and for a merge between its record and its log
+(A15), a partial compaction of a linked branch, and branches of branches past the depth
+limit. The router tests run A1–A5, A7, A9–A12, A14, A16, A19 and A20, the CLI tests run
+A22, and the UI's mock and real-server end-to-end tests cover the selector, the panel and
+the Merge button. A21 runs 40 random histories in CI (`SPARKLES_A21_RUNS` raises it),
+each with inserts, deletes, blank nodes, named graphs, compactions, bulk commits, branch
+creation and merges in both directions, and checks every merge against the three-way
+rule applied to dumps.
 
-[[BENCH]]
+**Performance.** At 10.5M triples ([BENCHMARKS](../BENCHMARKS.md#branches-and-merges-105m-triples)),
+creating a branch took 19.5 to 32.7 ms over HTTP and wrote about 1.4 KB of files; the
+store's first open adds a 68 KiB change-log segment. A query on a new linked branch took
+as long as on `main` (38.7 against 38.3 ms). A merge of 10,000 inserted quads into a
+`main` with 10,000 of its own took 115 ms, and its preview 62 ms. An interleaved A/B of
+the 1.05M query suite against the previous `main` showed no regression on `main`'s
+paths: server CPU time per request at 0.94 times and wall time at 0.89 times the old
+build's, both within the noise of a heavily loaded machine. The merge base of 64 branches
+with 10,000 merges was not measured.
 
 **Deviations.**
 
+* **First generation.** A branch's first generation is `gen-0001`, linked or built, not
+  `gen-0000`. Generation number 0 names an in-memory store's generation, so commits made
+  in a `gen-0000` would have reported their generation as `mem`. Rebuilds continue
+  from `gen-0002`.
 * **Layered vocabulary.** A linked generation's delta vocabulary is one in-memory
   vocabulary that starts with a copy of the upstream entries below the recorded length,
   read from the segments' files, followed by the branch's own file. Ids are as §4.2

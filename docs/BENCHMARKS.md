@@ -1214,6 +1214,37 @@ went from 213 ms to 67 ms, and a read 100 commits before the head from 486 ms to
 ([F06 Outcome](specs/F06-snapshots-and-point-in-time.md#replay-speedups-rdf-patch-and-the-change-feed)).
 The 10.5M run has not been repeated.
 
+### Branches and merges (10.5M triples)
+
+A release build loaded the 10.5M-triple benchmark data into a new database and served it
+over HTTP, on a machine that other builds kept at a load average of 35 to 85 on 16
+cores. Each figure is one `curl` request's `time_total`, except the query rows, which
+are medians of 15 interleaved requests ([F09](specs/F09-branches-and-merges.md)).
+
+| Step | Time |
+|---|---:|
+| Create a branch of `main` at its head (four runs) | 19.5–32.7 ms |
+| `star-join` on `main` | 38.3 ms |
+| `star-join` on the new, linked branch | 38.7 ms |
+| Preview a merge of 10,000 inserted quads into a `main` with 10,000 of its own | 61.9 ms |
+| That merge, committed | 114.9 ms |
+| First request to a linked branch after a restart | 3.2 ms |
+
+Creating a branch writes about 1.4 KB of files: the branch's identity, its link, its
+commit catalog and its copies of the configuration. When the branch's store first opens,
+its change log preallocates a 68 KiB segment, so a new branch takes about 70 KB on disk.
+A query on a linked branch reads `main`'s index files through the same cached blocks, and
+here took as long as on `main`. The first request after a restart replayed no inherited
+log, because `main` had no updates at the branch's starting commit; the replay costs
+what a past-state read of the same commits costs.
+
+The branch work left `main`'s read and write paths as they were. An interleaved A/B of the
+1.05M query suite, three rounds of 20 requests per query against the previous `main`,
+measured the server's CPU time per request at a geometric mean of 0.94 times the old
+build's and the wall time at 0.89 times, with the machine as busy as above. The
+differences are within the noise of that machine, and an insert and delete pair used no
+more CPU (1.5 against 2.0 ms).
+
 ### Backup repositories (10.5M triples)
 
 `mise run bench:backup` (`scripts/backup-bench.sh`) ran against the 10.5M-quad benchmark
