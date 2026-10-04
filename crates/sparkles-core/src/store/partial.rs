@@ -364,10 +364,14 @@ pub(crate) fn write(
     interrupt: &crate::builder::InterruptFn,
 ) -> Result<IndexMeta> {
     let g = &snap.generation;
-    let from = g
-        .dir
-        .as_ref()
-        .ok_or_else(|| Error::invalid("the generation has no index files"))?;
+    // a branch's linked generation reads its upstream's files
+    let from = match g.linked() {
+        Some(l) => l.base_dir().to_path_buf(),
+        None => g
+            .dir
+            .clone()
+            .ok_or_else(|| Error::invalid("the generation has no index files"))?,
+    };
     std::fs::create_dir_all(dir)?;
     for f in ["vocab.dat", "vocab.off", "vocab.idx"] {
         match std::fs::copy(from.join(f), dir.join(f)) {

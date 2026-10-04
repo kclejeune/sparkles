@@ -1172,3 +1172,42 @@ fn a21_cell_conflicts_match_the_dumps() {
         assert_eq!(got, want, "run {run}");
     }
 }
+
+/// A linked branch whose delta adds no terms compacts partially, copying its upstream's
+/// vocabulary.
+#[test]
+fn a_linked_branch_compacts_partially_from_its_upstreams_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    let mut nt = String::new();
+    for i in 0..2000 {
+        nt.push_str(&format!("<urn:s{i}> <urn:p> <urn:o{}> .\n", i % 50));
+    }
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        crate::io::RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    // only terms the base vocabulary has, and numbers
+    apply(
+        &dev,
+        "+<urn:s1> <urn:p> <urn:o7> .\n-<urn:s2> <urn:p> <urn:o2> .\n+<urn:s3> <urn:p> \"5\"^^<http://www.w3.org/2001/XMLSchema#integer> .",
+    );
+    let before = dump(&dev);
+    let r = dev
+        .compact_with(&CompactOptions {
+            partial: Some(PartialMode::Always),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(r.mode, "partial", "{r:?}");
+    assert_eq!(dump(&dev), before);
+    assert!(dev.snapshot().generation.linked().is_none());
+    drop(dev);
+    drop(s);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    assert_eq!(dump(&s.branch("dev").unwrap()), before);
+}
