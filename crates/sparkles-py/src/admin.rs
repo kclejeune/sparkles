@@ -13,8 +13,6 @@ use serde::de::DeserializeOwned;
 use sparkles::commit::{CommitInfo, CommitRange};
 use sparkles::history::{At, NamedSnapshot, Retention};
 use std::path::PathBuf;
-#[cfg(any(feature = "shacl", feature = "shex"))]
-use std::sync::Arc;
 
 static JSON: PyOnceLock<(Py<PyAny>, Py<PyAny>)> = PyOnceLock::new();
 
@@ -323,33 +321,9 @@ pub fn vector_indexes<'py>(py: Python<'py>, ds: &sparkles::Dataset) -> PyResult<
 
 // ---------------------------------------------------------- write validation ----
 
-/// The guard this binding installed, to report its status.
-pub enum Guard {
-    #[cfg(feature = "shacl")]
-    Shacl(Arc<sparkles_shacl::guard::ShaclGuard>),
-    #[cfg(feature = "shex")]
-    Shex(Arc<sparkles_shex::guard::ShexGuard>),
-    /// in a build without SHACL and ShEx, there is none
-    #[cfg(not(any(feature = "shacl", feature = "shex")))]
-    #[allow(dead_code)]
-    None(std::convert::Infallible),
-}
-
-/// Install the write-time validation a persistent dataset's `validation.json` sets
-/// up, as the server does when it opens one. Without the feature for its language, the
-/// store keeps refusing writes.
-pub fn install(store: &sparkles::store::Store) -> anyhow::Result<Option<Guard>> {
-    #[cfg(feature = "shacl")]
-    if let Some(g) = sparkles_shacl::guard::install(store)? {
-        return Ok(Some(Guard::Shacl(g)));
-    }
-    #[cfg(feature = "shex")]
-    if let Some(g) = sparkles_shex::guard::install(store)? {
-        return Ok(Some(Guard::Shex(g)));
-    }
-    let _ = store;
-    Ok(None)
-}
+/// The write-time validation of a dataset (the library's guard, which
+/// `sparkles::Dataset::open` installs from `validation.json`).
+pub use sparkles::write_guard::WriteGuard as Guard;
 
 /// Set, replace or (with `None` or mode `off`) remove the write-time validation.
 /// Returns `{"status": "installed" | "not-conforming" | "removed", "summary": …}` and
@@ -444,29 +418,8 @@ pub fn set_write_validation<'py>(
 }
 
 /// The installed guard's configuration and status.
-#[cfg_attr(
-    not(any(feature = "shacl", feature = "shex")),
-    allow(unreachable_code, unused_variables)
-)]
 pub fn guard_status<'py>(py: Python<'py>, g: &Guard) -> PyResult<Bound<'py, PyDict>> {
-    let d = PyDict::new(py);
-    match g {
-        #[cfg(feature = "shacl")]
-        Guard::Shacl(g) => {
-            d.set_item("language", "shacl")?;
-            d.set_item("config", to_py(py, g.config())?)?;
-            d.set_item("status", to_py(py, &g.status())?)?;
-        }
-        #[cfg(feature = "shex")]
-        Guard::Shex(g) => {
-            d.set_item("language", "shex")?;
-            d.set_item("config", to_py(py, g.config())?)?;
-            d.set_item("status", to_py(py, &g.status())?)?;
-        }
-        #[cfg(not(any(feature = "shacl", feature = "shex")))]
-        Guard::None(n) => match *n {},
-    }
-    Ok(d)
+    Ok(to_py(py, &g.json())?.cast_into::<PyDict>()?)
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

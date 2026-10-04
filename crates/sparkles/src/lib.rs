@@ -11,6 +11,8 @@ pub use sparkles_core::{
 
 pub mod dataset;
 pub mod querybuilder;
+pub mod reasoning;
+pub mod write_guard;
 
-pub use dataset::{Dataset, GraphView, QuadIter, Solution, Solutions, Transaction};
+pub use dataset::{Dataset, DatasetOptions, GraphView, QuadIter, Solution, Solutions, Transaction};
 pub use sparkles_core::{Budget, BudgetKind, Error, Result};

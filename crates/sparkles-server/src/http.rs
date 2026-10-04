@@ -3082,13 +3082,8 @@ fn dataset_info(st: &AppState, ds: &Dataset) -> J {
     if let Some(f) = ds.store.forked_from() {
         info["forkedFrom"] = json!(f);
     }
-    if let Some(o) = ds
-        .store
-        .root()
-        .and_then(crate::clone::read_origin)
-        .or_else(|| ds.mem_origin.clone())
-    {
-        info["origin"] = o;
+    if let Some(o) = ds.dataset.origin() {
+        info["origin"] = o.clone();
     }
     // a restore: the backup it came from
     #[cfg(feature = "backup")]

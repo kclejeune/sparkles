@@ -38,8 +38,6 @@ pub struct PyDataset {
     inner: RwLock<Option<sparkles::Dataset>>,
     path: Option<String>,
     writer: WriterSlot,
-    /// the write-time validation installed through this handle
-    guard: Mutex<Option<admin::Guard>>,
 }
 
 /// Arguments shared by the query methods of datasets and transactions.
@@ -209,7 +207,6 @@ impl PyDataset {
             inner: RwLock::new(Some(ds)),
             path,
             writer: Arc::new(Mutex::new(None)),
-            guard: Mutex::new(None),
         }
     }
 
@@ -222,26 +219,20 @@ impl PyDataset {
         let ds = py
             .detach(|| sparkles::Dataset::open_with(&path, opts))
             .py(py)?;
-        // the write-time validation the database sets up, as the server installs it;
-        // when it cannot be loaded, writes stay refused
-        let guard = match py.detach(|| admin::install(ds.store())) {
-            Ok(g) => g,
-            Err(e) => {
-                let msg = format!(
-                    "{shown}: write-time validation could not be loaded, so writes are refused: {e:#}"
-                );
-                PyErr::warn(
-                    py,
-                    &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
-                    &std::ffi::CString::new(msg).unwrap_or_default(),
-                    1,
-                )?;
-                None
-            }
-        };
-        let d = PyDataset::from_dataset(ds, Some(shown));
-        *d.guard.lock().unwrap() = guard;
-        Ok(d)
+        // the library installs the write-time validation the database sets up; when it
+        // cannot be loaded, writes stay refused
+        if let Some(e) = ds.guard_error() {
+            let msg = format!(
+                "{shown}: write-time validation could not be loaded, so writes are refused: {e}"
+            );
+            PyErr::warn(
+                py,
+                &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+                &std::ffi::CString::new(msg).unwrap_or_default(),
+                1,
+            )?;
+        }
+        Ok(PyDataset::from_dataset(ds, Some(shown)))
     }
 
     fn in_memory(union_default_graph: bool) -> PyDataset {
@@ -1324,7 +1315,7 @@ impl PyDataset {
         let ds = self.ds_for_write(py)?;
         let (out, guard) = admin::set_write_validation(py, &ds, config)?;
         if let Some(g) = guard {
-            *self.guard.lock().unwrap() = g;
+            ds.set_write_guard(g);
         }
         Ok(out)
     }
@@ -1334,8 +1325,7 @@ impl PyDataset {
         &self,
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
-        self.ds(py)?;
-        let g = self.guard.lock().unwrap();
+        let g = self.ds(py)?.write_guard();
         g.as_ref().map(|g| admin::guard_status(py, g)).transpose()
     }
 }

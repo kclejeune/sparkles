@@ -13,6 +13,16 @@ spargebra.workspace = true
 rustc-hash.workspace = true
 regex.workspace = true
 uuid.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+# the satellites behind the features of the same names
+sparkles-reasoner = { workspace = true, optional = true }
+sparkles-shacl = { workspace = true, optional = true }
+sparkles-shex = { workspace = true, optional = true }
+sparkles-graphql = { workspace = true, optional = true }
 
 [dev-dependencies]
 oxrdfio.workspace = true
@@ -29,3 +39,11 @@ geo-epsg = ["geo-proj4", "sparkles-core/geo-epsg"]
 zstd = ["sparkles-core/zstd"]
 brotli = ["sparkles-core/brotli"]
 failpoints = ["sparkles-core/failpoints"]
+# the reasoner's closure cache, and later its handle (RDFS on read needs no feature)
+reasoning = ["dep:sparkles-reasoner"]
+# SHACL write guards
+shacl = ["dep:sparkles-shacl"]
+# ShEx write guards
+shex = ["dep:sparkles-shex"]
+# the GraphQL configuration of a dataset
+graphql = ["dep:sparkles-graphql"]
