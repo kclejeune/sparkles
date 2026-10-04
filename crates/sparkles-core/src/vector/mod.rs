@@ -44,7 +44,7 @@ pub fn parse_b64(lex: &str) -> std::result::Result<Vec<f32>, String> {
     let at =
         |i: usize, what: &str| format!("malformed spk:vectorB64 literal at offset {i}: {what}");
     let b = lex.as_bytes();
-    if b.is_empty() || b.len() % 4 != 0 {
+    if b.is_empty() || !b.len().is_multiple_of(4) {
         return Err(at(b.len(), "the length is not a positive multiple of 4"));
     }
     let val = |i: usize, c: u8| -> std::result::Result<u32, String> {
@@ -76,18 +76,21 @@ pub fn parse_b64(lex: &str) -> std::result::Result<Vec<f32>, String> {
         let three = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
         bytes.extend_from_slice(&three[..3 - pad]);
     }
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(at(b.len(), "not a whole number of 4-byte values"));
     }
     let out: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     if out.len() > MAX_DIM {
         return Err(at(0, "more than 16384 elements"));
     }
     if let Some(i) = out.iter().position(|x| !x.is_finite()) {
-        return Err(at(i * 4 / 3 * 4 / 4, "a value that is not finite"));
+        // value i starts at byte 4i, in the base64 group that begins at character 4i / 3 * 4
+        return Err(at(i * 4 / 3 * 4, "a value that is not finite"));
     }
     Ok(out)
 }
