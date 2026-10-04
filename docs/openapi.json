@@ -5144,6 +5144,10 @@
           "source": {
             "type": "string"
           },
+          "squash": {
+            "description": "Apply the changes as one commit that records no second parent.",
+            "type": "boolean"
+          },
           "target": {
             "description": "Default `main`.",
             "type": "string"
@@ -5214,6 +5218,10 @@
           },
           "source": {
             "type": "object"
+          },
+          "squashed": {
+            "description": "A squash merge: the commit records no second parent.",
+            "type": "boolean"
           },
           "target": {
             "type": "object"
@@ -15266,6 +15274,14 @@
             }
           },
           {
+            "description": "Preview a squash merge.",
+            "in": "query",
+            "name": "squash",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "description": "The most conflict cells listed (default 100, at most 10000).",
             "in": "query",
             "name": "limit",
@@ -15317,7 +15333,7 @@
         "x-sparkles-permission": "read"
       },
       "post": {
-        "description": "Merges `source` into `target` as one commit of kind `merge`: a fast-forward when the target has not moved since the merge base, a three-way merge of quad sets otherwise. Conflicts that resolutions and `onConflict` leave answer `409` with the conflict report, and nothing is written. `dryRun: true` answers the write preview of the merge commit with the merge fields under `merge`.",
+        "description": "Merges `source` into `target` as one commit of kind `merge`: a fast-forward when the target has not moved since the merge base, a three-way merge of quad sets otherwise. With `squash: true` the changes are one commit of kind `merge` that records no second parent, so the target does not descend from the source, and a squash that changes nothing makes no commit. Conflicts that resolutions and `onConflict` leave answer `409` with the conflict report, and nothing is written. `dryRun: true` answers the write preview of the merge commit with the merge fields under `merge`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#merges"
         },

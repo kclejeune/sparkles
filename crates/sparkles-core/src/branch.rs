@@ -217,6 +217,9 @@ pub struct Resolution {
 pub struct MergeOptions {
     /// refuse anything but a fast-forward
     pub ff_only: bool,
+    /// apply the source's changes as one commit that records no second parent, so the
+    /// target does not descend from the source afterwards
+    pub squash: bool,
     pub scope: ConflictScope,
     /// the rule for every conflict no resolution covers (`None`: fail)
     pub on_conflict: Option<Take>,
@@ -284,6 +287,8 @@ pub struct MergeReport {
     pub merged: bool,
     pub up_to_date: bool,
     pub fast_forward: bool,
+    /// a squash merge: one commit without a second parent
+    pub squashed: bool,
     pub source: NamedCommitRef,
     pub target: NamedCommitRef,
     pub base: Option<NamedCommitRef>,
@@ -300,6 +305,32 @@ pub struct MergeReport {
     /// the conflicts that remain (previews only)
     #[serde(skip)]
     pub conflicts: Option<ConflictReport>,
+}
+
+impl MergeReport {
+    /// A report of nothing done yet, merging `source` into `target` over `base`.
+    pub fn new(
+        source: NamedCommitRef,
+        target: NamedCommitRef,
+        base: Option<NamedCommitRef>,
+    ) -> MergeReport {
+        MergeReport {
+            merged: false,
+            up_to_date: false,
+            fast_forward: false,
+            squashed: false,
+            source,
+            target,
+            base,
+            inserted: 0,
+            deleted: 0,
+            conflicts_found: 0,
+            conflicts_resolved: 0,
+            commit: None,
+            inferences_excluded: None,
+            conflicts: None,
+        }
+    }
 }
 
 /// The outcome of [`Store::merge`](crate::store::Store::merge).

@@ -1252,6 +1252,17 @@ holds the database.
 **A23. Performance (bench, not CI).** The targets of §6.4 on 10.5M quads, recorded in
 `docs/BENCHMARKS.md`.
 
+The examples from A24 on cover Phase 2 and the cherry-picks of Phase 3. They use the
+setup above.
+
+**A24. Squash merges.** `dev` at `main` 2 inserts c (commit 3) and d (commit 4).
+`POST /$/merge/ds {"source":"dev","squash":true}` → `200`, `squashed: true`, a commit 3
+on `main` of kind `merge` with the message `squash dev (commit 4) into main` and no
+`mergedFrom`. Q on `main` equals Q on `dev`, and `GET /$/branches/ds/dev` still reports
+`ahead: 2`. The same request again → `upToDate: true` and no commit. After `dev` inserts
+e, a squash inserts only e. An ordinary merge after that records the second parent, and
+`dev` is then 0 ahead. A protected `main` accepts squash merges.
+
 ## 10. Open questions
 
 1. **Exempt predicates.** Should `cell` scope exempt some predicates by default, such as

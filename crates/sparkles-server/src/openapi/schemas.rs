@@ -645,6 +645,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "source": { "type": "string" },
                 "target": { "type": "string", "description": "Default `main`." },
                 "ff": string_enum(&["auto", "only"]),
+                "squash": { "type": "boolean", "description": "Apply the changes as one commit that records no second parent." },
                 "conflicts": string_enum(&["cell", "subject", "quad"]),
                 "onConflict": string_enum(&["fail", "ours", "theirs", "union"]),
                 "resolutions": array(json!({
@@ -681,6 +682,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "merged": { "type": "boolean" },
                 "upToDate": { "type": "boolean" },
                 "fastForward": { "type": "boolean" },
+                "squashed": { "type": "boolean", "description": "A squash merge: the commit records no second parent." },
                 "source": { "type": "object" },
                 "target": { "type": "object" },
                 "base": { "type": ["object", "null"] },

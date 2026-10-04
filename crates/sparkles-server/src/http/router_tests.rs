@@ -16,6 +16,7 @@ use tower::ServiceExt;
 mod auth;
 #[cfg(feature = "backup")]
 mod backup;
+mod branch_ops;
 mod branches;
 mod clone;
 mod cost;

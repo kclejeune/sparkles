@@ -330,11 +330,7 @@ impl Store {
                 "a branch cannot be merged into itself",
             ));
         }
-        if matches!(o.on_conflict, Some(Take::Objects(_))) {
-            return Err(branch::invalid_merge(
-                "onConflict takes ours, theirs, union or fail",
-            ));
-        }
+        check_options(o)?;
         let src = self.branch(source)?;
         let tgt = self.branch(target)?;
         let (sid, tid) = (src.dataset_id, tgt.dataset_id);
@@ -392,31 +388,19 @@ impl Store {
                     return Err(Error::Branch(Box::new(e)));
                 }
             };
-            let named_src = NamedCommitRef {
-                branch: Some(source.to_string()),
-                branch_id: sid,
-                seq: s_head,
-            };
-            let named_tgt = NamedCommitRef {
-                branch: Some(target.to_string()),
-                branch_id: tid,
-                seq: t_head,
-            };
-            let mut report = MergeReport {
-                merged: false,
-                up_to_date: false,
-                fast_forward: false,
-                source: named_src.clone(),
-                target: named_tgt.clone(),
-                base: Some(set.named(base)),
-                inserted: 0,
-                deleted: 0,
-                conflicts_found: 0,
-                conflicts_resolved: 0,
-                commit: None,
-                inferences_excluded: None,
-                conflicts: None,
-            };
+            let mut report = MergeReport::new(
+                NamedCommitRef {
+                    branch: Some(source.to_string()),
+                    branch_id: sid,
+                    seq: s_head,
+                },
+                NamedCommitRef {
+                    branch: Some(target.to_string()),
+                    branch_id: tid,
+                    seq: t_head,
+                },
+                Some(set.named(base)),
+            );
             if base == sc {
                 report.up_to_date = true;
                 return Ok(MergeOutcome::UpToDate(report));
@@ -429,85 +413,180 @@ impl Store {
                 ));
             }
             report.fast_forward = ff;
-            let dopts = DiffOptions {
-                max_quads: o.max_quads,
-                cancel: o.cancel.clone(),
-                deadline: o.deadline,
-                ..Default::default()
-            };
-            let t_o = if ff {
-                Toggles::default()
+            report.squashed = o.squash;
+            let what =
+                format!("merging {source} (commit {s_head}) into {target} (commit {t_head})");
+            let writing = if o.squash {
+                // the changes alone: no second parent, so no commit without a change
+                Writing {
+                    kind: CommitKind::Merge,
+                    message: format!("squash {source} (commit {s_head}) into {target}"),
+                    record: None,
+                    force: false,
+                    what,
+                }
             } else {
-                self.toggles(&set, base, tc, &dopts)?
+                Writing {
+                    kind: CommitKind::Merge,
+                    message: format!("merge {source} (commit {s_head}) into {target}"),
+                    record: Some(MergeRec {
+                        seq: 0,
+                        source: sc,
+                        resolved: 0,
+                        flags: if ff { MERGE_FAST_FORWARD } else { 0 },
+                    }),
+                    force: true,
+                    what,
+                }
             };
-            let t_t = self.toggles(&set, base, sc, &dopts)?;
-            let snap = tgt.snapshot();
-            let plan = plan_merge(&snap, t_o, t_t, o)?;
-            report.inserted = plan.changes.values().filter(|i| **i).count() as u64;
-            report.deleted = plan.changes.len() as u64 - report.inserted;
-            report.conflicts_found = plan.found;
-            report.conflicts_resolved = plan.resolved;
-            report.inferences_excluded = plan.excluded;
-            if !plan.remaining.is_empty() {
-                let c = conflict_report(&snap, &plan, o, &named_src, &named_tgt, &report)?;
-                if preview {
-                    report.conflicts = Some(c);
-                    return Ok(MergeOutcome::Merged(report));
-                }
-                return Ok(MergeOutcome::Conflicts(Box::new(c)));
+            match self.three_way(&set, &tgt, report, base, sc, tc, o, preview, writing)? {
+                Step::Done(out) => return Ok(out),
+                Step::Moved => continue,
             }
-            if preview {
-                return Ok(MergeOutcome::Merged(report));
-            }
-            let mut wo = o.write.clone();
-            if wo.message.is_none() {
-                wo.message = Some(format!("merge {source} (commit {s_head}) into {target}").into());
-            }
-            let mut txn = tgt.try_write_with(CommitKind::Merge, wo)?;
-            if txn.guard.head.seq != t_head {
-                drop(txn);
-                if o.expect_target.is_some() {
-                    return Err(branch::conflict(
-                        "head-moved",
-                        format!("the target head moved past commit {t_head}"),
-                    ));
-                }
-                continue;
-            }
-            txn.force = true;
-            txn.merge = Some(MergeRec {
-                seq: 0,
-                source: sc,
-                resolved: plan.resolved,
-                flags: if ff { MERGE_FAST_FORWARD } else { 0 },
-            });
-            let mut changes: Vec<(&QuadKey, &bool)> = plan.changes.iter().collect();
-            // deletions first, each in key order, for a deterministic log
-            changes.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
-            for (i, (k, insert)) in changes.into_iter().enumerate() {
-                if i % 65_536 == 65_535 {
-                    txn.opts.check()?;
-                }
-                match quad_ids(&mut txn, k, *insert)? {
-                    Some(q) if *insert => {
-                        txn.insert(q)?;
-                    }
-                    Some(q) => {
-                        txn.delete(q)?;
-                    }
-                    None => {}
-                }
-            }
-            let receipt = txn.commit()?;
-            report.merged = true;
-            report.commit = Some(receipt);
-            return Ok(MergeOutcome::Merged(report));
         }
         Err(branch::conflict(
             "head-moved",
             format!("{target} kept moving during the merge; try again"),
         ))
     }
+
+    /// The three-way merge of commit `theirs` into the target, whose head is `tc`, over
+    /// `base`: the toggle sets, the plan, the conflicts, and the commit `w` describes.
+    /// [`Step::Moved`] when the target's head moved before its writer lock was taken.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn three_way(
+        &self,
+        set: &BranchSet,
+        tgt: &Store,
+        mut report: MergeReport,
+        base: CommitRef,
+        theirs: CommitRef,
+        tc: CommitRef,
+        o: &MergeOptions,
+        preview: bool,
+        w: Writing,
+    ) -> Result<Step> {
+        let t_head = report.target.seq;
+        let dopts = DiffOptions {
+            max_quads: o.max_quads,
+            cancel: o.cancel.clone(),
+            deadline: o.deadline,
+            ..Default::default()
+        };
+        let t_o = if base == tc {
+            Toggles::default()
+        } else {
+            self.toggles(set, base, tc, &dopts)?
+        };
+        let t_t = if base == theirs {
+            Toggles::default()
+        } else {
+            self.toggles(set, base, theirs, &dopts)?
+        };
+        let snap = tgt.snapshot();
+        let plan = plan_merge(&snap, t_o, t_t, o)?;
+        report.inserted = plan.changes.values().filter(|i| **i).count() as u64;
+        report.deleted = plan.changes.len() as u64 - report.inserted;
+        report.conflicts_found = plan.found;
+        report.conflicts_resolved = plan.resolved;
+        report.inferences_excluded = plan.excluded;
+        if !plan.remaining.is_empty() {
+            let c = conflict_report(&snap, &plan, o, &w.what, &report)?;
+            if preview {
+                report.conflicts = Some(c);
+                return Ok(Step::Done(MergeOutcome::Merged(report)));
+            }
+            return Ok(Step::Done(MergeOutcome::Conflicts(Box::new(c))));
+        }
+        if !w.force && plan.changes.is_empty() {
+            // nothing to write and no second parent to record
+            report.up_to_date = true;
+            return Ok(Step::Done(MergeOutcome::UpToDate(report)));
+        }
+        if preview {
+            return Ok(Step::Done(MergeOutcome::Merged(report)));
+        }
+        let mut wo = o.write.clone();
+        if wo.message.is_none() {
+            wo.message = Some(w.message.into());
+        }
+        if wo.cancel.is_none() {
+            wo.cancel = o.cancel.clone();
+        }
+        if wo.deadline.is_none() {
+            wo.deadline = o.deadline;
+        }
+        let mut txn = tgt.try_write_with(w.kind, wo)?;
+        if txn.guard.head.seq != t_head {
+            drop(txn);
+            if o.expect_target.is_some() {
+                return Err(branch::conflict(
+                    "head-moved",
+                    format!("the target head moved past commit {t_head}"),
+                ));
+            }
+            return Ok(Step::Moved);
+        }
+        txn.force = w.force;
+        txn.merge = w.record.map(|r| MergeRec {
+            resolved: plan.resolved,
+            ..r
+        });
+        let mut changes: Vec<(&QuadKey, &bool)> = plan.changes.iter().collect();
+        // deletions first, each in key order, for a deterministic log
+        changes.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+        for (i, (k, insert)) in changes.into_iter().enumerate() {
+            if i % 65_536 == 65_535 {
+                txn.opts.check()?;
+            }
+            match quad_ids(&mut txn, k, *insert)? {
+                Some(q) if *insert => {
+                    txn.insert(q)?;
+                }
+                Some(q) => {
+                    txn.delete(q)?;
+                }
+                None => {}
+            }
+        }
+        let receipt = txn.commit()?;
+        if !receipt.committed {
+            report.up_to_date = true;
+            return Ok(Step::Done(MergeOutcome::UpToDate(report)));
+        }
+        report.merged = true;
+        report.commit = Some(receipt);
+        Ok(Step::Done(MergeOutcome::Merged(report)))
+    }
+}
+
+/// The options every kind of merge checks before it starts.
+pub(crate) fn check_options(o: &MergeOptions) -> Result<()> {
+    if matches!(o.on_conflict, Some(Take::Objects(_))) {
+        return Err(branch::invalid_merge(
+            "onConflict takes ours, theirs, union or fail",
+        ));
+    }
+    Ok(())
+}
+
+/// How the result of a three-way merge is committed.
+pub(crate) struct Writing {
+    pub kind: CommitKind,
+    /// the commit message unless the caller gave one
+    pub message: String,
+    /// the second parent, recorded with the commit
+    pub record: Option<MergeRec>,
+    /// commit even without a net change, to record the second parent
+    pub force: bool,
+    /// what a conflict report says the merge was doing
+    pub what: String,
+}
+
+pub(crate) enum Step {
+    Done(MergeOutcome),
+    /// the target's head moved: plan again
+    Moved,
 }
 
 /// Group the toggles, find conflicts, apply resolutions and the rule, and keep blank
@@ -837,8 +916,7 @@ fn conflict_report(
     snap: &Snapshot,
     plan: &Plan,
     o: &MergeOptions,
-    source: &NamedCommitRef,
-    target: &NamedCommitRef,
+    what: &str,
     report: &MergeReport,
 ) -> Result<ConflictReport> {
     let limit = match o.limit {
@@ -895,18 +973,11 @@ fn conflict_report(
         });
     }
     let n = plan.remaining.len() as u64;
-    let sname = source.branch.clone().unwrap_or_default();
-    let tname = target.branch.clone().unwrap_or_default();
     Ok(ConflictReport {
-        error: format!(
-            "{n} conflict{} merging {sname} (commit {}) into {tname} (commit {})",
-            if n == 1 { "" } else { "s" },
-            source.seq,
-            target.seq
-        ),
+        error: format!("{n} conflict{} {what}", if n == 1 { "" } else { "s" }),
         code: "merge-conflict",
-        source: source.clone(),
-        target: target.clone(),
+        source: report.source.clone(),
+        target: report.target.clone(),
         base: report.base.clone(),
         scope: o.scope,
         conflicts: n,

@@ -716,6 +716,11 @@ fn merge_options(st: &AppState, v: &J, preview: bool) -> ApiResult<MergeAsk> {
             ));
         }
     }
+    match v.get("squash") {
+        None | Some(J::Null) => {}
+        Some(J::Bool(b)) => o.squash = *b,
+        Some(_) => return Err(invalid("invalid-merge", "squash: true or false")),
+    }
     if let Some(c) = s("conflicts") {
         o.scope = ConflictScope::parse(&c).ok_or_else(|| {
             invalid(
@@ -784,13 +789,16 @@ fn merge_json(r: &MergeReport, stale: Option<bool>) -> J {
         });
         j["branch"] = json!(r.target.branch);
         j["branchId"] = json!(r.target.branch_id);
-        j["mergedFrom"] = commit_ref(&r.source);
+        if !r.squashed {
+            j["mergedFrom"] = commit_ref(&r.source);
+        }
         j
     });
     let mut j = json!({
         "merged": r.merged,
         "upToDate": r.up_to_date,
         "fastForward": r.fast_forward,
+        "squashed": r.squashed,
         "source": side(&r.source),
         "target": side(&r.target),
         "base": r.base.as_ref().map(side),
@@ -846,6 +854,9 @@ pub(crate) async fn preview(
         if let Some(x) = params.get(k) {
             v.insert(k.into(), x.into());
         }
+    }
+    if let Some(x) = params.get("squash") {
+        v.insert("squash".into(), matches!(x, "true" | "1" | "").into());
     }
     if let Some(l) = params.get("limit") {
         v.insert(

@@ -12,6 +12,8 @@
 
 mod backup;
 #[cfg(test)]
+mod branch_ops_tests;
+#[cfg(test)]
 mod branch_tests;
 mod branching;
 mod changelog;

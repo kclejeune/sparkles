@@ -6,11 +6,11 @@ use super::*;
 use serde_json::json;
 use std::path::Path;
 
-fn open(dir: &Path) -> Arc<AppState> {
+pub(super) fn open(dir: &Path) -> Arc<AppState> {
     Arc::new(AppState::new(dir, StoreOptions::default(), Duration::from_secs(30)).unwrap())
 }
 
-async fn update(app: &Router, ds: &str, text: &str) -> (Resp, axum::http::HeaderMap) {
+pub(super) async fn update(app: &Router, ds: &str, text: &str) -> (Resp, axum::http::HeaderMap) {
     let path = match ds.split_once('?') {
         Some((d, q)) => format!("/{d}/update?{q}"),
         None => format!("/{ds}/update"),
@@ -26,7 +26,7 @@ async fn update(app: &Router, ds: &str, text: &str) -> (Resp, axum::http::Header
 }
 
 /// The subjects of `?s <urn:p> ?o` and `?s <urn:age> ?o`, sorted.
-async fn subjects(app: &Router, path: &str) -> Vec<String> {
+pub(super) async fn subjects(app: &Router, path: &str) -> Vec<String> {
     let r = send(
         app,
         Request::post(path)
@@ -47,7 +47,7 @@ async fn subjects(app: &Router, path: &str) -> Vec<String> {
     v
 }
 
-async fn json_req(
+pub(super) async fn json_req(
     app: &Router,
     method: &str,
     path: &str,
@@ -65,12 +65,12 @@ async fn json_req(
     .await
 }
 
-async fn get(app: &Router, path: &str) -> (Resp, axum::http::HeaderMap) {
+pub(super) async fn get(app: &Router, path: &str) -> (Resp, axum::http::HeaderMap) {
     send_h(app, Request::get(path).body(Body::empty()).unwrap()).await
 }
 
 /// A persistent `ds` with commits 1 (`<urn:a> <urn:age> 30`) and 2 (`<urn:b>`).
-async fn setup(dir: &Path) -> (Arc<AppState>, Router) {
+pub(super) async fn setup(dir: &Path) -> (Arc<AppState>, Router) {
     let st = open(dir);
     st.create("ds", DbType::Persistent).unwrap();
     let app = router(st.clone());

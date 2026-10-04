@@ -523,6 +523,9 @@ pub struct MergeArgs {
     /// Refuse anything but a fast-forward
     #[arg(long)]
     pub ff_only: bool,
+    /// Apply the changes as one commit that records no second parent
+    #[arg(long)]
+    pub squash: bool,
     /// What counts as one value when both sides changed it: cell, subject or quad
     #[arg(long, default_value = "cell")]
     pub conflicts: String,
@@ -592,6 +595,7 @@ fn report_json(r: &MergeReport) -> J {
         "merged": r.merged,
         "upToDate": r.up_to_date,
         "fastForward": r.fast_forward,
+        "squashed": r.squashed,
         "source": side(&r.source),
         "target": side(&r.target),
         "base": r.base.as_ref().map(side),
@@ -617,6 +621,7 @@ fn local_merge(loc: &Path, a: &MergeArgs, res: Option<&J>, opts: StoreOptions) -
     }
     let mut o = MergeOptions {
         ff_only: a.ff_only,
+        squash: a.squash,
         scope: ConflictScope::parse(&a.conflicts)
             .with_context(|| format!("--conflicts: cell, subject or quad, not {}", a.conflicts))?,
         on_conflict: match a.on_conflict.as_str() {
@@ -723,6 +728,7 @@ fn remote_merge(a: &MergeArgs, res: Option<J>) -> Result<Out> {
         "source": a.source,
         "target": a.into,
         "ff": if a.ff_only { "only" } else { "auto" },
+        "squash": a.squash,
         "conflicts": a.conflicts,
         "onConflict": a.on_conflict,
         "inferences": if a.include_inferences { "include" } else { "exclude" },
@@ -742,6 +748,7 @@ fn remote_merge(a: &MergeArgs, res: Option<J>) -> Result<Out> {
             .append_pair("target", &a.into)
             .append_pair("conflicts", &a.conflicts)
             .append_pair("onConflict", &a.on_conflict)
+            .append_pair("squash", if a.squash { "true" } else { "false" })
             .finish();
         r.req(reqwest::Method::GET, &format!("/$/merge/{ds}?{q}"))
             .send()
@@ -802,7 +809,9 @@ fn print_merge(out: &Out, a: &MergeArgs) -> Result<()> {
     match out {
         Out::Done(j) if j["upToDate"] == true => println!("already up to date, nothing merged"),
         Out::Done(j) => {
-            let what = if j["fastForward"] == true {
+            let what = if j["squashed"] == true {
+                "squash"
+            } else if j["fastForward"] == true {
                 "fast-forward"
             } else {
                 "three-way merge"

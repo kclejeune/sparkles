@@ -9,13 +9,13 @@ use std::collections::BTreeSet;
 
 const XSD_INT: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
-fn int(n: i64) -> String {
+pub(super) fn int(n: i64) -> String {
     format!("\"{n}\"^^<{XSD_INT}>")
 }
 
 /// Apply lines `+<s> <p> <o> .` and `-…` (N-Quads) in one commit. Blank-node labels of
 /// stored nodes (`_:b…`) name them; others are new nodes scoped to the call.
-fn apply(s: &Store, lines: &str) -> Receipt {
+pub(super) fn apply(s: &Store, lines: &str) -> Receipt {
     let mut t = s.write();
     let mut labels = std::collections::HashMap::new();
     for line in lines.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -55,7 +55,7 @@ fn apply(s: &Store, lines: &str) -> Receipt {
     t.commit().unwrap()
 }
 
-fn dump_snap(snap: &Snapshot) -> BTreeSet<String> {
+pub(super) fn dump_snap(snap: &Snapshot) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     snap.for_each_quad(|q| {
         out.insert(crate::annotations::nquads_line(
@@ -67,15 +67,15 @@ fn dump_snap(snap: &Snapshot) -> BTreeSet<String> {
     out
 }
 
-fn dump(s: &Store) -> BTreeSet<String> {
+pub(super) fn dump(s: &Store) -> BTreeSet<String> {
     dump_snap(&s.snapshot())
 }
 
-fn has(s: &Store, needle: &str) -> bool {
+pub(super) fn has(s: &Store, needle: &str) -> bool {
     dump(s).iter().any(|l| l.contains(needle))
 }
 
-fn setup() -> (tempfile::TempDir, Store) {
+pub(super) fn setup() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
     apply(&s, &format!("+<urn:a> <urn:age> {} .", int(30)));
@@ -83,18 +83,18 @@ fn setup() -> (tempfile::TempDir, Store) {
     (dir, s)
 }
 
-fn merge(s: &Store, src: &str, tgt: &str, o: &MergeOptions) -> MergeOutcome {
+pub(super) fn merge(s: &Store, src: &str, tgt: &str, o: &MergeOptions) -> MergeOutcome {
     s.merge(src, tgt, o).unwrap()
 }
 
-fn merged(o: MergeOutcome) -> crate::branch::MergeReport {
+pub(super) fn merged(o: MergeOutcome) -> crate::branch::MergeReport {
     match o {
         MergeOutcome::Merged(r) => r,
         o => panic!("not merged: {o:?}"),
     }
 }
 
-fn code(e: &Error) -> &'static str {
+pub(super) fn code(e: &Error) -> &'static str {
     match e {
         Error::Branch(b) => b.code,
         e => panic!("not a branch error: {e}"),
@@ -199,7 +199,7 @@ fn a4_clean_three_way_merge() {
     assert_eq!(dump(&dev), dev_before);
 }
 
-fn a5_state() -> (tempfile::TempDir, Store) {
+pub(super) fn a5_state() -> (tempfile::TempDir, Store) {
     let (dir, s) = setup();
     s.create_branch("dev", &BranchOptions::default()).unwrap();
     let dev = s.branch("dev").unwrap();
@@ -223,7 +223,7 @@ fn a5_state() -> (tempfile::TempDir, Store) {
     (dir, s)
 }
 
-fn ages(s: &Store) -> Vec<String> {
+pub(super) fn ages(s: &Store) -> Vec<String> {
     dump(s)
         .into_iter()
         .filter(|l| l.contains("urn:age"))

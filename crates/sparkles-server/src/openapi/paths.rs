@@ -1328,13 +1328,14 @@ fn branches(p: &mut Paths) {
             .query("target", s(), "The branch to merge into (default `main`).")
             .query("conflicts", json!({ "type": "string", "enum": ["cell", "subject", "quad"] }), "What counts as one value (default `cell`).")
             .query("onConflict", json!({ "type": "string", "enum": ["fail", "ours", "theirs", "union"] }), "The rule for conflicts.")
+            .query("squash", boolean(), "Preview a squash merge.")
             .query("limit", int(), "The most conflict cells listed (default 100, at most 10000).")
             .json("200", "The preview.", "MergeResult")
             .errors(&[400, 404, 409, 410, 507]),
     );
     p.add(
         op(POST, "/$/merge/{ds}", "merge", "Branches", "Merge a branch")
-            .doc("Merges `source` into `target` as one commit of kind `merge`: a fast-forward when the target has not moved since the merge base, a three-way merge of quad sets otherwise. Conflicts that resolutions and `onConflict` leave answer `409` with the conflict report, and nothing is written. `dryRun: true` answers the write preview of the merge commit with the merge fields under `merge`.")
+            .doc("Merges `source` into `target` as one commit of kind `merge`: a fast-forward when the target has not moved since the merge base, a three-way merge of quad sets otherwise. With `squash: true` the changes are one commit of kind `merge` that records no second parent, so the target does not descend from the source, and a squash that changes nothing makes no commit. Conflicts that resolutions and `onConflict` leave answer `409` with the conflict report, and nothing is written. `dryRun: true` answers the write preview of the merge commit with the merge fields under `merge`.")
             .see("merges")
             .json_body(true, "MergeRequest")
             .json("200", "The merge.", "MergeResult")

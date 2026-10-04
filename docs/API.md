@@ -2823,6 +2823,7 @@ branches including `main`, 64 by default, and creating another answers
 type MergeRequest = {
   source: string; target?: string;              // target defaults to "main"
   ff?: "auto" | "only";                         // default "auto"
+  squash?: boolean;                             // one commit without a second parent
   conflicts?: "cell" | "subject" | "quad";      // default "cell"
   onConflict?: "fail" | "ours" | "theirs" | "union";   // default "fail"
   resolutions?: Resolution[];
@@ -2838,7 +2839,7 @@ type Resolution = {
   objects?: string[];                           // with "objects": the cell's new objects
 };
 type MergeResult = {
-  merged: boolean; upToDate: boolean; fastForward: boolean;
+  merged: boolean; upToDate: boolean; fastForward: boolean; squashed: boolean;
   source: { branch: string; seq: number }; target: { branch: string; seq: number };
   base: { branch: string; seq: number } | null;
   changes: { inserted: number; deleted: number };
@@ -2857,6 +2858,16 @@ merge other than a fast-forward answers `409 not-fast-forward`. A merge is one c
 kind `merge` on the target, also when the target already holds every change of the
 source in another history. When the source's changes are already in the target, the
 merge writes nothing and answers `upToDate: true`.
+
+**Squash merges.** With `squash: true`, the merge applies the same changes as one commit
+of kind `merge` that records no second parent. The commit carries no `mergedFrom`, and
+the target does not descend from the source afterwards, so the source stays ahead of
+its upstream and a later merge finds the same merge base again. Changes that the target
+already holds in the same state do not conflict, so squashing a branch a second time
+brings only its newer changes. A squash merge that would change nothing makes no commit
+and answers `upToDate: true`. A protected branch accepts squash merges, as it accepts
+other merges. The default message is `squash dev (commit 57) into main`, and the preview
+takes `squash=true`.
 
 **Conflicts.** The quad-level rule never conflicts, so conflicts are defined on groups
 of quads. With the default `cell` scope, a group is a graph, a subject and a predicate,
