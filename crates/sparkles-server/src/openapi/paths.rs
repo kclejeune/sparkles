@@ -1347,6 +1347,8 @@ fn branches(p: &mut Paths) {
         op(POST, "/$/merge/{ds}", "merge", "Branches", "Merge a branch")
             .doc("Merges `source` into `target` as one commit of kind `merge`: a fast-forward when the target has not moved since the merge base, a three-way merge of quad sets otherwise. With `ff: \"replay\"` and a target that holds the merge base's state, each commit of the source after the base is replayed as its own commit on the target with its kind, message and author, and records the commit it replays. With `squash: true` the changes are one commit of kind `merge` that records no second parent, so the target does not descend from the source, and a squash that changes nothing makes no commit. Conflicts that resolutions and `onConflict` leave answer `409` with the conflict report, and nothing is written. `dryRun: true` answers the write preview of the merge commit with the merge fields under `merge`.")
             .see("merges")
+            .header("Prefer", s(), "`respond-async` runs it as a cancellable task: `202` with the task and `Location: /$/tasks/{id}`.")
+            .resp("202", "Started as a task (`Prefer: respond-async`).", Some(json!({ "application/json": { "schema": sref("Task") } })))
             .json_body(true, "MergeRequest")
             .json("200", "The merge.", "MergeResult")
             .resp(
@@ -1374,6 +1376,8 @@ fn branches(p: &mut Paths) {
             .see("reverts-and-cherry-picks")
             .query("branch", s(), "The branch whose history holds the commit, and that the revert writes to (default `main`).")
             .query_req("commit", int(), "The commit to revert.")
+            .header("Prefer", s(), "`respond-async` runs it as a cancellable task: `202` with the task and `Location: /$/tasks/{id}`.")
+            .resp("202", "Started as a task (`Prefer: respond-async`).", Some(json!({ "application/json": { "schema": sref("Task") } })))
             .json_body(false, "PickRequest")
             .json("200", "The revert, with `reverted`.", "MergeResult")
             .resp(
@@ -1403,6 +1407,8 @@ fn branches(p: &mut Paths) {
             .query_req("source", s(), "The branch whose history holds the commit.")
             .query_req("commit", int(), "The commit to apply.")
             .query("branch", s(), "The branch the commit is applied to (default `main`).")
+            .header("Prefer", s(), "`respond-async` runs it as a cancellable task: `202` with the task and `Location: /$/tasks/{id}`.")
+            .resp("202", "Started as a task (`Prefer: respond-async`).", Some(json!({ "application/json": { "schema": sref("Task") } })))
             .json_body(false, "PickRequest")
             .json("200", "The cherry-pick, with `picked`.", "MergeResult")
             .resp(

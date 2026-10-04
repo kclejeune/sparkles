@@ -261,6 +261,18 @@ pub struct MergeOptions {
     pub progress: crate::task::Progress,
 }
 
+impl MergeOptions {
+    /// These options under `ctl`: its cancel flag stops the merge at its next check,
+    /// before the commit is published, its deadline ends it with a timeout, and its
+    /// progress hears how far the merge got.
+    pub fn with_control(mut self, ctl: &crate::task::Control) -> MergeOptions {
+        self.cancel = Some(ctl.cancel.flag());
+        self.deadline = ctl.deadline.or(self.deadline);
+        self.progress = ctl.progress.clone();
+        self
+    }
+}
+
 /// The objects of one side of a conflicting group, in N-Triples.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ConflictCell {

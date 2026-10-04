@@ -291,6 +291,7 @@ fn entries() -> Vec<(&'static str, Entry)> {
         }),
         op!("merge", "branches.merge", |ds| {
             ds.merge("dev", "main", &Default::default());
+            ds.merge_with("dev", "main", &Default::default(), &Control::none());
         }),
         op!("previewRevert", "branches.preview_revert", |ds| {
             ds.preview_revert("main", 3, &Default::default());

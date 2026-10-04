@@ -1262,6 +1262,9 @@ async fn execute(
     });
     o.write.dry_run = dr.clone();
     let tds = st.branch_dataset(&ds, op.target())?;
+    if dr.is_none() && respond_async(headers) {
+        return start_task(st, name, ds, op, o);
+    }
     let reasoned = tds.reasoning.read().is_some();
     let d = ds.clone();
     let (op2, o2) = (op.clone(), o.clone());
@@ -1313,6 +1316,91 @@ async fn execute(
             Ok(with_commit(resp, &tds, seq))
         }
     }
+}
+
+/// Whether the request asks for an asynchronous answer (RFC 7240 `Prefer:
+/// respond-async`).
+fn respond_async(h: &HeaderMap) -> bool {
+    h.get_all("prefer").iter().any(|v| {
+        v.to_str().is_ok_and(|s| {
+            s.split(',')
+                .any(|p| p.trim().eq_ignore_ascii_case("respond-async"))
+        })
+    })
+}
+
+/// Run a merge as a cancellable task: `202` with the task and `Location: /$/tasks/{id}`.
+/// The task's `detail` is the result, or the conflict report of a merge that conflicts
+/// (the task then fails).
+fn start_task(
+    st: &Arc<AppState>,
+    name: &str,
+    ds: Arc<Dataset>,
+    op: Op,
+    o: MergeOptions,
+) -> ApiResult {
+    task_start_check(st, None, name)?;
+    let kind = match &op {
+        Op::Merge { .. } => "merge",
+        Op::Revert { .. } => "revert",
+        Op::CherryPick { .. } => "cherry-pick",
+    };
+    let (st2, n) = (st.clone(), name.to_string());
+    let task = st.start_task_opts(st.next_task_id(), kind, name, None, true, move |h| {
+        let ctl = h.control();
+        // a task has no request deadline: it runs until it ends or is cancelled
+        let mut o = o.with_control(&ctl);
+        o.deadline = None;
+        o.write.deadline = None;
+        let t0 = std::time::Instant::now();
+        let out = op.run(&ds.store, &o);
+        let secs = t0.elapsed().as_secs_f64();
+        match out {
+            Err(e) => {
+                count_merge(&st2, &n, "refused", None, secs);
+                Err(e.into())
+            }
+            Ok(out) => {
+                count_outcome(&st2, &n, &out, secs);
+                match out {
+                    MergeOutcome::Conflicts(c) => {
+                        h.set_detail(serde_json::to_value(c.as_ref()).unwrap_or_default());
+                        Err(anyhow::anyhow!("{}", c.error))
+                    }
+                    MergeOutcome::UpToDate(r) => {
+                        h.set_detail(op.json(&r, None));
+                        Ok("up to date: nothing to change".into())
+                    }
+                    MergeOutcome::Merged(r) => {
+                        h.set_detail(op.json(&r, None));
+                        Ok(match r.commit.as_ref() {
+                            Some(c) => format!(
+                                "commit {} on {}: +{} -{}",
+                                c.commit.seq,
+                                op.target(),
+                                r.inserted,
+                                r.deleted
+                            ),
+                            None => format!("+{} -{}", r.inserted, r.deleted),
+                        })
+                    }
+                }
+            }
+        }
+    });
+    let loc = format!("/$/tasks/{}", task.id);
+    Ok((
+        StatusCode::ACCEPTED,
+        [
+            (header::LOCATION, loc),
+            (
+                header::HeaderName::from_static("preference-applied"),
+                "respond-async".to_string(),
+            ),
+        ],
+        Json(task),
+    )
+        .into_response())
 }
 
 /// Count a merge's outcome in the merge metrics.

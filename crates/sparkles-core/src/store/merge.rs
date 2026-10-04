@@ -475,6 +475,7 @@ impl Store {
         w: Writing,
     ) -> Result<Step> {
         let t_head = report.target.seq;
+        o.progress.report(0.05, "reading the changes of both sides");
         let dopts = DiffOptions {
             max_quads: o.max_quads,
             cancel: o.cancel.clone(),
@@ -492,6 +493,7 @@ impl Store {
             self.toggles(set, base, theirs, &dopts)?
         };
         let snap = tgt.snapshot();
+        o.progress.report(0.5, "finding conflicts");
         let exempt = exempt_keys(set, o);
         let plan = plan_merge(&snap, t_o, t_t, o, &exempt)?;
         report.inserted = plan.changes.values().filter(|i| **i).count() as u64;
@@ -513,8 +515,10 @@ impl Store {
             return Ok(Step::Done(MergeOutcome::UpToDate(report)));
         }
         if preview {
+            o.progress.report(1.0, "previewed");
             return Ok(Step::Done(MergeOutcome::Merged(report)));
         }
+        o.progress.report(0.7, "committing");
         let mut wo = o.write.clone();
         if wo.message.is_none() {
             wo.message = Some(w.message.into());
@@ -558,7 +562,10 @@ impl Store {
                 None => {}
             }
         }
+        // a cancel that came while the changes were applied publishes nothing
+        txn.opts.check()?;
         let receipt = txn.commit()?;
+        o.progress.report(1.0, "committed");
         if !receipt.committed {
             report.up_to_date = true;
             return Ok(Step::Done(MergeOutcome::UpToDate(report)));

@@ -13204,6 +13204,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "`respond-async` runs it as a cancellable task: `202` with the task and `Location: /$/tasks/{id}`.",
+            "in": "header",
+            "name": "Prefer",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -13227,6 +13235,16 @@
               }
             },
             "description": "The cherry-pick, with `picked`."
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Started as a task (`Prefer: respond-async`)."
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -15802,6 +15820,14 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "`respond-async` runs it as a cancellable task: `202` with the task and `Location: /$/tasks/{id}`.",
+            "in": "header",
+            "name": "Prefer",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -15825,6 +15851,16 @@
               }
             },
             "description": "The merge."
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Started as a task (`Prefer: respond-async`)."
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -18101,6 +18137,14 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "description": "`respond-async` runs it as a cancellable task: `202` with the task and `Location: /$/tasks/{id}`.",
+            "in": "header",
+            "name": "Prefer",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -18124,6 +18168,16 @@
               }
             },
             "description": "The revert, with `reverted`."
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Started as a task (`Prefer: respond-async`)."
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"

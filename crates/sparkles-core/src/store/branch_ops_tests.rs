@@ -664,3 +664,49 @@ fn a30_exempt_predicates_never_conflict() {
     s.set_merge_exempt(&[]).unwrap();
     assert!(s.merge_exempt().unwrap().is_empty());
 }
+
+#[test]
+fn a31_merges_report_progress_and_stop_when_cancelled() {
+    use crate::task::{Cancel, Control, Progress};
+    let (_dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    apply(&s.branch("dev").unwrap(), "+<urn:c> <urn:p> <urn:x> .");
+    // a cancel that comes while the merge commits publishes nothing
+    let cancel = Cancel::new();
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (c2, s2) = (cancel.clone(), seen.clone());
+    let ctl = Control {
+        cancel: cancel.clone(),
+        progress: Progress::new(move |_, m| {
+            s2.lock().push(m.to_string());
+            if m == "committing" {
+                c2.cancel();
+            }
+        }),
+        deadline: None,
+    };
+    let o = MergeOptions::default().with_control(&ctl);
+    assert!(matches!(s.merge("dev", "main", &o), Err(Error::Cancelled)));
+    assert_eq!(s.head_commit().seq, 2);
+    assert!(s.merge_record(3).is_none());
+    assert_eq!(
+        *seen.lock(),
+        [
+            "reading the changes of both sides",
+            "finding conflicts",
+            "committing"
+        ]
+    );
+    // the same merge without the cancel goes through and reports its end
+    seen.lock().clear();
+    let s3 = seen.clone();
+    let ctl = Control {
+        progress: Progress::new(move |p, m| s3.lock().push(format!("{p} {m}"))),
+        ..Control::none()
+    };
+    merged(
+        s.merge("dev", "main", &MergeOptions::default().with_control(&ctl))
+            .unwrap(),
+    );
+    assert_eq!(seen.lock().last().map(String::as_str), Some("1 committed"));
+}

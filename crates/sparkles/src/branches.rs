@@ -57,6 +57,20 @@ impl Dataset {
         self.store().merge(source, target, o)
     }
 
+    /// [`merge`](Self::merge) under `ctl`: cancelled at its next check, with nothing
+    /// published, and reporting its stages (a replay, each commit) to its progress.
+    pub fn merge_with(
+        &self,
+        source: &str,
+        target: &str,
+        o: &MergeOptions,
+        ctl: &crate::task::Control,
+    ) -> Result<MergeOutcome> {
+        ctl.check()?;
+        self.store()
+            .merge(source, target, &o.clone().with_control(ctl))
+    }
+
     /// What merging `source` into `target` would do, without writing (see
     /// [`Store::preview_merge`](crate::store::Store::preview_merge)).
     pub fn preview_merge(

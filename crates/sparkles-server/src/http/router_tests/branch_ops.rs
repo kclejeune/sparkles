@@ -469,3 +469,72 @@ async fn a30_exempt_predicates() {
     .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
+
+#[tokio::test]
+async fn a31_merges_as_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, app) = setup(dir.path()).await;
+    json_req(&app, "POST", "/$/branches/ds", json!({ "name": "dev" })).await;
+    update(&app, "ds@dev", "INSERT DATA { <urn:c> <urn:p> 1 }").await;
+    let req = |path: &str, body: J| {
+        Request::post(path.to_string())
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("prefer", "respond-async, wait=10")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let (r, h) = send_h(&app, req("/$/merge/ds", json!({ "source": "dev" }))).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    assert_eq!(h["preference-applied"], "respond-async");
+    let t = r.json();
+    assert_eq!(t["kind"], "merge");
+    assert_eq!(t["cancellable"], true);
+    let id = t["id"].as_str().unwrap().to_string();
+    assert_eq!(h["location"], format!("/$/tasks/{id}").as_str());
+    let done = super::tasks::wait_done(&st, &id).await;
+    assert_eq!(done.state, "done", "{:?}", done.message);
+    let d = done.detail.unwrap();
+    assert_eq!(d["merged"], true);
+    assert_eq!(d["commit"]["seq"], 3);
+    assert!(
+        subjects(&app, "/ds/sparql")
+            .await
+            .contains(&"urn:c".to_string())
+    );
+    // a merge that conflicts fails, with the report as its detail
+    update(
+        &app,
+        "ds",
+        "DELETE DATA { <urn:a> <urn:age> 30 } ; INSERT DATA { <urn:a> <urn:age> 31 }",
+    )
+    .await;
+    update(
+        &app,
+        "ds@dev",
+        "DELETE DATA { <urn:a> <urn:age> 30 } ; INSERT DATA { <urn:a> <urn:age> 32 }",
+    )
+    .await;
+    let (r, _) = send_h(&app, req("/$/merge/ds", json!({ "source": "dev" }))).await;
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let done = super::tasks::wait_done(&st, &id).await;
+    assert_eq!(done.state, "failed");
+    assert_eq!(done.detail.unwrap()["code"], "merge-conflict");
+    // reverts and cherry-picks too
+    let (r, _) = send_h(&app, req("/$/revert/ds?commit=4", json!({}))).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    assert_eq!(r.json()["kind"], "revert");
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let done = super::tasks::wait_done(&st, &id).await;
+    assert_eq!(done.state, "done", "{:?}", done.message);
+    assert_eq!(done.detail.unwrap()["reverted"]["seq"], 4);
+    // a dry run answers at once
+    let (r, _) = send_h(
+        &app,
+        req(
+            "/$/merge/ds",
+            json!({ "source": "dev", "dryRun": true, "onConflict": "theirs" }),
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}

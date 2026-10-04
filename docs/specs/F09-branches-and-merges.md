@@ -1333,6 +1333,16 @@ labels. With `<urn:age>` exempt and the `subject` scope, ages changed to 31 and 
 two sides give both. A list entry that is not an IRI → `400`. `sparkles merge --exempt
 IRI` and `sparkles branch exempt` do the same.
 
+**A31. Merges as tasks.** `POST /$/merge/ds {"source":"dev"}` with `Prefer:
+respond-async` → `202` with a task of kind `merge` that is cancellable,
+`Location: /$/tasks/{id}` and `Preference-Applied: respond-async`. The task ends `done`
+with the merge result as its `detail`. A merge that conflicts ends `failed` with the
+conflict report as its `detail`. A revert with the same header runs as a `revert` task.
+A dry run answers `200` at once. In the library, a merge under a `Control` reports
+"reading the changes of both sides", "finding conflicts", "committing" and "committed",
+and a cancel that comes while it commits leaves the target at its old head with no merge
+record.
+
 ## 10. Open questions
 
 1. **Exempt predicates.** Should `cell` scope exempt some predicates by default, such as

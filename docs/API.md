@@ -2943,6 +2943,17 @@ resolution leaves out a side's insert of a quad whose object is a blank node tha
 else refers to, that side's quads about the blank node go too, so lists and other
 structures stay whole.
 
+**Merges as tasks.** A merge, revert or cherry-pick with the header `Prefer:
+respond-async` ([RFC 7240](https://www.rfc-editor.org/rfc/rfc7240)) runs as a task of
+kind `merge`, `revert` or `cherry-pick`. The answer is `202` with the task,
+`Location: /$/tasks/{id}` and `Preference-Applied: respond-async`. The task reports its
+stages in `progress` and `message`, and a replay reports each commit. Its `detail` holds
+the result once it is done, or the conflict report when conflicts stopped it, and it
+then ends `failed`. `DELETE /$/tasks/{id}` cancels it: the merge stops at its next
+check, and nothing is published unless the commit was already made. A replay keeps the
+commits it made before the cancel. A task has no request timeout, and it waits for a
+task slot like other tasks. A dry run ignores the preference and answers at once.
+
 `expect` carries the heads the caller saw in a report. When either head moved, the
 merge answers `409 head-moved` instead of applying resolutions to changes the caller has
 not seen. Without `expect`, a merge whose target moved while it was computed starts
