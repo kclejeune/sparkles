@@ -1,24 +1,27 @@
 # P06: Library administration API and parity
 
-> **Status:** implemented in part (steps 1 to 4 of Phase 1)
+> **Status:** implemented in part (steps 1 to 4 and 7 of Phase 1)
 >
-> **Phases:** Steps 1 to 4 of Phase 1 (§8.1) shipped. The engine is the `sparkles-core`
-> package in `crates/sparkles-core`, and `crates/sparkles` is the `sparkles` facade over
-> it. `sparkles::task::Control` carries cancellation, progress and a deadline, and the
+> **Phases:** Steps 1 to 4 and 7 of Phase 1 (§8.1) shipped. The engine is the
+> `sparkles-core` package in `crates/sparkles-core`, and `crates/sparkles` is the
+> `sparkles` facade over it. `sparkles::task::Control` carries cancellation, progress and a deadline, and the
 > server's tasks build one from each task. `Dataset::open` sets a dataset up as the
 > server does, with its write guard, RDFS on read, stored queries, GraphQL configuration,
 > reasoning record and clone origin, and the server's datasets hold a `sparkles::Dataset`.
 > `Dataset` has handles for snapshots, history, indexes, settings, schema, stored
 > queries, reasoning, validation, GraphQL and backups, and `Error::code()` names each
-> error. The parity test of §7.1 maps every operation, with 39 marked pending. The rest
-> of Phase 1 moves the server's handlers onto the handles (step 5), adds the `Catalog`
-> (step 6), moves the local CLI commands (step 7) and makes the parity test strict
-> (step 8). Phase 2 closes the Python bindings' gaps, and Phase 3 adds dataset renames
-> and catalog commands. None of these is built.
+> error. The parity test of §7.1 maps every operation, with 39 marked pending. The
+> local commands `quota`, `queries`, `compaction`, `describe-settings`, `validation`,
+> `geo-index` and `vector` open a `Dataset` and call its handles (step 7), and `clone`
+> waits for the catalog. The rest of Phase 1 moves the server's handlers onto the
+> handles (step 5), adds the `Catalog` (step 6), moves `clone` and makes the parity test
+> strict (step 8). Phase 2 closes the Python bindings' gaps, and Phase 3 adds dataset
+> renames and catalog commands. None of these is built.
 >
 > **User docs:** the "Embedding the library" section of [USAGE](../USAGE.md) describes
-> what `Dataset::open` sets up and the handles. The HTTP API, the commands and the file
-> formats have not changed.
+> what `Dataset::open` sets up and the handles. Its "Stored queries" section says that
+> `sparkles queries run` follows the dataset's RDFS on read and DESCRIBE setting. The
+> HTTP API, the other commands and the file formats have not changed.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end records how it lands.
@@ -1435,8 +1438,9 @@ and the wheel measurements.
 
 ## Outcome
 
-Phase 1 is in progress. Steps 1 to 4 have shipped, and the notes below record where
-they depart from the design.
+Phase 1 is in progress. Steps 1 to 4 and step 7 have shipped, and the notes below
+record where they depart from the design. Step 7 leaves `sparkles clone` for after
+step 6.
 
 ### Implementation notes
 
@@ -1497,3 +1501,57 @@ they depart from the design.
 * **Performance.** The query and update paths take no new lock. A server handler that
   reads `ds.store` follows one more pointer, from the server's dataset to the library's
   state. The store reads its new guard reason only when it refuses a write.
+
+The notes below record step 7, which moved the local commands onto the handles.
+
+* **What each command calls.** `sparkles quota` calls `ds.settings().quota()`,
+  `describe-settings` calls `ds.settings().describe()`, and `compaction` calls
+  `ds.settings().compaction()` with its new `status`. `queries put`, `delete` and `run`
+  call `ds.queries()`. `validation` calls `ds.validation().guard()` for `--status`,
+  `--off` and setting a configuration. `geo-index` calls `ds.indexes().geo()`, and
+  `vector` calls `ds.indexes().vector()`. Each opens the database with
+  `Dataset::open_with` and the command's store options. Their flags, output and exit
+  codes are unchanged, and their `--server` forms still call the HTTP API.
+* **`clone` waits for the catalog.** `sparkles clone` depends on the catalog of step 6,
+  so it moves after that step.
+* **The handles grew where a command needed more.** `DescribeSetting::status` returns a
+  `DescribeStatus`, the body of `GET /$/describe/{ds}`, and the server's describe
+  handler serializes it through the old helper in `describe_cmd.rs`.
+  `CompactionSetting::effective` applies a base policy, and `CompactionSetting::status`
+  returns a `CompactionStatus` with the policy in force, the dataset's own settings,
+  the measures in seconds, the state and the trigger. The server's compaction status
+  adds its scheduler's fields to the same values, and it still builds them itself until
+  step 5 moves that handler. `StoredQueries::run_version` runs an older version, and
+  `StoredQueries::error` says why `queries.json` could not be read.
+  `VectorIndexes::wait_all` waits for every index's build, and
+  `VectorIndexes::set_embedding_environment` lets the embedding workers reach their
+  providers for `sparkles vector embed` and `reembed`.
+* **The command code left the server's modules.** `sparkles geo-index` moved from
+  `geo.rs` to `geo_index_cmd.rs`, and `sparkles vector` moved from `vector.rs` to
+  `vector_cmd.rs` with `parse_secrets`, which `serve --embedding-secret` also uses.
+  The handler code of both modules did not change.
+* **Stored query runs follow the dataset's settings.** `sparkles queries run` used to
+  run a stored query with the engine's defaults. It now passes the dataset's RDFS on
+  read and DESCRIBE setting, as `/{ds}/queries/{name}` does, so a stored DESCRIBE query
+  follows `describe.json` and a query over a class matches its subclasses when
+  `rdfs.json` is set. `crates/sparkles-server/tests/cli_queries.rs` tests both. The
+  inferred graph is not added to the default graph, as before, and that follows the
+  query defaults that step 5 gives `Dataset`.
+* **Reading stored queries takes no lock.** `queries list`, `get` and `versions` read
+  `queries.json` with `sparkles::stored::Catalog` instead of opening a `Dataset`.
+  `Dataset::open` takes the directory's exclusive lock, and these commands have always
+  worked beside a server that has the database open. A `queries.json` that cannot be
+  read is still an error for every subcommand, and the writing ones check
+  `StoredQueries::error` after they open the dataset.
+* **Opening a dataset installs its write guard.** None of these commands commits data,
+  so the guard decides no write. `validation` still opens with `unvalidated_writes`.
+  `validation --status` fails with the guard's error, as it did when it installed the
+  guard itself.
+* **Broken files are logged.** `Dataset::open` logs an error for a `validation.json`,
+  `rdfs.json`, `queries.json` or `graphql.json` it cannot use, so each of these
+  commands now prints that line on stderr before its own output. The output and the
+  exit code do not change.
+* **`validation --off` needs a validator.** In a build without the `shacl` and `shex`
+  features, `--off` used to print `validation off` and leave `validation.json` in place.
+  It now fails with the handle's `Unsupported` error. The default build has both
+  features.

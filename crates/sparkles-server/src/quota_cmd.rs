@@ -4,7 +4,7 @@
 use anyhow::{Result, bail};
 use clap::Args;
 use serde_json::Value as J;
-use sparkles::store::{Store, StoreOptions};
+use sparkles::store::StoreOptions;
 use std::path::PathBuf;
 
 #[derive(Args, Debug)]
@@ -42,14 +42,11 @@ pub fn run(a: QuotaArgs, opts: StoreOptions) -> Result<()> {
 }
 
 fn local(loc: &std::path::Path, a: &QuotaArgs, opts: StoreOptions) -> Result<J> {
-    if !loc.join("CURRENT").exists() {
-        bail!("{} is not a database directory", loc.display());
-    }
-    let store = Store::open(loc, opts)?;
+    let quota = crate::open_dataset(loc, opts)?.settings().quota();
     let status = match (a.max_mb, a.default) {
-        (Some(mb), _) => store.set_quota(Some(mb.saturating_mul(1 << 20)))?,
-        (None, true) => store.set_quota(None)?,
-        (None, false) => store.quota(),
+        (Some(mb), _) => quota.set(mb.saturating_mul(1 << 20))?,
+        (None, true) => quota.reset()?,
+        (None, false) => quota.get(),
     };
     Ok(serde_json::to_value(status)?)
 }
@@ -103,6 +100,7 @@ fn print(status: &J, format: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sparkles::store::Store;
 
     fn args(loc: &std::path::Path, max_mb: Option<u64>, default: bool) -> QuotaArgs {
         QuotaArgs {

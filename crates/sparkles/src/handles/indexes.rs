@@ -11,6 +11,7 @@ use crate::sparql::QueryOptions;
 use crate::text::{TextConfig, TextStatus};
 use crate::vector::config::VectorRecall;
 use crate::vector::embed::EmbeddingStatus;
+use crate::vector::embed::Environment;
 use crate::vector::{VectorIndexConfig, VectorIndexStatus};
 use oxrdf::{Literal, NamedNode, Term};
 use serde::{Serialize, Serializer};
@@ -370,6 +371,17 @@ impl VectorIndexes {
     /// Block until every embedding worker is idle, or fail after `timeout`.
     pub fn embed_until_idle(&self, timeout: Duration) -> Result<()> {
         self.ds.store().embed_until_idle(timeout)
+    }
+
+    /// Block until every index's build ends, and return their statuses.
+    pub fn wait_all(&self) -> Vec<VectorIndexStatus> {
+        self.ds.store().wait_vector_indexes()
+    }
+
+    /// Let the embedding workers reach their providers with `env`: its outbound policy
+    /// and the secrets that the indexes' API keys name. `None` stops them.
+    pub fn set_embedding_environment(&self, env: Option<Environment>) {
+        self.ds.store().set_embedding_environment(env)
     }
 }
 

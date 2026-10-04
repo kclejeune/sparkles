@@ -434,17 +434,21 @@ pub fn cancel(st: &AppState, name: &str) {
 
 /// `CompactionStatus` of a dataset (`/$/compaction/{ds}`, `compaction` in `/$/stats`).
 pub fn status_json(st: &AppState, ds: &Dataset) -> J {
+    use sparkles::handles::CompactionState;
     let ac = &st.compaction;
-    let policy = ac.policy_for(ds);
-    let own = ds.dataset.settings().compaction().get();
-    let m = ds.dataset.settings().compaction().measures();
+    // the policy in force, the measures and the verdict; the scheduler's state is the
+    // server's
+    let status = ds.dataset.settings().compaction().status(&ac.policy);
+    let policy = &status.policy;
     let states = ac.states.lock();
     let s = states.get(&ds.key());
     let enabled = ac.enabled && policy.enabled && !st.read_only;
-    let running = s.and_then(|s| s.task.as_ref()).is_some() || m.compacting;
+    // (with the policy enabled, the status is `running` while a compaction runs)
+    let running =
+        s.and_then(|s| s.task.as_ref()).is_some() || status.state == CompactionState::Running;
     // between two passes, a verdict of its own (the scheduler may not have run yet)
     let seen = s.map(|s| s.seen.clone()).unwrap_or_default();
-    let trigger = seen.trigger.clone().or_else(|| policy.verdict(&m));
+    let trigger = seen.trigger.clone().or_else(|| status.trigger.clone());
     let state = if !enabled {
         "off"
     } else if running {
@@ -461,18 +465,9 @@ pub fn status_json(st: &AppState, ds: &Dataset) -> J {
         "enabled": enabled,
         "serverEnabled": ac.enabled,
         "policy": policy,
-        "own": own,
+        "own": status.own,
         "state": state,
-        "measures": {
-            "generation": m.generation,
-            "baseQuads": m.base_quads,
-            "deltaQuads": m.delta_quads,
-            "deltaBytes": m.delta_bytes,
-            "walBytes": m.wal_bytes,
-            "idleSeconds": m.idle_ms.map(|v| v / 1000),
-            "oldestChangeSeconds": m.oldest_change_ms.map(|v| v / 1000),
-            "threshold": policy.threshold(m.base_quads),
-        },
+        "measures": status.measures,
         "automaticRuns": s.map_or(0, |s| s.automatic_runs),
         "failures": s.map_or(0, |s| s.failures),
     });

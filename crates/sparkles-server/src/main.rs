@@ -24,6 +24,7 @@ mod exposure;
 mod fmt;
 mod fuseki_config;
 mod geo;
+mod geo_index_cmd;
 #[cfg(feature = "graphql")]
 mod graphql;
 mod http;
@@ -58,6 +59,7 @@ mod ui;
 mod validation_cmd;
 mod validation_common;
 mod vector;
+mod vector_cmd;
 mod write_validation;
 
 use anyhow::{Context, Result, bail};
@@ -1182,7 +1184,7 @@ enum Cmd {
     },
     /// Vector indexes for spk:vectorSearch: create, drop, rebuild, list, status (locally
     /// with --loc, or with --server)
-    Vector(vector::VectorArgs),
+    Vector(vector_cmd::VectorArgs),
     /// Build, rebuild or inspect a database's spatial index (GeoSPARQL)
     GeoIndex {
         #[arg(long)]
@@ -2375,7 +2377,7 @@ fn run() -> Result<()> {
             sparkles::vector::embed::set_environment(sparkles::vector::embed::Environment {
                 enabled: !no_embedding,
                 outbound: st.outbound.clone(),
-                secrets: vector::parse_secrets(&embedding_secret)?,
+                secrets: vector_cmd::parse_secrets(&embedding_secret)?,
             });
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
             st.schema_max_entries = schema_max_entries;
@@ -3019,7 +3021,7 @@ fn run() -> Result<()> {
         Cmd::Patch(a) => patch_cmd::run(a, opts, no_validate),
         #[cfg(feature = "auth")]
         Cmd::Auth { cmd } => auth::cli::run(cmd),
-        Cmd::Vector(a) => vector::cli(a, opts),
+        Cmd::Vector(a) => vector_cmd::cli(a, opts),
         Cmd::GeoIndex {
             loc,
             predicate,
@@ -3030,10 +3032,10 @@ fn run() -> Result<()> {
             rebuild,
             status,
             disable,
-        } => geo::geo_index(
+        } => geo_index_cmd::run(
             &loc,
             opts,
-            geo::IndexArgs {
+            geo_index_cmd::IndexArgs {
                 predicate,
                 feature_link,
                 exclude_graph,
@@ -4120,6 +4122,16 @@ fn print_diagnostics(r: &sparkles_reasoner::diagnostics::DiagnosticsReport, j: &
         },
         if checks == 1 { "" } else { "s" }
     );
+}
+
+/// The dataset of an existing database directory, set up as the server sets it up
+/// (`sparkles::Dataset::open_with`). A directory that is not a database is an error,
+/// and nothing is created.
+pub(crate) fn open_dataset(loc: &std::path::Path, opts: StoreOptions) -> Result<sparkles::Dataset> {
+    if !loc.join("CURRENT").exists() {
+        bail!("{} is not a database directory", loc.display());
+    }
+    Ok(sparkles::Dataset::open_with(loc, opts)?)
 }
 
 /// A database directory, or the given files loaded into an in-memory store.

@@ -57,7 +57,19 @@ impl StoredQueries {
         params: &BTreeMap<String, serde_json::Value>,
         opts: &QueryOptions,
     ) -> Result<QueryResult> {
-        let (stored, bindings) = self.bind(name, None, params)?;
+        self.run_version(name, None, params, opts)
+    }
+
+    /// [`run`](Self::run) at `version` of query `name` while it is kept, or at its
+    /// latest version. A missing version is [`Error::NotFound`].
+    pub fn run_version(
+        &self,
+        name: &str,
+        version: Option<u64>,
+        params: &BTreeMap<String, serde_json::Value>,
+        opts: &QueryOptions,
+    ) -> Result<QueryResult> {
+        let (stored, bindings) = self.bind(name, version, params)?;
         let mut opts = opts.clone();
         opts.initial_bindings.extend(bindings);
         self.ds.query_with(&stored.definition.query, &opts)

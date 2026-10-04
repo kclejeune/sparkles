@@ -380,3 +380,89 @@ fn schema_reports_are_kept_paged_and_compared() {
     let layer = schema.constraints(&Default::default()).unwrap();
     assert!(layer.is_empty());
 }
+
+#[test]
+fn describe_and_compaction_report_their_status() {
+    let (_dir, ds) = persistent();
+    let describe = ds.settings().describe();
+    let j = serde_json::to_value(describe.status()).unwrap();
+    assert_eq!(j["mode"], "cbd");
+    assert_eq!(j["source"], "default");
+    assert!(j["maxTriples"].is_null());
+    assert_eq!(j["modes"], serde_json::json!(["cbd", "scbd", "outgoing"]));
+    let mut o = describe.get();
+    o.max_triples = Some(10);
+    describe.set(o).unwrap();
+    let j = serde_json::to_value(describe.status()).unwrap();
+    assert_eq!(j["maxTriples"], 10);
+    assert_eq!(j["source"], "dataset");
+
+    let compaction = ds.settings().compaction();
+    let base = sparkles::store::CompactionPolicy::default();
+    let s = compaction.status(&base);
+    assert!(s.enabled);
+    assert_eq!(s.policy, compaction.effective(&base));
+    let j = serde_json::to_value(&s).unwrap();
+    assert_eq!(j["state"], "idle");
+    assert!(j.get("trigger").is_none(), "{j}");
+    ds.update("INSERT DATA { <http://ex.org/c> <http://ex.org/p> 3 }")
+        .unwrap();
+    let mut own = compaction.get();
+    own.set("maxDeltaQuads", "1").unwrap();
+    compaction.set(own).unwrap();
+    let s = compaction.status(&base);
+    assert_eq!(
+        s.trigger.as_ref().map(|t| t.kind),
+        Some(sparkles::store::TriggerKind::MaxDelta)
+    );
+    let j = serde_json::to_value(&s).unwrap();
+    assert_eq!(j["state"], "due");
+    assert!(
+        j["trigger"].as_str().unwrap().contains("maxDeltaQuads"),
+        "{j}"
+    );
+    let mut own = compaction.get();
+    own.set("enabled", "false").unwrap();
+    compaction.set(own).unwrap();
+    assert_eq!(
+        compaction.status(&base).state,
+        sparkles::handles::CompactionState::Off
+    );
+}
+
+#[test]
+fn stored_queries_run_an_older_version_and_name_a_broken_file() {
+    let (dir, ds) = persistent();
+    let def = |q: &str| -> sparkles::stored::Definition {
+        serde_json::from_value(serde_json::json!({ "query": q })).unwrap()
+    };
+    let q = ds.queries();
+    assert!(q.error().is_none());
+    q.put(
+        "v",
+        def("SELECT ?v WHERE { ?s <http://ex.org/p> ?v }"),
+        Default::default(),
+    )
+    .unwrap();
+    q.put(
+        "v",
+        def("SELECT ?v WHERE { <http://ex.org/a> <http://ex.org/p> ?v }"),
+        Default::default(),
+    )
+    .unwrap();
+    let none = BTreeMap::new();
+    let rows = |version| {
+        q.run_version("v", version, &none, &Default::default())
+            .map(|r| r.table.len())
+    };
+    assert_eq!(rows(Some(1)).unwrap(), 2);
+    assert_eq!(rows(None).unwrap(), 1);
+    assert_eq!(rows(Some(9)).unwrap_err().code(), "not-found");
+    drop((q, ds));
+
+    let db = dir.path().join("db");
+    std::fs::write(db.join("queries.json"), "{ not json").unwrap();
+    let ds = Dataset::open(&db).unwrap();
+    assert!(ds.queries().error().unwrap().contains("queries.json"));
+    assert!(ds.queries().list().is_empty());
+}

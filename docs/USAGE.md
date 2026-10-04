@@ -968,6 +968,11 @@ sparkles queries list --loc db
 sparkles queries versions --loc db adults
 ```
 
+`sparkles queries run` runs the query with the database's DESCRIBE setting and RDFS on
+read, as the server does. `list`, `get` and `versions` read the stored queries without
+locking the database, so they also work while a server has it open. `put`, `delete`
+and `run` need the database to themselves.
+
 On a server, `PUT /$/queries/{ds}/{name}` stores a definition (it needs `admin`), and
 `GET /{ds}/queries/{name}?minAge=40` runs it with the caller's permissions, budgets and
 rate limits:

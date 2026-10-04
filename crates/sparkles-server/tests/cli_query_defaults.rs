@@ -1,6 +1,6 @@
-//! `sparkles query --loc` runs with the dataset's query defaults, as a server and the
-//! library do: RDFS on read from the database's `rdfs.json`, and the materialized
-//! inferences as part of the default graph.
+//! `sparkles query --loc` and `sparkles queries run` run with the dataset's query
+//! defaults, as a server and the library do: RDFS on read from the database's
+//! `rdfs.json`, and the materialized inferences as part of the default graph.
 
 use std::process::Command;
 
@@ -52,11 +52,38 @@ fn query_reads_the_configured_rdfs() {
     assert!(ask(&db));
 }
 
+/// The answer of the stored query `parent`.
+#[cfg(feature = "reasoning")]
+#[track_caller]
+fn stored_ask(db: &str) -> bool {
+    let out = run(&["queries", "run", "--loc", db, "parent", "--results", "json"]);
+    let j: serde_json::Value = serde_json::from_str(&out).unwrap();
+    j["boolean"].as_bool().unwrap()
+}
+
+#[cfg(feature = "reasoning")]
+fn store_query(dir: &std::path::Path, db: &str) {
+    let q = dir.join("parent.rq");
+    std::fs::write(&q, ASK).unwrap();
+    run(&[
+        "queries",
+        "put",
+        "--loc",
+        db,
+        "parent",
+        "--query",
+        q.to_str().unwrap(),
+    ]);
+}
+
 #[cfg(feature = "reasoning")]
 #[test]
 fn query_reads_the_materialized_inferences() {
-    let (_dir, db) = database();
+    let (dir, db) = database();
+    store_query(dir.path(), &db);
     assert!(!ask(&db));
+    assert!(!stored_ask(&db));
     run(&["infer", "--loc", &db, "--profile", "rdfs"]);
     assert!(ask(&db));
+    assert!(stored_ask(&db));
 }

@@ -13,7 +13,7 @@ pub(super) const SPARKLES_DESCRIBE_TRUNCATED: &str = "sparkles-describe-truncate
 
 /// The setting as `GET /$/describe/{ds}` reports it.
 pub(crate) fn status_json(ds: &Dataset) -> J {
-    crate::describe_cmd::status(&ds.dataset.settings().describe().get())
+    serde_json::to_value(ds.dataset.settings().describe().status()).unwrap_or_default()
 }
 
 async fn get_setting(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {

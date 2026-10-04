@@ -52,6 +52,9 @@ pub use settings::{
     ChangeLogSetting, CompactionSetting, DescribeSetting, HistorySettings, HistoryUpdate,
     QuotaSetting, RetentionSetting, Settings,
 };
+pub use settings::{
+    CompactionReadings, CompactionState, CompactionStatus, DescribeStatus, SettingSource,
+};
 pub use validation::{GuardSetting, Validation};
 
 use crate::Dataset;
