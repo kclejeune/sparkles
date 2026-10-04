@@ -4,6 +4,7 @@
 import { CSRF_HEADER, needsCsrf, type Level } from './auth';
 import { fmtBytes, fmtInt } from './format';
 import { branchPath } from './branches';
+import type { CommitGraphPage } from './commit-graph';
 import { cloneBody, type CloneMethod, type CloneOptions } from './clone';
 import { mappingPart, tableParams } from './upload';
 
@@ -1871,8 +1872,11 @@ export function mergePreview(
   source: string,
   target: string,
   signal?: AbortSignal,
+  /** the most conflicts listed (default 100, at most 10,000) */
+  limit?: number,
 ): Promise<MergeOutcome> {
   const p = new URLSearchParams({ source, target });
+  if (limit != null) p.set('limit', String(limit));
   return json<MergeOutcome>(`/$/merge/${enc(ds)}?${p}`, { signal, cache: 'no-store' });
 }
 
@@ -1881,15 +1885,77 @@ export function mergePreview(
  * since answers `409` `head-moved`. Conflicts answer `409` `merge-conflict` with the
  * report as the error's `body`.
  */
-export const merge = (
+export const merge = (ds: string, body: MergeRequest) =>
+  json<MergeOutcome>(`/$/merge/${enc(ds)}`, jsonBody(body));
+
+/** A choice for conflicts: per graph, per subject or per cell (terms in N-Triples). */
+export type Resolution = {
+  /** null: the default graph */
+  graph: string | null;
+  subject?: string;
+  predicate?: string;
+  take: 'ours' | 'theirs' | 'base' | 'union' | 'objects';
+  /** with `objects`: the cell's new objects */
+  objects?: string[];
+};
+
+/** The body of `POST /$/merge/{ds}`. */
+export type MergeRequest = {
+  source: string;
+  target?: string;
+  ff?: 'auto' | 'only';
+  conflicts?: 'cell' | 'subject' | 'quad';
+  onConflict?: 'fail' | 'ours' | 'theirs' | 'union';
+  resolutions?: Resolution[];
+  expect?: { source?: number; target?: number };
+  inferences?: 'exclude' | 'include';
+  message?: string;
+  limit?: number;
+  dryRun?: boolean;
+  /** with `dryRun`: list this many of the merge commit's changes */
+  changes?: number;
+};
+
+/** A write guard's report, as a refused write (`422`) or a dry run carries it. */
+export type GuardReport = {
+  language?: 'shacl' | 'shex';
+  status?: string;
+  blocking?: number;
+  total?: number;
+  truncated?: boolean;
+  results?: Record<string, unknown>[];
+};
+
+/** The answer of a merge's dry run: the write preview of the merge commit. */
+export type MergeDryRun = {
+  dryRun: true;
+  wouldCommit: boolean;
+  /** `commit`, `no-change`, `rejected`, `storage-refused` … */
+  outcome: string;
+  head: number;
+  changes?: { total: number; limit: number; truncated: boolean; quads: DiffQuad[] };
+  validation?: GuardReport;
+  error?: string;
+  merge?: MergeOutcome;
+};
+
+/** `POST /$/merge/{ds}` with `dryRun: true`. */
+export const mergeDryRun = (ds: string, body: MergeRequest) =>
+  json<MergeDryRun>(`/$/merge/${enc(ds)}`, jsonBody({ ...body, dryRun: true }));
+
+/** `GET /$/commit-graph/{ds}`: the commits of several branches, newest first. */
+export function commitGraph(
   ds: string,
-  body: {
-    source: string;
-    target?: string;
-    expect?: { source?: number; target?: number };
-    message?: string;
-  },
-) => json<MergeOutcome>(`/$/merge/${enc(ds)}`, jsonBody(body));
+  opts: { branches?: string[]; limit?: number; next?: string | null; signal?: AbortSignal } = {},
+): Promise<CommitGraphPage> {
+  const init = { signal: opts.signal, cache: 'no-store' as const };
+  if (opts.next) return json<CommitGraphPage>(opts.next, init);
+  const p = new URLSearchParams();
+  if (opts.branches?.length) p.set('branches', opts.branches.join(','));
+  if (opts.limit != null) p.set('limit', String(opts.limit));
+  const qs = p.toString();
+  return json<CommitGraphPage>(`/$/commit-graph/${enc(ds)}${qs ? `?${qs}` : ''}`, init);
+}
 
 // --- spatial index (GeoSPARQL) -----------------------------------------------------
 

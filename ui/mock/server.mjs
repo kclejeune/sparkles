@@ -16,6 +16,8 @@ import {
   chooseBranch,
   createBranch,
   handleBranches,
+  handleDiff,
+  recordChanges,
   initBranches,
   resolveBranch,
 } from './branches.mjs';
@@ -125,6 +127,12 @@ function commitWrite(ds, kind, before, opts = {}) {
   for (const q of before) if (!after.has(q)) deleted++;
   const committed = inserted + deleted > 0;
   const commit = committed ? addCommit(ds, kind, inserted, deleted, opts) : headCommit(ds);
+  if (committed)
+    recordChanges(
+      commit,
+      [...after].filter((q) => !before.has(q)),
+      [...before].filter((q) => !after.has(q)),
+    );
   return { dataset: ds.name, datasetId: ds.id, committed, commit };
 }
 
@@ -1980,6 +1988,7 @@ const server = http.createServer(async (req, res) => {
       })
     )
       return;
+    if (handleDiff(req, res, url, seg, { datasets, send, fail })) return;
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
