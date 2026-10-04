@@ -495,6 +495,22 @@ settings. Most queries moved by less than their noise. These moved by more:
   times faster. The warm DBpedia queries, the load and the throughput stayed within the
   noise of that build's figures or improved.
 
+### Follow-up investigation on 2026-10-04
+
+A working-tree A/B against current main (`2fafbe8c`) identifies vocabulary page reads
+in serialization, planner samples and small sorts as the main cold regressions.
+On forge, cold medians fell from 325 to 90 ms for 10.5M `star-join`, 131 to 29 ms for
+DBpedia `label-regex`, and 1,840 to 1,029 ms for DBpedia `export-1m`. Warm `star-join`,
+export and full-sort controls showed no material regression. The changes preserve
+the sparse point-lookup index and synchronous commit durability.
+
+These measurements use direct HTTP timing rather than hyperfine/curl and do not
+replace the historical comparisons above. They compare Sparkles builds, not fresh
+competitor runs. Mixed-load variation is still too large to identify a regression's
+cause. [`scripts/bench-regressions.py`](../scripts/bench-regressions.py) took the
+measurements, and the [raw samples](benchmarks/2026-10-04-regressions.json) include
+result fingerprints.
+
 ## Updates and mixed load
 
 The `updates` mode copies each engine's store, commits the same 5,000 single-triple
@@ -1470,4 +1486,3 @@ The 19 queries that fail disagree with choices Sparkles made on purpose.
   strictly inside another as `ehCoveredBy` it, leave a feature's own geometries and the points inside
   it out of `sfIntersects`, and leave the EPSG:4326 point at latitude 31.95, longitude -88.38 out
   of the geometries disjoint from feature B.
-
