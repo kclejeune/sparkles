@@ -428,9 +428,9 @@ impl<'a> Reader<'a> {
 
     fn term_of(&mut self, tag: u8) -> Result<Term, Malformed> {
         match tag {
-            IRI => Ok(NamedNode::new(self.string()?)
-                .map_err(|e| bad(e.to_string()))?
-                .into()),
+            // Jena accepts any string as an IRI, relative ones included, and so does the
+            // store; the parsers are where IRIs are checked
+            IRI => Ok(NamedNode::new_unchecked(self.string()?).into()),
             BNODE => Ok(self.bnode()?.into()),
             STRING => Ok(Literal::new_simple_literal(self.string()?).into()),
             LANG => {
@@ -462,7 +462,7 @@ impl<'a> Reader<'a> {
             }
             TYPED => {
                 let v = self.string()?;
-                let dt = NamedNode::new(self.string()?).map_err(|e| bad(e.to_string()))?;
+                let dt = NamedNode::new_unchecked(self.string()?);
                 Ok(Literal::new_typed_literal(v, dt).into())
             }
             TRIPLE => {

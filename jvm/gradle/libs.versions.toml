@@ -1,0 +1,29 @@
+[versions]
+kotlin = "2.4.20"
+# the Jena line the library compiles against; Jena 6 programs resolve to their own version
+jena = "5.6.0"
+jna = "5.19.1"
+jspecify = "1.0.0"
+slf4j = "2.0.17"
+# the JUnit line Jena 5.6's own tests use
+junit = "6.0.3"
+# jena-core's graph contract tests are JUnit 3 test cases
+junit4 = "4.13.2"
+
+[libraries]
+jena-arq = { module = "org.apache.jena:jena-arq", version.ref = "jena" }
+jena-core = { module = "org.apache.jena:jena-core", version.ref = "jena" }
+jena-base = { module = "org.apache.jena:jena-base", version.ref = "jena" }
+jena-tdb2 = { module = "org.apache.jena:jena-tdb2", version.ref = "jena" }
+jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+jspecify = { module = "org.jspecify:jspecify", version.ref = "jspecify" }
+slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
+junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+junit-vintage = { module = "org.junit.vintage:junit-vintage-engine" }
+junit4 = { module = "junit:junit", version.ref = "junit4" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
