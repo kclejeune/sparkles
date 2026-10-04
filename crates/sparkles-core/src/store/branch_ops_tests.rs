@@ -2,7 +2,7 @@
 //! fast-forwards, renames, deletions that re-parent, exempt predicates and merges as
 //! tasks. The acceptance examples A24 onward of F09, at the library level.
 
-use super::branch_tests::{apply, dump, has, merge, merged, setup};
+use super::branch_tests::{apply, code, dump, has, int, merge, merged, setup};
 use super::*;
 use crate::branch::{BranchOptions, MergeOptions, MergeOutcome};
 
@@ -52,4 +52,69 @@ fn a24_squash_merges_record_no_second_parent() {
     apply(&dev, "+<urn:f> <urn:p> <urn:x> .");
     merged(merge(&s, "dev", "main", &squash));
     assert!(has(&s, "urn:f"));
+}
+
+#[test]
+fn a25_reverts_merge_a_commits_parent_over_the_commit() {
+    let (_dir, s) = setup();
+    apply(&s, "+<urn:c> <urn:p> <urn:x> .");
+    apply(
+        &s,
+        &format!(
+            "-<urn:a> <urn:age> {} .\n+<urn:a> <urn:age> {} .",
+            int(30),
+            int(31)
+        ),
+    );
+    let p = s.preview_revert("main", 3, &Default::default()).unwrap();
+    assert_eq!((p.inserted, p.deleted, p.merged), (0, 1, false));
+    let r = merged(s.revert("main", 3, &Default::default()).unwrap());
+    let c = r.commit.unwrap();
+    assert_eq!((c.commit.seq, c.commit.kind), (5, CommitKind::Revert));
+    assert_eq!(c.annotation.message.as_deref(), Some("revert commit 3"));
+    assert_eq!(r.base.as_ref().unwrap().seq, 3);
+    assert_eq!(r.source.seq, 2);
+    assert!(s.merge_record(5).is_none());
+    assert!(!has(&s, "urn:c") && has(&s, "urn:b"));
+    // reverting it again changes nothing
+    assert!(matches!(
+        s.revert("main", 3, &Default::default()).unwrap(),
+        MergeOutcome::UpToDate(_)
+    ));
+    // commit 1 set the age that commit 4 changed: the cell conflicts
+    let MergeOutcome::Conflicts(rep) = s.revert("main", 1, &Default::default()).unwrap() else {
+        panic!("expected a conflict");
+    };
+    assert_eq!(rep.conflicts, 1);
+    assert!(
+        rep.error
+            .starts_with("1 conflict reverting commit 1 on main"),
+        "{}",
+        rep.error
+    );
+    let theirs = MergeOptions {
+        on_conflict: Some(crate::branch::Take::Theirs),
+        ..Default::default()
+    };
+    merged(s.revert("main", 1, &theirs).unwrap());
+    assert!(!has(&s, "urn:age"));
+    // a revert on a branch of a commit it shares with main changes the branch alone
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    merged(s.revert("dev", 2, &Default::default()).unwrap());
+    assert!(!has(&dev, "urn:b") && has(&s, "urn:b"));
+    assert_eq!(
+        code(&s.revert("main", 0, &Default::default()).unwrap_err()),
+        "invalid-merge"
+    );
+    assert!(matches!(
+        s.revert("main", 99, &Default::default()).unwrap_err(),
+        Error::NotFound(_)
+    ));
+    // a protected branch takes changes through merges only
+    s.set_branch_protected("main", true).unwrap();
+    assert_eq!(
+        code(&s.revert("main", 2, &Default::default()).unwrap_err()),
+        "branch-protected"
+    );
 }

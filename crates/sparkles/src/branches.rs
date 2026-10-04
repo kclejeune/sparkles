@@ -68,6 +68,22 @@ impl Dataset {
         self.store().preview_merge(source, target, o)
     }
 
+    /// Revert commit `commit` of branch `branch`'s history on that branch (see
+    /// [`Store::revert`](crate::store::Store::revert)).
+    pub fn revert(&self, branch: &str, commit: u64, o: &MergeOptions) -> Result<MergeOutcome> {
+        self.store().revert(branch, commit, o)
+    }
+
+    /// What reverting commit `commit` on branch `branch` would do, without writing.
+    pub fn preview_revert(
+        &self,
+        branch: &str,
+        commit: u64,
+        o: &MergeOptions,
+    ) -> Result<MergeReport> {
+        self.store().preview_revert(branch, commit, o)
+    }
+
     /// Delete branch `name`, also with unmerged commits when `force`.
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
         self.store().delete_branch(name, force)

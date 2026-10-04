@@ -517,7 +517,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "parent": nullable("integer"),
                 "ref": { "type": "string", "examples": ["commit:42"] },
                 "timestamp": { "type": "string", "format": "date-time" },
-                "kind": { "type": "string", "examples": ["create", "baseline", "update", "gsp-put", "gsp-post", "gsp-delete", "upload", "load", "reason", "reason-clear", "transaction", "embed", "patch", "unknown"] },
+                "kind": { "type": "string", "examples": ["create", "baseline", "update", "gsp-put", "gsp-post", "gsp-delete", "upload", "load", "reason", "reason-clear", "transaction", "embed", "patch", "merge", "revert", "unknown"] },
                 "inserted": { "type": "integer" },
                 "deleted": { "type": "integer" },
                 "quads": { "type": "integer" },
@@ -665,6 +665,26 @@ pub(super) fn schemas() -> Map<String, J> {
                     "description": "The heads the caller saw: `409 head-moved` when either moved.",
                 },
                 "base": { "type": "object", "description": "The merge base to use among several." },
+                "inferences": string_enum(&["exclude", "include"]),
+                "limit": { "type": "integer" },
+                "message": { "type": "string" },
+                "dryRun": { "type": "boolean" },
+            }),
+        ),
+    );
+    put(
+        "PickRequest",
+        obj(
+            &[],
+            json!({
+                "conflicts": string_enum(&["cell", "subject", "quad"]),
+                "onConflict": string_enum(&["fail", "ours", "theirs", "union"]),
+                "resolutions": array(json!({ "type": "object", "description": "As in a MergeRequest." })),
+                "expect": {
+                    "type": "object",
+                    "properties": { "target": { "type": "integer" } },
+                    "description": "The head of the branch written to that the caller saw: `409 head-moved` when it moved.",
+                },
                 "inferences": string_enum(&["exclude", "include"]),
                 "limit": { "type": "integer" },
                 "message": { "type": "string" },

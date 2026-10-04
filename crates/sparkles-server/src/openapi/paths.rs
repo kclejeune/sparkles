@@ -1346,6 +1346,33 @@ fn branches(p: &mut Paths) {
             )
             .errors(&[400, 403, 404, 410, 422, 507]),
     );
+    p.add(
+        op(GET, "/$/revert/{ds}", "previewRevert", "Branches", "Preview a revert")
+            .doc("What reverting commit `commit` of branch `branch` would do: the changes and the conflicts. Nothing is written, and conflicts do not fail the request.")
+            .see("reverts")
+            .query("branch", s(), "The branch whose history holds the commit, and that the revert writes to (default `main`).")
+            .query_req("commit", int(), "The commit to revert.")
+            .query("conflicts", json!({ "type": "string", "enum": ["cell", "subject", "quad"] }), "What counts as one value (default `cell`).")
+            .query("onConflict", json!({ "type": "string", "enum": ["fail", "ours", "theirs", "union"] }), "The rule for conflicts.")
+            .query("limit", int(), "The most conflict cells listed (default 100, at most 10000).")
+            .json("200", "The preview.", "MergeResult")
+            .errors(&[400, 404, 409, 410, 507]),
+    );
+    p.add(
+        op(POST, "/$/revert/{ds}", "revert", "Branches", "Revert a commit")
+            .doc("Undoes commit `commit` of branch `branch`'s history with one commit of kind `revert` on that branch: a three-way merge of the commit's parent into the branch, with the commit as the merge base. Later changes to the same cells conflict as in a merge. The body is optional and takes the merge options that apply. A revert that would change nothing makes no commit and answers `upToDate: true`. Needs write on the branch through the `merge` endpoint, and a protected branch refuses it.")
+            .see("reverts")
+            .query("branch", s(), "The branch whose history holds the commit, and that the revert writes to (default `main`).")
+            .query_req("commit", int(), "The commit to revert.")
+            .json_body(false, "PickRequest")
+            .json("200", "The revert, with `reverted`.", "MergeResult")
+            .resp(
+                "409",
+                "Conflicts remain (`merge-conflict`, with the report), or the branch moved (`head-moved`).",
+                Some(json!({ "application/json": { "schema": sref("ConflictReport") } })),
+            )
+            .errors(&[400, 403, 404, 410, 422, 507]),
+    );
 }
 
 fn history(p: &mut Paths) {

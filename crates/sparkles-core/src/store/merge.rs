@@ -560,6 +560,113 @@ impl Store {
     }
 }
 
+/// Which commit-level merge [`Store::apply_commit`] makes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pick {
+    /// undo a commit: merge its parent with the commit as base
+    Revert,
+}
+
+impl Store {
+    /// Revert commit `commit` of branch `branch`'s history on that branch: a three-way
+    /// merge of the commit's parent into the branch's head, with the commit itself as
+    /// the base. The result is one commit of kind `revert`, which records no second
+    /// parent. Later changes to the same cells conflict as in a merge, and `o`'s
+    /// resolutions and rule apply. A revert whose changes the branch no longer holds
+    /// writes nothing and answers [`MergeOutcome::UpToDate`].
+    pub fn revert(&self, branch: &str, commit: u64, o: &MergeOptions) -> Result<MergeOutcome> {
+        self.apply_commit(Pick::Revert, branch, commit, branch, o, false)
+    }
+
+    /// What [`revert`](Self::revert) would do, without writing or failing over
+    /// conflicts.
+    pub fn preview_revert(
+        &self,
+        branch: &str,
+        commit: u64,
+        o: &MergeOptions,
+    ) -> Result<MergeReport> {
+        match self.apply_commit(Pick::Revert, branch, commit, branch, o, true)? {
+            MergeOutcome::UpToDate(r) | MergeOutcome::Merged(r) => Ok(r),
+            MergeOutcome::Conflicts(_) => unreachable!("a preview reports conflicts"),
+        }
+    }
+
+    /// The commit-level merges: commit `seq` of `source`'s history applied to `target`
+    /// (a cherry-pick) or undone on it (a revert).
+    pub(crate) fn apply_commit(
+        &self,
+        pick: Pick,
+        source: &str,
+        seq: u64,
+        target: &str,
+        o: &MergeOptions,
+        preview: bool,
+    ) -> Result<MergeOutcome> {
+        let set = self.owned_set()?.clone();
+        check_options(o)?;
+        if seq == 0 {
+            return Err(branch::invalid_merge(
+                "commit 0 is the dataset's first commit and has no parent",
+            ));
+        }
+        // the commit and its first parent, on the branches that made them
+        let (_, owner) = self.branch_resolve(source, &At::Commit(seq))?;
+        let c = set.normalize(CommitRef {
+            branch_id: owner,
+            seq,
+        });
+        let parent = set.normalize(CommitRef {
+            branch_id: owner,
+            seq: seq - 1,
+        });
+        let (theirs, base) = match pick {
+            Pick::Revert => (parent, c),
+        };
+        let tgt = self.branch(target)?;
+        let tid = tgt.dataset_id;
+        for _attempt in 0..3 {
+            let t_head = tgt.head_commit().seq;
+            if let Some(e) = o.expect_target.filter(|e| *e != t_head) {
+                return Err(branch::conflict(
+                    "head-moved",
+                    format!("the target head is commit {t_head}, not {e}; read the report again"),
+                ));
+            }
+            let tc = set.normalize(CommitRef {
+                branch_id: tid,
+                seq: t_head,
+            });
+            let report = MergeReport::new(
+                set.named(theirs),
+                NamedCommitRef {
+                    branch: Some(target.to_string()),
+                    branch_id: tid,
+                    seq: t_head,
+                },
+                Some(set.named(base)),
+            );
+            let writing = match pick {
+                Pick::Revert => Writing {
+                    kind: CommitKind::Revert,
+                    message: format!("revert commit {seq}"),
+                    record: None,
+                    force: false,
+                    what: format!("reverting commit {seq} on {target} (commit {t_head})"),
+                },
+            };
+            match self.three_way(&set, &tgt, report, base, theirs, tc, o, preview, writing)? {
+                Step::Done(out) => return Ok(out),
+                Step::Moved => continue,
+            }
+        }
+        Err(branch::conflict(
+            "head-moved",
+            format!("{target} kept moving; try again"),
+        ))
+    }
+}
+
 /// The options every kind of merge checks before it starts.
 pub(crate) fn check_options(o: &MergeOptions) -> Result<()> {
     if matches!(o.on_conflict, Some(Take::Objects(_))) {

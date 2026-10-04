@@ -1263,6 +1263,18 @@ on `main` of kind `merge` with the message `squash dev (commit 4) into main` and
 e, a squash inserts only e. An ordinary merge after that records the second parent, and
 `dev` is then 0 ahead. A protected `main` accepts squash merges.
 
+**A25. Reverts.** `main` commit 3 inserts c, and commit 4 changes `<urn:a> <urn:age>`
+from 30 to 31. `GET /$/revert/ds?commit=3` → `200` with `changes.deleted: 1`.
+`POST /$/revert/ds?commit=3` → `200`, a commit 5 of kind `revert` with the message
+`revert commit 3`, `base` commit 3, `source` commit 2 and `reverted: {branch:"main",
+seq:3}`, no `mergedFrom`, and Q on `main` lists a and b only. The same request again →
+`upToDate: true`. Reverting commit 1 → `409 merge-conflict` on the cell `<urn:a>
+<urn:age>`, because commit 4 changed it, and with `{"onConflict":"theirs"}` the age is
+gone. `?branch=dev&commit=2` on a new `dev` removes b from `dev` alone. `commit=0` →
+`400 invalid-merge`, a commit past the head → `404`, and a revert on a protected branch
+→ `403 branch-protected`. `sparkles revert --loc db 3` exits 0, and exits 2 on the
+conflict.
+
 ## 10. Open questions
 
 1. **Exempt predicates.** Should `cell` scope exempt some predicates by default, such as

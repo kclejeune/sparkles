@@ -203,6 +203,10 @@ const ADMIN_BRANCH_ROUTES: &[&str] = &[
     "cache",
 ];
 
+/// Admin routes whose `branch` names the branch a commit-level merge writes to: their
+/// handlers check it.
+const PICK_ROUTES: &[&str] = &["revert"];
+
 fn bad_branch(msg: impl Into<String>) -> Response {
     let body = json!({ "error": msg.into(), "code": "invalid-branch" });
     let mut r = (StatusCode::BAD_REQUEST, Json(body.clone())).into_response();
@@ -302,6 +306,10 @@ pub(crate) async fn select(
         let seg = path.split('/').nth(2).unwrap_or("");
         // `/$/datasets/{ds}/clone` copies a branch too
         let clone = seg == "datasets" && path.ends_with("/clone");
+        // reverts and cherry-picks name their branch with `branch`, and check it
+        if PICK_ROUTES.contains(&seg) {
+            return next.run(req).await;
+        }
         if branch != MAIN && !clone && !ADMIN_BRANCH_ROUTES.contains(&seg) {
             return bad_branch(format!("{path} does not take a branch"));
         }
@@ -789,7 +797,8 @@ fn merge_json(r: &MergeReport, stale: Option<bool>) -> J {
         });
         j["branch"] = json!(r.target.branch);
         j["branchId"] = json!(r.target.branch_id);
-        if !r.squashed {
+        // a merge that records its second parent
+        if rc.commit.kind == sparkles::commit::CommitKind::Merge && !r.squashed {
             j["mergedFrom"] = commit_ref(&r.source);
         }
         j
@@ -826,11 +835,68 @@ fn merge_json(r: &MergeReport, stale: Option<bool>) -> J {
     j
 }
 
-fn merge_access(p: &Principal, ds: &str, ask: &MergeAsk) -> ApiResult<()> {
-    check(p, ds, &ask.source, Level::Read, Some(Endpoint::Merge))?;
-    check(p, ds, &ask.target, Level::Write, Some(Endpoint::Merge))?;
-    whole(p, ds, &ask.source)?;
-    whole(p, ds, &ask.target)
+/// A merge of some kind: what it merges, and where.
+#[derive(Clone, Debug)]
+pub(crate) enum Op {
+    Merge {
+        source: String,
+        target: String,
+    },
+    /// undo commit `commit` of `branch`'s history on that branch
+    Revert {
+        branch: String,
+        commit: u64,
+    },
+}
+
+impl Op {
+    /// The branch the operation writes to.
+    fn target(&self) -> &str {
+        match self {
+            Op::Merge { target, .. } => target,
+            Op::Revert { branch, .. } => branch,
+        }
+    }
+
+    fn run(&self, s: &sparkles::store::Store, o: &MergeOptions) -> sparkles::Result<MergeOutcome> {
+        match self {
+            Op::Merge { source, target } => s.merge(source, target, o),
+            Op::Revert { branch, commit } => s.revert(branch, *commit, o),
+        }
+    }
+
+    fn preview(
+        &self,
+        s: &sparkles::store::Store,
+        o: &MergeOptions,
+    ) -> sparkles::Result<MergeReport> {
+        match self {
+            Op::Merge { source, target } => s.preview_merge(source, target, o),
+            Op::Revert { branch, commit } => s.preview_revert(branch, *commit, o),
+        }
+    }
+
+    /// The caller's access: read on what is merged, write on the target, from grants
+    /// without graph restrictions.
+    fn access(&self, p: &Principal, ds: &str) -> ApiResult<()> {
+        let source = match self {
+            Op::Merge { source, .. } => source,
+            Op::Revert { branch, .. } => branch,
+        };
+        check(p, ds, source, Level::Read, Some(Endpoint::Merge))?;
+        check(p, ds, self.target(), Level::Write, Some(Endpoint::Merge))?;
+        whole(p, ds, source)?;
+        whole(p, ds, self.target())
+    }
+
+    /// The result's JSON: the merge fields, and what a revert undid.
+    fn json(&self, r: &MergeReport, stale: Option<bool>) -> J {
+        let mut j = merge_json(r, stale);
+        if let Op::Revert { branch, commit } = self {
+            j["reverted"] = json!({ "branch": branch, "seq": commit });
+        }
+        j
+    }
 }
 
 /// `GET /$/merge/{ds}?source=&target=`: what a merge would do, without writing.
@@ -842,15 +908,23 @@ pub(crate) async fn preview(
 ) -> ApiResult {
     let ds = main_dataset(&st, &name)?;
     let params = Params::from_query(&uri);
+    let v = query_options(&params, &["source", "target", "ff"])?;
+    let ask = merge_options(&st, &v, true)?;
+    let op = Op::Merge {
+        source: ask.source,
+        target: ask.target,
+    };
+    run_preview(&p, &name, ds, op, ask.o).await
+}
+
+/// Merge options given as query parameters (the previews), as the JSON body has them.
+fn query_options(params: &Params, own: &[&str]) -> ApiResult<J> {
     let mut v = serde_json::Map::new();
-    for k in [
-        "source",
-        "target",
-        "ff",
-        "conflicts",
-        "onConflict",
-        "inferences",
-    ] {
+    for k in own
+        .iter()
+        .copied()
+        .chain(["conflicts", "onConflict", "inferences"])
+    {
         if let Some(x) = params.get(k) {
             v.insert(k.into(), x.into());
         }
@@ -866,10 +940,20 @@ pub(crate) async fn preview(
                 .into(),
         );
     }
-    let ask = merge_options(&st, &J::Object(v), true)?;
-    merge_access(&p, &name, &ask)?;
-    let r = blocking(move || Ok(ds.store.preview_merge(&ask.source, &ask.target, &ask.o)?)).await?;
-    Ok(Json(merge_json(&r, None)).into_response())
+    Ok(J::Object(v))
+}
+
+async fn run_preview(
+    p: &Principal,
+    name: &str,
+    ds: Arc<Dataset>,
+    op: Op,
+    o: MergeOptions,
+) -> ApiResult {
+    op.access(p, name)?;
+    let op2 = op.clone();
+    let r = blocking(move || Ok(op2.preview(&ds.store, &o)?)).await?;
+    Ok(Json(op.json(&r, None)).into_response())
 }
 
 /// `POST /$/merge/{ds}`: merge, or (`dryRun`) preview the merge commit with the
@@ -884,12 +968,121 @@ pub(crate) async fn merge(
     let ds = main_dataset(&st, &name)?;
     let v: J = serde_json::from_slice(&body)
         .map_err(|e| invalid("invalid-merge", format!("invalid request body: {e}")))?;
-    let mut ask = merge_options(&st, &v, false)?;
-    merge_access(&p, &name, &ask)?;
-    if let Some(a) = p.log_name() {
-        ask.o.write.author = Some(a.into());
+    let ask = merge_options(&st, &v, false)?;
+    let op = Op::Merge {
+        source: ask.source,
+        target: ask.target,
+    };
+    execute(&st, &p, &name, ds, &headers, &v, op, ask.o, ask.dry_run).await
+}
+
+/// The options of a revert or a cherry-pick: the JSON body's merge options, which may
+/// not choose how fast-forwards are made or squash.
+fn pick_options(st: &AppState, body: &Bytes, preview: bool) -> ApiResult<(J, MergeAsk)> {
+    let mut v: J = if body.iter().all(u8::is_ascii_whitespace) {
+        json!({})
+    } else {
+        serde_json::from_slice(body)
+            .map_err(|e| invalid("invalid-merge", format!("invalid request body: {e}")))?
+    };
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| invalid("invalid-merge", "the body is a JSON object"))?;
+    for k in ["source", "target", "ff", "squash", "base"] {
+        if obj.contains_key(k) {
+            return Err(invalid(
+                "invalid-merge",
+                format!("{k} does not apply here: the query names the branches and the commit"),
+            ));
+        }
     }
-    let dr = ask.dry_run.then(|| sparkles::preview::DryRun {
+    if let Some(e) = obj.get("expect")
+        && e.get("source").is_some()
+    {
+        return Err(invalid(
+            "invalid-merge",
+            "expect takes target here: a commit does not move",
+        ));
+    }
+    obj.insert("source".into(), MAIN.into());
+    let ask = merge_options(st, &v, preview)?;
+    Ok((v, ask))
+}
+
+/// `commit=N` of a revert or a cherry-pick.
+fn commit_param(params: &Params) -> ApiResult<u64> {
+    let c = params
+        .get("commit")
+        .ok_or_else(|| invalid("invalid-merge", "commit is required"))?;
+    c.strip_prefix("commit:")
+        .unwrap_or(c)
+        .parse()
+        .map_err(|_| invalid("invalid-merge", format!("commit: a commit number, not {c}")))
+}
+
+/// The branch `branch=` names (default `main`).
+fn branch_param(params: &Params) -> String {
+    params.get("branch").unwrap_or(MAIN).to_string()
+}
+
+/// `GET /$/revert/{ds}?branch=&commit=`: what reverting the commit would do.
+pub(crate) async fn preview_revert(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult {
+    let ds = main_dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let mut v = query_options(&params, &[])?;
+    v["source"] = MAIN.into();
+    let ask = merge_options(&st, &v, true)?;
+    let op = Op::Revert {
+        branch: branch_param(&params),
+        commit: commit_param(&params)?,
+    };
+    run_preview(&p, &name, ds, op, ask.o).await
+}
+
+/// `POST /$/revert/{ds}?branch=&commit=`: revert a commit of the branch's history on the
+/// branch, with the merge options of the JSON body, if any.
+pub(crate) async fn revert(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> ApiResult {
+    let ds = main_dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let (v, ask) = pick_options(&st, &body, false)?;
+    let op = Op::Revert {
+        branch: branch_param(&params),
+        commit: commit_param(&params)?,
+    };
+    execute(&st, &p, &name, ds, &headers, &v, op, ask.o, ask.dry_run).await
+}
+
+/// Run a merge of some kind and answer its result: `200` with the result, `409` with
+/// the conflicts, or for a dry run the write preview with the merge fields.
+#[allow(clippy::too_many_arguments)]
+async fn execute(
+    st: &Arc<AppState>,
+    p: &Principal,
+    name: &str,
+    ds: Arc<Dataset>,
+    headers: &HeaderMap,
+    v: &J,
+    op: Op,
+    mut o: MergeOptions,
+    dry_run: bool,
+) -> ApiResult {
+    op.access(p, name)?;
+    if let Some(a) = p.log_name() {
+        o.write.author = Some(a.into());
+    }
+    let dr = dry_run.then(|| sparkles::preview::DryRun {
         changes: v
             .get("changes")
             .and_then(J::as_u64)
@@ -898,15 +1091,14 @@ pub(crate) async fn merge(
         all_changes: false,
         max_changes: st.limits.max_rows as u64,
     });
-    ask.o.write.dry_run = dr.clone();
-    let (source, target) = (ask.source.clone(), ask.target.clone());
-    let tds = st.branch_dataset(&ds, &target)?;
+    o.write.dry_run = dr.clone();
+    let tds = st.branch_dataset(&ds, op.target())?;
     let reasoned = tds.reasoning.read().is_some();
     let d = ds.clone();
-    let o = ask.o.clone();
+    let (op2, o2) = (op.clone(), o.clone());
     let t0 = std::time::Instant::now();
     let out = blocking(move || {
-        Ok(match d.store.merge(&ask.source, &ask.target, &ask.o) {
+        Ok(match op2.run(&d.store, &o2) {
             Err(Error::DryRun(p)) => Err(*p),
             Ok(o) => Ok(o),
             Err(e) => return Err(e.into()),
@@ -917,46 +1109,26 @@ pub(crate) async fn merge(
     let out = match out {
         Ok(o) => o,
         Err(e) => {
-            count_merge(&st, &name, "refused", None, secs);
+            count_merge(st, name, "refused", None, secs);
             return Err(e);
         }
     };
-    match &out {
-        Ok(MergeOutcome::Conflicts(c)) => {
-            let mut m = MERGES.lock();
-            let e = m.entry(st.metrics.dataset_label(Some(&name))).or_default();
-            e.conflicts += c.conflicts;
-            *e.results.entry("conflict").or_default() += 1;
-            e.seconds += secs;
-            e.count += 1;
-        }
-        Ok(MergeOutcome::UpToDate(r)) => count_merge(&st, &name, "up-to-date", Some(r), secs),
-        Ok(MergeOutcome::Merged(r)) => count_merge(
-            &st,
-            &name,
-            if r.fast_forward {
-                "fast-forward"
-            } else {
-                "merged"
-            },
-            Some(r),
-            secs,
-        ),
-        Err(_) => {}
+    if let Ok(o) = &out {
+        count_outcome(st, name, o, secs);
     }
     match out {
         Err(preview) => {
             // a dry run: the C15 preview of the merge commit, with the merge fields
             let dr = dr.expect("only a dry run previews");
-            let req = dry_run::Request::new(&st, &headers, &dr, false);
+            let req = dry_run::Request::new(st, headers, &dr, false);
             let mut doc = req.json(&tds, &preview);
             let d = ds.clone();
             let mut po = o;
             po.write.dry_run = None;
-            let fields =
-                blocking(move || Ok(d.store.preview_merge(&source, &target, &po)?)).await?;
+            let op2 = op.clone();
+            let fields = blocking(move || Ok(op2.preview(&d.store, &po)?)).await?;
             if let Some(obj) = doc.as_object_mut() {
-                obj.insert("merge".into(), merge_json(&fields, None));
+                obj.insert("merge".into(), op.json(&fields, None));
             }
             Ok(Json(doc).into_response())
         }
@@ -964,12 +1136,38 @@ pub(crate) async fn merge(
             StatusCode::CONFLICT,
             serde_json::to_value(c.as_ref()).unwrap_or_default(),
         )),
-        Ok(MergeOutcome::UpToDate(r)) => Ok(Json(merge_json(&r, None)).into_response()),
+        Ok(MergeOutcome::UpToDate(r)) => Ok(Json(op.json(&r, None)).into_response()),
         Ok(MergeOutcome::Merged(r)) => {
             let stale = reasoned && (r.inserted + r.deleted) > 0;
             let seq = r.commit.as_ref().map_or(r.target.seq, |c| c.commit.seq);
-            let resp = Json(merge_json(&r, Some(stale))).into_response();
+            let resp = Json(op.json(&r, Some(stale))).into_response();
             Ok(with_commit(resp, &tds, seq))
         }
+    }
+}
+
+/// Count a merge's outcome in the merge metrics.
+fn count_outcome(st: &AppState, name: &str, out: &MergeOutcome, secs: f64) {
+    match out {
+        MergeOutcome::Conflicts(c) => {
+            let mut m = MERGES.lock();
+            let e = m.entry(st.metrics.dataset_label(Some(name))).or_default();
+            e.conflicts += c.conflicts;
+            *e.results.entry("conflict").or_default() += 1;
+            e.seconds += secs;
+            e.count += 1;
+        }
+        MergeOutcome::UpToDate(r) => count_merge(st, name, "up-to-date", Some(r), secs),
+        MergeOutcome::Merged(r) => count_merge(
+            st,
+            name,
+            if r.fast_forward && !r.squashed {
+                "fast-forward"
+            } else {
+                "merged"
+            },
+            Some(r),
+            secs,
+        ),
     }
 }

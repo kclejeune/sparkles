@@ -2640,7 +2640,7 @@ type Commit = {
   timestamp: string;             // RFC 3339 UTC with milliseconds, never decreasing
   kind: "create" | "baseline" | "update" | "gsp-put" | "gsp-post" | "gsp-delete"
       | "upload" | "load" | "reason" | "reason-clear" | "transaction" | "embed" | "patch"
-      | "merge" | "unknown";
+      | "merge" | "revert" | "unknown";
   inserted: number; deleted: number;   // net change relative to the parent
   quads: number;                        // dataset size after the commit
   generation: string;                   // index generation it was made in
@@ -2941,6 +2941,33 @@ its own range, so labels never collide across branches.
 | A write to a protected branch outside a merge | 403 | `branch-protected` |
 | An unknown or hidden branch | 404 | `no-such-branch` |
 | A bad name or request | 400 | `invalid-branch` or `invalid-merge` |
+
+### Reverts
+
+| Method | Path | Result |
+|--------|------|--------|
+| GET | `/$/revert/{ds}?branch=&commit=` | Previews a revert. Nothing is written, and conflicts do not fail the request. |
+| POST | `/$/revert/{ds}?branch=&commit=` | Reverts. Answers `200` with the result, or `409` with the conflict report. |
+
+A revert undoes one commit of a branch's history with a new commit of kind `revert` on
+that branch. `branch` names the branch, `main` by default, and `commit` the commit's
+number, which may be one the branch shares with its upstream. The revert is a three-way
+merge of the commit's parent into the branch's head, with the commit itself as the
+merge base, so the changes it applies are the commit's changes reversed. A later commit
+that changed the same cell conflicts as in a merge, and the conflict report, `onConflict`
+and `resolutions` work the same way. The revert of a merge commit undoes what the merge
+changed relative to its first parent. The merge stays recorded, so merging the same
+source again does not bring those changes back.
+
+The body is optional. It takes `conflicts`, `onConflict`, `resolutions`, `expect`
+with `target` only, `inferences`, `limit`, `message` and `dryRun`, as a `MergeRequest`
+does. The result is a `MergeResult` whose `source` is the commit's parent and whose
+`base` is the commit, with `reverted: {branch, seq}` added. A revert that would change
+nothing, because the branch no longer holds the commit's changes, makes no commit and
+answers `upToDate: true`. The default message is `revert commit 57`. A revert needs
+`write` on the branch through the `merge` endpoint, from a grant without graph
+restrictions, and a protected branch refuses it with `403 branch-protected`, since its
+changes do not come through a merge. Reverting commit 0 answers `400 invalid-merge`.
 
 ### Storage, history and access
 

@@ -829,43 +829,274 @@ fn print_merge(out: &Out, a: &MergeArgs) -> Result<()> {
                 j["conflicts"]["resolved"].as_u64().unwrap_or(0)
             );
         }
-        Out::Conflicts(j) => {
-            let ours = j["target"]["branch"]
-                .as_str()
-                .unwrap_or(&a.into)
-                .to_string();
-            let theirs = j["source"]["branch"]
-                .as_str()
-                .unwrap_or(&a.source)
-                .to_string();
-            for c in j["cells"].as_array().into_iter().flatten() {
-                let graph = c["graph"].as_str().unwrap_or("(default graph)");
-                println!(
-                    "CONFLICT  {} {}  {graph}",
-                    c["subject"].as_str().unwrap_or_default(),
-                    c["predicate"].as_str().unwrap_or("")
-                );
-                let vals = |v: &J| {
-                    v.as_array()
-                        .into_iter()
-                        .flatten()
-                        .map(short)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                println!("  base    {}", vals(&c["base"]));
-                println!("  ours    {}   ({ours})", vals(&c["ours"]));
-                println!("  theirs  {}   ({theirs})", vals(&c["theirs"]));
-            }
-            let n = j["conflicts"]
-                .as_u64()
-                .or(j["conflictCount"].as_u64())
-                .unwrap_or(0);
-            println!(
-                "{n} conflict{}, nothing merged. Resolve with --on-conflict or --resolve FILE.",
-                if n == 1 { "" } else { "s" }
-            );
-        }
+        Out::Conflicts(j) => print_conflicts(j, &a.into, &a.source),
     }
     Ok(())
+}
+
+/// The cells of a conflict report, and how to resolve them.
+fn print_conflicts(j: &J, ours: &str, theirs: &str) {
+    let ours = j["target"]["branch"].as_str().unwrap_or(ours).to_string();
+    let theirs = j["source"]["branch"].as_str().unwrap_or(theirs).to_string();
+    for c in j["cells"].as_array().into_iter().flatten() {
+        let graph = c["graph"].as_str().unwrap_or("(default graph)");
+        println!(
+            "CONFLICT  {} {}  {graph}",
+            c["subject"].as_str().unwrap_or_default(),
+            c["predicate"].as_str().unwrap_or("")
+        );
+        let vals = |v: &J| {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .map(short)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!("  base    {}", vals(&c["base"]));
+        println!("  ours    {}   ({ours})", vals(&c["ours"]));
+        println!("  theirs  {}   ({theirs})", vals(&c["theirs"]));
+    }
+    let n = j["conflicts"]
+        .as_u64()
+        .or(j["conflictCount"].as_u64())
+        .unwrap_or(0);
+    println!(
+        "{n} conflict{}, nothing merged. Resolve with --on-conflict or --resolve FILE.",
+        if n == 1 { "" } else { "s" }
+    );
+}
+
+// ------------------------------------------------------ revert and cherry-pick ------
+
+/// The options of `sparkles revert` and `sparkles cherry-pick`, which write to the
+/// branch of the global `--branch` (main by default).
+#[derive(Args, Debug)]
+pub struct PickArgs {
+    #[command(flatten)]
+    pub target: Target,
+    /// What counts as one value when both sides changed it: cell, subject or quad
+    #[arg(long, default_value = "cell")]
+    pub conflicts: String,
+    /// The rule for conflicts --resolve does not cover: fail, ours, theirs or union
+    #[arg(long, default_value = "fail")]
+    pub on_conflict: String,
+    /// A JSON array of resolutions ({graph, subject?, predicate?, take, objects?})
+    #[arg(long, value_name = "FILE.json")]
+    pub resolve: Option<PathBuf>,
+    /// The head of the branch the conflicts were read at
+    #[arg(long)]
+    pub expect_target: Option<u64>,
+    /// Include the inferred graph
+    #[arg(long)]
+    pub include_inferences: bool,
+    /// The commit's message
+    #[arg(long)]
+    pub message: Option<String>,
+    /// Show what it would do, and write nothing
+    #[arg(long)]
+    pub dry_run: bool,
+    /// text or json
+    #[arg(long, default_value = "text")]
+    pub format: String,
+}
+
+#[derive(Args, Debug)]
+pub struct RevertArgs {
+    /// The commit to revert, in the history of the --branch branch
+    pub commit: u64,
+    #[command(flatten)]
+    pub pick: PickArgs,
+}
+
+/// What a commit-level merge does.
+pub enum Pick {
+    Revert { commit: u64 },
+}
+
+/// `sparkles revert`: 0 after the commit or when there is nothing to undo, 2 when
+/// conflicts stopped it.
+pub fn run_pick(pick: Pick, a: PickArgs, opts: StoreOptions) -> Result<i32> {
+    if !matches!(a.format.as_str(), "text" | "json") {
+        bail!("--format: text or json, not {}", a.format);
+    }
+    let branch = branch().unwrap_or(MAIN).to_string();
+    let resolutions: Option<J> = match &a.resolve {
+        Some(f) => Some(
+            serde_json::from_slice(
+                &std::fs::read(f).with_context(|| format!("reading {}", f.display()))?,
+            )
+            .with_context(|| format!("{}: not JSON", f.display()))?,
+        ),
+        None => None,
+    };
+    let out = match &a.target.loc {
+        Some(loc) => local_pick(loc, &pick, &branch, &a, resolutions.as_ref(), opts)?,
+        None => remote_pick(&pick, &branch, &a, resolutions)?,
+    };
+    let code = match &out {
+        Out::Conflicts(_) => CONFLICT_EXIT,
+        _ => 0,
+    };
+    let j = match &out {
+        Out::Done(j) | Out::Conflicts(j) => j,
+    };
+    if a.format == "json" {
+        println!("{}", serde_json::to_string_pretty(j)?);
+        return Ok(code);
+    }
+    let what = match &pick {
+        Pick::Revert { commit } => format!("revert commit {commit} on {branch}"),
+    };
+    println!("{what} (commit {})", j["target"]["seq"]);
+    match &out {
+        Out::Done(j) if j["upToDate"] == true => println!("nothing to change"),
+        Out::Done(j) => {
+            let verb = if a.dry_run { "would change" } else { "changed" };
+            let commit = match j["commit"].as_u64().or(j["commit"]["seq"].as_u64()) {
+                Some(c) => format!(" as commit {c}"),
+                None => String::new(),
+            };
+            println!(
+                "{verb}: +{} -{}{commit}; {} conflicts, {} resolved",
+                j["changes"]["inserted"],
+                j["changes"]["deleted"],
+                j["conflicts"]["found"].as_u64().unwrap_or(0),
+                j["conflicts"]["resolved"].as_u64().unwrap_or(0)
+            );
+        }
+        Out::Conflicts(j) => print_conflicts(j, &branch, &branch),
+    }
+    Ok(code)
+}
+
+fn pick_options(a: &PickArgs, res: Option<&J>) -> Result<MergeOptions> {
+    let mut o = MergeOptions {
+        scope: ConflictScope::parse(&a.conflicts)
+            .with_context(|| format!("--conflicts: cell, subject or quad, not {}", a.conflicts))?,
+        on_conflict: match a.on_conflict.as_str() {
+            "fail" => None,
+            t => Some(
+                Take::parse(t)
+                    .filter(|t| *t != Take::Base)
+                    .with_context(|| {
+                        format!("--on-conflict: fail, ours, theirs or union, not {t}")
+                    })?,
+            ),
+        },
+        expect_target: a.expect_target,
+        include_inferences: a.include_inferences,
+        ..Default::default()
+    };
+    if let Some(m) = &a.message {
+        o.write.message = sparkles::annotations::validate_message(m)?;
+    }
+    if let Some(rs) = res {
+        for r in rs
+            .as_array()
+            .context("--resolve: a JSON array of resolutions")?
+        {
+            o.resolutions.push(parse_resolution(r)?);
+        }
+    }
+    Ok(o)
+}
+
+fn local_pick(
+    loc: &Path,
+    pick: &Pick,
+    branch: &str,
+    a: &PickArgs,
+    res: Option<&J>,
+    opts: StoreOptions,
+) -> Result<Out> {
+    let s = Store::open(loc, opts)?;
+    // the branch's write-time validation, as for any write
+    if branch == MAIN {
+        crate::write_validation::install(&s)?;
+    } else {
+        let b = s.branch(branch)?;
+        crate::write_validation::install(&b)?;
+    }
+    let o = pick_options(a, res)?;
+    if a.dry_run {
+        let r = match pick {
+            Pick::Revert { commit } => s.preview_revert(branch, *commit, &o)?,
+        };
+        return Ok(match &r.conflicts {
+            Some(c) => Out::Conflicts(conflicts_json(c)),
+            None => Out::Done(report_json(&r)),
+        });
+    }
+    let out = match pick {
+        Pick::Revert { commit } => s.revert(branch, *commit, &o)?,
+    };
+    Ok(match out {
+        MergeOutcome::UpToDate(r) | MergeOutcome::Merged(r) => Out::Done(report_json(&r)),
+        MergeOutcome::Conflicts(c) => Out::Conflicts(conflicts_json(&c)),
+    })
+}
+
+#[cfg(feature = "auth")]
+fn remote_pick(pick: &Pick, branch: &str, a: &PickArgs, res: Option<J>) -> Result<Out> {
+    use crate::remote::{JsonBody, Remote};
+    let ds = a
+        .target
+        .dataset
+        .as_deref()
+        .context("--dataset NAME is required with --server")?;
+    let r = Remote::open(a.target.server.as_deref(), a.target.insecure_http)?;
+    let mut q = form_urlencoded::Serializer::new(String::new());
+    q.append_pair("branch", branch);
+    let route = match pick {
+        Pick::Revert { commit } => {
+            q.append_pair("commit", &commit.to_string());
+            "revert"
+        }
+    };
+    let mut body = json!({
+        "conflicts": a.conflicts,
+        "onConflict": a.on_conflict,
+        "inferences": if a.include_inferences { "include" } else { "exclude" },
+    });
+    if let Some(res) = res {
+        body["resolutions"] = res;
+    }
+    if let Some(t) = a.expect_target {
+        body["expect"] = json!({ "target": t });
+    }
+    if let Some(m) = &a.message {
+        body["message"] = m.clone().into();
+    }
+    let path = format!("/$/{route}/{ds}?{}", q.finish());
+    let resp = if a.dry_run {
+        let mut q = form_urlencoded::Serializer::new(String::new());
+        q.append_pair("conflicts", &a.conflicts)
+            .append_pair("onConflict", &a.on_conflict);
+        r.req(reqwest::Method::GET, &format!("{path}&{}", q.finish()))
+            .send()
+    } else {
+        r.req(reqwest::Method::POST, &path)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+    }
+    .with_context(|| format!("cannot reach {}", r.base))?;
+    if resp.status() == reqwest::StatusCode::CONFLICT {
+        let j = resp.json_value()?;
+        if j["code"] == "merge-conflict" {
+            return Ok(Out::Conflicts(j));
+        }
+        bail!("409: {}", j["error"].as_str().unwrap_or_default());
+    }
+    let j = r.check(Ok(resp), Some(ds))?.json_value()?;
+    if a.dry_run && j["conflictCount"].as_u64().unwrap_or(0) > 0 {
+        return Ok(Out::Conflicts(j));
+    }
+    Ok(Out::Done(j))
+}
+
+#[cfg(not(feature = "auth"))]
+fn remote_pick(_: &Pick, _: &str, _: &PickArgs, _: Option<J>) -> Result<Out> {
+    bail!("--server: built without the remote client (cargo feature \"auth\")")
 }

@@ -286,6 +286,12 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("merge", "branches.merge", |ds| {
             ds.merge("dev", "main", &Default::default());
         }),
+        op!("previewRevert", "branches.preview_revert", |ds| {
+            ds.preview_revert("main", 3, &Default::default());
+        }),
+        op!("revert", "branches.revert", |ds| {
+            ds.revert("main", 3, &Default::default());
+        }),
         // ----------------------------------------------------------- search indexes
         op!("getTextIndex", "indexes.text.status", |ds| {
             ds.indexes().text().status();

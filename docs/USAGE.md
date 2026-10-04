@@ -1173,6 +1173,15 @@ parent, so the source stays ahead of the target and keeps its own history to its
 a merge or when the target is already up to date, 2 when conflicts stopped the merge,
 and 1 on any other error.
 
+`sparkles revert N` undoes commit N of the `--branch` branch, `main` by default, with
+a new commit of kind `revert`. Later changes to the same cells conflict as in a merge,
+and `revert` takes the conflict options of `merge` and exits the same way:
+
+```sh
+sparkles revert --loc db 57                     # undo commit 57 on main
+sparkles revert --loc db --branch dev 61 --on-conflict theirs
+```
+
 `--branch NAME` works with `query`, `update`, `load`, `dump`, `log`, `diff`, `snapshot`,
 `compact`, `stats`, `clone` and `patch`. With `--server`, these commands send the
 dataset's name in the path form, `ds@NAME`. The web UI has a branch menu next to the

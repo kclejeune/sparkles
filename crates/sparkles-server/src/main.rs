@@ -1466,6 +1466,9 @@ enum Cmd {
     },
     /// Merge a branch into another (main by default); exits 2 when conflicts stopped it
     Merge(branch_cmd::MergeArgs),
+    /// Undo a commit on the --branch branch (main by default) with a new commit; exits 2
+    /// when conflicts stopped it
+    Revert(branch_cmd::RevertArgs),
     /// Print database statistics
     Stats {
         #[arg(long)]
@@ -2120,6 +2123,7 @@ fn run() -> Result<()> {
                 | Cmd::Stats { .. }
                 | Cmd::Clone { .. }
                 | Cmd::Patch(_)
+                | Cmd::Revert(_)
         )
     {
         bail!("this command does not take --branch");
@@ -3261,6 +3265,14 @@ fn run() -> Result<()> {
         Cmd::Branch { cmd } => branch_cmd::run_branch(cmd, opts),
         Cmd::Merge(a) => {
             let code = branch_cmd::run_merge(a, opts)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Cmd::Revert(a) => {
+            let pick = branch_cmd::Pick::Revert { commit: a.commit };
+            let code = branch_cmd::run_pick(pick, a.pick, opts)?;
             if code != 0 {
                 std::process::exit(code);
             }

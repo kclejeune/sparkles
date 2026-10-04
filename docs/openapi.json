@@ -1969,6 +1969,8 @@
               "transaction",
               "embed",
               "patch",
+              "merge",
+              "revert",
               "unknown"
             ],
             "type": "string"
@@ -5663,6 +5665,60 @@
           },
           "timing": {
             "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "PickRequest": {
+        "properties": {
+          "conflicts": {
+            "enum": [
+              "cell",
+              "subject",
+              "quad"
+            ],
+            "type": "string"
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "expect": {
+            "description": "The head of the branch written to that the caller saw: `409 head-moved` when it moved.",
+            "properties": {
+              "target": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "inferences": {
+            "enum": [
+              "exclude",
+              "include"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "onConflict": {
+            "enum": [
+              "fail",
+              "ours",
+              "theirs",
+              "union"
+            ],
+            "type": "string"
+          },
+          "resolutions": {
+            "items": {
+              "description": "As in a MergeRequest.",
+              "type": "object"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -17506,6 +17562,222 @@
           "Backup repositories"
         ],
         "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/revert/{ds}": {
+      "get": {
+        "description": "What reverting commit `commit` of branch `branch` would do: the changes and the conflicts. Nothing is written, and conflicts do not fail the request.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reverts"
+        },
+        "operationId": "previewRevert",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The branch whose history holds the commit, and that the revert writes to (default `main`).",
+            "in": "query",
+            "name": "branch",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The commit to revert.",
+            "in": "query",
+            "name": "commit",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "What counts as one value (default `cell`).",
+            "in": "query",
+            "name": "conflicts",
+            "schema": {
+              "enum": [
+                "cell",
+                "subject",
+                "quad"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The rule for conflicts.",
+            "in": "query",
+            "name": "onConflict",
+            "schema": {
+              "enum": [
+                "fail",
+                "ours",
+                "theirs",
+                "union"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most conflict cells listed (default 100, at most 10000).",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeResult"
+                }
+              }
+            },
+            "description": "The preview."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Preview a revert",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "Undoes commit `commit` of branch `branch`'s history with one commit of kind `revert` on that branch: a three-way merge of the commit's parent into the branch, with the commit as the merge base. Later changes to the same cells conflict as in a merge. The body is optional and takes the merge options that apply. A revert that would change nothing makes no commit and answers `upToDate: true`. Needs write on the branch through the `merge` endpoint, and a protected branch refuses it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reverts"
+        },
+        "operationId": "revert",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The branch whose history holds the commit, and that the revert writes to (default `main`).",
+            "in": "query",
+            "name": "branch",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The commit to revert.",
+            "in": "query",
+            "name": "commit",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PickRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeResult"
+                }
+              }
+            },
+            "description": "The revert, with `reverted`."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictReport"
+                }
+              }
+            },
+            "description": "Conflicts remain (`merge-conflict`, with the report), or the branch moved (`head-moved`)."
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Revert a commit",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
       }
     },
     "/$/schema/{ds}": {

@@ -49,12 +49,14 @@ pub enum CommitKind {
     Patch,
     /// a merge of another branch's changes (`POST /$/merge/{ds}`, `Store::merge`)
     Merge,
+    /// a revert of an earlier commit (`POST /$/revert/{ds}`, `Store::revert`)
+    Revert,
     /// a WAL commit written by an older version after this one had upgraded the database
     Unknown,
 }
 
 impl CommitKind {
-    const ALL: [CommitKind; 15] = [
+    const ALL: [CommitKind; 16] = [
         CommitKind::Create,
         CommitKind::Baseline,
         CommitKind::Update,
@@ -69,6 +71,7 @@ impl CommitKind {
         CommitKind::Embed,
         CommitKind::Patch,
         CommitKind::Merge,
+        CommitKind::Revert,
         CommitKind::Unknown,
     ];
 
@@ -89,6 +92,7 @@ impl CommitKind {
             CommitKind::Embed => 11,
             CommitKind::Patch => 12,
             CommitKind::Merge => 13,
+            CommitKind::Revert => 14,
             CommitKind::Unknown => 255,
         }
     }
@@ -117,6 +121,7 @@ impl CommitKind {
             CommitKind::Embed => "embed",
             CommitKind::Patch => "patch",
             CommitKind::Merge => "merge",
+            CommitKind::Revert => "revert",
             CommitKind::Unknown => "unknown",
         }
     }
