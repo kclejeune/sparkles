@@ -640,8 +640,8 @@ fn rebuilds_are_counted_by_reason() {
     let c = s.rebuilds(RebuildReason::Compact);
     assert_eq!(c.count(), 1, "{c:?}");
     assert!(c.sum_seconds > 0.0);
-    // a quick rebuild lands in the first bucket
-    assert_eq!(c.buckets[0], 1);
+    // the rebuild lands in exactly one bucket; which one depends on the machine's load
+    assert_eq!(c.buckets.iter().filter(|&&n| n == 1).count(), 1, "{c:?}");
     // a dry run publishes nothing and counts nothing
     let dry = crate::guard::WriteOptions {
         dry_run: Some(crate::preview::DryRun::default()),

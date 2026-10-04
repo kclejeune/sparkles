@@ -801,7 +801,7 @@ fn schema(p: &mut Paths) {
             s(),
             "The sources: `guard`, `default`, a graph IRI or `none` (repeatable).",
         )
-        .json("200", "The constraints layer.", "ConstraintsLayer")
+        .json("200", "The constraints layer.", "ConstraintsReport")
         .errors(&[400]),
     );
     p.add(
@@ -2745,8 +2745,8 @@ fn protocol(p: &mut Paths) {
                 "200",
                 "The result.",
                 Some(json!({
-                    "application/json": { "schema": sref("ShexReport") },
-                    "text/turtle": text(),
+                    "application/json": { "schema": { "anyOf": [sref("ShexReport"), sref("ShexResultMap")] } },
+                    "text/plain": text(),
                 })),
             )
             .errors(&[400, 408, 501, 507]),

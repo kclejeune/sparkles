@@ -821,10 +821,9 @@ take `limit` with `before` or `after`. Backup listings take `limit` and `before`
 `412`. Responses of queries and writes carry `Sparkles-Commit` and `Sparkles-Dataset-Id`.
 
 **Coverage.** Every route of the server is described with its methods, parameters and \
-media types. The common bodies are described member by member, and so are the admin \
-bodies of history, stored queries, the search indexes, reasoning, validation and backups. \
-The other admin bodies (diffs, the change feed, write previews, backup policies) are open \
-objects that link to their section of the reference.";
+media types. Every named schema is described member by member. Members the reference \
+calls free-form, such as SHACL results and GeoJSON geometries, are open objects inside \
+them, and a few answers, such as class profiles and MCP messages, are plain objects.";
 
 fn tags() -> J {
     let t = |name: &str, d: &str, anchor: &str| json!({ "name": name, "description": d, "externalDocs": { "url": api_doc(anchor) } });

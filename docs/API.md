@@ -33,14 +33,15 @@ permission is `public`, `any caller`, `signed in`, `web session`, a dataset leve
 Listings that page carry `x-sparkles-pagination`, which names the parameters that select
 a page and the member that continues the listing.
 
-The common bodies have full schemas. They are the error body, the SPARQL results, dataset
-and server information, readiness, tasks, commits and receipts, whoami, tokens, schema
-pages and the formatter's request and result. So do the most used admin bodies: history
-status, snapshots and history queries, stored queries, the configuration and status of
-the full-text, vector and spatial indexes, reasoning status, write-time validation, and
-backup repositories and backups. A test checks these against the bodies a server
-returns. The other admin bodies, such as diffs, the change feed, write previews and
-backup policies, are open objects that link to their section of this page.
+Every named schema of the description is complete, from the error body, the SPARQL
+results and the dataset information to diffs, the change feed, write previews, the
+metrics snapshot, Fuseki's services, reasoning diagnostics, ShEx reports and backup
+policies. Members that this page calls free-form stay open objects inside them, such as
+the results of a validation summary, a stored query's parameters and a GeoJSON geometry.
+A few answers are still plain objects described inline: the JSON form of drafted shapes,
+class profiles, schema diffs, the linter's result, MCP's JSON-RPC messages and the
+explanation of a query. A test sends requests to a server and checks their JSON bodies
+and the answers against the schemas.
 
 The UI's Server page links both documents. Any OpenAPI viewer can open them, for example
 Swagger UI or Redocly pointed at `http://localhost:3030/$/openapi.json`. The Rust client
@@ -855,8 +856,9 @@ page. They read no dataset.
 | `/$/validate/data` | `data`, `languageSyntax` (Jena's names: `N-Quads`, the default, `Turtle`, `N-Triples`, `TriG`, `RDF/XML`, `JSON-LD`, `N3`, `RDF/JSON`, `TriX`) | `{input}`, or `{input, errors}` with the first syntax error |
 | `/$/validate/langtag` | `langtag` or `lang` (repeatable) | `{langtags: [{input, errors, formatted, language, script?, region?, variant?, extension?, privateuse?}]}` |
 
-`errors` is `[{"parse-error": string, "parse-error-line"?: number, "parse-error-column"?:
-number}]`, as in Fuseki. `formatted` is the formatter's output (the parser's serialization
+For queries, updates and data, `errors` is `[{"parse-error": string, "parse-error-line"?:
+number, "parse-error-column"?: number}]`, as in Fuseki. For IRIs and language tags it is a
+list of messages. `formatted` is the formatter's output (the parser's serialization
 in a build without the `fmt` feature), and `algebra` is the SPARQL algebra in SSE. Fuseki
 also gives the algebra in quad form and optimized, which Sparkles does not. Fuseki's
 language tag validator answers in HTML only. A missing parameter is a `400`.
@@ -4331,7 +4333,7 @@ exactly.
 | PUT | `/$/vector/{ds}/{name}` | Creates (`201`) or replaces (`200`) the index. The body is its configuration, and the response is `{ index, task }`, where the task follows the build. `409` when another index has the predicate. |
 | DELETE | `/$/vector/{ds}/{name}` | Drops the index and its files, with `204`. |
 | POST | `/$/vector/{ds}/{name}/rebuild` | Builds the index again from RDF. Returns `202` and a task. |
-| POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. |
+| POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. `recall` is `null` when no vector was sampled, for example while the index has no graph to search. |
 
 A `VectorIndexStatus` is
 `{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
