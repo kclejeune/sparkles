@@ -6,6 +6,7 @@
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
+  import { branchOption, branchParam, MAIN, onBranch } from '$lib/branches';
   import { receiptSummary } from '$lib/commits';
   import { normalizeAt, validAt } from '$lib/history';
   import { formatEditor } from '$lib/fmt-edit';
@@ -27,6 +28,7 @@
   import { cloneDetail, cloneMethodText, originSummary } from '$lib/clone';
   import { tableKind, tableProblem, UPLOAD_ACCEPT } from '$lib/upload';
   import BackupsPanel from '$components/BackupsPanel.svelte';
+  import BranchesPanel from '$components/BranchesPanel.svelte';
   import CloneDialog from '$components/CloneDialog.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
   import DescribePanel from '$components/DescribePanel.svelte';
@@ -45,7 +47,65 @@
 
   const name = $derived(page.params.name ?? '');
   const info = $derived(app.datasets.find((d) => d.name === name));
-  const prefixes = $derived(app.prefixes(name));
+  /** The branch the page shows (`?branch=`): null for `main`. */
+  const branch = $derived(branchParam(page.url.searchParams.get('branch')));
+  /** The dataset on that branch, as the API client takes it (`name@branch`). */
+  const target = $derived(onBranch(name, branch));
+  const prefixes = $derived(app.prefixes(target));
+
+  // the branches (none for in-memory datasets, which answer 501)
+  let branchList = $state<api.Branch[] | null>(null);
+  let branchesError = $state<api.ApiError | Error | null>(null);
+  let branchesLoading = $state(false);
+  const inMemory = $derived(info?.type === 'mem');
+  const hasBranches = $derived(!inMemory && branchList != null);
+  /** In-memory datasets answer 501, and servers without branches 404. */
+  const branchesUnsupported = $derived(
+    branchesError instanceof api.ApiError &&
+      (branchesError.status === 404 || branchesError.status === 501),
+  );
+  /** The branch the page shows, once the list has it. */
+  const shown = $derived(branchList?.find((b) => b.name === (branch ?? MAIN)));
+
+  async function loadBranches() {
+    const ds = name;
+    if (inMemory) {
+      branchList = null;
+      branchesError = null;
+      return;
+    }
+    branchesLoading = true;
+    try {
+      const l = await api.branches(ds);
+      if (ds !== name) return;
+      branchList = l.branches;
+      branchesError = null;
+    } catch (e) {
+      if (ds !== name) return;
+      branchList = null;
+      branchesError = e as Error;
+    } finally {
+      if (ds === name) branchesLoading = false;
+    }
+  }
+
+  $effect(() => {
+    if (!name) return;
+    void inMemory;
+    untrack(() => {
+      branchList = null;
+      void loadBranches();
+    });
+  });
+
+  /** Show another branch. The choice lives in the URL, so a link opens the same branch. */
+  function selectBranch(b: string) {
+    const path = resolve('/datasets/[name]', { name });
+    goto(b === MAIN ? path : `${path}?branch=${encodeURIComponent(b)}`, {
+      keepFocus: true,
+      noScroll: true,
+    });
+  }
 
   let stats = $state<api.DatasetStats | null>(null);
   let statsError = $state<api.ApiError | Error | null>(null);
@@ -72,7 +132,7 @@
     loading = true;
     try {
       const at = statsAtOk ? (normalizeAt(statsAt) ?? undefined) : undefined;
-      stats = await api.datasetStats(name, at);
+      stats = await api.datasetStats(target, at);
       statsError = null;
     } catch (e) {
       statsError = e as Error;
@@ -81,11 +141,11 @@
     }
   }
 
-  // only a new name resets the page: reloading the prefixes (refreshAll) must not
-  // unmount the panels and their open dialogs
+  // only a new name or branch resets the page: reloading the prefixes (refreshAll) must
+  // not unmount the panels and their open dialogs
   $effect(() => {
     if (!name) return;
-    const ds = name;
+    const ds = target;
     untrack(() => {
       stats = null;
       statsAt = '';
@@ -97,8 +157,9 @@
   function refreshAll() {
     refreshKick++;
     void loadStats();
+    void loadBranches();
     void app.refreshDatasets();
-    void app.loadPrefixes(name, true);
+    void app.loadPrefixes(target, true);
   }
 
   // --- actions -----------------------------------------------------------
@@ -121,7 +182,7 @@
   async function toggleAutoCompaction(c: api.CompactionStatus) {
     acting = 'Automatic compaction';
     try {
-      await api.setCompaction(name, { ...c.own, enabled: !c.policy.enabled });
+      await api.setCompaction(target, { ...c.own, enabled: !c.policy.enabled });
       await loadStats();
     } catch (e) {
       toasts.error('Changing automatic compaction failed', e);
@@ -188,7 +249,7 @@
     uploadCtl = new AbortController();
     try {
       if (hasTables) save(tableBaseKey, tableBase.trim());
-      const res = await api.upload(name, files, {
+      const res = await api.upload(target, files, {
         graph: graph.trim() || undefined,
         tables: hasTables ? { base: tableBase, key: tableKey, mapping: tableMapping } : undefined,
         onProgress: (p) => (progress = p.total ? p.loaded / p.total : 0),
@@ -230,7 +291,7 @@
   async function clearCache() {
     clearingCache = true;
     try {
-      const r = await api.clearResultCache(name);
+      const r = await api.clearResultCache(target);
       toasts.push(
         'success',
         'Result cache cleared',
@@ -352,7 +413,7 @@ ex:PersonShape a sh:NodeShape ;
     save(shapesKey, shapes);
     const t0 = performance.now();
     try {
-      report = await api.shacl(name, shapes, { ...shaclOpts(), signal: shaclCtl.signal });
+      report = await api.shacl(target, shapes, { ...shaclOpts(), signal: shaclCtl.signal });
       reportMs = performance.now() - t0;
       resultsShown = 50;
     } catch (e) {
@@ -394,7 +455,7 @@ ex:PersonShape a sh:NodeShape ;
   async function downloadReport() {
     downloadingReport = true;
     try {
-      const blob = await api.shaclRaw(name, shapes, 'text/turtle', shaclOpts());
+      const blob = await api.shaclRaw(target, shapes, 'text/turtle', shaclOpts());
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -457,7 +518,12 @@ ex:PersonShape a sh:NodeShape ;
   }
   function openInQuery(q: string) {
     app.pendingQuery = { query: q };
+    openQuery();
+  }
+  /** The query page, on this dataset and branch. */
+  function openQuery() {
     app.setDataset(name);
+    app.queryBranch = branch ?? '';
     goto(resolve('/query'));
   }
   const explore = (iri: string) =>
@@ -473,7 +539,25 @@ ex:PersonShape a sh:NodeShape ;
 
   <header class="head">
     <div class="title">
-      <h1 class="mono">{name}</h1>
+      <div class="name row">
+        <h1 class="mono">{name}</h1>
+        {#if hasBranches && branchList}
+          <label class="branch-pick" title="The branch this page shows">
+            <Icon name="branch" size={14} />
+            <select
+              class="select sm mono"
+              aria-label="Branch"
+              value={branch ?? MAIN}
+              onchange={(e) => selectBranch(e.currentTarget.value)}
+            >
+              {#each branchList as b (b.name)}
+                <option value={b.name}>{branchOption(b)}</option>
+              {/each}
+              {#if !shown}<option value={branch}>{branch}</option>{/if}
+            </select>
+          </label>
+        {/if}
+      </div>
       <div class="row meta">
         {#if info}<span class="badge">{info.type === 'mem' ? 'in-memory' : 'persistent'}</span>{/if}
         {#if info?.reasoning}
@@ -491,15 +575,30 @@ ex:PersonShape a sh:NodeShape ;
                 : ''}</span
           >
         {/if}
-        {#if info?.head != null}
-          <span
-            class="badge iri"
-            title="Head commit{info.modified ? `, made ${fmtTime(info.modified)}` : ''}"
-            >commit {info.head}</span
-          >
-          {#if info.modified}<span class="faint">modified {fmtRelative(info.modified)}</span>{/if}
+        {#if branch}
+          {#if shown}
+            <span
+              class="badge iri"
+              title="Head commit of {shown.name}, made {fmtTime(shown.modified)}"
+              >commit {shown.head}</span
+            >
+            {#if shown.protected}<span class="badge" title="Takes changes through merges only"
+                ><Icon name="lock" size={10} /> protected</span
+              >{/if}
+            <span class="faint">modified {fmtRelative(shown.modified)}</span>
+          {/if}
+          <span class="mono faint">/{name}@{branch}/sparql</span>
+        {:else}
+          {#if info?.head != null}
+            <span
+              class="badge iri"
+              title="Head commit{info.modified ? `, made ${fmtTime(info.modified)}` : ''}"
+              >commit {info.head}</span
+            >
+            {#if info.modified}<span class="faint">modified {fmtRelative(info.modified)}</span>{/if}
+          {/if}
+          <span class="mono faint">{info?.endpoints?.query ?? `/${name}/sparql`}</span>
         {/if}
-        <span class="mono faint">{info?.endpoints?.query ?? `/${name}/sparql`}</span>
       </div>
       {#if info?.origin}
         {@const o = info.origin}
@@ -517,13 +616,7 @@ ex:PersonShape a sh:NodeShape ;
     <button class="btn" onclick={refreshAll} disabled={loading}>
       {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={14} />{/if} Refresh
     </button>
-    <button
-      class="btn"
-      onclick={() => {
-        app.setDataset(name);
-        goto(resolve('/query'));
-      }}><Icon name="query" size={14} /> Query</button
-    >
+    <button class="btn" onclick={openQuery}><Icon name="query" size={14} /> Query</button>
     <a class="btn" href={explore('')}><Icon name="explore" size={14} /> Explore</a>
     {#if auth.can(name, 'admin')}
       <button
@@ -559,11 +652,16 @@ ex:PersonShape a sh:NodeShape ;
   {#if statsError}
     <div class="error-box">
       <strong
-        >{statsError instanceof api.ApiError && statsError.status === 404
-          ? `No dataset named “${name}”.`
-          : 'Could not load statistics.'}</strong
+        >{statsError instanceof api.ApiError && statsError.code === 'no-such-branch'
+          ? `No branch named “${branch}”.`
+          : statsError instanceof api.ApiError && statsError.status === 404
+            ? `No dataset named “${name}”.`
+            : 'Could not load statistics.'}</strong
       >
       <span class="muted">{api.errorMessage(statsError)}</span>
+      {#if branch}
+        <button class="btn sm" onclick={() => selectBranch(MAIN)}>Show main</button>
+      {/if}
     </div>
   {/if}
 
@@ -646,7 +744,7 @@ ex:PersonShape a sh:NodeShape ;
             {#if auth.can(name, 'admin')}
               <button
                 class="btn sm"
-                onclick={() => startTask('Compaction', () => api.compact(name))}
+                onclick={() => startTask('Compaction', () => api.compact(target))}
                 disabled={acting != null || !delta?.dirty}
                 title={delta?.dirty
                   ? 'Merge pending updates into a freshly sorted base index'
@@ -657,8 +755,10 @@ ex:PersonShape a sh:NodeShape ;
               <button
                 class="btn sm"
                 onclick={() => startTask('Dump', () => api.backup(name))}
-                disabled={acting != null}
-                title="Write a zstd-compressed N-Quads dump (.nq.zst) into the server's backup directory"
+                disabled={acting != null || branch != null}
+                title={branch
+                  ? 'Dumps cover main. Open main to write one.'
+                  : "Write a zstd-compressed N-Quads dump (.nq.zst) into the server's backup directory"}
               >
                 <Icon name="download" size={13} /> Dump
               </button>
@@ -768,12 +868,29 @@ ex:PersonShape a sh:NodeShape ;
           </div>
         </section>
 
+        <!-- branches and merges -->
+        {#if !inMemory && !branchesUnsupported}
+          <BranchesPanel
+            {name}
+            list={branchList}
+            error={branchesError}
+            loading={branchesLoading}
+            current={branch ?? MAIN}
+            canEdit={auth.can(name, 'admin') && !readOnly}
+            canMerge={auth.can(name, 'write') && !readOnly}
+            onreload={loadBranches}
+            onchange={refreshAll}
+            onselect={selectBranch}
+          />
+        {/if}
+
         <!-- commit history -->
-        <HistoryPanel {name} {info} refreshKey={refreshKick} />
+        <HistoryPanel {name} {branch} {info} refreshKey={refreshKick} />
 
         <!-- named snapshots and retention -->
         <SnapshotsPanel
           {name}
+          {branch}
           canEdit={auth.can(name, 'admin') && !readOnly}
           refreshKey={refreshKick}
           onchange={() => refreshKick++}
@@ -813,6 +930,7 @@ ex:PersonShape a sh:NodeShape ;
           {#if lang === 'shex'}
             <ShexPanel
               {name}
+              {branch}
               {info}
               {prefixes}
               {namedGraphs}
@@ -968,10 +1086,10 @@ ex:PersonShape a sh:NodeShape ;
         </section>
 
         <!-- write-time validation -->
-        <WriteValidationPanel {name} {prefixes} refreshKey={refreshKick} />
+        <WriteValidationPanel {name} {branch} {prefixes} refreshKey={refreshKick} />
 
         <!-- how DESCRIBE describes a resource -->
-        <DescribePanel {name} canEdit={auth.can(name, 'admin') && !readOnly} />
+        <DescribePanel {name} {branch} canEdit={auth.can(name, 'admin') && !readOnly} />
 
         <!-- predicates -->
         <section class="panel">
@@ -1228,6 +1346,7 @@ ex:PersonShape a sh:NodeShape ;
         <!-- reasoning -->
         <ReasoningPanel
           {name}
+          {branch}
           {info}
           {prefixes}
           {explore}
@@ -1240,6 +1359,7 @@ ex:PersonShape a sh:NodeShape ;
         <!-- full-text search -->
         <FullTextPanel
           {name}
+          {branch}
           {prefixes}
           predicates={stats.predicates.map((p) => p.iri)}
           readOnly={readOnly || !auth.can(name, 'admin')}
@@ -1253,6 +1373,7 @@ ex:PersonShape a sh:NodeShape ;
         <!-- spatial index -->
         <SpatialIndexPanel
           {name}
+          {branch}
           {prefixes}
           readOnly={readOnly || !auth.can(name, 'admin')}
           busy={acting != null}
@@ -1265,6 +1386,7 @@ ex:PersonShape a sh:NodeShape ;
         <!-- vector indexes -->
         <VectorIndexPanel
           {name}
+          {branch}
           {prefixes}
           predicates={stats.predicates.map((p) => p.iri)}
           canAdmin={auth.can(name, 'admin')}
@@ -1352,6 +1474,7 @@ ex:PersonShape a sh:NodeShape ;
 <CloneDialog
   bind:open={cloneOpen}
   source={name}
+  {branch}
   hasInferences={!!info?.reasoning}
   graphs={stats?.graphs ?? []}
   onstarted={() => taskKick++}
@@ -1386,10 +1509,33 @@ ex:PersonShape a sh:NodeShape ;
     display: grid;
     gap: 6px;
   }
+  .title {
+    min-width: 0;
+  }
   .title h1 {
     font-family: var(--font-mono);
     font-size: 22px;
     letter-spacing: -0.03em;
+    overflow-wrap: anywhere;
+  }
+  .name {
+    flex-wrap: wrap;
+    gap: 6px 12px;
+  }
+  .branch-pick {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    max-width: 100%;
+    color: var(--text-2);
+  }
+  .branch-pick .select {
+    min-width: 0;
+    max-width: 260px;
+  }
+  .meta {
+    flex-wrap: wrap;
   }
   .meta {
     font-size: var(--fs-sm);

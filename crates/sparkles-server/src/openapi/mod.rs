@@ -486,7 +486,7 @@ fn parameters() -> Map<String, J> {
         "name",
         path(
             "name",
-            "The name of the stored query, snapshot or vector index.",
+            "The name of the stored query, snapshot, vector index or branch.",
         ),
     );
     put("id", path("id", "The id of the task, token or lock."));
@@ -517,6 +517,14 @@ fn parameters() -> Map<String, J> {
             "at",
             s(),
             "The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`.",
+        ),
+    );
+    put(
+        "branch",
+        q(
+            "branch",
+            s(),
+            "The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree.",
         ),
     );
     put(
@@ -854,6 +862,11 @@ fn tags() -> J {
             "GraphQL",
             "Read-only GraphQL over a dataset, and its mapping schema.",
             "graphql"
+        ),
+        t(
+            "Branches",
+            "Branches of a dataset and merges between them.",
+            "branches-and-merges"
         ),
         t(
             "History",

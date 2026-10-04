@@ -156,7 +156,7 @@ pub(super) fn quad_json(op: DiffOp, q: &oxrdf::Quad) -> J {
 fn summary(name: &str, ds: &Dataset, d: &Diff, restricted: bool) -> J {
     let mut j = json!({
         "dataset": name,
-        "datasetId": ds.store.dataset_id(),
+        "datasetId": ds.store.owner_dataset_id(),
         "from": side(&d.from, restricted),
         "to": side(&d.to, restricted),
         "added": d.added,
@@ -214,18 +214,58 @@ pub(super) async fn diff(
         deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
         graphs: view.clone(),
     };
+    // a diff across branches: `fromBranch` and `toBranch`, each the request's branch
+    // by default; without `from`, from the head of `fromBranch`
+    let here = ds.branch_name().to_string();
+    let (fb, tb) = (params.get("fromBranch"), params.get("toBranch"));
+    let cross = fb.is_some() || tb.is_some();
+    let (fb, tb) = (
+        fb.map_or(here.clone(), str::to_string),
+        tb.map_or(here.clone(), str::to_string),
+    );
+    for b in [&fb, &tb] {
+        let q = crate::auth::on_branch(&name, b);
+        if p.level_at(&q, crate::auth::Endpoint::Diff).is_none() {
+            return Err(ApiError(
+                StatusCode::NOT_FOUND,
+                json!({ "error": format!("no such branch: {b}"), "code": "no-such-branch" }),
+            ));
+        }
+    }
+    let main = ds.main().unwrap_or_else(|| ds.clone());
+    let (from_id, to_id) = if ds.kind == DbType::Persistent {
+        (main.store.branch_id_of(&fb)?, main.store.branch_id_of(&tb)?)
+    } else {
+        (ds.store.dataset_id(), ds.store.dataset_id())
+    };
     let d = blocking({
         let ds = ds.clone();
+        let (fb, tb) = (fb.clone(), tb.clone());
         move || {
+            if cross {
+                let from = from.unwrap_or(At::Head);
+                return Ok(main.store.branch_diff(&fb, &from, &tb, &to, &o)?);
+            }
             // without `from`: the commit before `to`
             let from = match from {
                 Some(f) => f,
                 None => {
-                    let r = ds.store.resolve(&to)?;
+                    let r = match ds.store.resolve(&to) {
+                        Err(e) if sparkles::branch::inherited_commit(&e).is_some() => {
+                            main.store.branch_resolve(&here, &to)?.0
+                        }
+                        r => r?,
+                    };
                     At::Commit(r.commit.seq.saturating_sub(1))
                 }
             };
-            Ok(ds.store.diff(&from, &to, &o)?)
+            match ds.store.diff(&from, &to, &o) {
+                // a commit the branch shares with its upstream
+                Err(e) if sparkles::branch::inherited_commit(&e).is_some() => {
+                    Ok(main.store.branch_diff(&here, &from, &here, &to, &o)?)
+                }
+                r => Ok(r?),
+            }
         }
     })
     .await?;
@@ -257,6 +297,12 @@ pub(super) async fn diff(
             _ => String::new(),
         }
     );
+    // across branches, the branches are part of what the tag names
+    let tag = if from_id != to_id {
+        format!("{}:{from_id}..{to_id}\"", tag.trim_end_matches('"'))
+    } else {
+        tag
+    };
     // a view's body differs from the full one
     let tag = match &view {
         Some(v) => format!(
@@ -287,8 +333,8 @@ pub(super) async fn diff(
     }
     let d = Arc::new(d);
     let patch_ids = (
-        sparkles::patch::commit_iri(id, d.to.commit.seq),
-        sparkles::patch::commit_iri(id, d.from.commit.seq),
+        sparkles::patch::commit_iri(to_id, d.to.commit.seq),
+        sparkles::patch::commit_iri(from_id, d.from.commit.seq),
     );
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         if fmt.is_patch() {

@@ -6,16 +6,20 @@
   import { fmtCommitTime } from '$lib/commits';
   import { fmtBytes, fmtInt, fmtRelative } from '$lib/format';
   import { expiresParam, normalizeAt, validAt, validSnapshotName } from '$lib/history';
+  import { onBranch } from '$lib/branches';
   import { LatestRun } from '$lib/supersede';
   import Icon from './Icon.svelte';
 
   let {
     name,
+    branch = null,
     canEdit = false,
     refreshKey = 0,
     onchange,
   }: {
     name: string;
+    /** The branch whose snapshots to list (null: `main`). */
+    branch?: string | null;
     /** Create and delete snapshots (admin on a writable server). */
     canEdit?: boolean;
     /** Bump to reload (after a write or compaction). */
@@ -32,12 +36,13 @@
   let formOpen = $state(false);
   let form = $state({ name: '', at: '', note: '', expires: '' });
   const runs = new LatestRun();
+  const target = $derived(onBranch(name, branch));
 
   async function reload() {
     const owns = runs.claim('snapshots');
     loading = true;
     try {
-      const [l, h] = await Promise.all([api.snapshots(name), api.history(name)]);
+      const [l, h] = await Promise.all([api.snapshots(target), api.history(target)]);
       if (!owns()) return;
       list = l;
       status = h;
@@ -50,7 +55,7 @@
   }
 
   $effect(() => {
-    void name;
+    void target;
     void refreshKey;
     void reload();
   });
@@ -72,7 +77,7 @@
     if (!nameOk || !atOk || !expiresOk) return;
     busy = true;
     try {
-      const s = await api.createSnapshot(name, {
+      const s = await api.createSnapshot(target, {
         name: form.name.trim(),
         at: normalizeAt(form.at) ?? undefined,
         note: form.note.trim() || undefined,
@@ -94,7 +99,7 @@
     if (!confirm(`Delete snapshot ${s.name}? History only it keeps is removed.`)) return;
     busy = true;
     try {
-      await api.deleteSnapshot(name, s.name);
+      await api.deleteSnapshot(target, s.name);
       await reload();
       onchange?.();
     } catch (e) {
@@ -106,6 +111,7 @@
 
   function queryAt(ref: string) {
     app.setDataset(name);
+    app.queryBranch = branch ?? '';
     app.queryAt = ref;
     goto(resolve('/query'));
   }

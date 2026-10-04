@@ -55,6 +55,11 @@ running queries.
   ([API](docs/API.md#point-in-time-reads-and-snapshots)).
 * A change feed of commits and their changes, resumable from any readable commit, with
   long polling and server-sent events ([API](docs/API.md#change-feed)).
+* Branches and merges. A branch shares its upstream's index until it compacts, so
+  creating one writes a few kilobytes. Requests choose one with `?branch=` or the
+  endpoint URL `/{ds}@{branch}/sparql`, and merges fast-forward or merge quad sets three
+  ways, with conflicts by cell or subject and resolutions
+  ([API](docs/API.md#branches-and-merges)).
 * History queries in SPARQL and over HTTP answer when a triple was added or removed,
   which commit last changed a subject, and which values a property took, with each
   commit's time, author and message. They read a change log that outlives compactions
@@ -201,7 +206,7 @@ running queries.
 | [Apache Jena / Fuseki](https://jena.apache.org/) | The reference Java stack. It has ARQ, TDB2 on B+trees, Fuseki, on-the-fly inference, jena-text and GeoSPARQL. | Sparkles has the same protocols, endpoints, admin API and CLI model, on sorted columnar indexes. It is faster on every benchmark query at 10.5M triples, by a median of 60×. Reasoning is materialized, apart from RDFS on read. Sparkles writes RDF Patch and applies it through Fuseki's `patch` operation. It has ARQ's query language, its function and property function libraries, and its `cdt:` lists and maps, but no JavaScript functions, and there is no ontology API. |
 | [QLever](https://github.com/ad-freiburg/qlever) | A C++ engine for billions of triples, with lazy, streaming execution. | Sparkles uses the same index and execution architecture and adds exact term identity, MVCC updates, the Graph Store Protocol, reasoning and SHACL. It is faster on all 28 benchmark queries at 10.5M triples and on all 20 WatDiv templates, and its server uses about 40% more memory at 10.5M. On English DBpedia (1.24 billion triples) it loads 2.8× faster, is faster warm on 28 of the 29 queries whose answers agree and ties on the 29th, and is faster cold on 26 of 31 ([BENCHMARKS.md](docs/BENCHMARKS.md#dbpedia-at-124-billion-triples)). It materializes intermediate results. |
 | [Oxigraph](https://github.com/oxigraph/oxigraph) | A Rust database and toolkit on RocksDB, with Python and WebAssembly packages. | Sparkles uses Oxigraph's parsers, SPARQL parser and datatypes, with its own storage and planner. It is faster on every benchmark query at 10.5M triples, by a median of 87×. It fsyncs its writes and Oxigraph does not, and Oxigraph commits a stream of single-triple updates 2.7× faster. It adds reasoning, validation, search, authentication and a UI. It has Rust and Python APIs and no WebAssembly build. |
-| [Fluree](https://github.com/fluree/db) | A versioned, permissioned ledger with clustering, licensed under BUSL-1.1. JSON-LD is its main interface. | Sparkles passes the W3C SPARQL suites in full and is compatible with Fuseki. It has point-in-time reads, snapshots, diffs, history queries and protections of triples in its configuration, but no branches, policies stored in the data or clustering. It is faster on every benchmark query that Fluree completes at 10.5M triples, by a median of 7.7×, but only by 4–7% on a few counts and point lookups. |
+| [Fluree](https://github.com/fluree/db) | A versioned, permissioned ledger with clustering, licensed under BUSL-1.1. JSON-LD is its main interface. | Sparkles passes the W3C SPARQL suites in full and is compatible with Fuseki. It has point-in-time reads, snapshots, diffs, history queries, branches with three-way merges and protections of triples in its configuration, but no policies stored in the data or clustering. It is faster on every benchmark query that Fluree completes at 10.5M triples, by a median of 7.7×, but only by 4–7% on a few counts and point lookups. |
 
 [docs/COMPARISON.md](docs/COMPARISON.md) lists the feature gaps per engine, the places
 where Sparkles departs from Jena and QLever on purpose, and the optimizations it adopted
@@ -319,6 +324,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `csv` | Convert CSV and TSV tables to RDF, or print the CSVW metadata of the default mapping. `load` maps and loads them directly. |
 | `compact`, `compaction`, `clone`, `stats`, `log`, `check`, `vocab-index` | Merge updates, set a dataset's automatic compaction, copy a dataset, show statistics or the commit history, verify a database, and add the sparse vocabulary index to a database built before it existed. |
 | `quota`, `describe-settings` | Set a dataset's storage quota, and choose how DESCRIBE describes a resource. |
+| `branch`, `merge` | List, create, protect and delete branches, and merge one into another. `--branch` chooses the branch of `query`, `update`, `load`, `dump` and the other commands that open a database. |
 | `snapshot`, `diff`, `history` | Manage named snapshots, pin schedules, history retention and the commit catalog's horizon, show the quads added and removed between two commits, also as RDF Patch, and list the recorded changes of a subject, predicate or object across commits. |
 | `backup`, `repo` | Write N-Quads dumps, and manage backup repositories on a file system or S3, restores and policies. |
 | `infer` | Materialize RDFS, OWL 2 RL or Jena rules. Report staleness and check for inconsistencies. |

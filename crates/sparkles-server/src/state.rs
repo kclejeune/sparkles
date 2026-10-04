@@ -33,6 +33,10 @@ pub use sparkles::reasoning::{RunChanges, RunInfo};
 pub struct Dataset {
     pub name: String,
     pub kind: DbType,
+    /// the branch this dataset object serves (`None`: `main`, the dataset itself)
+    pub branch: Option<BranchOf>,
+    /// the dataset objects of the branches other than `main`, opened on first use
+    pub branches: Mutex<BTreeMap<String, Arc<Dataset>>>,
     /// not part of the persisted registry (e.g. `--loc` on the command line)
     pub ephemeral: bool,
     /// write-time validation counters (the store's guard observer)
@@ -49,6 +53,36 @@ impl std::ops::Deref for Dataset {
 
     fn deref(&self) -> &Self::Target {
         self.dataset.state()
+    }
+}
+
+/// Which branch a branch's dataset object serves.
+pub struct BranchOf {
+    pub name: String,
+    /// the dataset (its `main`)
+    pub main: std::sync::Weak<Dataset>,
+}
+
+impl Dataset {
+    /// The branch this object serves (`main` for the dataset itself).
+    pub fn branch_name(&self) -> &str {
+        self.branch
+            .as_ref()
+            .map_or(sparkles::branch::MAIN, |b| b.name.as_str())
+    }
+
+    /// The dataset's own object (`main`), for a branch's.
+    pub fn main(&self) -> Option<Arc<Dataset>> {
+        self.branch.as_ref().and_then(|b| b.main.upgrade())
+    }
+
+    /// The name the server's per-dataset state (compaction, tasks) keeps it under:
+    /// the dataset's name, and `name@branch` for a branch other than `main`.
+    pub fn key(&self) -> String {
+        match &self.branch {
+            Some(b) => format!("{}@{}", self.name, b.name),
+            None => self.name.clone(),
+        }
     }
 }
 
@@ -595,13 +629,61 @@ impl AppState {
         Ok(self.dataset_of(name, kind, store, ephemeral, None))
     }
 
+    /// The object of branch `branch` of dataset `main` (`main` itself for `main`),
+    /// opened on first use and kept.
+    pub fn branch_dataset(
+        &self,
+        main: &Arc<Dataset>,
+        branch: &str,
+    ) -> sparkles::Result<Arc<Dataset>> {
+        if branch == sparkles::branch::MAIN {
+            return Ok(main.clone());
+        }
+        let id = main.store.branch_id_of(branch)?;
+        // a cached object of a branch deleted and made again under the same name is stale
+        if let Some(d) = main.branches.lock().get(branch)
+            && d.store.branch_id() == id
+        {
+            return Ok(d.clone());
+        }
+        let ds = self.branch_dataset_uncached(main, branch)?;
+        main.branches.lock().insert(branch.to_string(), ds.clone());
+        Ok(ds)
+    }
+
+    /// A branch's dataset object: the library opens the state the branch's directory
+    /// configures, as for any dataset.
+    fn branch_dataset_uncached(
+        &self,
+        main: &Arc<Dataset>,
+        branch: &str,
+    ) -> sparkles::Result<Arc<Dataset>> {
+        let store = main
+            .store
+            .branch(branch)?
+            .shared()
+            .expect("a branch other than main has its own store");
+        let mut ds = self.dataset_of(
+            &main.name,
+            main.kind,
+            sparkles::dataset::StoreHandle::Branch(store),
+            main.ephemeral,
+            None,
+        );
+        Arc::get_mut(&mut ds).expect("just made").branch = Some(BranchOf {
+            name: branch.to_string(),
+            main: Arc::downgrade(main),
+        });
+        Ok(ds)
+    }
+
     /// The dataset `name` around `store`: the library opens the state the store's
     /// directory configures, and the server adds its validation metrics.
     fn dataset_of(
         &self,
         name: &str,
         kind: DbType,
-        store: Store,
+        store: impl Into<sparkles::dataset::StoreHandle>,
         ephemeral: bool,
         origin: Option<serde_json::Value>,
     ) -> Arc<Dataset> {
@@ -621,6 +703,8 @@ impl AppState {
         Arc::new(Dataset {
             name: name.to_string(),
             kind,
+            branch: None,
+            branches: Mutex::new(BTreeMap::new()),
             ephemeral,
             validation_metrics,
             offline: AtomicBool::new(false),
@@ -678,6 +762,32 @@ impl AppState {
 
     pub fn get(&self, name: &str) -> Option<Arc<Dataset>> {
         self.datasets.read().get(name).cloned()
+    }
+
+    /// Every dataset, and the open branches of each (for the background upkeep:
+    /// compaction and history ticks).
+    pub fn datasets_and_branches(&self) -> Vec<Arc<Dataset>> {
+        let mains: Vec<Arc<Dataset>> = self.datasets.read().values().cloned().collect();
+        let mut out = Vec::with_capacity(mains.len());
+        for m in mains {
+            let names: Vec<String> = m
+                .store
+                .branch_set()
+                .map(|s| {
+                    s.open_stores()
+                        .iter()
+                        .map(|b| b.branch_name().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(m.clone());
+            for n in names {
+                if let Ok(b) = self.branch_dataset(&m, &n) {
+                    out.push(b);
+                }
+            }
+        }
+        out
     }
 
     pub fn create(&self, name: &str, kind: DbType) -> Result<Arc<Dataset>> {

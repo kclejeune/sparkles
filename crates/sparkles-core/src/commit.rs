@@ -47,12 +47,14 @@ pub enum CommitKind {
     Embed,
     /// an RDF Patch applied (`POST /{ds}/patch`, `sparkles patch`, `Store::apply_patch`)
     Patch,
+    /// a merge of another branch's changes (`POST /$/merge/{ds}`, `Store::merge`)
+    Merge,
     /// a WAL commit written by an older version after this one had upgraded the database
     Unknown,
 }
 
 impl CommitKind {
-    const ALL: [CommitKind; 14] = [
+    const ALL: [CommitKind; 15] = [
         CommitKind::Create,
         CommitKind::Baseline,
         CommitKind::Update,
@@ -66,6 +68,7 @@ impl CommitKind {
         CommitKind::Transaction,
         CommitKind::Embed,
         CommitKind::Patch,
+        CommitKind::Merge,
         CommitKind::Unknown,
     ];
 
@@ -85,6 +88,7 @@ impl CommitKind {
             CommitKind::Transaction => 10,
             CommitKind::Embed => 11,
             CommitKind::Patch => 12,
+            CommitKind::Merge => 13,
             CommitKind::Unknown => 255,
         }
     }
@@ -112,6 +116,7 @@ impl CommitKind {
             CommitKind::Transaction => "transaction",
             CommitKind::Embed => "embed",
             CommitKind::Patch => "patch",
+            CommitKind::Merge => "merge",
             CommitKind::Unknown => "unknown",
         }
     }
@@ -576,6 +581,15 @@ pub(crate) fn dataset_id_of(bytes: &[u8]) -> Result<uuid::Uuid> {
     let f: DatasetFile =
         serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
     Ok(f.id)
+}
+
+/// When `<root>/dataset.json` says the dataset was created (milliseconds since the
+/// epoch), if it can be read.
+pub(crate) fn read_dataset_created(root: Option<&Path>) -> Option<i64> {
+    read_dataset(root?)
+        .ok()
+        .flatten()
+        .and_then(|f| parse_rfc3339_ms(&f.created))
 }
 
 /// `<root>/dataset.json`: the dataset id, if the database has one yet.

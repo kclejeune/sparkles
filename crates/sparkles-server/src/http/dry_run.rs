@@ -245,7 +245,7 @@ impl Request {
         let mut doc = json!({
             "dryRun": true,
             "dataset": ds.name,
-            "datasetId": ds.store.dataset_id(),
+            "datasetId": ds.store.owner_dataset_id(),
             "committed": false,
             "wouldCommit": would,
             "outcome": outcome.name(),

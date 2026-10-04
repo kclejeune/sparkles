@@ -75,6 +75,10 @@ pub enum Error {
     /// was written.
     #[error("{0}")]
     Patch(Box<crate::patch::PatchError>),
+    /// A branch or merge request that failed (see [`crate::branch::BranchError`] for
+    /// its code and status); nothing was written.
+    #[error("{0}")]
+    Branch(Box<crate::branch::BranchError>),
     /// An error of a component outside the engine (a backup repository, the reasoner,
     /// the GraphQL adapter), with the component's own stable code. Its `source` is the
     /// component's error, which a program can downcast for the details.
@@ -294,6 +298,7 @@ impl Error {
             Error::DryRun(_) => "dry-run",
             Error::Patch(_) => "patch",
             Error::Component(c) => &c.code,
+            Error::Branch(b) => b.code,
         }
     }
 

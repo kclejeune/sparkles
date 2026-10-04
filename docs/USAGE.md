@@ -1114,6 +1114,73 @@ writes the triples without loading them, as N-Triples, N-Quads (`--graph`) or Tu
 triples. On a server, `POST /{ds}/upload` takes tables too
 ([API](API.md#csv-and-tsv-uploads)).
 
+## Branches and merges
+
+A branch lets a change take several steps, or several people, before it reaches the data
+everyone reads. Every persistent dataset has the branch `main`. A new branch starts from
+a commit of another branch and shares that branch's index files until it compacts, so
+creating one is cheap at any size. Reads and writes choose a branch with `--branch` on
+the command line, `?branch=NAME` over HTTP, or the endpoint URL `/{ds}@{branch}/sparql`.
+[API.md](API.md#branches-and-merges) describes the routes, the merge rules and the
+conflict report.
+
+```sh
+sparkles branch create --loc db dev --note "schema migration"
+sparkles update --loc db --branch dev 'INSERT DATA { <urn:a> <urn:p> 1 }'
+sparkles query --loc db --branch dev 'SELECT * { ?s ?p ?o }'
+sparkles branch list --loc db
+sparkles merge --loc db dev                    # into main; exits 2 on conflicts
+```
+
+`branch list` prints one line per branch, with its head, the commit it started from,
+the commits it is ahead of and behind its upstream, and whether it still shares its
+upstream's index (`linked`):
+
+```
+branch  head  from     ahead  behind  storage           note
+main      61  -            -       -  gen-0004
+dev       57  main@42     15      19  linked (2.1 MiB)  schema migration
+```
+
+It reads the files when a server holds the database, and then shows heads and starting
+points without the ahead and behind counts. `branch create` takes `--from BRANCH` and
+`--at REF` to start elsewhere than `main`'s head, and `--protected` to refuse every write
+but merges. `branch protect NAME [--off]`, `branch show NAME` and `branch delete NAME
+[--force]` complete the set, and every branch command works against a server with
+`--server URL --dataset NAME`.
+
+`merge` prints the result, or the conflicts that stopped it:
+
+```
+merge dev (commit 57) into main (commit 61), base main@42
+CONFLICT  <http://ex.org/a> <http://ex.org/age>  (default graph)
+  base    30
+  ours    31   (main)
+  theirs  32   (dev)
+1 conflict, nothing merged. Resolve with --on-conflict or --resolve FILE.
+```
+
+A conflict is a cell, a subject and a predicate in a graph, that both sides changed in
+different ways. `--on-conflict ours`, `theirs` or `union` resolves every conflict one way,
+and `--resolve FILE.json` reads a JSON array of resolutions for single graphs, subjects or
+cells, such as `[{"graph": null, "subject": "<http://ex.org/a>", "predicate":
+"<http://ex.org/age>", "take": "objects", "objects": ["33"]}]`. `--expect-source N` and
+`--expect-target N` refuse the merge when either head moved since the report was read.
+`--conflicts subject` treats a whole subject as one value, and `--conflicts quad` never
+reports a conflict. `--dry-run` shows what the merge would do. The exit status is 0 after
+a merge or when the target is already up to date, 2 when conflicts stopped the merge,
+and 1 on any other error.
+
+`--branch NAME` works with `query`, `update`, `load`, `dump`, `log`, `diff`, `snapshot`,
+`compact`, `stats`, `clone` and `patch`. With `--server`, these commands send the
+dataset's name in the path form, `ds@NAME`. The web UI has a branch menu next to the
+dataset's name, and its Branches panel creates, protects, deletes and merges branches.
+
+A branch costs almost nothing while it stays linked. Its memory then holds the upstream's
+delta at the starting commit, and its first compaction builds a full index, about what a
+clone costs. `--max-branches` (64) limits the branches of a dataset, and the dataset's
+storage quota covers every branch.
+
 ## Automatic compaction
 
 A server compacts each dataset in the background when its delta of updates grows large,

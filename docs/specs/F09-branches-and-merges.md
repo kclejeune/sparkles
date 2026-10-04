@@ -1,20 +1,23 @@
 # F09: Branches and merges
 
-> **Status:** specified
+> **Status:** implemented in part
 >
-> **Phases:** None shipped. Phase 1 covers branches of persistent datasets that share
-> their parent's index until they compact, reads and writes on a branch, per-branch
-> commits and history, three-way merges at the quad level with cell conflicts and
-> resolutions, deletion, holds and quotas, access control by branch, the HTTP API, the
-> CLI and a branch selector in the UI. Phase 2 adds the merge page in the UI, Python,
+> **Phases:** Phase 1 shipped. It covers branches of persistent datasets that share
+> their upstream's index until they compact, reads and writes on a branch with
+> `?branch=` and the path form, per-branch commits and history, three-way merges of quad
+> sets with cell and subject conflicts and resolutions, deletion, holds and quotas,
+> access control by branch, the HTTP API, the CLI, and the UI's branch selector,
+> Branches panel and conflict-free Merge button. Phase 2 (the merge page, Python,
 > squash merges, reverts, replayed fast-forwards, renames, in-memory branches and
-> backups of branches. Phase 3 adds cross-server clones, relinking a branch to a newer
-> base, virtual merge bases and cherry-picks.
+> backups of branches) and Phase 3 (cross-server clones, relinking, virtual merge bases
+> and cherry-picks) are not built.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [API: Branches and merges](../API.md#branches-and-merges) ·
+> [Usage: Branches and merges](../USAGE.md#branches-and-merges) ·
+> [Features](../FEATURES.md#storage-tdb2-equivalent)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
-> at the end will record how it lands.
+> at the end records how it landed.
 
 This spec is Phase 3 of [C06](C06-clone-to-sandbox.md), which listed
 "cloning at a past commit, cloning across servers through archives, and branch and merge
@@ -1324,4 +1327,112 @@ holds the database.
 
 ## Outcome
 
-Nothing is built.
+**Delivered.** Phase 1 landed on 2026-10-03. The engine came first, then the HTTP API,
+the CLI and the UI, each with its tests.
+
+* **Engine.** `sparkles::branch` holds the public types. `store/branching.rs` keeps the
+  branch table (`branches.json`), opens branch stores on first use, creates, protects and
+  deletes branches, keeps the holds, records merges and computes frontiers and merge
+  bases. `store/link.rs` opens linked generations, and `store/merge.rs` computes toggle
+  sets, conflicts, resolutions and the blank-node rule, and writes the merge commit.
+  `CommitKind::Merge` has code 13. A branch store is an ordinary `Store` rooted at
+  `branches/<id>/`, so compaction, history, snapshots, the change log and write guards
+  work on a branch unchanged.
+* **Server.** `?branch=`, the path form and `branch=` in form bodies choose a branch
+  before routing. `/$/branches/{ds}[/{name}]` and `/$/merge/{ds}` serve the routes of
+  §2.4, and responses from a branch carry `Sparkles-Branch` and `Sparkles-Branch-Id`.
+  Commit listings follow a branch's history into its upstream, the diff endpoint takes
+  `fromBranch` and `toBranch`, clones copy a branch, grants take `branches`, and the
+  compaction scheduler and the history upkeep cover open branches. The metrics
+  `sparkles_branches`, `sparkles_branch_linked`, `sparkles_merges_total`,
+  `sparkles_merge_conflicts_total`, `sparkles_merge_changes_total` and
+  `sparkles_merge_seconds` are exported.
+* **CLI.** `sparkles branch list|create|show|delete|protect`, `sparkles merge`, and the
+  global `--branch` of `query`, `update`, `load`, `dump`, `log`, `diff`, `snapshot`,
+  `compact`, `stats`, `clone` and `patch`. `sparkles check` verifies the branch table,
+  the links and the merge records.
+* **UI.** A branch menu in the dataset header keeps the choice in `?branch=`, and every
+  panel of the dataset page works on the chosen branch. The query page has a Branch
+  field next to At. The Branches panel creates, protects and deletes branches, warns
+  before deleting one with unmerged commits, and merges a branch without conflicts after
+  a preview, sending the previewed heads as `expect`. A conflicting merge shows the cells
+  and the equivalent `sparkles merge` command. History marks merge commits and the branch
+  of inherited commits. In-memory datasets show no branch controls.
+
+Tests cover A1–A22. The library tests run A1, A3–A9, A11–A15, A17, A18, A20 and A21,
+with failpoint crash tests for creation and for a merge between its record and its log
+(A15), a partial compaction of a linked branch, and branches of branches past the depth
+limit. The router tests run A1–A5, A7, A9–A12, A14, A16, A19 and A20, the CLI tests run
+A22, and the UI's mock and real-server end-to-end tests cover the selector, the panel and
+the Merge button. A21 runs 40 random histories in CI (`SPARKLES_A21_RUNS` raises it),
+each with inserts, deletes, blank nodes, named graphs, compactions, bulk commits, branch
+creation and merges in both directions, and checks every merge against the three-way
+rule applied to dumps.
+
+**Performance.** At 10.5M triples ([BENCHMARKS](../BENCHMARKS.md#branches-and-merges-105m-triples)),
+creating a branch took 19.5 to 32.7 ms over HTTP and wrote about 1.4 KB of files; the
+store's first open adds a 68 KiB change-log segment. A query on a new linked branch took
+as long as on `main` (38.7 against 38.3 ms). A merge of 10,000 inserted quads into a
+`main` with 10,000 of its own took 115 ms, and its preview 62 ms. An interleaved A/B of
+the 1.05M query suite against the previous `main` showed no regression on `main`'s
+paths: server CPU time per request at 0.94 times and wall time at 0.89 times the old
+build's, both within the noise of a heavily loaded machine. The merge base of 64 branches
+with 10,000 merges was not measured.
+
+**Deviations.**
+
+* **First generation.** A branch's first generation is `gen-0001`, linked or built, not
+  `gen-0000`. Generation number 0 names an in-memory store's generation, so commits made
+  in a `gen-0000` would have reported their generation as `mem`. Rebuilds continue
+  from `gen-0002`.
+* **Layered vocabulary.** A linked generation's delta vocabulary is one in-memory
+  vocabulary that starts with a copy of the upstream entries below the recorded length,
+  read from the segments' files, followed by the branch's own file. Ids are as §4.2
+  gives them. The copy costs memory proportional to the upstream's delta vocabulary,
+  which the branch's delta already costs in the same proportion.
+* **No `BaseIndex` split.** A linked generation opens the upstream generation's files
+  again, so the mappings are shared by the page cache rather than by one `Arc`. Branch
+  stores share the dataset's block cache, and a linked generation takes the block-cache
+  identities of the upstream permutations when the upstream generation is open, so the
+  two read the same cached blocks.
+* **The base pin stays.** `branch-base:NAME` pins the branch's starting commit for the
+  branch's life instead of moving with merges. Every later merge between the branch and
+  its upstream walks the logs from the newest commit both first-parent chains share,
+  which is that starting commit, so a moved pin would not keep the merge possible. The
+  pin is attributed like a named snapshot, to the newest retained generation that covers
+  the commit. The change log answers the walks when generations are collected.
+* **Main-level operations.** The branch-set operations (create, delete, protect, merge,
+  merge bases, listings and reads that follow a history into the upstream) are methods of
+  the dataset's own store. A branch store answers them with `400 invalid-branch`, since
+  it cannot reach the dataset's store. `Store::branch(name)` returns a `BranchStore`,
+  the store itself for `main` and a shared branch store otherwise. The facade adds
+  `Dataset::branch`, `branches`, `create_branch`, `merge` and `delete_branch` in a new
+  file.
+* **One error variant.** `Error::Branch(Box<BranchError>)` carries the kind, the code
+  and the HTTP status of every branch error, with the conflict report, the merge-base
+  candidates or the inherited commit, in place of four variants.
+* **Inherited commits.** A branch store answers a read of a commit it shares with its
+  upstream with code `inherited-commit`. `Store::branch_snapshot_at` and
+  `Store::branch_resolve` follow the history, and the server follows it for SPARQL reads
+  with `at`, diffs and commit listings. Other admin routes answer such a read with `404
+  inherited-commit`. `sparkles log --branch` lists the branch's own commits.
+* **Merges commit through the delta.** A merge applies its changes as one write
+  transaction even past the bulk threshold, so a very large merge is slower than a
+  rebuild would be.
+* **`take: objects`** needs the cell scope.
+* **Result fields.** `target.seq` of a merge result is the target's head before the
+  merge, and `commit` gives the merge commit. A preview lists the remaining conflicts
+  with the report's members and counts them in `conflictCount`, since its own
+  `conflicts` member is `{found, resolved}`. A dry run answers `200` with the write
+  preview and puts the merge fields under `merge`.
+* **Grants.** `branches` is a field of `[[grants]]` entries. A grant limited to branches
+  alone, without graphs or endpoints, may be `admin`.
+* **Not built.** Per-branch gauges with a `branch` label and
+  `sparkles_branch_held_bytes`, the backup manifest's count of left-out branches and the
+  Backups panel's note, and the raised minimum version in `dataset.json` (§5.1) remain.
+  The full-text, spatial and vector indexes of a branch are built when the branch opens.
+
+The open questions kept their defaults: no exempt predicates, configuration copied at
+creation, base pins always kept, no `/` in names, the `@` path form, branches of
+branches with a depth limit of 4, backups of `main` only, branch stores open until the
+server stops, no extra RDF Patch header, and the dataset's quota for all branches.

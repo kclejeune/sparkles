@@ -7,7 +7,8 @@
 // repositories under a temporary directory. The returned function is the global teardown.
 //
 // SPARKLES_BIN selects the binary (default: ../target/debug/sparkles, which serves ui/build
-// from disk); SPARKLES_E2E_KEEP=1 keeps the data directory and server log.
+// from disk); SPARKLES_E2E_KEEP=1 keeps the data directory and server log;
+// SPARKLES_E2E_PORT=N runs the servers on ports N and N + 1 instead of free ones.
 
 import { request, type FullConfig } from '@playwright/test';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
@@ -94,11 +95,17 @@ async function check(r: Response, what: string) {
   return r;
 }
 
-/** `sparkles serve` on a free port of 127.0.0.1 with these extra arguments. */
-async function serve(bin: string, data: string, log: string, extra: string[]) {
+/** `SPARKLES_E2E_PORT`: the first server's port, and the next one the second server's. */
+const fixedPort = process.env.SPARKLES_E2E_PORT ? Number(process.env.SPARKLES_E2E_PORT) : null;
+
+/**
+ * `sparkles serve` on 127.0.0.1 with these extra arguments, on a free port, or on
+ * `SPARKLES_E2E_PORT` plus `offset` when that is set.
+ */
+async function serve(bin: string, data: string, log: string, extra: string[], offset = 0) {
   let server: Awaited<ReturnType<typeof start>> | null = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const port = await freePort();
+  for (let attempt = 0; attempt < (fixedPort == null ? 3 : 1); attempt++) {
+    const port = fixedPort == null ? await freePort() : fixedPort + offset;
     // --host is explicit: the tests must not listen on every interface
     server = await start(
       bin,
@@ -204,10 +211,13 @@ server = ["server-admin"]
     writeFileSync(backupConfig, `version = 1\n\n[api]\nfs_roots = [${JSON.stringify(repos)}]\n`, {
       mode: 0o600,
     });
-    const openServer = await serve(bin, join(dir, 'open-data'), join(dir, 'open-server.log'), [
-      '--backup-config',
-      backupConfig,
-    ]);
+    const openServer = await serve(
+      bin,
+      join(dir, 'open-data'),
+      join(dir, 'open-server.log'),
+      ['--backup-config', backupConfig],
+      1,
+    );
     open = openServer.child;
     process.env.SPARKLES_E2E_OPEN_URL = openServer.url;
     process.env.SPARKLES_E2E_REPOS = repos;

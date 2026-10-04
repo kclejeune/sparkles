@@ -126,6 +126,26 @@ pub fn glob(pattern: &str, name: &str) -> bool {
     sparkles::access::glob(pattern, name)
 }
 
+/// A dataset name with the branch a request chose: `ds@branch`. Grants are checked on
+/// such names, so that a grant limited to some branches covers only those.
+pub fn on_branch(ds: &str, branch: &str) -> String {
+    format!("{ds}@{branch}")
+}
+
+/// The dataset and branch of a name checked against grants: `ds@branch`, or `ds` for
+/// `main`. The branch `*` stands for any branch.
+pub fn split_branch(ds: &str) -> (&str, &str) {
+    ds.split_once('@').unwrap_or((ds, sparkles::branch::MAIN))
+}
+
+/// Whether branch patterns `patterns` (`None`: every branch) cover `branch`.
+fn branch_covered(patterns: &Option<Vec<String>>, branch: &str) -> bool {
+    branch == "*"
+        || patterns
+            .as_ref()
+            .is_none_or(|ps| ps.iter().any(|p| glob(p, branch)))
+}
+
 /// A service of a dataset that a grant may be limited to (Fuseki's operation names,
 /// and a few of Sparkles').
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -149,10 +169,14 @@ pub enum Endpoint {
     Info,
     /// GraphQL queries (`/{ds}/graphql`); a `query` grant covers it
     Graphql,
+    /// creating, changing and deleting branches (`/$/branches/{ds}/…`)
+    Branches,
+    /// merges and merge previews (`/$/merge/{ds}`)
+    Merge,
 }
 
 impl Endpoint {
-    pub const ALL: [Endpoint; 11] = [
+    pub const ALL: [Endpoint; 13] = [
         Endpoint::Query,
         Endpoint::Update,
         Endpoint::GspR,
@@ -164,6 +188,8 @@ impl Endpoint {
         Endpoint::Patch,
         Endpoint::Info,
         Endpoint::Graphql,
+        Endpoint::Branches,
+        Endpoint::Merge,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -179,6 +205,8 @@ impl Endpoint {
             Endpoint::Patch => "patch",
             Endpoint::Info => "info",
             Endpoint::Graphql => "graphql",
+            Endpoint::Branches => "branches",
+            Endpoint::Merge => "merge",
         }
     }
 
@@ -208,11 +236,15 @@ pub struct Restricted {
     pub endpoints: Option<Vec<Endpoint>>,
     /// the protections it lifts in its graphs, at its level
     pub lifts: Vec<String>,
+    /// branch names and `*` patterns; `None` is every branch
+    pub branches: Option<Vec<String>>,
 }
 
 impl Restricted {
     fn applies(&self, ds: &str, e: Option<Endpoint>) -> bool {
+        let (ds, branch) = split_branch(ds);
         glob(&self.dataset, ds)
+            && branch_covered(&self.branches, branch)
             && match (e, &self.endpoints) {
                 (_, None) | (None, Some(_)) => true,
                 (Some(e), Some(es)) => es.iter().any(|x| x.covers(e)),
@@ -267,10 +299,11 @@ impl Grants {
         if self.server.contains(&ServerPerm::ServerAdmin) {
             return Some(Level::Admin);
         }
+        let name = split_branch(ds).0;
         let full = self
             .datasets
             .iter()
-            .filter(|(p, _)| glob(p, ds))
+            .filter(|(p, _)| glob(p, name))
             .map(|(_, l)| *l);
         let restricted = self
             .restricted
@@ -285,7 +318,10 @@ impl Grants {
     pub fn graphs(&self, ds: &str, e: Endpoint, min: Level) -> sparkles::access::Graphs {
         use sparkles::access::Graphs;
         if self.server.contains(&ServerPerm::ServerAdmin)
-            || self.datasets.iter().any(|(p, l)| *l >= min && glob(p, ds))
+            || self
+                .datasets
+                .iter()
+                .any(|(p, l)| *l >= min && glob(p, split_branch(ds).0))
         {
             return Graphs::All;
         }
@@ -333,7 +369,7 @@ impl Grants {
         let mine: Vec<&Arc<sparkles::access::Protection>> = ps
             .list
             .iter()
-            .filter(|(d, _)| glob(d, ds))
+            .filter(|(d, _)| glob(d, split_branch(ds).0))
             .map(|(_, p)| p)
             .collect();
         // admin acts on the whole dataset, as it does on every graph
@@ -410,6 +446,7 @@ impl Scope {
     }
 
     fn level(&self, ds: &str) -> Option<Level> {
+        let ds = split_branch(ds).0;
         self.datasets
             .iter()
             .filter(|(p, _)| glob(p, ds))
@@ -637,6 +674,8 @@ pub struct Principal {
     pub scheme: Scheme,
     access: Arc<Access>,
     pub info: Arc<PrincipalInfo>,
+    /// the branch the request chose: dataset names without one are checked on it
+    pub branch: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for Principal {
@@ -661,6 +700,7 @@ impl Principal {
                 ..Default::default()
             })),
             info: Arc::default(),
+            branch: None,
         });
         LOCAL.clone()
     }
@@ -672,6 +712,7 @@ impl Principal {
             scheme,
             access: Arc::new(access),
             info: Arc::default(),
+            branch: None,
         }
     }
 
@@ -698,9 +739,29 @@ impl Principal {
         self.is_ambient()
     }
 
-    /// The level granted on dataset `ds` (whether or not it exists).
+    /// This principal for a request that chose branch `branch`.
+    pub fn on_branch(mut self, branch: Option<&str>) -> Principal {
+        self.branch = branch.map(Arc::from);
+        self
+    }
+
+    /// `ds` as grants check it: with the request's branch unless it names one.
+    fn qualified<'a>(&self, ds: &'a str) -> std::borrow::Cow<'a, str> {
+        match &self.branch {
+            Some(b) if !ds.contains('@') => on_branch(ds, b).into(),
+            _ => ds.into(),
+        }
+    }
+
+    /// The level granted on dataset `ds` (whether or not it exists), on the request's
+    /// branch unless `ds` names one (`ds@branch`).
     pub fn level(&self, ds: &str) -> Option<Level> {
-        self.access.level(ds)
+        self.access.level(&self.qualified(ds))
+    }
+
+    /// The highest level granted on any branch of `ds`.
+    pub fn level_any_branch(&self, ds: &str) -> Option<Level> {
+        self.access.level(&on_branch(split_branch(ds).0, "*"))
     }
 
     pub fn can(&self, ds: &str, need: Level) -> bool {
@@ -709,7 +770,7 @@ impl Principal {
 
     /// The level granted on `ds` through endpoint `e`.
     pub fn level_at(&self, ds: &str, e: Endpoint) -> Option<Level> {
-        self.access.level_for(ds, Some(e))
+        self.access.level_for(&self.qualified(ds), Some(e))
     }
 
     /// Whether `need` is granted on `ds` through endpoint `e`.
@@ -723,7 +784,9 @@ impl Principal {
         if self.is_local() {
             return None;
         }
-        self.access.view(ds, e, self.caller()).map(Arc::new)
+        self.access
+            .view(&self.qualified(ds), e, self.caller())
+            .map(Arc::new)
     }
 
     /// What a protection's pattern may know of this caller: its name (the owner's for

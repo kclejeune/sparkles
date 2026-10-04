@@ -141,7 +141,7 @@ pub(super) async fn history(
         .collect();
     Ok(Json(json!({
         "dataset": name,
-        "datasetId": ds.store.dataset_id(),
+        "datasetId": ds.store.owner_dataset_id(),
         "head": r.head,
         "from": r.from,
         "to": r.to,

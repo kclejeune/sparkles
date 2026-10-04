@@ -16,6 +16,7 @@ const KIND_LABELS: Record<CommitKind, string> = {
   transaction: 'transaction',
   embed: 'embeddings',
   patch: 'RDF Patch',
+  merge: 'merge',
   unknown: 'unknown',
 };
 

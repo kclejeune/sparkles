@@ -754,12 +754,26 @@ impl AppendVocab {
         self.map.insert(k, i);
         (i, true)
     }
+    /// Append `key` at the next position even if an earlier position holds it (the
+    /// layers of a linked delta vocabulary are positional). A lookup by key finds the
+    /// first position.
+    pub(crate) fn push_dup(&mut self, key: &[u8]) {
+        let k: Arc<[u8]> = key.into();
+        let i = self.keys.len() as u64;
+        self.key_bytes += k.len();
+        self.keys.push(k.clone());
+        self.map.entry(k).or_insert(i);
+    }
+
     /// Keep the first `n` entries only.
     pub fn truncate(&mut self, n: u64) {
         while self.keys.len() as u64 > n {
             let k = self.keys.pop().expect("longer than n");
             self.key_bytes -= k.len();
-            self.map.remove(&k);
+            let i = self.keys.len() as u64;
+            if self.map.get(&k) == Some(&i) {
+                self.map.remove(&k);
+            }
         }
     }
     pub fn iter(&self) -> impl Iterator<Item = (u64, &[u8])> {
@@ -869,6 +883,53 @@ impl DeltaVocab {
                 #[cfg(test)]
                 fail_next_sync: false,
             })),
+        })
+    }
+
+    /// The delta vocabulary of a linked generation (a branch that reads an upstream
+    /// generation's files). Its first entries are those of the upstream files `prefix`,
+    /// each `(path, end)` pair contributing the entries up to id `end` (a file's
+    /// entries continue the ids of the pairs before it). Its own entries follow, from
+    /// `own`, which takes the appends unless the generation is opened `read_only`.
+    pub(crate) fn open_layered(
+        prefix: &[(std::path::PathBuf, u64)],
+        own: &Path,
+        read_only: bool,
+    ) -> Result<DeltaVocab> {
+        let mut v = AppendVocab::default();
+        for (path, end) in prefix {
+            if v.len() >= *end {
+                continue;
+            }
+            let mut buf = Vec::new();
+            File::open(path)?.read_to_end(&mut buf)?;
+            for key in delta_entries(&buf).0 {
+                if v.len() >= *end {
+                    break;
+                }
+                // ids are positions: a key seen before still takes its position here
+                v.push_dup(key);
+            }
+            if v.len() < *end {
+                return Err(crate::error::Error::Corrupt(format!(
+                    "{} has {} delta terms, fewer than the {end} a branch's link names",
+                    path.display(),
+                    v.len()
+                )));
+            }
+        }
+        let own_v = if read_only {
+            DeltaVocab::open_read_only(own)?
+        } else {
+            DeltaVocab::open(own)?
+        };
+        let own_inner = own_v.inner.into_inner();
+        for (_, key) in own_inner.iter() {
+            v.push_dup(key);
+        }
+        Ok(DeltaVocab {
+            inner: RwLock::new(v),
+            file: own_v.file,
         })
     }
 

@@ -24,7 +24,11 @@ class AppState {
   /** The state the Query page reads (`at=`): empty for the head. */
   queryAt = $state('');
 
+  /** The branch the Query page works on (`branch=`): empty for `main`. */
+  queryBranch = $state('');
+
   setDataset(name: string | null) {
+    if (name !== this.current) this.queryBranch = '';
     this.current = name;
     saveRaw('sparkles.dataset', name);
     if (name) void this.loadPrefixes(name);

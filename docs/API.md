@@ -2640,7 +2640,7 @@ type Commit = {
   timestamp: string;             // RFC 3339 UTC with milliseconds, never decreasing
   kind: "create" | "baseline" | "update" | "gsp-put" | "gsp-post" | "gsp-delete"
       | "upload" | "load" | "reason" | "reason-clear" | "transaction" | "embed" | "patch"
-      | "unknown";
+      | "merge" | "unknown";
   inserted: number; deleted: number;   // net change relative to the parent
   quads: number;                        // dataset size after the commit
   generation: string;                   // index generation it was made in
@@ -2649,6 +2649,9 @@ type Commit = {
   unvalidated?: true;                   // the write bypassed write-time validation
   message?: string;                     // the writer's commit message
   digest?: string;                      // change digest (hex SHA-256), when enabled
+  branch?: string | null;               // in listings of a persistent dataset: who made it
+  branchId?: string;
+  mergedFrom?: { branch: string | null; branchId: string; seq: number };  // merge commits
 };
 ```
 
@@ -2684,6 +2687,275 @@ digest chains from 32 zero bytes. The exact input is defined in
 Entries of `GET /$/datasets[/{ds}]` gain `id`, `head` and `modified`, the head's timestamp.
 `sparkles log --loc DB [--limit N] [--before SEQ | --after SEQ | --at REF] [--format json]`
 lists commits without taking the database lock, so it works next to a running server.
+
+## Branches and merges
+
+The design and its rationale are in [F09 Branches and merges](specs/F09-branches-and-merges.md).
+
+A **branch** is a named, writable line of commits that starts from a commit of another
+branch. Every persistent dataset has the branch `main`, which is the dataset as clients
+have always seen it, so a client that never names a branch sees no change. In-memory
+datasets have no other branches and answer `501` with code `branches-unsupported`.
+
+A new branch writes no index. Its first generation is linked: it reads the index files
+of the generation that holds its starting commit, and it replays that generation's
+write-ahead log up to the commit when it opens. Creating a branch therefore takes a few
+milliseconds and writes a few kilobytes, whatever the size of the dataset. The branch
+has its own log, commits, history, snapshots, write guard and writer lock, so writes to
+different branches never wait for each other. It owns a full index once it compacts or
+makes a bulk commit, and it then stops reading its upstream's files.
+
+A linked branch costs memory rather than disk. Each branch keeps its own delta, so a
+linked branch's memory holds a copy of the upstream's delta at the starting commit, and
+a restart replays that delta's log. Once it compacts, the branch costs a full index on
+disk, about what a clone costs. Long-lived branches are therefore cheapest when they are
+created soon after `main` compacts.
+
+**Names.** A branch name matches `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, contains a letter,
+and is not `head`. Each branch also has an id, a UUID minted when it is created. The id
+of `main` is the dataset id. A deleted branch's name can be used again, and the new
+branch gets a new id.
+
+**Commits.** A branch continues the numbering of the commit it starts from. A branch
+`dev` created at commit 42 of `main` makes commit 43 as its first commit, while `main`
+may make its own commit 43. On `dev`, commits up to 42 are those of `main`. A commit
+listing on a branch shows its own commits, then those it shares with its upstream, and
+each commit carries the branch that made it:
+
+| Field | Meaning |
+|---|---|
+| `branch` | The name of the branch that made the commit, or `null` when that branch was deleted. |
+| `branchId` | The id of that branch. |
+| `mergedFrom` | For a merge commit, the merged commit as `{branch, branchId, seq}`. |
+
+Merge commits have kind `merge`. Creating or deleting a branch makes no commit.
+
+### Choosing a branch
+
+Every endpoint of a dataset takes `branch=NAME`, in the query string or in a form body,
+and works on that branch. The **path form** `/{ds}@{branch}/…` replaces `/{ds}/…` in
+every dataset route, as in `/prod@dev/sparql`, `/prod@dev/update` and
+`/prod@dev/data?graph=…`. It lets a client that takes only an endpoint URL, such as
+Jena's `RDFConnection` or rdflib's SPARQL store, work on a branch. When both are given
+they must agree, and a request that names two different branches gets `400` with code
+`invalid-branch`. A branch the request may not see answers `404` with code
+`no-such-branch`, the same answer as for a branch that does not exist.
+
+The admin routes `/$/commits`, `/$/snapshots`, `/$/history`, `/$/compaction`,
+`/$/compact`, `/$/stats`, `/$/schema`, `/$/reason`, `/$/validation`, `/$/prefixes`,
+`/$/describe`, `/$/text`, `/$/geo`, `/$/vector`, `/$/rdfs`, `/$/cache` and
+`/$/datasets/{ds}/clone` take `branch` as a query parameter. Other admin routes refuse
+a branch other than `main`.
+
+Responses from a branch other than `main` carry two more headers, which cross-origin
+clients can read:
+
+```
+Sparkles-Branch: dev
+Sparkles-Branch-Id: 9d0c41e2-…
+```
+
+`Sparkles-Commit` gives the seq on that branch, and `Sparkles-Dataset-Id` keeps giving
+the dataset id. Entity tags on a branch use the branch id, `W/"<branchId>:<seq>:<format>"`,
+so two branches never share a tag, and `main`'s tags are unchanged. RDF Patch output
+names a branch's commits `urn:uuid:<branch id>#commit:<seq>`.
+
+`at` works on a branch as it does on `main`. A selector resolves within the branch's
+history, so `?branch=dev&at=commit:40` reads commit 40 of `main` when `dev` started at
+42. Snapshots belong to one branch, so `snapshot:NAME` names a snapshot of the chosen
+branch.
+
+The diff endpoint compares branches with `fromBranch` and `toBranch`, which default to
+the request's branch. `GET /prod/diff?fromBranch=main&toBranch=dev` gives the net
+changes from `main`'s head to `dev`'s head, and `from` and `to` select commits within
+those branches. Entries of `GET /$/datasets` gain `branches`, the number of branches
+including `main`.
+
+### Branch routes
+
+| Method | Path | Result |
+|--------|------|--------|
+| GET | `/$/branches/{ds}` | `{dataset, datasetId, branches: Branch[]}`, `main` first, then by name. Only the branches the caller may read are listed. |
+| POST | `/$/branches/{ds}` | Creates a branch from JSON `{name, from?, at?, protected?, note?}`. `from` defaults to `main` and `at` to its head. Answers `201` with `Location` and the `Branch`. |
+| GET | `/$/branches/{ds}/{name}` | The `Branch`, or `404 no-such-branch`. |
+| PATCH | `/$/branches/{ds}/{name}` | Changes `protected` or `note` (`null` removes the note). |
+| DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits. Answers `204`. |
+
+```ts
+type Branch = {
+  name: string; id: string; ordinal: number;
+  head: number; modified: string;               // the head commit and its time
+  from: { branch: string | null; branchId: string; seq: number } | null;  // null for main
+  upstream: string | null;                       // the branch it was created from
+  mergeBase: { branch: string; seq: number } | null;   // with its upstream
+  ahead: number; behind: number;                 // commits relative to its upstream
+  protected: boolean; note: string | null; created: string;
+  storage: { linked: boolean; ownBytes: number; heldBytes: number; generation: string };
+};
+```
+
+`storage.linked` says the branch still reads its upstream's index files.
+`storage.heldBytes` counts the upstream generations that are no longer current there and
+that the branch keeps on disk.
+
+Creating a branch from a branch is allowed. When the link would chain more than
+`--max-branch-depth` log segments, four by default, the new branch is built as its own
+index instead, and creating it costs a full build.
+
+A **protected** branch refuses updates, Graph Store writes, uploads, loads, patches and
+reasoning runs with `403 branch-protected`. It accepts merges, so protecting `main`
+gives a workflow where every change reaches it through a branch and a merge.
+
+Deleting a branch is refused with `409 unmerged` while it has commits its upstream does
+not have, unless `force=true` is given, and with `409 has-children` while other branches
+start from it. Deleting `main` answers `400`. A dataset has at most `--max-branches`
+branches including `main`, 64 by default, and creating another answers
+`409 branch-limit`.
+
+### Merges
+
+| Method | Path | Result |
+|--------|------|--------|
+| GET | `/$/merge/{ds}?source=&target=` | Previews a merge. Nothing is written, and conflicts do not fail the request. |
+| POST | `/$/merge/{ds}` | Merges. Answers `200` with the result, or `409` with the conflict report. |
+
+```ts
+type MergeRequest = {
+  source: string; target?: string;              // target defaults to "main"
+  ff?: "auto" | "only";                         // default "auto"
+  conflicts?: "cell" | "subject" | "quad";      // default "cell"
+  onConflict?: "fail" | "ours" | "theirs" | "union";   // default "fail"
+  resolutions?: Resolution[];
+  expect?: { source?: number; target?: number };       // the heads the caller saw
+  base?: { branchId: string; seq: number };     // to choose among several merge bases
+  inferences?: "exclude" | "include";           // default "exclude"
+  message?: string; dryRun?: boolean; limit?: number;
+};
+type Resolution = {
+  graph: string | null;                         // N-Triples; null is the default graph
+  subject?: string; predicate?: string;         // narrow it to a subject or a cell
+  take: "ours" | "theirs" | "base" | "union" | "objects";
+  objects?: string[];                           // with "objects": the cell's new objects
+};
+type MergeResult = {
+  merged: boolean; upToDate: boolean; fastForward: boolean;
+  source: { branch: string; seq: number }; target: { branch: string; seq: number };
+  base: { branch: string; seq: number } | null;
+  changes: { inserted: number; deleted: number };
+  conflicts: { found: number; resolved: number };
+  commit: Commit | null;                        // the merge commit
+  inferences: { excluded: number; stale: boolean } | null;
+  validation?: object;                          // the write guard's summary
+};
+```
+
+A merge works with the two sides' changes since their **merge base**, the newest commit
+both descend from. When the target has not moved since the merge base, the merge is a
+fast-forward and its result equals the source. Otherwise Sparkles merges the quad sets
+three ways: a quad changed on one side takes that side's state. With `ff: "only"`, any
+merge other than a fast-forward answers `409 not-fast-forward`. A merge is one commit of
+kind `merge` on the target, also when the target already holds every change of the
+source in another history. When the source's changes are already in the target, the
+merge writes nothing and answers `upToDate: true`.
+
+**Conflicts.** The quad-level rule never conflicts, so conflicts are defined on groups
+of quads. With the default `cell` scope, a group is a graph, a subject and a predicate,
+the RDF counterpart of a cell in a table. A cell conflicts when both sides changed it
+and the two changed cells differ. The `subject` scope groups by graph and subject, which
+catches a subject deleted on one side and edited on the other. The `quad` scope never
+reports a conflict. Two sides that made the same change do not conflict.
+
+`onConflict` resolves every remaining conflict one way: `ours` keeps the target's
+state, `theirs` takes the source's, and `union` keeps both sides' changes. `resolutions`
+choose per graph, per subject or per cell, and the most specific one that covers a
+conflict wins. `take: "base"` puts the group back as it was at the merge base, and
+`take: "objects"` sets a cell to the given objects. A resolution that covers no conflict
+answers `400 invalid-merge`, because it usually comes from a stale report. When a
+resolution leaves out a side's insert of a quad whose object is a blank node that nothing
+else refers to, that side's quads about the blank node go too, so lists and other
+structures stay whole.
+
+`expect` carries the heads the caller saw in a report. When either head moved, the
+merge answers `409 head-moved` instead of applying resolutions to changes the caller has
+not seen. Without `expect`, a merge whose target moved while it was computed starts
+again, at most three times.
+
+The conflict report lists at most `limit` cells (default 100, at most 10,000), and at
+most 100 objects per side of a cell. `graphs` counts every conflict by graph:
+
+```json
+{ "error": "1 conflict merging dev (commit 57) into main (commit 61)",
+  "code": "merge-conflict",
+  "source": { "branch": "dev", "branchId": "9d0c41e2-…", "seq": 57 },
+  "target": { "branch": "main", "branchId": "3f1c9a2e-…", "seq": 61 },
+  "base": { "branch": "main", "branchId": "3f1c9a2e-…", "seq": 42 },
+  "scope": "cell", "conflicts": 1, "truncated": false,
+  "graphs": [ { "graph": null, "conflicts": 1 } ],
+  "cells": [
+    { "graph": null, "subject": "<http://ex.org/a>", "predicate": "<http://ex.org/age>",
+      "base": ["\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>"],
+      "ours": ["\"31\"^^<http://www.w3.org/2001/XMLSchema#integer>"],
+      "theirs": ["\"32\"^^<http://www.w3.org/2001/XMLSchema#integer>"] } ] }
+```
+
+`ours` is the target and `theirs` is the source, as in Git. A preview adds the report's
+members to its result, with the number of remaining conflicts in `conflictCount`.
+
+**Inferences.** With `inferences: "exclude"`, the default, changes to the inferred graph
+`urn:x-sparkles:inferred` are left out on both sides, and the target keeps its own
+inferences. The merge changes asserted data, so the target's reasoning status reports
+the inferences as stale, and an automatic re-run updates them. `inferences.excluded`
+counts the inferred quads left out.
+
+**Validation and dry runs.** A merge commit passes the target's write-time validation
+like any other commit, and a refusal answers `422` with the report. With `dryRun: true`,
+the merge runs up to its commit and answers `200` with the
+[write preview](#write-previews) of the merge commit, with the merge's own fields under
+`merge`.
+
+**Blank nodes.** All branches of a dataset share one blank-node space. A blank node that
+existed at a branch's starting commit has the same `_:b…` label on both branches, and a
+merge copies blank nodes with their labels. Each branch allocates new blank nodes from
+its own range, so labels never collide across branches.
+
+| Condition | Status | `code` |
+|---|---|---|
+| Conflicts remain after `onConflict` and `resolutions` | 409 | `merge-conflict` |
+| `ff: "only"` and the target has moved | 409 | `not-fast-forward` |
+| `expect` names a head that is no longer the head | 409 | `head-moved` |
+| Several merge bases and no `base` | 409 | `ambiguous-merge-base`, with `candidates` |
+| The merge base is no longer reconstructable | 410 | `merge-base-gone` |
+| The target's validation refuses the result | 422 | as for any write |
+| The change sets exceed `--max-rows` or the quota | 507 | `budget` |
+| A write to a protected branch outside a merge | 403 | `branch-protected` |
+| An unknown or hidden branch | 404 | `no-such-branch` |
+| A bad name or request | 400 | `invalid-branch` or `invalid-merge` |
+
+### Storage, history and access
+
+A linked branch holds the upstream generations it reads, and `GET /$/history/{ds}` lists
+such a hold as `branch:NAME` in `heldBy`. Each branch also keeps its starting commit
+readable, listed as `branch-base:NAME`, so a merge back is always possible. The automatic
+compaction scheduler and the history upkeep treat each open branch as a dataset, and
+`GET /$/compaction/{ds}?branch=dev` reports a branch's state.
+
+A dataset's storage quota covers its whole directory, every branch included. The first
+compaction of a linked branch adds a full index, so it is refused when it would take the
+dataset over its quota, and the compaction status gives `quota` as the reason it waits.
+
+A grant of [access control](#authentication-and-access-control) may list `branches`,
+names and `*` patterns; without the list, it covers every branch. Reading a branch needs
+`read` on it, writing it needs `write`, creating one needs `read` on the source branch
+and `write` on the new name, and a merge needs `read` on the source and `write` on the
+target. Creating branches and merging act on whole datasets, so they need grants without
+graph restrictions. Protecting a branch, and deleting a protected one, need `admin` on
+it. The endpoint names `branches` and `merge` limit a grant to the branch routes and to
+merges.
+
+`sparkles branch` and `sparkles merge` do the same from the command line, on a local
+database or a server, and `--branch NAME` chooses the branch of `query`, `update`,
+`load`, `dump`, `log`, `diff`, `snapshot`, `compact`, `stats`, `clone` and `patch` (see
+[USAGE](USAGE.md#branches-and-merges)).
 
 ## Point-in-time reads and snapshots
 

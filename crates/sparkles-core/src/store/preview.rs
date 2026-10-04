@@ -207,7 +207,7 @@ impl Store {
             (Vec::new(), None)
         };
         Ok(Preview {
-            dataset_id: self.dataset_id,
+            dataset_id: self.owner_dataset_id(),
             head: b.head,
             commit: Some(b.commit),
             kind: b.commit.kind,
@@ -312,7 +312,7 @@ impl WriteTxn<'_> {
             (Vec::new(), None)
         };
         Ok(Preview {
-            dataset_id: store.dataset_id,
+            dataset_id: store.owner_dataset_id(),
             head,
             commit,
             kind: self.kind,

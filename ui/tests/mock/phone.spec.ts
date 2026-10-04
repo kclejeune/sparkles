@@ -121,6 +121,22 @@ test('the dataset list and a dataset with its panels and dialogs', async ({ page
   await visit(page, '/ui/datasets/places');
 });
 
+test('a branch: the selector, the Branches panel and its dialogs', async ({ page, request }) => {
+  // the one write of these tests: a branch to show (it may exist from an earlier run)
+  await request.post('/$/branches/foaf', { data: { name: 'phone-check', note: 'a long note' } });
+  await visit(page, '/ui/datasets/foaf?branch=phone-check');
+  await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveValue('phone-check');
+  await open(page, 'New branch');
+  for (const dialog of ['Merge phone-check', 'Delete branch phone-check']) {
+    await open(page, dialog);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('dialog[open]')).toHaveCount(0);
+  }
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'foaf'));
+  await visit(page, '/ui/query');
+  await expect(page.getByRole('combobox', { name: 'Branch' })).toBeVisible();
+});
+
 test('Similar: from an entity and from a pasted vector', async ({ page }) => {
   await visit(
     page,

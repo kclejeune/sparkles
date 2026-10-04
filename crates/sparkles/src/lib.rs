@@ -4,13 +4,14 @@
 //! and the [`querybuilder`] are defined here.
 
 pub use sparkles_core::{
-    access, annotations, builder, check, codec, commit, disk, error, geo, guard, history, id,
-    index, io, jena_formats, nesting, outbound, patch, preview, schema, sparql, store, stored,
+    access, annotations, branch, builder, check, codec, commit, disk, error, geo, guard, history,
+    id, index, io, jena_formats, nesting, outbound, patch, preview, schema, sparql, store, stored,
     tabular, task, text, trix, validation, vector, vocab, xsd,
 };
 
 #[cfg(feature = "backup")]
 pub mod backup;
+mod branches;
 pub mod dataset;
 pub mod embed;
 #[cfg(feature = "fmt")]

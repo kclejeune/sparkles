@@ -1169,3 +1169,37 @@ async fn the_service_description_names_the_materialized_regime() {
     );
     assert_eq!(nt.matches("void#triples").count(), 1, "{nt}");
 }
+
+/// F09 A9: a merge leaves the inferred graph out by default, and the target reports its
+/// inferences as stale; a new branch reads as fresh.
+#[tokio::test]
+async fn a9_merges_leave_inferences_out_and_mark_them_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("m", DbType::Persistent).unwrap();
+    load(&st, "m", "ex:C rdfs:subClassOf ex:B . ex:x a ex:C .");
+    let app = router(st.clone());
+    let r = post_json(&app, "/$/reason/m", r#"{"profile":"rdfs"}"#).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    wait_tasks(&st).await;
+    let r = post_json(&app, "/$/branches/m", r#"{"name":"dev"}"#).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let s = get_json(&app, "/$/reason/m?branch=dev").await;
+    assert_eq!(s["stale"], false, "{s}");
+    update(&app, "m@dev", "INSERT DATA { ex:y a ex:C }").await;
+    let r = post_json(&app, "/$/reason/m?branch=dev", r#"{"rerun":true}"#).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    wait_tasks(&st).await;
+    let (rows, _) = b_instances(&app, "m@dev").await;
+    assert_eq!(rows, ["http://ex.org/x", "http://ex.org/y"]);
+    let r = post_json(&app, "/$/merge/m", r#"{"source":"dev"}"#).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let m = r.json();
+    assert!(m["inferences"]["excluded"].as_u64().unwrap() > 0, "{m}");
+    assert_eq!(m["inferences"]["stale"], true);
+    let s = get_json(&app, "/$/reason/m").await;
+    assert_eq!(s["stale"], true, "{s}");
+    // the asserted triple came, the inferred one did not
+    let (rows, _) = b_instances(&app, "m").await;
+    assert_eq!(rows, ["http://ex.org/x"]);
+}

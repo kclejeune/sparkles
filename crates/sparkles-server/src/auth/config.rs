@@ -36,6 +36,9 @@ pub struct GrantCfg {
     /// names of `[[protections]]` this grant lifts in its graphs, at its level
     #[serde(default)]
     pub lifts: Vec<String>,
+    /// branch names and `*` patterns the grant covers; absent: every branch
+    #[serde(default)]
+    pub branches: Option<Vec<String>>,
 }
 
 /// `[[protections]]`: triples of a dataset that only grants lifting the protection
@@ -199,6 +202,7 @@ impl GrantCfg {
                     .collect()
             }),
             lifts: self.lifts.clone(),
+            branches: self.branches.clone(),
         }
     }
 }
@@ -228,7 +232,26 @@ fn check_restricted(what: &str, grants: &[GrantCfg], protections: &BTreeSet<&str
         if !valid_pattern(&g.dataset) {
             bail!("{what}: invalid dataset pattern '{}' in grants", g.dataset);
         }
-        if g.level == Level::Admin {
+        if let Some(bs) = &g.branches {
+            if bs.is_empty() {
+                bail!(
+                    "{what}: the grant on '{}' has an empty branches list (omit branches to \
+                     cover every branch)",
+                    g.dataset
+                );
+            }
+            if let Some(b) = bs.iter().find(|b| {
+                *b != "*" && !sparkles::branch::valid_name(&b.replace('*', "x")) && *b != "main"
+            }) {
+                bail!(
+                    "{what}: the grant on '{}' has an invalid branch pattern '{b}'",
+                    g.dataset
+                );
+            }
+        }
+        // a grant limited to branches alone may administer them
+        let branches_only = g.branches.is_some() && g.graphs.is_none() && g.endpoints.is_none();
+        if g.level == Level::Admin && !branches_only {
             bail!(
                 "{what}: a grant on '{}' cannot be admin (admin covers every graph and \
                  endpoint: grant it under datasets)",

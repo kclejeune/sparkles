@@ -263,6 +263,29 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("historyChanges", "history.query", |ds| {
             ds.history().query(&any());
         }),
+        // --------------------------------------------------- branches and merges
+        op!("listBranches", "branches.list", |ds| {
+            ds.branches();
+        }),
+        op!("getBranch", "branches.get", |ds| {
+            ds.branch_info("dev");
+        }),
+        op!("createBranch", "branches.create", |ds| {
+            ds.create_branch("dev", &Default::default());
+        }),
+        op!("updateBranch", "branches.update", |ds| {
+            ds.set_branch_protected("dev", true);
+            ds.set_branch_note("dev", None);
+        }),
+        op!("deleteBranch", "branches.delete", |ds| {
+            ds.delete_branch("dev", false);
+        }),
+        op!("previewMerge", "branches.preview_merge", |ds| {
+            ds.preview_merge("dev", "main", &Default::default());
+        }),
+        op!("merge", "branches.merge", |ds| {
+            ds.merge("dev", "main", &Default::default());
+        }),
         // ----------------------------------------------------------- search indexes
         op!("getTextIndex", "indexes.text.status", |ds| {
             ds.indexes().text().status();

@@ -112,7 +112,7 @@ impl From<StoreOptions> for DatasetOptions {
 /// may change between releases; programs use the methods of [`Dataset`].
 #[doc(hidden)]
 pub struct DatasetState {
-    pub store: Store,
+    pub store: StoreHandle,
     pub name: Option<String>,
     /// the stored queries (`queries.json`)
     pub queries: crate::stored::Catalog,
@@ -147,6 +147,37 @@ impl DatasetState {
         }
         *self.reasoning.write() = record;
         Ok(())
+    }
+}
+
+/// A dataset's store: its own, or a branch's, which the branch set of the dataset that
+/// owns the branch keeps open. It derefs to the [`Store`].
+#[doc(hidden)]
+#[allow(clippy::large_enum_variant)]
+pub enum StoreHandle {
+    Own(Store),
+    Branch(Arc<Store>),
+}
+
+impl std::ops::Deref for StoreHandle {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        match self {
+            StoreHandle::Own(s) => s,
+            StoreHandle::Branch(s) => s,
+        }
+    }
+}
+
+impl From<Store> for StoreHandle {
+    fn from(s: Store) -> StoreHandle {
+        StoreHandle::Own(s)
+    }
+}
+
+impl From<Arc<Store>> for StoreHandle {
+    fn from(s: Arc<Store>) -> StoreHandle {
+        StoreHandle::Branch(s)
     }
 }
 
@@ -188,7 +219,8 @@ impl Dataset {
 
     /// [`from_store`](Self::from_store) with the library's settings of `opts` (its
     /// `store` options are those `store` was opened with and are not read).
-    pub fn from_store_with(store: Store, opts: DatasetOptions) -> Dataset {
+    pub fn from_store_with(store: impl Into<StoreHandle>, opts: DatasetOptions) -> Dataset {
+        let store: StoreHandle = store.into();
         let shown = || {
             opts.name
                 .as_deref()
@@ -249,6 +281,12 @@ impl Dataset {
                 store,
             }),
         }
+    }
+
+    /// A dataset around a store others share (a branch's, which its dataset keeps open),
+    /// with the state the branch's directory configures.
+    pub(crate) fn from_shared(store: Arc<Store>, opts: DatasetOptions) -> Dataset {
+        Dataset::from_store_with(StoreHandle::Branch(store), opts)
     }
 
     /// The underlying store (ids, snapshots, low-level scans).

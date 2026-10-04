@@ -825,12 +825,18 @@ impl Store {
         let now = self.now_ms();
         let t = &self.compaction;
         let since = |ms: i64| (ms != NONE).then(|| now.saturating_sub(ms).max(0) as u64);
+        // a linked branch counts its own changes, those since its starting commit, for
+        // the delta-size triggers: the delta it inherited is not its to compact away
+        let inherited = snap.generation.linked().map_or(0, |l| {
+            (l.base_delta.inserts() + l.base_delta.deletes()) as u64
+        });
         CompactionMeasures {
             generation: snap.generation.name.clone(),
             base_seq: t.base_seq.load(Ordering::Relaxed),
             head: snap.commit,
             base_quads: snap.generation.meta.quads,
-            delta_quads: (snap.delta.inserts() + snap.delta.deletes()) as u64,
+            delta_quads: ((snap.delta.inserts() + snap.delta.deletes()) as u64)
+                .saturating_sub(inherited),
             delta_inserts: snap.delta.inserts() as u64,
             delta_deletes: snap.delta.deletes() as u64,
             delta_bytes: delta_bytes(&snap.delta)
@@ -862,6 +868,22 @@ impl Store {
         };
         let snap = self.snapshot();
         let current = commit::generation_number(&snap.generation.name);
+        // the first rebuild of a linked branch adds a full index to the dataset
+        if snap.generation.link.is_some()
+            && let Some(limit) = self.quota.limit()
+        {
+            let projected = self.quota.used() + self.compaction_disk_need(&snap);
+            if projected > limit {
+                return b(
+                    "quota",
+                    format!(
+                        "the branch's own index would take the dataset to about {}, over its quota of {}",
+                        crate::error::human_bytes(projected),
+                        crate::error::human_bytes(limit)
+                    ),
+                );
+            }
+        }
         {
             let h = hist.lock();
             if let Some(l) = h.leases.values().find(|l| l.generation == current) {
@@ -1029,6 +1051,20 @@ impl Store {
         }?;
         let mut build = tb.elapsed();
         self.failpoint("compact-built");
+        // the first rebuild of a linked branch adds a full index: refused over the quota
+        if snap0.generation.link.is_some()
+            && let (Some(limit), Some(root)) = (self.quota.limit(), &self.root)
+        {
+            let ds_root = super::link::dataset_root_of(root)?;
+            let projected = dir_size(&ds_root);
+            if projected > limit {
+                return Err(Error::BudgetExceeded(crate::Budget {
+                    kind: crate::BudgetKind::DatasetBytes,
+                    limit,
+                    requested: projected,
+                }));
+            }
+        }
         let persistent = self.root.is_some();
         let mut gen_ = Generation::open(&dir, &name, persistent)?;
         gen_._tmp = tmp;
@@ -1225,6 +1261,7 @@ impl Store {
             let _ = std::fs::remove_dir_all(d);
         }
         self.quota.invalidate();
+        self.release_link_if_rebuilt();
         Ok(CompactReport {
             generation: name,
             quads,

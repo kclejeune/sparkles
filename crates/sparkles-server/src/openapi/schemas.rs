@@ -561,6 +561,167 @@ pub(super) fn schemas() -> Map<String, J> {
             },
         }),
     );
+    // ---------------------------------------------------------------- branches --
+    let commit_ref = || {
+        json!({
+            "type": "object",
+            "properties": {
+                "branch": { "type": ["string", "null"] },
+                "branchId": { "type": "string" },
+                "seq": { "type": "integer" },
+            },
+        })
+    };
+    put(
+        "Branch",
+        obj(
+            &["name", "id", "head", "protected", "storage"],
+            json!({
+                "name": { "type": "string" },
+                "id": { "type": "string", "description": "The branch id (the dataset id for `main`)." },
+                "ordinal": { "type": "integer" },
+                "head": { "type": ["integer", "null"] },
+                "modified": { "type": ["string", "null"] },
+                "from": with_desc(commit_ref(), "The commit the branch started from (`null` for `main`)."),
+                "upstream": { "type": ["string", "null"] },
+                "mergeBase": { "type": ["object", "null"] },
+                "ahead": { "type": "integer" },
+                "behind": { "type": "integer" },
+                "protected": { "type": "boolean" },
+                "note": { "type": ["string", "null"] },
+                "created": { "type": "string" },
+                "storage": {
+                    "type": "object",
+                    "properties": {
+                        "linked": { "type": "boolean", "description": "The branch still reads its upstream's index files." },
+                        "ownBytes": { "type": "integer" },
+                        "heldBytes": { "type": "integer" },
+                        "generation": { "type": "string" },
+                    },
+                },
+                "broken": { "type": "boolean" },
+            }),
+        ),
+    );
+    put(
+        "BranchList",
+        obj(
+            &["dataset", "datasetId", "branches"],
+            json!({
+                "dataset": { "type": "string" },
+                "datasetId": { "type": "string" },
+                "branches": array(sref("Branch")),
+            }),
+        ),
+    );
+    put(
+        "BranchCreate",
+        obj(
+            &["name"],
+            json!({
+                "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+                "from": { "type": "string", "description": "The branch to start from (default `main`)." },
+                "at": { "type": "string", "description": "The commit of `from` to start at (default `head`)." },
+                "protected": { "type": "boolean" },
+                "note": { "type": "string" },
+            }),
+        ),
+    );
+    put(
+        "BranchPatch",
+        obj(
+            &[],
+            json!({
+                "protected": { "type": "boolean" },
+                "note": { "type": ["string", "null"] },
+            }),
+        ),
+    );
+    put(
+        "MergeRequest",
+        obj(
+            &["source"],
+            json!({
+                "source": { "type": "string" },
+                "target": { "type": "string", "description": "Default `main`." },
+                "ff": string_enum(&["auto", "only"]),
+                "conflicts": string_enum(&["cell", "subject", "quad"]),
+                "onConflict": string_enum(&["fail", "ours", "theirs", "union"]),
+                "resolutions": array(json!({
+                    "type": "object",
+                    "required": ["take"],
+                    "properties": {
+                        "graph": { "type": ["string", "null"], "description": "N-Triples; `null` is the default graph." },
+                        "subject": { "type": "string" },
+                        "predicate": { "type": "string" },
+                        "take": string_enum(&["ours", "theirs", "base", "union", "objects"]),
+                        "objects": array(json!({ "type": "string" })),
+                    },
+                })),
+                "expect": {
+                    "type": "object",
+                    "properties": { "source": { "type": "integer" }, "target": { "type": "integer" } },
+                    "description": "The heads the caller saw: `409 head-moved` when either moved.",
+                },
+                "base": { "type": "object", "description": "The merge base to use among several." },
+                "inferences": string_enum(&["exclude", "include"]),
+                "limit": { "type": "integer" },
+                "message": { "type": "string" },
+                "dryRun": { "type": "boolean" },
+            }),
+        ),
+    );
+    put(
+        "MergeResult",
+        json!({
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["merged", "upToDate", "fastForward", "source", "target", "changes", "conflicts"],
+            "properties": {
+                "merged": { "type": "boolean" },
+                "upToDate": { "type": "boolean" },
+                "fastForward": { "type": "boolean" },
+                "source": { "type": "object" },
+                "target": { "type": "object" },
+                "base": { "type": ["object", "null"] },
+                "changes": { "type": "object", "properties": { "inserted": { "type": "integer" }, "deleted": { "type": "integer" } } },
+                "conflicts": { "type": "object", "properties": { "found": { "type": "integer" }, "resolved": { "type": "integer" } } },
+                "conflictCount": { "type": "integer", "description": "A preview's conflicts that remain." },
+                "commit": { "description": "The merge commit.", "oneOf": [sref("Commit"), { "type": "null" }] },
+                "inferences": { "type": ["object", "null"] },
+            },
+        }),
+    );
+    put(
+        "ConflictReport",
+        json!({
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["error", "code"],
+            "properties": {
+                "error": { "type": "string" },
+                "code": { "type": "string" },
+                "source": commit_ref(),
+                "target": commit_ref(),
+                "base": { "type": ["object", "null"] },
+                "scope": string_enum(&["cell", "subject", "quad"]),
+                "conflicts": { "type": "integer" },
+                "truncated": { "type": "boolean" },
+                "graphs": array(json!({ "type": "object" })),
+                "cells": array(json!({
+                    "type": "object",
+                    "properties": {
+                        "graph": { "type": ["string", "null"] },
+                        "subject": { "type": "string" },
+                        "predicate": { "type": "string" },
+                        "base": array(json!({ "type": "string" })),
+                        "ours": array(json!({ "type": "string" })),
+                        "theirs": array(json!({ "type": "string" })),
+                    },
+                })),
+            },
+        }),
+    );
     put(
         "CommitResponse",
         obj(

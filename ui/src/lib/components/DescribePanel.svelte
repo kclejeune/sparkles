@@ -3,6 +3,7 @@
   // resource in this dataset. Everyone who can read the dataset sees it; an admin of the
   // dataset changes it or goes back to the server's defaults.
   import * as api from '$lib/api';
+  import { onBranch } from '$lib/branches';
   import { toasts } from '$lib/app.svelte';
   import {
     describeBody,
@@ -15,12 +16,17 @@
 
   let {
     name,
+    branch = null,
     canEdit = false,
   }: {
     name: string;
+    /** The branch to work on (null: `main`). */
+    branch?: string | null;
     /** Admin on the dataset and a writable server. */
     canEdit?: boolean;
   } = $props();
+
+  const target = $derived(onBranch(name, branch));
 
   let setting = $state<api.DescribeSetting | null>(null);
   let form = $state<DescribeForm | null>(null);
@@ -30,7 +36,7 @@
 
   async function load() {
     try {
-      const s = await api.describeSetting(name);
+      const s = await api.describeSetting(target);
       setting = s;
       form = describeForm(s);
       error = null;
@@ -41,7 +47,7 @@
   }
 
   $effect(() => {
-    void name;
+    void target;
     setting = null;
     form = null;
     unsupported = false;
@@ -57,7 +63,7 @@
     if (!body || 'error' in body) return;
     saving = true;
     try {
-      const s = await api.setDescribeSetting(name, body.ok);
+      const s = await api.setDescribeSetting(target, body.ok);
       setting = s;
       form = describeForm(s);
       toasts.push('info', 'DESCRIBE setting saved', describeSummary(s));
@@ -71,7 +77,7 @@
   async function reset() {
     saving = true;
     try {
-      const s = await api.clearDescribeSetting(name);
+      const s = await api.clearDescribeSetting(target);
       setting = s;
       form = describeForm(s);
       toasts.push('info', 'DESCRIBE uses the defaults', describeSummary(s));
