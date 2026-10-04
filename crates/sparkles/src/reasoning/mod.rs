@@ -15,6 +15,11 @@ use std::path::Path;
 /// The file of a persistent dataset that holds its [`ReasoningRecord`].
 pub const RECORD_FILE: &str = "reasoning.json";
 
+/// The named graph that holds the materialized inferences. While a dataset has a
+/// [`ReasoningRecord`], its queries read this graph as part of the default graph (see
+/// [`Dataset::query_options`](crate::Dataset::query_options)).
+pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
+
 /// The recorded reasoning status (`reasoning.json`, also embedded in the server's
 /// registry). Fields after `at` are absent from files written by older versions.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

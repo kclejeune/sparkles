@@ -158,6 +158,20 @@ pub fn query_options(args: &QueryArgs<'_>) -> PyResult<(QueryOptions, Option<At>
     Ok((opts, at))
 }
 
+/// The dataset's query defaults in `opts`: RDFS on read, and the DESCRIBE setting with
+/// the query's `describe` options over it. The inferred overlay stays what
+/// `include_inferred` asked for, so the options are marked as holding the defaults.
+pub fn apply_defaults(
+    opts: &mut QueryOptions,
+    defaults: &QueryOptions,
+    args: &QueryArgs<'_>,
+) -> PyResult<()> {
+    opts.rdfs = defaults.rdfs.clone();
+    opts.describe = describe_options(defaults.describe.clone(), args.describe.as_ref())?;
+    opts.defaults_applied = true;
+    Ok(())
+}
+
 /// A point in a dataset's history: a commit number, or `head`, `commit:N`,
 /// `time:<RFC 3339>` or `snapshot:<name>`.
 pub fn at_from_py(ob: &Bound<'_, PyAny>) -> PyResult<At> {
@@ -274,8 +288,7 @@ impl PyDataset {
     ) -> PyResult<Bound<'py, PyAny>> {
         let ds = self.ds(py)?;
         let (mut opts, at) = query_options(&args)?;
-        // DESCRIBE follows the dataset's setting, with the query's options over it
-        opts.describe = describe_options(ds.store().describe_settings(), args.describe.as_ref())?;
+        apply_defaults(&mut opts, &ds.query_options(), &args)?;
         let cancel = opts.cancel.clone().unwrap_or_default();
         let query = query.to_string();
         let r = interrupt::run(py, &cancel, move || {

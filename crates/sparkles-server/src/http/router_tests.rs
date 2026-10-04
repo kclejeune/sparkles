@@ -33,6 +33,7 @@ mod loads;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod open;
+mod query_defaults;
 #[cfg(feature = "reasoning")]
 mod reasoning;
 mod sd;

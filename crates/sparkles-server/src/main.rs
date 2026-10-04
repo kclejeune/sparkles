@@ -2864,16 +2864,21 @@ fn run() -> Result<()> {
                 return no_remote(&ds, insecure_http);
             }
             let outbound = outbound.local_policy()?;
-            let store = open_or_load(loc, &data, opts)?;
+            // the dataset's query defaults (RDFS on read, the inferred overlay and
+            // DESCRIBE), as a server and the library apply them
+            let (ds, _main) = open_or_load(loc, &data, opts)?.into_dataset();
+            let store = ds.store();
+            let defaults = ds.query_options();
             use sparkles::sparql::rdfs::{RdfsOnRead, RdfsSchema, SchemaSource};
+            // `--rdfs` and `--rdfs-graph` override the dataset's RDFS on read
             let rdfs = match (rdfs, rdfs_graph) {
-                (Some(f), _) => Some(RdfsOnRead::fixed(RdfsSchema::from_triples(
+                (Some(f), _) => Some(Arc::new(RdfsOnRead::fixed(RdfsSchema::from_triples(
                     &rdfs::read_file(&f).with_context(|| format!("--rdfs {}", f.display()))?,
-                ))),
-                (None, Some(g)) => Some(RdfsOnRead::new(SchemaSource::Graph(
+                )))),
+                (None, Some(g)) => Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(
                     (g != "default").then_some(g),
-                ))),
-                (None, None) => None,
+                )))),
+                (None, None) => defaults.rdfs.clone(),
             };
             let qopts = QueryOptions {
                 timeout: timeout.map(Duration::from_secs_f64),
@@ -2881,9 +2886,9 @@ fn run() -> Result<()> {
                 allow_service: true,
                 outbound,
                 prefixes: store.prefixes().into_iter().collect(),
-                rdfs: rdfs.map(Arc::new),
+                rdfs,
                 describe: {
-                    let mut d = store.describe_settings();
+                    let mut d = defaults.describe.clone();
                     if let Some(m) = &describe {
                         d.mode = sparkles::sparql::describe::DescribeMode::parse(m)?;
                     }
@@ -2891,7 +2896,7 @@ fn run() -> Result<()> {
                     d.reifiers |= describe_reifiers;
                     d.lowered(describe_max_triples, describe_max_depth)
                 },
-                ..Default::default()
+                ..defaults
             };
             let snap = match at {
                 Some(a) => {
@@ -2913,7 +2918,7 @@ fn run() -> Result<()> {
             let mut out = out.lock();
             match r.kind {
                 QueryKind::Select | QueryKind::Ask if fmt == "text" => {
-                    print_table(&r, &store, &mut out)?
+                    print_table(&r, store, &mut out)?
                 }
                 QueryKind::Select | QueryKind::Ask => {
                     let f = SolutionsFormat::from_name(&fmt).context("unknown result format")?;

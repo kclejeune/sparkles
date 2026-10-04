@@ -506,6 +506,19 @@ impl Tools<'_> {
                 endpoint.as_str()
             )));
         }
+        // the dataset's query defaults (RDFS on read, the inferred overlay and DESCRIBE),
+        // as over HTTP
+        let mut defaults = self
+            .server
+            .state
+            .datasets
+            .read()
+            .get(ds)
+            .map(|d| d.dataset.query_options())
+            .unwrap_or_default();
+        if !reasoning {
+            defaults.default_graph_extra.clear();
+        }
         let mut opts = QueryOptions {
             timeout: Some(remaining(deadline)?),
             max_rows: Some(self.server.state.limits.max_rows),
@@ -514,30 +527,8 @@ impl Tools<'_> {
             allow_service: self.cfg().allow_service,
             outbound: self.server.state.outbound.clone(),
             cancel: Some(self.call.cancel.clone()),
-            default_graph_extra: if reasoning {
-                vec![INFERRED_GRAPH.to_string()]
-            } else {
-                Vec::new()
-            },
             prefixes: prefix_vec(prefixes),
-            // RDFS on read, as over HTTP
-            rdfs: self
-                .server
-                .state
-                .datasets
-                .read()
-                .get(ds)
-                .and_then(|d| d.rdfs.read().clone()),
-            // the dataset's DESCRIBE setting, as over HTTP
-            describe: self
-                .server
-                .state
-                .datasets
-                .read()
-                .get(ds)
-                .map(|d| d.store.describe_settings())
-                .unwrap_or_default(),
-            ..Default::default()
+            ..defaults
         };
         // SERVICE and LOAD are the principal's server permissions, and the graphs its
         // grants cover, as over HTTP

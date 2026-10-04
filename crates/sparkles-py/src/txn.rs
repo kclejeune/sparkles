@@ -72,14 +72,14 @@ pub struct PyTransaction {
     writer: WriterSlot,
     /// the thread that began it
     owner: ThreadId,
-    /// the dataset's DESCRIBE setting when the transaction began
-    describe: sparkles::sparql::describe::DescribeOptions,
+    /// the dataset's query defaults when the transaction began
+    defaults: sparkles::sparql::QueryOptions,
 }
 
 impl PyTransaction {
     /// Begin a transaction on `ds`: waits for the writer lock without the GIL.
     pub fn begin(py: Python<'_>, ds: sparkles::Dataset, writer: WriterSlot) -> PyResult<Self> {
-        let describe = ds.store().describe_settings();
+        let defaults = ds.query_options();
         let (req_tx, req_rx) = channel::<Req>();
         let (resp_tx, resp_rx) = channel::<Resp>();
         std::thread::Builder::new()
@@ -111,7 +111,7 @@ impl PyTransaction {
             })),
             writer,
             owner,
-            describe,
+            defaults,
         })
     }
 
@@ -218,9 +218,7 @@ impl PyTransaction {
         want: Option<&[QueryKind]>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (mut opts, at) = query_options(&args)?;
-        // DESCRIBE follows the dataset's setting, with the query's options over it
-        opts.describe =
-            crate::dataset::describe_options(self.describe.clone(), args.describe.as_ref())?;
+        crate::dataset::apply_defaults(&mut opts, &self.defaults, &args)?;
         if at.is_some() {
             return Err(crate::errors::invalid(
                 py,

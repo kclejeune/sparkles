@@ -46,6 +46,21 @@ impl From<Store> for Db {
     }
 }
 
+impl Db {
+    /// The library's dataset of the chosen branch, with the state its directory
+    /// configures, and the database's main store, which a branch's dataset needs open
+    /// while it is used.
+    pub fn into_dataset(self) -> (sparkles::Dataset, Option<Store>) {
+        match self.branch {
+            Some(b) => (
+                sparkles::Dataset::from_store_with(b, Default::default()),
+                Some(self.main),
+            ),
+            None => (sparkles::Dataset::from_store(self.main), None),
+        }
+    }
+}
+
 /// Open the database `loc` and choose the global `--branch` in it.
 pub fn open_db(loc: &Path, opts: StoreOptions) -> Result<Db> {
     let main = Store::open(loc, opts)?;

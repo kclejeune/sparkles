@@ -130,6 +130,13 @@ pub struct QueryOptions {
     /// (`None`: the store's setting). Unlike a protocol dataset whose default graph is
     /// `urn:x-arq:UnionGraph`, it leaves the named graphs as they are.
     pub union_default_graph: Option<bool>,
+    /// Whether these options already hold a dataset's query defaults, which are RDFS on
+    /// read, the overlay of materialized inferences and the DESCRIBE setting.
+    /// `sparkles::Dataset::query_options` returns options with this set, and a
+    /// `sparkles::Dataset` then uses every field as given. When it is false, the
+    /// dataset fills each of those fields that the caller left unset. The engine itself
+    /// does not read it.
+    pub defaults_applied: bool,
 }
 
 /// `snap` with the request's union default graph setting, if it overrides the store's.

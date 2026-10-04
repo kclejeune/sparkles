@@ -48,6 +48,7 @@ use oxrdf::{
 };
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashSet;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -414,18 +415,69 @@ impl Dataset {
     // ------------------------------------------------------------------- SPARQL ------
 
     /// Run any SPARQL query and get the full result (solutions, boolean or triples, plus
-    /// the executed plan and timings). DESCRIBE follows the dataset's setting
-    /// ([`Store::describe_settings`](crate::store::Store::describe_settings)).
+    /// the executed plan and timings), with the dataset's query defaults (see
+    /// [`query_options`](Self::query_options)).
     pub fn query(&self, query: &str) -> Result<QueryResult> {
-        let opts = QueryOptions {
-            describe: self.inner.store.describe_settings(),
-            ..Default::default()
-        };
-        self.query_with(query, &opts)
+        crate::sparql::query(self.inner.store.snapshot(), query, &self.query_options())
     }
 
+    /// [`query`](Self::query) with options. The dataset fills each of its defaults that
+    /// `opts` leaves unset, as [`with_query_defaults`](Self::with_query_defaults)
+    /// describes, and every field `opts` sets wins.
     pub fn query_with(&self, query: &str, opts: &QueryOptions) -> Result<QueryResult> {
-        crate::sparql::query(self.inner.store.snapshot(), query, opts)
+        crate::sparql::query(
+            self.inner.store.snapshot(),
+            query,
+            &self.with_query_defaults(opts),
+        )
+    }
+
+    /// The options a query of this dataset runs with by default. They hold RDFS on read
+    /// when the dataset has it set, the graph of materialized inferences
+    /// ([`INFERRED_GRAPH`](crate::reasoning::INFERRED_GRAPH)) as part of the default
+    /// graph while the dataset has a reasoning record, and the dataset's DESCRIBE
+    /// setting. Their `defaults_applied` is set, so the dataset uses them as given: a
+    /// caller changes a field to override a default, such as clearing
+    /// `default_graph_extra` to leave the inferences out or setting `rdfs` to `None` to
+    /// turn RDFS on read off for one query.
+    pub fn query_options(&self) -> QueryOptions {
+        let state = &self.inner;
+        QueryOptions {
+            rdfs: state.rdfs.read().clone(),
+            default_graph_extra: if state.reasoning.read().is_some() {
+                vec![crate::reasoning::INFERRED_GRAPH.to_string()]
+            } else {
+                Vec::new()
+            },
+            describe: state.store.describe_settings(),
+            defaults_applied: true,
+            ..Default::default()
+        }
+    }
+
+    /// `opts` with the dataset's query defaults in the fields it leaves unset. A field
+    /// is unset when it has its `Default` value: `rdfs` is `None`, `default_graph_extra`
+    /// is empty, or `describe` equals `DescribeOptions::default()`. Options whose
+    /// `defaults_applied` is set, such as those of
+    /// [`query_options`](Self::query_options), are returned as given. Updates take their
+    /// options as given, because the defaults change only what queries read.
+    pub fn with_query_defaults<'o>(&self, opts: &'o QueryOptions) -> Cow<'o, QueryOptions> {
+        if opts.defaults_applied {
+            return Cow::Borrowed(opts);
+        }
+        let defaults = self.query_options();
+        let mut o = opts.clone();
+        if o.rdfs.is_none() {
+            o.rdfs = defaults.rdfs;
+        }
+        if o.default_graph_extra.is_empty() {
+            o.default_graph_extra = defaults.default_graph_extra;
+        }
+        if o.describe == crate::sparql::describe::DescribeOptions::default() {
+            o.describe = defaults.describe;
+        }
+        o.defaults_applied = true;
+        Cow::Owned(o)
     }
 
     /// Run a SELECT query and return its solutions as terms.
@@ -644,6 +696,7 @@ impl Dataset {
         let mut tx = Transaction {
             txn: self.inner.store.write(),
             labels: HashMap::new(),
+            ds: self,
         };
         let r = f(&mut tx)?;
         let receipt = tx.txn.commit()?;
@@ -745,13 +798,15 @@ impl Dataset {
         Ok(n)
     }
 
-    /// The plan of a query without running it, as text and as the plan's summary.
+    /// The plan of a query without running it, as text and as the plan's summary. The
+    /// dataset's query defaults fill the fields `opts` leaves unset, as in
+    /// [`query_with`](Self::query_with).
     pub fn explain(
         &self,
         query: &str,
         opts: &QueryOptions,
     ) -> Result<(String, crate::sparql::PlanInfo)> {
-        crate::sparql::explain(self.snapshot(), query, opts)
+        crate::sparql::explain(self.snapshot(), query, &self.with_query_defaults(opts))
     }
 
     /// Drop the cached query results.
@@ -902,6 +957,8 @@ impl GraphView<'_> {
 pub struct Transaction<'s> {
     pub(crate) txn: WriteTxn<'s>,
     pub(crate) labels: HashMap<String, Id>,
+    /// the dataset, for its query defaults
+    pub(crate) ds: &'s Dataset,
 }
 
 impl Transaction<'_> {
@@ -1008,12 +1065,17 @@ impl Transaction<'_> {
             .map(|id| crate::store::bnode_for(*id))
     }
 
-    /// Run a SPARQL query that sees this transaction's changes. The full-text index
-    /// covers committed data only, so a `text:query` call returns
+    /// Run a SPARQL query that sees this transaction's changes, with the dataset's query
+    /// defaults in the fields `opts` leaves unset, as in [`Dataset::query_with`]. The
+    /// full-text index covers committed data only, so a `text:query` call returns
     /// [`Error::Unsupported`](crate::Error::Unsupported) once the transaction has
     /// changed data.
     pub fn query_with(&self, query: &str, opts: &QueryOptions) -> Result<QueryResult> {
-        crate::sparql::query(Arc::new(self.txn.view()), query, opts)
+        crate::sparql::query(
+            Arc::new(self.txn.view()),
+            query,
+            &self.ds.with_query_defaults(opts),
+        )
     }
 
     /// Run a SPARQL Update request in this transaction. Its operations see the

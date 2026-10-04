@@ -53,7 +53,7 @@ mod stream;
 mod tabular;
 mod validation;
 
-pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
+pub use sparkles::reasoning::INFERRED_GRAPH;
 
 type St = State<Arc<AppState>>;
 
@@ -976,12 +976,17 @@ fn with_timeout(mut e: ApiError, timeout: Option<Duration>) -> ApiError {
     e
 }
 
+/// The options of a query request: the dataset's query defaults (RDFS on read, the
+/// inferred overlay and DESCRIBE, see [`sparkles::Dataset::query_options`]) with the
+/// server's limits and the request's parameters. `reasoning=false` leaves the inferred
+/// overlay out.
 fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
-    let timeout = timeout_param(st, params);
-    let reasoning =
-        params.get("reasoning").is_none_or(|v| v != "false") && ds.reasoning.read().is_some();
+    let mut defaults = ds.dataset.query_options();
+    if params.get("reasoning") == Some("false") {
+        defaults.default_graph_extra.clear();
+    }
     QueryOptions {
-        timeout: Some(timeout),
+        timeout: Some(timeout_param(st, params)),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
         max_rows_produced: st.limits.max_rows_produced,
@@ -990,14 +995,7 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         named_graph_uris: params.all("named-graph-uri"),
         allow_service: st.allow_service,
         outbound: st.outbound.clone(),
-        default_graph_extra: if reasoning {
-            vec![INFERRED_GRAPH.to_string()]
-        } else {
-            Vec::new()
-        },
-        rdfs: ds.rdfs.read().clone(),
-        describe: ds.store.describe_settings(),
-        ..Default::default()
+        ..defaults
     }
 }
 
