@@ -196,10 +196,10 @@ running queries.
 
 | Engine | What it is | Where Sparkles stands |
 |---|---|---|
-| [Apache Jena / Fuseki](https://jena.apache.org/) | The reference Java stack. It has ARQ, TDB2 on B+trees, Fuseki, on-the-fly inference, jena-text and GeoSPARQL. | Sparkles has the same protocols, endpoints, admin API and CLI model, on sorted columnar indexes. It is faster on every benchmark query at 10.5M triples, by a median of 78×. Reasoning is materialized, apart from RDFS on read. Sparkles writes RDF Patch and applies it through Fuseki's `patch` operation. It has ARQ's query language, its function and property function libraries, and its `cdt:` lists and maps, but no JavaScript functions, and there is no ontology API. |
-| [QLever](https://github.com/ad-freiburg/qlever) | A C++ engine for billions of triples, with lazy, streaming execution. | Sparkles uses the same index and execution architecture and adds exact term identity, MVCC updates, the Graph Store Protocol, reasoning and SHACL. It is faster on all 28 benchmark queries at 10.5M triples and on all 20 WatDiv templates, and its server uses about a third more memory at 10.5M. On English DBpedia (1.24 billion triples) it loads 2.9× faster and is faster warm on all 29 queries whose answers agree ([BENCHMARKS.md](docs/BENCHMARKS.md#dbpedia-at-124-billion-triples) has the cold runs). It materializes intermediate results. |
-| [Oxigraph](https://github.com/oxigraph/oxigraph) | A Rust database and toolkit on RocksDB, with Python and WebAssembly packages. | Sparkles uses Oxigraph's parsers, SPARQL parser and datatypes, with its own storage and planner. It is faster on every benchmark query at 10.5M triples, by a median of 85×. It fsyncs its writes, so Oxigraph's single-triple updates are faster. It adds reasoning, validation, search, authentication and a UI. It has Rust and Python APIs and no WebAssembly build. |
-| [Fluree](https://github.com/fluree/db) | A versioned, permissioned ledger with clustering, licensed under BUSL-1.1. JSON-LD is its main interface. | Sparkles passes the W3C SPARQL suites in full and is compatible with Fuseki. It has point-in-time reads, snapshots, diffs, history queries and protections of triples in its configuration, but no branches, policies stored in the data or clustering. It is faster on every benchmark query that Fluree completes at 10.5M triples, by a median of 9.8×, but only by 1–5% on a few counts and point lookups. |
+| [Apache Jena / Fuseki](https://jena.apache.org/) | The reference Java stack. It has ARQ, TDB2 on B+trees, Fuseki, on-the-fly inference, jena-text and GeoSPARQL. | Sparkles has the same protocols, endpoints, admin API and CLI model, on sorted columnar indexes. It is faster on every benchmark query at 10.5M triples, by a median of 60×. Reasoning is materialized, apart from RDFS on read. Sparkles writes RDF Patch and applies it through Fuseki's `patch` operation. It has ARQ's query language, its function and property function libraries, and its `cdt:` lists and maps, but no JavaScript functions, and there is no ontology API. |
+| [QLever](https://github.com/ad-freiburg/qlever) | A C++ engine for billions of triples, with lazy, streaming execution. | Sparkles uses the same index and execution architecture and adds exact term identity, MVCC updates, the Graph Store Protocol, reasoning and SHACL. It is faster on all 28 benchmark queries at 10.5M triples and on 19 of the 20 WatDiv templates, and its server uses about 40% more memory at 10.5M. On English DBpedia (1.24 billion triples) it loads 2.8× faster, is faster warm on 28 of the 29 queries whose answers agree and ties on the 29th, and is faster cold on 26 of 31 ([BENCHMARKS.md](docs/BENCHMARKS.md#dbpedia-at-124-billion-triples)). It materializes intermediate results. |
+| [Oxigraph](https://github.com/oxigraph/oxigraph) | A Rust database and toolkit on RocksDB, with Python and WebAssembly packages. | Sparkles uses Oxigraph's parsers, SPARQL parser and datatypes, with its own storage and planner. It is faster on every benchmark query at 10.5M triples, by a median of 87×. It fsyncs its writes and Oxigraph does not, and Oxigraph commits a stream of single-triple updates 2.7× faster. It adds reasoning, validation, search, authentication and a UI. It has Rust and Python APIs and no WebAssembly build. |
+| [Fluree](https://github.com/fluree/db) | A versioned, permissioned ledger with clustering, licensed under BUSL-1.1. JSON-LD is its main interface. | Sparkles passes the W3C SPARQL suites in full and is compatible with Fuseki. It has point-in-time reads, snapshots, diffs, history queries and protections of triples in its configuration, but no branches, policies stored in the data or clustering. It is faster on every benchmark query that Fluree completes at 10.5M triples, by a median of 7.7×, but only by 4–7% on a few counts and point lookups. |
 
 [docs/COMPARISON.md](docs/COMPARISON.md) lists the feature gaps per engine, the places
 where Sparkles departs from Jena and QLever on purpose, and the optimizations it adopted
@@ -209,34 +209,37 @@ from QLever.
 
 The benchmarks run hyperfine over HTTP against Jena/Fuseki, QLever, Fluree and Oxigraph.
 Every result cache is off and each engine runs alone. Before timing, the benchmark checks
-that all engines return the same answers. These numbers come from one machine, an Intel
-i5-13500 with 15 GiB of usable RAM, on 2026-10-02, with Sparkles at commit `4995963`. At
-10.5M triples:
+that all engines return the same answers. Every number here comes from one machine, an
+Intel i5-13500 with 15 GiB of usable RAM, on 2026-10-03, with Sparkles at commit
+`98a75c1a`. At 10.5M triples:
 
 | | Sparkles | Best of the others |
 |---|---|---|
-| Bulk load | **6.5 s** | QLever 9.3 s |
-| Queries (28) | Fastest on all 28 | Fluree is within 5% on `count-all`, `distinct-obj` and `star-lookup`. |
-| WatDiv, 20 templates (11M triples) | **4.95 ms** geometric mean, fastest on all 20 | Fluree 7.39 ms |
-| Update latency (1 triple) | 4.9 ms, fsynced | **Oxigraph 3.7 ms**, not fsynced |
-| Throughput, 16 clients | **242 q/s** | QLever 92 q/s |
-| Server memory after the run | 892 MiB, of which 379 MiB is block cache | **QLever 676 MiB** |
+| Bulk load | **3.7 s** | QLever 9.7 s |
+| Queries (28) | Fastest on all 28 | Fluree is within 5% on `count-all` and `distinct-obj` and within 7% on `star-lookup`, and Oxigraph within 8% on `values-star`. |
+| WatDiv, 20 templates (11M triples) | **5.04 ms** geometric mean, fastest on 19 of 20 | Fluree 7.41 ms, and 0.5% faster on `S7` |
+| Update latency (1 triple) | **4.17 ms**, fsynced | QLever 4.19 ms, in memory only |
+| Throughput, 16 clients | **243 q/s** | QLever 92 q/s |
+| Server memory after the run | 916 MiB, of which 379 MiB is block cache | **QLever 653 MiB** |
+
+At 1.05M triples Sparkles is the fastest on 26 of 28 queries. QLever is 1.24× faster on
+`range-topk`, and Fluree is 1% faster on `star-lookup`.
 
 Sparkles trades memory for speed by default. Each dataset gets a 1 GiB decoded-block
 cache and a 512 MiB result cache, which was off in these runs, and every operator
 materializes its result. With the block cache turned off, the server's RSS after the
-10.5M run falls to 319 MiB, below QLever's, but throughput halves to 128 q/s and some
-queries run up to 14× slower. A 256 MiB cache is as fast as the default on this data and
-uses 161 MiB less ([the memory tradeoff](docs/BENCHMARKS.md#memory-and-the-speed-it-buys)).
+10.5M run falls to 331 MiB, below QLever's, but throughput halves to 123 q/s and some
+queries run up to 17× slower. A 256 MiB cache is nearly as fast as the default on this
+data and uses 125 MiB less
+([the memory tradeoff](docs/BENCHMARKS.md#memory-and-the-speed-it-buys)).
 
-On English DBpedia, 1.24 billion triples on the same machine and with a later build,
-Sparkles loads the data in 584 s against QLever's 1,674 s, with a peak RSS of 6.6 GiB
-against 11.1 GiB. Warm, it is faster on all 29 queries whose answers both engines agree
-on. Its server's RSS after the queries was 5.6 GiB against QLever's 1.4 GiB. Much of
-that is memory-mapped index pages the kernel can drop, plus the 1 GiB block cache.
-Cold, QLever was faster on 17 of 31 queries, most of them point lookups and small
-joins. Later changes to how a cold server reads its files made Sparkles faster on 7 of
-the 8 cold lookups measured again
+On English DBpedia, 1.24 billion triples on the same machine and build, Sparkles loads
+the data in 596 s against QLever's 1,674 s and Fluree's 2,919 s, with a peak RSS of 6.3
+GiB against 11.1 and 12.1 GiB. Warm, it is faster than QLever on 28 of the 29 queries
+whose answers agree, and QLever is 1.3% faster on the 29th. Cold, Sparkles is faster on
+26 of 31 queries. Its server's RSS after the queries was 4.3 GiB against QLever's 1.4
+GiB. Of that, 2.6 GiB are memory-mapped index pages the kernel can drop and 1 GiB is the
+block cache. Fluree's server ran out of its 14 GiB during the warm runs
 ([DBpedia at 1.24 billion triples](docs/BENCHMARKS.md#dbpedia-at-124-billion-triples)).
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every number for all three data sizes,
 WatDiv, full-text search, cold starts and mixed read/write load, the memory tradeoff, and
