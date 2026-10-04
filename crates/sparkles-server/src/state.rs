@@ -19,9 +19,11 @@ pub enum DbType {
 }
 
 pub use sparkles::reasoning::{
-    AutoSetting, ReasoningRecord as ReasoningInfo, RunChanges, RunInfo,
-    read_record as read_reasoning_file, write_record as write_reasoning_file,
+    AutoSetting, ReasoningRecord as ReasoningInfo, read_record as read_reasoning_file,
+    write_record as write_reasoning_file,
 };
+#[cfg(feature = "reasoning")]
+pub use sparkles::reasoning::{RunChanges, RunInfo};
 
 /// A dataset of the server: the library's [`sparkles::Dataset`], which holds the store
 /// and the state its directory configures (the write guard, RDFS on read, the stored
@@ -50,6 +52,8 @@ impl std::ops::Deref for Dataset {
     }
 }
 
+// the guard type of the validators; builds without one do not name it
+#[allow(unused_imports)]
 pub use crate::write_validation::Validation;
 
 /// Default of `serve --reason-cache-triples`.
@@ -1248,6 +1252,7 @@ impl TaskHandle {
     }
 
     /// Set by `DELETE /$/tasks/{id}` (for a cancellable task).
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.cancel.clone()
     }
