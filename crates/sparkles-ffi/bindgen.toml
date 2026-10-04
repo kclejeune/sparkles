@@ -1,0 +1,4 @@
+# Where uniffi-bindgen finds this crate's uniffi.toml, so that it needs no `cargo metadata`
+# (the Nix build runs it offline): `uniffi-bindgen generate --config bindgen.toml …`
+[crate-roots]
+sparkles_ffi = "."
