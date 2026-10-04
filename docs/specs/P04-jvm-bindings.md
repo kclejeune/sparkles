@@ -1,21 +1,25 @@
 # P04: JVM bindings behind Apache Jena's API
 
-> **Status:** specified
+> **Status:** implemented in part (Phase 1)
 >
-> **Phases:** None shipped. Phase 1 covers the `sparkles-ffi` crate, the Kotlin library
-> `sparkles-jena` with a Sparkles-backed `DatasetGraph`, Jena transactions, query and
-> update engines that run whole requests in Sparkles with a fallback to ARQ, bulk loads,
-> commit receipts, an in-process import of TDB2 databases, and a jar for Linux x86_64.
-> Phase 2 adds the other four platforms, the
+> **Phases:** Phase 1 shipped on Linux x86_64. It is the `sparkles-ffi` crate, the Kotlin
+> library `sparkles-jena` with a Sparkles-backed `DatasetGraph`, Jena transactions, query
+> and update engines that run whole requests in Sparkles with a fallback to ARQ, bulk
+> loads, commit receipts, an in-process import of TDB2 databases, a jar with the host's
+> native library, Jena's contract tests, a Java sample and a flake package and check. The
+> [Outcome](#outcome) records how it landed. Phase 2 adds the other four platforms, the
 > assembler type for Fuseki, refined fallback detection, point-in-time reads, dumps,
 > DESCRIBE in the engine and the publishing workflow. Phase 3 adds reasoning, validation,
 > index administration and history from Java, ARQ fallbacks that still run basic graph
-> patterns in Sparkles, Java functions called from the engine, and musl builds.
+> patterns in Sparkles, Java functions called from the engine, and musl builds. Its
+> administration parts bind the handles of [P06](P06-library-admin-api.md) rather than the
+> JSON-string methods of §4.5.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [Usage: JVM](../USAGE.md#jvm-apache-jena) ·
+> [Features](../FEATURES.md#known-gaps) · [Development](../DEVELOPMENT.md#jvm-bindings)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
-> at the end will record how it lands.
+> at the end records how it landed.
 
 This spec draws on the Sparkles code, Apache Jena's source (Apache-2.0, the 6.3.0-SNAPSHOT
 checkout and the release notes of 5.0 to 6.2), the UniFFI user guide and its Kotlin
@@ -1431,4 +1435,119 @@ its items are independent.
 
 ## Outcome
 
-Nothing is built.
+**Delivered.** Phase 1 landed on 2026-10-03 on Linux x86_64, as §8 lists it:
+
+* the engine APIs of §2.3. `QueryOptions::union_default_graph` overrides the store's
+  setting for one request, and the result cache keys on it. `sparkles::embed` in the
+  facade has `QuadPattern` with `GraphMatch`, `Dataset::quads_in` over a given snapshot,
+  `count_in`, `QuadIter::next_ids`, `Transaction::remove_matching`,
+  `Transaction::snapshot` and `TxnWorker`. `TxnWorker::begin` takes the commit a promotion
+  expects, and `TxnWorker::run` runs a closure in the transaction on the worker thread;
+* `crates/sparkles-ffi`, a cdylib in its own cargo workspace with its own lock, on UniFFI
+  0.32.2 with procedural macros. It has `FfiDataset`, `FfiReadTxn`, `FfiWriteTxn`,
+  `FfiQuery` and `FfiCursor`, the batch encoding of §2.4 with Rust tests for every term
+  kind, and the `uniffi-bindgen` binary behind the `bindgen` feature;
+* `jvm/sparkles-jena`, the Kotlin library of §2.6 to §4.6 for Phase 1:
+  `DatasetGraphSparkles`, its graph views, prefixes and blank node table, transactions
+  with both kinds of promotion, the write buffer, the query and update engines with
+  detector rules 1 to 3 and 6 and the late check, `SparklesDatasets`, `SparklesOptions`,
+  the exceptions of §4.3, `loadFiles`, `load`, `bulkSink`, `lastReceipt`, `headCommit`,
+  `stats` and `importTdb2`, the union default graph of §3.7, and the native loader of §6.3;
+* the tests of §7 for Phase 1. Jena 5.6.0's contract suites run on Sparkles datasets from
+  Jena's published test jars: `AbstractDatasetGraphTests` (32), `AbstractDatasetGraphFind`
+  (20), `AbstractDatasetGraphFindPatterns` (16), `AbstractTestGraphOverDatasetGraph` (11),
+  `AbstractTestGraphAddDelete` on the default and a named graph (16 each),
+  `AbstractTestTransactionLifecycle` (51), `AbstractTestTransPromote` (25),
+  `AbstractTestDynamicDataset` (27), `AbstractTestUpdateGraph` (29),
+  `AbstractTestPrefixMappingView` (8) and jena-core's `AbstractTestGraph` (55). The
+  acceptance examples A1 to A14, A18, A19 and A20 are tests, A3 with a second JVM;
+* `jvm/sample-java`, compiled with `-Xlint:all -Werror` against the library;
+* `mise run jvm:native`, `jvm:build`, `jvm:test`, `jvm:sample`, `jvm:lint`,
+  `jvm:rust-test`, `jvm:lock` and `jvm:nix-deps`, with `jvm:lint`, `jvm:rust-test` and
+  `jvm:test` in `mise run ci`. Java 17 and 21 and Gradle 9.7.1 come from mise, and the
+  Gradle wrapper is checked in;
+* `nix/jvm.nix` with `packages.sparkles-ffi`, `packages.sparkles-jena` and
+  `checks.jvm-bindings`, a JDK 17 and Gradle 9 in the dev shell, and the Gradle
+  dependencies pinned in `nix/jvm-deps.json` through `gradle.fetchDeps`;
+* `jvm/sparkles-jena/THIRD_PARTY_LICENSES.md`, written by
+  `scripts/third-party-licenses.py` and carried in the jar's `META-INF` with the project's
+  license.
+
+**Deviations and decisions.**
+
+* Batches cross as `Vec<u8>` and `ByteArray`. UniFFI 0.32's Kotlin generator passes
+  bytes through a `RustBuffer` in both directions and has no direct `ByteBuffer` for
+  `&[u8]`, so each batch is copied once each way, as §2.4 allowed.
+* The library override property is `uniffi.component.sparkles_ffi.libraryOverride`,
+  because the component's name is the crate's namespace. The generated exception has one
+  case, `Engine`, with the kind and a `detail` field, since Kotlin exceptions already
+  have `message`. Cursors and queries free their state with `release()`, because a
+  method named `close` clashes with the generated `AutoCloseable.close`.
+* `FfiDataset` also has `find`, `count`, `contains`, `graph_names` and `prepare_query` on
+  the head snapshot, so a read outside a transaction is one call. `begin_write` takes the
+  commit a promotion expects and whether the transaction's blank node labels enter the
+  dataset's table, which bulk loads turn off.
+* Reads in a write transaction run on the caller's thread over a view of the
+  transaction's state. The view is taken on the worker once after each change, so a run
+  of reads costs one thread hop rather than one per read.
+* One jar. `sparkles-jena` carries the host's native library as a resource, and the
+  separate natives artifact, its classifier jars and `sparkles-jena-all` wait for the
+  platforms and the Fuseki bundle of Phase 2.
+* The query engine accepts every query on a `DatasetGraphSparkles` and builds ARQ's plan
+  itself when it falls back, rather than declining in `accept`. The fallback plan then
+  applies the union default graph, as §3.7 asks.
+* A seventh fallback rule sends a query to ARQ when its FROM or FROM NAMED names
+  `urn:x-arq:UnionGraph` or `urn:x-arq:DefaultGraph`, or when it has FROM NAMED and a
+  GRAPH on one of them. Jena gives these names a meaning in dynamic datasets that
+  Sparkles does not share, and `AbstractTestDynamicDataset` covers it.
+* Jena 5.6 signals a timeout by setting an `AtomicBoolean` in the query's context rather
+  than by calling `QueryIterator.cancel`. One daemon thread checks the signals of the
+  running native queries every 10 ms and cancels the one whose signal is set.
+* Sparkles parses ARQ's `LET`, so A7's late check is tested with ARQ's two-argument
+  `IRI()`, which Sparkles rejects.
+* IRIs cross unchecked, because Jena accepts relative IRIs and the contract tests use them.
+* The crate's cargo features are `text` and `geo`. `reasoning`, `shacl` and `shex` come
+  with the functions of Phase 3 that need them.
+* `Sparkles.NO_CACHE` turns the result cache off for a request, which the performance
+  check uses.
+* Three inherited tests are disabled with their reasons. `promote_active_writer_1`
+  expects a promotion to fail after a writer that committed nothing, which §3.11 records
+  as a difference. jena-core's `testContainsConcrete` and `testContainsNode` add
+  generalized triples, which Sparkles refuses.
+* The Nix build compiles the library and the generator in one cargo build with the
+  `bindgen` feature, and runs the generator with `--metadata-no-deps` and the crate's
+  `bindgen.toml`, which names the crate's root.
+* Dependency locking, dependency verification metadata, Dokka and the module descriptor
+  are left for the publishing work of Phase 2.
+
+**Performance.** A sanity check, not the benchmark of §5.4, ran on 2026-10-03 with the
+data of `scripts/bench.sh` at its default size (1,052,801 triples) and its 28 queries,
+with the result cache off. Other work kept the machine's load average between 18 and 40,
+so the numbers are rough. Each is the median of 10 runs after 10 warm-up runs, in
+milliseconds. "Rust API" is `Dataset::query_with` with every cell decoded to a term
+(`crates/sparkles-ffi/examples/perf.rs`). "Native" is the query through `FfiQuery` and
+the batch decoder without Jena, and "Jena" is `QueryExec` on a `DatasetGraphSparkles`.
+TDB2 is an in-memory TDB2 dataset with the same data in the same JVM
+(`./gradlew :sparkles-jena:perfCheck`).
+
+| Query | Rust API | Native | Jena on Sparkles | Jena on TDB2 | Rows |
+|---|---|---|---|---|---|
+| count-all | 0.03 | 0.36 | 0.99 | 1,034 | 1 |
+| star-join | 4.68 | 3.61 | 5.77 | 45.3 | 2,916 |
+| two-hop-count | 1.99 | 1.49 | 2.03 | 2,515 | 1 |
+| group-avg | 9.56 | 11.9 | 13.2 | 575 | 10 |
+| order-by-full | 60.6 | 70.9 | 80.0 | 514 | 102,000 |
+| export-500k | 309 | 71.3 | 109 | 607 | 500,000 |
+| knows-reach | 11.6 | 10.0 | 10.9 | 845 | 1 |
+| star-lookup | 0.15 | 0.34 | 1.06 | 1.39 | 35 |
+| values-star | 0.10 | 0.25 | 0.99 | 0.57 | 16 |
+| employee-docs | 0.09 | 0.23 | 0.72 | 0.75 | 17 |
+
+On queries that do real work, the time through Jena is within a few milliseconds of the
+Rust API's. A large export is faster through Jena than through the Rust API, because the
+term table decodes each distinct term once while the Rust check decodes every cell. The
+fixed cost of a query through Jena is 0.6 to 0.9 ms, against the 50 µs of target T1.
+About 0.3 ms of it is the native path and the rest is Jena's parsing, the query's
+serialization and the plan, so the small-query work of Phase 2 starts there. TDB2 was
+faster on `values-star` and about even on `employee-docs` and `path-plus`, and Sparkles
+was faster on the other 25 queries.

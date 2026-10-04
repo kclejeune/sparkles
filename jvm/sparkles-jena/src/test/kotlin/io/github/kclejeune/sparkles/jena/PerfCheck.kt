@@ -25,14 +25,20 @@ import java.nio.file.Path
 object PerfCheck {
     private fun median(xs: List<Double>): Double = xs.sorted()[xs.size / 2]
 
+    /** The median of `iters` runs after as many warm-up runs; NaN when the query fails. */
     private fun time(iters: Int, f: () -> Long): Pair<Double, Long> {
         var rows = 0L
         val times = ArrayList<Double>()
-        repeat(iters + 3) { i ->
-            val t = System.nanoTime()
-            rows = f()
-            val ms = (System.nanoTime() - t) / 1e6
-            if (i >= 3) times.add(ms)
+        try {
+            repeat(iters * 2) { i ->
+                val t = System.nanoTime()
+                rows = f()
+                val ms = (System.nanoTime() - t) / 1e6
+                if (i >= iters) times.add(ms)
+            }
+        } catch (e: Throwable) {
+            System.err.println("failed: $e")
+            return Double.NaN to -1
         }
         return median(times) to rows
     }

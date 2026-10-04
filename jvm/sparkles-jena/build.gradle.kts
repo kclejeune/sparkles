@@ -176,7 +176,7 @@ tasks.register<JavaExec>("perfCheck") {
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass = "io.github.kclejeune.sparkles.jena.PerfCheck"
     maxHeapSize = "8g"
-    jvmArgs("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn")
+    jvmArgs("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn", "-Xss64m")
     args(
         providers.gradleProperty("data").orElse("data.nt").get(),
         providers.gradleProperty("queries").orElse("queries.tsv").get(),
