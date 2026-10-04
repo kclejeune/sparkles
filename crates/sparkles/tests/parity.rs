@@ -414,7 +414,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("graphql", "getGraphqlConfig", "graphql.config.get", |ds| {
             ds.graphql().get(None);
         }),
-        pending!("putGraphqlConfig", "phase 1 step 5"),
+        op_if!("graphql", "putGraphqlConfig", "graphql.put", |ds| {
+            ds.graphql().put(any(), any());
+        }),
         op_if!(
             "graphql",
             "deleteGraphqlConfig",
@@ -426,10 +428,18 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("graphql", "listGraphqlVersions", "graphql.versions", |ds| {
             ds.graphql().versions();
         }),
-        pending!("draftGraphqlSchema", "phase 1 step 5"),
-        pending!("graphqlGet", "phase 1 step 5"),
-        pending!("graphqlPost", "phase 1 step 5"),
-        pending!("graphqlApiSchema", "phase 1 step 5"),
+        op_if!("graphql", "draftGraphqlSchema", "graphql.draft", |ds| {
+            ds.graphql().draft("ds", Default::default());
+        }),
+        op_if!("graphql", "graphqlGet", "graphql.execute", |ds| {
+            ds.graphql().execute(&any(), &Default::default());
+        }),
+        op_if!("graphql", "graphqlPost", "graphql.execute", |ds| {
+            ds.graphql().execute(&any(), &Default::default());
+        }),
+        op_if!("graphql", "graphqlApiSchema", "graphql.sdl", |ds| {
+            ds.graphql().sdl();
+        }),
         // ------------------------------------------------- reasoning and validation
         op_if!("reasoning", "reason", "reasoning.run_with", |ds| {
             ds.reasoning()

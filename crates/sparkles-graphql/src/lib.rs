@@ -76,6 +76,14 @@ impl PutError {
     }
 }
 
+impl std::fmt::Display for PutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for PutError {}
+
 impl Compiled {
     /// Compile a configuration. Returns the warnings of §3.3 as well.
     pub fn new(

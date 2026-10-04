@@ -9,7 +9,6 @@ use super::{
     content_type, dataset, err, history, query_options, with_commit,
 };
 use crate::auth::{Endpoint, Level, Principal};
-use crate::graphql::Backing;
 use crate::obs::{GraphqlReport, Op, Outcome, RequestReport};
 use crate::state::{AppState, Dataset};
 use axum::Extension;
@@ -66,7 +65,8 @@ fn not_installed(ds: &str) -> GqlError {
 
 /// The installed schema, compiled.
 fn compiled(ds: &Dataset) -> Result<Option<Arc<Compiled>>, ApiError> {
-    ds.graphql
+    ds.dataset
+        .graphql()
         .compiled()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
@@ -189,13 +189,13 @@ pub(super) async fn run(
             GqlError::new(Code::BadRequest, format!("no such dataset: /{ds_name}")),
         ));
     };
-    let Some(c) = compiled(&ds)? else {
+    if compiled(&ds)?.is_none() {
         return Ok(gql_error(
             StatusCode::NOT_FOUND,
             ct,
             not_installed(&ds.name),
         ));
-    };
+    }
     let params = Params::from_query(&uri);
     let req = match request(&method, &params, &headers, &body) {
         Ok(r) => r,
@@ -248,7 +248,7 @@ pub(super) async fn run(
                 }
                 Ok(snap)
             };
-            Ok(sparkles_graphql::execute(&c, &req, &opts, &resolve))
+            Ok(ds.dataset.graphql().execute_with(&req, &opts, &resolve)?)
         })
         .await?
     };
@@ -301,13 +301,13 @@ fn api_message(e: &ApiError) -> String {
 /// `GET /{ds}/graphql/schema`: the API schema as SDL.
 pub(super) async fn api_schema(st: St, Path(ds_name): Path<String>) -> ApiResult {
     let ds = dataset(&st, &ds_name)?;
-    let c = compiled(&ds)?
+    let sdl = ds
+        .dataset
+        .graphql()
+        .sdl()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, not_installed(&ds.name).message))?;
-    Ok((
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        c.api_sdl.clone(),
-    )
-        .into_response())
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], sdl).into_response())
 }
 
 fn etag(v: u64) -> HeaderValue {
@@ -335,7 +335,7 @@ pub(super) async fn get_config(st: St, Path(ds_name): Path<String>, uri: Uri) ->
                 .map_err(|_| err(StatusCode::BAD_REQUEST, "version must be a version number"))
         })
         .transpose()?;
-    let s = ds.graphql.get(version).ok_or_else(|| {
+    let s = ds.dataset.graphql().get(version).ok_or_else(|| {
         err(
             StatusCode::NOT_FOUND,
             format!("no GraphQL configuration for /{}", ds.name),
@@ -351,7 +351,7 @@ pub(super) async fn get_config(st: St, Path(ds_name): Path<String>, uri: Uri) ->
 pub(super) async fn versions(st: St, Path(ds_name): Path<String>) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &ds_name)?;
     Ok(Json(
-        json!({ "dataset": ds.name, "versions": ds.graphql.versions() }),
+        json!({ "dataset": ds.name, "versions": ds.dataset.graphql().versions() }),
     ))
 }
 
@@ -413,7 +413,7 @@ pub(super) async fn put_config(
         "application/graphql" | "text/plain" => {
             let sdl = String::from_utf8(body.to_vec())
                 .map_err(|_| err(StatusCode::BAD_REQUEST, "the SDL is not UTF-8"))?;
-            match ds.graphql.get(None) {
+            match ds.dataset.graphql().get(None) {
                 Some(cur) => Config { sdl, ..cur.config },
                 None => Config::new(sdl),
             }
@@ -471,18 +471,16 @@ pub(super) async fn put_config(
             "message must be at most 1024 bytes without control characters",
         ));
     }
-    let if_version = precondition(&headers, ds.graphql.get(None).is_some())?;
+    let if_version = precondition(&headers, ds.dataset.graphql().get(None).is_some())?;
     let author = (!p.name.is_empty()).then(|| p.name.to_string());
     blocking(move || {
-        let backing = Backing::of(ds.validation.read().clone(), &ds.store, &config.data_graph);
         let change = Change {
             author,
             message: message.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
             dataset_commit: Some(ds.store.snapshot().commit),
             if_version,
         };
-        let backs = |c: &str, p: &str, i: bool| backing.backs(c, p, i);
-        match ds.graphql.put(config, change, &backs) {
+        match ds.dataset.graphql().put(config, change) {
             Ok((saved, warnings)) => {
                 let status = if saved.created {
                     StatusCode::CREATED
@@ -497,17 +495,36 @@ pub(super) async fn put_config(
                     .insert(header::ETAG, etag(saved.stored.version.version));
                 Ok(r)
             }
-            Err(sparkles_graphql::PutError::Engine(e)) => Err(e.into()),
-            Err(sparkles_graphql::PutError::Sdl(errs)) => Err(ApiError(
-                StatusCode::BAD_REQUEST,
-                json!({
-                    "error": format!("the mapping schema is invalid: {}", errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ")),
-                    "errors": errs.iter().map(|e| json!({ "message": e.message, "line": e.line })).collect::<Vec<_>>(),
-                }),
-            )),
+            Err(e) => match sdl_errors(&e) {
+                Some(errs) => Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": e.to_string(),
+                        "errors": errs.iter().map(|e| json!({ "message": e.message, "line": e.line })).collect::<Vec<_>>(),
+                    }),
+                )),
+                None => Err(e.into()),
+            },
         }
     })
     .await
+}
+
+/// The errors of a mapping schema that does not compile, if `e` is one.
+fn sdl_errors(e: &sparkles::Error) -> Option<&[sparkles_graphql::mapping::SdlError]> {
+    match e {
+        sparkles::Error::Component(c) if c.component == "graphql" => {
+            match c
+                .source
+                .as_ref()?
+                .downcast_ref::<sparkles_graphql::PutError>()?
+            {
+                sparkles_graphql::PutError::Sdl(errs) => Some(errs),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// `DELETE /$/graphql/{ds}`
@@ -520,10 +537,10 @@ pub(super) async fn delete_config(
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let ds = dataset(&st, &ds_name)?;
-    let exists = ds.graphql.get(None).is_some();
+    let exists = ds.dataset.graphql().get(None).is_some();
     let if_version = precondition(&headers, exists)?.filter(|v| *v > 0);
     blocking(move || {
-        if ds.graphql.delete(if_version)? {
+        if ds.dataset.graphql().reset(if_version)? {
             Ok(StatusCode::NO_CONTENT.into_response())
         } else {
             Err(err(
@@ -587,7 +604,7 @@ pub(super) async fn draft_schema(
             ))
         })?,
     };
-    let req = crate::graphql::DraftRequest {
+    let req = sparkles::handles::graphql::DraftRequest {
         source: params.get("source").map(str::to_string),
         shapes_graph: params.get("shapesGraph").map(str::to_string),
         graph,
@@ -598,16 +615,9 @@ pub(super) async fn draft_schema(
         timeout: super::timeout_param(&st, &params),
         view: p.view(&ds.name, Endpoint::Info),
         max_entries: st.schema_max_entries,
-        inferred_graph: super::INFERRED_GRAPH.to_string(),
     };
     blocking(move || {
-        let data_graph = ds
-            .graphql
-            .get(None)
-            .map(|s| s.config.data_graph)
-            .unwrap_or_default();
-        let v = ds.validation.read().clone();
-        let (d, commit) = crate::graphql::draft(&ds.name, &ds.store, v, &data_graph, req)?;
+        let (d, commit) = ds.dataset.graphql().draft(&ds.name, req)?;
         Ok(if json_out {
             let mut j = serde_json::to_value(&d).unwrap_or_default();
             j["dataset"] = ds.name.clone().into();

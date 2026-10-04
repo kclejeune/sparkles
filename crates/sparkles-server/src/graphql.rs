@@ -1,280 +1,17 @@
-//! GraphQL (C03) in the server and the CLI: what the write-time guard says about
-//! non-null fields, drafts of mapping schemas, and `sparkles graphql`.
+//! GraphQL (C03) in the server and the CLI: the server's ceilings and `sparkles
+//! graphql`. The library's [`sparkles::handles::GraphQl`] installs, drafts and runs
+//! mapping schemas.
 
-use crate::state::Validation;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value as J};
-use sparkles::guard::config::DataGraphSel;
+use sparkles::handles::graphql::{Backing, DraftRequest, draft_of};
 use sparkles::history::{At, HistoryOptions};
 use sparkles::sparql::QueryOptions;
 use sparkles::store::{Store, StoreOptions};
-use sparkles_graphql::{Catalog, Change, Code, Config, Request, draft};
+use sparkles_graphql::{Catalog, Change, Code, Config, Request};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-/// The write-time guard's SHACL configuration and its shapes as one graph: its shapes
-/// graphs at the head, and its shapes file or inline shapes.
-#[cfg(feature = "shacl")]
-pub fn guard(
-    v: Option<Validation>,
-    store: &Store,
-) -> Option<(sparkles_shacl::guard::ValidationConfig, oxrdf::Graph)> {
-    #[allow(irrefutable_let_patterns)]
-    let Validation::Shacl(g) = v? else {
-        return None;
-    };
-    let cfg = g.config().clone();
-    let mut graph = oxrdf::Graph::new();
-    let snap = store.snapshot();
-    for name in cfg.shapes.graphs.iter().flatten() {
-        let Ok(n) = oxrdf::NamedNode::new(name.as_str()) else {
-            continue;
-        };
-        let q = format!("CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH {n} {{ ?s ?p ?o }} }}");
-        if let Ok(r) = sparkles::sparql::query(snap.clone(), &q, &QueryOptions::default()) {
-            for t in &r.triples {
-                graph.insert(t);
-            }
-        }
-    }
-    let text = match (&cfg.shapes.inline, &cfg.shapes.file, store.root()) {
-        (Some(t), _, _) => Some(t.clone()),
-        (None, Some(_), Some(root)) => {
-            std::fs::read_to_string(root.join(sparkles::guard::config::SHACL_SHAPES_FILE)).ok()
-        }
-        _ => None,
-    };
-    if let Some(text) = text {
-        let syntax = cfg
-            .shapes
-            .format
-            .as_deref()
-            .and_then(sparkles_shacl::ShapesSyntax::from_media_type)
-            .unwrap_or_default();
-        if let Ok(g) = sparkles_shacl::shapes::Shapes::read_graph(&text, syntax, None) {
-            for t in &g {
-                graph.insert(t);
-            }
-        }
-    }
-    Some((cfg, graph))
-}
-
-/// Whether the guard enforces its shapes on a schema's data graph (§3.3): `reject`
-/// mode, a `strict` baseline and the same data graph.
-#[cfg(feature = "shacl")]
-pub fn enforces(g: &sparkles_shacl::guard::ValidationConfig, data_graph: &DataGraphSel) -> bool {
-    g.mode == sparkles::guard::GuardMode::Reject
-        && g.baseline.is_strict()
-        && g.data_graph == *data_graph
-}
-
-/// The facts behind the non-null warnings: the `(class, path, inverse)` triples the
-/// guard requires a value for, and the data that says which classes are superclasses.
-pub struct Backing {
-    required: Vec<(String, String, bool)>,
-    snap: Arc<sparkles::store::Snapshot>,
-}
-
-impl Backing {
-    pub fn of(v: Option<Validation>, store: &Store, data_graph: &DataGraphSel) -> Backing {
-        #[cfg(feature = "shacl")]
-        let required = match guard(v, store) {
-            Some((cfg, graph)) if enforces(&cfg, data_graph) => {
-                let (types, _) = draft::read_shapes(&graph);
-                types
-                    .iter()
-                    .flat_map(|t| {
-                        t.fields
-                            .iter()
-                            .filter(|f| f.min_one)
-                            .map(|f| (t.class.clone(), f.path.clone(), f.inverse))
-                    })
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
-        #[cfg(not(feature = "shacl"))]
-        let required = {
-            let _ = (v, data_graph);
-            Vec::new()
-        };
-        Backing {
-            required,
-            snap: store.snapshot(),
-        }
-    }
-
-    /// Whether a shape of the guard requires a value of `path` for the class or one of
-    /// its superclasses.
-    pub fn backs(&self, class: &str, path: &str, inverse: bool) -> bool {
-        if self.required.is_empty() {
-            return false;
-        }
-        let Ok(c) = oxrdf::NamedNode::new(class) else {
-            return false;
-        };
-        let q = format!(
-            "SELECT DISTINCT ?s WHERE {{ {c} <http://www.w3.org/2000/01/rdf-schema#subClassOf>* ?s }}"
-        );
-        let mut classes = vec![class.to_string()];
-        if let Ok(r) = sparkles::sparql::query(self.snap.clone(), &q, &QueryOptions::default()) {
-            for row in r.rows() {
-                if let Some(oxrdf::Term::NamedNode(n)) = &row[0] {
-                    classes.push(n.as_str().to_string());
-                }
-            }
-        }
-        self.required
-            .iter()
-            .any(|(k, p, i)| classes.contains(k) && p == path && *i == inverse)
-    }
-}
-
-/// What a draft is made from (§3.5).
-pub struct DraftRequest {
-    /// `shapes` or `observed`; `None`: shapes when there is a shapes graph or a SHACL
-    /// guard, else observed
-    pub source: Option<String>,
-    pub shapes_graph: Option<String>,
-    pub graph: sparkles::schema::GraphSelection,
-    pub support: f64,
-    pub classes: Vec<String>,
-    pub min_instances: u64,
-    pub reasoning: bool,
-    pub timeout: Duration,
-    /// the caller's view through the `info` endpoint
-    pub view: Option<Arc<sparkles::access::GraphAccess>>,
-    pub max_entries: usize,
-    pub inferred_graph: String,
-}
-
-fn invalid(msg: impl Into<String>) -> anyhow::Error {
-    sparkles::Error::Invalid(msg.into()).into()
-}
-
-/// Draft a mapping schema of a dataset. Returns the draft and the commit it read.
-pub fn draft(
-    name: &str,
-    store: &Store,
-    v: Option<Validation>,
-    data_graph: &DataGraphSel,
-    r: DraftRequest,
-) -> Result<(draft::Draft, u64)> {
-    #[cfg(feature = "shacl")]
-    let has_guard = v
-        .as_ref()
-        .is_some_and(|v| v.language() == sparkles::guard::GuardLanguage::Shacl);
-    #[cfg(not(feature = "shacl"))]
-    let has_guard = false;
-    let source = match r.source.as_deref() {
-        Some("shapes") => "shapes",
-        Some("observed") => "observed",
-        None if r.shapes_graph.is_some() || has_guard => "shapes",
-        None => "observed",
-        Some(s) => {
-            return Err(invalid(format!(
-                "source must be shapes or observed, not '{s}'"
-            )));
-        }
-    };
-    let qopts = QueryOptions {
-        timeout: Some(r.timeout),
-        graphs: r.view.clone(),
-        ..Default::default()
-    };
-    let mut prefixes: Vec<(String, String)> =
-        sparkles::io::standard_prefixes().into_iter().collect();
-    prefixes.extend(store.prefixes());
-    prefixes.sort();
-    prefixes.dedup_by(|a, b| a.0 == b.0);
-    let snap = store.snapshot();
-    let commit = snap.commit;
-    let from = if source == "shapes" {
-        match &r.shapes_graph {
-            Some(g) => format!("the SHACL shapes of the graph <{g}>"),
-            None => "the SHACL shapes of the write-time guard".to_string(),
-        }
-    } else {
-        "the shapes drafted from the data".to_string()
-    };
-    let header = format!(
-        "A draft of a GraphQL mapping schema for /{name}, from {from} at commit {commit}.\nReview it, then install it with PUT /$/graphql/{name}."
-    );
-    let d = if source == "shapes" {
-        let (graph, enforced) = match &r.shapes_graph {
-            Some(g) => {
-                let n = oxrdf::NamedNode::new(g.as_str())
-                    .map_err(|e| invalid(format!("shapesGraph: {e}")))?;
-                let q = format!("CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH {n} {{ ?s ?p ?o }} }}");
-                let res = sparkles::sparql::query(snap.clone(), &q, &qopts)?;
-                let mut graph = oxrdf::Graph::new();
-                for t in &res.triples {
-                    graph.insert(t);
-                }
-                (graph, false)
-            }
-            None => {
-                #[cfg(feature = "shacl")]
-                {
-                    match guard(v, store) {
-                        Some((cfg, graph)) => {
-                            let e = enforces(&cfg, data_graph);
-                            (graph, e)
-                        }
-                        None => {
-                            return Err(invalid(
-                                "the dataset has no SHACL write-time validation: name a shapes graph, or draft from the data (source observed)",
-                            ));
-                        }
-                    }
-                }
-                #[cfg(not(feature = "shacl"))]
-                {
-                    let _ = (v, data_graph);
-                    return Err(invalid("name a shapes graph"));
-                }
-            }
-        };
-        let (types, skipped) = draft::read_shapes(&graph);
-        draft::render(types, skipped, &prefixes, enforced, &header, "shapes")
-    } else {
-        if !(r.support > 0.0 && r.support <= 1.0) {
-            return Err(invalid("support must be a number in (0, 1]"));
-        }
-        let o = sparkles::schema::draft::DraftOptions {
-            schema: sparkles::schema::SchemaOptions {
-                graph: r.graph,
-                inferred_graph: Some(r.inferred_graph.clone()),
-                include_inferred: r.reasoning,
-                max_entries: r.max_entries,
-                graphs: r.view,
-                deadline: Some(Instant::now() + r.timeout),
-                ..Default::default()
-            },
-            dataset: name.to_string(),
-            support: r.support,
-            classes: r.classes,
-            min_instances: r.min_instances,
-            max_in: sparkles::schema::draft::DEFAULT_MAX_IN,
-            max_count: 1,
-            closed: false,
-            base: sparkles::schema::draft::default_base(name),
-            prefixes: prefixes.clone(),
-        };
-        let shapes =
-            sparkles::schema::draft_shapes(&snap, &o).map_err(|e| invalid(e.to_string()))?;
-        let big = |class: &str, pred: &str| {
-            sparkles::sparql::query(snap.clone(), &draft::big_integer_query(class, pred), &qopts)
-                .is_ok_and(|r| r.boolean)
-        };
-        let types = draft::read_observed(&shapes, &big);
-        draft::render(types, Vec::new(), &prefixes, false, &header, "observed")
-    };
-    Ok((d, commit))
-}
+use std::time::Duration;
 
 // ------------------------------------------------------------------- serve flags ------
 
@@ -587,7 +324,7 @@ pub fn run(args: GraphqlArgs, opts: StoreOptions) -> Result<()> {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "data".into());
-                let (d, commit) = draft(
+                let (d, commit) = draft_of(
                     &name,
                     &store,
                     v,
@@ -599,11 +336,7 @@ pub fn run(args: GraphqlArgs, opts: StoreOptions) -> Result<()> {
                         support,
                         classes: class,
                         min_instances,
-                        reasoning: false,
-                        timeout: Duration::from_secs(600),
-                        view: None,
-                        max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
-                        inferred_graph: crate::http::INFERRED_GRAPH.to_string(),
+                        ..Default::default()
                     },
                 )?;
                 if json {

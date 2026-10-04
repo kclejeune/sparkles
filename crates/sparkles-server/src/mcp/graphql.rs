@@ -35,7 +35,7 @@ const MAX_QUERY_CHARS: usize = 65536;
 /// Whether `p` may run GraphQL on `ds` and `ds` has a mapping schema installed.
 pub fn graphql_on(p: &Principal, ds: &Dataset) -> bool {
     p.can_at(&ds.name, Endpoint::Graphql, Level::Read)
-        && ds.graphql.compiled().ok().flatten().is_some()
+        && ds.dataset.graphql().compiled().ok().flatten().is_some()
 }
 
 impl McpServer {
@@ -59,7 +59,8 @@ impl Tools<'_> {
         let timeout = self.timeout(a.timeout_seconds)?;
         let ds = self.dataset(a.dataset.as_deref())?;
         let compiled = ds
-            .graphql
+            .dataset
+            .graphql()
             .compiled()
             .map_err(|e| {
                 tracing::error!("GraphQL schema of /{}: {e}", ds.name);
@@ -126,7 +127,11 @@ impl Tools<'_> {
                     .0),
             }
         };
-        let r = sparkles_graphql::execute(&compiled, &req, &gopts, &resolve);
+        let r = ds
+            .dataset
+            .graphql()
+            .execute_with(&req, &gopts, &resolve)
+            .map_err(|e| ctx.engine(e))?;
         use sparkles_graphql::Outcome as O;
         let fail = |code: &'static str, status: u16| {
             let msg = r.body["errors"][0]["message"]

@@ -541,3 +541,56 @@ fn sparkles_reasoner_options() -> sparkles::reasoning::reasoner::diagnostics::Di
         prefixes: Vec::new(),
     }
 }
+
+#[cfg(feature = "graphql")]
+#[test]
+fn graphql_drafts_installs_and_runs() {
+    let (_dir, ds) = persistent();
+    ds.update(
+        "INSERT DATA { <http://ex.org/a> a <http://ex.org/Person> ; <http://ex.org/name> \"Ann\" }",
+    )
+    .unwrap();
+    let gql = ds.graphql();
+    assert!(gql.sdl().unwrap().is_none());
+    let none = gql.execute(
+        &sparkles_graphql_request("{ __typename }"),
+        &Default::default(),
+    );
+    assert!(matches!(none, Err(sparkles::Error::NotFound(_))));
+    let (draft, commit) = gql.draft("ds", Default::default()).unwrap();
+    assert_eq!(commit, ds.head_commit().seq);
+    assert!(draft.sdl.contains("Person"), "{}", draft.sdl);
+    let (saved, _) = gql
+        .put(
+            sparkles::handles::graphql::Config::new(draft.sdl.clone()),
+            Default::default(),
+        )
+        .unwrap();
+    assert!(saved.created);
+    assert!(gql.sdl().unwrap().unwrap().contains("Person"));
+    let r = gql
+        .execute(
+            &sparkles_graphql_request("{ __typename }"),
+            &Default::default(),
+        )
+        .unwrap();
+    assert!(r.body.is_object(), "{}", r.body);
+    // a schema that does not compile keeps its errors as the source
+    let Err(e) = gql.put(
+        sparkles::handles::graphql::Config::new("type X { y: Nope }".to_string()),
+        Default::default(),
+    ) else {
+        panic!("an invalid mapping schema was installed");
+    };
+    assert_eq!(e.code(), "invalid-schema");
+    assert!(gql.reset(None).unwrap());
+}
+
+#[cfg(feature = "graphql")]
+fn sparkles_graphql_request(q: &str) -> sparkles::handles::graphql::Request {
+    sparkles::handles::graphql::Request {
+        query: q.into(),
+        operation_name: None,
+        variables: Default::default(),
+    }
+}
