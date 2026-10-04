@@ -1349,7 +1349,7 @@ fn branches(p: &mut Paths) {
     p.add(
         op(GET, "/$/revert/{ds}", "previewRevert", "Branches", "Preview a revert")
             .doc("What reverting commit `commit` of branch `branch` would do: the changes and the conflicts. Nothing is written, and conflicts do not fail the request.")
-            .see("reverts")
+            .see("reverts-and-cherry-picks")
             .query("branch", s(), "The branch whose history holds the commit, and that the revert writes to (default `main`).")
             .query_req("commit", int(), "The commit to revert.")
             .query("conflicts", json!({ "type": "string", "enum": ["cell", "subject", "quad"] }), "What counts as one value (default `cell`).")
@@ -1361,11 +1361,40 @@ fn branches(p: &mut Paths) {
     p.add(
         op(POST, "/$/revert/{ds}", "revert", "Branches", "Revert a commit")
             .doc("Undoes commit `commit` of branch `branch`'s history with one commit of kind `revert` on that branch: a three-way merge of the commit's parent into the branch, with the commit as the merge base. Later changes to the same cells conflict as in a merge. The body is optional and takes the merge options that apply. A revert that would change nothing makes no commit and answers `upToDate: true`. Needs write on the branch through the `merge` endpoint, and a protected branch refuses it.")
-            .see("reverts")
+            .see("reverts-and-cherry-picks")
             .query("branch", s(), "The branch whose history holds the commit, and that the revert writes to (default `main`).")
             .query_req("commit", int(), "The commit to revert.")
             .json_body(false, "PickRequest")
             .json("200", "The revert, with `reverted`.", "MergeResult")
+            .resp(
+                "409",
+                "Conflicts remain (`merge-conflict`, with the report), or the branch moved (`head-moved`).",
+                Some(json!({ "application/json": { "schema": sref("ConflictReport") } })),
+            )
+            .errors(&[400, 403, 404, 410, 422, 507]),
+    );
+    p.add(
+        op(GET, "/$/cherry-pick/{ds}", "previewCherryPick", "Branches", "Preview a cherry-pick")
+            .doc("What applying commit `commit` of branch `source`'s history to branch `branch` would do: the changes and the conflicts. Nothing is written, and conflicts do not fail the request.")
+            .see("reverts-and-cherry-picks")
+            .query_req("source", s(), "The branch whose history holds the commit.")
+            .query_req("commit", int(), "The commit to apply.")
+            .query("branch", s(), "The branch the commit is applied to (default `main`).")
+            .query("conflicts", json!({ "type": "string", "enum": ["cell", "subject", "quad"] }), "What counts as one value (default `cell`).")
+            .query("onConflict", json!({ "type": "string", "enum": ["fail", "ours", "theirs", "union"] }), "The rule for conflicts.")
+            .query("limit", int(), "The most conflict cells listed (default 100, at most 10000).")
+            .json("200", "The preview.", "MergeResult")
+            .errors(&[400, 404, 409, 410, 507]),
+    );
+    p.add(
+        op(POST, "/$/cherry-pick/{ds}", "cherryPick", "Branches", "Cherry-pick a commit")
+            .doc("Applies the changes of commit `commit` of branch `source`'s history to branch `branch` as one commit of kind `cherry-pick`: a three-way merge of the commit into the branch, with the commit's parent as the merge base. It records no second parent. The body is optional and takes the merge options that apply. A cherry-pick whose changes the branch already holds makes no commit and answers `upToDate: true`. Needs read on the source and write on the branch through the `merge` endpoint, and a protected branch refuses it.")
+            .see("reverts-and-cherry-picks")
+            .query_req("source", s(), "The branch whose history holds the commit.")
+            .query_req("commit", int(), "The commit to apply.")
+            .query("branch", s(), "The branch the commit is applied to (default `main`).")
+            .json_body(false, "PickRequest")
+            .json("200", "The cherry-pick, with `picked`.", "MergeResult")
             .resp(
                 "409",
                 "Conflicts remain (`merge-conflict`, with the report), or the branch moved (`head-moved`).",

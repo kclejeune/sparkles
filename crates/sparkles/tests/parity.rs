@@ -292,6 +292,12 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("revert", "branches.revert", |ds| {
             ds.revert("main", 3, &Default::default());
         }),
+        op!("previewCherryPick", "branches.preview_cherry_pick", |ds| {
+            ds.preview_cherry_pick("dev", 3, "main", &Default::default());
+        }),
+        op!("cherryPick", "branches.cherry_pick", |ds| {
+            ds.cherry_pick("dev", 3, "main", &Default::default());
+        }),
         // ----------------------------------------------------------- search indexes
         op!("getTextIndex", "indexes.text.status", |ds| {
             ds.indexes().text().status();

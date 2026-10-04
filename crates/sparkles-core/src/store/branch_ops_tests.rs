@@ -118,3 +118,83 @@ fn a25_reverts_merge_a_commits_parent_over_the_commit() {
         "branch-protected"
     );
 }
+
+#[test]
+fn a26_cherry_picks_merge_a_commit_over_its_parent() {
+    let (_dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&dev, "+<urn:c> <urn:p> <urn:x> .");
+    apply(&dev, "+<urn:d> <urn:p> <urn:x> .");
+    let p = s
+        .preview_cherry_pick("dev", 4, "main", &Default::default())
+        .unwrap();
+    assert_eq!((p.inserted, p.deleted), (1, 0));
+    let r = merged(
+        s.cherry_pick("dev", 4, "main", &Default::default())
+            .unwrap(),
+    );
+    let c = r.commit.unwrap();
+    assert_eq!((c.commit.seq, c.commit.kind), (3, CommitKind::CherryPick));
+    assert_eq!(
+        c.annotation.message.as_deref(),
+        Some("cherry-pick commit 4 of dev")
+    );
+    assert!(s.merge_record(3).is_none());
+    assert!(has(&s, "urn:d") && !has(&s, "urn:c"));
+    // the same commit again, or one main already has, changes nothing
+    assert!(matches!(
+        s.cherry_pick("dev", 4, "main", &Default::default())
+            .unwrap(),
+        MergeOutcome::UpToDate(_)
+    ));
+    assert!(matches!(
+        s.cherry_pick("dev", 2, "main", &Default::default())
+            .unwrap(),
+        MergeOutcome::UpToDate(_)
+    ));
+    // a later merge brings the rest, and the picked change does not conflict
+    let r = merged(merge(&s, "dev", "main", &Default::default()));
+    assert_eq!((r.inserted, r.deleted, r.conflicts_found), (1, 0, 0));
+    assert_eq!(dump(&s), dump(&dev));
+    // a commit that changes a cell the target changed conflicts
+    apply(
+        &s,
+        &format!(
+            "-<urn:a> <urn:age> {} .\n+<urn:a> <urn:age> {} .",
+            int(30),
+            int(31)
+        ),
+    );
+    let seq = apply(
+        &dev,
+        &format!(
+            "-<urn:a> <urn:age> {} .\n+<urn:a> <urn:age> {} .",
+            int(30),
+            int(32)
+        ),
+    )
+    .commit
+    .seq;
+    let MergeOutcome::Conflicts(rep) = s
+        .cherry_pick("dev", seq, "main", &Default::default())
+        .unwrap()
+    else {
+        panic!("expected a conflict");
+    };
+    assert!(
+        rep.error.starts_with(&format!(
+            "1 conflict cherry-picking commit {seq} of dev into main"
+        )),
+        "{}",
+        rep.error
+    );
+    s.set_branch_protected("main", true).unwrap();
+    assert_eq!(
+        code(
+            &s.cherry_pick("dev", seq, "main", &Default::default())
+                .unwrap_err()
+        ),
+        "branch-protected"
+    );
+}

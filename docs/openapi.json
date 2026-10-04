@@ -1971,6 +1971,7 @@
               "patch",
               "merge",
               "revert",
+              "cherry-pick",
               "unknown"
             ],
             "type": "string"
@@ -12891,6 +12892,240 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/cherry-pick/{ds}": {
+      "get": {
+        "description": "What applying commit `commit` of branch `source`'s history to branch `branch` would do: the changes and the conflicts. Nothing is written, and conflicts do not fail the request.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reverts-and-cherry-picks"
+        },
+        "operationId": "previewCherryPick",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The branch whose history holds the commit.",
+            "in": "query",
+            "name": "source",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The commit to apply.",
+            "in": "query",
+            "name": "commit",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The branch the commit is applied to (default `main`).",
+            "in": "query",
+            "name": "branch",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "What counts as one value (default `cell`).",
+            "in": "query",
+            "name": "conflicts",
+            "schema": {
+              "enum": [
+                "cell",
+                "subject",
+                "quad"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The rule for conflicts.",
+            "in": "query",
+            "name": "onConflict",
+            "schema": {
+              "enum": [
+                "fail",
+                "ours",
+                "theirs",
+                "union"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most conflict cells listed (default 100, at most 10000).",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeResult"
+                }
+              }
+            },
+            "description": "The preview."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Preview a cherry-pick",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "Applies the changes of commit `commit` of branch `source`'s history to branch `branch` as one commit of kind `cherry-pick`: a three-way merge of the commit into the branch, with the commit's parent as the merge base. It records no second parent. The body is optional and takes the merge options that apply. A cherry-pick whose changes the branch already holds makes no commit and answers `upToDate: true`. Needs read on the source and write on the branch through the `merge` endpoint, and a protected branch refuses it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reverts-and-cherry-picks"
+        },
+        "operationId": "cherryPick",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The branch whose history holds the commit.",
+            "in": "query",
+            "name": "source",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The commit to apply.",
+            "in": "query",
+            "name": "commit",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The branch the commit is applied to (default `main`).",
+            "in": "query",
+            "name": "branch",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PickRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeResult"
+                }
+              }
+            },
+            "description": "The cherry-pick, with `picked`."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictReport"
+                }
+              }
+            },
+            "description": "Conflicts remain (`merge-conflict`, with the report), or the branch moved (`head-moved`)."
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Cherry-pick a commit",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/commits/{ds}": {
       "get": {
         "description": "Newest first, or oldest first after `after`. On a branch other than `main`, its own commits come first, then those it shares with its upstream; each commit names the branch that made it.",
@@ -17568,7 +17803,7 @@
       "get": {
         "description": "What reverting commit `commit` of branch `branch` would do: the changes and the conflicts. Nothing is written, and conflicts do not fail the request.",
         "externalDocs": {
-          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reverts"
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reverts-and-cherry-picks"
         },
         "operationId": "previewRevert",
         "parameters": [
@@ -17673,7 +17908,7 @@
       "post": {
         "description": "Undoes commit `commit` of branch `branch`'s history with one commit of kind `revert` on that branch: a three-way merge of the commit's parent into the branch, with the commit as the merge base. Later changes to the same cells conflict as in a merge. The body is optional and takes the merge options that apply. A revert that would change nothing makes no commit and answers `upToDate: true`. Needs write on the branch through the `merge` endpoint, and a protected branch refuses it.",
         "externalDocs": {
-          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reverts"
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#reverts-and-cherry-picks"
         },
         "operationId": "revert",
         "parameters": [

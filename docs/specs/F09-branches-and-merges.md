@@ -1275,6 +1275,16 @@ gone. `?branch=dev&commit=2` on a new `dev` removes b from `dev` alone. `commit=
 → `403 branch-protected`. `sparkles revert --loc db 3` exits 0, and exits 2 on the
 conflict.
 
+**A26. Cherry-picks.** `dev` at `main` 2 inserts c (commit 3) and d (commit 4).
+`POST /$/cherry-pick/ds?source=dev&commit=4` → `200`, a commit 3 on `main` of kind
+`cherry-pick` with the message `cherry-pick commit 4 of dev`, `base` dev's commit 3,
+`picked: {branch:"dev", seq:4}` and no `mergedFrom`. `main` holds d and not c. The same
+request again → `upToDate: true`, and so does picking commit 2, which `main` already
+has. A merge of `dev` afterwards inserts c only and reports no conflict. A commit of
+`dev` that changes a cell `main` changed too → `409 merge-conflict`, and a protected
+`main` → `403 branch-protected`. `&branch=qa` applies a commit to `qa`.
+`sparkles cherry-pick --loc db dev 3` exits 0.
+
 ## 10. Open questions
 
 1. **Exempt predicates.** Should `cell` scope exempt some predicates by default, such as

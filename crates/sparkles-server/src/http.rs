@@ -177,6 +177,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/$/revert/{ds}",
             get(branches::preview_revert).post(branches::revert),
         )
+        .route(
+            "/$/cherry-pick/{ds}",
+            get(branches::preview_cherry_pick).post(branches::cherry_pick),
+        )
         .route("/{ds}", any(dataset_root))
         .route("/{ds}/sparql", any(query_endpoint))
         .route("/{ds}/query", any(query_endpoint))

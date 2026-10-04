@@ -2640,7 +2640,7 @@ type Commit = {
   timestamp: string;             // RFC 3339 UTC with milliseconds, never decreasing
   kind: "create" | "baseline" | "update" | "gsp-put" | "gsp-post" | "gsp-delete"
       | "upload" | "load" | "reason" | "reason-clear" | "transaction" | "embed" | "patch"
-      | "merge" | "revert" | "unknown";
+      | "merge" | "revert" | "cherry-pick" | "unknown";
   inserted: number; deleted: number;   // net change relative to the parent
   quads: number;                        // dataset size after the commit
   generation: string;                   // index generation it was made in
@@ -2942,12 +2942,14 @@ its own range, so labels never collide across branches.
 | An unknown or hidden branch | 404 | `no-such-branch` |
 | A bad name or request | 400 | `invalid-branch` or `invalid-merge` |
 
-### Reverts
+### Reverts and cherry-picks
 
 | Method | Path | Result |
 |--------|------|--------|
 | GET | `/$/revert/{ds}?branch=&commit=` | Previews a revert. Nothing is written, and conflicts do not fail the request. |
 | POST | `/$/revert/{ds}?branch=&commit=` | Reverts. Answers `200` with the result, or `409` with the conflict report. |
+| GET | `/$/cherry-pick/{ds}?source=&commit=&branch=` | Previews a cherry-pick. |
+| POST | `/$/cherry-pick/{ds}?source=&commit=&branch=` | Cherry-picks. Answers `200` with the result, or `409` with the conflict report. |
 
 A revert undoes one commit of a branch's history with a new commit of kind `revert` on
 that branch. `branch` names the branch, `main` by default, and `commit` the commit's
@@ -2968,6 +2970,21 @@ answers `upToDate: true`. The default message is `revert commit 57`. A revert ne
 `write` on the branch through the `merge` endpoint, from a grant without graph
 restrictions, and a protected branch refuses it with `403 branch-protected`, since its
 changes do not come through a merge. Reverting commit 0 answers `400 invalid-merge`.
+
+A cherry-pick applies the changes of one commit of another branch's history to a
+branch, as one commit of kind `cherry-pick`. `source` names the branch whose history
+holds the commit, `commit` its number, and `branch` the branch the commit is applied to,
+`main` by default, so in both routes `branch` is the branch that receives the new commit.
+The cherry-pick is a three-way merge of the commit into the branch's head, with the
+commit's parent as the merge base, so the changes it applies are the commit's own. It
+records no second parent, so the branch does not descend from the source afterwards.
+When the source is merged later, the picked changes are in the same state on both sides
+and do not conflict. A cherry-pick whose changes the branch already holds makes no
+commit and answers `upToDate: true`. The body and the result are those of a revert,
+with `picked: {branch, seq}` in place of `reverted`. The default message is
+`cherry-pick commit 57 of dev`. A cherry-pick needs `read` on the source and `write` on
+the branch, through the `merge` endpoint and from grants without graph restrictions,
+and a protected branch refuses it.
 
 ### Storage, history and access
 

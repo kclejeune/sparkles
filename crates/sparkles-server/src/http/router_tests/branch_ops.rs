@@ -150,3 +150,55 @@ async fn a25_reverts() {
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
     assert_eq!(r.json()["code"], "branch-protected");
 }
+
+#[tokio::test]
+async fn a26_cherry_picks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_st, app) = setup(dir.path()).await;
+    json_req(&app, "POST", "/$/branches/ds", json!({ "name": "dev" })).await;
+    update(&app, "ds@dev", "INSERT DATA { <urn:c> <urn:p> 1 }").await;
+    update(&app, "ds@dev", "INSERT DATA { <urn:d> <urn:p> 1 }").await;
+    let (r, _) = get(&app, "/$/cherry-pick/ds?source=dev&commit=4").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["changes"]["inserted"], 1);
+    let (r, h) = post(&app, "/$/cherry-pick/ds?source=dev&commit=4", "").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let m = r.json();
+    assert_eq!(m["commit"]["kind"], "cherry-pick");
+    assert_eq!(m["commit"]["message"], "cherry-pick commit 4 of dev");
+    assert!(m["commit"].get("mergedFrom").is_none(), "{m}");
+    assert_eq!(m["picked"], json!({ "branch": "dev", "seq": 4 }));
+    assert_eq!(m["base"]["seq"], 3);
+    assert_eq!(commit_header(&h), 3);
+    assert_eq!(
+        subjects(&app, "/ds/sparql").await,
+        ["urn:a", "urn:b", "urn:d"]
+    );
+    let (r, _) = post(&app, "/$/cherry-pick/ds?source=dev&commit=4", "").await;
+    assert_eq!(r.json()["upToDate"], true, "{}", r.text());
+    // into another branch than main
+    json_req(&app, "POST", "/$/branches/ds", json!({ "name": "qa" })).await;
+    let (r, _) = post(&app, "/$/cherry-pick/ds?source=dev&commit=3&branch=qa", "").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["target"]["branch"], "qa");
+    assert!(
+        subjects(&app, "/ds@qa/sparql")
+            .await
+            .contains(&"urn:c".to_string())
+    );
+    for (path, status) in [
+        ("/$/cherry-pick/ds?commit=4", StatusCode::BAD_REQUEST),
+        ("/$/cherry-pick/ds?source=dev", StatusCode::BAD_REQUEST),
+        (
+            "/$/cherry-pick/ds?source=nope&commit=4",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "/$/cherry-pick/ds?source=dev&commit=9",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (r, _) = post(&app, path, "").await;
+        assert_eq!(r.status, status, "{path}: {}", r.text());
+    }
+}

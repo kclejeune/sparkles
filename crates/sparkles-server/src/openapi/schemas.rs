@@ -517,7 +517,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "parent": nullable("integer"),
                 "ref": { "type": "string", "examples": ["commit:42"] },
                 "timestamp": { "type": "string", "format": "date-time" },
-                "kind": { "type": "string", "examples": ["create", "baseline", "update", "gsp-put", "gsp-post", "gsp-delete", "upload", "load", "reason", "reason-clear", "transaction", "embed", "patch", "merge", "revert", "unknown"] },
+                "kind": { "type": "string", "examples": ["create", "baseline", "update", "gsp-put", "gsp-post", "gsp-delete", "upload", "load", "reason", "reason-clear", "transaction", "embed", "patch", "merge", "revert", "cherry-pick", "unknown"] },
                 "inserted": { "type": "integer" },
                 "deleted": { "type": "integer" },
                 "quads": { "type": "integer" },

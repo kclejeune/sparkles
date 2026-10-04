@@ -1182,6 +1182,15 @@ sparkles revert --loc db 57                     # undo commit 57 on main
 sparkles revert --loc db --branch dev 61 --on-conflict theirs
 ```
 
+`sparkles cherry-pick SOURCE N` applies the changes of commit N of branch SOURCE to the
+`--branch` branch, `main` by default, as one commit of kind `cherry-pick`. It records no
+second parent, so a later merge of SOURCE still brings its other commits:
+
+```sh
+sparkles cherry-pick --loc db dev 57             # commit 57 of dev, applied to main
+sparkles cherry-pick --loc db --branch qa dev 57
+```
+
 `--branch NAME` works with `query`, `update`, `load`, `dump`, `log`, `diff`, `snapshot`,
 `compact`, `stats`, `clone` and `patch`. With `--server`, these commands send the
 dataset's name in the path form, `ds@NAME`. The web UI has a branch menu next to the

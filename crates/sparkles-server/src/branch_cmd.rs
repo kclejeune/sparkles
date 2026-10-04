@@ -909,9 +909,20 @@ pub struct RevertArgs {
     pub pick: PickArgs,
 }
 
+#[derive(Args, Debug)]
+pub struct CherryPickArgs {
+    /// The branch whose history holds the commit
+    pub source: String,
+    /// The commit to apply to the --branch branch
+    pub commit: u64,
+    #[command(flatten)]
+    pub pick: PickArgs,
+}
+
 /// What a commit-level merge does.
 pub enum Pick {
     Revert { commit: u64 },
+    CherryPick { source: String, commit: u64 },
 }
 
 /// `sparkles revert`: 0 after the commit or when there is nothing to undo, 2 when
@@ -947,6 +958,9 @@ pub fn run_pick(pick: Pick, a: PickArgs, opts: StoreOptions) -> Result<i32> {
     }
     let what = match &pick {
         Pick::Revert { commit } => format!("revert commit {commit} on {branch}"),
+        Pick::CherryPick { source, commit } => {
+            format!("cherry-pick commit {commit} of {source} into {branch}")
+        }
     };
     println!("{what} (commit {})", j["target"]["seq"]);
     match &out {
@@ -965,7 +979,13 @@ pub fn run_pick(pick: Pick, a: PickArgs, opts: StoreOptions) -> Result<i32> {
                 j["conflicts"]["resolved"].as_u64().unwrap_or(0)
             );
         }
-        Out::Conflicts(j) => print_conflicts(j, &branch, &branch),
+        Out::Conflicts(j) => {
+            let theirs = match &pick {
+                Pick::Revert { .. } => branch.clone(),
+                Pick::CherryPick { source, .. } => source.clone(),
+            };
+            print_conflicts(j, &branch, &theirs)
+        }
     }
     Ok(code)
 }
@@ -1022,6 +1042,9 @@ fn local_pick(
     if a.dry_run {
         let r = match pick {
             Pick::Revert { commit } => s.preview_revert(branch, *commit, &o)?,
+            Pick::CherryPick { source, commit } => {
+                s.preview_cherry_pick(source, *commit, branch, &o)?
+            }
         };
         return Ok(match &r.conflicts {
             Some(c) => Out::Conflicts(conflicts_json(c)),
@@ -1030,6 +1053,7 @@ fn local_pick(
     }
     let out = match pick {
         Pick::Revert { commit } => s.revert(branch, *commit, &o)?,
+        Pick::CherryPick { source, commit } => s.cherry_pick(source, *commit, branch, &o)?,
     };
     Ok(match out {
         MergeOutcome::UpToDate(r) | MergeOutcome::Merged(r) => Out::Done(report_json(&r)),
@@ -1052,6 +1076,11 @@ fn remote_pick(pick: &Pick, branch: &str, a: &PickArgs, res: Option<J>) -> Resul
         Pick::Revert { commit } => {
             q.append_pair("commit", &commit.to_string());
             "revert"
+        }
+        Pick::CherryPick { source, commit } => {
+            q.append_pair("source", source);
+            q.append_pair("commit", &commit.to_string());
+            "cherry-pick"
         }
     };
     let mut body = json!({

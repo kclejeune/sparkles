@@ -565,6 +565,8 @@ impl Store {
 pub(crate) enum Pick {
     /// undo a commit: merge its parent with the commit as base
     Revert,
+    /// copy a commit's changes: merge the commit with its parent as base
+    CherryPick,
 }
 
 impl Store {
@@ -587,6 +589,37 @@ impl Store {
         o: &MergeOptions,
     ) -> Result<MergeReport> {
         match self.apply_commit(Pick::Revert, branch, commit, branch, o, true)? {
+            MergeOutcome::UpToDate(r) | MergeOutcome::Merged(r) => Ok(r),
+            MergeOutcome::Conflicts(_) => unreachable!("a preview reports conflicts"),
+        }
+    }
+
+    /// Apply the changes of commit `commit` of branch `source`'s history to branch
+    /// `target`: a three-way merge of the commit into the target's head, with the
+    /// commit's parent as the base. The result is one commit of kind `cherry-pick`,
+    /// which records no second parent, so a later merge of `source` brings the same
+    /// changes again, and they do not conflict. A commit whose changes the target
+    /// already holds writes nothing and answers [`MergeOutcome::UpToDate`].
+    pub fn cherry_pick(
+        &self,
+        source: &str,
+        commit: u64,
+        target: &str,
+        o: &MergeOptions,
+    ) -> Result<MergeOutcome> {
+        self.apply_commit(Pick::CherryPick, source, commit, target, o, false)
+    }
+
+    /// What [`cherry_pick`](Self::cherry_pick) would do, without writing or failing
+    /// over conflicts.
+    pub fn preview_cherry_pick(
+        &self,
+        source: &str,
+        commit: u64,
+        target: &str,
+        o: &MergeOptions,
+    ) -> Result<MergeReport> {
+        match self.apply_commit(Pick::CherryPick, source, commit, target, o, true)? {
             MergeOutcome::UpToDate(r) | MergeOutcome::Merged(r) => Ok(r),
             MergeOutcome::Conflicts(_) => unreachable!("a preview reports conflicts"),
         }
@@ -622,8 +655,16 @@ impl Store {
         });
         let (theirs, base) = match pick {
             Pick::Revert => (parent, c),
+            Pick::CherryPick => (c, parent),
         };
         let tgt = self.branch(target)?;
+        // a protected branch takes merges only: refused before any planning
+        if !preview {
+            tgt.check_protected(match pick {
+                Pick::Revert => CommitKind::Revert,
+                Pick::CherryPick => CommitKind::CherryPick,
+            })?;
+        }
         let tid = tgt.dataset_id;
         for _attempt in 0..3 {
             let t_head = tgt.head_commit().seq;
@@ -653,6 +694,15 @@ impl Store {
                     record: None,
                     force: false,
                     what: format!("reverting commit {seq} on {target} (commit {t_head})"),
+                },
+                Pick::CherryPick => Writing {
+                    kind: CommitKind::CherryPick,
+                    message: format!("cherry-pick commit {seq} of {source}"),
+                    record: None,
+                    force: false,
+                    what: format!(
+                        "cherry-picking commit {seq} of {source} into {target} (commit {t_head})"
+                    ),
                 },
             };
             match self.three_way(&set, &tgt, report, base, theirs, tc, o, preview, writing)? {

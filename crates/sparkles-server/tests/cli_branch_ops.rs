@@ -94,3 +94,35 @@ fn a24_a25_squash_and_revert() {
     ok(dir, &["revert", "--loc", "db", "--branch", "dev", "2"]);
     assert!(!subjects(dir, "dev").contains("urn:c"));
 }
+
+#[test]
+fn a26_cherry_pick() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    update(dir, "main", "INSERT DATA { <urn:a> <urn:age> 30 }");
+    ok(dir, &["branch", "create", "--loc", "db", "dev"]);
+    update(dir, "dev", "INSERT DATA { <urn:c> <urn:p> 1 }");
+    update(dir, "dev", "INSERT DATA { <urn:d> <urn:p> 1 }");
+    let o = ok(dir, &["cherry-pick", "--loc", "db", "dev", "3"]);
+    assert!(
+        out(&o).contains("cherry-pick commit 3 of dev into main"),
+        "{}",
+        out(&o)
+    );
+    assert!(
+        out(&o).contains("changed: +1 -0 as commit 2"),
+        "{}",
+        out(&o)
+    );
+    let main = subjects(dir, "main");
+    assert!(main.contains("urn:d") && !main.contains("urn:c"), "{main}");
+    let o = ok(dir, &["cherry-pick", "--loc", "db", "dev", "3"]);
+    assert!(out(&o).contains("nothing to change"), "{}", out(&o));
+    // into another branch, with the global --branch
+    ok(dir, &["branch", "create", "--loc", "db", "qa"]);
+    ok(
+        dir,
+        &["cherry-pick", "--loc", "db", "--branch", "qa", "dev", "2"],
+    );
+    assert!(subjects(dir, "qa").contains("urn:c"));
+}

@@ -51,12 +51,15 @@ pub enum CommitKind {
     Merge,
     /// a revert of an earlier commit (`POST /$/revert/{ds}`, `Store::revert`)
     Revert,
+    /// another branch's commit applied again (`POST /$/cherry-pick/{ds}`,
+    /// `Store::cherry_pick`)
+    CherryPick,
     /// a WAL commit written by an older version after this one had upgraded the database
     Unknown,
 }
 
 impl CommitKind {
-    const ALL: [CommitKind; 16] = [
+    const ALL: [CommitKind; 17] = [
         CommitKind::Create,
         CommitKind::Baseline,
         CommitKind::Update,
@@ -72,6 +75,7 @@ impl CommitKind {
         CommitKind::Patch,
         CommitKind::Merge,
         CommitKind::Revert,
+        CommitKind::CherryPick,
         CommitKind::Unknown,
     ];
 
@@ -93,6 +97,7 @@ impl CommitKind {
             CommitKind::Patch => 12,
             CommitKind::Merge => 13,
             CommitKind::Revert => 14,
+            CommitKind::CherryPick => 15,
             CommitKind::Unknown => 255,
         }
     }
@@ -122,6 +127,7 @@ impl CommitKind {
             CommitKind::Patch => "patch",
             CommitKind::Merge => "merge",
             CommitKind::Revert => "revert",
+            CommitKind::CherryPick => "cherry-pick",
             CommitKind::Unknown => "unknown",
         }
     }

@@ -84,6 +84,29 @@ impl Dataset {
         self.store().preview_revert(branch, commit, o)
     }
 
+    /// Apply commit `commit` of branch `source`'s history to branch `target` (see
+    /// [`Store::cherry_pick`](crate::store::Store::cherry_pick)).
+    pub fn cherry_pick(
+        &self,
+        source: &str,
+        commit: u64,
+        target: &str,
+        o: &MergeOptions,
+    ) -> Result<MergeOutcome> {
+        self.store().cherry_pick(source, commit, target, o)
+    }
+
+    /// What applying commit `commit` of `source` to `target` would do, without writing.
+    pub fn preview_cherry_pick(
+        &self,
+        source: &str,
+        commit: u64,
+        target: &str,
+        o: &MergeOptions,
+    ) -> Result<MergeReport> {
+        self.store().preview_cherry_pick(source, commit, target, o)
+    }
+
     /// Delete branch `name`, also with unmerged commits when `force`.
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
         self.store().delete_branch(name, force)

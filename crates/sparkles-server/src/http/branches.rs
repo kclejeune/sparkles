@@ -205,7 +205,7 @@ const ADMIN_BRANCH_ROUTES: &[&str] = &[
 
 /// Admin routes whose `branch` names the branch a commit-level merge writes to: their
 /// handlers check it.
-const PICK_ROUTES: &[&str] = &["revert"];
+const PICK_ROUTES: &[&str] = &["revert", "cherry-pick"];
 
 fn bad_branch(msg: impl Into<String>) -> Response {
     let body = json!({ "error": msg.into(), "code": "invalid-branch" });
@@ -847,6 +847,12 @@ pub(crate) enum Op {
         branch: String,
         commit: u64,
     },
+    /// apply commit `commit` of `source`'s history to `branch`
+    CherryPick {
+        source: String,
+        commit: u64,
+        branch: String,
+    },
 }
 
 impl Op {
@@ -854,7 +860,7 @@ impl Op {
     fn target(&self) -> &str {
         match self {
             Op::Merge { target, .. } => target,
-            Op::Revert { branch, .. } => branch,
+            Op::Revert { branch, .. } | Op::CherryPick { branch, .. } => branch,
         }
     }
 
@@ -862,6 +868,11 @@ impl Op {
         match self {
             Op::Merge { source, target } => s.merge(source, target, o),
             Op::Revert { branch, commit } => s.revert(branch, *commit, o),
+            Op::CherryPick {
+                source,
+                commit,
+                branch,
+            } => s.cherry_pick(source, *commit, branch, o),
         }
     }
 
@@ -873,6 +884,11 @@ impl Op {
         match self {
             Op::Merge { source, target } => s.preview_merge(source, target, o),
             Op::Revert { branch, commit } => s.preview_revert(branch, *commit, o),
+            Op::CherryPick {
+                source,
+                commit,
+                branch,
+            } => s.preview_cherry_pick(source, *commit, branch, o),
         }
     }
 
@@ -882,6 +898,7 @@ impl Op {
         let source = match self {
             Op::Merge { source, .. } => source,
             Op::Revert { branch, .. } => branch,
+            Op::CherryPick { source, .. } => source,
         };
         check(p, ds, source, Level::Read, Some(Endpoint::Merge))?;
         check(p, ds, self.target(), Level::Write, Some(Endpoint::Merge))?;
@@ -894,6 +911,9 @@ impl Op {
         let mut j = merge_json(r, stale);
         if let Op::Revert { branch, commit } = self {
             j["reverted"] = json!({ "branch": branch, "seq": commit });
+        }
+        if let Op::CherryPick { source, commit, .. } = self {
+            j["picked"] = json!({ "branch": source, "seq": commit });
         }
         j
     }
@@ -1170,4 +1190,57 @@ fn count_outcome(st: &AppState, name: &str, out: &MergeOutcome, secs: f64) {
             secs,
         ),
     }
+}
+
+/// The cherry-pick a request names: `source=` and `commit=` the commit, `branch=` the
+/// branch it is applied to (default `main`).
+fn cherry_pick_op(params: &Params) -> ApiResult<Op> {
+    let source = params
+        .get("source")
+        .ok_or_else(|| invalid("invalid-merge", "source is required"))?
+        .to_string();
+    if source != MAIN && !sparkles::branch::valid_name(&source) {
+        return Err(invalid(
+            "invalid-branch",
+            format!("invalid branch name '{source}'"),
+        ));
+    }
+    Ok(Op::CherryPick {
+        source,
+        commit: commit_param(params)?,
+        branch: branch_param(params),
+    })
+}
+
+/// `GET /$/cherry-pick/{ds}?source=&commit=&branch=`: what applying the commit would do.
+pub(crate) async fn preview_cherry_pick(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult {
+    let ds = main_dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let mut v = query_options(&params, &[])?;
+    v["source"] = MAIN.into();
+    let ask = merge_options(&st, &v, true)?;
+    let op = cherry_pick_op(&params)?;
+    run_preview(&p, &name, ds, op, ask.o).await
+}
+
+/// `POST /$/cherry-pick/{ds}?source=&commit=&branch=`: apply a commit of the source
+/// branch's history to the branch, with the merge options of the JSON body, if any.
+pub(crate) async fn cherry_pick(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> ApiResult {
+    let ds = main_dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let (v, ask) = pick_options(&st, &body, false)?;
+    let op = cherry_pick_op(&params)?;
+    execute(&st, &p, &name, ds, &headers, &v, op, ask.o, ask.dry_run).await
 }

@@ -89,6 +89,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/branches/{ds}/{name}", &["GET", "PATCH", "DELETE"]),
     ("/$/merge/{ds}", &["GET", "POST"]),
     ("/$/revert/{ds}", &["GET", "POST"]),
+    ("/$/cherry-pick/{ds}", &["GET", "POST"]),
     ("/$/vector/{ds}", &["GET"]),
     ("/$/vector/{ds}/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/vector/{ds}/{name}/rebuild", &["POST"]),
@@ -240,9 +241,11 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/datasets/{ds}" if get => Dataset(Read),
         "/$/datasets/{ds}" => Dataset(Admin),
         // visible on some branch: the handlers check the branches a request names
-        "/$/branches/{ds}" | "/$/branches/{ds}/{name}" | "/$/merge/{ds}" | "/$/revert/{ds}" => {
-            Dataset(Read)
-        }
+        "/$/branches/{ds}"
+        | "/$/branches/{ds}/{name}"
+        | "/$/merge/{ds}"
+        | "/$/revert/{ds}"
+        | "/$/cherry-pick/{ds}" => Dataset(Read),
         "/$/ready/{ds}"
         | "/$/stats/{ds}"
         | "/$/schema/{ds}"
@@ -1044,7 +1047,8 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             // check each branch a request names
             let branch_routes = route.starts_with("/$/branches/")
                 || route.starts_with("/$/merge/")
-                || route.starts_with("/$/revert/");
+                || route.starts_with("/$/revert/")
+                || route.starts_with("/$/cherry-pick/");
             let have = if branch_routes {
                 p.level_any_branch(&ds)
             } else {
