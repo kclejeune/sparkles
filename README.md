@@ -191,10 +191,38 @@ sparkles query --loc ./books 'SELECT (COUNT(*) AS ?n) { ?s ?p ?o }'
 sparkles query --data books.ttl --query q.rq   # files in memory, no database
 ```
 
-The UI is at <http://localhost:3030/ui/>. The CLI has Jena's `tdb2.*`, `arq` and `riot`
-tools and Sparkles' own commands for backups, history, reasoning, validation, indexes and
-more. `sparkles --help` lists them, and [docs/USAGE.md](docs/USAGE.md) covers the CLI and
-running the server.
+The UI is at <http://localhost:3030/ui/>. [docs/USAGE.md](docs/USAGE.md) covers running
+and operating the server.
+
+## Command line
+
+These commands work on a database directory (`--loc`) that no server has open. Many also
+take `--server URL` to work on a running server instead.
+
+```sh
+sparkles load    --loc db data/*.ttl.gz       # parallel bulk load
+sparkles query   --loc db 'SELECT ...'        # --results text|json|csv|tsv, --explain, --time
+sparkles dump    --loc db --out dump.nq.zst   # syntax and compression by extension
+sparkles compact --loc db                     # merge updates into a new generation
+sparkles backup  create --loc db --repo local # incremental backup to a repository
+sparkles check   --loc db                     # read-only integrity check
+sparkles fmt     --check queries/ shapes/     # format SPARQL and RDF files
+```
+
+| Commands | What they do |
+|---|---|
+| `serve` | Run the server with the web UI. |
+| `load`, `query`, `update`, `patch`, `dump`, `csv` | Load, query, update, apply RDF Patch, export, and import CSV and TSV. |
+| `compact`, `clone`, `stats`, `log`, `check` | Merge updates, copy a dataset, show statistics and the commit history, and verify a database. |
+| `snapshot`, `diff`, `history`, `branch`, `merge` | Named snapshots and retention, diffs between commits, the changes of a term across commits, and branches. |
+| `backup`, `repo` | Back up to a file system or S3, restore, and run backup policies. |
+| `infer`, `shacl`, `shex`, `validation`, `schema` | Reason, validate, set write-time guards, and report or draft the schema. |
+| `text-index`, `vector`, `geo-index`, `queries`, `graphql` | Manage the search indexes, stored queries and the GraphQL schema. |
+| `convert`, `compare`, `qparse`, `uparse`, `rsparql`, `rupdate`, `rset` | Jena's file and remote tools: `riot`, `rdfdiff` and the rest. |
+| `fmt`, `lint`, `lsp`, `mcp`, `auth`, `config` | Format and lint, the language server, the MCP server, sign-in and tokens, and Fuseki configuration import. |
+
+`sparkles help COMMAND` describes each command and its flags, and
+[docs/USAGE.md](docs/USAGE.md#command-line-tools) describes them in full.
 
 ## Library usage
 
