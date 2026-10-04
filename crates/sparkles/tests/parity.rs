@@ -431,12 +431,24 @@ fn entries() -> Vec<(&'static str, Entry)> {
         pending!("graphqlPost", "phase 1 step 5"),
         pending!("graphqlApiSchema", "phase 1 step 5"),
         // ------------------------------------------------- reasoning and validation
-        pending!("reason", "phase 1 step 5"),
-        pending!("getReasoning", "phase 1 step 5"),
+        op_if!("reasoning", "reason", "reasoning.run_with", |ds| {
+            ds.reasoning()
+                .run_with(&Default::default(), &Control::none());
+        }),
+        op!("getReasoning", "reasoning.status", |ds| {
+            ds.reasoning().status();
+        }),
         op_if!("reasoning", "clearReasoning", "reasoning.clear", |ds| {
             ds.reasoning().clear();
         }),
-        pending!("reasoningDiagnostics", "phase 1 step 5"),
+        op_if!(
+            "reasoning",
+            "reasoningDiagnostics",
+            "reasoning.diagnostics",
+            |ds| {
+                ds.reasoning().diagnostics(&any());
+            }
+        ),
         op!("getRdfs", "reasoning.rdfs.get", |ds| {
             ds.reasoning().rdfs().get();
         }),

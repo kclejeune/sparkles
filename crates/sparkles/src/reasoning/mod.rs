@@ -6,7 +6,21 @@
 //! and its serde form is that of `reasoning.json`, which older versions also embedded in
 //! the server's registry (`config.json`).
 
+pub mod freshness;
 pub mod rdfs;
+#[cfg(feature = "reasoning")]
+pub mod run;
+
+pub use freshness::{Freshness, ReasoningStatus, freshness, watched_graphs};
+#[cfg(feature = "reasoning")]
+pub use run::{
+    Diagnostics, ReasonOutcome, ReasonRequest, diagnose, incremental_since, record_inputs,
+    recorded, run_info, run_text,
+};
+/// The reasoner (feature `reasoning`): its profiles, extras, input graphs, reports and
+/// diagnostics, which the requests and results of [`run`] use.
+#[cfg(feature = "reasoning")]
+pub use sparkles_reasoner as reasoner;
 
 use crate::error::Result;
 use serde::{Deserialize, Serialize};

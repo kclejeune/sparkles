@@ -4131,11 +4131,11 @@ async fn reason(
             .read()
             .clone()
             .ok_or_else(|| err(StatusCode::CONFLICT, "no recorded reasoning to re-run"))?;
-        let conflict = |e: anyhow::Error| err(StatusCode::CONFLICT, format!("{e:#}"));
+        let conflict = |e: sparkles::Error| err(StatusCode::CONFLICT, e.to_string());
         Some((
-            crate::reasoning::recorded_profile(&info).map_err(conflict)?,
-            crate::reasoning::recorded_extras(&info).map_err(conflict)?,
-            crate::reasoning::recorded_inputs(&info).map_err(conflict)?,
+            info.profile().map_err(conflict)?,
+            info.extras().map_err(conflict)?,
+            info.run_inputs().map_err(conflict)?,
         ))
     } else {
         None
@@ -4188,9 +4188,7 @@ async fn unreason(State(st): St, Path(name): Path<String>) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let st2 = st.clone();
     blocking(move || {
-        let n = sparkles_reasoner::clear(&ds.store)?;
-        ds.closure.clear();
-        ds.set_reasoning(None)?;
+        let n = ds.dataset.reasoning().clear()?;
         st2.save_registry()?;
         Ok(Json(json!({ "removed": n })).into_response())
     })
@@ -4369,9 +4367,9 @@ async fn reason_diagnostics(
             format!("graph must be default or an absolute IRI, not '{bad}'"),
         )
     })?;
-    let info = ds.reasoning.read().clone();
+    let reasoning = ds.dataset.reasoning();
     // the inferences follow from the default graph: included by default when it is checked
-    let inferences = info.is_some()
+    let inferences = reasoning.record().is_some()
         && match params.get("reasoning") {
             Some(v) => v != "false",
             None => graphs.is_empty() || graphs.iter().any(|g| g == diagnostics::DEFAULT_GRAPH),
@@ -4389,7 +4387,7 @@ async fn reason_diagnostics(
     };
     blocking(move || {
         let (report, j) =
-            crate::reasoning::diagnostics_json(&ds.name, &ds.store, info.as_ref(), &opts)?;
+            crate::reasoning::diagnostics_render(&ds.name, reasoning.diagnostics(&opts)?);
         let seq = j["commit"].as_u64().unwrap_or(0);
         let r = if turtle {
             let inf = &j["scope"]["inferences"];

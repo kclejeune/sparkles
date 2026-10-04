@@ -41,15 +41,26 @@ pub fn parse(bytes: Vec<u8>, format: RdfFormat) -> Result<Vec<oxrdf::Triple>> {
     Ok(quads.into_iter().map(oxrdf::Triple::from).collect())
 }
 
-/// Set the dataset's RDFS on read, or with `None` remove it (see
-/// [`sparkles::reasoning::rdfs::set`]).
+/// Set the dataset's RDFS on read, or with `None` remove it (the library's
+/// [`RdfsSetting`](sparkles::handles::RdfsSetting)).
 pub fn set(ds: &Dataset, new: Option<NewSchema>) -> Result<()> {
-    Ok(sparkles::reasoning::rdfs::set(&ds.dataset, new)?)
+    let setting = ds.dataset.reasoning().rdfs();
+    Ok(match new {
+        Some(n) => setting.set(n)?,
+        None => setting.reset()?,
+    })
 }
 
 /// The setting for dataset info: `null`, or where the schema comes from.
 pub fn info_json(ds: &Dataset) -> J {
-    match ds.rdfs.read().as_deref().map(|r| &r.source) {
+    match ds
+        .dataset
+        .reasoning()
+        .rdfs()
+        .get()
+        .as_deref()
+        .map(|r| &r.source)
+    {
         None => J::Null,
         Some(SchemaSource::Fixed(_)) => json!({ "source": "upload" }),
         Some(SchemaSource::Graph(g)) => {
@@ -60,7 +71,7 @@ pub fn info_json(ds: &Dataset) -> J {
 
 /// `GET /$/rdfs/{ds}`: the setting and the schema it gives at the head.
 fn status(ds: &Dataset) -> ApiResult<J> {
-    let Some(r) = ds.rdfs.read().clone() else {
+    let Some(r) = ds.dataset.reasoning().rdfs().get() else {
         return Ok(json!({ "enabled": false }));
     };
     let schema = r.schema(&ds.store.snapshot())?;

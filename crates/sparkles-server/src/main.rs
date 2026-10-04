@@ -3456,7 +3456,7 @@ fn run() -> Result<()> {
                     i
                 } else {
                     match &previous {
-                        Some(p) => reasoning::recorded_inputs(p)?,
+                        Some(p) => p.run_inputs()?,
                         None => Default::default(),
                     }
                 };

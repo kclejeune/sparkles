@@ -22,8 +22,6 @@ pub use sparkles::reasoning::{
     AutoSetting, ReasoningRecord as ReasoningInfo, read_record as read_reasoning_file,
     write_record as write_reasoning_file,
 };
-#[cfg(feature = "reasoning")]
-pub use sparkles::reasoning::{RunChanges, RunInfo};
 
 /// A dataset of the server: the library's [`sparkles::Dataset`], which holds the store
 /// and the state its directory configures (the write guard, RDFS on read, the stored

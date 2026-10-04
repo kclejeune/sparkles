@@ -1,179 +1,33 @@
-//! Freshness of materialized inferences, re-runs, automatic re-materialization and
-//! inconsistency diagnostics.
+//! The reasoning status as the server shows it, the reasoning task, automatic
+//! re-materialization and inconsistency diagnostics.
 //!
-//! A materialization records the commit (`seq`) it wrote, or the unchanged head it read
-//! when it changed nothing, together with the dataset id and the graphs it read. The
-//! inferences are fresh while no later commit changed one of those graphs (the default
-//! graph alone, unless the run read others or followed imports). Commits to other
-//! graphs, the inferred graph included, leave them fresh; `commitsSince` still counts
-//! every commit.
+//! The library's [`sparkles::handles::Reasoning`] materializes, keeps the record and
+//! computes the freshness of the inferences (see [`sparkles::reasoning::freshness`]).
+//! This module renders the status, runs a materialization as a task, and schedules the
+//! automatic re-runs.
 
 use crate::state::{AppState, Dataset, ReasoningInfo};
-#[cfg(feature = "reasoning")]
-use crate::state::{RunChanges, RunInfo};
 use axum::http::HeaderValue;
 use parking_lot::Mutex;
 use serde_json::{Value as J, json};
+pub use sparkles::reasoning::{ReasoningStatus, freshness};
+#[cfg(feature = "reasoning")]
+pub use sparkles::reasoning::{incremental_since, record_inputs, recorded, run_text};
 use sparkles::store::Store;
 use std::collections::HashMap;
 #[cfg(feature = "reasoning")]
 use std::sync::Arc;
-#[cfg(feature = "reasoning")]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Response header on reads that include stale (or unknown-freshness) inferences.
 pub const SPARKLES_INFERENCES: &str = "sparkles-inferences";
 
-/// How the recorded inferences relate to a store position.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Freshness {
-    /// `None`: unknown (no recorded position, or one from another dataset)
-    pub stale: Option<bool>,
-    pub commits_since: Option<u64>,
-    pub reason: Option<String>,
-}
-
-/// Freshness of `info` at commit `at` of `store`.
-pub fn freshness(info: &ReasoningInfo, store: &Store, at: u64) -> Freshness {
-    let unknown = |why: &str| Freshness {
-        stale: None,
-        commits_since: None,
-        reason: Some(why.to_string()),
-    };
-    if info.inherited_stale {
-        return Freshness {
-            stale: Some(true),
-            commits_since: None,
-            reason: Some("inherited from source at clone time".into()),
-        };
-    }
-    let Some(commit) = info.commit else {
-        return unknown("no recorded store position (materialized by an older version)");
-    };
-    if info.position_source.as_deref() != Some("commit") {
-        return unknown("recorded position is not a commit");
-    }
-    if info.dataset_id.as_deref() != Some(store.dataset_id().to_string().as_str()) {
-        return unknown("recorded for another dataset");
-    }
-    match at.cmp(&commit) {
-        std::cmp::Ordering::Equal => Freshness {
-            stale: Some(false),
-            commits_since: Some(0),
-            reason: None,
-        },
-        std::cmp::Ordering::Greater => {
-            let n = at - commit;
-            // commits to graphs the run did not read, the inferred graph included,
-            // leave the inferences fresh
-            match inputs_changed(info, store, commit, at) {
-                Ok(false) => Freshness {
-                    stale: Some(false),
-                    commits_since: Some(n),
-                    reason: None,
-                },
-                Ok(true) => Freshness {
-                    stale: Some(true),
-                    commits_since: Some(n),
-                    reason: Some(format!(
-                        "{n} commit{} since materialization",
-                        if n == 1 { "" } else { "s" }
-                    )),
-                },
-                Err(e) => {
-                    tracing::debug!("reading the changes since commit {commit}: {e}");
-                    Freshness {
-                        stale: Some(true),
-                        commits_since: Some(n),
-                        reason: Some(
-                            "the changes since the materialization can no longer be read".into(),
-                        ),
-                    }
-                }
-            }
-        }
-        std::cmp::Ordering::Less => Freshness {
-            stale: Some(true),
-            commits_since: None,
-            reason: Some("store position moved backwards".into()),
-        },
-    }
-}
-
-/// The graphs whose changes make `info`'s inferences stale: `default` or IRIs.
-pub fn watched_graphs(info: &ReasoningInfo) -> Vec<String> {
-    info.watched_graphs
-        .clone()
-        .unwrap_or_else(|| vec!["default".to_string()])
-}
-
-/// Whether a commit after `commit`, up to `at`, changed a graph the run read. The commit
-/// flag answers for the default graph. For named graphs, the commit diff restricted to
-/// each graph answers, and the answer is remembered by dataset and recorded commit, so
-/// that each new head reads the commits since the last one asked about.
-fn inputs_changed(
-    info: &ReasoningInfo,
-    store: &Store,
-    commit: u64,
-    at: u64,
-) -> Result<bool, String> {
-    let watched = watched_graphs(info);
-    if watched.iter().any(|g| g == "default") && store.default_graph_changed(commit, at) {
-        return Ok(true);
-    }
-    let named: Vec<&str> = watched
-        .iter()
-        .map(String::as_str)
-        .filter(|g| *g != "default")
-        .collect();
-    if named.is_empty() {
-        return Ok(false);
-    }
-    type Memo = HashMap<(String, u64, String), (u64, bool)>;
-    static MEMO: std::sync::OnceLock<Mutex<Memo>> = std::sync::OnceLock::new();
-    let memo = MEMO.get_or_init(Default::default);
-    let key = (store.dataset_id().to_string(), commit, named.join("\n"));
-    // the commits from `start` on still need reading
-    let start = match memo.lock().get(&key).copied() {
-        Some((to, changed)) if to == at || (changed && to <= at) => return Ok(changed),
-        Some((to, false)) if to < at => to,
-        _ => commit,
-    };
-    let mut changed = false;
-    for g in &named {
-        let o = sparkles::store::DiffOptions {
-            graph: Some(oxrdf::GraphName::NamedNode(
-                oxrdf::NamedNode::new_unchecked(*g),
-            )),
-            ..Default::default()
-        };
-        use sparkles::history::At;
-        let d = store
-            .diff(&At::Commit(start), &At::Commit(at), &o)
-            .map_err(|e| e.to_string())?;
-        if !d.is_empty() {
-            changed = true;
-            break;
-        }
-    }
-    let mut m = memo.lock();
-    if m.len() > 4096 {
-        m.clear();
-    }
-    let later = m.get(&key).is_some_and(|(to, _)| *to > at);
-    if !later {
-        m.insert(key, (at, changed));
-    }
-    Ok(changed)
-}
-
 /// `DatasetInfo.reasoning`: the recorded summary plus freshness at the head.
 pub fn info_json(ds: &Dataset) -> J {
-    let Some(info) = ds.reasoning.read().clone() else {
+    let Some(s) = ds.dataset.reasoning().status() else {
         return J::Null;
     };
-    let f = freshness(&info, &ds.store, ds.store.head_commit().seq);
+    let (info, f) = (&s.record, &s.freshness);
     json!({
         "profile": info.profile,
         "inferred": info.inferred,
@@ -186,10 +40,11 @@ pub fn info_json(ds: &Dataset) -> J {
 
 /// The full `ReasoningStatus`, or `null`.
 pub fn status_json(st: &AppState, ds: &Dataset) -> J {
-    let Some(info) = ds.reasoning.read().clone() else {
+    let Some(s) = ds.dataset.reasoning().status() else {
         return J::Null;
     };
-    status_value(&info, &ds.store, auto_json(st, &ds.name, &info))
+    let auto = auto_json(st, &ds.name, &s.record);
+    status_render(&s, auto)
 }
 
 /// `ReasoningStatus.auto`: the effective setting, where it comes from, and the next
@@ -216,9 +71,14 @@ pub fn auto_json(st: &AppState, name: &str, info: &ReasoningInfo) -> J {
 }
 
 /// `ReasoningStatus` of a recorded status at the store's head.
+#[cfg_attr(not(feature = "reasoning"), allow(dead_code))]
 pub fn status_value(info: &ReasoningInfo, store: &Store, auto: J) -> J {
-    let head = store.head_commit().seq;
-    let f = freshness(info, store, head);
+    status_render(&ReasoningStatus::of(info.clone(), store), auto)
+}
+
+/// `ReasoningStatus` of the library's status, with the server's `auto`.
+fn status_render(s: &ReasoningStatus, auto: J) -> J {
+    let (info, f, head) = (&s.record, s.freshness.clone(), s.head);
     let mut j = json!({
         "profile": info.profile,
         "inferred": info.inferred,
@@ -309,8 +169,7 @@ pub fn status_line(info: &ReasoningInfo, store: &Store) -> String {
 /// The `Sparkles-Inferences` header for a read of commit `seq` that included the
 /// inferred graph; `None` when the inferences are fresh.
 pub fn inferences_header(ds: &Dataset, seq: u64) -> Option<HeaderValue> {
-    let info = ds.reasoning.read().clone()?;
-    let f = freshness(&info, &ds.store, seq);
+    let f = ds.dataset.reasoning().freshness_at(seq)?;
     let v = match (f.stale, f.commits_since) {
         (Some(false), _) => return None,
         (Some(true), Some(n)) => format!("stale; commits-since={n}"),
@@ -321,164 +180,6 @@ pub fn inferences_header(ds: &Dataset, seq: u64) -> Option<HeaderValue> {
 }
 
 // ---------------------------------------------------------------- running ------
-
-/// The status recorded after a materialization.
-#[cfg(feature = "reasoning")]
-pub fn recorded(
-    profile: &sparkles_reasoner::Profile,
-    extras: &sparkles_reasoner::Extras,
-    report: &sparkles_reasoner::ReasonReport,
-    store: &Store,
-) -> ReasoningInfo {
-    let receipt = report.receipt.as_ref();
-    ReasoningInfo {
-        reasoning_format: 2,
-        profile: profile.name().to_string(),
-        inferred: report.inferred,
-        at: crate::state::now(),
-        // the run's own commit, or the head it read when it changed nothing
-        commit: receipt.map(|r| r.commit.seq),
-        position_source: receipt.map(|_| "commit".to_string()),
-        dataset_id: Some(
-            receipt
-                .map_or(store.dataset_id(), |r| r.dataset_id)
-                .to_string(),
-        ),
-        rules: match profile {
-            sparkles_reasoner::Profile::Rules(t) => Some(t.clone()),
-            _ => None,
-        },
-        vocabularies: extras.names(),
-        geo_default_geometry: extras.geo_default_geometry,
-        warnings: report.warnings.clone(),
-        millis: Some(report.millis),
-        inherited_stale: false,
-        auto: None,
-        run: Some(run_info(report)),
-        ..Default::default()
-    }
-}
-
-/// Record a run's input graphs in its status: the configuration (unless it is the
-/// default), the graphs read and watched and the imports (unless the run read the
-/// default graph alone), and the imports fetched by it or by earlier runs that it still
-/// imports.
-#[cfg(feature = "reasoning")]
-pub fn record_inputs(
-    info: &mut ReasoningInfo,
-    inputs: &sparkles_reasoner::Inputs,
-    report: &sparkles_reasoner::ReasonReport,
-    fetched: Vec<String>,
-) {
-    if *inputs != sparkles_reasoner::Inputs::default() {
-        info.inputs = serde_json::to_value(inputs).ok();
-    }
-    let Some(r) = &report.inputs else {
-        return;
-    };
-    let names = |g: Vec<sparkles_reasoner::GraphRef>| -> Vec<String> {
-        g.iter().map(|g| g.as_str().to_string()).collect()
-    };
-    if !r.default_only() || !r.imports.is_empty() {
-        info.input_graphs = Some(names(r.graphs.clone()));
-        info.watched_graphs = Some(names(r.watched()));
-        info.imports = r
-            .imports
-            .iter()
-            .filter_map(|i| serde_json::to_value(i).ok())
-            .collect();
-    }
-    let mut f: Vec<String> = fetched
-        .into_iter()
-        .filter(|iri| r.imports.iter().any(|i| &i.iri == iri && i.graph.is_some()))
-        .collect();
-    f.sort();
-    f.dedup();
-    info.fetched_imports = f;
-}
-
-/// The input configuration a recorded status re-runs.
-#[cfg(feature = "reasoning")]
-pub fn recorded_inputs(info: &ReasoningInfo) -> anyhow::Result<sparkles_reasoner::Inputs> {
-    match &info.inputs {
-        None => Ok(Default::default()),
-        Some(j) => Ok(serde_json::from_value(j.clone())?),
-    }
-}
-
-/// How a run materialized, for the status.
-#[cfg(feature = "reasoning")]
-pub fn run_info(report: &sparkles_reasoner::ReasonReport) -> RunInfo {
-    RunInfo {
-        method: report.method.as_str().to_string(),
-        fallback: report.fallback.clone(),
-        inferred_added: report.inferred_added,
-        inferred_removed: report.inferred_removed,
-        changes: report.changes.as_ref().map(|c| RunChanges {
-            explicit_added: c.base_added,
-            explicit_removed: c.base_removed,
-            checked: c.checked,
-            removed: c.removed,
-            derived: c.derived,
-            source: c.source.clone(),
-        }),
-    }
-}
-
-/// The commit of the recorded materialization that a run can update incrementally: the
-/// status's own commit, when the status belongs to this dataset.
-#[cfg(feature = "reasoning")]
-pub fn incremental_since(info: Option<&ReasoningInfo>, store: &Store) -> Option<u64> {
-    let info = info?;
-    if info.inherited_stale
-        || info.position_source.as_deref() != Some("commit")
-        || info.dataset_id.as_deref() != Some(store.dataset_id().to_string().as_str())
-    {
-        return None;
-    }
-    info.commit
-}
-
-/// One line on how a run went: `incremental: 3 explicit triples added, 1 removed; …`.
-#[cfg(feature = "reasoning")]
-pub fn run_text(report: &sparkles_reasoner::ReasonReport) -> String {
-    let graph = format!(
-        "inferred graph +{} -{}",
-        report.inferred_added, report.inferred_removed
-    );
-    match (&report.changes, &report.fallback) {
-        (Some(c), _) => format!(
-            "incremental: {} explicit triples added, {} removed; {} derived triples removed, {} added; {graph}",
-            c.base_added, c.base_removed, c.removed, c.derived
-        ),
-        (None, Some(why)) => format!(
-            "full, {} iterations, because {why}; {graph}",
-            report.iterations
-        ),
-        (None, None) => format!("full, {} iterations; {graph}", report.iterations),
-    }
-}
-
-/// The profile a recorded status re-runs.
-#[cfg(feature = "reasoning")]
-pub fn recorded_profile(info: &ReasoningInfo) -> anyhow::Result<sparkles_reasoner::Profile> {
-    if info.profile == "rules" {
-        return match &info.rules {
-            Some(t) => Ok(sparkles_reasoner::Profile::Rules(t.clone())),
-            None => anyhow::bail!("the recorded custom rules are not available to re-run"),
-        };
-    }
-    Ok(info.profile.parse()?)
-}
-
-/// The extras a recorded status re-runs.
-#[cfg(feature = "reasoning")]
-pub fn recorded_extras(info: &ReasoningInfo) -> anyhow::Result<sparkles_reasoner::Extras> {
-    Ok(sparkles_reasoner::Extras::parse(
-        &info.vocabularies,
-        info.geo_default_geometry,
-    )?)
-}
 
 /// What started a reasoning run.
 #[cfg(feature = "reasoning")]
@@ -491,13 +192,12 @@ pub enum Trigger {
     Auto { superseded_by_writes: bool },
 }
 
-/// Start a `reason` task: materialize, then record the status (data first, then the
-/// status file, so a crash in between reads as stale). The task can be cancelled.
+/// Start a `reason` task: the library's materialization
+/// ([`sparkles::handles::Reasoning::run_with`]) with the task's cancellation and
+/// progress, then the registry saved. The task can be cancelled.
 ///
-/// With `incremental`, the run updates the recorded materialization when it can (see
-/// [`sparkles_reasoner::materialize_incremental`]), with the closure the dataset keeps
-/// in memory or, after a restart, the one saved with it.
-///
+/// With `incremental`, the run updates the recorded materialization when it can, with
+/// the closure the dataset keeps in memory or, after a restart, the one saved with it.
 /// The run reads the graphs of `inputs`. With imports fetched, it first loads the
 /// missing ones under the server's `LOAD` rules, and with `refresh` loads again those
 /// that earlier runs fetched.
@@ -522,108 +222,55 @@ pub fn start_reason(
         };
     let prefix = if auto { "auto: " } else { "" };
     st.start_task_opts(st.next_task_id(), "reason", &name, None, true, move |h| {
-        let ctl = h.control();
-        // the reasoner reports progress only once it holds the writer lock
-        let locked = Arc::new(AtomicBool::new(false));
-        let locked2 = locked.clone();
-        let task_progress = ctl.progress.clone();
-        let progress: sparkles_reasoner::ProgressFn = Arc::new(move |p, msg: &str| {
-            locked2.store(true, Ordering::Relaxed);
-            task_progress.report(p, &format!("{prefix}{msg}"));
-        });
-        let cancel = ctl.cancel.flag();
-        let fetched_before: Vec<String> = ds
-            .reasoning
-            .read()
-            .as_ref()
-            .map(|i| i.fetched_imports.clone())
-            .unwrap_or_default();
-        let mut fetched = fetched_before.clone();
-        let mut fetch_warnings = Vec::new();
-        if inputs.imports == sparkles_reasoner::ImportMode::Fetch || refresh {
-            ctl.progress
-                .report(0.02, &format!("{prefix}fetching imports"));
+        let task = h.control();
+        let progress = task.progress.clone();
+        let ctl = sparkles::task::Control {
+            progress: sparkles::task::Progress::new(move |p, msg: &str| {
+                progress.report(p, &format!("{prefix}{msg}"))
+            }),
+            ..task.clone()
+        };
+        let req = sparkles::reasoning::ReasonRequest {
+            profile,
+            extras,
+            inputs,
+            incremental,
+            refresh_imports: refresh,
+            yield_to_writers: yields,
             // the rules of the server's LOAD
-            let qopts = sparkles::sparql::QueryOptions {
+            load: sparkles::sparql::QueryOptions {
                 outbound: st2.outbound.clone(),
                 file_loads: st2.file_loads.clone(),
-                cancel: Some(cancel.clone()),
                 ..Default::default()
-            };
-            let refresh_list = if refresh { fetched_before } else { Vec::new() };
-            let f = sparkles_reasoner::fetch_imports(&ds.store, &inputs, &refresh_list, &qopts)
-                .map_err(|e| e.context(format!("{prefix}fetching imports")))?;
-            fetched.extend(f.fetched);
-            fetch_warnings = f.warnings;
-        }
-        ctl.progress
-            .report(0.05, &format!("{prefix}loading triples"));
-        let opts = sparkles_reasoner::ReasonOptions {
-            progress: Some(progress),
-            cancel: Some(cancel.clone()),
-            inputs: inputs.clone(),
-            ..Default::default()
+            },
         };
-        let superseded = AtomicBool::new(false);
-        let done = AtomicBool::new(false);
-        let result = std::thread::scope(|s| {
-            if yields {
-                // a newer write waiting for the lock supersedes this run
-                s.spawn(|| {
-                    while !done.load(Ordering::Relaxed) {
-                        // before that, the waiting writer may be this run itself
-                        if locked.load(Ordering::Relaxed) && ds.store.writers_waiting() > 0 {
-                            superseded.store(true, Ordering::Relaxed);
-                            ctl.cancel.cancel();
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                });
+        ds.closure.set_max_triples(st2.reason_cache_triples);
+        let outcome = match ds.dataset.reasoning().run_with(&req, &ctl) {
+            Ok(o) => o,
+            Err(sparkles::Error::Component(c))
+                if c.code == sparkles::reasoning::run::SUPERSEDED =>
+            {
+                return Err(anyhow::Error::new(sparkles::Error::Cancelled)
+                    .context("auto: superseded by a write"));
             }
-            let since = if incremental {
-                incremental_since(ds.reasoning.read().as_ref(), &ds.store)
-            } else {
-                None
-            };
-            ds.closure.set_max_triples(st2.reason_cache_triples);
-            let inc = sparkles_reasoner::Incremental {
-                since,
-                cache: Some(&ds.closure),
-            };
-            let r = sparkles_reasoner::materialize_incremental(
-                &ds.store, &profile, &extras, inc, &opts,
-            );
-            done.store(true, Ordering::Relaxed);
-            r
-        });
-        let report = match result {
-            Ok(r) => r,
-            Err(_) if ctl.cancel.is_cancelled() => {
-                let why = if superseded.load(Ordering::Relaxed) {
-                    "auto: superseded by a write"
-                } else {
-                    "reasoning cancelled"
-                };
-                return Err(anyhow::Error::new(sparkles::Error::Cancelled).context(why));
+            Err(sparkles::Error::Cancelled) => {
+                return Err(
+                    anyhow::Error::new(sparkles::Error::Cancelled).context("reasoning cancelled")
+                );
             }
             Err(e) => {
                 let e = match rejection_text(&e) {
                     Some(text) => anyhow::anyhow!("{prefix}{text}"),
-                    None if auto => e.context("auto: reasoning failed"),
-                    None => e,
+                    None if auto => anyhow::Error::new(e).context("auto: reasoning failed"),
+                    None => e.into(),
                 };
                 return Err(e);
             }
         };
-        let mut info = recorded(&profile, &extras, &report, &ds.store);
-        record_inputs(&mut info, &inputs, &report, fetched);
-        info.warnings.splice(0..0, fetch_warnings);
-        // a run keeps the dataset's automatic re-run setting
-        info.auto = ds.reasoning.read().as_ref().and_then(|i| i.auto.clone());
-        ds.set_reasoning(Some(info))?;
         st2.save_registry()?;
-        let mut detail = serde_json::to_value(run_info(&report)).unwrap_or(J::Null);
+        let report = &outcome.report;
+        let mut detail =
+            serde_json::to_value(sparkles::reasoning::run_info(report)).unwrap_or(J::Null);
         detail["inferred"] = report.inferred.into();
         detail["millis"] = report.millis.into();
         detail["iterations"] = report.iterations.into();
@@ -632,7 +279,7 @@ pub fn start_reason(
             "{prefix}{} inferred triples in {} ms ({}){}",
             report.inferred,
             report.millis,
-            run_text(&report),
+            run_text(report),
             if report.warnings.is_empty() {
                 String::new()
             } else {
@@ -646,8 +293,8 @@ pub fn start_reason(
 /// `inferences rejected by SHACL validation: 2 blocking results (first: <shape> at <node>)`
 /// (ShEx: `… 2 nonconformant associations …`).
 #[cfg(feature = "reasoning")]
-pub fn rejection_text(e: &anyhow::Error) -> Option<String> {
-    let Some(sparkles::Error::Rejected(r)) = e.downcast_ref::<sparkles::Error>() else {
+pub fn rejection_text(e: &sparkles::Error) -> Option<String> {
+    let sparkles::Error::Rejected(r) = e else {
         return None;
     };
     let s = &r.summary;
@@ -851,13 +498,9 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
         if !quiet && !forced {
             continue;
         }
-        let run = info.as_ref().map(|i| {
-            Ok::<_, anyhow::Error>((
-                recorded_profile(i)?,
-                recorded_extras(i)?,
-                recorded_inputs(i)?,
-            ))
-        });
+        let run = info
+            .as_ref()
+            .map(|i| Ok::<_, sparkles::Error>((i.profile()?, i.extras()?, i.run_inputs()?)));
         let (profile, extras, inputs) = match run {
             Some(Ok(p)) => p,
             Some(Err(e)) => {
@@ -903,7 +546,7 @@ pub fn spawn_auto_reason(st: Arc<AppState>) {
 // ------------------------------------------------------------ diagnostics ------
 
 /// The diagnostics report of a store's current snapshot as JSON, with the dataset name
-/// and the inferences' freshness at that snapshot.
+/// and the inferences' freshness at that snapshot (see [`sparkles::reasoning::diagnose`]).
 #[cfg(feature = "reasoning")]
 pub fn diagnostics_json(
     name: &str,
@@ -911,19 +554,23 @@ pub fn diagnostics_json(
     info: Option<&ReasoningInfo>,
     opts: &sparkles_reasoner::diagnostics::DiagnoseOptions,
 ) -> anyhow::Result<(sparkles_reasoner::diagnostics::DiagnosticsReport, J)> {
-    let snap = store.snapshot();
-    let at = snap.commit;
-    let report = sparkles_reasoner::diagnostics::diagnose(snap, opts)?;
-    let mut j = report.to_json();
+    let d = sparkles::reasoning::diagnose(store, info, opts)?;
+    Ok(diagnostics_render(name, d))
+}
+
+/// The JSON of a diagnostics report, with the dataset name and the inferences' freshness.
+#[cfg(feature = "reasoning")]
+pub fn diagnostics_render(
+    name: &str,
+    d: sparkles::reasoning::Diagnostics,
+) -> (sparkles_reasoner::diagnostics::DiagnosticsReport, J) {
+    let mut j = d.report.to_json();
     j["dataset"] = name.into();
-    if opts.inferences
-        && let Some(info) = info
-    {
-        let f = freshness(info, store, at);
+    if let Some((profile, f)) = &d.inferences {
         let inf = &mut j["scope"]["inferences"];
-        inf["profile"] = info.profile.clone().into();
+        inf["profile"] = profile.clone().into();
         inf["stale"] = f.stale.into();
         inf["commitsSince"] = f.commits_since.into();
     }
-    Ok((report, j))
+    (d.report, j)
 }

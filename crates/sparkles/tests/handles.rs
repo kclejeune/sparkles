@@ -466,3 +466,78 @@ fn stored_queries_run_an_older_version_and_name_a_broken_file() {
     assert!(ds.queries().error().unwrap().contains("queries.json"));
     assert!(ds.queries().list().is_empty());
 }
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn reasoning_runs_records_and_reports_freshness() {
+    use sparkles::reasoning::ReasonRequest;
+    let (_dir, ds) = persistent();
+    ds.update(
+        "INSERT DATA { <http://ex.org/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/B> . <http://ex.org/x> a <http://ex.org/C> }",
+    )
+    .unwrap();
+    let ask = "ASK { <http://ex.org/x> a <http://ex.org/B> }";
+    assert!(ds.reasoning().status().is_none());
+    assert!(!ds.ask(ask).unwrap());
+    let reports = Arc::new(Mutex::new(Vec::new()));
+    let r2 = reports.clone();
+    let ctl = Control {
+        progress: Progress::new(move |f, m: &str| r2.lock().unwrap().push((f, m.to_string()))),
+        ..Control::none()
+    };
+    let out = ds
+        .reasoning()
+        .run_with(&ReasonRequest::default(), &ctl)
+        .unwrap();
+    assert!(out.report.inferred > 0);
+    assert_eq!(out.record.profile, "rdfs");
+    assert_eq!(reports.lock().unwrap().last().unwrap().0, 1.0);
+    // the inferences are part of the default graph, and fresh
+    assert!(ds.ask(ask).unwrap());
+    let s = ds.reasoning().status().unwrap();
+    assert_eq!(s.freshness.stale, Some(false));
+    // a change to the default graph makes them stale; a rerun updates them
+    ds.update("INSERT DATA { <http://ex.org/y> a <http://ex.org/C> }")
+        .unwrap();
+    assert_eq!(ds.reasoning().status().unwrap().freshness.stale, Some(true));
+    let again = ds
+        .reasoning()
+        .run(&ds.reasoning().record().unwrap().rerun().unwrap())
+        .unwrap();
+    assert_eq!(again.record.run.unwrap().method, "incremental");
+    assert_eq!(
+        ds.reasoning().status().unwrap().freshness.stale,
+        Some(false)
+    );
+    let d = ds
+        .reasoning()
+        .diagnostics(&sparkles_reasoner_options())
+        .unwrap();
+    assert_eq!(d.commit, ds.head_commit().seq);
+    // cancelled before it starts, nothing changes
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let stopped = ds.reasoning().run_with(
+        &ReasonRequest::default(),
+        &Control {
+            cancel,
+            ..Control::none()
+        },
+    );
+    assert!(matches!(stopped, Err(sparkles::Error::Cancelled)));
+    assert!(ds.reasoning().clear().unwrap() > 0);
+    assert!(ds.reasoning().status().is_none());
+}
+
+#[cfg(feature = "reasoning")]
+fn sparkles_reasoner_options() -> sparkles::reasoning::reasoner::diagnostics::DiagnoseOptions {
+    sparkles::reasoning::reasoner::diagnostics::DiagnoseOptions {
+        checks: Vec::new(),
+        limit: 10,
+        inferences: true,
+        graphs: Vec::new(),
+        closure: sparkles::reasoning::reasoner::diagnostics::Closure::Subclass,
+        timeout: None,
+        prefixes: Vec::new(),
+    }
+}
