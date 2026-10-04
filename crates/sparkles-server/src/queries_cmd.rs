@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use sparkles::sparql::QueryKind;
 use sparkles::sparql::results::{self, SolutionsFormat};
-use sparkles::store::{Store, StoreOptions};
+use sparkles::store::StoreOptions;
 use sparkles::stored::{Catalog, Change, Definition, ParamType, Parameter};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -265,15 +265,14 @@ pub fn run(cmd: QueriesCmd, opts: StoreOptions) -> Result<()> {
                 }
             };
             // the store's lock keeps a server from changing the catalog meanwhile
-            let store = Store::open(&loc, opts)?;
-            let c = open_catalog(&loc)?;
-            let saved = c.put(
+            let ds = open_dataset(&loc, opts)?;
+            let saved = ds.queries().put(
                 &name,
                 def,
                 Change {
                     author: std::env::var("USER").ok(),
                     message,
-                    dataset_commit: Some(store.snapshot().commit),
+                    dataset_commit: Some(ds.snapshot().commit),
                     if_version: None,
                 },
             )?;
@@ -288,8 +287,7 @@ pub fn run(cmd: QueriesCmd, opts: StoreOptions) -> Result<()> {
             }
         }
         QueriesCmd::Delete { loc, name } => {
-            let _store = Store::open(&loc, opts)?;
-            if !open_catalog(&loc)?.delete(&name, None)? {
+            if !open_dataset(&loc, opts)?.queries().delete(&name, None)? {
                 bail!("no stored query '{name}'");
             }
         }
@@ -301,8 +299,12 @@ pub fn run(cmd: QueriesCmd, opts: StoreOptions) -> Result<()> {
             results: fmt,
             timeout,
         } => {
-            let c = open_catalog(&loc)?;
-            let s = c
+            if !loc.is_dir() {
+                bail!("{} is not a database directory", loc.display());
+            }
+            let ds = open_dataset(&loc, opts)?;
+            let s = ds
+                .queries()
                 .get(&name, version)
                 .with_context(|| format!("no stored query '{name}'"))?;
             let mut given = BTreeMap::new();
@@ -315,22 +317,23 @@ pub fn run(cmd: QueriesCmd, opts: StoreOptions) -> Result<()> {
                     Value::String(v.to_string()),
                 );
             }
-            let store = Store::open(&loc, opts)?;
-            let mut prefixes = sparkles::io::standard_prefixes();
-            prefixes.extend(store.prefixes());
-            let bindings = s.definition.bind(&given, &prefixes)?;
+            // the dataset's RDFS on read and DESCRIBE setting apply, as on the server
             let qopts = sparkles::sparql::QueryOptions {
                 timeout: timeout.map(Duration::from_secs_f64),
-                initial_bindings: bindings,
+                rdfs: ds.reasoning().rdfs().get(),
+                describe: ds.settings().describe().get(),
                 ..Default::default()
             };
-            let r = sparkles::sparql::query(store.snapshot(), &s.definition.query, &qopts)?;
+            let r = ds
+                .queries()
+                .run_version(&name, Some(s.version.version), &given, &qopts)?;
+            let store = ds.store();
             let fmt = fmt
                 .or_else(|| s.definition.results.clone())
                 .unwrap_or_else(|| "text".into());
             match r.kind {
                 QueryKind::Select | QueryKind::Ask if fmt == "text" => {
-                    crate::print_table(&r, &store, &mut out)?
+                    crate::print_table(&r, store, &mut out)?
                 }
                 QueryKind::Select | QueryKind::Ask => {
                     let f = SolutionsFormat::from_name(&fmt).context("unknown result format")?;
@@ -357,9 +360,22 @@ pub fn run(cmd: QueriesCmd, opts: StoreOptions) -> Result<()> {
     Ok(())
 }
 
+/// The catalog of `loc`, read without the database's lock, so that `list`, `get` and
+/// `versions` work beside a server that has the database open.
 fn open_catalog(loc: &Path) -> Result<Catalog> {
     if !loc.is_dir() {
         bail!("{} is not a database directory", loc.display());
     }
     Ok(Catalog::open(Some(loc))?)
+}
+
+/// The dataset of `loc`, set up as the server sets it up. It holds the database's lock,
+/// which keeps a server from changing the catalog meanwhile. A `queries.json` that
+/// cannot be read is an error, as it is for the commands that only read it.
+fn open_dataset(loc: &Path, opts: StoreOptions) -> Result<sparkles::Dataset> {
+    let ds = sparkles::Dataset::open_with(loc, opts)?;
+    if let Some(e) = ds.queries().error() {
+        bail!("{e}");
+    }
+    Ok(ds)
 }

@@ -287,3 +287,40 @@ fn describe_and_compaction_report_their_status() {
         sparkles::handles::CompactionState::Off
     );
 }
+
+#[test]
+fn stored_queries_run_an_older_version_and_name_a_broken_file() {
+    let (dir, ds) = persistent();
+    let def = |q: &str| -> sparkles::stored::Definition {
+        serde_json::from_value(serde_json::json!({ "query": q })).unwrap()
+    };
+    let q = ds.queries();
+    assert!(q.error().is_none());
+    q.put(
+        "v",
+        def("SELECT ?v WHERE { ?s <http://ex.org/p> ?v }"),
+        Default::default(),
+    )
+    .unwrap();
+    q.put(
+        "v",
+        def("SELECT ?v WHERE { <http://ex.org/a> <http://ex.org/p> ?v }"),
+        Default::default(),
+    )
+    .unwrap();
+    let none = BTreeMap::new();
+    let rows = |version| {
+        q.run_version("v", version, &none, &Default::default())
+            .map(|r| r.table.len())
+    };
+    assert_eq!(rows(Some(1)).unwrap(), 2);
+    assert_eq!(rows(None).unwrap(), 1);
+    assert_eq!(rows(Some(9)).unwrap_err().code(), "not-found");
+    drop((q, ds));
+
+    let db = dir.path().join("db");
+    std::fs::write(db.join("queries.json"), "{ not json").unwrap();
+    let ds = Dataset::open(&db).unwrap();
+    assert!(ds.queries().error().unwrap().contains("queries.json"));
+    assert!(ds.queries().list().is_empty());
+}

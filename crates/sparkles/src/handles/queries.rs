@@ -34,6 +34,12 @@ impl StoredQueries {
         self.ds.state().queries.put(name, def, change)
     }
 
+    /// Why `queries.json` could not be read, if it could not. The catalog is then empty
+    /// and refuses changes, so the file is never overwritten.
+    pub fn error(&self) -> Option<String> {
+        self.ds.state().queries.broken().map(str::to_string)
+    }
+
     /// Remove query `name` (if its latest version is `if_version`, when given); whether
     /// it existed.
     pub fn delete(&self, name: &str, if_version: Option<u64>) -> Result<bool> {
@@ -50,8 +56,20 @@ impl StoredQueries {
         params: &BTreeMap<String, serde_json::Value>,
         opts: &QueryOptions,
     ) -> Result<QueryResult> {
+        self.run_version(name, None, params, opts)
+    }
+
+    /// [`run`](Self::run) at `version` of query `name` while it is kept, or at its
+    /// latest version. A missing version is [`Error::NotFound`].
+    pub fn run_version(
+        &self,
+        name: &str,
+        version: Option<u64>,
+        params: &BTreeMap<String, serde_json::Value>,
+        opts: &QueryOptions,
+    ) -> Result<QueryResult> {
         let stored = self
-            .get(name, None)
+            .get(name, version)
             .ok_or_else(|| Error::NotFound(format!("no stored query '{name}'")))?;
         let mut prefixes = crate::io::standard_prefixes();
         prefixes.extend(self.ds.store().prefixes());
