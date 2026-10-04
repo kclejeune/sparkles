@@ -342,7 +342,8 @@ pub enum CsvCmd {
         /// The graph of the triples in N-Quads output
         #[arg(long, value_name = "IRI")]
         graph: Option<String>,
-        /// Write here instead of standard output
+        /// Write here instead of standard output, through a temporary file that
+        /// replaces FILE only when the conversion succeeds (an input is refused as FILE)
         #[arg(long, short = 'o', value_name = "FILE")]
         output: Option<PathBuf>,
     },
@@ -383,14 +384,23 @@ pub fn run(args: CsvCmdArgs) -> Result<()> {
             if graph.is_some() && format != oxrdfio::RdfFormat::NQuads {
                 bail!("--graph needs --format nq");
             }
-            let mut out: Box<dyn std::io::Write> = match &output {
-                Some(p) => Box::new(std::io::BufWriter::new(
-                    std::fs::File::create(p)
-                        .with_context(|| format!("creating {}", p.display()))?,
-                )),
+            let jobs = jobs(&files, &csv)?;
+            // written through a temporary file that replaces the output at the end
+            let staged = match &output {
+                Some(p) => Some(crate::tools::out_file::OutFile::create(
+                    p,
+                    jobs.iter()
+                        .map(|j| j.path.as_path())
+                        .chain(csv.mapping.as_deref())
+                        .chain(csv.template.as_deref()),
+                )?),
+                None => None,
+            };
+            let mut out: Box<dyn std::io::Write> = match &staged {
+                Some(o) => Box::new(std::io::BufWriter::new(o.file()?)),
                 None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
             };
-            for (i, job) in jobs(&files, &csv)?.iter().enumerate() {
+            for (i, job) in jobs.iter().enumerate() {
                 let input = tabular::open(&job.path, None)?;
                 let stats = tabular::write(
                     input,
@@ -402,6 +412,10 @@ pub fn run(args: CsvCmdArgs) -> Result<()> {
                 report(&job.path.display().to_string(), &stats, job.note.as_deref());
             }
             out.flush()?;
+            drop(out);
+            if let Some(o) = staged {
+                o.commit()?;
+            }
             Ok(())
         }
         CsvCmd::Mapping { file, base, key } => {

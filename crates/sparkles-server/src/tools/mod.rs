@@ -10,6 +10,7 @@ pub mod compare;
 pub mod convert;
 #[cfg(feature = "auth")]
 pub mod endpoint;
+pub mod out_file;
 pub mod rdfpatch;
 pub mod rset;
 pub mod sniff;

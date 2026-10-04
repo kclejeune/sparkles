@@ -523,7 +523,8 @@ default graph. `--graph IRI`, which can be repeated, limits the dump to some gra
 written as one graph. `--at` dumps a past state. With `--server URL --dataset NAME` the
 dump comes from the server's Graph Store endpoint in the syntax asked for. When the
 endpoint cannot give that subset in that syntax, such as two graphs or `--merge`, the
-dump is read as N-Quads and converted locally.
+dump is read as N-Quads and converted locally. The `--out` file is written to a temporary
+file in its directory and replaces an existing file only when the dump completes.
 
 `sparkles infer` updates the materialization that `reasoning.json` records when its
 rules are the same and monotonic and the commit diff still reaches its commit. It reads
@@ -819,12 +820,18 @@ namespace. A `-metadata.json` file next to a table is read with it rather than c
 
 The output goes to standard output, or to `--output-file` (`-o`), whose extension picks
 the syntax and the compression unless `--output` and `--compress` name them. `--out` and
-`--format` are aliases of `--output`, so the file needs its own flag. `--out-dir DIR`
+`--format` are aliases of `--output`, so the file needs its own flag. The output file is
+written to a temporary file in its directory, which replaces it only when every input
+converted without errors. A failed conversion leaves an existing output file as it was.
+An output file that is also one of the inputs is refused before anything is written,
+whether it is named by the same path, a symbolic link or a hard link. To convert a file
+in place, write to another file and rename it. `--out-dir DIR`
 writes one file per input instead, at the input's path below the directory it was found
 in, with the output syntax's extension in place of the input's. `--compress` adds its
 extension. The files are converted in parallel, `--jobs` (`-j`) at a time, by default
 one per CPU up to 8. A file that exists is replaced only with `--overwrite`, and a file
-that fails to convert leaves nothing behind. With directories or `--out-dir`, `convert`
+that fails to convert leaves nothing behind. An input is never its own output there
+either. With directories or `--out-dir`, `convert`
 prints the statements of each file and a summary with the number of files, the total
 and the time. Errors give the file, line and column, and the exit status is 1 when any
 file failed.
@@ -1110,6 +1117,8 @@ are refused, because rows are mapped in batches of 10,000.
 A cell that does not match its datatype, or a row with the wrong number of cells, stops
 the load with the file, row and column, and nothing is committed. `sparkles csv convert`
 writes the triples without loading them, as N-Triples, N-Quads (`--graph`) or Turtle.
+Its `--output` file replaces an existing file only when the conversion succeeds, and an
+input given as the output is refused.
 `--server` loads into a running server: the CLI converts the tables and sends the
 triples. On a server, `POST /{ds}/upload` takes tables too
 ([API](API.md#csv-and-tsv-uploads)).

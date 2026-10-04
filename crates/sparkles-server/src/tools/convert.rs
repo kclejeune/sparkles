@@ -11,6 +11,7 @@
 //! bytes. The output is one stream (standard output or `--output-file`), or with
 //! `--out-dir` one file per input, converted in parallel.
 
+use super::out_file::OutFile;
 use super::sniff::{self, Kind, Sniffed};
 use super::terms::TermChecker;
 use crate::csv_cmd::{CsvArgs, Tables};
@@ -46,7 +47,9 @@ pub struct ConvertArgs {
     #[arg(long, visible_aliases = ["out", "format"], value_name = "LANG")]
     output: Option<String>,
     /// Write the output to this file instead of standard output (its extension picks the
-    /// syntax and the compression)
+    /// syntax and the compression). The output goes to a temporary file that replaces
+    /// FILE only when every input converted without errors. An output that is one of the
+    /// inputs, by its path, a symbolic link or a hard link, is refused.
     #[arg(long, short = 'o', value_name = "FILE", conflicts_with_all = ["count", "sink", "validate", "out_dir"])]
     output_file: Option<PathBuf>,
     /// Write one file per input into this directory, at the input's path relative to
@@ -729,6 +732,8 @@ pub fn run(a: ConvertArgs) -> Result<()> {
     }
     let started = Instant::now();
     let writes = !(a.count || a.sink || a.validate);
+    // --output-file, written when no input had errors
+    let mut staged = None;
     let mut out = if writes {
         let format = match (&a.output, &a.output_file) {
             (Some(o), _) => {
@@ -746,9 +751,17 @@ pub fn run(a: ConvertArgs) -> Result<()> {
             bail!("built without {codec}");
         }
         let sink: Box<dyn std::io::Write> = match &a.output_file {
-            Some(f) => Box::new(
-                std::fs::File::create(f).with_context(|| format!("creating {}", f.display()))?,
-            ),
+            Some(f) => {
+                let inputs = inputs
+                    .iter()
+                    .filter_map(|i| i.path.as_deref())
+                    .chain(r.csv.mapping.as_deref())
+                    .chain(r.csv.template.as_deref());
+                let o = OutFile::create(f, inputs)?;
+                let file = o.file()?;
+                staged = Some(o);
+                Box::new(file)
+            }
             None => Box::new(std::io::stdout().lock()),
         };
         let w = codec.writer(std::io::BufWriter::with_capacity(1 << 16, sink), None, 1)?;
@@ -758,6 +771,7 @@ pub fn run(a: ConvertArgs) -> Result<()> {
     };
     let mut tables = Tables::new(r.csv.clone());
     let mut failed = 0usize;
+    let mut errors = false;
     let mut total = 0u64;
     for input in &inputs {
         let t = Instant::now();
@@ -767,6 +781,7 @@ pub fn run(a: ConvertArgs) -> Result<()> {
         };
         let bad = report_one(input, &o, strict);
         failed += usize::from(bad);
+        errors |= !o.errors.is_empty();
         total += o.statements;
         let unit = input.unit();
         if a.count {
@@ -789,6 +804,15 @@ pub fn run(a: ConvertArgs) -> Result<()> {
     }
     if let Some(out) = out {
         out.finish()?;
+    }
+    if let Some(o) = staged {
+        if errors {
+            eprintln!("{} left unchanged: an input had errors", o.path().display());
+            // removes the temporary file, which `exit` below would not
+            drop(o);
+        } else {
+            o.commit()?;
+        }
     }
     if found.walked {
         summary(inputs.len(), total, failed, started);
@@ -954,19 +978,18 @@ fn convert_to_file(
     }
     let parent = target.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let tmp = tempfile::Builder::new()
-        .prefix(".sparkles-convert-")
-        .tempfile_in(parent)
-        .with_context(|| format!("creating a file in {}", parent.display()))?;
-    let file = tmp.reopen()?;
-    let w = codec.writer(std::io::BufWriter::with_capacity(1 << 16, file), None, 1)?;
+    let staged = OutFile::create(target, input.path.as_deref())?;
+    let w = codec.writer(
+        std::io::BufWriter::with_capacity(1 << 16, staged.file()?),
+        None,
+        1,
+    )?;
     let mut out = Output::new(syntax, w, a.merge);
     out.label = Some(input.name.clone());
     let o = convert_one(input, r, tables, &mut out)?;
     out.finish()?;
     if o.errors.is_empty() {
-        tmp.persist(target)
-            .with_context(|| format!("writing {}", target.display()))?;
+        staged.commit()?;
     }
     Ok(o)
 }

@@ -136,6 +136,82 @@ fn convert_counts_and_validates() {
     assert_eq!(out(&o), "");
 }
 
+/// An output file is written through a temporary file: an output that is one of the
+/// inputs is refused, and a failed conversion leaves an existing output as it was.
+#[test]
+fn convert_never_destroys_its_input_or_an_existing_output() {
+    let d = setup();
+    let dir = d.path();
+    let nt = "<http://e/s> <http://e/p> <http://e/o> .\n";
+    std::fs::write(dir.join("one.nt"), nt).unwrap();
+    let refused = |args: &[&str]| {
+        let o = run(dir, args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", err(&o));
+        assert!(err(&o).contains("is the input"), "{args:?}: {}", err(&o));
+        assert_eq!(std::fs::read_to_string(dir.join("one.nt")).unwrap(), nt);
+    };
+    // the same path
+    refused(&["convert", "one.nt", "-o", "one.nt"]);
+    refused(&["convert", "a.ttl", "one.nt", "-o", "./one.nt"]);
+    #[cfg(unix)]
+    {
+        // a symbolic link to the input, either way round
+        std::os::unix::fs::symlink(dir.join("one.nt"), dir.join("link.nt")).unwrap();
+        refused(&["convert", "one.nt", "-o", "link.nt"]);
+        refused(&["convert", "link.nt", "-o", "one.nt"]);
+        // a hard link
+        std::fs::hard_link(dir.join("one.nt"), dir.join("hard.nt")).unwrap();
+        refused(&["convert", "one.nt", "-o", "hard.nt"]);
+        // out-dir conversion refuses it too
+        std::fs::create_dir(dir.join("o")).unwrap();
+        std::fs::write(dir.join("o/same.nt"), nt).unwrap();
+        let o = run(
+            dir,
+            &[
+                "convert",
+                "o/same.nt",
+                "--out-dir",
+                "o",
+                "--output",
+                "nt",
+                "--overwrite",
+            ],
+        );
+        assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+        assert!(err(&o).contains("is the input"), "{}", err(&o));
+        assert_eq!(std::fs::read_to_string(dir.join("o/same.nt")).unwrap(), nt);
+    }
+    // a malformed source leaves an existing output untouched, and no temporary file
+    std::fs::write(dir.join("kept.nt"), "kept\n").unwrap();
+    let o = run(dir, &["convert", "bad.nt", "-o", "kept.nt"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("kept.nt left unchanged"), "{}", err(&o));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("kept.nt")).unwrap(),
+        "kept\n"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".sparkles-out-")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    // a good source replaces it
+    let o = run(dir, &["convert", "a.ttl", "-o", "kept.nt"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("kept.nt"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+}
+
 /// Directories: merged into one output file, or mirrored into an output directory in
 /// parallel; files without a known extension by their content, unknown ones skipped.
 #[test]

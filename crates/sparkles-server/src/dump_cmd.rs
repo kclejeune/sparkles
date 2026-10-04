@@ -24,7 +24,7 @@ pub struct DumpArgs {
     #[arg(long)]
     at: Option<String>,
     /// Write to this file instead of stdout (its extension picks the syntax and the
-    /// compression)
+    /// compression), through a temporary file that replaces it when the dump completes
     #[arg(long)]
     out: Option<PathBuf>,
     /// Output syntax: nq, trig, nt, ttl, jsonld, rdfxml, trix, rt (RDF Thrift), rpb (RDF
@@ -114,10 +114,16 @@ pub fn run(a: DumpArgs, opts: StoreOptions) -> Result<()> {
             .and_then(Codec::from_extension)
             .unwrap_or_default(),
     )?;
-    let sink: Box<dyn std::io::Write> = match &a.out {
-        Some(p) => {
-            Box::new(std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?)
-        }
+    // written through a temporary file that replaces the output when the dump is done
+    let staged = match &a.out {
+        Some(p) => Some(crate::tools::out_file::OutFile::create(
+            p,
+            a.loc.as_deref(),
+        )?),
+        None => None,
+    };
+    let sink: Box<dyn std::io::Write> = match &staged {
+        Some(o) => Box::new(o.file()?),
         None => Box::new(std::io::stdout().lock()),
     };
     let w = codec.writer(
@@ -128,6 +134,10 @@ pub fn run(a: DumpArgs, opts: StoreOptions) -> Result<()> {
     match &a.loc {
         Some(loc) => local(loc, &a, &plan, w, opts),
         None => remote(&a, &plan, w),
+    }?;
+    match staged {
+        Some(o) => o.commit(),
+        None => Ok(()),
     }
 }
 
