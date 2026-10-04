@@ -59,8 +59,8 @@ full feature list is in [FEATURES.md](FEATURES.md).
 
 | Area | QLever | Sparkles |
 |---|---|---|
-| Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Measured up to 1.24 billion triples (English DBpedia, [BENCHMARKS.md](BENCHMARKS.md#dbpedia-at-124-billion-triples)). It loads them in 584 s, where QLever takes 1,674 s on the same machine. |
-| Streaming execution | Lazy, block-wise scans, joins, filters and GROUP BY; results streamed to the client | Every operator materializes its result, within row and memory budgets. Responses over 1 MiB are streamed as they are serialized. Materialization and the 1 GiB block cache trade memory for speed. After the 10.5M benchmark, Sparkles' server holds 892 MiB to QLever's 676 MiB. Of that, 379 MiB is the block cache, and a server with the cache off ends at 319 MiB at about half the throughput ([BENCHMARKS.md](BENCHMARKS.md#memory-and-the-speed-it-buys)). |
+| Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Measured up to 1.24 billion triples (English DBpedia, [BENCHMARKS.md](BENCHMARKS.md#dbpedia-at-124-billion-triples)). It loads them in 596 s, where QLever takes 1,674 s on the same machine. |
+| Streaming execution | Lazy, block-wise scans, joins, filters and GROUP BY; results streamed to the client | Every operator materializes its result, within row and memory budgets. Responses over 1 MiB are streamed as they are serialized. Materialization and the 1 GiB block cache trade memory for speed. After the 10.5M benchmark, Sparkles' server holds 916 MiB to QLever's 653 MiB. Of that, 379 MiB is the block cache, and a server with the cache off ends at 331 MiB at about half the throughput ([BENCHMARKS.md](BENCHMARKS.md#memory-and-the-speed-it-buys)). |
 | Block prefiltering | FILTER ranges and STRSTARTS checked against block min/max to skip blocks | Numeric range FILTERs on a scan's sort column read only the matching id ranges (inline integers and decimals). Non-canonical numerals are tested row by row. `STRSTARTS` and a `REGEX` anchored on a literal start read only the vocabulary ids of the keys with that start. |
 | Pattern trick | `ql:has-predicate`, per-subject predicate patterns | ✗ (predicate counts come from index runs) |
 | Text and spatial | `ql:contains-word`, BM25 scoring, spatial joins, a geo index | BM25 search through `text:query` (no text/entity co-occurrence index). GeoSPARQL functions, a spatial index, spatial joins and nearest-neighbour ORDER BY. |
@@ -138,10 +138,11 @@ Sparkles' own.
 Oxigraph describes its query evaluation as "not optimized yet". It evaluates lazily, one
 iterator per RocksDB scan. In the benchmarks at 10.5M triples, it answers point lookups
 and single paths about as fast as Sparkles, within 1.1–1.4×. Joins, grouping, sorting and
-counting run about 30–1,400× slower, and one EXISTS join 8,553× slower. It serves 1.7
-concurrent star-join queries per second to Sparkles' 242. Its load, including
-`optimize`, takes 13.2 s to Sparkles' 6.5 s. Its single-triple updates are the fastest
-of the five engines, 3.7 ms to Sparkles' 4.9 ms, because it does not fsync them.
+counting run about 20–1,700× slower, and one EXISTS join 8,295× slower. It serves 1.7
+concurrent star-join queries per second to Sparkles' 243. Its load, including
+`optimize`, takes 14.1 s to Sparkles' 3.7 s. A single-triple update takes 4.3 ms to
+Sparkles' 4.2 ms, although Oxigraph does not fsync it, and Oxigraph commits a stream of
+them 2.7× faster.
 Oxigraph has no reasoning, SHACL, full-text or vector search, path search, CSV imports,
 point-in-time reads, authentication or per-dataset permissions, Fuseki admin API, GraphQL
 endpoint, query budgets, result cache or web UI.

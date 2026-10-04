@@ -381,7 +381,13 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
   (hyperfine), cold (one run after a restart with the engine's files evicted from the
   page cache; `--no-cold` skips it), and two of them under 16 concurrent clients. Loads
   record their time, peak RSS (GNU `time`) and index size. `--engines` also takes `jena`
-  (TDB2 `xloader` and Fuseki) and `oxigraph`. Jena and Oxigraph store `xsd:float`
+  (TDB2 `xloader` and Fuseki), `oxigraph` and `fluree`. Fluree is the release binary that
+  `scripts/bench.sh` downloads. Its bulk import reads a directory of `.nt.zst` files, but
+  version 4.2.2 fails on a file larger than its chunk size, so the load step first splits
+  the files into pieces of whole lines of at most 512 MB uncompressed (`FLUREE_PIECE`),
+  outside the timed load.
+  `LOAD_TIMEOUT` (for example `4h`) stops a load that takes longer, and the load then
+  fails. Jena and Oxigraph store `xsd:float`
   literals as values, so latitudes written with different precision that round to the
   same float are one triple there and two in Sparkles and QLever (3 triples at `50m`):
   `count-all` and `predicate-counts` then have no majority answer and are not ranked.
