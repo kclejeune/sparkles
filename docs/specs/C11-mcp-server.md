@@ -1428,13 +1428,13 @@ If day 2 slips, `explain_query` warnings beyond `unknown-term` move to Phase 2.
 - **W3C SPARQL 1.1 Query Language and Protocol:** query forms, algebra (`Slice`), term
   syntax, `SERVICE`, `LOAD`. Cited from working knowledge.
 - **Sparkles repository** (the only implementation source):
-  - `crates/sparkles/src/schema.rs`: `discover`, `SchemaOptions`, `SchemaError`,
+  - `crates/sparkles-core/src/schema.rs`: `discover`, `SchemaOptions`, `SchemaError`,
     `GraphSelection`, `page_after`;
-  - `crates/sparkles/src/sparql/mod.rs`: `QueryOptions`, `query`, `execute_query`,
+  - `crates/sparkles-core/src/sparql/mod.rs`: `QueryOptions`, `query`, `execute_query`,
     `explain`, `QueryResult`, DESCRIBE;
-  - `crates/sparkles/src/sparql/{results.rs,update.rs,exec.rs}`: writers,
+  - `crates/sparkles-core/src/sparql/{results.rs,update.rs,exec.rs}`: writers,
     `LimitedWriter`, `UpdateStats`, `LOAD`, SERVICE gate;
-  - `crates/sparkles/src/{error.rs,store.rs,commit.rs,index.rs,vector.rs}`: `Error`,
+  - `crates/sparkles-core/src/{error.rs,store.rs,commit.rs,index.rs,vector/mod.rs}`: `Error`,
     `Budget`, `Snapshot::commit`, the lock, generation unlinking, `CommitInfo`, `Perm`,
     vector constants;
   - `crates/sparkles-server/src/{http.rs,http/schema.rs,main.rs,state.rs}` and

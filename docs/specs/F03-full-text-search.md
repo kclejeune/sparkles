@@ -326,7 +326,7 @@ gives 400.
 
 | Where | Change |
 |---|---|
-| `crates/sparkles/Cargo.toml` | Add `tantivy = { version = "0.26", default-features = false, features = ["mmap","stemmer","lz4-compression"], optional = true }` and `[features] text = ["dep:tantivy"]`. |
+| `crates/sparkles-core/Cargo.toml` | Add `tantivy = { version = "0.26", default-features = false, features = ["mmap","stemmer","lz4-compression"], optional = true }` and `[features] text = ["dep:tantivy"]`. |
 | `crates/sparkles-server/Cargo.toml` | Add `text = ["sparkles/text"]` to `default`. |
 | `sparkles/src/text/mod.rs` (new, `cfg(feature="text")`) | Holds `TextConfig`, the schema, `TextIndex` (writer, reader, state, paths), `TextView`, `apply_commit`, `rebuild`, `recover` and `search`. |
 | `sparkles/src/sparql/textpf.rs` (new, always compiled) | Recognizes `text:query` in a BGP and decodes the collections into a `TextCall`. It is pure algebra, with no Tantivy. |
@@ -619,7 +619,7 @@ ex:g1 { ex:b4 rdfs:label "Fox in Socks" }
 
 * The Sparkles repository:
   * `README.md`, `docs/API.md` and `docs/AUDIT.md` for feature status and API conventions;
-  * `crates/sparkles/src/store.rs` for generations, the WAL format and replay,
+  * `crates/sparkles-core/src/store.rs` for generations, the WAL format and replay,
     `publish_log`, `rebuild_locked` and the preservation of blank-node ids;
   * `id.rs` for term keys and tags;
   * `vocab.rs` for `prefix_range` and `get_sorted`;
@@ -684,7 +684,7 @@ an admin panel and ranked search in Explore. Clones keep text search enabled (`8
   for the doc store (`docstoreCompression`). That brings in tantivy's `zstd-compression`
   when the `zstd` feature is on.
 
-**Tests at landing.** Integration tests in `crates/sparkles/tests/text.rs` cover the
+**Tests at landing.** Integration tests in `crates/sparkles-core/tests/text.rs` cover the
 acceptance examples, with a test hook that fails an index commit. Server tests cover the
 routes, and the Playwright smoke tests include text search.
 

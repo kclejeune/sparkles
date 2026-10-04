@@ -140,7 +140,9 @@ pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>]) {
                 ctx.probes.lock().insert(v, p);
             }
             Ok(None) => {}
-            Err(e) => tracing::debug!("no key probes for ?{}: {e}", ctx.var_name(v)),
+            Err(e) => {
+                tracing::debug!(target: "sparkles::sparql::keyprobe", "no key probes for ?{}: {e}", ctx.var_name(v))
+            }
         }
     }
 }

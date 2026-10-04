@@ -49,6 +49,7 @@ mise run serve        # build, then serve ./data on :3030
 mise run fmt          # cargo fmt + oxfmt        (fmt:check for CI)
 mise run lint         # clippy -D warnings + svelte-check
 mise run lint:features # clippy -D warnings over feature combinations (in ci)
+mise run lint:doc-paths # every crates/sparkles… path cited in the docs exists (in ci)
 mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
 mise run fmt:fuzz     # fuzz the formatter with cargo-fuzz (needs nightly and cargo-fuzz; not in ci)
 mise run test         # all Rust tests            (test:w3c, test:shacl, test:shex for suite summaries)
@@ -62,7 +63,7 @@ mise run py:build     # the Python wheel (crates/sparkles-py) into target/wheels
 mise run py:sdist     # the Python source distribution into target/wheels
 mise run py:test      # build the Python extension and run its pytest suite (in ci, with py:lint)
 mise run py:lock      # refresh crates/sparkles-py/Cargo.lock from Cargo.lock
-mise run ci           # fmt:check + lint + lint:features + fmt:wasm + test + ui:test + py:lint + py:test + licenses:check
+mise run ci           # fmt:check + lint + lint:features + lint:doc-paths + fmt:wasm + test + ui:test + py:lint + py:test + licenses:check
 mise run doc          # API docs of the library crates
 mise run openapi      # rewrite docs/openapi.json after an API change (a test fails until then)
 mise run docs:screenshots # the README's screenshots (docs/images) from the demo dataset in docs/demo
@@ -147,6 +148,11 @@ Code that only some features use is gated on those features, and this task catch
 code and missing gates. Every combination shares the workspace target directory. The
 first run builds the dependencies once per feature set. After that, a change costs a
 minute or two.
+
+`mise run lint:doc-paths` (`scripts/check-doc-paths.py`) checks that every
+`crates/sparkles…` path cited in the README, `docs/*.md`, `docs/specs` and the comments of
+the Rust sources exists. It expands `{a,b}` groups and ignores line numbers. A file that a
+spec describes before it is written goes in the script's `PLANNED` set.
 
 ### Python bindings
 

@@ -97,7 +97,7 @@ impl Source {
         };
         let (codec, warning) = Codec::detect(self.compression, &prefix[..n], path)?;
         if let Some(w) = warning {
-            tracing::warn!("{w}");
+            tracing::warn!(target: "sparkles::io", "{w}");
         }
         if !codec.supported() {
             return Err(Error::Unsupported(format!(
@@ -126,7 +126,7 @@ pub fn sniff_codec(r: &mut impl Read, path: Option<&Path>, name: &str) -> Result
     }
     let (codec, warning) = Codec::detect(None, &head[..n], path)?;
     if let Some(w) = warning {
-        tracing::warn!("{w}");
+        tracing::warn!(target: "sparkles::io", "{w}");
     }
     if !codec.supported() {
         return Err(Error::Unsupported(format!(

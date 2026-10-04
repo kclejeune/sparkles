@@ -1815,7 +1815,7 @@ Results go in `docs/BENCHMARKS.md` (measured numbers only).
      the §4.1 trailing-operator and nested-chain examples, and `prefix-groups` with the
      empty label and with a `BASE` inside the run.
 2. **W3C corpora.** These reuse the Apache Jena checkout that the SPARQL suites use.
-   `SPARKLES_W3C_DIR` works as in `crates/sparkles/tests/w3c.rs` and defaults to Jena's
+   `SPARKLES_W3C_DIR` works as in `crates/sparkles-core/tests/w3c.rs` and defaults to Jena's
    `jena-arq/testing/rdf-tests-cg` in a sibling checkout. The tests are skipped when the
    checkout is absent.
    - **SPARQL** (`sparql/sparql10`, `sparql11`, `sparql12`): every positive syntax test
@@ -2157,8 +2157,8 @@ this spec already stated; a key name means the default can be changed (§2.2).
 - `ui/src/lib/components/SparqlEditor.svelte` (CodeMirror 6 keymap, `Prec.highest`);
 - `ui/src/lib/sparql-lang.ts` (`highlightError`, 1-based columns);
 - `ui/src/routes/query/+page.svelte` (toolbar, `showError`);
-- `crates/sparkles/src/sparql/mod.rs` (`parse_query` with dataset prefixes);
-- `crates/sparkles/tests/w3c.rs` (`SPARKLES_W3C_DIR`);
+- `crates/sparkles-core/src/sparql/mod.rs` (`parse_query` with dataset prefixes);
+- `crates/sparkles-core/tests/w3c.rs` (`SPARKLES_W3C_DIR`);
 - `mise.toml` (`fmt:check`: `cargo fmt --check` plus Prettier);
 - spargebra 0.4.7 `parser.rs` (random blank nodes and variables; `AdditiveExpression`);
 - oxttl 0.2.4 (anonymous blank nodes are random, labels are kept, language tags are

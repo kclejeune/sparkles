@@ -316,6 +316,7 @@ fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx) -> Option<Offer<'p>> {
     }
     if !drive.certain.contains(&key) {
         tracing::debug!(
+            target: "sparkles::sparql::indexjoin",
             "index join on {} not offered: the input does not always bind it",
             var_str(ctx, key)
         );
@@ -327,6 +328,7 @@ fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx) -> Option<Offer<'p>> {
     };
     let Some(probe_cost) = side.cost(keys_in, probe.cost) else {
         tracing::debug!(
+            target: "sparkles::sparql::indexjoin",
             "index join on {} into {} not offered: probing {keys_in:.0} keys costs more than scanning {:.0} rows",
             var_str(ctx, key),
             scan.desc,
@@ -479,7 +481,7 @@ fn fuse(mut n: Node, ctx: &Ctx) -> Node {
         return n;
     }
     if let Err(why) = fusable(low, top, inner) {
-        tracing::debug!("star on {} not fused: {why}", var_str(ctx, top.key));
+        tracing::debug!(target: "sparkles::sparql::indexjoin", "star on {} not fused: {why}", var_str(ctx, top.key));
         return n;
     }
     let spec = IndexJoinSpec {

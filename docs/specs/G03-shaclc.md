@@ -1,10 +1,11 @@
 # G03: SHACL Compact Syntax and SHACL 1.2 list constraints
 
-> **Status:** implemented in part (Phase 1)
+> **Status:** implemented in part (Phase 1 and two of the later items)
 >
 > **Phases:** Phase 1 is the SHACLC reader and writer in `sparkles-shacl`, SHACLC wherever
-> shapes are read or shown, and the four SHACL 1.2 list constraint components. The later
-> items of §9 are not built.
+> shapes are read or shown, and the four SHACL 1.2 list constraint components. Of the
+> later items of §9, `sparkles shacl parse` converts shapes between syntaxes and the MCP
+> tool `draft_shapes` returns SHACLC. A comment-preserving SHACLC formatter is not built.
 >
 > **User docs:** [API: SHACL Compact Syntax](../API.md#shacl-compact-syntax-shaclc) ·
 > [API: SHACL validation](../API.md#shacl-validation) ·
@@ -463,6 +464,25 @@ mode, and the incremental results equal full validation's.
 **Performance.** Not measured. Parsing and writing SHACLC are linear in the document.
 A list constraint costs two index scans per list cell and value node.
 
+**Later items, 2026-10-03.** Two items of §9 landed.
+* **`sparkles shacl parse FILE…`** reads shapes files in any syntax, checks that they
+  are well-formed SHACL, and prints them in the syntax of `--out`: `shaclc` (the
+  default), `turtle`, `nt`, `jsonld` or `rdfxml`. It follows `sparkles shex parse`, with
+  a `# FILE` line before each of several files, `-` for stdin, `--in` and `--base`. The
+  validation form `sparkles shacl --shapes …` is unchanged. Clap's
+  `args_conflicts_with_subcommands` keeps its flags apart from the subcommand. Two choices
+  differ from validation. A SHACLC file is read without its location as the base, because
+  the reader names the base as the ontology (`<base> a owl:Ontology`) when the document
+  has no `BASE`, and a conversion should not add that triple. The predeclared SHACLC
+  prefixes `rdf`, `rdfs`, `sh` and `xsd` are offered to the Turtle writer, which writes
+  those the graph uses. `tests/cli_shaclc.rs` converts SHACLC to Turtle and back to the
+  same graph, and checks stdin, several files, a graph SHACLC cannot express, ill-formed
+  SHACL and the usage errors.
+* **The MCP tool `draft_shapes`** takes `shapesFormat` (`turtle` or `shaclc`) for SHACL
+  drafts and returns it with the text. The draft already rendered SHACLC for
+  `/$/schema/{ds}/shapes`, so no new code renders it. `shapesFormat` with
+  `language: "shex"` is a `bad-argument`.
+
 **Not built.** A comment-preserving SHACLC formatter for `sparkles fmt`, `POST /$/format`
-and the editor. A CLI command that converts shapes between syntaxes, like Jena's `shacl
-parse --out=compact`. SHACLC output from the MCP tool `draft_shapes`.
+and the editor. §9 makes it wait for users who ask for it, and it needs a lossless
+SHACLC parser in `sparkles-fmt` next to the one in `sparkles-shacl`.

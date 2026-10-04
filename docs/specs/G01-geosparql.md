@@ -903,7 +903,7 @@ are `400` with `Error::Invalid`.
 
 | Where | Change |
 |---|---|
-| `crates/sparkles/Cargo.toml` | Optional dependencies: `geo = "0.33"` with default features off (`earcutr` and `spade` are not needed), `wkt = "0.14"`, `geojson = "1"`, `geographiclib-rs = "0.2"` (already a `geo` dependency) and `geo-index = "0.4"`. The feature is `[features] geo = ["dep:geo", "dep:wkt", "dep:geojson", "dep:geo-index"]`. |
+| `crates/sparkles-core/Cargo.toml` | Optional dependencies: `geo = "0.33"` with default features off (`earcutr` and `spade` are not needed), `wkt = "0.14"`, `geojson = "1"`, `geographiclib-rs = "0.2"` (already a `geo` dependency) and `geo-index = "0.4"`. The feature is `[features] geo = ["dep:geo", "dep:wkt", "dep:geojson", "dep:geo-index"]`. |
 | `crates/sparkles-server/Cargo.toml` | `geo = ["sparkles/geo"]`, added to `default`. |
 | `sparkles/src/geo/mod.rs` (always compiled) | IRIs, `GeoConfig` (serde), `GeoStatus`, the `not_built()` error, and the CRS and unit tables. These are pure data, so the planner can recognize the terms without the feature. |
 | `geo/geom.rs` (`cfg(feature="geo")`) | `Geom`, parsing (a WKT front end over `wkt`, and GeoJSON), writing (§4.1.5) and axis handling. |
@@ -1361,7 +1361,7 @@ not against the rounded numbers shown here.
 
 ## 8. Conformance testing
 
-* **Sparkles' own tests** (§7) live in `crates/sparkles/src/sparql/tests.rs` and a new
+* **Sparkles' own tests** (§7) live in `crates/sparkles-core/src/sparql/tests.rs` and a new
   `geo/tests.rs`. They cover parser edge cases, CRS and axis handling, the DE-9IM table,
   the distance models against reference values, and budgets.
 * **Oxigraph's GeoSPARQL test suite** (`testsuite/oxigraph-tests/geosparql/`) has 44 cases
@@ -1571,9 +1571,9 @@ list gets updated too, since QLever's libspatialjoin is likely faster on huge se
     `docs/BENCHMARKS.md`, the project's feature planning notes,
     [F03](F03-full-text-search.md), [F04](F04-vector-search.md),
     [PROVENANCE.md](PROVENANCE.md);
-  * `crates/sparkles/src/`:
+  * `crates/sparkles-core/src/`:
     * `text.rs`: deferred commits, views and slots, open, WAL catch-up, rebuild;
-    * `vector.rs`: per-generation segments, delta overlay, budget, search kernel;
+    * `vector/`: per-generation segments, delta overlay, budget, search kernel;
     * `store.rs`: `Generation`, `Delta`, `Snapshot`, `publish_log`, `rebuild_locked`,
       `maintain_text`, `StoreOptions`;
     * `id.rs`: tags and inline types;

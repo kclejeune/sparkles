@@ -395,12 +395,13 @@ pub(crate) fn write(
                     )
                 })
                 .collect();
-            tracing::debug!("partial compaction: blocks written in {:?}", t0.elapsed());
+            tracing::debug!(target: "sparkles::store::partial", "partial compaction: blocks written in {:?}", t0.elapsed());
             r
         },
         || {
             let r = update_stats(snap);
             tracing::debug!(
+                target: "sparkles::store::partial",
                 "partial compaction: statistics updated in {:?}",
                 t0.elapsed()
             );
