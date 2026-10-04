@@ -86,6 +86,19 @@ Rust, Python and JVM APIs, a Fuseki-compatible server and CLI, and a web UI.
 * GeoSPARQL 1.1 with a spatial index, Jena's `spatial:` functions, spatial joins and
   nearest-neighbour search ([API](docs/API.md#geosparql)).
 
+**Command line and tooling**
+* A `sparkles` CLI with equivalents of Jena's `tdb2.*` and `arq` commands. They work on
+  a database directory or on a remote server, and cover loads, dumps, backups, history,
+  reasoning, validation and indexes ([usage](docs/USAGE.md#command-line-tools)).
+* Jena's file tools: `convert` (`riot`) to validate and convert RDF, `compare`
+  (`rdfdiff`), `qparse`, `uparse`, `rsparql`, `rupdate`, `rset`, `rdfpatch`, `iri` and
+  `langtag` ([usage](docs/USAGE.md#file-tools)).
+* A formatter for SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD that keeps
+  comments and checks its own output, and a linter with safe fixes
+  ([formatting](docs/USAGE.md#formatting), [linting](docs/USAGE.md#linting)).
+* `sparkles lsp`, a language server that brings the formatter and linter to editors
+  ([editors](docs/editors.md)), and shell completions and man pages.
+
 **Libraries and bindings**
 * A Rust library with the whole engine. Its `Dataset` API covers queries, updates,
   transactions and loads, and its handles cover snapshots, history, indexes, reasoning,
@@ -108,9 +121,7 @@ Rust, Python and JVM APIs, a Fuseki-compatible server and CLI, and a web UI.
 * Stored queries with typed parameters, a read-only GraphQL endpoint over a mapping
   schema, and an MCP server whose tools run as the caller
   ([MCP](docs/USAGE.md#mcp-server-llm-agents), [GraphQL](docs/API.md#graphql)).
-* A web UI embedded in the binary, a Jena-style CLI that works on a database directory
-  or a remote server, a formatter, linter and language server for SPARQL and RDF, and
-  Prometheus metrics and OpenTelemetry traces.
+* A web UI embedded in the binary, Prometheus metrics and OpenTelemetry traces.
 * A Docker image and compose file, and a Nix package with a NixOS module
   ([Docker](docs/USAGE.md#docker), [NixOS](docs/USAGE.md#deploying-on-nixos)).
 
