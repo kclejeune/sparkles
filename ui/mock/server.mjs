@@ -11,6 +11,14 @@ import http from 'node:http';
 import { performance } from 'node:perf_hooks';
 import ox from 'oxigraph';
 import { handleBackups } from './backups.mjs';
+import {
+  allCommits,
+  chooseBranch,
+  createBranch,
+  handleBranches,
+  initBranches,
+  resolveBranch,
+} from './branches.mjs';
 import { handleDescribe } from './describe.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
@@ -43,6 +51,7 @@ function cloneGraphFilter(names) {
 
 /** @type {Map<string, any>} */
 const datasets = new Map();
+const allDatasets = datasets;
 /** @type {any[]} */
 const tasks = [];
 let taskSeq = 1;
@@ -67,6 +76,7 @@ function makeDataset(name, type) {
     textBuilding: false,
     textRebuilt: null,
   };
+  initBranches(ds);
   addCommit(ds, 'create', 0, 0);
   datasets.set(name, ds);
   return ds;
@@ -76,7 +86,7 @@ function makeDataset(name, type) {
 // commits
 
 function addCommit(ds, kind, inserted, deleted, opts = {}) {
-  const head = ds.commits[ds.commits.length - 1];
+  const head = headCommit(ds);
   const seq = head ? head.seq + 1 : 0;
   const ts = Math.max(opts.at ?? Date.now(), head ? Date.parse(head.timestamp) : 0);
   const c = {
@@ -91,12 +101,17 @@ function addCommit(ds, kind, inserted, deleted, opts = {}) {
     generation: ds.type === 'mem' ? 'mem' : 'gen-0001',
     bulk: !!opts.bulk,
     exact: opts.exact ?? true,
+    branch: ds.branchName,
+    branchId: ds.branchId,
   };
   ds.commits.push(c);
   return c;
 }
 
-const headCommit = (ds) => ds.commits[ds.commits.length - 1];
+/** The newest commit of a dataset or branch (inherited ones included). */
+function headCommit(ds) {
+  return allCommits(ds).at(-1);
+}
 
 /** Quads of the store as N-Quads lines, to diff a write. */
 const quadSet = (ds) => new Set(ds.store.match().map(String));
@@ -161,6 +176,16 @@ function seedHistory(ds) {
   scratch.baseQuads = scratch.store.size;
   addCommit(scratch, 'upload', scratch.store.size, 0, { bulk: true });
   seedVectors(datasets);
+  // a branch of foaf two commits ahead of main
+  const dev = createBranch(foaf, { name: 'dev', note: 'schema migration' }).branch;
+  for (const u of [
+    'INSERT DATA { <http://example.org/ontology#Contractor> a <http://www.w3.org/2002/07/owl#Class> }',
+    'INSERT DATA { <http://example.org/ontology#Contractor> <http://www.w3.org/2000/01/rdf-schema#label> "Contractor"@en }',
+  ]) {
+    const before = quadSet(dev);
+    dev.store.update(u);
+    commitWrite(dev, 'update', before);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +208,7 @@ function info(ds) {
     head: headCommit(ds).seq,
     modified: headCommit(ds).timestamp,
     text: ds.text ? { state: textState(ds), docs: textDocs(ds).length } : null,
+    ...(ds.type === 'mem' ? {} : { branches: 1 + ds.branchSet.size }),
     ...(ds.origin ? { forkedFrom: ds.origin.forkedFrom, origin: ds.origin } : {}),
   };
 }
@@ -192,7 +218,8 @@ function send(res, status, body, type = 'application/json', headers = {}) {
   res.writeHead(status, {
     'Content-Type': type,
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Expose-Headers': 'X-Request-Id, Sparkles-Commit, Sparkles-Dataset-Id',
+    'Access-Control-Expose-Headers':
+      'X-Request-Id, Sparkles-Commit, Sparkles-Dataset-Id, Sparkles-Branch, Sparkles-Branch-Id',
     'X-Request-Id': res.requestId ?? '',
     ...headers,
   });
@@ -1902,8 +1929,8 @@ function schemaPage(items, limit, cursor) {
 const server = http.createServer(async (req, res) => {
   if (LATENCY) await new Promise((r) => setTimeout(r, LATENCY));
   const url = new URL(req.url ?? '/', 'http://localhost');
-  const path = decodeURIComponent(url.pathname);
-  const seg = path.split('/').filter(Boolean);
+  let path = decodeURIComponent(url.pathname);
+  let seg = path.split('/').filter(Boolean);
   const incoming = String(req.headers['x-request-id'] ?? '');
   res.requestId = /^[A-Za-z0-9._:-]{1,128}$/.test(incoming) ? incoming : nextRequestId();
   const counted = req.method === 'OPTIONS' ? null : classify(seg, req.method, url);
@@ -1920,6 +1947,39 @@ const server = http.createServer(async (req, res) => {
   };
   res.on('finish', log);
   try {
+    // the branch the request chose (mock/branches.mjs): `datasets` below answers the
+    // dataset's name with that branch
+    const chosen = chooseBranch(path, seg, url);
+    if (chosen.error) return send(res, ...chosen.error);
+    ({ path, seg } = chosen);
+    let datasets = allDatasets;
+    if (chosen.name) {
+      const dsName = seg[0] === '$' ? (seg[1] === 'cache' ? seg[3] : seg[2]) : seg[0];
+      const r = resolveBranch(allDatasets.get(dsName ?? ''), chosen.name);
+      if (r.error) return send(res, ...r.error);
+      if (r.ds) {
+        res.setHeader('Sparkles-Branch', chosen.name);
+        res.setHeader('Sparkles-Branch-Id', r.ds.branchId);
+        datasets = new Proxy(allDatasets, {
+          get(target, prop) {
+            if (prop === 'get') return (n) => (n === dsName ? r.ds : target.get(n));
+            const v = Reflect.get(target, prop, target);
+            return typeof v === 'function' ? v.bind(target) : v;
+          },
+        });
+      }
+    }
+    // branches and merges (mock/branches.mjs)
+    if (
+      await handleBranches(req, res, url, seg, {
+        datasets,
+        send,
+        fail,
+        readBody,
+        addCommit,
+      })
+    )
+      return;
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
@@ -2229,6 +2289,8 @@ const server = http.createServer(async (req, res) => {
             res,
             200,
             startTask('compact', ds, () => {
+              // a branch no longer reads its upstream's index files
+              ds.compacted = true;
               ds.baseQuads = ds.store.size;
               ds.deltaInserts = 0;
               ds.deltaDeletes = 0;
@@ -2334,7 +2396,7 @@ const server = http.createServer(async (req, res) => {
             if (Number.isNaN(seq)) return fail(res, 400, `invalid commit reference '${extra}'`);
             if (seq > head.seq)
               return fail(res, 404, `no commit ${seq} in dataset ${name} (head is ${head.seq})`);
-            const c = ds.commits.find((x) => x.seq === seq);
+            const c = allCommits(ds).find((x) => x.seq === seq);
             if (!c)
               return fail(res, 410, `commit metadata before ${seq + 1} is no longer retained`);
             return send(res, 200, { dataset: name, datasetId: ds.id, commit: c });
@@ -2347,8 +2409,10 @@ const server = http.createServer(async (req, res) => {
             return fail(res, 400, 'invalid commit range: use either before or after');
           const list =
             after != null
-              ? ds.commits.filter((c) => c.seq > after).slice(0, limit)
-              : ds.commits
+              ? allCommits(ds)
+                  .filter((c) => c.seq > after)
+                  .slice(0, limit)
+              : allCommits(ds)
                   .filter((c) => before == null || c.seq < before)
                   .reverse()
                   .slice(0, limit);
@@ -2451,6 +2515,15 @@ const server = http.createServer(async (req, res) => {
     const ds = datasets.get(seg[0] ?? '');
     if (!ds) return fail(res, 404, `No such dataset: ${seg[0] ?? ''}`);
     const op = seg[1] ?? '';
+    const writes =
+      (op === 'upload' && req.method === 'POST') ||
+      op === 'update' ||
+      (['data', 'get'].includes(op) && !['GET', 'HEAD'].includes(req.method ?? ''));
+    if (
+      ds.protected &&
+      (writes || (['', 'sparql', 'query'].includes(op) && url.searchParams.has('update')))
+    )
+      return fail(res, 403, `branch ${ds.branchName} is protected`, { code: 'branch-protected' });
     if (op === 'upload' && req.method === 'POST') return handleUpload(req, res, ds, url);
     const p = await params(req, url);
     if (['', 'sparql', 'query'].includes(op)) {

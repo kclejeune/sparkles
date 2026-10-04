@@ -3,6 +3,7 @@
 
 import { CSRF_HEADER, needsCsrf, type Level } from './auth';
 import { fmtBytes, fmtInt } from './format';
+import { branchPath } from './branches';
 import { cloneBody, type CloneMethod, type CloneOptions } from './clone';
 import { mappingPart, tableParams } from './upload';
 
@@ -46,6 +47,8 @@ export type DatasetInfo = {
   geo?: { state: GeoState; rows: number } | null;
   /** The caller's level on the dataset; absent without auth (then everything goes). */
   access?: Level;
+  /** The number of branches, `main` included; absent on servers without branches. */
+  branches?: number;
 };
 
 /** Per-request budgets of the server; 0 means unlimited. */
@@ -425,6 +428,8 @@ type ApiErrorExtra = {
   budget?: Budget;
   /** the machine-readable error code of bodies that have one (`syntax`, `bad-request` …) */
   code?: string;
+  /** the whole JSON body (a merge's conflict report) */
+  body?: Record<string, unknown>;
 };
 
 /** Error shape for non-2xx responses: `{ error, detail?, line?, column? }`. */
@@ -437,6 +442,8 @@ export class ApiError extends Error {
   requestId?: string;
   budget?: Budget;
   code?: string;
+  /** The whole JSON error body. */
+  body?: Record<string, unknown>;
   constructor(status: number, message: string, extra: ApiErrorExtra = {}) {
     super(message);
     this.name = 'ApiError';
@@ -447,6 +454,7 @@ export class ApiError extends Error {
     this.requestId = extra.requestId;
     this.budget = extra.budget;
     this.code = extra.code;
+    this.body = extra.body;
   }
 }
 
@@ -511,6 +519,7 @@ async function toError(res: Response): Promise<ApiError> {
         requestId,
         budget: budgetOf(body),
         code: typeof body.code === 'string' ? body.code : undefined,
+        body,
       });
     }
   } catch {
@@ -558,11 +567,15 @@ async function withCsrf(init: RequestInit): Promise<RequestInit> {
   return { ...init, headers };
 }
 
+/**
+ * Fetch a path of the API. A dataset written as `name@branch` (see `onBranch`) works on
+ * that branch: `branchPath` turns it into the path form or the `branch=` parameter.
+ */
 export async function request(path: string, init: RequestInit = {}): Promise<Response> {
   const withToken = await withCsrf(init);
   let res: Response;
   try {
-    res = await fetch(path, withToken);
+    res = await fetch(branchPath(path), withToken);
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') throw e;
     throw new ApiError(0, 'Cannot reach the Sparkles server', {
@@ -1419,7 +1432,7 @@ export async function upload(
     for (const f of files) form.append('file', f, f.name);
     const params = opts.tables ? tableParams(opts.tables) : '';
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/${enc(ds)}/upload?receipt=true${params ? `&${params}` : ''}`);
+    xhr.open('POST', branchPath(`/${enc(ds)}/upload?receipt=true${params ? `&${params}` : ''}`));
     xhr.setRequestHeader('Accept', 'application/json');
     if (csrf) xhr.setRequestHeader(CSRF_HEADER, csrf);
     xhr.upload.onprogress = (e) =>
@@ -1651,6 +1664,7 @@ export type CommitKind =
   | 'transaction'
   | 'embed'
   | 'patch'
+  | 'merge'
   | 'unknown';
 
 /** One commit: the state after a write that changed data. */
@@ -1683,6 +1697,11 @@ export type Commit = {
   snapshots?: string[];
   /** The message recorded with the commit. */
   message?: string;
+  /** The branch that made the commit (null once deleted); absent on servers without branches. */
+  branch?: string | null;
+  branchId?: string;
+  /** A merge commit's second parent: the merged commit. */
+  mergedFrom?: { branch: string | null; branchId: string; seq: number };
 };
 
 /** What a write produced: the new commit, or the unchanged head when nothing changed. */
@@ -1737,6 +1756,136 @@ export function commits(
     cache: 'no-store',
   });
 }
+
+// --- branches and merges (F09) -------------------------------------------------------
+
+/** A branch of a persistent dataset (`GET /$/branches/{ds}`). */
+export type Branch = {
+  name: string;
+  id: string;
+  ordinal: number;
+  /** The head commit and its time. */
+  head: number;
+  modified: string;
+  /** The commit it started from; null for `main`. */
+  from: { branch: string | null; branchId: string; seq: number } | null;
+  /** The branch it was created from; null for `main`. */
+  upstream: string | null;
+  /** The merge base with its upstream. */
+  mergeBase: { branch: string; seq: number } | null;
+  /** Commits relative to its upstream. */
+  ahead: number;
+  behind: number;
+  protected: boolean;
+  note: string | null;
+  created: string;
+  /** `linked`: it reads its upstream's index files until its first compaction. */
+  storage: { linked: boolean; ownBytes: number; heldBytes: number; generation?: string };
+  broken?: boolean;
+};
+
+export type BranchList = { dataset: string; datasetId: string; branches: Branch[] };
+
+/**
+ * `GET /$/branches/{ds}`: `main` first, then by name. In-memory datasets answer `501`
+ * (`branches-unsupported`).
+ */
+export const branches = (ds: string, signal?: AbortSignal) =>
+  json<BranchList>(`/$/branches/${enc(ds)}`, { signal, cache: 'no-store' });
+
+/**
+ * `POST /$/branches/{ds}`: a branch of `from` (default `main`) at `at` (default the head;
+ * `commit:N`, `snapshot:NAME` or `time:…`). Errors: `409` `branch-exists` or
+ * `branch-limit`, `400` `invalid-branch`.
+ */
+export const createBranch = (
+  ds: string,
+  body: { name: string; from?: string; at?: string; protected?: boolean; note?: string },
+) => json<Branch>(`/$/branches/${enc(ds)}`, jsonBody(body));
+
+/** `PATCH /$/branches/{ds}/{name}`: protect or unprotect it, or change its note. */
+export const updateBranch = (
+  ds: string,
+  name: string,
+  body: { protected?: boolean; note?: string | null },
+) =>
+  json<Branch>(`/$/branches/${enc(ds)}/${enc(name)}`, {
+    ...jsonBody(body),
+    method: 'PATCH',
+  });
+
+/**
+ * `DELETE /$/branches/{ds}/{name}`. Without `force`, a branch with unmerged commits answers
+ * `409` `unmerged`, and a branch that others start from answers `409` `has-children`.
+ */
+export async function deleteBranch(ds: string, name: string, force = false): Promise<void> {
+  await request(`/$/branches/${enc(ds)}/${enc(name)}${force ? '?force=true' : ''}`, {
+    method: 'DELETE',
+  });
+}
+
+/** A conflicting cell (or subject) of a merge: the objects on each side, in N-Triples. */
+export type ConflictCell = {
+  /** null: the default graph */
+  graph: string | null;
+  subject: string;
+  predicate?: string;
+  base: string[];
+  /** the target's */
+  ours: string[];
+  /** the source's */
+  theirs: string[];
+};
+
+/** A merge's preview, result or conflict report: the members they share. */
+export type MergeOutcome = {
+  merged?: boolean;
+  upToDate?: boolean;
+  fastForward?: boolean;
+  source: { branch: string; seq: number };
+  target: { branch: string; seq: number };
+  base: { branch: string; seq: number } | null;
+  changes?: { inserted: number; deleted: number };
+  /** A preview's or a result's `{found, resolved}`; a conflict report's count. */
+  conflicts?: { found: number; resolved: number } | number;
+  /** The merge commit (`kind: "merge"`) of a merge that committed. */
+  commit?: Commit | null;
+  inferences?: { excluded: number; stale: boolean } | null;
+  /** When conflicts remain: how many (in a preview), and the report. */
+  conflictCount?: number;
+  error?: string;
+  code?: string;
+  scope?: 'cell' | 'subject' | 'quad';
+  truncated?: boolean;
+  graphs?: { graph: string | null; conflicts: number }[];
+  cells?: ConflictCell[];
+};
+
+/** `GET /$/merge/{ds}?source=&target=`: what merging would do. It never writes. */
+export function mergePreview(
+  ds: string,
+  source: string,
+  target: string,
+  signal?: AbortSignal,
+): Promise<MergeOutcome> {
+  const p = new URLSearchParams({ source, target });
+  return json<MergeOutcome>(`/$/merge/${enc(ds)}?${p}`, { signal, cache: 'no-store' });
+}
+
+/**
+ * `POST /$/merge/{ds}`. `expect` holds the heads the caller saw, and a head that moved
+ * since answers `409` `head-moved`. Conflicts answer `409` `merge-conflict` with the
+ * report as the error's `body`.
+ */
+export const merge = (
+  ds: string,
+  body: {
+    source: string;
+    target?: string;
+    expect?: { source?: number; target?: number };
+    message?: string;
+  },
+) => json<MergeOutcome>(`/$/merge/${enc(ds)}`, jsonBody(body));
 
 // --- spatial index (GeoSPARQL) -----------------------------------------------------
 

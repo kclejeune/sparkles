@@ -8,6 +8,7 @@
   import { onMount } from 'svelte';
   import { resolve } from '$app/paths';
   import * as api from '$lib/api';
+  import { onBranch } from '$lib/branches';
   import { toasts } from '$lib/app.svelte';
   import { fmtBytes, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
   import { poll } from '$lib/poll';
@@ -38,6 +39,7 @@
 
   let {
     name,
+    branch = null,
     prefixes,
     predicates = [],
     canAdmin = false,
@@ -49,6 +51,8 @@
     onchanged,
   }: {
     name: string;
+    /** The branch to work on (null: `main`). */
+    branch?: string | null;
     prefixes: PrefixMap;
     /** The dataset's predicates (most used first), offered when creating an index. */
     predicates?: string[];
@@ -68,6 +72,8 @@
     onchanged: () => void;
   } = $props();
 
+  const target = $derived(onBranch(name, branch));
+
   type Loaded = { kind: 'ok'; status: api.VectorStatus } | { kind: 'unsupported' };
 
   let loaded = $state<Loaded | null>(null);
@@ -78,7 +84,7 @@
   async function load() {
     const owns = runs.claim('vector');
     try {
-      const s = await api.vectorStatus(name);
+      const s = await api.vectorStatus(target);
       if (!owns()) return;
       loaded = { kind: 'ok', status: s };
       error = null;
@@ -91,7 +97,7 @@
   }
 
   $effect(() => {
-    void name;
+    void target;
     void refreshKey;
     void load();
   });
@@ -160,7 +166,7 @@
     measuring[ix.name] = true;
     recallError[ix.name] = null;
     try {
-      const r = await api.vectorRecall(name, ix.name, { k: recallK[ix.name] ?? 10, ef });
+      const r = await api.vectorRecall(target, ix.name, { k: recallK[ix.name] ?? 10, ef });
       const kept: RememberedRecall = { ...r, at: new Date().toISOString() };
       measured[`${name}/${ix.name}`] = kept;
       saveStored(recallKey(name, ix.name), kept);
@@ -173,7 +179,7 @@
 
   // --- rebuild and drop ----------------------------------------------------------------
   async function rebuild(ix: api.VectorIndexStatus) {
-    await onstart(`Vector index ${ix.name} rebuild`, () => api.rebuildVectorIndex(name, ix.name));
+    await onstart(`Vector index ${ix.name} rebuild`, () => api.rebuildVectorIndex(target, ix.name));
     void load();
   }
 
@@ -181,7 +187,7 @@
   async function reembed(ix: api.VectorIndexStatus) {
     reembedding[ix.name] = true;
     try {
-      await api.reembedVectorIndex(name, ix.name);
+      await api.reembedVectorIndex(target, ix.name);
       toasts.push(
         'info',
         `Re-embedding vector index ${ix.name}`,
@@ -203,7 +209,7 @@
     if (!dropTarget) return;
     dropping = true;
     try {
-      await api.dropVectorIndex(name, dropTarget.name);
+      await api.dropVectorIndex(target, dropTarget.name);
       toasts.push('success', `Vector index ${dropTarget.name} dropped`, 'Its files were deleted.');
       dropOpen = false;
       onchanged();
@@ -311,7 +317,7 @@
     saving = true;
     formError = null;
     try {
-      const r = await api.putVectorIndex(name, indexName, checked.config);
+      const r = await api.putVectorIndex(target, indexName, checked.config);
       toasts.push(
         'info',
         editing ? `Vector index ${indexName} saved` : `Vector index ${indexName} created`,

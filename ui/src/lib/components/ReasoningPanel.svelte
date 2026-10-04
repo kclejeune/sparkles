@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
+  import { onBranch } from '$lib/branches';
   import { toasts } from '$lib/app.svelte';
   import { fmtInt, fmtRelative } from '$lib/format';
   import type { PrefixMap } from '$lib/rdf';
@@ -10,6 +11,7 @@
 
   let {
     name,
+    branch = null,
     info,
     busy = false,
     readOnly = false,
@@ -19,6 +21,8 @@
     onchanged,
   }: {
     name: string;
+    /** The branch to work on (null: `main`). */
+    branch?: string | null;
     info: api.DatasetInfo | undefined;
     /** Another action is starting; disables the task buttons. */
     busy?: boolean;
@@ -32,13 +36,15 @@
     onchanged: () => void;
   } = $props();
 
+  const target = $derived(onBranch(name, branch));
+
   // --- status ----------------------------------------------------------------
   let status = $state<api.ReasoningStatus | null>(null);
   let now = $state(Date.now());
 
   async function loadStatus() {
     try {
-      status = await api.reasonStatus(name);
+      status = await api.reasonStatus(target);
     } catch {
       // older servers have no status route: fall back to the dataset info
       status = null;
@@ -52,8 +58,8 @@
     try {
       status =
         enabled == null
-          ? await api.clearAutoReasoning(name)
-          : await api.setAutoReasoning(name, enabled);
+          ? await api.clearAutoReasoning(target)
+          : await api.setAutoReasoning(target, enabled);
     } catch (e) {
       toasts.error('Could not change automatic re-runs', e);
     } finally {
@@ -63,7 +69,7 @@
 
   $effect(() => {
     // reload when the dataset or its recorded reasoning changes
-    void name;
+    void target;
     void JSON.stringify(info?.reasoning ?? null);
     void loadStatus();
   });
@@ -131,7 +137,7 @@
   async function dropInf() {
     dropping = true;
     try {
-      await api.dropInferences(name);
+      await api.dropInferences(target);
       toasts.push('success', 'Dropped inferred triples');
       onchanged();
     } catch (e) {
@@ -183,7 +189,7 @@
           <button
             class="btn primary sm rerun"
             disabled={busy || readOnly}
-            onclick={() => onstart('Reasoning', () => api.rerunReasoning(name))}
+            onclick={() => onstart('Reasoning', () => api.rerunReasoning(target))}
             title="Re-run {r.profile} on the current data"
           >
             <Icon name="refresh" size={13} /> Re-run reasoning
@@ -244,13 +250,13 @@
       <button
         class="btn primary"
         disabled={busy || readOnly || (profile === 'rules' && !rules.trim())}
-        onclick={() => onstart('Reasoning', () => api.reason(name, profile, rules))}
+        onclick={() => onstart('Reasoning', () => api.reason(target, profile, rules))}
       >
         <Icon name="wand" size={14} /> Materialize inferences
       </button>
     </div>
   </div>
-  <DiagnosticsPanel {name} hasInferences={!!r} {stale} {prefixes} {explore} />
+  <DiagnosticsPanel {name} {branch} hasInferences={!!r} {stale} {prefixes} {explore} />
 </section>
 
 <style>

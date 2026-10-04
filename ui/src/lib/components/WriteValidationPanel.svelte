@@ -6,6 +6,7 @@
   // `PUT /$/validation/{ds}`.
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
+  import { onBranch } from '$lib/branches';
   import { fmtInt, fmtMs, fmtRelative } from '$lib/format';
   import { displayIri, type PrefixMap } from '$lib/rdf';
   import { LatestRun } from '$lib/supersede';
@@ -15,14 +16,19 @@
 
   let {
     name,
+    branch = null,
     prefixes,
     refreshKey = 0,
   }: {
     name: string;
+    /** The branch to work on (null: `main`). */
+    branch?: string | null;
     prefixes: PrefixMap;
     /** Bump to reload the status (data changed). */
     refreshKey?: number;
   } = $props();
+
+  const target = $derived(onBranch(name, branch));
 
   type Loaded = { kind: 'on'; v: api.WriteValidation } | { kind: 'off' } | { kind: 'unsupported' };
 
@@ -34,7 +40,7 @@
   async function load() {
     const owns = runs.claim('validation');
     try {
-      const v = await api.writeValidation(name);
+      const v = await api.writeValidation(target);
       if (!owns()) return;
       loaded = v ? { kind: 'on', v } : { kind: 'off' };
       error = null;
@@ -47,7 +53,7 @@
   }
 
   $effect(() => {
-    void name;
+    void target;
     void refreshKey;
     void load();
   });

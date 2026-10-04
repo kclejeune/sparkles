@@ -1,5 +1,6 @@
 <script lang="ts">
   import * as api from '$lib/api';
+  import { onBranch } from '$lib/branches';
   import { app, toasts } from '$lib/app.svelte';
   import { INFERRED_GRAPH, selectedGraphs, type CloneMode, type CloneType } from '$lib/clone';
   import { fmtInt } from '$lib/format';
@@ -8,13 +9,15 @@
   let {
     open = $bindable(false),
     source,
+    branch = null,
     hasInferences,
     graphs = [],
     onstarted,
   }: {
     open?: boolean;
-    /** The dataset to clone. */
+    /** The dataset to clone, and the branch to copy (null: `main`). */
     source: string;
+    branch?: string | null;
     /** Offer the "Include inferences" choice. */
     hasInferences: boolean;
     /** The source's graphs (from its statistics), offered for a partial clone. */
@@ -65,7 +68,7 @@
     busy = true;
     error = null;
     try {
-      const t = await api.cloneDataset(source, name, {
+      const t = await api.cloneDataset(onBranch(source, branch), name, {
         type,
         inferences: hasInferences && !inferences ? 'drop' : 'copy',
         mode,

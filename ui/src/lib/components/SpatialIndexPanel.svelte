@@ -5,6 +5,7 @@
   // indexed geometries in view (`GET /{ds}/geo`).
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
+  import { onBranch } from '$lib/branches';
   import { toasts } from '$lib/app.svelte';
   import { fmtBytes, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
   import { crsLabel, GEO } from '$lib/geo';
@@ -18,6 +19,7 @@
 
   let {
     name,
+    branch = null,
     prefixes,
     readOnly = false,
     busy = false,
@@ -27,6 +29,8 @@
     onchanged,
   }: {
     name: string;
+    /** The branch to work on (null: `main`). */
+    branch?: string | null;
     prefixes: PrefixMap;
     readOnly?: boolean;
     /** Another action is starting; disables the task buttons. */
@@ -40,6 +44,8 @@
     /** Something changed on the server: refresh the dataset. */
     onchanged: () => void;
   } = $props();
+
+  const target = $derived(onBranch(name, branch));
 
   const DEFAULT_PREDICATES = [`${GEO}asWKT`, `${GEO}asGeoJSON`, `${GEO}hasSerialization`];
   const DEFAULT_LINKS = [`${GEO}hasDefaultGeometry`, `${GEO}hasGeometry`];
@@ -57,7 +63,7 @@
   async function load() {
     const owns = runs.claim('geo');
     try {
-      const s = await api.geoStatus(name);
+      const s = await api.geoStatus(target);
       if (!owns()) return;
       loaded = s ? { kind: 'enabled', status: s } : { kind: 'disabled' };
       error = null;
@@ -69,7 +75,7 @@
   }
 
   $effect(() => {
-    void name;
+    void target;
     void refreshKey;
     void load();
   });
@@ -122,7 +128,7 @@
   const crsMax = $derived(Math.max(1, ...crsList.map(([, n]) => n)));
 
   async function rebuild() {
-    await onstart('Spatial index rebuild', () => api.geoRebuild(name));
+    await onstart('Spatial index rebuild', () => api.geoRebuild(target));
     void load();
   }
 
@@ -170,7 +176,7 @@
       distance,
     };
     try {
-      const t = await api.geoConfigure(name, config);
+      const t = await api.geoConfigure(target, config);
       toasts.push(
         'info',
         status ? 'Reconfiguring the spatial index' : 'Enabling the spatial index',
@@ -193,7 +199,7 @@
   async function disable() {
     disabling = true;
     try {
-      await api.geoDisable(name);
+      await api.geoDisable(target);
       toasts.push('success', 'Spatial index disabled', 'The index was deleted.');
       disableOpen = false;
       mapOpen = false;
@@ -218,7 +224,7 @@
     boxTimer = setTimeout(async () => {
       const owns = boxRuns.claim('box');
       try {
-        const fc = await api.geoBox(name, { bbox, limit: 2000 });
+        const fc = await api.geoBox(target, { bbox, limit: 2000 });
         if (!owns()) return;
         boxed = fc;
         boxError = null;

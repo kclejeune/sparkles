@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { resolve } from '$app/paths';
   import * as api from '$lib/api';
+  import { onBranch } from '$lib/branches';
   import { toasts } from '$lib/app.svelte';
   import { fmtBytes, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
   import { displayIri, type PrefixMap } from '$lib/rdf';
@@ -13,6 +14,7 @@
 
   let {
     name,
+    branch = null,
     prefixes,
     predicates = [],
     readOnly = false,
@@ -23,6 +25,8 @@
     onchanged,
   }: {
     name: string;
+    /** The branch to work on (null: `main`). */
+    branch?: string | null;
     prefixes: PrefixMap;
     /** The dataset's predicates (most used first), offered when configuring. */
     predicates?: string[];
@@ -39,6 +43,8 @@
     onchanged: () => void;
   } = $props();
 
+  const target = $derived(onBranch(name, branch));
+
   type Loaded =
     | { kind: 'enabled'; status: api.TextStatus }
     | { kind: 'disabled' }
@@ -52,7 +58,7 @@
   async function load() {
     const owns = runs.claim('text');
     try {
-      const s = await api.textStatus(name);
+      const s = await api.textStatus(target);
       if (!owns()) return;
       loaded = s ? { kind: 'enabled', status: s } : { kind: 'disabled' };
       error = null;
@@ -64,7 +70,7 @@
   }
 
   $effect(() => {
-    void name;
+    void target;
     void refreshKey;
     void load();
   });
@@ -94,7 +100,7 @@
     s === 'ready' ? 'ok' : s === 'failed' ? 'danger' : 'warn';
 
   async function rebuild() {
-    await onstart('Full-text rebuild', () => api.rebuildText(name));
+    await onstart('Full-text rebuild', () => api.rebuildText(target));
     void load();
   }
 
@@ -140,7 +146,7 @@
       predicates: scope === 'all' ? 'all' : parsed.iris,
     };
     try {
-      const t = await api.enableText(name, config);
+      const t = await api.enableText(target, config);
       toasts.push(
         'info',
         status ? 'Reconfiguring full-text search' : 'Enabling full-text search',
@@ -163,7 +169,7 @@
   async function disable() {
     disabling = true;
     try {
-      await api.disableText(name);
+      await api.disableText(target);
       toasts.push('success', 'Full-text search disabled', 'The index was deleted.');
       disableOpen = false;
       onchanged();

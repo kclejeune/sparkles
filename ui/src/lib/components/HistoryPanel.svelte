@@ -25,19 +25,32 @@
     unrecordedNote,
     validAt,
   } from '$lib/history';
+  import { MAIN, onBranch } from '$lib/branches';
   import { LatestRun } from '$lib/supersede';
   import Icon from './Icon.svelte';
 
   let {
     name,
+    branch = null,
     info,
     refreshKey = 0,
   }: {
     name: string;
+    /** The branch to list (null: `main`). */
+    branch?: string | null;
     info: api.DatasetInfo | undefined;
     /** Bump to reload the newest commits (after a write). */
     refreshKey?: number;
   } = $props();
+
+  const target = $derived(onBranch(name, branch));
+  const branchName = $derived(branch ?? MAIN);
+
+  /** A link to the dataset page on another branch. */
+  const branchHref = (b: string) =>
+    b === MAIN
+      ? resolve('/datasets/[name]', { name })
+      : `${resolve('/datasets/[name]', { name })}?branch=${encodeURIComponent(b)}`;
 
   const PAGE = 20;
 
@@ -54,7 +67,7 @@
     const owns = runs.claim('history');
     loading = true;
     try {
-      const p = await api.commits(name, { limit: PAGE });
+      const p = await api.commits(target, { limit: PAGE });
       if (!owns()) return;
       page = p;
       shown = p.commits;
@@ -73,7 +86,7 @@
     const owns = runs.claim('history');
     loadingOlder = true;
     try {
-      const p = await api.commits(name, { before, limit: PAGE });
+      const p = await api.commits(target, { before, limit: PAGE });
       if (!owns()) return;
       shown = mergeCommits(shown, p.commits);
       page = { ...p, head: page.head };
@@ -85,7 +98,7 @@
   }
 
   $effect(() => {
-    void name;
+    void target;
     void refreshKey;
     void reload();
   });
@@ -118,7 +131,7 @@
     const owns = runs.claim('diff');
     diffLoading = true;
     try {
-      const d = await api.diff(name, {
+      const d = await api.diff(target, {
         from: normalizeAt(diffForm.from) ?? 'head',
         to: normalizeAt(diffForm.to) ?? 'head',
         quads: true,
@@ -166,7 +179,7 @@
     const owns = runs.claim('changes');
     histLoading = true;
     try {
-      const h = await api.historyChanges(name, {
+      const h = await api.historyChanges(target, {
         subject: subject ?? undefined,
         predicate: predicate ?? undefined,
         order: 'desc',
@@ -187,14 +200,15 @@
 
   function queryAt(c: api.Commit) {
     app.setDataset(name);
+    app.queryBranch = branch ?? '';
     app.queryAt = c.seq === page?.head ? '' : c.ref;
     goto(resolve('/query'));
   }
 
-  async function copyId(id: string) {
+  async function copyId(id: string, what: 'dataset' | 'branch') {
     try {
       await navigator.clipboard.writeText(id);
-      toasts.push('success', 'Copied dataset id', undefined, 1400);
+      toasts.push('success', `Copied ${what} id`, undefined, 1400);
     } catch (e) {
       toasts.error('Could not copy', e);
     }
@@ -220,13 +234,22 @@
   </div>
   <div class="panel-body ids">
     {#if info?.id || page?.datasetId}
-      {@const id = page?.datasetId ?? info?.id ?? ''}
+      {@const id = (branch ? info?.id : undefined) ?? page?.datasetId ?? info?.id ?? ''}
       <div class="idline">
         <span class="faint">Dataset id</span>
-        <button class="id mono" title="Copy the dataset id" onclick={() => copyId(id)}
+        <button class="id mono" title="Copy the dataset id" onclick={() => copyId(id, 'dataset')}
           >{id} <Icon name="copy" size={11} /></button
         >
       </div>
+      {@const bid = branch ? page?.commits?.find((c) => c.branch === branch)?.branchId : undefined}
+      {#if bid && bid !== id}
+        <div class="idline">
+          <span class="faint">Branch id</span>
+          <button class="id mono" title="Copy the branch id" onclick={() => copyId(bid, 'branch')}
+            >{bid} <Icon name="copy" size={11} /></button
+          >
+        </div>
+      {/if}
     {/if}
     {#if info?.forkedFrom}
       {@const f = info.forkedFrom}
@@ -285,6 +308,35 @@
                     {#each commitFlags(c) as f (f.label)}
                       <span class="badge flag" class:warn={f.warn} title={f.title}>{f.label}</span>
                     {/each}
+                    {#if c.mergedFrom}
+                      {@const m = c.mergedFrom}
+                      {#if m.branch}
+                        <a
+                          class="badge flag merged"
+                          href={branchHref(m.branch)}
+                          title="Merged commit {m.seq} of {m.branch}">from {m.branch}@{m.seq}</a
+                        >
+                      {:else}
+                        <span
+                          class="badge flag merged"
+                          title="Merged commit {m.seq} of a deleted branch"
+                          >from deleted@{m.seq}</span
+                        >
+                      {/if}
+                    {/if}
+                    {#if c.branch !== undefined && c.branch !== branchName}
+                      {#if c.branch}
+                        <a
+                          class="badge flag inherited"
+                          href={branchHref(c.branch)}
+                          title="Made on {c.branch}, before {branchName} started">{c.branch}</a
+                        >
+                      {:else}
+                        <span class="badge flag inherited" title="Made on a branch that was deleted"
+                          >deleted branch</span
+                        >
+                      {/if}
+                    {/if}
                     {#each c.snapshots ?? [] as s (s)}
                       <span class="badge flag snap" title="Pinned by the snapshot {s}">{s}</span>
                     {/each}
@@ -579,6 +631,19 @@
   .snap {
     background: color-mix(in srgb, var(--iri) 14%, transparent);
     color: var(--iri);
+  }
+  a.flag {
+    text-decoration: none;
+  }
+  a.flag:hover {
+    text-decoration: underline;
+  }
+  .merged {
+    background: color-mix(in srgb, var(--literal) 14%, transparent);
+    color: var(--literal);
+  }
+  .inherited {
+    font-family: var(--font-mono);
   }
   .row-actions {
     text-align: right;

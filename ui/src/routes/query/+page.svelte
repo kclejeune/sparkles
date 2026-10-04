@@ -5,6 +5,7 @@
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
+  import { branchOption, branchParam, MAIN, onBranch, onBranchLabel } from '$lib/branches';
   import { receiptSummary } from '$lib/commits';
   import { atLabel, normalizeAt, validAt } from '$lib/history';
   import { EXAMPLES } from '$lib/examples';
@@ -44,6 +45,8 @@
   type Outcome = {
     status: 'running' | 'done' | 'error';
     ds: string;
+    /** The branch it ran on (null: `main`). */
+    branch: string | null;
     kind: string;
     result?: api.SparklesResult;
     explain?: api.ExplainResult;
@@ -117,16 +120,35 @@
   const reasoningInfo = $derived(app.datasets.find((d) => d.name === ds)?.reasoning ?? null);
   /** The `at` field: a past state to read, or empty for the head. */
   const atOk = $derived(validAt(app.queryAt));
+  /** The `branch` field: the branch to read and write, or empty for `main`. */
+  const branch = $derived(branchParam(app.queryBranch));
+  /** The dataset on that branch, as the API client takes it. */
+  const target = $derived(ds ? onBranch(ds, branch) : null);
+  /** The dataset's branches, offered in the Branch field (null: it has none). */
+  let branchList = $state<api.Branch[] | null>(null);
+  // in-memory datasets have no branches
+  const persistent = $derived(app.datasets.find((d) => d.name === ds)?.type === 'persistent');
+  $effect(() => {
+    const name = ds;
+    branchList = null;
+    if (!name || !persistent) return;
+    api
+      .branches(name)
+      .then((l) => {
+        if (ds === name) branchList = l.branches;
+      })
+      .catch(() => {});
+  });
   /** Named snapshots of the dataset, offered in the `at` field. */
   let snapshotNames = $state<string[]>([]);
   $effect(() => {
-    const name = ds;
+    const name = target;
     snapshotNames = [];
     if (!name) return;
     api
       .snapshots(name)
       .then((l) => {
-        if (ds === name) snapshotNames = l.snapshots.map((s) => s.ref);
+        if (target === name) snapshotNames = l.snapshots.map((s) => s.ref);
       })
       .catch(() => {});
   });
@@ -452,6 +474,8 @@
       toasts.push('error', 'Choose a dataset first', 'Create one on the Datasets page.');
       return;
     }
+    const dsBranch = branch;
+    const dsTarget = onBranch(dsName, dsBranch);
     // capture the tab and its text before awaiting: the user may switch tabs meanwhile
     const tab = active;
     // format first when asked to; on any failure the query runs as written
@@ -483,6 +507,7 @@
     outcomes[tabId] = {
       status: 'running',
       ds: dsName,
+      branch: dsBranch,
       kind: k,
       view: prevView ?? 'table',
       startedAt: started,
@@ -491,7 +516,7 @@
     };
     try {
       if (k === 'UPDATE') {
-        const result = await api.update(dsName, text, controller.signal);
+        const result = await api.update(dsTarget, text, controller.signal);
         const ms = performance.now() - started;
         // the update was applied either way; only the outcome display is ownership-bound
         delete app.vocab[dsName];
@@ -500,6 +525,7 @@
         outcomes[tabId] = {
           status: 'done',
           ds: dsName,
+          branch: dsBranch,
           kind: k,
           updated: { ms, result },
           view: 'table',
@@ -512,16 +538,16 @@
             ? 'Update applied, no change'
             : 'Update applied',
           result?.receipt
-            ? `${dsName}: ${receiptSummary(result.receipt)} in ${fmtMs(ms)}`
+            ? `${dsTarget}: ${receiptSummary(result.receipt)} in ${fmtMs(ms)}`
             : result
-              ? `${dsName}: +${fmtInt(result.inserted)} / −${fmtInt(result.deleted)} quads in ${fmtMs(ms)}`
-              : `${dsName} in ${fmtMs(ms)}`,
+              ? `${dsTarget}: +${fmtInt(result.inserted)} / −${fmtInt(result.deleted)} quads in ${fmtMs(ms)}`
+              : `${dsTarget} in ${fmtMs(ms)}`,
         );
       } else {
         const opts = { send: limit, reasoning, at, signal: controller.signal };
         const result = stored
-          ? await api.runStoredQuery(dsName, stored.name, stored.values, opts)
-          : await api.query(dsName, text, opts);
+          ? await api.runStoredQuery(dsTarget, stored.name, stored.values, opts)
+          : await api.query(dsTarget, text, opts);
         const elapsed = performance.now() - started;
         if (!owns()) return;
         // Keep the user's chosen view only when re-running the same kind of query.
@@ -535,6 +561,7 @@
         outcomes[tabId] = {
           status: 'done',
           ds: dsName,
+          branch: dsBranch,
           kind: result.queryType,
           result,
           view: keep ? prevView! : defaultView(result),
@@ -553,6 +580,7 @@
       outcomes[tabId] = {
         status: 'error',
         ds: dsName,
+        branch: dsBranch,
         kind: k,
         error: e as Error,
         view: 'table',
@@ -584,13 +612,15 @@
     // confirmation or an error, which would otherwise take precedence over the plan.
     const prev = outcomes[tabId]?.result ? outcomes[tabId] : undefined;
     const base = {
-      ...(prev ?? { ds: dsName, kind: 'EXPLAIN', startedAt: started }),
+      ...(prev ?? { ds: dsName, branch, kind: 'EXPLAIN', startedAt: started }),
       updated: undefined,
       error: undefined,
     };
     outcomes[tabId] = { ...base, status: 'running', view: 'explain' } as Outcome;
     try {
-      const ex = await api.explain(dsName, text, { reasoning: reasoningFor(dsName) });
+      const ex = await api.explain(onBranch(dsName, branch), text, {
+        reasoning: reasoningFor(dsName),
+      });
       if (!owns()) return;
       outcomes[tabId] = { ...base, status: 'done', explain: ex, view: 'explain' } as Outcome;
     } catch (e) {
@@ -598,6 +628,7 @@
       outcomes[tabId] = {
         status: 'error',
         ds: dsName,
+        branch,
         kind: 'EXPLAIN',
         error: e as Error,
         view: 'explain',
@@ -708,10 +739,11 @@
   async function download(fmt: { label: string; accept: string; ext: string }) {
     const dsName = outcome?.ds ?? ds;
     if (!dsName) return;
+    const dsBranch = outcome ? outcome.branch : branch;
     downloading = fmt.label;
     try {
       const reasoning = outcome?.reasoning ?? reasoningFor(dsName);
-      const blob = await api.queryRaw(dsName, active.query, fmt.accept, {
+      const blob = await api.queryRaw(onBranch(dsName, dsBranch), active.query, fmt.accept, {
         reasoning: reasoning ?? undefined,
       });
       const url = URL.createObjectURL(blob);
@@ -875,7 +907,7 @@
     <span class="kind" data-kind={kind ?? ''}>{kind ?? 'SPARQL'}</span>
     <span class="target faint">
       {kind === 'UPDATE' ? 'POST' : 'POST'}
-      <span class="mono">/{ds ?? '…'}/{kind === 'UPDATE' ? 'update' : 'sparql'}</span>
+      <span class="mono">/{target ?? '…'}/{kind === 'UPDATE' ? 'update' : 'sparql'}</span>
     </span>
     <span class="spacer"></span>
     <div class="examples">
@@ -952,6 +984,19 @@
       >
         <input type="checkbox" bind:checked={inferences} />
         <span>Use inferences</span>
+      </label>
+    {/if}
+    {#if branchList}
+      <label class="at" title="The branch queries read and updates change (branch=)">
+        <span class="faint">Branch</span>
+        <select class="select sm mono" bind:value={app.queryBranch} aria-label="Branch">
+          {#each branchList as b (b.name)}
+            <option value={b.name === MAIN ? '' : b.name}>{branchOption(b)}</option>
+          {/each}
+          {#if branch && !branchList.some((b) => b.name === branch)}
+            <option value={branch}>{branch}</option>
+          {/if}
+        </select>
       </label>
     {/if}
     <label
@@ -1226,17 +1271,25 @@
             {@const at = outcome.result.at}
             <span
               class="badge commit past"
-              title="A past state of {outcome.ds}, read with at={at.selector}{at.datetime
-                ? ` (${at.datetime})`
-                : ''}">{atLabel(at)}</span
+              title="A past state of {onBranch(
+                outcome.ds,
+                outcome.branch,
+              )}, read with at={at.selector}{at.datetime ? ` (${at.datetime})` : ''}"
+              >{onBranchLabel(outcome.branch, atLabel(at))}</span
             >
           {:else if outcome.result?.meta.commit != null && outcome.view !== 'explain'}
+            {@const c = outcome.result.meta.commit}
             <span
               class="badge commit"
-              title="The result was read at commit {outcome.result.meta
-                .commit} of {outcome.ds}{outcome.result.meta.datasetId
+              title="The result was read at commit {c} of {onBranch(
+                outcome.ds,
+                outcome.branch,
+              )}{outcome.result.meta.datasetId
                 ? ` (dataset id ${outcome.result.meta.datasetId})`
-                : ''}">commit {outcome.result.meta.commit}</span
+                : ''}"
+              >{outcome.branch
+                ? onBranchLabel(outcome.branch, `at commit ${c}`)
+                : `commit ${c}`}</span
             >
           {/if}
           {#if outcome.status === 'running'}
@@ -1319,7 +1372,12 @@
         {:else if outcome.updated}
           <div class="empty">
             <Icon name="check" size={22} />
-            <p>Update applied to <strong>{outcome.ds}</strong> in {fmtMs(outcome.updated.ms)}.</p>
+            <p>
+              Update applied to <strong>{outcome.ds}</strong>{#if outcome.branch}
+                on the branch <strong class="mono">{outcome.branch}</strong>{/if} in {fmtMs(
+                outcome.updated.ms,
+              )}.
+            </p>
             {#if outcome.updated.result?.receipt}
               {@const r = outcome.updated.result.receipt}
               {#if r.committed}

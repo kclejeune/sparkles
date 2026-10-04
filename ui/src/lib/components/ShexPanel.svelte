@@ -4,6 +4,7 @@
   // localStorage; a dataset without a draft starts from an example built from its
   // classes with the most instances.
   import * as api from '$lib/api';
+  import { onBranch } from '$lib/branches';
   import { toasts } from '$lib/app.svelte';
   import { displayIri, type PrefixMap } from '$lib/rdf';
   import {
@@ -22,6 +23,7 @@
 
   let {
     name,
+    branch = null,
     info,
     prefixes,
     namedGraphs,
@@ -29,6 +31,8 @@
     conforms = $bindable(null),
   }: {
     name: string;
+    /** The branch to work on (null: `main`). */
+    branch?: string | null;
     info: api.DatasetInfo | undefined;
     prefixes: PrefixMap;
     /** The dataset's named graphs, for the data graph choice. */
@@ -37,6 +41,8 @@
     /** Whether the last validation conformed (null: none yet). */
     conforms?: boolean | null;
   } = $props();
+
+  const target = $derived(onBranch(name, branch));
 
   let schema = $state('');
   let map = $state('');
@@ -67,7 +73,7 @@
     if (draft) ({ schema, map } = draft);
     // the classes feed the example maps, and the example schema
     const ctl = new AbortController();
-    api.schemaSummary(ds, { limit: 50, signal: ctl.signal }).then(
+    api.schemaSummary(target, { limit: 50, signal: ctl.signal }).then(
       (s) => (classes = topClasses(s)),
       () => {},
     );
@@ -108,7 +114,7 @@
     editor?.showError(undefined);
     keep();
     try {
-      report = await api.shex(name, schema, map, { ...opts(), signal: ctl.signal });
+      report = await api.shex(target, schema, map, { ...opts(), signal: ctl.signal });
       conforms = report.conforms;
     } catch (e) {
       if (!(e instanceof DOMException && e.name === 'AbortError')) {
@@ -125,7 +131,7 @@
   async function download() {
     downloading = true;
     try {
-      const blob = await api.shexRaw(name, schema, map, 'shapemap', opts());
+      const blob = await api.shexRaw(target, schema, map, 'shapemap', opts());
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;

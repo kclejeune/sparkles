@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import * as api from '$lib/api';
+  import { onBranch } from '$lib/branches';
   import { fmtInt, fmtMs } from '$lib/format';
   import type { PrefixMap } from '$lib/rdf';
   import Icon from './Icon.svelte';
@@ -8,12 +9,15 @@
 
   let {
     name,
+    branch = null,
     hasInferences,
     stale,
     prefixes,
     explore,
   }: {
     name: string;
+    /** The branch to work on (null: `main`). */
+    branch?: string | null;
     /** The dataset has materialized inferences. */
     hasInferences: boolean;
     /** Freshness of those inferences (null: unknown). */
@@ -21,6 +25,8 @@
     prefixes: PrefixMap;
     explore: (iri: string) => string;
   } = $props();
+
+  const target = $derived(onBranch(name, branch));
 
   const CHECKS: { id: api.DiagnosticCheck; label: string }[] = [
     { id: 'nothing-member', label: 'owl:Nothing members' },
@@ -59,7 +65,7 @@
 
   $effect(() => {
     // a different dataset: forget the old report
-    void name;
+    void target;
     report = null;
     error = null;
   });
@@ -73,7 +79,7 @@
     const t0 = performance.now();
     try {
       const checks = CHECKS.filter((c) => selected[c.id]).map((c) => c.id);
-      report = await api.diagnostics(name, {
+      report = await api.diagnostics(target, {
         checks: checks.length === CHECKS.length ? undefined : checks,
         closure,
         limit,
