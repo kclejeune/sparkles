@@ -302,11 +302,13 @@ pub fn start_compaction(st: &Arc<AppState>, ds: Arc<Dataset>, trigger: Option<Tr
     let state = st.clone();
     st.start_task_opts(id, TASK, &name, None, true, move |h| {
         let prefix = if auto { "auto: " } else { "" };
-        h.progress(0.05, &format!("{prefix}rebuilding index"));
+        let ctl = h.control();
+        ctl.progress
+            .report(0.05, &format!("{prefix}rebuilding index"));
         let started = SystemTime::now();
         let t0 = Instant::now();
         let r = ds.store.compact_with(&CompactOptions {
-            cancel: Some(h.cancel_flag()),
+            cancel: Some(ctl.cancel.flag()),
             ..opts
         });
         record(&state, &ds.key(), trigger.as_ref(), started, t0.elapsed(), &r);

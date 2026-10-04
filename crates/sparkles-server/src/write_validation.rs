@@ -3,172 +3,28 @@
 //! as JSON, and installing it when a store is opened.
 
 // (no validator: nothing is installed, and a dataset that requires one refuses writes)
-#![cfg_attr(not(any(feature = "shacl", feature = "shex")), allow(dead_code))]
+#![cfg_attr(
+    not(any(feature = "shacl", feature = "shex")),
+    allow(dead_code, unused_imports)
+)]
 
 use anyhow::Result;
 use serde_json::{Value as J, json};
 use sparkles::guard::GuardLanguage;
 use sparkles::store::Store;
-#[cfg(any(feature = "shacl", feature = "shex"))]
-use std::sync::Arc;
 
-/// The write-time validation installed on a dataset.
-#[derive(Clone)]
-pub enum Validation {
-    #[cfg(feature = "shacl")]
-    Shacl(Arc<sparkles_shacl::guard::ShaclGuard>),
-    #[cfg(feature = "shex")]
-    Shex(Arc<sparkles_shex::guard::ShexGuard>),
-}
-
-impl Validation {
-    pub fn language(&self) -> GuardLanguage {
-        match *self {
-            #[cfg(feature = "shacl")]
-            Validation::Shacl(_) => GuardLanguage::Shacl,
-            #[cfg(feature = "shex")]
-            Validation::Shex(_) => GuardLanguage::Shex,
-        }
-    }
-
-    /// `{language, config, status}` (`GET /$/validation/{ds}`, `sparkles validation
-    /// --status --format json`).
-    pub fn json(&self) -> J {
-        match *self {
-            #[cfg(feature = "shacl")]
-            Validation::Shacl(ref g) => {
-                json!({ "language": "shacl", "config": g.config(), "status": g.status() })
-            }
-            #[cfg(feature = "shex")]
-            Validation::Shex(ref g) => {
-                json!({ "language": "shex", "config": g.config(), "status": g.status() })
-            }
-        }
-    }
-
-    /// The files of this validation in a database directory, for a backup of an
-    /// in-memory dataset, which has no directory: `validation.json`, and the copy of
-    /// SHACL shapes given inline or of the ShEx schema. They are what a persistent
-    /// dataset with the same configuration keeps.
-    #[cfg(feature = "backup")]
-    pub fn memory_files(&self) -> Vec<(String, Vec<u8>)> {
-        #[cfg(any(feature = "shacl", feature = "shex"))]
-        let config = sparkles::guard::config::CONFIG_FILE.to_string();
-        match *self {
-            #[cfg(feature = "shacl")]
-            Validation::Shacl(ref g) => {
-                // inline shapes become the copy a persistent dataset keeps
-                let mut cfg = g.config().clone();
-                let mut out = Vec::new();
-                if let Some(text) = cfg.shapes.inline.take() {
-                    let file = sparkles::guard::config::SHACL_SHAPES_FILE;
-                    cfg.shapes.file = Some(file.to_string());
-                    cfg.shapes.sha256 = Some(sparkles::guard::config::sha256_hex(text.as_bytes()));
-                    cfg.shapes.format = None;
-                    out.push((file.to_string(), text.into_bytes()));
-                }
-                match serde_json::to_vec_pretty(&cfg) {
-                    Ok(b) => out.insert(0, (config, b)),
-                    Err(_) => out.clear(),
-                }
-                out
-            }
-            #[cfg(feature = "shex")]
-            Validation::Shex(ref g) => {
-                let Some((file, text)) = g.schema_copy() else {
-                    return Vec::new();
-                };
-                match serde_json::to_vec_pretty(g.config()) {
-                    Ok(b) => vec![(config, b), (file.to_string(), text.as_bytes().to_vec())],
-                    Err(_) => Vec::new(),
-                }
-            }
-        }
-    }
-
-    /// The `sparkles stats` line: `reject · 2 shape graphs · 20 shapes · last full 164 ms`.
-    pub fn stats_line(&self) -> String {
-        match *self {
-            #[cfg(feature = "shacl")]
-            Validation::Shacl(ref g) => {
-                let cfg = g.config();
-                let s = g.status();
-                let mut parts = vec![
-                    mode_name(cfg.mode).to_string(),
-                    match (&cfg.shapes.graphs, &cfg.shapes.file) {
-                        (Some(g), file) => format!(
-                            "{} shape graph{}{}",
-                            g.len(),
-                            if g.len() == 1 { "" } else { "s" },
-                            if file.is_some() {
-                                " and a shapes file"
-                            } else {
-                                ""
-                            }
-                        ),
-                        (None, _) => "shapes file".to_string(),
-                    },
-                    format!("{} shapes", s.shape_count),
-                ];
-                if let Some(ms) = s.last_full_millis {
-                    parts.push(format!("last full {ms} ms"));
-                }
-                parts.join(" · ")
-            }
-            #[cfg(feature = "shex")]
-            Validation::Shex(ref g) => {
-                let s = g.status();
-                let mut parts = vec![
-                    mode_name(g.config().mode).to_string(),
-                    "ShEx".to_string(),
-                    format!("{} shapes", s.shape_count),
-                ];
-                if let Some(ms) = s.last_full_millis {
-                    parts.push(format!("last full {ms} ms"));
-                }
-                parts.join(" · ")
-            }
-        }
-    }
-}
-
-/// `reject`, `warn` or `off`.
-pub fn mode_name(m: sparkles::guard::GuardMode) -> &'static str {
-    match m {
-        sparkles::guard::GuardMode::Reject => "reject",
-        sparkles::guard::GuardMode::Warn => "warn",
-        sparkles::guard::GuardMode::Off => "off",
-    }
-}
+/// The write-time validation installed on a dataset (the library's guard).
+pub use sparkles::write_guard::{WriteGuard as Validation, mode_name};
 
 /// The JSON of a dataset without write-time validation.
 pub fn none_json() -> J {
     json!({ "config": null })
 }
 
-/// Install a persistent store's write-time validation from its `validation.json`, with
-/// the validator its `language` names. Without a configuration (or with mode `off`)
-/// nothing is installed. An error (a configuration that cannot be loaded, or a language
-/// this binary was built without) leaves the store refusing writes: it fails closed.
+/// Install a persistent store's write-time validation from its `validation.json` (see
+/// [`sparkles::write_guard::install`]). An error leaves the store refusing writes.
 pub fn install(store: &Store) -> Result<Option<Validation>> {
-    let Some(root) = store.root() else {
-        return Ok(None);
-    };
-    let Some(language) = sparkles::guard::config::config_language(root)? else {
-        return Ok(None);
-    };
-    match language {
-        #[cfg(feature = "shacl")]
-        GuardLanguage::Shacl => Ok(sparkles_shacl::guard::install(store)?.map(Validation::Shacl)),
-        #[cfg(feature = "shex")]
-        GuardLanguage::Shex => Ok(sparkles_shex::guard::install(store)?.map(Validation::Shex)),
-        #[allow(unreachable_patterns)]
-        l => anyhow::bail!(
-            "the dataset uses write-time {} validation, but this binary was built without the `{}` feature",
-            l.title(),
-            l.name()
-        ),
-    }
+    Ok(sparkles::write_guard::install(store)?)
 }
 
 /// `serve --validate NAME[=CONFIG.json]`: set a dataset's write-time validation from a

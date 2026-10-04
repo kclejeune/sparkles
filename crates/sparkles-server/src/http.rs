@@ -3235,13 +3235,8 @@ fn dataset_info(st: &AppState, ds: &Dataset) -> J {
     if let Some(f) = ds.store.forked_from() {
         info["forkedFrom"] = json!(f);
     }
-    if let Some(o) = ds
-        .store
-        .root()
-        .and_then(crate::clone::read_origin)
-        .or_else(|| ds.mem_origin.clone())
-    {
-        info["origin"] = o;
+    if let Some(o) = ds.dataset.origin() {
+        info["origin"] = o.clone();
     }
     // a restore: the backup it came from
     #[cfg(feature = "backup")]
@@ -3599,9 +3594,8 @@ async fn clone_dataset(
     let st2 = st.clone();
     let target = name.clone();
     let task = st.start_task_opts(id, "clone", &source, Some(&name), true, move |h| {
-        let h2 = h.clone();
-        let progress: sparkles::store::ProgressFn =
-            Arc::new(move |p, msg: &str| h2.progress(p * 0.95, msg));
+        let ctl = h.control();
+        let progress = ctl.part(0.0, 0.95).progress.as_fn();
         let reasoning = src.reasoning.read().clone();
         let rep = if in_memory {
             let c = crate::clone::clone_into_memory(
@@ -3611,11 +3605,11 @@ async fn clone_dataset(
                 reasoning,
                 &spec,
                 st2.store_opts.clone(),
-                Some(progress),
-                Some(h.cancel_flag()),
+                progress,
+                Some(ctl.cancel.flag()),
             )?;
             h.set_cancellable(false);
-            h.progress(0.97, "registering");
+            ctl.progress.report(0.97, "registering");
             st2.adopt_memory(reservation, c.store, c.reasoning, c.origin)?;
             c.report
         } else {
@@ -3626,12 +3620,12 @@ async fn clone_dataset(
                 &tmp,
                 &dst,
                 &spec,
-                Some(progress),
-                Some(h.cancel_flag()),
+                progress,
+                Some(ctl.cancel.flag()),
             )?;
             // the clone is in place: registering it is no longer undone by a cancel
             h.set_cancellable(false);
-            h.progress(0.97, "registering");
+            ctl.progress.report(0.97, "registering");
             st2.adopt(reservation)?;
             rep
         };
@@ -4080,7 +4074,8 @@ pub(crate) async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) ->
         .clamp(1, 4);
     let id = st.next_task_id();
     let task = st.start_task_opts(id, "backup", &name, None, true, move |h| {
-        h.progress(0.1, "writing N-Quads");
+        let ctl = h.control();
+        ctl.progress.report(0.1, "writing N-Quads");
         let t = std::time::Instant::now();
         std::fs::create_dir_all(&dir)?;
         let ts = sparkles::builder::now_rfc3339().replace(':', "-");
@@ -4098,7 +4093,7 @@ pub(crate) async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) ->
             dir: dir.clone(),
             reserve,
             unchecked: DISK_CHECK_EVERY,
-            cancel: h.cancel_flag(),
+            cancel: ctl.cancel.flag(),
         };
         let written = (|| -> sparkles::Result<()> {
             let mut w = codec.writer(out, level, threads)?;
@@ -4109,9 +4104,7 @@ pub(crate) async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) ->
             w.finish()?;
             Ok(())
         })();
-        if h.is_cancelled() {
-            return Err(sparkles::Error::Cancelled.into());
-        }
+        ctl.cancel.check()?;
         written?;
         tmp.as_file().sync_all()?;
         tmp.persist(&path)?;

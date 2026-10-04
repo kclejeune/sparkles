@@ -522,15 +522,16 @@ pub fn start_reason(
         };
     let prefix = if auto { "auto: " } else { "" };
     st.start_task_opts(st.next_task_id(), "reason", &name, None, true, move |h| {
-        let h2 = h.clone();
+        let ctl = h.control();
         // the reasoner reports progress only once it holds the writer lock
         let locked = Arc::new(AtomicBool::new(false));
         let locked2 = locked.clone();
+        let task_progress = ctl.progress.clone();
         let progress: sparkles_reasoner::ProgressFn = Arc::new(move |p, msg: &str| {
             locked2.store(true, Ordering::Relaxed);
-            h2.progress(p, &format!("{prefix}{msg}"));
+            task_progress.report(p, &format!("{prefix}{msg}"));
         });
-        let cancel = h.cancel_flag();
+        let cancel = ctl.cancel.flag();
         let fetched_before: Vec<String> = ds
             .reasoning
             .read()
@@ -540,7 +541,8 @@ pub fn start_reason(
         let mut fetched = fetched_before.clone();
         let mut fetch_warnings = Vec::new();
         if inputs.imports == sparkles_reasoner::ImportMode::Fetch || refresh {
-            h.progress(0.02, &format!("{prefix}fetching imports"));
+            ctl.progress
+                .report(0.02, &format!("{prefix}fetching imports"));
             // the rules of the server's LOAD
             let qopts = sparkles::sparql::QueryOptions {
                 outbound: st2.outbound.clone(),
@@ -554,7 +556,8 @@ pub fn start_reason(
             fetched.extend(f.fetched);
             fetch_warnings = f.warnings;
         }
-        h.progress(0.05, &format!("{prefix}loading triples"));
+        ctl.progress
+            .report(0.05, &format!("{prefix}loading triples"));
         let opts = sparkles_reasoner::ReasonOptions {
             progress: Some(progress),
             cancel: Some(cancel.clone()),
@@ -571,7 +574,7 @@ pub fn start_reason(
                         // before that, the waiting writer may be this run itself
                         if locked.load(Ordering::Relaxed) && ds.store.writers_waiting() > 0 {
                             superseded.store(true, Ordering::Relaxed);
-                            cancel.store(true, Ordering::Relaxed);
+                            ctl.cancel.cancel();
                             return;
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -596,7 +599,7 @@ pub fn start_reason(
         });
         let report = match result {
             Ok(r) => r,
-            Err(_) if cancel.load(Ordering::Relaxed) => {
+            Err(_) if ctl.cancel.is_cancelled() => {
                 let why = if superseded.load(Ordering::Relaxed) {
                     "auto: superseded by a write"
                 } else {

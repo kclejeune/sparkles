@@ -8,7 +8,7 @@
 
 use crate::Dataset;
 use crate::Result;
-use crate::branch::{BranchInfo, BranchOptions, MergeOptions, MergeOutcome};
+use crate::branch::{BranchInfo, BranchOptions, MergeOptions, MergeOutcome, MergeReport};
 
 impl Dataset {
     /// The dataset bound to branch `name`: reads and writes go to that branch. `main`
@@ -16,7 +16,13 @@ impl Dataset {
     /// the dataset that owns the branches, the one [`Dataset::open`] returned.
     pub fn branch(&self, name: &str) -> Result<Dataset> {
         match self.store().branch(name)?.shared() {
-            Some(s) => Ok(Dataset::from_shared(s)),
+            Some(s) => Ok(Dataset::from_shared(
+                s,
+                crate::DatasetOptions {
+                    name: self.name().map(str::to_string),
+                    ..Default::default()
+                },
+            )),
             None => Ok(self.clone()),
         }
     }
@@ -24,6 +30,21 @@ impl Dataset {
     /// The branches, `main` first.
     pub fn branches(&self) -> Result<Vec<BranchInfo>> {
         self.store().branches()
+    }
+
+    /// Branch `name`, `main` included.
+    pub fn branch_info(&self, name: &str) -> Result<BranchInfo> {
+        self.store().branch_info(name)
+    }
+
+    /// Protect branch `name` from writes other than merges, or lift the protection.
+    pub fn set_branch_protected(&self, name: &str, on: bool) -> Result<BranchInfo> {
+        self.store().set_branch_protected(name, on)
+    }
+
+    /// Set or clear the note of branch `name`.
+    pub fn set_branch_note(&self, name: &str, note: Option<String>) -> Result<BranchInfo> {
+        self.store().set_branch_note(name, note)
     }
 
     /// Create branch `name` (see [`Store::create_branch`](crate::store::Store::create_branch)).
@@ -34,6 +55,17 @@ impl Dataset {
     /// Merge branch `source` into `target` (see [`Store::merge`](crate::store::Store::merge)).
     pub fn merge(&self, source: &str, target: &str, o: &MergeOptions) -> Result<MergeOutcome> {
         self.store().merge(source, target, o)
+    }
+
+    /// What merging `source` into `target` would do, without writing (see
+    /// [`Store::preview_merge`](crate::store::Store::preview_merge)).
+    pub fn preview_merge(
+        &self,
+        source: &str,
+        target: &str,
+        o: &MergeOptions,
+    ) -> Result<MergeReport> {
+        self.store().preview_merge(source, target, o)
     }
 
     /// Delete branch `name`, also with unmerged commits when `force`.

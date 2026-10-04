@@ -115,11 +115,11 @@ sparkles-client = { workspace = true, features = ["blocking"] }
 [features]
 default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "geo-epsg", "otel", "auth", "mcp", "backup", "fmt", "tls", "graphql"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
-reasoning = ["dep:sparkles-reasoner"]
+reasoning = ["dep:sparkles-reasoner", "sparkles/reasoning"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
-shacl = ["dep:sparkles-shacl"]
+shacl = ["dep:sparkles-shacl", "sparkles/shacl"]
 # ShEx validation (`/{ds}/shex`, `sparkles shex`)
-shex = ["dep:sparkles-shex"]
+shex = ["dep:sparkles-shex", "sparkles/shex"]
 # full-text search (`text:query`, `/$/text`, `sparkles text-index`)
 text = ["sparkles/text"]
 # GeoSPARQL (`geof:` functions, `spatial:` property functions, `/$/geo`, `sparkles geo-index`),
@@ -147,9 +147,10 @@ tls = ["dep:rustls", "dep:tokio-rustls"]
 mcp = ["dep:rmcp", "dep:tokio-util"]
 # backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
 # `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
-backup = ["dep:sparkles-backup", "dep:toml"]
+backup = ["dep:sparkles-backup", "dep:toml", "sparkles/backup"]
 # the formatter: `sparkles fmt`, `sparkles lsp` and `POST /$/format`
 fmt = [
+    "sparkles/fmt",
     "dep:sparkles-fmt",
     "dep:ignore",
     "dep:similar",
@@ -158,7 +159,7 @@ fmt = [
     "dep:lsp-types",
 ]
 # the read-only GraphQL adapter: `/{ds}/graphql`, `/$/graphql/{ds}`, `sparkles graphql`
-graphql = ["dep:sparkles-graphql"]
+graphql = ["dep:sparkles-graphql", "sparkles/graphql"]
 # mimalloc as the global allocator (faster joins than glibc malloc under concurrency);
 # without it, glibc's malloc_trim releases idle heap memory instead
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]

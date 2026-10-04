@@ -37,25 +37,160 @@ use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::index::{G, Key, O, P, Perm, S};
 use crate::io::{RdfFormat, Source};
+use crate::reasoning::ReasoningRecord;
+use crate::sparql::rdfs::RdfsOnRead;
 use crate::sparql::update::UpdateStats;
 use crate::sparql::{QueryKind, QueryOptions, QueryResult};
 use crate::store::{Snapshot, Store, StoreOptions, WriteTxn};
+use crate::write_guard::WriteGuard;
 use oxrdf::{
     GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, QuadRef, Term, Triple, TripleRef,
 };
+use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashSet;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// The name of the file in which a persistent clone records where it came from.
+pub const ORIGIN_FILE: &str = "origin.json";
+
 /// An RDF dataset (default graph + named graphs) backed by a Sparkles store.
 ///
 /// Cheap to clone (shared handle). Reads work on consistent snapshots; writes are
 /// serialized through a single-writer transaction (MR+SW, like TDB2).
+///
+/// Opening a dataset sets up what its directory configures, as the server does: the
+/// write guard of `validation.json`, RDFS on read from `rdfs.json`, the stored queries
+/// of `queries.json`, the GraphQL configuration of `graphql.json` (feature `graphql`),
+/// the reasoning record of `reasoning.json` and the clone origin of `origin.json`.
 #[derive(Clone)]
 pub struct Dataset {
-    store: Arc<Store>,
+    inner: Arc<DatasetState>,
+}
+
+/// How [`Dataset::open_with`] and [`Dataset::from_store_with`] open a dataset: the
+/// store's options and the library's own settings. Every `StoreOptions` converts into
+/// one.
+#[derive(Clone, Debug)]
+pub struct DatasetOptions {
+    pub store: StoreOptions,
+    /// the name a catalog or a server gives the dataset (see [`Dataset::name`])
+    pub name: Option<String>,
+    /// the largest closure kept in memory for incremental reasoning, in triples
+    /// (`serve --reason-cache-triples`)
+    pub closure_cache_triples: usize,
+    /// the origin of an in-memory clone, which has no `origin.json`
+    pub origin: Option<serde_json::Value>,
+}
+
+impl Default for DatasetOptions {
+    fn default() -> DatasetOptions {
+        DatasetOptions {
+            store: StoreOptions::default(),
+            name: None,
+            closure_cache_triples: crate::reasoning::DEFAULT_CLOSURE_CACHE_TRIPLES,
+            origin: None,
+        }
+    }
+}
+
+impl From<StoreOptions> for DatasetOptions {
+    fn from(store: StoreOptions) -> DatasetOptions {
+        DatasetOptions {
+            store,
+            ..DatasetOptions::default()
+        }
+    }
+}
+
+/// The state of an open dataset beside its store: what [`Dataset::open`] reads from the
+/// dataset's directory and what the dataset keeps between calls.
+///
+/// This is the engine-level view that the server reads through [`Dataset::state`]. It
+/// may change between releases; programs use the methods of [`Dataset`].
+#[doc(hidden)]
+pub struct DatasetState {
+    pub store: StoreHandle,
+    pub name: Option<String>,
+    /// the stored queries (`queries.json`)
+    pub queries: crate::stored::Catalog,
+    /// the GraphQL configuration (`graphql.json`)
+    #[cfg(feature = "graphql")]
+    pub graphql: sparkles_graphql::Catalog,
+    /// the record of the last materialization (`reasoning.json`)
+    pub reasoning: RwLock<Option<ReasoningRecord>>,
+    /// the closure of the last materialization, for the next incremental run
+    #[cfg(feature = "reasoning")]
+    pub closure: sparkles_reasoner::Cache,
+    /// RDFS on read, when set (`rdfs.json`)
+    pub rdfs: RwLock<Option<Arc<RdfsOnRead>>>,
+    /// the installed write-time validation (`validation.json`)
+    pub validation: RwLock<Option<WriteGuard>>,
+    /// why the write guard that `validation.json` asks for is not installed
+    pub guard_error: RwLock<Option<String>>,
+    /// the last schema report computed, kept for its pagination cursors and to be
+    /// maintained from later changes
+    pub schema_cache: Mutex<Option<SchemaCacheEntry>>,
+    /// where a clone was made from (`origin.json`, or kept in memory for an in-memory
+    /// clone)
+    pub origin: Option<serde_json::Value>,
+}
+
+impl DatasetState {
+    /// Update the reasoning record in memory and, for a persistent dataset, in its
+    /// directory.
+    pub fn set_reasoning(&self, record: Option<ReasoningRecord>) -> Result<()> {
+        if let Some(root) = self.store.root() {
+            crate::reasoning::write_record(root, record.as_ref())?;
+        }
+        *self.reasoning.write() = record;
+        Ok(())
+    }
+}
+
+/// A dataset's store: its own, or a branch's, which the branch set of the dataset that
+/// owns the branch keeps open. It derefs to the [`Store`].
+#[doc(hidden)]
+#[allow(clippy::large_enum_variant)]
+pub enum StoreHandle {
+    Own(Store),
+    Branch(Arc<Store>),
+}
+
+impl std::ops::Deref for StoreHandle {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        match self {
+            StoreHandle::Own(s) => s,
+            StoreHandle::Branch(s) => s,
+        }
+    }
+}
+
+impl From<Store> for StoreHandle {
+    fn from(s: Store) -> StoreHandle {
+        StoreHandle::Own(s)
+    }
+}
+
+impl From<Arc<Store>> for StoreHandle {
+    fn from(s: Arc<Store>) -> StoreHandle {
+        StoreHandle::Branch(s)
+    }
+}
+
+/// A computed schema report and what it was computed for.
+pub struct SchemaCacheEntry {
+    /// snapshot identity (`sparkles::schema::snapshot_identity`)
+    pub identity: u64,
+    /// hash of the selection parameters
+    pub selection: u64,
+    pub report: Arc<crate::schema::SchemaReport>,
+    /// the state the report was computed at, for an in-memory dataset, whose past states
+    /// a later report cannot otherwise be compared with
+    pub mark: Option<crate::store::StateMark>,
 }
 
 impl Dataset {
@@ -70,29 +205,141 @@ impl Dataset {
         Dataset::open_with(path, StoreOptions::default())
     }
 
-    pub fn open_with(path: impl AsRef<Path>, opts: StoreOptions) -> Result<Dataset> {
-        Ok(Dataset::from_store(Store::open(path.as_ref(), opts)?))
+    /// [`open`](Self::open) with options: a [`DatasetOptions`], or a `StoreOptions`.
+    pub fn open_with(path: impl AsRef<Path>, opts: impl Into<DatasetOptions>) -> Result<Dataset> {
+        let opts = opts.into();
+        let store = Store::open(path.as_ref(), opts.store.clone())?;
+        Ok(Dataset::from_store_with(store, opts))
     }
 
+    /// The dataset of an open store, with the state its directory configures.
     pub fn from_store(store: Store) -> Dataset {
+        Dataset::from_store_with(store, DatasetOptions::default())
+    }
+
+    /// [`from_store`](Self::from_store) with the library's settings of `opts` (its
+    /// `store` options are those `store` was opened with and are not read).
+    pub fn from_store_with(store: impl Into<StoreHandle>, opts: DatasetOptions) -> Dataset {
+        let store: StoreHandle = store.into();
+        let shown = || {
+            opts.name
+                .as_deref()
+                .map(|n| format!("/{n}"))
+                .or_else(|| store.root().map(|r| r.display().to_string()))
+                .unwrap_or_else(|| "(memory)".into())
+        };
+        let (validation, guard_error) = match crate::write_guard::install(&store) {
+            Ok(g) => (g, None),
+            Err(e) => {
+                let why = e.to_string();
+                tracing::error!(
+                    "write-time validation of {}: {why}; writes are refused until it is fixed",
+                    shown()
+                );
+                store.set_guard_missing_reason(Some(why.clone()));
+                (None, Some(why))
+            }
+        };
+        let rdfs = crate::reasoning::rdfs::load(&store);
+        let queries = crate::stored::Catalog::open_or_broken(store.root());
+        if let Some(e) = queries.broken() {
+            tracing::error!(
+                "stored queries of {}: {e}; they cannot be changed until it is fixed",
+                shown()
+            );
+        }
+        #[cfg(feature = "graphql")]
+        let graphql = sparkles_graphql::Catalog::open_or_broken(store.root());
+        #[cfg(feature = "graphql")]
+        if let Some(e) = graphql.broken() {
+            tracing::error!(
+                "GraphQL configuration of {}: {e}; it cannot be changed until it is fixed",
+                shown()
+            );
+        }
+        let reasoning = store.root().and_then(crate::reasoning::read_record);
+        let origin = match store.root() {
+            Some(root) => std::fs::read(root.join(ORIGIN_FILE))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok()),
+            None => opts.origin,
+        };
         Dataset {
-            store: Arc::new(store),
+            inner: Arc::new(DatasetState {
+                name: opts.name,
+                queries,
+                #[cfg(feature = "graphql")]
+                graphql,
+                reasoning: RwLock::new(reasoning),
+                #[cfg(feature = "reasoning")]
+                closure: sparkles_reasoner::Cache::new(opts.closure_cache_triples),
+                rdfs: RwLock::new(rdfs),
+                validation: RwLock::new(validation),
+                guard_error: RwLock::new(guard_error),
+                schema_cache: Mutex::new(None),
+                origin,
+                store,
+            }),
         }
     }
 
-    /// A dataset around a store others share (a branch's, which its dataset keeps open).
-    pub(crate) fn from_shared(store: Arc<Store>) -> Dataset {
-        Dataset { store }
+    /// A dataset around a store others share (a branch's, which its dataset keeps open),
+    /// with the state the branch's directory configures.
+    pub(crate) fn from_shared(store: Arc<Store>, opts: DatasetOptions) -> Dataset {
+        Dataset::from_store_with(StoreHandle::Branch(store), opts)
     }
 
     /// The underlying store (ids, snapshots, low-level scans).
     pub fn store(&self) -> &Store {
-        &self.store
+        &self.inner.store
+    }
+
+    /// The dataset's state beside its store, for the server. Programs use the methods of
+    /// `Dataset` and its handles.
+    #[doc(hidden)]
+    pub fn state(&self) -> &DatasetState {
+        &self.inner
+    }
+
+    /// The name a catalog or a server gave the dataset, if any.
+    pub fn name(&self) -> Option<&str> {
+        self.inner.name.as_deref()
+    }
+
+    /// The installed write-time validation, if any.
+    pub fn write_guard(&self) -> Option<WriteGuard> {
+        self.inner.validation.read().clone()
+    }
+
+    /// Record the guard that a new configuration installed on the store (or `None` once
+    /// it is removed): the guard an earlier open could not install no longer applies.
+    #[doc(hidden)]
+    pub fn set_write_guard(&self, g: Option<WriteGuard>) {
+        *self.inner.validation.write() = g;
+        *self.inner.guard_error.write() = None;
+        self.inner.store.set_guard_missing_reason(None);
+    }
+
+    /// Why the write guard that the dataset's `validation.json` asks for could not be
+    /// installed. While this is set, writes fail with [`Error::GuardMissing`].
+    pub fn guard_error(&self) -> Option<String> {
+        self.inner.guard_error.read().clone()
+    }
+
+    /// The reasoning record of the last materialization, if any.
+    pub fn reasoning_record(&self) -> Option<ReasoningRecord> {
+        self.inner.reasoning.read().clone()
+    }
+
+    /// Where a clone was made from: the `origin.json` of a persistent clone, or what an
+    /// in-memory clone keeps.
+    pub fn origin(&self) -> Option<&serde_json::Value> {
+        self.inner.origin.as_ref()
     }
 
     /// Current read snapshot.
     pub fn snapshot(&self) -> Arc<Snapshot> {
-        self.store.snapshot()
+        self.inner.store.snapshot()
     }
 
     // ------------------------------------------------------------------ loading ------
@@ -138,30 +385,30 @@ impl Dataset {
     }
 
     fn load_sources(&self, sources: Vec<Source>) -> Result<u64> {
-        self.store.load(&sources)
+        self.inner.store.load(&sources)
     }
 
     /// Load sources in one commit and return its receipt.
     pub fn load_sources_receipt(&self, sources: Vec<Source>) -> Result<Receipt> {
-        self.store.load_as(&sources, CommitKind::Load)
+        self.inner.store.load_as(&sources, CommitKind::Load)
     }
 
     // ------------------------------------------------------------------ commits ------
 
     /// The dataset id: a UUID created with the database, naming its commit history.
     pub fn dataset_id(&self) -> uuid::Uuid {
-        self.store.dataset_id()
+        self.inner.store.dataset_id()
     }
 
     /// The latest commit.
     pub fn head_commit(&self) -> CommitInfo {
-        self.store.head_commit()
+        self.inner.store.head_commit()
     }
 
     /// A page of commit metadata (newest first for [`CommitRange::Latest`] and
     /// [`CommitRange::Before`], oldest first for [`CommitRange::After`]).
     pub fn commits(&self, range: CommitRange, limit: usize) -> CommitPage {
-        self.store.commits(range, limit)
+        self.inner.store.commits(range, limit)
     }
 
     // ------------------------------------------------------------------- SPARQL ------
@@ -171,14 +418,14 @@ impl Dataset {
     /// ([`Store::describe_settings`](crate::store::Store::describe_settings)).
     pub fn query(&self, query: &str) -> Result<QueryResult> {
         let opts = QueryOptions {
-            describe: self.store.describe_settings(),
+            describe: self.inner.store.describe_settings(),
             ..Default::default()
         };
         self.query_with(query, &opts)
     }
 
     pub fn query_with(&self, query: &str, opts: &QueryOptions) -> Result<QueryResult> {
-        crate::sparql::query(self.store.snapshot(), query, opts)
+        crate::sparql::query(self.inner.store.snapshot(), query, opts)
     }
 
     /// Run a SELECT query and return its solutions as terms.
@@ -226,11 +473,11 @@ impl Dataset {
 
     /// Run a SPARQL Update request (all operations in one transaction).
     pub fn update(&self, update: &str) -> Result<UpdateStats> {
-        crate::sparql::update::update(&self.store, update, &QueryOptions::default())
+        crate::sparql::update::update(&self.inner.store, update, &QueryOptions::default())
     }
 
     pub fn update_with(&self, update: &str, opts: &QueryOptions) -> Result<UpdateStats> {
-        crate::sparql::update::update(&self.store, update, opts)
+        crate::sparql::update::update(&self.inner.store, update, opts)
     }
 
     /// Apply an RDF Patch, in the text form or (`binary`) the RDF Thrift form, as one
@@ -240,7 +487,7 @@ impl Dataset {
         patch: impl std::io::Read,
         binary: bool,
     ) -> Result<crate::store::PatchOutcome> {
-        self.store.apply_patch(
+        self.inner.store.apply_patch(
             patch,
             &crate::store::PatchOptions {
                 binary,
@@ -278,7 +525,7 @@ impl Dataset {
 
     /// Names of the non-empty named graphs.
     pub fn graph_names(&self) -> Result<Vec<NamedOrBlankNode>> {
-        let snap = self.store.snapshot();
+        let snap = self.inner.store.snapshot();
         Ok(snap
             .graph_ids()?
             .into_iter()
@@ -299,7 +546,7 @@ impl Dataset {
         predicate: Option<&NamedNode>,
         object: Option<&Term>,
     ) -> Result<Vec<Quad>> {
-        let snap = self.store.snapshot();
+        let snap = self.inner.store.snapshot();
         let sel = match graph {
             None => GraphSel::Any,
             Some(GraphNameRef::DefaultGraph) => GraphSel::Default,
@@ -319,7 +566,7 @@ impl Dataset {
         predicate: Option<&NamedNode>,
         object: Option<&Term>,
     ) -> QuadIter {
-        let snap = self.store.snapshot();
+        let snap = self.inner.store.snapshot();
         let sel = match graph {
             None => GraphSel::Any,
             Some(GraphNameRef::DefaultGraph) => GraphSel::Default,
@@ -339,13 +586,13 @@ impl Dataset {
         predicate: Option<&NamedNode>,
         object: Option<&Term>,
     ) -> QuadIter {
-        let snap = self.store.snapshot();
+        let snap = self.inner.store.snapshot();
         let plan = scan_plan(&snap, &GraphSel::Any, subject, predicate, object, true);
         QuadIter::new(snap, plan)
     }
 
     pub fn contains(&self, quad: QuadRef<'_>) -> Result<bool> {
-        let snap = self.store.snapshot();
+        let snap = self.inner.store.snapshot();
         match quad_ids(&snap, quad) {
             Some(ids) => snap.contains(&ids),
             None => Ok(false),
@@ -354,7 +601,7 @@ impl Dataset {
 
     /// Number of quads in the dataset.
     pub fn len(&self) -> u64 {
-        self.store.snapshot().len()
+        self.inner.store.snapshot().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -395,7 +642,7 @@ impl Dataset {
         f: impl FnOnce(&mut Transaction<'_>) -> Result<R>,
     ) -> Result<(R, Receipt)> {
         let mut tx = Transaction {
-            txn: self.store.write(),
+            txn: self.inner.store.write(),
             labels: HashMap::new(),
         };
         let r = f(&mut tx)?;
@@ -406,11 +653,11 @@ impl Dataset {
     // --------------------------------------------------------------------- admin ------
 
     pub fn prefixes(&self) -> BTreeMap<String, String> {
-        self.store.prefixes()
+        self.inner.store.prefixes()
     }
 
     pub fn set_prefix(&self, prefix: &str, iri: &str) -> Result<()> {
-        self.store.add_prefixes(
+        self.inner.store.add_prefixes(
             [(prefix.to_string(), iri.to_string())]
                 .into_iter()
                 .collect(),
@@ -420,11 +667,11 @@ impl Dataset {
     /// Serialize the dataset. Quad formats (N-Quads, TriG) write every graph; triple
     /// formats write the default graph only.
     pub fn dump(&self, w: impl Write, format: RdfFormat) -> Result<u64> {
-        let snap = self.store.snapshot();
+        let snap = self.inner.store.snapshot();
         let quads_format = format.supports_datasets();
         let ser = crate::io::with_prefixes(
             oxrdfio::RdfSerializer::from_format(format),
-            self.store.prefixes(),
+            self.inner.store.prefixes(),
         );
         let mut out = ser.for_writer(w);
         let mut n = 0;
@@ -450,21 +697,105 @@ impl Dataset {
         Ok(n)
     }
 
+    /// Remove one prefix; whether it was defined.
+    pub fn remove_prefix(&self, prefix: &str) -> Result<bool> {
+        self.inner.store.remove_prefix(prefix)
+    }
+
+    /// Replace the content of `target` (a graph, the default graph, or every graph) with
+    /// the quads of `sources`, in one commit. The sources are parsed before anything is
+    /// cleared.
+    pub fn replace(
+        &self,
+        target: crate::store::ReplaceTarget,
+        sources: &[Source],
+    ) -> Result<Receipt> {
+        Ok(self
+            .inner
+            .store
+            .replace_as(target, sources, CommitKind::GspPut)?
+            .1)
+    }
+
+    /// Remove every quad of every graph; the quads removed.
+    pub fn clear(&self) -> Result<u64> {
+        Ok(self.update("CLEAR SILENT ALL")?.deleted)
+    }
+
+    /// Serialize one graph's triples (the default graph for
+    /// [`GraphNameRef::DefaultGraph`]) in a triple format; the triples written.
+    pub fn dump_graph(
+        &self,
+        graph: GraphNameRef<'_>,
+        w: impl Write,
+        format: RdfFormat,
+    ) -> Result<u64> {
+        let ser = crate::io::with_prefixes(
+            oxrdfio::RdfSerializer::from_format(format),
+            self.inner.store.prefixes(),
+        );
+        let mut out = ser.for_writer(w);
+        let mut n = 0;
+        for q in self.quads(Some(graph), None, None, None) {
+            let q = q?;
+            out.serialize_triple(TripleRef::new(&q.subject, &q.predicate, &q.object))?;
+            n += 1;
+        }
+        out.finish()?;
+        Ok(n)
+    }
+
+    /// The plan of a query without running it, as text and as the plan's summary.
+    pub fn explain(
+        &self,
+        query: &str,
+        opts: &QueryOptions,
+    ) -> Result<(String, crate::sparql::PlanInfo)> {
+        crate::sparql::explain(self.snapshot(), query, opts)
+    }
+
+    /// Drop the cached query results.
+    pub fn clear_cache(&self) {
+        self.inner.store.result_cache().clear();
+    }
+
     /// Merge updates into a freshly built index generation (TDB2 compaction).
     pub fn compact(&self) -> Result<()> {
-        self.store.compact()
+        self.inner.store.compact()
+    }
+
+    /// [`compact`](Self::compact) with options, cancelled by `ctl` (the generation is
+    /// then unchanged) and reporting the build's phases to its progress, ending at 1.0.
+    pub fn compact_with(
+        &self,
+        opts: &crate::store::CompactOptions,
+        ctl: &crate::task::Control,
+    ) -> Result<crate::store::CompactReport> {
+        ctl.check()?;
+        let progress = ctl.progress.clone();
+        let mut o = opts.clone();
+        o.cancel = Some(ctl.cancel.flag());
+        if progress.is_some() {
+            progress.report(0.0, "compacting");
+            let p = progress.clone();
+            o.progress = Some(Arc::new(move |m: &str| p.report(0.0, m)));
+        }
+        let r = self.inner.store.compact_with(&o)?;
+        progress.report(1.0, "compacted");
+        Ok(r)
     }
 
     /// Write a compressed N-Quads backup into `dir` (zstd, or gzip in builds without zstd);
     /// returns the file path.
     pub fn backup(&self, dir: impl AsRef<Path>) -> Result<PathBuf> {
         let name = self
+            .inner
             .store
             .root()
             .and_then(|r| r.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "dataset".into());
-        self.store.backup(dir.as_ref(), &name)
+        self.inner.store.backup(dir.as_ref(), &name)
     }
 }
 
@@ -504,7 +835,7 @@ impl GraphView<'_> {
         predicate: Option<&NamedNode>,
         object: Option<&Term>,
     ) -> Result<Vec<Triple>> {
-        let snap = self.ds.store.snapshot();
+        let snap = self.ds.inner.store.snapshot();
         let quads = find_quads(&snap, &self.graph, subject, predicate, object)?;
         let mut seen = FxHashSet::default();
         Ok(quads
@@ -526,7 +857,7 @@ impl GraphView<'_> {
     }
 
     pub fn len(&self) -> Result<u64> {
-        let snap = self.ds.store.snapshot();
+        let snap = self.ds.inner.store.snapshot();
         match &self.graph {
             GraphSel::Default => snap.count(Perm::Gspo, &[Id::DEFAULT_GRAPH.0]),
             GraphSel::Named(n) => match snap.lookup_iri(n.as_str()) {
@@ -1326,5 +1657,110 @@ mod tests {
         });
         assert!(r.is_err());
         assert!(s_of("q").len() == 3);
+    }
+
+    const PERSON: &str = "INSERT DATA { <http://ex.org/a> a <http://ex.org/P> }";
+
+    /// A database whose `validation.json` asks for a ShEx guard requiring a name on
+    /// every `ex:P`, written as the server writes it.
+    fn shex_database(dir: &Path) {
+        drop(Store::open(dir, Default::default()).unwrap());
+        std::fs::write(
+            dir.join(crate::guard::config::CONFIG_FILE),
+            r#"{"format":2,"language":"shex","mode":"reject","schema":{"file":"validation-schema.shex","format":"shexc"},"shapeMap":"{FOCUS a <http://ex.org/P>}@<http://ex.org/S>"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(crate::guard::config::SHEX_SCHEMA_SHEXC_FILE),
+            "<http://ex.org/S> { <http://ex.org/name> . }",
+        )
+        .unwrap();
+    }
+
+    /// Regression: `Dataset::open` installs the write guard that `validation.json` asks
+    /// for, as the server does, so writes are validated rather than refused with
+    /// `GuardMissing`.
+    #[cfg(feature = "shex")]
+    #[test]
+    fn open_installs_the_write_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        shex_database(dir.path());
+        let ds = Dataset::open(dir.path()).unwrap();
+        assert!(ds.guard_error().is_none());
+        assert_eq!(
+            ds.write_guard().unwrap().language(),
+            crate::guard::GuardLanguage::Shex
+        );
+        assert!(matches!(ds.update(PERSON), Err(Error::Rejected(_))));
+        ds.update(
+            "INSERT DATA { <http://ex.org/a> a <http://ex.org/P> ; <http://ex.org/name> \"A\" }",
+        )
+        .unwrap();
+        assert_eq!(ds.len(), 2);
+    }
+
+    /// Without the validator's feature the dataset fails closed, and the error names the
+    /// feature.
+    #[cfg(not(feature = "shex"))]
+    #[test]
+    fn open_without_the_validator_refuses_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        shex_database(dir.path());
+        let ds = Dataset::open(dir.path()).unwrap();
+        assert!(ds.guard_error().unwrap().contains("`shex` feature"));
+        match ds.update(PERSON) {
+            Err(Error::GuardMissing(m)) => assert!(m.contains("`shex` feature"), "{m}"),
+            r => panic!("not refused: {r:?}"),
+        }
+        assert!(ds.is_empty());
+    }
+
+    /// A SHACL configuration set on the store installs at the next open.
+    #[cfg(feature = "shacl")]
+    #[test]
+    fn open_installs_a_shacl_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path(), Default::default()).unwrap();
+            let cfg = serde_json::from_value(serde_json::json!({
+                "mode": "reject",
+                "shapes": {"inline": "<urn:S> a <http://www.w3.org/ns/shacl#NodeShape> ; \
+                    <http://www.w3.org/ns/shacl#targetClass> <http://ex.org/P> ; \
+                    <http://www.w3.org/ns/shacl#property> [ \
+                    <http://www.w3.org/ns/shacl#path> <http://ex.org/name> ; \
+                    <http://www.w3.org/ns/shacl#minCount> 1 ] ."},
+            }))
+            .unwrap();
+            sparkles_shacl::guard::set_config(&store, Some(cfg)).unwrap();
+        }
+        let ds = Dataset::open(dir.path()).unwrap();
+        assert!(matches!(ds.write_guard(), Some(WriteGuard::Shacl(_))));
+        assert!(matches!(ds.update(PERSON), Err(Error::Rejected(_))));
+        assert!(ds.is_empty());
+    }
+
+    /// The reasoning record and RDFS on read are read back at open.
+    #[test]
+    fn open_reads_the_reasoning_record_and_rdfs() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let ds = Dataset::open(dir.path()).unwrap();
+            ds.state()
+                .set_reasoning(Some(ReasoningRecord {
+                    profile: "rdfs".into(),
+                    inferred: 3,
+                    ..Default::default()
+                }))
+                .unwrap();
+            crate::reasoning::rdfs::set(
+                &ds,
+                Some(crate::reasoning::rdfs::NewSchema::Graph("default".into())),
+            )
+            .unwrap();
+        }
+        let ds = Dataset::open(dir.path()).unwrap();
+        assert_eq!(ds.reasoning_record().unwrap().inferred, 3);
+        assert!(ds.state().rdfs.read().is_some());
+        assert!(ds.origin().is_none());
     }
 }

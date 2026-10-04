@@ -54,7 +54,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 /// Progress callback: (fraction done in `[0, 1]`, message).
-pub type ProgressFn = Arc<dyn Fn(f32, &str) + Send + Sync>;
+pub use sparkles_core::task::ProgressFn;
 
 /// How a [`Repository`] is opened.
 #[derive(Clone, Debug)]
@@ -103,7 +103,9 @@ impl Default for OpenEnv {
     }
 }
 
-/// Cancellation and progress of one operation.
+/// Cancellation and progress of one operation. A
+/// [`Control`](sparkles_core::task::Control) fills it (`Ctl::from(&control)`); its
+/// deadline does not apply, since object requests have their own timeouts.
 #[derive(Clone, Default)]
 pub struct Ctl {
     /// set to `true` to cancel; checked between object requests and every 8 MiB of
@@ -134,11 +136,36 @@ impl Ctl {
         }
     }
 
+    /// The same cancellation and progress as a library
+    /// [`Control`](sparkles_core::task::Control).
+    pub fn control(&self) -> sparkles_core::task::Control {
+        sparkles_core::task::Control {
+            cancel: sparkles_core::task::Cancel::from_flag(self.cancel.clone()),
+            progress: sparkles_core::task::Progress::from_fn(self.progress.clone()),
+            deadline: None,
+        }
+    }
+
     /// Report progress (a no-op without a callback).
     pub fn report(&self, fraction: f32, msg: &str) {
         if let Some(p) = &self.progress {
             p(fraction.clamp(0.0, 1.0), msg);
         }
+    }
+}
+
+impl From<&sparkles_core::task::Control> for Ctl {
+    fn from(c: &sparkles_core::task::Control) -> Ctl {
+        Ctl {
+            cancel: c.cancel.flag(),
+            progress: c.progress.as_fn(),
+        }
+    }
+}
+
+impl From<sparkles_core::task::Control> for Ctl {
+    fn from(c: sparkles_core::task::Control) -> Ctl {
+        Ctl::from(&c)
     }
 }
 

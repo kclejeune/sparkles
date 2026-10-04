@@ -553,7 +553,7 @@ pub struct CompactOptions {
     pub io_bytes_per_sec: Option<u64>,
     /// stops the build ([`Error::Cancelled`]) when set
     pub cancel: Option<Arc<AtomicBool>>,
-    pub progress: Option<crate::builder::ProgressFn>,
+    pub progress: Option<crate::builder::MessageFn>,
     /// whether it may rewrite only the blocks the delta touches (`None`: the dataset's
     /// own setting, else [`PartialMode::Auto`])
     pub partial: Option<PartialMode>,

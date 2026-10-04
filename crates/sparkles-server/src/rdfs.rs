@@ -12,76 +12,22 @@
 //! `PUT` and `DELETE` need `admin`.
 
 use crate::http::{AdminBody, ApiResult, dataset, err};
-use crate::state::{Dataset, write_file_atomic};
+use crate::state::Dataset;
 use anyhow::{Context, Result};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value as J, json};
 use sparkles::io::{RdfFormat, Source};
-use sparkles::sparql::rdfs::{RdfsOnRead, RdfsSchema, SchemaSource};
-use sparkles::store::Store;
+use sparkles::sparql::rdfs::SchemaSource;
 use std::sync::Arc;
 
 type St = State<Arc<crate::state::AppState>>;
 
-/// The setting of a persistent dataset.
-pub const SETTING_FILE: &str = "rdfs.json";
-/// The closed triples of an uploaded schema.
-pub const SCHEMA_FILE: &str = "rdfs-schema.nt";
-
-/// What `rdfs.json` holds.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Setting {
-    #[serde(default)]
-    rdfs_format: u32,
-    /// the schema graph, `default` or an IRI; without it, the schema of `rdfs-schema.nt`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    graph: Option<String>,
-}
-
-/// A new setting.
-pub enum NewSchema {
-    /// a graph of the dataset: `default` or an IRI
-    Graph(String),
-    /// a schema given as triples
-    Triples(Vec<oxrdf::Triple>),
-}
-
-fn graph_source(g: &str) -> SchemaSource {
-    SchemaSource::Graph((g != "default").then(|| g.to_string()))
-}
-
-/// The setting kept in a dataset's directory, if any. A setting that cannot be read is
-/// logged and ignored.
-pub fn load(store: &Store) -> Option<Arc<RdfsOnRead>> {
-    let root = store.root()?;
-    let bytes = std::fs::read(root.join(SETTING_FILE)).ok()?;
-    let open = || -> Result<RdfsOnRead> {
-        let s: Setting = serde_json::from_slice(&bytes)?;
-        Ok(match s.graph {
-            Some(g) => RdfsOnRead::new(graph_source(&g)),
-            None => {
-                let nt = std::fs::read(root.join(SCHEMA_FILE))
-                    .with_context(|| format!("reading {SCHEMA_FILE}"))?;
-                RdfsOnRead::fixed(RdfsSchema::from_triples(&parse(nt, RdfFormat::NTriples)?))
-            }
-        })
-    };
-    match open() {
-        Ok(r) => Some(Arc::new(r)),
-        Err(e) => {
-            tracing::error!(
-                "RDFS on read of {}: {e:#}; queries run without it",
-                root.display()
-            );
-            None
-        }
-    }
-}
+pub use sparkles::reasoning::rdfs::NewSchema;
+#[cfg(test)]
+use sparkles::reasoning::rdfs::{SCHEMA_FILE, SETTING_FILE};
 
 /// The triples of an RDF file, its format (and compression) from its name.
 pub fn read_file(path: &std::path::Path) -> Result<Vec<oxrdf::Triple>> {
@@ -95,53 +41,10 @@ pub fn parse(bytes: Vec<u8>, format: RdfFormat) -> Result<Vec<oxrdf::Triple>> {
     Ok(quads.into_iter().map(oxrdf::Triple::from).collect())
 }
 
-/// Set the dataset's RDFS on read, or with `None` remove it: in its directory first,
-/// for a persistent dataset, then in memory.
+/// Set the dataset's RDFS on read, or with `None` remove it (see
+/// [`sparkles::reasoning::rdfs::set`]).
 pub fn set(ds: &Dataset, new: Option<NewSchema>) -> Result<()> {
-    let r = match new {
-        None => {
-            if let Some(root) = ds.store.root() {
-                for f in [SETTING_FILE, SCHEMA_FILE] {
-                    match std::fs::remove_file(root.join(f)) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-            }
-            None
-        }
-        Some(NewSchema::Graph(g)) => {
-            if let Some(root) = ds.store.root() {
-                let s = Setting {
-                    rdfs_format: 1,
-                    graph: Some(g.clone()),
-                };
-                write_file_atomic(&root.join(SETTING_FILE), &serde_json::to_vec_pretty(&s)?)?;
-                let _ = std::fs::remove_file(root.join(SCHEMA_FILE));
-            }
-            Some(RdfsOnRead::new(graph_source(&g)))
-        }
-        Some(NewSchema::Triples(t)) => {
-            let schema = RdfsSchema::from_triples(&t);
-            if let Some(root) = ds.store.root() {
-                let mut nt = String::new();
-                for t in schema.triples() {
-                    nt.push_str(&format!("{t} .\n"));
-                }
-                // the schema before the setting that names it
-                write_file_atomic(&root.join(SCHEMA_FILE), nt.as_bytes())?;
-                let s = Setting {
-                    rdfs_format: 1,
-                    graph: None,
-                };
-                write_file_atomic(&root.join(SETTING_FILE), &serde_json::to_vec_pretty(&s)?)?;
-            }
-            Some(RdfsOnRead::fixed(schema))
-        }
-    };
-    *ds.rdfs.write() = r.map(Arc::new);
-    Ok(())
+    Ok(sparkles::reasoning::rdfs::set(&ds.dataset, new)?)
 }
 
 /// The setting for dataset info: `null`, or where the schema comes from.

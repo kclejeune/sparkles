@@ -1084,6 +1084,8 @@ pub struct Store {
     guard_observer: parking_lot::RwLock<Option<Arc<dyn crate::guard::GuardObserver>>>,
     /// `validation.json` asks for a guard: commits fail without one (fail closed)
     guard_required: AtomicBool,
+    /// why the required guard is not installed, for the error of a refused commit
+    guard_missing_reason: parking_lot::RwLock<Option<String>>,
     /// write transactions waiting for the writer lock
     writers_waiting: AtomicUsize,
     /// the newest published commit, for waiters on new commits (change feeds)
@@ -1236,6 +1238,7 @@ impl Store {
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(false),
+            guard_missing_reason: parking_lot::RwLock::new(None),
             writers_waiting: Default::default(),
             wal_end: AtomicU64::new(0),
             commits: tokio::sync::watch::Sender::new(0),
@@ -1554,6 +1557,7 @@ impl Store {
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(guard_required_by(root)),
+            guard_missing_reason: parking_lot::RwLock::new(None),
             writers_waiting: Default::default(),
             wal_end: AtomicU64::new(wal_len),
             commits: tokio::sync::watch::Sender::new(head.seq),
@@ -3132,6 +3136,13 @@ impl Store {
         self.guard_required.load(Ordering::Relaxed)
     }
 
+    /// Say why the guard this dataset requires could not be installed (such as a build
+    /// without the validator's feature). Commits refused for want of the guard then
+    /// fail with [`Error::GuardMissing`] carrying this reason.
+    pub fn set_guard_missing_reason(&self, reason: Option<String>) {
+        *self.guard_missing_reason.write() = reason;
+    }
+
     /// Mark whether this dataset requires a guard (set with its configuration).
     pub fn set_guard_required(&self, required: bool) {
         self.guard_required.store(required, Ordering::Relaxed);
@@ -3179,7 +3190,12 @@ impl Store {
         let Some(g) = g else {
             if self.guard_required() && !self.opts.unvalidated_writes {
                 return Err(Error::GuardMissing(
-                    "dataset requires write-time validation (validation.json); install its guard (sparkles_shacl::guard::install or sparkles_shex::guard::install) or allow unvalidated writes".into(),
+                    match self.guard_missing_reason.read().as_deref() {
+                        Some(why) => format!(
+                            "dataset requires write-time validation (validation.json), and its guard could not be installed: {why}"
+                        ),
+                        None => "dataset requires write-time validation (validation.json); install its guard (sparkles_shacl::guard::install or sparkles_shex::guard::install) or allow unvalidated writes".into(),
+                    },
                 ));
             }
             return Ok(None);
@@ -4012,7 +4028,7 @@ fn write_snapshot(
 }
 
 /// Progress callback: (fraction done in `[0, 1]`, message).
-pub type ProgressFn = Arc<dyn Fn(f32, &str) + Send + Sync>;
+pub use crate::task::ProgressFn;
 
 pub(crate) fn dir_size(p: &Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(p) else {

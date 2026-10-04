@@ -2521,12 +2521,17 @@ dependencies = [
 name = "sparkles"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "oxrdf",
  "oxrdfio",
+ "parking_lot",
  "regex",
  "rustc-hash",
+ "serde",
+ "serde_json",
  "spargebra",
  "sparkles-core",
+ "tracing",
  "uuid",
 ]
 

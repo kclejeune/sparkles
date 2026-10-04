@@ -135,11 +135,6 @@ struct OriginSource {
     quads: u64,
 }
 
-/// `origin.json` of a database directory, as JSON, if it is a clone.
-pub fn read_origin(root: &Path) -> Option<J> {
-    serde_json::from_slice(&std::fs::read(root.join("origin.json")).ok()?).ok()
-}
-
 /// The origin record of a clone of `store` (dataset `name`).
 fn origin(store: &Store, name: &str, spec: &Spec, report: &CloneReport) -> OriginFile {
     OriginFile {
@@ -225,7 +220,7 @@ pub fn clone_into(
         }
     }
     write_file_atomic(
-        &tmp.join("origin.json"),
+        &tmp.join(sparkles::dataset::ORIGIN_FILE),
         &serde_json::to_vec_pretty(&origin(store, name, spec, &report))?,
     )?;
     if let Some(info) = reasoning.filter(|_| spec.keeps_inferences()) {

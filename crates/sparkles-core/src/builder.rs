@@ -194,12 +194,13 @@ pub struct Builder {
     input_quads: AtomicU64,
     /// whether a quad is in a graph other than the default graph
     named_graphs: AtomicBool,
-    progress: Option<ProgressFn>,
+    progress: Option<MessageFn>,
     interrupt: Option<InterruptFn>,
 }
 
-/// Progress callback for long-running builds.
-pub type ProgressFn = Arc<dyn Fn(&str) + Send + Sync>;
+/// The messages of a long-running build, one per phase (`building POS`). A build does
+/// not know its fraction done, so this is not a [`ProgressFn`](crate::task::ProgressFn).
+pub type MessageFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Called every [`INTERRUPT_EVERY`] quads an encoder takes and between build phases: an
 /// error stops the build (a cancelled write, a deadline, too little disk space).
@@ -234,7 +235,7 @@ impl Builder {
         })
     }
 
-    pub fn with_progress(mut self, f: ProgressFn) -> Self {
+    pub fn with_progress(mut self, f: MessageFn) -> Self {
         self.progress = Some(f);
         self
     }

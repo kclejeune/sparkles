@@ -13,6 +13,20 @@ spargebra.workspace = true
 rustc-hash.workspace = true
 regex.workspace = true
 uuid.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+# the satellites behind the features of the same names
+sparkles-reasoner = { workspace = true, optional = true }
+sparkles-shacl = { workspace = true, optional = true }
+sparkles-shex = { workspace = true, optional = true }
+sparkles-graphql = { workspace = true, optional = true }
+sparkles-backup = { workspace = true, optional = true }
+sparkles-fmt = { workspace = true, optional = true }
+# the runtime that the blocking backup calls run on (feature `backup`)
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 oxrdfio.workspace = true
@@ -29,3 +43,34 @@ geo-epsg = ["geo-proj4", "sparkles-core/geo-epsg"]
 zstd = ["sparkles-core/zstd"]
 brotli = ["sparkles-core/brotli"]
 failpoints = ["sparkles-core/failpoints"]
+# the reasoner's closure cache, and later its handle (RDFS on read needs no feature)
+reasoning = ["dep:sparkles-reasoner"]
+# SHACL write guards
+shacl = ["dep:sparkles-shacl"]
+# ShEx write guards
+shex = ["dep:sparkles-shex"]
+# the GraphQL configuration of a dataset
+graphql = ["dep:sparkles-graphql"]
+# backup repositories: `ds.backups(&repo)` and `sparkles::backup` (file systems and S3,
+# the backup crate's defaults)
+backup = ["dep:sparkles-backup", "dep:tokio"]
+backup-s3 = ["backup", "sparkles-backup/s3"]
+backup-gcs = ["backup", "sparkles-backup/gcs"]
+backup-azure = ["backup", "sparkles-backup/azure"]
+# the formatter and linter: `sparkles::fmt`
+fmt = ["dep:sparkles-fmt"]
+# what the server has: every feature but geo-epsg and the cloud backends other than S3
+full = [
+    "text",
+    "geo",
+    "geo-proj4",
+    "zstd",
+    "brotli",
+    "reasoning",
+    "shacl",
+    "shex",
+    "backup",
+    "backup-s3",
+    "graphql",
+    "fmt",
+]

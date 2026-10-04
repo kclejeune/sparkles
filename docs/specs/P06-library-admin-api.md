@@ -1,23 +1,27 @@
 # P06: Library administration API and parity
 
-> **Status:** implemented in part (step 1 of Phase 1)
+> **Status:** implemented in part (steps 1 to 4 of Phase 1)
 >
-> **Phases:** Step 1 of Phase 1 (§8.1) shipped. The engine is the `sparkles-core`
-> package in `crates/sparkles-core`. `crates/sparkles` is the `sparkles` facade, which
-> re-exports the engine's modules and holds `Dataset` and the query builder, and the
-> satellite crates depend on `sparkles-core`. The rest of Phase 1 adds the `Control` type
-> for cancellation and progress, moves the per-dataset state that only the server keeps
-> today into the library, gives `Dataset` its handles for snapshots, history, backups,
-> indexes, schema, stored queries, reasoning, validation, settings and GraphQL, adds the
-> `Catalog` of datasets in one data directory, moves the server's handlers onto them, and
-> adds the two parity tests. Phase 2 closes the Python bindings' gaps against that
-> surface. Phase 3 adds dataset renames over HTTP and in the CLI, and catalog commands
-> for a stopped server's data directory. None of these is built.
+> **Phases:** Steps 1 to 4 of Phase 1 (§8.1) shipped. The engine is the `sparkles-core`
+> package in `crates/sparkles-core`, and `crates/sparkles` is the `sparkles` facade over
+> it. `sparkles::task::Control` carries cancellation, progress and a deadline, and the
+> server's tasks build one from each task. `Dataset::open` sets a dataset up as the
+> server does, with its write guard, RDFS on read, stored queries, GraphQL configuration,
+> reasoning record and clone origin, and the server's datasets hold a `sparkles::Dataset`.
+> `Dataset` has handles for snapshots, history, indexes, settings, schema, stored
+> queries, reasoning, validation, GraphQL and backups, and `Error::code()` names each
+> error. The parity test of §7.1 maps every operation, with 39 marked pending. The rest
+> of Phase 1 moves the server's handlers onto the handles (step 5), adds the `Catalog`
+> (step 6), moves the local CLI commands (step 7) and makes the parity test strict
+> (step 8). Phase 2 closes the Python bindings' gaps, and Phase 3 adds dataset renames
+> and catalog commands. None of these is built.
 >
-> **User docs:** none. The crate split changes no HTTP API, command or file format.
+> **User docs:** the "Embedding the library" section of [USAGE](../USAGE.md) describes
+> what `Dataset::open` sets up and the handles. The HTTP API, the commands and the file
+> formats have not changed.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
-> at the end will record how it lands.
+> at the end records how it lands.
 
 This spec draws on the Sparkles code, the checked-in OpenAPI description
 (`docs/openapi.json`, from [X03](X03-openapi-and-completions.md)), the UI's API modules,
@@ -1431,4 +1435,65 @@ and the wheel measurements.
 
 ## Outcome
 
-Nothing is built.
+Phase 1 is in progress. Steps 1 to 4 have shipped, and the notes below record where
+they depart from the design.
+
+### Implementation notes
+
+* **`Ctl` stays a struct.** The tests of `sparkles-backup` build `Ctl` from its fields,
+  so it is not a re-export of `Control`. It converts from a `Control` with `Ctl::from`
+  and back with `Ctl::control`, which is how the server's backup tasks pass their
+  task's `Control`.
+* **The builder's callback is not merged.** `sparkles::builder` reported messages
+  without a fraction, because a build does not know how far it is. Its callback type is
+  now `builder::MessageFn`, and `Dataset::compact_with` turns its messages into reports
+  of the `Control`'s progress. The store, the reasoner and the backup crate share
+  `task::ProgressFn`.
+* **The dataset's state is reachable for the server.** `Dataset` holds an `Arc` of a
+  `DatasetState`, which `Dataset::state` returns and which is hidden from the
+  documentation. The server's `state::Dataset` holds a `sparkles::Dataset` with its own
+  name, kind, offline flag and validation metrics, and it dereferences to the library's
+  state. That keeps `ds.store`, `ds.reasoning`, `ds.queries`, `ds.validation` and the
+  other fields that the server's handlers and tests use. The guard's field keeps the
+  server's name, `validation`.
+* **`DatasetOptions` has two more fields.** Besides the store's options and the closure
+  cache's size, it carries the name a server or catalog gives the dataset and the
+  origin of an in-memory clone, which has no `origin.json`. The origin stays JSON in
+  the form of `origin.json`.
+* **A missing guard says why.** The store gained `set_guard_missing_reason`, so a write
+  refused for want of a guard fails with `GuardMissing` whose message names the missing
+  feature or the configuration error. `Dataset::guard_error` returns the same reason,
+  and the Python binding warns with it as before.
+* **Pending entries wait for the step that moves their logic.** Where the work of an
+  operation still lives in a handler, step 4 did not copy it into a handle, because
+  step 5 moves each handler's logic into its handle in one commit. The parity test marks
+  these operations `pending!`: the dataset statistics, text search, the schema report,
+  its classes, predicates, diff and constraints, the GraphQL configuration's `put`,
+  draft, execution and SDL, the reasoning run, status and diagnostics, backup creation,
+  and the stateless validators of data, IRIs and language tags. The catalog's
+  operations, restores, the repository registry, policy runs and retention wait for
+  step 6. `Dataset::clone_to`, `Dataset::stats`, `Schema::report`, `Schema::void`,
+  `TextIndex::search`, `Reasoning::run` and `status`, `Backups::create`,
+  `restore_to_dir` and `run_policy`, and the free functions `check_data`, `check_iri`
+  and `check_langtag` come with those steps.
+* **`Snapshots::create` takes the commit.** Its signature is `create(name, at, opts)`,
+  as `POST /$/snapshots/{ds}` takes `at`, and it returns the snapshot with whether it
+  was created, which the server needs for its status code.
+* **Text index calls have no `_with` forms.** The store's text index builds take no
+  cancel flag, so `TextIndex` has `enable` and `rebuild` only.
+* **Backups use the library's runtime.** `sparkles::backup::open` and `blocking` give
+  blocking forms of the repository's calls, and `Backups` has `list`, `get`, `delete`
+  and `verify_with`. They run on a two-thread runtime that the library starts on first
+  use. There is no option to pass another runtime's handle. The workspace's
+  `sparkles-backup` dependency has its default features, so `backup` includes S3.
+* **`Error::Locked` is not added yet.** `Error::code()` and `Error::Component` exist.
+  The directory lock's error changes with the catalog lock in step 6.
+* **RDFS on read applies where the caller asks.** `Dataset::open` loads the setting,
+  and the server passes it to each query as before. `Dataset::query` does not read it,
+  because that would take a lock on the library's query path. A program passes
+  `ds.reasoning().rdfs().get()` as `QueryOptions::rdfs`.
+* **The binding table of §7.2 comes with step 8.** `crates/sparkles/bindings.toml` and
+  its checks land when the parity test becomes strict.
+* **Performance.** The query and update paths take no new lock. A server handler that
+  reads `ds.store` follows one more pointer, from the server's dataset to the library's
+  state. The store reads its new guard reason only when it refuses a write.

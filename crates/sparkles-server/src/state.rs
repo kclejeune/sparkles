@@ -18,169 +18,41 @@ pub enum DbType {
     Mem,
 }
 
-/// The recorded reasoning status (`reasoning.json`, also embedded in the registry).
-/// Fields after `at` are absent from files written by older versions.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReasoningInfo {
-    #[serde(default)]
-    pub reasoning_format: u32,
-    pub profile: String,
-    pub inferred: u64,
-    pub at: String,
-    /// commit (`seq`) at which the inferences were materialized
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commit: Option<u64>,
-    /// what `commit` counts: `"commit"` (the commit sequence)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub position_source: Option<String>,
-    /// the dataset `commit` belongs to
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dataset_id: Option<String>,
-    /// rule text of profile `rules`, for re-runs
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rules: Option<String>,
-    /// built-in vocabularies added to the profile (`geosparql`)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub vocabularies: Vec<String>,
-    /// `geo:hasDefaultGeometry` materialized for features with one geometry
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub geo_default_geometry: bool,
-    #[serde(default)]
-    pub warnings: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub millis: Option<u64>,
-    /// copied from a clone source whose inferences were already stale
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub inherited_stale: bool,
-    /// this dataset's automatic re-runs; `None` follows the server's `--auto-reason`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto: Option<AutoSetting>,
-    /// how the last run materialized
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run: Option<RunInfo>,
-    /// the input graphs as the request configured them (`dataGraphs`, `ontologyGraphs`,
-    /// `imports`, `locationMapping`); absent: the default graph and its imports
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inputs: Option<serde_json::Value>,
-    /// the graphs the run read (`default` or IRIs); absent: the default graph alone
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_graphs: Option<Vec<String>>,
-    /// the graphs whose changes make the inferences stale: those read, and those the
-    /// imports that did not resolve name; absent: the default graph alone
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub watched_graphs: Option<Vec<String>>,
-    /// the imports the run found, resolved or not
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub imports: Vec<serde_json::Value>,
-    /// the imports that runs fetched into the dataset, by IRI
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fetched_imports: Vec<String>,
-}
+pub use sparkles::reasoning::{
+    AutoSetting, ReasoningRecord as ReasoningInfo, read_record as read_reasoning_file,
+    write_record as write_reasoning_file,
+};
+#[cfg(feature = "reasoning")]
+pub use sparkles::reasoning::{RunChanges, RunInfo};
 
-/// How a materialization ran: in full or incrementally, and what it changed.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RunInfo {
-    /// `full` or `incremental`
-    pub method: String,
-    /// why a run that could have updated the previous materialization ran in full
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<String>,
-    /// triples added to and removed from the inferred graph
-    pub inferred_added: u64,
-    pub inferred_removed: u64,
-    /// incremental runs: what changed since the previous run
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub changes: Option<RunChanges>,
-}
-
-/// What an incremental run found changed and did.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RunChanges {
-    /// default graph triples added and removed since the previous run
-    pub explicit_added: u64,
-    pub explicit_removed: u64,
-    /// derived triples whose other proofs were searched for
-    pub checked: u64,
-    /// derived triples that no longer follow, and new ones (generalized ones included)
-    pub removed: u64,
-    pub derived: u64,
-    /// `memory` (kept by the server) or `store` (read from the dataset)
-    pub source: String,
-}
-
-/// A dataset's own automatic re-run setting (`PUT /$/reason/{ds}/auto`).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AutoSetting {
-    pub enabled: bool,
-    /// seconds without a commit before a run; the server's, else 5
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub debounce_seconds: Option<f64>,
-    /// seconds after which a run starts even while writes continue; 12 × the debounce
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_delay_seconds: Option<f64>,
-}
-
+/// A dataset of the server: the library's [`sparkles::Dataset`], which holds the store
+/// and the state its directory configures (the write guard, RDFS on read, the stored
+/// queries, the GraphQL configuration, the reasoning record, the closure cache, the
+/// schema cache and the clone origin), and what only the server keeps. Its fields read
+/// through to the library's state, so `ds.store` and `ds.reasoning` are the library's.
 pub struct Dataset {
     pub name: String,
     pub kind: DbType,
-    pub store: StoreHandle,
     /// the branch this dataset object serves (`None`: `main`, the dataset itself)
     pub branch: Option<BranchOf>,
     /// the dataset objects of the branches other than `main`, opened on first use
     pub branches: Mutex<BTreeMap<String, Arc<Dataset>>>,
-    pub reasoning: RwLock<Option<ReasoningInfo>>,
     /// not part of the persisted registry (e.g. `--loc` on the command line)
     pub ephemeral: bool,
-    /// the last schema report served (`/$/schema/{ds}`), kept for its pagination cursors
-    pub schema_cache: Mutex<Option<SchemaCacheEntry>>,
-    /// write-time validation (SHACL or ShEx), when configured
-    pub validation: RwLock<Option<Validation>>,
     /// write-time validation counters (the store's guard observer)
     pub validation_metrics: Arc<crate::obs::ValidationMetrics>,
-    /// the stored queries (`queries.json`)
-    pub queries: sparkles::stored::Catalog,
-    /// the GraphQL configuration (`graphql.json`)
-    #[cfg(feature = "graphql")]
-    pub graphql: sparkles_graphql::Catalog,
     /// taken offline by `POST /$/datasets/{ds}?state=offline` (Fuseki): its services
     /// answer `503` until `?state=active`; not persisted
     pub offline: AtomicBool,
-    /// the closure of the last materialization, for the next incremental run
-    #[cfg(feature = "reasoning")]
-    pub closure: sparkles_reasoner::Cache,
-    /// RDFS on read, when set (see [`crate::rdfs`])
-    pub rdfs: RwLock<Option<Arc<sparkles::sparql::rdfs::RdfsOnRead>>>,
-    /// the origin of an in-memory clone (a persistent clone keeps it in `origin.json`)
-    pub mem_origin: Option<serde_json::Value>,
+    /// the library's dataset
+    pub dataset: sparkles::Dataset,
 }
 
-pub use crate::write_validation::Validation;
+impl std::ops::Deref for Dataset {
+    type Target = sparkles::dataset::DatasetState;
 
-/// A dataset's store: its own, or a branch's, which the dataset's branch set keeps open.
-/// It lives in its dataset's `Arc` and is never moved, so the own store stays inline.
-#[allow(clippy::large_enum_variant)]
-pub enum StoreHandle {
-    Own(Store),
-    Branch(Arc<Store>),
-}
-
-impl std::ops::Deref for StoreHandle {
-    type Target = Store;
-    fn deref(&self) -> &Store {
-        match self {
-            StoreHandle::Own(s) => s,
-            StoreHandle::Branch(s) => s,
-        }
-    }
-}
-
-impl From<Store> for StoreHandle {
-    fn from(s: Store) -> StoreHandle {
-        StoreHandle::Own(s)
+    fn deref(&self) -> &Self::Target {
+        self.dataset.state()
     }
 }
 
@@ -214,38 +86,14 @@ impl Dataset {
     }
 }
 
+// the guard type of the validators; builds without one do not name it
+#[allow(unused_imports)]
+pub use crate::write_validation::Validation;
+
 /// Default of `serve --reason-cache-triples`.
-pub const DEFAULT_REASON_CACHE_TRIPLES: usize = 10_000_000;
+pub const DEFAULT_REASON_CACHE_TRIPLES: usize = sparkles::reasoning::DEFAULT_CLOSURE_CACHE_TRIPLES;
 
-/// Install a store's write-time validation from its `validation.json`. A configuration
-/// that cannot be loaded leaves the dataset refusing writes (the store fails closed).
-fn install_validation(store: &Store) -> Option<Validation> {
-    match crate::write_validation::install(store) {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::error!(
-                "write-time validation of {}: {e:#}; writes are refused until it is fixed",
-                store
-                    .root()
-                    .map_or("(memory)".into(), |r| r.display().to_string())
-            );
-            None
-        }
-    }
-}
-
-/// A computed schema report and what it was computed for.
-pub struct SchemaCacheEntry {
-    /// snapshot identity (`sparkles::schema::snapshot_identity`)
-    pub identity: u64,
-    /// hash of the selection parameters
-    pub selection: u64,
-    pub report: Arc<sparkles::schema::SchemaReport>,
-    /// the state the report was computed at, for an in-memory dataset, whose past states
-    /// a later report cannot otherwise be compared with (see
-    /// `http::schema::maintained`)
-    pub mark: Option<sparkles::store::StateMark>,
-}
+pub use sparkles::dataset::SchemaCacheEntry;
 
 #[derive(Serialize, Deserialize, Default)]
 struct Registry {
@@ -503,31 +351,6 @@ impl Default for FormatConf {
     }
 }
 
-/// Reasoning status is kept inside the database directory (`reasoning.json`) so it
-/// survives restarts however the database is attached (registry, `--loc`, CLI `infer`).
-pub fn read_reasoning_file(root: &Path) -> Option<ReasoningInfo> {
-    serde_json::from_slice(&std::fs::read(root.join("reasoning.json")).ok()?).ok()
-}
-
-/// Write (or remove) `reasoning.json` durably: temporary file, sync, rename, directory
-/// sync, so a crash leaves the old status or the new one, never a torn file.
-pub fn write_reasoning_file(root: &Path, info: Option<&ReasoningInfo>) -> Result<()> {
-    let path = root.join("reasoning.json");
-    match info {
-        Some(i) => {
-            let mut i = i.clone();
-            i.reasoning_format = 2;
-            write_file_atomic(&path, &serde_json::to_vec_pretty(&i)?)?;
-        }
-        None => match std::fs::remove_file(&path) {
-            Ok(()) => sync_dir(root)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        },
-    }
-    Ok(())
-}
-
 /// Replace `path` durably (temporary file, sync, rename, directory sync).
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
@@ -554,18 +377,6 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
-}
-
-impl Dataset {
-    #[cfg(feature = "reasoning")]
-    /// Update the reasoning status in memory and in the database directory.
-    pub fn set_reasoning(&self, info: Option<ReasoningInfo>) -> Result<()> {
-        if let Some(root) = self.store.root() {
-            write_reasoning_file(root, info.as_ref())?;
-        }
-        *self.reasoning.write() = info;
-        Ok(())
-    }
 }
 
 pub fn now() -> String {
@@ -737,7 +548,7 @@ impl AppState {
             let reg: Registry = serde_json::from_slice(&std::fs::read(&reg_path)?)
                 .with_context(|| format!("reading {}", reg_path.display()))?;
             for e in reg.datasets {
-                let ds = state.open_dataset(&e.name, e.kind, None)?;
+                let ds = state.open_dataset(&e.name, e.kind, None, false)?;
                 // older registries kept the reasoning status only here
                 if ds.reasoning.read().is_none() {
                     *ds.reasoning.write() = e.reasoning;
@@ -798,7 +609,13 @@ impl AppState {
         }
     }
 
-    fn open_dataset(&self, name: &str, kind: DbType, loc: Option<&Path>) -> Result<Arc<Dataset>> {
+    fn open_dataset(
+        &self,
+        name: &str,
+        kind: DbType,
+        loc: Option<&Path>,
+        ephemeral: bool,
+    ) -> Result<Arc<Dataset>> {
         let store = match kind {
             DbType::Mem => Store::in_memory(self.store_opts.clone()),
             DbType::Persistent => {
@@ -809,8 +626,7 @@ impl AppState {
                     .with_context(|| format!("opening database {}", dir.display()))?
             }
         };
-        let reasoning = store.root().and_then(read_reasoning_file);
-        Ok(self.dataset_of(name, kind, store.into(), reasoning, loc.is_some(), None))
+        Ok(self.dataset_of(name, kind, store, ephemeral, None))
     }
 
     /// The object of branch `branch` of dataset `main` (`main` itself for `main`),
@@ -835,6 +651,8 @@ impl AppState {
         Ok(ds)
     }
 
+    /// A branch's dataset object: the library opens the state the branch's directory
+    /// configures, as for any dataset.
     fn branch_dataset_uncached(
         &self,
         main: &Arc<Dataset>,
@@ -845,12 +663,10 @@ impl AppState {
             .branch(branch)?
             .shared()
             .expect("a branch other than main has its own store");
-        let reasoning = store.root().and_then(read_reasoning_file);
         let mut ds = self.dataset_of(
             &main.name,
             main.kind,
-            StoreHandle::Branch(store),
-            reasoning,
+            sparkles::dataset::StoreHandle::Branch(store),
             main.ephemeral,
             None,
         );
@@ -861,54 +677,38 @@ impl AppState {
         Ok(ds)
     }
 
-    /// The dataset `name` around `store`, with its validation, RDFS-on-read setting
-    /// and stored queries read from the store's directory.
+    /// The dataset `name` around `store`: the library opens the state the store's
+    /// directory configures, and the server adds its validation metrics.
     fn dataset_of(
         &self,
         name: &str,
         kind: DbType,
-        store: StoreHandle,
-        reasoning: Option<ReasoningInfo>,
+        store: impl Into<sparkles::dataset::StoreHandle>,
         ephemeral: bool,
-        mem_origin: Option<serde_json::Value>,
+        origin: Option<serde_json::Value>,
     ) -> Arc<Dataset> {
-        let validation = install_validation(&store);
-        let rdfs = crate::rdfs::load(&store);
+        let dataset = sparkles::Dataset::from_store_with(
+            store,
+            sparkles::DatasetOptions {
+                store: self.store_opts.clone(),
+                name: Some(name.to_string()),
+                closure_cache_triples: self.reason_cache_triples,
+                origin,
+            },
+        );
         let validation_metrics = Arc::new(crate::obs::ValidationMetrics::new(name));
-        store.set_guard_observer(Some(validation_metrics.clone()));
-        let queries = sparkles::stored::Catalog::open_or_broken(store.root());
-        if let Some(e) = queries.broken() {
-            tracing::error!(
-                "stored queries of /{name}: {e}; they cannot be changed until it is fixed"
-            );
-        }
-        #[cfg(feature = "graphql")]
-        let graphql = sparkles_graphql::Catalog::open_or_broken(store.root());
-        #[cfg(feature = "graphql")]
-        if let Some(e) = graphql.broken() {
-            tracing::error!(
-                "GraphQL configuration of /{name}: {e}; it cannot be changed until it is fixed"
-            );
-        }
+        dataset
+            .store()
+            .set_guard_observer(Some(validation_metrics.clone()));
         Arc::new(Dataset {
             name: name.to_string(),
             kind,
-            store,
             branch: None,
             branches: Mutex::new(BTreeMap::new()),
-            reasoning: RwLock::new(reasoning),
             ephemeral,
-            schema_cache: Mutex::new(None),
-            validation: RwLock::new(validation),
             validation_metrics,
-            queries,
-            #[cfg(feature = "graphql")]
-            graphql,
             offline: AtomicBool::new(false),
-            #[cfg(feature = "reasoning")]
-            closure: sparkles_reasoner::Cache::new(self.reason_cache_triples),
-            rdfs: RwLock::new(rdfs),
-            mem_origin,
+            dataset,
         })
     }
 
@@ -1004,7 +804,7 @@ impl AppState {
         if let Some(t) = self.restoring.lock().get(name) {
             bail!("dataset /{name} is being restored by task {t}");
         }
-        let ds = self.open_dataset(name, kind, None)?;
+        let ds = self.open_dataset(name, kind, None, false)?;
         self.datasets.write().insert(name.to_string(), ds.clone());
         if let Err(e) = self.save_registry_locked() {
             // not reported as created, so it must not stay registered
@@ -1029,11 +829,7 @@ impl AppState {
         if let Some(t) = self.restoring.lock().get(name) {
             bail!("dataset /{name} is being restored by task {t}");
         }
-        let ds = self.open_dataset(name, kind, loc)?;
-        let ds = Arc::new(Dataset {
-            ephemeral: true,
-            ..Arc::try_unwrap(ds).map_err(|_| anyhow::anyhow!("unexpected"))?
-        });
+        let ds = self.open_dataset(name, kind, loc, true)?;
         self.datasets.write().insert(name.to_string(), ds.clone());
         Ok(ds)
     }
@@ -1081,7 +877,7 @@ impl AppState {
         if self.datasets.read().contains_key(name) {
             bail!("dataset '{name}' already exists");
         }
-        let ds = self.open_dataset(name, DbType::Persistent, None)?;
+        let ds = self.open_dataset(name, DbType::Persistent, None, false)?;
         self.datasets.write().insert(name.to_string(), ds.clone());
         Ok(ds)
     }
@@ -1124,7 +920,7 @@ impl AppState {
         let name = reservation.name.clone();
         let _guard = self.manage.lock();
         let dir = self.data_dir.join("databases").join(&name);
-        let ds = match self.open_dataset(&name, DbType::Persistent, None) {
+        let ds = match self.open_dataset(&name, DbType::Persistent, None, false) {
             Ok(ds) => ds,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -1154,14 +950,8 @@ impl AppState {
     ) -> Result<Arc<Dataset>> {
         let name = reservation.name.clone();
         let _guard = self.manage.lock();
-        let ds = self.dataset_of(
-            &name,
-            DbType::Mem,
-            store.into(),
-            reasoning,
-            false,
-            Some(origin),
-        );
+        let ds = self.dataset_of(&name, DbType::Mem, store, false, Some(origin));
+        *ds.reasoning.write() = reasoning;
         self.datasets.write().insert(name.clone(), ds.clone());
         if let Err(e) = self.save_registry_locked() {
             self.datasets.write().remove(&name);
@@ -1559,7 +1349,20 @@ impl TaskHandle {
         });
     }
 
+    /// The task as a library [`Control`](sparkles::task::Control): its cancel flag is
+    /// the one `DELETE /$/tasks/{id}` sets, and its progress reports become the task's
+    /// `progress` and `message`.
+    pub fn control(&self) -> sparkles::task::Control {
+        let h = self.clone();
+        sparkles::task::Control {
+            cancel: sparkles::task::Cancel::from_flag(self.cancel.clone()),
+            progress: sparkles::task::Progress::new(move |p, m| h.progress(p, m)),
+            deadline: None,
+        }
+    }
+
     /// Set by `DELETE /$/tasks/{id}` (for a cancellable task).
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.cancel.clone()
     }
