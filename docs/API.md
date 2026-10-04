@@ -3975,6 +3975,15 @@ form is a JSON array of 1–16384 finite numbers, read as `f32`, for example
 stored and returned exactly as written. One that does not parse is stored but never
 matched.
 
+The compact datatype `<urn:x-sparkles:vectorB64>` holds the same values as the base64
+(RFC 4648, with padding) of their little-endian IEEE 754 binary32 bytes, so
+`"zczMPc3MTD6amZk+"^^spk:vectorB64` is the vector `[0.1, 0.2, 0.3]` as `f32`. It takes
+about 5.3 bytes per dimension where the JSON form of a typical embedding takes about 12.
+Every function, search, index and option below reads both datatypes alike, and one
+predicate can hold both. A compact literal whose length is not a multiple of 4
+characters, whose bytes are not a whole number of values, or that holds a NaN or an
+infinity, is malformed.
+
 * **Functions.** `spk:cosine(?a, ?b)`, `spk:dot(?a, ?b)`, `spk:euclidean(?a, ?b)` (L2
   distance) and `spk:dimension(?a)`. They raise a type error on a malformed argument, a
   dimension mismatch, or a zero vector with cosine.
@@ -4017,6 +4026,23 @@ matched.
   bound by the rest of the group. `{ ?s a ex:Doc . (?s ?score) spk:vectorSearch (ex:emb ?q
   10 "candidates:join") }` returns the 10 best documents, where the plain search returns
   the documents among the 10 best rows.
+* **Ordering by similarity.** A query that orders one pattern `?s ex:emb ?v` by
+  `DESC(spk:cosine(?v, C))` or `DESC(spk:dot(?v, C))` with a `LIMIT`, where `C` is a
+  constant vector, runs as an exact vector search for the best rows, which the ORDER BY
+  then sorts:
+
+  ```sparql
+  SELECT ?s WHERE { ?s ex:emb ?v } ORDER BY DESC(spk:cosine(?v, "[0.1, -0.2, 0.3]"^^spk:vector)) LIMIT 10
+  ```
+
+  The score can also be bound by a `BIND` and ordered by its variable. The answer is
+  the one the generic plan gives, up to the choice among rows tied at the last place.
+  The search never uses the HNSW graph, so it is exact. When fewer rows than the limit
+  have a score, because the others are malformed or of another dimension, the generic
+  plan runs and puts those rows last, as SPARQL orders errors. An ascending order, the
+  euclidean distance, a constant subject, a `FILTER` or another pattern in the group,
+  or a second ordering key keep the generic plan. EXPLAIN shows a `VectorSearch` with
+  `the best rows of ORDER BY`. The `vector_topk` optimization turns this off.
 * **Without an index.** Vectors are packed per predicate and dimension on their first
   search and cached per index generation. Each search scans them exactly. Every query
   overlays its snapshot's inserts and deletes, so results always match its data. A
@@ -4298,11 +4324,17 @@ SELECT ?s ?score ?textRank ?vectorRank WHERE {
   better.
 * **Fusion.** A subject's score is the sum of `weight / (k + rank)` over the lists that
   hold it. The best `limit` subjects are returned, and ties break by term id.
-* **Restrictions.** The text list takes no `highlight:` option. The vector query must be
-  a vector literal, an entity or a text for an index that computes its vectors, and
-  `candidates:join` is refused. Errors follow the two
-  searches, and malformed calls and options give `400`. The call needs the `text`
-  feature and a full-text index.
+* **Queries from the group.** The text query string and the vector query can be
+  variables that the rest of the group binds, as in `VALUES ?q { … } (?s ?score)
+  spk:hybridSearch ((rdfs:label ?t) (ex:emb ?q))`. The call then runs once for each
+  distinct pair of values, at most 1,000 pairs, and each row joins with the fused rows
+  of its own pair. A text value that is not a string, or does not parse, gives an empty
+  text ranking. With `candidates:join` in the vector list, the vector ranking holds only
+  the subjects that the rest of the group binds to `?s`, and the text ranking is not
+  restricted. EXPLAIN reports the number of fusions.
+* **Restrictions.** The text list takes no `highlight:` option. Errors follow the two
+  searches, and malformed calls and options give `400`, as does a query variable that
+  nothing in the group binds. The call needs the `text` feature and a full-text index.
 
 ## Path search
 

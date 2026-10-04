@@ -1,14 +1,16 @@
 # F04: Vector similarity search
 
-> **Status:** implemented in part (Phases 1, 1b and 2, part of Phase 3)
+> **Status:** implemented in part (Phases 1, 1b and 2, most of Phase 3)
 >
 > **Phases:** Phases 1, 1b and 2 shipped. They cover `spk:vector` literals, the
 > similarity functions, `spk:vectorSearch` with variable queries, `candidates:join` and
 > `distinct:subject`, configured indexes with persisted files and background builds,
 > `/$/vector/{ds}/{name}`, `sparkles vector`, an HNSW graph with an exact overlay of each
 > snapshot's changes, the `/similar` page and the dataset page's index cards. Of Phase 3,
-> hybrid ranking with full-text search shipped as `spk:hybridSearch`. The rest of Phase 3
-> is not built.
+> hybrid ranking with full-text search shipped as `spk:hybridSearch`, and on 2026-10-03
+> the `ORDER BY … LIMIT k` rewrite, the compact datatype `spk:vectorB64` and hybrid calls
+> with bound queries shipped. Background catch-up of the graph and keeping the graph
+> across compactions are not built.
 >
 > **User docs:** [API: Vector similarity](../API.md#vector-similarity) · [API: Vector indexes](../API.md#vector-indexes) · [Features](../FEATURES.md#sparql-arq-equivalent)
 >
@@ -1074,7 +1076,59 @@ subjects, `GRAPH ?g`, subjects with several hits, the `maxHits` budget and every
 computes its vectors after each commit, and `spk:vectorSearch` and `spk:hybridSearch`
 then accept a text as their query.
 
-**Not built.** Quantization and the rest of Phase 3 were not built. That rest is
-background catch-up of the graph with overlay inserts, keeping the graph across
-compactions, rewriting `ORDER BY spk:cosine(…) LIMIT k`, and a compact datatype. A
-hybrid call with a variable vector query or with `candidates:join` is not built either.
+**Not built at first.** Quantization and the rest of Phase 3 were not built with the
+first phases. That rest was background catch-up of the graph with overlay inserts,
+keeping the graph across compactions, rewriting `ORDER BY spk:cosine(…) LIMIT k`, and a
+compact datatype. A hybrid call with a variable vector query or with `candidates:join`
+was not built either.
+
+**Phase 3 additions (2026-10-03).**
+* *`ORDER BY … LIMIT k`.* An ORDER BY with a LIMIT and one key,
+  `DESC(spk:cosine(?v, C))` or `DESC(spk:dot(?v, C))` with a constant vector `C`, either
+  directly or through a `BIND` of the score, over a group that is one triple pattern
+  `?s <p> ?v` under its BINDs, has that pattern replaced by a vector search of the `k`
+  best rows (`sparql/vectortopk.rs`). The order stays above the search and sorts its
+  rows. The search is exact, so the answer is the generic plan's up to ties at the
+  `k`-th place: the HNSW graph would trade that for speed, which a query that did not
+  ask for a vector search should not. A row whose vector is malformed or of another
+  dimension has an error as its key, which a descending order puts last, so such rows
+  matter only when fewer than `k` rows have a score. The search node keeps the pattern
+  as its child and runs it, with the generic order, in that case, and also when the
+  vector budget is exceeded or the predicate's index has another dimension. An
+  ascending order and the euclidean distance, whose error rows would come first, a
+  constant subject, which the search applies after its top k, a FILTER or a second
+  pattern, which drop rows, a second key, a zero query vector and a graph variable keep
+  the generic plan. The optimization is `vector_topk`.
+* *The compact datatype.* `spk:vectorB64` (`urn:x-sparkles:vectorB64`) holds the
+  base64 of the values as little-endian binary32, as §9 proposed. The reader is strict:
+  RFC 4648 with padding, no whitespace, zero padding bits, a whole number of 4-byte
+  values from 1 to 16,384, and only finite values. `vector::parse_typed` and
+  `vector::from_key` read both datatypes, so the functions, the packed segments, the
+  overlays, the indexes, constant and bound queries, the hybrid call, the ORDER BY
+  rewrite and the MCP schema tool take either, and one predicate can mix them. The
+  UI's term view abbreviates compact literals as it does JSON ones, and the index
+  dialog reads their dimension. Literals that Sparkles writes, such as computed
+  embeddings, stay in the JSON form.
+* *Hybrid calls over their group.* The text query string and the vector query of
+  `spk:hybridSearch` can be variables, and the vector list can take `candidates:join`.
+  The call is then planned like a vector search with a variable query, over the rest
+  of its group. It groups the input rows by their pair of query values, at most 1,000
+  pairs, and fuses one text ranking and one vector ranking per pair. A ranking that
+  depends on no input row runs once. `candidates:join` passes the rows' subjects to the
+  vector search, so the vector ranking holds only them, and the text ranking is not
+  restricted. The fused rows carry their pair's values and join with the input.
+* *Tests.* `crates/sparkles-core/tests/vectors.rs` compares the ORDER BY rewrite with
+  the generic plan on the §7 data, on 3,000 random vectors with malformed ones and
+  another dimension among them, and after updates, and checks the shapes that keep the
+  generic plan. It searches a predicate holding both datatypes from either form. Unit
+  tests in `vector/mod.rs` cover the compact grammar and round trips, and
+  `crates/sparkles-core/tests/hybrid.rs` checks that bound queries give the fusions of
+  their constants, several pairs at once, and `candidates:join`.
+* *Performance.* On 100,000 random 128-dimension vectors in JSON form, with 15
+  interleaved runs per query while other builds kept the load average between 60 and
+  75 on 16 cores, `ORDER BY DESC(spk:cosine(?v, C)) LIMIT 10` took a median of 30 ms
+  and 8.7 ms of server CPU, against 634 ms and 1,059 ms with the rewrite off, which
+  parses every literal for every query. With `LIMIT 100` it took 25 ms against 732 ms,
+  with `spk:dot` 21 ms against 568 ms, and with the score bound by a BIND 21 ms
+  against 536 ms. The compact form takes about 5.3 bytes per dimension where the JSON
+  literals of these vectors take about 9.
