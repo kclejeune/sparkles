@@ -17,6 +17,7 @@ mod branching;
 mod changelog;
 mod changes;
 mod clone;
+mod commit_graph;
 mod compaction;
 #[cfg(test)]
 mod compaction_tests;
@@ -52,6 +53,7 @@ pub use changelog::{
 };
 pub use changes::{ChangePage, ChangesOptions, CommitChanges};
 pub use clone::{CloneMethod, CloneMode, CloneOptions, CloneReport};
+pub use commit_graph::{CommitGraph, CommitGraphOptions, GraphBranch, GraphCommit, GraphCursor};
 pub use compaction::{
     Blocker, COMPACTION_FILE, CompactOptions, CompactReport, CompactionMeasures, CompactionPolicy,
     CompactionSettings, REBUILD_BUCKETS, RebuildHistogram, RebuildReason, SETTING_NAMES, Trigger,

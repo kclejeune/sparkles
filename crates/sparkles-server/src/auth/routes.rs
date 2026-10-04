@@ -88,6 +88,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/branches/{ds}", &["GET", "POST"]),
     ("/$/branches/{ds}/{name}", &["GET", "PATCH", "DELETE"]),
     ("/$/merge/{ds}", &["GET", "POST"]),
+    ("/$/commit-graph/{ds}", &["GET"]),
     ("/$/vector/{ds}", &["GET"]),
     ("/$/vector/{ds}/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/vector/{ds}/{name}/rebuild", &["POST"]),
@@ -239,7 +240,10 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/datasets/{ds}" if get => Dataset(Read),
         "/$/datasets/{ds}" => Dataset(Admin),
         // visible on some branch: the handlers check the branches a request names
-        "/$/branches/{ds}" | "/$/branches/{ds}/{name}" | "/$/merge/{ds}" => Dataset(Read),
+        "/$/branches/{ds}"
+        | "/$/branches/{ds}/{name}"
+        | "/$/merge/{ds}"
+        | "/$/commit-graph/{ds}" => Dataset(Read),
         "/$/ready/{ds}"
         | "/$/stats/{ds}"
         | "/$/schema/{ds}"
@@ -1039,7 +1043,9 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             let ds = ds_of(&route, req.uri()).unwrap_or_default();
             // the branch routes need the dataset visible on some branch; their handlers
             // check each branch a request names
-            let branch_routes = route.starts_with("/$/branches/") || route.starts_with("/$/merge/");
+            let branch_routes = route.starts_with("/$/branches/")
+                || route.starts_with("/$/merge/")
+                || route.starts_with("/$/commit-graph/");
             let have = if branch_routes {
                 p.level_any_branch(&ds)
             } else {

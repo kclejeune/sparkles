@@ -286,6 +286,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("merge", "branches.merge", |ds| {
             ds.merge("dev", "main", &Default::default());
         }),
+        op!("getCommitGraph", "branches.commit_graph", |ds| {
+            ds.commit_graph(&Default::default());
+        }),
         // ----------------------------------------------------------- search indexes
         op!("getTextIndex", "indexes.text.status", |ds| {
             ds.indexes().text().status();

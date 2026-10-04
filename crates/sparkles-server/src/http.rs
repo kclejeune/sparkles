@@ -25,6 +25,7 @@ use std::time::Duration;
 pub(crate) mod branches;
 mod budgets;
 mod changes;
+mod commit_graph;
 mod conditional;
 mod describe;
 mod diff;
@@ -173,6 +174,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/$/merge/{ds}",
             get(branches::preview).post(branches::merge),
         )
+        .route("/$/commit-graph/{ds}", get(commit_graph::get))
         .route("/{ds}", any(dataset_root))
         .route("/{ds}/sparql", any(query_endpoint))
         .route("/{ds}/query", any(query_endpoint))

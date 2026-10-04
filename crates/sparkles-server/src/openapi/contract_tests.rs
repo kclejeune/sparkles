@@ -428,6 +428,8 @@ async fn more_answers(doc: &J, app: &axum::Router) {
         c("GET", t, u, None).await;
     }
     c("GET", "/$/compaction/{ds}", "/$/compaction/h", None).await;
+    let j = c("GET", "/$/commit-graph/{ds}", "/$/commit-graph/h", None).await;
+    assert_eq!(j["branches"][0]["name"], "main", "{j}");
     c(
         "PUT",
         "/$/compaction/{ds}",

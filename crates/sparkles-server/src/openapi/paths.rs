@@ -1345,6 +1345,21 @@ fn branches(p: &mut Paths) {
             )
             .errors(&[400, 403, 404, 410, 422, 507]),
     );
+    p.add(
+        op(GET, "/$/commit-graph/{ds}", "getCommitGraph", "Branches", "Get the commit graph")
+            .doc("The own commits of several branches, newest first by time, each with the branch that made it and its parents: the previous commit, or the starting commit for a branch's first commit, and a merge commit's merged commit. The answer also lists each branch's head, upstream and starting commit. Only the branches the caller may read are drawn.")
+            .see("commit-graph")
+            .query("branches", s(), "The branches to draw, comma-separated or repeated (default every branch the caller may read).")
+            .query(
+                "limit",
+                json!({ "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 }),
+                "The page size.",
+            )
+            .query("before", s(), "The cursor of the next page, as `next` gives it.")
+            .json("200", "One page of the graph.", "CommitGraph")
+            .paginated("cursor", &["limit", "before"], "next")
+            .errors(&[400, 403, 404, 501]),
+    );
 }
 
 fn history(p: &mut Paths) {

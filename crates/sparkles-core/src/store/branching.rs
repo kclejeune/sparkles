@@ -654,6 +654,27 @@ impl BranchSet {
         c
     }
 
+    /// The listed branches whose files can be read, in table order, each with its id,
+    /// ordinal, starting commit and creation time (RFC 3339).
+    pub(crate) fn readable_entries(&self) -> Vec<(String, uuid::Uuid, u16, CommitRef, String)> {
+        let broken = self.broken.lock().clone();
+        self.table
+            .lock()
+            .branches
+            .iter()
+            .filter(|e| !broken.contains(&e.id))
+            .map(|e| {
+                (
+                    e.name.clone(),
+                    e.id,
+                    e.ordinal,
+                    e.from.into(),
+                    e.created.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// The first-parent chain of commit `c`, from `main` to `c`'s branch: each branch
     /// with the range of its own commits on the chain, `(id, after, through)`.
     pub(crate) fn chain(&self, c: CommitRef) -> Vec<(uuid::Uuid, u64, u64)> {

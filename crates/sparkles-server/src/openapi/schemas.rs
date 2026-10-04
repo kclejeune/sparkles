@@ -615,6 +615,48 @@ pub(super) fn schemas() -> Map<String, J> {
         ),
     );
     put(
+        "CommitGraph",
+        obj(
+            &["dataset", "datasetId", "branches", "commits", "next"],
+            json!({
+                "dataset": { "type": "string" },
+                "datasetId": { "type": "string" },
+                "branches": array(obj(
+                    &["name", "id", "head", "from", "upstream"],
+                    json!({
+                        "name": { "type": "string" },
+                        "id": { "type": "string" },
+                        "ordinal": { "type": "integer" },
+                        "head": { "type": "integer" },
+                        "modified": { "type": "string" },
+                        "from": with_desc(
+                            {
+                                let mut f = commit_ref();
+                                f["type"] = json!(["object", "null"]);
+                                f
+                            },
+                            "The commit the branch started from (`null` for `main`).",
+                        ),
+                        "upstream": { "type": ["string", "null"] },
+                        "created": { "type": "string" },
+                    }),
+                )),
+                "commits": array(json!({
+                    "allOf": [sref("Commit")],
+                    "properties": {
+                        "branch": { "type": "string", "description": "The branch that made the commit." },
+                        "branchId": { "type": "string" },
+                        "parents": array(commit_ref()),
+                        "mergedFrom": commit_ref(),
+                        "reconstructable": { "type": "boolean" },
+                        "snapshots": array(json!({ "type": "string" })),
+                    },
+                })),
+                "next": { "type": ["string", "null"], "description": "The URL of the next page." },
+            }),
+        ),
+    );
+    put(
         "BranchCreate",
         obj(
             &["name"],
