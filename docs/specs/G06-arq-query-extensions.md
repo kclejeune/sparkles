@@ -896,8 +896,10 @@ client, and a UI control for the setting.
 
 **Phase 3, tests.** Jena's `SPARQL-CDTs` (655 tests) and ARQ's `PropertyFunctions` (48)
 are vendored in `testsuite/jena-arq` with Jena's license and run from `tests/w3c.rs`:
-642 and 39 pass, and the 13 and 9 others are listed with their reasons in
-`expected-failures.txt` (A18, A19). `tests/arq_library.rs` checks `LET`, `FOLD`,
+642 and 39 passed when Phase 3 shipped, with the 13 and 9 others listed with their
+reasons in `expected-failures.txt` (A18, A19). Later work brought both suites to every
+test passing. The property functions reached 48 of 48, and the CDTs reached 655 of 655
+once blank node labels inside CDT literals were scoped as Jena scopes them. `tests/arq_library.rs` checks `LET`, `FOLD`,
 `UNFOLD`, the property functions, the half joins and the path forms against Jena 6.2.0's
 answers, and the plans of calls and OPTIONALs (A20 to A22). `tests/arq_functions.rs`
 checks the new functions and operators (A23), and unit tests cover the CDT parser,

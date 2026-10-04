@@ -480,3 +480,155 @@ fn path_forms_match_arq() {
     let q = format!("{PREFIXES}SELECT * {{ ?s shortest(:n*) ?o }}");
     assert!(query(ttl(JOIN_DATA).snapshot(), &q, &QueryOptions::default()).is_err());
 }
+
+// ------------------------------------------- blank nodes in composite literals ------
+
+const CDT_LIST: &str = "http://w3id.org/awslabs/neptune/SPARQL-CDTs/List";
+
+/// A literal whose blank node labels name the subject's node: directly, in a nested
+/// list, in a nested list written as a typed literal, and in a map nested in a map.
+fn cdt_bnode_data() -> String {
+    format!(
+        "PREFIX ex: <http://example.org/>
+PREFIX cdt: <http://w3id.org/awslabs/neptune/SPARQL-CDTs/>
+_:b ex:p \"\"\"[_:b, [_:b], '[_:b]'^^<{CDT_LIST}>]\"\"\"^^cdt:List ;
+    ex:m \"{{'k': {{'j': _:b}}}}\"^^cdt:Map .
+"
+    )
+}
+
+const CDT_BNODES_SAME: &str = "SELECT ?a ?b ?c ?d {
+  ?s ex:p ?l ; ex:m ?m .
+  BIND(sameTerm(?s, cdt:get(?l, 1)) AS ?a)
+  BIND(sameTerm(?s, cdt:get(cdt:get(?l, 2), 1)) AS ?b)
+  BIND(sameTerm(?s, cdt:get(cdt:get(?l, 3), 1)) AS ?c)
+  BIND(sameTerm(?s, cdt:get(cdt:get(?m, 'k'), 'j')) AS ?d)
+}";
+
+/// Jena's `SPARQL-CDTs/bnodes` turtle tests: a label inside a literal names the node the
+/// same label names in the literal's file, and the labels of another file name other
+/// nodes. The first load is a bulk build. The second goes through the transactional
+/// delta, or rebuilds the store when `bulk_threshold` is 0.
+#[test]
+fn cdt_bnode_labels_name_the_files_nodes() {
+    for bulk_threshold in [StoreOptions::default().bulk_threshold, 0] {
+        let s = Store::in_memory(StoreOptions {
+            bulk_threshold,
+            ..Default::default()
+        });
+        let src = |d: String| Source::from_bytes(d.into_bytes(), RdfFormat::Turtle, None);
+        s.load(&[src(cdt_bnode_data())]).unwrap();
+        check(&s, CDT_BNODES_SAME, "true true true true");
+        s.load(&[src("PREFIX ex: <http://example.org/>
+PREFIX cdt: <http://w3id.org/awslabs/neptune/SPARQL-CDTs/>
+_:b ex:p2 \"[_:b]\"^^cdt:List .
+"
+        .into())])
+            .unwrap();
+        check(&s, CDT_BNODES_SAME, "true true true true");
+        check(
+            &s,
+            "SELECT ?own ?other {
+  ?s ex:p ?l . ?t ex:p2 ?l2 .
+  BIND(sameTerm(?t, cdt:get(?l2, 1)) AS ?own)
+  BIND(sameTerm(?s, cdt:get(?l2, 1)) AS ?other)
+}",
+            "true false",
+        );
+    }
+}
+
+/// Labels inside a literal of the query text name blank nodes of the query: the same
+/// node for the same label in all its literals, and never a stored node, also when the
+/// label is the one Sparkles writes for a stored node.
+#[test]
+fn cdt_bnode_labels_of_the_query_name_its_own_nodes() {
+    let s = ttl(&cdt_bnode_data());
+    let label = rows(&s, "SELECT ?s { ?s ex:p ?l }").remove(0);
+    assert!(label.starts_with("_:b"), "{label}");
+    // the stored literal carries the stored node's label
+    let lex = rows(&s, "SELECT (STR(?l) AS ?x) { ?s ex:p ?l }").remove(0);
+    assert!(lex.starts_with(&format!("[{label},")), "{lex}");
+    for q in [
+        format!(
+            "SELECT ?same {{ ?s ex:p ?l BIND(sameTerm(?s, cdt:get(\"[{label}]\"^^cdt:List, 1)) AS ?same) }}"
+        ),
+        format!(
+            "SELECT ?same {{ ?s ex:p ?l VALUES ?q {{ \"[{label}]\"^^cdt:List }} BIND(sameTerm(?s, cdt:head(?q)) AS ?same) }}"
+        ),
+        format!(
+            "SELECT ?same {{ ?s ex:p ?l BIND(cdt:containsTerm(\"[{label}]\"^^cdt:List, ?s) AS ?same) }}"
+        ),
+    ] {
+        check(&s, &q, "false");
+    }
+    check(
+        &s,
+        &format!(
+            "SELECT ?same ?blank {{
+  BIND(cdt:get(\"[{label}]\"^^cdt:List, 1) AS ?x)
+  BIND(cdt:get(\"{{'k': [{label}]}}\"^^cdt:Map, 'k') AS ?y)
+  BIND(sameTerm(?x, cdt:head(?y)) AS ?same)
+  BIND(isBlank(?x) AS ?blank)
+}}"
+        ),
+        "true true",
+    );
+}
+
+/// `INSERT DATA` relates a literal's labels to the operation's blank nodes, a template
+/// to the template's blank nodes of each solution, and a literal the WHERE clause built
+/// to the nodes it names there.
+#[test]
+fn cdt_bnode_labels_in_updates() {
+    use sparkles_core::sparql::update::update;
+    let s = ttl("PREFIX ex: <http://example.org/>
+ex:a a ex:T . ex:b a ex:T .
+");
+    let up = |u: &str| {
+        update(&s, &format!("{PREFIXES}{u}"), &QueryOptions::default())
+            .unwrap_or_else(|e| panic!("{u}: {e}"));
+    };
+    up("INSERT DATA { _:x ex:q \"[_:x, [_:x]]\"^^cdt:List }");
+    check(
+        &s,
+        "SELECT ?a ?b { ?s ex:q ?l
+  BIND(sameTerm(?s, cdt:get(?l, 1)) AS ?a)
+  BIND(sameTerm(?s, cdt:get(cdt:get(?l, 2), 1)) AS ?b) }",
+        "true true",
+    );
+    up("INSERT { ?s ex:r \"[_:n]\"^^cdt:List . _:n ex:of ?s } WHERE { ?s a ex:T }");
+    check(
+        &s,
+        "SELECT ?s ?o { ?s ex:r ?l . ?n ex:of ?o FILTER(sameTerm(?n, cdt:get(?l, 1))) }",
+        "ex:a ex:a \n ex:b ex:b",
+    );
+    up("INSERT { ex:c ex:l ?l . ?e ex:is 1 } WHERE {
+  BIND(\"[_:z]\"^^cdt:List AS ?l) BIND(cdt:get(?l, 1) AS ?e) }");
+    check(
+        &s,
+        "SELECT ?same { ex:c ex:l ?l . ?e ex:is 1 BIND(sameTerm(?e, cdt:get(?l, 1)) AS ?same) }",
+        "true",
+    );
+}
+
+/// A dump writes a literal's labels as it writes the labels of the triples, so loading
+/// the dump keeps the relation, also through RDF Patch.
+#[test]
+fn cdt_bnode_labels_survive_a_dump_and_a_patch() {
+    let s = ttl(&cdt_bnode_data());
+    let mut out = Vec::new();
+    s.dump_nquads(&mut out).unwrap();
+    let dump = String::from_utf8(out).unwrap();
+    let again = load(&dump, RdfFormat::NQuads);
+    check(&again, CDT_BNODES_SAME, "true true true true");
+    // the patch's labels are its own, as in INSERT DATA
+    let p = Store::in_memory(StoreOptions::default());
+    let patch: String = dump.lines().map(|l| format!("A {l}\n")).collect();
+    p.apply_patch(
+        patch.as_bytes(),
+        &sparkles_core::store::PatchOptions::default(),
+    )
+    .unwrap();
+    check(&p, CDT_BNODES_SAME, "true true true true");
+}

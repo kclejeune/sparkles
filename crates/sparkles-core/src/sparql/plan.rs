@@ -697,7 +697,7 @@ impl<'a> Planner<'a> {
                 )
             }
             TermPattern::NamedNode(n) => PT::C(self.ctx.intern_term(&Term::NamedNode(n.clone()))),
-            TermPattern::Literal(l) => PT::C(self.ctx.intern_term(&Term::Literal(l.clone()))),
+            TermPattern::Literal(l) => PT::C(self.ctx.intern_query_literal(l)),
             TermPattern::Triple(tp) => match ground_triple(tp) {
                 Some(t) => PT::C(self.ctx.intern_term(&Term::Triple(Box::new(t)))),
                 None => {
@@ -958,9 +958,7 @@ impl<'a> Planner<'a> {
                                 GroundTerm::NamedNode(n) => {
                                     self.ctx.intern_term(&Term::NamedNode(n.clone()))
                                 }
-                                GroundTerm::Literal(l) => {
-                                    self.ctx.intern_term(&Term::Literal(l.clone()))
-                                }
+                                GroundTerm::Literal(l) => self.ctx.intern_query_literal(l),
                                 GroundTerm::Triple(_) => self.ctx.intern_term(&ground_term(t)),
                             }),
                         })

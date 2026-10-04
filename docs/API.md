@@ -1914,11 +1914,21 @@ SELECT ?person ?i ?friend WHERE {
 
 A list or map that Sparkles builds is written in a canonical form, with `, ` between
 elements and a map's entries in key order. Jena writes a map's entries in hash order, so
-its lexical forms can differ from Sparkles' while the values are equal. A blank node
-label inside a literal names a blank node of the query that reads it. Jena's loader also
-matches it with the blank nodes of the data file the literal came from, which Sparkles
-does not. Jena's SPARQL-CDTs tests run in the W3C harness: 644 of 655 pass, and the 11
-others are those blank nodes.
+its lexical forms can differ from Sparkles' while the values are equal.
+
+A blank node label inside a list or map is scoped the way Jena scopes it. When Sparkles
+loads a file, a label inside a literal names the same blank node as that label elsewhere
+in the file, and another file's labels name other nodes. The loader writes such a
+literal again in the canonical form with the labels of the stored nodes, so the data
+`_:b ex:p "[_:b, 42]"^^cdt:List` is stored with a literal such as `"[_:b1f, 42]"`, where
+`_:b1f` is the subject. A dump therefore writes the literal with the labels of the
+dumped triples, and loading the dump keeps the relation. `INSERT DATA` and RDF Patch
+scope the labels of their literals as they scope their other labels. In an `INSERT`
+template, a label inside a literal names the template's blank node of each solution. A
+label inside a literal written in a query names a blank node of that query. It names
+the same node in all the query's literals and never a stored node, even when it looks
+like the label of one. Jena's SPARQL-CDTs tests run in the W3C harness, and all 655
+pass.
 
 The formatter, the editor's highlighting and the query builder know `LATERAL`, ranges
 and CONSTRUCT with `GRAPH`, and the formatter and the editor know the other forms too.
