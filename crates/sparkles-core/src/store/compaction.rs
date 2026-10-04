@@ -1316,7 +1316,7 @@ pub(crate) fn remove_interrupted(root: &Path, dataset_id: uuid::Uuid, current: u
         let ours = std::fs::read_to_string(e.path().join(BUILDING_FILE))
             .is_ok_and(|id| id.trim() == dataset_id.to_string());
         if ours && let Err(err) = crate::history::delete_generation(root, &e.path()) {
-            tracing::warn!("could not remove the interrupted compaction {name}: {err}");
+            tracing::warn!(target: "sparkles::store::compaction", "could not remove the interrupted compaction {name}: {err}");
         }
     }
 }

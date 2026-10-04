@@ -1474,7 +1474,7 @@ impl Store {
         store.collect_history(gen_no, head.seq);
         if let Err(e) = store.recover_change_log() {
             // history queries report the commits it could not record
-            tracing::warn!(error = %e, "could not recover the change log");
+            tracing::warn!(target: "sparkles::store", error = %e, "could not recover the change log");
         }
         store.open_text(&wal_text)?;
         store.open_geo();
@@ -1797,7 +1797,9 @@ impl Store {
             let before = hist.lock().materializations;
             match self.snapshot_at(&crate::history::At::Commit(seq), &Default::default()) {
                 Ok(_) => built += usize::from(hist.lock().materializations > before),
-                Err(e) => tracing::warn!("warm snapshot {name} (commit {seq}): {e}"),
+                Err(e) => {
+                    tracing::warn!(target: "sparkles::store", "warm snapshot {name} (commit {seq}): {e}")
+                }
             }
         }
         built
@@ -2241,7 +2243,7 @@ impl Store {
         drop(w);
         if n > 0 {
             self.quota.invalidate();
-            tracing::info!(pruned = n, first = cutoff, "pruned the commit catalog");
+            tracing::info!(target: "sparkles::store", pruned = n, first = cutoff, "pruned the commit catalog");
         }
         Ok(n)
     }
@@ -2397,7 +2399,7 @@ impl Store {
         }
         drop(a);
         if let Err(e) = self.annotate(root, None, || Some((Vec::new(), Vec::new()))) {
-            tracing::warn!(error = %e, "could not record the root commit's change digest");
+            tracing::warn!(target: "sparkles::store", error = %e, "could not record the root commit's change digest");
         }
     }
 
@@ -2445,7 +2447,9 @@ impl Store {
                     s.text = Some(view);
                     self.current.store(Arc::new(s));
                 }
-                Err(e) => tracing::error!("full-text index of {}: {e}", root.display()),
+                Err(e) => {
+                    tracing::error!(target: "sparkles::store", "full-text index of {}: {e}", root.display())
+                }
             }
         }
         #[cfg(not(feature = "text"))]
@@ -2453,6 +2457,7 @@ impl Store {
         #[cfg(not(feature = "text"))]
         if root.join("text.json").exists() {
             tracing::warn!(
+                target: "sparkles::store",
                 "{}: full-text search is configured but this build has no `text` feature",
                 root.display()
             );
@@ -2479,7 +2484,7 @@ impl Store {
             snap.text = match ti.rebuild(snap) {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    tracing::error!("full-text rebuild after a bulk commit failed: {e}");
+                    tracing::error!(target: "sparkles::store", "full-text rebuild after a bulk commit failed: {e}");
                     prev
                 }
             };
@@ -2636,6 +2641,7 @@ impl Store {
         }
         if skipped > 0 {
             tracing::warn!(
+                target: "sparkles::store",
                 "{skipped} prefixes of the loaded data were not added (at most {} per dataset, names of {MAX_PREFIX_NAME_BYTES} bytes, IRIs of {MAX_PREFIX_IRI_BYTES})",
                 self.opts.max_prefixes
             );
@@ -2937,7 +2943,7 @@ impl Store {
             {
                 o.observe(language, kind, Ok(&summary), std::time::Duration::ZERO);
             }
-            tracing::warn!("a write bypassed write-time validation");
+            tracing::warn!(target: "sparkles::store", "a write bypassed write-time validation");
             return Ok(Some(Arc::new(summary)));
         }
         let Some(g) = g else {
@@ -3862,7 +3868,7 @@ impl Drop for WriteTxn<'_> {
         // writer lock is still held here, and only this transaction's views reached them
         if self.opts.dry_run.is_some() {
             if let Err(e) = self.base.generation.dvocab.rollback(&self.mark) {
-                tracing::warn!("a dry run could not remove the terms it added: {e}");
+                tracing::warn!(target: "sparkles::store", "a dry run could not remove the terms it added: {e}");
             }
             self.guard.next_bnode = self.start_bnode;
         }
@@ -4690,7 +4696,9 @@ fn collect_generations(
                 h.gens.remove(&no);
                 retired.extend(d);
             }
-            Err(e) => tracing::warn!("could not remove {}: {e}", dir.display()),
+            Err(e) => {
+                tracing::warn!(target: "sparkles::store", "could not remove {}: {e}", dir.display())
+            }
         }
     }
     retired
@@ -4770,7 +4778,7 @@ impl Drop for Store {
         if let Some(log) = &self.changelog
             && let Err(e) = log.flush(true)
         {
-            tracing::warn!(error = %e, "could not write the change log on close");
+            tracing::warn!(target: "sparkles::store", error = %e, "could not write the change log on close");
         }
         self.embed.close();
     }
@@ -4798,7 +4806,7 @@ fn open_history(
         let dir = root.join(&name);
         if no > current {
             if let Err(e) = history::delete_generation(root, &dir) {
-                tracing::warn!("could not remove the interrupted rebuild {name}: {e}");
+                tracing::warn!(target: "sparkles::store", "could not remove the interrupted rebuild {name}: {e}");
             }
             continue;
         }

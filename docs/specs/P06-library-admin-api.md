@@ -319,6 +319,16 @@ The satellite crates depend on `sparkles-core` and change their `sparkles::` pat
 form a cycle. P04's planned `sparkles::embed` module, which holds the transaction worker
 shared by the bindings, belongs in the facade as well.
 
+Log targets keep their names too. A `tracing` event without a `target:` takes its module
+path, which the move changed from `sparkles::store` to `sparkles_core::store`. That broke
+filters such as `RUST_LOG=sparkles::store=debug` and renamed the targets in JSON logs.
+Every event and span in the core now names its target, the module path it had in the
+`sparkles` package. A test in `crates/sparkles-core/tests/log_targets.rs` fails on a new
+event without one, and checks that a `sparkles::store` directive enables a store event.
+Rewriting `sparkles::` directives when the server builds its filter would have fixed
+filtering but not the names in JSON logs or OTLP records, and a crate-wide macro cannot
+compute `sparkles::` plus the rest of `module_path!()` as the constant a target must be.
+
 ### 3.2 Cargo features
 
 The facade's features name what they turn on. The core's features keep their names, and

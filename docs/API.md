@@ -132,6 +132,14 @@ Query and update text is logged only at DEBUG under `sparkles::query`
 (`RUST_LOG=sparkles::query=debug`), cut to 2048 characters. `--log-format json` writes one
 JSON object per line.
 
+The engine logs under the target `sparkles::` followed by its module path, for example
+`sparkles::store`, `sparkles::store::changelog`, `sparkles::text` or `sparkles::sparql::exec`.
+These names did not change when the engine moved into the `sparkles-core` package, so
+`RUST_LOG=sparkles::store=debug` enables the store's events. A directive matches every
+target that starts with it, so the default filter of `sparkles serve`,
+`sparkles=info,sparkles_server=info,tower_http=warn`, covers the engine, the server and the
+validators (`sparkles_shacl`, `sparkles_shex`).
+
 ### Metrics
 
 | Name | Type | Labels |

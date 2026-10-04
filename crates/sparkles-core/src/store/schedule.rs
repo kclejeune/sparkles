@@ -101,7 +101,9 @@ impl Store {
                     mine.push(p);
                 }
                 Ok(_) => {}
-                Err(e) => tracing::warn!("scheduled snapshot {name}: {e}"),
+                Err(e) => {
+                    tracing::warn!(target: "sparkles::store::schedule", "scheduled snapshot {name}: {e}")
+                }
             }
             while mine.len() > s.keep_last as usize {
                 let oldest = mine.remove(0);
