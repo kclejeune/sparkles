@@ -592,9 +592,12 @@ this, and each can be switched off for comparisons.
 * The vocabulary has a sparse index, `vocab.idx`, which holds the first key of every 128th
   front-coded block. It is loaded at open, and a lookup then reads one range of the
   offsets and one range of the data instead of one place per step of a binary search.
-  Loads and compactions write it, and `sparkles vocab-index` adds it to an older
-  database. It costs 66 KB at 10.5M and 8.4 MB of memory at 1.01B quads.
-  `SPARKLES_SPARSE_VOCAB=off` turns it off.
+  Only the first lookup in each group of 128 blocks asks the kernel to read those ranges
+  ahead. The request takes two system calls, which cost more than a lookup whose pages
+  are in memory, and group-avg was 15 ms slower at 10.5M when every lookup made them,
+  because it looks up the 20,000 decimals its AVG computes. Loads and compactions write the
+  index, and `sparkles vocab-index` adds it to an older database. It costs 66 KB at 10.5M
+  and 8.4 MB of memory at 1.01B quads. `SPARKLES_SPARSE_VOCAB=off` turns it off.
 * An index join with up to 16,384 keys asks for all the blocks it will read before it
   decodes the first, so their reads overlap (`prefetch_blocks` in
   `SPARKLES_DISABLE_OPTIMIZATIONS`).
