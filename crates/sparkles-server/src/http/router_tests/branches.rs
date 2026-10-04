@@ -93,7 +93,7 @@ async fn a1_a2_create_isolate_and_the_path_form() {
     assert_eq!(b["storage"]["linked"], true);
     let id = b["id"].as_str().unwrap().to_string();
     let bdir = dir.path().join("databases/ds/branches").join(&id);
-    assert!(bdir.join("gen-0000/link.json").exists());
+    assert!(bdir.join("gen-0001/link.json").exists());
 
     let (r, h) = update(&app, "ds?branch=dev", "INSERT DATA { <urn:c> <urn:p> 1 }").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());

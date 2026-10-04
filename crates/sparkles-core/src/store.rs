@@ -3738,7 +3738,7 @@ impl Store {
         // a new generation (and maybe one fewer old one): measure the directory again
         self.quota.invalidate();
         let receipt = Receipt {
-            dataset_id: self.dataset_id,
+            dataset_id: self.owner_dataset_id(),
             committed: bulk.is_some(),
             commit: head,
             validation,
@@ -4563,7 +4563,7 @@ impl WriteTxn<'_> {
         if self.net_ins == 0 && self.net_del == 0 && !self.force {
             // nothing changed (or every change was undone): no commit, nothing published
             return Ok(Receipt {
-                dataset_id: self.store.dataset_id,
+                dataset_id: self.store.owner_dataset_id(),
                 committed: false,
                 commit: head,
                 validation: None,
@@ -4714,7 +4714,7 @@ impl WriteTxn<'_> {
             self.store.guard_committed(c.seq);
         }
         Ok(Receipt {
-            dataset_id: self.store.dataset_id,
+            dataset_id: self.store.owner_dataset_id(),
             committed: true,
             commit: c,
             validation,

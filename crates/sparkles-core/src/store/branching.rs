@@ -1094,7 +1094,9 @@ impl Store {
                 created_ms,
                 storage: BranchStorage {
                     linked: false,
-                    own_bytes: 0,
+                    own_bytes: self.root.as_ref().map_or(0, |r| {
+                        dir_size(r).saturating_sub(dir_size(&r.join(BRANCHES_DIR)))
+                    }),
                     held_bytes: 0,
                     generation: self.snapshot().generation.name.clone(),
                 },
@@ -1404,7 +1406,8 @@ impl Store {
                 &tmp.join("dataset.json"),
                 &commit::dataset_file_bytes(e.id, "branch", self.now_ms()),
             )?;
-            let gen_no: u32 = if build { 1 } else { 0 };
+            // the first generation is gen-0001, linked or built (0 names in-memory ones)
+            let gen_no: u32 = 1;
             let gen_name = format!("gen-{gen_no:04}");
             let gdir = tmp.join(&gen_name);
             std::fs::create_dir_all(&gdir)?;
@@ -1614,8 +1617,11 @@ impl Store {
                     return Err(branch::conflict(
                         "unmerged",
                         format!(
-                            "branch {name} has {} commits its upstream does not have; merge it or delete with force",
-                            head - merged.max(e.from.seq)
+                            "branch {name} has {} its upstream does not have; merge it or delete with force",
+                            match head - merged.max(e.from.seq) {
+                                1 => "1 commit".to_string(),
+                                n => format!("{n} commits"),
+                            }
                         ),
                     ));
                 }
@@ -1672,14 +1678,13 @@ impl Store {
         let Some(set) = self.branching.set() else {
             return;
         };
-        let linked_retained = self
-            .history
-            .as_ref()
-            .is_some_and(|h| h.lock().gens.contains_key(&0))
-            && self
-                .root
-                .as_ref()
-                .is_some_and(|r| r.join("gen-0000").join(LINK_FILE).exists());
+        // a retained generation that is linked still reads the upstream
+        let linked_retained = self.history.as_ref().is_some_and(|h| {
+            h.lock()
+                .gens
+                .values()
+                .any(|g| g.dir.join(LINK_FILE).exists())
+        });
         if self.snapshot().generation.linked().is_some() || linked_retained {
             return;
         }

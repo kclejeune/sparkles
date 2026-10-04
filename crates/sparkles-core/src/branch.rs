@@ -81,7 +81,7 @@ pub struct BranchStorage {
     /// bytes of upstream generations that are no longer current there and that this
     /// branch's link keeps
     pub held_bytes: u64,
-    /// the current generation of the branch (`gen-0000` while linked)
+    /// the current generation of the branch (`gen-0001` while linked)
     pub generation: String,
 }
 

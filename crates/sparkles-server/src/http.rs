@@ -1911,7 +1911,7 @@ async fn list_commits(
     }
     Ok(Json(json!({
         "dataset": name,
-        "datasetId": ds.store.dataset_id(),
+        "datasetId": ds.store.owner_dataset_id(),
         "head": head.seq,
         "firstRetained": page.first_retained,
         "complete": page.complete,
@@ -1960,7 +1960,7 @@ async fn get_commit(
     }
     Ok(Json(json!({
         "dataset": name,
-        "datasetId": ds.store.dataset_id(),
+        "datasetId": ds.store.owner_dataset_id(),
         "commit": commit,
     })))
 }

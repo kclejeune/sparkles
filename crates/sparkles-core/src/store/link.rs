@@ -1,7 +1,7 @@
 //! Linked generations: the first generation of a branch, which shares the index files of
 //! an upstream generation instead of building its own.
 //!
-//! `gen-0000/link.json` lists the log segments that lead from the shared base index to
+//! `gen-0001/link.json` (a branch's first generation) lists the log segments that lead from the shared base index to
 //! the branch's starting commit, oldest first. The first segment's generation holds the
 //! base files (vocabulary, permutations, statistics). Opening the generation opens those
 //! files, layers the delta vocabularies of the segments under the branch's own

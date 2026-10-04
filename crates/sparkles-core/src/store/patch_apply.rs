@@ -355,7 +355,7 @@ impl Store {
             drop(txn);
             return Ok(PatchOutcome {
                 receipt: Receipt {
-                    dataset_id: self.dataset_id,
+                    dataset_id: self.owner_dataset_id(),
                     committed: false,
                     commit: head,
                     validation: None,

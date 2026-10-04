@@ -156,7 +156,7 @@ pub(super) fn quad_json(op: DiffOp, q: &oxrdf::Quad) -> J {
 fn summary(name: &str, ds: &Dataset, d: &Diff, restricted: bool) -> J {
     let mut j = json!({
         "dataset": name,
-        "datasetId": ds.store.dataset_id(),
+        "datasetId": ds.store.owner_dataset_id(),
         "from": side(&d.from, restricted),
         "to": side(&d.to, restricted),
         "added": d.added,

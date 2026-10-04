@@ -1855,8 +1855,10 @@ impl Checker<'_> {
                     continue;
                 }
             }
-            let gen0 = dir.join("gen-0000");
-            if let Ok(Some(link)) = crate::store::read_link_file(&gen0) {
+            let first = std::fs::read_to_string(dir.join("CURRENT"))
+                .map(|c| dir.join(c.trim()))
+                .unwrap_or_else(|_| dir.join("gen-0001"));
+            if let Ok(Some(link)) = crate::store::read_link_file(&first) {
                 linked += 1;
                 for seg in link {
                     let sdir = self.root.join(&seg.0);

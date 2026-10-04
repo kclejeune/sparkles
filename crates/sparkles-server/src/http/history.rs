@@ -161,7 +161,7 @@ fn snapshot_json(s: &NamedSnapshot) -> J {
 fn history_json(name: &str, ds: &Dataset, h: &sparkles::history::HistoryStatus) -> J {
     json!({
         "dataset": name,
-        "datasetId": ds.store.dataset_id(),
+        "datasetId": ds.store.owner_dataset_id(),
         "head": h.head,
         "oldestReconstructable": h.oldest_reconstructable(),
         "reconstructable": ranges(&h.reconstructable),
@@ -332,7 +332,7 @@ pub(super) async fn list_snapshots(
         .collect();
     Ok(Json(json!({
         "dataset": name,
-        "datasetId": ds.store.dataset_id(),
+        "datasetId": ds.store.owner_dataset_id(),
         "head": ds.store.head_commit().seq,
         "snapshots": snaps,
     })))

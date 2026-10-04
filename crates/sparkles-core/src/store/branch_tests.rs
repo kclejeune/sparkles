@@ -108,9 +108,9 @@ fn a1_create_and_isolate() {
     assert_eq!(info.from.as_ref().unwrap().seq, 2);
     assert!(info.storage.linked);
     let bdir = dir.path().join("ds/branches").join(info.id.to_string());
-    assert!(bdir.join("gen-0000/link.json").exists());
+    assert!(bdir.join("gen-0001/link.json").exists());
     assert!(
-        !bdir.join("gen-0000/meta.json").exists(),
+        !bdir.join("gen-0001/meta.json").exists(),
         "no index is built"
     );
     let dev = s.branch("dev").unwrap();
@@ -602,7 +602,7 @@ fn a13_holds_keep_the_upstream_generation_until_the_branch_compacts() {
     assert_eq!(dump(&dev), before);
     // the branch's own rebuild releases the link hold
     dev.compact().unwrap();
-    assert_eq!(dev.snapshot().generation.name, "gen-0001");
+    assert_eq!(dev.snapshot().generation.name, "gen-0002");
     assert!(dev.snapshot().generation.linked().is_none());
     let info = s.branch_info("dev").unwrap();
     assert!(!info.storage.linked);
@@ -1253,7 +1253,7 @@ fn a18_the_first_rebuild_of_a_linked_branch_keeps_the_quota() {
         !root
             .join("branches")
             .join(id.to_string())
-            .join("gen-0001")
+            .join("gen-0002")
             .exists()
     );
     // writes that fit still succeed
