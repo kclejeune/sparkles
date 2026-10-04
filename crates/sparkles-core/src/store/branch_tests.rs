@@ -1211,3 +1211,46 @@ fn a_linked_branch_compacts_partially_from_its_upstreams_files() {
     let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
     assert_eq!(dump(&s.branch("dev").unwrap()), before);
 }
+
+/// A18: the first rebuild of a linked branch adds a full index, so it is refused over the
+/// dataset's quota, and the compaction status says so; writes that fit go on.
+#[test]
+fn a18_the_first_rebuild_of_a_linked_branch_keeps_the_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ds");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let mut nt = String::new();
+    for i in 0..5000 {
+        nt.push_str(&format!("<urn:s{i}> <urn:p> \"value {i}\" .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        crate::io::RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&dev, "+<urn:new> <urn:p> <urn:x> .");
+    let used = s.disk_usage();
+    s.set_quota(Some(used + (64 << 10))).unwrap();
+    let b = dev.compaction_blocker(false).expect("the quota blocks it");
+    assert_eq!(b.reason, "quota", "{}", b.detail);
+    let e = dev.compact().unwrap_err();
+    assert!(
+        matches!(&e, Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::DatasetBytes),
+        "{e}"
+    );
+    assert!(dev.snapshot().generation.linked().is_some());
+    let id = s.branch_id_of("dev").unwrap();
+    assert!(
+        !root
+            .join("branches")
+            .join(id.to_string())
+            .join("gen-0001")
+            .exists()
+    );
+    // writes that fit still succeed
+    apply(&dev, "+<urn:new2> <urn:p> <urn:x> .");
+    assert!(has(&dev, "urn:new2"));
+}

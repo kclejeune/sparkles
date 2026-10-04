@@ -319,6 +319,13 @@ impl Store {
                 "backups of in-memory datasets are not supported",
             ));
         }
+        // a backup copies the dataset's own store; a branch's linked generation would
+        // copy without the upstream files it reads
+        if self.is_branch() {
+            return Err(Error::unsupported(
+                "backups copy a dataset's main branch; branches are not backed up yet",
+            ));
+        }
         if let Some(c) = self.capture_once(label)? {
             return Ok(c);
         }
