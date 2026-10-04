@@ -9,6 +9,7 @@ use crate::sparql::describe::{DescribeMode, DescribeOptions};
 use crate::store::{
     ChangeLogSettings, ChangeLogStatus, CompactionMeasures, CompactionSettings, QuotaStatus,
 };
+use crate::store::{CompactionPolicy, Trigger};
 use serde::Serialize;
 
 /// The dataset's settings (from [`Dataset::settings`]).
@@ -78,6 +79,110 @@ impl CompactionSetting {
     pub fn measures(&self) -> CompactionMeasures {
         self.ds.store().compaction_measures()
     }
+
+    /// The policy in force: `base`, the caller's policy (`serve --auto-compact-*`), with
+    /// the dataset's own settings applied.
+    pub fn effective(&self, base: &CompactionPolicy) -> CompactionPolicy {
+        base.with(&self.get())
+    }
+
+    /// The policy in force over `base`, what it measures now, and whether a compaction
+    /// is due.
+    pub fn status(&self, base: &CompactionPolicy) -> CompactionStatus {
+        let own = self.get();
+        let policy = base.with(&own);
+        let m = self.measures();
+        let trigger = policy.verdict(&m);
+        let state = if !policy.enabled {
+            CompactionState::Off
+        } else if m.compacting {
+            CompactionState::Running
+        } else if trigger.is_some() {
+            CompactionState::Due
+        } else {
+            CompactionState::Idle
+        };
+        CompactionStatus {
+            enabled: policy.enabled,
+            state,
+            measures: CompactionReadings {
+                threshold: policy.threshold(m.base_quads),
+                generation: m.generation,
+                base_quads: m.base_quads,
+                delta_quads: m.delta_quads,
+                delta_bytes: m.delta_bytes,
+                wal_bytes: m.wal_bytes,
+                idle_seconds: m.idle_ms.map(|v| v / 1000),
+                oldest_change_seconds: m.oldest_change_ms.map(|v| v / 1000),
+            },
+            policy,
+            own,
+            trigger,
+        }
+    }
+}
+
+/// Where automatic compaction of a dataset stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum CompactionState {
+    /// the policy is off
+    Off,
+    /// a compaction is running
+    Running,
+    /// the policy's verdict is that a compaction is due
+    Due,
+    /// nothing is due
+    Idle,
+}
+
+/// A dataset's automatic compaction as `GET /$/compaction/{ds}` reports it, without the
+/// server's scheduler state: the policy in force, the dataset's own settings, the
+/// measures and the verdict.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompactionStatus {
+    /// whether the policy in force is enabled
+    pub enabled: bool,
+    pub policy: CompactionPolicy,
+    pub own: CompactionSettings,
+    pub state: CompactionState,
+    pub measures: CompactionReadings,
+    /// the first trigger that fires, whether or not the policy is enabled; its detail
+    /// in JSON
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "trigger_detail"
+    )]
+    pub trigger: Option<Trigger>,
+}
+
+fn trigger_detail<S: serde::Serializer>(
+    t: &Option<Trigger>,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match t {
+        Some(t) => s.serialize_str(&t.detail),
+        None => s.serialize_none(),
+    }
+}
+
+/// The measures of a [`CompactionStatus`], in seconds, with the delta size at which the
+/// policy's relative trigger fires.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompactionReadings {
+    pub generation: String,
+    pub base_quads: u64,
+    pub delta_quads: u64,
+    pub delta_bytes: u64,
+    pub wal_bytes: u64,
+    pub idle_seconds: Option<u64>,
+    pub oldest_change_seconds: Option<u64>,
+    pub threshold: u64,
 }
 
 /// How DESCRIBE describes a resource.

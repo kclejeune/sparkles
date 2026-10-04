@@ -4,8 +4,8 @@
 
 use anyhow::{Result, bail};
 use clap::Args;
-use serde_json::{Value as J, json};
-use sparkles::store::{CompactionPolicy, CompactionSettings, Store, StoreOptions};
+use serde_json::Value as J;
+use sparkles::store::{CompactionPolicy, CompactionSettings, StoreOptions};
 use std::path::PathBuf;
 
 #[derive(Args, Debug)]
@@ -55,45 +55,16 @@ fn apply_sets(mut own: CompactionSettings, sets: &[String]) -> Result<Compaction
 }
 
 fn local(loc: &std::path::Path, a: &CompactionArgs, opts: StoreOptions) -> Result<J> {
-    if !loc.join("CURRENT").exists() {
-        bail!("{} is not a database directory", loc.display());
-    }
-    let store = Store::open(loc, opts)?;
+    let compaction = crate::open_dataset(loc, opts)?.settings().compaction();
     if a.default {
-        store.set_compaction_settings(None)?;
+        compaction.reset()?;
     } else if !a.set.is_empty() {
-        let own = apply_sets(store.compaction_settings(), &a.set)?;
-        store.set_compaction_settings(Some(own))?;
+        compaction.set(apply_sets(compaction.get(), &a.set)?)?;
     }
-    let own = store.compaction_settings();
-    let policy = CompactionPolicy::default().with(&own);
-    let m = store.compaction_measures();
-    let trigger = policy.verdict(&m);
-    let state = match (&trigger, policy.enabled) {
-        (_, false) => "off",
-        (Some(_), true) => "due",
-        (None, true) => "idle",
-    };
-    let mut j = json!({
-        "enabled": policy.enabled,
-        "policy": policy,
-        "own": own,
-        "state": state,
-        "measures": {
-            "generation": m.generation,
-            "baseQuads": m.base_quads,
-            "deltaQuads": m.delta_quads,
-            "deltaBytes": m.delta_bytes,
-            "walBytes": m.wal_bytes,
-            "idleSeconds": m.idle_ms.map(|v| v / 1000),
-            "oldestChangeSeconds": m.oldest_change_ms.map(|v| v / 1000),
-            "threshold": policy.threshold(m.base_quads),
-        },
-    });
-    if let Some(t) = trigger {
-        j["trigger"] = t.detail.into();
-    }
-    Ok(j)
+    // a local database has no server policy beneath its own settings
+    Ok(serde_json::to_value(
+        compaction.status(&CompactionPolicy::default()),
+    )?)
 }
 
 #[cfg(feature = "auth")]
@@ -181,6 +152,8 @@ fn print(status: &J, format: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use sparkles::store::Store;
 
     fn args(loc: &std::path::Path, set: &[&str], default: bool) -> CompactionArgs {
         CompactionArgs {

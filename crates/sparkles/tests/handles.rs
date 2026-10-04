@@ -238,3 +238,52 @@ fn backups_in_a_file_system_repository() {
             .is_empty()
     );
 }
+
+#[test]
+fn describe_and_compaction_report_their_status() {
+    let (_dir, ds) = persistent();
+    let describe = ds.settings().describe();
+    let j = serde_json::to_value(describe.status()).unwrap();
+    assert_eq!(j["mode"], "cbd");
+    assert_eq!(j["source"], "default");
+    assert!(j["maxTriples"].is_null());
+    assert_eq!(j["modes"], serde_json::json!(["cbd", "scbd", "outgoing"]));
+    let mut o = describe.get();
+    o.max_triples = Some(10);
+    describe.set(o).unwrap();
+    let j = serde_json::to_value(describe.status()).unwrap();
+    assert_eq!(j["maxTriples"], 10);
+    assert_eq!(j["source"], "dataset");
+
+    let compaction = ds.settings().compaction();
+    let base = sparkles::store::CompactionPolicy::default();
+    let s = compaction.status(&base);
+    assert!(s.enabled);
+    assert_eq!(s.policy, compaction.effective(&base));
+    let j = serde_json::to_value(&s).unwrap();
+    assert_eq!(j["state"], "idle");
+    assert!(j.get("trigger").is_none(), "{j}");
+    ds.update("INSERT DATA { <http://ex.org/c> <http://ex.org/p> 3 }")
+        .unwrap();
+    let mut own = compaction.get();
+    own.set("maxDeltaQuads", "1").unwrap();
+    compaction.set(own).unwrap();
+    let s = compaction.status(&base);
+    assert_eq!(
+        s.trigger.as_ref().map(|t| t.kind),
+        Some(sparkles::store::TriggerKind::MaxDelta)
+    );
+    let j = serde_json::to_value(&s).unwrap();
+    assert_eq!(j["state"], "due");
+    assert!(
+        j["trigger"].as_str().unwrap().contains("maxDeltaQuads"),
+        "{j}"
+    );
+    let mut own = compaction.get();
+    own.set("enabled", "false").unwrap();
+    compaction.set(own).unwrap();
+    assert_eq!(
+        compaction.status(&base).state,
+        sparkles::handles::CompactionState::Off
+    );
+}
