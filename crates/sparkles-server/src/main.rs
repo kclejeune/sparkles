@@ -141,6 +141,29 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum ShaclCmd {
+    /// Read shapes files, check that they are well-formed SHACL, and print them in
+    /// another syntax (Jena's `shacl parse`); several files are printed one after
+    /// another, each after a `# FILE` header
+    #[command(visible_aliases = ["p", "print"])]
+    Parse {
+        /// Shapes files (`-` for stdin; `.gz` allowed)
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+        /// Output syntax: shaclc (or compact), turtle, nt, jsonld or rdfxml
+        #[arg(long, default_value = "shaclc", value_name = "SYNTAX")]
+        out: String,
+        /// Input syntax, when the file name does not say (stdin): shaclc, turtle, nt,
+        /// jsonld, rdfxml, trig or nquads; default: by extension, else Turtle
+        #[arg(long = "in", value_name = "SYNTAX")]
+        input: Option<String>,
+        /// Base IRI for relative IRIs (default: the file's location)
+        #[arg(long, value_name = "IRI")]
+        base: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SnapshotCmd {
     /// Pin a commit under a name (default: the head)
     Create {
@@ -1674,8 +1697,12 @@ enum Cmd {
         to: Option<String>,
     },
     /// Validate a database (or data files) against a SHACL shapes graph; exits with
-    /// status 1 when the data does not conform
+    /// status 1 when the data does not conform. `sparkles shacl parse` prints shapes
+    /// files in another syntax
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Shacl {
+        #[command(subcommand)]
+        cmd: Option<ShaclCmd>,
         /// Database directory
         #[arg(long)]
         loc: Option<PathBuf>,
@@ -1684,8 +1711,8 @@ enum Cmd {
         data: Vec<PathBuf>,
         /// Shapes graph file (Turtle, N-Triples, RDF/XML, JSON-LD, ..., or SHACLC as
         /// `.shaclc` or `.shc`; `.gz` allowed)
-        #[arg(long)]
-        shapes: PathBuf,
+        #[arg(long, required = true)]
+        shapes: Option<PathBuf>,
         /// Data graph: `default`, `union` (all graphs) or a graph IRI
         #[arg(long, default_value = "default")]
         graph: String,
@@ -3604,6 +3631,18 @@ fn run() -> Result<()> {
         Cmd::Shacl { .. } => bail!("built without the `shacl` feature"),
         #[cfg(feature = "shacl")]
         Cmd::Shacl {
+            cmd:
+                Some(ShaclCmd::Parse {
+                    files,
+                    out,
+                    input,
+                    base,
+                }),
+            ..
+        } => shacl_parse(&files, &out, input.as_deref(), base.as_deref()),
+        #[cfg(feature = "shacl")]
+        Cmd::Shacl {
+            cmd: None,
             loc,
             data,
             shapes,
@@ -3614,7 +3653,7 @@ fn run() -> Result<()> {
         } => {
             let fmt = shacl::ReportFormat::from_name(&format)
                 .with_context(|| format!("unknown report format '{format}'"))?;
-            let shapes = read_shapes(&shapes)?;
+            let shapes = read_shapes(&shapes.context("--shapes is required")?)?;
             let store = open_or_load(loc, &data, opts)?;
             let graph = validation_common::GraphParam::parse(&graph)?;
             let snap = store.snapshot();
@@ -4264,9 +4303,20 @@ fn schema_draft(
     Ok(())
 }
 
+/// The text of a shapes file (`-` for stdin), decompressed, with its syntax and the
+/// base IRI of its location.
 #[cfg(feature = "shacl")]
-fn read_shapes(path: &std::path::Path) -> Result<sparkles_shacl::Shapes> {
+fn read_shapes_text(
+    path: &std::path::Path,
+) -> Result<(String, sparkles_shacl::ShapesSyntax, Option<String>)> {
     use std::io::Read;
+    if path.as_os_str() == "-" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .context("reading stdin")?;
+        return Ok((text, sparkles_shacl::ShapesSyntax::default(), None));
+    }
     // `.shaclc` and `.shc` are SHACLC; other names as for RDF files, Turtle by default
     let (format, _) = sparkles_shacl::ShapesSyntax::from_path(path).unwrap_or_default();
     let codec = Source::from_path(path, None)
@@ -4281,8 +4331,79 @@ fn read_shapes(path: &std::path::Path) -> Result<sparkles_shacl::Shapes> {
     let base = std::path::absolute(path)
         .ok()
         .map(|p| format!("file://{}", p.display()));
+    Ok((text, format, base))
+}
+
+#[cfg(feature = "shacl")]
+fn read_shapes(path: &std::path::Path) -> Result<sparkles_shacl::Shapes> {
+    let (text, format, base) = read_shapes_text(path)?;
     sparkles_shacl::Shapes::parse(&text, format, base.as_deref())
         .with_context(|| format!("reading shapes from {}", path.display()))
+}
+
+/// `sparkles shacl parse`: each file read, checked as SHACL and written in `out`.
+#[cfg(feature = "shacl")]
+fn shacl_parse(
+    files: &[PathBuf],
+    out: &str,
+    input: Option<&str>,
+    base: Option<&str>,
+) -> Result<()> {
+    use sparkles_shacl::ShapesSyntax;
+    use sparkles_shacl::syntax::{read_document, to_turtle};
+    let to = ShapesSyntax::from_name(out).with_context(|| {
+        format!("unknown output syntax '{out}' (shaclc, turtle, nt, jsonld or rdfxml)")
+    })?;
+    let from = input
+        .map(|i| ShapesSyntax::from_name(i).with_context(|| format!("unknown input syntax '{i}'")))
+        .transpose()?;
+    let mut w = std::io::stdout().lock();
+    for f in files {
+        let (text, syntax, file_base) = read_shapes_text(f)?;
+        let syntax = from.unwrap_or(syntax);
+        // a SHACLC document without BASE would name its base as the ontology
+        // (`<base> a owl:Ontology`), so the file's location is not its base
+        let file_base = file_base.filter(|_| syntax != ShapesSyntax::Compact);
+        let what = || format!("reading shapes from {}", f.display());
+        let mut doc =
+            read_document(&text, syntax, base.or(file_base.as_deref())).with_context(what)?;
+        // SHACLC's predeclared prefixes, for the other syntaxes (only those used are written)
+        for (p, ns) in [
+            ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+            ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
+            ("sh", "http://www.w3.org/ns/shacl#"),
+            ("xsd", "http://www.w3.org/2001/XMLSchema#"),
+        ] {
+            if !doc.prefixes.iter().any(|(q, n)| q == p || n == ns) {
+                doc.prefixes.push((p.to_string(), ns.to_string()));
+            }
+        }
+        // well-formed SHACL, as Jena's `shacl parse` checks
+        sparkles_shacl::Shapes::from_graph(doc.graph.clone()).with_context(what)?;
+        let printed = match to {
+            ShapesSyntax::Compact => sparkles_shacl::compact::write(&doc.graph, &doc.prefixes)
+                .with_context(|| format!("{} has no SHACLC form", f.display()))?,
+            ShapesSyntax::Rdf(sparkles::io::RdfFormat::Turtle) => {
+                to_turtle(&doc.graph, &doc.prefixes)?
+            }
+            ShapesSyntax::Rdf(format) => {
+                let mut s = oxrdfio::RdfSerializer::from_format(format).for_writer(Vec::new());
+                for t in doc.graph.iter() {
+                    s.serialize_triple(t)?;
+                }
+                String::from_utf8(s.finish()?)?
+            }
+        };
+        if files.len() > 1 {
+            writeln!(w, "# {}", f.display())?;
+        }
+        w.write_all(printed.as_bytes())?;
+        if !printed.ends_with('\n') {
+            writeln!(w)?;
+        }
+    }
+    w.flush()?;
+    Ok(())
 }
 
 fn print_plan(p: &sparkles::sparql::PlanInfo, depth: usize) {
