@@ -68,7 +68,7 @@ async fn status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
         "budgetBytes": sparkles::vector::budget(),
         "usedBytes": vectors.used_bytes(),
         "generation": snap.generation.name,
-        "indexes": ds.store.vector_indexes(),
+        "indexes": ds.dataset.indexes().vector().list(),
         "predicates": predicates,
     })))
 }
@@ -83,8 +83,10 @@ async fn index_status(
     Path((ds_name, name)): Path<(String, String)>,
 ) -> ApiResult<Json<VectorIndexStatus>> {
     let ds = dataset(&st, &ds_name)?;
-    ds.store
-        .vector_index(&name)
+    ds.dataset
+        .indexes()
+        .vector()
+        .get(&name)
         .map(Json)
         .ok_or_else(|| unknown(&name))
 }
@@ -125,9 +127,14 @@ async fn create(
     let created = {
         let ds = ds.clone();
         let name = name.clone();
-        blocking(move || Ok(ds.store.create_vector_index(&name, cfg)?)).await?
+        blocking(move || Ok(ds.dataset.indexes().vector().put(&name, cfg)?)).await?
     };
-    let index = ds.store.vector_index(&name).ok_or_else(|| unknown(&name))?;
+    let index = ds
+        .dataset
+        .indexes()
+        .vector()
+        .get(&name)
+        .ok_or_else(|| unknown(&name))?;
     ensure_worker(&st, &ds);
     let task = start_wait(&st, &ds_name, ds, name, "building the vector index");
     let code = if created {
@@ -149,8 +156,10 @@ fn start_wait(
     st.start_task(TASK, ds_name, move |h| {
         h.progress(0.0, what);
         let s = ds
-            .store
-            .wait_vector_index(&name)
+            .dataset
+            .indexes()
+            .vector()
+            .wait(&name)
             .ok_or_else(|| anyhow::anyhow!("vector index {name} was dropped"))?;
         if s.state == "failed" || s.state == "over-budget" {
             bail!(
@@ -169,7 +178,7 @@ async fn drop_index(State(st): St, Path((ds_name, name)): Path<(String, String)>
     }
     let ds = dataset(&st, &ds_name)?;
     blocking(move || {
-        ds.store.drop_vector_index(&name)?;
+        ds.dataset.indexes().vector().drop(&name)?;
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
@@ -183,7 +192,7 @@ async fn rebuild(State(st): St, Path((ds_name, name)): Path<(String, String)>) -
     }
     let ds = dataset(&st, &ds_name)?;
     task_start_check(&st, None, &ds_name)?;
-    ds.store.rebuild_vector_index(&name)?;
+    ds.dataset.indexes().vector().rebuild(&name)?;
     let task = start_wait(&st, &ds_name, ds, name, "rebuilding the vector index");
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
@@ -195,16 +204,17 @@ async fn reembed(State(st): St, Path((ds_name, name)): Path<(String, String)>) -
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let ds = dataset(&st, &ds_name)?;
-    let index = ds.store.vector_index(&name).ok_or_else(|| unknown(&name))?;
+    let vectors = ds.dataset.indexes().vector();
+    let index = vectors.get(&name).ok_or_else(|| unknown(&name))?;
     if index.embedding.is_none() {
         return Err(err(
             StatusCode::BAD_REQUEST,
             format!("vector index {name} has no embedding configuration"),
         ));
     }
-    ds.store.reembed(&name)?;
+    vectors.reembed(&name)?;
     ensure_worker(&st, &ds);
-    let index = ds.store.vector_index(&name).ok_or_else(|| unknown(&name))?;
+    let index = vectors.get(&name).ok_or_else(|| unknown(&name))?;
     Ok((StatusCode::ACCEPTED, Json(index)).into_response())
 }
 
@@ -415,7 +425,8 @@ async fn recall(
         true => Some(num("ef", 64, sparkles::vector::config::MAX_EF)?),
         false => None,
     };
-    let r = blocking(move || Ok(ds.store.vector_recall(&name, samples, k, ef)?)).await?;
+    let opts = sparkles::handles::RecallOptions { samples, k, ef };
+    let r = blocking(move || Ok(ds.dataset.indexes().vector().recall(&name, &opts)?)).await?;
     Ok(Json(serde_json::to_value(r).unwrap()))
 }
 

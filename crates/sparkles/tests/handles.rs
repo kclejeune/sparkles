@@ -238,3 +238,47 @@ fn backups_in_a_file_system_repository() {
             .is_empty()
     );
 }
+
+#[cfg(feature = "text")]
+#[test]
+fn text_search_marks_the_matches() {
+    use sparkles::handles::TextSearch;
+    let ds = Dataset::memory();
+    ds.load_str(
+        "<http://ex.org/a> <http://www.w3.org/2000/01/rdf-schema#label> \"red <fox> jumps\" .
+         <http://ex.org/b> <http://www.w3.org/2000/01/rdf-schema#label> \"blue whale\" .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    let text = ds.indexes().text();
+    assert!(!text.enabled());
+    text.enable(Default::default()).unwrap();
+    assert!(text.enabled());
+    let hits = text
+        .search(&TextSearch {
+            query: "fox".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!hits.limited);
+    assert_eq!(hits.hits.len(), 1);
+    let h = &hits.hits[0];
+    assert_eq!(h.subject.as_ref().unwrap().to_string(), "<http://ex.org/a>");
+    assert_eq!(h.literal.as_ref().unwrap().value(), "red <fox> jumps");
+    let snippet = h.snippet.as_deref().unwrap();
+    assert!(
+        snippet.contains("<mark>") && snippet.contains("&lt;"),
+        "{snippet}"
+    );
+    let j = serde_json::to_value(&hits).unwrap();
+    assert_eq!(j["hits"][0]["s"]["value"], "http://ex.org/a");
+    let plain = text
+        .search(&TextSearch {
+            query: "whale".into(),
+            highlight: false,
+            limit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(plain.limited && plain.hits[0].snippet.is_none());
+}

@@ -587,7 +587,7 @@ impl Tools<'_> {
                     "commit": snap.commit,
                     "modified": modified,
                     "reasoning": reasoning,
-                    "textSearch": ds.store.text_enabled(),
+                    "textSearch": ds.dataset.indexes().text().enabled(),
                     "writable": updates && p.can(&ds.name, crate::auth::Level::Write),
                 });
                 // graphql_query reads this dataset

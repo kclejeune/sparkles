@@ -131,7 +131,7 @@ impl Tools<'_> {
                 _ => Err(ToolError::bad_argument("predicates must be IRIs")),
             })
             .collect::<Result<Vec<NamedNode>, _>>()?;
-        if !ds.store.text_enabled() {
+        if !ds.dataset.indexes().text().enabled() {
             return Err(ToolError::new(
                 "text-disabled",
                 400,

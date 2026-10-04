@@ -1399,7 +1399,7 @@ fn params_wants_sparkles(h: &HeaderMap) -> bool {
 #[cfg(feature = "text")]
 async fn text_status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
-    Ok(Json(match ds.store.text_status() {
+    Ok(Json(match ds.dataset.indexes().text().status() {
         Some(s) => serde_json::to_value(s).unwrap(),
         None => json!({ "enabled": false }),
     }))
@@ -1430,7 +1430,7 @@ async fn text_enable(
     task_start_check(&st, Some("text-rebuild"), &name)?;
     let task = st.start_task("text-rebuild", &name, move |h| {
         h.progress(0.1, "building the full-text index");
-        let s = ds.store.enable_text(cfg)?;
+        let s = ds.dataset.indexes().text().enable(cfg)?;
         Ok(format!("full-text index: {} documents", s.docs))
     });
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
@@ -1443,7 +1443,7 @@ async fn text_disable(State(st): St, Path(name): Path<String>) -> ApiResult {
     }
     let ds = dataset(&st, &name)?;
     blocking(move || {
-        ds.store.disable_text()?;
+        ds.dataset.indexes().text().disable()?;
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
@@ -1455,7 +1455,7 @@ async fn text_rebuild(State(st): St, Path(name): Path<String>) -> ApiResult {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let ds = dataset(&st, &name)?;
-    if !ds.store.text_enabled() {
+    if !ds.dataset.indexes().text().enabled() {
         return Err(err(
             StatusCode::BAD_REQUEST,
             "full-text search is not enabled",
@@ -1464,16 +1464,11 @@ async fn text_rebuild(State(st): St, Path(name): Path<String>) -> ApiResult {
     task_start_check(&st, Some("text-rebuild"), &name)?;
     let task = st.start_task("text-rebuild", &name, move |h| {
         h.progress(0.1, "rebuilding the full-text index");
-        let s = ds.store.rebuild_text()?;
+        let s = ds.dataset.indexes().text().rebuild()?;
         Ok(format!("full-text index: {} documents", s.docs))
     });
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
-
-/// Marks the engine puts around a match in a snippet, replaced by `<mark>` and `</mark>`
-/// once the text is HTML-escaped (private-use characters).
-#[cfg(feature = "text")]
-const MARK: (char, char) = ('\u{e000}', '\u{e001}');
 
 /// `GET` or `POST /{ds}/text?q=&predicate=&lang=&graph=&limit=&highlight=`: the best hits
 /// of a `text:query`, each with its subject, score, literal, predicate and graph, and,
@@ -1487,7 +1482,7 @@ async fn text_search(
     uri: Uri,
     QueryBody(body): QueryBody,
 ) -> ApiResult {
-    use oxrdf::{Literal, NamedNode, Term};
+    use oxrdf::NamedNode;
     let ds = dataset(&st, &name)?;
     let mut params = Params::from_query(&uri);
     if method == Method::POST {
@@ -1506,106 +1501,36 @@ async fn text_search(
             _ => return Err(bad("limit: between 1 and 1000".into())),
         },
     };
-    let iri = |k: &str, v: &str| {
-        NamedNode::new(v)
-            .map(|n| n.to_string())
-            .map_err(|_| bad(format!("{k}: {v:?} is not an IRI")))
-    };
-    // the call's arguments, serialized by oxrdf (escaped)
-    let mut args = params
+    let iri =
+        |k: &str, v: &str| NamedNode::new(v).map_err(|_| bad(format!("{k}: {v:?} is not an IRI")));
+    let predicates = params
         .all("predicate")
         .iter()
         .map(|v| iri("predicate", v))
-        .collect::<ApiResult<Vec<String>>>()?;
-    args.push(Literal::new_simple_literal(q.as_str()).to_string());
-    args.push(limit.to_string());
-    if let Some(l) = params.get("lang") {
-        if l.is_empty() || !l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
-            return Err(bad(format!("lang: {l:?} is not a language tag")));
-        }
-        args.push(Literal::new_simple_literal(format!("lang:{l}")).to_string());
+        .collect::<ApiResult<Vec<NamedNode>>>()?;
+    let lang = params.get("lang").map(str::to_string);
+    if let Some(l) = &lang
+        && (l.is_empty() || !l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'))
+    {
+        return Err(bad(format!("lang: {l:?} is not a language tag")));
     }
-    let highlight = params.get("highlight").is_none_or(truthy);
-    if highlight {
-        args.push(
-            Literal::new_simple_literal(format!("highlight:s:{} | e:{} | f:…", MARK.0, MARK.1))
-                .to_string(),
-        );
-    }
-    let call = format!(
-        "(?s ?score ?lit ?g ?p) <http://jena.apache.org/text#query> ({})",
-        args.join(" ")
-    );
-    let pattern = match params.get("graph") {
-        Some(g) => format!("GRAPH {} {{ {call} }}", iri("graph", g)?),
-        None => call,
+    let graph = params.get("graph").map(|g| iri("graph", g)).transpose()?;
+    let mut options = query_options(&st, &ds, &params);
+    crate::auth::restrict(&mut options, &p, &ds.name, crate::auth::Endpoint::Query);
+    let search = sparkles::handles::TextSearch {
+        query: q,
+        predicates,
+        lang,
+        graph,
+        limit,
+        highlight: params.get("highlight").is_none_or(truthy),
+        options,
     };
-    let query = format!("SELECT ?s ?score ?lit ?g ?p WHERE {{ {pattern} }} ORDER BY DESC(?score)");
-    let mut opts = query_options(&st, &ds, &params);
-    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     blocking(move || {
-        let snap = ds.store.snapshot();
-        let seq = snap.commit;
-        let r = sparkles::sparql::query(snap, &query, &opts)?;
-        let hits: Vec<J> = r
-            .rows()
-            .into_iter()
-            .map(|row| {
-                let get = |i: usize| row.get(i).cloned().flatten();
-                let mut h = serde_json::Map::new();
-                if let Some(s) = get(0) {
-                    h.insert("s".into(), sparkles::sparql::results::term_json(&s));
-                }
-                if let Some(Term::Literal(sc)) = get(1) {
-                    h.insert("score".into(), json!(sc.value().parse::<f64>().ok()));
-                }
-                if let Some(Term::Literal(l)) = get(2) {
-                    let text = l.value();
-                    if highlight {
-                        let mut html = String::with_capacity(text.len() + 16);
-                        for c in text.chars() {
-                            match c {
-                                '&' => html.push_str("&amp;"),
-                                '<' => html.push_str("&lt;"),
-                                '>' => html.push_str("&gt;"),
-                                '"' => html.push_str("&quot;"),
-                                '\'' => html.push_str("&#39;"),
-                                c if c == MARK.0 => html.push_str("<mark>"),
-                                c if c == MARK.1 => html.push_str("</mark>"),
-                                c => html.push(c),
-                            }
-                        }
-                        h.insert("snippet".into(), html.into());
-                    }
-                    let plain: String = text
-                        .chars()
-                        .filter(|c| *c != MARK.0 && *c != MARK.1)
-                        .collect();
-                    let lit = match l.language() {
-                        Some(lang) => Literal::new_language_tagged_literal_unchecked(plain, lang),
-                        None => Literal::new_typed_literal(plain, l.datatype()),
-                    };
-                    h.insert(
-                        "literal".into(),
-                        sparkles::sparql::results::term_json(&Term::Literal(lit)),
-                    );
-                }
-                for (i, k) in [(3, "g"), (4, "p")] {
-                    if let Some(t) = get(i) {
-                        h.insert(k.into(), sparkles::sparql::results::term_json(&t));
-                    }
-                }
-                J::Object(h)
-            })
-            .collect();
-        let resp = Json(json!({
-            "dataset": ds.name,
-            "commit": seq,
-            "limited": hits.len() == limit,
-            "hits": hits,
-        }))
-        .into_response();
-        Ok(with_commit(resp, &ds, seq))
+        let hits = ds.dataset.indexes().text().search(&search)?;
+        let mut body = serde_json::to_value(&hits).unwrap_or_default();
+        body["dataset"] = ds.name.clone().into();
+        Ok(with_commit(Json(body).into_response(), &ds, hits.commit))
     })
     .await
 }
@@ -3182,12 +3107,10 @@ async fn ping() -> impl IntoResponse {
 
 /// `{state, docs}` of the dataset's full-text index, or null.
 fn text_summary(ds: &Dataset) -> J {
-    #[cfg(feature = "text")]
-    if let Some(s) = ds.store.text_status() {
-        return json!({ "state": s.state, "docs": s.docs });
+    match ds.dataset.indexes().text().status() {
+        Some(s) => json!({ "state": s.state, "docs": s.docs }),
+        None => J::Null,
     }
-    let _ = ds;
-    J::Null
 }
 
 fn dataset_info(st: &AppState, ds: &Dataset) -> J {

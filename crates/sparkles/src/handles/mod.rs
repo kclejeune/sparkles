@@ -39,7 +39,9 @@ pub use backups::Backups;
 #[cfg(feature = "graphql")]
 pub use graphql::GraphQl;
 pub use history::{CommitDetail, CommitRef, History, Snapshots};
-pub use indexes::{GeoIndex, Indexes, RecallOptions, TextIndex, VectorIndexes};
+pub use indexes::{
+    GeoIndex, Indexes, RecallOptions, TextHit, TextHits, TextIndex, TextSearch, VectorIndexes,
+};
 pub use queries::StoredQueries;
 pub use reasoning::{RdfsSetting, Reasoning};
 pub use schema::Schema;

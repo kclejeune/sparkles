@@ -321,8 +321,12 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("rebuildTextIndex", "indexes.text.rebuild", |ds| {
             ds.indexes().text().rebuild();
         }),
-        pending!("textSearch", "phase 1 step 5"),
-        pending!("textSearchPost", "phase 1 step 5"),
+        op!("textSearch", "indexes.text.search", |ds| {
+            ds.indexes().text().search(&Default::default());
+        }),
+        op!("textSearchPost", "indexes.text.search", |ds| {
+            ds.indexes().text().search(&Default::default());
+        }),
         op!("getVectorIndexes", "indexes.vector.list", |ds| {
             ds.indexes().vector().list();
         }),

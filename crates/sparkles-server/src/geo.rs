@@ -79,7 +79,7 @@ async fn status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
         return Err(not_built());
     }
     let ds = dataset(&st, &name)?;
-    Ok(Json(match ds.store.geo_status() {
+    Ok(Json(match ds.dataset.indexes().geo().status() {
         Some(s) => serde_json::to_value(s).unwrap(),
         None => json!({ "enabled": false }),
     }))
@@ -107,7 +107,7 @@ async fn enable(State(st): St, Path(name): Path<String>, AdminBody(body): AdminB
         parse_config(v)?
     };
     start_build(&st, &name, ds, "building the spatial index", move |ds| {
-        ds.store.enable_geo(cfg)
+        ds.dataset.indexes().geo().enable(cfg)
     })
 }
 
@@ -121,7 +121,7 @@ async fn disable(State(st): St, Path(name): Path<String>) -> ApiResult {
     }
     let ds = dataset(&st, &name)?;
     blocking(move || {
-        ds.store.disable_geo()?;
+        ds.dataset.indexes().geo().disable()?;
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
@@ -136,11 +136,11 @@ async fn rebuild(State(st): St, Path(name): Path<String>) -> ApiResult {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let ds = dataset(&st, &name)?;
-    if !ds.store.geo_enabled() {
+    if !ds.dataset.indexes().geo().enabled() {
         return Err(err(StatusCode::BAD_REQUEST, "spatial index is not enabled"));
     }
     start_build(&st, &name, ds, "rebuilding the spatial index", |ds| {
-        ds.store.rebuild_geo()
+        ds.dataset.indexes().geo().rebuild()
     })
 }
 
@@ -160,14 +160,9 @@ async fn features(
     {
         let q = box_query(&uri)?;
         let graphs = p.view(&ds.name, crate::auth::Endpoint::Query);
-        let fc = blocking(move || {
-            Ok(sparkles::geo::map::features_in_box_of(
-                &ds.store.snapshot(),
-                &q,
-                graphs.as_deref(),
-            )?)
-        })
-        .await?;
+        let fc =
+            blocking(move || Ok(ds.dataset.indexes().geo().features(&q, graphs.as_deref())?))
+                .await?;
         Ok((
             [(axum::http::header::CONTENT_TYPE, "application/geo+json")],
             Json(fc),
@@ -299,7 +294,7 @@ fn start_build(
 
 /// `{state, rows}` of the dataset's spatial index for its `DatasetInfo`, or null.
 pub fn summary(ds: &Dataset) -> J {
-    match ds.store.geo_status() {
+    match ds.dataset.indexes().geo().status() {
         Some(s) => json!({
             "state": s.state,
             "rows": s.rows.base + s.rows.overlay + s.rows.tail,
@@ -310,8 +305,10 @@ pub fn summary(ds: &Dataset) -> J {
 
 /// The full status for `/$/stats/{ds}`, or null.
 pub fn status_json(ds: &Dataset) -> J {
-    ds.store
-        .geo_status()
+    ds.dataset
+        .indexes()
+        .geo()
+        .status()
         .map_or(J::Null, |s| serde_json::to_value(s).unwrap())
 }
 
@@ -363,7 +360,7 @@ pub fn series(st: &AppState) -> std::collections::BTreeMap<String, GeoSeries> {
     let mut out: std::collections::BTreeMap<String, GeoSeries> = Default::default();
     let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
     for ds in datasets {
-        let Some(s) = ds.store.geo_status() else {
+        let Some(s) = ds.dataset.indexes().geo().status() else {
             continue;
         };
         let e = out
