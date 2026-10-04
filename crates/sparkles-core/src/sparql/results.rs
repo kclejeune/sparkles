@@ -463,6 +463,27 @@ pub fn write_graph(
     Ok(())
 }
 
+/// Serialize CONSTRUCT / DESCRIBE results in one of Jena's syntaxes, by the policy of
+/// [`write_graph`]: TriX, RDF Thrift and RDF Protobuf also get the quads of a CONSTRUCT
+/// with `GRAPH` blocks, and RDF/JSON, which holds one graph, the default graph only.
+pub fn write_jena_graph(
+    r: &QueryResult,
+    fmt: crate::jena_formats::JenaFormat,
+    w: impl Write,
+) -> Result<()> {
+    let mut out = crate::jena_formats::RdfWriter::new(fmt, w);
+    for t in &r.triples {
+        out.triple(t).map_err(io)?;
+    }
+    if fmt.quads() {
+        for q in &r.quads {
+            out.quad(q).map_err(io)?;
+        }
+    }
+    out.finish().map_err(io)?;
+    Ok(())
+}
+
 pub fn term_json(t: &Term) -> J {
     match t {
         Term::NamedNode(n) => json!({"type": "uri", "value": n.as_str()}),

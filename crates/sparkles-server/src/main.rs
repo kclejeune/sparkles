@@ -2932,13 +2932,7 @@ fn run() -> Result<()> {
                         .then(|| http::jena_formats::JenaFormat::from_name(&fmt))
                         .flatten();
                     match jena {
-                        Some(j) => {
-                            let mut w = http::jena_formats::RdfWriter::new(j, &mut out);
-                            for t in &r.triples {
-                                w.triple(t)?;
-                            }
-                            w.finish()?;
-                        }
+                        Some(j) => results::write_jena_graph(&r, j, &mut out)?,
                         None => results::write_graph(
                             &r,
                             f.context("unknown RDF format")?,

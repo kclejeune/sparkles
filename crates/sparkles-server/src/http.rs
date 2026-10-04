@@ -1353,21 +1353,7 @@ fn serialize_result(
     } else if is_graph {
         match rfmt {
             OutFormat::Rdf(f) => results::write_graph(r, f, prefixes, w),
-            OutFormat::Jena(j) => {
-                let mut out = jena_formats::RdfWriter::new(j, w);
-                for t in &r.triples {
-                    out.triple(t)?;
-                }
-                // a CONSTRUCT's GRAPH blocks: RDF Thrift and Protobuf carry quads,
-                // RDF/JSON is one graph
-                if j != jena_formats::JenaFormat::RdfJson {
-                    for q in &r.quads {
-                        out.quad(q)?;
-                    }
-                }
-                out.finish()?;
-                Ok(())
-            }
+            OutFormat::Jena(j) => results::write_jena_graph(r, j, w),
         }
     } else {
         results::write_solutions(r, sfmt, w, send)

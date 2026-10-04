@@ -501,6 +501,39 @@ fn convert_and_load_take_jena_syntaxes() {
     );
 }
 
+/// A CONSTRUCT with triples and a `GRAPH` block writes both in TriX, RDF Thrift and RDF
+/// Protobuf, as over HTTP, and the triples only in RDF/JSON, which holds one graph.
+#[test]
+fn query_writes_construct_quads_in_jena_syntaxes() {
+    use sparkles::jena_formats::{JenaFormat, transcode};
+    let d = setup();
+    let dir = d.path();
+    let o = run(dir, &["load", "--loc", "db", "a.ttl"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let q = "CONSTRUCT { <urn:s> <urn:p> <urn:o> . GRAPH <urn:g> { <urn:s> <urn:p> <urn:o2> } } WHERE {}";
+    let triple = "<urn:s> <urn:p> <urn:o> .";
+    let quad = "<urn:s> <urn:p> <urn:o2> <urn:g> .";
+    for (name, fmt) in [
+        ("trix", JenaFormat::TriX),
+        ("rt", JenaFormat::Thrift),
+        ("rpb", JenaFormat::Protobuf),
+        ("rj", JenaFormat::RdfJson),
+    ] {
+        let o = run(dir, &["query", "--loc", "db", "--results", name, q]);
+        assert!(o.status.success(), "{name}: {}", err(&o));
+        let mut nq = Vec::new();
+        transcode(fmt, &o.stdout[..], true, &mut nq).unwrap();
+        let nq = String::from_utf8(nq).unwrap();
+        assert!(nq.contains(triple), "{name}: {nq}");
+        if fmt.quads() {
+            assert!(nq.contains(quad), "{name}: {nq}");
+            assert_eq!(nq.lines().count(), 2, "{name}: {nq}");
+        } else {
+            assert_eq!(nq.lines().count(), 1, "{name}: {nq}");
+        }
+    }
+}
+
 #[test]
 fn load_checks_terms_first() {
     let d = setup();
