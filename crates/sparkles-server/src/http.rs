@@ -1189,6 +1189,7 @@ pub(crate) async fn run_query(
         operation: Some(Op::Query),
         rows: Some(r.len() as u64),
         mem_peak_bytes: Some(r.mem_peak_bytes),
+        rows_produced: Some(r.rows_produced),
         timing: Some(r.timing.clone()),
         geo_work: crate::geo::plan_work(&r.plan),
         ..Default::default()
@@ -1958,6 +1959,7 @@ fn update_response(
         operation: Some(Op::Update),
         rows: Some(stats.inserted + stats.deleted),
         mem_peak_bytes: Some(stats.mem_peak_bytes),
+        rows_produced: Some(stats.rows_produced),
         ..Default::default()
     };
     let body = serde_json::to_value(&stats).unwrap();

@@ -46,7 +46,8 @@ pub use changes::{ChangePage, ChangesOptions, CommitChanges};
 pub use clone::{CloneMethod, CloneMode, CloneOptions, CloneReport};
 pub use compaction::{
     Blocker, COMPACTION_FILE, CompactOptions, CompactReport, CompactionMeasures, CompactionPolicy,
-    CompactionSettings, SETTING_NAMES, Trigger, TriggerKind,
+    CompactionSettings, REBUILD_BUCKETS, RebuildHistogram, RebuildReason, SETTING_NAMES, Trigger,
+    TriggerKind,
 };
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
@@ -3220,6 +3221,7 @@ impl Store {
         bulk: Option<BulkCommit>,
         check: Option<(crate::guard::Changes<'_>, &crate::guard::WriteOptions)>,
     ) -> Result<(u64, Receipt)> {
+        let started = std::time::Instant::now();
         let before = snap.len();
         // the head state before a bulk commit, whose changes the change log records
         let prior = self.snapshot();
@@ -3452,7 +3454,8 @@ impl Store {
             self.catalog.lock().append(head);
             self.forget_annotations();
         }
-        self.compaction.bulk_committed(head.seq, head.timestamp_ms);
+        self.compaction
+            .bulk_committed(head.seq, head.timestamp_ms, started.elapsed());
         if let Err(e) = self.add_prefixes(meta.prefixes.clone()) {
             w.poisoned = true;
             return Err(e);

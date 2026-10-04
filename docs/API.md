@@ -122,7 +122,8 @@ of the request carries it.
   `proxy:…` or `anonymous`, never a credential. `auth` is `none`, `basic`, `bearer`,
   `session` or `proxy`. A failed login adds `auth_error`.
 * Where known, `rows`, `parse_ms`, `plan_ms`, `exec_ms`, `serialize_ms`, `total_ms`,
-  `response_bytes` and `mem_peak_bytes`.
+  `response_bytes` and `mem_peak_bytes`. Queries and updates also have `rows_produced`,
+  the rows their operators produced.
 * For writes to a validated dataset, `validation` (the status from the
   `Sparkles-Validation` header) and `validation_ms`.
 
@@ -152,6 +153,8 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_requests_active` | gauge | `operation` |
 | `sparkles_response_bytes_total` | counter (uncompressed) | `dataset`, `operation` |
 | `sparkles_result_rows_total` | counter | `dataset` |
+| `sparkles_rows_produced_total` | counter. The rows every operator of a query or an update produced, the work that `--max-rows-produced` limits. | `dataset` |
+| `sparkles_query_memory_peak_bytes` | histogram (1 MiB … 16 GiB, ×4). The estimated memory peak of each query, the measure that `--query-memory-mb` limits. | `dataset` |
 | `sparkles_budget_exceeded_total` | counter | `dataset`, `budget` |
 | `sparkles_dataset_quads`, `sparkles_wal_bytes`, `sparkles_disk_bytes` | gauge | `dataset` |
 | `sparkles_dataset_quota_bytes` | gauge. The storage quota of a persistent dataset, `0` when unlimited. | `dataset` |
@@ -164,6 +167,8 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `language`, `strategy` = `full` \| `incremental` |
 | `sparkles_validation_results_total` | counter. Results found by validated writes. ShEx counts nonconformant associations as `violation`. | `dataset`, `language`, `severity` = `violation` \| `warning` \| `info` |
 | `sparkles_validation_fallbacks_total` | counter. Validated writes that ran a full validation, or validated some shapes in full. | `dataset`, `language`, `reason` = `baseline` \| `shapes` \| `subclass` \| `sparql` \| `recursive` \| `bulk` \| `budget` |
+| `sparkles_rebuilds_total` | counter. New generations published since the dataset was opened. `compact` counts the compactions that published, and `bulk` the bulk commits, such as a large load, that wrote the data into a new generation. | `dataset`, `reason` = `compact` \| `bulk` |
+| `sparkles_rebuild_duration_seconds` | histogram (0.1 s … 3600 s). The duration of those rebuilds. A reason has series once it has a rebuild. | `dataset`, `reason` |
 | `sparkles_compactions_total` | counter. Compactions since the server started. | `dataset`, `mode` = `auto` \| `manual`, `outcome` = `done` \| `abandoned` \| `cancelled` \| `failed` |
 | `sparkles_compaction_seconds`, `sparkles_compaction_lock_seconds` | summary (`_sum`, `_count`). The duration of the compactions that published a generation, and how long their switch held the writer lock. | `dataset` |
 | `sparkles_compaction_lock_seconds_max` | gauge. The longest switch since the server started. | `dataset` |
