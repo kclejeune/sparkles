@@ -524,7 +524,9 @@ impl TextView {
 #[cfg_attr(not(feature = "text"), allow(dead_code))]
 pub(crate) fn uncommitted_changes() -> Error {
     Error::Unsupported(
-        "text:query cannot run in a write transaction after the transaction has changed data,          because the full-text index covers committed data only: search before the first          change or after the commit"
+        "text:query cannot run in a write transaction after the transaction has changed \
+         data, because the full-text index covers committed data only: search before the \
+         first change or after the commit"
             .into(),
     )
 }
