@@ -24,6 +24,7 @@ mod exposure;
 mod fmt;
 mod fuseki_config;
 mod geo;
+mod geo_index_cmd;
 #[cfg(feature = "graphql")]
 mod graphql;
 mod http;
@@ -3025,10 +3026,10 @@ fn run() -> Result<()> {
             rebuild,
             status,
             disable,
-        } => geo::geo_index(
+        } => geo_index_cmd::run(
             &loc,
             opts,
-            geo::IndexArgs {
+            geo_index_cmd::IndexArgs {
                 predicate,
                 feature_link,
                 exclude_graph,
