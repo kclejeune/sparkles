@@ -2,8 +2,9 @@
 """Write THIRD_PARTY_LICENSES.md: the license and NOTICE files of every crate the
 `sparkles` binary links (the normal dependencies of sparkles-server with its default
 features, on every platform the flake builds for), from `cargo metadata`. Without an OUT
-argument it also writes crates/sparkles-py/THIRD_PARTY_LICENSES.md for the Python wheel,
-from that crate's own workspace and lock.
+argument it also writes crates/sparkles-py/THIRD_PARTY_LICENSES.md for the Python wheel and
+jvm/sparkles-jena/THIRD_PARTY_LICENSES.md for the JVM library's native part, each from its
+crate's own workspace and lock.
 
 Identical texts are printed once, with the crates that ship them. A crate whose package
 has no license file gets the standard text of its license (of the first of MIT,
@@ -321,6 +322,14 @@ def apache_text(by_text):
     raise SystemExit("no crate ships the Apache License 2.0 text")
 
 
+def mpl_text(by_text):
+    """The Mozilla Public License 2.0 as some crate ships it."""
+    for text, _, _ in sorted(by_text.values(), key=lambda t: (t[2][0], t[1])):
+        if "Mozilla Public License Version 2.0" in text[:200]:
+            return text
+    raise SystemExit("no crate ships the Mozilla Public License 2.0 text")
+
+
 def standard_text(p, by_text):
     """(license, text) for a crate without a license file."""
     ids = re.findall(r"[A-Za-z0-9.+-]+", spdx(p))
@@ -334,6 +343,8 @@ def standard_text(p, by_text):
             if id == "BSD-3-Clause":
                 return id, BSD3.format(holders=holders)
             return id, apache_text(by_text)
+    if "MPL-2.0" in ids:
+        return "MPL-2.0", mpl_text(by_text)
     raise SystemExit(f"{p['name']} {p['version']}: no license file and no standard text for {spdx(p)!r}")
 
 
@@ -355,6 +366,14 @@ WHEEL_INTRO = (
     "The `sparkles` Python package (its extension module, built from `crates/sparkles-py`) "
     "links the crates below on Linux and macOS. Their licenses and notices follow, each "
     "text once, with the crates that ship it.\n"
+)
+
+
+JAR_INTRO = (
+    "The `sparkles-jena` jar carries the native library built from `crates/sparkles-ffi`, "
+    "which links the crates below on Linux and macOS. Their licenses and notices follow, "
+    "each text once, with the crates that ship it. The jar's Kotlin bindings of the "
+    "library are generated from UniFFI's templates and keep UniFFI's MPL-2.0 license.\n"
 )
 
 
@@ -450,6 +469,16 @@ def main():
                 pkgs[p["id"]] = p
         text = render(pkgs.values(), WHEEL_INTRO, "crates/sparkles-py/Cargo.lock")
         write_or_check(os.path.join(crate, "THIRD_PARTY_LICENSES.md"), text, len(pkgs), check)
+        # the JVM library's native part, from crates/sparkles-ffi (the notices travel in the jar)
+        crate = os.path.join(ROOT, "crates", "sparkles-ffi")
+        pkgs = {}
+        for t in ROOTS[0][1]:
+            meta = metadata(t, os.path.join(crate, "Cargo.toml"), locked=check)
+            for p in linked(meta, "sparkles-ffi"):
+                pkgs[p["id"]] = p
+        text = render(pkgs.values(), JAR_INTRO, "crates/sparkles-ffi/Cargo.lock")
+        out = os.path.join(ROOT, "jvm", "sparkles-jena", "THIRD_PARTY_LICENSES.md")
+        write_or_check(out, text, len(pkgs), check)
 
 
 if __name__ == "__main__":

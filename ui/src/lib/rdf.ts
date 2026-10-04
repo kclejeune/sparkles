@@ -122,18 +122,24 @@ export function sparqlString(value: string): string {
 
 export const SPK = 'urn:x-sparkles:';
 export const VECTOR_DATATYPE = SPK + 'vector';
+/** The compact form: base64 of the values as little-endian binary32. */
+export const VECTOR_B64_DATATYPE = SPK + 'vectorB64';
 
 export function isVectorLiteral(
   t: Term | null | undefined,
 ): t is Extract<Term, { type: 'literal' }> & { datatype: string } {
-  return t?.type === 'literal' && t.datatype === VECTOR_DATATYPE;
+  return (
+    t?.type === 'literal' && (t.datatype === VECTOR_DATATYPE || t.datatype === VECTOR_B64_DATATYPE)
+  );
 }
 
 /**
- * The numbers of a vector literal (a JSON array of 1–16384 finite numbers), or null when
- * it does not parse (the server stores such a literal but never matches it).
+ * The numbers of a vector literal (a JSON array of 1–16384 finite numbers, or with the
+ * compact datatype their base64), or null when it does not parse (the server stores such
+ * a literal but never matches it).
  */
-export function parseVector(value: string): number[] | null {
+export function parseVector(value: string, datatype: string = VECTOR_DATATYPE): number[] | null {
+  if (datatype === VECTOR_B64_DATATYPE) return parseVectorB64(value);
   let v: unknown;
   try {
     v = JSON.parse(value);
@@ -142,6 +148,27 @@ export function parseVector(value: string): number[] | null {
   }
   if (!Array.isArray(v) || v.length === 0 || v.length > 16384) return null;
   return v.every((x) => typeof x === 'number' && Number.isFinite(x)) ? (v as number[]) : null;
+}
+
+/** The values of a compact vector literal, or null when it does not parse. */
+export function parseVectorB64(value: string): number[] | null {
+  if (!value || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return null;
+  let bin: string;
+  try {
+    bin = atob(value);
+  } catch {
+    return null;
+  }
+  if (bin.length % 4 !== 0 || bin.length / 4 > 16384) return null;
+  const view = new DataView(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) view.setUint8(i, bin.charCodeAt(i));
+  const out: number[] = [];
+  for (let i = 0; i < bin.length; i += 4) {
+    const x = view.getFloat32(i, true);
+    if (!Number.isFinite(x)) return null;
+    out.push(x);
+  }
+  return out;
 }
 
 /** A component for display: at most 3 decimals (tiny or huge ones in exponent form). */
@@ -155,8 +182,8 @@ function fmtComponent(x: number): string {
  * Compact text of a vector literal: `vector(384) [0.12, −0.03, 0.4, …]` showing the first
  * `head` components; `vector(invalid) …` for one that does not parse.
  */
-export function abbreviateVector(value: string, head = 3): string {
-  const v = parseVector(value);
+export function abbreviateVector(value: string, head = 3, datatype = VECTOR_DATATYPE): string {
+  const v = parseVector(value, datatype);
   if (!v) return `vector(invalid) ${value.length > 24 ? value.slice(0, 21) + '…' : value}`;
   const shown = v.slice(0, head).map(fmtComponent);
   return `vector(${v.length}) [${shown.join(', ')}${v.length > head ? ', …' : ''}]`;
@@ -164,7 +191,7 @@ export function abbreviateVector(value: string, head = 3): string {
 
 /** Display text of a literal's value: vectors abbreviated, everything else unchanged. */
 export function literalText(t: Extract<Term, { type: 'literal' }>): string {
-  return isVectorLiteral(t) ? abbreviateVector(t.value) : t.value;
+  return isVectorLiteral(t) ? abbreviateVector(t.value, 3, t.datatype) : t.value;
 }
 
 // --- query text analysis --------------------------------------------------

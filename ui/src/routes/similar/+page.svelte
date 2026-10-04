@@ -384,7 +384,7 @@
     ds ? resolve('/datasets/[name]', { name: ds }) : resolve('/datasets'),
   );
   const vectorLabel = (t: Term | undefined) =>
-    t?.type === 'literal' ? abbreviateVector(t.value, 8) : '';
+    t?.type === 'literal' ? abbreviateVector(t.value, 8, t.datatype) : '';
 </script>
 
 <svelte:head><title>Similar | Sparkles</title></svelte:head>

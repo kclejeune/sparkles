@@ -1688,9 +1688,10 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
         // a well-typed spk:vector literal, or a type error
         let vec_arg = |i: usize| -> EvalResult<Vec<f32>> {
             match &*a(i)? {
-                Value::Other { lex, dt } if &**dt == vector::DATATYPE => {
-                    vector::parse(lex).map_err(|_| TypeError)
-                }
+                Value::Other { lex, dt } => match vector::parse_typed(lex, dt) {
+                    Some(v) => v.map_err(|_| TypeError),
+                    None => Err(TypeError),
+                },
                 _ => Err(TypeError),
             }
         };

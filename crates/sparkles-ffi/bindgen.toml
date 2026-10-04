@@ -1,0 +1,6 @@
+# The global configuration of uniffi-bindgen for this crate. It names where the crate's
+# uniffi.toml is, so that the generator can run with --metadata-no-deps and needs no
+# resolved dependency graph, as in the offline Nix build:
+#   uniffi-bindgen generate --library <lib> --language kotlin --metadata-no-deps --config bindgen.toml …
+[crate-roots]
+sparkles_ffi = "."

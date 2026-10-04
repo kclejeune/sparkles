@@ -1010,6 +1010,353 @@ fn concurrent_searches_match_their_snapshots() {
     );
 }
 
+/// A full rebuild with every predicate reads only the quads with literal objects, from
+/// the base vocabulary and from literals added since, and indexes what maintenance did.
+#[test]
+fn rebuilds_index_what_maintenance_indexed() {
+    let s = mem();
+    sparkles_core::sparql::update::update(
+        &s,
+        &format!(
+            "{P}INSERT DATA {{ ex:b5 rdfs:label \"Brown Owl\" ; ex:see ex:b1 . _:x rdfs:label \"brown bnode\" . \
+             GRAPH ex:g2 {{ ex:b6 rdfs:comment \"brown in a graph\"@en-GB }} }} ; \
+             DELETE DATA {{ ex:b2 rdfs:label \"Brown Bears\" }}"
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let q = "SELECT ?s ?l { GRAPH ?g { (?s ?sc ?l) text:query \"brown OR fox OR foxglove\" } }";
+    let q_default = "SELECT ?s ?l { (?s ?sc ?l) text:query \"brown OR fox OR foxglove\" }";
+    let maintained = (sorted(rows(&s, q)), sorted(rows(&s, q_default)));
+    let docs = s.text_status().unwrap().docs;
+    assert_eq!(maintained.0.len() + maintained.1.len(), 7, "{maintained:?}");
+    s.rebuild_text().unwrap();
+    let st = s.text_status().unwrap();
+    assert_eq!((st.docs, st.state.as_str()), (docs, "ready"));
+    assert_eq!(
+        (sorted(rows(&s, q)), sorted(rows(&s, q_default))),
+        maintained
+    );
+    // a typed literal is never a document
+    assert!(
+        rows(&s, "SELECT ?s { ?s text:query \"fox\" }")
+            .iter()
+            .all(|r| r != "p1")
+    );
+    // and after compaction, from the base vocabulary alone
+    s.compact().unwrap();
+    s.rebuild_text().unwrap();
+    assert_eq!(s.text_status().unwrap().docs, docs);
+    assert_eq!(
+        (sorted(rows(&s, q)), sorted(rows(&s, q_default))),
+        maintained
+    );
+}
+
+/// A bulk commit that adds or replaces few documents updates the index by them, without a
+/// rebuild, and a reopened store finds the index as it was left.
+#[test]
+fn bulk_commits_update_the_index_by_their_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let opts = || StoreOptions {
+        bulk_threshold: 20,
+        ..Default::default()
+    };
+    let ttl = |from: usize, to: usize, word: &str| {
+        let mut t = String::new();
+        for i in from..to {
+            t.push_str(&format!(
+                "<http://example.org/n{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"number {i} {word}\" .\n"
+            ));
+        }
+        Source::from_bytes(t.into_bytes(), RdfFormat::NTriples, None)
+    };
+    let count = |s: &Store, w: &str| {
+        rows(
+            s,
+            &format!("SELECT (COUNT(*) AS ?n) {{ ?s text:query \"{w}\" }}"),
+        )[0]
+        .clone()
+    };
+    {
+        let s = Store::open(&root, opts()).unwrap();
+        load(&s);
+        s.enable_text(TextConfig::default()).unwrap();
+        // the first big load is indexed by a rebuild, since the index was nearly empty
+        s.load(&[ttl(0, 30_000, "walrus")]).unwrap();
+        let built = s.text_status().unwrap().last_rebuild.unwrap();
+        assert_eq!(count(&s, "walrus"), "30000");
+        // a small bulk load adds its documents
+        s.load(&[ttl(30_000, 30_050, "narwhal")]).unwrap();
+        let st = s.text_status().unwrap();
+        assert_eq!(st.last_rebuild.unwrap().at, built.at);
+        assert_eq!((st.state.as_str(), st.seq), ("ready", st.store_seq));
+        assert_eq!(count(&s, "narwhal"), "50");
+        assert_eq!(st.docs, 30_050 + 6);
+        // replacing a graph removes the documents of what it held
+        s.replace(
+            sparkles_core::store::ReplaceTarget::Named(oxrdf::NamedNode::new_unchecked(
+                "http://example.org/g1",
+            )),
+            &[Source::from_bytes(
+                (0..30)
+                    .map(|i| format!("<http://example.org/m{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"mole {i}\" .\n"))
+                    .collect::<String>()
+                    .into_bytes(),
+                RdfFormat::NTriples,
+                Some(oxrdf::NamedNode::new_unchecked("http://example.org/g1")),
+            )],
+        )
+        .unwrap();
+        let st = s.text_status().unwrap();
+        assert_eq!(st.last_rebuild.unwrap().at, built.at);
+        assert_eq!(
+            rows(
+                &s,
+                "SELECT (COUNT(*) AS ?n) { GRAPH ?g { ?s text:query \"socks\" } }"
+            ),
+            ["0"]
+        );
+        assert_eq!(
+            rows(
+                &s,
+                "SELECT (COUNT(*) AS ?n) { GRAPH ?g { ?s text:query \"mole\" } }"
+            ),
+            ["30"]
+        );
+        assert_eq!(st.docs, 30_050 + 6 - 1 + 30);
+    }
+    // reopened without a rebuild or catch-up: the bulk commits were synced
+    let s = Store::open(&root, opts()).unwrap();
+    let st = s.text_status().unwrap();
+    assert!(st.last_rebuild.is_none());
+    assert_eq!((st.state.as_str(), st.docs), ("ready", 30_050 + 6 - 1 + 30));
+    assert_eq!(count(&s, "narwhal"), "50");
+    // a large bulk load relative to the index is still a rebuild
+    s.load(&[ttl(40_000, 80_000, "seal")]).unwrap();
+    assert!(s.text_status().unwrap().last_rebuild.is_some());
+    assert_eq!(count(&s, "seal"), "40000");
+}
+
+/// A rebuild builds the new index while writes go on, then applies the writes made
+/// meanwhile: the result is the index of the final state, and writes did not wait for
+/// the build.
+#[test]
+fn rebuilds_run_while_writes_go_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let s =
+        std::sync::Arc::new(Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap());
+    let mut base = String::new();
+    for i in 0..20_000 {
+        base.push_str(&format!(
+            "<http://example.org/n{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"number {i} walrus\" .\n"
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        base.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    s.enable_text(TextConfig::default()).unwrap();
+    for (round, word) in [(0, "orca"), (1, "dolphin")] {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let t = {
+            let (s, done) = (s.clone(), done.clone());
+            std::thread::spawn(move || {
+                let r = s.rebuild_text();
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                r
+            })
+        };
+        // writes during the build: new literals, and removed ones
+        let mut during = 0;
+        let mut i = 0;
+        while !done.load(std::sync::atomic::Ordering::SeqCst) || i < 5 {
+            sparkles_core::sparql::update::update(
+                &s,
+                &format!(
+                    "{P}INSERT DATA {{ ex:r{round}x{i} rdfs:label \"{word} {i}\" }} ; \
+                     DELETE DATA {{ <http://example.org/n{}> rdfs:label \"number {} walrus\" }}",
+                    round * 1000 + i,
+                    round * 1000 + i
+                ),
+                &QueryOptions::default(),
+            )
+            .unwrap();
+            if !done.load(std::sync::atomic::Ordering::SeqCst) {
+                during += 1;
+            }
+            i += 1;
+            // and a compaction in the second round, which changes the generation
+            if round == 1 && i == 2 {
+                s.compact().unwrap();
+            }
+        }
+        let st = t.join().unwrap().unwrap();
+        assert_eq!(st.state, "ready");
+        if round == 0 {
+            assert!(
+                during >= 2,
+                "writes waited for the build ({during} during it)"
+            );
+        }
+        let docs = s.text_status().unwrap().docs;
+        let found = rows(
+            &s,
+            &format!("SELECT (COUNT(*) AS ?n) {{ ?s text:query \"{word}\" }}"),
+        );
+        assert_eq!(found, [i.to_string()], "round {round}");
+        // the same as a rebuild with nothing going on
+        s.rebuild_text().unwrap();
+        assert_eq!(s.text_status().unwrap().docs, docs, "round {round}");
+        assert_eq!(
+            rows(&s, "SELECT (COUNT(*) AS ?n) { ?s text:query \"walrus\" }"),
+            rows(
+                &s,
+                "SELECT (COUNT(*) AS ?n) { ?s rdfs:label ?l FILTER(CONTAINS(?l, \"walrus\")) }"
+            )
+        );
+    }
+}
+
+/// Query options with the subject restriction of text searches on or off.
+fn pushdown(on: bool) -> QueryOptions {
+    let mut o = sparkles_core::sparql::Optimizations::ALL;
+    o.text_subject_pushdown = on;
+    QueryOptions {
+        optimizations: Some(o),
+        no_cache: true,
+        ..Default::default()
+    }
+}
+
+fn run(s: &Store, q: &str, o: &QueryOptions) -> sparkles_core::sparql::QueryResult {
+    query(s.snapshot(), &format!("{P}{q}"), o).unwrap_or_else(|e| panic!("{q}: {e}"))
+}
+
+fn texts(r: &sparkles_core::sparql::QueryResult) -> Vec<String> {
+    let mut v: Vec<String> = r
+        .rows()
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|t| t.map_or("-".into(), |t| t.to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Whether a plan entry's description contains `needle`.
+fn plan_has(p: &sparkles_core::sparql::PlanInfo, needle: &str) -> bool {
+    p.description.contains(needle) || p.children.iter().any(|c| plan_has(c, needle))
+}
+
+#[test]
+fn joins_search_only_the_subjects_of_a_small_side() {
+    let s = mem();
+    for q in [
+        "SELECT ?s ?sc ?l { ?s a ex:Book . (?s ?sc ?l) text:query \"brown OR fox\" }",
+        "SELECT ?s ?l ?p { ?s a ex:Book . (?s ?sc ?l [] ?p) text:query (\"brown\" \"lang:en\") }",
+        "SELECT ?s { VALUES ?s { ex:b2 ex:b3 } ?s text:query \"brown OR renard\" }",
+        // a limit or a rank is taken over every hit: no restriction
+        "SELECT ?s { ?s a ex:Book . ?s text:query (\"brown OR fox\" 1) }",
+        "SELECT ?s ?r { ?s a ex:Book . (?s ?sc [] [] [] ?r) text:query \"brown OR fox\" }",
+        // the left side leaves the subject unbound in a row
+        "SELECT ?s { { ?s a ex:Book } UNION { BIND(1 AS ?x) } ?s text:query \"brown\" }",
+    ] {
+        let (on, off) = (run(&s, q, &pushdown(true)), run(&s, q, &pushdown(false)));
+        assert_eq!(texts(&on), texts(&off), "{q}");
+        assert!(!plan_has(&off.plan, "subjects of the join"), "{q}");
+    }
+    let r = run(
+        &s,
+        "SELECT ?s ?sc { ?s a ex:Book . (?s ?sc) text:query \"brown OR fox\" }",
+        &pushdown(true),
+    );
+    assert_eq!(texts(&r).len(), 3, "{:?}", texts(&r));
+    assert!(
+        plan_has(&r.plan, "searched the 2 subjects of the join's left side"),
+        "{:#?}",
+        r.plan
+    );
+    let r = run(
+        &s,
+        "SELECT ?s { ?s a ex:Book . ?s text:query (\"brown OR fox\" 1) }",
+        &pushdown(true),
+    );
+    assert!(!plan_has(&r.plan, "subjects of the join"));
+}
+
+#[test]
+fn query_strings_bound_by_the_group() {
+    let s = mem();
+    let o = QueryOptions::default();
+    // one search per value; a language tag on a value acts as lang:; a value that is not
+    // a string or does not parse matches nothing
+    let r = run(
+        &s,
+        "SELECT ?q ?s { VALUES ?q { \"fox\" \"bears\" \"renard\"@fr 7 \"(\" <http://example.org/x> } ?s text:query ?q }",
+        &o,
+    );
+    assert_eq!(
+        texts(&r),
+        [
+            "\"bears\" <http://example.org/b2>",
+            "\"bears\" <http://example.org/b2>",
+            "\"fox\" <http://example.org/b1>",
+            "\"renard\"@fr <http://example.org/b3>",
+        ]
+    );
+    assert!(plan_has(&r.plan, "[4 searches"), "{:#?}", r.plan);
+    // bound by a triple pattern, with constant predicates, limit and other outputs
+    sparkles_core::sparql::update::update(
+        &s,
+        &format!("{P}INSERT DATA {{ ex:k1 ex:word \"brown\" . ex:k2 ex:word \"socks\" }}"),
+        &o,
+    )
+    .unwrap();
+    let r = run(
+        &s,
+        "SELECT ?k ?s ?l { ?k ex:word ?q . (?s ?sc ?l) text:query (rdfs:label ?q 1) }",
+        &o,
+    );
+    assert_eq!(texts(&r).len(), 1, "{:?}", texts(&r));
+    assert!(texts(&r)[0].starts_with("<http://example.org/k1>"));
+    let r = run(
+        &s,
+        "SELECT ?k ?s { ?k ex:word ?q . GRAPH ?g { ?s text:query ?q } }",
+        &o,
+    );
+    assert_eq!(
+        texts(&r),
+        ["<http://example.org/k2> <http://example.org/b4>"]
+    );
+    let r = run(&s, "SELECT ?s { BIND(\"fox\" AS ?q) ?s text:query ?q }", &o);
+    assert_eq!(texts(&r), ["<http://example.org/b1>"]);
+    // the rows of a value with their subjects bound search only those subjects
+    let q = "SELECT ?s ?l { VALUES (?s ?q) { (ex:b1 \"brown\") (ex:b2 \"brown\") (ex:b3 \"brown\") } (?s ?sc ?l) text:query ?q }";
+    let (on, off) = (run(&s, q, &pushdown(true)), run(&s, q, &pushdown(false)));
+    assert_eq!(texts(&on), texts(&off));
+    assert_eq!(texts(&on).len(), 3, "{:?}", texts(&on));
+    assert!(plan_has(&on.plan, "1 restricted"), "{:#?}", on.plan);
+    // errors: unbound, too many values, other arguments variables
+    let e = err(&s, "SELECT ?s { ?s text:query (rdfs:label ?q) }");
+    assert!(e.contains("not bound by the rest of the group"), "{e}");
+    let values: String = (0..1001).map(|i| format!("\"w{i}\" ")).collect();
+    let e = err(
+        &s,
+        &format!("SELECT ?s {{ VALUES ?q {{ {values} }} ?s text:query ?q }}"),
+    );
+    assert!(e.contains("1000"), "{e}");
+    let e = err(&s, "SELECT ?s { BIND(3 AS ?n) ?s text:query (\"fox\" ?n) }");
+    assert!(e.contains("must be constants"), "{e}");
+}
+
 /// Rough write-path timing with full-text search on and off (not a benchmark: run it
 /// alone, optimized, with `--ignored --nocapture`).
 #[test]

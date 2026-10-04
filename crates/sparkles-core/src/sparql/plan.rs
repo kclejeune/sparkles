@@ -184,6 +184,9 @@ pub struct VectorSpec {
     pub distinct_subject: bool,
     /// `candidates:join`: only subjects the rest of the group binds
     pub candidates: bool,
+    /// the `k` best rows of an ORDER BY over one pattern (see `vectortopk`): child 0 is
+    /// the pattern, whose generic plan runs when fewer than `k` rows have a score
+    pub order_fallback: bool,
 }
 
 impl VectorSpec {
@@ -194,10 +197,14 @@ impl VectorSpec {
     }
 }
 
-/// A `text:query` call planned as a leaf (full-text search).
+/// A `text:query` call planned as a leaf (full-text search), or as a node over the rest
+/// of its group when its query string is a variable.
 #[derive(Clone, Debug)]
 pub struct TextSpec {
     pub query: String,
+    /// a variable query string that the rest of the group binds (child 0): one search
+    /// per distinct value
+    pub query_var: Option<VarId>,
     /// predicate IRIs to search (empty: all indexed)
     pub predicates: Vec<String>,
     pub lang: Option<String>,
@@ -219,6 +226,49 @@ pub struct TextSpec {
     pub dedup: bool,
     /// `highlight:` options: the literal output is the highlighted fragments
     pub highlight: Option<crate::text::HighlightOpts>,
+}
+
+impl TextSpec {
+    /// Whether the search reads the rest of its group (child 0): a variable query string.
+    pub fn needs_input(&self) -> bool {
+        self.query_var.is_some()
+    }
+
+    /// Whether a join may restrict the search to the subjects of its other side: without
+    /// a limit (the top n are taken before any join) and without a rank (counted over
+    /// every hit), restricting the subjects drops only hits the join drops.
+    pub fn subjects_pushable(&self) -> Option<VarId> {
+        match self.subject {
+            PathEnd::Var(v) if self.limit.is_none() && self.rank.is_none() => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The variables the search itself binds, in the order of its output columns.
+    pub fn output_vars(&self) -> Vec<VarId> {
+        let subject = match self.subject {
+            PathEnd::Var(v) => Some(v),
+            _ => None,
+        };
+        let mut vars = Vec::new();
+        for v in [
+            subject,
+            self.score,
+            self.literal,
+            self.graph_out,
+            self.graph_var,
+            self.prop,
+            self.rank,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !vars.contains(&v) {
+                vars.push(v);
+            }
+        }
+        vars
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1497,8 +1547,10 @@ impl<'a> Planner<'a> {
             _ => return Err(shape()),
         };
         let query = match args.next() {
-            Some(TermPattern::Literal(l)) if l.datatype().as_str() == vector::DATATYPE => {
-                let v = vector::parse(l.value()).map_err(Error::invalid)?;
+            Some(TermPattern::Literal(l)) if vector::is_datatype(l.datatype().as_str()) => {
+                let v = vector::parse_typed(l.value(), l.datatype().as_str())
+                    .expect("a vector datatype")
+                    .map_err(Error::invalid)?;
                 VectorQuery::Vector(v.into())
             }
             Some(TermPattern::Literal(l))
@@ -1645,6 +1697,7 @@ impl<'a> Planner<'a> {
             mode,
             distinct_subject,
             candidates,
+            order_fallback: false,
         };
         let mut n = Node::leaf(Kind::VectorSearch(Box::new(spec)), vars, k as f64, desc);
         n.cost = k as f64 * 16.0;
@@ -1716,6 +1769,41 @@ impl<'a> Planner<'a> {
         })
     }
 
+    /// A `text:query` call with a variable query string over the rest of its group.
+    fn attach_text(&self, left: Node, search: Node) -> Result<Node> {
+        let Kind::TextSearch(spec) = &search.kind else {
+            unreachable!("a text search that depends on its group");
+        };
+        if let Some(q) = spec.query_var
+            && !left.vars.contains(&q)
+        {
+            return Err(Error::invalid(format!(
+                "text:query: the query variable ?{} is not bound by the rest of the group",
+                self.ctx.var_name(q)
+            )));
+        }
+        let mut vars = left.vars.clone();
+        for v in &search.vars {
+            if !vars.contains(v) {
+                vars.push(*v);
+            }
+        }
+        let mut certain = left.certain.clone();
+        certain.extend(search.vars.iter().copied());
+        let est = (left.est * spec.limit.unwrap_or(10) as f64).max(1.0);
+        Ok(Node {
+            dist: vars.iter().map(|&v| (v, est)).collect(),
+            cost: left.cost + est * 8.0,
+            vars,
+            certain,
+            sorted: Vec::new(),
+            est,
+            desc: search.desc,
+            kind: search.kind,
+            children: vec![left],
+        })
+    }
+
     /// A `text:query` call as a search leaf.
     pub(super) fn text_leaf(&self, c: super::textpf::TextCall, g: &ActiveGraph) -> Result<Node> {
         let slot = |t: &Option<TermPattern>| -> Option<VarId> {
@@ -1728,6 +1816,7 @@ impl<'a> Planner<'a> {
             PT::V(v) => PathEnd::Var(v),
             PT::C(id) => PathEnd::Const(id),
         };
+        let query_var = slot(&c.query_var);
         // a score or literal the rest of the query never reads is not produced, and the
         // search then reads no literal
         let output =
@@ -1773,12 +1862,15 @@ impl<'a> Planner<'a> {
             }
         }
         let desc = format!(
-            "{} ← {:?}{}{}{}{}",
+            "{} ← {}{}{}{}{}",
             vars.iter()
                 .map(|v| format!("?{}", self.ctx.var_name(*v)))
                 .collect::<Vec<_>>()
                 .join(" "),
-            c.query,
+            match query_var {
+                Some(q) => format!("?{}", self.ctx.var_name(q)),
+                None => format!("{:?}", c.query),
+            },
             if c.predicates.is_empty() {
                 String::new()
             } else {
@@ -1804,6 +1896,7 @@ impl<'a> Planner<'a> {
         );
         let spec = TextSpec {
             query: c.query,
+            query_var,
             predicates: c
                 .predicates
                 .iter()
@@ -2288,6 +2381,8 @@ impl<'a> Planner<'a> {
         let (dependent, nodes): (Vec<Node>, Vec<Node>) =
             nodes.into_iter().partition(|n| match &n.kind {
                 Kind::VectorSearch(s) => s.needs_input(),
+                Kind::TextSearch(s) => s.needs_input(),
+                Kind::HybridSearch(s) => s.needs_input(),
                 Kind::SpatialPf(s) => s.needs_input(),
                 Kind::PathSearch(s) => s.needs_input(),
                 Kind::PropertyFn(s) => s.needs_input(),
@@ -2351,6 +2446,8 @@ impl<'a> Planner<'a> {
                 Kind::PathSearch(_) => super::pathsearch::attach(self, result, d)?,
                 Kind::HistoryChanges(_) => super::history_svc::attach(self, result, d)?,
                 Kind::PropertyFn(_) => super::arqpf::attach(result, d),
+                Kind::TextSearch(_) => self.attach_text(result, d)?,
+                Kind::HybridSearch(_) => super::hybrid::attach(self, result, d)?,
                 _ => self.attach_vector(result, d)?,
             };
             let (now, later): (Vec<Expr>, Vec<Expr>) =
@@ -3789,7 +3886,10 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
             if let Kind::OrderBy { limit, .. } = &mut n.kind {
                 *limit = Some(k);
             }
-            ordered_topk(super::geojoin::spatial_knn(n, ctx), ctx)
+            ordered_topk(
+                super::geojoin::spatial_knn(super::vectortopk::vector_topk(n, ctx), ctx),
+                ctx,
+            )
         }
         (mut n, Some(k))
             if matches!(n.kind, Kind::Project(_))
@@ -3799,8 +3899,10 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
                 *limit = Some(k);
             }
             let order = n.children.pop().unwrap();
-            n.children
-                .push(ordered_topk(super::geojoin::spatial_knn(order, ctx), ctx));
+            n.children.push(ordered_topk(
+                super::geojoin::spatial_knn(super::vectortopk::vector_topk(order, ctx), ctx),
+                ctx,
+            ));
             n
         }
         (n, _) => n,

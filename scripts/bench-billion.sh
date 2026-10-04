@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Benchmark on real data at a chosen scale, up to the full 1.24 billion triples of English
 # DBpedia (release 2022.12.01, scripts/bench-billion/dbpedia-2022.12.tsv): Sparkles vs
-# QLever, optionally Jena (TDB2 xloader + Fuseki) and Oxigraph.
+# QLever, optionally Jena (TDB2 xloader + Fuseki), Oxigraph and Fluree.
 #
 #   scripts/bench-billion.sh [STEP...]      steps: fetch prepare slice load queries report
 #                                           (default: all of them, in this order)
@@ -23,6 +23,7 @@
 #   (scripts/bench-billion/queries, chosen from the 10m slice) occur at every scale.
 # * load: builds each selected engine's index in WORKDIR/SCALE (reused by later runs;
 #   RELOAD=1 rebuilds it), recording the load time, peak RSS (GNU time) and index size.
+#   A load that runs longer than LOAD_TIMEOUT (for example 4h) is stopped and fails.
 # * queries: starts the engines, checks that all of them give the same answers
 #   (scripts/bench-answers.py), then times every query warm (hyperfine: WARMUP runs, then
 #   RUNS), cold (COLD=1: one run after a restart with the engine's files evicted from the
@@ -32,16 +33,21 @@
 #   scripts/bench.sh.
 #
 # Env: WORKDIR (default target/bench-billion), SCALE (default 50m), ENGINES (default
-# "sparkles qlever"; also jena, oxigraph), RELOAD=1, RUNS (5), WARMUP (1), COLD (1),
+# "sparkles qlever"; also jena, oxigraph, fluree), RELOAD=1, RUNS (5), WARMUP (1), COLD (1),
 # CONC (16), NREQ (64), THROUGHPUT ("entity-facts-1 place-births-1"), QUERIES (a subset of
 # query names), ANSWERS_ONLY=1 (check answers and rebuild the summary, time nothing),
 # TIMEOUT (seconds per query, default 600), QUERY_MEM_GB (the query memory budget of
 # Sparkles and QLever, default 12), QLEVER_INDEX_MEM (QLever's sort memory while indexing,
-# default 10G), JENA_HEAP (Fuseki -Xmx, default 8G), SPARKLES (the binary, default
-# target/release/sparkles).
+# default 10G), JENA_HEAP (Fuseki -Xmx, default 8G), FLUREE_IMPORT_MB (the memory budget
+# of Fluree's bulk import, default 8192), FLUREE_PIECE (the largest piece of Fluree's
+# input, uncompressed, as `split -C` takes it, default 512M), FLUREE_CACHE_MB (the cache of Fluree's server,
+# default 4096), LOAD_TIMEOUT (a time limit for each load, in the form `timeout` takes),
+# SPARKLES (the binary, default target/release/sparkles).
 #
 # Tools come from nixpkgs when not on PATH (qlever, apache-jena, apache-jena-fuseki,
-# oxigraph, lbzip2, zstd, GNU time). The data is DBpedia's, under CC BY-SA 3.0 and GFDL
+# oxigraph, lbzip2, zstd, GNU time). Fluree (BUSL-1.1, not in nixpkgs) is the
+# checksum-verified release binary that scripts/bench.sh uses, downloaded to WORKDIR
+# unless FLUREE points at one (FLUREE_VERSION, default 4.2.2). The data is DBpedia's, under CC BY-SA 3.0 and GFDL
 # (https://www.dbpedia.org/about/); see docs/BENCHMARKS.md for the attribution.
 set -euo pipefail
 
@@ -80,6 +86,31 @@ nixbin() { # nixbin <pkg> <bin>
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
 selected() { [ -z "${QUERIES:-}" ] || [[ " $QUERIES " == *" $1 "* ]]; }
 ZSTD=$(nixbin zstd zstd)
+# Fluree's release binary, downloaded and checked as scripts/bench-lib.sh does
+fluree_bin() {
+  local ft fdir furl want got f
+  case "$(uname -sm)" in
+    "Linux x86_64") ft=x86_64-unknown-linux-gnu ;;
+    "Linux aarch64") ft=aarch64-unknown-linux-gnu ;;
+    "Darwin arm64") ft=aarch64-apple-darwin ;;
+    "Darwin x86_64") ft=x86_64-apple-darwin ;;
+    *) die "no Fluree release binary for $(uname -sm); set FLUREE" ;;
+  esac
+  fdir=$WORK/fluree-${FLUREE_VERSION:-4.2.2}
+  f=$fdir/fluree-db-cli-$ft/fluree
+  if [ ! -x "$f" ]; then
+    mkdir -p "$fdir"
+    furl="https://github.com/fluree/db/releases/download/v${FLUREE_VERSION:-4.2.2}/fluree-db-cli-$ft.tar.xz"
+    curl -sfL "$furl" -o "$fdir/fluree.tar.xz"
+    want=$(curl -sfL "$furl.sha256" | cut -d' ' -f1)
+    got=$(sha256sum "$fdir/fluree.tar.xz" 2> /dev/null || shasum -a 256 "$fdir/fluree.tar.xz")
+    got=${got%% *}
+    [ "$want" = "$got" ] || die "Fluree checksum mismatch ($got != $want)"
+    tar xJf "$fdir/fluree.tar.xz" -C "$fdir"
+  fi
+  echo "$f"
+}
+if has fluree && [ -z "${FLUREE:-}" ]; then FLUREE=$(fluree_bin); fi
 # GNU time (not the shell keyword) for the peak RSS of loads
 GTIME=/usr/bin/time
 [ -x "$GTIME" ] || GTIME=$(nix build nixpkgs#time --no-link --print-out-paths | tail -1)/bin/time
@@ -241,8 +272,9 @@ EOF
 }
 # timed <engine> <index path> <command…>: run a load under GNU time unless it is done
 timed() {
-  local engine=$1 index=$2 t0 t1
+  local engine=$1 index=$2 t0 t1 limit=() rc=0
   shift 2
+  [ -n "${LOAD_TIMEOUT:-}" ] && limit=(timeout --kill-after=60 "$LOAD_TIMEOUT")
   if [ -f "$S/$engine.loaded" ] && [ -z "${RELOAD:-}" ]; then
     log "$engine: reusing $index (RELOAD=1 rebuilds it)"
     return
@@ -250,8 +282,9 @@ timed() {
   rm -rf "$index" "$S/$engine.loaded"
   log "$engine: loading (log: $S/logs/load-$engine.log)"
   t0=$(date +%s.%N)
-  "$GTIME" -v -o "$S/logs/load-$engine.time" "$@" > "$S/logs/load-$engine.log" 2>&1 ||
-    die "$engine: load failed, see $S/logs/load-$engine.log"
+  "$GTIME" -v -o "$S/logs/load-$engine.time" "${limit[@]}" "$@" > "$S/logs/load-$engine.log" 2>&1 || rc=$?
+  [ "$rc" -eq 124 ] && die "$engine: load stopped after LOAD_TIMEOUT ($LOAD_TIMEOUT), see $S/logs/load-$engine.log"
+  [ "$rc" -eq 0 ] || die "$engine: load failed (exit $rc), see $S/logs/load-$engine.log"
   t1=$(date +%s.%N)
   record_load "$engine" "$(awk "BEGIN {print $t1 - $t0}")" "$S/logs/load-$engine.time" "$index"
   touch "$S/$engine.loaded"
@@ -297,13 +330,37 @@ step_load() {
       "$1" -dc "${@:4}" | "$2" load --lenient --location "$3" --format nt && "$2" optimize --location "$3"' _ \
       "$ZSTD" "$oxigraph" "$S/oxigraph.db" "${FILES[@]}"
   fi
+  if has fluree; then
+    # Fluree's parallel bulk import reads a directory of .nt.zst files, as bench.sh's
+    # import reads data.nt. Fluree 4.2.2 fails on a file larger than its chunk size (768 MB
+    # with the default budget) because it finds no statement boundary where it cuts the
+    # file, so the files are split into pieces of whole lines of at most FLUREE_PIECE
+    # bytes uncompressed (512 MB by default), which it reads whole.
+    if [ ! -f "$S/fluree-input.complete" ]; then
+      rm -rf "$S/fluree-input"
+      mkdir -p "$S/fluree-input"
+      log "fluree: splitting the input into pieces of ${FLUREE_PIECE:-512M}"
+      # shellcheck disable=SC2016 # expanded by the inner shell
+      printf '%s\0' "${FILES[@]}" | xargs -0 -P "${PREPARE_JOBS:-6}" -I{} bash -c '
+        set -o pipefail
+        "$1" -dc "$2" | split -C "$4" -d -a 4 --additional-suffix=.nt.zst \
+          --filter="\"$1\" -q -o \"\$FILE\"" - "$3/$(basename "$2" .nt.zst)-"' _ \
+        "$ZSTD" {} "$S/fluree-input" "${FLUREE_PIECE:-512M}"
+      touch "$S/fluree-input.complete"
+    fi
+    # shellcheck disable=SC2016 # expanded by the inner shell
+    timed fluree "$S/fluree" bash -c '
+      mkdir -p "$1" && cd "$1" && "$2" init -q &&
+      "$2" create dbpedia --from "$3" --memory-budget-mb "$4"' _ \
+      "$S/fluree" "$FLUREE" "$S/fluree-input" "${FLUREE_IMPORT_MB:-8192}"
+  fi
 }
 
 # --------------------------------------------------------------------------- servers
 freeport() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 declare -A NAME URL READY PORT PID FILESOF
-NAME=([sparkles]=sparkles [qlever]=qlever [jena]=jena-fuseki [oxigraph]=oxigraph)
-FILESOF=([sparkles]=$S/sparkles.db [qlever]=$S/qlever-index [jena]=$S/jena.db [oxigraph]=$S/oxigraph.db)
+NAME=([sparkles]=sparkles [qlever]=qlever [jena]=jena-fuseki [oxigraph]=oxigraph [fluree]=fluree)
+FILESOF=([sparkles]=$S/sparkles.db [qlever]=$S/qlever-index [jena]=$S/jena.db [oxigraph]=$S/oxigraph.db [fluree]=$S/fluree)
 pid_on() { ss -ltnp 2> /dev/null | grep ":$1 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1 || true; }
 start() { # start <engine>
   local e=$1 p
@@ -334,6 +391,14 @@ start() { # start <engine>
       URL[$e]=localhost:$p/query
       READY[$e]="localhost:$p/query?query=ASK%7B%7D"
       ;;
+    fluree)
+      # the settings of scripts/bench-lib.sh, with this script's TIMEOUT
+      (cd "$S/fluree" && FLUREE_CACHE_MAX_MB=${FLUREE_CACHE_MB:-4096} FLUREE_PATH_MAX_VISITED=20000000 \
+        FLUREE_QUERY_TIMEOUT_MS=$((TIMEOUT * 1000)) exec "$FLUREE" server run --listen-addr "127.0.0.1:$p" \
+        --storage-path "$S/fluree/.fluree/storage" --log-level warn > "$S/logs/server-fluree.log" 2>&1) &
+      URL[$e]=localhost:$p/v1/fluree/query/dbpedia:main
+      READY[$e]="localhost:$p/health"
+      ;;
   esac
   PID[$e]=$!
   for _ in $(seq 1 1200); do
@@ -359,8 +424,18 @@ stop() { # stop <engine>: by port, since wrapper scripts (fuseki-server) outlive
 stop_all() { for e in $ENGINES; do stop "$e"; done; }
 trap stop_all EXIT
 # drop an engine's files from the page cache (no root needed: posix_fadvise DONTNEED);
-# a running server's mapped pages stay, so this runs between a stop and a start
-evict() { find "${FILESOF[$1]}" -type f -exec dd if={} iflag=nocache count=0 status=none \;; }
+# a running server's mapped pages stay, so this runs between a stop and a start. One
+# process for all files: Fluree's index has about 90,000 files at full scale, and a dd
+# per file took six minutes.
+evict() {
+  find "${FILESOF[$1]}" -type f -print0 | python3 -c '
+import os, sys
+for p in sys.stdin.buffer.read().split(b"\0"):
+    if p:
+        fd = os.open(p, os.O_RDONLY)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        os.close(fd)'
+}
 
 # --------------------------------------------------------------------------- queries
 NAMES=()

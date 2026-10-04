@@ -2136,7 +2136,33 @@ const server = http.createServer(async (req, res) => {
               if (datasets.has(dbName)) return fail(res, 409, `Dataset "${dbName}" already exists`);
               if (!['mem', 'persistent'].includes(dbType))
                 return fail(res, 400, 'dbType must be "mem" or "persistent"');
-              return send(res, 201, info(makeDataset(dbName, dbType)));
+              // `text`: true, "true" (a form), a configuration, or absent
+              let text = p.get('text') ?? null;
+              if (text === 'true') text = true;
+              if (text === 'false') text = null;
+              let textCfg = null;
+              if (text === true) textCfg = { predicates: 'all' };
+              else if (text && typeof text === 'object') textCfg = text;
+              else if (text !== null && text !== false)
+                return fail(res, 400, 'text must be true, false or a configuration object');
+              const preds = textCfg?.predicates ?? 'all';
+              if (
+                textCfg &&
+                preds !== 'all' &&
+                !(Array.isArray(preds) && preds.every((x) => typeof x === 'string'))
+              )
+                return fail(
+                  res,
+                  400,
+                  `invalid text configuration: predicates: expected "all" or a list of IRIs, got ${JSON.stringify(preds)}`,
+                );
+              const created = makeDataset(dbName, dbType);
+              if (textCfg)
+                created.text = {
+                  predicates: preds,
+                  graphs: { include: 'all', exclude: [], ...(textCfg.graphs ?? {}) },
+                };
+              return send(res, 201, info(created));
             }
             break;
           }

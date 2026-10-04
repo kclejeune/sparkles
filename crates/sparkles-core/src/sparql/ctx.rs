@@ -181,10 +181,16 @@ pub struct Optimizations {
     /// fixes the start of the string rejects the base-vocabulary ids outside the id
     /// ranges of the keys with that start, without reading their keys
     pub filter_id_ranges: bool,
+    /// a hash join whose right side is a `text:query` call without a limit searches only
+    /// the subjects of a small left side
+    pub text_subject_pushdown: bool,
+    /// ORDER BY DESC(spk:cosine(?v, C)) LIMIT k (or spk:dot) over one pattern reads the
+    /// k best rows by an exact vector search
+    pub vector_topk: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 31] = [
+    pub const NAMES: [&str; 33] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -216,6 +222,8 @@ impl Optimizations {
         "fused_star_costs",
         "prefetch_blocks",
         "filter_id_ranges",
+        "text_subject_pushdown",
+        "vector_topk",
     ];
 
     /// Everything on.
@@ -251,6 +259,8 @@ impl Optimizations {
         fused_star_costs: true,
         prefetch_blocks: true,
         filter_id_ranges: true,
+        text_subject_pushdown: true,
+        vector_topk: true,
     };
 
     /// Everything off: the generic operators only.
@@ -286,6 +296,8 @@ impl Optimizations {
         fused_star_costs: false,
         prefetch_blocks: false,
         filter_id_ranges: false,
+        text_subject_pushdown: false,
+        vector_topk: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -321,6 +333,8 @@ impl Optimizations {
             "fused_star_costs" => &mut self.fused_star_costs,
             "prefetch_blocks" => &mut self.prefetch_blocks,
             "filter_id_ranges" => &mut self.filter_id_ranges,
+            "text_subject_pushdown" => &mut self.text_subject_pushdown,
+            "vector_topk" => &mut self.vector_topk,
             _ => return None,
         })
     }

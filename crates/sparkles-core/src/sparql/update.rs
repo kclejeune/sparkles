@@ -293,6 +293,7 @@ impl Request<'_> {
 
     /// Query context for a WHERE clause, under the request's limits.
     fn ctx(&self, snap: Arc<crate::store::Snapshot>) -> Ctx {
+        let snap = super::with_union_default(snap, self.opts);
         #[cfg(feature = "geo")]
         let op_vertices = snap.geo_op_vertices;
         let mut ctx = Ctx::new(snap);

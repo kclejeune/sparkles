@@ -1,6 +1,7 @@
 <script lang="ts">
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
+  import { parsePredicateList } from '$lib/textsearch';
   import Modal from './Modal.svelte';
 
   let {
@@ -21,21 +22,32 @@
   let error = $state<string | null>(null);
   let confirmText = $state('');
 
+  // full-text search from the start: every predicate, or the listed ones
+  let text = $state(false);
+  let textPreds = $state('');
+
   const validName = $derived(/^[A-Za-z0-9_.-]+$/.test(name));
   const exists = $derived(app.datasets.some((d) => d.name === name));
+  const parsedPreds = $derived(parsePredicateList(textPreds, app.prefixes(null)));
+  const textValid = $derived(!text || parsedPreds.bad.length === 0);
 
   async function create(e: Event) {
     e.preventDefault();
-    if (!validName || exists) return;
+    if (!validName || exists || !textValid) return;
     busy = true;
     error = null;
+    const opts = text
+      ? { text: parsedPreds.iris.length ? { predicates: parsedPreds.iris } : true }
+      : {};
     try {
-      await api.createDataset(name, type);
+      await api.createDataset(name, type, opts);
       toasts.push('success', `Created dataset ${name}`);
       await app.refreshDatasets();
       oncreated?.(name);
       createOpen = false;
       name = '';
+      text = false;
+      textPreds = '';
     } catch (err) {
       error = api.errorMessage(err);
     } finally {
@@ -99,6 +111,31 @@
         >
       </label>
     </fieldset>
+    <label class="check">
+      <input type="checkbox" bind:checked={text} />
+      <span
+        ><strong>Enable full-text search</strong><span class="muted"
+          >Index string literals for <span class="mono">text:query</span> and the Search page.</span
+        ></span
+      >
+    </label>
+    {#if text}
+      <label class="field">
+        Predicates <span class="hint">(optional, one per line; empty indexes every predicate)</span>
+        <textarea
+          class="textarea mono"
+          rows="3"
+          bind:value={textPreds}
+          spellcheck="false"
+          placeholder="rdfs:label&#10;skos:prefLabel"
+          aria-invalid={parsedPreds.bad.length > 0}></textarea>
+        {#if parsedPreds.bad.length}
+          <span class="hint bad"
+            >Not an IRI or known prefixed name: {parsedPreds.bad.join(', ')}</span
+          >
+        {/if}
+      </label>
+    {/if}
     {#if error}<div class="error-box">{error}</div>{/if}
   </form>
   {#snippet actions()}
@@ -107,7 +144,7 @@
       class="btn primary"
       type="submit"
       form="create-ds"
-      disabled={busy || !validName || exists}
+      disabled={busy || !validName || exists || !textValid}
     >
       {#if busy}<span class="spinner"></span>{/if} Create dataset
     </button>
@@ -197,6 +234,21 @@
     font-size: var(--fs-sm);
   }
   .opt input {
+    margin-top: 2px;
+    accent-color: var(--iri);
+  }
+  .check {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    cursor: pointer;
+  }
+  .check > span {
+    display: grid;
+    gap: 2px;
+    font-size: var(--fs-sm);
+  }
+  .check input {
     margin-top: 2px;
     accent-color: var(--iri);
   }
