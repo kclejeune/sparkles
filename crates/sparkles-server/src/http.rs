@@ -1708,8 +1708,6 @@ pub(crate) fn write_error(e: Error, restricted: bool) -> ApiError {
     }
 }
 
-/// Parse `N`, `commit:N` or `head` (resolved by the caller).
-
 async fn list_commits(
     State(st): St,
     Path(name): Path<String>,

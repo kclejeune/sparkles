@@ -372,19 +372,19 @@ fn entries() -> Vec<(&'static str, Entry)> {
         }),
         // ------------------------------------------------------------------- schema
         op!("getSchema", "schema.report", |ds| {
-            ds.schema().report(&Default::default()).map(|r| {
+            if let Ok(r) = ds.schema().report(&Default::default()) {
                 r.summary("ds");
-            });
+            }
         }),
         op!("listSchemaClasses", "schema.classes", |ds| {
-            ds.schema().report(&Default::default()).map(|r| {
+            if let Ok(r) = ds.schema().report(&Default::default()) {
                 r.classes();
-            });
+            }
         }),
         op!("listSchemaPredicates", "schema.predicates", |ds| {
-            ds.schema().report(&Default::default()).map(|r| {
+            if let Ok(r) = ds.schema().report(&Default::default()) {
                 r.predicates();
-            });
+            }
         }),
         op!("getSchemaConstraints", "schema.constraints", |ds| {
             ds.schema().constraints(&Default::default());

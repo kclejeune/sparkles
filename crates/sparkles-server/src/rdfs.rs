@@ -45,10 +45,11 @@ pub fn parse(bytes: Vec<u8>, format: RdfFormat) -> Result<Vec<oxrdf::Triple>> {
 /// [`RdfsSetting`](sparkles::handles::RdfsSetting)).
 pub fn set(ds: &Dataset, new: Option<NewSchema>) -> Result<()> {
     let setting = ds.dataset.reasoning().rdfs();
-    Ok(match new {
+    match new {
         Some(n) => setting.set(n)?,
         None => setting.reset()?,
-    })
+    }
+    Ok(())
 }
 
 /// The setting for dataset info: `null`, or where the schema comes from.
