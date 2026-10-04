@@ -60,7 +60,7 @@ pub use compaction::{
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
 pub use history_query::{HistoryBound, HistoryChange, HistoryQuery, HistoryResult};
-pub use link::Linked;
+pub use link::{Linked, read_link_file};
 pub use merge::{INFERRED_GRAPH, conflict_error};
 pub use partial::PartialMode;
 pub use patch_apply::{PatchOptions, PatchOutcome, parse_commit_iri};

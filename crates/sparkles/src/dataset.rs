@@ -80,6 +80,11 @@ impl Dataset {
         }
     }
 
+    /// A dataset around a store others share (a branch's, which its dataset keeps open).
+    pub(crate) fn from_shared(store: Arc<Store>) -> Dataset {
+        Dataset { store }
+    }
+
     /// The underlying store (ids, snapshots, low-level scans).
     pub fn store(&self) -> &Store {
         &self.store

@@ -500,7 +500,6 @@ impl Store {
             }
             let receipt = txn.commit()?;
             report.merged = true;
-            report.target.seq = receipt.commit.seq;
             report.commit = Some(receipt);
             return Ok(MergeOutcome::Merged(report));
         }

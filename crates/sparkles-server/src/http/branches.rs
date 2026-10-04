@@ -10,6 +10,158 @@ use sparkles::branch::{
 };
 use sparkles::history::At;
 
+/// Merge counters by dataset label: results, conflicts, changes and time.
+#[derive(Default)]
+struct MergeCounts {
+    results: std::collections::BTreeMap<&'static str, u64>,
+    conflicts: u64,
+    inserted: u64,
+    deleted: u64,
+    seconds: f64,
+    count: u64,
+}
+
+static MERGES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::BTreeMap<String, MergeCounts>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn count_merge(st: &AppState, ds: &str, result: &'static str, r: Option<&MergeReport>, secs: f64) {
+    let mut m = MERGES.lock();
+    let c = m.entry(st.metrics.dataset_label(Some(ds))).or_default();
+    *c.results.entry(result).or_default() += 1;
+    if let Some(r) = r {
+        c.conflicts += r.conflicts_found;
+        if r.merged {
+            c.inserted += r.inserted;
+            c.deleted += r.deleted;
+        }
+    }
+    c.seconds += secs;
+    c.count += 1;
+}
+
+/// Branch and merge metrics in the Prometheus text format.
+pub(crate) fn metrics(st: &AppState, out: &mut String) {
+    use std::fmt::Write;
+    let label = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let family = |o: &mut String, name: &str, kind: &str, help: &str| {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} {kind}");
+    };
+    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    let mut gauges: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    for d in datasets.iter().filter(|d| d.kind == DbType::Persistent) {
+        let linked = d.store.branch_set().map_or(0, |s| {
+            s.open_stores()
+                .iter()
+                .filter(|b| b.snapshot().generation.linked().is_some())
+                .count() as u64
+        });
+        let g = gauges
+            .entry(st.metrics.dataset_label(Some(&d.name)))
+            .or_default();
+        g.0 += d.store.branch_count() as u64;
+        g.1 += linked;
+    }
+    if !gauges.is_empty() {
+        family(
+            out,
+            "sparkles_branches",
+            "gauge",
+            "Branches per dataset, main included.",
+        );
+        for (ds, (n, _)) in &gauges {
+            let _ = writeln!(out, "sparkles_branches{{dataset=\"{}\"}} {n}", label(ds));
+        }
+        family(
+            out,
+            "sparkles_branch_linked",
+            "gauge",
+            "Open branches that still read their upstream's index files.",
+        );
+        for (ds, (_, n)) in &gauges {
+            let _ = writeln!(
+                out,
+                "sparkles_branch_linked{{dataset=\"{}\"}} {n}",
+                label(ds)
+            );
+        }
+    }
+    let m = MERGES.lock();
+    if m.is_empty() {
+        return;
+    }
+    family(
+        out,
+        "sparkles_merges_total",
+        "counter",
+        "Merges by result: merged, fast-forward, up-to-date, conflict or refused.",
+    );
+    for (ds, c) in m.iter() {
+        for (r, n) in &c.results {
+            let _ = writeln!(
+                out,
+                "sparkles_merges_total{{dataset=\"{}\",result=\"{r}\"}} {n}",
+                label(ds)
+            );
+        }
+    }
+    family(
+        out,
+        "sparkles_merge_conflicts_total",
+        "counter",
+        "Conflicting groups that merges found.",
+    );
+    for (ds, c) in m.iter() {
+        let _ = writeln!(
+            out,
+            "sparkles_merge_conflicts_total{{dataset=\"{}\"}} {}",
+            label(ds),
+            c.conflicts
+        );
+    }
+    family(
+        out,
+        "sparkles_merge_changes_total",
+        "counter",
+        "Quads that merges inserted and deleted.",
+    );
+    for (ds, c) in m.iter() {
+        let _ = writeln!(
+            out,
+            "sparkles_merge_changes_total{{dataset=\"{}\",op=\"insert\"}} {}",
+            label(ds),
+            c.inserted
+        );
+        let _ = writeln!(
+            out,
+            "sparkles_merge_changes_total{{dataset=\"{}\",op=\"delete\"}} {}",
+            label(ds),
+            c.deleted
+        );
+    }
+    family(
+        out,
+        "sparkles_merge_seconds",
+        "summary",
+        "Time spent in merges.",
+    );
+    for (ds, c) in m.iter() {
+        let _ = writeln!(
+            out,
+            "sparkles_merge_seconds_sum{{dataset=\"{}\"}} {}",
+            label(ds),
+            c.seconds
+        );
+        let _ = writeln!(
+            out,
+            "sparkles_merge_seconds_count{{dataset=\"{}\"}} {}",
+            label(ds),
+            c.count
+        );
+    }
+}
+
 /// Response header: the branch a response comes from (absent for `main`).
 pub(crate) const SPARKLES_BRANCH: &str = "sparkles-branch";
 /// Response header: that branch's id.
@@ -99,8 +251,10 @@ pub(crate) async fn select(
         }
     }
     // the parameter, in the query string
-    let params = Params::from_query(req.uri());
-    chosen.extend(params.all("branch"));
+    // (parsed only when it names a branch, so other requests pay for a substring check)
+    if req.uri().query().is_some_and(|q| q.contains("branch=")) {
+        chosen.extend(Params::from_query(req.uri()).all("branch"));
+    }
     // and in a form body (not compressed: the decompression layer runs later)
     let form = req
         .headers()
@@ -119,9 +273,11 @@ pub(crate) async fn select(
             Ok(b) => b,
             Err(e) => return err(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response(),
         };
-        let mut p = Params::default();
-        p.extend_form(&bytes);
-        chosen.extend(p.all("branch"));
+        if bytes.windows(7).any(|w| w == b"branch=") {
+            let mut p = Params::default();
+            p.extend_form(&bytes);
+            chosen.extend(p.all("branch"));
+        }
         req = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
     }
     chosen.dedup();
@@ -735,6 +891,7 @@ pub(crate) async fn merge(
     let reasoned = tds.reasoning.read().is_some();
     let d = ds.clone();
     let o = ask.o.clone();
+    let t0 = std::time::Instant::now();
     let out = blocking(move || {
         Ok(match d.store.merge(&ask.source, &ask.target, &ask.o) {
             Err(Error::DryRun(p)) => Err(*p),
@@ -742,7 +899,38 @@ pub(crate) async fn merge(
             Err(e) => return Err(e.into()),
         })
     })
-    .await?;
+    .await;
+    let secs = t0.elapsed().as_secs_f64();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            count_merge(&st, &name, "refused", None, secs);
+            return Err(e);
+        }
+    };
+    match &out {
+        Ok(MergeOutcome::Conflicts(c)) => {
+            let mut m = MERGES.lock();
+            let e = m.entry(st.metrics.dataset_label(Some(&name))).or_default();
+            e.conflicts += c.conflicts;
+            *e.results.entry("conflict").or_default() += 1;
+            e.seconds += secs;
+            e.count += 1;
+        }
+        Ok(MergeOutcome::UpToDate(r)) => count_merge(&st, &name, "up-to-date", Some(r), secs),
+        Ok(MergeOutcome::Merged(r)) => count_merge(
+            &st,
+            &name,
+            if r.fast_forward {
+                "fast-forward"
+            } else {
+                "merged"
+            },
+            Some(r),
+            secs,
+        ),
+        Err(_) => {}
+    }
     match out {
         Err(preview) => {
             // a dry run: the C15 preview of the merge commit, with the merge fields

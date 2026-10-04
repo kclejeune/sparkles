@@ -96,6 +96,8 @@ fn commit_headers() -> J {
     json!({
         "Sparkles-Commit": { "description": "The commit a read saw, or a write produced.", "schema": { "type": "integer" } },
         "Sparkles-Dataset-Id": { "description": "The dataset id.", "schema": { "type": "string" } },
+        "Sparkles-Branch": { "description": "The branch, when it is not `main`.", "schema": { "type": "string" } },
+        "Sparkles-Branch-Id": { "description": "The branch's id, when it is not `main`.", "schema": { "type": "string" } },
     })
 }
 
@@ -108,6 +110,7 @@ fn query_params(o: Op) -> Op {
         "timeout",
         "reasoning",
         "at",
+        "branch",
         "send",
         "nocache",
         "memoryMb",
@@ -182,6 +185,7 @@ fn query_post(route: &'static str, id: &str) -> Op {
 /// The parameters of every write.
 fn write_params(o: Op) -> Op {
     o.params(&[
+        "branch",
         "timeout",
         "dryRun",
         "changes",
@@ -417,6 +421,7 @@ pub(super) fn add_all(p: &mut Paths) {
     queries(p);
     graphql(p);
     history(p);
+    branches(p);
     search(p);
     settings(p);
     format_and_mcp(p);
@@ -1265,6 +1270,83 @@ fn graphql(p: &mut Paths) {
     );
 }
 
+fn branches(p: &mut Paths) {
+    p.add(
+        op(
+            GET,
+            "/$/branches/{ds}",
+            "listBranches",
+            "Branches",
+            "List branches",
+        )
+        .doc("The branches the caller may read, `main` first, then by name.")
+        .see("branches-and-merges")
+        .json("200", "The branches.", "BranchList")
+        .errors(&[501]),
+    );
+    p.add(
+        op(POST, "/$/branches/{ds}", "createBranch", "Branches", "Create a branch")
+            .doc("Creates a branch from a commit of another branch. The branch shares the index files of the generation that holds the commit until it compacts, so creating one writes a few kilobytes. Needs read on the source branch and write on the new one, from grants without graph restrictions.")
+            .see("branches-and-merges")
+            .json_body(true, "BranchCreate")
+            .json("201", "The branch.", "Branch")
+            .errors(&[400, 404, 409, 501]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/branches/{ds}/{name}",
+            "getBranch",
+            "Branches",
+            "Get a branch",
+        )
+        .see("branches-and-merges")
+        .json("200", "The branch.", "Branch")
+        .errors(&[404]),
+    );
+    p.add(
+        op(PATCH, "/$/branches/{ds}/{name}", "updateBranch", "Branches", "Protect a branch or change its note")
+            .doc("`protected` needs admin on the branch. A protected branch takes changes through merges only.")
+            .see("branches-and-merges")
+            .json_body(true, "BranchPatch")
+            .json("200", "The branch.", "Branch")
+            .errors(&[400, 403, 404]),
+    );
+    p.add(
+        op(DELETE, "/$/branches/{ds}/{name}", "deleteBranch", "Branches", "Delete a branch")
+            .doc("Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it.")
+            .see("branches-and-merges")
+            .query("force", boolean(), "Delete a branch with unmerged commits.")
+            .resp("204", "Deleted.", None)
+            .errors(&[400, 403, 404, 409]),
+    );
+    p.add(
+        op(GET, "/$/merge/{ds}", "previewMerge", "Branches", "Preview a merge")
+            .doc("What merging `source` into `target` would do: the merge base, the changes and the conflicts. Nothing is written, and conflicts do not fail the request.")
+            .see("merges")
+            .query_req("source", s(), "The branch to merge.")
+            .query("target", s(), "The branch to merge into (default `main`).")
+            .query("conflicts", json!({ "type": "string", "enum": ["cell", "subject", "quad"] }), "What counts as one value (default `cell`).")
+            .query("onConflict", json!({ "type": "string", "enum": ["fail", "ours", "theirs", "union"] }), "The rule for conflicts.")
+            .query("limit", int(), "The most conflict cells listed (default 100, at most 10000).")
+            .json("200", "The preview.", "MergeResult")
+            .errors(&[400, 404, 409, 410, 507]),
+    );
+    p.add(
+        op(POST, "/$/merge/{ds}", "merge", "Branches", "Merge a branch")
+            .doc("Merges `source` into `target` as one commit of kind `merge`: a fast-forward when the target has not moved since the merge base, a three-way merge of quad sets otherwise. Conflicts that resolutions and `onConflict` leave answer `409` with the conflict report, and nothing is written. `dryRun: true` answers the write preview of the merge commit with the merge fields under `merge`.")
+            .see("merges")
+            .json_body(true, "MergeRequest")
+            .json("200", "The merge.", "MergeResult")
+            .resp(
+                "409",
+                "Conflicts remain (`merge-conflict`, with the report), the target moved (`head-moved`), not a fast-forward (`not-fast-forward`), or several merge bases (`ambiguous-merge-base`).",
+                Some(json!({ "application/json": { "schema": sref("ConflictReport") } })),
+            )
+            .errors(&[400, 403, 404, 410, 422, 507]),
+    );
+}
+
 fn history(p: &mut Paths) {
     p.add(
         op(
@@ -1274,8 +1356,9 @@ fn history(p: &mut Paths) {
             "History",
             "List commits",
         )
-        .doc("Newest first, or oldest first after `after`.")
+        .doc("Newest first, or oldest first after `after`. On a branch other than `main`, its own commits come first, then those it shares with its upstream; each commit names the branch that made it.")
         .see("commits")
+        .param("branch")
         .query(
             "limit",
             json!({ "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 }),

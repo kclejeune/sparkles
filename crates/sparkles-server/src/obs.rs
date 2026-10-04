@@ -1689,6 +1689,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     crate::compaction::metrics(st, &mut o);
     crate::vector::metrics(st, &mut o);
     crate::http::history::metrics(st, &mut o);
+    crate::http::branches::metrics(st, &mut o);
     if let Some(rss) = resident_bytes() {
         family(
             &mut o,

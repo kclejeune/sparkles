@@ -26,6 +26,14 @@
           "type": "string"
         }
       },
+      "branch": {
+        "description": "The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree.",
+        "in": "query",
+        "name": "branch",
+        "schema": {
+          "type": "string"
+        }
+      },
       "changes": {
         "description": "With `dryRun`: list up to this many changed quads.",
         "in": "query",
@@ -248,7 +256,7 @@
         }
       },
       "name": {
-        "description": "The name of the stored query, snapshot or vector index.",
+        "description": "The name of the stored query, snapshot, vector index or branch.",
         "in": "path",
         "name": "name",
         "required": true,
@@ -720,6 +728,18 @@
         },
         "description": "The results, negotiated with `Accept` or `format`: results for SELECT and ASK, RDF for CONSTRUCT and DESCRIBE.",
         "headers": {
+          "Sparkles-Branch": {
+            "description": "The branch, when it is not `main`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          "Sparkles-Branch-Id": {
+            "description": "The branch's id, when it is not `main`.",
+            "schema": {
+              "type": "string"
+            }
+          },
           "Sparkles-Commit": {
             "description": "The commit a read saw, or a write produced.",
             "schema": {
@@ -861,6 +881,18 @@
         },
         "description": "The write's count, with a receipt when asked, or a dry run's report. A dry run with `Accept: application/rdf-patch` gets the change as RDF Patch.",
         "headers": {
+          "Sparkles-Branch": {
+            "description": "The branch, when it is not `main`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          "Sparkles-Branch-Id": {
+            "description": "The branch's id, when it is not `main`.",
+            "schema": {
+              "type": "string"
+            }
+          },
           "Sparkles-Commit": {
             "description": "The commit a read saw, or a write produced.",
             "schema": {
@@ -1422,6 +1454,171 @@
         ],
         "type": "object"
       },
+      "Branch": {
+        "properties": {
+          "ahead": {
+            "type": "integer"
+          },
+          "behind": {
+            "type": "integer"
+          },
+          "broken": {
+            "type": "boolean"
+          },
+          "created": {
+            "type": "string"
+          },
+          "from": {
+            "description": "The commit the branch started from (`null` for `main`).",
+            "properties": {
+              "branch": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "branchId": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "head": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "The branch id (the dataset id for `main`).",
+            "type": "string"
+          },
+          "mergeBase": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "modified": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ordinal": {
+            "type": "integer"
+          },
+          "protected": {
+            "type": "boolean"
+          },
+          "storage": {
+            "properties": {
+              "generation": {
+                "type": "string"
+              },
+              "heldBytes": {
+                "type": "integer"
+              },
+              "linked": {
+                "description": "The branch still reads its upstream's index files.",
+                "type": "boolean"
+              },
+              "ownBytes": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "upstream": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "id",
+          "head",
+          "protected",
+          "storage"
+        ],
+        "type": "object"
+      },
+      "BranchCreate": {
+        "properties": {
+          "at": {
+            "description": "The commit of `from` to start at (default `head`).",
+            "type": "string"
+          },
+          "from": {
+            "description": "The branch to start from (default `main`).",
+            "type": "string"
+          },
+          "name": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "protected": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "BranchList": {
+        "properties": {
+          "branches": {
+            "items": {
+              "$ref": "#/components/schemas/Branch"
+            },
+            "type": "array"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset",
+          "datasetId",
+          "branches"
+        ],
+        "type": "object"
+      },
+      "BranchPatch": {
+        "properties": {
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "protected": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "BudgetError": {
         "allOf": [
           {
@@ -1763,6 +1960,120 @@
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#automatic-compaction"
         },
+        "type": "object"
+      },
+      "ConflictReport": {
+        "additionalProperties": true,
+        "properties": {
+          "base": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "cells": {
+            "items": {
+              "properties": {
+                "base": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "graph": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "ours": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "predicate": {
+                  "type": "string"
+                },
+                "subject": {
+                  "type": "string"
+                },
+                "theirs": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "code": {
+            "type": "string"
+          },
+          "conflicts": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          },
+          "graphs": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "scope": {
+            "enum": [
+              "cell",
+              "subject",
+              "quad"
+            ],
+            "type": "string"
+          },
+          "source": {
+            "properties": {
+              "branch": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "branchId": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "target": {
+            "properties": {
+              "branch": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "branchId": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "error",
+          "code"
+        ],
         "type": "object"
       },
       "ConstraintsLayer": {
@@ -3295,6 +3606,196 @@
         },
         "required": [
           "redirect"
+        ],
+        "type": "object"
+      },
+      "MergeRequest": {
+        "properties": {
+          "base": {
+            "description": "The merge base to use among several.",
+            "type": "object"
+          },
+          "conflicts": {
+            "enum": [
+              "cell",
+              "subject",
+              "quad"
+            ],
+            "type": "string"
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "expect": {
+            "description": "The heads the caller saw: `409 head-moved` when either moved.",
+            "properties": {
+              "source": {
+                "type": "integer"
+              },
+              "target": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "ff": {
+            "enum": [
+              "auto",
+              "only"
+            ],
+            "type": "string"
+          },
+          "inferences": {
+            "enum": [
+              "exclude",
+              "include"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "onConflict": {
+            "enum": [
+              "fail",
+              "ours",
+              "theirs",
+              "union"
+            ],
+            "type": "string"
+          },
+          "resolutions": {
+            "items": {
+              "properties": {
+                "graph": {
+                  "description": "N-Triples; `null` is the default graph.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "objects": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "predicate": {
+                  "type": "string"
+                },
+                "subject": {
+                  "type": "string"
+                },
+                "take": {
+                  "enum": [
+                    "ours",
+                    "theirs",
+                    "base",
+                    "union",
+                    "objects"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "take"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "source": {
+            "type": "string"
+          },
+          "target": {
+            "description": "Default `main`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "type": "object"
+      },
+      "MergeResult": {
+        "additionalProperties": true,
+        "properties": {
+          "base": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "changes": {
+            "properties": {
+              "deleted": {
+                "type": "integer"
+              },
+              "inserted": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "commit": {
+            "description": "The merge commit.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Commit"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "conflictCount": {
+            "description": "A preview's conflicts that remain.",
+            "type": "integer"
+          },
+          "conflicts": {
+            "properties": {
+              "found": {
+                "type": "integer"
+              },
+              "resolved": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "fastForward": {
+            "type": "boolean"
+          },
+          "inferences": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "merged": {
+            "type": "boolean"
+          },
+          "source": {
+            "type": "object"
+          },
+          "target": {
+            "type": "object"
+          },
+          "upToDate": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "merged",
+          "upToDate",
+          "fastForward",
+          "source",
+          "target",
+          "changes",
+          "conflicts"
         ],
         "type": "object"
       },
@@ -8589,6 +9090,321 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/branches/{ds}": {
+      "get": {
+        "description": "The branches the caller may read, `main` first, then by name.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#branches-and-merges"
+        },
+        "operationId": "listBranches",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchList"
+                }
+              }
+            },
+            "description": "The branches."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List branches",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "Creates a branch from a commit of another branch. The branch shares the index files of the generation that holds the commit until it compacts, so creating one writes a few kilobytes. Needs read on the source branch and write on the new one, from grants without graph restrictions.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#branches-and-merges"
+        },
+        "operationId": "createBranch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BranchCreate"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Branch"
+                }
+              }
+            },
+            "description": "The branch."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Create a branch",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/branches/{ds}/{name}": {
+      "delete": {
+        "description": "Deletes the branch's commits, snapshots and storage. Refused with `409 unmerged` while it has commits its upstream does not have, unless `force=true`, and with `409 has-children` while other branches start from it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#branches-and-merges"
+        },
+        "operationId": "deleteBranch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "description": "Delete a branch with unmerged commits.",
+            "in": "query",
+            "name": "force",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Delete a branch",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#branches-and-merges"
+        },
+        "operationId": "getBranch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Branch"
+                }
+              }
+            },
+            "description": "The branch."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a branch",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "patch": {
+        "description": "`protected` needs admin on the branch. A protected branch takes changes through merges only.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#branches-and-merges"
+        },
+        "operationId": "updateBranch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BranchPatch"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Branch"
+                }
+              }
+            },
+            "description": "The branch."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Protect a branch or change its note",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/cache/clear/{ds}": {
       "post": {
         "externalDocs": {
@@ -8651,7 +9467,7 @@
     },
     "/$/commits/{ds}": {
       "get": {
-        "description": "Newest first, or oldest first after `after`.",
+        "description": "Newest first, or oldest first after `after`. On a branch other than `main`, its own commits come first, then those it shares with its upstream; each commit names the branch that made it.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#commits"
         },
@@ -8659,6 +9475,9 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "description": "The page size.",
@@ -11027,6 +11846,205 @@
           "MCP"
         ],
         "x-sparkles-permission": "any caller"
+      }
+    },
+    "/$/merge/{ds}": {
+      "get": {
+        "description": "What merging `source` into `target` would do: the merge base, the changes and the conflicts. Nothing is written, and conflicts do not fail the request.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#merges"
+        },
+        "operationId": "previewMerge",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The branch to merge.",
+            "in": "query",
+            "name": "source",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The branch to merge into (default `main`).",
+            "in": "query",
+            "name": "target",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "What counts as one value (default `cell`).",
+            "in": "query",
+            "name": "conflicts",
+            "schema": {
+              "enum": [
+                "cell",
+                "subject",
+                "quad"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The rule for conflicts.",
+            "in": "query",
+            "name": "onConflict",
+            "schema": {
+              "enum": [
+                "fail",
+                "ours",
+                "theirs",
+                "union"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most conflict cells listed (default 100, at most 10000).",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeResult"
+                }
+              }
+            },
+            "description": "The preview."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Preview a merge",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "Merges `source` into `target` as one commit of kind `merge`: a fast-forward when the target has not moved since the merge base, a three-way merge of quad sets otherwise. Conflicts that resolutions and `onConflict` leave answer `409` with the conflict report, and nothing is written. `dryRun: true` answers the write preview of the merge commit with the merge fields under `merge`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#merges"
+        },
+        "operationId": "merge",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergeRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeResult"
+                }
+              }
+            },
+            "description": "The merge."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictReport"
+                }
+              }
+            },
+            "description": "Conflicts remain (`merge-conflict`, with the report), the target moved (`head-moved`), not a fast-forward (`not-fast-forward`), or several merge bases (`ambiguous-merge-base`)."
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Merge a branch",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
       }
     },
     "/$/metrics": {
@@ -16176,6 +17194,9 @@
             "$ref": "#/components/parameters/ifNoneMatch"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "$ref": "#/components/parameters/timeout"
           },
           {
@@ -16311,6 +17332,9 @@
           },
           {
             "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/send"
@@ -16467,6 +17491,9 @@
           },
           {
             "$ref": "#/components/parameters/gspDefault"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/timeout"
@@ -16804,6 +17831,18 @@
             },
             "description": "The results, the update's statistics or the write's count.",
             "headers": {
+              "Sparkles-Branch": {
+                "description": "The branch, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch-Id": {
+                "description": "The branch's id, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "Sparkles-Commit": {
                 "description": "The commit a read saw, or a write produced.",
                 "schema": {
@@ -16903,6 +17942,9 @@
           },
           {
             "$ref": "#/components/parameters/ifNoneMatch"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/timeout"
@@ -17153,6 +18195,9 @@
           },
           {
             "$ref": "#/components/parameters/gspDefault"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/timeout"
@@ -17420,6 +18465,9 @@
             "$ref": "#/components/parameters/gspDefault"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "$ref": "#/components/parameters/timeout"
           },
           {
@@ -17540,6 +18588,9 @@
           },
           {
             "$ref": "#/components/parameters/gspDefault"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/timeout"
@@ -18238,6 +19289,18 @@
             },
             "description": "The response, with or without execution errors.",
             "headers": {
+              "Sparkles-Branch": {
+                "description": "The branch, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch-Id": {
+                "description": "The branch's id, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "Sparkles-Commit": {
                 "description": "The commit a read saw, or a write produced.",
                 "schema": {
@@ -18560,6 +19623,18 @@
             },
             "description": "The response, with or without execution errors.",
             "headers": {
+              "Sparkles-Branch": {
+                "description": "The branch, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch-Id": {
+                "description": "The branch's id, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "Sparkles-Commit": {
                 "description": "The commit a read saw, or a write produced.",
                 "schema": {
@@ -18964,6 +20039,9 @@
             "$ref": "#/components/parameters/ds"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "$ref": "#/components/parameters/timeout"
           },
           {
@@ -19033,6 +20111,18 @@
             },
             "description": "What the patch did, with a receipt or a dry run's report when asked.",
             "headers": {
+              "Sparkles-Branch": {
+                "description": "The branch, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch-Id": {
+                "description": "The branch's id, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "Sparkles-Commit": {
                 "description": "The commit a read saw, or a write produced.",
                 "schema": {
@@ -19122,6 +20212,9 @@
             "$ref": "#/components/parameters/ds"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "$ref": "#/components/parameters/timeout"
           },
           {
@@ -19191,6 +20284,18 @@
             },
             "description": "What the patch did, with a receipt or a dry run's report when asked.",
             "headers": {
+              "Sparkles-Branch": {
+                "description": "The branch, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch-Id": {
+                "description": "The branch's id, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "Sparkles-Commit": {
                 "description": "The commit a read saw, or a write produced.",
                 "schema": {
@@ -19983,6 +21088,9 @@
             "$ref": "#/components/parameters/at"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "$ref": "#/components/parameters/send"
           },
           {
@@ -20092,6 +21200,9 @@
           },
           {
             "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/send"
@@ -20569,6 +21680,9 @@
             "$ref": "#/components/parameters/at"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "$ref": "#/components/parameters/send"
           },
           {
@@ -20678,6 +21792,9 @@
           },
           {
             "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/send"
@@ -21037,6 +22154,9 @@
             "$ref": "#/components/parameters/maxRowsProduced"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "$ref": "#/components/parameters/timeout"
           },
           {
@@ -21135,6 +22255,18 @@
             },
             "description": "The update's statistics, with a receipt or a dry run's report when asked.",
             "headers": {
+              "Sparkles-Branch": {
+                "description": "The branch, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch-Id": {
+                "description": "The branch's id, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "Sparkles-Commit": {
                 "description": "The commit a read saw, or a write produced.",
                 "schema": {
@@ -21248,6 +22380,9 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/timeout"
@@ -21405,6 +22540,9 @@
           },
           {
             "$ref": "#/components/parameters/ifNoneMatch"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/timeout"
@@ -21663,6 +22801,9 @@
             "$ref": "#/components/parameters/ifNoneMatch"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "$ref": "#/components/parameters/timeout"
           },
           {
@@ -21780,6 +22921,9 @@
           },
           {
             "$ref": "#/components/parameters/ifNoneMatch"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           },
           {
             "$ref": "#/components/parameters/timeout"
@@ -21956,6 +23100,13 @@
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphql"
       },
       "name": "GraphQL"
+    },
+    {
+      "description": "Branches of a dataset and merges between them.",
+      "externalDocs": {
+        "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#branches-and-merges"
+      },
+      "name": "Branches"
     },
     {
       "description": "Commits, diffs, the change feed, snapshots and retention.",

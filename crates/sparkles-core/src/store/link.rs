@@ -200,3 +200,14 @@ impl Generation {
         }
     }
 }
+
+/// The segments of the linked generation in `gen_dir`, as (directory relative to the
+/// dataset, log bytes, delta terms), for `sparkles check` (`None` when not linked).
+pub fn read_link_file(gen_dir: &Path) -> Result<Option<Vec<(String, u64, u64)>>> {
+    Ok(read_link(gen_dir)?.map(|f| {
+        f.segments
+            .into_iter()
+            .map(|s| (s.path, s.wal_end, s.dvocab_len))
+            .collect()
+    }))
+}

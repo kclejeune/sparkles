@@ -391,6 +391,7 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
         c.vector(root, &dir);
     }
     c.reasoning();
+    c.branches();
     // a compaction while checking: the files read may belong to different generations
     if let Some(before) = &c.current {
         let now = std::fs::read_to_string(root.join("CURRENT")).map(|s| s.trim().to_string());
@@ -1792,6 +1793,113 @@ impl Checker<'_> {
     }
 
     // --------------------------------------------------------------- reasoning ------
+
+    /// The branch table (`branches.json`): every listed branch has its directory, which
+    /// names this dataset, distinct ordinals below the next one, and a linked
+    /// generation whose upstream files hold what its link names; merge records with
+    /// valid checksums.
+    fn branches(&mut self) {
+        let mut run = Run::new("branches");
+        let file = crate::store::BRANCHES_FILE;
+        let t = match crate::store::read_branch_table(self.root) {
+            Ok(None) => {
+                self.checks.push(run.done("no branches"));
+                return;
+            }
+            Ok(Some(t)) => t,
+            Err(e) => {
+                run.add(Issue::error(e.to_string()).file(file));
+                self.checks.push(run.done("unreadable"));
+                return;
+            }
+        };
+        if let (Some(ds), Some(id)) = (self.dataset_id, t["datasetId"].as_str())
+            && ds.to_string() != id
+        {
+            run.add(Issue::error(format!("belongs to dataset {id}, not {ds}")).file(file));
+        }
+        let next = t["nextOrdinal"].as_u64().unwrap_or(1);
+        let mut ordinals = std::collections::BTreeSet::new();
+        let entries = t["branches"].as_array().cloned().unwrap_or_default();
+        let mut linked = 0usize;
+        for e in &entries {
+            let name = e["name"].as_str().unwrap_or("?");
+            let id = e["id"].as_str().unwrap_or("");
+            let o = e["ordinal"].as_u64().unwrap_or(0);
+            if o == 0 || o >= next || !ordinals.insert(o) {
+                run.add(
+                    Issue::error(format!(
+                        "branch {name} has ordinal {o}: ordinals are distinct, from 1 to below {next}"
+                    ))
+                    .file(file),
+                );
+            }
+            let dir = self.root.join(crate::store::BRANCHES_DIR).join(id);
+            let bf = dir.join("branch.json");
+            match std::fs::read(&bf)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            {
+                Some(b) if b["id"] == e["id"] => {}
+                Some(_) => run.add(
+                    Issue::error(format!("branch {name}: branch.json names another branch"))
+                        .file(file),
+                ),
+                None => {
+                    run.add(
+                        Issue::error(format!(
+                            "branch {name}: its directory is missing or unreadable"
+                        ))
+                        .file(file),
+                    );
+                    continue;
+                }
+            }
+            let gen0 = dir.join("gen-0000");
+            if let Ok(Some(link)) = crate::store::read_link_file(&gen0) {
+                linked += 1;
+                for seg in link {
+                    let sdir = self.root.join(&seg.0);
+                    let wal = std::fs::metadata(sdir.join("wal.log"))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    if wal < seg.1 {
+                        run.add(Issue::error(format!(
+                            "branch {name}: its link reads {} bytes of {}/wal.log, which has {wal}",
+                            seg.1, seg.0
+                        )).file(file));
+                    }
+                    let terms = std::fs::read(sdir.join("delta.vocab"))
+                        .map(|b| crate::vocab::delta_entries(&b).0.len() as u64)
+                        .unwrap_or(0);
+                    if !seg.0.contains("branches/") && terms < seg.2 {
+                        run.add(Issue::error(format!(
+                            "branch {name}: its link names {} delta terms of {}, which has {terms}",
+                            seg.2, seg.0
+                        )).file(file));
+                    }
+                }
+            }
+            for (m, what) in [
+                (self.root.join("merges.bin"), "main"),
+                (dir.join("merges.bin"), name),
+            ] {
+                if let Ok(b) = std::fs::read(&m)
+                    && b.len() % 48 != 0
+                {
+                    run.add(Issue::warning(format!(
+                        "{what}: merges.bin ends in a partial record (the next open cuts it)"
+                    )));
+                }
+            }
+        }
+        let n = entries.len();
+        let summary = format!(
+            "{n} branch{} besides main, {linked} linked; ordinals below {next}",
+            if n == 1 { "" } else { "es" }
+        );
+        self.checks.push(run.done(summary));
+    }
 
     fn reasoning(&mut self) {
         #[derive(serde::Deserialize)]

@@ -443,3 +443,46 @@ async fn a14_a20_a19_inherited_commits_diffs_and_clones() {
     assert_eq!(r.json()["forkedFrom"]["id"], dev_id.as_str());
     assert_eq!(r.json()["forkedFrom"]["seq"], 3);
 }
+
+/// A10: the target's write-time validation refuses a merge, and a dry run reports it.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn a10_validation_refuses_a_merge_and_a_dry_run_reports_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_st, app) = setup(dir.path()).await;
+    // dev starts before main gets its guard, so dev has none
+    json_req(&app, "POST", "/$/branches/ds", json!({ "name": "dev" })).await;
+    let shapes = "@prefix sh: <http://www.w3.org/ns/shacl#> .
+<urn:PersonShape> a sh:NodeShape ; sh:targetClass <urn:Person> ;
+  sh:property [ sh:path <urn:name> ; sh:minCount 1 ; sh:maxCount 1 ] .";
+    let (r, _) = json_req(
+        &app,
+        "PUT",
+        "/$/validation/ds",
+        json!({ "mode": "reject", "shapes": { "inline": shapes } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let (r, _) = update(&app, "ds@dev", "INSERT DATA { <urn:p1> a <urn:Person> }").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let head = |app: Router| async move {
+        get(&app, "/$/commits/ds?limit=1").await.0.json()["head"].clone()
+    };
+    let before = head(app.clone()).await;
+    let (r, _) = json_req(&app, "POST", "/$/merge/ds", json!({ "source": "dev" })).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    assert_eq!(head(app.clone()).await, before, "nothing is committed");
+    let (r, _) = json_req(
+        &app,
+        "POST",
+        "/$/merge/ds",
+        json!({ "source": "dev", "dryRun": true }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let p = r.json();
+    assert_eq!(p["dryRun"], true);
+    assert_eq!(p["outcome"], "rejected", "{p:#}");
+    assert_eq!(p["merge"]["fastForward"], true);
+    assert_eq!(head(app.clone()).await, before);
+}

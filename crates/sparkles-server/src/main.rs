@@ -112,6 +112,13 @@ struct Cli {
     /// Named snapshots per dataset
     #[arg(long, global = true, default_value_t = 256)]
     max_snapshots: usize,
+    /// Branches per dataset, main included
+    #[arg(long, global = true, default_value_t = sparkles::branch::DEFAULT_MAX_BRANCHES)]
+    max_branches: usize,
+    /// The most upstream log segments a new branch links before it is built as its own
+    /// index instead
+    #[arg(long, global = true, default_value_t = sparkles::branch::DEFAULT_MAX_BRANCH_DEPTH)]
+    max_branch_depth: usize,
     /// Prefixes per dataset (0: unlimited); a new one past it is refused, and loaded
     /// data stops adding its prefixes
     #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_MAX_PREFIXES)]
@@ -1766,6 +1773,8 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         history_cache_bytes: cli.history_cache_mb << 20,
         history_max_generations: cli.history_max_generations,
         max_snapshots: cli.max_snapshots,
+        max_branches: cli.max_branches,
+        max_branch_depth: cli.max_branch_depth,
         max_prefixes: cli.max_prefixes,
         commit_digests: cli.commit_digests,
         wal_prealloc_bytes: cli.wal_prealloc_kb << 10,

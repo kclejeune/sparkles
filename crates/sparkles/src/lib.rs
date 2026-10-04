@@ -9,6 +9,7 @@ pub use sparkles_core::{
     tabular, text, trix, validation, vector, vocab, xsd,
 };
 
+mod branches;
 pub mod dataset;
 pub mod querybuilder;
 

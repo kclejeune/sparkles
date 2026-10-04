@@ -9,6 +9,7 @@ use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod branches;
 mod cli_grants;
 #[cfg(feature = "graphql")]
 mod graphql;
