@@ -3,8 +3,10 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
+use sparkles::Dataset;
 use sparkles::guard::GuardLanguage;
-use sparkles::store::{Store, StoreOptions};
+use sparkles::handles::validation::GuardOutcome;
+use sparkles::store::StoreOptions;
 use std::path::PathBuf;
 
 #[derive(Args, Debug)]
@@ -114,20 +116,25 @@ fn data_graph(gs: &[String]) -> sparkles::guard::config::DataGraphSel {
 pub fn run(a: ValidationArgs, opts: StoreOptions) -> Result<()> {
     let mut opts = opts;
     opts.unvalidated_writes = true;
-    let store = Store::open(&a.loc, opts)?;
+    let ds = Dataset::open_with(&a.loc, opts)?;
     if a.status || (a.mode.is_none() && !a.off) {
-        return status(&store, &a.format);
+        return status(&ds, &a.format);
     }
     if a.off {
-        off(&store)?;
+        ds.validation().guard().reset()?;
         println!("validation off");
         return Ok(());
     }
     let mode: sparkles::guard::GuardMode =
         serde_json::from_value(serde_json::json!(a.mode.as_deref().unwrap_or("reject")))?;
-    let summary = match language(&a)? {
-        GuardLanguage::Shacl => set_shacl(&store, &a, mode)?,
-        GuardLanguage::Shex => set_shex(&store, &a, mode)?,
+    let outcome = match language(&a)? {
+        GuardLanguage::Shacl => set_shacl(&ds, &a, mode)?,
+        GuardLanguage::Shex => set_shex(&ds, &a, mode)?,
+    };
+    let summary = match outcome {
+        GuardOutcome::Installed(s) => Ok(s),
+        GuardOutcome::NotConforming(s) => Err(s),
+        _ => bail!("validation was turned off"),
     };
     // ShEx counts associations, every nonconformant one blocking
     let (total, blocking) = match summary.as_ref().unwrap_or_else(|s| s) {
@@ -153,9 +160,13 @@ pub fn run(a: ValidationArgs, opts: StoreOptions) -> Result<()> {
     }
 }
 
-/// Print the installed configuration and status.
-fn status(store: &Store, format: &str) -> Result<()> {
-    let v = crate::write_validation::install(store)?;
+/// Print the installed configuration and status. A configuration whose guard could not
+/// be installed is an error.
+fn status(ds: &Dataset, format: &str) -> Result<()> {
+    if let Some(why) = ds.guard_error() {
+        bail!("{why}");
+    }
+    let v = ds.validation().guard().get();
     if format == "json" {
         let j = v
             .as_ref()
@@ -188,29 +199,13 @@ fn status(store: &Store, format: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove the configuration, whatever its language (every validation file goes).
-fn off(store: &Store) -> Result<()> {
-    #[cfg(feature = "shacl")]
-    sparkles_shacl::guard::set_config(store, None)?;
-    #[cfg(all(feature = "shex", not(feature = "shacl")))]
-    sparkles_shex::guard::set_config(store, None, &sparkles_shex::NoImports)?;
-    #[cfg(not(any(feature = "shacl", feature = "shex")))]
-    let _ = store;
-    Ok(())
-}
-
-/// The summary of setting a configuration: `Ok` when installed, `Err` when `reject` was
-/// refused because the data does not conform.
-type SetResult =
-    std::result::Result<sparkles::guard::ValidationSummary, sparkles::guard::ValidationSummary>;
-
 #[cfg(feature = "shacl")]
 fn set_shacl(
-    store: &Store,
+    ds: &Dataset,
     a: &ValidationArgs,
     mode: sparkles::guard::GuardMode,
-) -> Result<SetResult> {
-    use sparkles_shacl::guard::{self, SetOutcome, ShapesSource, ValidationConfig};
+) -> Result<GuardOutcome> {
+    use sparkles_shacl::guard::{self, ShapesSource, ValidationConfig};
     let threshold: sparkles::guard::Severity = serde_json::from_value(serde_json::json!(
         a.threshold.as_deref().unwrap_or("violation")
     ))
@@ -248,26 +243,26 @@ fn set_shacl(
         report_limit: a.report_limit,
         updated: None,
     };
-    Ok(match guard::set_config(store, Some(cfg))? {
-        SetOutcome::Installed(_, s) => Ok(s),
-        SetOutcome::NotConforming(s) => Err(s),
-        SetOutcome::Removed => bail!("validation was turned off"),
-    })
+    Ok(ds.validation().guard().set_shacl(cfg)?)
 }
 
 #[cfg(not(feature = "shacl"))]
-fn set_shacl(_: &Store, _: &ValidationArgs, _: sparkles::guard::GuardMode) -> Result<SetResult> {
+fn set_shacl(
+    _: &Dataset,
+    _: &ValidationArgs,
+    _: sparkles::guard::GuardMode,
+) -> Result<GuardOutcome> {
     bail!("built without the `shacl` feature")
 }
 
 #[cfg(feature = "shex")]
 fn set_shex(
-    store: &Store,
+    ds: &Dataset,
     a: &ValidationArgs,
     mode: sparkles::guard::GuardMode,
-) -> Result<SetResult> {
+) -> Result<GuardOutcome> {
     use sparkles_shex::guard::{
-        self, CONFIG_FORMAT, MapSource, SchemaSource, SetOutcome, ShexValidationConfig,
+        self, CONFIG_FORMAT, MapSource, SchemaSource, ShexValidationConfig,
     };
     let Some(map) = &a.shape_map else {
         bail!("give --schema FILE (or --schema-graph IRI) and --shape-map MAP");
@@ -301,13 +296,10 @@ fn set_shex(
             report_limit: a.report_limit,
             updated: None,
         };
-        return Ok(
-            match guard::set_config(store, Some(cfg), &sparkles_shex::NoImports)? {
-                SetOutcome::Installed(_, s) => Ok(s),
-                SetOutcome::NotConforming(s) => Err(s),
-                SetOutcome::Removed => bail!("validation was turned off"),
-            },
-        );
+        return Ok(ds
+            .validation()
+            .guard()
+            .set_shex(cfg, &sparkles_shex::NoImports)?);
     }
     let Some(schema) = &a.schema else {
         bail!("give --schema FILE (or --schema-graph IRI) and --shape-map MAP");
@@ -357,15 +349,15 @@ fn set_shex(
         report_limit: a.report_limit,
         updated: None,
     };
-    Ok(match guard::set_config(store, Some(cfg), &resolver)? {
-        SetOutcome::Installed(_, s) => Ok(s),
-        SetOutcome::NotConforming(s) => Err(s),
-        SetOutcome::Removed => bail!("validation was turned off"),
-    })
+    Ok(ds.validation().guard().set_shex(cfg, &resolver)?)
 }
 
 #[cfg(not(feature = "shex"))]
-fn set_shex(_: &Store, _: &ValidationArgs, _: sparkles::guard::GuardMode) -> Result<SetResult> {
+fn set_shex(
+    _: &Dataset,
+    _: &ValidationArgs,
+    _: sparkles::guard::GuardMode,
+) -> Result<GuardOutcome> {
     bail!("built without the `shex` feature")
 }
 
