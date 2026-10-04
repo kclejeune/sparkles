@@ -16,6 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 pub const FC_BLOCK: usize = 16;
 
@@ -54,11 +55,28 @@ struct Sparse {
     starts: Vec<u32>,
     /// the data offset of each group's first block
     offsets: Vec<u64>,
+    /// one bit per group: a lookup asked for the group to be read ahead
+    hinted: Box<[AtomicU64]>,
 }
 
 impl Sparse {
     fn len(&self) -> usize {
         self.offsets.len()
+    }
+
+    /// Whether this is the first lookup in group `g`, which asks for the group's offsets
+    /// and data to be read ahead. Those are two `madvise` calls, which take longer than
+    /// the rest of a lookup when the pages are in memory: `AVG` over 20,000 groups
+    /// interns 20,000 computed decimals, and with a hint on every lookup it ran about
+    /// 15 ms slower at 10.5M triples. So each group asks once in the life of the
+    /// vocabulary. The cold read the hint is for happens then, and later lookups find
+    /// the pages in the page cache. If the kernel evicts them, a lookup reads them a
+    /// page per fault, as it would without the hint.
+    fn first_hint(&self, g: usize) -> bool {
+        let (word, bit) = (&self.hinted[g / 64], 1u64 << (g % 64));
+        // a plain load first, so that warm lookups do not write the shared word
+        word.load(AtomicOrdering::Relaxed) & bit == 0
+            && word.fetch_or(bit, AtomicOrdering::Relaxed) & bit == 0
     }
     fn key(&self, g: usize) -> &[u8] {
         let end = self
@@ -114,6 +132,7 @@ impl Sparse {
             keys: Vec::new(),
             starts: Vec::with_capacity(n),
             offsets: Vec::with_capacity(n),
+            hinted: (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
         };
         let mut pos = 24;
         for _ in 0..n {
@@ -462,14 +481,16 @@ impl Vocab {
             let g = g - 1;
             lo = g * IDX_BLOCKS;
             hi = ((g + 1) * IDX_BLOCKS).min(nb);
-            if let Bytes::Map(m) = &self.offsets {
-                crate::index::will_need(m, lo * 8, (hi - lo) * 8);
+            if crate::index::io_hints() && s.first_hint(g) {
+                if let Bytes::Map(m) = &self.offsets {
+                    crate::index::will_need(m, lo * 8, (hi - lo) * 8);
+                }
+                let end = s
+                    .offsets
+                    .get(g + 1)
+                    .map_or(self.data.as_slice().len(), |&o| o as usize);
+                self.data.will_need(s.offsets[g] as usize, end);
             }
-            let end = s
-                .offsets
-                .get(g + 1)
-                .map_or(self.data.as_slice().len(), |&o| o as usize);
-            self.data.will_need(s.offsets[g] as usize, end);
             // block `lo` starts with the group's key, which is not above `key`
             lo += 1;
         }
@@ -1127,6 +1148,26 @@ mod tests {
             v.prefix_range(b"<http://example.org/r/00001"),
             plain.prefix_range(b"<http://example.org/r/00001")
         );
+    }
+
+    #[test]
+    fn each_group_asks_for_read_ahead_once() {
+        let dir = tempfile::tempdir().unwrap();
+        // 64 groups of IRIs and 16 of literals: two words of the bitmap
+        let keys = write_keys(dir.path(), 64 * FC_BLOCK * IDX_BLOCKS);
+        let v = Vocab::open(dir.path()).unwrap();
+        let s = v.sparse.as_ref().unwrap();
+        assert_eq!(s.len(), 80);
+        for g in [0, 63, 64, 79] {
+            assert!(s.first_hint(g));
+            assert!(!s.first_hint(g));
+        }
+        assert!(s.first_hint(1));
+        // a lookup marks its group, and finds the key with or without the hint
+        let i = 5 * FC_BLOCK * IDX_BLOCKS + 3;
+        assert_eq!(v.find(&keys[i]), Ok(i as u64));
+        assert!(!s.first_hint(5) || !crate::index::io_hints());
+        assert_eq!(v.find(&keys[i]), Ok(i as u64));
     }
 
     #[test]

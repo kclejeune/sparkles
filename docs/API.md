@@ -561,7 +561,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | Method | Path                         | Description |
 |--------|------------------------------|-------------|
 | GET    | `/$/datasets`                | `{ "datasets": [DatasetInfo] }` |
-| POST   | `/$/datasets`                | Creates a dataset. The form or JSON body has `dbName`, `dbType` = `persistent` \| `mem`, and optionally `geo`. Fuseki's `dbType` values `tdb2` and `tdb` mean `persistent`, and `dbName` and `dbType` may also be query parameters. `geo` = `true` adds a spatial index with the defaults. In a JSON body `geo` can also be a `GeoConfig` (see [GeoSPARQL](#geosparql)). An invalid one is a `400`, and a build without the `geo` feature returns `501`. A body in an RDF syntax is a Fuseki service description; see [Assembler bodies](#assembler-bodies). `201` on success, `409` if the dataset exists. |
+| POST   | `/$/datasets`                | Creates a dataset. The form or JSON body has `dbName`, `dbType` = `persistent` \| `mem`, and optionally `geo` and `text`. Fuseki's `dbType` values `tdb2` and `tdb` mean `persistent`, and `dbName` and `dbType` may also be query parameters. `geo` = `true` adds a spatial index with the defaults, and `text` = `true` enables full-text search with the defaults. In a JSON body `geo` can also be a `GeoConfig` (see [GeoSPARQL](#geosparql)) and `text` a `TextConfig` (see [Full-text search](#full-text-search)). An invalid one is a `400` and creates no dataset, and a build without the `geo` or `text` feature returns `501`. A body in an RDF syntax is a Fuseki service description; see [Assembler bodies](#assembler-bodies). `201` on success, `409` if the dataset exists. |
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | POST   | `/$/datasets/{ds}?state=offline\|active` | Fuseki's dataset state. An offline dataset answers `503 {code: "dataset-offline"}` on its own endpoints (`/{ds}/…`) and keeps its admin routes. The state is not persisted, so a restart brings every dataset back. `400` without `state` or for another value. Needs `admin` on the dataset. |
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. |
@@ -3842,6 +3842,23 @@ SELECT ?s ?score ?label WHERE {
 * **Evaluation.** The search runs once within the active graph, and `GRAPH`, `FROM` and
   `reasoning=false` apply inside the search. `limit` is therefore the top n of that scope,
   before any join.
+* **Query strings from the data.** The query string can be a variable that the rest of
+  the group binds, as in `?k ex:keyword ?q . ?s text:query (rdfs:label ?q 10)`. The
+  search then runs once for each distinct value, with the call's limit applying to each
+  search, and each row of the group is joined with the hits of its own value. A value
+  with a language tag searches that language, as `lang:` does. A value that is not a
+  string, or that does not parse, matches nothing, while the same constant is a `400`.
+  The other arguments must still be constants. A query variable that nothing in the
+  group binds is a `400`, and more than 1,000 distinct values are a `507`. EXPLAIN
+  reports the number of searches.
+* **Joins with few subjects.** When a call without a limit and without a rank output is
+  joined with a side that binds its subject in every row to at most 4,096 distinct
+  values, the search only looks for hits of those subjects. Scores do not change,
+  because BM25 statistics are taken over the whole index. EXPLAIN shows this as
+  `searched the N subjects of the join's left side`. A call whose query string is a
+  variable restricts each search to the subjects of its rows in the same way. The
+  `text_subject_pushdown` optimization turns this off (see
+  `QueryOptions::optimizations` and `SPARKLES_DISABLE_OPTIMIZATIONS`).
 * **Analyzer.** Tokens are split on non-alphanumeric characters, lowercased and
   ASCII-folded, so `café` matches `cafe`.
 * **Languages.** An index can also stem the literals of chosen languages, as jena-text
@@ -3872,6 +3889,11 @@ SELECT ?s ?score ?label WHERE {
     `pt`, `ro`, `ru`, `es`, `sv`, `ta` and `tr`, and `zh`, `ja` and `ko` for `cjk`.
     `"all"` names the 18 stemmed languages, so CJK is listed on its own, as in
     `["en", "zh", "ja", "ko"]`.
+  * `porter` stems English with Porter's algorithm after the English stop words, as
+    Lucene's English analyzer, and so jena-text, does, where `english` uses the
+    Snowball English stemmer. The two differ on words such as `relativity`, which
+    Porter stems to `rel`, as it does `relative`, and Snowball to `relat`. No tag takes
+    it by default: `{"en": "porter"}` selects it.
   * `cjk` segments Chinese, Japanese and Korean text without a dictionary, as Lucene's
     `CJKAnalyzer` does. A run of Han, Hiragana, Katakana or Hangul characters becomes its
     overlapping pairs of characters, so `東京都` is indexed as `東京` and `京都`, and a
@@ -3884,9 +3906,18 @@ SELECT ?s ?score ?label WHERE {
   the text of its own snapshot, including the writes just before it. A write only stages
   its documents. The index commit, which writes a new segment, happens at the next text
   query that needs it, about once a second, or as soon as about 16,000 changes are
-  staged. A burst of writes therefore shares one index commit. If an index is behind,
-  after a failed update or during a rebuild, text queries return `503` until it is
-  rebuilt. They never return stale results.
+  staged. A burst of writes therefore shares one index commit. If an index is behind
+  after a failed update, text queries return `503` until it is rebuilt. They never
+  return stale results.
+* **Rebuilds.** `POST /$/text/{ds}/rebuild` builds a new index from a snapshot while
+  writes go on and the current index answers searches. The commits made meanwhile are
+  then applied to the new index, which takes the current one's place, so writes wait
+  only for that last step. A compaction or bulk commit during the build renumbers the
+  store's terms, and the index is then built again with writes waiting. A full rebuild
+  reads only the quads whose object is a literal. A bulk commit, such as a large load,
+  updates the index by the documents it adds and removes when they are few next to the
+  index, and rebuilds it otherwise. Enabling or reconfiguring an index builds it with
+  writes waiting.
 * **Durability.** Index commits are not fsynced. The write-ahead log is the durable
   record. The index is checkpointed (synced) about once a second while writes continue,
   before compaction and on close. After a crash, an index with unsynced changes, marked
@@ -3908,7 +3939,7 @@ SELECT ?s ?score ?label WHERE {
 | GET | `/$/text/{ds}` | `TextStatus` (below), or `{ "enabled": false }` |
 | PUT | `/$/text/{ds}` | Enables or reconfigures the index. The body is a `TextConfig`, and an empty body means the defaults. Returns `202` with the build `Task` (`kind: "text-rebuild"`). |
 | DELETE | `/$/text/{ds}` | Disables and deletes the index (`204`). |
-| POST | `/$/text/{ds}/rebuild` | Rebuilds the index from the current data. Returns `202` with a `Task`, `409` if a rebuild is running, or `400` if the index is not enabled. |
+| POST | `/$/text/{ds}/rebuild` | Rebuilds the index from the current data while writes go on (see Rebuilds above). Returns `202` with a `Task`, `409` if a rebuild is running, or `400` if the index is not enabled. |
 | GET, POST | `/{ds}/text?q=&predicate=&lang=&graph=&limit=&highlight=` | Searches the index and returns `TextHits` (below), best first. `q` is a query string, `predicate` may repeat, `graph` searches one named graph instead of the default graph, `limit` is 1 to 1000 (20 by default), and `highlight=false` leaves out the snippets. It needs `read` on the dataset. `400` for a missing `q` or a bad parameter, as for `text:query`. |
 
 ```ts
@@ -3944,6 +3975,11 @@ an analyzer name, such as `{"en": "english", "gl": "portuguese"}`. `--language a
 `--language en` set it from the CLI. An index without `languages` keeps the schema and
 configuration it had before languages existed and is not rebuilt.
 
+A dataset can also have full-text search from the start. `POST /$/datasets` takes
+`text` = `true` for the defaults, or a `TextConfig` in a JSON body, and the index exists
+before the dataset's first write. The UI's new dataset dialog has a checkbox for it and
+an optional list of predicates.
+
 Dataset info (`/$/datasets`) has `text: null | { state, docs }`. The configuration lives
 in the database directory, in `text.json`, with the index in `text/`. The CLI commands
 are
@@ -3959,6 +3995,15 @@ form is a JSON array of 1–16384 finite numbers, read as `f32`, for example
 `"[0.1, -0.2, 0.3]"^^spk:vector` with `PREFIX spk: <urn:x-sparkles:>`. Literals are
 stored and returned exactly as written. One that does not parse is stored but never
 matched.
+
+The compact datatype `<urn:x-sparkles:vectorB64>` holds the same values as the base64
+(RFC 4648, with padding) of their little-endian IEEE 754 binary32 bytes, so
+`"zczMPc3MTD6amZk+"^^spk:vectorB64` is the vector `[0.1, 0.2, 0.3]` as `f32`. It takes
+about 5.3 bytes per dimension where the JSON form of a typical embedding takes about 12.
+Every function, search, index and option below reads both datatypes alike, and one
+predicate can hold both. A compact literal whose length is not a multiple of 4
+characters, whose bytes are not a whole number of values, or that holds a NaN or an
+infinity, is malformed.
 
 * **Functions.** `spk:cosine(?a, ?b)`, `spk:dot(?a, ?b)`, `spk:euclidean(?a, ?b)` (L2
   distance) and `spk:dimension(?a)`. They raise a type error on a malformed argument, a
@@ -4002,6 +4047,23 @@ matched.
   bound by the rest of the group. `{ ?s a ex:Doc . (?s ?score) spk:vectorSearch (ex:emb ?q
   10 "candidates:join") }` returns the 10 best documents, where the plain search returns
   the documents among the 10 best rows.
+* **Ordering by similarity.** A query that orders one pattern `?s ex:emb ?v` by
+  `DESC(spk:cosine(?v, C))` or `DESC(spk:dot(?v, C))` with a `LIMIT`, where `C` is a
+  constant vector, runs as an exact vector search for the best rows, which the ORDER BY
+  then sorts:
+
+  ```sparql
+  SELECT ?s WHERE { ?s ex:emb ?v } ORDER BY DESC(spk:cosine(?v, "[0.1, -0.2, 0.3]"^^spk:vector)) LIMIT 10
+  ```
+
+  The score can also be bound by a `BIND` and ordered by its variable. The answer is
+  the one the generic plan gives, up to the choice among rows tied at the last place.
+  The search never uses the HNSW graph, so it is exact. When fewer rows than the limit
+  have a score, because the others are malformed or of another dimension, the generic
+  plan runs and puts those rows last, as SPARQL orders errors. An ascending order, the
+  euclidean distance, a constant subject, a `FILTER` or another pattern in the group,
+  or a second ordering key keep the generic plan. EXPLAIN shows a `VectorSearch` with
+  `the best rows of ORDER BY`. The `vector_topk` optimization turns this off.
 * **Without an index.** Vectors are packed per predicate and dimension on their first
   search and cached per index generation. Each search scans them exactly. Every query
   overlays its snapshot's inserts and deletes, so results always match its data. A
@@ -4283,11 +4345,17 @@ SELECT ?s ?score ?textRank ?vectorRank WHERE {
   better.
 * **Fusion.** A subject's score is the sum of `weight / (k + rank)` over the lists that
   hold it. The best `limit` subjects are returned, and ties break by term id.
-* **Restrictions.** The text list takes no `highlight:` option. The vector query must be
-  a vector literal, an entity or a text for an index that computes its vectors, and
-  `candidates:join` is refused. Errors follow the two
-  searches, and malformed calls and options give `400`. The call needs the `text`
-  feature and a full-text index.
+* **Queries from the group.** The text query string and the vector query can be
+  variables that the rest of the group binds, as in `VALUES ?q { … } (?s ?score)
+  spk:hybridSearch ((rdfs:label ?t) (ex:emb ?q))`. The call then runs once for each
+  distinct pair of values, at most 1,000 pairs, and each row joins with the fused rows
+  of its own pair. A text value that is not a string, or does not parse, gives an empty
+  text ranking. With `candidates:join` in the vector list, the vector ranking holds only
+  the subjects that the rest of the group binds to `?s`, and the text ranking is not
+  restricted. EXPLAIN reports the number of fusions.
+* **Restrictions.** The text list takes no `highlight:` option. Errors follow the two
+  searches, and malformed calls and options give `400`, as does a query variable that
+  nothing in the group binds. The call needs the `text` feature and a full-text index.
 
 ## Path search
 
@@ -4316,15 +4384,17 @@ ORDER BY ?path ?i
 
 The block holds triples with one subject, usually `[]`, whose predicates are the
 parameters below. An unknown parameter, or one given twice that takes one value, fails
-with `400`.
+with `400`. The block can also hold a nested pattern whose solutions are the edges, as
+described under "Edges from a pattern" below.
 
 | Parameter | Value | Default | Meaning |
 |---|---|---|---|
 | `path:source` | a variable or a constant | required | The first node of each path. |
 | `path:target` | a variable or a constant | required | The last node of each path. |
 | `path:algorithm` | `path:shortest`, `path:allShortest`, `path:kShortest` or `path:all` | `path:shortest` | One shortest path per pair, every shortest path, the `k` shortest paths (Yen's algorithm), or every path up to `path:maxLength`. |
-| `path:predicate` | an IRI, repeatable | every predicate | The predicates whose triples are edges. |
-| `path:direction` | `path:forward`, `path:backward` or `path:both` | `path:forward` | Follow a triple from subject to object, from object to subject, or both ways. |
+| `path:predicate` | an IRI, or a list of an IRI and a direction, repeatable | every predicate | The predicates whose triples are edges. `(ex:parent path:backward)` follows that predicate in its own direction. |
+| `path:direction` | `path:forward`, `path:backward` or `path:both` | `path:forward` | Follow a triple from subject to object, from object to subject, or both ways. It applies to the predicates without a direction of their own, and to the edges of a nested pattern. |
+| `path:start`, `path:end` | variables | | The variables of a nested pattern that give each edge's start and end. |
 | `path:minLength` | an integer | 1 | The fewest edges. 0 adds the empty path from a node to itself. The shortest modes take 0 or 1. |
 | `path:maxLength` | an integer | none | The most edges. `path:all` requires it. |
 | `path:k` | a positive integer | none | The paths per pair of `path:kShortest`, which requires it. |
@@ -4334,7 +4404,8 @@ with `400`.
 | `path:defaultWeight` | a non-negative number | 1 | The weight of an edge without one. |
 | `path:pathIndex` | a variable | | The path's number in the result, from 0. |
 | `path:edgeIndex` | a variable | | The edge's position in its path, from 0. |
-| `path:edgeSubject`, `path:edgePredicate`, `path:edgeObject` | variables | | The edge's triple as stored. |
+| `path:edgeSubject`, `path:edgePredicate`, `path:edgeObject` | variables | | The edge's triple as stored. For the edges of a nested pattern, the start and end, and no predicate. |
+| `path:edge` | a variable | | The edge's triple as a triple term, `<<( s p o )>>`. |
 | `path:length` | a variable | | The number of edges, an `xsd:integer`. |
 | `path:cost` | a variable | | The sum of the weights, an `xsd:double`. Without `path:weight` it is the length. |
 
@@ -4343,8 +4414,8 @@ with `400`.
   `?s foaf:knows+ ?s` would, and the empty path only with `path:minLength 0`. Two
   triples between the same nodes with different predicates make two different paths.
   Literals can end a path.
-* **Rows.** With any of `path:edgeIndex`, `path:edgeSubject`, `path:edgePredicate` and
-  `path:edgeObject`, the call returns one row per edge. Without them it returns one row
+* **Rows.** With any of `path:edgeIndex`, `path:edgeSubject`, `path:edgePredicate`,
+  `path:edgeObject` and `path:edge`, the call returns one row per edge. Without them it returns one row
   per path. A path of length 0 has one row with the edge variables unbound. The source
   and target variables are bound to each path's ends.
 * **Sources and targets from the query.** When `path:source` or `path:target` is a
@@ -4367,6 +4438,32 @@ with `400`.
   reifier gives no weight.
 * **Without predicates** every triple is an edge, `rdf:type` included, so a search
   without `path:predicate` usually visits far more nodes than one with them.
+* **Directions per predicate.** `path:predicate ex:knows, (ex:parent path:backward)`
+  follows `ex:knows` from subject to object and `ex:parent` from object to subject, so
+  `ex:a ex:knows ex:b . ex:c ex:parent ex:b` gives the path `a b c`. The edge variables
+  still give each triple as stored. A list with anything other than an IRI and one of
+  the three directions fails with `400`.
+* **Edges from a pattern.** Instead of predicates, the block can hold a graph pattern
+  whose solutions are the edges, as QLever's and GraphDB's path services allow.
+  `path:start` and `path:end` name the pattern's variables of an edge's two ends:
+
+  ```sparql
+  SERVICE path:search {
+    [] path:source ex:alice ; path:target ?t ; path:start ?x ; path:end ?y ;
+       path:length ?len .
+    { ?x foaf:knows ?y } UNION { ?y ex:parent ?x }
+  }
+  ```
+
+  The pattern is evaluated once in the active graph, and each distinct pair of its
+  `?x` and `?y` values is one edge. It can be a group, a `UNION`, a subquery, and a
+  `FILTER` in the block filters it. Its other variables stay inside it. `path:direction`
+  applies to these edges, and `path:edgeSubject` and `path:edgeObject` give their start
+  and end. Such edges have no triple, so `path:predicate`, `path:edgePredicate`,
+  `path:edge` and `path:weight` cannot be combined with a pattern, and fail with `400`,
+  as does a pattern without `path:start` and `path:end` or one that does not bind them.
+  The search then reads a table of the pattern's edges instead of the indexes, so it
+  costs the pattern's evaluation and is best for edges no predicate list can describe.
 * **Budgets.** Besides `path:maxVisited`, a search counts against the query's timeout,
   memory budget and row limits. `path:allShortest` and `path:all` can find
   exponentially many paths, which `path:limit` bounds.

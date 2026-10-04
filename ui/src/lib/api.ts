@@ -752,8 +752,12 @@ export async function listDatasets(): Promise<DatasetInfo[]> {
 
 export const getDataset = (ds: string) => json<DatasetInfo>(`/$/datasets/${enc(ds)}`);
 
-export const createDataset = (dbName: string, dbType: DatasetType) =>
-  json<unknown>('/$/datasets', jsonBody({ dbName, dbType }));
+/** `POST /$/datasets`; `text` enables full-text search on the new dataset. */
+export const createDataset = (
+  dbName: string,
+  dbType: DatasetType,
+  opts: { text?: boolean | TextConfig } = {},
+) => json<unknown>('/$/datasets', jsonBody({ dbName, dbType, ...opts }));
 
 export const deleteDataset = (ds: string) =>
   json<unknown>(`/$/datasets/${enc(ds)}`, { method: 'DELETE' });

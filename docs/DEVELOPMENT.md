@@ -39,8 +39,8 @@ Node, pnpm or Rust on the host. `mise run docker:build` builds the image of
 
 ## mise tasks
 
-[`mise.toml`](../mise.toml) pins Node, pnpm, hyperfine, prek, shfmt and shellcheck. Rust
-comes from `rust-toolchain.toml`. `mise.toml` also defines the everyday tasks, and
+[`mise.toml`](../mise.toml) pins Node, pnpm, hyperfine, prek, shfmt, shellcheck, a Java 17
+and a Java 21 JDK, and Gradle. Rust comes from `rust-toolchain.toml`. `mise.toml` also defines the everyday tasks, and
 `mise tasks` lists them all:
 
 ```sh
@@ -63,7 +63,12 @@ mise run py:build     # the Python wheel (crates/sparkles-py) into target/wheels
 mise run py:sdist     # the Python source distribution into target/wheels
 mise run py:test      # build the Python extension and run its pytest suite (in ci, with py:lint)
 mise run py:lock      # refresh crates/sparkles-py/Cargo.lock from Cargo.lock
-mise run ci           # fmt:check + lint + lint:features + lint:doc-paths + fmt:wasm + test + ui:test + py:lint + py:test + licenses:check
+mise run jvm:build    # the sparkles-jena jar (jvm/sparkles-jena/build/libs), with the native library
+mise run jvm:test     # Jena's contract tests and the binding's own tests (in ci, with jvm:lint and jvm:rust-test)
+mise run jvm:sample   # compile, test and run the Java sample (jvm/sample-java)
+mise run jvm:lock     # refresh crates/sparkles-ffi/Cargo.lock from Cargo.lock
+mise run jvm:nix-deps # refresh nix/jvm-deps.json after the Gradle dependencies change
+mise run ci           # fmt:check + lint + lint:features + lint:doc-paths + fmt:wasm + test + ui:test + py:lint + py:test + jvm:lint + jvm:rust-test + jvm:test + licenses:check
 mise run doc          # API docs of the library crates
 mise run openapi      # rewrite docs/openapi.json after an API change (a test fails until then)
 mise run docs:screenshots # the README's screenshots (docs/images) from the demo dataset in docs/demo
@@ -94,7 +99,7 @@ runs every hook over the whole tree.
 ## Testing
 
 ```sh
-mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, Python binding tests, license notices
+mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, Python and JVM binding tests, license notices
 mise run lint:features # clippy over feature combinations (in ci)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites, SHACL 1.2 list tests, SHACLC pairs
@@ -183,6 +188,34 @@ the vendored spargebra that the crate's `[patch.crates-io]` names, so the script
 to the archive and points the patch at it. `mise run py:wheel-test -- <wheel or sdist>
 <python>...` installs a package into a fresh virtual environment for each interpreter
 and runs the pytest suite against the installation (`scripts/py-wheel-test.sh`).
+
+### JVM bindings
+
+`crates/sparkles-ffi` is the native library of the JVM bindings
+([USAGE](USAGE.md#jvm-apache-jena), [spec P04](specs/P04-jvm-bindings.md)). It exports
+the engine through UniFFI 0.32 and is its own cargo workspace with its own `Cargo.lock`,
+for the same reasons as `crates/sparkles-py`. UniFFI's bindings generator, with its
+template engine and object-file reader, is a binary of the crate behind the `bindgen`
+feature, so the generated Kotlin and the library's scaffolding always come from the same
+UniFFI version. `mise run jvm:lock` refreshes the lock from the root one.
+
+`mise run jvm:native` (`scripts/jvm-native.sh`) builds the library in release mode in the
+root `target` directory and writes its generated Kotlin to `target/jvm/uniffi`.
+`JVM_PROFILE=dev` builds it without optimizations. The Gradle build in `jvm/` runs through
+its checked-in wrapper and reads both paths, which the Gradle properties
+`sparkles.nativeLib` and `sparkles.bindings` can change. It compiles the generated code
+on its own, puts the library into the jar under
+`io/github/kclejeune/sparkles/native/<os>-<arch>/` with its SHA-256, and compiles the
+library in explicit API mode with warnings as errors. `mise run jvm:test` runs Jena's
+contract tests from Jena's published test jars, the acceptance examples of the spec, and
+jena-core's JUnit 3 graph suite. `mise run jvm:sample` builds the Java sample with
+`-Xlint:all -Werror` and runs it.
+
+`./gradlew :sparkles-jena:perfCheck -Pdata=DATA.nt -Pqueries=QUERIES.tsv`, run in `jvm/`,
+times queries through Jena on Sparkles, through the native library alone and on an
+in-memory TDB2 dataset. `cargo run --release --example perf --manifest-path
+crates/sparkles-ffi/Cargo.toml --target-dir target -- DATA.nt QUERIES.tsv 10` times the same
+queries through the Rust API. Each line of `QUERIES.tsv` is a name, a tab and a query.
 
 #### Release workflow
 
@@ -410,6 +443,12 @@ The flake is built on flake-parts, rust-overlay and crane, with the toolchain fr
   * `sparkles-fmt-wasm`: the formatter's WebAssembly module, which `sparkles-ui` builds in.
   * `sparkles-py`: the Python package for nixpkgs' `python3`, built into an abi3 wheel by
     maturin. The wheel is in its `dist` output.
+  * `sparkles-ffi`: the JVM bindings' native library in `lib/`, with the Kotlin that its
+    `uniffi-bindgen` generates in `share/uniffi`.
+  * `sparkles-jena`: the JVM library's jar in `share/java`, built by Gradle offline with the
+    host's native library inside. Its Maven dependencies are pinned in
+    `nix/jvm-deps.json`, which `mise run jvm:nix-deps` refreshes through
+    `gradle.fetchDeps`.
 * **Other outputs:**
   * `overlays.default`;
   * a dev shell;
@@ -417,10 +456,12 @@ The flake is built on flake-parts, rust-overlay and crane, with the toolchain fr
     * the packages;
     * `sparkles-tests`, which runs the unit tests of the engine and the facade
       (`cargo test -p sparkles-core -p sparkles --lib`);
-    * `fmt`, which runs rustfmt over the workspace and `crates/sparkles-py` as
-      `mise run fmt:check` does;
+    * `fmt`, which runs rustfmt over the workspace, `crates/sparkles-py` and
+      `crates/sparkles-ffi` as `mise run fmt:check` does;
     * `python-bindings`, which builds `sparkles-py` and runs the pytest suite on the
       installed package;
+    * on Linux, `jvm-bindings`, which builds `sparkles-jena` and runs its tests and the
+      Java sample's tests offline;
     * `ui-licenses`, which checks that `THIRD_PARTY_LICENSES-UI.md` matches the UI build;
     * on Linux, a NixOS VM test of the module behind nginx;
     * on Linux, `ui-e2e`, which runs the Playwright UI tests against the release binary
@@ -489,7 +530,11 @@ only when `Cargo.lock` does. Ship it with binaries. The Nix packages install it 
 The script also writes `crates/sparkles-py/THIRD_PARTY_LICENSES.md` for the Python wheel
 from that crate's own lock. It lists the crates the extension module links, which are the
 engine's and PyO3's. maturin puts it in the wheel's `licenses/` directory with the
-project's `LICENSE`, as `pyproject.toml` declares. `licenses:check` checks both files.
+project's `LICENSE`, as `pyproject.toml` declares. It writes
+`jvm/sparkles-jena/THIRD_PARTY_LICENSES.md` for the JVM library from the lock of
+`crates/sparkles-ffi`, and the jar carries it in `META-INF` with the project's `LICENSE`.
+Crates that state MPL-2.0 without a license file, such as UniFFI's, get the MPL-2.0 text
+that another crate ships. `licenses:check` checks all three files.
 
 [`THIRD_PARTY_LICENSES-UI.md`](../THIRD_PARTY_LICENSES-UI.md) does the same for the npm
 packages whose code or fonts end up in the embedded web UI. These are CodeMirror,

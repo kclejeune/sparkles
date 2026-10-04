@@ -764,7 +764,7 @@ impl Dataset {
 // -------------------------------------------------------------------------- graphs ----
 
 #[derive(Clone, Debug)]
-enum GraphSel {
+pub(crate) enum GraphSel {
     Default,
     Named(NamedNode),
     Blank(oxrdf::BlankNode),
@@ -862,8 +862,8 @@ impl GraphView<'_> {
 /// A write transaction over terms (Jena `Txn` + `DatasetGraph.add/delete`).
 /// Blank node labels in inserted data are scoped to the transaction.
 pub struct Transaction<'s> {
-    txn: WriteTxn<'s>,
-    labels: HashMap<String, Id>,
+    pub(crate) txn: WriteTxn<'s>,
+    pub(crate) labels: HashMap<String, Id>,
 }
 
 impl Transaction<'_> {
@@ -1083,7 +1083,7 @@ fn subject_id(snap: &Snapshot, s: &NamedOrBlankNode) -> Option<Id> {
     }
 }
 
-fn quad_ids(snap: &Snapshot, q: QuadRef<'_>) -> Option<[Id; 4]> {
+pub(crate) fn quad_ids(snap: &Snapshot, q: QuadRef<'_>) -> Option<[Id; 4]> {
     let q = q.into_owned();
     Some([
         subject_id(snap, &q.subject)?,
@@ -1100,16 +1100,16 @@ fn quad_ids(snap: &Snapshot, q: QuadRef<'_>) -> Option<[Id; 4]> {
 /// How to read the quads of a pattern: the permutation with the longest bound prefix,
 /// the prefix, the bound components to check past it, and whether only named graphs
 /// count (the union graph, whose triples are deduplicated).
-struct ScanPlan {
-    perm: Perm,
-    prefix: Vec<u64>,
-    bound: [Option<u64>; 4],
-    named_only: bool,
+pub(crate) struct ScanPlan {
+    pub(crate) perm: Perm,
+    pub(crate) prefix: Vec<u64>,
+    pub(crate) bound: [Option<u64>; 4],
+    pub(crate) named_only: bool,
 }
 
 impl ScanPlan {
     /// Whether a quad of the scan matches the components past the prefix.
-    fn matches(&self, q: &[Id; 4]) -> bool {
+    pub(crate) fn matches(&self, q: &[Id; 4]) -> bool {
         !(0..4).any(|c| self.bound[c].is_some_and(|b| b != q[c].0))
             && !(self.named_only && q[3] == Id::DEFAULT_GRAPH)
     }
@@ -1118,7 +1118,7 @@ impl ScanPlan {
 /// The scan of a pattern, or `None` when a bound term is not in the store (no match).
 /// With `graph_last`, the scan reads a permutation that ends with the graph, so the
 /// quads of one triple are adjacent.
-fn scan_plan(
+pub(crate) fn scan_plan(
     snap: &Snapshot,
     graph: &GraphSel,
     subject: Option<&NamedOrBlankNode>,
@@ -1207,17 +1207,17 @@ const QUAD_BATCH: usize = 4096;
 /// iteration after it is returned.
 pub struct QuadIter {
     snap: Arc<Snapshot>,
-    plan: Option<ScanPlan>,
+    pub(crate) plan: Option<ScanPlan>,
     /// where the next batch starts; `None` once the scan is done
     next: Option<Key>,
     hi: Key,
-    batch: std::vec::IntoIter<Key>,
+    pub(crate) batch: std::vec::IntoIter<Key>,
     /// triples already returned (union graph only)
-    seen: FxHashSet<[Id; 3]>,
+    pub(crate) seen: FxHashSet<[Id; 3]>,
 }
 
 impl QuadIter {
-    fn new(snap: Arc<Snapshot>, plan: Option<ScanPlan>) -> QuadIter {
+    pub(crate) fn new(snap: Arc<Snapshot>, plan: Option<ScanPlan>) -> QuadIter {
         let pad = |v: u64| -> Key {
             let mut k = [v; 4];
             if let Some(p) = &plan {
@@ -1241,7 +1241,7 @@ impl QuadIter {
     }
 
     /// Read the next batch of keys; false when the scan is done.
-    fn fill(&mut self) -> Result<bool> {
+    pub(crate) fn fill(&mut self) -> Result<bool> {
         let (Some(plan), Some(lo)) = (&self.plan, self.next) else {
             return Ok(false);
         };

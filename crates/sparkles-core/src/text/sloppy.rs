@@ -139,7 +139,12 @@ impl SloppyScorer {
                     return TERMINATED;
                 }
                 for (_, p) in &mut self.postings {
-                    let d = p.seek(target);
+                    // a word's postings may already be past the target (never seek back)
+                    let d = if p.doc() < target {
+                        p.seek(target)
+                    } else {
+                        p.doc()
+                    };
                     if d > target {
                         target = d;
                         continue 'all;

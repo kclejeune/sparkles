@@ -1,0 +1,298 @@
+package io.github.kclejeune.sparkles.jena.engine
+
+import io.github.kclejeune.sparkles.jena.DatasetGraphSparkles
+import io.github.kclejeune.sparkles.jena.SparklesFallback
+import io.github.kclejeune.sparkles.jena.internal.CancelWatcher
+import io.github.kclejeune.sparkles.jena.internal.RowBatch
+import io.github.kclejeune.sparkles.jena.internal.RowDecoder
+import io.github.kclejeune.sparkles.jena.internal.ffi.ErrorKind
+import io.github.kclejeune.sparkles.jena.internal.ffi.FfiException
+import io.github.kclejeune.sparkles.jena.internal.ffi.FfiQuery
+import io.github.kclejeune.sparkles.jena.internal.ffi.FfiQueryKind
+import io.github.kclejeune.sparkles.jena.internal.ffi.InternalException
+import io.github.kclejeune.sparkles.jena.internal.ffi.QueryOpts
+import io.github.kclejeune.sparkles.jena.internal.mapError
+import io.github.kclejeune.sparkles.jena.SparklesInternalException
+import org.apache.jena.atlas.io.IndentedWriter
+import org.apache.jena.graph.Node
+import org.apache.jena.query.Query
+import org.apache.jena.query.QueryExecException
+import org.apache.jena.query.Syntax
+import org.apache.jena.sparql.algebra.Algebra
+import org.apache.jena.sparql.algebra.Op
+import org.apache.jena.sparql.algebra.Transformer
+import org.apache.jena.sparql.algebra.op.OpLabel
+import org.apache.jena.sparql.algebra.op.OpTable
+import org.apache.jena.sparql.algebra.AlgebraQuad
+import org.apache.jena.sparql.algebra.TransformGraphRename
+import org.apache.jena.sparql.core.DatasetGraph
+import org.apache.jena.sparql.core.Quad
+import org.apache.jena.sparql.core.Var
+import org.apache.jena.sparql.engine.Plan
+import org.apache.jena.sparql.engine.PlanOp
+import org.apache.jena.sparql.engine.QueryEngineFactory
+import org.apache.jena.sparql.engine.QueryEngineRegistry
+import org.apache.jena.sparql.engine.QueryIterator
+import org.apache.jena.sparql.engine.binding.Binding
+import org.apache.jena.sparql.engine.binding.BindingBase
+import org.apache.jena.sparql.engine.iterator.QueryIteratorBase
+import org.apache.jena.sparql.engine.main.QueryEngineMain
+import org.apache.jena.sparql.serializer.SerializationContext
+import org.apache.jena.sparql.syntax.ElementGroup
+import org.apache.jena.sparql.util.Context
+import org.slf4j.LoggerFactory
+
+/**
+ * The query engine (P04 §3.4): a whole query runs in Sparkles' planner and executor, and
+ * its solutions come back to Jena as bindings in batches. A query that uses something only
+ * Java can evaluate runs in ARQ over the dataset's `find()` (§3.5).
+ */
+public object QueryEngineSparkles {
+    private val log = LoggerFactory.getLogger(QueryEngineSparkles::class.java)
+
+    /** The factory registered with Jena's `QueryEngineRegistry`. */
+    @JvmField
+    public val factory: QueryEngineFactory = Factory
+
+    /** Register the engine with Jena (done by Jena's initialization). */
+    @JvmStatic
+    @Synchronized
+    public fun register() {
+        if (!QueryEngineRegistry.get().contains(factory)) QueryEngineRegistry.addFactory(factory)
+    }
+
+    /** Remove the engine from Jena's registry. */
+    @JvmStatic
+    @Synchronized
+    public fun unregister() {
+        QueryEngineRegistry.removeFactory(factory)
+    }
+
+    private object Factory : QueryEngineFactory {
+        override fun accept(query: Query, dataset: DatasetGraph, context: Context): Boolean = dataset is DatasetGraphSparkles
+
+        override fun create(query: Query, dataset: DatasetGraph, inputBinding: Binding, context: Context): Plan =
+            plan(query, dataset as DatasetGraphSparkles, inputBinding, context)
+
+        /** Algebra executed directly runs in ARQ in Phase 1. */
+        override fun accept(op: Op, dataset: DatasetGraph, context: Context): Boolean = false
+
+        override fun create(op: Op, dataset: DatasetGraph, inputBinding: Binding, context: Context): Plan =
+            throw UnsupportedOperationException("Sparkles does not execute algebra")
+    }
+
+    private fun plan(query: Query, dsg: DatasetGraphSparkles, input: Binding, context: Context): Plan {
+        val mode = fallbackMode(dsg, context)
+        val reason = if (mode == SparklesFallback.ALWAYS) {
+            "the fallback mode is ALWAYS"
+        } else {
+            FallbackDetector.check(query, context, knownOf(dsg))
+        }
+        if (reason != null) {
+            if (mode == SparklesFallback.NEVER) {
+                throw QueryExecException("the query needs ARQ, and the fallback mode is NEVER: $reason")
+            }
+            log.debug("query runs in ARQ: {}", reason)
+            dsg.handle.fallbackQueries.incrementAndGet()
+            return arqPlan(query, dsg, input, context)
+        }
+        dsg.handle.nativeQueries.incrementAndGet()
+        val text = sparklesText(query)
+        val opts = requestOptions(dsg, context, input.takeUnless { it.isEmpty })
+        val iter = QueryIterSparkles(dsg, query, text, opts, input, context, mode)
+        return PlanOp(OpLabel.create("sparkles", OpTable.unit()), null, iter)
+    }
+
+    /** ARQ's plan for the query, with the union default graph when the request has it. */
+    internal fun arqPlan(query: Query, dsg: DatasetGraphSparkles, input: Binding, context: Context): Plan {
+        if (!unionDefaultGraph(dsg, context)) return QueryEngineMain(query, dsg, input, context).plan
+        // as QueryEngineTDB does: quads, with the default graph renamed to the union graph
+        var op = Algebra.compile(query)
+        op = AlgebraQuad.quadize(op)
+        op = Transformer.transform(TransformGraphRename(Quad.defaultGraphNodeGenerated, Quad.unionGraph), op)
+        return QueryEngineMain(op, dsg, input, context).plan
+    }
+
+    /**
+     * The text Sparkles runs. Jena applies the CONSTRUCT template, takes the first solution
+     * for ASK and runs the DESCRIBE handlers itself, so every form becomes a SELECT.
+     */
+    internal fun sparklesText(query: Query): String {
+        if (query.isSelectType) return query.serialize(Syntax.syntaxARQ)
+        val q = query.cloneQuery()
+        val ask = q.isAskType
+        q.setQuerySelectType()
+        q.setQueryResultStar(true)
+        if (q.queryPattern == null) q.queryPattern = ElementGroup()
+        if (ask) q.limit = 1
+        return q.serialize(Syntax.syntaxARQ)
+    }
+}
+
+/**
+ * The solutions of a query run in Sparkles. The query is prepared when the iterator is
+ * made and runs when Jena first asks for a binding, which is when Jena's first timeout
+ * starts counting. A syntax error or `Unsupported` from Sparkles before any row replaces
+ * it with ARQ's plan for the same query (the late check of P04 §3.5).
+ */
+internal class QueryIterSparkles(
+    private val dsg: DatasetGraphSparkles,
+    private val query: Query,
+    text: String,
+    opts: QueryOpts,
+    input: Binding,
+    private val context: Context,
+    private val mode: SparklesFallback,
+) : QueryIteratorBase(Context.getCancelSignal(context)) {
+    private val input: Binding = input
+    private val cancelSignal = Context.getCancelSignal(context)
+    private val parent: Binding? = input.takeUnless { it.isEmpty }
+    private var ffiQuery: FfiQuery? = dsg.source().prepareQuery(text, opts)
+    private var started = false
+    private var done = false
+    private var delegate: QueryIterator? = null
+    private val decoder = RowDecoder()
+    private var batch: RowBatch? = null
+    private var row = 0
+    private var vars: Array<Var> = emptyArray()
+
+    private fun start() {
+        started = true
+        val q = ffiQuery ?: return
+        val signal = cancelSignal
+        if (signal != null) CancelWatcher.watch(q, signal)
+        val e = try {
+            q.execute(FIRST_ROWS.toUInt())
+        } catch (e: FfiException.Engine) {
+            if (e.kind == ErrorKind.SPARQL_SYNTAX || e.kind == ErrorKind.UNSUPPORTED) {
+                fallBack(e.detail)
+                return
+            }
+            release()
+            throw mapError(e)
+        } catch (e: InternalException) {
+            release()
+            throw SparklesInternalException("Internal", e.message ?: "a failure in the native library")
+        } finally {
+            CancelWatcher.unwatch(q)
+        }
+        vars = e.variables.map { Var.alloc(it) }.toTypedArray()
+        if (e.kind == FfiQueryKind.ASK) {
+            done = true
+            release()
+            return
+        }
+        batch = decoder.decode(e.batch)
+        row = 0
+        if (e.done) {
+            done = true
+            release()
+        }
+    }
+
+    private fun fallBack(why: String) {
+        release()
+        if (mode == SparklesFallback.NEVER) {
+            throw QueryExecException("Sparkles cannot run the query, and the fallback mode is NEVER: $why")
+        }
+        LOG.debug("query runs in ARQ after Sparkles refused it: {}", why)
+        dsg.handle.nativeQueries.decrementAndGet()
+        dsg.handle.fallbackQueries.incrementAndGet()
+        delegate = QueryEngineSparkles.arqPlan(query, dsg, input, context).iterator()
+    }
+
+    private fun fetch(): Boolean {
+        if (done) return false
+        val q = ffiQuery ?: return false
+        val b = try {
+            q.nextBatch(LATER_ROWS.toUInt())
+        } catch (e: FfiException.Engine) {
+            throw mapError(e)
+        }
+        batch = decoder.decode(b.batch)
+        row = 0
+        if (b.done) {
+            done = true
+            release()
+        }
+        return batch!!.rows > 0
+    }
+
+    override fun hasNextBinding(): Boolean {
+        if (!started) start()
+        delegate?.let { return it.hasNext() }
+        val b = batch ?: return false
+        if (row < b.rows) return true
+        return fetch()
+    }
+
+    override fun moveToNextBinding(): Binding {
+        delegate?.let { return it.nextBinding() }
+        val b = batch!!
+        val n = vars.size
+        val values = arrayOfNulls<Node>(n)
+        val base = row * b.columns
+        for (i in 0 until n) values[i] = decoder.node(b.cells[base + i])
+        row++
+        return BindingSparkles(parent, vars, values)
+    }
+
+    private fun release() {
+        ffiQuery?.let {
+            it.release()
+            it.close()
+        }
+        ffiQuery = null
+    }
+
+    override fun closeIterator() {
+        delegate?.close()
+        release()
+    }
+
+    override fun requestCancel() {
+        delegate?.cancel()
+        ffiQuery?.cancel()
+    }
+
+    override fun output(out: IndentedWriter, sCxt: SerializationContext?) {
+        out.print("QueryIterSparkles")
+    }
+
+    private companion object {
+        val LOG = LoggerFactory.getLogger(QueryIterSparkles::class.java)
+        const val FIRST_ROWS = 256
+        const val LATER_ROWS = 8192
+    }
+}
+
+/** A solution from Sparkles: the result's variables and an array of nodes (null is unbound). */
+internal class BindingSparkles(
+    parent: Binding?,
+    private val vars: Array<Var>,
+    private val values: Array<Node?>,
+) : BindingBase(parent) {
+    private fun index(v: Var): Int {
+        for (i in vars.indices) if (vars[i] == v) return i
+        return -1
+    }
+
+    override fun vars1(): MutableIterator<Var> =
+        vars.indices.filter { values[it] != null }.map { vars[it] }.toMutableList().iterator()
+
+    override fun size1(): Int = values.count { it != null }
+
+    override fun isEmpty1(): Boolean = values.all { it == null }
+
+    override fun contains1(v: Var): Boolean {
+        val i = index(v)
+        return i >= 0 && values[i] != null
+    }
+
+    override fun get1(v: Var): Node? {
+        val i = index(v)
+        return if (i >= 0) values[i] else null
+    }
+
+    override fun detachWithNewParent(newParent: Binding?): Binding = BindingSparkles(newParent, vars, values)
+}

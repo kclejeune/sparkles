@@ -1,0 +1,60 @@
+# The native library of the JVM bindings (spec docs/specs/P04-jvm-bindings.md), exported
+# through UniFFI and called from Kotlin through JNA.
+#
+# This crate is its own workspace, excluded from the root one, as crates/sparkles-py is:
+# UniFFI's bindings generator brings in a template engine and an object-file reader that
+# neither the server nor the root workspace's lint and test runs should compile. It has its
+# own Cargo.lock, refreshed from the root lock with `mise run jvm:lock`, and repeats the
+# root's spargebra patch and profiles. `mise run jvm:build` builds it and the jar.
+[package]
+name = "sparkles-ffi"
+description = "The native library of the Sparkles JVM bindings (UniFFI)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/kclejeune/sparkles"
+publish = false
+
+[lib]
+name = "sparkles_ffi"
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+# the bindings generator, built from this crate's own lock so that the generated Kotlin
+# and the library's scaffolding come from the same UniFFI version
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[dependencies]
+uniffi = "=0.32.2"
+sparkles = { path = "../sparkles", features = ["zstd", "brotli"] }
+oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
+rustc-hash = "2"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["text", "geo"]
+# the same names as the server's features
+text = ["sparkles/text"]
+geo = ["sparkles/geo"]
+# the uniffi-bindgen binary
+bindgen = ["uniffi/cli"]
+
+[workspace]
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+# UniFFI turns a panic into an exception on the Kotlin side; an abort would end the JVM
+panic = "unwind"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# the root workspace's patch (see vendor/spargebra/PATCHED.md)
+[patch.crates-io]
+spargebra = { path = "../../vendor/spargebra" }

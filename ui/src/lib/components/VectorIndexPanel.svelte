@@ -28,6 +28,7 @@
     parseVector,
     recallKey,
     resolvePredicate,
+    VECTOR_B64_DATATYPE,
     VECTOR_DATATYPE,
     type IndexForm,
     type IndexFormErrors,
@@ -281,11 +282,11 @@
     try {
       const rows = await api.select(
         name,
-        `SELECT ?o WHERE { ?s ${sparqlIri(iri)} ?o . FILTER(DATATYPE(?o) = <${VECTOR_DATATYPE}>) } LIMIT 1`,
+        `SELECT ?o WHERE { ?s ${sparqlIri(iri)} ?o . FILTER(DATATYPE(?o) IN (<${VECTOR_DATATYPE}>, <${VECTOR_B64_DATATYPE}>)) } LIMIT 1`,
       );
       if (!owns()) return;
       const o = rows[0]?.o;
-      const v = o?.type === 'literal' ? parseVector(o.value) : null;
+      const v = o?.type === 'literal' ? parseVector(o.value, o.datatype) : null;
       if (v) {
         form.dimension = String(v.length);
         detectNote = `A vector of this predicate has ${v.length} dimensions.`;

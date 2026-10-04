@@ -12,6 +12,7 @@ pub use sparkles_core::{
 #[cfg(feature = "backup")]
 pub mod backup;
 pub mod dataset;
+pub mod embed;
 #[cfg(feature = "fmt")]
 pub mod fmt;
 pub mod handles;

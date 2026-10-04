@@ -71,6 +71,8 @@
             rustc = toolchain;
           };
           # Chromium for the Playwright UI tests (the dev shell and the `ui-e2e` check)
+          # the JVM bindings: the native library, the jar and its check
+          jvm = pkgs.callPackage ./nix/jvm.nix { inherit rustPlatform; };
           playwrightBrowsers = pkgs.playwright-driver.browsers.override {
             withFirefox = false;
             withWebkit = false;
@@ -100,6 +102,10 @@
             };
             # the Python bindings (crates/sparkles-py) for nixpkgs' python3
             sparkles-py = pkgs.callPackage ./nix/python.nix { inherit rustPlatform; };
+            # the JVM bindings' native library (lib/) with its generated Kotlin (share/uniffi)
+            sparkles-ffi = jvm.ffi;
+            # the sparkles-jena jar (share/java) with the host's native library inside
+            sparkles-jena = jvm.jar;
             default = self'.packages.sparkles;
           };
 
@@ -133,6 +139,9 @@
                 ps.rdflib
               ]))
               pkgs.maturin
+              # the JVM bindings (`mise run jvm:test`): a Java 17 toolchain and Gradle 9
+              pkgs.jdk17
+              pkgs.gradle_9
               pkgs.mise
             ];
           };
@@ -141,8 +150,8 @@
             inherit (self'.packages) sparkles sparkles-cli;
             # the engine's unit tests, on the packages' dependency layer
             sparkles-tests = self'.packages.sparkles-cli.passthru.tests;
-            # rustfmt, as `mise run fmt:check` runs it (crates/sparkles-py is its own
-            # workspace, outside `--all`)
+            # rustfmt, as `mise run fmt:check` runs it (crates/sparkles-py and
+            # crates/sparkles-ffi are their own workspaces, outside `--all`)
             fmt = craneLib.cargoFmt {
               pname = "sparkles";
               version = (lib.importTOML ./Cargo.toml).workspace.package.version;
@@ -156,7 +165,10 @@
                 ];
               };
               cargoExtraArgs = "--all";
-              postBuild = "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml -- --check";
+              postBuild = ''
+                cargo fmt --manifest-path crates/sparkles-py/Cargo.toml -- --check
+                cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml -- --check
+              '';
             };
             # the wheel, installed, with the pytest suite as its check phase
             python-bindings = self'.packages.sparkles-py;
@@ -198,6 +210,9 @@
                   touch $out
                 '';
             nixos-module = pkgs.testers.runNixOSTest (import ./nix/test.nix { inherit self; });
+            # the jar built offline, with Jena's contract tests, the binding's own tests and
+            # the Java sample's tests as its check phase
+            jvm-bindings = jvm.check;
             # the Playwright UI tests against the release binary, in nixpkgs' Chromium
             ui-e2e = pkgs.callPackage ./nix/ui-e2e.nix {
               inherit (self'.packages) sparkles;

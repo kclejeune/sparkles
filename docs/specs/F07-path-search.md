@@ -1,11 +1,14 @@
 # F07: Path search
 
-> **Status:** implemented in part (Phase 1, part of Phase 2)
+> **Status:** implemented in part (Phases 1 and 2)
 >
 > **Phases:** Phase 1 shipped. It covers `SERVICE path:search` with the four modes,
 > predicate sets and directions, ends bound by the query, weights on reifiers, the
 > limits and the masked view. Searches per named graph under `GRAPH ?g`, planned for
-> Phase 2, came with it. The rest of Phase 2 and Phase 3 are not built.
+> Phase 2, came with it, and the MCP tool `find_paths` came later. The rest of Phase 2
+> shipped on 2026-10-03: edges from a nested pattern, a direction per predicate and the
+> `path:edge` binding. Phase 3 waits for the Cypher frontend of [F01](F01-cypher.md),
+> which is not built.
 >
 > **User docs:** [API: Path search](../API.md#path-search) · [Usage: Finding paths](../USAGE.md#finding-paths) · [Features](../FEATURES.md#sparql-arq-equivalent)
 >
@@ -506,11 +509,49 @@ visited more than 10 million nodes and failed. A weighted search from one person
 everyone took 1.6 s, because Dijkstra's algorithm seeks the index once per node instead
 of sweeping whole levels.
 
-**Not built.** Edges from a nested pattern, a direction per predicate, a `path:edge`
-binding of the edge as a triple term and the Cypher frontend's use of the operator were
-not built. Zero-weight edges can hide equally cheap paths from `path:allShortest`, as
-§9 says.
+**Not built at first.** Edges from a nested pattern, a direction per predicate, a
+`path:edge` binding of the edge as a triple term and the Cypher frontend's use of the
+operator were not built with Phase 1. Zero-weight edges can hide equally cheap paths
+from `path:allShortest`, as §9 says.
 
 **Later additions (2026-10-03).** The MCP server gained a dedicated tool, `find_paths`,
 which writes the search's block from its arguments and returns the paths with their
 edges ([C11](C11-mcp-server.md#outcome)).
+
+**The rest of Phase 2 (2026-10-03).**
+* **A direction per predicate.** The spec named the feature but not its syntax. A
+  `path:predicate` value can be a list of the predicate and a direction, as in
+  `path:predicate ex:knows, (ex:parent path:backward)`. Such a predicate is followed in
+  its own direction, and `path:direction` applies to the others. Each predicate's
+  direction gives its own index lanes, so a mixed search reads the indexes exactly as a
+  search with one direction does. The planner takes a list's `rdf:first` and `rdf:rest`
+  triples out of the block before it reads the parameters.
+* **`path:edge`.** It binds each edge, in the rows per edge, to the triple term
+  `<<( s p o )>>` of its stored triple, built once per edge of the call. The term joins
+  with `rdf:reifies` and the triple term functions.
+* **Edges from a nested pattern.** The block can hold a graph pattern besides its
+  configuration triples: plain triples, groups, `UNION`s or a subquery, and a `FILTER`
+  of the block filters it. `path:start` and `path:end` name its variables of an edge's
+  ends, which follows QLever's `pathSearch:start` and `pathSearch:end`. The planner
+  plans the pattern in the active graph as the leaf's last child, after the input of a
+  search with bound ends. The executor evaluates it once and keeps its distinct
+  (start, end) pairs in two maps, by start and by end, which the searches read in place
+  of the indexes. `path:direction` applies to these edges. Since they have no triple,
+  `path:predicate`, `path:edgePredicate`, `path:edge` and `path:weight` are refused with
+  a pattern, and so are a pattern without `path:start` and `path:end`, those two
+  without a pattern, and an end variable the pattern does not bind.
+* **Tests.** `crates/sparkles-core/tests/path_search.rs` gained a test of the three
+  features and their errors, a test of edges that are a join in the block with a
+  `FILTER`, and a differential test on random graphs. It compares a search with
+  `ex:p0` forward and `ex:p1` backward, and the same search over the pattern
+  `{ ?x ex:p0 ?y } UNION { ?y ex:p1 ?x }`, with paths enumerated by brute force.
+* **Performance.** On the 10.5M-triple benchmark data, with 21 to 31 interleaved runs
+  per query against the build before the change, while other builds kept the load
+  average between 39 and 49 on 16 cores, the searches over predicates did not change.
+  The shortest path 17 edges long took a median of 7.5 ms and 6.1 ms of server CPU,
+  against 8.9 ms and 7.1 ms. The 5 shortest paths took 134 ms and 119 ms of CPU,
+  against 146 ms and 128 ms, and the paths to everyone 693 ms and 476 ms of CPU,
+  against 737 ms and 474 ms. A search with `foaf:knows` forward and `ex:advisor`
+  backward took 12 ms. The same shortest path over the nested pattern
+  `?x foaf:knows ?y` took 1.4 s, because the pattern's 2.6 million edges are read and
+  kept in maps first, so a pattern is for edges that predicates cannot describe.

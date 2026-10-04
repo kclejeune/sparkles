@@ -334,9 +334,12 @@ fn budgets_and_errors() {
         (hybrid("\"brown\"", "ex:emb", ""), "vector list"),
         (hybrid("\"brown\" ?x", v, ""), "constants"),
         (
-            "SELECT ?s { ?d ex:emb ?q . (?s ?score) spk:hybridSearch ((\"brown\") (ex:emb ?q)) }"
-                .into(),
-            "vector literal or an entity",
+            "SELECT ?s { (?s ?score) spk:hybridSearch ((\"brown\") (ex:emb ?q)) }".into(),
+            "vector query variable ?q is not bound",
+        ),
+        (
+            "SELECT ?s { (?s ?score) spk:hybridSearch ((rdfs:label ?t) (ex:emb ?q)) }".into(),
+            "text query variable ?t is not bound",
         ),
         (
             "SELECT ?s { (?s ?score) spk:hybridSearch (\"brown\" \"x\") }".into(),
@@ -355,4 +358,74 @@ fn budgets_and_errors() {
     let plain = store(None);
     let e = err(&plain, &hybrid("\"brown\"", v, ""));
     assert!(e.contains("no full-text index"), "{e}");
+}
+
+/// Query values bound by the group: one fusion per value (or pair of values), each the
+/// fusion its constants give; `candidates:join` ranks only the group's subjects.
+#[test]
+fn queries_bound_by_the_group() {
+    let s = store(Some(TextConfig::default()));
+    for v in ["\"[1,0]\"^^spk:vector", "\"[0,1]\"^^spk:vector", "ex:d"] {
+        let constant = rows(&s, &hybrid("\"brown\"", &format!("ex:emb {v} 3"), "3"));
+        let bound = rows(
+            &s,
+            &format!(
+                "SELECT ?s ?score ?tr ?vr {{ VALUES ?q {{ {v} }} (?s ?score ?tr ?vr) spk:hybridSearch ((\"brown\") (ex:emb ?q 3) 3) }} ORDER BY DESC(?score) ?s"
+            ),
+        );
+        assert_eq!(bound, constant, "{v}");
+    }
+    for t in ["brown", "fox", "red OR bear"] {
+        let constant = rows(
+            &s,
+            &hybrid(
+                &format!("rdfs:label \"{t}\""),
+                "ex:emb \"[1,0]\"^^spk:vector",
+                "4",
+            ),
+        );
+        let bound = rows(
+            &s,
+            &format!(
+                "SELECT ?s ?score ?tr ?vr {{ VALUES ?t {{ \"{t}\" }} (?s ?score ?tr ?vr) spk:hybridSearch ((rdfs:label ?t) (ex:emb \"[1,0]\"^^spk:vector) 4) }} ORDER BY DESC(?score) ?s"
+            ),
+        );
+        assert_eq!(bound, constant, "{t}");
+    }
+    // several pairs at once: each row gets its own pair's fusion
+    let r = rows(
+        &s,
+        "SELECT ?t ?s { VALUES (?t ?q) { (\"brown\" \"[1,0]\"^^spk:vector) (\"red\" \"[0,1]\"^^spk:vector) } \
+         (?s ?score) spk:hybridSearch ((?t) (ex:emb ?q 1) 1) }",
+    );
+    assert_eq!(sorted(r), ["brown a", "red c"]);
+    // a value that is not a string or a vector matches nothing in that list
+    let r = rows(
+        &s,
+        "SELECT ?s ?tr ?vr { VALUES ?t { 7 } (?s ?score ?tr ?vr) spk:hybridSearch ((?t) (ex:emb \"[0,1]\"^^spk:vector 1) 2) }",
+    );
+    assert_eq!(r, ["c - 1"]);
+    // candidates:join: the vector ranking among the documents only
+    let r = rows(
+        &s,
+        "SELECT ?s ?tr ?vr { ?s a ex:Doc . (?s ?score ?tr ?vr) spk:hybridSearch ((\"brown\") (ex:emb \"[0,1]\"^^spk:vector 2 \"candidates:join\") 5) } ORDER BY ?s",
+    );
+    assert_eq!(
+        r,
+        ["a 2 -", "b 2 2", "d - 1"],
+        "e is first by text, but not a document"
+    );
+    let plan = query(
+        s.snapshot(),
+        &format!(
+            "{P}SELECT ?s {{ VALUES ?q {{ \"[1,0]\"^^spk:vector \"[0,1]\"^^spk:vector }} (?s ?score) spk:hybridSearch ((\"brown\") (ex:emb ?q)) }}"
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap()
+    .plan;
+    fn has(p: &sparkles_core::sparql::PlanInfo, needle: &str) -> bool {
+        p.description.contains(needle) || p.children.iter().any(|c| has(c, needle))
+    }
+    assert!(has(&plan, "[2 fusions]"), "{plan:#?}");
 }

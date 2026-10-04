@@ -194,6 +194,50 @@ fn languages_are_configured_per_index() {
     assert_eq!(hits(&s, "\"run\" \"lang:en\""), ["a", "b", "d"]);
 }
 
+/// `porter`: English with Porter's stemmer, as Lucene's (and jena-text's) English
+/// analyzer stems, where `english` uses Snowball's.
+#[test]
+fn english_can_stem_with_porter() {
+    let data = r#"
+@prefix ex: <http://example.org/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:t1 rdfs:label "On the theory of relativity"@en .
+ex:t2 rdfs:label "Relative motion"@en .
+ex:t3 rdfs:label "Theories of generalization"@en .
+ex:t4 rdfs:label "General theories"@en .
+ex:t5 rdfs:label "A generous offer"@en .
+"#;
+    let open = |cfg: &str| {
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            data.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        s.enable_text(serde_json::from_str(cfg).unwrap()).unwrap();
+        s
+    };
+    let porter = open(r#"{"languages": {"en": "porter"}}"#);
+    let snowball = open(r#"{"languages": {"en": "english"}}"#);
+    // Porter stems general, generalization and generous to "gener", Snowball keeps
+    // generous apart
+    assert_eq!(hits(&porter, "\"general\" \"lang:en\""), ["t3", "t4", "t5"]);
+    assert_eq!(hits(&snowball, "\"general\" \"lang:en\""), ["t3", "t4"]);
+    // both merge relativity and relative (to "rel" and "relat"), stem theories and
+    // theory alike, and drop the English stop words
+    for s in [&porter, &snowball] {
+        assert_eq!(hits(s, "\"relativity\" \"lang:en\""), ["t1", "t2"]);
+        assert_eq!(hits(s, "\"theories\" \"lang:en\""), ["t1", "t3", "t4"]);
+        assert_eq!(hits(s, "\"+of +theory\" \"lang:en\""), ["t1", "t3", "t4"]);
+    }
+    let cfg: TextConfig = serde_json::from_str(r#"{"languages": {"en": "Porter"}}"#).unwrap();
+    let Languages::Only(m) = &cfg.languages else {
+        panic!()
+    };
+    assert_eq!(m.get("en"), Some(&Analyzer::Porter));
+}
+
 const CJK_DATA: &str = r#"
 @prefix ex: <http://example.org/> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .

@@ -1761,3 +1761,49 @@ fn rows_produced_is_shared_by_the_operations_of_an_update() {
     );
     assert_eq!(s.snapshot().len(), before);
 }
+
+#[test]
+fn union_default_graph_per_request() {
+    let count = |s: &Store, text: &str, u: Option<bool>| -> usize {
+        let opts = QueryOptions {
+            union_default_graph: u,
+            ..Default::default()
+        };
+        query(s.snapshot(), text, &opts).unwrap().table.len()
+    };
+    for store_union in [false, true] {
+        let s = Store::in_memory(StoreOptions {
+            union_default_graph: store_union,
+            ..Default::default()
+        });
+        s.load(&[Source::from_bytes(
+            TRIG.as_bytes().to_vec(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+        let all = "SELECT * { ?s ?p ?o }";
+        let named = "SELECT * { GRAPH ?g { ?s ?p ?o } }";
+        // the store's setting, then each override; the cache keeps them apart
+        for _ in 0..2 {
+            assert_eq!(count(&s, all, None), if store_union { 4 } else { 1 });
+            assert_eq!(count(&s, all, Some(true)), 4);
+            assert_eq!(count(&s, all, Some(false)), 1);
+            // the named graphs stay as they are
+            assert_eq!(count(&s, named, Some(true)), 4);
+            assert_eq!(count(&s, named, Some(false)), 4);
+        }
+        // an update's WHERE sees the same default graph
+        let opts = QueryOptions {
+            union_default_graph: Some(true),
+            ..Default::default()
+        };
+        let st = update::update(
+            &s,
+            "INSERT { <http://ex.org/copy> <http://ex.org/p> ?o } WHERE { ?s ?p ?o }",
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(st.inserted, 4);
+    }
+}

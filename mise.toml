@@ -12,6 +12,11 @@ hyperfine = "1.20"
 prek = "0.5.4"
 shfmt = "3.14.1"
 shellcheck = "0.11.0"
+# The JVM bindings (jvm/): the library builds with a Java 17 toolchain, and Java 21 runs Jena
+# 6 and Fuseki 6. Gradle runs through the checked-in wrapper (jvm/gradlew); this Gradle is the
+# version the wrapper and nixpkgs' gradle_9 pin, for `gradle wrapper` and the Nix lock file.
+java = ["temurin-17.0.20+8", "temurin-21.0.12+8.0.LTS"]
+gradle = "9.7.1"
 
 # ------------------------------------------------------------------------------ UI ----
 
@@ -126,8 +131,12 @@ run = "prek run --all-files"
 [tasks.fmt]
 description = "Format Rust and UI code"
 depends = ["ui:fmt"]
-# crates/sparkles-py is its own workspace, outside `--all`
-run = ["cargo fmt --all", "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml"]
+# crates/sparkles-py and crates/sparkles-ffi are their own workspaces, outside `--all`
+run = [
+  "cargo fmt --all",
+  "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml",
+  "cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml",
+]
 
 [tasks."fmt:check"]
 description = "Check formatting (CI)"
@@ -135,6 +144,7 @@ depends = ["ui:fmt:check"]
 run = [
   "cargo fmt --all --check",
   "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml --check",
+  "cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml --check",
 ]
 
 [tasks."fmt:jsonld-compare"]
@@ -201,8 +211,8 @@ description = "Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectio
 run = "scripts/test-jena-clients.sh"
 
 [tasks.ci]
-description = "Everything CI should run: formatting, lints, cited paths in the docs, the formatter's browser build, Rust, UI and Python binding tests, third-party license notices up to date"
-depends = ["fmt:check", "lint", "lint:features", "lint:doc-paths", "fmt:wasm", "test", "ui:test", "py:lint", "py:test", "licenses:check"]
+description = "Everything CI should run: formatting, lints, cited paths in the docs, the formatter's browser build, Rust, UI, Python and JVM binding tests, third-party license notices up to date"
+depends = ["fmt:check", "lint", "lint:features", "lint:doc-paths", "fmt:wasm", "test", "ui:test", "py:lint", "py:test", "jvm:lint", "jvm:rust-test", "jvm:test", "licenses:check"]
 
 # ------------------------------------------------------------------- Python bindings ----
 # crates/sparkles-py is its own cargo workspace (see its Cargo.toml). These tasks build it
@@ -239,6 +249,55 @@ run = [
   "cp Cargo.lock crates/sparkles-py/Cargo.lock",
   "cargo metadata --manifest-path crates/sparkles-py/Cargo.toml --format-version 1 > /dev/null",
 ]
+
+# ---------------------------------------------------------------------- JVM bindings ----
+# crates/sparkles-ffi is its own cargo workspace (see its Cargo.toml), built in the root
+# target directory so that it reuses the workspace's compiled dependencies. jvm/ is the Gradle
+# build of the Kotlin library, run through its checked-in wrapper.
+
+[tasks."jvm:native"]
+description = "Build the JVM bindings' native library (crates/sparkles-ffi, release; JVM_PROFILE=dev for an unoptimized one) and generate its Kotlin bindings into target/jvm/uniffi"
+run = "scripts/jvm-native.sh"
+
+[tasks."jvm:build"]
+description = "Build the sparkles-jena jar (jvm/sparkles-jena/build/libs), with the host's native library inside"
+depends = ["jvm:native"]
+dir = "jvm"
+run = "./gradlew --console=plain :sparkles-jena:assemble"
+
+[tasks."jvm:test"]
+description = "Jena's contract tests and the binding's own tests on the host's native library; extra args go to Gradle"
+depends = ["jvm:native"]
+dir = "jvm"
+run = "./gradlew --console=plain :sparkles-jena:test"
+
+[tasks."jvm:sample"]
+description = "Compile the Java sample (jvm/sample-java) with -Xlint:all -Werror against the library, run its tests, and run it"
+depends = ["jvm:native"]
+dir = "jvm"
+run = "./gradlew --console=plain :sample-java:build :sample-java:run"
+
+[tasks."jvm:lint"]
+description = "Clippy (warnings are errors) on the JVM bindings' native library, with its default features and with none"
+run = [
+  "cargo clippy --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --all-targets -- -D warnings",
+  "cargo clippy --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
+]
+
+[tasks."jvm:rust-test"]
+description = "The native library's Rust tests (the batch encoding and the objects the Kotlin library uses)"
+run = "cargo test --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target"
+
+[tasks."jvm:lock"]
+description = "Refresh crates/sparkles-ffi/Cargo.lock from the root Cargo.lock, after the workspace's dependencies change"
+run = [
+  "cp Cargo.lock crates/sparkles-ffi/Cargo.lock",
+  "cargo metadata --manifest-path crates/sparkles-ffi/Cargo.toml --format-version 1 > /dev/null",
+]
+
+[tasks."jvm:nix-deps"]
+description = "Refresh nix/jvm-deps.json, the Gradle dependencies the Nix build of the jar fetches (after jvm/ dependencies change)"
+run = "nix build .#sparkles-jena.mitmCache.updateScript -o target/jvm-nix-deps-update && target/jvm-nix-deps-update"
 
 # -------------------------------------------------------------------------- build / run ----
 
