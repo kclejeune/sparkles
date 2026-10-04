@@ -619,6 +619,12 @@ mod imp {
     };
     use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
+    /// A bulk commit is applied to the index document by document when it adds at most
+    /// one document per `BULK_SHARE` the index holds, or `BULK_MIN`; more are faster to
+    /// index by a rebuild, which runs several writer threads.
+    const BULK_SHARE: usize = 8;
+    const BULK_MIN: usize = 20_000;
+
     /// The index format. Format 2 keeps each document's terms in columns (fast fields),
     /// where format 1 kept them in the doc store. An index of another format is rebuilt
     /// on open.
@@ -1201,6 +1207,69 @@ mod imp {
         }
     }
 
+    /// The quads of `snap` that can be documents under `cfg`: those of the configured
+    /// predicates, or with every predicate those whose object is a literal.
+    fn for_each_candidate(
+        snap: &Snapshot,
+        cfg: &TextConfig,
+        mut f: impl FnMut(&[Id; 4]) -> Result<()>,
+    ) -> Result<()> {
+        use crate::index::Perm;
+        match &cfg.predicates {
+            PredicateSet::Only(ps) => {
+                for p in ps {
+                    let Some(pid) = snap.lookup_iri(p) else {
+                        continue;
+                    };
+                    snap.scan(Perm::Pso, &[pid.0], |c| {
+                        match c {
+                            crate::store::Chunk::Block(b, s, e) => {
+                                for i in s..e {
+                                    f(&Perm::Pso.to_quad(&b.key(i)))?;
+                                }
+                            }
+                            crate::store::Chunk::Row(k) => f(&Perm::Pso.to_quad(&k))?,
+                        }
+                        Ok(true)
+                    })?;
+                }
+                Ok(())
+            }
+            PredicateSet::All => for_each_literal_quad(snap, f),
+        }
+    }
+
+    /// The quads whose object is a literal of the vocabulary, the only ones that can be
+    /// documents, in OPS order: the base vocabulary's keys that start with `"`, then
+    /// every delta id (the delta vocabulary is not sorted, so its IRIs are read too).
+    fn for_each_literal_quad(
+        snap: &Snapshot,
+        mut f: impl FnMut(&[Id; 4]) -> Result<()>,
+    ) -> Result<()> {
+        use crate::index::Perm;
+        let (lo, hi) = snap.generation.vocab.prefix_range(b"\"");
+        let mut ranges = Vec::with_capacity(2);
+        if lo < hi {
+            ranges.push((Id::vocab(lo).0, Id::vocab(hi - 1).0));
+        }
+        ranges.push((Id::delta(0).0, Id::local(0).0 - 1));
+        for (a, b) in ranges {
+            let (from, to) = ([a, 0, 0, 0], [b, u64::MAX, u64::MAX, u64::MAX]);
+            snap.scan_between(Perm::Ops, from, to, |c| {
+                match c {
+                    crate::store::Chunk::Block(b, s, e) => {
+                        for i in s..e {
+                            f(&Perm::Ops.to_quad(&b.key(i)))?;
+                        }
+                    }
+                    crate::store::Chunk::Row(k) => f(&Perm::Ops.to_quad(&k))?,
+                }
+                Ok(true)
+            })?;
+        }
+        Ok(())
+    }
+
     struct Doc {
         key: [u8; 16],
         /// see [`doc_hash`]
@@ -1217,6 +1286,8 @@ mod imp {
     struct Terms {
         preds: rustc_hash::FxHashMap<Id, Option<(String, Vec<u8>, bool)>>,
         graphs: rustc_hash::FxHashMap<Id, Option<(String, Vec<u8>, bool)>>,
+        /// the last object and its key: a rebuild reads quads in object order
+        last_o: Option<(Id, Option<Arc<[u8]>>)>,
     }
 
     impl Terms {
@@ -1229,10 +1300,30 @@ mod imp {
             cfg: &TextConfig,
             q: &[Id; 4],
         ) -> Option<Doc> {
+            self.document_or_key(snap, f, cfg, q, true)
+        }
+
+        /// [`document`](Self::document), or with `build` false only the key and hash: an
+        /// in-scope quad then gets an empty document.
+        fn document_or_key(
+            &mut self,
+            snap: &Snapshot,
+            f: &Fields,
+            cfg: &TextConfig,
+            q: &[Id; 4],
+            build: bool,
+        ) -> Option<Doc> {
             if !matches!(q[2].tag(), Tag::Vocab | Tag::Delta) {
                 return None;
             }
-            let o = snap.key(q[2])?;
+            let o = match &self.last_o {
+                Some((id, o)) if *id == q[2] => o.clone()?,
+                _ => {
+                    let o: Option<Arc<[u8]>> = snap.key(q[2]).map(|k| Arc::from(&*k));
+                    self.last_o = Some((q[2], o.clone()));
+                    o?
+                }
+            };
             let (lex, lang) = string_literal(&o)?;
             if self.preds.len() >= MEMO_MAX {
                 self.preds.clear();
@@ -1275,6 +1366,13 @@ mod imp {
                     key,
                     hash,
                     doc: None,
+                });
+            }
+            if !build {
+                return Some(Doc {
+                    key,
+                    hash,
+                    doc: Some(TantivyDocument::default()),
                 });
             }
             let mut d = TantivyDocument::default();
@@ -1471,6 +1569,18 @@ mod imp {
             self.inner.rebuild(snap)
         }
 
+        /// After a bulk commit from `old` to `new` (states of different generations):
+        /// bring the index to `new` by the documents that differ, and return `new`'s
+        /// view. `None` when that would not pay: the index does not reflect `old`, or
+        /// the commit adds too many documents for one writer thread, and a rebuild is
+        /// then cheaper. Nothing has changed in that case.
+        pub fn apply_bulk(&self, old: &Snapshot, new: &Snapshot) -> Result<Option<Arc<TextView>>> {
+            if !self.inner.healthy() {
+                return Ok(None);
+            }
+            self.inner.apply_bulk(old, new)
+        }
+
         pub fn status(&self, view: Option<&TextView>, store_seq: u64) -> TextStatus {
             self.inner.status(view, store_seq)
         }
@@ -1601,6 +1711,92 @@ mod imp {
                 self.seal_locked(live)?;
             }
             Ok(self.view_in(live, snap.commit, slot))
+        }
+
+        /// See [`TextIndex::apply_bulk`]. The documents of `old` are known by their keys,
+        /// and `new`'s candidates are compared against them: a document of `new` whose
+        /// key is not among them is added, and the keys of `old` that `new` does not
+        /// have are deleted. The change is committed and synced at once, because the
+        /// write-ahead log of the new generation does not hold it.
+        fn apply_bulk(
+            self: &Arc<Self>,
+            old: &Snapshot,
+            new: &Snapshot,
+        ) -> Result<Option<Arc<TextView>>> {
+            let t0 = Instant::now();
+            let mut live = self.live.lock();
+            let live = &mut *live;
+            self.settle_locked(live)?;
+            if live.applied != old.commit {
+                return Ok(None);
+            }
+            let fields = live.shared.fields.clone();
+            let cfg = &self.config;
+            let mut keys: Vec<[u8; 16]> = Vec::new();
+            let mut terms = Terms::default();
+            for_each_candidate(old, cfg, |q| {
+                if let Some(Doc {
+                    key, doc: Some(_), ..
+                }) = terms.document_or_key(old, &fields, cfg, q, false)
+                {
+                    keys.push(key);
+                }
+                Ok(())
+            })?;
+            keys.sort_unstable();
+            keys.dedup();
+            // past this many additions one writer thread is slower than a rebuild
+            let most = (keys.len() / BULK_SHARE).max(BULK_MIN);
+            let mut kept = vec![false; keys.len()];
+            let mut terms = Terms::default();
+            let (mut added, mut too_many) = (0usize, false);
+            let writer = live.writer()?;
+            for_each_candidate(new, cfg, |q| {
+                if too_many {
+                    return Ok(());
+                }
+                let Some(Doc {
+                    key, doc: Some(_), ..
+                }) = terms.document_or_key(new, &fields, cfg, q, false)
+                else {
+                    return Ok(());
+                };
+                match keys.binary_search(&key) {
+                    Ok(i) => kept[i] = true,
+                    Err(_) => {
+                        if added == most {
+                            too_many = true;
+                            return Ok(());
+                        }
+                        if let Some(Doc { doc: Some(d), .. }) = terms.document(new, &fields, cfg, q)
+                        {
+                            writer.add_document(d).map_err(text_err)?;
+                            added += 1;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            if too_many {
+                writer.rollback().map_err(text_err)?;
+                return Ok(None);
+            }
+            let mut deleted = 0usize;
+            for (key, _) in keys.iter().zip(&kept).filter(|(_, k)| !**k) {
+                writer.delete_term(Term::from_field_bytes(fields.key, key));
+                deleted += 1;
+            }
+            live.applied = new.commit;
+            live.staged = added + deleted;
+            self.commit_locked(live)?;
+            live.uncertain.clear();
+            live.last = Slot::sealed(live.reader.searcher(), Default::default());
+            self.checkpoint_locked(live)?;
+            tracing::info!(
+                "full-text index after a bulk commit: {added} documents added and {deleted} removed in {:?}",
+                t0.elapsed()
+            );
+            Ok(Some(self.view_in(live, new.commit, live.last.clone())))
         }
 
         /// Commit the writer and reload the reader. The payload names the applied commit,
@@ -1746,28 +1942,7 @@ mod imp {
                     }
                     Ok(())
                 };
-                match &self.config.predicates {
-                    PredicateSet::Only(ps) => {
-                        use crate::index::Perm;
-                        for p in ps {
-                            let Some(pid) = snap.lookup_iri(p) else {
-                                continue;
-                            };
-                            snap.scan(Perm::Pso, &[pid.0], |c| {
-                                match c {
-                                    crate::store::Chunk::Block(b, s, e) => {
-                                        for i in s..e {
-                                            add(&Perm::Pso.to_quad(&b.key(i)))?;
-                                        }
-                                    }
-                                    crate::store::Chunk::Row(k) => add(&Perm::Pso.to_quad(&k))?,
-                                }
-                                Ok(true)
-                            })?;
-                        }
-                    }
-                    PredicateSet::All => snap.for_each_quad(&mut add)?,
-                }
+                for_each_candidate(snap, &self.config, &mut add)?;
                 self.epoch.fetch_add(1, Ordering::SeqCst);
                 let payload = self.payload(snap.commit);
                 let mut prepared = writer.prepare_commit().map_err(text_err)?;

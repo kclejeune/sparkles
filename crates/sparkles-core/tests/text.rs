@@ -1010,6 +1010,135 @@ fn concurrent_searches_match_their_snapshots() {
     );
 }
 
+/// A full rebuild with every predicate reads only the quads with literal objects, from
+/// the base vocabulary and from literals added since, and indexes what maintenance did.
+#[test]
+fn rebuilds_index_what_maintenance_indexed() {
+    let s = mem();
+    sparkles_core::sparql::update::update(
+        &s,
+        &format!(
+            "{P}INSERT DATA {{ ex:b5 rdfs:label \"Brown Owl\" ; ex:see ex:b1 . _:x rdfs:label \"brown bnode\" . \
+             GRAPH ex:g2 {{ ex:b6 rdfs:comment \"brown in a graph\"@en-GB }} }} ; \
+             DELETE DATA {{ ex:b2 rdfs:label \"Brown Bears\" }}"
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let q = "SELECT ?s ?l { GRAPH ?g { (?s ?sc ?l) text:query \"brown OR fox OR foxglove\" } }";
+    let q_default = "SELECT ?s ?l { (?s ?sc ?l) text:query \"brown OR fox OR foxglove\" }";
+    let maintained = (sorted(rows(&s, q)), sorted(rows(&s, q_default)));
+    let docs = s.text_status().unwrap().docs;
+    assert_eq!(maintained.0.len() + maintained.1.len(), 7, "{maintained:?}");
+    s.rebuild_text().unwrap();
+    let st = s.text_status().unwrap();
+    assert_eq!((st.docs, st.state.as_str()), (docs, "ready"));
+    assert_eq!(
+        (sorted(rows(&s, q)), sorted(rows(&s, q_default))),
+        maintained
+    );
+    // a typed literal is never a document
+    assert!(
+        rows(&s, "SELECT ?s { ?s text:query \"fox\" }")
+            .iter()
+            .all(|r| r != "p1")
+    );
+    // and after compaction, from the base vocabulary alone
+    s.compact().unwrap();
+    s.rebuild_text().unwrap();
+    assert_eq!(s.text_status().unwrap().docs, docs);
+    assert_eq!(
+        (sorted(rows(&s, q)), sorted(rows(&s, q_default))),
+        maintained
+    );
+}
+
+/// A bulk commit that adds or replaces few documents updates the index by them, without a
+/// rebuild, and a reopened store finds the index as it was left.
+#[test]
+fn bulk_commits_update_the_index_by_their_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let opts = || StoreOptions {
+        bulk_threshold: 20,
+        ..Default::default()
+    };
+    let ttl = |from: usize, to: usize, word: &str| {
+        let mut t = String::new();
+        for i in from..to {
+            t.push_str(&format!(
+                "<http://example.org/n{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"number {i} {word}\" .\n"
+            ));
+        }
+        Source::from_bytes(t.into_bytes(), RdfFormat::NTriples, None)
+    };
+    let count = |s: &Store, w: &str| {
+        rows(
+            s,
+            &format!("SELECT (COUNT(*) AS ?n) {{ ?s text:query \"{w}\" }}"),
+        )[0]
+        .clone()
+    };
+    {
+        let s = Store::open(&root, opts()).unwrap();
+        load(&s);
+        s.enable_text(TextConfig::default()).unwrap();
+        // the first big load is indexed by a rebuild, since the index was nearly empty
+        s.load(&[ttl(0, 30_000, "walrus")]).unwrap();
+        let built = s.text_status().unwrap().last_rebuild.unwrap();
+        assert_eq!(count(&s, "walrus"), "30000");
+        // a small bulk load adds its documents
+        s.load(&[ttl(30_000, 30_050, "narwhal")]).unwrap();
+        let st = s.text_status().unwrap();
+        assert_eq!(st.last_rebuild.unwrap().at, built.at);
+        assert_eq!((st.state.as_str(), st.seq), ("ready", st.store_seq));
+        assert_eq!(count(&s, "narwhal"), "50");
+        assert_eq!(st.docs, 30_050 + 6);
+        // replacing a graph removes the documents of what it held
+        s.replace(
+            sparkles_core::store::ReplaceTarget::Named(oxrdf::NamedNode::new_unchecked(
+                "http://example.org/g1",
+            )),
+            &[Source::from_bytes(
+                (0..30)
+                    .map(|i| format!("<http://example.org/m{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"mole {i}\" .\n"))
+                    .collect::<String>()
+                    .into_bytes(),
+                RdfFormat::NTriples,
+                Some(oxrdf::NamedNode::new_unchecked("http://example.org/g1")),
+            )],
+        )
+        .unwrap();
+        let st = s.text_status().unwrap();
+        assert_eq!(st.last_rebuild.unwrap().at, built.at);
+        assert_eq!(
+            rows(
+                &s,
+                "SELECT (COUNT(*) AS ?n) { GRAPH ?g { ?s text:query \"socks\" } }"
+            ),
+            ["0"]
+        );
+        assert_eq!(
+            rows(
+                &s,
+                "SELECT (COUNT(*) AS ?n) { GRAPH ?g { ?s text:query \"mole\" } }"
+            ),
+            ["30"]
+        );
+        assert_eq!(st.docs, 30_050 + 6 - 1 + 30);
+    }
+    // reopened without a rebuild or catch-up: the bulk commits were synced
+    let s = Store::open(&root, opts()).unwrap();
+    let st = s.text_status().unwrap();
+    assert!(st.last_rebuild.is_none());
+    assert_eq!((st.state.as_str(), st.docs), ("ready", 30_050 + 6 - 1 + 30));
+    assert_eq!(count(&s, "narwhal"), "50");
+    // a large bulk load relative to the index is still a rebuild
+    s.load(&[ttl(40_000, 80_000, "seal")]).unwrap();
+    assert!(s.text_status().unwrap().last_rebuild.is_some());
+    assert_eq!(count(&s, "seal"), "40000");
+}
+
 /// Query options with the subject restriction of text searches on or off.
 fn pushdown(on: bool) -> QueryOptions {
     let mut o = sparkles_core::sparql::Optimizations::ALL;

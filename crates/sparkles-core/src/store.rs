@@ -2471,21 +2471,26 @@ impl Store {
         let _ = (snap, log);
     }
 
-    /// After a bulk commit: rebuild the full-text index from the new snapshot (on failure
-    /// the previous view stays, and text queries report the index as stale).
-    fn rebuild_text_locked(&self, snap: &mut Snapshot, prev: Option<Arc<crate::text::TextView>>) {
+    /// After a bulk commit from `old`: bring the full-text index to the new snapshot,
+    /// by the documents that differ when they are few, else by a rebuild (on failure the
+    /// previous view stays, and text queries report the index as stale).
+    fn rebuild_text_locked(&self, snap: &mut Snapshot, old: &Snapshot) {
         #[cfg(feature = "text")]
         if let Some(ti) = self.text.load_full() {
-            snap.text = match ti.rebuild(snap) {
+            let incremental = ti.apply_bulk(old, snap).unwrap_or_else(|e| {
+                tracing::warn!("full-text index after a bulk commit: {e}; rebuilding");
+                None
+            });
+            snap.text = match incremental.map_or_else(|| ti.rebuild(snap), Ok) {
                 Ok(v) => Some(v),
                 Err(e) => {
                     tracing::error!("full-text rebuild after a bulk commit failed: {e}");
-                    prev
+                    old.text.clone()
                 }
             };
         }
         #[cfg(not(feature = "text"))]
-        let _ = (snap, prev);
+        let _ = (snap, old);
     }
 
     /// Enable (or reconfigure) full-text search and build the index from the current
@@ -3477,7 +3482,7 @@ impl Store {
             change_log: self.changelog.clone(),
         };
         if bulk.is_some() {
-            self.rebuild_text_locked(&mut new_snap, snap.text.clone());
+            self.rebuild_text_locked(&mut new_snap, &prior);
             // the bulk commit's changes, while the state before it is at hand
             let author = check.as_ref().and_then(|(_, o)| o.author.clone());
             self.log_bulk_commit(&head, message.clone(), author, &prior, &new_snap);
