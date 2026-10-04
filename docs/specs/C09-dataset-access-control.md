@@ -2019,7 +2019,7 @@ These tests run against a real listener on 127.0.0.1, with `HOME` and
   - `main.rs`: the `serve` flags, the `query`, `update` and `load` definitions (local
     only), and `axum::serve`.
   - `ui.rs`, `crates/sparkles-server/Cargo.toml`, `Cargo.toml` and `Cargo.lock`.
-  - `crates/sparkles/src/sparql/exec.rs` (`service`), `sparql/update.rs` (`load`,
+  - `crates/sparkles-core/src/sparql/exec.rs` (`service`), `sparql/update.rs` (`load`,
     including `file://`), `vector.rs`.
   - `nix/module.nix`, `docs/API.md`, and the auth rows of `README.md`.
   - `ui/src/lib/api.ts` (`request`, `ready`, the `upload` XHR),

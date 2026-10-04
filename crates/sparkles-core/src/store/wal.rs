@@ -204,7 +204,7 @@ impl WalIndex {
                 Ok(Some(_)) => ix.note(c.position()),
                 Ok(None) => break,
                 Err(e) => {
-                    tracing::debug!("indexing {} stopped: {e}", path.display());
+                    tracing::debug!(target: "sparkles::store::wal", "indexing {} stopped: {e}", path.display());
                     break;
                 }
             }

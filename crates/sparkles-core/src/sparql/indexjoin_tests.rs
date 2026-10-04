@@ -296,7 +296,7 @@ fn check_snapshot(snap: &Arc<crate::store::Snapshot>, label: &str) -> usize {
                 && !has_op(&r.plan, op)
             {
                 missed += 1;
-                tracing::info!("{label}, {how}: {q} lacks {op}: {:#?}", r.plan);
+                tracing::info!(target: "sparkles::sparql::indexjoin_tests", "{label}, {how}: {q} lacks {op}: {:#?}", r.plan);
             }
         }
     }

@@ -275,7 +275,7 @@ fn distinct(
     let v = match input(exprs) {
         Ok(v) => v,
         Err(why) => {
-            tracing::debug!("expression cache: {why}");
+            tracing::debug!(target: "sparkles::sparql::exprcache", "expression cache: {why}");
             return Ok(None);
         }
     };
@@ -296,7 +296,7 @@ fn distinct(
     let col = &t.cols[c];
     let runs = t.sorted.first() == Some(&v);
     let reject = |report: &mut Report, why: String| {
-        tracing::debug!("expression cache: {why}");
+        tracing::debug!(target: "sparkles::sparql::exprcache", "expression cache: {why}");
         report.push(ctx, exprs, n, Err(why));
         Ok(None)
     };
@@ -430,7 +430,7 @@ pub fn filter(
                 None => groups.push((v, vec![e])),
             },
             Err(why) => {
-                tracing::debug!("expression cache: {why}");
+                tracing::debug!(target: "sparkles::sparql::exprcache", "expression cache: {why}");
                 rest.push(e);
             }
         }

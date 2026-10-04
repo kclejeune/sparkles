@@ -481,7 +481,9 @@ pub(crate) fn remove(dir: &Path) {
     match std::fs::remove_dir_all(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => tracing::warn!("cannot remove {}: {e}", dir.display()),
+        Err(e) => {
+            tracing::warn!(target: "sparkles::geo::persist", "cannot remove {}: {e}", dir.display())
+        }
     }
 }
 

@@ -170,6 +170,10 @@ description = "Clippy (warnings are errors) over feature combinations: the serve
 depends = ["ui:build"]
 run = "scripts/lint-features.sh"
 
+[tasks."lint:doc-paths"]
+description = "Check that every crates/sparkles… path cited in the README, docs/*.md, docs/specs and the Rust comments exists"
+run = "python3 scripts/check-doc-paths.py --code"
+
 [tasks.check]
 description = "Fast compile check of all crates and targets + UI type check"
 depends = ["ui:check", "ui:build"]
@@ -197,8 +201,8 @@ description = "Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectio
 run = "scripts/test-jena-clients.sh"
 
 [tasks.ci]
-description = "Everything CI should run: formatting, lints, the formatter's browser build, Rust, UI and Python binding tests, third-party license notices up to date"
-depends = ["fmt:check", "lint", "lint:features", "fmt:wasm", "test", "ui:test", "py:lint", "py:test", "licenses:check"]
+description = "Everything CI should run: formatting, lints, cited paths in the docs, the formatter's browser build, Rust, UI and Python binding tests, third-party license notices up to date"
+depends = ["fmt:check", "lint", "lint:features", "lint:doc-paths", "fmt:wasm", "test", "ui:test", "py:lint", "py:test", "licenses:check"]
 
 # ------------------------------------------------------------------- Python bindings ----
 # crates/sparkles-py is its own cargo workspace (see its Cargo.toml). These tasks build it

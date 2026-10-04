@@ -125,7 +125,9 @@ impl Record {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!("embedding record {}: {e}", p.display()),
+                Err(e) => {
+                    tracing::warn!(target: "sparkles::vector::embed::worker", "embedding record {}: {e}", p.display())
+                }
             }
             // a damaged or foreign file is written anew
             r.rewrite();
@@ -152,7 +154,7 @@ impl Record {
             rec[..8].copy_from_slice(&k.to_le_bytes());
             rec[8..].copy_from_slice(&v.to_le_bytes());
             if let Err(e) = out.write_all(&rec) {
-                tracing::warn!("embedding record: {e}");
+                tracing::warn!(target: "sparkles::vector::embed::worker", "embedding record: {e}");
                 self.out = None;
             }
             self.written += 1;
@@ -165,7 +167,7 @@ impl Record {
         if let Some(out) = self.out.as_mut()
             && let Err(e) = out.flush()
         {
-            tracing::warn!("embedding record: {e}");
+            tracing::warn!(target: "sparkles::vector::embed::worker", "embedding record: {e}");
             self.out = None;
         }
         if self.written > 2 * self.map.len() as u64 + 1024 {
@@ -206,7 +208,9 @@ impl Record {
                 self.out = Some(std::io::BufWriter::new(f));
                 self.written = self.map.len() as u64;
             }
-            Err(e) => tracing::warn!("embedding record {}: {e}", p.display()),
+            Err(e) => {
+                tracing::warn!(target: "sparkles::vector::embed::worker", "embedding record {}: {e}", p.display())
+            }
         }
     }
 

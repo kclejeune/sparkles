@@ -1120,15 +1120,15 @@ directory.
 
 ### 5.9 Changes to existing code
 
-* `crates/sparkles/src/store.rs`: `backup_capture`, `BackupCapture`, `CapturedFile`,
+* `crates/sparkles-core/src/store.rs`: `backup_capture`, `BackupCapture`, `CapturedFile`,
   `collect_history`. `rebuild_locked` and `collect_locked` are unchanged except that
   `needed` sees leases.
-* `crates/sparkles/src/history.rs`: `leases` and `Hold::Lease`. `protected()` includes
+* `crates/sparkles-core/src/history.rs`: `leases` and `Hold::Lease`. `protected()` includes
   leased seqs, and `HistoryStatus` lists them.
-* `crates/sparkles/src/vocab.rs`: `DeltaVocab::flush() -> Result<u64>`.
-* `crates/sparkles/src/commit.rs`: `Catalog::flushed_len`, `reidentify`, and the
+* `crates/sparkles-core/src/vocab.rs`: `DeltaVocab::flush() -> Result<u64>`.
+* `crates/sparkles-core/src/commit.rs`: `Catalog::flushed_len`, `reidentify`, and the
   `restore` origin. `DatasetFile` gains an optional `restoredFrom`.
-* `crates/sparkles/src/check.rs`: no change. Restore calls `check::check` and treats
+* `crates/sparkles-core/src/check.rs`: no change. Restore calls `check::check` and treats
   `Status::Warning` as success. It warns on a missing text index, which the open rebuilds.
 * `crates/sparkles-server/src/state.rs`: tasks (above), a `restoring` state on `Dataset`
   (an `AtomicBool` that `dataset()` checks, answering 503), and startup recovery of
@@ -1683,7 +1683,7 @@ service. Open question 7 covers an in-process emulator instead.
 ## 13. Sources
 
 * **Sparkles repository, read for this spec:**
-  * `crates/sparkles/src/store.rs`:
+  * `crates/sparkles-core/src/store.rs`:
     * `Generation` (`open`, `open_sealed`, files `vocab.dat`, `vocab.off`, `meta.json`,
       `stats.json`, `delta.vocab`);
     * `Store` fields and `open`;
@@ -1693,16 +1693,16 @@ service. Open question 7 covers an in-process emulator instead.
     * `rebuild_locked` (publication order, history hook), `collect_locked`, `compact`,
       `clone_to`, `backup`, `dump_nquads`, `wal_bytes`, `write_atomic`, `dir_size`,
       `lock_dir`;
-  * `crates/sparkles/src/history.rs`: `At`, `valid_name`, `Hold`, `HistoryState`
+  * `crates/sparkles-core/src/history.rs`: `At`, `valid_name`, `Hold`, `HistoryState`
     (`protected`, `needed`), `GenEntry`, the `history.json` format;
-  * `crates/sparkles/src/check.rs`: the module documentation, `CheckOptions`, `Status`,
+  * `crates/sparkles-core/src/check.rs`: the module documentation, `CheckOptions`, `Status`,
     `check`;
-  * `crates/sparkles/src/index.rs`: `Perm::name`, and the `.dat`/`.meta` file names;
-  * `crates/sparkles/src/vocab.rs`: the `DeltaVocab` format (length-prefixed records),
+  * `crates/sparkles-core/src/index.rs`: `Perm::name`, and the `.dat`/`.meta` file names;
+  * `crates/sparkles-core/src/vocab.rs`: the `DeltaVocab` format (length-prefixed records),
     `open_read_only`, the buffered writer;
-  * `crates/sparkles/src/commit.rs`: `Catalog` (`append`, `pending`), the dataset-file
+  * `crates/sparkles-core/src/commit.rs`: `Catalog` (`append`, `pending`), the dataset-file
     origins;
-  * `crates/sparkles/src/store.rs` `open_text`: the full-text index is opened or rebuilt
+  * `crates/sparkles-core/src/store.rs` `open_text`: the full-text index is opened or rebuilt
     at open;
   * `crates/sparkles-server/src/http.rs`: the router (including `/$/snapshots`,
     `/$/history`, `/$/backup`), `backup`, `clone_dataset`;

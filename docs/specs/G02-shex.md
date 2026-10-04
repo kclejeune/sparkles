@@ -24,7 +24,7 @@ This spec depends on three parts of Sparkles:
 * the store snapshot API (`Snapshot::scan`, `count`, `lookup_term`, `term`);
 * the data-graph selection of the SHACL validator (`crates/sparkles-shacl/src/data.rs`);
 * for Phase 2, the write guard of [C10](C10-write-time-validation.md)
-  (`crates/sparkles/src/guard.rs`, `CommitGuard`).
+  (`crates/sparkles-core/src/guard.rs`, `CommitGuard`).
 
 It closes the README gap "Shape languages | ShEx (jena-shex) | ✗ SHACL only" and removes
 ShEx from the non-goals in [AUDIT §5](../AUDIT.md#5-explicit-non-goals-for-v1).
@@ -1511,7 +1511,7 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
     `GraphSel`, parallel chunking, limits, the guard and `validation.json`),
     `crates/sparkles-shacl/examples/bench.rs`, `crates/sparkles-shacl/tests/w3c_shacl.rs`
     and `known-failures.txt`;
-  * `crates/sparkles/src/guard.rs` (`CommitGuard`, `Candidate`, `ValidationSummary`),
+  * `crates/sparkles-core/src/guard.rs` (`CommitGuard`, `Candidate`, `ValidationSummary`),
     `store.rs` (guard slots, `scan`, `count`, `term`, blank-node labels), `index.rs`
     (`Perm`), `id.rs` (tags), `vocab.rs` (`prefix_range`), `error.rs` (`BudgetKind`),
     `sparql/expr.rs` (`compile_regex`, `lang_matches`);
@@ -1810,4 +1810,6 @@ covers a schema change, a rejected change and a restart,
 
 **Deferred or rejected.** SHACL and ShEx guards on one dataset, a persisted typing, a
 schema in graphs merged with a file, and ShEx 2.2 (`EXTENDS`, `ABSTRACT`) are not
-built.
+built. The copy of shexTest that the harness runs, Jena's `jena-shex/src/test/files/spec`,
+has no test that uses `EXTENDS` or `ABSTRACT`, so ShEx 2.2 waits for a suite that covers
+it, as Open question 11 says.

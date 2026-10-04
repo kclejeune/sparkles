@@ -441,7 +441,7 @@ fn partial(build: &Build, mask: u64, held: &Charge<'_>) -> Option<Arc<KeySet>> {
 
 impl Decor {
     fn note(&self, reason: &str) {
-        tracing::debug!("EXISTS evaluated per row: {reason}");
+        tracing::debug!(target: "sparkles::sparql::exists", "EXISTS evaluated per row: {reason}");
         *self.reason.lock() = Some(reason.to_string());
     }
 }
