@@ -1810,4 +1810,6 @@ covers a schema change, a rejected change and a restart,
 
 **Deferred or rejected.** SHACL and ShEx guards on one dataset, a persisted typing, a
 schema in graphs merged with a file, and ShEx 2.2 (`EXTENDS`, `ABSTRACT`) are not
-built.
+built. The copy of shexTest that the harness runs, Jena's `jena-shex/src/test/files/spec`,
+has no test that uses `EXTENDS` or `ABSTRACT`, so ShEx 2.2 waits for a suite that covers
+it, as Open question 11 says.
