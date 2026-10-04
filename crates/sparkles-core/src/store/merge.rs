@@ -764,7 +764,17 @@ fn keep_bnodes_whole(
         .filter(|k| is_bnode(&k[3]))
         .map(|k| k[3].clone())
         .collect();
+    if todo.is_empty() {
+        return Ok(());
+    }
     let mut seen: FxHashSet<Arc<[u8]>> = FxHashSet::default();
+    // the plan's net references to each blank node it names as an object
+    let mut plan_refs: FxHashMap<Arc<[u8]>, i64> = FxHashMap::default();
+    for (k, insert) in &plan.changes {
+        if is_bnode(&k[3]) {
+            *plan_refs.entry(k[3].clone()).or_default() += if *insert { 1 } else { -1 };
+        }
+    }
     // quads of each side's toggles by subject
     let mut theirs_by_subject: FxHashMap<Arc<[u8]>, Vec<QuadKey>> = FxHashMap::default();
     for (k, a) in t_t {
@@ -791,15 +801,10 @@ fn keep_bnodes_whole(
         // references to x after the merge: in the target, plus the plan's inserts, less
         // its deletions
         let id = diff::key_id(snap, &x);
-        let mut refs: i64 = match id {
+        let refs: i64 = match id {
             Some(id) => snap.count(Perm::Osp, &[id.0])? as i64,
             None => 0,
-        };
-        for (k, insert) in &plan.changes {
-            if k[3] == x {
-                refs += if *insert { 1 } else { -1 };
-            }
-        }
+        } + plan_refs.get(&x).copied().unwrap_or(0);
         if refs > 0 {
             continue;
         }
@@ -808,6 +813,7 @@ fn keep_bnodes_whole(
             if plan.changes.get(k) == Some(&true) {
                 plan.changes.remove(k);
                 if is_bnode(&k[3]) {
+                    *plan_refs.entry(k[3].clone()).or_default() -= 1;
                     todo.push(k[3].clone());
                 }
             }
@@ -817,6 +823,7 @@ fn keep_bnodes_whole(
             if plan.changes.get(k) != Some(&false) {
                 plan.changes.insert(k.clone(), false);
                 if is_bnode(&k[3]) {
+                    *plan_refs.entry(k[3].clone()).or_default() -= 1;
                     todo.push(k[3].clone());
                 }
             }
