@@ -115,6 +115,12 @@ fn a1_create_and_isolate() {
     );
     let dev = s.branch("dev").unwrap();
     assert_eq!(dump(&dev), dump(&s));
+    // the branch reads main's index files through the same cached blocks
+    let (a, b) = (dev.snapshot(), s.snapshot());
+    for (x, y) in a.generation.perms.iter().zip(b.generation.perms.iter()) {
+        assert_eq!(x.uid, y.uid);
+    }
+    assert!(Arc::ptr_eq(dev.cache(), s.cache()));
     assert_eq!(apply(&dev, "+<urn:c> <urn:p> <urn:x> .").commit.seq, 3);
     assert_eq!(apply(&s, "+<urn:d> <urn:p> <urn:x> .").commit.seq, 3);
     assert!(has(&s, "urn:d") && !has(&s, "urn:c"));

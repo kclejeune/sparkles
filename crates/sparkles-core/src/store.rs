@@ -1576,6 +1576,9 @@ impl Store {
             let recs = store.branching.merges.lock().recs.clone();
             set.note_merges(store.dataset_id, &recs, true);
             store.install_branch_holds(&set);
+            if store.branching.ident.is_none() {
+                set.set_main(&store.current);
+            }
         }
         store.collect_history(gen_no, head.seq);
         if let Err(e) = store.recover_change_log() {

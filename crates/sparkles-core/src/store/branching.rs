@@ -421,6 +421,9 @@ pub struct BranchSet {
     broken: Mutex<HashSet<uuid::Uuid>>,
     /// a branch released its holds: upstream stores may collect
     pub(crate) unlinked: AtomicBool,
+    /// the dataset's own store's current state, whose generation a linked branch shares
+    /// cached blocks with
+    main_current: Mutex<Weak<ArcSwap<Snapshot>>>,
     me: Weak<BranchSet>,
 }
 
@@ -494,6 +497,7 @@ impl BranchSet {
             merges: Default::default(),
             broken: Mutex::new(broken),
             unlinked: AtomicBool::new(false),
+            main_current: Mutex::new(Weak::new()),
             me: me.clone(),
         }))
     }
@@ -506,6 +510,11 @@ impl BranchSet {
     pub(crate) fn holds_on(&self, id: uuid::Uuid) -> Holds {
         let t = self.table.lock();
         holds_in(&t, id)
+    }
+
+    /// Remember the dataset's own store's current state (at its open).
+    pub(crate) fn set_main(&self, current: &Arc<ArcSwap<Snapshot>>) {
+        *self.main_current.lock() = Arc::downgrade(current);
     }
 
     pub(crate) fn main_protected(&self) -> bool {
@@ -560,12 +569,15 @@ impl BranchSet {
             ));
         }
         // the generations already open that the branch's link may share blocks with
-        let share: Vec<Arc<Generation>> = self
+        let mut share: Vec<Arc<Generation>> = self
             .stores
             .lock()
             .values()
             .map(|s| s.snapshot().generation.clone())
             .collect();
+        if let Some(c) = self.main_current.lock().upgrade() {
+            share.push(c.load().generation.clone());
+        }
         let ctx = OpenCtx {
             ident: Ident {
                 name: entry.name.clone(),
