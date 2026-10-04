@@ -623,11 +623,11 @@ finding.
     for the whole run, reads the default graph and commits in bulk. Also `clear` and
     `ReasonReport`.
   - `crates/sparkles-reasoner/rules/owl-rl.rules`: the covered and uncovered rules.
-  - `crates/sparkles/src/store.rs`: `Snapshot::version`, the WAL record layout
+  - `crates/sparkles-core/src/store.rs`: `Snapshot::version`, the WAL record layout
     (`WAL_REC`, `WAL_COMMIT`, spare bytes), the replay in `Store::open`,
     `rebuild_locked`, and `WriteTxn::commit`/`publish_log`.
-  - `crates/sparkles/src/builder.rs`: `IndexMeta`, `FORMAT_VERSION`.
-  - `crates/sparkles/src/sparql/mod.rs`: `QueryOptions::{default_graph_extra,
+  - `crates/sparkles-core/src/builder.rs`: `IndexMeta`, `FORMAT_VERSION`.
+  - `crates/sparkles-core/src/sparql/mod.rs`: `QueryOptions::{default_graph_extra,
     initial_bindings, max_rows}`, `query`.
   - `crates/sparkles-server/src/state.rs`: `ReasoningInfo`, `read_reasoning_file`/
     `write_reasoning_file`, the registry, tasks.
@@ -1049,7 +1049,7 @@ deletions still run in full. The UI shows the run's method only in the task mess
   `RDFSFactory.datasetRDFS`, the call behind `ja:DatasetRDFS`. `sparql --desc` refuses
   an assembler file with both the RDFS dataset and its base dataset, because it finds
   two dataset roots. `scripts/rdfs-jena-expected.sh` runs the program and writes
-  `crates/sparkles/tests/rdfs/expected.json`.
+  `crates/sparkles-core/tests/rdfs/expected.json`.
 - Reading Jena's `MatchRDFS` showed three behaviours that Sparkles follows. A pattern
   with a constant subject applies superproperties only when the schema has a class
   hierarchy, because `ApplyRDFS` guards them with the class test. Type patterns with a

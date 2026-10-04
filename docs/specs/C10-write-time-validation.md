@@ -1045,11 +1045,11 @@ with strategy `incremental`, in < 5 ms.
     for snapshot access, `GraphSel`, parallel chunking, deadlines, targets, constraints
     and the `$shapesGraph` binding;
   * `crates/sparkles-shacl/examples/bench.rs`;
-  * `crates/sparkles/src/store.rs` for `WriteTxn`, `view`, `commit`, `publish_log`,
+  * `crates/sparkles-core/src/store.rs` for `WriteTxn`, `view`, `commit`, `publish_log`,
     `insert_bulk`, `load_as`, `replace_as`, `rebuild_locked`, `clone_to` and the
     persistence of the text config;
-  * `crates/sparkles/src/sparql/update.rs`, `crates/sparkles/src/dataset.rs`,
-    `crates/sparkles/src/error.rs`, `crates/sparkles/src/commit.rs` (`Receipt`);
+  * `crates/sparkles-core/src/sparql/update.rs`, `crates/sparkles/src/dataset.rs`,
+    `crates/sparkles-core/src/error.rs`, `crates/sparkles-core/src/commit.rs` (`Receipt`);
   * `crates/sparkles-reasoner/src/lib.rs` for the `materialize`/`clear` commit kinds and
     the bulk insert;
   * `crates/sparkles-server/src/{http.rs,shacl.rs,state.rs,obs.rs,clone.rs,main.rs}` for

@@ -138,7 +138,7 @@ no registry entry, and releases the name.
 ### 2.4 Rust API
 
 ```rust
-// crates/sparkles/src/store.rs
+// crates/sparkles-core/src/store.rs
 pub struct CloneOptions {
     /// graphs to leave out (e.g. the inferred graph); named by the caller
     pub exclude_graphs: Vec<NamedNode>,
@@ -275,7 +275,7 @@ if it is missing. That does not change any data.
 
 ## 5. Design sketch
 
-**`crates/sparkles/src/store.rs`**
+**`crates/sparkles-core/src/store.rs`**
 
 1. **Refactor.** `rebuild_locked` contains a loop that pushes every quad of a snapshot
    into a `Builder` encoder. It translates `Vocab` and `Delta` ids to keys (`Slot::Key`)
@@ -514,13 +514,13 @@ most the final source count. The source ends with all 100 inserts.
   - [CI-commit-identity.md](CI-commit-identity.md) and [C08-inference-freshness.md](C08-inference-freshness.md),
     the sibling specs, for the dataset id, root commit, `forkedFrom` and the
     reasoning status fields.
-  - `crates/sparkles/src/store.rs`: `Store::{open, write, rebuild_locked, dump_nquads,
+  - `crates/sparkles-core/src/store.rs`: `Store::{open, write, rebuild_locked, dump_nquads,
     backup}`, `bnode_for`/`parse_bnode_label`, `WriteTxn::{intern_scoped, encode_quad}`,
     the WAL format, `write_atomic`/`sync_dir`.
-  - `crates/sparkles/src/builder.rs`: per-document `LabelScope`, `Slot`,
+  - `crates/sparkles-core/src/builder.rs`: per-document `LabelScope`, `Slot`,
     `BuildOptions::first_bnode`, `IndexMeta`.
-  - `crates/sparkles/src/id.rs`: the triple-term key encoding with blank-node payloads.
-  - `crates/sparkles/src/index.rs` and `vocab.rs`: generation file names.
+  - `crates/sparkles-core/src/id.rs`: the triple-term key encoding with blank-node payloads.
+  - `crates/sparkles-core/src/index.rs` and `vocab.rs`: generation file names.
   - `crates/sparkles-server/src/state.rs`: the registry, the `manage` lock,
     `create`/`attach`/`delete`, `valid_name`, the reasoning file and tasks.
   - `crates/sparkles-server/src/http.rs`: dataset admin handlers and status codes.

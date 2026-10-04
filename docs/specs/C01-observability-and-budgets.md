@@ -857,8 +857,8 @@ Expect `outcome="cancelled"` = 1 and `sparkles_requests_active{operation="query"
   - `docs/BENCHMARKS.md`: result sizes and memory notes.
   - The project's feature order (internal planning notes).
   - `crates/sparkles-server/src/{main.rs,http.rs,state.rs,http/router_tests.rs}`.
-  - `crates/sparkles/src/{error.rs,store.rs,index.rs}`.
-  - `crates/sparkles/src/sparql/{ctx.rs,exec.rs,mod.rs,cache.rs,table.rs,results.rs,update.rs}`.
+  - `crates/sparkles-core/src/{error.rs,store.rs,index.rs}`.
+  - `crates/sparkles-core/src/sparql/{ctx.rs,exec.rs,mod.rs,cache.rs,table.rs,results.rs,update.rs}`.
   - `ui/src/lib/{api.ts,app.svelte.ts}`, `ui/src/routes/server/+page.svelte`, `ui/mock/`.
   - `scripts/bench.sh`: only the Sparkles invocation and the query list were read.
 - **Apache Jena** (Apache-2.0):

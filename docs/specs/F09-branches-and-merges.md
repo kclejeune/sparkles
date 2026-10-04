@@ -358,7 +358,7 @@ stopped the merge, and 1 on any other error. `--resolve` reads a JSON array of
 ### 2.8 Rust library API
 
 ```rust
-// crates/sparkles/src/branch.rs (new)
+// crates/sparkles-core/src/branch.rs (new)
 pub struct BranchInfo { pub name: String, pub id: uuid::Uuid, pub ordinal: u16,
                         pub head: CommitInfo, pub from: CommitRef, pub upstream: Option<String>,
                         pub merge_base: Option<CommitRef>, pub ahead: u64, pub behind: u64,
@@ -1285,12 +1285,12 @@ holds the database.
     [C12](C12-graph-access-control.md) (summary and model), and the openings of
     [C08](C08-inference-freshness.md), [C10](C10-write-time-validation.md),
     [C15](C15-write-previews.md) and [P01](P01-python-bindings.md);
-  - `crates/sparkles/src/store.rs`: `Generation`, `Delta`, `Snapshot`, `WriterState`,
+  - `crates/sparkles-core/src/store.rs`: `Generation`, `Delta`, `Snapshot`, `WriterState`,
     `Store`, the WAL record constants, `bnode_for` and `parse_bnode_label`;
-  - `crates/sparkles/src/id.rs`: the tag layout and the blank-node payload bits;
-  - `crates/sparkles/src/history.rs`: `Hold` and the history state's leases;
-  - `crates/sparkles/src/commit.rs`: `CommitKind` and `ForkedFrom`;
-  - `crates/sparkles/src/store/quota.rs`, and the storage quota and diff sections of
+  - `crates/sparkles-core/src/id.rs`: the tag layout and the blank-node payload bits;
+  - `crates/sparkles-core/src/history.rs`: `Hold` and the history state's leases;
+  - `crates/sparkles-core/src/commit.rs`: `CommitKind` and `ForkedFrom`;
+  - `crates/sparkles-core/src/store/quota.rs`, and the storage quota and diff sections of
     `docs/API.md`;
   - `crates/sparkles-server/src/state.rs`: `valid_name`.
 - **Fetched:**

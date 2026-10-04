@@ -436,7 +436,7 @@ The graph for A1 to A6 has the triples `a→b`, `b→c`, `c→d`, `a→e`, `e→
 
 **Delivered** on 2026-10-02, as Phase 1.
 
-* **Planning.** `crates/sparkles/src/sparql/pathsearch.rs` holds the operator. The
+* **Planning.** `crates/sparkles-core/src/sparql/pathsearch.rs` holds the operator. The
   planner turns `SERVICE <urn:x-sparkles:path#search>` into a `PathSearch` leaf before
   it would plan a remote call, so the outbound policy and `--no-service` never apply to
   it. A leaf with a variable source or target is attached to the rest of its join group
@@ -483,7 +483,7 @@ The graph for A1 to A6 has the triples `a→b`, `b→c`, `c→d`, `a→e`, `e→
 * RDFS on read does not add edges. The search reads the stored triples of the view, so
   a triple derived through `rdfs:subPropertyOf` on read is not an edge.
 
-**Tests at landing.** `crates/sparkles/tests/path_search.rs` has ten tests. They cover
+**Tests at landing.** `crates/sparkles-core/tests/path_search.rs` has ten tests. They cover
 the acceptance examples A1 to A10, rows per path and per edge, the three directions,
 ends from `VALUES`, `BIND` and triple patterns, limits and every planning error,
 searches per named graph and in the union graph, weights from annotations, and a

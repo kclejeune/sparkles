@@ -29,7 +29,7 @@ section lists them.
 The design depends on these parts of Sparkles:
 
 * the embedded API in `crates/sparkles/src/dataset.rs` and the `Store` in
-  `crates/sparkles/src/store.rs` with its modules in `store/`;
+  `crates/sparkles-core/src/store.rs` with its modules in `store/`;
 * the core modules `sparkles::history`, `sparkles::schema`, `sparkles::stored`,
   `sparkles::guard`, `sparkles::geo`, `sparkles::text` and `sparkles::vector`;
 * the crates `sparkles-backup`, `sparkles-reasoner`, `sparkles-shacl`, `sparkles-shex`,
