@@ -36,7 +36,7 @@ fn bad(msg: impl Into<String>) -> ApiError {
 /// the commit has no quad counts, and a commit too large to list has no change counts,
 /// since both would count every graph.
 fn commit_json(ds: &Dataset, c: &CommitChanges, restricted: bool) -> J {
-    let note = ds.store.annotation(c.commit.seq);
+    let note = ds.dataset.history().annotation(c.commit.seq);
     let commit = sparkles::commit::AnnotatedCommit {
         commit: &c.commit,
         annotation: note.as_ref(),
@@ -106,7 +106,7 @@ async fn page(ds: &Arc<Dataset>, ask: &Ask) -> ApiResult<ChangePage> {
         graphs: ask.graphs.clone(),
     };
     let after = ask.after;
-    match tokio::task::spawn_blocking(move || ds.store.changes(after, &o)).await {
+    match tokio::task::spawn_blocking(move || ds.dataset.history().changes(after, &o)).await {
         Ok(r) => r.map_err(ApiError::from),
         Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }

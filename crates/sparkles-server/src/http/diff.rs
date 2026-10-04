@@ -259,7 +259,7 @@ pub(super) async fn diff(
                     At::Commit(r.commit.seq.saturating_sub(1))
                 }
             };
-            match ds.store.diff(&from, &to, &o) {
+            match ds.dataset.history().diff(&from, &to, &o) {
                 // a commit the branch shares with its upstream
                 Err(e) if sparkles::branch::inherited_commit(&e).is_some() => {
                     Ok(main.store.branch_diff(&here, &from, &here, &to, &o)?)

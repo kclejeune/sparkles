@@ -1386,13 +1386,14 @@ impl Tools<'_> {
             .collect();
         // the past states `at` and `atCommit` can read beyond the pins of this server
         let readable: Vec<Value> = ds
-            .store
+            .dataset
             .history()
+            .status()
             .reconstructable
             .iter()
             .map(|&(from, to)| json!({ "from": from, "to": to.min(head) }))
             .collect();
-        let mut snapshots = ds.store.snapshots();
+        let mut snapshots = ds.dataset.snapshots().list();
         snapshots.sort_by(|a, b| b.seq.cmp(&a.seq).then_with(|| a.name.cmp(&b.name)));
         let snapshots: Vec<Value> = snapshots
             .iter()

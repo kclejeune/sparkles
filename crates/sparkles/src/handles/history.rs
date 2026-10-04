@@ -43,8 +43,8 @@ impl Snapshots {
     }
 }
 
-/// A commit as `/$/commits/{ds}/{reference}` names it: `head`, a commit number, or a
-/// commit IRI (`urn:x-sparkles:commit:{dataset id}:{seq}`).
+/// A commit as `/$/commits/{ds}/{reference}` names it: `head`, a commit number (`7` or
+/// `commit:7`), or a commit IRI (`urn:x-sparkles:commit:{dataset id}:{seq}`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitRef {
     Head,
@@ -59,7 +59,7 @@ impl std::str::FromStr for CommitRef {
         if s == "head" {
             return Ok(CommitRef::Head);
         }
-        if let Ok(n) = s.parse() {
+        if let Ok(n) = s.strip_prefix("commit:").unwrap_or(s).parse() {
             return Ok(CommitRef::Seq(n));
         }
         if crate::store::parse_commit_iri(s).is_some() {
@@ -134,6 +134,11 @@ impl History {
     /// [`CommitRange::Before`], oldest first for [`CommitRange::After`]).
     pub fn commits(&self, range: CommitRange, limit: usize) -> CommitPage {
         self.ds.store().commits(range, limit)
+    }
+
+    /// The annotation (message and change digest) of commit `seq`, if it has one.
+    pub fn annotation(&self, seq: u64) -> Option<Annotation> {
+        self.ds.store().annotation(seq)
     }
 
     /// The quads added and removed between two states.

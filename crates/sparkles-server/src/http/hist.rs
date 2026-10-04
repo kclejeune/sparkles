@@ -115,7 +115,7 @@ pub(super) async fn history(
     };
     let r = blocking({
         let ds = ds.clone();
-        move || Ok(ds.store.history_changes(&q)?)
+        move || Ok(ds.dataset.history().query(&q)?)
     })
     .await?;
     let changes: Vec<J> = r

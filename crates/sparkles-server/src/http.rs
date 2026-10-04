@@ -1786,16 +1786,6 @@ pub(crate) fn write_error(e: Error, restricted: bool) -> ApiError {
 }
 
 /// Parse `N`, `commit:N` or `head` (resolved by the caller).
-fn parse_commit_ref(s: &str) -> Option<Option<u64>> {
-    if s == "head" {
-        return Some(None);
-    }
-    s.strip_prefix("commit:")
-        .unwrap_or(s)
-        .parse()
-        .ok()
-        .map(Some)
-}
 
 async fn list_commits(
     State(st): St,
@@ -1839,7 +1829,7 @@ async fn list_commits(
         (None, None) => CommitRange::Latest,
     };
     let head = ds.store.head_commit();
-    let page = ds.store.commits(range, limit);
+    let page = ds.dataset.history().commits(range, limit);
     let next = match (range, page.commits.last()) {
         (CommitRange::After(_), Some(last)) if last.seq < head.seq => Some(format!(
             "/$/commits/{name}?after={}&limit={limit}",
@@ -1960,34 +1950,35 @@ async fn get_commit(
     Path((name, reference)): Path<(String, String)>,
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
+    use sparkles::handles::CommitRef;
     let ds = dataset(&st, &name)?;
-    let head = ds.store.head_commit();
-    let seq = parse_commit_ref(&reference)
+    // `head`, `N` or `commit:N`: this route takes no commit IRIs
+    let r = reference
+        .parse::<CommitRef>()
+        .ok()
+        .filter(|r| !matches!(r, CommitRef::Iri(_)))
         .ok_or_else(|| {
             err(
                 StatusCode::BAD_REQUEST,
                 format!("invalid commit reference '{reference}'"),
             )
-        })?
-        .unwrap_or(head.seq);
-    if seq > head.seq {
-        return Err(err(
-            StatusCode::NOT_FOUND,
-            format!("no commit {seq} in dataset {name} (head is {})", head.seq),
-        ));
-    }
-    let c = ds.store.commit(seq).ok_or_else(|| {
-        err(
-            StatusCode::GONE,
-            format!("commit metadata before {} is no longer retained", seq + 1),
-        )
-    })?;
-    let note = ds.store.annotation(seq);
-    let commit = sparkles::commit::AnnotatedCommit {
-        commit: &c,
-        annotation: note.as_ref(),
+        })?;
+    let detail = match ds.dataset.history().commit(&r) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            // only a commit number after the head names no commit
+            let seq = if let CommitRef::Seq(n) = r { n } else { 0 };
+            let head = ds.store.head_commit().seq;
+            return Err(err(
+                StatusCode::NOT_FOUND,
+                format!("no commit {seq} in dataset {name} (head is {head})"),
+            ));
+        }
+        // the commit's metadata is no longer retained
+        Err(Error::NotFound(m)) => return Err(err(StatusCode::GONE, m)),
+        Err(e) => return Err(e.into()),
     };
-    let mut commit = json!(commit);
+    let mut commit = json!(detail);
     if p.restricted(&ds.name) {
         redact_commit_json(&mut commit);
     }

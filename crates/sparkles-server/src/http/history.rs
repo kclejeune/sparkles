@@ -175,14 +175,14 @@ fn history_json(name: &str, ds: &Dataset, h: &sparkles::history::HistoryStatus) 
             "heldBy": g.held_by.iter().map(|h| h.to_string()).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "retention": retention_json(h.retention),
-        "schedules": ds.store.schedules().iter().map(schedule_json).collect::<Vec<_>>(),
+        "schedules": ds.dataset.settings().retention().get().schedules.iter().map(schedule_json).collect::<Vec<_>>(),
         "catalog": {
             "keepCommits": h.catalog.keep_commits,
             "keepAge": h.catalog.keep_age_ms.map(|ms| format!("{}s", ms / 1000)),
             "firstRetained": h.first_commit,
         },
         "snapshots": h.snapshots,
-        "changeLog": ds.store.change_log_status().map(|s| change_log_json(&s)),
+        "changeLog": ds.dataset.settings().change_log().status().map(|s| change_log_json(&s)),
         "cache": {
             "entries": h.cache_entries,
             "bytes": h.cache_bytes,
@@ -325,8 +325,9 @@ pub(super) async fn list_snapshots(
     let ds = dataset(&st, &name)?;
     let restricted = p.restricted(&ds.name);
     let snaps: Vec<J> = ds
-        .store
+        .dataset
         .snapshots()
+        .list()
         .iter()
         .map(|s| snapshot_json_for(s, restricted))
         .collect();
@@ -394,7 +395,7 @@ pub(super) async fn create_snapshot(
     };
     let warm = params.get("warm").is_some_and(truthy);
     blocking(move || {
-        let (snap, created) = ds.store.create_snapshot_opts(
+        let (snap, created) = ds.dataset.snapshots().create(
             &snap_name,
             &at,
             &sparkles::history::SnapshotOptions {
@@ -426,7 +427,7 @@ pub(super) async fn get_snapshot(
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
-    let s = ds.store.named_snapshot(&snap).ok_or_else(|| {
+    let s = ds.dataset.snapshots().get(&snap).ok_or_else(|| {
         code_err(
             StatusCode::NOT_FOUND,
             "no-such-snapshot",
@@ -445,7 +446,7 @@ pub(super) async fn delete_snapshot(
     }
     let ds = dataset(&st, &name)?;
     blocking(move || {
-        if ds.store.delete_snapshot(&snap)? {
+        if ds.dataset.snapshots().delete(&snap)? {
             Ok(StatusCode::NO_CONTENT.into_response())
         } else {
             Err(code_err(
@@ -460,7 +461,7 @@ pub(super) async fn delete_snapshot(
 
 pub(super) async fn get_history(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
-    let h = ds.store.history();
+    let h = ds.dataset.history().status();
     Ok(Json(history_json(&name, &ds, &h)))
 }
 
@@ -561,16 +562,15 @@ pub(super) async fn put_history(
         Some(v) => Some(change_log_param(v)?),
     };
     blocking(move || {
+        let settings = ds.dataset.settings();
         if let Some(c) = change_log {
-            ds.store.set_change_log_settings(c)?;
+            settings.change_log().set(c)?;
         }
-        if let Some(s) = schedules {
-            ds.store.set_schedules(s)?;
-        }
-        if let Some(c) = catalog {
-            ds.store.set_catalog_horizon(c)?;
-        }
-        let h = ds.store.set_retention(r)?;
+        let h = settings.retention().set(sparkles::handles::HistoryUpdate {
+            retention: Some(r),
+            schedules,
+            catalog,
+        })?;
         Ok(Json(history_json(&ds.name, &ds, &h)))
     })
     .await
@@ -611,13 +611,13 @@ pub(super) fn commit_list_extras(
     ds: &Dataset,
     commits: &[sparkles::commit::CommitInfo],
 ) -> (J, J, Vec<J>) {
-    let h = ds.store.history();
-    let pins = ds.store.snapshots();
+    let h = ds.dataset.history().status();
+    let pins = ds.dataset.snapshots().list();
     let inside = |s: u64| h.reconstructable.iter().any(|&(a, b)| a <= s && s <= b);
     let list = commits
         .iter()
         .map(|c| {
-            let note = ds.store.annotation(c.seq);
+            let note = ds.dataset.history().annotation(c.seq);
             let commit = sparkles::commit::AnnotatedCommit {
                 commit: c,
                 annotation: note.as_ref(),
@@ -654,7 +654,7 @@ pub(crate) fn spawn_tick(st: Arc<AppState>, every: std::time::Duration) {
             let all: Vec<Arc<Dataset>> = st.datasets_and_branches();
             for ds in all {
                 let name = ds.key();
-                match tokio::task::spawn_blocking(move || ds.store.history_tick()).await {
+                match tokio::task::spawn_blocking(move || ds.dataset.history().tick()).await {
                     Ok(Ok(r)) => {
                         for n in &r.created {
                             tracing::info!("dataset {name}: scheduled snapshot {n}");
@@ -682,7 +682,7 @@ pub(crate) fn metrics(st: &AppState, out: &mut String) {
     // by dataset label: datasets beyond the label cap are summed under one
     let mut all: std::collections::BTreeMap<String, [f64; 7]> = Default::default();
     for ds in datasets {
-        let h = ds.store.history();
+        let h = ds.dataset.history().status();
         let e = all
             .entry(st.metrics.dataset_label(Some(&ds.name)))
             .or_default();
@@ -774,7 +774,7 @@ pub(super) fn accept_datetime(headers: &HeaderMap) -> ApiResult<Option<i64>> {
 /// its own TimeGate): the readable commit that best matches instant `ms`, the last one
 /// at or before it, clamped to the oldest readable commit.
 pub(super) fn negotiate_datetime(ds: &Dataset, ms: i64) -> sparkles::Result<At> {
-    let h = ds.store.history();
+    let h = ds.dataset.history().status();
     let wanted = match ds.store.resolve(&At::Time(ms)) {
         Ok(r) => r.commit.seq,
         // before the first commit the catalog has

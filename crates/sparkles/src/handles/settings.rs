@@ -204,4 +204,10 @@ impl ChangeLogSetting {
             .store()
             .set_change_log_settings(ChangeLogSettings::default())
     }
+
+    /// The change log's state and settings, or `None` for a dataset without a change
+    /// log.
+    pub fn status(&self) -> Option<ChangeLogStatus> {
+        self.ds.store().change_log_status()
+    }
 }
