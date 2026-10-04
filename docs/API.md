@@ -2705,10 +2705,10 @@ has its own log, commits, history, snapshots, write guard and writer lock, so wr
 different branches never wait for each other. It owns a full index once it compacts or
 makes a bulk commit, and it then stops reading its upstream's files.
 
-The tradeoff is memory and disk at the right times. While a branch is linked, its memory
-holds the upstream's delta at the starting commit, because each branch keeps its own
-delta, and a restart replays that delta's log. Once it compacts, the branch costs a full
-index on disk, about what a clone costs. Long-lived branches are cheapest when they are
+A linked branch costs memory rather than disk. Each branch keeps its own delta, so a
+linked branch's memory holds a copy of the upstream's delta at the starting commit, and
+a restart replays that delta's log. Once it compacts, the branch costs a full index on
+disk, about what a clone costs. Long-lived branches are therefore cheapest when they are
 created soon after `main` compacts.
 
 **Names.** A branch name matches `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, contains a letter,
