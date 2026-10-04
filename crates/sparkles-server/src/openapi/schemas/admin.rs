@@ -4,33 +4,9 @@
 //! `docs/API.md`, and `openapi::contract_tests` checks them against the bodies a server
 //! returns.
 
+use super::kit::*;
 use super::*;
 
-fn int() -> J {
-    json!({ "type": "integer" })
-}
-fn num() -> J {
-    json!({ "type": "number" })
-}
-fn string() -> J {
-    json!({ "type": "string" })
-}
-fn boolean() -> J {
-    json!({ "type": "boolean" })
-}
-fn strings() -> J {
-    array(string())
-}
-/// A schema or `null`.
-fn or_null(v: J) -> J {
-    json!({ "oneOf": [v, { "type": "null" }] })
-}
-/// A link to `docs/API.md` at `anchor`, and a description.
-fn doc(mut v: J, description: &str, anchor: &str) -> J {
-    v["description"] = description.into();
-    v["externalDocs"] = json!({ "url": api_doc(anchor) });
-    v
-}
 /// `{enabled: false}`, the answer when a feature is off.
 fn disabled() -> J {
     obj(&["enabled"], json!({ "enabled": { "const": false } }))
