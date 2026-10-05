@@ -819,10 +819,13 @@ fn xpath_replacement(r: &str) -> EvalResult<String> {
 /// SPARQL `langMatches` (RFC 4647 basic filtering): `range` is `*`, the tag itself, or
 /// a prefix of it ending at a `-`, compared case-insensitively.
 pub fn lang_matches(tag: &str, range: &str) -> bool {
-    if range == "*" {
-        return !tag.is_empty();
+    lang_matches_bytes(tag.as_bytes(), range.as_bytes())
+}
+
+pub(super) fn lang_matches_bytes(t: &[u8], r: &[u8]) -> bool {
+    if r == b"*" {
+        return !t.is_empty();
     }
-    let (t, r) = (tag.as_bytes(), range.as_bytes());
     t.len() >= r.len()
         && t[..r.len()].eq_ignore_ascii_case(r)
         && (t.len() == r.len() || t[r.len()] == b'-')

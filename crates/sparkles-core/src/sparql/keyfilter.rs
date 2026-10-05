@@ -7,7 +7,7 @@
 //! straight off the key are compiled; ids that are not stored terms (inline numbers and
 //! dates, blank nodes, unbound) are left to the general evaluator.
 
-use super::expr::{Expr, Func, compile_regex, lang_matches};
+use super::expr::{Expr, Func, compile_regex, lang_matches_bytes};
 use super::table::VarId;
 use super::value::Value;
 use crate::id::KEY_SEP;
@@ -263,9 +263,10 @@ impl KeyFilter {
                 .and_then(|(s, _)| std::str::from_utf8(s).ok())
                 .is_some_and(|s| re.is_match(s)),
             Test::LangMatches(range) => match &key {
-                Key::Literal { lang: None, .. } => lang_matches("", range),
-                Key::Literal { lang: Some(l), .. } => {
-                    std::str::from_utf8(l).is_ok_and(|l| lang_matches(l, range))
+                // Basic language filtering only compares bytes. The final validity
+                // check rejects malformed UTF-8 after all predicates pass.
+                Key::Literal { lang, .. } => {
+                    lang_matches_bytes(lang.unwrap_or_default(), range.as_bytes())
                 }
                 _ => false,
             },
@@ -445,5 +446,41 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn language_keys_validate_utf8_for_every_predicate() {
+        let v = 0;
+        let lang = |range| {
+            call(
+                Function::LangMatches,
+                vec![call(Function::Lang, vec![Expr::Var(v)]), lit(range)],
+            )
+        };
+        let contains = call(Function::Contains, vec![Expr::Var(v), lit("Ada")]);
+        let regex = call(Function::Regex, vec![Expr::Var(v), lit("Ada")]);
+        let filters = [
+            vec![lang("*")],
+            vec![contains.clone()],
+            vec![regex.clone()],
+            vec![lang("en"), contains.clone(), regex.clone()],
+            vec![lang("en"), lang("*"), contains.clone(), regex.clone()],
+            vec![regex, contains, lang("en")],
+        ];
+        let raw = |lex: &[u8], tag: &[u8]| [b"\"".as_slice(), lex, &[KEY_SEP], b"@", tag].concat();
+        for exprs in filters {
+            let f = KeyFilter::new(&exprs, v).unwrap();
+            for tag in [b"EN-gb".as_slice(), b"en--ltr", b"en--rtl"] {
+                assert!(f.test(&raw("Ada é 日本語".as_bytes(), tag)));
+                assert!(!f.test(&raw(b"Ada\xc3(", tag)));
+            }
+            for tag in [b"en-\xc3(".as_slice(), b"en-\xc3(--rtl", b"\x80--ltr"] {
+                assert!(!f.test(&raw(b"Ada", tag)));
+            }
+        }
+        let f = KeyFilter::new(&[lang("en")], v).unwrap();
+        for tag in [b"de".as_slice(), b"english", b"enx--rtl"] {
+            assert!(!f.test(&raw(b"Ada", tag)));
+        }
     }
 }
