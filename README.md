@@ -142,8 +142,9 @@ departs from Jena and QLever on purpose.
 
 ## Performance
 
-All numbers come from one machine (an Intel i5-13500 with 15 GiB of RAM) on 2026-10-03,
-with Sparkles at commit `98a75c1a`, each engine running alone with its result cache off.
+The comparison below comes from one machine (an Intel i5-13500 with 15 GiB of RAM)
+on 2026-10-03, with Sparkles at commit `98a75c1a`, each engine running alone with its
+result cache off.
 At 10.5M triples:
 
 | | Sparkles | Best of the others |
@@ -160,6 +161,12 @@ English DBpedia (1.24 billion triples) it loads in 596 s against QLever's 1,674 
 Fluree's 2,919 s, and is faster than QLever on 28 of 29 warm queries and 26 of 31 cold
 ones. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every number, the memory tradeoff and
 every query where Sparkles loses or ties.
+
+A [P06 rerun on 2026-10-05](docs/BENCHMARKS.md#p06-rerun-on-2026-10-05) against main
+found warm query geometric mean latency changes of −0.2% at 1.05M and +1.3% at 10.5M,
+with loads about 5% faster and commit throughput about 2% lower. One repeatable
+10.5M `lang-filter` slowdown remains: about 8% with multiple cores and 14% with the
+server confined to one CPU.
 
 ## Getting started
 

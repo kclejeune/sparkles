@@ -511,6 +511,51 @@ cause. [`scripts/bench-regressions.py`](../scripts/bench-regressions.py) took th
 measurements, and the [raw samples](benchmarks/2026-10-04-regressions.json) include
 result fingerprints.
 
+### P06 rerun on 2026-10-05
+
+A Sparkles-only rerun on forge compares main (`df3dc74a`) with the uncommitted P06
+Phases 1–3 implementation. Both builds use Rust 1.99.0, the same release profile
+and default server features. The datasets contain 1,052,801 and 10,527,319 triples.
+Billion-scale and competitor benchmarks were excluded; the historical comparison
+tables above are unchanged.
+
+| Metric | 1.05M: main → P06 | 10.5M: main → P06 |
+|---|---:|---:|
+| Warm query latency, geometric mean of 28 per-query ratios | −0.2% | +1.3% |
+| Bulk load, seconds | 0.492 → 0.469 | 4.376 → 4.174 |
+| Load peak RSS, MiB | 327.6 → 324.1 | 2008.8 → 2037.1 |
+| Churn, commits/s | 1,079 → 1,061 | 1,324 → 1,298 |
+| Mixed load, reads/s | 1,493 → 1,508 | 147.9 → 149.6 |
+| Mixed load, commits/s | 132.2 → 132.4 | 94.3 → 94.0 |
+
+The warm query matrix uses alternating builds, two server processes per build,
+30 warmups and 20 timed samples per query and process. Each ratio compares pooled
+per-query median latencies. The client is pinned to CPU 11 and the server to CPUs
+0–9, leaving the client's physical core free of server workers. Result caching is
+off. Direct HTTP timing includes the full response body and differs from the
+historical hyperfine/curl measurements.
+
+Loads and 5,000-commit churn run twice per build and size; mixed load runs three
+60-second trials with 16 readers and one writer. These trials use server CPUs 0–10
+and client CPU 11, identically for both builds. Table values are trial medians.
+Load and commit counts match, with zero write or mixed-load request errors apart
+from normal end-of-duration cancellations. All 188 paired query controls match
+result fingerprints and row counts. Cold, full-text and post-churn controls show
+geometric mean latency changes within 3% at both sizes.
+
+**One repeatable slowdown remains:** warm 10.5M `lang-filter` takes 3.57 → 3.84 ms
+(+7.8%) with the multi-core configuration. Longer diagnostic runs with the server
+confined to CPU 0 take 17.23 → 19.56 ms (+13.5%). Internal timings place the
+difference in execution. A scratch build preserving the old error enum ordering
+only partly reduces it; the cause remains unresolved, and no experimental change
+was applied to P06.
+
+Other initial flags varied across server processes: 1.05M `not-exists` and
+`range-topk` did not reproduce with a fixed CPU, and cold `contains` did not persist
+in longer repeats. The 10.5M `employee-docs` multi-core timings also vary by process;
+fixed-CPU medians are 0.293 → 0.295 ms. The broad results are close to main, but the
+`lang-filter` finding prevents an unconditional regression-free assessment.
+
 ## Updates and mixed load
 
 The `updates` mode copies each engine's store, commits the same 5,000 single-triple
