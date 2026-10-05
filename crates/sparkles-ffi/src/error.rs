@@ -102,8 +102,7 @@ impl From<sparkles::Error> for FfiError {
                 };
             }
             E::Unsupported(_) => ErrorKind::Unsupported,
-            // the store's lock on a database directory
-            E::Invalid(m) if m.contains("is in use by another process") => ErrorKind::Locked,
+            E::Locked { .. } => ErrorKind::Locked,
             E::Invalid(_) => ErrorKind::Invalid,
             E::Corrupt(_) => ErrorKind::Corrupt,
             E::Service(_) => ErrorKind::Service,

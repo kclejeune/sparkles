@@ -113,6 +113,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .delete(delete_dataset),
         )
         .route("/$/datasets/{ds}/clone", post(clone_dataset))
+        .route("/$/datasets/{ds}/rename", post(rename_dataset))
         .route("/$/stats/{ds}", get(stats).post(stats))
         .route("/$/schema/{ds}", get(schema::summary))
         .route("/$/schema/{ds}/classes", get(schema::classes))
@@ -466,18 +467,19 @@ async fn restoring_guard(
     let Some(ds) = crate::obs::ds_param(route, req.uri()) else {
         return next.run(req).await;
     };
-    let checked = {
-        let restoring = st.restoring.lock();
-        match restoring.get(&ds) {
-            Some(t) => Err(t.clone()),
-            // taken under the lock: a swap that starts later waits for this request
-            None => Ok(st.get(&ds)),
-        }
-    };
+    // A rename must close the dataset, so this request cannot retain its handle.
+    // The catalog checks reservations and live handles atomically during rename.
+    if route == Some("/$/datasets/{ds}/rename") {
+        return next.run(req).await;
+    }
+    let checked = st
+        .catalog
+        .get_for_request(&ds)
+        .map(|held| (st.get(&ds), held));
     match checked {
         // a dataset taken offline (Fuseki's `?state=offline`) refuses its services, not
         // the admin routes that name it
-        Ok(Some(d))
+        Ok((Some(d), _))
             if d.offline.load(std::sync::atomic::Ordering::Relaxed)
                 && route.is_some_and(|r| r.starts_with("/{ds}")) =>
         {
@@ -544,7 +546,7 @@ impl From<Error> for ApiError {
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::HistoryGone(_) => StatusCode::GONE,
             Error::HistoryUnsupported(_) => StatusCode::NOT_IMPLEMENTED,
-            Error::Conflict(_) => StatusCode::CONFLICT,
+            Error::Conflict(_) | Error::Locked { .. } => StatusCode::CONFLICT,
             Error::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Error::GuardMissing(_) => StatusCode::NOT_IMPLEMENTED,
             Error::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
@@ -3163,7 +3165,7 @@ fn dataset_info(st: &AppState, ds: &Dataset) -> J {
 /// The `DatasetInfo` of every dataset the caller may read, with its `access` level
 /// when auth is enabled.
 fn visible_datasets(st: &AppState, p: &Principal) -> Vec<J> {
-    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<Arc<Dataset>> = st.datasets().values().cloned().collect();
     datasets
         .iter()
         // a dataset is listed when some branch of it is readable
@@ -3498,47 +3500,24 @@ async fn clone_dataset(
     let reservation = st
         .reserve(&name, &id)
         .map_err(|m| err(StatusCode::CONFLICT, m))?;
-    let databases = st.data_dir.join("databases");
-    let tmp = databases.join(format!(".clone-{name}-{id}"));
-    let dst = databases.join(&name);
     let st2 = st.clone();
     let target = name.clone();
     let task = st.start_task_opts(id, "clone", &source, Some(&name), true, move |h| {
         let ctl = h.control();
-        let progress = ctl.part(0.0, 0.95).progress.as_fn();
-        let reasoning = src.reasoning.read().clone();
-        let rep = if in_memory {
-            let c = crate::clone::clone_into_memory(
-                &src.store,
-                &src.name,
-                &target,
-                reasoning,
-                &spec,
-                st2.store_opts.clone(),
-                progress,
-                Some(ctl.cancel.flag()),
-            )?;
-            h.set_cancellable(false);
-            ctl.progress.report(0.97, "registering");
-            st2.adopt_memory(reservation, c.store, c.reasoning, c.origin)?;
-            c.report
-        } else {
-            let rep = crate::clone::clone_into(
-                &src.store,
-                &src.name,
-                reasoning,
-                &tmp,
-                &dst,
-                &spec,
-                progress,
-                Some(ctl.cancel.flag()),
-            )?;
-            // the clone is in place: registering it is no longer undone by a cancel
-            h.set_cancellable(false);
-            ctl.progress.report(0.97, "registering");
-            st2.adopt(reservation)?;
-            rep
-        };
+        let (_, rep) = st2.catalog.clone_from_reserved(
+            &src.dataset,
+            reservation,
+            &sparkles::catalog::CloneRequest {
+                kind: Some(if in_memory {
+                    DbType::Mem
+                } else {
+                    DbType::Persistent
+                }),
+                spec,
+            },
+            &ctl,
+        )?;
+        h.set_cancellable(false);
         h.set_detail(json!({
             "method": rep.method.name(),
             "rebuildReason": rep.rebuild_reason,
@@ -3558,6 +3537,56 @@ async fn clone_dataset(
         StatusCode::ACCEPTED,
         [(header::LOCATION, location)],
         Json(task),
+    )
+        .into_response())
+}
+
+async fn rename_dataset(
+    State(st): St,
+    Path(name): Path<String>,
+    AdminBody(body): AdminBody,
+) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let value: J =
+        serde_json::from_slice(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let target = value["name"]
+        .as_str()
+        .filter(|n| sparkles::catalog::valid_name(n))
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "name must be a valid dataset name"))?
+        .to_string();
+    #[cfg(feature = "auth")]
+    if let Some(auth) = &st.auth {
+        let policy = auth.policy();
+        let mut grants = policy.dataset_grants_naming(&name);
+        grants.extend(policy.dataset_grants_naming(&target));
+        for token in auth.tokens.list(|t| t.expires_at() > auth.now()) {
+            for pattern in token.scope.datasets.keys() {
+                if crate::auth::glob(pattern, &name) || crate::auth::glob(pattern, &target) {
+                    grants.push(format!("token {}: dataset grant {pattern}", token.id));
+                }
+            }
+        }
+        grants.sort();
+        grants.dedup();
+        if !grants.is_empty() {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!("rename is blocked by grants: {}", grants.join("; ")),
+            ));
+        }
+    }
+    let old = name.clone();
+    let new = target.clone();
+    blocking(move || {
+        st.rename(&old, &new)?;
+        Ok(())
+    })
+    .await?;
+    Ok((
+        [(header::LOCATION, format!("/$/datasets/{target}"))],
+        Json(json!({"name": target, "renamedFrom": name})),
     )
         .into_response())
 }

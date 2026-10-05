@@ -79,7 +79,7 @@ fn server(max_decompressed: Option<u64>) -> (tempfile::TempDir, Arc<AppState>, R
 }
 
 fn count(st: &AppState) -> u64 {
-    st.datasets.read()["c"].store.snapshot().len()
+    st.datasets()["c"].store.snapshot().len()
 }
 
 fn post_encoded(uri: &str, ct: &str, encoding: &str, body: Vec<u8>) -> Request<Body> {

@@ -36,6 +36,7 @@ mod open;
 mod query_defaults;
 #[cfg(feature = "reasoning")]
 mod reasoning;
+mod rename;
 mod sd;
 mod tabular;
 mod tasks;
@@ -656,7 +657,7 @@ fn concurrent_dataset_management_is_serialized() {
     drop(state);
     let reopened =
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
-    let names: Vec<String> = reopened.datasets.read().keys().cloned().collect();
+    let names: Vec<String> = reopened.datasets().keys().cloned().collect();
     assert_eq!(names.len(), 31, "{names:?}");
 }
 

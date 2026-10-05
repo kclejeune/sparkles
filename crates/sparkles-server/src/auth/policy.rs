@@ -176,6 +176,36 @@ fn summarize(g: &Grants) -> String {
 }
 
 impl Policy {
+    /// Grants naming this dataset, including wildcard and branch-scoped grants.
+    pub fn dataset_grants_naming(&self, ds: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut look = |who: String, g: &Grants| {
+            for pattern in g
+                .datasets
+                .iter()
+                .map(|(p, _)| p)
+                .chain(g.restricted.iter().map(|r| &r.dataset))
+            {
+                if super::glob(pattern, ds) {
+                    out.push(format!("{who}: dataset grant {pattern}"));
+                }
+            }
+        };
+        look("anonymous".into(), &self.anonymous);
+        for (name, user) in &self.users {
+            look(format!("user {name}"), &user.grants);
+        }
+        for (name, grants) in &self.roles {
+            look(format!("role {name}"), grants);
+        }
+        for token in self.static_tokens.values() {
+            look(format!("token {}", token.id), &token.grants);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// The grants whose branch patterns cover one of branches `old` and `new` of
     /// dataset `ds` but not the other, as `who: dataset branches` lines: a rename from
     /// `old` to `new` changes who they let reach the branch.

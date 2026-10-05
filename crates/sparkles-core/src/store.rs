@@ -1129,11 +1129,10 @@ fn lock_dir(root: &Path) -> Result<File> {
         Err(std::fs::TryLockError::WouldBlock) => {
             let mut pid = String::new();
             let _ = File::open(&path).and_then(|mut f| f.read_to_string(&mut pid));
-            Err(Error::Invalid(format!(
-                "database {} is in use by another process (pid {}); stop it or talk to it over HTTP",
-                root.display(),
-                pid.trim()
-            )))
+            Err(Error::Locked {
+                path: root.to_path_buf(),
+                pid: pid.trim().parse().ok(),
+            })
         }
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }

@@ -69,7 +69,7 @@ pub struct BackupState {
     pub max_tasks: usize,
     /// the server's runtime, set by [`start`] once it exists
     handle: OnceLock<Handle>,
-    pub registry: registry::Registry,
+    pub registry: Arc<registry::Registry>,
     /// the `--backup-max-tasks` slots
     pub slots: Slots,
     claims: Mutex<Claims>,
@@ -123,7 +123,7 @@ impl BackupState {
             config_path,
             max_tasks,
             handle: OnceLock::new(),
-            registry,
+            registry: Arc::new(registry),
             slots: Slots::new(max_tasks),
             claims: Mutex::new(Claims::default()),
             metrics: metrics::BackupMetrics::default(),
@@ -756,43 +756,6 @@ pub fn restored_from(root: &Path) -> Option<serde_json::Value> {
         }
     };
     serde_json::to_value(from).ok()
-}
-
-/// Lock the data directory for this server process (`<data>/sparkles-server.lock`, an
-/// OS lock held while the returned file is open): a second server on the same data
-/// directory, or an offline `sparkles backup restore --data`, is refused.
-pub fn lock_data_dir(data_dir: &Path) -> anyhow::Result<std::fs::File> {
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("creating {}", data_dir.display()))?;
-    let path = data_dir.join(DATA_LOCK);
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    match f.try_lock() {
-        Ok(()) => Ok(f),
-        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-            "data directory {} is in use by another sparkles server ({DATA_LOCK} is locked)",
-            data_dir.display()
-        ),
-        Err(std::fs::TryLockError::Error(e)) => {
-            Err(e).with_context(|| format!("locking {}", path.display()))
-        }
-    }
-}
-
-/// `<data>/sparkles-server.lock`
-pub const DATA_LOCK: &str = "sparkles-server.lock";
-
-/// Whether a server holds the data directory's lock now (for offline commands that
-/// write into it).
-pub fn data_dir_in_use(data_dir: &Path) -> bool {
-    match std::fs::File::open(data_dir.join(DATA_LOCK)) {
-        Ok(f) => matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
-        Err(_) => false,
-    }
 }
 
 /// Start the background parts once the server's runtime exists: remember `h`, check

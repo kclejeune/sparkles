@@ -68,7 +68,8 @@ pub const ORIGIN_FILE: &str = "origin.json";
 /// the reasoning record of `reasoning.json` and the clone origin of `origin.json`.
 #[derive(Clone)]
 pub struct Dataset {
-    inner: Arc<DatasetState>,
+    pub(crate) inner: Arc<DatasetState>,
+    pub(crate) alias: Option<Arc<str>>,
 }
 
 /// How [`Dataset::open_with`] and [`Dataset::from_store_with`] open a dataset: the
@@ -113,6 +114,9 @@ impl From<StoreOptions> for DatasetOptions {
 /// may change between releases; programs use the methods of [`Dataset`].
 #[doc(hidden)]
 pub struct DatasetState {
+    pub(crate) branches: Mutex<BTreeMap<String, Dataset>>,
+    pub(crate) branch_handles: Mutex<Vec<std::sync::Weak<DatasetState>>>,
+    pub(crate) closure_cache_triples: usize,
     pub store: StoreHandle,
     pub name: Option<String>,
     /// the stored queries (`queries.json`)
@@ -266,7 +270,11 @@ impl Dataset {
             None => opts.origin,
         };
         Dataset {
+            alias: None,
             inner: Arc::new(DatasetState {
+                branches: Mutex::new(BTreeMap::new()),
+                branch_handles: Mutex::new(Vec::new()),
+                closure_cache_triples: opts.closure_cache_triples,
                 name: opts.name,
                 queries,
                 #[cfg(feature = "graphql")]
@@ -290,6 +298,27 @@ impl Dataset {
         Dataset::from_store_with(StoreHandle::Branch(store), opts)
     }
 
+    fn branches_in_use(&self) -> bool {
+        let branches = self.state().branches.lock();
+        let mut handles = self.state().branch_handles.lock();
+        handles.retain(|weak| weak.strong_count() > 0);
+        handles.iter().any(|weak| {
+            let cached = branches
+                .values()
+                .any(|ds| std::ptr::eq(Arc::as_ptr(&ds.inner), weak.as_ptr()));
+            weak.strong_count() > usize::from(cached)
+        })
+    }
+
+    #[cfg(feature = "backup")]
+    pub(crate) fn in_use_without_self(&self) -> bool {
+        Arc::strong_count(&self.inner) > 2 || self.branches_in_use()
+    }
+
+    pub(crate) fn in_use(&self) -> bool {
+        Arc::strong_count(&self.inner) > 1 || self.branches_in_use()
+    }
+
     /// The underlying store (ids, snapshots, low-level scans).
     pub fn store(&self) -> &Store {
         &self.inner.store
@@ -304,7 +333,7 @@ impl Dataset {
 
     /// The name a catalog or a server gave the dataset, if any.
     pub fn name(&self) -> Option<&str> {
-        self.inner.name.as_deref()
+        self.alias.as_deref().or(self.inner.name.as_deref())
     }
 
     /// The installed write-time validation, if any.

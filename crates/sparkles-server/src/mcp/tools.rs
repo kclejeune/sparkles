@@ -509,8 +509,7 @@ impl Tools<'_> {
         let mut defaults = self
             .server
             .state
-            .datasets
-            .read()
+            .datasets()
             .get(ds)
             .map(|d| d.dataset.query_options())
             .unwrap_or_default();

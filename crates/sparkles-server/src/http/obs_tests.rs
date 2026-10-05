@@ -304,7 +304,7 @@ async fn metrics_count_work_memory_peaks_and_rebuilds() {
         ))
         .unwrap();
     assert_eq!(send(&s.app, rq).await.status, StatusCode::OK);
-    let ds = s.state.datasets.read()["ds"].clone();
+    let ds = s.state.datasets()["ds"].clone();
     ds.store.compact().unwrap();
     let m = metrics(&s.app).await;
     // the query's 9 rows at least, and the rows of the update's WHERE

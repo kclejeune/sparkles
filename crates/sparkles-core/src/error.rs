@@ -4,6 +4,14 @@ use std::io;
 pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    /// An exclusive database or catalog lock is held by another opener.
+    #[error(
+        "directory {path} is in use by another process (pid {pid:?}); stop it or talk to it over HTTP"
+    )]
+    Locked {
+        path: std::path::PathBuf,
+        pid: Option<u32>,
+    },
     #[error("SPARQL syntax error: {0}")]
     SparqlSyntax(#[from] spargebra::SparqlSyntaxError),
     #[error("RDF parse error: {0}")]
@@ -274,6 +282,7 @@ impl Error {
     pub fn code(&self) -> &str {
         match self {
             Error::Io(_) => "io",
+            Error::Locked { .. } => "locked",
             Error::SparqlSyntax(_) => "sparql-syntax",
             Error::RdfParse(_) => "rdf-parse",
             Error::Timeout => "timeout",

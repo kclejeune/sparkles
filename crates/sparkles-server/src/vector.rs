@@ -282,7 +282,7 @@ pub fn spawn_embedders(st: Arc<crate::state::AppState>) {
         .spawn(move || {
             loop {
                 let all: Vec<Arc<crate::state::Dataset>> =
-                    st.datasets.read().values().cloned().collect();
+                    st.datasets().values().cloned().collect();
                 for ds in &all {
                     ensure_worker(&st, ds);
                 }
@@ -302,7 +302,7 @@ pub fn metrics(st: &crate::state::AppState, out: &mut String) {
     use sparkles::vector::embed::FailureKind;
     use std::collections::BTreeMap;
     use std::fmt::Write;
-    let datasets: Vec<Arc<crate::state::Dataset>> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<Arc<crate::state::Dataset>> = st.datasets().values().cloned().collect();
     let mut all: BTreeMap<(String, String), sparkles::vector::embed::EmbeddingMetrics> =
         BTreeMap::new();
     for d in &datasets {

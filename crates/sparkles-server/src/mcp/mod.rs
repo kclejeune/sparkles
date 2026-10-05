@@ -342,8 +342,7 @@ impl McpServer {
     /// The datasets `p` may read through MCP, in name order.
     pub fn visible(&self, p: &Principal) -> Vec<Arc<Dataset>> {
         self.state
-            .datasets
-            .read()
+            .datasets()
             .values()
             .filter(|ds| self.exposed(&ds.name) && p.can(&ds.name, Level::Read))
             .cloned()

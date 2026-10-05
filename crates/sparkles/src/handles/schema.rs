@@ -291,7 +291,7 @@ impl Schema {
             }
             Some(at) => {
                 let o = HistoryOptions {
-                    cancel: None,
+                    cancel: req.options.cancel.clone(),
                     deadline: deadline(req.timeout, req.options.deadline),
                 };
                 let (snap, r) = store.snapshot_at(at, &o)?;
@@ -366,7 +366,7 @@ impl Schema {
     pub fn diff(&self, from: &At, req: &ReportRequest) -> Result<(SchemaDiff, Computed)> {
         let deadline = deadline(req.timeout, req.options.deadline);
         let o = HistoryOptions {
-            cancel: None,
+            cancel: req.options.cancel.clone(),
             deadline,
         };
         let (old_snap, _) = self.ds.store().snapshot_at(from, &o)?;

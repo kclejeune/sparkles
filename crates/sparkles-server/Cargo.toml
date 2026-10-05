@@ -100,6 +100,7 @@ lsp-types = { workspace = true, optional = true }
 libc = "0.2"
 
 [dev-dependencies]
+sparkles = { workspace = true, features = ["failpoints"] }
 tower = { version = "0.5", features = ["util"] }
 # HTTPS clients of the native TLS tests (HTTP/1.1 and HTTP/2)
 reqwest = { workspace = true, features = ["http2"] }

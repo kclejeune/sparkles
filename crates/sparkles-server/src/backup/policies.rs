@@ -27,17 +27,17 @@ use axum::routing::{get, post};
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use sparkles_backup::RunRetention;
 use sparkles_backup::policy::{self, NameCtx, Schedule, Tz};
 use sparkles_backup::{
-    BackupError, BackupSummary, Code, ConfigSource, CreateOptions, Ctl, DatasetRunResult,
-    GcOptions, ListFilter, Policy, PolicyConfig, PolicyList, PolicyRun, PolicyRunDataset,
-    PolicyRunList, PolicyState, PreviewRequest, PreviewResponse, RetentionResponse, RunGc,
-    RunResult, RunRetention, RunTrigger,
+    BackupError, BackupSummary, Code, ConfigSource, CreateOptions, DatasetRunResult, GcOptions,
+    ListFilter, Policy, PolicyConfig, PolicyList, PolicyRun, PolicyRunList, PolicyState,
+    PreviewRequest, PreviewResponse, RetentionResponse, RunGc, RunResult, RunTrigger,
 };
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 use uuid::Uuid;
 
 /// `runs.json` keeps this many runs (all policies together).
@@ -114,8 +114,7 @@ pub fn block_on<F: std::future::Future>(b: &BackupState, f: F) -> F::Output {
 
 impl Engine for ServerEngine {
     fn datasets(&self, st: &Arc<AppState>) -> Vec<DatasetInfo> {
-        st.datasets
-            .read()
+        st.datasets()
             .values()
             .map(|d| DatasetInfo {
                 name: d.name.clone(),
@@ -601,7 +600,7 @@ pub fn start_run(
         .get(&name)
         .map(|e| e.config.clone())
         .ok_or_else(|| no_such_policy(&name))?;
-    let (_, tz) = policy::check_policy(&config)?;
+    policy::check_policy(&config)?;
     let admission = b.admit()?;
     let id = st.next_task_id();
     {
@@ -621,7 +620,6 @@ pub fn start_run(
             b: &b,
             h,
             config,
-            tz,
             trigger,
             scheduled_for,
             started,
@@ -643,7 +641,6 @@ struct Run<'a> {
     b: &'a Arc<BackupState>,
     h: &'a TaskHandle,
     config: PolicyConfig,
-    tz: Tz,
     trigger: RunTrigger,
     scheduled_for: Option<DateTime<Utc>>,
     started: DateTime<Utc>,
@@ -665,109 +662,38 @@ impl Run<'_> {
         let p = &self.config;
         let pols = &self.b.policies;
         let engine = pols.engine();
-        let run_id = Uuid::new_v4();
-        let at = self.scheduled_for.unwrap_or(self.started);
-        tracing::info!(target: "sparkles::backup", policy = p.name.as_str(), run = %run_id,
-            trigger = ?self.trigger, "policy run started");
-        let mut run = PolicyRun {
-            id: run_id.to_string(),
-            policy: p.name.clone(),
-            trigger: self.trigger,
-            scheduled_for: self.scheduled_for.map(fmt_time),
-            started: fmt_time(self.started),
-            finished: None,
-            result: RunResult::Ok,
-            reason: None,
-            datasets: Vec::new(),
-            retention: None,
-            gc: None,
+        let adapter = PolicyEngine {
+            st: self.st,
+            engine: &*engine,
+            run: Some(self),
         };
-        let selected: Vec<DatasetInfo> = engine
-            .datasets(self.st)
-            .into_iter()
-            .filter(|d| p.datasets.iter().any(|g| crate::auth::glob(g, &d.name)))
-            .collect();
-        // this policy's latest backup per dataset id, for skipUnchanged
-        let previous: Vec<BackupSummary> = if p.skip_unchanged {
-            engine
-                .list(self.st, &p.repository, &p.name)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let (mut cancelled, mut disabled) = (false, false);
-        for (i, ds) in selected.iter().enumerate() {
-            let skip = |why: &str| PolicyRunDataset {
-                dataset: ds.name.clone(),
-                backup: None,
-                result: DatasetRunResult::Skipped,
-                reason: Some(why.to_string()),
-                added_bytes: None,
-                millis: None,
-            };
-            if !cancelled && self.h.is_cancelled() {
-                cancelled = true;
-            }
-            if !cancelled && !disabled && !self.still_enabled() {
-                disabled = true;
-            }
-            if cancelled {
-                run.datasets.push(skip("cancelled"));
-                continue;
-            }
-            if disabled {
-                run.datasets.push(skip("policy disabled"));
-                continue;
-            }
-            self.h.progress(
-                i as f32 / selected.len() as f32 * 0.9,
-                &format!("dataset {}/{}: {}", i + 1, selected.len(), ds.name),
-            );
-            let unchanged = previous
-                .iter()
-                .filter(|b| b.dataset.id == ds.id)
-                .max_by(|a, b| a.completed.cmp(&b.completed))
-                .is_some_and(|b| b.commit.seq == ds.head);
-            if unchanged {
-                run.datasets.push(skip("unchanged"));
-                continue;
-            }
-            run.datasets.push(self.backup(&*engine, ds, run_id, at));
-        }
-        let (ok, failed) = run
+        let mut run = sparkles::backup::policy::run(
+            &adapter,
+            p,
+            self.trigger,
+            self.scheduled_for,
+            self.started,
+            &self.h.control(),
+            || self.still_enabled(),
+        )?;
+        let cancelled = run.reason.as_deref() == Some("cancelled");
+        let ok = run
             .datasets
             .iter()
-            .fold((0, 0), |(o, f), d| match d.result {
-                DatasetRunResult::Ok => (o + 1, f),
-                DatasetRunResult::Failed => (o, f + 1),
-                DatasetRunResult::Skipped => (o, f),
-            });
-        run.result = if disabled {
-            RunResult::Skipped
-        } else if failed == 0 && !cancelled {
-            RunResult::Ok
-        } else if ok == 0 {
-            RunResult::Failed
-        } else {
-            RunResult::Partial
-        };
-        if !cancelled && !disabled {
-            self.h.progress(0.95, "retention");
-            let retention = self.retention(&*engine);
-            // collecting is worth it only when retention deleted something
-            let deleted = !retention.deleted.is_empty();
-            run.retention = Some(retention);
-            if p.gc_after_retention && deleted {
-                run.gc = self.gc(&*engine);
-            }
-        }
+            .filter(|d| d.result == DatasetRunResult::Ok)
+            .count();
+        let failed = run
+            .datasets
+            .iter()
+            .filter(|d| d.result == DatasetRunResult::Failed)
+            .count();
         let finished = pols.now();
         run.finished = Some(fmt_time(finished));
         if matches!(run.result, RunResult::Failed | RunResult::Partial) {
-            tracing::warn!(target: "sparkles::backup", policy = p.name.as_str(), run = %run_id,
+            tracing::warn!(target: "sparkles::backup", policy = p.name.as_str(), run = %run.id,
                 result = result_str(run.result), failed, ok, "policy run failed");
         } else {
-            tracing::info!(target: "sparkles::backup", policy = p.name.as_str(), run = %run_id,
+            tracing::info!(target: "sparkles::backup", policy = p.name.as_str(), run = %run.id,
                 result = result_str(run.result), ok, "policy run finished");
         }
         {
@@ -796,95 +722,6 @@ impl Run<'_> {
                 _ => String::new(),
             }
         ))
-    }
-
-    /// Back up one dataset under the rendered name, appending `-2`, `-3`, … while the
-    /// name is taken.
-    fn backup(
-        &self,
-        engine: &dyn Engine,
-        ds: &DatasetInfo,
-        run_id: Uuid,
-        at: DateTime<Utc>,
-    ) -> PolicyRunDataset {
-        let p = &self.config;
-        let t0 = Instant::now();
-        let failed = |e: &BackupError| {
-            tracing::warn!(target: "sparkles::backup", policy = p.name.as_str(),
-                dataset = ds.name.as_str(), code = e.code().as_str(), "policy backup failed: {}", e.message());
-            PolicyRunDataset {
-                dataset: ds.name.clone(),
-                backup: None,
-                result: DatasetRunResult::Failed,
-                reason: Some(e.message().to_string()),
-                added_bytes: None,
-                millis: Some(t0.elapsed().as_millis() as u64),
-            }
-        };
-        let base = match policy::render_name(
-            &p.name_template,
-            &NameCtx {
-                policy: &p.name,
-                dataset: &ds.name,
-                seq: ds.head,
-                run: run_id,
-                time: at,
-                tz: self.tz,
-            },
-        ) {
-            Ok(n) => n,
-            Err(e) => return failed(&e),
-        };
-        let mut k = 1;
-        loop {
-            let name = if k == 1 {
-                base.clone()
-            } else {
-                let suffix = format!("-{k}");
-                let keep = base.len().min(64 - suffix.len());
-                format!("{}{suffix}", &base[..keep])
-            };
-            let o = CreateOptions {
-                name: name.clone(),
-                note: None,
-                policy: Some((p.name.clone(), run_id.to_string())),
-                dataset_name: ds.name.clone(),
-                extra: Vec::new(),
-                min_free_disk_bytes: None,
-                ctl: Ctl::with_cancel(self.h.cancel_flag()),
-            };
-            match engine.create(self.st, &p.repository, &ds.name, o) {
-                Ok(s) => {
-                    return PolicyRunDataset {
-                        dataset: ds.name.clone(),
-                        backup: Some(s.name),
-                        result: DatasetRunResult::Ok,
-                        reason: None,
-                        added_bytes: Some(s.added_bytes),
-                        millis: Some(t0.elapsed().as_millis() as u64),
-                    };
-                }
-                Err(e) if e.code() == Code::BackupExists && k < 100 => k += 1,
-                Err(e) => return failed(&e),
-            }
-        }
-    }
-
-    fn retention(&self, engine: &dyn Engine) -> RunRetention {
-        match apply_retention(self.st, engine, &self.config, false) {
-            Ok(r) => RunRetention {
-                deleted: r.delete.into_iter().map(|b| b.name).collect(),
-                error: r.errors.map(|e| e.join("; ")),
-            },
-            Err(e) => {
-                tracing::warn!(target: "sparkles::backup", policy = self.config.name.as_str(),
-                    "policy retention failed: {}", e.message());
-                RunRetention {
-                    deleted: Vec::new(),
-                    error: Some(e.message().to_string()),
-                }
-            }
-        }
     }
 
     /// Start GC unless this repository was collected after retention in the last 24 h.
@@ -929,31 +766,69 @@ fn apply_retention(
     dry_run: bool,
 ) -> Result<RetentionResponse, BackupError> {
     let b = backup_state(st)?;
-    let list = engine.list(st, &p.repository, &p.name)?;
-    let busy = engine.busy(st, &p.repository);
-    let plan = policy::retention(&list, &p.name, &p.retention, b.policies.now(), &busy);
-    let mut errors = Vec::new();
-    let mut deleted = Vec::new();
-    for s in plan.delete {
-        if dry_run {
-            deleted.push(s);
-            continue;
-        }
-        match engine.delete(st, &p.repository, &s.name) {
-            Ok(_) => deleted.push(s),
-            Err(e) => errors.push(format!("{}: {}", s.name, e.message())),
-        }
-    }
-    if !dry_run && !deleted.is_empty() {
-        tracing::info!(target: "sparkles::backup", policy = p.name.as_str(),
-            deleted = deleted.len(), "policy retention");
-    }
-    Ok(RetentionResponse {
+    sparkles::backup::policy::apply_retention(
+        &PolicyEngine {
+            st,
+            engine,
+            run: None,
+        },
+        p,
         dry_run,
-        delete: deleted,
-        keep: plan.keep,
-        errors: (!errors.is_empty()).then_some(errors),
-    })
+        b.policies.now(),
+    )
+}
+
+struct PolicyEngine<'a> {
+    st: &'a Arc<AppState>,
+    engine: &'a dyn Engine,
+    run: Option<&'a Run<'a>>,
+}
+impl sparkles::backup::policy::Engine for PolicyEngine<'_> {
+    fn datasets(&self) -> Vec<sparkles::backup::policy::DatasetInfo> {
+        self.engine
+            .datasets(self.st)
+            .into_iter()
+            .map(|d| sparkles::backup::policy::DatasetInfo {
+                name: d.name,
+                id: d.id,
+                head: d.head,
+            })
+            .collect()
+    }
+    fn list(&self, repo: &str, policy: &str) -> Result<Vec<BackupSummary>, BackupError> {
+        self.engine.list(self.st, repo, policy)
+    }
+    fn create(
+        &self,
+        repo: &str,
+        dataset: &str,
+        o: CreateOptions,
+    ) -> Result<BackupSummary, BackupError> {
+        self.engine.create(self.st, repo, dataset, o)
+    }
+    fn delete(&self, repo: &str, backup: &str) -> Result<bool, BackupError> {
+        self.engine.delete(self.st, repo, backup)
+    }
+    fn busy(&self, repo: &str) -> HashSet<String> {
+        self.engine.busy(self.st, repo)
+    }
+    fn start_gc(&self, repo: &str) -> Result<String, BackupError> {
+        match self.run {
+            Some(run) => run
+                .gc(self.engine)
+                .map(|g| g.task)
+                .ok_or_else(|| BackupError::internal("GC deferred")),
+            None => self.engine.start_gc(self.st, repo),
+        }
+    }
+    fn now(&self) -> DateTime<Utc> {
+        self.st
+            .backup
+            .as_ref()
+            .expect("backup enabled")
+            .policies
+            .now()
+    }
 }
 
 // ----------------------------------------------------------------------- metrics ------

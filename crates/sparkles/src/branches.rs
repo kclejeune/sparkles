@@ -16,16 +16,36 @@ impl Dataset {
     /// is this dataset itself. Branch operations (create, merge, delete) are made on
     /// the dataset that owns the branches, the one [`Dataset::open`] returned.
     pub fn branch(&self, name: &str) -> Result<Dataset> {
-        match self.store().branch(name)?.shared() {
-            Some(s) => Ok(Dataset::from_shared(
-                s,
-                crate::DatasetOptions {
-                    name: self.name().map(str::to_string),
-                    ..Default::default()
-                },
-            )),
-            None => Ok(self.clone()),
+        if name == crate::branch::MAIN {
+            return Ok(self.clone());
         }
+        let id = self.store().branch_id_of(name)?;
+        let mut branches = self.state().branches.lock();
+        if let Some(ds) = branches.get(name)
+            && ds.store().branch_id() == id
+        {
+            return Ok(ds.clone());
+        }
+        let store = self
+            .store()
+            .branch(name)?
+            .shared()
+            .expect("non-main branch");
+        let ds = Dataset::from_shared(
+            store,
+            crate::DatasetOptions {
+                store: self.store().options().clone(),
+                name: self.name().map(str::to_string),
+                closure_cache_triples: self.state().closure_cache_triples,
+                ..Default::default()
+            },
+        );
+        self.state()
+            .branch_handles
+            .lock()
+            .push(std::sync::Arc::downgrade(&ds.inner));
+        branches.insert(name.to_string(), ds.clone());
+        Ok(ds)
     }
 
     /// The branches, `main` first.
@@ -125,13 +145,20 @@ impl Dataset {
     /// Rename branch `name` to `new` (see
     /// [`Store::rename_branch`](crate::store::Store::rename_branch)).
     pub fn rename_branch(&self, name: &str, new: &str) -> Result<BranchInfo> {
-        self.store().rename_branch(name, new)
+        let info = self.store().rename_branch(name, new)?;
+        let mut branches = self.state().branches.lock();
+        if let Some(ds) = branches.remove(name) {
+            branches.insert(new.to_string(), ds);
+        }
+        Ok(info)
     }
 
     /// Delete branch `name` with options, which can re-parent the branches created from
     /// it (see [`Store::delete_branch_with`](crate::store::Store::delete_branch_with)).
     pub fn delete_branch_with(&self, name: &str, o: &crate::branch::DeleteOptions) -> Result<()> {
-        self.store().delete_branch_with(name, o)
+        self.store().delete_branch_with(name, o)?;
+        self.state().branches.lock().remove(name);
+        Ok(())
     }
 
     /// The predicates whose cells never conflict in this dataset's merges.
@@ -149,7 +176,9 @@ impl Dataset {
 
     /// Delete branch `name`, also with unmerged commits when `force`.
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
-        self.store().delete_branch(name, force)
+        self.store().delete_branch(name, force)?;
+        self.state().branches.lock().remove(name);
+        Ok(())
     }
 
     /// A page of the commit graph of several branches, newest first (see

@@ -279,7 +279,7 @@ pub async fn whoami(
     let mut datasets = Map::new();
     // datasets where grants cover only some graphs or endpoints (never the patterns)
     let mut restricted = Map::new();
-    for name in st.datasets.read().keys() {
+    for name in st.datasets().keys() {
         let lvl = if p.is_local() {
             Some(Level::Admin)
         } else {

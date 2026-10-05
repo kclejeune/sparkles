@@ -47,6 +47,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // POST: Fuseki's `?state=offline|active`
     ("/$/datasets/{ds}", &["GET", "POST", "DELETE"]),
     ("/$/datasets/{ds}/clone", &["POST"]),
+    ("/$/datasets/{ds}/rename", &["POST"]),
     ("/$/stats/{ds}", &["GET", "POST"]),
     // Fuseki's routes (`http/fuseki.rs`)
     ("/$/stats", &["GET", "POST"]),
@@ -239,6 +240,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/metrics" => Server(ServerPerm::Metrics),
         "/$/datasets" if get => Caller,
         "/$/datasets" => Server(ServerPerm::ServerAdmin),
+        "/$/datasets/{ds}/rename" => Server(ServerPerm::ServerAdmin),
         "/$/datasets/{ds}" if get => Dataset(Read),
         "/$/datasets/{ds}" => Dataset(Admin),
         // visible on some branch: the handlers check the branches a request names

@@ -444,7 +444,7 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
     if st.read_only {
         return;
     }
-    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<Arc<Dataset>> = st.datasets().values().cloned().collect();
     let mut pending = auto.pending.lock();
     pending.retain(|n, _| datasets.iter().any(|d| &d.name == n));
     for ds in datasets {

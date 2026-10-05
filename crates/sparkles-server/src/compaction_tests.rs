@@ -180,12 +180,15 @@ async fn due_compactions_wait_for_what_needs_the_dataset() {
     assert_eq!(compactions(&st).len(), 1);
     // an hour later it goes ahead, unless something else needs the dataset
     let later = Instant::now() + Duration::from_secs(3601);
-    st.restoring.lock().insert("p".into(), "9".into());
+    let restoring = st
+        .catalog
+        .reserve("p", sparkles::catalog::ReservationKind::Restore, "9")
+        .unwrap();
     tick(&st, later);
     // requests to the dataset wait for the restore: ask the status directly
     let j = status_json(&st, &st.get("p").unwrap());
     assert_eq!(j["deferred"], "restore", "{j}");
-    st.restoring.lock().clear();
+    drop(restoring);
     // a load task of the dataset
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let load = st.start_task("load", "p", move |_| {

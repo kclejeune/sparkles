@@ -5,18 +5,22 @@
 use super::cli::plural;
 use super::metrics::{Operation, Outcome};
 use super::{BackupState, ClaimSpec, Started, swap};
-use crate::state::{AppState, Dataset, DbType, Reservation, Task, TaskHandle};
+use crate::state::{AppState, Dataset, Reservation, Task, TaskHandle};
 use serde_json::{Value as J, json};
 use sparkles_backup::{
     BackupError, BackupSummary, Code, CreateOptions, Ctl, GcOptions, GcReport, LastGc, RepoConfig,
-    RestoreOptions, RestoreRequest, Source, Verified, VerifyLevel, VerifyOptions, VerifyReport,
+    RestoreRequest, Verified, VerifyLevel, VerifyOptions, VerifyReport,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 /// The backup state of a server that has one.
 pub fn backup_state(st: &AppState) -> Result<Arc<BackupState>, BackupError> {
+    if let Some(b) = &st.backup {
+        st.catalog
+            .share_repositories(b.registry.clone())
+            .map_err(library_error)?;
+    }
     st.backup.clone().ok_or_else(|| {
         BackupError::new(
             Code::NotImplemented,
@@ -62,6 +66,11 @@ fn log_end<T>(what: &str, r: &Result<T, BackupError>, t0: Instant) {
     }
 }
 
+/// Preserve the backup component's structured error at HTTP/task boundaries.
+pub fn library_error(e: sparkles::Error) -> BackupError {
+    sparkles::backup::policy::to_backup(e)
+}
+
 // ----------------------------------------------------------------- create ------
 
 /// What to call a backup.
@@ -71,20 +80,6 @@ pub struct CreateArgs {
     pub note: Option<String>,
     /// `(policy, run id)` of a policy run
     pub policy: Option<(String, String)>,
-}
-
-/// `reasoning.json` of a backup of `ds` at commit `seq`: the dataset's reasoning status,
-/// unless it describes a later commit (inferences materialized after the capture).
-fn reasoning_file(ds: &Dataset, seq: u64) -> Option<(String, Vec<u8>)> {
-    let mut info = ds.reasoning.read().clone()?;
-    if info.commit.is_some_and(|c| c > seq) {
-        return None;
-    }
-    info.reasoning_format = 2;
-    Some((
-        "reasoning.json".into(),
-        serde_json::to_vec_pretty(&info).ok()?,
-    ))
 }
 
 /// `409 repository-read-only` for a write to a read-only repository.
@@ -171,38 +166,6 @@ fn create_now(
     r.map(|(s, _)| s)
 }
 
-/// Progress `p` of `ctl` reported as `lo + p × (hi − lo)`.
-fn scaled(ctl: &Ctl, lo: f32, hi: f32) -> Ctl {
-    Ctl::from(&ctl.control().part(lo, hi))
-}
-
-/// The capture of `ds`: of its files, or for an in-memory dataset of a temporary
-/// database built from its snapshot in `<data>/tmp` (the first 40 % of the progress).
-fn capture(
-    ds: &Dataset,
-    name: &str,
-    reserve: Option<u64>,
-    tmp: &std::path::Path,
-    ctl: &Ctl,
-) -> Result<sparkles::store::BackupCapture, BackupError> {
-    if ds.kind != DbType::Mem {
-        return Ok(ds.store.backup_capture(name)?);
-    }
-    let build = scaled(ctl, 0.02, 0.4);
-    let o = sparkles::store::MemoryCaptureOptions {
-        tmp_dir: tmp.to_path_buf(),
-        min_free_disk_bytes: reserve,
-        cancel: Some(ctl.cancel.clone()),
-        progress: build
-            .progress
-            .clone()
-            .map(|f| -> sparkles::store::ProgressFn {
-                Arc::new(move |p, m: &str| f(p, &format!("building a temporary copy: {m}")))
-            }),
-    };
-    Ok(ds.store.memory_backup_capture(name, &o)?)
-}
-
 fn create_in(
     b: &BackupState,
     ds: &Arc<Dataset>,
@@ -213,48 +176,36 @@ fn create_in(
     ctl: Ctl,
 ) -> Result<(BackupSummary, Outcome), BackupError> {
     let repo = b.repo(repo_name)?;
-    ctl.report(0.02, &format!("capturing /{}", ds.name));
-    let cap = {
-        let span = tracing::info_span!(
-            "backup.capture",
-            "db.namespace" = ds.name.as_str(),
-            "sparkles.repository" = repo_name,
-            "sparkles.backup.name" = a.name.as_str(),
-            "sparkles.commit" = tracing::field::Empty,
-            "sparkles.backup.lock_ms" = tracing::field::Empty,
-        );
-        let _g = span.enter();
-        let cap = capture(ds, &a.name, reserve, tmp, &ctl)?;
-        span.record("sparkles.commit", cap.commit.seq);
-        span.record(
-            "sparkles.backup.lock_ms",
-            cap.lock_hold.as_secs_f64() * 1000.0,
-        );
-        cap
-    };
-    b.metrics.capture_lock(cap.lock_hold);
-    let mut extra: Vec<_> = reasoning_file(ds, cap.commit.seq).into_iter().collect();
-    // an in-memory dataset keeps its validation configuration in the guard
-    if cap.in_memory
-        && let Some(v) = ds.validation.read().as_ref()
-    {
-        extra.extend(v.memory_files());
-    }
-    let ctl = if cap.in_memory {
-        scaled(&ctl, 0.4, 1.0)
-    } else {
-        ctl
-    };
     let o = CreateOptions {
-        name: a.name.clone(),
+        name: a.name,
         note: a.note,
         policy: a.policy,
         dataset_name: ds.name.clone(),
-        extra,
+        extra: Vec::new(),
         min_free_disk_bytes: reserve,
-        ctl,
+        ctl: ctl.clone(),
     };
-    let s = b.block_on(repo.create(Source::from(cap), &o))??;
+    let create = || {
+        ds.dataset
+            .backups(&repo)
+            .create_observed_with(&o, &ctl.control(), tmp, |cap| {
+                b.metrics.capture_lock(cap.lock_hold)
+            })
+    };
+    // Tokio's blocking pool still enters its runtime. The library's blocking API
+    // runs outside that context, including when an embedding host drives this path.
+    let s = if tokio::runtime::Handle::try_current().is_ok() {
+        let span = tracing::Span::current();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| span.in_scope(create))
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    } else {
+        create()
+    }
+    .map_err(library_error)?;
     // the manifest (cached by the create) has the blob counts
     let stats = b
         .block_on(repo.manifest(&s.name))
@@ -279,7 +230,6 @@ pub struct RestoreArgs {
     pub repo: String,
     pub backup: String,
     /// the backup's dataset id
-    pub source_id: Uuid,
     /// the dataset to create, or to replace with `req.replace`
     pub target: String,
     pub req: RestoreRequest,
@@ -347,44 +297,25 @@ fn restore_in(
     if tmp.exists() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
-    // the identity rule: `auto` keeps the id only if no dataset here has it (the
-    // target included, so restoring in place of the live source gets a new id). In
-    // place of a dataset with the backup's id, `keep` is checked against its head
-    // instead (the handler checked that no other dataset has the id)
-    let st2 = st.clone();
-    let id_in_use = Arc::new(move |id: Uuid| {
-        st2.datasets
-            .read()
-            .values()
-            .any(|d| d.store.dataset_id() == id)
-    });
-    let in_place_head = if a.req.replace {
-        st.get(&a.target)
-            .filter(|d| d.store.dataset_id() == a.source_id)
-            .map(|d| d.store.head_commit().seq)
-    } else {
-        None
-    };
     let c = ctl(h, 0.0, 0.9);
-    // the free-space check keeps the server's disk reserve (`--min-free-disk-mb`)
     let mut store_opts = st.store_opts.clone();
     store_opts.min_free_disk_bytes = st
         .limits
         .min_free_disk_bytes
         .or(store_opts.min_free_disk_bytes);
-    let o = RestoreOptions {
-        identity: a.req.identity,
-        check: a.req.check,
-        id_in_use,
-        in_place_head,
+    let report = match st.catalog.download_restore(
+        &repo,
+        &a.backup,
+        &a.target,
+        &a.req,
+        &tmp,
         store_opts,
-        ctl: c.clone(),
-    };
-    let report = match b.block_on(repo.restore(&a.backup, &tmp, &o)) {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) | Err(e) => {
+        &c.control(),
+    ) {
+        Ok(report) => report,
+        Err(e) => {
             let _ = std::fs::remove_dir_all(&tmp);
-            return Err(e);
+            return Err(library_error(e));
         }
     };
     // a cancel before the swap leaves everything as it was

@@ -48,7 +48,7 @@ pub(crate) fn metrics(st: &AppState, out: &mut String) {
         let _ = writeln!(o, "# HELP {name} {help}");
         let _ = writeln!(o, "# TYPE {name} {kind}");
     };
-    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<Arc<Dataset>> = st.datasets().values().cloned().collect();
     let mut gauges: std::collections::BTreeMap<String, (u64, u64, u64)> = Default::default();
     // per branch: quads, delta inserts and deletes, log bytes, own disk bytes
     type Per = std::collections::BTreeMap<(String, String), [u64; 5]>;
@@ -779,7 +779,7 @@ pub(crate) async fn patch_branch(
     let (b, r) = (branch.clone(), rename.clone());
     let info = blocking(move || {
         let b = match &r {
-            Some(new) => d.store.rename_branch(&b, new)?.name,
+            Some(new) => d.dataset.rename_branch(&b, new)?.name,
             None => b,
         };
         if let Some(on) = protected {
@@ -851,7 +851,7 @@ pub(crate) async fn delete_branch(
     }
     let d = ds.clone();
     let b = branch.clone();
-    blocking(move || Ok(d.store.delete_branch_with(&b, &o)?)).await?;
+    blocking(move || Ok(d.dataset.delete_branch_with(&b, &o)?)).await?;
     ds.branches.lock().remove(&branch);
     Ok(StatusCode::NO_CONTENT.into_response())
 }

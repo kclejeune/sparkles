@@ -12,6 +12,8 @@ pub use sparkles_core::{
 #[cfg(feature = "backup")]
 pub mod backup;
 mod branches;
+pub mod catalog;
+pub mod cloning;
 pub mod dataset;
 pub mod embed;
 #[cfg(feature = "fmt")]
@@ -23,5 +25,6 @@ pub mod stats;
 pub mod terms;
 pub mod write_guard;
 
+pub use catalog::{Catalog, CatalogOptions};
 pub use dataset::{Dataset, DatasetOptions, GraphView, QuadIter, Solution, Solutions, Transaction};
 pub use sparkles_core::{Budget, BudgetKind, Error, Result};

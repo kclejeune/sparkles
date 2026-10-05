@@ -101,7 +101,7 @@ async fn server(limits: impl FnOnce(&mut crate::state::Limits)) -> Server {
     limits(&mut st.limits);
     let state = Arc::new(st);
     state.attach("h", DbType::Persistent, None).unwrap();
-    let store = state.datasets.read()["h"].clone();
+    let store = state.datasets()["h"].clone();
     let clock = Arc::new(std::sync::atomic::AtomicI64::new(T0));
     let c = clock.clone();
     store.store.set_clock(Arc::new(move || {
@@ -218,7 +218,7 @@ async fn diffs_as_json_and_lines() {
 #[tokio::test]
 async fn diffs_as_rdf_patch() {
     let s = server(|_| {}).await;
-    let id = s.state.datasets.read()["h"].store.dataset_id();
+    let id = s.state.datasets()["h"].store.dataset_id();
     let r = get_with(
         &s.app,
         "/h/diff?from=1&to=4",
@@ -305,7 +305,7 @@ async fn read_events(body: &mut axum::body::BodyDataStream, n: usize) -> Vec<(St
 #[tokio::test]
 async fn the_change_feed() {
     let s = server(|_| {}).await;
-    let id = s.state.datasets.read()["h"].store.dataset_id();
+    let id = s.state.datasets()["h"].store.dataset_id();
     // every commit after 0, oldest first
     let r = get(&s.app, "/h/changes?after=0").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
@@ -820,7 +820,7 @@ async fn retention_bytes_schedules_expiry_and_metrics() {
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     // the tick: the schedule pins the head, the expired pin goes (the clock is at
     // T0 + 40 s, before the expiry at T0 + 60 s)
-    let ds = s.state.datasets.read()["h"].clone();
+    let ds = s.state.datasets()["h"].clone();
     let store = &ds.store;
     let t = store.history_tick().unwrap();
     assert_eq!(t.created.len(), 1);

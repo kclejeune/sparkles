@@ -733,6 +733,28 @@ fn restored_copy(dir: &std::path::Path, n: usize) -> uuid::Uuid {
     s.dataset_id()
 }
 
+#[test]
+fn a_request_past_the_guard_does_not_repopulate_drained_restore_routing() {
+    let s = server(Opts::default());
+    let held = s.st.catalog.get_for_request("ds").unwrap().unwrap();
+    let reservation =
+        s.st.catalog
+            .reserve("ds", sparkles::catalog::ReservationKind::Restore, "78")
+            .unwrap();
+    let tmp = s.dir.path().join("databases/.restore-ds-78");
+    let id = restored_copy(&tmp, 3);
+    s.st.forget_routing("ds");
+    // The accepted request only now asks the server for its routing object.
+    drop(s.st.get("ds").unwrap());
+    drop(held);
+    let restored =
+        s.st.catalog
+            .replace_restored_reserved(reservation, &tmp, "78", false)
+            .unwrap();
+    assert_eq!(restored.dataset_id(), id);
+    assert_eq!(s.st.get("ds").unwrap().store.dataset_id(), id);
+}
+
 /// A client polling a dataset during an in-place swap sees its old or new state, or a
 /// retryable `503`, never a `404` or `500`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -758,6 +780,9 @@ async fn a_polling_client_never_sees_the_dataset_missing_during_a_swap() {
                     assert_eq!(r.body["code"], "dataset-restoring", "{}", r.body);
                 }
                 *seen.entry(r.status.as_u16()).or_default() += 1;
+                // In-process router calls can finish without yielding, unlike HTTP.
+                // Let the swap completion and this test's timers run under load.
+                tokio::task::yield_now().await;
             }
             seen
         }));
@@ -847,17 +872,16 @@ async fn metrics_include_the_backup_families() {
 #[test]
 fn one_server_per_data_directory() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(!data_dir_in_use(dir.path()));
-    let lock = lock_data_dir(dir.path()).unwrap();
-    assert!(data_dir_in_use(dir.path()));
-    let e = lock_data_dir(dir.path()).unwrap_err();
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let e = sparkles::Catalog::open(dir.path(), Default::default())
+        .err()
+        .unwrap();
     assert!(
-        format!("{e:#}").contains("in use by another sparkles server"),
+        matches!(e, sparkles::Error::Locked { pid: Some(pid), .. } if pid == std::process::id()),
         "{e:#}"
     );
-    drop(lock);
-    assert!(!data_dir_in_use(dir.path()));
-    let _again = lock_data_dir(dir.path()).unwrap();
+    drop(catalog);
+    let _again = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
 }
 
 // ---------------------------------------------------------- permissions ------

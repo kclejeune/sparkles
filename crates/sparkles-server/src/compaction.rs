@@ -168,7 +168,7 @@ fn decide(st: &AppState, ds: &Dataset, s: &DsState, running_auto: usize, now: In
             ),
         );
     }
-    if let Some(t) = st.restoring.lock().get(&ds.name) {
+    if let Some(t) = st.catalog.restoring_by(&ds.name) {
         return defer("restore", format!("task {t} is restoring the dataset"));
     }
     for (kind, reason) in [
@@ -558,7 +558,7 @@ pub fn metrics(st: &AppState, out: &mut String) {
         let _ = writeln!(o, "# HELP {name} {help}");
         let _ = writeln!(o, "# TYPE {name} {kind}");
     };
-    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<Arc<Dataset>> = st.datasets().values().cloned().collect();
     let mut all: BTreeMap<String, Agg> = BTreeMap::new();
     for d in &datasets {
         let p = st.compaction.policy_for(d);

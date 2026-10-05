@@ -675,7 +675,7 @@ pub(crate) fn spawn_tick(st: Arc<AppState>, every: std::time::Duration) {
 /// cache hits and misses, and materializations with their time.
 pub(crate) fn metrics(st: &AppState, out: &mut String) {
     use std::fmt::Write;
-    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<Arc<Dataset>> = st.datasets().values().cloned().collect();
     if datasets.is_empty() {
         return;
     }

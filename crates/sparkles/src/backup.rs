@@ -9,6 +9,11 @@
 //! [`Repository`]'s own async methods instead.
 
 pub use sparkles_backup::*;
+pub mod config;
+pub mod policy;
+pub mod registry;
+mod repositories;
+pub use repositories::Repositories;
 
 use crate::error::{ComponentError, Error};
 use std::future::Future;
@@ -67,6 +72,15 @@ pub struct Blocking<'r> {
 }
 
 impl Blocking<'_> {
+    /// Download and verify a backup into an unregistered directory.
+    pub fn restore_to_dir(
+        &self,
+        name: &str,
+        directory: &std::path::Path,
+        options: &RestoreOptions,
+    ) -> crate::Result<RestoreReport> {
+        block_on(self.repo.restore(name, directory, options))?.map_err(error)
+    }
     /// Check that the repository can be read and written.
     pub fn test(&self) -> crate::Result<TestReport> {
         block_on(self.repo.test())?.map_err(error)

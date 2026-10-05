@@ -635,7 +635,7 @@ async fn schema_explain_text_and_diff_cover_the_view() {
 #[tokio::test]
 async fn drafted_shapes_cover_the_view() {
     let s = server();
-    let ds = s.state.datasets.read().get("graphs").cloned().unwrap();
+    let ds = s.state.datasets().get("graphs").cloned().unwrap();
     ds.store
         .load(&[Source::from_bytes(
             br#"@prefix ex: <http://ex/> .
@@ -675,7 +675,7 @@ async fn drafted_shapes_cover_the_view() {
 #[tokio::test]
 async fn constraints_cover_the_view() {
     let s = server();
-    let ds = s.state.datasets.read().get("graphs").cloned().unwrap();
+    let ds = s.state.datasets().get("graphs").cloned().unwrap();
     ds.store
         .load(&[Source::from_bytes(
             br#"@prefix ex: <http://ex/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
@@ -726,7 +726,7 @@ async fn constraints_cover_the_view() {
 #[tokio::test]
 async fn stored_queries_run_on_the_view() {
     let s = server();
-    let ds = s.state.datasets.read().get("graphs").cloned().unwrap();
+    let ds = s.state.datasets().get("graphs").cloned().unwrap();
     let def: sparkles::stored::Definition = serde_json::from_value(serde_json::json!({
         "query": "SELECT ?s WHERE { GRAPH ?g { ?s <http://ex/p> ?o FILTER(CONTAINS(?o, ?word)) } } ORDER BY ?s",
         "parameters": { "word": { "type": "string", "default": "fox" } }

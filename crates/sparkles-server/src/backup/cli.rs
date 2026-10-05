@@ -1640,25 +1640,7 @@ fn restore_to(
     print_restore(&report, &to, None, out)
 }
 
-/// The dataset ids of the datasets registered in a data directory's `config.json`.
-fn registered_ids(data: &Path, reg: &J) -> HashSet<Uuid> {
-    reg["datasets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|e| e["type"] == "persistent")
-        .filter_map(|e| e["name"].as_str())
-        .filter_map(|n| {
-            let b = std::fs::read(data.join("databases").join(n).join("dataset.json")).ok()?;
-            let v: J = serde_json::from_slice(&b).ok()?;
-            Uuid::parse_str(v["id"].as_str()?).ok()
-        })
-        .collect()
-}
-
-/// `--data DATA [--as DS]`: restore into `DATA/databases/DS` of a stopped server and
-/// register it in `DATA/config.json`. The data directory is locked meanwhile, like a
-/// server locks it.
+/// Restore into the catalog of a stopped server, using its registry and identity rules.
 fn restore_data(
     cfg: &RepoConfig,
     a: RestoreArgs,
@@ -1666,86 +1648,18 @@ fn restore_data(
     as_name: Option<String>,
     out: &OutputArg,
 ) -> Result<()> {
-    if super::data_dir_in_use(data) {
-        bail!(
-            "data directory {} is in use by a running sparkles server ({} is locked): stop it, or restore through its HTTP API",
-            data.display(),
-            super::DATA_LOCK
-        );
-    }
-    let _data_lock = super::lock_data_dir(data)?;
-    let reg_path = data.join("config.json");
-    let mut reg: J = match std::fs::read(&reg_path) {
-        Ok(b) => {
-            serde_json::from_slice(&b).with_context(|| format!("reading {}", reg_path.display()))?
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({ "datasets": [] }),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", reg_path.display())),
-    };
-    if !reg["datasets"].is_array() {
-        bail!("{}: no \"datasets\" array", reg_path.display());
-    }
+    let catalog = sparkles::Catalog::open(data, a.opts.into())?;
     let cli = Cli::new()?;
-    let r = cli.open(cfg, false)?;
-    let target = match as_name {
-        Some(n) => n,
-        None => cli.block_on(r.manifest(&a.name))?.dataset.name,
-    };
-    if !state::valid_name(&target) {
-        bail!("{target:?} is not a valid dataset name: pass --as NAME");
-    }
-    let registered = reg["datasets"]
-        .as_array()
-        .is_some_and(|d| d.iter().any(|e| e["name"] == target.as_str()));
-    if registered {
-        bail!(
-            "dataset {target} is already registered in {}: pick another name with --as",
-            reg_path.display()
-        );
-    }
-    let databases = data.join("databases");
-    let dst = databases.join(&target);
-    if dst.exists() {
-        bail!(
-            "{} exists but is not a registered dataset; remove it first",
-            dst.display()
-        );
-    }
-    std::fs::create_dir_all(&databases)
-        .with_context(|| format!("creating {}", databases.display()))?;
-    let ids = registered_ids(data, &reg);
-    // the server's startup recovery removes this if the restore does not finish
-    let tmp = databases.join(format!(
-        "{}{target}-{}",
-        super::recover::RESTORE_PREFIX,
-        std::process::id()
-    ));
-    if tmp.exists() {
-        std::fs::remove_dir_all(&tmp)?;
-    }
-    let o = RestoreOptions {
+    let repo = cli.open(cfg, false)?;
+    let req = sparkles_backup::RestoreRequest {
+        target: as_name,
         identity: a.identity,
         check: a.check,
-        id_in_use: Arc::new(move |id| ids.contains(&id)),
-        in_place_head: None,
-        store_opts: a.opts,
-        ctl: cli.ctl(),
+        ..Default::default()
     };
-    let report = cli.block_on(r.restore(&a.name, &tmp, &o))?;
-    let published = (|| -> Result<()> {
-        std::fs::rename(&tmp, &dst)?;
-        state::sync_dir(&databases)?;
-        if let Some(d) = reg["datasets"].as_array_mut() {
-            d.push(json!({ "name": target, "type": "persistent" }));
-        }
-        state::write_file_atomic(&reg_path, &serde_json::to_vec_pretty(&reg)?)
-    })();
-    if let Err(e) = published {
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&dst);
-        return Err(e);
-    }
-    print_restore(&report, &dst, Some(&target), out)
+    let (dataset, report) = catalog.restore_report(&repo, &a.name, &req, &cli.ctl().control())?;
+    let root = dataset.store().root().expect("persistent restore");
+    print_restore(&report, root, dataset.name(), out)
 }
 
 // ------------------------------------------------------- sparkles backup policy ------

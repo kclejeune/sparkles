@@ -1,7 +1,6 @@
 //! Parity of the HTTP API and the library (spec P06 §7.1): every operation of
 //! `docs/openapi.json` has exactly one entry here. `op!` maps it to the library call that
-//! performs it, `server_only!` names the reason of §6 why it has none, and `pending!`
-//! marks an operation whose library call a later step of Phase 1 adds. The closures are
+//! performs it, and `server_only!` names the reason of §6 why it has none. The closures are
 //! type-checked and never called, so an entry compiles only when the library call exists
 //! with arguments of that shape. A call behind a Cargo feature is checked in builds with
 //! that feature (`--features full` checks them all).
@@ -33,8 +32,6 @@ enum Entry {
     /// the surface key of the library call
     Op(#[allow(dead_code)] &'static str),
     ServerOnly(#[allow(dead_code)] Reason),
-    /// the step of Phase 1 that adds the call
-    Pending(&'static str),
 }
 
 /// A value of any type, for arguments whose value does not matter: the closures that
@@ -67,24 +64,40 @@ macro_rules! server_only {
     };
 }
 
-macro_rules! pending {
-    ($id:literal, $step:literal) => {
-        ($id, Entry::Pending($step))
-    };
-}
-
 fn entries() -> Vec<(&'static str, Entry)> {
     use Reason::*;
     use sparkles::task::Control;
     vec![
         // ------------------------------------------------ datasets and the catalog
-        pending!("listDatasets", "phase 1 step 6"),
-        pending!("getDataset", "phase 1 step 6"),
-        pending!("createDataset", "phase 1 step 6"),
-        pending!("deleteDataset", "phase 1 step 6"),
-        pending!("cloneDataset", "phase 1 step 6"),
-        pending!("listBackupFiles", "phase 1 step 6"),
-        pending!("listBackupFilesPost", "phase 1 step 6"),
+        op!("listDatasets", "catalog.list", |_| {
+            any::<sparkles::Catalog>().list();
+        }),
+        op!("getDataset", "catalog.info", |_| {
+            any::<sparkles::Catalog>().info("d");
+        }),
+        op!("createDataset", "catalog.create", |_| {
+            any::<sparkles::Catalog>().create("d", &Default::default());
+        }),
+        op!("deleteDataset", "catalog.delete", |_| {
+            any::<sparkles::Catalog>().delete("d");
+        }),
+        op!("renameDataset", "catalog.rename", |_| {
+            any::<sparkles::Catalog>().rename("d", "renamed");
+        }),
+        op!("cloneDataset", "catalog.clone_dataset", |_| {
+            any::<sparkles::Catalog>().clone_dataset(
+                "d",
+                "c",
+                &Default::default(),
+                &Control::none(),
+            );
+        }),
+        op!("listBackupFiles", "catalog.backup_files", |_| {
+            any::<sparkles::Catalog>().backup_files();
+        }),
+        op!("listBackupFilesPost", "catalog.backup_files", |_| {
+            any::<sparkles::Catalog>().backup_files();
+        }),
         server_only!("setDatasetState", Http),
         op!("getDatasetStats", "dataset.stats", |ds| {
             ds.stats(&Default::default());
@@ -508,7 +521,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op_if!("backup", "getBackup", "backups.get", |ds| {
             ds.backups(&any()).get("b");
         }),
-        pending!("createBackup", "phase 1 step 6"),
+        op_if!("backup", "createBackup", "backups.create_with", |ds| {
+            ds.backups(&any()).create_with(&any(), &Control::none());
+        }),
         op_if!("backup", "deleteBackup", "backups.delete", |ds| {
             ds.backups(&any()).delete("b");
         }),
@@ -516,12 +531,33 @@ fn entries() -> Vec<(&'static str, Entry)> {
             ds.backups(&any())
                 .verify_with("b", &any(), &Control::none());
         }),
-        pending!("restoreBackup", "phase 1 step 6"),
-        pending!("listRepositories", "phase 1 step 6"),
-        pending!("getRepository", "phase 1 step 6"),
-        pending!("createRepository", "phase 1 step 6"),
-        pending!("updateRepository", "phase 1 step 6"),
-        pending!("deleteRepository", "phase 1 step 6"),
+        op_if!("backup", "restoreBackup", "catalog.restore", |_| {
+            any::<sparkles::Catalog>().restore(&any(), "b", &any(), &Control::none());
+        }),
+        op_if!("backup", "listRepositories", "repositories.list", |_| {
+            any::<sparkles::Catalog>().repositories().unwrap().list();
+        }),
+        op_if!("backup", "getRepository", "repositories.get", |_| {
+            any::<sparkles::Catalog>().repositories().unwrap().get("r");
+        }),
+        op_if!("backup", "createRepository", "repositories.add", |_| {
+            any::<sparkles::Catalog>()
+                .repositories()
+                .unwrap()
+                .add(any());
+        }),
+        op_if!("backup", "updateRepository", "repositories.update", |_| {
+            any::<sparkles::Catalog>()
+                .repositories()
+                .unwrap()
+                .update("r", any());
+        }),
+        op_if!("backup", "deleteRepository", "repositories.remove", |_| {
+            any::<sparkles::Catalog>()
+                .repositories()
+                .unwrap()
+                .remove("r");
+        }),
         op_if!(
             "backup",
             "listRepositoryBackups",
@@ -573,8 +609,17 @@ fn entries() -> Vec<(&'static str, Entry)> {
                 sparkles::backup::policy::next_runs(&any(), any(), any(), 5);
             }
         ),
-        pending!("runPolicy", "phase 1 step 6"),
-        pending!("applyRetention", "phase 1 step 6"),
+        op_if!("backup", "runPolicy", "catalog.run_policy", |_| {
+            any::<sparkles::Catalog>().run_policy(&any(), &Control::none());
+        }),
+        op_if!(
+            "backup",
+            "applyRetention",
+            "catalog.apply_retention",
+            |_| {
+                any::<sparkles::Catalog>().apply_retention(&any(), true);
+            }
+        ),
         server_only!("listPolicies", Schedulers),
         server_only!("getPolicy", Schedulers),
         server_only!("createPolicy", Schedulers),
@@ -699,20 +744,122 @@ fn every_operation_maps_to_a_library_call_or_a_reason() {
             ));
         }
     }
-    let pending: Vec<_> = entries
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// Library calls with no HTTP operation. Keep their binding decisions explicit too.
+const EXTRA_KEYS: &[&str] = &[
+    "catalog.open",
+    "catalog.memory",
+    "catalog.inspect",
+    "catalog.get",
+    "catalog.get_by_id",
+    "catalog.attach",
+    "catalog.rename",
+    "catalog.reserve",
+    "catalog.repositories",
+    "dataset.open",
+    "dataset.memory",
+    "dataset.dataset_id",
+    "dataset.head_commit",
+    "dataset.select",
+    "dataset.ask",
+    "dataset.construct",
+    "dataset.transaction",
+    "dataset.quads",
+    "dataset.insert",
+    "dataset.remove",
+    "dataset.clone_to_with",
+    "dataset.clone_to_memory_with",
+    "dataset.branch",
+    "history.wait_for_commit",
+    "history.prune",
+    "history.tick",
+    "indexes.vector.embed_until_idle",
+    "repositories.open",
+    "repositories.with_fixed",
+];
+
+#[allow(dead_code)]
+fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
+    sparkles::Catalog::open("data", Default::default());
+    sparkles::Catalog::memory(Default::default());
+    sparkles::Catalog::inspect("data");
+    cat.get("d");
+    cat.get_by_id(ds.dataset_id());
+    cat.attach("d", sparkles::catalog::Attach::Memory);
+    cat.rename("d", "e");
+    cat.reserve("d", sparkles::catalog::ReservationKind::Clone, "holder");
+    Dataset::open("db");
+    Dataset::memory();
+    ds.dataset_id();
+    ds.head_commit();
+    ds.select("SELECT * {}");
+    ds.ask("ASK {}");
+    ds.construct("CONSTRUCT {} {}");
+    ds.transaction(|_| Ok(()));
+    ds.quads(None, None, None, None);
+    ds.insert(any());
+    ds.remove(any());
+    ds.branch("dev");
+    ds.clone_to_with("clone", &Default::default(), &Default::default());
+    ds.clone_to_memory_with("clone", &Default::default(), &Default::default());
+    ds.history().wait_for_commit(0, std::time::Duration::ZERO);
+    ds.history().prune();
+    ds.history().tick();
+    ds.indexes()
+        .vector()
+        .embed_until_idle(std::time::Duration::ZERO);
+    #[cfg(feature = "backup")]
+    {
+        let repos = cat.repositories().unwrap();
+        repos.open("r");
+        repos.with_fixed(&[]);
+    }
+}
+
+#[test]
+fn every_surface_key_has_a_binding_decision() {
+    use std::collections::BTreeSet;
+    let mut keys: BTreeSet<&str> = entries()
         .iter()
-        .filter_map(|(id, e)| match e {
-            Entry::Pending(step) => Some(format!("{id} ({step})")),
-            _ => None,
+        .filter_map(|(_, entry)| {
+            if let Entry::Op(key) = entry {
+                Some(*key)
+            } else {
+                None
+            }
         })
         .collect();
-    if !pending.is_empty() {
-        println!(
-            "{} of {} operations are pending: {}",
-            pending.len(),
-            entries.len(),
-            pending.join(", ")
-        );
+    keys.extend(EXTRA_KEYS.iter().copied());
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/bindings.toml");
+    let bindings: toml::Table = std::fs::read_to_string(path)
+        .expect("bindings.toml")
+        .parse()
+        .expect("valid bindings TOML");
+    let mut problems = Vec::new();
+    for key in &keys {
+        match bindings.get(*key).and_then(toml::Value::as_table) {
+            None => problems.push(format!("surface key `{key}` has no entry in `crates/sparkles/bindings.toml`. Add its python, jvm and node names, or planned or skip with a reason.")),
+            Some(entry) => {
+                for column in ["python", "jvm", "node"] {
+                    let value = entry.get(column).and_then(toml::Value::as_str).unwrap_or("").trim();
+                    if value.is_empty() || value == "planned:" || value == "skip:" {
+                        problems.push(format!("surface key `{key}` needs a nonempty `{column}` binding decision"));
+                    }
+                }
+                if entry.keys().any(|k| !["python", "jvm", "node"].contains(&k.as_str())) {
+                    problems.push(format!("surface key `{key}` has an unknown binding column"));
+                }
+            }
+        }
+    }
+    for key in bindings.keys() {
+        if !keys.contains(key.as_str()) {
+            problems.push(format!(
+                "bindings.toml has stale surface key `{key}`; remove it or add its parity entry"
+            ));
+        }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

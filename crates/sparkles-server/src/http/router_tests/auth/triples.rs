@@ -434,7 +434,7 @@ async fn diffs_and_the_change_feed() {
 #[tokio::test]
 async fn stored_queries_run_on_the_protected_view() {
     let s = server();
-    let ds = s.state.datasets.read().get("hr").cloned().unwrap();
+    let ds = s.state.datasets().get("hr").cloned().unwrap();
     let def: sparkles::stored::Definition = serde_json::from_value(serde_json::json!({
         "query": "SELECT ?s ?v WHERE { ?s <http://ex/salary> ?v }"
     }))

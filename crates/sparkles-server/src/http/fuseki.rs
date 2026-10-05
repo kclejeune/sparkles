@@ -172,7 +172,7 @@ pub(super) fn fuseki_stats(st: &AppState, ds: &Dataset) -> J {
 /// `GET|POST /$/stats` (Fuseki): `{datasets: {"/ds": counters}}` for every dataset the
 /// caller may read.
 async fn stats_all(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
-    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<Arc<Dataset>> = st.datasets().values().cloned().collect();
     let mut out = Map::new();
     for ds in datasets.iter().filter(|d| p.can(&d.name, Level::Read)) {
         out.insert(format!("/{}", ds.name), fuseki_stats(&st, ds));
@@ -186,19 +186,14 @@ async fn stats_all(State(st): St, Extension(p): Extension<Principal>) -> Json<J>
 /// N-Quads backups in `<data>/backups`. A caller without `server-admin` sees the files of
 /// the datasets it administers.
 async fn backups_list(State(st): St, Extension(p): Extension<Principal>) -> ApiResult<Json<J>> {
-    let dir = st.data_dir.join("backups");
     let admin = p.has(crate::auth::ServerPerm::ServerAdmin);
-    let names: Vec<String> = st.datasets.read().keys().cloned().collect();
-    let mut files: Vec<String> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|f| !f.starts_with('.'))
-            .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    };
+    let names: Vec<String> = st.datasets().keys().cloned().collect();
+    let mut files: Vec<String> = st
+        .catalog
+        .backup_files()?
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
     if !admin {
         files.retain(|f| backup_dataset(f, &names).is_some_and(|ds| p.can(ds, Level::Admin)));
     }

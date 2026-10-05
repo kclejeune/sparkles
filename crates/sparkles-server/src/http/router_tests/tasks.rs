@@ -171,7 +171,11 @@ async fn restoring_datasets_answer_503() {
         .await
     };
     assert_eq!(ask(s.app.clone()).await.status, StatusCode::OK);
-    s.state.restoring.lock().insert("ds".into(), "7".into());
+    let restoring = s
+        .state
+        .catalog
+        .reserve("ds", sparkles::catalog::ReservationKind::Restore, "7")
+        .unwrap();
     let r = ask(s.app.clone()).await;
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
     let j = r.json();
@@ -188,7 +192,7 @@ async fn restoring_datasets_answer_503() {
     // routes without that dataset are not affected
     assert_eq!(get(&s.app, "/$/tasks").await.status, StatusCode::OK);
     assert_eq!(get(&s.app, "/$/datasets").await.status, StatusCode::OK);
-    s.state.restoring.lock().clear();
+    drop(restoring);
     assert_eq!(ask(s.app.clone()).await.status, StatusCode::OK);
 }
 

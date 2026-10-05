@@ -1,26 +1,23 @@
 //! Server state: dataset registry (persisted like Fuseki's `configuration/`), async tasks.
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
-use serde::{Deserialize, Serialize};
-use sparkles::store::{Store, StoreOptions};
+use serde::Serialize;
+use sparkles::store::StoreOptions;
 use std::collections::BTreeMap;
+#[cfg(feature = "backup")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DbType {
-    Persistent,
-    Mem,
-}
+pub use sparkles::catalog::{DatasetKind as DbType, Reservation, valid_name};
 
+#[cfg(feature = "reasoning")]
+pub use sparkles::reasoning::write_record as write_reasoning_file;
 pub use sparkles::reasoning::{
     AutoSetting, ReasoningRecord as ReasoningInfo, read_record as read_reasoning_file,
-    write_record as write_reasoning_file,
 };
 
 /// A dataset of the server: the library's [`sparkles::Dataset`], which holds the store
@@ -93,20 +90,6 @@ pub use crate::write_validation::Validation;
 
 /// Default of `serve --reason-cache-triples`.
 pub const DEFAULT_REASON_CACHE_TRIPLES: usize = sparkles::reasoning::DEFAULT_CLOSURE_CACHE_TRIPLES;
-
-#[derive(Serialize, Deserialize, Default)]
-struct Registry {
-    datasets: Vec<RegistryEntry>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RegistryEntry {
-    name: String,
-    #[serde(rename = "type")]
-    kind: DbType,
-    #[serde(default)]
-    reasoning: Option<ReasoningInfo>,
-}
 
 /// A background task. Its JSON form also carries Fuseki's names for its fields
 /// (`taskId`, `task`, `started`, `finished`, `success`; see [`Task::serialize`]).
@@ -237,7 +220,9 @@ fn rooted_in_cancel(e: &anyhow::Error) -> bool {
 
 pub struct AppState {
     pub data_dir: PathBuf,
-    pub datasets: RwLock<BTreeMap<String, Arc<Dataset>>>,
+    pub catalog: sparkles::Catalog,
+    /// HTTP routing state and observers, keyed by dataset name.
+    routing: Mutex<BTreeMap<String, Arc<Dataset>>>,
     pub tasks: Mutex<Vec<Task>>,
     task_counter: AtomicU64,
     pub started: Instant,
@@ -288,19 +273,9 @@ pub struct AppState {
     /// automatic compaction (`serve --auto-compact-*`) and what is known of each
     /// dataset's compactions
     pub compaction: crate::compaction::AutoCompact,
-    /// dataset names being created by a task (clone), with the task id
-    reserved: Mutex<BTreeMap<String, String>>,
-    /// datasets being replaced in place (an in-place restore), with the task id: every
-    /// request naming one of them gets `503` + `Retry-After` (the router's restoring
-    /// layer)
-    pub restoring: Mutex<BTreeMap<String, String>>,
     /// backup repositories and policies (`serve`; `None` for embedded use)
     #[cfg(feature = "backup")]
     pub backup: Option<Arc<crate::backup::BackupState>>,
-    /// Serializes dataset management (create / attach / delete / registry saves) so a
-    /// name is reserved atomically and an older registry snapshot can never overwrite
-    /// a newer one.
-    manage: Mutex<()>,
     /// background task slots (`serve --max-tasks`)
     pub task_queue: TaskQueue,
     /// `POST /$/format` (`serve --format-*`)
@@ -351,6 +326,7 @@ impl Default for FormatConf {
 }
 
 /// Replace `path` durably (temporary file, sync, rename, directory sync).
+#[cfg(feature = "backup")]
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -370,6 +346,7 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Flush a directory's entries to stable storage (a no-op where directories cannot be
 /// opened for syncing).
+#[cfg(any(feature = "backup", feature = "auth"))]
 pub fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
@@ -380,17 +357,6 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
 
 pub fn now() -> String {
     sparkles::builder::now_rfc3339()
-}
-
-pub fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name != "ui"
-        && name != "$"
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        && !name.starts_with('.')
 }
 
 /// Per-request budgets of the server (`None`: unlimited).
@@ -494,7 +460,8 @@ impl AppState {
         std::fs::create_dir_all(data_dir.join("databases"))?;
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
-            datasets: RwLock::new(BTreeMap::new()),
+            catalog: sparkles::Catalog::open(data_dir, store_opts.clone().into())?,
+            routing: Mutex::new(BTreeMap::new()),
             tasks: Mutex::new(Vec::new()),
             task_counter: AtomicU64::new(1),
             started: Instant::now(),
@@ -523,39 +490,14 @@ impl AppState {
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
             compaction: Default::default(),
-            reserved: Mutex::new(BTreeMap::new()),
-            restoring: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "backup")]
             backup: None,
-            manage: Mutex::new(()),
             task_queue: TaskQueue::new(DEFAULT_MAX_TASKS),
             #[cfg(feature = "fmt")]
             format: FormatConf::default(),
             #[cfg(feature = "mcp")]
             mcp: None,
         };
-        // clones that were being built when the server stopped are never registered
-        for e in std::fs::read_dir(data_dir.join("databases"))?.flatten() {
-            if e.file_name().to_string_lossy().starts_with(".clone-") {
-                tracing::info!("removing unfinished clone {}", e.path().display());
-                std::fs::remove_dir_all(e.path())
-                    .with_context(|| format!("removing {}", e.path().display()))?;
-            }
-        }
-        let reg_path = data_dir.join("config.json");
-        if reg_path.exists() {
-            let reg: Registry = serde_json::from_slice(&std::fs::read(&reg_path)?)
-                .with_context(|| format!("reading {}", reg_path.display()))?;
-            for e in reg.datasets {
-                let ds = state.open_dataset(&e.name, e.kind, None, false)?;
-                // older registries kept the reasoning status only here
-                if ds.reasoning.read().is_none() {
-                    *ds.reasoning.write() = e.reasoning;
-                }
-                state.datasets.write().insert(e.name.clone(), ds);
-                tracing::info!("opened dataset /{} ({:?})", e.name, e.kind);
-            }
-        }
         Ok(state)
     }
 
@@ -566,7 +508,8 @@ impl AppState {
     pub fn standalone(store_opts: StoreOptions, default_timeout: std::time::Duration) -> AppState {
         AppState {
             data_dir: PathBuf::new(),
-            datasets: RwLock::new(BTreeMap::new()),
+            catalog: sparkles::Catalog::memory(store_opts.clone().into()),
+            routing: Mutex::new(BTreeMap::new()),
             tasks: Mutex::new(Vec::new()),
             task_counter: AtomicU64::new(1),
             started: Instant::now(),
@@ -587,11 +530,8 @@ impl AppState {
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
             compaction: Default::default(),
-            reserved: Mutex::new(BTreeMap::new()),
-            restoring: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "backup")]
             backup: None,
-            manage: Mutex::new(()),
             task_queue: TaskQueue::new(DEFAULT_MAX_TASKS),
             #[cfg(feature = "fmt")]
             format: FormatConf::default(),
@@ -606,26 +546,6 @@ impl AppState {
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
         }
-    }
-
-    fn open_dataset(
-        &self,
-        name: &str,
-        kind: DbType,
-        loc: Option<&Path>,
-        ephemeral: bool,
-    ) -> Result<Arc<Dataset>> {
-        let store = match kind {
-            DbType::Mem => Store::in_memory(self.store_opts.clone()),
-            DbType::Persistent => {
-                let dir = loc
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| self.data_dir.join("databases").join(name));
-                Store::open(&dir, self.store_opts.clone())
-                    .with_context(|| format!("opening database {}", dir.display()))?
-            }
-        };
-        Ok(self.dataset_of(name, kind, store, ephemeral, None))
     }
 
     /// The object of branch `branch` of dataset `main` (`main` itself for `main`),
@@ -669,18 +589,8 @@ impl AppState {
         main: &Arc<Dataset>,
         branch: &str,
     ) -> sparkles::Result<Arc<Dataset>> {
-        let store = main
-            .store
-            .branch(branch)?
-            .shared()
-            .expect("a branch other than main has its own store");
-        let mut ds = self.dataset_of(
-            &main.name,
-            main.kind,
-            sparkles::dataset::StoreHandle::Branch(store),
-            main.ephemeral,
-            None,
-        );
+        let dataset = main.dataset.branch(branch)?;
+        let mut ds = self.wrap_dataset(&main.name, main.kind, dataset, main.ephemeral);
         Arc::get_mut(&mut ds).expect("just made").branch = Some(BranchOf {
             name: RwLock::new(branch.to_string()),
             main: Arc::downgrade(main),
@@ -688,25 +598,13 @@ impl AppState {
         Ok(ds)
     }
 
-    /// The dataset `name` around `store`: the library opens the state the store's
-    /// directory configures, and the server adds its validation metrics.
-    fn dataset_of(
+    fn wrap_dataset(
         &self,
         name: &str,
         kind: DbType,
-        store: impl Into<sparkles::dataset::StoreHandle>,
+        dataset: sparkles::Dataset,
         ephemeral: bool,
-        origin: Option<serde_json::Value>,
     ) -> Arc<Dataset> {
-        let dataset = sparkles::Dataset::from_store_with(
-            store,
-            sparkles::DatasetOptions {
-                store: self.store_opts.clone(),
-                name: Some(name.to_string()),
-                closure_cache_triples: self.reason_cache_triples,
-                origin,
-            },
-        );
         let validation_metrics = Arc::new(crate::obs::ValidationMetrics::new(name));
         dataset
             .store()
@@ -723,44 +621,18 @@ impl AppState {
         })
     }
 
-    #[cfg(any(feature = "reasoning", feature = "backup"))]
-    /// Persist the registry of managed datasets.
-    pub fn save_registry(&self) -> Result<()> {
-        let _guard = self.manage.lock();
-        self.save_registry_locked()
+    /// A snapshot of the server's routing objects for the catalog's datasets.
+    pub fn datasets(&self) -> BTreeMap<String, Arc<Dataset>> {
+        self.catalog
+            .list()
+            .into_iter()
+            .filter_map(|d| self.get(&d.name).map(|ds| (d.name, ds)))
+            .collect()
     }
 
-    /// Write `config.json` durably (temporary file, sync, rename, directory sync). The
-    /// caller holds `manage`, so the snapshot taken here is the newest one written.
-    fn save_registry_locked(&self) -> Result<()> {
-        if self.data_dir.as_os_str().is_empty() {
-            // standalone state: no registry
-            return Ok(());
-        }
-        let reg = Registry {
-            datasets: self
-                .datasets
-                .read()
-                .values()
-                .filter(|d| !d.ephemeral)
-                .map(|d| RegistryEntry {
-                    name: d.name.clone(),
-                    kind: d.kind,
-                    reasoning: d.reasoning.read().clone(),
-                })
-                .collect(),
-        };
-        let path = self.data_dir.join("config.json");
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&serde_json::to_vec_pretty(&reg)?)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(tmp, path)?;
-        #[cfg(unix)]
-        std::fs::File::open(&self.data_dir)?.sync_all()?;
-        Ok(())
+    #[cfg(feature = "reasoning")]
+    pub fn save_registry(&self) -> Result<()> {
+        Ok(self.catalog.save()?)
     }
 
     pub fn phase(&self) -> crate::obs::Phase {
@@ -772,13 +644,33 @@ impl AppState {
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<Dataset>> {
-        self.datasets.read().get(name).cloned()
+        let mut routing = self.routing.lock();
+        let dataset = self.catalog.get(name)?;
+        let info = self.catalog.info(name)?;
+        if let Some(ds) = routing.get(name)
+            && ds.store.dataset_id() == dataset.dataset_id()
+        {
+            return Some(ds.clone());
+        }
+        let ds = self.wrap_dataset(name, info.kind, dataset, info.attached);
+        // A request that passed the restore guard can reach this lookup after the
+        // routing cache was drained. Its temporary wrapper must not keep the old
+        // library dataset alive after that request finishes.
+        if self.catalog.restoring_by(name).is_none() {
+            routing.insert(name.to_string(), ds.clone());
+        }
+        Some(ds)
+    }
+
+    #[cfg(feature = "backup")]
+    pub fn forget_routing(&self, name: &str) {
+        self.routing.lock().remove(name);
     }
 
     /// Every dataset, and the open branches of each (for the background upkeep:
     /// compaction and history ticks).
     pub fn datasets_and_branches(&self) -> Vec<Arc<Dataset>> {
-        let mains: Vec<Arc<Dataset>> = self.datasets.read().values().cloned().collect();
+        let mains: Vec<Arc<Dataset>> = self.datasets().values().cloned().collect();
         let mut out = Vec::with_capacity(mains.len());
         for m in mains {
             let names: Vec<String> = m
@@ -802,176 +694,120 @@ impl AppState {
     }
 
     pub fn create(&self, name: &str, kind: DbType) -> Result<Arc<Dataset>> {
-        if !valid_name(name) {
-            bail!("invalid dataset name '{name}'");
-        }
-        let _guard = self.manage.lock();
-        if self.datasets.read().contains_key(name) {
-            bail!("dataset '{name}' already exists");
-        }
-        if let Some(t) = self.reserved_by(name) {
-            bail!("dataset /{name} is being created by task {t}");
-        }
-        if let Some(t) = self.restoring.lock().get(name) {
-            bail!("dataset /{name} is being restored by task {t}");
-        }
-        let ds = self.open_dataset(name, kind, None, false)?;
-        self.datasets.write().insert(name.to_string(), ds.clone());
-        if let Err(e) = self.save_registry_locked() {
-            // not reported as created, so it must not stay registered
-            self.datasets.write().remove(name);
-            return Err(e);
-        }
-        Ok(ds)
+        self.catalog.set_defaults(sparkles::DatasetOptions {
+            store: self.store_opts.clone(),
+            closure_cache_triples: self.reason_cache_triples,
+            ..Default::default()
+        });
+        self.catalog.create(
+            name,
+            &sparkles::catalog::CreateDataset {
+                kind,
+                ..Default::default()
+            },
+        )?;
+        Ok(self.get(name).expect("created"))
     }
-
-    /// Register a dataset that is not persisted in the registry (`--mem`, `--loc`).
     pub fn attach(&self, name: &str, kind: DbType, loc: Option<&Path>) -> Result<Arc<Dataset>> {
-        if !valid_name(name) {
-            bail!("invalid dataset name '{name}'");
-        }
-        let _guard = self.manage.lock();
-        if self.datasets.read().contains_key(name) {
-            bail!("dataset '{name}' already exists");
-        }
-        if let Some(t) = self.reserved_by(name) {
-            bail!("dataset /{name} is being created by task {t}");
-        }
-        if let Some(t) = self.restoring.lock().get(name) {
-            bail!("dataset /{name} is being restored by task {t}");
-        }
-        let ds = self.open_dataset(name, kind, loc, true)?;
-        self.datasets.write().insert(name.to_string(), ds.clone());
-        Ok(ds)
-    }
-
-    pub fn delete(&self, name: &str) -> Result<bool> {
-        let _guard = self.manage.lock();
-        let Some(ds) = self.datasets.write().remove(name) else {
-            return Ok(false);
+        let source = match kind {
+            DbType::Memory => sparkles::catalog::Attach::Memory,
+            DbType::Persistent => sparkles::catalog::Attach::Directory(
+                loc.map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.data_dir.join("databases").join(name)),
+            ),
         };
-        if let Err(e) = self.save_registry_locked() {
-            self.datasets.write().insert(name.to_string(), ds);
-            return Err(e);
-        }
-        self.metrics.forget(name);
-        if ds.kind == DbType::Persistent
-            && !ds.ephemeral
-            && let Some(root) = ds.store.root()
-        {
-            let root = root.to_path_buf();
-            drop(ds);
-            std::fs::remove_dir_all(root)?;
-        }
-        Ok(true)
+        self.catalog.set_defaults(sparkles::DatasetOptions {
+            store: self.store_opts.clone(),
+            closure_cache_triples: self.reason_cache_triples,
+            ..Default::default()
+        });
+        self.catalog.attach(name, source)?;
+        Ok(self.get(name).expect("attached"))
     }
-
-    /// Take the registered persistent dataset `name` out of the map for an in-place
-    /// replacement; the persisted registry keeps it (put it back with
-    /// [`reattach`](Self::reattach)). `None` if there is no such dataset, or it is not a
-    /// managed persistent one (`--loc`, `--mem`).
-    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
-    pub fn detach_for_swap(&self, name: &str) -> Option<Arc<Dataset>> {
-        let _guard = self.manage.lock();
-        let mut map = self.datasets.write();
-        match map.get(name) {
-            Some(ds) if ds.kind == DbType::Persistent && !ds.ephemeral => map.remove(name),
-            _ => None,
-        }
-    }
-
-    /// Open `databases/<name>` and register it under `name` again (after a swap, or to
-    /// roll one back). Fails if the name is registered.
-    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
-    pub fn reattach(&self, name: &str) -> Result<Arc<Dataset>> {
-        let _guard = self.manage.lock();
-        if self.datasets.read().contains_key(name) {
-            bail!("dataset '{name}' already exists");
-        }
-        let ds = self.open_dataset(name, DbType::Persistent, None, false)?;
-        self.datasets.write().insert(name.to_string(), ds.clone());
-        Ok(ds)
-    }
-
-    /// The task creating dataset `name`, if one is.
-    pub fn reserved_by(&self, name: &str) -> Option<String> {
-        self.reserved.lock().get(name).cloned()
-    }
-
-    /// Reserve the name of a dataset that task `task` will create. Fails (with the
-    /// message for a `409`) when the name is registered, reserved, or its directory
-    /// exists. The name is released when the reservation is dropped.
-    pub fn reserve(self: &Arc<Self>, name: &str, task: &str) -> Result<Reservation, String> {
-        let _guard = self.manage.lock();
-        if self.datasets.read().contains_key(name) {
-            return Err(format!("dataset /{name} already exists"));
-        }
-        let mut reserved = self.reserved.lock();
-        if let Some(t) = reserved.get(name) {
-            return Err(format!("dataset /{name} is being created by task {t}"));
-        }
-        if let Some(t) = self.restoring.lock().get(name) {
-            return Err(format!("dataset /{name} is being restored by task {t}"));
-        }
-        if self.data_dir.join("databases").join(name).exists() {
-            return Err(format!(
-                "directory databases/{name} exists but is not a registered dataset; remove it first"
-            ));
-        }
-        reserved.insert(name.to_string(), task.to_string());
-        Ok(Reservation {
-            state: self.clone(),
-            name: name.to_string(),
-        })
-    }
-
-    /// Register the persistent database now in `databases/{name}` under a reserved name
-    /// and persist the registry. On failure the directory is removed.
-    pub fn adopt(&self, reservation: Reservation) -> Result<Arc<Dataset>> {
-        let name = reservation.name.clone();
-        let _guard = self.manage.lock();
-        let dir = self.data_dir.join("databases").join(&name);
-        let ds = match self.open_dataset(&name, DbType::Persistent, None, false) {
-            Ok(ds) => ds,
+    pub fn delete(&self, name: &str) -> Result<bool> {
+        // Close cached routing handles before the catalog removes the directory.
+        // Keep lookups out until the registry mutation finishes, so they cannot
+        // repopulate the cache with a dataset being deleted.
+        let mut routing = self.routing.lock();
+        let cached = routing.remove(name);
+        let offline = cached
+            .as_ref()
+            .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
+        drop(cached);
+        let deleted = match self.catalog.delete(name) {
+            Ok(deleted) => deleted,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(e);
+                drop(routing);
+                if let Some(ds) = self.get(name) {
+                    ds.offline.store(offline, Ordering::Relaxed);
+                }
+                return Err(e.into());
             }
         };
-        self.datasets.write().insert(name.clone(), ds.clone());
-        if let Err(e) = self.save_registry_locked() {
-            self.datasets.write().remove(&name);
-            drop(ds);
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(e);
+        drop(routing);
+        if deleted {
+            self.metrics.forget(name);
         }
-        drop(reservation);
-        Ok(ds)
+        Ok(deleted)
+    }
+    #[cfg(test)]
+    pub fn detach_for_swap(&self, name: &str) -> Option<Arc<Dataset>> {
+        let dataset = self.catalog.detach_for_swap(name)?;
+        let cached = self.routing.lock().remove(name);
+        cached.or_else(|| Some(self.wrap_dataset(name, DbType::Persistent, dataset, false)))
     }
 
-    /// Register the in-memory store `store` (a clone) under a reserved name, with its
-    /// reasoning status and origin, and persist the registry. Like every in-memory
-    /// dataset, it is registered again after a restart, empty.
-    pub fn adopt_memory(
-        &self,
-        reservation: Reservation,
-        store: Store,
-        reasoning: Option<ReasoningInfo>,
-        origin: serde_json::Value,
-    ) -> Result<Arc<Dataset>> {
-        let name = reservation.name.clone();
-        let _guard = self.manage.lock();
-        let ds = self.dataset_of(&name, DbType::Mem, store, false, Some(origin));
-        *ds.reasoning.write() = reasoning;
-        self.datasets.write().insert(name.clone(), ds.clone());
-        if let Err(e) = self.save_registry_locked() {
-            self.datasets.write().remove(&name);
-            return Err(e);
+    pub fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let mut routing = self.routing.lock();
+        if routing
+            .get(from)
+            .is_some_and(|ds| Arc::strong_count(ds) > 1)
+        {
+            return Err(sparkles::Error::Conflict(format!(
+                "dataset /{from} still has live requests"
+            ))
+            .into());
         }
-        drop(reservation);
-        Ok(ds)
+        let offline = routing
+            .get(from)
+            .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
+        drop(routing.remove(from));
+        let result = self.catalog.rename(from, to);
+        drop(routing);
+        match result {
+            Ok(ds) => {
+                drop(ds);
+                self.metrics.forget(from);
+                if let Some(ds) = self.get(to) {
+                    ds.offline.store(offline, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(ds) = self.get(from) {
+                    ds.offline.store(offline, Ordering::Relaxed);
+                }
+                Err(e.into())
+            }
+        }
     }
-
+    #[cfg(test)]
+    pub fn reattach(&self, name: &str) -> Result<Arc<Dataset>> {
+        self.catalog.reattach(name)?;
+        Ok(self.get(name).expect("reattached"))
+    }
+    pub fn reserved_by(&self, name: &str) -> Option<String> {
+        self.catalog.reserved_by(name)
+    }
+    pub fn reserve(
+        self: &Arc<Self>,
+        name: &str,
+        task: &str,
+    ) -> std::result::Result<Reservation, String> {
+        self.catalog
+            .reserve(name, sparkles::catalog::ReservationKind::Clone, task)
+            .map_err(|e| e.to_string())
+    }
     // ----------------------------------------------------------------- tasks ------
 
     /// A new task id (for a task started with [`start_task_as`](Self::start_task_as)).
@@ -1325,26 +1161,6 @@ impl TaskQueue {
     }
 }
 
-/// A reserved dataset name (see [`AppState::reserve`]), released on drop.
-pub struct Reservation {
-    state: Arc<AppState>,
-    name: String,
-}
-
-impl Reservation {
-    #[cfg(feature = "backup")]
-    /// The reserved dataset name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        self.state.reserved.lock().remove(&self.name);
-    }
-}
-
 #[derive(Clone)]
 pub struct TaskHandle {
     state: Arc<AppState>,
@@ -1380,6 +1196,7 @@ impl TaskHandle {
 
     /// Whether a cancel request came in.
     #[cfg_attr(not(any(test, feature = "backup")), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }

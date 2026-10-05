@@ -580,6 +580,16 @@ fn datasets(p: &mut Paths) {
         .resp("200", "Deleted.", None),
     );
     p.add(
+        op(POST, "/$/datasets/{ds}/rename", "renameDataset", "Datasets", "Rename a dataset")
+            .doc("Requires server-admin. Refused while source or destination is covered by a dataset grant, or while persistent dataset handles remain alive. Dataset identity is retained.")
+            .body(true, "The new name.", json!({"application/json": {"schema": {
+                "type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}
+            }}}))
+            .resp("200", "Renamed.", Some(json!({"type": "object", "required": ["name", "renamedFrom"],
+                "properties": {"name": {"type": "string"}, "renamedFrom": {"type": "string"}}})))
+            .errors(&[400, 409]),
+    );
+    p.add(
         op(POST, "/$/datasets/{ds}/clone", "cloneDataset", "Datasets", "Clone a dataset")
             .doc("Copies one consistent snapshot into a new persistent dataset. Parameters come from the query string, a form or a JSON body.")
             .see("clone")

@@ -168,8 +168,7 @@ pub fn configure(st: &crate::state::AppState, spec: &str) -> Result<()> {
         .split_once('=')
         .with_context(|| format!("--rdfs {spec}: expected NAME=FILE"))?;
     let ds = st
-        .datasets
-        .read()
+        .datasets()
         .get(name)
         .cloned()
         .with_context(|| format!("--rdfs {spec}: no dataset /{name}"))?;

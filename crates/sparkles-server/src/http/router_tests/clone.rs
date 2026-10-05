@@ -288,7 +288,7 @@ async fn failed_clones_leave_nothing_behind() {
     std::fs::create_dir_all(orphan.join("gen-0001")).unwrap();
     let st = open(dir.path(), false);
     assert!(!orphan.exists());
-    assert_eq!(st.datasets.read().len(), 1);
+    assert_eq!(st.datasets().len(), 1);
 }
 
 #[tokio::test]

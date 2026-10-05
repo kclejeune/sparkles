@@ -94,7 +94,7 @@ impl Scheduler {
 /// Best-effort collection of every dataset's unneeded history generations (skipped for
 /// a dataset whose writer is busy).
 fn collect_history(st: &AppState) {
-    let datasets: Vec<_> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<_> = st.datasets().values().cloned().collect();
     for d in datasets {
         d.store.try_collect_history();
     }

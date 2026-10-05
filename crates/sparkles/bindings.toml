@@ -1,0 +1,812 @@
+# P06 library surface. Concrete names describe the shipped bindings.
+# Planned entries are intentional and become required in their binding phase.
+
+["backup.policy.next_runs"]
+python = "preview_schedule"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["backup.repository.break_lock"]
+python = "BackupRepository.break_lock"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["backup.repository.gc"]
+python = "BackupRepository.gc"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["backup.repository.list"]
+python = "BackupRepository.backups"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["backup.repository.locks"]
+python = "BackupRepository.locks"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["backup.repository.test"]
+python = "BackupRepository.test"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["backup.repository.verify"]
+python = "BackupRepository.verify"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["backups.create_with"]
+python = "Dataset.backups.create"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["backups.delete"]
+python = "Dataset.backups.delete"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["backups.get"]
+python = "Dataset.backups.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["backups.list"]
+python = "Dataset.backups.list"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["backups.verify_with"]
+python = "Dataset.backups.verify"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.cherry_pick"]
+python = "Dataset.branches.cherry_pick"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.commit_graph"]
+python = "Dataset.branches.commit_graph"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.create"]
+python = "Dataset.branches.create"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.delete"]
+python = "Dataset.branches.delete"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.get"]
+python = "Dataset.branches.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.list"]
+python = "Dataset.branches.list"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.merge"]
+python = "Dataset.branches.merge"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.preview_cherry_pick"]
+python = "Dataset.branches.preview_cherry_pick"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.preview_merge"]
+python = "Dataset.branches.preview_merge"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.preview_revert"]
+python = "Dataset.branches.preview_revert"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.revert"]
+python = "Dataset.branches.revert"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.settings"]
+python = "Dataset.branches.settings"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["branches.update"]
+python = "Dataset.branches.update"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.apply_retention"]
+python = "Catalog.apply_retention"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.attach"]
+python = "Catalog.attach"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.backup_files"]
+python = "Catalog.backup_files"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.clone_dataset"]
+python = "Catalog.clone_dataset"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.create"]
+python = "Catalog.create"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.delete"]
+python = "Catalog.delete"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.get"]
+python = "Catalog.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.get_by_id"]
+python = "Catalog.get_by_id"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.info"]
+python = "Catalog.info"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.inspect"]
+python = "Catalog.inspect"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.list"]
+python = "Catalog.list"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.memory"]
+python = "Catalog.memory"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.open"]
+python = "Catalog"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.rename"]
+python = "Catalog.rename"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.repositories"]
+python = "Catalog.repositories"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.reserve"]
+python = "Catalog.reserve"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.restore"]
+python = "Catalog.restore"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["catalog.run_policy"]
+python = "Catalog.run_policy"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.apply_patch"]
+python = "Dataset.apply_patch"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.ask"]
+python = "Dataset.ask"
+jvm = "FfiDataset.prepareQuery"
+node = "planned: P05"
+
+["dataset.backup"]
+python = "Dataset.backup"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.branch"]
+python = "Dataset.branch"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.clear"]
+python = "Dataset.clear"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.clear_cache"]
+python = "Dataset.clear_cache"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.clone_to_memory_with"]
+python = "Dataset.clone_to_memory"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.clone_to_with"]
+python = "Dataset.clone_to"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.compact_with"]
+python = "Dataset.compact"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.construct"]
+python = "Dataset.construct"
+jvm = "FfiDataset.prepareQuery"
+node = "planned: P05"
+
+["dataset.dataset_id"]
+python = "Dataset.dataset_id"
+jvm = "FfiDataset.datasetId"
+node = "planned: P05"
+
+["dataset.dump"]
+python = "Dataset.dump"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.dump_graph"]
+python = "Dataset.dump"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.explain"]
+python = "Dataset.explain"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.head_commit"]
+python = "Dataset.head_commit"
+jvm = "FfiDataset.headCommit"
+node = "planned: P05"
+
+["dataset.insert"]
+python = "Dataset.add"
+jvm = "FfiWriteTxn.apply"
+node = "planned: P05"
+
+["dataset.load_sources_receipt"]
+python = "Dataset.load_files"
+jvm = "FfiDataset.loadFiles"
+node = "planned: P05"
+
+["dataset.memory"]
+python = "Dataset.memory"
+jvm = "FfiDataset.memory"
+node = "planned: P05"
+
+["dataset.open"]
+python = "Dataset.open"
+jvm = "FfiDataset.open"
+node = "planned: P05"
+
+["dataset.prefixes"]
+python = "Dataset.prefixes"
+jvm = "FfiDataset.prefixes"
+node = "planned: P05"
+
+["dataset.quads"]
+python = "Dataset.quads_for_pattern"
+jvm = "FfiDataset.find"
+node = "planned: P05"
+
+["dataset.query_with"]
+python = "Dataset.query"
+jvm = "FfiDataset.prepareQuery"
+node = "planned: P05"
+
+["dataset.remove"]
+python = "Dataset.remove"
+jvm = "FfiWriteTxn.apply"
+node = "planned: P05"
+
+["dataset.remove_prefix"]
+python = "Dataset.remove_prefix"
+jvm = "FfiDataset.removePrefix"
+node = "planned: P05"
+
+["dataset.replace"]
+python = "Dataset.replace"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.select"]
+python = "Dataset.select"
+jvm = "FfiDataset.prepareQuery"
+node = "planned: P05"
+
+["dataset.set_prefix"]
+python = "Dataset.set_prefix"
+jvm = "FfiDataset.setPrefix"
+node = "planned: P05"
+
+["dataset.stats"]
+python = "Dataset.stats"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["dataset.transaction"]
+python = "Dataset.transaction"
+jvm = "FfiDataset.beginWrite"
+node = "planned: P05"
+
+["dataset.update_with"]
+python = "Dataset.update"
+jvm = "FfiWriteTxn.update"
+node = "planned: P05"
+
+["fmt.format"]
+python = "skip: formatter and linter remain CLI tools"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["fmt.lint"]
+python = "skip: formatter and linter remain CLI tools"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["geo.convert"]
+python = "convert_geometries"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["graph.clear"]
+python = "Dataset.clear_graph"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["graphql.config.get"]
+python = "Dataset.graphql.config.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["graphql.config.reset"]
+python = "Dataset.graphql.config.reset"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["graphql.draft"]
+python = "Dataset.graphql.draft"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["graphql.execute"]
+python = "Dataset.graphql.execute"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["graphql.put"]
+python = "Dataset.graphql.config.set"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["graphql.sdl"]
+python = "Dataset.graphql.sdl"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["graphql.versions"]
+python = "Dataset.graphql.versions"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["history.changes"]
+python = "Dataset.history.changes"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["history.commit"]
+python = "Dataset.history.commit"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["history.commits"]
+python = "Dataset.history.commits"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["history.diff"]
+python = "Dataset.history.diff"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["history.prune"]
+python = "Dataset.history.prune"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["history.query"]
+python = "Dataset.history.query"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["history.status"]
+python = "Dataset.history.status"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["history.tick"]
+python = "Dataset.history.tick"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["history.wait_for_commit"]
+python = "Dataset.history.wait_for_commit"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.geo.disable"]
+python = "Dataset.indexes.geo.disable"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.geo.enable"]
+python = "Dataset.indexes.geo.enable"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.geo.features"]
+python = "Dataset.indexes.geo.features"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.geo.rebuild"]
+python = "Dataset.indexes.geo.rebuild"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.geo.status"]
+python = "Dataset.indexes.geo.status"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.text.disable"]
+python = "Dataset.indexes.text.disable"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.text.enable"]
+python = "Dataset.indexes.text.enable"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.text.rebuild"]
+python = "Dataset.indexes.text.rebuild"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.text.search"]
+python = "Dataset.indexes.text.search"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.text.status"]
+python = "Dataset.indexes.text.status"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.vector.drop"]
+python = "Dataset.indexes.vector.drop"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.vector.embed_until_idle"]
+python = "Dataset.indexes.vector.embed_until_idle"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.vector.get"]
+python = "Dataset.indexes.vector.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.vector.list"]
+python = "Dataset.indexes.vector.list"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.vector.put"]
+python = "Dataset.indexes.vector.put"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.vector.rebuild"]
+python = "Dataset.indexes.vector.rebuild"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.vector.recall"]
+python = "Dataset.indexes.vector.recall"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["indexes.vector.reembed"]
+python = "Dataset.indexes.vector.reembed"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["io.check_data"]
+python = "check_data"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["queries.delete"]
+python = "Dataset.queries.delete"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["queries.get"]
+python = "Dataset.queries.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["queries.list"]
+python = "Dataset.queries.list"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["queries.put"]
+python = "Dataset.queries.put"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["queries.run"]
+python = "Dataset.queries.run"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["queries.versions"]
+python = "Dataset.queries.versions"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["reasoning.clear"]
+python = "Dataset.reasoning.clear"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["reasoning.diagnostics"]
+python = "Dataset.reasoning.diagnostics"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["reasoning.rdfs.get"]
+python = "Dataset.reasoning.rdfs.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["reasoning.rdfs.reset"]
+python = "Dataset.reasoning.rdfs.reset"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["reasoning.rdfs.set"]
+python = "Dataset.reasoning.rdfs.set"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["reasoning.run_with"]
+python = "Dataset.reasoning.run"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["reasoning.status"]
+python = "Dataset.reasoning.status"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["repositories.add"]
+python = "Catalog.repositories.add"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["repositories.get"]
+python = "Catalog.repositories.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["repositories.list"]
+python = "Catalog.repositories.list"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["repositories.open"]
+python = "Catalog.repositories.open"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["repositories.remove"]
+python = "Catalog.repositories.remove"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["repositories.update"]
+python = "Catalog.repositories.update"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["repositories.with_fixed"]
+python = "Catalog.repositories.with_fixed"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["schema.classes"]
+python = "Dataset.schema.classes"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["schema.constraints"]
+python = "Dataset.schema.constraints"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["schema.diff"]
+python = "Dataset.schema.diff"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["schema.draft_shapes"]
+python = "Dataset.schema.draft_shapes"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["schema.predicates"]
+python = "Dataset.schema.predicates"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["schema.profiles"]
+python = "Dataset.schema.profiles"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["schema.report"]
+python = "Dataset.schema.report"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["settings.compaction.get"]
+python = "Dataset.settings.compaction.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["settings.compaction.reset"]
+python = "Dataset.settings.compaction.reset"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["settings.compaction.set"]
+python = "Dataset.settings.compaction.set"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["settings.describe.get"]
+python = "Dataset.settings.describe.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["settings.describe.reset"]
+python = "Dataset.settings.describe.reset"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["settings.describe.set"]
+python = "Dataset.settings.describe.set"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["settings.quota.get"]
+python = "Dataset.settings.quota.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["settings.quota.reset"]
+python = "Dataset.settings.quota.reset"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["settings.quota.set"]
+python = "Dataset.settings.quota.set"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["settings.retention.set"]
+python = "Dataset.settings.retention.set"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["snapshots.create"]
+python = "Dataset.snapshots.create"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["snapshots.delete"]
+python = "Dataset.snapshots.delete"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["snapshots.get"]
+python = "Dataset.snapshots.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["snapshots.list"]
+python = "Dataset.snapshots.list"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["sparql.parse_query"]
+python = "parse_query"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["sparql.parse_update"]
+python = "parse_update"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["terms.check_iri"]
+python = "check_iri"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["terms.check_langtag"]
+python = "check_langtag"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["validation.guard.get"]
+python = "Dataset.validation.guard.get"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["validation.guard.reset"]
+python = "Dataset.validation.guard.reset"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["validation.guard.set"]
+python = "Dataset.validation.guard.set"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["validation.shacl"]
+python = "Dataset.validation.shacl"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"
+
+["validation.shex"]
+python = "Dataset.validation.shex"
+jvm = "planned: P04 phase 3"
+node = "planned: P05"

@@ -644,7 +644,7 @@ async fn draft_shapes_tool() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stored_queries_are_tools() {
     let server = fixture_server();
-    let ds = server.state.datasets.read()["t"].clone();
+    let ds = server.state.datasets()["t"].clone();
     let put = |name: &str, def: Value| {
         let d: sparkles::stored::Definition = serde_json::from_value(def).unwrap();
         ds.queries
@@ -736,7 +736,7 @@ fn stored_tool_names_fit_clients() {
 #[tokio::test(flavor = "multi_thread")]
 async fn describe_schema_constraints_and_subject_classes() {
     let server = fixture_server();
-    let ds = server.state.datasets.read()["t"].clone();
+    let ds = server.state.datasets()["t"].clone();
     ds.store
         .load(&[Source::from_bytes(
             br#"@prefix ex: <http://ex.org/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
@@ -1978,7 +1978,7 @@ async fn update_over_stdio() {
 #[tokio::test(flavor = "multi_thread")]
 async fn profiles_and_schema_diffs() {
     let server = fixture_server();
-    let ds = server.state.datasets.read()["t"].clone();
+    let ds = server.state.datasets()["t"].clone();
     // an in-memory dataset keeps past states only within a retention window
     ds.store
         .set_retention(sparkles::history::Retention {

@@ -18,6 +18,7 @@ mod idp;
 mod limits;
 mod oidc;
 mod proxy;
+mod rename;
 mod sessions;
 mod tasks;
 mod tokens;
@@ -167,9 +168,10 @@ impl AuthServer {
             config,
             state,
             fixture,
-            ..
+            app,
         } = self;
         crate::auth::flush(&state);
+        drop(app);
         drop(state);
         let (state, app) = open_state(dir.path(), &config, &fixture);
         AuthServer {

@@ -357,7 +357,7 @@ pub struct GeoSeries {
 /// queries ran spatial operators.
 pub fn series(st: &AppState) -> std::collections::BTreeMap<String, GeoSeries> {
     let mut out: std::collections::BTreeMap<String, GeoSeries> = Default::default();
-    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<Arc<Dataset>> = st.datasets().values().cloned().collect();
     for ds in datasets {
         let Some(s) = ds.dataset.indexes().geo().status() else {
             continue;

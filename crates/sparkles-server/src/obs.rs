@@ -999,7 +999,7 @@ struct ValidationTotals {
 /// Validation counters by dataset label and language, for the language of a dataset's
 /// configuration and the languages with counts.
 fn validation_totals(st: &AppState) -> BTreeMap<(String, &'static str), ValidationTotals> {
-    let datasets: Vec<_> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<_> = st.datasets().values().cloned().collect();
     let mut out: BTreeMap<(String, &'static str), ValidationTotals> = BTreeMap::new();
     for d in datasets {
         let configured = d.validation.read().as_ref().map(|v| v.language());
@@ -1070,7 +1070,7 @@ struct DsGauges {
 }
 
 fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
-    let datasets: Vec<_> = st.datasets.read().values().cloned().collect();
+    let datasets: Vec<_> = st.datasets().values().cloned().collect();
     let mut out: BTreeMap<String, DsGauges> = BTreeMap::new();
     for d in datasets {
         let label = if st.metrics.enabled {
@@ -1924,8 +1924,7 @@ fn ready_for(st: &AppState, p: &crate::auth::Principal) -> (bool, J) {
     let phase = st.phase();
     let all = p.has(crate::auth::ServerPerm::Metrics);
     let datasets: Vec<J> = st
-        .datasets
-        .read()
+        .datasets()
         .values()
         .filter(|d| all || p.can(&d.name, crate::auth::Level::Read))
         .map(|d| dataset_ready_for(d, p))

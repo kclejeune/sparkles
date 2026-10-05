@@ -177,11 +177,7 @@ async fn define_and_run() {
     assert_eq!(d.json()["query"], ADULTS);
     assert_eq!(d.header("etag"), "\"v1\"");
     // the file is in the database directory
-    let root = s.state.datasets.read()["t"]
-        .store
-        .root()
-        .unwrap()
-        .to_path_buf();
+    let root = s.state.datasets()["t"].store.root().unwrap().to_path_buf();
     assert!(root.join(sparkles::stored::FILE).exists());
 }
 
@@ -366,7 +362,7 @@ async fn the_definition_names_the_default_format() {
 async fn clones_keep_the_queries() {
     let s = server();
     put(&s.app, "adults", adults(), &[]).await;
-    let ds = s.state.datasets.read()["t"].clone();
+    let ds = s.state.datasets()["t"].clone();
     let out = tempfile::tempdir().unwrap();
     let dir = out.path().join("copy");
     ds.store

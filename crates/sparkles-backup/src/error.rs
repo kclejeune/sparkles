@@ -353,7 +353,7 @@ impl From<sparkles_core::Error> for BackupError {
             E::Cancelled => Code::Cancelled,
             E::Unsupported(_) => Code::BackupUnsupported,
             E::Conflict(m) if m.starts_with("catalog-lagging") => Code::CatalogLagging,
-            E::Invalid(_) => Code::InvalidRequest,
+            E::Invalid(_) | E::Locked { .. } => Code::InvalidRequest,
             // the temporary copy of an in-memory dataset hit the disk reserve
             E::StorageFull(_) => Code::InsufficientStorage,
             _ => Code::Internal,

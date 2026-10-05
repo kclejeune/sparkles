@@ -14364,6 +14364,97 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/datasets/{ds}/rename": {
+      "post": {
+        "description": "Requires server-admin. Refused while source or destination is covered by a dataset grant, or while persistent dataset handles remain alive. Dataset identity is retained.",
+        "operationId": "renameDataset",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The new name.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "renamedFrom": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "renamedFrom"
+              ],
+              "type": "object"
+            },
+            "description": "Renamed."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Rename a dataset",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
     "/$/describe/{ds}": {
       "delete": {
         "externalDocs": {

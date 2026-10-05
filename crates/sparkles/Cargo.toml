@@ -18,6 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+libc = "0.2"
 # the cursors of the schema report's lists (base64url JSON)
 base64 = "0.23"
 # the IRI and language tag checks of `sparkles::terms`
@@ -32,8 +33,11 @@ sparkles-backup = { workspace = true, optional = true }
 sparkles-fmt = { workspace = true, optional = true }
 # the runtime that the blocking backup calls run on (feature `backup`)
 tokio = { workspace = true, optional = true }
+toml = { version = "1", optional = true }
+chrono = { workspace = true, optional = true }
 
 [dev-dependencies]
+toml = "1"
 oxrdfio.workspace = true
 spargebra.workspace = true
 serde_json.workspace = true
@@ -58,7 +62,7 @@ shex = ["dep:sparkles-shex"]
 graphql = ["dep:sparkles-graphql"]
 # backup repositories: `ds.backups(&repo)` and `sparkles::backup` (file systems and S3,
 # the backup crate's defaults)
-backup = ["dep:sparkles-backup", "dep:tokio"]
+backup = ["dep:sparkles-backup", "dep:tokio", "dep:toml", "dep:chrono"]
 backup-s3 = ["backup", "sparkles-backup/s3"]
 backup-gcs = ["backup", "sparkles-backup/gcs"]
 backup-azure = ["backup", "sparkles-backup/azure"]

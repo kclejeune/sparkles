@@ -298,7 +298,7 @@ async fn list_repositories(State(st): St, Extension(p): Extension<Principal>) ->
             .filter_map(|n| b.registry.view(n).ok())
             .map(|r| RepositoryEntry::Full(Box::new(r)))
             .collect()
-    } else if st.datasets.read().keys().any(|d| p.can(d, Level::Admin)) {
+    } else if st.datasets().keys().any(|d| p.can(d, Level::Admin)) {
         b.registry
             .repos
             .read()
@@ -421,21 +421,7 @@ async fn add_repository(
         }
         (None, _) => e.mark_unreachable(open_err.as_ref().map_or("unreachable", |e| e.message())),
     }
-    {
-        let mut repos = b.registry.repos.write();
-        if repos.contains_key(&name) {
-            return Err(BackupError::new(
-                Code::RepositoryExists,
-                format!("a repository named \u{201c}{name}\u{201d} exists"),
-            )
-            .into());
-        }
-        repos.insert(name.clone(), e);
-    }
-    if let Err(e) = b.registry.save_repositories(&b.dir) {
-        b.registry.repos.write().remove(&name);
-        return Err(BackupError::internal(format!("{e:#}")).into());
-    }
+    b.registry.insert_repository(Some(&b.dir), e)?;
     tracing::info!(
         target: "sparkles::audit",
         event = "repository_added",
@@ -507,18 +493,7 @@ async fn put_repository(
     }
     cfg.validate(&b.forbid)?;
     b.check_api(&cfg)?;
-    b.registry
-        .update(&name, |e| {
-            e.config = cfg.clone();
-            // reopened with the new settings (limits, credentials) at the next use
-            e.opened = None;
-            e.status.single_writer =
-                !cfg.conditional_writes || e.status.conditional_writes == Some(false);
-        })
-        .ok_or_else(|| no_such_repository(&name))?;
-    if let Err(e) = b.registry.save_repositories(&b.dir) {
-        return Err(BackupError::internal(format!("{e:#}")).into());
-    }
+    b.registry.replace_repository(Some(&b.dir), &name, cfg)?;
     tracing::info!(
         target: "sparkles::audit",
         event = "repository_changed",
@@ -570,12 +545,8 @@ async fn remove_repository(
         .with("task", t)
         .into());
     }
-    let Some(entry) = b.registry.repos.write().remove(&name) else {
+    if !b.registry.remove_repository(Some(&b.dir), &name)? {
         return Err(no_such_repository(&name).into());
-    };
-    if let Err(e) = b.registry.save_repositories(&b.dir) {
-        b.registry.repos.write().insert(name, entry);
-        return Err(BackupError::internal(format!("{e:#}")).into());
     }
     tracing::info!(
         target: "sparkles::audit",
@@ -1045,7 +1016,7 @@ async fn restore_backup(
         let busy = b
             .target_busy(&target)
             .or_else(|| b.dataset_task(&target))
-            .or_else(|| st.restoring.lock().get(&target).cloned());
+            .or_else(|| st.catalog.restoring_by(&target));
         if let Some(task) = busy {
             return Err(BackupError::new(
                 Code::DatasetBusy,
@@ -1063,8 +1034,7 @@ async fn restore_backup(
     }
     if req.identity == Identity::Keep {
         let in_use = st
-            .datasets
-            .read()
+            .datasets()
             .values()
             .any(|d| !(req.replace && d.name == target) && d.store.dataset_id() == source);
         if in_use {
@@ -1132,7 +1102,6 @@ async fn restore_backup(
     let args = ops::RestoreArgs {
         repo,
         backup: name.clone(),
-        source_id: source,
         target: target.clone(),
         req,
         reservation,

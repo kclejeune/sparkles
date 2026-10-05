@@ -17,6 +17,7 @@ mod compaction_cmd;
 mod compress;
 mod config_cmd;
 mod csv_cmd;
+mod dataset_cmd;
 mod describe_cmd;
 mod dump_cmd;
 mod exposure;
@@ -1360,6 +1361,11 @@ enum Cmd {
     /// The storage quota of a persistent dataset: print it, set it (--max-mb), or go
     /// back to the default (--default)
     Quota(quota_cmd::QuotaArgs),
+    /// Manage datasets in a stopped server's catalog or on a running server
+    Dataset {
+        #[command(subcommand)]
+        cmd: dataset_cmd::DatasetCmd,
+    },
     /// Show or change a dataset's automatic compaction settings, on a local database or
     /// on a server
     Compaction(compaction_cmd::CompactionArgs),
@@ -2321,15 +2327,8 @@ fn run() -> Result<()> {
             if tls_cert.is_some() || tls_key.is_some() {
                 bail!("--tls-cert: built without native TLS (cargo feature \"tls\")");
             }
-            // one server per data directory (held until the process exits)
-            #[cfg(feature = "backup")]
-            let _data_lock = backup::lock_data_dir(&data)?;
             let bound = if unix_socket.is_some() { "unix" } else { &host };
             let auth = auth::load(auth_config.as_deref(), &data, bound, tls_cert.is_some())?;
-            // an in-place restore interrupted between its renames is undone before the
-            // registry's datasets are opened
-            #[cfg(feature = "backup")]
-            backup::recover::startup(&data)?;
             if let Some(o) = cors_origin.iter().find(|o| !exposure::valid_origin(o)) {
                 bail!("--cors-origin '{o}': expected scheme://host[:port]");
             }
@@ -2368,6 +2367,7 @@ fn run() -> Result<()> {
                 if let Some(f) = &auth_config {
                     b.forbid_config_dir(f);
                 }
+                st.catalog.share_repositories(b.registry.clone())?;
                 st.backup = Some(Arc::new(b));
             }
             st.read_only = read_only;
@@ -2592,7 +2592,7 @@ fn run() -> Result<()> {
                     "Sparkles {} listening on {listening} (UI at /ui/)",
                     env!("CARGO_PKG_VERSION")
                 );
-                for name in st.datasets.read().keys() {
+                for name in st.datasets().keys() {
                     tracing::info!(
                         "  dataset /{name}  →  /{name}/sparql  /{name}/update  /{name}/data"
                     );
@@ -3122,6 +3122,7 @@ fn run() -> Result<()> {
         #[cfg(any(feature = "shacl", feature = "shex"))]
         Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Quota(args) => quota_cmd::run(args, opts),
+        Cmd::Dataset { cmd } => dataset_cmd::run(cmd, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
         #[cfg(feature = "auth")]
         Cmd::Ping(args) => ping_cmd::run(args),
@@ -3233,21 +3234,9 @@ fn run() -> Result<()> {
             if to.exists() && std::fs::read_dir(&to)?.next().is_some() {
                 bail!("{} exists and is not empty", to.display());
             }
-            let store = branch_cmd::open_db(&loc, opts)?;
+            let (dataset, _main) = branch_cmd::open_db(&loc, opts)?.into_dataset();
             let t = Instant::now();
-            clone::sweep_cli_leftovers(&to);
-            let mut tmp = to.as_os_str().to_owned();
-            tmp.push(format!(".clone-tmp-{}", std::process::id()));
-            let r = clone::clone_into(
-                &store,
-                &loc.display().to_string(),
-                state::read_reasoning_file(&loc),
-                std::path::Path::new(&tmp),
-                &to,
-                &spec,
-                None,
-                None,
-            )?;
+            let r = dataset.clone_to_with(&to, &spec, &sparkles::task::Control::none())?;
             eprintln!(
                 "cloned {} (commit {}, {} quads, {} graph{}) to {} by {} in {:.2}s",
                 loc.display(),
