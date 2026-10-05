@@ -109,7 +109,7 @@ Rust, Python and JVM APIs, a Fuseki-compatible server and CLI, and a web UI.
 * A JVM library, `sparkles-jena`, that gives Jena programs a `DatasetGraph` backed by
   Sparkles, so TDB2 code runs on it with a one-line change
   ([usage](docs/USAGE.md#jvm-apache-jena)).
-* Node.js and TypeScript bindings are planned ([spec P05](docs/specs/P05-node-bindings.md)).
+* Node.js and TypeScript bindings are planned.
 * A Rust client for Sparkles and any SPARQL endpoint ([usage](docs/USAGE.md#rust-client)).
 
 **Server and integrations**
@@ -161,12 +161,6 @@ English DBpedia (1.24 billion triples) it loads in 596 s against QLever's 1,674 
 Fluree's 2,919 s, and is faster than QLever on 28 of 29 warm queries and 26 of 31 cold
 ones. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every number, the memory tradeoff and
 every query where Sparkles loses or ties.
-
-A [P06 rerun on 2026-10-05](docs/BENCHMARKS.md#p06-rerun-on-2026-10-05) against main
-found warm query geometric mean latency changes of −0.2% at 1.05M and +1.3% at 10.5M,
-with loads about 5% faster and commit throughput about 2% lower. One repeatable
-10.5M `lang-filter` slowdown remains: about 8% with multiple cores and 14% with the
-server confined to one CPU.
 
 ## Getting started
 
