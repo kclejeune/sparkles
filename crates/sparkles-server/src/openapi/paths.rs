@@ -2219,12 +2219,14 @@ fn backups(p: &mut Paths) {
         )
         .doc("In every repository, or in `repository` only, newest first.")
         .see("backup-routes")
+        .param("branch")
         .query("repository", s(), "One repository.")
         .json("200", "The backups.", "BackupList"),
     );
     p.add(
         op(POST, "/$/backups/{ds}", "createBackup", tag, "Back up a dataset")
-            .doc("A JSON body backs up into a repository. Without one, this is Fuseki's alias of `POST /$/backup/{ds}`, an N-Quads file.")
+            .doc("A JSON body captures the selected branch as a standalone dataset in a repository. Branch restores use a fresh identity. Without a JSON body, this is Fuseki's N-Quads file alias.")
+            .param("branch")
             .see("backup-routes")
             .body(false, "", json!({ "application/json": { "schema": sref("BackupRequest") } }))
             .task()
@@ -2238,6 +2240,7 @@ fn backups(p: &mut Paths) {
             tag,
             "Get a backup",
         )
+        .param("branch")
         .see("backup-routes")
         .json("200", "The backup.", "Backup"),
     );
@@ -2250,6 +2253,7 @@ fn backups(p: &mut Paths) {
             "Delete a backup",
         )
         .doc("Deletes the manifest. Its blobs go at the next GC.")
+        .param("branch")
         .see("backup-routes")
         .no_content("Deleted.")
         .errors(&[409]),
@@ -2263,6 +2267,7 @@ fn backups(p: &mut Paths) {
             "Restore a backup",
         )
         .doc("Needs `admin` on the target too.")
+        .param("branch")
         .see("restore")
         .json_body(true, "RestoreRequest")
         .task()
@@ -2276,6 +2281,7 @@ fn backups(p: &mut Paths) {
             tag,
             "Verify a backup",
         )
+        .param("branch")
         .see("backup-routes")
         .body(
             false,

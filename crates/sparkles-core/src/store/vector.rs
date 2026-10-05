@@ -508,12 +508,17 @@ impl Store {
 
     /// The directory of `snap`'s generation's index files (`None`: an in-memory store).
     fn vector_dir(&self, snap: &Snapshot) -> Option<std::path::PathBuf> {
-        let root = self.root.as_ref()?;
-        let gdir = snap
-            .generation
-            .dir
-            .as_ref()
-            .filter(|d| d.starts_with(root))?;
+        let gdir = if let Some(link) = snap.generation.linked() {
+            link.base_dir()
+        } else if let Some(base) = &snap.generation._base {
+            base.dir.as_deref()?
+        } else {
+            let root = self.root.as_ref()?;
+            snap.generation
+                .dir
+                .as_deref()
+                .filter(|d| d.starts_with(root))?
+        };
         Some(persist::dir_of(gdir))
     }
 
@@ -530,7 +535,13 @@ impl Store {
         entry.progress.store(0f32.to_bits(), Ordering::Relaxed);
         let files = if persist::SUPPORTED {
             self.vector_dir(&snap).map(|dir| {
-                let gdir = snap.generation.dir.clone().unwrap_or_default();
+                let gdir = snap
+                    .generation
+                    .linked()
+                    .map(|l| l.base_dir().to_path_buf())
+                    .or_else(|| snap.generation._base.as_ref().and_then(|b| b.dir.clone()))
+                    .or_else(|| snap.generation.dir.clone())
+                    .unwrap_or_default();
                 (
                     dir,
                     Identity::of(
@@ -544,7 +555,9 @@ impl Store {
         } else {
             None
         };
-        let write = self.opts.vector_files;
+        let write = self.opts.vector_files
+            && snap.generation.linked().is_none()
+            && snap.generation._base.is_none();
         let sequential = self.vector.sequential.load(Ordering::SeqCst);
         let current = Arc::downgrade(&self.current);
         let registry = Arc::downgrade(&self.vector);

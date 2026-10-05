@@ -57,11 +57,27 @@ impl WriteGuard {
         match *self {
             #[cfg(feature = "shacl")]
             WriteGuard::Shacl(ref g) => {
-                json!({ "language": "shacl", "config": g.config(), "status": g.status() })
+                let mut config = json!(g.config());
+                // Inline sources have no file on memory stores. Include them in the
+                // editable response; on-disk configuration serialization stays compact.
+                if let Some(text) = &g.config().shapes.inline {
+                    config["shapes"]["inline"] = json!(text);
+                    if let Some(format) = &g.config().shapes.format {
+                        config["shapes"]["format"] = json!(format);
+                    }
+                }
+                json!({ "language": "shacl", "config": config, "status": g.status() })
             }
             #[cfg(feature = "shex")]
             WriteGuard::Shex(ref g) => {
-                json!({ "language": "shex", "config": g.config(), "status": g.status() })
+                let mut config = json!(g.config());
+                if let Some((_, text)) = g.schema_copy()
+                    && let Some(schema) = config["schema"].as_object_mut()
+                {
+                    schema.remove("file");
+                    schema.insert("inline".into(), json!(text));
+                }
+                json!({ "language": "shex", "config": config, "status": g.status() })
             }
         }
     }
@@ -80,6 +96,27 @@ impl WriteGuard {
                 let mut cfg = g.config().clone();
                 let mut out = Vec::new();
                 if let Some(text) = cfg.shapes.inline.take() {
+                    // Match persistent installation: the copied file is always Turtle.
+                    let syntax = match cfg.shapes.format.as_deref() {
+                        None => sparkles_shacl::ShapesSyntax::default(),
+                        Some(media) => match sparkles_shacl::ShapesSyntax::from_media_type(media) {
+                            Some(syntax) => syntax,
+                            None => return Vec::new(),
+                        },
+                    };
+                    let text = if syntax == sparkles_shacl::ShapesSyntax::default() {
+                        text
+                    } else {
+                        match sparkles_shacl::syntax::convert(
+                            &text,
+                            syntax,
+                            sparkles_shacl::ShapesSyntax::default(),
+                            None,
+                        ) {
+                            Ok(text) => text,
+                            Err(_) => return Vec::new(),
+                        }
+                    };
                     let file = crate::guard::config::SHACL_SHAPES_FILE;
                     cfg.shapes.file = Some(file.to_string());
                     cfg.shapes.sha256 = Some(crate::guard::config::sha256_hex(text.as_bytes()));
@@ -93,15 +130,16 @@ impl WriteGuard {
                 out
             }
             #[cfg(feature = "shex")]
-            WriteGuard::Shex(ref g) => {
-                let Some((file, text)) = g.schema_copy() else {
-                    return Vec::new();
-                };
-                match serde_json::to_vec_pretty(g.config()) {
-                    Ok(b) => vec![(config, b), (file.to_string(), text.as_bytes().to_vec())],
-                    Err(_) => Vec::new(),
+            WriteGuard::Shex(ref g) => match serde_json::to_vec_pretty(g.config()) {
+                Ok(b) => {
+                    let mut files = vec![(config, b)];
+                    if let Some((file, text)) = g.schema_copy() {
+                        files.push((file.to_string(), text.as_bytes().to_vec()));
+                    }
+                    files
                 }
-            }
+                Err(_) => Vec::new(),
+            },
         }
     }
 

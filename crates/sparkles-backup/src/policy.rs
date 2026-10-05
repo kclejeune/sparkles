@@ -1133,6 +1133,7 @@ mod tests {
             name: name.into(),
             repository: "local".into(),
             dataset: DatasetRef {
+                branch: None,
                 name: "ds".into(),
                 id: uuid::Uuid::from_u128(id),
                 kind: "persistent".into(),

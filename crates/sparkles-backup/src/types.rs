@@ -313,6 +313,8 @@ pub struct TestReport {
 /// The dataset of a backup summary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<sparkles_core::store::BackupBranch>,
     pub name: String,
     pub id: Uuid,
     /// `persistent`, or `mem` for a backup of an in-memory dataset
@@ -459,6 +461,15 @@ pub struct Backup {
 /// The dataset of a manifest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestDataset {
+    /// The first unused branch blank-node ordinal; older manifests may omit it.
+    #[serde(
+        default,
+        rename = "nextOrdinal",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub next_ordinal: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<sparkles_core::store::BackupBranch>,
     pub name: String,
     pub id: Uuid,
     /// `persistent`, or `mem` for a backup of an in-memory dataset
@@ -561,6 +572,7 @@ impl Manifest {
             name: self.name.clone(),
             repository: repository.to_string(),
             dataset: DatasetRef {
+                branch: self.dataset.branch.clone(),
                 name: self.dataset.name.clone(),
                 id: self.dataset.id,
                 kind: self.dataset.kind.clone(),

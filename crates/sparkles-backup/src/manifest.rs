@@ -79,6 +79,25 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_format: u32) -> Result<()>
     if m.dataset.id.is_nil() {
         return bad("dataset.id", "the nil UUID".into());
     }
+    if m.dataset
+        .next_ordinal
+        .is_some_and(|n| !(1..=65536).contains(&n))
+    {
+        return bad("dataset.nextOrdinal", "invalid ordinal reservation".into());
+    }
+    if let Some(b) = &m.dataset.branch
+        && (b.id != m.dataset.id
+            || b.dataset_id.is_nil()
+            || b.id == b.dataset_id
+            || !sparkles_core::branch::valid_name(&b.name)
+            || b.name == "main"
+            || !(2..=65536).contains(&b.next_ordinal))
+    {
+        return bad(
+            "dataset.branch",
+            "invalid branch identity or ordinal reservation".into(),
+        );
+    }
     if m.dataset.name.is_empty() || m.dataset.name.chars().any(char::is_control) {
         return bad(
             "dataset.name",
@@ -453,5 +472,37 @@ mod tests {
                 .contains(&format!("index format {}; this build reads {v}", v + 1)),
             "{e}"
         );
+    }
+    #[test]
+    fn branch_provenance_is_validated_without_breaking_legacy_manifests() {
+        let mut m = good();
+        assert!(m.dataset.branch.is_none());
+        assert!(m.dataset.next_ordinal.is_none());
+        for next in [0, 65_537] {
+            m.dataset.next_ordinal = Some(next);
+            assert_eq!(field_of(&m).1, "dataset.nextOrdinal");
+        }
+        for next in [1, 65_536] {
+            m.dataset.next_ordinal = Some(next);
+            validate(&m, PIECE, 2).unwrap();
+        }
+        m.dataset.next_ordinal = None;
+        m.dataset.branch = Some(sparkles_core::store::BackupBranch {
+            dataset_id: uuid::Uuid::new_v4(),
+            id: m.dataset.id,
+            name: "work".into(),
+            next_ordinal: 2,
+        });
+        validate(&m, PIECE, 2).unwrap();
+        for next in [0, 1, 65_537] {
+            m.dataset.branch.as_mut().unwrap().next_ordinal = next;
+            assert_eq!(field_of(&m).1, "dataset.branch");
+        }
+        m.dataset.branch.as_mut().unwrap().next_ordinal = 2;
+        m.dataset.branch.as_mut().unwrap().name = "main".into();
+        assert_eq!(field_of(&m).1, "dataset.branch");
+        m.dataset.branch.as_mut().unwrap().name = "work".into();
+        m.dataset.branch.as_mut().unwrap().id = uuid::Uuid::new_v4();
+        assert_eq!(field_of(&m).1, "dataset.branch");
     }
 }

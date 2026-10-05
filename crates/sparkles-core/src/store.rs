@@ -30,6 +30,8 @@ mod geo;
 mod history_query;
 mod link;
 mod mem_history;
+#[cfg(test)]
+mod memory_branch_tests;
 mod merge;
 mod partial;
 mod patch_apply;
@@ -44,9 +46,10 @@ mod vector;
 pub(crate) use embed::embed_query_text;
 pub(crate) mod wal;
 pub use backup::{
-    BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard, MEMORY_CAPTURE_PREFIX,
-    MemoryCaptureOptions,
+    BackupBranch, BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard,
+    MEMORY_CAPTURE_PREFIX, MemoryCaptureOptions,
 };
+pub(crate) use branching::write_initial_table;
 pub use branching::{
     BRANCHES_DIR, BRANCHES_FILE, BranchCommit, BranchSet, BranchStore, read_branch_table,
 };
@@ -100,13 +103,15 @@ pub struct Generation {
     pub uid: u64,
     pub name: String,
     pub dir: Option<PathBuf>,
-    pub vocab: Vocab,
+    pub vocab: Arc<Vocab>,
     pub perms: Vec<PermIndex>,
     pub stats: Stats,
     pub meta: IndexMeta,
     pub dvocab: DeltaVocab,
     /// keeps a temporary directory alive for in-memory stores with a bulk-built base
     _tmp: Option<tempfile::TempDir>,
+    /// A memory branch retains its immutable base mappings and temporary owner.
+    _base: Option<Arc<Generation>>,
     /// packed vectors of the base index, built on first search
     pub vectors: crate::vector::GenerationVectors,
     /// the spatial index's geometry column and base tree for this generation
@@ -127,12 +132,35 @@ impl Generation {
             uid: crate::index::next_uid(),
             name: "mem".into(),
             dir: None,
-            vocab: Vocab::empty(),
+            vocab: Arc::new(Vocab::empty()),
             perms: Perm::ALL.iter().map(|&p| PermIndex::empty(p)).collect(),
             stats: Stats::default(),
             meta: IndexMeta::default(),
             dvocab,
             _tmp: None,
+            _base: None,
+            vectors: Default::default(),
+            geo: Default::default(),
+            counts: Default::default(),
+            charsets: Default::default(),
+            wal_index: Mutex::new(None),
+            link: None,
+        }
+    }
+
+    fn memory_branch(base: &Arc<Generation>, vocab_len: u64) -> Generation {
+        let dvocab = base.dvocab.fork_memory(vocab_len);
+        Generation {
+            uid: crate::index::next_uid(),
+            name: "mem".into(),
+            dir: None,
+            vocab: base.vocab.clone(),
+            perms: base.perms.clone(),
+            stats: base.stats.clone(),
+            meta: base.meta.clone(),
+            dvocab,
+            _tmp: None,
+            _base: Some(base.clone()),
             vectors: Default::default(),
             geo: Default::default(),
             counts: Default::default(),
@@ -177,7 +205,7 @@ impl Generation {
             uid: crate::index::next_uid(),
             name: name.to_string(),
             dir: Some(dir.to_path_buf()),
-            vocab: Vocab::open(dir)?,
+            vocab: Arc::new(Vocab::open(dir)?),
             perms: Perm::ALL
                 .iter()
                 .map(|&p| PermIndex::open(dir, p))
@@ -186,6 +214,7 @@ impl Generation {
             meta,
             dvocab,
             _tmp: None,
+            _base: None,
             vectors: Default::default(),
             geo: Default::default(),
             counts: Default::default(),
@@ -1202,7 +1231,7 @@ impl Store {
                 cache: cache.clone(),
                 results: results.clone(),
                 dvocab_len,
-                commit: 0,
+                commit: root.seq,
                 text: None,
                 geo: None,
                 union_default_graph: opts.union_default_graph,
@@ -1245,7 +1274,7 @@ impl Store {
             guard_missing_reason: parking_lot::RwLock::new(None),
             writers_waiting: Default::default(),
             wal_end: AtomicU64::new(0),
-            commits: tokio::sync::watch::Sender::new(0),
+            commits: tokio::sync::watch::Sender::new(root.seq),
             quota: Arc::new(quota::Quota::open(None, None).expect("no file to read in memory")),
             branching: Default::default(),
             compaction: compaction::Track::new(0, None, Some(root.timestamp_ms)),
@@ -1254,6 +1283,15 @@ impl Store {
             failpoints: Default::default(),
             opts,
         };
+        let set = branching::BranchSet::memory(
+            dataset_id,
+            &store.opts,
+            store.cache.clone(),
+            store.quota.clone(),
+        );
+        set.set_main(&store.current);
+        let mut store = store;
+        store.branching.set = branching::SetRef::Owner(set);
         store.open_geo();
         store.digest_root(&root);
         store
@@ -1284,8 +1322,10 @@ impl Store {
         opts: StoreOptions,
         ctx: Option<branching::OpenCtx>,
     ) -> Result<Store> {
+        commit::check_dataset_compatibility(root)?;
         std::fs::create_dir_all(root)?;
         let lock = lock_dir(root)?;
+        commit::check_dataset_compatibility(root)?;
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
             // a new database: its id, an empty generation holding the root commit, the
@@ -1770,7 +1810,14 @@ impl Store {
                 return Err(self.inherited(at, seq));
             }
         }
+        // History operations also acquire memory history before the catalog. Release
+        // the catalog guard before following a missing record into memory history.
         let meta = self.catalog.lock().get(seq);
+        let meta = meta.or_else(|| {
+            self.mem_history
+                .as_ref()
+                .and_then(|m| m.lock().branch_bases.get(&seq).map(|(c, _)| *c))
+        });
         let Some(commit) = meta else {
             let snapshot = match at {
                 At::Snapshot(n) => Some(n.clone()),
@@ -2633,7 +2680,48 @@ impl Store {
                 return Ok(());
             };
             let snap = self.snapshot();
-            match crate::text::TextIndex::open(Some(root), cfg, &snap, wal) {
+            let mut touched = Vec::new();
+            if let Some(link) = snap.generation.linked() {
+                let dataset_root = link::dataset_root_of(root)?;
+                for segment in &link.file.segments {
+                    let path = segment.dir(&dataset_root).join("wal.log");
+                    let from = wal::WalPoint {
+                        seq: segment.base_seq,
+                        offset: 0,
+                        folding: false,
+                    };
+                    let mut cursor = wal::WalCursor::open(&path, from)?;
+                    while cursor.position().offset < segment.wal_end {
+                        let Some((seq, bytes)) = cursor.next()? else {
+                            return Err(Error::Corrupt("inherited text replay ends early".into()));
+                        };
+                        touched.push((
+                            seq,
+                            bytes
+                                .as_chunks::<WAL_REC>()
+                                .0
+                                .iter()
+                                .map(|r| wal::record_quad(r))
+                                .collect(),
+                        ));
+                    }
+                    if cursor.position().offset != segment.wal_end {
+                        return Err(Error::Corrupt(
+                            "inherited text replay is not at a commit boundary".into(),
+                        ));
+                    }
+                }
+                if !root.join("text").exists()
+                    && let (Some(ident), Some(set)) = (&self.branching.ident, self.branch_set())
+                    && let Some(source) = set.current_of(ident.from.branch_id)
+                    && let Some(view) = &source.text
+                    && let Err(e) = crate::text::seed_branch(view, root, &cfg, snap.commit)
+                {
+                    tracing::warn!(target: "sparkles::store", "cannot reuse upstream text index: {e}; rebuilding");
+                }
+            }
+            touched.extend_from_slice(wal);
+            match crate::text::TextIndex::open(Some(root), cfg, &snap, &touched) {
                 Ok((ti, view)) => {
                     self.text.store(Some(Arc::new(ti)));
                     let mut s = (*snap).clone();

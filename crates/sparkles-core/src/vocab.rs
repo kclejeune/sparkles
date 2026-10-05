@@ -937,6 +937,21 @@ struct DeltaFile {
 }
 
 impl DeltaVocab {
+    pub(crate) fn fork_memory(&self, len: u64) -> DeltaVocab {
+        let mut copy = AppendVocab::default();
+        self.with(|v| {
+            for n in 0..len {
+                if let Some(k) = v.get(n) {
+                    copy.push_dup(k);
+                }
+            }
+        });
+        DeltaVocab {
+            inner: RwLock::new(copy),
+            file: None,
+        }
+    }
+
     pub fn in_memory() -> DeltaVocab {
         DeltaVocab {
             inner: RwLock::new(AppendVocab::default()),

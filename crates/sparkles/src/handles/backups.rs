@@ -36,16 +36,27 @@ impl Backups<'_> {
         captured: impl FnOnce(&crate::store::BackupCapture),
     ) -> Result<BackupSummary> {
         ctl.check()?;
-        let cap = if self.ds.store().root().is_some() {
-            self.ds.store().backup_capture(&opts.name)?
+        let cap = if self.ds.store().root().is_some()
+            && self.ds.store().snapshot().generation.linked().is_none()
+        {
+            self.ds.store().backup_capture_with(
+                &opts.name,
+                &crate::guard::WriteOptions {
+                    cancel: Some(ctl.cancel.flag()),
+                    deadline: ctl.deadline,
+                    ..Default::default()
+                },
+            )?
         } else {
-            self.ds.store().memory_backup_capture(
+            self.ds.store().materialized_backup_capture(
                 &opts.name,
                 &crate::store::MemoryCaptureOptions {
                     tmp_dir: tmp.to_path_buf(),
                     min_free_disk_bytes: opts.min_free_disk_bytes,
                     cancel: Some(ctl.cancel.flag()),
                     progress: ctl.part(0.0, 0.4).progress.as_fn(),
+                    deadline: ctl.deadline,
+                    no_wait: false,
                 },
             )?
         };
@@ -66,7 +77,7 @@ impl Backups<'_> {
         {
             extra.extend(guard.memory_files());
         }
-        let progress = if cap.in_memory {
+        let progress = if cap.materialized {
             ctl.part(0.4, 1.0)
         } else {
             ctl.clone()

@@ -212,6 +212,13 @@ impl Repository {
         } else {
             (Uuid::new_v4(), Some(source))
         };
+        let next_ordinal = m
+            .dataset
+            .next_ordinal
+            .into_iter()
+            .chain(m.dataset.branch.as_ref().map(|b| b.next_ordinal))
+            .max()
+            .filter(|n| *n > 1);
         let record = RestoreRecord {
             restore_format: 1,
             repository: RestoreRepository {
@@ -230,8 +237,14 @@ impl Repository {
         {
             let dir = tmp.to_path_buf();
             blocking(move || {
+                // Refuse a newer dataset before reidentification or publication,
+                // including restores that request no integrity check.
+                sparkles_core::commit::check_dataset_compatibility(&dir)?;
                 if let Some(from) = forked_from {
                     sparkles_core::commit::reidentify(&dir, dataset_id, from)?;
+                }
+                if let Some(next) = next_ordinal {
+                    sparkles_core::commit::reserve_branch_ordinals(&dir, dataset_id, next as u64)?;
                 }
                 let mut f = OpenOptions::new()
                     .write(true)
@@ -557,8 +570,14 @@ fn identity_rule(m: &Manifest, o: &RestoreOptions) -> Result<bool> {
     let (id, seq) = (m.dataset.id, m.commit.seq);
     Ok(match o.identity {
         Identity::New => false,
-        Identity::Auto => !(o.id_in_use)(id),
+        Identity::Auto => m.dataset.branch.is_none() && !(o.id_in_use)(id),
         Identity::Keep => {
+            if m.dataset.branch.is_some() {
+                return Err(BackupError::new(
+                    Code::DuplicateDatasetId,
+                    "a branch backup must be restored with a new dataset identity",
+                ));
+            }
             match o.in_place_head {
                 Some(head) if head > seq => {
                     return Err(BackupError::new(

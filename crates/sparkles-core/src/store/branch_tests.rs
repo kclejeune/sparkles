@@ -949,10 +949,8 @@ fn limits_and_names() {
         "branch-limit"
     );
     let mem = Store::in_memory(Default::default());
-    assert_eq!(
-        code(&mem.create_branch("dev", &Default::default()).unwrap_err()),
-        "branches-unsupported"
-    );
+    mem.create_branch("dev", &Default::default()).unwrap();
+    assert_eq!(mem.branches().unwrap().len(), 2);
 }
 
 /// A21: random histories. After each merge with `union` and the quad scope, the

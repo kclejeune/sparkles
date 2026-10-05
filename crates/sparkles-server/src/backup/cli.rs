@@ -1465,8 +1465,21 @@ fn create(
     let cli = Cli::new()?;
     let r = cli.open(&cfg, true)?;
     // opens the database (the "in use by another process" error while a server has it)
-    let src = Source::from_closed_dir(loc)?;
-    let extra = reasoning_file(loc, src.commit.seq).into_iter().collect();
+    let src = Source::from_closed_branch(
+        loc,
+        crate::branch_cmd::branch().unwrap_or("main"),
+        &sparkles::store::MemoryCaptureOptions {
+            cancel: Some(cli.ctl().cancel.clone()),
+            ..Default::default()
+        },
+    )?;
+    let branch_root = src
+        .branch
+        .as_ref()
+        .map(|b| loc.join("branches").join(b.id.to_string()));
+    let extra = reasoning_file(branch_root.as_deref().unwrap_or(loc), src.commit.seq)
+        .into_iter()
+        .collect();
     let o = sparkles_backup::CreateOptions {
         name,
         note,

@@ -1,4 +1,5 @@
-//! Branches of a persistent dataset ([F09](../../../docs/specs/F09-branches-and-merges.md)).
+//! Branches of a persistent or in-memory dataset
+//! ([F09](../../../docs/specs/F09-branches-and-merges.md)).
 //!
 //! The branch operations are methods of the dataset's own store
 //! ([`Store::create_branch`](crate::store::Store::create_branch),
@@ -20,6 +21,15 @@ impl Dataset {
             return Ok(self.clone());
         }
         let id = self.store().branch_id_of(name)?;
+        let upstream = if self.store().root().is_none() {
+            self.branch_info(name)?
+                .upstream
+                .filter(|n| n != "main")
+                .map(|n| self.branch(&n))
+                .transpose()?
+        } else {
+            None
+        };
         let mut branches = self.state().branches.lock();
         if let Some(ds) = branches.get(name)
             && ds.store().branch_id() == id
@@ -40,6 +50,35 @@ impl Dataset {
                 ..Default::default()
             },
         );
+        if ds.store().root().is_none() {
+            let source = upstream.as_ref().unwrap_or(self);
+            *ds.state().reasoning.write() = source.reasoning_record();
+            *ds.state().rdfs.write() = source.state().rdfs.read().as_ref().map(|r| {
+                std::sync::Arc::new(crate::sparql::rdfs::RdfsOnRead::new(r.source.clone()))
+            });
+            let guard = source
+                .write_guard()
+                .map(|guard| -> Result<_> {
+                    match guard {
+                        #[cfg(feature = "shacl")]
+                        crate::write_guard::WriteGuard::Shacl(g) => {
+                            Ok(crate::write_guard::WriteGuard::Shacl(
+                                g.fork_for_store(ds.store())
+                                    .map_err(crate::catalog::component)?,
+                            ))
+                        }
+                        #[cfg(feature = "shex")]
+                        crate::write_guard::WriteGuard::Shex(g) => {
+                            Ok(crate::write_guard::WriteGuard::Shex(
+                                g.fork_for_store(ds.store())
+                                    .map_err(crate::catalog::component)?,
+                            ))
+                        }
+                    }
+                })
+                .transpose()?;
+            ds.set_write_guard(guard);
+        }
         self.state()
             .branch_handles
             .lock()
@@ -70,7 +109,11 @@ impl Dataset {
 
     /// Create branch `name` (see [`Store::create_branch`](crate::store::Store::create_branch)).
     pub fn create_branch(&self, name: &str, o: &BranchOptions) -> Result<BranchInfo> {
-        self.store().create_branch(name, o)
+        let info = self.store().create_branch(name, o)?;
+        if self.store().root().is_none() {
+            self.branch(name)?;
+        }
+        Ok(info)
     }
 
     /// Merge branch `source` into `target` (see [`Store::merge`](crate::store::Store::merge)).

@@ -770,6 +770,7 @@ impl HistoryState {
 /// predecessor is kept.
 #[derive(Default)]
 pub(crate) struct MemHistory {
+    pub branch_bases: BTreeMap<u64, (crate::commit::CommitInfo, Arc<Snapshot>)>,
     pub pins: BTreeMap<String, (Pin, Arc<Snapshot>)>,
     pub retention: Retention,
     /// past states kept by the window, oldest first (never the head)
@@ -781,11 +782,16 @@ pub(crate) struct MemHistory {
 impl MemHistory {
     /// The kept state of commit `seq`.
     pub fn get(&self, seq: u64) -> Option<Arc<Snapshot>> {
-        self.window
-            .iter()
-            .find(|s| s.commit == seq)
-            .or_else(|| self.pins.values().map(|p| &p.1).find(|s| s.commit == seq))
-            .cloned()
+        self.branch_bases
+            .get(&seq)
+            .map(|(_, s)| s.clone())
+            .or_else(|| {
+                self.window
+                    .iter()
+                    .find(|s| s.commit == seq)
+                    .or_else(|| self.pins.values().map(|p| &p.1).find(|s| s.commit == seq))
+                    .cloned()
+            })
     }
 
     /// The readable commits, the head included, as ascending disjoint ranges.
@@ -795,6 +801,7 @@ impl MemHistory {
             .iter()
             .map(|s| s.commit)
             .chain(self.pins.values().map(|p| p.1.commit))
+            .chain(self.branch_bases.keys().copied())
             .chain(std::iter::once(head))
             .collect();
         seqs.sort_unstable();

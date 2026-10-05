@@ -2198,3 +2198,116 @@ async fn dataset_admins_see_no_absolute_paths() {
             .contains(&secret)
     );
 }
+
+#[cfg(feature = "auth")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selected_branch_backups_follow_identity_and_authorization_after_rename() {
+    let s = server(Opts {
+        auth: true,
+        ..Default::default()
+    });
+    start(&s.st, &Handle::current());
+    let repo = tempfile::tempdir().unwrap();
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/repositories",
+        Some("alice"),
+        json!({"name":"local", "type":"fs", "path":repo.path()}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let ds = s.st.get("wiki").unwrap();
+    ds.dataset
+        .create_branch("work", &Default::default())
+        .unwrap();
+    ds.dataset
+        .branch("work")
+        .unwrap()
+        .update("INSERT DATA { <urn:branch> <urn:p> 2 }")
+        .unwrap();
+    let created = call(
+        &s.app,
+        "POST",
+        "/$/backups/wiki?branch=work",
+        Some("carol"),
+        json!({"repository":"local", "name":"branch"}),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED);
+    let location = created.headers.get("location").unwrap().to_str().unwrap();
+    assert_eq!(location, "/$/backups/wiki/local/branch?branch=work");
+    let t = wait_task(&s.st, created.body["id"].as_str().unwrap()).await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    let located = call(&s.app, "GET", location, Some("carol"), J::Null).await;
+    assert_eq!(located.status, StatusCode::OK);
+    let main = call(&s.app, "GET", "/$/backups/wiki", Some("alice"), J::Null).await;
+    assert!(names(&main).is_empty());
+    ds.dataset.rename_branch("work", "renamed").unwrap();
+    let listing = call(
+        &s.app,
+        "GET",
+        "/$/backups/wiki?branch=renamed",
+        Some("carol"),
+        J::Null,
+    )
+    .await;
+    assert_eq!(names(&listing), ["branch"]);
+    let scoped = call(
+        &s.app,
+        "GET",
+        "/$/backups/wiki/local/branch?branch=renamed",
+        Some("carol"),
+        J::Null,
+    )
+    .await;
+    assert_eq!(scoped.status, StatusCode::OK);
+    assert_eq!(scoped.body["dataset"]["branch"]["name"], "work");
+    let hidden = call(
+        &s.app,
+        "GET",
+        "/$/backups/wiki/local/branch",
+        Some("carol"),
+        J::Null,
+    )
+    .await;
+    expect(&hidden, StatusCode::NOT_FOUND, "no-such-backup");
+    let admin = call(
+        &s.app,
+        "GET",
+        "/$/backups/wiki/local/branch",
+        Some("alice"),
+        J::Null,
+    )
+    .await;
+    assert_eq!(admin.status, StatusCode::OK);
+    let unrelated = call(
+        &s.app,
+        "GET",
+        "/$/backups/unrelated/local/branch",
+        Some("alice"),
+        J::Null,
+    )
+    .await;
+    expect(&unrelated, StatusCode::NOT_FOUND, "no-such-backup");
+    let denied = call(
+        &s.app,
+        "POST",
+        "/$/backups/wiki?branch=renamed",
+        Some("dave"),
+        json!({"repository":"local","name":"denied"}),
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    let restored = run_as(
+        &s,
+        "alice",
+        "/$/backups/wiki/local/branch/restore",
+        json!({"target":"copy"}),
+    )
+    .await;
+    assert_eq!(restored.state, "done", "{:?}", restored.message);
+    let copy = s.st.get("copy").unwrap();
+    assert_eq!(copy.store.snapshot().len(), 2);
+    assert_eq!(copy.store.branches().unwrap().len(), 1);
+}

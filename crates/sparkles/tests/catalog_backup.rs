@@ -191,3 +191,206 @@ fn manual_policy_runs_skip_unchanged_and_apply_retention() {
     );
     assert!(cat.apply_retention(&policy, true).unwrap().dry_run);
 }
+
+#[test]
+fn selected_branch_backups_restore_as_independent_main_datasets() {
+    for memory in [false, true] {
+        for compact in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cat = Catalog::open(dir.path().join("data"), Default::default()).unwrap();
+            cat.repositories()
+                .unwrap()
+                .add(config("local", &dir.path().join("repo")))
+                .unwrap();
+            let repo = cat.repositories().unwrap().open("local").unwrap();
+            let opts = sparkles::catalog::CreateDataset {
+                kind: if memory {
+                    sparkles::catalog::DatasetKind::Memory
+                } else {
+                    sparkles::catalog::DatasetKind::Persistent
+                },
+                ..Default::default()
+            };
+            let ds = cat.create("wiki", &opts).unwrap();
+            ds.update("INSERT DATA { _:main <urn:p> 1 }").unwrap();
+            ds.create_branch("dev", &Default::default()).unwrap();
+            let dev = ds.branch("dev").unwrap();
+            dev.update("INSERT DATA { _:dev <urn:p> 2 }").unwrap();
+            if compact {
+                dev.store().compact().unwrap();
+            }
+            let summary = dev
+                .backups(&repo)
+                .create_with(&create_options("branch"), &Default::default())
+                .unwrap();
+            let branch = summary.dataset.branch.as_ref().unwrap();
+            assert_eq!(branch.dataset_id, ds.dataset_id());
+            assert_eq!(branch.id, dev.dataset_id());
+            assert_eq!(branch.name, "dev");
+            assert_eq!(
+                summary.dataset.kind,
+                if memory { "mem" } else { "persistent" }
+            );
+            let restored = cat
+                .restore(
+                    &repo,
+                    "branch",
+                    &RestoreRequest {
+                        target: Some("copy".into()),
+                        ..Default::default()
+                    },
+                    &Default::default(),
+                )
+                .unwrap();
+            assert_eq!(restored.len(), 2);
+            assert_ne!(restored.dataset_id(), dev.dataset_id());
+            assert_eq!(restored.store().forked_from().unwrap().id, dev.dataset_id());
+            assert_eq!(restored.branches().unwrap().len(), 1);
+            restored.create_branch("new", &Default::default()).unwrap();
+            assert!(restored.branch_info("new").unwrap().ordinal >= branch.next_ordinal as u16);
+            assert!(
+                cat.restore(
+                    &repo,
+                    "branch",
+                    &RestoreRequest {
+                        target: Some("keep".into()),
+                        identity: Identity::Keep,
+                        ..Default::default()
+                    },
+                    &Default::default()
+                )
+                .is_err()
+            );
+            assert!(cat.get("keep").is_none());
+            assert_eq!(ds.len(), 1);
+            assert_eq!(dev.len(), 2);
+        }
+    }
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn memory_branch_backup_preserves_graph_sourced_shex_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat = Catalog::open(dir.path().join("data"), Default::default()).unwrap();
+    cat.repositories()
+        .unwrap()
+        .add(config("local", &dir.path().join("repo")))
+        .unwrap();
+    let repo = cat.repositories().unwrap().open("local").unwrap();
+    let ds = cat
+        .create(
+            "wiki",
+            &sparkles::catalog::CreateDataset {
+                kind: sparkles::catalog::DatasetKind::Memory,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let schema =
+        sparkles_shex::Schema::parse_shexc("<urn:S> { a [<urn:T>] ; <urn:p> . }", None).unwrap();
+    let graph = sparkles_shex::shexr::to_graph(&schema);
+    let triples = graph
+        .iter()
+        .map(|t| format!("{t} ."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <urn:schema> {{ {triples} }} <urn:n> a <urn:T>; <urn:p> 1 }}"
+    ))
+    .unwrap();
+    ds.validation()
+        .guard()
+        .set_shex(
+            serde_json::from_value(serde_json::json!({
+                "language":"shex", "mode":"reject", "schema":{"graphs":["urn:schema"]},
+                "shapeMap":"{ FOCUS a <urn:T> }@<urn:S>"
+            }))
+            .unwrap(),
+            &sparkles_shex::NoImports,
+        )
+        .unwrap();
+    ds.create_branch("work", &Default::default()).unwrap();
+    let work = ds.branch("work").unwrap();
+    assert!(work.update("INSERT DATA { <urn:bad> a <urn:T> }").is_err());
+    work.backups(&repo)
+        .create_with(&create_options("guarded"), &Default::default())
+        .unwrap();
+    let restored = cat
+        .restore(
+            &repo,
+            "guarded",
+            &RestoreRequest {
+                target: Some("copy".into()),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    assert!(restored.write_guard().is_some());
+    assert!(
+        restored
+            .update("INSERT DATA { <urn:bad> a <urn:T> }")
+            .is_err()
+    );
+    assert!(!restored.ask("ASK { <urn:bad> a <urn:T> }").unwrap());
+}
+
+#[test]
+fn main_backups_reserve_blank_node_ordinals_after_merged_branches_are_deleted() {
+    for memory in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path().join("data"), Default::default()).unwrap();
+        cat.repositories()
+            .unwrap()
+            .add(config("local", &dir.path().join("repo")))
+            .unwrap();
+        let repo = cat.repositories().unwrap().open("local").unwrap();
+        let ds = cat
+            .create(
+                "wiki",
+                &sparkles::catalog::CreateDataset {
+                    kind: if memory {
+                        sparkles::catalog::DatasetKind::Memory
+                    } else {
+                        sparkles::catalog::DatasetKind::Persistent
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ds.create_branch("work", &Default::default()).unwrap();
+        let work = ds.branch("work").unwrap();
+        work.update("INSERT DATA { _:original <urn:p> 1 }").unwrap();
+        ds.merge("work", "main", &Default::default()).unwrap();
+        ds.delete_branch("work", true).unwrap();
+        let summary = ds
+            .backups(&repo)
+            .create_with(&create_options("main"), &Default::default())
+            .unwrap();
+        assert!(summary.dataset.branch.is_none());
+        let restored = cat
+            .restore(
+                &repo,
+                "main",
+                &RestoreRequest {
+                    target: Some("copy".into()),
+                    ..Default::default()
+                },
+                &Default::default(),
+            )
+            .unwrap();
+        assert_eq!(restored.branches().unwrap().len(), 1);
+        let new = restored.create_branch("new", &Default::default()).unwrap();
+        assert_eq!(new.ordinal, 2);
+        let branch = restored.branch("new").unwrap();
+        branch
+            .update("INSERT DATA { _:independent <urn:p> 2 }")
+            .unwrap();
+        assert!(
+            branch
+                .ask("ASK { ?a <urn:p> 1 . ?b <urn:p> 2 . FILTER(?a != ?b) }")
+                .unwrap()
+        );
+    }
+}

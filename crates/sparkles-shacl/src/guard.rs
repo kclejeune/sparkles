@@ -337,6 +337,26 @@ impl ShaclGuard {
         }
     }
 
+    /// An independent guard for a memory branch, retaining only immutable schema data.
+    pub fn fork_for_store(&self, store: &Store) -> Result<Arc<Self>> {
+        let loaded = if let Some(graphs) = &self.cfg.shapes.graphs {
+            Loaded::new(Shapes::from_store_graphs_with(
+                &store.snapshot(),
+                graphs,
+                self.file_shapes.as_deref(),
+            )?)
+        } else {
+            self.loaded.read().clone()
+        };
+        let mut fork = Self::new(self.cfg.clone(), loaded, None);
+        fork.file_shapes = self.file_shapes.clone();
+        *fork.tuning.write() = *self.tuning.read();
+        let fork = Arc::new(fork);
+        store.set_guard(Some(fork.clone()));
+        store.set_guard_required(true);
+        Ok(fork)
+    }
+
     pub fn config(&self) -> &ValidationConfig {
         &self.cfg
     }

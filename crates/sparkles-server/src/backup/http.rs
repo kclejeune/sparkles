@@ -729,21 +729,36 @@ struct Lineage {
     live: Option<Uuid>,
     replaced: Option<Uuid>,
     by_name: bool,
+    branch: Option<String>,
 }
 
 impl Lineage {
     fn of(st: &AppState, ds: &str, p: &Principal) -> Lineage {
-        let d = st.get(ds);
+        let branch = crate::http::branches::current().filter(|b| b != "main");
+        let d = st.get(ds).and_then(|d| match branch.as_deref() {
+            Some(b) => st.branch_dataset(&d, b).ok(),
+            None => Some(d),
+        });
         Lineage {
             live: d.as_ref().map(|d| d.store.dataset_id()),
             replaced: d.and_then(|d| d.store.forked_from()).map(|f| f.id),
             by_name: p.has(ServerPerm::ServerAdmin),
+            branch,
         }
     }
 
     /// Whether a backup of the dataset `name` with id `id` belongs to `ds`.
-    fn shows(&self, ds: &str, name: &str, id: Uuid) -> bool {
-        Some(id) == self.live || (name == ds && (self.by_name || Some(id) == self.replaced))
+    fn shows(
+        &self,
+        ds: &str,
+        name: &str,
+        id: Uuid,
+        branch: Option<&sparkles::store::BackupBranch>,
+    ) -> bool {
+        Some(id) == self.live
+            || (name == ds
+                && (Some(id) == self.replaced
+                    || (self.by_name && self.branch.as_deref() == branch.map(|b| b.name.as_str()))))
     }
 
     /// `sameLineage`: taken of the live dataset or of the one it replaced.
@@ -778,7 +793,25 @@ async fn find_backup(
         Err(e) if e.code() == Code::NoSuchBackup => return Err(hidden()),
         Err(e) => return Err(e.into()),
     };
-    if !Lineage::of(st, ds, p).shows(ds, &m.dataset.name, m.dataset.id) {
+    // Repository-wide administrators can act on a captured branch by backup id
+    // through the main route, even after the live branch has been renamed/deleted.
+    // Dataset-scoped administrators still need the selected branch's lineage.
+    let repository_admin = p.has(ServerPerm::ServerAdmin)
+        && crate::http::branches::current().is_none_or(|b| b == "main")
+        && m.dataset.branch.as_ref().is_some_and(|branch| {
+            m.dataset.name == ds
+                || st
+                    .get(ds)
+                    .is_some_and(|d| d.store.dataset_id() == branch.dataset_id)
+        });
+    if !repository_admin
+        && !Lineage::of(st, ds, p).shows(
+            ds,
+            &m.dataset.name,
+            m.dataset.id,
+            m.dataset.branch.as_ref(),
+        )
+    {
         return Err(hidden());
     }
     Ok((r, m))
@@ -823,7 +856,14 @@ async fn dataset_backups(
         };
         let mut list: Vec<_> = list
             .into_iter()
-            .filter(|s| lineage.shows(&ds, &s.dataset.name, s.dataset.id))
+            .filter(|s| {
+                lineage.shows(
+                    &ds,
+                    &s.dataset.name,
+                    s.dataset.id,
+                    s.dataset.branch.as_ref(),
+                )
+            })
             .map(|mut s| {
                 s.same_lineage = Some(lineage.same(s.dataset.id));
                 s
@@ -880,6 +920,12 @@ async fn create_backup(State(st): St, Path(ds_name): Path<String>, body: Bytes) 
     let b = backups(&st)?;
     let Some(ds) = st.get(&ds_name) else {
         return Err(no_such_dataset(&ds_name));
+    };
+    let ds = if let Some(branch) = crate::http::branches::current() {
+        st.branch_dataset(&ds, &branch)
+            .map_err(|e| Fail(Box::new(crate::http::ApiError::from(e).into_response())))?
+    } else {
+        ds
     };
     let v: J = parse(&body)?;
     let text = |k: &str| v[k].as_str().map(str::to_string).filter(|s| !s.is_empty());
@@ -941,7 +987,14 @@ async fn create_backup(State(st): St, Path(ds_name): Path<String>, body: Bytes) 
             ds.name, s.commit.seq, s.name
         ))
     });
-    let location = format!("/$/backups/{ds_name}/{repo}/{name}");
+    let mut location = format!("/$/backups/{ds_name}/{repo}/{name}");
+    if let Some(branch) = crate::http::branches::current().filter(|b| b != "main") {
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("branch", &branch)
+            .finish();
+        location.push('?');
+        location.push_str(&query);
+    }
     Ok(accepted(started_task(&st, task, rx).await, Some(location)))
 }
 

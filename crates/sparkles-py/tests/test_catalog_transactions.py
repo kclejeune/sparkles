@@ -131,3 +131,31 @@ def test_captures_reject_the_transaction_owner(
         timeout=20,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif("backup" not in sparkles.FEATURES, reason="built without backup")
+@pytest.mark.parametrize("kind", ["mem", "persistent"])
+def test_branch_backups_restore_independent_main_and_preserve_provenance(tmp_path: Path, kind: str) -> None:
+    with Catalog(tmp_path / "catalog") as cat:
+        ds = cat.create("wiki", kind=kind)
+        ds.update("INSERT DATA { _:base <urn:p> 1 }")
+        ds.branches.create("work")
+        work = ds.branch("work")
+        work.update("INSERT DATA { _:branch <urn:p> 2 }")
+        cat.repositories.add({"name": "local", "type": "fs", "path": str(tmp_path / "repo")})
+        repo = cat.repositories.open("local")
+        captured = work.backups(repo).create("branch")
+        provenance = captured.to_dict()["dataset"]["branch"]
+        assert provenance["datasetId"] == ds.dataset_id
+        assert provenance["id"] == work.dataset_id == captured.dataset_id
+        assert captured.to_dict()["dataset"]["type"] == kind
+        copy = cat.restore(repo, "branch", name="copy")
+        assert copy.dataset_id != work.dataset_id
+        assert len(copy) == 2 and len(ds) == 1
+        assert [b["name"] for b in copy.branches.list()] == ["main"]
+        copy.branches.create("new")
+        copy.update("INSERT DATA { <urn:copy> <urn:p> 3 }")
+        assert len(work) == 2
+        with pytest.raises(sparkles.BackupError, match="new dataset identity"):
+            cat.restore(repo, "branch", name="duplicate", identity="keep")
+        assert cat.get("duplicate") is None

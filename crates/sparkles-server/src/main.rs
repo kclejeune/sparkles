@@ -148,7 +148,7 @@ struct Cli {
     #[arg(long, global = true, env = "SPARKLES_GEO_CRS", value_name = "FILE")]
     geo_crs: Option<PathBuf>,
     /// The branch to work on, for query, update, load, dump, log, diff, snapshot,
-    /// compact, stats and clone (default: main)
+    /// compact, stats, clone and backup create (default: main)
     #[arg(long, global = true, value_name = "NAME")]
     branch: Option<String>,
     #[command(subcommand)]
@@ -2119,25 +2119,33 @@ fn open_for_write(
 fn run() -> Result<()> {
     let cli = Cli::parse();
     branch_cmd::set_branch(cli.branch.clone());
-    // the commands that work on a branch of a database
-    if branch_cmd::branch().is_some()
-        && !matches!(
-            cli.cmd,
-            Cmd::Query { .. }
-                | Cmd::Update { .. }
-                | Cmd::Load { .. }
-                | Cmd::Dump(_)
-                | Cmd::Log { .. }
-                | Cmd::Diff { .. }
-                | Cmd::Snapshot { .. }
-                | Cmd::Compact { .. }
-                | Cmd::Stats { .. }
-                | Cmd::Clone { .. }
-                | Cmd::Patch(_)
-                | Cmd::Revert(_)
-                | Cmd::CherryPick(_)
-        )
-    {
+    // The commands that work on a branch of a database.
+    let branch_capable = matches!(
+        &cli.cmd,
+        Cmd::Query { .. }
+            | Cmd::Update { .. }
+            | Cmd::Load { .. }
+            | Cmd::Dump(_)
+            | Cmd::Log { .. }
+            | Cmd::Diff { .. }
+            | Cmd::Snapshot { .. }
+            | Cmd::Compact { .. }
+            | Cmd::Stats { .. }
+            | Cmd::Clone { .. }
+            | Cmd::Patch(_)
+            | Cmd::Revert(_)
+            | Cmd::CherryPick(_)
+    );
+    #[cfg(feature = "backup")]
+    let branch_capable = branch_capable
+        || matches!(
+            &cli.cmd,
+            Cmd::Backup {
+                cmd: Some(backup::cli::BackupCmd::Create { .. }),
+                ..
+            }
+        );
+    if branch_cmd::branch().is_some() && !branch_capable {
         bail!("this command does not take --branch");
     }
     // bulk loads merge a file per batch, and a server holds the files of every dataset

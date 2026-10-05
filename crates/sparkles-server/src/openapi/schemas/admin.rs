@@ -848,11 +848,28 @@ fn backups(put: &mut dyn FnMut(&str, J)) {
             "backup-routes",
         ),
     );
+    put(
+        "BackupBranch",
+        doc(
+            obj(
+                &["datasetId", "id", "name", "nextOrdinal"],
+                json!({
+                    "datasetId": { "type": "string", "format": "uuid", "description": "The enclosing dataset's identity." },
+                    "id": { "type": "string", "format": "uuid", "description": "The captured branch identity, also dataset.id." },
+                    "name": string(),
+                    "nextOrdinal": { "type": "integer", "minimum": 2, "maximum": 65536 },
+                }),
+            ),
+            "The provenance of a branch captured as a standalone dataset. Restores use a fresh identity and reserve its blank-node allocation range.",
+            "backup-types",
+        ),
+    );
     let summary_members = json!({
         "name": string(),
         "repository": string(),
         "dataset": obj(&["name", "id", "type"], json!({
             "name": string(), "id": string(), "type": string_enum(&["persistent", "mem"]),
+            "branch": sref("BackupBranch"),
         })),
         "commit": obj(&["seq", "timestamp", "quads", "ref"], json!({
             "seq": int(), "timestamp": string(), "quads": int(), "ref": string(),
@@ -897,6 +914,14 @@ fn backups(put: &mut dyn FnMut(&str, J)) {
     );
     let mut full = summary_members;
     let f = full.as_object_mut().expect("an object");
+    f.get_mut("dataset")
+        .and_then(|dataset| dataset.get_mut("properties"))
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("dataset properties")
+        .insert(
+            "nextOrdinal".into(),
+            json!({ "type": "integer", "minimum": 1, "maximum": 65536, "description": "The first unused branch blank-node ordinal. Restores reserve earlier allocation ranges, including those of merged or deleted branches. Older backups may omit this field." }),
+        );
     f.insert("format".into(), int());
     f.insert("generation".into(), string());
     f.insert("indexFormat".into(), int());
@@ -937,7 +962,7 @@ fn backups(put: &mut dyn FnMut(&str, J)) {
     );
     f.insert(
         "branchesOmitted".into(),
-        json!({ "type": "integer", "description": "The dataset's branches other than main, which the backup did not copy (absent when there were none)." }),
+        json!({ "type": "integer", "description": "The other branches omitted from this standalone backup (absent when there were none)." }),
     );
     let mut required = summary_required.to_vec();
     required.extend(["format", "generation", "files"]);

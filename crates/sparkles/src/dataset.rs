@@ -722,8 +722,21 @@ impl Dataset {
         &self,
         f: impl FnOnce(&mut Transaction<'_>) -> Result<R>,
     ) -> Result<(R, Receipt)> {
+        self.transaction_receipt_with(Default::default(), f)
+    }
+
+    /// Run a transaction with cancellation, a deadline, writer admission and commit
+    /// options. Controls apply while waiting for the writer and before publishing.
+    pub fn transaction_receipt_with<R>(
+        &self,
+        opts: crate::guard::WriteOptions,
+        f: impl FnOnce(&mut Transaction<'_>) -> Result<R>,
+    ) -> Result<(R, Receipt)> {
         let mut tx = Transaction {
-            txn: self.inner.store.write(),
+            txn: self
+                .inner
+                .store
+                .try_write_with(CommitKind::Transaction, opts)?,
             labels: HashMap::new(),
             ds: self,
         };

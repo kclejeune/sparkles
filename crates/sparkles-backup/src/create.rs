@@ -271,6 +271,8 @@ impl Repository {
             files,
             lease,
             in_memory,
+            branch,
+            next_ordinal,
             branches_omitted,
             ..
         } = src;
@@ -440,6 +442,8 @@ impl Repository {
             id: uuid::Uuid::new_v4(),
             repository_id: self.marker.id,
             dataset: ManifestDataset {
+                next_ordinal: Some(next_ordinal),
+                branch,
                 name: o.dataset_name.clone(),
                 id: dataset_id,
                 kind: if in_memory { "mem" } else { "persistent" }.to_string(),

@@ -147,6 +147,17 @@ impl LeaseGuard {
         }
     }
 
+    /// Keep an additional owner alive until this capture is released.
+    pub fn hold_owner(&mut self, owner: Box<dyn FnOnce() + Send + Sync>) {
+        let release = self.release.take();
+        self.release = Some(Box::new(move || {
+            if let Some(r) = release {
+                r();
+            }
+            owner();
+        }));
+    }
+
     /// The leased generation number (0 when nothing is leased).
     pub fn generation(&self) -> u32 {
         self.generation
@@ -175,6 +186,17 @@ impl Drop for LeaseGuard {
     }
 }
 
+/// The branch captured as a standalone database. UUIDs identify its lineage even
+/// when its name is renamed or reused.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupBranch {
+    pub dataset_id: uuid::Uuid,
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub next_ordinal: u32,
+}
+
 /// A consistent capture of a persistent store at one commit ([`Store::backup_capture`]).
 #[derive(Debug)]
 pub struct BackupCapture {
@@ -199,6 +221,11 @@ pub struct BackupCapture {
     /// a capture of an in-memory store ([`Store::memory_backup_capture`]): the files
     /// are a temporary database built from its snapshot, removed with the lease
     pub in_memory: bool,
+    /// Scratch materialization is independent of whether the source lives in memory.
+    pub materialized: bool,
+    pub branch: Option<BackupBranch>,
+    /// Preserve every allocated branch blank-node range, including merged/deleted branches.
+    pub next_ordinal: u32,
     /// the dataset's branches other than `main`, which a backup leaves out
     pub branches_omitted: u64,
 }
@@ -240,6 +267,13 @@ impl BackupCapture {
             }
             out.sync_all()?;
         }
+        if self.next_ordinal > 1 {
+            crate::commit::reserve_branch_ordinals(
+                tmp.path(),
+                self.dataset_id,
+                self.next_ordinal as u64,
+            )?;
+        }
         super::sync_dir(&tmp.path().join(&self.generation))?;
         super::sync_dir(tmp.path())?;
         std::fs::rename(tmp.keep(), dir)?;
@@ -262,6 +296,10 @@ pub struct MemoryCaptureOptions {
     pub min_free_disk_bytes: Option<u64>,
     /// set to `true` to cancel the build
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Stop admission and materialization after this deadline.
+    pub deadline: Option<Instant>,
+    /// Refuse capture while another writer holds the store.
+    pub no_wait: bool,
     /// progress of the build: (fraction done in `[0, 1]`, message)
     pub progress: Option<super::ProgressFn>,
 }
@@ -316,6 +354,15 @@ impl Store {
     ///   `commits.bin` prefix at its catalog record, so a restored store's head is
     ///   `commit.seq`.
     pub fn backup_capture(&self, label: &str) -> Result<BackupCapture> {
+        self.backup_capture_with(label, &Default::default())
+    }
+
+    /// A capture whose writer admission follows cancellation, deadline and no-wait.
+    pub fn backup_capture_with(
+        &self,
+        label: &str,
+        control: &crate::guard::WriteOptions,
+    ) -> Result<BackupCapture> {
         if self.root.is_none() || self.history.is_none() {
             return Err(Error::unsupported(
                 "backups of in-memory datasets are not supported",
@@ -323,16 +370,16 @@ impl Store {
         }
         // a backup copies the dataset's own store; a branch's linked generation would
         // copy without the upstream files it reads
-        if self.is_branch() {
+        if self.snapshot().generation.linked().is_some() {
             return Err(Error::unsupported(
-                "backups copy a dataset's main branch; branches are not backed up yet",
+                "a linked branch needs a materialized backup capture",
             ));
         }
-        if let Some(c) = self.capture_once(label)? {
+        if let Some(c) = self.capture_once(label, control)? {
             return Ok(c);
         }
         // a compaction or bulk commit switched CURRENT right after the lock: once more
-        match self.capture_once(label)? {
+        match self.capture_once(label, control)? {
             Some(c) => Ok(c),
             None => Err(Error::Conflict(
                 "the database's generation changed twice during the backup capture; retry".into(),
@@ -388,14 +435,30 @@ impl Store {
                 "a persistent store is captured with backup_capture".into(),
             ));
         }
+        self.materialized_backup_capture(label, o)
+    }
+
+    /// Build standalone files for any store without changing its source generation.
+    pub fn materialized_backup_capture(
+        &self,
+        label: &str,
+        o: &MemoryCaptureOptions,
+    ) -> Result<BackupCapture> {
         let report = |f: f32, msg: &str| {
             if let Some(p) = &o.progress {
                 p(f, msg);
             }
         };
+        let control = crate::guard::WriteOptions {
+            cancel: o.cancel.clone(),
+            deadline: o.deadline,
+            no_wait: o.no_wait,
+            ..Default::default()
+        };
+        control.check()?;
         let t0 = Instant::now();
         let (snap, next_bnode, head, prefixes) = {
-            let w = self.writer.lock();
+            let w = self.lock_writer(&control)?;
             if w.poisoned {
                 return Err(Error::Poisoned);
             }
@@ -427,9 +490,7 @@ impl Store {
             |_| {
                 seen += 1;
                 if seen.is_multiple_of(65_536) {
-                    if o.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                        return Err(Error::Cancelled);
-                    }
+                    control.check()?;
                     report(0.7 * seen as f32 / total as f32, "writing quads");
                 }
                 Ok(true)
@@ -437,6 +498,7 @@ impl Store {
             || report(0.7, "building indexes"),
         )?;
         drop(snap);
+        control.check()?;
         // the head commit, held by the base of generation 1
         let commit = CommitInfo {
             generation: 1,
@@ -499,6 +561,18 @@ impl Store {
         for (name, bytes) in self.index_config_files()? {
             files.push(meta_file(name, bytes));
         }
+        if let Some(root) = &self.root {
+            for name in OPTIONAL_META {
+                if files.iter().any(|f| f.path == name) {
+                    continue;
+                }
+                match std::fs::read(root.join(name)) {
+                    Ok(bytes) => files.push(meta_file(name, bytes)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
         report(1.0, "built");
         Ok(BackupCapture {
             dataset_id: self.dataset_id,
@@ -514,20 +588,47 @@ impl Store {
                 // but the upload has ended by the time the lease is dropped
                 release: Some(Box::new(move || drop(tmp))),
             },
-            in_memory: true,
-            branches_omitted: 0,
+            in_memory: self.root.is_none(),
+            materialized: true,
+            branch: self.backup_branch(),
+            next_ordinal: self.backup_next_ordinal(),
+            branches_omitted: self.backup_omitted(),
         })
+    }
+
+    fn backup_next_ordinal(&self) -> u32 {
+        self.branch_set().map_or_else(
+            || self.branching.next_ordinal.load(Ordering::Relaxed).max(1) as u32,
+            |set| set.next_ordinal() as u32,
+        )
+    }
+
+    fn backup_branch(&self) -> Option<BackupBranch> {
+        self.branching.ident.as_ref().map(|i| BackupBranch {
+            dataset_id: i.dataset_id,
+            id: self.dataset_id,
+            name: self.branch_name(),
+            next_ordinal: self.branching.next_ordinal.load(Ordering::Relaxed) as u32,
+        })
+    }
+
+    fn backup_omitted(&self) -> u64 {
+        self.branch_set().map_or(0, |set| set.table_len() as u64)
     }
 
     /// One capture attempt: `None` if `CURRENT` no longer names the captured generation
     /// once the lock is released.
-    fn capture_once(&self, label: &str) -> Result<Option<BackupCapture>> {
+    fn capture_once(
+        &self,
+        label: &str,
+        control: &crate::guard::WriteOptions,
+    ) -> Result<Option<BackupCapture>> {
         let (Some(root), Some(hist)) = (&self.root, &self.history) else {
             return Err(Error::unsupported(
                 "backups of in-memory datasets are not supported",
             ));
         };
-        let w = self.writer.lock();
+        let w = self.lock_writer(control)?;
         let t0 = Instant::now();
         if w.poisoned {
             return Err(Error::Poisoned);
@@ -652,7 +753,10 @@ impl Store {
             lock_hold,
             lease,
             in_memory: false,
-            branches_omitted: self.branch_count().saturating_sub(1) as u64,
+            materialized: false,
+            branch: self.backup_branch(),
+            next_ordinal: self.backup_next_ordinal(),
+            branches_omitted: self.backup_omitted(),
         }))
     }
 

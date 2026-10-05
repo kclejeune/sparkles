@@ -423,9 +423,44 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 
 // ------------------------------------------------------------- dataset.json ------
 
+/// Dataset capabilities supported by this reader (1: legacy, 2: branches).
+pub const DATASET_READER: u32 = 2;
+fn legacy_reader() -> u32 {
+    1
+}
+
+fn check_dataset(f: DatasetFile) -> Result<DatasetFile> {
+    if f.format != 1 || f.minimum_reader > DATASET_READER {
+        return Err(Error::Unsupported(format!(
+            "dataset format {} requires reader {}, this build supports format 1 and reader {}",
+            f.format, f.minimum_reader, DATASET_READER
+        )));
+    }
+    Ok(f)
+}
+
+/// Check compatibility without changing any database files.
+pub fn check_dataset_compatibility(root: &Path) -> Result<()> {
+    read_dataset(root).map(|_| ())
+}
+
+/// Publish the minimum reader needed by branches before publishing their table.
+pub(crate) fn require_branch_reader(root: &Path) -> Result<()> {
+    let Some(mut ds) = read_dataset(root)? else {
+        return Ok(());
+    };
+    if ds.minimum_reader < 2 {
+        ds.minimum_reader = 2;
+        write_dataset(root, &ds)?;
+    }
+    Ok(())
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DatasetFile {
     format: u32,
+    #[serde(default = "legacy_reader", rename = "minimumReader")]
+    minimum_reader: u32,
     id: uuid::Uuid,
     created: String,
     origin: String,
@@ -534,6 +569,11 @@ pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> R
     crate::store::sync_dir(root)
 }
 
+/// Preserve the blank-node ordinal space of a standalone branch restore.
+pub fn reserve_branch_ordinals(root: &Path, id: uuid::Uuid, next: u64) -> Result<()> {
+    crate::store::write_initial_table(root, id, next)
+}
+
 /// `restoredFrom` of `<root>/dataset.json`, if the database was restored from a backup.
 pub fn read_restored_from(root: &Path) -> Result<Option<RestoredFrom>> {
     Ok(read_dataset(root)?.and_then(|f| f.restored_from))
@@ -550,9 +590,10 @@ pub fn set_restored_from(root: &Path, from: &RestoredFrom) -> Result<()> {
 
 fn read_dataset(root: &Path) -> Result<Option<DatasetFile>> {
     match std::fs::read(root.join("dataset.json")) {
-        Ok(b) => serde_json::from_slice(&b)
-            .map(Some)
-            .map_err(|e| Error::Corrupt(format!("dataset.json: {e}"))),
+        Ok(b) => check_dataset(
+            serde_json::from_slice(&b).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?,
+        )
+        .map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -578,6 +619,7 @@ pub(crate) fn clone_dataset_file_bytes(
 ) -> Vec<u8> {
     serde_json::to_vec_pretty(&DatasetFile {
         format: 1,
+        minimum_reader: 1,
         id,
         created: rfc3339_ms(created_ms),
         origin: "clone".to_string(),
@@ -591,7 +633,7 @@ pub(crate) fn clone_dataset_file_bytes(
 pub(crate) fn dataset_id_of(bytes: &[u8]) -> Result<uuid::Uuid> {
     let f: DatasetFile =
         serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
-    Ok(f.id)
+    Ok(check_dataset(f)?.id)
 }
 
 /// When `<root>/dataset.json` says the dataset was created (milliseconds since the
@@ -611,6 +653,7 @@ pub(crate) fn read_dataset_file(root: &Path) -> Result<Option<uuid::Uuid>> {
 pub(crate) fn dataset_file_bytes(id: uuid::Uuid, origin: &str, created_ms: i64) -> Vec<u8> {
     serde_json::to_vec_pretty(&DatasetFile {
         format: 1,
+        minimum_reader: 1,
         id,
         created: rfc3339_ms(created_ms),
         origin: origin.to_string(),

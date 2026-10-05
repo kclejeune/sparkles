@@ -569,3 +569,30 @@ fn read_only_stores_write_nothing() {
     ds.disable_geo().unwrap();
     assert_eq!(std::fs::read(&rtree).unwrap(), b);
 }
+
+#[test]
+fn linked_branches_reuse_upstream_geo_files_without_modifying_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = persistent(dir.path(), GeoConfig::default());
+    let original = geo_dir(&ds.snapshot());
+    let bytes = std::fs::read(original.join(persist::COLUMN_FILE)).unwrap();
+    ds.create_branch("work", &Default::default()).unwrap();
+    let work = ds.branch("work").unwrap();
+    assert!(work.wait_geo().unwrap().files.unwrap().opened);
+    assert_eq!(answers(&work), answers(&ds));
+    update(
+        &work,
+        "INSERT",
+        "<urn:new> <http://www.opengis.net/ont/geosparql#asWKT> \"POINT(1 1)\"^^<http://www.opengis.net/ont/geosparql#wktLiteral> .",
+    );
+    assert_ne!(answers(&work), answers(&ds));
+    work.enable_geo(GeoConfig {
+        predicates: vec!["urn:other".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        std::fs::read(original.join(persist::COLUMN_FILE)).unwrap(),
+        bytes
+    );
+}

@@ -97,6 +97,10 @@ pub struct CloneOptions {
     pub graphs: Option<Graphs>,
     /// set to `true` to cancel (checked every 65536 quads, or between files)
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Stop capture admission and rebuilding after this deadline.
+    pub deadline: Option<std::time::Instant>,
+    /// Refuse capture immediately while another writer holds the store.
+    pub no_wait: bool,
     pub progress: Option<ProgressFn>,
     /// clone the state at this commit instead of the head (it must be readable)
     pub at: Option<crate::history::At>,
@@ -332,7 +336,12 @@ impl Store {
     fn clone_capture(&self, opts: &CloneOptions) -> Result<Capture> {
         let share = opts.mode != CloneMode::Rebuild && opts.at.is_none();
         let (snap, next_bnode, lease) = {
-            let w = self.writer.lock();
+            let w = self.lock_writer(&crate::guard::WriteOptions {
+                cancel: opts.cancel.clone(),
+                deadline: opts.deadline,
+                no_wait: opts.no_wait,
+                ..Default::default()
+            })?;
             let snap = self.snapshot();
             let lease = match (&self.root, &self.history) {
                 // a linked generation's base files are its upstream's: rebuilt
@@ -372,7 +381,7 @@ impl Store {
             Some(at) => {
                 let o = crate::history::HistoryOptions {
                     cancel: opts.cancel.clone(),
-                    deadline: None,
+                    deadline: opts.deadline,
                 };
                 self.snapshot_at(at, &o)?.0
             }
@@ -462,9 +471,7 @@ impl Store {
             |_| {
                 seen += 1;
                 if seen.is_multiple_of(65_536) {
-                    if cancelled(opts) {
-                        return Err(Error::Cancelled);
-                    }
+                    check_control(opts)?;
                     report(opts, 0.7 * seen as f32 / total as f32, "copying quads");
                 }
                 Ok(true)
@@ -482,7 +489,7 @@ impl Store {
 
     /// Configure the full-text, spatial and vector indexes of `dst` (an in-memory
     /// clone) as they are configured here; each is built from `dst`'s data.
-    fn configure_indexes(&self, dst: &Store) -> Result<()> {
+    pub(super) fn configure_indexes(&self, dst: &Store) -> Result<()> {
         for (file, cfg) in self.index_config_files()? {
             match file {
                 #[cfg(feature = "text")]
@@ -535,10 +542,13 @@ fn report(opts: &CloneOptions, f: f32, msg: &str) {
     }
 }
 
-fn cancelled(opts: &CloneOptions) -> bool {
-    opts.cancel
-        .as_ref()
-        .is_some_and(|c| c.load(Ordering::Relaxed))
+fn check_control(opts: &CloneOptions) -> Result<()> {
+    crate::guard::WriteOptions {
+        cancel: opts.cancel.clone(),
+        deadline: opts.deadline,
+        ..Default::default()
+    }
+    .check()
 }
 
 /// Share the index files of the generation in `src` into `gdir`, and write `gdir`'s own
@@ -569,9 +579,7 @@ fn share_generation(
     let mut reflink = true;
     report(opts, 0.0, "copying files");
     for (name, len) in &files {
-        if cancelled(opts) {
-            return Err(Error::Cancelled);
-        }
+        check_control(opts)?;
         let m = share_file(
             &src.join(name),
             &gdir.join(name),

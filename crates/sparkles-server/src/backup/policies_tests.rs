@@ -153,6 +153,7 @@ fn summary(
         name: name.into(),
         repository: "local".into(),
         dataset: DatasetRef {
+            branch: None,
             name: dataset.into(),
             id,
             kind: "persistent".into(),

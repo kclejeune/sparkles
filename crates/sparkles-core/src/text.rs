@@ -611,6 +611,8 @@ pub use imp::TextIndex;
 #[cfg(feature = "text")]
 pub(crate) use imp::read_config as imp_read_config;
 #[cfg(feature = "text")]
+pub(crate) use imp::seed_branch;
+#[cfg(feature = "text")]
 pub use search::{search, search_in};
 
 #[cfg(not(feature = "text"))]
@@ -1485,6 +1487,76 @@ mod imp {
                 doc: Some(d),
             })
         }
+    }
+
+    /// Copy a pinned committed Tantivy checkpoint into a branch-owned directory.
+    /// Segment metadata is kept alive throughout copying, so upstream merges cannot
+    /// garbage-collect its files. A checkpoint after the fork cannot seed that fork.
+    pub(crate) fn seed_branch(
+        view: &super::TextView,
+        root: &Path,
+        config: &TextConfig,
+        seq: u64,
+    ) -> Result<bool> {
+        let Some(owner) = view.owner.upgrade() else {
+            return Ok(false);
+        };
+        let Some(source) = owner.root.as_ref() else {
+            return Ok(false);
+        };
+        let (index, meta) = {
+            let live = owner.live.lock();
+            let Some(writer) = live.writer.as_ref() else {
+                return Ok(false);
+            };
+            let index = writer.index().clone();
+            let meta = index.load_metas().map_err(text_err)?;
+            (index, meta)
+        };
+        let Some(payload) = meta
+            .payload
+            .as_deref()
+            .and_then(|p| serde_json::from_str::<Payload>(p).ok())
+        else {
+            return Ok(false);
+        };
+        if payload.format != FORMAT || payload.seq > seq || payload.config != config_hash(config) {
+            return Ok(false);
+        }
+        verify(&index)?;
+        let tmp = tempfile::Builder::new()
+            .prefix(".text-seed-")
+            .tempdir_in(root)?;
+        let mut files = std::collections::HashSet::new();
+        for segment in &meta.segments {
+            for file in segment.list_files() {
+                if segment.delete_opstamp().is_none()
+                    && file.extension().is_some_and(|e| e == "del")
+                {
+                    continue;
+                }
+                if files.insert(file.clone()) {
+                    std::fs::copy(source.join("text").join(&file), tmp.path().join(&file))?;
+                    std::fs::File::open(tmp.path().join(&file))?.sync_all()?;
+                }
+            }
+        }
+        files.insert(std::path::PathBuf::from("meta.json"));
+        crate::store::write_synced(
+            &tmp.path().join("meta.json"),
+            &serde_json::to_vec(&meta).map_err(text_err)?,
+        )?;
+        crate::store::write_synced(
+            &tmp.path().join(".managed.json"),
+            &serde_json::to_vec(&files).map_err(text_err)?,
+        )?;
+        // Verify the exact checkpoint being published, rather than whichever
+        // checkpoint the upstream has advanced to during copying.
+        verify(&Index::open_in_dir(tmp.path()).map_err(text_err)?)?;
+        crate::store::sync_dir(tmp.path())?;
+        std::fs::rename(tmp.path(), root.join("text"))?;
+        crate::store::sync_dir(root)?;
+        Ok(true)
     }
 
     impl TextIndex {

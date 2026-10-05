@@ -29,6 +29,8 @@ pub struct Source {
     pub lease: LeaseGuard,
     /// the source is an in-memory dataset (the manifest's `dataset.type` is `mem`)
     pub in_memory: bool,
+    pub branch: Option<sparkles_core::store::BackupBranch>,
+    pub next_ordinal: u32,
     /// the dataset's branches other than `main`, which the backup leaves out
     pub branches_omitted: u64,
 }
@@ -44,6 +46,8 @@ impl From<BackupCapture> for Source {
             lock_hold: c.lock_hold,
             lease: c.lease,
             in_memory: c.in_memory,
+            branch: c.branch,
+            next_ordinal: c.next_ordinal,
             branches_omitted: c.branches_omitted,
         }
     }
@@ -76,6 +80,48 @@ impl Source {
         };
         let store = Store::open(dir, opts)?;
         Ok(Source::from(store.into_backup_capture("offline")?))
+    }
+
+    /// Capture a selected branch of a stopped dataset, keeping its owner locked
+    /// until the upload finishes. Linked branches are materialized independently.
+    pub fn from_closed_branch(
+        dir: &Path,
+        branch: &str,
+        options: &sparkles_core::store::MemoryCaptureOptions,
+    ) -> Result<Source> {
+        if branch == "main" {
+            return Self::from_closed_dir(dir);
+        }
+        if !dir.join("CURRENT").is_file() {
+            return Err(BackupError::new(
+                crate::Code::InvalidRequest,
+                "not a database directory",
+            ));
+        }
+        let store = Store::open(
+            dir,
+            StoreOptions {
+                unvalidated_writes: true,
+                ..Default::default()
+            },
+        )?;
+        let selected = store.branch(branch)?;
+        let mut cap = if selected.snapshot().generation.linked().is_some() {
+            selected.materialized_backup_capture("offline", options)?
+        } else {
+            selected.backup_capture_with(
+                "offline",
+                &sparkles_core::guard::WriteOptions {
+                    cancel: options.cancel.clone(),
+                    deadline: options.deadline,
+                    no_wait: options.no_wait,
+                    ..Default::default()
+                },
+            )?
+        };
+        drop(selected);
+        cap.lease.hold_owner(Box::new(move || drop(store)));
+        Ok(cap.into())
     }
 
     /// The file at `path` (`gen-0001/wal.log`, `CURRENT`, …).

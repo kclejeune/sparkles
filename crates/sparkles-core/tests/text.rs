@@ -1531,3 +1531,74 @@ fn batch_insert_timing() {
         }
     }
 }
+
+#[test]
+fn linked_branch_text_seeds_a_checkpoint_and_replays_uncheckpointed_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(dir.path(), Default::default()).unwrap();
+    load(&s);
+    s.compact().unwrap();
+    s.enable_text(Default::default()).unwrap();
+    s.set_text_ticks(false);
+    let checkpoint = std::fs::read(dir.path().join("text/meta.json")).unwrap();
+    sparkles_core::sparql::update::update(&s, &format!("{P}DELETE DATA {{ ex:b1 rdfs:label \"The Quick Brown Fox\"@en }}; INSERT DATA {{ ex:new rdfs:label \"silver fox\" }}"), &Default::default()).unwrap();
+    s.create_branch("work", &Default::default()).unwrap();
+    let work = s.branch("work").unwrap();
+    assert!(
+        work.text_status().unwrap().last_rebuild.is_none(),
+        "copied checkpoint was caught up without rebuilding"
+    );
+    assert_eq!(
+        sorted(rows(&work, "SELECT ?s { ?s text:query \"fox\" }")),
+        ["new"]
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("text/meta.json")).unwrap(),
+        checkpoint,
+        "branch opening cannot checkpoint the upstream"
+    );
+    sparkles_core::sparql::update::update(
+        &work,
+        &format!("{P}INSERT DATA {{ ex:only rdfs:label \"silver fox\" }}"),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        rows(&work, "SELECT ?s { ?s text:query \"silver\" }").len(),
+        2
+    );
+    assert_eq!(rows(&s, "SELECT ?s { ?s text:query \"silver\" }").len(), 1);
+}
+
+#[test]
+fn linked_branch_text_rebuilds_when_upstream_checkpoint_is_after_the_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(dir.path(), Default::default()).unwrap();
+    load(&s);
+    s.compact().unwrap();
+    s.enable_text(Default::default()).unwrap();
+    s.create_snapshot("past", &sparkles_core::history::At::Head, None)
+        .unwrap();
+    sparkles_core::sparql::update::update(
+        &s,
+        &format!("{P}INSERT DATA {{ ex:future rdfs:label \"futurefox\" }}"),
+        &Default::default(),
+    )
+    .unwrap();
+    s.rebuild_text().unwrap();
+    s.create_branch(
+        "past",
+        &sparkles_core::branch::BranchOptions {
+            at: sparkles_core::history::At::Snapshot("past".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let branch = s.branch("past").unwrap();
+    assert!(branch.text_status().unwrap().last_rebuild.is_some());
+    assert!(rows(&branch, "SELECT ?s { ?s text:query \"futurefox\" }").is_empty());
+    assert_eq!(
+        sorted(rows(&branch, "SELECT ?s { ?s text:query \"fox\" }")),
+        ["b1"]
+    );
+}

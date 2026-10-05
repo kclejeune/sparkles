@@ -994,3 +994,49 @@ impl Drop for Server {
         let _ = self.child.wait();
     }
 }
+
+#[test]
+fn selected_branch_backup_is_standalone_and_restores_with_fresh_identity() {
+    let home = tempfile::tempdir().unwrap();
+    let db = database(home.path());
+    let store = sparkles::store::Store::open(Path::new(&db), Default::default()).unwrap();
+    store.create_branch("work", &Default::default()).unwrap();
+    let branch = store.branch("work").unwrap();
+    sparkles::sparql::update::update(
+        &branch,
+        "INSERT DATA { <urn:branch> <urn:p> 3 }",
+        &Default::default(),
+    )
+    .unwrap();
+    let branch_id = branch.dataset_id();
+    drop(branch);
+    drop(store);
+    let url = file_url(&home.path().join("repo"));
+    expect(
+        home.path(),
+        &[
+            "backup", "create", "--loc", &db, "--branch", "work", "--repo", &url, "--name",
+            "branch",
+        ],
+        0,
+    );
+    let copy = home.path().join("copy");
+    expect(
+        home.path(),
+        &[
+            "backup",
+            "restore",
+            "branch",
+            "--repo",
+            &url,
+            "--to",
+            s(&copy),
+        ],
+        0,
+    );
+    let restored = sparkles::store::Store::open(&copy, Default::default()).unwrap();
+    assert_eq!(restored.snapshot().len(), 3);
+    assert_ne!(restored.dataset_id(), branch_id);
+    assert_eq!(restored.forked_from().unwrap().id, branch_id);
+    assert_eq!(restored.branches().unwrap().len(), 1);
+}

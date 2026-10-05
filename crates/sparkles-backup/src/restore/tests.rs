@@ -156,6 +156,60 @@ async fn check_levels() {
 }
 
 #[tokio::test]
+async fn unsupported_dataset_metadata_is_refused_even_without_integrity_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fixture::make_db(&source);
+    let repo = fixture::memory_repo().await;
+    let original = std::fs::read(source.join("dataset.json")).unwrap();
+    for (field, value) in [("format", 2), ("minimumReader", 3)] {
+        let mut capture = crate::Source::from_closed_dir(&source).unwrap();
+        let mut metadata: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        metadata[field] = value.into();
+        let bytes = serde_json::to_vec(&metadata).unwrap();
+        let file = capture
+            .files
+            .iter_mut()
+            .find(|f| f.path == "dataset.json")
+            .unwrap();
+        file.len = bytes.len() as u64;
+        file.src = sparkles_core::store::FileSource::Bytes(bytes.into());
+        repo.create(
+            capture,
+            &crate::CreateOptions {
+                name: field.into(),
+                dataset_name: "ds".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for identity in [Identity::New, Identity::Keep] {
+            let destination = dir.path().join(format!("{field}-{identity:?}"));
+            let error = repo
+                .restore(
+                    field,
+                    &destination,
+                    &RestoreOptions {
+                        check: CheckLevel::None,
+                        identity,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(error.message().contains("this build supports"), "{error}");
+            assert!(!destination.exists());
+            assert_eq!(
+                std::fs::read(source.join("dataset.json")).unwrap(),
+                original
+            );
+        }
+    }
+    assert!(repo.locks().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn a_corrupt_blob_fails_the_restore_and_leaves_nothing() {
     let (dir, repo, m) = setup_big().await;
     let id = blob_of(&m, "gen-0002/spo.dat");
@@ -733,4 +787,27 @@ async fn backups_under_concurrent_writes_restore_to_their_commits() {
         *holds.last().unwrap() < std::time::Duration::from_millis(5),
         "{holds:?}"
     );
+}
+
+#[tokio::test]
+async fn branch_ordinal_reservation_reads_legacy_and_current_manifest_metadata() {
+    for next_ordinal in [None, Some(7)] {
+        let (dir, repo, mut manifest) = setup().await;
+        manifest.dataset.branch = Some(sparkles_core::store::BackupBranch {
+            dataset_id: Uuid::new_v4(),
+            id: manifest.dataset.id,
+            name: "work".into(),
+            next_ordinal: 4,
+        });
+        manifest.dataset.next_ordinal = next_ordinal;
+        fixture::put_manifest(&repo, &manifest).await;
+        let target = dir.path().join("restore");
+        repo.restore("b1", &target, &RestoreOptions::default())
+            .await
+            .unwrap();
+        let store = Store::open(&target, StoreOptions::default()).unwrap();
+        let branch = store.create_branch("new", &Default::default()).unwrap();
+        assert_eq!(branch.ordinal as u32, next_ordinal.unwrap_or(4));
+        assert_ne!(store.dataset_id(), manifest.dataset.id);
+    }
 }

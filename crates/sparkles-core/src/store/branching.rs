@@ -240,6 +240,7 @@ fn read_table(root: &Path) -> Result<Option<TableFile>> {
 }
 
 fn write_table(root: &Path, t: &TableFile) -> Result<()> {
+    commit::require_branch_reader(root)?;
     let mut t = t.clone();
     t.format = if t.retired.is_empty() { 1 } else { 2 };
     write_atomic(
@@ -474,8 +475,12 @@ pub(crate) struct OpenCtx {
 
 // --------------------------------------------------------------- branch set ------
 
-/// The branches of one persistent dataset.
+type MemoryBases = HashMap<(uuid::Uuid, u64), (CommitInfo, Arc<Snapshot>)>;
+
+/// The branches of one persistent or in-memory dataset.
 pub struct BranchSet {
+    memory: bool,
+    memory_bases: Mutex<MemoryBases>,
     root: PathBuf,
     dataset_id: uuid::Uuid,
     opts: StoreOptions,
@@ -499,6 +504,39 @@ pub struct BranchSet {
 }
 
 impl BranchSet {
+    pub(crate) fn memory(
+        dataset_id: uuid::Uuid,
+        opts: &StoreOptions,
+        cache: Arc<BlockCache>,
+        quota: Arc<quota::Quota>,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
+            memory: true,
+            memory_bases: Default::default(),
+            root: PathBuf::new(),
+            dataset_id,
+            opts: opts.clone(),
+            cache,
+            quota,
+            table: Mutex::new(TableFile::new(dataset_id)),
+            stores: Default::default(),
+            opening: Mutex::new(()),
+            merges: Default::default(),
+            broken: Default::default(),
+            unlinked: AtomicBool::new(false),
+            main_current: Default::default(),
+            me: me.clone(),
+        })
+    }
+
+    fn save(&self, table: &TableFile) -> Result<()> {
+        if self.memory {
+            Ok(())
+        } else {
+            write_table(&self.root, table)
+        }
+    }
+
     /// The branch set of the dataset rooted at `root`, recovering from interrupted
     /// creations and deletions (see the crash-safety rules in F09).
     pub(crate) fn load(
@@ -571,6 +609,8 @@ impl BranchSet {
             }
         }
         Ok(Arc::new_cyclic(|me| BranchSet {
+            memory: false,
+            memory_bases: Default::default(),
             root: root.to_path_buf(),
             dataset_id,
             opts: opts.clone(),
@@ -587,6 +627,10 @@ impl BranchSet {
         }))
     }
 
+    pub(crate) fn table_len(&self) -> usize {
+        self.table.lock().branches.len()
+    }
+
     fn branch_root(&self, id: uuid::Uuid) -> PathBuf {
         self.root.join(BRANCHES_DIR).join(id.to_string())
     }
@@ -595,6 +639,15 @@ impl BranchSet {
     pub(crate) fn holds_on(&self, id: uuid::Uuid) -> Holds {
         let t = self.table.lock();
         holds_in(&t, id)
+    }
+
+    #[cfg(feature = "text")]
+    pub(crate) fn current_of(&self, id: uuid::Uuid) -> Option<Arc<Snapshot>> {
+        if id == self.dataset_id {
+            self.main_current.lock().upgrade().map(|c| c.load_full())
+        } else {
+            self.stores.lock().get(&id).map(|s| s.snapshot())
+        }
     }
 
     /// Remember the dataset's own store's current state (at its open).
@@ -632,6 +685,16 @@ impl BranchSet {
 
     /// Give every open store of the dataset the holds the table places on it.
     fn refresh_holds(&self, main: &Store) {
+        if self.memory {
+            let t = self.table.lock();
+            let needed: HashSet<_> = t
+                .all()
+                .flat_map(|e| [(e.id, e.from.seq), (e.from.branch_id, e.from.seq)])
+                .collect();
+            self.memory_bases
+                .lock()
+                .retain(|key, _| needed.contains(key));
+        }
         // retired stores too: branches created from them read their files
         let stores: Vec<Arc<Store>> = self.stores.lock().values().cloned().collect();
         main.install_branch_holds(self);
@@ -648,6 +711,11 @@ impl BranchSet {
         let _opening = self.opening.lock();
         if let Some(s) = self.stores.lock().get(&id) {
             return Ok(s.clone());
+        }
+        if self.memory {
+            // Memory branches are initialized before their table entry is published.
+            // They have no directory from which a missing store could be reopened.
+            return Err(branch::no_such_branch(&id.to_string()));
         }
         let (entry, next_ordinal, retired) = {
             let t = self.table.lock();
@@ -1140,6 +1208,24 @@ impl Store {
 
     /// Put the holds that `set`'s table places on this store into its history state.
     pub(crate) fn install_branch_holds(&self, set: &BranchSet) {
+        if let Some(mem) = &self.mem_history {
+            let t = set.table.lock();
+            let needed: HashSet<u64> = t
+                .all()
+                .filter_map(|e| e.base_hold)
+                .filter(|b| b.branch_id == self.dataset_id)
+                .map(|b| b.seq)
+                .chain(self.branching.ident.as_ref().map(|i| i.from.seq))
+                .collect();
+            let bases = set.memory_bases.lock();
+            let mut mem = mem.lock();
+            mem.branch_bases = bases
+                .iter()
+                .filter(|((id, seq), _)| *id == self.dataset_id && needed.contains(seq))
+                .map(|((_, seq), b)| (*seq, b.clone()))
+                .collect();
+            return;
+        }
         let Some(h) = &self.history else { return };
         let (gens, pins) = set.holds_on(self.dataset_id);
         let mut h = h.lock();
@@ -1262,7 +1348,11 @@ impl Store {
             created_ms,
             storage: BranchStorage {
                 linked: !e.holds.is_empty(),
-                own_bytes: dir_size(&set.branch_root(e.id)),
+                own_bytes: if set.memory {
+                    0
+                } else {
+                    dir_size(&set.branch_root(e.id))
+                },
                 held_bytes: 0,
                 generation: String::new(),
             },
@@ -1330,6 +1420,9 @@ impl Store {
     /// and the directories of retired branches (0 without branches).
     pub fn branch_held_bytes(&self) -> u64 {
         let Ok(set) = self.owned_set() else { return 0 };
+        if set.memory {
+            return 0;
+        }
         let t = set.table.lock().clone();
         let mut dirs: HashSet<PathBuf> = HashSet::new();
         for e in t.all() {
@@ -1381,13 +1474,12 @@ impl Store {
             return Err(branch::invalid_merge("at most 1024 exempt predicates"));
         }
         let set = self.owned_set()?;
-        let root = self.root.as_ref().expect("a branch set has a root");
         let mut t = set.table.lock();
         let mut next = t.clone();
         next.exempt = predicates.iter().map(|p| p.as_str().to_string()).collect();
         next.exempt.sort();
         next.exempt.dedup();
-        write_table(root, &next)?;
+        set.save(&next)?;
         *t = next;
         drop(t);
         Ok(set.exempt())
@@ -1411,7 +1503,6 @@ impl Store {
         f: impl Fn(&mut MainEntry, Option<&mut Entry>),
     ) -> Result<()> {
         let set = self.owned_set()?;
-        let root = self.root.as_ref().expect("a branch set has a root");
         let mut t = set.table.lock();
         let mut next = t.clone();
         if name == MAIN {
@@ -1425,7 +1516,7 @@ impl Store {
                 .ok_or_else(|| branch::no_such_branch(name))?;
             f(&mut main, Some(e));
         }
-        write_table(root, &next)?;
+        set.save(&next)?;
         *t = next;
         let protected_main = t.main.protected;
         let by_id: HashMap<uuid::Uuid, bool> =
@@ -1453,7 +1544,10 @@ impl Store {
             return Err(branch::invalid_branch("the note is longer than 1024 bytes"));
         }
         let set = self.owned_set()?.clone();
-        let root = self.root.clone().expect("a branch set has a root");
+        if set.memory {
+            return self.create_memory_branch(name, o, &set);
+        }
+        let root = set.root.clone();
         {
             let t = set.table.lock();
             if t.by_name(name).is_some() {
@@ -1577,6 +1671,120 @@ impl Store {
             linked = !build,
             "created a branch"
         );
+        self.branch_info(name)
+    }
+
+    fn create_memory_branch(
+        &self,
+        name: &str,
+        o: &BranchOptions,
+        set: &Arc<BranchSet>,
+    ) -> Result<BranchInfo> {
+        let (snap, resolved) = self.branch_snapshot_at(&o.from, &o.at, &Default::default())?;
+        let (_, owner_id) = self.branch_resolve(&o.from, &At::Commit(resolved.commit.seq))?;
+        let up = self.branch_by_id(owner_id)?;
+        let mut t = set.table.lock();
+        if t.by_name(name).is_some() {
+            return Err(branch::conflict(
+                "branch-exists",
+                format!("branch {name} exists"),
+            ));
+        }
+        if 1 + t.branches.len() >= self.opts.max_branches || t.next_ordinal > u16::MAX as u32 {
+            return Err(branch::conflict(
+                "branch-limit",
+                "the dataset has used its branch limit",
+            ));
+        }
+        let ordinal = t.next_ordinal as u16;
+        let id = uuid::Uuid::new_v4();
+        let from = FromRef {
+            branch_id: owner_id,
+            seq: resolved.commit.seq,
+        };
+        let root = CommitInfo {
+            generation: 0,
+            ..resolved.commit
+        };
+        let gen_ = Arc::new(Generation::memory_branch(&snap.generation, snap.dvocab_len));
+        let mut store = Store::in_memory_from(
+            self.opts.clone(),
+            gen_,
+            branch::bnode_range_start(ordinal),
+            up.prefixes(),
+            root,
+            id,
+            None,
+        );
+        store.cache = set.cache.clone();
+        store.quota = set.quota.clone();
+        store.branching.ident = Some(Ident {
+            name: name.into(),
+            ordinal,
+            dataset_id: self.dataset_id,
+            from: from.into(),
+        });
+        *store.branching.name.write() = name.into();
+        store.branching.set = SetRef::Member(set.me.clone());
+        store
+            .branching
+            .protected
+            .store(o.protected, Ordering::Relaxed);
+        store
+            .guard_required
+            .store(up.guard_required.load(Ordering::Relaxed), Ordering::Relaxed);
+        let mut state = (*store.snapshot()).clone();
+        state.delta = snap.delta.clone();
+        state.delta_stats = snap.delta_stats.clone();
+        state.version = snap.version;
+        state.commit = root.seq;
+        state.cache = set.cache.clone();
+        store.current.store(Arc::new(state));
+        t.next_ordinal += 1;
+        let next = t.next_ordinal;
+        // Reserve the ordinal even if index configuration fails. No branch is
+        // published until all fallible initialization has completed.
+        self.branching
+            .next_ordinal
+            .store(next as u64, Ordering::Relaxed);
+        for s in set.open_stores() {
+            s.branching
+                .next_ordinal
+                .store(next as u64, Ordering::Relaxed);
+        }
+        up.configure_indexes(&store)?;
+        *store.describe.write() = up.describe.read().clone();
+        *store.compaction.settings.lock() = up.compaction.settings.lock().clone();
+        if let (Some(src), Some(dst)) = (&up.mem_history, &store.mem_history) {
+            dst.lock().retention = src.lock().retention;
+        }
+        t.branches.push(Entry {
+            name: name.into(),
+            id,
+            ordinal,
+            from,
+            created: commit::rfc3339_ms(self.now_ms()),
+            protected: o.protected,
+            note: o.note.clone(),
+            holds: Vec::new(),
+            base_hold: Some(from),
+        });
+        let store = Arc::new(store);
+        let mut bases = set.memory_bases.lock();
+        bases.insert((owner_id, root.seq), (resolved.commit, snap));
+        bases.insert((id, root.seq), (root, store.snapshot()));
+        drop(bases);
+        set.stores.lock().insert(id, store.clone());
+        drop(t);
+        self.branching
+            .next_ordinal
+            .store(next as u64, Ordering::Relaxed);
+        for s in set.open_stores() {
+            s.branching
+                .next_ordinal
+                .store(next as u64, Ordering::Relaxed);
+        }
+        set.refresh_holds(self);
         self.branch_info(name)
     }
 
@@ -1806,7 +2014,7 @@ impl Store {
             return Err(branch::invalid_branch("branch main cannot be deleted"));
         }
         let set = self.owned_set()?.clone();
-        let root = self.root.clone().expect("a branch set has a root");
+        let root = set.root.clone();
         let e = set.entry(name)?;
         // the branches that start from it or read its files
         let (children, kept) = {
@@ -1879,7 +2087,7 @@ impl Store {
             });
         }
         let pruned = next.prune_retired();
-        write_table(&root, &next)?;
+        set.save(&next)?;
         *t = next;
         drop(t);
         self.failpoint("branch-delete-committed");
@@ -1898,10 +2106,13 @@ impl Store {
             let store = set.stores.lock().remove(id);
             set.merges.write().remove(id);
             set.broken.lock().remove(id);
+            if let Some(mem) = store.as_ref().and_then(|s| s.mem_history.as_ref()) {
+                mem.lock().branch_bases.clear();
+            }
             drop(store);
         }
         set.refresh_holds(self);
-        for id in &gone {
+        for id in gone.iter().filter(|_| !set.memory) {
             let dir = set.branch_root(*id);
             let doomed = dir.with_extension("deleting");
             if dir.exists() {
@@ -1943,7 +2154,6 @@ impl Store {
         }
         branch::check_name(new)?;
         let set = self.owned_set()?.clone();
-        let root = self.root.clone().expect("a branch set has a root");
         let id = {
             let mut t = set.table.lock();
             if t.by_name(new).is_some() {
@@ -1961,7 +2171,7 @@ impl Store {
             e.name = new.to_string();
             let id = e.id;
             // the commit point
-            write_table(&root, &next)?;
+            set.save(&next)?;
             *t = next;
             id
         };
@@ -1972,7 +2182,9 @@ impl Store {
         // the holds' names, as history listings show them
         set.refresh_holds(self);
         // the identity file follows; an open after a crash here writes it
-        if let Err(e) = sync_branch_file(&set.branch_root(id), new) {
+        if !set.memory
+            && let Err(e) = sync_branch_file(&set.branch_root(id), new)
+        {
             tracing::warn!(target: "sparkles::store::branching",
                 branch = new,
                 "could not write the new name to {BRANCH_FILE}: {e}"
@@ -2016,7 +2228,7 @@ impl Store {
             }
             let mut next = t.clone();
             next.branches[i].holds.clear();
-            if let Err(e) = write_table(&set.root, &next) {
+            if let Err(e) = set.save(&next) {
                 tracing::warn!(target: "sparkles::store::branching",
                     branch = self.branch_name(),
                     "could not release the branch's holds: {e}"

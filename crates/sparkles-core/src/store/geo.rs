@@ -528,12 +528,17 @@ impl Store {
         if !persist::SUPPORTED {
             return None;
         }
-        let root = self.root.as_ref()?;
-        let gdir = snap
-            .generation
-            .dir
-            .as_ref()
-            .filter(|d| d.starts_with(root))?;
+        let gdir = if let Some(link) = snap.generation.linked() {
+            link.base_dir()
+        } else if let Some(base) = &snap.generation._base {
+            base.dir.as_deref()?
+        } else {
+            let root = self.root.as_ref()?;
+            snap.generation
+                .dir
+                .as_deref()
+                .filter(|d| d.starts_with(root))?
+        };
         Some((
             persist::dir_of(gdir),
             Identity::of(
@@ -552,7 +557,9 @@ impl Store {
     /// closing.
     fn spawn_geo_build(&self, idx: Arc<GeoIndex>, epoch: u64, snap: Arc<Snapshot>, load: bool) {
         let files = self.geo_files(&snap, &idx.config);
-        let write = self.opts.geo_files;
+        let write = self.opts.geo_files
+            && snap.generation.linked().is_none()
+            && snap.generation._base.is_none();
         let current = Arc::downgrade(&self.current);
         let writer = Arc::downgrade(&self.writer);
         let uid = snap.generation.uid;

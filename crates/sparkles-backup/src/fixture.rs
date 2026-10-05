@@ -210,6 +210,8 @@ pub async fn put_backup(repo: &Repository, root: &Path, name: &str) -> Manifest 
         id: Uuid::new_v4(),
         repository_id: repo.id(),
         dataset: ManifestDataset {
+            next_ordinal: None,
+            branch: None,
             name: "ds".into(),
             id,
             kind: "persistent".into(),

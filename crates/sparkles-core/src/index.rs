@@ -547,10 +547,11 @@ impl PermWriter {
 }
 
 /// Read side of one permutation.
+#[derive(Clone)]
 pub struct PermIndex {
     pub perm: Perm,
-    data: Option<Mmap>,
-    pub blocks: Vec<BlockMeta>,
+    data: Option<Arc<Mmap>>,
+    pub blocks: Arc<Vec<BlockMeta>>,
     pub rows: u64,
     /// unique id of this permutation instance, used for cache keys
     pub uid: u64,
@@ -561,7 +562,7 @@ impl PermIndex {
         PermIndex {
             perm,
             data: None,
-            blocks: Vec::new(),
+            blocks: Arc::new(Vec::new()),
             rows: 0,
             uid: next_uid(),
         }
@@ -581,14 +582,14 @@ impl PermIndex {
         let rows = blocks.last().map_or(0, |b| b.row_start + b.rows as u64);
         let f = File::open(dir.join(format!("{}.dat", perm.name())))?;
         let data = if f.metadata()?.len() > 0 {
-            Some(map_random(&f)?)
+            Some(Arc::new(map_random(&f)?))
         } else {
             None
         };
         Ok(PermIndex {
             perm,
             data,
-            blocks,
+            blocks: Arc::new(blocks),
             rows,
             uid: next_uid(),
         })

@@ -245,6 +245,16 @@ impl TxnWorker {
     /// released and the result is `Ok(None)`. Since no commit can land while the lock is
     /// held, the check is final.
     pub fn begin(ds: &Dataset, expect_commit: Option<u64>) -> Result<Option<TxnWorker>> {
+        Self::begin_with(ds, expect_commit, Default::default())
+    }
+
+    /// Start a transaction with controls for writer admission and commit. A cancelled
+    /// or expired wait returns its engine error and never retains the writer lock.
+    pub fn begin_with(
+        ds: &Dataset,
+        expect_commit: Option<u64>,
+        opts: crate::guard::WriteOptions,
+    ) -> Result<Option<TxnWorker>> {
         if let Some(c) = expect_commit
             && ds.snapshot().commit != c
         {
@@ -256,7 +266,7 @@ impl TxnWorker {
         let ds = ds.clone();
         let thread = std::thread::Builder::new()
             .name("sparkles-txn".into())
-            .spawn(move || work(ds, expect_commit, jobs_rx, started_tx))?;
+            .spawn(move || work(ds, expect_commit, opts, jobs_rx, started_tx))?;
         match started_rx.recv() {
             Ok(Ok(Some(base))) => Ok(Some(TxnWorker {
                 jobs: Some(jobs_tx),
@@ -267,7 +277,10 @@ impl TxnWorker {
                 let _ = thread.join();
                 Ok(None)
             }
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
             Err(_) => Err(Error::invalid("the write transaction could not start")),
         }
     }
@@ -338,17 +351,20 @@ impl Drop for TxnWorker {
 fn work(
     ds: Dataset,
     expect: Option<u64>,
+    opts: crate::guard::WriteOptions,
     jobs: Receiver<Msg>,
     started: Sender<Result<Option<u64>>>,
 ) {
     let mut reply: Option<Sender<Result<Receipt>>> = None;
     let mut moved = false;
-    let r = ds.transaction_receipt(|tx| {
+    let mut began = false;
+    let r = ds.transaction_receipt_with(opts, |tx| {
         let base = tx.base_commit();
         if expect.is_some_and(|c| c != base) {
             moved = true;
             return Err(Error::Cancelled);
         }
+        began = true;
         let _ = started.send(Ok(Some(base)));
         loop {
             match jobs.recv() {
@@ -369,6 +385,11 @@ fn work(
     });
     if moved {
         let _ = started.send(Ok(None));
+        return;
+    }
+    if !began {
+        let _ = started.send(r.map(|_| None));
+        return;
     }
     if let Some(reply) = reply {
         let _ = reply.send(r.map(|(_, receipt)| receipt));
@@ -526,5 +547,127 @@ mod tests {
         w.run(move |tx| tx.insert(q.as_ref())).unwrap();
         w.commit().unwrap();
         assert!(!waiter.join().unwrap().unwrap());
+    }
+
+    #[test]
+    fn controlled_worker_waits_return_the_original_error() {
+        use crate::guard::WriteOptions;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        for case in 0..3 {
+            let ds = data();
+            let held = TxnWorker::begin(&ds, None).unwrap().unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let opts = match case {
+                0 => WriteOptions {
+                    no_wait: true,
+                    ..Default::default()
+                },
+                1 => WriteOptions {
+                    deadline: Some(Instant::now() + Duration::from_millis(40)),
+                    ..Default::default()
+                },
+                _ => WriteOptions {
+                    cancel: Some(cancel.clone()),
+                    ..Default::default()
+                },
+            };
+            let other = ds.clone();
+            let (send, recv) = channel();
+            let waiter = std::thread::spawn(move || {
+                let result = TxnWorker::begin_with(&other, None, opts).map(|w| {
+                    if let Some(w) = w {
+                        w.abort();
+                    }
+                });
+                let _ = send.send(result);
+            });
+            if case == 2 {
+                let end = Instant::now() + Duration::from_secs(1);
+                while ds.store().writers_waiting() == 0 && Instant::now() < end {
+                    std::thread::yield_now();
+                }
+                cancel.store(true, Ordering::Relaxed);
+            }
+            // Release the holder even if the regression returns no reply. The test
+            // fails promptly instead of leaving a worker stuck behind its own fixture.
+            let result = recv.recv_timeout(Duration::from_secs(1));
+            held.abort();
+            waiter.join().unwrap();
+            let error = result.unwrap().unwrap_err();
+            assert!(matches!(
+                (case, error),
+                (0, Error::WriterBusy) | (1, Error::Timeout) | (2, Error::Cancelled)
+            ));
+            TxnWorker::begin(&ds, None).unwrap().unwrap().abort();
+            assert_eq!(ds.len(), 5);
+        }
+    }
+
+    #[test]
+    fn controlled_worker_cancellation_prevents_commit() {
+        use crate::guard::WriteOptions;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ds = data();
+        let before = ds.snapshot().commit;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = TxnWorker::begin_with(
+            &ds,
+            None,
+            WriteOptions {
+                cancel: Some(cancel.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        worker
+            .run(|tx| {
+                tx.update_with(
+                    "INSERT DATA { <urn:pending> <urn:p> 1 }",
+                    &Default::default(),
+                )
+            })
+            .unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(worker.commit(), Err(Error::Cancelled)));
+        assert_eq!(ds.snapshot().commit, before);
+        assert_eq!(ds.len(), 5);
+        TxnWorker::begin(&ds, None).unwrap().unwrap().abort();
+    }
+
+    #[test]
+    fn controlled_transactions_preserve_preconditions_and_messages() {
+        use crate::guard::{Precondition, WriteOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let opts = WriteOptions {
+            precondition: Some(Precondition::new(|_| Err(Error::Cancelled))),
+            ..Default::default()
+        };
+        assert!(matches!(
+            TxnWorker::begin_with(&ds, None, opts),
+            Err(Error::Cancelled)
+        ));
+        let (_, receipt) = ds
+            .transaction_receipt_with(
+                WriteOptions {
+                    message: Some(Arc::from("controlled commit")),
+                    ..Default::default()
+                },
+                |tx| tx.update_with("INSERT DATA { <urn:s> <urn:p> 1 }", &Default::default()),
+            )
+            .unwrap();
+        assert_eq!(
+            ds.history()
+                .annotation(receipt.commit.seq)
+                .unwrap()
+                .message
+                .as_deref(),
+            Some("controlled commit")
+        );
     }
 }

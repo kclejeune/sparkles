@@ -273,6 +273,7 @@ const ADMIN_BRANCH_ROUTES: &[&str] = &[
     "vector",
     "rdfs",
     "cache",
+    "backups",
 ];
 
 /// Admin routes whose `branch` names the branch a commit-level merge writes to: their
@@ -467,15 +468,6 @@ pub(super) fn main_dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>>
     let ds = st
         .get(name)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")))?;
-    if ds.kind != DbType::Persistent {
-        return Err(ApiError(
-            StatusCode::NOT_IMPLEMENTED,
-            json!({
-                "error": "branches need a persistent dataset",
-                "code": "branches-unsupported",
-            }),
-        ));
-    }
     Ok(ds)
 }
 

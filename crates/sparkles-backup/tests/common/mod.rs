@@ -70,6 +70,8 @@ pub async fn memory_repo() -> (Repository, Arc<InMemory>) {
 /// fresh dataset id at commit 1 of `gen-0001`.
 pub fn synthetic(files: Vec<(&str, FileKind, Vec<u8>)>) -> Source {
     Source {
+        next_ordinal: 1,
+        branch: None,
         dataset_id: uuid::Uuid::new_v4(),
         commit: sparkles_core::commit::CommitInfo {
             seq: 1,

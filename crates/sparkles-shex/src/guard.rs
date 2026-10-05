@@ -386,6 +386,33 @@ impl ShexGuard {
         }
     }
 
+    /// An independent guard for a memory branch with its own validation state.
+    pub fn fork_for_store(&self, store: &Store) -> Result<Arc<Self>> {
+        let model = if self.cfg.schema.graphs.is_some() {
+            Arc::new(load_graph_model(&self.cfg, &store.snapshot())?)
+        } else {
+            self.model.read().clone()
+        };
+        let fork = Arc::new(Self {
+            cfg: self.cfg.clone(),
+            model: parking_lot::RwLock::new(model),
+            pending: Mutex::new(None),
+            baseline: Mutex::new(None),
+            exact: Mutex::new(None),
+            typing: Mutex::new(None),
+            persist: None,
+            counters: DecisionCounts::default(),
+            last_full: AtomicU64::new(u64::MAX),
+            associations: AtomicU64::new(u64::MAX),
+            warnings: Mutex::new(Vec::new()),
+            copy: self.copy.clone(),
+            history: CheckHistory::default(),
+        });
+        store.set_guard(Some(fork.clone()));
+        store.set_guard_required(true);
+        Ok(fork)
+    }
+
     pub fn config(&self) -> &ShexValidationConfig {
         &self.cfg
     }
@@ -1523,7 +1550,7 @@ pub fn set_config(
                 text,
                 cfg.schema.format.as_deref(),
                 cfg.schema.base.as_deref(),
-                &BTreeMap::new(),
+                &cfg.schema.prefixes,
                 resolver,
             )?
         }

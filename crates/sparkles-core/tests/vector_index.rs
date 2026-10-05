@@ -506,3 +506,40 @@ fn configuration_errors() {
         assert!(r.is_err(), "{bad}");
     }
 }
+
+#[test]
+fn linked_branches_reuse_immutable_vector_files_with_independent_overlays() {
+    let dir = tempfile::tempdir().unwrap();
+    let vs = clustered(80, 7);
+    let s = store_with(Store::open(dir.path(), Default::default()).unwrap(), &vs);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    let path = s
+        .root()
+        .unwrap()
+        .join(s.snapshot().generation.name.clone())
+        .join("vectors/emb.spkv");
+    let before = std::fs::read(&path).unwrap();
+    s.create_branch("work", &Default::default()).unwrap();
+    let work = s.branch("work").unwrap();
+    assert!(work.wait_vector_index("emb").unwrap().files.unwrap().opened);
+    assert_eq!(
+        search(&s.snapshot(), &vs[0], 10, EXACT).0,
+        search(&work.snapshot(), &vs[0], 10, EXACT).0
+    );
+    update(
+        &work,
+        "DELETE WHERE { <urn:n0> <urn:emb> ?v }",
+        &Default::default(),
+    )
+    .unwrap();
+    assert_ne!(
+        search(&s.snapshot(), &vs[0], 10, EXACT).0,
+        search(&work.snapshot(), &vs[0], 10, EXACT).0
+    );
+    let mut changed = config(0);
+    changed.hnsw.as_mut().unwrap().m = 10;
+    work.create_vector_index("emb", changed).unwrap();
+    work.wait_vector_index("emb").unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}

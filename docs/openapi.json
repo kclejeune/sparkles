@@ -994,7 +994,7 @@
             "type": "integer"
           },
           "branchesOmitted": {
-            "description": "The dataset's branches other than main, which the backup did not copy (absent when there were none).",
+            "description": "The other branches omitted from this standalone backup (absent when there were none).",
             "type": "integer"
           },
           "commit": {
@@ -1028,11 +1028,20 @@
           },
           "dataset": {
             "properties": {
+              "branch": {
+                "$ref": "#/components/schemas/BackupBranch"
+              },
               "id": {
                 "type": "string"
               },
               "name": {
                 "type": "string"
+              },
+              "nextOrdinal": {
+                "description": "The first unused branch blank-node ordinal. Restores reserve earlier allocation ranges, including those of merged or deleted branches. Older backups may omit this field.",
+                "maximum": 65536,
+                "minimum": 1,
+                "type": "integer"
               },
               "type": {
                 "enum": [
@@ -1260,6 +1269,39 @@
         ],
         "type": "object"
       },
+      "BackupBranch": {
+        "description": "The provenance of a branch captured as a standalone dataset. Restores use a fresh identity and reserve its blank-node allocation range.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-types"
+        },
+        "properties": {
+          "datasetId": {
+            "description": "The enclosing dataset's identity.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "description": "The captured branch identity, also dataset.id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "nextOrdinal": {
+            "maximum": 65536,
+            "minimum": 2,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "datasetId",
+          "id",
+          "name",
+          "nextOrdinal"
+        ],
+        "type": "object"
+      },
       "BackupFiles": {
         "description": "Fuseki's list of N-Quads backup files in `<data>/backups`, sorted.",
         "externalDocs": {
@@ -1390,6 +1432,9 @@
           },
           "dataset": {
             "properties": {
+              "branch": {
+                "$ref": "#/components/schemas/BackupBranch"
+              },
               "id": {
                 "type": "string"
               },
@@ -12402,6 +12447,9 @@
             "$ref": "#/components/parameters/ds"
           },
           {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
             "description": "One repository.",
             "in": "query",
             "name": "repository",
@@ -12441,7 +12489,7 @@
         "x-sparkles-permission": "read"
       },
       "post": {
-        "description": "A JSON body backs up into a repository. Without one, this is Fuseki's alias of `POST /$/backup/{ds}`, an N-Quads file.",
+        "description": "A JSON body captures the selected branch as a standalone dataset in a repository. Branch restores use a fresh identity. Without a JSON body, this is Fuseki's N-Quads file alias.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#backup-routes"
         },
@@ -12449,6 +12497,9 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           }
         ],
         "requestBody": {
@@ -12526,6 +12577,9 @@
           },
           {
             "$ref": "#/components/parameters/backup"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           }
         ],
         "responses": {
@@ -12586,6 +12640,9 @@
           },
           {
             "$ref": "#/components/parameters/backup"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           }
         ],
         "responses": {
@@ -12635,6 +12692,9 @@
           },
           {
             "$ref": "#/components/parameters/backup"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           }
         ],
         "requestBody": {
@@ -12711,6 +12771,9 @@
           },
           {
             "$ref": "#/components/parameters/backup"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
           }
         ],
         "requestBody": {

@@ -77,6 +77,8 @@ impl Spec {
             },
             graphs: self.rule().map(Graphs::Only),
             cancel,
+            deadline: None,
+            no_wait: false,
             progress,
             at: self.at.clone(),
             mode: self.mode,
@@ -220,7 +222,8 @@ pub(crate) fn clone_into_controlled(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let opts = spec.options(&label, progress, cancel.clone());
+    let mut opts = spec.options(&label, progress, cancel.clone());
+    opts.deadline = control.and_then(|c| c.deadline);
     let report = store.clone_to(tmp, &opts)?;
     let mut guard = RemoveDir(Some(tmp.to_path_buf()));
     if let Some(ctl) = control {
@@ -299,7 +302,25 @@ pub fn clone_into_memory(
     progress: Option<ProgressFn>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<MemoryClone> {
-    let opts = spec.options(target, progress, cancel);
+    clone_into_memory_controlled(
+        store, name, target, reasoning, spec, store_opts, progress, cancel, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clone_into_memory_controlled(
+    store: &Store,
+    name: &str,
+    target: &str,
+    reasoning: Option<ReasoningInfo>,
+    spec: &Spec,
+    store_opts: StoreOptions,
+    progress: Option<ProgressFn>,
+    cancel: Option<Arc<AtomicBool>>,
+    control: Option<&crate::task::Control>,
+) -> Result<MemoryClone> {
+    let mut opts = spec.options(target, progress, cancel);
+    opts.deadline = control.and_then(|c| c.deadline);
     let (clone, report) = store.clone_to_memory(&opts, store_opts)?;
     let reasoning = reasoning
         .filter(|_| spec.keeps_inferences())
@@ -441,7 +462,7 @@ impl crate::Dataset {
         ctl: &crate::task::Control,
     ) -> crate::Result<MemoryClone> {
         ctl.check()?;
-        let cloned = clone_into_memory(
+        let cloned = clone_into_memory_controlled(
             self.store(),
             self.name().unwrap_or(""),
             target,
@@ -450,6 +471,7 @@ impl crate::Dataset {
             self.store().options().clone(),
             ctl.progress.as_fn(),
             Some(ctl.cancel.flag()),
+            Some(ctl),
         )
         .map_err(crate::catalog::component)?;
         ctl.check()?;
