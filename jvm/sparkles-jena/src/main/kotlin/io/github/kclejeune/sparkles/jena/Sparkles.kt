@@ -11,6 +11,10 @@ import org.apache.jena.sys.JenaSystem
 public object Sparkles {
     private const val NS = "urn:x-sparkles:symbol#"
 
+    /** A point-in-time reference: head, commit:N, time:ISO8601 or snapshot:NAME. */
+    @JvmField
+    public val AT: Symbol = Symbol.create(NS + "at")
+
     /** Queries see the union of the named graphs as their default graph (a Boolean). */
     @JvmField
     public val UNION_DEFAULT_GRAPH: Symbol = Symbol.create(NS + "unionDefaultGraph")
@@ -39,6 +43,8 @@ public object Sparkles {
     @JvmField
     public val FALLBACK: Symbol = Symbol.create(NS + "fallback")
 
+    internal val RESOLVED_AT: Symbol = Symbol.create(NS + "resolvedAt")
+
     /** The version of this library. */
     @JvmStatic
     public fun version(): String = NativeLoader.version
@@ -61,6 +67,9 @@ public object Sparkles {
  */
 public class InitSparkles : JenaSubsystemLifecycle {
     override fun start() {
+        io.github.kclejeune.sparkles.jena.engine.FallbackDetector.initialize()
+        io.github.kclejeune.sparkles.jena.assembler.VocabSparkles.register()
+        io.github.kclejeune.sparkles.jena.engine.DescribeSparkles.register()
         QueryEngineSparkles.register()
         UpdateEngineSparkles.register()
     }

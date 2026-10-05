@@ -1,0 +1,135 @@
+name: JVM bindings
+
+on:
+  push:
+    tags: ["jvm-v*"]
+  pull_request:
+    paths: ["crates/**", "vendor/**", "Cargo.toml", "jvm/**", "scripts/jvm-native.sh", ".github/workflows/jvm-bindings.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jvm-bindings-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  natives:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, platform: linux-x86_64 }
+          - { runner: ubuntu-24.04-arm, platform: linux-aarch64 }
+          - { runner: macos-15-intel, platform: macos-x86_64 }
+          - { runner: macos-15, platform: macos-aarch64 }
+          - { runner: windows-2025, platform: windows-x86_64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "17" }
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build native library and generate matching bindings
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/jvm-v* ]]; then
+            test "${GITHUB_REF_NAME#jvm-v}" = "$(sed -n 's/^version=//p' jvm/gradle.properties)"
+          fi
+          scripts/jvm-native.sh
+      - name: Run native and Jena contract tests
+        shell: bash
+        run: |
+          cargo test --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --lib
+          cd jvm
+          ./gradlew --no-daemon --console=plain :sparkles-jena:test :sample-java:build
+      - name: Stage platform resources
+        shell: bash
+        run: |
+          mkdir -p "dist/${{ matrix.platform }}"
+          for library in target/release/libsparkles_ffi.so target/release/libsparkles_ffi.dylib target/release/sparkles_ffi.dll; do
+            if [ -f "$library" ]; then cp "$library" "dist/${{ matrix.platform }}/"; fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jvm-native-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+  jars:
+    needs: natives
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "17" }
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
+      - name: Generate bindings and assemble all-platform artifacts
+        run: |
+          cargo build --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --features bindgen --bin uniffi-bindgen
+          target/debug/uniffi-bindgen generate --library target/jvm/natives/linux-x86_64/libsparkles_ffi.so --language kotlin --no-format --metadata-no-deps --config crates/sparkles-ffi/bindgen.toml --out-dir target/jvm/uniffi
+          cd jvm
+          ./gradlew --no-daemon --console=plain -Psparkles.nativeDir=../target/jvm/natives :sparkles-jena:assemble :sparkles-jena-natives:assemble :sparkles-jena-all:assemble
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jvm-jars
+          path: jvm/**/build/libs/*.jar
+          if-no-files-found: error
+
+  compatibility:
+    needs: jars
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { java: "17", jena: "5.6.0" }
+          - { java: "21", jena: "6.2.0" }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "${{ matrix.java }}" }
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: actions/download-artifact@v4
+        with: { name: jvm-native-linux-x86_64, path: target/jvm/natives }
+      - run: |
+          cargo build --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --features bindgen --bin uniffi-bindgen
+          target/debug/uniffi-bindgen generate --library target/jvm/natives/linux-x86_64/libsparkles_ffi.so --language kotlin --no-format --metadata-no-deps --config crates/sparkles-ffi/bindgen.toml --out-dir target/jvm/uniffi
+          cd jvm
+          ./gradlew --no-daemon --console=plain -Psparkles.nativeDir=../target/jvm/natives -Psparkles.javaVersion=${{ matrix.java }} -Psparkles.jenaVersion=${{ matrix.jena }} :sparkles-jena:test :sample-java:build
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/jvm-v') && vars.MAVEN_PUBLISH == 'true'
+    needs: [jars, compatibility]
+    runs-on: ubuntu-24.04
+    environment: maven
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "17" }
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
+      - name: Publish signed Maven artifacts
+        env:
+          SPARKLES_PUBLISH: "true"
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+          MAVEN_SIGNING_KEY: ${{ secrets.MAVEN_SIGNING_KEY }}
+          MAVEN_SIGNING_PASSWORD: ${{ secrets.MAVEN_SIGNING_PASSWORD }}
+          MAVEN_PUBLISH_URL: ${{ vars.MAVEN_PUBLISH_URL }}
+        run: |
+          test -n "$MAVEN_PUBLISH_URL" && test -n "$MAVEN_SIGNING_KEY"
+          cargo build --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --features bindgen --bin uniffi-bindgen
+          target/debug/uniffi-bindgen generate --library target/jvm/natives/linux-x86_64/libsparkles_ffi.so --language kotlin --no-format --metadata-no-deps --config crates/sparkles-ffi/bindgen.toml --out-dir target/jvm/uniffi
+          cd jvm
+          ./gradlew --no-daemon --console=plain -Pversion="${GITHUB_REF_NAME#jvm-v}" -Psparkles.nativeDir=../target/jvm/natives -Psparkles.publishUrl="$MAVEN_PUBLISH_URL" publish

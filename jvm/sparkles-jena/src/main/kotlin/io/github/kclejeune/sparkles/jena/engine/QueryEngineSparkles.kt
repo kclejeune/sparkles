@@ -2,6 +2,7 @@ package io.github.kclejeune.sparkles.jena.engine
 
 import io.github.kclejeune.sparkles.jena.DatasetGraphSparkles
 import io.github.kclejeune.sparkles.jena.SparklesFallback
+import io.github.kclejeune.sparkles.jena.Sparkles
 import io.github.kclejeune.sparkles.jena.internal.CancelWatcher
 import io.github.kclejeune.sparkles.jena.internal.RowBatch
 import io.github.kclejeune.sparkles.jena.internal.RowDecoder
@@ -75,13 +76,31 @@ public object QueryEngineSparkles {
             plan(query, dataset as DatasetGraphSparkles, inputBinding, context)
 
         /** Algebra executed directly runs in ARQ in Phase 1. */
-        override fun accept(op: Op, dataset: DatasetGraph, context: Context): Boolean = false
+        override fun accept(op: Op, dataset: DatasetGraph, context: Context?): Boolean =
+            dataset is DatasetGraphSparkles && runCatching { org.apache.jena.sparql.algebra.OpAsQuery.asQuery(op) }.isSuccess
 
-        override fun create(op: Op, dataset: DatasetGraph, inputBinding: Binding, context: Context): Plan =
-            throw UnsupportedOperationException("Sparkles does not execute algebra")
+        override fun create(op: Op, dataset: DatasetGraph, inputBinding: Binding?, context: Context?): Plan =
+            plan(org.apache.jena.sparql.algebra.OpAsQuery.asQuery(op), dataset as DatasetGraphSparkles,
+                inputBinding ?: org.apache.jena.sparql.engine.binding.BindingFactory.empty(), context ?: dataset.context)
     }
 
     private fun plan(query: Query, dsg: DatasetGraphSparkles, input: Binding, context: Context): Plan {
+        DescribeSparkles.select(query, context)
+        val at = context.get<Any>(Sparkles.AT)
+        if (at != null && !dsg.isPinned()) {
+            val view = when (at) {
+                is Number -> dsg.at(at.toLong())
+                else -> dsg.at(at.toString())
+            }
+            try {
+                context.set(Sparkles.RESOLVED_AT, view.pinnedReference())
+                val inner = plan(query, view, input, context)
+                return PlanOp(inner.op, null, OwnedViewIterator(inner.iterator(), view, context))
+            } catch (e: Throwable) {
+                view.close()
+                throw e
+            }
+        }
         val mode = fallbackMode(dsg, context)
         val reason = if (mode == SparklesFallback.ALWAYS) {
             "the fallback mode is ALWAYS"
@@ -295,4 +314,19 @@ internal class BindingSparkles(
     }
 
     override fun detachWithNewParent(newParent: Binding?): Binding = BindingSparkles(newParent, vars, values)
+}
+
+/** Releases a historical request view on completion, failure or cancellation. */
+private class OwnedViewIterator(
+    private val delegate: QueryIterator,
+    private val owner: DatasetGraphSparkles,
+    context: Context,
+) : QueryIteratorBase(Context.getCancelSignal(context)) {
+    override fun hasNextBinding(): Boolean = try {
+        delegate.hasNext().also { if (!it) closeIterator() }
+    } catch (e: Throwable) { closeIterator(); throw e }
+    override fun moveToNextBinding(): Binding = delegate.nextBinding()
+    override fun closeIterator() { try { delegate.close() } finally { owner.close() } }
+    override fun requestCancel() { delegate.cancel() }
+    override fun output(out: IndentedWriter, sCxt: SerializationContext?) { out.print("HistoricalSparkles") }
 }

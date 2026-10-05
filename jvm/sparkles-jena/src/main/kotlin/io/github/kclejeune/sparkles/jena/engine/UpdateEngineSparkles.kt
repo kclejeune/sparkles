@@ -14,7 +14,6 @@ import org.apache.jena.sparql.core.DatasetGraph
 import org.apache.jena.sparql.core.Quad
 import org.apache.jena.sparql.engine.binding.Binding
 import org.apache.jena.sparql.modify.UpdateEngine
-import org.apache.jena.sparql.modify.UpdateEngineBase
 import org.apache.jena.sparql.modify.UpdateEngineFactory
 import org.apache.jena.sparql.modify.UpdateEngineRegistry
 import org.apache.jena.sparql.modify.UpdateEngineWorker
@@ -38,7 +37,20 @@ public object UpdateEngineSparkles {
 
     /** The factory registered with Jena's `UpdateEngineRegistry`. */
     @JvmField
-    public val factory: UpdateEngineFactory = Factory
+    public val factory: UpdateEngineFactory = java.lang.reflect.Proxy.newProxyInstance(
+        UpdateEngineFactory::class.java.classLoader, arrayOf(UpdateEngineFactory::class.java),
+    ) { proxy, method, args ->
+        when (method.name) {
+            "accept" -> args!![0] is DatasetGraphSparkles && fallbackMode(args[0] as DatasetGraphSparkles, args[1] as Context?) != SparklesFallback.ALWAYS
+            // Jena 6 removes initial bindings from its update factory. Keep one artifact
+            // by adapting this tiny factory seam instead of linking either constructor.
+            "create" -> Engine(args!![0] as DatasetGraphSparkles, if (args.size == 3) args[1] as Binding? else null, args.last() as Context?)
+            "equals" -> proxy === args!![0]
+            "hashCode" -> System.identityHashCode(proxy)
+            "toString" -> "Sparkles update engine factory"
+            else -> throw UnsupportedOperationException(method.name)
+        }
+    } as UpdateEngineFactory
 
     @JvmStatic
     @Synchronized
@@ -52,24 +64,22 @@ public object UpdateEngineSparkles {
         UpdateEngineRegistry.removeFactory(factory)
     }
 
-    private object Factory : UpdateEngineFactory {
-        override fun accept(datasetGraph: DatasetGraph, context: Context?): Boolean =
-            datasetGraph is DatasetGraphSparkles && fallbackMode(datasetGraph, context) != SparklesFallback.ALWAYS
-
-        override fun create(datasetGraph: DatasetGraph, inputBinding: Binding?, context: Context?): UpdateEngine =
-            Engine(datasetGraph as DatasetGraphSparkles, inputBinding, context)
-    }
-
     private class Engine(
         private val dsg: DatasetGraphSparkles,
         inputBinding: Binding?,
         context: Context?,
-    ) : UpdateEngineBase(dsg, inputBinding, context) {
+    ) : UpdateEngine {
+        private val context: Context = Context.setupContextForDataset(context, dsg)
         private var ownTxn = false
         private var failed = false
         private var pending = UpdateRequest()
         private val hasInput = inputBinding != null && !inputBinding.isEmpty
-        private val worker by lazy { UpdateEngineWorker(dsg, inputBinding, this.context) }
+        private val worker by lazy {
+            val constructors = UpdateEngineWorker::class.java.constructors
+            val legacy = constructors.firstOrNull { it.parameterCount == 3 }
+            (if (legacy != null) legacy.newInstance(dsg, inputBinding, this.context)
+            else constructors.first { it.parameterCount == 2 }.newInstance(dsg, this.context)) as UpdateEngineWorker
+        }
         private val sink = SinkImpl()
 
         override fun startRequest() {

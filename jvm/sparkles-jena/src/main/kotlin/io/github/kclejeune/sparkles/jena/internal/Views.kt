@@ -26,13 +26,13 @@ internal class GraphViewSparkles(private val dsg: DatasetGraphSparkles, private 
 
     override fun graphBaseFind(m: Triple?): ExtendedIterator<Triple> {
         val t = m ?: Triple.ANY
-        return graphBaseFind(t.matchSubject, t.matchPredicate, t.matchObject)
+        return graphBaseFind(t.subject, t.predicate, t.`object`)
     }
 
     override fun graphBaseSize(): Int = dsg.countQuads(node, null, null, null).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
     override fun graphBaseContains(t: Triple): Boolean =
-        dsg.contains(node, t.matchSubject, t.matchPredicate, t.matchObject)
+        dsg.contains(node, t.subject, t.predicate, t.`object`)
 
     override fun isEmpty(): Boolean = graphBaseSize() == 0
 

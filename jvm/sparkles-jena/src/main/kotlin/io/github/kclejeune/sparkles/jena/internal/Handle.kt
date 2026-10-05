@@ -4,6 +4,8 @@ import io.github.kclejeune.sparkles.jena.CommitInfo
 import io.github.kclejeune.sparkles.jena.CommitReceipt
 import io.github.kclejeune.sparkles.jena.SparklesInvalidException
 import io.github.kclejeune.sparkles.jena.SparklesOptions
+import io.github.kclejeune.sparkles.jena.SparklesBulkSink
+import org.apache.jena.sparql.JenaTransactionException
 import io.github.kclejeune.sparkles.jena.internal.ffi.Capabilities
 import io.github.kclejeune.sparkles.jena.internal.ffi.FfiDataset
 import io.github.kclejeune.sparkles.jena.internal.ffi.FfiReadTxn
@@ -26,6 +28,7 @@ internal const val WRITE_BATCH_BYTES = 1 shl 20
  * see it.
  */
 internal class Handle(val key: String?, val ffi: FfiDataset, val options: SparklesOptions) {
+    val ownerDatasetId: String by lazy { ffi { ffi.ownerDatasetId() } }
     val refs = AtomicInteger(1)
 
     @Volatile
@@ -36,6 +39,29 @@ internal class Handle(val key: String?, val ffi: FfiDataset, val options: Sparkl
 
     /** Write transactions that have not ended, aborted when the dataset closes. */
     val openWrites: MutableSet<TxnState> = ConcurrentHashMap.newKeySet()
+    private val sinks = ConcurrentHashMap<Thread, SparklesBulkSink>()
+
+    fun checkNoSink() {
+        if (sinks.containsKey(Thread.currentThread())) {
+            throw JenaTransactionException("this thread has an active bulk sink on the dataset")
+        }
+    }
+
+    @Synchronized
+    fun registerSink(sink: SparklesBulkSink): Thread {
+        checkOpen()
+        if (txns.get() != null) throw JenaTransactionException("bulk loads run outside a transaction")
+        checkNoSink()
+        return Thread.currentThread().also { sinks[it] = sink }
+    }
+
+    fun closeSinksFor(dsg: io.github.kclejeune.sparkles.jena.DatasetGraphSparkles) {
+        for (sink in sinks.values.toList()) if (sink.dsg === dsg) sink.close()
+    }
+
+    fun releaseSink(owner: Thread, sink: SparklesBulkSink) {
+        sinks.remove(owner, sink)
+    }
 
     val capabilities: Capabilities by lazy { ffi { ffi.capabilities() } }
 
@@ -57,8 +83,11 @@ internal class Handle(val key: String?, val ffi: FfiDataset, val options: Sparkl
     }
 
     /** Abort what is still open and free the native dataset. */
+    @Synchronized
     fun shutdown() {
         closed = true
+        for (sink in sinks.values.toList()) sink.close()
+        sinks.clear()
         for (t in openWrites) {
             try {
                 t.write?.abort()

@@ -28,7 +28,13 @@ let
         # the root workspace, which the library crates inherit their dependencies from
         ../Cargo.toml
         ../LICENSE
-        ../crates
+        (lib.fileset.difference ../crates (
+          lib.fileset.unions [
+            (lib.fileset.maybeMissing ../crates/sparkles-ffi/target)
+            ../crates/sparkles-node
+            ../crates/sparkles-py
+          ]
+        ))
         ../vendor
       ];
     };
@@ -77,6 +83,8 @@ let
             (lib.fileset.maybeMissing ../jvm/.kotlin)
             (lib.fileset.maybeMissing ../jvm/sparkles-jena/build)
             (lib.fileset.maybeMissing ../jvm/sample-java/build)
+            (lib.fileset.maybeMissing ../jvm/sparkles-jena-natives/build)
+            (lib.fileset.maybeMissing ../jvm/sparkles-jena-all/build)
           ]
         ))
       ];
@@ -99,9 +107,9 @@ let
       # nixpkgs' nixDownloadDeps task reads the projects' configurations when it runs
       "--no-configuration-cache"
     ];
-    gradleBuildTask = ":sparkles-jena:assemble";
+    gradleBuildTask = ":sparkles-jena:assemble :sparkles-jena-natives:assemble :sparkles-jena-all:assemble";
     # everything the build and the tests resolve, for the update script
-    gradleUpdateTask = "nixDownloadDeps :sparkles-jena:assemble :sparkles-jena:testClasses :sample-java:testClasses";
+    gradleUpdateTask = "nixDownloadDeps :sparkles-jena:assemble :sparkles-jena-natives:assemble :sparkles-jena-all:assemble :sparkles-jena:testClasses :sample-java:testClasses";
     gradleCheckTask = ":sparkles-jena:test :sample-java:test";
     doCheck = false;
 
@@ -110,6 +118,9 @@ let
       mkdir -p $out/share/java
       cp sparkles-jena/build/libs/sparkles-jena-${finalAttrs.version}.jar $out/share/java/
       cp sparkles-jena/build/libs/sparkles-jena-${finalAttrs.version}-sources.jar $out/share/java/
+      cp sparkles-jena/build/libs/sparkles-jena-${finalAttrs.version}-javadoc.jar $out/share/java/
+      cp sparkles-jena-natives/build/libs/*.jar $out/share/java/
+      cp sparkles-jena-all/build/libs/*.jar $out/share/java/
       runHook postInstall
     '';
 

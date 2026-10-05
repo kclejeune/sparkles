@@ -1,11 +1,13 @@
-import java.security.MessageDigest
 import org.jetbrains.kotlin.gradle.dsl.JvmDefaultMode
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
     `java-library`
+    `maven-publish`
+    signing
     alias(libs.plugins.kotlin.jvm)
+    alias(libs.plugins.dokka)
 }
 
 description = "Apache Jena's DatasetGraph, transactions and query engines backed by the Sparkles engine"
@@ -14,36 +16,15 @@ description = "Apache Jena's DatasetGraph, transactions and query engines backed
 // jvm:build`, or the Nix package). These properties name them; the defaults are where the
 // mise tasks put them.
 val repoRoot: File = rootDir.parentFile
-val nativeLib: Provider<RegularFile> =
-    providers.gradleProperty("sparkles.nativeLib")
-        .map { layout.projectDirectory.file(File(it).absolutePath) }
-        .orElse(layout.projectDirectory.file(repoRoot.resolve("target/release/libsparkles_ffi.so").path))
-val bindingsDir: Provider<String> =
-    providers.gradleProperty("sparkles.bindings")
-        .orElse(repoRoot.resolve("target/jvm/uniffi").path)
-val nativePlatform: Provider<String> =
-    providers.gradleProperty("sparkles.nativePlatform").orElse(hostPlatform())
-
-fun hostPlatform(): String {
-    val os = System.getProperty("os.name").lowercase()
-    val arch = when (val a = System.getProperty("os.arch").lowercase()) {
-        "amd64", "x86_64" -> "x86_64"
-        "aarch64", "arm64" -> "aarch64"
-        else -> a
-    }
-    val name = when {
-        os.startsWith("linux") -> "linux"
-        os.startsWith("mac") || os.startsWith("darwin") -> "macos"
-        os.startsWith("windows") -> "windows"
-        else -> os
-    }
-    return "$name-$arch"
-}
+val bindingsDir: Provider<String> = providers.gradleProperty("sparkles.bindings").orElse(repoRoot.resolve("target/jvm/uniffi").path)
 
 java {
-    toolchain.languageVersion = JavaLanguageVersion.of(17)
+    toolchain.languageVersion = JavaLanguageVersion.of(providers.gradleProperty("sparkles.javaVersion").orElse("17").get().toInt())
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
     withSourcesJar()
 }
+tasks.withType<JavaCompile>().configureEach { options.release = 17 }
 
 // The generated bindings compile on their own: they are public Kotlin that explicit API mode
 // would reject, and their warnings are not ours. Their classes go into this jar.
@@ -52,7 +33,7 @@ val ffi: SourceSet = sourceSets.create("ffi") {
 }
 
 kotlin {
-    jvmToolchain(17)
+    jvmToolchain(providers.gradleProperty("sparkles.javaVersion").orElse("17").get().toInt())
     explicitApi()
     compilerOptions {
         jvmTarget = JvmTarget.JVM_17
@@ -64,6 +45,11 @@ kotlin {
 
 tasks.named<KotlinCompile>("compileTestKotlin") {
     compilerOptions.allWarningsAsErrors = false
+}
+if (providers.gradleProperty("sparkles.jenaVersion").orNull?.startsWith("6.") == true) {
+    // Jena 6 removed jena-core's legacy JUnit 3 AbstractTestGraph fixture. The ARQ
+    // dataset/graph/transaction suites and our round-trip tests still run on this line.
+    kotlin.sourceSets.named("test") { kotlin.exclude("**/contract/TestGraphSparkles.kt") }
 }
 
 tasks.named<KotlinCompile>("compileFfiKotlin") {
@@ -77,6 +63,7 @@ dependencies {
     "ffiImplementation"(libs.jna)
     api(libs.jena.arq)
     api(files(ffi.output.classesDirs).builtBy(tasks.named("compileFfiKotlin")))
+    runtimeOnly(project(":sparkles-jena-natives"))
     implementation(libs.jna)
     implementation(libs.jspecify)
     implementation(libs.slf4j.api)
@@ -92,41 +79,9 @@ dependencies {
     testImplementation(variantOf(libs.jena.core) { classifier("tests") })
     testImplementation(variantOf(libs.jena.base) { classifier("tests") })
     testImplementation(libs.jena.tdb2)
+    testImplementation(libs.jena.rdfconnection)
+    testImplementation(libs.jena.fuseki.main)
     testRuntimeOnly(libs.slf4j.simple)
-}
-
-/** Copies the native library into the resource layout the loader reads, with its SHA-256. */
-abstract class PackNative : DefaultTask() {
-    @get:InputFile
-    abstract val library: RegularFileProperty
-
-    @get:Input
-    abstract val platform: Property<String>
-
-    @get:OutputDirectory
-    abstract val output: DirectoryProperty
-
-    @TaskAction
-    fun pack() {
-        val lib = library.get().asFile
-        val dir = output.get().asFile.resolve("io/github/kclejeune/sparkles/native/${platform.get()}")
-        output.get().asFile.deleteRecursively()
-        dir.mkdirs()
-        val target = dir.resolve(lib.name)
-        lib.copyTo(target, overwrite = true)
-        val digest = MessageDigest.getInstance("SHA-256").digest(target.readBytes())
-        dir.resolve("${lib.name}.sha256").writeText(digest.joinToString("") { "%02x".format(it) } + "\n")
-    }
-}
-
-val packNative = tasks.register<PackNative>("packNative") {
-    library = nativeLib
-    platform = nativePlatform
-    output = layout.buildDirectory.dir("natives")
-}
-
-sourceSets.main {
-    resources.srcDir(packNative)
 }
 
 tasks.processResources {
@@ -145,6 +100,7 @@ tasks.jar {
     manifest {
         attributes(
             "Implementation-Title" to "sparkles-jena",
+            "Automatic-Module-Name" to "io.github.kclejeune.sparkles.jena",
             "Implementation-Version" to project.version,
             "Enable-Native-Access" to "ALL-UNNAMED",
         )
@@ -184,3 +140,25 @@ tasks.register<JavaExec>("perfCheck") {
         if (providers.gradleProperty("tdb2").orElse("true").get() == "false") "notdb" else "tdb",
     )
 }
+
+publishing { publications { create<MavenPublication>("maven") { from(components["java"]) } } }
+
+configurations.configureEach { resolutionStrategy.eachDependency { if (requested.group == "org.apache.jena" && providers.gradleProperty("sparkles.jenaVersion").isPresent) useVersion(providers.gradleProperty("sparkles.jenaVersion").get()) } }
+
+// HTML documentation is also carried as the standard Maven documentation artifact.
+dokka {
+    dokkaPublications.html { outputDirectory.set(layout.buildDirectory.dir("dokka/html")) }
+    dokkaSourceSets.configureEach {
+        if (name != "main") suppress.set(true)
+        perPackageOption { matchingRegex.set(".*\\.internal.*"); suppress.set(true) }
+        enableJdkDocumentationLink.set(false)
+        enableKotlinStdLibDocumentationLink.set(false)
+    }
+}
+val documentationJar = tasks.register<Jar>("documentationJar") {
+    dependsOn(tasks.named("dokkaGeneratePublicationHtml"))
+    archiveClassifier.set("javadoc")
+    from(layout.buildDirectory.dir("dokka/html"))
+}
+tasks.assemble { dependsOn(documentationJar) }
+publishing.publications.named<MavenPublication>("maven") { artifact(documentationJar) }

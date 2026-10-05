@@ -431,3 +431,61 @@ fn persistent_dataset_is_locked_and_reopens() {
     assert!(caps.functions.iter().any(|f| f.ends_with("#localname")));
     assert_eq!(ffi_version().encoding_version, encode::ENCODING_VERSION);
 }
+
+#[test]
+fn named_snapshots_forks_history_and_streaming_dump() {
+    let ds = FfiDataset::memory(opts(BlankNodeMode::Dataset));
+    let w = ds.begin_write(None, true).unwrap().unwrap();
+    let mut bytes = Vec::new();
+    op(
+        &mut bytes,
+        true,
+        None,
+        &iri("s"),
+        &iri("p"),
+        &Literal::from(1).into(),
+    );
+    w.apply(bytes).unwrap();
+    let first = w.commit().unwrap().commit.seq;
+    ds.snapshots_create("before".into(), "head".into(), None, None, false)
+        .unwrap();
+    let w = ds.begin_write(None, true).unwrap().unwrap();
+    let mut bytes = Vec::new();
+    op(
+        &mut bytes,
+        true,
+        None,
+        &iri("s"),
+        &iri("p"),
+        &Literal::from(2).into(),
+    );
+    w.apply(bytes).unwrap();
+    w.commit().unwrap();
+    let historical = ds.begin_read_at("snapshot:before".into()).unwrap();
+    assert_eq!(historical.commit_seq(), first);
+    assert_eq!(
+        historical
+            .fork()
+            .count(pattern(G::Any, None, None, None))
+            .unwrap(),
+        1
+    );
+    assert_eq!(ds.commits("latest".into(), None, 10).unwrap().len(), 3);
+    let dump = historical
+        .dump_cursor("application/n-quads".into())
+        .unwrap();
+    let control = FfiOperation::new(None);
+    let mut output = Vec::new();
+    loop {
+        let b = dump.next_chunk(1, control.clone()).unwrap();
+        output.extend(b.batch);
+        if b.done {
+            break;
+        }
+    }
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("1"));
+    assert!(!output.contains("\"2\""));
+    control.cancel();
+    assert!(ds.compact(control).is_err());
+}

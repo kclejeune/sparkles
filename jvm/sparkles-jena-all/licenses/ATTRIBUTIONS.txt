@@ -1,0 +1,19 @@
+Bundled JVM runtime dependencies
+
+Kotlin standard library (org.jetbrains.kotlin:kotlin-stdlib)
+License: Apache License 2.0
+Source: https://github.com/JetBrains/kotlin
+Upstream license: https://github.com/JetBrains/kotlin/blob/v2.4.20/license/LICENSE.txt
+
+JSpecify annotations (org.jspecify:jspecify)
+License: Apache License 2.0
+Source: https://github.com/jspecify/jspecify
+Upstream license: https://github.com/jspecify/jspecify/blob/v1.0.0/LICENSE
+
+JNA (net.java.dev.jna:jna)
+Source: https://github.com/java-native-access/jna
+The jar's original LICENSE, AL2.0 and LGPL2.1 notices are retained under its
+artifact-specific directory. See its LICENSE for the applicable license options.
+
+Sparkles' license and native Rust dependency notices remain at the root META-INF
+and are also retained under the Sparkles artifacts' individual directories.

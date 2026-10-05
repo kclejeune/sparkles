@@ -1,3 +1,5 @@
+// FunctionRegistry.get remains the common API of Jena 5 and 6; its replacement is 6-only.
+@file:Suppress("DEPRECATION")
 package io.github.kclejeune.sparkles.jena.engine
 
 import org.apache.jena.graph.Node
@@ -16,6 +18,7 @@ import org.apache.jena.sparql.expr.ExprVisitorFunction
 import org.apache.jena.sparql.expr.NodeValue
 import org.apache.jena.sparql.expr.aggregate.AggCustom
 import org.apache.jena.sparql.expr.aggregate.AggregateRegistry
+import org.apache.jena.sparql.expr.aggregate.lib.AggURI
 import org.apache.jena.sparql.function.FunctionRegistry
 import org.apache.jena.sparql.modify.request.UpdateDeleteWhere
 import org.apache.jena.sparql.modify.request.UpdateModify
@@ -27,6 +30,11 @@ import org.apache.jena.sparql.syntax.ElementFilter
 import org.apache.jena.sparql.syntax.ElementNamedGraph
 import org.apache.jena.sparql.syntax.ElementPathBlock
 import org.apache.jena.sparql.syntax.ElementSubQuery
+import org.apache.jena.sparql.syntax.ElementService
+import org.apache.jena.sparql.engine.main.StageBuilder
+import org.apache.jena.sparql.engine.main.QC
+import org.apache.jena.sparql.engine.main.OpExecutor
+import org.apache.jena.sparql.service.ServiceExecutorRegistry
 import org.apache.jena.sparql.syntax.ElementTriplesBlock
 import org.apache.jena.sparql.syntax.ElementVisitorBase
 import org.apache.jena.sparql.syntax.ElementWalker
@@ -49,8 +57,42 @@ private const val XSD = "http://www.w3.org/2001/XMLSchema#"
  * in Jena that Sparkles does not list. An IRI that both know runs in Sparkles.
  */
 internal object FallbackDetector {
+    private val functionsAtInit = HashMap<String, Any>()
+    private val propertiesAtInit = HashMap<String, Any>()
+    private val aggregatesAtInit = HashMap<String, Any>()
+    private var stageAtInit: Any? = null
+    private var executorAtInit: Any? = null
+    private var serviceSingles: List<Any> = emptyList()
+    private var serviceBulks: List<Any> = emptyList()
+
+    fun initialize() {
+        stageAtInit = StageBuilder.getGenerator()
+        executorAtInit = QC.getFactory(ARQ.getContext())
+        val f = FunctionRegistry.get()
+        f.keys().forEachRemaining { iri -> f.get(iri)?.let { functionsAtInit[iri] = it } }
+        val p = PropertyFunctionRegistry.get()
+        p.keys().forEachRemaining { iri -> p.get(iri)?.let { propertiesAtInit[iri] = it } }
+        // Jena exposes no iterator for its aggregate registry. These are the standard
+        // aggregate IRIs in its public AggURI vocabulary, including the legacy aliases.
+        for (iri in listOf(AggURI.stdev, AggURI.stdev_samp, AggURI.stdev_pop, AggURI.variance, AggURI.var_samp, AggURI.var_pop)) {
+            for (alias in listOf(iri, iri.replace("/aggregate", ""))) {
+                AggregateRegistry.getAccumulatorFactory(alias)?.let { aggregatesAtInit[alias] = it }
+            }
+        }
+        serviceSingles = ServiceExecutorRegistry.get().singleChain.toList()
+        serviceBulks = ServiceExecutorRegistry.get().bulkChain.toList()
+    }
+
+    private fun hooks(context: Context): String? {
+        val stage = StageBuilder.getGenerator(context)
+        if (stage != null && stage !== stageAtInit && stage !== StageBuilder.standardGenerator() && stage !== StageBuilder.executeInline) return "a custom ARQ stage generator"
+        val executor = QC.getFactory(context)
+        if (executor != null && executor !== executorAtInit && executor !== OpExecutor.stdFactory) return "a custom ARQ operator executor"
+        return null
+    }
     /** The reason the query must run in ARQ, or `null`. */
     fun check(query: Query, context: Context, known: Known): String? {
+        hooks(context)?.let { return it }
         if (query.isJsonType) return "the JSON query form"
         val w = Walk(context, known)
         w.query(query)
@@ -72,6 +114,7 @@ internal object FallbackDetector {
 
     /** The reason an update operation must run in ARQ, or `null`. */
     fun check(update: Update, context: Context, known: Known): String? {
+        hooks(context)?.let { return it }
         val w = Walk(context, known)
         when (update) {
             is UpdateModify -> update.wherePattern?.let(w::element)
@@ -106,6 +149,15 @@ internal object FallbackDetector {
                 override fun visit(el: ElementBind) = expr(el.expr)
                 override fun visit(el: ElementAssign) = expr(el.expr)
                 override fun visit(el: ElementSubQuery) = query(el.query)
+                override fun visit(el: ElementService) {
+                    val service = el.serviceNode
+                    val iri = if (service.isURI) service.uri else null
+                    val builtin = iri != null && iri == "urn:x-sparkles:path#search"
+                    val registry = ServiceExecutorRegistry.chooseRegistry(context)
+                    if (!builtin && (registry.singleChain != serviceSingles || registry.bulkChain != serviceBulks)) {
+                        reason = "a custom Java SERVICE executor"
+                    }
+                }
                 override fun visit(el: ElementNamedGraph) {
                     val g = el.graphNameNode
                     if (g != null && g.isURI && (g.uri == UNION || g.uri == DEFAULT)) specialGraph = true
@@ -123,7 +175,7 @@ internal object FallbackDetector {
         private fun predicate(p: Node) {
             if (reason != null || !p.isURI || !pfEnabled) return
             val iri = p.uri
-            if (pfs != null && pfs.isRegistered(iri) && iri !in known.propertyFunctions) {
+            if (pfs != null && pfs.isRegistered(iri) && (iri !in known.propertyFunctions || pfs.get(iri) !== propertiesAtInit[iri])) {
                 reason = "the property function <$iri> is registered in Jena and not in Sparkles"
             }
         }
@@ -137,7 +189,7 @@ internal object FallbackDetector {
             if (reason != null) return
             if (iri.startsWith("java:")) {
                 reason = "the function <$iri> is a Java class"
-            } else if (functions.isRegistered(iri) && iri !in known.functions && !iri.startsWith(XSD)) {
+            } else if (functions.isRegistered(iri) && ((iri !in known.functions && !iri.startsWith(XSD)) || (iri in known.functions && functions.get(iri) !== functionsAtInit[iri]))) {
                 reason = "the function <$iri> is registered in Jena and not in Sparkles"
             }
         }
@@ -160,7 +212,7 @@ internal object FallbackDetector {
                 val agg = eAgg.aggregator
                 if (agg is AggCustom) {
                     val iri = agg.iri
-                    if (reason == null && AggregateRegistry.isRegistered(iri) && iri !in known.aggregates) {
+                    if (reason == null && AggregateRegistry.isRegistered(iri) && (iri !in known.aggregates || AggregateRegistry.getAccumulatorFactory(iri) !== aggregatesAtInit[iri])) {
                         reason = "the aggregate <$iri> is registered in Jena and not in Sparkles"
                     }
                 }

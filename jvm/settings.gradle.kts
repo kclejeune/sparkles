@@ -20,3 +20,5 @@ rootProject.name = "sparkles-jvm"
 
 include("sparkles-jena")
 include("sample-java")
+
+include("sparkles-jena-natives", "sparkles-jena-all")

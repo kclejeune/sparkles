@@ -7,7 +7,7 @@ import io.github.kclejeune.sparkles.jena.internal.ffi.FfiWriteTxn
 import io.github.kclejeune.sparkles.jena.internal.toReceipt
 import org.apache.jena.graph.Node
 import org.apache.jena.graph.Triple
-import org.apache.jena.riot.system.StreamRDF
+import org.apache.jena.riot.system.StreamRDFBase
 import org.apache.jena.sparql.core.Quad
 
 /**
@@ -16,8 +16,10 @@ import org.apache.jena.sparql.core.Quad
  * It holds the dataset's writer lock from [start] to [finish], so the thread that feeds
  * it must not begin a write transaction on the dataset meanwhile.
  */
-public class SparklesBulkSink internal constructor(private val dsg: DatasetGraphSparkles) : StreamRDF, AutoCloseable {
+public class SparklesBulkSink internal constructor(internal val dsg: DatasetGraphSparkles) : StreamRDFBase(), AutoCloseable {
     private var write: FfiWriteTxn? = null
+    private var owner: Thread? = null
+    private var operation: SparklesOperation? = null
     private val writer = TermWriter()
     private var ops = 0
     private var finished = false
@@ -28,12 +30,27 @@ public class SparklesBulkSink internal constructor(private val dsg: DatasetGraph
         private set
 
     private fun txn(): FfiWriteTxn {
+        dsg.checkOpen()
         check(!finished) { "the bulk load has finished" }
         write?.let { return it }
-        val w = ffi { dsg.handle.ffi.beginWrite(null, false) }
-            ?: throw IllegalStateException("the write transaction did not start")
-        write = w
-        return w
+        dsg.checkNoTxn("bulkSink.start")
+        owner = dsg.handle.registerSink(this)
+        val control = SparklesOperation()
+        operation = control
+        try {
+            val w = ffi { dsg.handle.ffi.beginWriteWith(null, false, control.native) }
+                ?: throw IllegalStateException("the write transaction did not start")
+            if (finished || dsg.isClosed() || dsg.handle.closed) {
+                w.abort()
+                w.close()
+                throw IllegalStateException("the dataset closed while starting the bulk load")
+            }
+            write = w
+            return w
+        } catch (e: Throwable) {
+            releaseOwner()
+            throw e
+        }
     }
 
     override fun start() {
@@ -56,10 +73,10 @@ public class SparklesBulkSink internal constructor(private val dsg: DatasetGraph
         writer.term(o)
         ops++
         count++
-        if (ops >= BATCH) flush()
+        if (ops >= BATCH) flushPending()
     }
 
-    private fun flush() {
+    private fun flushPending() {
         if (ops == 0) return
         val bytes = writer.buf.toByteArray()
         writer.reset()
@@ -78,7 +95,7 @@ public class SparklesBulkSink internal constructor(private val dsg: DatasetGraph
     override fun finish() {
         val w = txn()
         try {
-            flush()
+            flushPending()
             val r = ffi { w.commit() }.toReceipt()
             receipt = r
             dsg.setLastReceipt(r)
@@ -86,6 +103,7 @@ public class SparklesBulkSink internal constructor(private val dsg: DatasetGraph
             finished = true
             w.close()
             write = null
+            releaseOwner()
         }
     }
 
@@ -94,14 +112,24 @@ public class SparklesBulkSink internal constructor(private val dsg: DatasetGraph
 
     /** Abort the load if it has not finished. */
     override fun close() {
-        val w = write ?: return
-        write = null
         finished = true
+        val w = write
+        write = null
+        operation?.cancel()
+        releaseOwner()
+        if (w == null) return
         try {
             w.abort()
         } finally {
             w.close()
         }
+    }
+
+    private fun releaseOwner() {
+        owner?.let { dsg.handle.releaseSink(it, this) }
+        owner = null
+        operation?.close()
+        operation = null
     }
 
     private companion object {

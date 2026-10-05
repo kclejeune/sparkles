@@ -1,5 +1,6 @@
 [versions]
 kotlin = "2.4.20"
+dokka = "2.2.0"
 # the Jena line the library compiles against; Jena 6 programs resolve to their own version
 jena = "5.6.0"
 jna = "5.19.1"
@@ -15,6 +16,8 @@ jena-arq = { module = "org.apache.jena:jena-arq", version.ref = "jena" }
 jena-core = { module = "org.apache.jena:jena-core", version.ref = "jena" }
 jena-base = { module = "org.apache.jena:jena-base", version.ref = "jena" }
 jena-tdb2 = { module = "org.apache.jena:jena-tdb2", version.ref = "jena" }
+jena-rdfconnection = { module = "org.apache.jena:jena-rdfconnection", version.ref = "jena" }
+jena-fuseki-main = { module = "org.apache.jena:jena-fuseki-main", version.ref = "jena" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 jspecify = { module = "org.jspecify:jspecify", version.ref = "jspecify" }
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
@@ -26,4 +29,5 @@ junit-vintage = { module = "org.junit.vintage:junit-vintage-engine" }
 junit4 = { module = "junit:junit", version.ref = "junit4" }
 
 [plugins]
+dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

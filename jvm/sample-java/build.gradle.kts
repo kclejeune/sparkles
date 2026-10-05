@@ -8,7 +8,7 @@ plugins {
 }
 
 java {
-    toolchain.languageVersion = JavaLanguageVersion.of(17)
+    toolchain.languageVersion = JavaLanguageVersion.of(providers.gradleProperty("sparkles.javaVersion").orElse("17").get().toInt())
 }
 
 dependencies {
@@ -21,7 +21,7 @@ dependencies {
 }
 
 tasks.withType<JavaCompile>().configureEach {
-    options.release = 17
+    options.release = providers.gradleProperty("sparkles.javaVersion").orElse("17").get().toInt()
     options.compilerArgs.addAll(listOf("-Xlint:all", "-Werror"))
 }
 
@@ -34,3 +34,5 @@ tasks.test {
     useJUnitPlatform()
     systemProperty("org.slf4j.simpleLogger.defaultLogLevel", "warn")
 }
+
+configurations.configureEach { resolutionStrategy.eachDependency { if (requested.group == "org.apache.jena" && providers.gradleProperty("sparkles.jenaVersion").isPresent) useVersion(providers.gradleProperty("sparkles.jenaVersion").get()) } }

@@ -138,11 +138,18 @@ impl FfiQuery {
         snap: Arc<Snapshot>,
         text: String,
         opts: &QueryOpts,
+        dataset: &sparkles::Dataset,
         labels: Labels,
         term_cache: usize,
     ) -> FfiResult<FfiQuery> {
         let cancel = Arc::new(AtomicBool::new(false));
+        let include_inferred = opts.include_inferred;
         let opts = opts.to_options(&labels, cancel.clone())?;
+        let mut applied = dataset.with_query_defaults(&opts).into_owned();
+        if !include_inferred {
+            applied.default_graph_extra.clear();
+        }
+        let opts = applied;
         Ok(FfiQuery {
             snap,
             text,

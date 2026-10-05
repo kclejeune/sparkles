@@ -24,11 +24,13 @@ import org.apache.jena.riot.system.PrefixMap
 import org.apache.jena.shared.AddDeniedException
 import org.apache.jena.shared.DeleteDeniedException
 import org.apache.jena.sparql.JenaTransactionException
-import org.apache.jena.sparql.core.DatasetGraphBaseFind
+import io.github.kclejeune.sparkles.jena.internal.DatasetGraphFindCompatibility
 import org.apache.jena.sparql.core.Quad
 import org.apache.jena.sparql.core.Transactional.Promote
 import org.apache.jena.sparql.util.Context
 import java.io.InputStream
+import java.io.OutputStream
+import io.github.kclejeune.sparkles.jena.internal.ffi.FfiReadTxn
 import java.nio.file.Path
 
 /**
@@ -44,7 +46,8 @@ public class DatasetGraphSparkles internal constructor(
     internal val handle: Handle,
     /** the options this dataset was opened with */
     public val options: SparklesOptions,
-) : DatasetGraphBaseFind(), AutoCloseable {
+    private val pinned: FfiReadTxn? = null,
+) : DatasetGraphFindCompatibility(), AutoCloseable {
     @Volatile
     private var closed = false
 
@@ -64,6 +67,7 @@ public class DatasetGraphSparkles internal constructor(
     /** What reads run on for this thread: its transaction, or the head snapshot. */
     internal fun source(): Source {
         checkOpen()
+        pinned?.let { return Source.Read(it) }
         val t = txn() ?: return Source.Head(handle.ffi)
         val w = t.write
         if (w != null) {
@@ -89,14 +93,9 @@ public class DatasetGraphSparkles internal constructor(
     override fun findNG(g: Node?, s: Node?, p: Node?, o: Node?): MutableIterator<Quad> =
         if (isWildcard(g)) findQuads(null, s, p, o, namedOnly = true) else findQuads(g, s, p, o, namedOnly = false)
 
-    override fun findInDftGraph(s: Node?, p: Node?, o: Node?): MutableIterator<Quad> =
-        findQuads(Quad.defaultGraphIRI, s, p, o, namedOnly = false)
-
-    override fun findInSpecificNamedGraph(g: Node, s: Node?, p: Node?, o: Node?): MutableIterator<Quad> =
-        findQuads(g, s, p, o, namedOnly = false)
-
-    override fun findInAnyNamedGraphs(s: Node?, p: Node?, o: Node?): MutableIterator<Quad> =
-        findQuads(null, s, p, o, namedOnly = true)
+    override fun findInDftGraph(s: Node?, p: Node?, o: Node?): MutableIterator<Quad> = findQuads(Quad.defaultGraphIRI, s, p, o, namedOnly = false)
+    override fun findInSpecificNamedGraph(g: Node, s: Node?, p: Node?, o: Node?): MutableIterator<Quad> = findQuads(g, s, p, o, namedOnly = false)
+    override fun findInAnyNamedGraphs(s: Node?, p: Node?, o: Node?): MutableIterator<Quad> = findQuads(null, s, p, o, namedOnly = true)
 
     override fun contains(g: Node?, s: Node?, p: Node?, o: Node?): Boolean =
         source().contains(encodePattern(g, s, p, o))
@@ -235,7 +234,9 @@ public class DatasetGraphSparkles internal constructor(
 
     override fun begin(type: TxnType) {
         checkOpen()
+        handle.checkNoSink()
         if (txn() != null) throw JenaTransactionException("Currently in an active transaction")
+        if (type != TxnType.READ && pinned != null) throw JenaTransactionException("historical views are read-only")
         val t = TxnState(handle, type)
         if (type == TxnType.WRITE) {
             val w = ffi { handle.ffi.beginWrite(null, true) }
@@ -244,7 +245,7 @@ public class DatasetGraphSparkles internal constructor(
             t.baseSeq = w.baseSeq().toLong()
             handle.openWrites.add(t)
         } else {
-            val r = ffi { handle.ffi.beginRead() }
+            val r = pinned?.fork() ?: ffi { handle.ffi.beginRead() }
             t.read = r
             t.baseSeq = r.commitSeq().toLong()
         }
@@ -345,12 +346,19 @@ public class DatasetGraphSparkles internal constructor(
         return ffi { handle.ffi.datasetId() }
     }
 
-    private fun checkNoTxn(what: String) {
+    internal fun checkNoTxn(what: String) {
         checkOpen()
+        handle.checkNoSink()
         if (txn() != null) {
             throw JenaTransactionException("$what runs outside a transaction, and this thread is in one")
         }
-        if (options.readOnly) throw SparklesNotPermittedException("NotPermitted", "the dataset was opened read-only")
+        if (options.readOnly || pinned != null) throw SparklesNotPermittedException("NotPermitted", "the dataset was opened read-only")
+    }
+
+    internal fun checkCapture(what: String) {
+        checkOpen()
+        handle.checkNoSink()
+        if (txn() != null || pinned != null) throw JenaTransactionException("$what runs outside a transaction on the live dataset")
     }
 
     /** Bulk-load files in one commit. Each file's format comes from its extension (`.ttl`, `.nq.gz`, …). */
@@ -389,6 +397,76 @@ public class DatasetGraphSparkles internal constructor(
 
     internal fun setLastReceipt(r: CommitReceipt) = handle.lastReceipt.set(r)
 
+    /** A read-only dataset pinned to the selected commit. */
+    public fun at(reference: String): DatasetGraphSparkles {
+        checkOpen()
+        val read = ffi { handle.ffi.beginReadAt(reference) }
+        handle.refs.incrementAndGet()
+        return DatasetGraphSparkles(handle, options.toBuilder().readOnly(true).build(), read)
+    }
+
+    public fun at(commit: Long): DatasetGraphSparkles {
+        require(commit >= 0) { "commit must be nonnegative" }
+        return at("commit:$commit")
+    }
+
+    internal fun isPinned(): Boolean = pinned != null
+    internal fun pinnedReference(): String? = pinned?.let { "commit:${ffi { it.commitSeq() }}" }
+
+    public fun snapshots(): SparklesSnapshots = SparklesSnapshots(this)
+    public fun history(): SparklesHistory = SparklesHistory(this)
+    public fun settings(): SparklesSettings = SparklesSettings(this)
+    public fun indexes(): SparklesIndexes = SparklesIndexes(this)
+    public fun reasoning(): SparklesReasoning = SparklesReasoning(this)
+    public fun validation(): SparklesValidation = SparklesValidation(this)
+    public fun backups(repository: SparklesBackupRepository): SparklesBackups = SparklesBackups(this, repository)
+    public fun queries(): SparklesQueries = SparklesQueries(this)
+    public fun schema(): SparklesSchema = SparklesSchema(this)
+    public fun graphql(): SparklesGraphQl = SparklesGraphQl(this)
+
+    /** Serialize one committed snapshot with bounded native byte batches. */
+    public fun dump(output: OutputStream, lang: Lang) {
+        checkOpen()
+        if (txn() != null) throw JenaTransactionException("dump runs outside a transaction")
+        val read = pinned?.fork() ?: ffi { handle.ffi.beginRead() }
+        read.use { r ->
+            ffi { r.dumpCursor(lang.contentType.contentTypeStr) }.use { cursor ->
+                SparklesOperation().use { operation ->
+                    try {
+                        do {
+                            checkOpen()
+                            val batch = ffi { cursor.nextChunk(65536u, operation.native) }
+                            output.write(batch.batch)
+                        } while (!batch.done)
+                    } finally { cursor.release() }
+                }
+            }
+        }
+    }
+
+    public fun dump(path: Path) {
+        checkOpen()
+        if (txn() != null) throw JenaTransactionException("dump runs outside a transaction")
+        val lang = org.apache.jena.riot.RDFLanguages.filenameToLang(path.toString())
+            ?: throw IllegalArgumentException("unknown RDF format: $path")
+        java.nio.file.Files.newOutputStream(path).use { dump(it, lang) }
+    }
+
+    public fun compact(): Unit = SparklesOperation().use { compact(it) }
+    public fun compact(operation: SparklesOperation) {
+        checkNoTxn("compact")
+        ffi { handle.ffi.compact(operation.native) }
+    }
+    public fun cloneTo(path: Path): Unit = SparklesOperation().use { cloneTo(path, it) }
+    public fun cloneTo(path: Path, operation: SparklesOperation) {
+        checkCapture("cloneTo")
+        ffi { handle.ffi.cloneTo(path.toAbsolutePath().toString(), operation.native) }
+    }
+    public fun backup(path: Path): Path {
+        checkCapture("backup")
+        return Path.of(ffi { handle.ffi.backup(path.toAbsolutePath().toString()) })
+    }
+
     /** Counts of the queries and updates that ran in Sparkles and in ARQ. */
     public fun stats(): DatasetStats = DatasetStats(
         handle.nativeQueries.get(),
@@ -403,11 +481,21 @@ public class DatasetGraphSparkles internal constructor(
      */
     override fun close() {
         if (closed) return
+        handle.closeSinksFor(this)
+        pinned?.close()
         closed = true
         Registry.release(handle)
     }
 
     public fun isClosed(): Boolean = closed
+    public fun branches(): SparklesBranches = SparklesBranches(this)
+    public fun branch(name: String): DatasetGraphSparkles {
+        checkCapture("branch")
+        require(pinned == null) { "branch opens operate on the live dataset" }
+        handle.checkNoSink()
+        Registry.checkNoTransactionsForDataset(handle.ownerDatasetId)
+        return DatasetGraphSparkles(Registry.fromNative(ffi { handle.ffi.branch(name) }, options), options)
+    }
 
     override fun toString(): String = "DatasetGraphSparkles(${handle.key ?: "memory"})"
 }

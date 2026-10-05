@@ -7,8 +7,34 @@
 
 uniffi::setup_scaffolding!();
 
+mod admin;
 pub mod encode;
 mod error;
+mod patch;
+pub use patch::PatchReport;
+mod advanced;
+mod backups;
+mod branches;
+mod catalog;
+mod documents;
+mod history;
+mod settings;
+pub use admin::{
+    DescribeSettings, FfiDump, FfiOperation, OperationProgress, SnapshotInfo, TextInfo,
+    TextSettings,
+};
+pub use advanced::{
+    GeoInfo, GeoSettings, GuardInfo, GuardSettings, ReasonInfo, ReasonSettings, ShaclReport,
+    ShaclResult, ShexReport, ShexResult, VectorInfo, VectorSettings,
+};
+pub use backups::{
+    BackupInfo, BackupVerification, FfiBackupRepository, GcInfo, LockInfo, RepositoryTest,
+    VerifyInfo,
+};
+pub use branches::{BranchInfo, ConflictCell, MergeInfo, MergeSettings};
+pub use catalog::{CatalogFile, DatasetInfo, FfiCatalog, FfiReservation, catalog_inspect};
+pub use documents::{BoundQuery, QueryChange, SchemaRequest};
+pub use settings::{CompactionSettings, QuotaInfo, RetentionSettings, SnapshotSchedule};
 mod labels;
 mod query;
 mod read;
@@ -213,6 +239,17 @@ impl FfiDataset {
     pub fn dataset_id(&self) -> String {
         self.inner.ds.dataset_id().to_string()
     }
+    pub fn owner_dataset_id(&self) -> String {
+        self.inner.ds.store().owner_dataset_id().to_string()
+    }
+    /// The native store's directory, for sharing ownership across path and catalog opens.
+    pub fn directory(&self) -> Option<String> {
+        self.inner
+            .ds
+            .store()
+            .root()
+            .map(|p| p.display().to_string())
+    }
 
     /// The commit of the head snapshot, read without the writer lock.
     pub fn head_commit(&self) -> CommitInfo {
@@ -255,8 +292,23 @@ impl FfiDataset {
         expect_commit: Option<u64>,
         record_labels: bool,
     ) -> FfiResult<Option<Arc<FfiWriteTxn>>> {
+        self.begin_write_with(expect_commit, record_labels, FfiOperation::new(None))
+    }
+
+    /// Begin a writer with cancellation and a deadline while waiting for the lock.
+    pub fn begin_write_with(
+        &self,
+        expect_commit: Option<u64>,
+        record_labels: bool,
+        operation: Arc<FfiOperation>,
+    ) -> FfiResult<Option<Arc<FfiWriteTxn>>> {
         self.inner.check_writable()?;
-        let Some(worker) = TxnWorker::begin(&self.inner.ds, expect_commit)? else {
+        let opts = sparkles::guard::WriteOptions {
+            cancel: Some(operation.control.cancel.flag()),
+            deadline: operation.control.deadline,
+            ..Default::default()
+        };
+        let Some(worker) = TxnWorker::begin_with(&self.inner.ds, expect_commit, opts)? else {
             return Ok(None);
         };
         Ok(Some(Arc::new(FfiWriteTxn {
@@ -301,6 +353,7 @@ impl FfiDataset {
             self.head(),
             text,
             &options,
+            &self.inner.ds,
             self.inner.labels(),
             self.inner.term_cache(),
         )?))
@@ -363,6 +416,16 @@ pub fn capabilities() -> Capabilities {
     if cfg!(feature = "geo") {
         features.push("geo".to_string());
     }
+    for (enabled, name) in [
+        (cfg!(feature = "reasoning"), "reasoning"),
+        (cfg!(feature = "shacl"), "shacl"),
+        (cfg!(feature = "shex"), "shex"),
+        (cfg!(feature = "backup"), "backup"),
+    ] {
+        if enabled {
+            features.push(name.into());
+        }
+    }
     Capabilities {
         functions: catalog::extension_functions(),
         aggregates: catalog::extension_aggregates(),
@@ -420,6 +483,7 @@ impl FfiReadTxn {
             self.snap.clone(),
             text,
             &options,
+            &self.ds.ds,
             self.ds.labels(),
             self.ds.term_cache(),
         )?))
@@ -674,6 +738,7 @@ impl FfiWriteTxn {
             snap,
             text,
             &options,
+            &self.ds.ds,
             self.labels(),
             self.ds.term_cache(),
         )?))
