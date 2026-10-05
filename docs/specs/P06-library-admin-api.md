@@ -1,33 +1,26 @@
 # P06: Library administration API and parity
 
-> **Status:** implemented in part (steps 1 to 5 and 7 of Phase 1)
+> **Status:** Phases 1, 2 and 3 implemented.
 >
-> **Phases:** Steps 1 to 5 and 7 of Phase 1 (§8.1) shipped. The engine is the
-> `sparkles-core` package in `crates/sparkles-core`, and `crates/sparkles` is the
-> `sparkles` facade over it. `sparkles::task::Control` carries cancellation, progress and a deadline, and the
-> server's tasks build one from each task. `Dataset::open` sets a dataset up as the
-> server does, with its write guard, RDFS on read, stored queries, GraphQL configuration,
-> reasoning record and clone origin, and the server's datasets hold a `sparkles::Dataset`.
-> `Dataset` has handles for snapshots, history, indexes, settings, schema, stored
-> queries, reasoning, validation, GraphQL and backups, and `Error::code()` names each
-> error. The server's handlers call those handles for the history, the indexes, the
-> settings, the schema, the stored queries, reasoning, the write guard, GraphQL, the
-> statistics and the stateless validators (step 5). `Dataset` holds the dataset's query
-> defaults, RDFS on read, the inferred graph and DESCRIBE, and every library query, the
-> local `sparkles query` and the server start from them. The parity test of §7.1 maps
-> every operation, with 16 marked pending, all for step 6. The local commands `quota`,
-> `queries`, `compaction`, `describe-settings`, `validation`, `geo-index` and `vector`
-> open a `Dataset` and call its handles (step 7), and `clone` waits for the catalog. The
-> rest of Phase 1 adds the `Catalog` (step 6), moves `clone` and makes the parity test
-> strict (step 8). Phase 2 closes the Python bindings' gaps, and Phase 3 adds dataset
-> renames and catalog commands. None of these is built.
+> **Phases:** The `sparkles` facade exposes `Dataset`, its administration handles and
+> `Catalog`. The server uses the catalog for dataset registration and reservations,
+> and the library owns cloning, backup capture, restore download and publication,
+> repository persistence, policy execution and retention. Branches remain under each
+> dataset and share lazily opened library state. The parity test maps every OpenAPI
+> operation to a checked library call or an explicit server-only reason. `bindings.toml`
+> records the shipped Python and JVM names and planned phases for missing bindings;
+> the Python parity test resolves every concrete name through the extension stub and
+> native module. Python exposes property handles, backups, GraphQL and branches.
+> Dataset rename is available through HTTP, and the dataset CLI supports stopped
+> catalogs and running servers. Startup measurements retain eager catalog opening.
 >
 > **User docs:** the "Embedding the library" section of [USAGE](../USAGE.md) describes
 > what `Dataset::open` sets up, the handles and the query defaults with their override
 > rule. Its "Stored queries" section and its notes on the local tools say that
 > `sparkles queries run` and `sparkles query --loc` follow the dataset's RDFS on read,
-> materialized inferences and DESCRIBE setting. The HTTP API, the other commands and the
-> file formats have not changed.
+> materialized inferences and DESCRIBE setting. The Python guide documents the new
+> handles, and the API guide documents dataset rename. Existing file formats are
+> unchanged.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end records how it lands.
@@ -1346,7 +1339,7 @@ and the wheel measurements.
   fills `seen` with fractions that never decrease, and `cat.restore(repo, name, name="copy")` gives a
   dataset whose `len` equals the source's.
 * **A15.** In Python, with a GraphQL configuration set from `ds.graphql.draft()`,
-  `ds.graphql.execute("{ persons { name } }")` returns the same `data` as `POST
+  `ds.graphql.execute("{ allPerson { nodes { name } } }")` returns the same `data` as `POST
   /{ds}/graphql` with that query.
 * **A16.** Changing the `python` value of `schema.diff` in `bindings.toml` to
   `Dataset.schema.difference` fails `test_parity.py` with the message of §7.2.
@@ -1444,9 +1437,9 @@ and the wheel measurements.
 
 ## Outcome
 
-Phase 1 is in progress. Steps 1 to 5 and step 7 have shipped, and the notes below
-record where they depart from the design. Step 7 leaves `sparkles clone` for after
-step 6.
+Phases 1, 2 and 3 are implemented. The notes below record the implementation
+decisions and measurements. The catalog, Python handles, dataset CLI and HTTP rename
+are available. Catalog opening remains eager after the startup measurements below.
 
 ### Implementation notes
 
@@ -1666,3 +1659,105 @@ the fix of the library's query defaults that came with it.
 * **The facade has new dependencies.** `base64` encodes the schema cursors, whose form
   did not change, and `oxiri` and `oxilangtag` serve `sparkles::terms`. The lock files
   of `crates/sparkles-py` and `crates/sparkles-ffi` list them.
+
+### Phase 1 steps 6 and 8
+
+`Catalog` owns the dataset registry and holds `catalog.lock` before opening stores or
+recovering unfinished work. `inspect` reads the registry without store locks. Store
+and catalog lock conflicts now return the structured `Error::Locked`; the Python
+binding maps it to `DatasetLockedError` without inspecting an error message.
+
+The catalog namespace contains datasets only. `Dataset::branch` keeps branch state
+in a lazy library cache, preserving the parent's store options and closure-cache size.
+The server retains HTTP routing objects, offline flags and validation observers, while
+the library owns the underlying dataset objects and registry mutations.
+
+Cloning records origin and rebases reasoning through the library. Backup capture
+preserves reasoning at the captured commit and in-memory validation files. Restore
+publication retains the two-rename rollback and startup-recovery behavior. HTTP
+request draining and cancellation admission stay in the server around catalog calls.
+The library policy engine accepts server effects for admission, active-backup claims,
+clock and GC scheduling, so the server's scheduler history and task limits remain local.
+
+The strict parity test has no pending entries. `EXTRA_KEYS` covers library-only calls,
+and `bindings.toml` must contain exactly that union with three nonempty binding
+columns. The Python parity test follows handle return annotations when resolving
+dotted names and checks the native members. The Python column has no planned entries;
+only the formatter and linter are exempt. The flat administration methods have been
+replaced with native property handles.
+
+
+### Phase 2: native Python handles
+
+The Python package exposes native PyO3 handles for the catalog, snapshots, history,
+settings, indexes, schema, stored queries, reasoning, validation, GraphQL and backups.
+Branches remain under each dataset. Branch operations include previews, merges,
+reverts, cherry-picks, protection, rename and merge-exempt predicates. No aliases remain
+for the former flat administration names. Stubs and examples use the new surface;
+Python parity requires the stub and native members and refuses planned entries.
+
+Handles retain their Python dataset owner, so closing it invalidates every handle
+without keeping another Rust store view alive. Catalog contexts track opened dataset
+and branch views with weak references and close them, along with reservations. Dataset
+aliases share the writer ownership marker to preserve the transaction deadlock check.
+Commits, snapshots, backup records and change pages are immutable; history commits also
+carry annotations. JSON reports use camelCase dictionaries.
+
+Controlled calls release the GIL, check Python signals, throttle progress callbacks at
+100 ms and always deliver completion. A callback exception cancels work, waits for the
+worker and raises the original exception. GraphQL and file-system/S3 backups are enabled
+in standard wheels; source builds can disable them. Backup errors retain their code and
+catalog lock errors are subclasses of dataset lock errors.
+
+### Phase 3: dataset management and startup
+
+`POST /$/datasets/{ds}/rename` preserves dataset identity and needs server
+administration. It refuses configured grants or active minted token scopes covering
+either name, including wildcard and restricted dataset grants, and lists the blockers.
+It also refuses live views and reservations, preserves the offline state and refreshes
+routing and metric labels. The OpenAPI description includes this operation.
+
+`sparkles dataset list|create|delete|rename|clone --data-dir` manages a stopped catalog.
+The same commands accept `--server` and the existing remote-client credentials. Remote
+clones wait for the task; both targets support JSON output. Integration tests use the
+real CLI binary and a temporary running server.
+
+Eager opening remains the default, preserving startup failure for corrupt datasets.
+A local release-wheel benchmark used generated compacted persistent datasets, measured
+one first open and five repeated opens, and closed every catalog between measurements.
+The first measurement still had a warm filesystem cache after generation.
+
+| Datasets | Quads per dataset | First open | Median repeated open | Maximum repeated open |
+|---|---:|---:|---:|---:|
+| 1 | 1,000 | 2.24 ms | 1.50 ms | 1.82 ms |
+| 10 | 1,000 | 14.69 ms | 12.25 ms | 14.20 ms |
+| 100 | 1,000 | 123.66 ms | 87.47 ms | 95.37 ms |
+| 10 | 100,000 | 393.13 ms | 383.49 ms | 434.28 ms |
+
+These measurements do not justify adding lazy opening and deferring corruption errors
+to the first request. They measure this host and cached files, rather than cold storage
+or catalogs with thousands of large datasets. An optional lazy mode would need
+measurements of those workloads, including first-query latency and memory use.
+
+### Wheel size
+
+Both measurements used maturin 1.15.0, `--release --locked`, the same Rust release
+profile (thin LTO, four codegen units), and the cp310 abi3 manylinux_2_38 x86_64 wheel.
+The earlier wheel used the former default features; the completed wheel adds backup
+with file-system and S3 support, GraphQL, the native handles, stubs and license notices.
+
+| Artifact | Before | After | Change |
+|---|---:|---:|---:|
+| Compressed wheel | 13,842,818 bytes | 19,475,496 bytes | +40.7% |
+| Native extension | 32,780,192 bytes | 47,492,968 bytes | +44.9% |
+
+The larger default wheel is the expected cost of the requested AWS client and GraphQL
+support. GCS and Azure remain source-build choices.
+
+### Verification
+
+The completed phases pass the full CI tasks, including 2,709 Rust tests, 124 Python
+tests, 342 UI tests, JVM tests, feature checks, formatting, lint and license checks.
+Nix checks pass on x86_64 Linux, including 177 packaged Python tests, 34 browser tests,
+Jena clients and the NixOS VM tests. W3C, SHACL and ShEx conformance runs pass with
+their existing documented exclusions. The checked-in OpenAPI description is current.

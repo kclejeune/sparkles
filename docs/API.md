@@ -564,6 +564,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | POST   | `/$/datasets`                | Creates a dataset. The form or JSON body has `dbName`, `dbType` = `persistent` \| `mem`, and optionally `geo` and `text`. Fuseki's `dbType` values `tdb2` and `tdb` mean `persistent`, and `dbName` and `dbType` may also be query parameters. `geo` = `true` adds a spatial index with the defaults, and `text` = `true` enables full-text search with the defaults. In a JSON body `geo` can also be a `GeoConfig` (see [GeoSPARQL](#geosparql)) and `text` a `TextConfig` (see [Full-text search](#full-text-search)). An invalid one is a `400` and creates no dataset, and a build without the `geo` or `text` feature returns `501`. A body in an RDF syntax is a Fuseki service description; see [Assembler bodies](#assembler-bodies). `201` on success, `409` if the dataset exists. |
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | POST   | `/$/datasets/{ds}?state=offline\|active` | Fuseki's dataset state. An offline dataset answers `503 {code: "dataset-offline"}` on its own endpoints (`/{ds}/…`) and keeps its admin routes. The state is not persisted, so a restart brings every dataset back. `400` without `state` or for another value. Needs `admin` on the dataset. |
+| POST   | `/$/datasets/{ds}/rename`    | JSON `{ "name": "new-name" }`. Preserves identity and data; `200` with `{ "name", "renamedFrom" }` and `Location`. Requires server administration. `400` for invalid names, `404` for a missing source, `409` for an existing target, live views, reservations, or grants covering either name. The conflict identifies the blocking grants, including wildcard patterns and active minted token scopes. |
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset, or some of its graphs, into a new persistent or in-memory dataset. Returns `202` with a `Task`. See [Clone](#clone). |
 | GET/POST | `/$/stats/{ds}`            | `DatasetStats`, which includes Fuseki's request counters in `datasets`. |
@@ -6182,7 +6183,7 @@ drafted shapes are shown:
 | `sparkles schema --draft-shapes` | `--format shaclc` |
 | MCP `validate_shacl` | `shapesFormat: "shaclc"` |
 | MCP `draft_shapes` | `shapesFormat: "shaclc"` |
-| Python `Dataset.validate_shacl` | `format="shaclc"` |
+| Python `Dataset.validation.shacl` | `format="shaclc"` |
 
 ```
 PREFIX ex: <http://example.com/ns#>

@@ -1783,7 +1783,7 @@ caller who may read the dataset, which a `queryText: false` index refuses.
 The next server start, or `sparkles vector embed --loc db`, catches their writes up, and
 sends nothing for text that was already embedded. The local commands use the local
 outbound policy, which allows private addresses, and take `--embedding-secret` for keys
-named by a secret. The Python package does the same with `Dataset.embed()`.
+named by a secret. The Python package does the same with `Dataset.indexes.vector.embed_until_idle()`.
 
 ## Checking a database
 
@@ -1986,9 +1986,11 @@ flags and the transport details.
 
 ## Embedding the library
 
-`crates/sparkles` is a plain Rust library. The CLI (everything except `serve`) and the
-server are built on it, so anything they do can be done in-process. A database
-directory is locked while it is open, with `sparkles.lock`, like TDB2's `tdb.lock`.
+`sparkles::Dataset` opens one database, and `sparkles::Catalog` manages named datasets
+in the server's data-directory layout. Queries, transactions and administration run
+in-process through the same library calls that the server uses. HTTP authentication,
+routing, task admission and scheduling belong to the server. A database directory
+holds `sparkles.lock` while it is open, like TDB2's `tdb.lock`.
 
 ```rust
 use sparkles::{Dataset, io::RdfFormat};
@@ -2096,15 +2098,82 @@ The handles that need another crate sit behind the `sparkles` crate's Cargo feat
 `reasoning`, `shacl`, `shex`, `graphql`, `backup` and `fmt` turn on the reasoner's
 calls, the validators, the GraphQL configuration, `ds.backups(&repo)` with
 `sparkles::backup`, and `sparkles::fmt`. The feature `full` turns on what the server
-has. The default is empty. The operations on the catalog of datasets, backup creation,
-restores and the registry of backup repositories have no library call yet.
-[Spec P06](specs/P06-library-admin-api.md) lists what is still to come.
+has. The default is empty. `ds.backups(&repo).create_with` captures a consistent state,
+including its reasoning record and validation configuration, and uploads it to the
+repository. `Catalog::restore` downloads and verifies a backup, then registers a new
+dataset or replaces an existing managed persistent dataset. A failed replacement
+reopens the original database. Live dataset or branch handles must be released before
+an in-place restore can close that store.
 `sparkles::terms` checks IRIs and language tags, and `sparkles::io::check_data` finds
 the first syntax error of RDF data, as the server's validators do.
+
+A catalog preserves the server's `config.json`, `databases/`, `backups/` and
+`backup/` layout. `Catalog::open` takes an exclusive `catalog.lock` before recovery or
+opening stores. A second opener returns `Error::Locked { path, pid }`. Every cloned
+catalog handle shares this lock. Keep data directories on a local disk.
+`Catalog::inspect` reads the registry without locking or opening databases, so it can
+list a running server's persistent datasets. Memory datasets report a nil UUID in this
+inspection because their identity is not persisted.
+
+```rust
+use sparkles::Catalog;
+use sparkles::catalog::{Attach, CloneRequest, CreateDataset};
+use sparkles::task::Control;
+
+let catalog = Catalog::open("server-data", Default::default())?;
+let ds = catalog.create("wiki", &CreateDataset::default())?;
+ds.update("INSERT DATA { <urn:page> <urn:title> \"Home\" }")?;
+let info = catalog.info("wiki").unwrap();
+assert_eq!(catalog.get_by_id(info.id).unwrap().dataset_id(), ds.dataset_id());
+let sandbox = catalog.clone_dataset("wiki", "sandbox", &CloneRequest::default(), &Control::none())?;
+catalog.attach("scratch", Attach::Memory)?;       // omitted from config.json
+let branches = ds.branches()?;                    // branches belong to their dataset
+ds.create_branch("dev", &Default::default())?;
+let dev = ds.branch("dev")?;
+drop((ds, sandbox, dev));                         // release handles before a rename
+let renamed = catalog.rename("wiki", "pages")?;  // UUID and commit IRIs stay valid
+```
+
+`Catalog::memory` has no registry directory and accepts memory or attached datasets.
+`attach` opens an external directory or a temporary memory dataset without registering
+it on disk. A reservation holds a target name during a clone or restore and releases
+it on drop. Dataset names use 1 to 64 ASCII letters, digits, `_`, `-` and `.`, cannot
+start with `.`, and cannot be `ui` or `$`. A persistent rename refuses live handles,
+then closes the store, moves its directory and updates the registry.
+
+With feature `backup`, `catalog.repositories()` manages `backup/repositories.json`.
+Its `list`, `get`, `add`, `update`, `remove` and `open` calls share configuration and
+opened repository handles. `with_fixed` adds immutable operator-defined entries to
+the same namespace. `catalog.run_policy` backs up the datasets selected by a
+`PolicyConfig` and applies retention. `catalog.apply_retention` can preview deletions
+with `dry_run: true`. Embedders decide when to call these operations.
+
+The checked-in [binding surface](../crates/sparkles/bindings.toml) records each call's
+Python, JVM and Node name or planned phase. Tests require a decision for every OpenAPI
+library operation and require Python names to resolve in both the extension stub and native module.
+[Spec P06](specs/P06-library-admin-api.md) describes the remaining binding phases.
 
 `Dataset::store()` and the `store`, `index` and `builder` modules give lower-level
 access: ids, snapshots, raw index scans and the bulk `Builder`. `mise run doc` builds
 the API documentation of the library crates.
+
+A stopped server's catalog can also be managed with the dataset CLI:
+
+```sh
+sparkles dataset list --data-dir server-data
+sparkles dataset create wiki --data-dir server-data
+sparkles dataset clone wiki sandbox --data-dir server-data --at snapshot:before
+sparkles dataset rename sandbox review --data-dir server-data
+sparkles dataset delete review --data-dir server-data
+sparkles dataset list --server http://localhost:3030 --json
+```
+
+Every dataset command also accepts `--server` for a running server and uses the saved
+login or `SPARKLES_TOKEN`. Remote clones wait for the clone task. Renames preserve the
+dataset identity and require server administration. They refuse live requests,
+reservations, and grants or active token scopes covering the old or new name, with the
+grants named in the error. `--data-dir` takes the catalog lock and requires a stopped
+server.
 
 ## Python
 
@@ -2276,40 +2345,89 @@ blank node that a query makes, such as with `BNODE()`, has a label like `_:q0`. 
 stored, so a later pattern finds nothing for it and a query binding takes it for a new
 node.
 
+### Catalog and administration handles
+
+`Catalog` owns a registry of datasets; branches belong to each dataset. A context closes
+all dataset views it opened, including branch views. `Dataset.close()` also invalidates
+its administration handles. Closing a standalone main view leaves its branch views open.
+A rename or deletion refuses while a dataset view remains open; close the views first.
+
+```python
+from sparkles import Catalog, BackupRepository
+
+with Catalog("server-data") as cat:
+    ds = cat.create("wiki", kind="persistent")
+    ds.load('@prefix ex: <http://ex.org/> . ex:ann a ex:Person; ex:name "Ann" .', "turtle")
+    ds.snapshots.create("before")
+    ds.schema.report()                             # camelCase report dict
+    ds.schema.profiles(classes=["http://ex.org/Person"])
+    ds.queries.put("names", "SELECT ?name WHERE {?s <http://ex.org/name> ?name}")
+    rows = list(ds.queries.run("names"))            # QuerySolutions, as for query()
+    draft = ds.graphql.draft()
+    ds.graphql.config.set({"sdl": draft["sdl"]})
+    ds.graphql.execute("{ allPerson { nodes { name } } }")
+    ds.branches.create("work")
+    work = ds.branch("work")
+    ds.branches.preview_merge("work")
+    repo = BackupRepository.open("file:///srv/backups")
+    backup = ds.backups(repo).create(progress=lambda fraction, message: print(fraction, message))
+    copy = cat.restore(repo, backup.name, name="copy")
+```
+
+`Catalog.inspect(path)` lists a registry without taking its lock. `get(name)` and
+`info(name)` return `None` for a missing dataset; `cat[name]` raises `KeyError`.
+`Catalog.memory()` manages temporary datasets. `attach` opens an external dataset;
+`clone_dataset` copies into another catalog name with a new identity. Repository
+configuration lives on `cat.repositories`, and backup schedules can be run with
+`cat.run_policy` or previewed with `sparkles.preview_schedule`.
+
+History diffs iterate over `(op, Quad)` pairs, where `op` is `"+"` or `"-"`.
+`history.changes(after)` returns a frozen page of commit changes; each commit change
+also iterates over those pairs. Snapshots, commits and backup records are immutable.
+`settings` groups compaction, DESCRIBE, quota, retention and change-log settings;
+`reasoning` groups materialization, status, diagnostics and RDFS configuration;
+`validation` groups SHACL, ShEx and write guards. `indexes.geo` controls spatial indexing.
+The flat administration methods have been replaced by these handles.
+
+Long administration operations accept `cancel`, `progress` and `timeout`. Callbacks
+receive a fraction and a message; reports are throttled to one per 100 ms, with the
+completion report always delivered. A callback exception cancels the worker and is
+raised after it stops. Ctrl-C cancels work as it does for queries.
+
 ### History, snapshots and clones
 
 ```python
 ds.head_commit                                     # Commit(seq, kind, inserted, deleted, quads, timestamp)
-ds.commits(10)                                     # the latest ten, newest first
-ds.create_snapshot("before-cleanup", note="…")     # keeps the head readable under a name
+ds.history.commits(10)                                     # the latest ten, newest first
+ds.snapshots.create("before-cleanup", note="…")     # keeps the head readable under a name
 ds.query(q, at="snapshot:before-cleanup")          # also at=42, "commit:42" or "time:<RFC 3339>"
-ds.set_retention(keep_commits=100, keep_age=86400) # keep recent states readable
-ds.history()                                       # the readable ranges, retention and snapshots
+ds.settings.retention.set(keep_commits=100, keep_age=86400) # keep recent states readable
+ds.history.status()                                       # the readable ranges, retention and snapshots
 ds.clone_to("copy-db", at="snapshot:before-cleanup")
 ```
 
 A past state is readable while a snapshot or the retention window holds it. Reading one
 that is gone raises `NotFoundError`. An in-memory dataset keeps the states its snapshots
 and window hold. `clone_to` writes a new database directory with its own dataset id and
-can leave graphs out with `exclude_graphs`.
+selects graphs with `graphs=["default", "http://ex.org/graph"]`.
 
 ### Search indexes and write-time validation
 
 ```python
-ds.enable_text({"predicates": ["http://www.w3.org/2000/01/rdf-schema#label"]})
+ds.indexes.text.enable({"predicates": ["http://www.w3.org/2000/01/rdf-schema#label"]})
 ds.query("""PREFIX text: <http://jena.apache.org/text#>
             SELECT ?s WHERE { ?s text:query 'fox' }""")
-ds.create_vector_index("emb", "http://ex.org/embedding", 384, options={"metric": "cosine"})
-ds.vector_index("emb", wait=True)                  # the status once the build is done
-ds.create_vector_index("docs", "http://ex.org/docEmb", 768, options={"embedding": {
+ds.indexes.vector.put("emb", {"predicate": "http://ex.org/embedding", "dimension": 384, "metric": "cosine"})
+ds.indexes.vector.wait("emb")                  # the status once the build is done
+ds.indexes.vector.put("docs", {"predicate": "http://ex.org/docEmb", "dimension": 768, "embedding": {
     "url": "http://127.0.0.1:11434/v1/embeddings", "model": "nomic-embed-text",
     "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"]}})
-ds.embed(timeout=600)                              # embed the waiting text on this thread
+ds.indexes.vector.embed_until_idle(timeout=600)                              # embed the waiting text on this thread
 
-ds.set_write_validation({"mode": "reject", "shapes": {"inline": shapes_turtle}})
+ds.validation.guard.set({"mode": "reject", "shapes": {"inline": shapes_turtle}})
 ds.add(quad_that_breaks_the_shapes)                # raises WriteRejectedError
-ds.write_validation()                              # the configuration and its status
-ds.set_write_validation(None)                      # removes it
+ds.validation.guard.get()                              # the configuration and its status
+ds.validation.guard.reset()                      # removes it
 ```
 
 The configurations and statuses are dicts in the server's JSON shape: `text.json` for
@@ -2318,9 +2436,8 @@ the text index ([API](API.md#full-text-search)), the vector index configuration,
 ([API](API.md#write-time-validation)). A ShEx configuration has `"language": "shex"`,
 a `schema` and a `shapeMap`. Opening a database directory installs the write-time
 validation its `validation.json` sets up, as the server does. When the configuration
-cannot be loaded, the package warns and writes stay refused. `text_status`,
-`rebuild_text`, `disable_text`, `drop_vector_index`, `rebuild_vector_index`,
-`reembed_vector_index` and `vector_indexes` complete the administration.
+cannot be loaded, the package warns and writes stay refused. `indexes.text.status/rebuild/disable` and `indexes.vector.drop/rebuild/reembed/list`
+complete the index administration.
 
 ### Query builder
 

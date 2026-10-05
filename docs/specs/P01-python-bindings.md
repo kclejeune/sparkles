@@ -37,6 +37,10 @@ It closes the known gap "Embedding: Sparkles is Rust only" in
 [FEATURES.md](../FEATURES.md#known-gaps) for Python, and the Embedding row of the
 Oxigraph comparison in [COMPARISON.md](../COMPARISON.md).
 
+P06 Phase 2 replaces the flat administration methods described here with native
+property handles. See [P06](P06-library-admin-api.md#9-phase-2-closing-the-python-gaps)
+and the current [Python guide](../USAGE.md#python) for the shipped names.
+
 ## 1. Summary, goals, non-goals
 
 Sparkles can be embedded in Rust programs only. Python is where most RDF tooling,
