@@ -115,7 +115,12 @@ export type BackupSummary = {
   name: string;
   repository: string;
   /** `type` is `mem` for a backup of an in-memory dataset. Older servers leave it out. */
-  dataset: { name: string; id: string; type?: 'persistent' | 'mem' };
+  dataset: {
+    name: string;
+    id: string;
+    type?: 'persistent' | 'mem';
+    branch?: { datasetId: string; id: string; name: string; nextOrdinal: number };
+  };
   commit: { seq: number; timestamp: string; quads: number; ref: string };
   created: string;
   completed: string;
@@ -143,6 +148,10 @@ export type BackupFile = {
 
 /** The manifest view of one backup. */
 export type Backup = BackupSummary & {
+  dataset: BackupSummary['dataset'] & {
+    /** First unused branch blank-node ordinal; older backups may omit it. */
+    nextOrdinal?: number;
+  };
   format: 1;
   generation: string;
   indexFormat: number;

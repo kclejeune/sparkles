@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import type { ValidationCheck } from './api';
-import { baselineBadge, checkLine, fallbackText, firstResult } from './write-validation';
+import { ApiError, type GuardReport, type ValidationCheck } from './api';
+import {
+  baselineBadge,
+  checkLine,
+  fallbackText,
+  firstResult,
+  rejectionReport,
+} from './write-validation';
+
+import { guardRows } from './merge-page';
 
 const check = (over: Partial<ValidationCheck> = {}): ValidationCheck => ({
   time: '2026-10-02T10:00:00.000Z',
@@ -59,5 +67,56 @@ describe('write-time validation labels', () => {
       ),
     ).toEqual({ shape: 'START', node: 'http://x' });
     expect(firstResult(check())).toBeNull();
+  });
+});
+
+describe('structured write rejections', () => {
+  it('renders SHACL results and ShEx START associations', () => {
+    const shacl = {
+      language: 'shacl',
+      blocking: 1,
+      truncated: true,
+      results: [
+        {
+          focusNode: { type: 'uri', value: 'urn:n' },
+          sourceShape: { type: 'uri', value: 'urn:S' },
+          messages: ['Missing value'],
+        },
+      ],
+    };
+    const shex = {
+      language: 'shex',
+      blocking: 1,
+      results: [
+        { node: { type: 'bnode', value: 'n' }, shape: { type: 'start' }, reason: 'Missing triple' },
+      ],
+    };
+    for (const validation of [shacl, shex])
+      expect(rejectionReport(new ApiError(422, 'rejected', { body: { validation } }))).toEqual(
+        validation,
+      );
+    expect(guardRows(shex as GuardReport)[0]).toEqual({
+      node: '_:n',
+      path: '',
+      shape: 'START',
+      message: 'Missing triple',
+    });
+  });
+  it('ignores other failures and malformed reports', () => {
+    for (const validation of [
+      null,
+      [],
+      {},
+      { results: [null] },
+      { blocking: -1 },
+      { blocking: '3' },
+      { language: 'other', results: [] },
+    ]) {
+      expect(rejectionReport(new ApiError(422, 'error', { body: { validation } }))).toBeNull();
+    }
+    expect(
+      rejectionReport(new ApiError(409, 'conflict', { body: { validation: { blocking: 1 } } })),
+    ).toBeNull();
+    expect(rejectionReport(new Error('error'))).toBeNull();
   });
 });

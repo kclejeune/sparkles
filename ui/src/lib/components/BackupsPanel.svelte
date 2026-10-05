@@ -13,6 +13,7 @@
 
   let {
     name,
+    branch = null,
     info,
     readOnly = false,
     refreshKey = 0,
@@ -20,6 +21,7 @@
     onchanged,
   }: {
     name: string;
+    branch?: string | null;
     info: api.DatasetInfo | undefined;
     readOnly?: boolean;
     /** Bump to reload (a backup task finished). */
@@ -100,7 +102,10 @@
 {#if loaded?.kind !== 'unsupported'}
   <section class="panel" aria-labelledby="backups-h">
     <div class="panel-head">
-      <h2 id="backups-h">Backups</h2>
+      <h2 id="backups-h">
+        Backups{#if branch}
+          of main{/if}
+      </h2>
       {#if list.length}<span class="faint">{list.length}</span>{/if}
       <span class="spacer"></span>
       {#if admin}

@@ -64,8 +64,8 @@ const copyStore = (store) => new ox.Store(store.match());
 function branchJson(ds, b, upstream = b.upstream ? branchOf(ds, b.upstream) : null) {
   const h = head(b);
   const base = b.base;
-  const linked = b !== ds && !b.compacted;
-  const own = b.store.size * 38;
+  const linked = ds.type !== 'mem' && b !== ds && !b.compacted;
+  const own = ds.type === 'mem' ? 0 : b.store.size * 38;
   return {
     name: b.branchName,
     id: b.branchId,
@@ -131,10 +131,6 @@ export function chooseBranch(path, seg, url) {
 /** The dataset a request names, on the branch it chose: `{ ds }` or `{ error }`. */
 export function resolveBranch(main, name) {
   if (!main || !name) return { ds: main };
-  if (main.type === 'mem')
-    return {
-      error: [501, { error: 'branches need a persistent dataset', code: 'branches-unsupported' }],
-    };
   const b = main.branchSet.get(name);
   if (!b) return { error: [404, { error: `no such branch: ${name}`, code: 'no-such-branch' }] };
   return { ds: b };
@@ -222,6 +218,22 @@ function guardReport(b, store, kind) {
   };
 }
 
+function guardJson(b) {
+  if (!b.guard) return { config: null };
+  return {
+    language: 'shacl',
+    config: b.guard.config,
+    status: {
+      mode: b.guard.mode,
+      shapeCount: b.guard.rules.length,
+      baseline: null,
+      lastFullMillis: null,
+      counters: { passed: 0, warned: 0, rejected: 0, skipped: 0, bypassed: 0 },
+      warnings: [],
+    },
+  };
+}
+
 /** `PUT /$/validation/{ds}` in the mock: `{mode, shapes: {inline}}` sets the guard. */
 export async function putGuard(b, raw) {
   let o;
@@ -238,8 +250,12 @@ export async function putGuard(b, raw) {
   if (typeof text !== 'string') return [400, { error: 'shapes.inline is required' }];
   try {
     const rules = guardRules(text);
-    b.guard = { mode: o.mode ?? 'reject', rules };
-    return [200, { mode: b.guard.mode, shapeCount: rules.length }];
+    const candidate = { mode: o.mode ?? 'reject', rules, config: { language: 'shacl', ...o } };
+    const report = guardReport({ ...b, guard: candidate }, b.store, 'configuration');
+    if (candidate.mode === 'reject' && o.baseline !== 'grandfather' && report)
+      return [409, { error: 'The current data does not conform.', validation: report }];
+    b.guard = candidate;
+    return [200, guardJson(b)];
   } catch (e) {
     return [400, { error: `the shapes do not parse: ${e}` }];
   }
@@ -460,9 +476,17 @@ export function createBranch(
 
 export async function handleBranches(req, res, url, seg, ctx) {
   if (seg[0] !== '$') return false;
-  if (seg[1] === 'validation' && req.method === 'PUT') {
+  if (seg[1] === 'validation') {
     const b = seg[2] ? ctx.datasets.get(seg[2]) : undefined;
     if (!b) return (ctx.fail(res, 404, `No such dataset: ${seg[2] ?? ''}`), true);
+    if (req.method === 'GET') return (ctx.send(res, 200, guardJson(b)), true);
+    if (req.method === 'DELETE') {
+      b.guard = null;
+      res.writeHead(204);
+      res.end();
+      return true;
+    }
+    if (req.method !== 'PUT') return (ctx.fail(res, 405, 'method not allowed'), true);
     const raw = (await ctx.readBody(req)).toString('utf8');
     return (ctx.send(res, ...(await putGuard(b, raw))), true);
   }
@@ -470,10 +494,6 @@ export async function handleBranches(req, res, url, seg, ctx) {
   const { send, fail } = ctx;
   const ds = seg[2] ? ctx.datasets.get(seg[2]) : undefined;
   if (!ds) return (fail(res, 404, `No such dataset: ${seg[2] ?? ''}`), true);
-  if (ds.type === 'mem')
-    return (
-      fail(res, 501, 'branches need a persistent dataset', { code: 'branches-unsupported' }), true
-    );
   const err = ([status, body]) => (send(res, status, body), true);
   const body = async () => {
     const raw = (await ctx.readBody(req)).toString('utf8').trim();
@@ -530,6 +550,19 @@ export async function handleBranches(req, res, url, seg, ctx) {
     if (req.method === 'PATCH') {
       const o = await body();
       if (!o) return err([400, { error: 'invalid JSON' }]);
+      if (o.name !== undefined && o.name !== name) {
+        if (b === ds || !validName(o.name) || o.name === MAIN)
+          return err([400, { error: 'invalid branch name', code: 'invalid-branch' }]);
+        if (branchOf(ds, o.name))
+          return err([409, { error: 'branch already exists', code: 'branch-exists' }]);
+        ds.branchSet.delete(name);
+        b.branchName = o.name;
+        ds.branchSet.set(o.name, b);
+        for (const child of ds.branchSet.values()) {
+          if (child.upstream === name) child.upstream = o.name;
+          if (child.from?.branch === name) child.from.branch = o.name;
+        }
+      }
       if (typeof o.protected === 'boolean') b.protected = o.protected;
       if ('note' in o) b.note = o.note || null;
       return (send(res, 200, branchJson(ds, b)), true);

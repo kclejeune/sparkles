@@ -1764,7 +1764,7 @@ export function commits(
 
 // --- branches and merges (F09) -------------------------------------------------------
 
-/** A branch of a persistent dataset (`GET /$/branches/{ds}`). */
+/** A branch of a dataset (`GET /$/branches/{ds}`). */
 export type Branch = {
   name: string;
   id: string;
@@ -1792,8 +1792,7 @@ export type Branch = {
 export type BranchList = { dataset: string; datasetId: string; branches: Branch[] };
 
 /**
- * `GET /$/branches/{ds}`: `main` first, then by name. In-memory datasets answer `501`
- * (`branches-unsupported`).
+ * `GET /$/branches/{ds}`: `main` first, then by name.
  */
 export const branches = (ds: string, signal?: AbortSignal) =>
   json<BranchList>(`/$/branches/${enc(ds)}`, { signal, cache: 'no-store' });
@@ -1808,13 +1807,13 @@ export const createBranch = (
   body: { name: string; from?: string; at?: string; protected?: boolean; note?: string },
 ) => json<Branch>(`/$/branches/${enc(ds)}`, jsonBody(body));
 
-/** `PATCH /$/branches/{ds}/{name}`: protect or unprotect it, or change its note. */
+/** `PATCH /$/branches/{ds}/{name}`: rename, change protection or edit its note. */
 export const updateBranch = (
   ds: string,
   name: string,
-  body: { protected?: boolean; note?: string | null },
+  body: { name?: string; protected?: boolean; note?: string | null },
 ) =>
-  json<Branch>(`/$/branches/${enc(ds)}/${enc(name)}`, {
+  json<Branch & { grantsChanged?: number }>(`/$/branches/${enc(ds)}/${enc(name)}`, {
     ...jsonBody(body),
     method: 'PATCH',
   });
@@ -2639,20 +2638,46 @@ export type WriteValidationStatus = {
   recentRejections?: ValidationCheck[];
 };
 
+export type ValidationSource = {
+  graphs?: string[];
+  file?: string;
+  inline?: string;
+  format?: string;
+  source?: string;
+  sha256?: string;
+  base?: string;
+  prefixes?: Record<string, string>;
+};
+
+export type ValidationConfig = {
+  language?: 'shacl' | 'shex';
+  format?: number;
+  mode: 'reject' | 'warn' | 'off';
+  threshold?: 'violation' | 'warning' | 'info';
+  baseline?: 'strict' | 'grandfather';
+  includeInferences?: boolean;
+  dataGraph?: string | string[];
+  shapes?: ValidationSource;
+  schema?: ValidationSource;
+  shapeMap?: string | Record<string, unknown>[];
+  timeoutSeconds?: number;
+  reportLimit?: number;
+  updated?: string;
+};
+
 export type WriteValidation = {
   language: 'shacl' | 'shex';
-  config: {
-    mode: 'reject' | 'warn' | 'off';
-    threshold?: 'violation' | 'warning' | 'info';
-    baseline?: 'strict' | 'grandfather';
-    includeInferences?: boolean;
-    dataGraph?: string | string[];
-    shapes?: { graphs?: string[]; file?: string };
-    timeoutSeconds?: number;
-    updated?: string;
-  };
+  config: ValidationConfig;
   status: WriteValidationStatus;
 };
+
+/** Replace the guard configuration after validating it against the head. */
+export const setWriteValidation = (ds: string, config: ValidationConfig) =>
+  json<WriteValidation>(`/$/validation/${enc(ds)}`, { ...jsonBody(config), method: 'PUT' });
+
+/** Disable write-time validation. */
+export const removeWriteValidation = (ds: string) =>
+  json<unknown>(`/$/validation/${enc(ds)}`, { method: 'DELETE' });
 
 /**
  * `GET /$/validation/{ds}`: the dataset's write-time validation and its status, or null

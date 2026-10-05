@@ -1,9 +1,4 @@
 <script lang="ts">
-  // The dataset page's write-time validation panel (`GET /$/validation/{ds}`): the mode
-  // and language, the validation state of the head with its result counts, how shapes
-  // are validated on a write, the last validated write, the decision counters and the
-  // last rejected writes. Configuration stays with `sparkles validation` and
-  // `PUT /$/validation/{ds}`.
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
   import { onBranch } from '$lib/branches';
@@ -13,12 +8,15 @@
   import { baselineBadge, checkLine, fallbackText, firstResult } from '$lib/write-validation';
   import { poll } from '$lib/poll';
   import Icon from './Icon.svelte';
+  import ValidationConfigForm from './ValidationConfigForm.svelte';
+  import { toasts } from '$lib/app.svelte';
 
   let {
     name,
     branch = null,
     prefixes,
     refreshKey = 0,
+    canEdit = false,
   }: {
     name: string;
     /** The branch to work on (null: `main`). */
@@ -26,29 +24,61 @@
     prefixes: PrefixMap;
     /** Bump to reload the status (data changed). */
     refreshKey?: number;
+    canEdit?: boolean;
   } = $props();
 
   const target = $derived(onBranch(name, branch));
 
   type Loaded = { kind: 'on'; v: api.WriteValidation } | { kind: 'off' } | { kind: 'unsupported' };
 
-  let loaded = $state<Loaded | null>(null);
-  let error = $state<string | null>(null);
+  let response = $state<{ target: string; value: Loaded } | null>(null);
+  let failure = $state<{ target: string; message: string } | null>(null);
+  const loaded = $derived(response?.target === target ? response.value : null);
+  const error = $derived(failure?.target === target ? failure.message : null);
   let now = $state(Date.now());
+  let editing = $state(false);
+  let disabling = $state(false);
+  $effect(() => {
+    void target;
+    editing = false;
+  });
+
+  async function disable() {
+    if (loaded?.kind !== 'on') return;
+    const captured = target;
+    disabling = true;
+    try {
+      await api.removeWriteValidation(captured);
+      if (captured === target) {
+        editing = false;
+        await load();
+      }
+      toasts.push('success', 'Write validation disabled');
+    } catch (e) {
+      toasts.error('Could not disable validation', e);
+    } finally {
+      disabling = false;
+    }
+  }
   const runs = new LatestRun();
 
   async function load() {
     const owns = runs.claim('validation');
+    const captured = target;
     try {
-      const v = await api.writeValidation(target);
-      if (!owns()) return;
-      loaded = v ? { kind: 'on', v } : { kind: 'off' };
-      error = null;
+      const v = await api.writeValidation(captured);
+      if (!owns() || captured !== target) return;
+      response = { target: captured, value: v ? { kind: 'on', v } : { kind: 'off' } };
+      failure = null;
     } catch (e) {
-      if (!owns()) return;
+      if (!owns() || captured !== target) return;
       if (e instanceof api.ApiError && (e.status === 404 || e.status === 501)) {
-        loaded = { kind: 'unsupported' };
-      } else error = api.errorMessage(e);
+        response = { target: captured, value: { kind: 'unsupported' } };
+        failure = null;
+      } else {
+        response = null;
+        failure = { target: captured, message: api.errorMessage(e) };
+      }
     }
   }
 
@@ -108,6 +138,14 @@
   <div class="panel-head">
     <h2>Write-time validation</h2>
     <span class="spacer"></span>
+    {#if canEdit && loaded && loaded.kind !== 'unsupported'}
+      <button class="btn sm" disabled={disabling} onclick={() => (editing = !editing)}
+        >{editing ? 'Cancel' : v ? 'Configure' : 'Configure validation'}</button
+      >
+      {#if v}<button class="btn ghost sm" disabled={disabling} onclick={disable}
+          >{disabling ? 'Disabling…' : 'Disable'}</button
+        >{/if}
+    {/if}
     {#if v}
       <span class="badge {v.config.mode === 'reject' ? 'iri' : ''}" title="Mode">
         {v.config.mode}
@@ -130,8 +168,8 @@
       <p class="faint">This server does not offer write-time validation.</p>
     {:else if loaded.kind === 'off'}
       <p class="faint">
-        Writes are not validated. Turn validation on with <code>sparkles validation</code> or
-        <code>PUT /$/validation/{name}</code>.
+        Writes are not validated.{#if canEdit}
+          Configure validation to warn about or reject invalid writes.{/if}
       </p>
     {:else if v && st}
       <dl class="facts">
@@ -250,6 +288,22 @@
           </table>
         </div>
       {/if}
+    {/if}
+    {#if editing && canEdit && loaded && loaded.kind !== 'unsupported'}
+      {#key target}
+        <ValidationConfigForm
+          {target}
+          current={v}
+          {prefixes}
+          oncancel={() => (editing = false)}
+          onsaved={(savedTarget) => {
+            if (savedTarget === target) {
+              editing = false;
+              void load();
+            }
+          }}
+        />
+      {/key}
     {/if}
   </div>
 </section>

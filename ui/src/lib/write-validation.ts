@@ -1,5 +1,5 @@
 // Labels for the dataset page's write-time validation panel.
-import type { ValidationBaseline, ValidationCheck } from './api';
+import { ApiError, type GuardReport, type ValidationBaseline, type ValidationCheck } from './api';
 import { fmtInt } from './format';
 
 /** The baseline badge: class and label. */
@@ -54,4 +54,25 @@ export function firstResult(c: ValidationCheck): { shape: string; node: string }
   // SHACL results have sourceShape/focusNode, ShEx result-map entries shape/node
   if ('sourceShape' in r) return { shape: term(r.sourceShape), node: term(r.focusNode) };
   return { shape: term(r.shape), node: term(r.node) };
+}
+
+/** Only structured validation rejections belong in the results table. */
+export function rejectionReport(error: unknown): GuardReport | null {
+  if (!(error instanceof ApiError) || error.status !== 422) return null;
+  const report = error.body?.validation;
+  if (!report || typeof report !== 'object' || Array.isArray(report)) return null;
+  const r = report as GuardReport;
+  if (r.language !== undefined && r.language !== 'shacl' && r.language !== 'shex') return null;
+  for (const n of [r.blocking, r.total]) {
+    if (n !== undefined && (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0))
+      return null;
+  }
+  if (
+    r.results !== undefined &&
+    (!Array.isArray(r.results) ||
+      r.results.some((row) => !row || typeof row !== 'object' || Array.isArray(row)))
+  )
+    return null;
+  if (r.blocking === undefined && r.results === undefined) return null;
+  return r;
 }

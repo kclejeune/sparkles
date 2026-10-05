@@ -131,7 +131,8 @@ export function mergeHref(datasetPath: string, source: string, target: string): 
 /** A term of a guard result (SPARQL JSON) as text. */
 function term(t: unknown): string {
   const x = (t ?? {}) as { type?: string; value?: string };
-  if (x.value == null) return '';
+  if (x.type === 'start') return 'START';
+  if (typeof x.value !== 'string') return '';
   if (x.type === 'uri') return `<${x.value}>`;
   if (x.type === 'bnode') return `_:${x.value}`;
   if (x.type === 'path') return x.value;
@@ -146,7 +147,9 @@ export function guardRows(v: GuardReport, prefixes: PrefixMap = {}): GuardRow[] 
   const short = (t: string) => (t ? ntShort(t, prefixes) : '');
   return (v.results ?? []).map((r) => {
     if ('focusNode' in r) {
-      const msgs = (r.messages as string[] | undefined) ?? [];
+      const msgs = Array.isArray(r.messages)
+        ? r.messages.filter((m): m is string => typeof m === 'string')
+        : [];
       const comp = term(r.sourceConstraintComponent).replace(/^<.*#(.*)>$/, '$1');
       return {
         node: short(term(r.focusNode)),

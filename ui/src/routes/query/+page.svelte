@@ -18,6 +18,8 @@
   import { lintCounts, lintSummary } from '$lib/lint-view';
   import { LatestRun } from '$lib/supersede';
   import { load, save } from '$lib/storage';
+  import { rejectionReport } from '$lib/write-validation';
+  import GuardReportView from '$components/GuardReportView.svelte';
   import GraphView from '$components/GraphView.svelte';
   import Icon from '$components/Icon.svelte';
   import PlanView from '$components/PlanView.svelte';
@@ -126,12 +128,10 @@
   const target = $derived(ds ? onBranch(ds, branch) : null);
   /** The dataset's branches, offered in the Branch field (null: it has none). */
   let branchList = $state<api.Branch[] | null>(null);
-  // in-memory datasets have no branches
-  const persistent = $derived(app.datasets.find((d) => d.name === ds)?.type === 'persistent');
   $effect(() => {
     const name = ds;
     branchList = null;
-    if (!name || !persistent) return;
+    if (!name) return;
     api
       .branches(name)
       .then((l) => {
@@ -1343,6 +1343,7 @@
       <div class="rbody">
         {#if outcome.status === 'error' && outcome.error}
           {@const err = outcome.error}
+          {@const rejection = rejectionReport(err)}
           <div class="pad">
             <div class="error-box">
               {#if err instanceof api.ApiError && err.budget}
@@ -1363,6 +1364,10 @@
                   Show in editor
                 </button>
               {/if}
+              {#if rejection}<GuardReportView
+                  report={rejection}
+                  prefixes={app.prefixes(onBranch(outcome.ds, outcome.branch))}
+                />{/if}
               {#if err instanceof api.ApiError && err.detail}<pre>{err.detail}</pre>{/if}
               {#if err instanceof api.ApiError && err.requestId}
                 <div class="faint rid">Request <span class="mono">{err.requestId}</span></div>

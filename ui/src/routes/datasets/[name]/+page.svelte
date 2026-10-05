@@ -53,13 +53,13 @@
   const target = $derived(onBranch(name, branch));
   const prefixes = $derived(app.prefixes(target));
 
-  // the branches (none for in-memory datasets, which answer 501)
+  // Every dataset can offer branches; older servers may answer 404 or 501.
   let branchList = $state<api.Branch[] | null>(null);
   let branchesError = $state<api.ApiError | Error | null>(null);
   let branchesLoading = $state(false);
   const inMemory = $derived(info?.type === 'mem');
-  const hasBranches = $derived(!inMemory && branchList != null);
-  /** In-memory datasets answer 501, and servers without branches 404. */
+  const hasBranches = $derived(branchList != null);
+  /** Servers without branch support answer 404 or 501. */
   const branchesUnsupported = $derived(
     branchesError instanceof api.ApiError &&
       (branchesError.status === 404 || branchesError.status === 501),
@@ -69,11 +69,6 @@
 
   async function loadBranches() {
     const ds = name;
-    if (inMemory) {
-      branchList = null;
-      branchesError = null;
-      return;
-    }
     branchesLoading = true;
     try {
       const l = await api.branches(ds);
@@ -91,7 +86,6 @@
 
   $effect(() => {
     if (!name) return;
-    void inMemory;
     untrack(() => {
       branchList = null;
       void loadBranches();
@@ -869,7 +863,7 @@ ex:PersonShape a sh:NodeShape ;
         </section>
 
         <!-- branches and merges -->
-        {#if !inMemory && !branchesUnsupported}
+        {#if !branchesUnsupported}
           <BranchesPanel
             {name}
             list={branchList}
@@ -1086,7 +1080,13 @@ ex:PersonShape a sh:NodeShape ;
         </section>
 
         <!-- write-time validation -->
-        <WriteValidationPanel {name} {branch} {prefixes} refreshKey={refreshKick} />
+        <WriteValidationPanel
+          {name}
+          {branch}
+          {prefixes}
+          refreshKey={refreshKick}
+          canEdit={auth.can(name, 'admin') && !readOnly}
+        />
 
         <!-- how DESCRIBE describes a resource -->
         <DescribePanel {name} {branch} canEdit={auth.can(name, 'admin') && !readOnly} />
@@ -1401,6 +1401,7 @@ ex:PersonShape a sh:NodeShape ;
         <!-- backups in repositories -->
         <BackupsPanel
           {name}
+          {branch}
           {info}
           {readOnly}
           refreshKey={refreshKick}

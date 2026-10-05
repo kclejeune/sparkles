@@ -1,5 +1,5 @@
 // Branches and merges against the server without auth, on persistent datasets of their own
-// (in-memory datasets have no branches): a branch made in the Branches panel, an update on
+// and memory datasets: a branch made in the Branches panel, an update on
 // it through the query page's Branch field, the Merge button, and the merge commit in
 // History. A merge with conflicts opens the merge page, where a choice resolves the
 // conflict and the merge goes through.
@@ -143,5 +143,42 @@ open(
     );
     expect((await balance.json()).boolean).toBe(true);
     await expect(history(page).getByRole('row').nth(1)).toContainText('merge');
+  },
+);
+
+open(
+  'memory branches are selectable, renameable and isolated from main',
+  async ({ page, request }) => {
+    expect(
+      (
+        await request.post('/$/datasets', { data: { dbName: 'branchy-memory', dbType: 'mem' } })
+      ).ok(),
+    ).toBe(true);
+    const made = await request.post('/$/branches/branchy-memory', { data: { name: 'draft' } });
+    expect(made.ok()).toBe(true);
+    const id = (await made.json()).id;
+    await update(request, 'branchy-memory@draft', 'INSERT DATA { <urn:memory-branch> <urn:p> 1 }');
+    await page.goto('/ui/datasets/branchy-memory?branch=draft');
+    await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveValue('draft');
+    await row(page, 'draft').getByRole('button', { name: 'Rename branch draft' }).click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('textbox', { name: 'New name' }).fill('renamed');
+    await dialog.getByRole('button', { name: 'Rename', exact: true }).click();
+    await expect(page).toHaveURL(/\?branch=renamed$/);
+    await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveValue('renamed');
+    expect((await (await request.get('/$/branches/branchy-memory/renamed')).json()).id).toBe(id);
+    const ask = await request.get('/branchy-memory/sparql', {
+      params: { query: 'ASK { <urn:memory-branch> <urn:p> 1 }' },
+      headers: { Accept: 'application/sparql-results+json' },
+    });
+    expect((await ask.json()).boolean).toBe(false);
+    await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'branchy-memory'));
+    await page.goto('/ui/query');
+    await page.getByRole('combobox', { name: 'Branch' }).selectOption('renamed');
+    await page.locator('.cm-content').click();
+    await page.keyboard.press('ControlOrMeta+a');
+    await page.keyboard.insertText('ASK { <urn:memory-branch> <urn:p> 1 }');
+    await page.getByRole('button', { name: /^Run\b/ }).click();
+    await expect(page.getByRole('region', { name: 'Results' })).toContainText('true');
   },
 );

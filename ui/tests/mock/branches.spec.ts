@@ -73,7 +73,14 @@ test('the branch selector keeps the branch in the URL and in every request', asy
   await expect(page.locator('.meta')).toContainText('/ledger/sparql');
 });
 
-test('an in-memory dataset shows no branches', async ({ page }) => {
+test('older servers without memory branches keep the dataset page usable', async ({ page }) => {
+  await page.route('**/$/branches/scratch', (route) =>
+    route.fulfill({
+      status: 501,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'branches unsupported' }),
+    }),
+  );
   await page.goto('/ui/datasets/scratch');
   await expect(page.getByRole('heading', { name: 'History' })).toBeVisible();
   await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveCount(0);
@@ -213,4 +220,59 @@ test('a merge with conflicts opens the merge page, and merges nothing on its own
   await page.getByRole('link', { name: 'Cancel' }).click();
   await expect(page).toHaveURL(/\/ui\/datasets\/ledger$/);
   await expect(history(page).getByRole('row').nth(1)).not.toContainText('merge');
+});
+
+test('renaming the selected branch updates its URL and preserves identity and children', async ({
+  page,
+  request,
+}) => {
+  const created = await request.post('/$/branches/ledger', { data: { name: 'rename-old' } });
+  const original = await created.json();
+  expect(created.ok()).toBe(true);
+  expect(
+    (
+      await request.post('/$/branches/ledger', {
+        data: { name: 'rename-child', from: 'rename-old' },
+      })
+    ).ok(),
+  ).toBe(true);
+  await page.goto('/ui/datasets/ledger?branch=rename-old');
+  await row(page, 'rename-old').getByRole('button', { name: 'Rename branch rename-old' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('textbox', { name: 'New name' }).fill('main');
+  await expect(dialog.getByRole('button', { name: 'Rename', exact: true })).toBeDisabled();
+  await dialog.getByRole('textbox', { name: 'New name' }).fill('rename-new');
+  await dialog.getByRole('button', { name: 'Rename', exact: true }).click();
+  await expect(page).toHaveURL(/\?branch=rename-new$/);
+  await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveValue('rename-new');
+  await expect(row(page, 'rename-old')).toHaveCount(0);
+  const renamed = await (await request.get('/$/branches/ledger/rename-new')).json();
+  expect(renamed.id).toBe(original.id);
+  const child = await (await request.get('/$/branches/ledger/rename-child')).json();
+  expect(child.upstream).toBe('rename-new');
+});
+
+test('memory branches are selectable and isolate writes from main', async ({ page, request }) => {
+  expect(
+    (
+      await request.post('/$/datasets', { data: { dbName: 'memory-branches', dbType: 'mem' } })
+    ).ok(),
+  ).toBe(true);
+  expect((await request.post('/$/branches/memory-branches', { data: { name: 'dev' } })).ok()).toBe(
+    true,
+  );
+  await update(request, 'memory-branches@dev', 'INSERT DATA { <urn:branch> <urn:p> 1 }');
+  await page.goto('/ui/datasets/memory-branches?branch=dev');
+  await expect(page.getByRole('combobox', { name: 'Branch' })).toHaveValue('dev');
+  await expect(row(page, 'dev')).toBeVisible();
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'memory-branches'));
+  await page.goto('/ui/query');
+  await expect(
+    page.getByRole('combobox', { name: 'Branch' }).getByRole('option', { name: /^dev/ }),
+  ).toHaveCount(1);
+  const main = await request.get('/memory-branches/sparql', {
+    params: { query: 'ASK { <urn:branch> <urn:p> 1 }' },
+    headers: { Accept: 'application/sparql-results+json' },
+  });
+  expect((await main.json()).boolean).toBe(false);
 });

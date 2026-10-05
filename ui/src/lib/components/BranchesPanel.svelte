@@ -36,7 +36,7 @@
     loading?: boolean;
     /** The branch the page shows. */
     current: string;
-    /** Create, protect and delete branches (admin on a writable server). */
+    /** Create, rename, protect and delete branches (admin on a writable server). */
     canEdit?: boolean;
     /** Merge branches (write access on a writable server). */
     canMerge?: boolean;
@@ -94,6 +94,35 @@
       onchange?.();
     } catch (e) {
       toasts.error(on ? 'Could not protect the branch' : 'Could not unprotect the branch', e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  let renaming = $state<{ branch: api.Branch; name: string; error: string | null } | null>(null);
+  const renameName = $derived(renaming?.name.trim() ?? '');
+  const renameOk = $derived(
+    validBranchName(renameName) && !list?.some((b) => b.name === renameName),
+  );
+
+  async function rename() {
+    if (!renaming || !renameOk) return;
+    const r = renaming;
+    busy = true;
+    try {
+      const b = await api.updateBranch(name, r.branch.name, { name: renameName });
+      renaming = null;
+      toasts.push('success', `Renamed ${r.branch.name} to ${b.name}`);
+      if (b.grantsChanged)
+        toasts.push(
+          'info',
+          'Review branch grants',
+          `${b.grantsChanged} grants still refer to the old name. Update them to grant access to ${b.name}.`,
+        );
+      if (current === r.branch.name) onselect?.(b.name);
+      onchange?.();
+    } catch (e) {
+      renaming = { ...r, error: api.errorMessage(e) };
     } finally {
       busy = false;
     }
@@ -316,6 +345,13 @@
                   >
                   {#if b.name !== MAIN}
                     <button
+                      class="btn ghost sm"
+                      aria-label="Rename branch {b.name}"
+                      disabled={busy}
+                      onclick={() => (renaming = { branch: b, name: b.name, error: null })}
+                      >Rename</button
+                    >
+                    <button
                       class="btn ghost icon sm"
                       aria-label="Delete branch {b.name}"
                       title="Delete"
@@ -334,6 +370,32 @@
     <div class="pad faint row"><span class="spinner"></span> Loading branches…</div>
   {/if}
 </section>
+
+<Modal
+  open={renaming != null}
+  title="Rename branch {renaming?.branch.name ?? ''}"
+  onclose={() => (renaming = null)}
+>
+  {#if renaming}
+    <label
+      >New name <input
+        class="input mono"
+        bind:value={renaming.name}
+        maxlength="64"
+        autocomplete="off"
+      /></label
+    >
+    <p class="faint">
+      Branch grants refer to names. Review grants that use the old name after renaming.
+    </p>
+    {#if renameName && !renameOk}<p class="warn-text">Choose a valid, unused branch name.</p>{/if}
+    {#if renaming.error}<div class="error-box">{renaming.error}</div>{/if}
+  {/if}
+  {#snippet actions()}
+    <button class="btn" onclick={() => (renaming = null)}>Cancel</button>
+    <button class="btn primary" onclick={rename} disabled={busy || !renameOk}>Rename</button>
+  {/snippet}
+</Modal>
 
 <Modal
   open={deleting != null}
