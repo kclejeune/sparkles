@@ -1,0 +1,17 @@
+{
+  "name": "@sparkles-rdf/engine-darwin-arm64",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "main": "sparkles.darwin-arm64.node",
+  "files": [
+    "sparkles.darwin-arm64.node",
+    "LICENSE",
+    "THIRD_PARTY_LICENSES.md"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ]
+}

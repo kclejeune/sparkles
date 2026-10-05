@@ -1,0 +1,25 @@
+{
+  "name": "sparkles-js-workspace",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm --filter @sparkles-rdf/common build && pnpm --filter @sparkles-rdf/client build && pnpm --filter @sparkles-rdf/engine build",
+    "test": "node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs",
+    "client:gen": "openapi-typescript ../docs/openapi.json -o client/src/openapi.d.ts",
+    "client:check": "node scripts/check-openapi.mjs",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check",
+    "platforms": "node scripts/platforms.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.10.7",
+    "@rdfjs/types": "2.0.1",
+    "@types/node": "^24.0.0",
+    "@types/n3": "^1.26.0",
+    "n3": "^2.0.3",
+    "openapi-typescript": "7.13.0",
+    "typescript": "6.0.3",
+    "oxfmt": "0.71.0",
+    "@comunica/query-sparql-rdfjs": "^5.2.0"
+  }
+}

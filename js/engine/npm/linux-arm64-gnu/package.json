@@ -1,0 +1,20 @@
+{
+  "name": "@sparkles-rdf/engine-linux-arm64-gnu",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "main": "sparkles.linux-arm64-gnu.node",
+  "files": [
+    "sparkles.linux-arm64-gnu.node",
+    "LICENSE",
+    "THIRD_PARTY_LICENSES.md"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "name": "@sparkles-rdf/engine",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_LICENSES.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "native": "napi build --manifest-path ../../crates/sparkles-node/Cargo.toml --platform --release --output-dir native"
+  },
+  "dependencies": {
+    "@sparkles-rdf/common": "workspace:*",
+    "@rdfjs/types": "2.0.1"
+  },
+  "napi": {
+    "binaryName": "sparkles",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "optionalDependencies": {
+    "@sparkles-rdf/engine-linux-x64-gnu": "workspace:*",
+    "@sparkles-rdf/engine-linux-arm64-gnu": "workspace:*",
+    "@sparkles-rdf/engine-linux-x64-musl": "workspace:*",
+    "@sparkles-rdf/engine-linux-arm64-musl": "workspace:*",
+    "@sparkles-rdf/engine-darwin-x64": "workspace:*",
+    "@sparkles-rdf/engine-darwin-arm64": "workspace:*",
+    "@sparkles-rdf/engine-win32-x64-msvc": "workspace:*"
+  }
+}

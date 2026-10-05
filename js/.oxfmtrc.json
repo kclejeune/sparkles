@@ -1,0 +1,17 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "singleQuote": true,
+  "tabWidth": 2,
+  "trailingComma": "all",
+  "printWidth": 100,
+  "sortPackageJson": false,
+  "ignorePatterns": [
+    "node_modules/",
+    "**/dist/",
+    "engine/native/",
+    "pnpm-lock.yaml",
+    "client/src/openapi.d.ts",
+    "engine/THIRD_PARTY_LICENSES.md",
+    "engine/npm/**/THIRD_PARTY_LICENSES.md"
+  ]
+}

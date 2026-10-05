@@ -1,9 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# crates/sparkles-py and crates/sparkles-ffi are their own workspaces (they build the Python
-# extension and the JVM bindings' native library; see their Cargo.toml)
-exclude = ["vendor", "crates/sparkles-py", "crates/sparkles-ffi"]
+# Language bindings have their own workspaces and dependency locks.
+exclude = ["vendor", "crates/sparkles-py", "crates/sparkles-ffi", "crates/sparkles-node"]
 
 [workspace.package]
 version = "0.1.0"

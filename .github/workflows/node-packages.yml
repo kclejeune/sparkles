@@ -1,0 +1,119 @@
+# Build/install checks; publishing additionally requires an explicitly enabled npm environment.
+name: Node packages
+on:
+  push:
+    tags: ['node-v*']
+  pull_request:
+    paths: ['crates/**', 'vendor/**', 'js/**', 'Cargo.toml', 'scripts/node-native.sh', '.github/workflows/node-packages.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: node-packages-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with: {node-version: '24'}
+      - name: Check release tag matches package versions
+        if: startsWith(github.ref, 'refs/tags/')
+        run: node js/scripts/check-version.mjs "${{ github.ref_name }}"
+      - uses: pnpm/action-setup@v4
+        with: {version: '10.34.5'}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm --dir js install --frozen-lockfile
+      - name: Build native Node-API module
+        working-directory: js/engine
+        run: pnpm native
+      - run: pnpm --dir js build
+      - name: Test Node 22, 24 and 26
+        shell: bash
+        run: |
+          for major in 22 24 26; do
+            npx --yes --package node@$major node --test js/common/test/*.test.mjs js/client/test/*.test.mjs js/engine/test/*.test.mjs
+          done
+      - name: Package native target
+        run: node js/scripts/platforms.mjs
+      - name: Pack runtime/type dependency closure
+        run: node js/scripts/pack-runtime.mjs packed
+      - name: Test installed package archives
+        shell: bash
+        run: |
+          mkdir installed
+          cd installed
+          npm init -y
+          npm install --offline --ignore-scripts --omit=optional ../packed/*.tgz
+          cp ../js/scripts/packed-smoke.mjs ../js/scripts/packed-types.mts .
+          node packed-smoke.mjs
+          node node_modules/typescript/bin/tsc --noEmit --strict --target es2023 --module nodenext packed-types.mts
+      - uses: oven-sh/setup-bun@v2
+      - run: bun js/scripts/runtime-smoke.mjs
+      - uses: denoland/setup-deno@v2
+        with: {deno-version: v2.x}
+      - run: deno run --allow-read --allow-write --allow-env --allow-sys --allow-ffi js/scripts/runtime-smoke.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.runner }}
+          path: packed/sparkles-rdf-*.tgz
+  musl:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and test the addon on Alpine
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work node:24-alpine sh -ec '
+            apk add --no-cache bash curl build-base cmake perl git
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            export PATH="/root/.cargo/bin:$PATH"
+            npm install -g pnpm@10.34.5
+            pnpm --dir js install --frozen-lockfile
+            bash scripts/node-native.sh
+            pnpm --dir js build
+            node --test js/common/test/*.test.mjs js/client/test/*.test.mjs js/engine/test/*.test.mjs
+            node js/scripts/platforms.mjs
+            node js/scripts/pack-runtime.mjs packed
+            mkdir installed
+            cd installed
+            npm init -y
+            npm install --offline --ignore-scripts --omit=optional ../packed/*.tgz
+            cp ../js/scripts/packed-smoke.mjs ../js/scripts/packed-types.mts .
+            node packed-smoke.mjs
+            node node_modules/typescript/bin/tsc --noEmit --strict --target es2023 --module nodenext packed-types.mts
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-musl-${{ matrix.runner }}
+          path: packed/sparkles-rdf-*.tgz
+  publish:
+    if: startsWith(github.ref, 'refs/tags/node-v') && vars.NPM_PUBLISH == 'true'
+    needs: [native, musl]
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v5
+        with: {node-version: '24', registry-url: 'https://registry.npmjs.org'}
+      - uses: actions/download-artifact@v4
+        with: {path: artifacts, merge-multiple: false}
+      - name: Publish packages through npm trusted publishing
+        shell: bash
+        run: |
+          mkdir unique
+          find artifacts -name 'sparkles-rdf-*.tgz' -exec cp -n {} unique/ \;
+          for package in unique/sparkles-rdf-engine-linux-*.tgz unique/sparkles-rdf-engine-darwin-*.tgz unique/sparkles-rdf-engine-win32-*.tgz unique/sparkles-rdf-common-*.tgz unique/sparkles-rdf-engine-[0-9]*.tgz unique/sparkles-rdf-client-*.tgz; do
+            [ -f "$package" ] || continue
+            npm publish "$package" --access public --provenance
+          done

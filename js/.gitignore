@@ -1,0 +1,8 @@
+node_modules/
+dist/
+engine/native/
+*.tgz
+engine/npm/*/*.node
+
+engine/npm/*/LICENSE
+engine/npm/*/THIRD_PARTY_LICENSES.md
