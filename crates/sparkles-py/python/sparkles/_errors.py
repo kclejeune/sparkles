@@ -20,6 +20,8 @@ __all__ = [
     "BudgetExceededError",
     "StorageError",
     "DatasetLockedError",
+    "CatalogLockedError",
+    "BackupError",
     "ConflictError",
     "NotFoundError",
     "PermissionDeniedError",
@@ -101,3 +103,13 @@ class ServiceError(SparklesError):
 
 class WriteRejectedError(SparklesError):
     """A write that the dataset's write-time validation rejected."""
+
+
+class CatalogLockedError(DatasetLockedError):
+    """A catalog held by another process or open Catalog."""
+
+
+class BackupError(SparklesError):
+    """A repository failure; code carries the engine backup error code."""
+
+    code: str

@@ -34,13 +34,15 @@ serde = "1"
 serde_json = "1"
 
 [features]
-default = ["reasoning", "shacl", "shex", "text", "geo"]
+default = ["reasoning", "shacl", "shex", "text", "geo", "backup", "graphql"]
 # the same names as the server's features
 reasoning = ["dep:sparkles-reasoner", "sparkles/reasoning"]
 shacl = ["dep:sparkles-shacl", "sparkles/shacl"]
 shex = ["dep:sparkles-shex", "sparkles/shex"]
 text = ["sparkles/text"]
 geo = ["sparkles/geo"]
+backup = ["sparkles/backup", "sparkles/backup-s3"]
+graphql = ["sparkles/graphql"]
 
 [workspace]
 

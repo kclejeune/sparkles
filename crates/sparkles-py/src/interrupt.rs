@@ -162,3 +162,89 @@ pub fn run<T: Send + 'static>(
         )),
     }
 }
+
+/// Run a controlled operation, retaining a callback exception until the worker has
+/// stopped. Progress may arrive from multiple engine threads; serialize reports and
+/// throttle them before acquiring the GIL.
+pub fn controlled<T: Send + 'static>(
+    py: Python<'_>,
+    token: Option<&Bound<'_, PyAny>>,
+    callback: Option<&Bound<'_, PyAny>>,
+    timeout: Option<f64>,
+    f: impl FnOnce(sparkles::task::Control) -> sparkles::Result<T> + Send + 'static,
+) -> PyResult<T> {
+    use sparkles::task::{Control, Progress};
+    use std::time::Instant;
+    let cancel = flag(token)?;
+    let deadline =
+        timeout
+            .map(|s| {
+                if !s.is_finite() || s < 0.0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "timeout must be finite and nonnegative",
+                    ));
+                }
+                Instant::now()
+                    .checked_add(Duration::try_from_secs_f64(s).map_err(|_| {
+                        pyo3::exceptions::PyValueError::new_err("timeout is too large")
+                    })?)
+                    .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("timeout is too large"))
+            })
+            .transpose()?;
+    let failure = Arc::new(Mutex::new(None::<PyErr>));
+    let progress = match callback.filter(|c| !c.is_none()) {
+        None => Progress::default(),
+        Some(cb) => {
+            if !cb.is_callable() {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "progress must be callable",
+                ));
+            }
+            let cb = cb.clone().unbind();
+            let error = failure.clone();
+            let flag = cancel.clone();
+            let last = Mutex::new(None::<(Instant, f32)>);
+            Progress::new(move |fraction, message| {
+                let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+                if error.lock().unwrap().is_some() {
+                    return;
+                }
+                let now = Instant::now();
+                let fraction = fraction.max(last.map_or(0.0, |(_, f)| f));
+                if last.is_some_and(|(_, f)| f >= 1.0)
+                    || (fraction < 1.0
+                        && last.is_some_and(|(t, _)| {
+                            now.duration_since(t) < Duration::from_millis(100)
+                        }))
+                {
+                    return;
+                }
+                *last = Some((now, fraction));
+                Python::attach(|py| {
+                    if let Err(e) = cb.bind(py).call1((fraction, message)) {
+                        flag.store(true, Ordering::Relaxed);
+                        *error.lock().unwrap() = Some(e);
+                    }
+                });
+            })
+        }
+    };
+    let ctl = Control {
+        progress,
+        deadline,
+        ..Control::with_cancel(cancel.clone())
+    };
+    let result = run(py, &cancel, move || {
+        ctl.check()?;
+        let result = f(ctl.clone())?;
+        ctl.check()?;
+        ctl.progress.report(1.0, "completed");
+        ctl.check()?;
+        Ok(result)
+    });
+    let error = failure.lock().unwrap().take();
+    match error {
+        Some(e) => Err(e),
+        None => result,
+    }
+}

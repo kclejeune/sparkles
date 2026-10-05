@@ -28,6 +28,12 @@ pub fn new_err(py: Python<'_>, class: &str, msg: impl Into<String>) -> PyErr {
 pub fn engine(py: Python<'_>, e: sparkles::Error) -> PyErr {
     use sparkles::Error as E;
     let msg = e.to_string();
+    let code = e.code().to_owned();
+    if matches!(&e, E::Component(c) if c.component == "backup") {
+        let err = new_err(py, "BackupError", msg);
+        let _ = err.value(py).setattr("code", code);
+        return err;
+    }
     let class = match e {
         E::Io(io) => return PyErr::from(io),
         E::SparqlSyntax(_) => "SparqlSyntaxError",
@@ -43,8 +49,7 @@ pub fn engine(py: Python<'_>, e: sparkles::Error) -> PyErr {
             return err;
         }
         E::Unsupported(_) => "UnsupportedError",
-        // the store's lock on a database directory (`lock_dir` in store.rs)
-        E::Invalid(ref m) if m.contains("is in use by another process") => "DatasetLockedError",
+        E::Locked { .. } => "DatasetLockedError",
         E::Invalid(_) => "InvalidInputError",
         E::Corrupt(_) | E::Poisoned | E::StorageFull(_) => "StorageError",
         E::Service(_) => "ServiceError",
@@ -53,23 +58,32 @@ pub fn engine(py: Python<'_>, e: sparkles::Error) -> PyErr {
         E::Conflict(_) | E::PreconditionFailed(_) | E::WriterBusy => "ConflictError",
         E::Rejected(_) | E::GuardMissing(_) => "WriteRejectedError",
         E::NotPermitted(_) => "PermissionDeniedError",
+        E::Branch(ref b) => match b.kind {
+            sparkles::branch::BranchErrorKind::Invalid => "InvalidInputError",
+            sparkles::branch::BranchErrorKind::Forbidden => "PermissionDeniedError",
+            sparkles::branch::BranchErrorKind::NotFound
+            | sparkles::branch::BranchErrorKind::Gone => "NotFoundError",
+            sparkles::branch::BranchErrorKind::Conflict => "ConflictError",
+            sparkles::branch::BranchErrorKind::Unsupported => "UnsupportedError",
+        },
         E::Patch(ref p) => match p.kind {
             sparkles::patch::PatchErrorKind::Syntax => "RdfSyntaxError",
             sparkles::patch::PatchErrorKind::Term => "InvalidInputError",
             sparkles::patch::PatchErrorKind::PrevMismatch => "ConflictError",
         },
-        _ => "SparklesError",
+        _ => match code.as_str() {
+            "not-found" | "no-such-graph" | "no-such-branch" => "NotFoundError",
+            "conflict" | "precondition-failed" | "superseded" => "ConflictError",
+            "timeout" => "QueryTimeoutError",
+            "cancelled" => "CancelledError",
+            "invalid" | "invalid-schema" | "invalid-name" => "InvalidInputError",
+            "unsupported" => "UnsupportedError",
+            _ => "SparklesError",
+        },
     };
-    new_err(py, class, msg)
-}
-
-/// An error of the reasoner or a validator: a `sparkles::Error` inside keeps its class.
-#[cfg(any(feature = "reasoning", feature = "shacl", feature = "shex"))]
-pub fn anyhow(py: Python<'_>, e: anyhow::Error) -> PyErr {
-    match e.downcast::<sparkles::Error>() {
-        Ok(e) => engine(py, e),
-        Err(e) => new_err(py, "SparklesError", format!("{e:#}")),
-    }
+    let err = new_err(py, class, msg);
+    let _ = err.value(py).setattr("code", code);
+    err
 }
 
 /// A method of a feature this build left out.

@@ -27,31 +27,31 @@ def test_commits_and_snapshots(tmp_path: Path) -> None:
     first = ds.head_commit
     assert first.seq == 1 and first.inserted == 1 and first.quads == 1
     assert first.timestamp.endswith("Z")
-    snap = ds.create_snapshot("v1", note="before b")
+    snap = ds.snapshots.create("v1", note="before b")
     assert (snap.name, snap.seq, snap.note) == ("v1", 1, "before b")
     ds.add(Triple(ex("b"), ex("name"), Literal("B")))
     ds.update("DELETE DATA { <http://ex.org/a> <http://ex.org/name> 'A' }")
-    log = ds.commits()
+    log = ds.history.commits()
     assert [c.seq for c in log] == [3, 2, 1, 0]
     assert [c.kind for c in log[:3]] == ["update", "transaction", "transaction"]
-    assert [c.seq for c in ds.commits(2, after=0)] == [1, 2]
-    assert [c.seq for c in ds.commits(before=2)] == [1, 0]
+    assert [c.seq for c in ds.history.commits(2, after=0)] == [1, 2]
+    assert [c.seq for c in ds.history.commits(before=2)] == [1, 0]
     # point-in-time queries
     assert names(ds) == ["B"]
     assert names(ds, at="snapshot:v1") == ["A"]
     assert names(ds, at=1) == ["A"]
     assert names(ds, at="commit:2") == ["A", "B"]
-    assert [s.name for s in ds.snapshots()] == ["v1"]
-    h = ds.history()
+    assert [s.name for s in ds.snapshots.list()] == ["v1"]
+    h = ds.history.status()
     assert h["head"] == 3 and h["snapshots"] == 1
-    assert ds.delete_snapshot("v1") is True
-    assert ds.delete_snapshot("v1") is False
+    assert ds.snapshots.delete("v1") is True
+    assert ds.snapshots.delete("v1") is False
     ds.close()
 
 
 def test_retention_and_memory_history() -> None:
     ds = Dataset()
-    h = ds.set_retention(keep_commits=10)
+    h = ds.settings.retention.set(keep_commits=10)
     assert h["retention"]["keepCommits"] == 10
     ds.add(Triple(ex("a"), ex("name"), Literal("A")))
     ds.add(Triple(ex("b"), ex("name"), Literal("B")))
@@ -70,10 +70,10 @@ def test_clone(tmp_path: Path) -> None:
     ds = Dataset(tmp_path / "db")
     ds.add(Triple(ex("a"), ex("name"), Literal("A")))
     ds.add(Quad(ex("a"), ex("p"), Literal(1), ex("g")))
-    ds.create_snapshot("one")
+    ds.snapshots.create("one")
     ds.add(Triple(ex("b"), ex("name"), Literal("B")))
-    report = ds.clone_to(tmp_path / "copy", exclude_graphs=[ex("g")])
-    assert report["quads"] == 2 and report["source_quads"] == 3
+    report = ds.clone_to(tmp_path / "copy", graphs=["default"])
+    assert report["quads"] == 2 and report["sourceQuads"] == 3
     old = ds.clone_to(tmp_path / "old", at="snapshot:one")
     assert old["commit"] == 2
     ds.close()
@@ -96,18 +96,18 @@ def test_text_index() -> None:
             Triple(ex("b"), ex("label"), Literal("a lazy dog")),
         ]
     )
-    assert ds.text_status() is None
-    status = ds.enable_text({"predicates": ["http://ex.org/label"]})
+    assert ds.indexes.text.status() is None
+    status = ds.indexes.text.enable({"predicates": ["http://ex.org/label"]})
     assert status["enabled"] is True and status["docs"] == 2
     q = "PREFIX text: <http://jena.apache.org/text#> SELECT ?s WHERE { ?s text:query 'fox' }"
     assert [r["s"] for r in ds.query(q)] == [ex("a")]
     ds.add(Triple(ex("c"), ex("label"), Literal("another fox")))
     assert {r["s"] for r in ds.query(q)} == {ex("a"), ex("c")}
-    assert ds.rebuild_text()["docs"] == 3
+    assert ds.indexes.text.rebuild()["docs"] == 3
     with pytest.raises(ValueError):
-        ds.enable_text({"predicates": 5})
-    ds.disable_text()
-    assert ds.text_status() is None
+        ds.indexes.text.enable({"predicates": 5})
+    ds.indexes.text.disable()
+    assert ds.indexes.text.status() is None
 
 
 def test_vector_index() -> None:
@@ -115,20 +115,20 @@ def test_vector_index() -> None:
     vec = NamedNode("urn:x-sparkles:vector")
     vectors = {"a": "[1.0,0.0,0.0]", "b": "[0.0,1.0,0.0]", "c": "[0.9,0.1,0.0]"}
     ds.extend(Triple(ex(k), ex("emb"), Literal(v, datatype=vec)) for k, v in vectors.items())
-    assert ds.create_vector_index("emb", ex("emb"), 3, options={"metric": "cosine"}) is True
-    status = ds.vector_index("emb", wait=True)
+    assert ds.indexes.vector.put("emb", {"predicate": ex("emb").value, "dimension": 3, "metric": "cosine"}) is True
+    status = ds.indexes.vector.wait("emb")
     assert status is not None and status["name"] == "emb"
-    assert [s["name"] for s in ds.vector_indexes()] == ["emb"]
+    assert [s["name"] for s in ds.indexes.vector.list()] == ["emb"]
     q = """PREFIX spk: <urn:x-sparkles:>
     SELECT ?s WHERE { (?s ?score) spk:vectorSearch (<http://ex.org/emb> "[1.0,0.0,0.0]"^^spk:vector 2) }
     ORDER BY DESC(?score)"""
     assert [r["s"] for r in ds.query(q)] == [ex("a"), ex("c")]
     with pytest.raises(ValueError):
-        ds.create_vector_index("bad", ex("emb2"), 3, options={"metric": "nonsense"})
-    ds.rebuild_vector_index("emb")
-    ds.drop_vector_index("emb")
-    assert ds.vector_indexes() == []
-    assert ds.vector_index("emb") is None
+        ds.indexes.vector.put("bad", {"predicate": ex("emb2").value, "dimension": 3, "metric": "nonsense"})
+    ds.indexes.vector.rebuild("emb")
+    ds.indexes.vector.drop("emb")
+    assert ds.indexes.vector.list() == []
+    assert ds.indexes.vector.get("emb") is None
 
 
 def test_embeddings_on_write() -> None:
@@ -168,16 +168,16 @@ def test_embeddings_on_write() -> None:
         )
         url = f"http://127.0.0.1:{server.server_address[1]}/v1/embeddings"
         embedding = {"url": url, "model": "m", "predicates": ["http://ex.org/label"]}
-        ds.create_vector_index("names", ex("emb"), 3, options={"embedding": embedding})
-        ds.embed(timeout=30)
+        ds.indexes.vector.put("names", {"predicate": ex("emb").value, "dimension": 3, "embedding": embedding})
+        ds.indexes.vector.embed_until_idle(timeout=30)
         assert sorted(received) == ["ab", "abcd"]
-        status = ds.vector_index("names")
+        status = ds.indexes.vector.get("names")
         assert status is not None and status["embedding"]["embedded"] == 2
         q = """PREFIX spk: <urn:x-sparkles:>
         SELECT ?s WHERE { (?s ?score) spk:vectorSearch (<http://ex.org/emb> "abcd" 1) }"""
         assert [r["s"] for r in ds.query(q)] == [ex("b")]
-        ds.reembed_vector_index("names")
-        ds.embed(timeout=30)
+        ds.indexes.vector.reembed("names")
+        ds.indexes.vector.embed_until_idle(timeout=30)
         # the query text equals a stored input, so it came from the cache
         assert len(received) == 4
     finally:
@@ -199,10 +199,10 @@ RDF_TYPE = NamedNode("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 def test_shacl_write_validation(tmp_path: Path) -> None:
     ds = Dataset(tmp_path / "db")
     ds.extend([Triple(ex("alice"), RDF_TYPE, ex("Person")), Triple(ex("alice"), ex("name"), Literal("Alice"))])
-    out = ds.set_write_validation({"mode": "reject", "shapes": {"inline": SHAPES}})
+    out = ds.validation.guard.set({"mode": "reject", "shapes": {"inline": SHAPES}})
     assert out["status"] == "installed"
     assert out["summary"]["conforms"] is True
-    status = ds.write_validation()
+    status = ds.validation.guard.get()
     assert status is not None and status["language"] == "shacl" and status["config"]["mode"] == "reject"
     with pytest.raises(WriteRejectedError):
         ds.add(Triple(ex("bob"), RDF_TYPE, ex("Person")))
@@ -210,24 +210,24 @@ def test_shacl_write_validation(tmp_path: Path) -> None:
     ds.close()
     # a reopened database validates its writes again
     ds = Dataset(tmp_path / "db")
-    assert ds.write_validation() is not None
+    assert ds.validation.guard.get() is not None
     with pytest.raises(WriteRejectedError):
         ds.add(Triple(ex("carol"), RDF_TYPE, ex("Person")))
-    assert ds.set_write_validation(None)["status"] == "removed"
-    assert ds.write_validation() is None
+    ds.validation.guard.reset()
+    assert ds.validation.guard.get() is None
     ds.add(Triple(ex("carol"), RDF_TYPE, ex("Person")))
     # a configuration the data does not meet is refused in reject mode
-    out = ds.set_write_validation({"mode": "reject", "shapes": {"inline": SHAPES}})
+    out = ds.validation.guard.set({"mode": "reject", "shapes": {"inline": SHAPES}})
     assert out["status"] == "not-conforming"
     with pytest.raises(ValueError):
-        ds.set_write_validation({"mode": "reject", "shapez": {}})
+        ds.validation.guard.set({"mode": "reject", "shapez": {}})
 
 
 @pytest.mark.skipif("shex" not in sparkles.FEATURES, reason="built without shex")
 def test_shex_write_validation() -> None:
     ds = Dataset()
     schema = "PREFIX ex: <http://ex.org/> ex:Person { ex:name . }"
-    out = ds.set_write_validation(
+    out = ds.validation.guard.set(
         {
             "language": "shex",
             "mode": "reject",
@@ -236,6 +236,6 @@ def test_shex_write_validation() -> None:
         }
     )
     assert out["status"] == "installed"
-    assert ds.write_validation()["language"] == "shex"  # type: ignore[index]
+    assert ds.validation.guard.get()["language"] == "shex"  # type: ignore[index]
     with pytest.raises(WriteRejectedError):
         ds.add(Triple(ex("bob"), RDF_TYPE, ex("Person")))

@@ -33,11 +33,12 @@ pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 
 /// An RDF dataset: the default graph and named graphs, in memory or in a database
 /// directory.
-#[pyclass(frozen, module = "sparkles", name = "Dataset")]
+#[pyclass(frozen, module = "sparkles", name = "Dataset", weakref)]
 pub struct PyDataset {
     inner: RwLock<Option<sparkles::Dataset>>,
     path: Option<String>,
     writer: WriterSlot,
+    pub(crate) group: Option<crate::catalog::DatasetGroup>,
 }
 
 /// Arguments shared by the query methods of datasets and transactions.
@@ -216,11 +217,13 @@ pub fn result_to_py<'py>(
 }
 
 impl PyDataset {
-    fn from_dataset(ds: sparkles::Dataset, path: Option<String>) -> PyDataset {
+    pub(crate) fn from_dataset(ds: sparkles::Dataset, path: Option<String>) -> PyDataset {
+        let writer = writer_slot(&ds);
         PyDataset {
             inner: RwLock::new(Some(ds)),
             path,
-            writer: Arc::new(Mutex::new(None)),
+            writer,
+            group: None,
         }
     }
 
@@ -258,7 +261,7 @@ impl PyDataset {
     }
 
     /// The engine's handle (a cheap clone), or an error once closed.
-    fn ds(&self, py: Python<'_>) -> PyResult<sparkles::Dataset> {
+    pub(crate) fn ds(&self, py: Python<'_>) -> PyResult<sparkles::Dataset> {
         self.inner
             .read()
             .unwrap()
@@ -266,17 +269,11 @@ impl PyDataset {
             .ok_or_else(|| invalid(py, "the dataset is closed"))
     }
 
-    /// The handle for a write: refused on the thread whose transaction is open, where
-    /// it would wait for its own lock.
-    fn ds_for_write(&self, py: Python<'_>) -> PyResult<sparkles::Dataset> {
-        if *self.writer.lock().unwrap() == Some(std::thread::current().id()) {
-            return Err(new_err(
-                py,
-                "ConflictError",
-                "this thread has an open transaction on the dataset: write through the transaction",
-            ));
-        }
-        self.ds(py)
+    /// The handle for an operation that takes the writer lock, including captures.
+    pub(crate) fn ds_for_write(&self, py: Python<'_>) -> PyResult<sparkles::Dataset> {
+        let ds = self.ds(py)?;
+        check_transaction(py, &ds)?;
+        Ok(ds)
     }
 
     fn run_query<'py>(
@@ -386,7 +383,7 @@ impl PyDataset {
 
     /// Release this handle. The directory lock goes once the iterators and transactions
     /// still using the dataset are gone.
-    fn close(&self, py: Python<'_>) {
+    pub(crate) fn close(&self, py: Python<'_>) {
         let ds = self.inner.write().unwrap().take();
         py.detach(|| drop(ds));
     }
@@ -966,9 +963,19 @@ impl PyDataset {
     }
 
     /// Merge the pending changes into a new index generation.
-    fn compact(&self, py: Python<'_>) -> PyResult<()> {
+    #[pyo3(signature=(*,cancel=None,progress=None,timeout=None))]
+    fn compact<'py>(
+        &self,
+        py: Python<'py>,
+        cancel: Option<&Bound<'py, PyAny>>,
+        progress: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let ds = self.ds_for_write(py)?;
-        py.detach(|| ds.compact()).py(py)
+        let r = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
+            ds.compact_with(&Default::default(), &ctl)
+        })?;
+        admin::to_py(py, &r)
     }
 
     /// Write a compressed N-Quads backup into a directory; returns its path.
@@ -989,99 +996,6 @@ impl PyDataset {
         py.detach(|| ds.set_prefix(prefix, iri)).py(py)
     }
 
-    // ------------------------------------------------------ reasoning, validation ----
-
-    /// Materialize entailments into `urn:x-sparkles:inferred`.
-    #[pyo3(signature = (profile = "rdfs", *, rules = None))]
-    fn reason(
-        &self,
-        py: Python<'_>,
-        profile: &str,
-        rules: Option<String>,
-    ) -> PyResult<crate::validate::PyReasonReport> {
-        let ds = self.ds_for_write(py)?;
-        crate::validate::reason(py, ds, profile, rules)
-    }
-
-    /// Remove the materialized entailments; returns how many triples were removed.
-    fn clear_inferences(&self, py: Python<'_>) -> PyResult<u64> {
-        let ds = self.ds_for_write(py)?;
-        crate::validate::clear_inferences(py, ds)
-    }
-
-    /// Validate with SHACL shapes given as text, or read from `shapes_graph`.
-    #[pyo3(signature = (shapes = None, *, format = None, shapes_graph = None, data_graph = None, include_inferred = false))]
-    fn validate_shacl(
-        &self,
-        py: Python<'_>,
-        shapes: Option<&Bound<'_, PyAny>>,
-        format: Option<&Bound<'_, PyAny>>,
-        shapes_graph: Option<&Bound<'_, PyAny>>,
-        data_graph: Option<&Bound<'_, PyAny>>,
-        include_inferred: bool,
-    ) -> PyResult<crate::validate::PyShaclReport> {
-        let ds = self.ds(py)?;
-        let shapes_graph = opt(shapes_graph, iri_from_py)?.map(|n| n.into_string());
-        let data_graph = opt(data_graph, iri_from_py)?.map(|n| n.into_string());
-        // "shaclc" (or `text/shaclc`) is the SHACL Compact Syntax; other names are RDF
-        // formats
-        let compact = match format.and_then(|f| f.cast::<PyString>().ok()) {
-            Some(s) => matches!(
-                s.to_str()?.trim().to_ascii_lowercase().as_str(),
-                "shaclc" | "shc" | "text/shaclc"
-            ),
-            None => false,
-        };
-        let format = if compact {
-            None
-        } else {
-            crate::io::rdf_only(format_from_py(format)?, "shapes")?
-        };
-        let shapes = match shapes.filter(|s| !s.is_none()) {
-            None => None,
-            Some(s) => Some(if let Ok(b) = s.cast::<PyBytes>() {
-                String::from_utf8(b.as_bytes().to_vec())
-                    .map_err(|_| invalid(py, "the shapes are not UTF-8"))?
-            } else {
-                s.extract::<String>()?
-            }),
-        };
-        crate::validate::shacl(
-            py,
-            ds,
-            shapes,
-            format,
-            compact,
-            shapes_graph,
-            data_graph,
-            include_inferred,
-        )
-    }
-
-    /// Validate with a ShEx schema (ShExC or ShExJ) and a shape map.
-    #[pyo3(signature = (schema, shape_map, *, format = None, data_graph = None, include_inferred = false))]
-    fn validate_shex(
-        &self,
-        py: Python<'_>,
-        schema: String,
-        shape_map: String,
-        format: Option<String>,
-        data_graph: Option<&Bound<'_, PyAny>>,
-        include_inferred: bool,
-    ) -> PyResult<crate::validate::PyShexReport> {
-        let ds = self.ds(py)?;
-        let data_graph = opt(data_graph, iri_from_py)?.map(|n| n.into_string());
-        crate::validate::shex(
-            py,
-            ds,
-            schema,
-            shape_map,
-            format,
-            data_graph,
-            include_inferred,
-        )
-    }
-
     // ------------------------------------------------------- history, snapshots ----
 
     /// The latest commit.
@@ -1090,255 +1004,258 @@ impl PyDataset {
         Ok(admin::head_commit(&self.ds(py)?))
     }
 
-    /// Commits, newest first, or oldest first with `after`.
-    #[pyo3(signature = (limit = 100, *, before = None, after = None))]
-    fn commits(
-        &self,
-        py: Python<'_>,
-        limit: usize,
-        before: Option<u64>,
-        after: Option<u64>,
-    ) -> PyResult<Vec<admin::PyCommit>> {
-        admin::commits(py, &self.ds(py)?, limit, before, after)
-    }
-
-    /// Keep a commit readable under a name (`at="snapshot:<name>"`).
-    #[pyo3(signature = (name, at = None, *, note = None, expires_ms = None))]
-    fn create_snapshot(
-        &self,
-        py: Python<'_>,
-        name: &str,
-        at: Option<&Bound<'_, PyAny>>,
-        note: Option<String>,
-        expires_ms: Option<i64>,
-    ) -> PyResult<admin::PySnapshot> {
-        let at = opt(at, at_from_py)?.unwrap_or(At::Head);
-        admin::create_snapshot(py, &self.ds(py)?, name, at, note, expires_ms)
-    }
-
-    /// The named snapshots.
-    fn snapshots(&self, py: Python<'_>) -> PyResult<Vec<admin::PySnapshot>> {
-        Ok(admin::snapshots(&self.ds(py)?))
-    }
-
-    /// Remove a named snapshot; true if it existed.
-    fn delete_snapshot(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
-        admin::delete_snapshot(py, &self.ds(py)?, name)
-    }
-
-    /// What the dataset's history holds: the head, the readable commit ranges, the
-    /// retention window and the number of snapshots.
-    fn history<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        admin::history(py, &self.ds(py)?)
-    }
-
-    /// Keep past states readable for the last `keep_commits` commits or `keep_age`
-    /// seconds, in at most `max_bytes` of disk; returns `history()`.
-    #[pyo3(signature = (*, keep_commits = None, keep_age = None, max_bytes = None))]
-    fn set_retention<'py>(
-        &self,
-        py: Python<'py>,
-        keep_commits: Option<u64>,
-        keep_age: Option<f64>,
-        max_bytes: Option<u64>,
-    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        admin::set_retention(py, &self.ds(py)?, keep_commits, keep_age, max_bytes)
-    }
-
-    /// Copy the dataset, or its state `at`, into a new database directory with a new
-    /// dataset id; returns a report.
-    #[pyo3(signature = (directory, *, at = None, exclude_graphs = None))]
+    /// Copy a consistent state to an unregistered persistent directory.
+    #[pyo3(signature=(directory,*,at=None,graphs=None,inferences="copy",cancel=None,progress=None,timeout=None))]
+    #[allow(clippy::too_many_arguments)]
     fn clone_to<'py>(
         &self,
         py: Python<'py>,
         directory: PathBuf,
         at: Option<&Bound<'py, PyAny>>,
-        exclude_graphs: Option<&Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let at = opt(at, at_from_py)?;
-        let exclude = match exclude_graphs {
-            None => Vec::new(),
-            Some(g) => g
-                .try_iter()?
-                .map(|g| iri_from_py(&g?))
-                .collect::<PyResult<_>>()?,
-        };
-        admin::clone_to(py, &self.ds(py)?, directory, at, exclude)
-    }
-
-    // --------------------------------------------------------- text and vectors ----
-
-    /// Enable (or reconfigure) full-text search, as a dict like `text.json`, and build
-    /// the index; returns its status.
-    #[pyo3(signature = (config = None))]
-    fn enable_text<'py>(
-        &self,
-        py: Python<'py>,
-        config: Option<&Bound<'py, PyAny>>,
+        graphs: Option<Vec<String>>,
+        inferences: &str,
+        cancel: Option<&Bound<'py, PyAny>>,
+        progress: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ds = self.ds_for_write(py)?;
-        #[cfg(feature = "text")]
-        return admin::enable_text(py, &ds, config);
-        #[cfg(not(feature = "text"))]
-        {
-            let _ = (ds, config);
-            Err(crate::errors::missing_feature(py, "text"))
-        }
-    }
-
-    /// Rebuild the full-text index from the current state; returns its status.
-    fn rebuild_text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let ds = self.ds_for_write(py)?;
-        #[cfg(feature = "text")]
-        return admin::rebuild_text(py, &ds);
-        #[cfg(not(feature = "text"))]
-        {
-            let _ = ds;
-            Err(crate::errors::missing_feature(py, "text"))
-        }
-    }
-
-    /// Turn full-text search off and remove the index.
-    fn disable_text(&self, py: Python<'_>) -> PyResult<()> {
-        let ds = self.ds_for_write(py)?;
-        #[cfg(feature = "text")]
-        return admin::disable_text(py, &ds);
-        #[cfg(not(feature = "text"))]
-        {
-            let _ = ds;
-            Err(crate::errors::missing_feature(py, "text"))
-        }
-    }
-
-    /// The full-text index's status, or `None` when it is off.
-    fn text_status<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let ds = self.ds(py)?;
-        #[cfg(feature = "text")]
-        return admin::text_status(py, &ds);
-        #[cfg(not(feature = "text"))]
-        {
-            let _ = ds;
-            Ok(None)
-        }
-    }
-
-    /// Create or replace a vector index over the embeddings of `predicate`, and start
-    /// building it in the background; true when it was created. `options` holds more of
-    /// the configuration (`metric`, `model`, `hnsw`, `exactThreshold`, and `embedding` for
-    /// an index that computes its vectors with an embeddings endpoint).
-    #[pyo3(signature = (name, predicate, dimension, *, options = None))]
-    fn create_vector_index(
-        &self,
-        py: Python<'_>,
-        name: &str,
-        predicate: &Bound<'_, PyAny>,
-        dimension: usize,
-        options: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<bool> {
-        let predicate = iri_from_py(predicate)?;
-        let ds = self.ds_for_write(py)?;
-        admin::create_vector_index(py, &ds, name, predicate, dimension, options)
-    }
-
-    /// Remove a vector index.
-    fn drop_vector_index(&self, py: Python<'_>, name: &str) -> PyResult<()> {
-        let ds = self.ds_for_write(py)?;
-        py.detach(|| ds.store().drop_vector_index(name)).py(py)
-    }
-
-    /// Rebuild a vector index in the background.
-    fn rebuild_vector_index(&self, py: Python<'_>, name: &str) -> PyResult<()> {
-        let ds = self.ds_for_write(py)?;
-        py.detach(|| ds.store().rebuild_vector_index(name)).py(py)
-    }
-
-    /// Embed every selected text of a vector index again, the next time `embed` runs.
-    fn reembed_vector_index(&self, py: Python<'_>, name: &str) -> PyResult<()> {
-        let ds = self.ds_for_write(py)?;
-        py.detach(|| ds.store().reembed(name)).py(py)
-    }
-
-    /// Embed the text waiting for the vector indexes that compute their vectors, on this
-    /// thread, and return when nothing is left. Requests may reach private addresses
-    /// (a local Ollama) unless `allow_private` is false. `secrets` maps the names an
-    /// `apiKey` may give to `env:VARIABLE` or `file:PATH`. Raises `QueryTimeoutError`
-    /// when `timeout` seconds pass with work left, as when the provider keeps failing.
-    #[pyo3(signature = (*, timeout = 3600.0, allow_private = true, secrets = None))]
-    fn embed(
-        &self,
-        py: Python<'_>,
-        timeout: f64,
-        allow_private: bool,
-        secrets: Option<std::collections::BTreeMap<String, String>>,
-    ) -> PyResult<()> {
-        if !(timeout.is_finite() && timeout > 0.0) {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "timeout must be a positive number of seconds",
-            ));
-        }
-        let mut env = sparkles::vector::embed::Environment {
-            outbound: sparkles::outbound::OutboundPolicy {
-                allow_private,
-                ..Default::default()
-            },
+        let spec = sparkles::cloning::Spec {
+            at: at.map(at_from_py).transpose()?,
+            graphs,
+            inferences: sparkles::cloning::Inferences::parse(inferences)
+                .ok_or_else(|| invalid(py, "inferences must be copy or drop"))?,
             ..Default::default()
         };
-        for (name, src) in secrets.unwrap_or_default() {
-            let src = src
-                .parse()
-                .map_err(|e: String| pyo3::exceptions::PyValueError::new_err(e))?;
-            env.secrets.insert(name, src);
-        }
+        let r = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
+            ds.clone_to_with(&directory, &spec, &ctl)
+        })?;
+        admin::to_py(
+            py,
+            &serde_json::json!({"datasetId":r.dataset_id,"commit":r.forked_from.seq,"sourceQuads":r.source_quads,"quads":r.quads,"graphs":r.graphs,"millis":r.millis,"method":r.method.name()}),
+        )
+    }
+    #[pyo3(signature=(*,at=None,graphs=None,inferences="copy",cancel=None,progress=None,timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn clone_to_memory(
+        &self,
+        py: Python<'_>,
+        at: Option<&Bound<'_, PyAny>>,
+        graphs: Option<Vec<String>>,
+        inferences: &str,
+        cancel: Option<&Bound<'_, PyAny>>,
+        progress: Option<&Bound<'_, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Py<Self>> {
         let ds = self.ds_for_write(py)?;
-        ds.store().set_embedding_environment(Some(env));
-        py.detach(|| {
-            ds.store()
-                .embed_until_idle(std::time::Duration::from_secs_f64(timeout))
-        })
-        .py(py)
+        let spec = sparkles::cloning::Spec {
+            at: at.map(at_from_py).transpose()?,
+            graphs,
+            inferences: sparkles::cloning::Inferences::parse(inferences)
+                .ok_or_else(|| invalid(py, "inferences must be copy or drop"))?,
+            ..Default::default()
+        };
+        let r = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
+            ds.clone_to_memory_with("copy", &spec, &ctl)
+        })?;
+        let cloned = sparkles::Dataset::from_store(r.store);
+        cloned.state().set_reasoning(r.reasoning).py(py)?;
+        crate::catalog::owned(py, cloned, None, self.group.clone())
     }
 
-    /// The status of a vector index, or `None`; with `wait`, once its build is done.
-    #[pyo3(signature = (name, *, wait = false))]
-    fn vector_index<'py>(
-        &self,
-        py: Python<'py>,
-        name: &str,
-        wait: bool,
-    ) -> PyResult<Option<Bound<'py, PyAny>>> {
-        admin::vector_index(py, &self.ds(py)?, name, wait)
+    #[getter]
+    fn snapshots(slf: Py<Self>) -> crate::handles::PySnapshots {
+        crate::handles::PySnapshots { owner: slf }
+    }
+    #[getter]
+    fn history(slf: Py<Self>) -> crate::handles::PyHistory {
+        crate::handles::PyHistory { owner: slf }
+    }
+    #[getter]
+    fn settings(slf: Py<Self>) -> crate::handles::PySettings {
+        crate::handles::PySettings { owner: slf }
     }
 
-    /// The status of every vector index.
-    fn vector_indexes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        admin::vector_indexes(py, &self.ds(py)?)
+    #[getter]
+    fn validation(slf: Py<Self>) -> crate::validation::PyValidation {
+        crate::validation::PyValidation { owner: slf }
     }
 
-    // ---------------------------------------------------------- write validation ----
+    #[getter]
+    fn indexes(slf: Py<Self>) -> crate::indexes::PyIndexes {
+        crate::indexes::PyIndexes { owner: slf }
+    }
 
-    /// Set, replace or (with `None`) remove write-time validation, from a dict like
-    /// `validation.json` with the shapes or schema given inline. Returns the outcome
-    /// and the validation of the current state.
-    #[pyo3(signature = (config))]
-    fn set_write_validation<'py>(
-        &self,
-        py: Python<'py>,
-        config: Option<&Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    #[getter]
+    fn reasoning(slf: Py<Self>) -> crate::reasoning::PyReasoning {
+        crate::reasoning::PyReasoning { owner: slf }
+    }
+
+    #[getter]
+    fn dataset_id(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(self.ds(py)?.dataset_id().to_string())
+    }
+    fn remove_prefix(&self, py: Python<'_>, prefix: &str) -> PyResult<bool> {
         let ds = self.ds_for_write(py)?;
-        let (out, guard) = admin::set_write_validation(py, &ds, config)?;
-        if let Some(g) = guard {
-            ds.set_write_guard(g);
-        }
-        Ok(out)
+        py.detach(|| ds.remove_prefix(prefix)).py(py)
     }
-
-    /// The installed write-time validation's configuration and status, or `None`.
-    fn write_validation<'py>(
+    fn clear_cache(&self, py: Python<'_>) -> PyResult<()> {
+        let ds = self.ds(py)?;
+        py.detach(|| ds.clear_cache());
+        Ok(())
+    }
+    #[pyo3(signature=(*,at=None,cancel=None,progress=None,timeout=None))]
+    fn stats<'py>(
         &self,
         py: Python<'py>,
-    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
-        let g = self.ds(py)?.write_guard();
-        g.as_ref().map(|g| admin::guard_status(py, g)).transpose()
+        at: Option<&Bound<'py, PyAny>>,
+        cancel: Option<&Bound<'py, PyAny>>,
+        progress: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds(py)?;
+        let at = at.map(at_from_py).transpose()?;
+        let r = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
+            let r = ds.stats(&sparkles::stats::StatsOptions {
+                at,
+                cancel: Some(ctl.cancel.flag()),
+                deadline: ctl.deadline,
+            })?;
+            ctl.progress.report(1.0, "read statistics");
+            Ok(r)
+        })?;
+        admin::to_py(py, &r)
     }
+    #[pyo3(signature=(query,*,base_iri=None,prefixes=None))]
+    fn explain<'py>(
+        &self,
+        py: Python<'py>,
+        query: &str,
+        base_iri: Option<String>,
+        prefixes: Option<BTreeMap<String, String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds(py)?;
+        let opts = QueryOptions {
+            base_iri,
+            prefixes: prefixes.unwrap_or_default().into_iter().collect(),
+            ..Default::default()
+        };
+        let (plan, info) = py.detach(|| ds.explain(query, &opts)).py(py)?;
+        let out = PyDict::new(py);
+        out.set_item("plan", plan)?;
+        out.set_item("summary", admin::to_py(py, &info)?)?;
+        Ok(out.into_any())
+    }
+    #[pyo3(signature=(input=None,*,format=None,path=None,target=None,base_iri=None,compression=None,lenient=false,cancel=None,progress=None,timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn replace<'py>(
+        &self,
+        py: Python<'py>,
+        input: Option<&Bound<'py, PyAny>>,
+        format: Option<&Bound<'py, PyAny>>,
+        path: Option<PathBuf>,
+        target: Option<&Bound<'py, PyAny>>,
+        base_iri: Option<String>,
+        compression: Option<&str>,
+        lenient: bool,
+        cancel: Option<&Bound<'py, PyAny>>,
+        progress: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds_for_write(py)?;
+        let target = match target {
+            None => sparkles::store::ReplaceTarget::All,
+            Some(g) if g.is_none() => sparkles::store::ReplaceTarget::Default,
+            Some(g) => match graph_from_py(g)? {
+                GraphName::DefaultGraph => sparkles::store::ReplaceTarget::Default,
+                GraphName::NamedNode(n) => sparkles::store::ReplaceTarget::Named(n),
+                _ => return Err(invalid(py, "target cannot be a blank node")),
+            },
+        };
+        let (src, spool) = source_from_py(
+            py,
+            input,
+            format,
+            path,
+            base_iri,
+            None,
+            compression,
+            lenient,
+        )?;
+        let r = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
+            let _spool = spool;
+            ctl.progress.report(0.0, "replacing data");
+            ctl.check()?;
+            let r = ds.replace(target, &[src])?;
+            ctl.progress.report(1.0, "replaced data");
+            Ok(r)
+        })?;
+        admin::to_py(py, &r)
+    }
+
+    #[getter]
+    fn queries(slf: Py<Self>) -> crate::queries::PyStoredQueries {
+        crate::queries::PyStoredQueries { owner: slf }
+    }
+
+    #[getter]
+    fn schema(slf: Py<Self>) -> crate::schema::PySchema {
+        crate::schema::PySchema { owner: slf }
+    }
+
+    #[getter]
+    fn graphql(slf: Py<Self>) -> crate::graphql::PyGraphQl {
+        crate::graphql::PyGraphQl { owner: slf }
+    }
+
+    #[cfg(feature = "backup")]
+    fn backups(
+        slf: Py<Self>,
+        repository: Py<crate::backups::PyBackupRepository>,
+    ) -> crate::backups::PyBackups {
+        crate::backups::PyBackups {
+            owner: slf,
+            repository,
+        }
+    }
+
+    #[getter]
+    fn branches(slf: Py<Self>) -> crate::branches::PyBranches {
+        crate::branches::PyBranches { owner: slf }
+    }
+    fn branch(&self, py: Python<'_>, name: &str) -> PyResult<Py<Self>> {
+        let ds = self.ds(py)?;
+        let ds = py.detach(|| ds.branch(name)).py(py)?;
+        let path = ds.store().root().map(|p| p.display().to_string());
+        crate::catalog::owned(py, ds, path, self.group.clone())
+    }
+}
+
+/// Dataset aliases share the transaction owner slot while any alias or transaction
+/// lives, so an alias cannot wait for a writer lock held by its own Python thread.
+fn writer_slot(ds: &sparkles::Dataset) -> WriterSlot {
+    use std::sync::{OnceLock, Weak};
+    type Slots = std::collections::HashMap<usize, Weak<Mutex<Option<std::thread::ThreadId>>>>;
+    static SLOTS: OnceLock<Mutex<Slots>> = OnceLock::new();
+    let mut slots = SLOTS.get_or_init(Default::default).lock().unwrap();
+    slots.retain(|_, v| v.strong_count() > 0);
+    let key = ds.state() as *const _ as usize;
+    if let Some(slot) = slots.get(&key).and_then(Weak::upgrade) {
+        return slot;
+    }
+    let slot = Arc::new(Mutex::new(None));
+    slots.insert(key, Arc::downgrade(&slot));
+    slot
+}
+
+/// Reject waiting for a store lock owned by this Python thread's transaction.
+/// Checking the shared state also covers aliases obtained through a catalog.
+pub(crate) fn check_transaction(py: Python<'_>, ds: &sparkles::Dataset) -> PyResult<()> {
+    if *writer_slot(ds).lock().unwrap() == Some(std::thread::current().id()) {
+        return Err(new_err(
+            py,
+            "ConflictError",
+            "this thread has an open transaction on the dataset: finish the transaction before this operation",
+        ));
+    }
+    Ok(())
 }

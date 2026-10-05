@@ -51,54 +51,17 @@ impl PyReasonReport {
 }
 
 #[cfg(feature = "reasoning")]
-pub fn reason(
-    py: Python<'_>,
-    ds: sparkles::Dataset,
-    profile: &str,
-    rules: Option<String>,
-) -> PyResult<PyReasonReport> {
-    use sparkles_reasoner::{Profile, ReasonOptions};
-    let profile = match rules {
-        Some(text) => {
-            sparkles_reasoner::parse_rules(&text).map_err(|e| errors::syntax(py, e.to_string()))?;
-            Profile::Rules(text)
+impl From<sparkles_reasoner::ReasonReport> for PyReasonReport {
+    fn from(r: sparkles_reasoner::ReasonReport) -> Self {
+        Self {
+            profile: r.profile,
+            rules: r.rules,
+            iterations: r.iterations,
+            inferred: r.inferred,
+            millis: r.millis,
+            warnings: r.warnings,
         }
-        None => profile
-            .parse::<Profile>()
-            .map_err(|e| errors::invalid(py, e.to_string()))?,
-    };
-    let r = py
-        .detach(|| sparkles_reasoner::materialize(ds.store(), &profile, &ReasonOptions::default()))
-        .map_err(|e| errors::anyhow(py, e))?;
-    Ok(PyReasonReport {
-        profile: r.profile,
-        rules: r.rules,
-        iterations: r.iterations,
-        inferred: r.inferred,
-        millis: r.millis,
-        warnings: r.warnings,
-    })
-}
-
-#[cfg(not(feature = "reasoning"))]
-pub fn reason(
-    py: Python<'_>,
-    _ds: sparkles::Dataset,
-    _profile: &str,
-    _rules: Option<String>,
-) -> PyResult<PyReasonReport> {
-    Err(errors::missing_feature(py, "reasoning"))
-}
-
-#[cfg(feature = "reasoning")]
-pub fn clear_inferences(py: Python<'_>, ds: sparkles::Dataset) -> PyResult<u64> {
-    py.detach(|| sparkles_reasoner::clear(ds.store()))
-        .map_err(|e| errors::anyhow(py, e))
-}
-
-#[cfg(not(feature = "reasoning"))]
-pub fn clear_inferences(py: Python<'_>, _ds: sparkles::Dataset) -> PyResult<u64> {
-    Err(errors::missing_feature(py, "reasoning"))
+    }
 }
 
 // --------------------------------------------------------------------------- SHACL ----
@@ -210,6 +173,9 @@ pub fn shacl(
     shapes_graph: Option<String>,
     data_graph: Option<String>,
     include_inferred: bool,
+    cancel: Option<&Bound<'_, PyAny>>,
+    progress: Option<&Bound<'_, PyAny>>,
+    timeout: Option<f64>,
 ) -> PyResult<PyShaclReport> {
     use sparkles_shacl::{Shapes, ShapesSyntax, ValidateOptions};
     let syntax = if compact {
@@ -217,36 +183,43 @@ pub fn shacl(
     } else {
         format.unwrap_or(RdfFormat::Turtle).into()
     };
-    let snap = ds.snapshot();
-    let shapes = match (shapes, shapes_graph) {
+    match (&shapes, &shapes_graph) {
         (Some(_), Some(_)) => {
             return Err(errors::invalid(py, "give shapes or shapes_graph, not both"));
         }
         (None, None) => return Err(errors::invalid(py, "give shapes or shapes_graph")),
-        (Some(text), None) => py
-            .detach(|| Shapes::parse(&text, syntax, None))
-            .map_err(|e| errors::syntax(py, format!("{e:#}")))?,
-        (None, Some(g)) => py
-            .detach(|| Shapes::from_store(&snap, Some(&g)))
-            .map_err(|e| errors::anyhow(py, e))?,
-    };
-    let opts = ValidateOptions {
-        data_graph,
-        extra_graphs: if include_inferred {
-            vec![INFERRED_GRAPH.to_string()]
-        } else {
-            Vec::new()
-        },
-        ..Default::default()
-    };
-    let (report, turtle) = py
-        .detach(|| {
-            sparkles_shacl::validate(&snap, &shapes, &opts).map(|r| {
-                let t = r.to_turtle();
-                (r, t)
-            })
-        })
-        .map_err(|e| errors::anyhow(py, e))?;
+        _ => {}
+    }
+    let (report, turtle) =
+        crate::interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
+            ctl.progress.report(0.0, "parsing shapes");
+            ctl.check()?;
+            let snap = ds.snapshot();
+            let shapes = match (shapes, shapes_graph) {
+                (Some(text), None) => Shapes::parse(&text, syntax, None)
+                    .map_err(|e| sparkles::Error::RdfParse(format!("{e:#}")))?,
+                (None, Some(g)) => Shapes::from_store(&snap, Some(&g)).map_err(engine_error)?,
+                _ => unreachable!(),
+            };
+            ctl.check()?;
+            let opts = ValidateOptions {
+                data_graph,
+                extra_graphs: if include_inferred {
+                    vec![INFERRED_GRAPH.into()]
+                } else {
+                    Vec::new()
+                },
+                cancel: Some(ctl.cancel.flag()),
+                timeout: ctl
+                    .deadline
+                    .map(|d| d.saturating_duration_since(std::time::Instant::now())),
+                ..Default::default()
+            };
+            let report = ds.validation().shacl(&shapes, &opts)?;
+            let turtle = report.to_turtle();
+            ctl.progress.report(1.0, "validated SHACL");
+            Ok((report, turtle))
+        })?;
     let results = report
         .results
         .into_iter()
@@ -284,6 +257,9 @@ pub fn shacl(
     _shapes_graph: Option<String>,
     _data_graph: Option<String>,
     _include_inferred: bool,
+    _cancel: Option<&Bound<'_, PyAny>>,
+    _progress: Option<&Bound<'_, PyAny>>,
+    _timeout: Option<f64>,
 ) -> PyResult<PyShaclReport> {
     Err(errors::missing_feature(py, "shacl"))
 }
@@ -362,6 +338,9 @@ pub fn shex(
     format: Option<String>,
     data_graph: Option<String>,
     include_inferred: bool,
+    cancel: Option<&Bound<'_, PyAny>>,
+    progress: Option<&Bound<'_, PyAny>>,
+    timeout: Option<f64>,
 ) -> PyResult<PyShexReport> {
     use sparkles_shex::{
         FileResolver, SchemaFormat, ShapeLabel, ShapeMap, Status, ValidateOptions,
@@ -373,30 +352,37 @@ pub fn shex(
                 .ok_or_else(|| errors::invalid(py, format!("unknown ShEx schema format {f:?}")))?,
         ),
     };
-    let parsed = sparkles_shex::parse_schema(&schema, None, hint)
-        .map_err(|e| errors::syntax(py, format!("schema: {e}")))?;
-    let compiled = py
-        .detach(|| sparkles_shex::compile(&parsed, &FileResolver::default()))
-        .map_err(|e| errors::syntax(py, format!("schema: {e}")))?;
-    let map = if shape_map.trim_start().starts_with('[') {
-        ShapeMap::from_json(&shape_map)
-    } else {
-        ShapeMap::parse(&shape_map, compiled.prefixes(), compiled.base())
-    }
-    .map_err(|e| errors::syntax(py, format!("shape map: {e}")))?;
-    let opts = ValidateOptions {
-        data_graph,
-        extra_graphs: if include_inferred {
-            vec![INFERRED_GRAPH.to_string()]
+    let rm = crate::interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
+        ctl.progress.report(0.0, "compiling schema");
+        ctl.check()?;
+        let parsed = sparkles_shex::parse_schema(&schema, None, hint)
+            .map_err(|e| sparkles::Error::RdfParse(format!("schema: {e}")))?;
+        let compiled = sparkles_shex::compile(&parsed, &FileResolver::default())
+            .map_err(|e| sparkles::Error::RdfParse(format!("schema: {e:#}")))?;
+        let map = if shape_map.trim_start().starts_with('[') {
+            ShapeMap::from_json(&shape_map)
         } else {
-            Vec::new()
-        },
-        ..Default::default()
-    };
-    let snap = ds.snapshot();
-    let rm = py
-        .detach(|| sparkles_shex::validate(&snap, &compiled, &map, &opts))
-        .map_err(|e| errors::anyhow(py, e))?;
+            ShapeMap::parse(&shape_map, compiled.prefixes(), compiled.base())
+        }
+        .map_err(|e| sparkles::Error::RdfParse(format!("shape map: {e}")))?;
+        ctl.check()?;
+        let opts = ValidateOptions {
+            data_graph,
+            extra_graphs: if include_inferred {
+                vec![INFERRED_GRAPH.into()]
+            } else {
+                Vec::new()
+            },
+            cancel: Some(ctl.cancel.flag()),
+            timeout: ctl
+                .deadline
+                .map(|d| d.saturating_duration_since(std::time::Instant::now())),
+            ..Default::default()
+        };
+        let rm = ds.validation().shex(&compiled, &map, &opts)?;
+        ctl.progress.report(1.0, "validated ShEx");
+        Ok(rm)
+    })?;
     let json = rm.to_json().to_string();
     let results = rm
         .results
@@ -434,6 +420,9 @@ pub fn shex(
     _format: Option<String>,
     _data_graph: Option<String>,
     _include_inferred: bool,
+    _cancel: Option<&Bound<'_, PyAny>>,
+    _progress: Option<&Bound<'_, PyAny>>,
+    _timeout: Option<f64>,
 ) -> PyResult<PyShexReport> {
     Err(errors::missing_feature(py, "shex"))
 }
@@ -445,4 +434,12 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyShexReport>()?;
     m.add_class::<PyShexResult>()?;
     Ok(())
+}
+
+#[cfg(feature = "shacl")]
+fn engine_error(e: anyhow::Error) -> sparkles::Error {
+    match e.downcast::<sparkles::Error>() {
+        Ok(e) => e,
+        Err(e) => sparkles::Error::invalid(format!("{e:#}")),
+    }
 }

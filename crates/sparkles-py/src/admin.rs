@@ -3,16 +3,13 @@
 //! statuses that the engine reads and writes as JSON cross over as Python dicts in the
 //! same camelCase shape (`text.json`, the vector index configuration, `validation.json`).
 
-use crate::errors::EngineResult;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyDict, PyList};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sparkles::commit::{CommitInfo, CommitRange};
-use sparkles::history::{At, NamedSnapshot, Retention};
-use std::path::PathBuf;
+use sparkles::history::NamedSnapshot;
 
 static JSON: PyOnceLock<(Py<PyAny>, Py<PyAny>)> = PyOnceLock::new();
 
@@ -63,6 +60,10 @@ pub struct PyCommit {
     /// quads in the dataset after the commit
     #[pyo3(get)]
     quads: u64,
+    #[pyo3(get)]
+    message: Option<String>,
+    #[pyo3(get)]
+    digest: Option<String>,
 }
 
 impl From<CommitInfo> for PyCommit {
@@ -74,7 +75,24 @@ impl From<CommitInfo> for PyCommit {
             inserted: c.inserted,
             deleted: c.deleted,
             quads: c.quads,
+            message: None,
+            digest: None,
         }
+    }
+}
+
+impl PyCommit {
+    pub fn annotated(mut self, annotation: Option<&sparkles::annotations::Annotation>) -> Self {
+        if let Some(a) = annotation {
+            self.message = a.message.as_ref().map(ToString::to_string);
+            self.digest = a.digest_hex();
+        }
+        self
+    }
+}
+impl From<sparkles::handles::CommitDetail> for PyCommit {
+    fn from(c: sparkles::handles::CommitDetail) -> Self {
+        PyCommit::from(c.commit).annotated(c.annotation.as_ref())
     }
 }
 
@@ -137,7 +155,8 @@ impl PySnapshot {
 }
 
 pub fn head_commit(ds: &sparkles::Dataset) -> PyCommit {
-    ds.head_commit().into()
+    let c = ds.head_commit();
+    PyCommit::from(c).annotated(ds.history().annotation(c.seq).as_ref())
 }
 
 pub fn commits(
@@ -156,270 +175,11 @@ pub fn commits(
         (None, None) => CommitRange::Latest,
     };
     let page = py.detach(|| ds.commits(range, limit));
-    Ok(page.commits.into_iter().map(PyCommit::from).collect())
-}
-
-pub fn create_snapshot(
-    py: Python<'_>,
-    ds: &sparkles::Dataset,
-    name: &str,
-    at: At,
-    note: Option<String>,
-    expires_ms: Option<i64>,
-) -> PyResult<PySnapshot> {
-    let (snap, _) = py
-        .detach(|| ds.store().create_snapshot_with(name, &at, note, expires_ms))
-        .py(py)?;
-    Ok(snap.into())
-}
-
-pub fn snapshots(ds: &sparkles::Dataset) -> Vec<PySnapshot> {
-    ds.store()
-        .snapshots()
+    Ok(page
+        .commits
         .into_iter()
-        .map(PySnapshot::from)
-        .collect()
-}
-
-pub fn delete_snapshot(py: Python<'_>, ds: &sparkles::Dataset, name: &str) -> PyResult<bool> {
-    py.detach(|| ds.store().delete_snapshot(name)).py(py)
-}
-
-/// What the dataset's history holds, as a dict.
-pub fn history<'py>(py: Python<'py>, ds: &sparkles::Dataset) -> PyResult<Bound<'py, PyDict>> {
-    let h = py.detach(|| ds.store().history());
-    let d = PyDict::new(py);
-    d.set_item("head", h.head)?;
-    d.set_item("reconstructable", PyList::new(py, h.reconstructable)?)?;
-    d.set_item("bytes", h.bytes)?;
-    d.set_item("retention", to_py(py, &h.retention)?)?;
-    d.set_item("snapshots", h.snapshots)?;
-    d.set_item("first_commit", h.first_commit)?;
-    Ok(d)
-}
-
-pub fn set_retention<'py>(
-    py: Python<'py>,
-    ds: &sparkles::Dataset,
-    keep_commits: Option<u64>,
-    keep_age: Option<f64>,
-    max_bytes: Option<u64>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let r = Retention {
-        keep_commits,
-        keep_age_ms: keep_age.map(|s| (s * 1000.0).round() as u64),
-        max_bytes,
-    };
-    py.detach(|| ds.store().set_retention(r)).py(py)?;
-    history(py, ds)
-}
-
-pub fn clone_to<'py>(
-    py: Python<'py>,
-    ds: &sparkles::Dataset,
-    directory: PathBuf,
-    at: Option<At>,
-    exclude_graphs: Vec<oxrdf::NamedNode>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let opts = sparkles::store::CloneOptions {
-        exclude_graphs,
-        at,
-        ..Default::default()
-    };
-    let r = py
-        .detach(|| ds.store().clone_to(&directory, &opts))
-        .py(py)?;
-    let d = PyDict::new(py);
-    d.set_item("path", directory.display().to_string())?;
-    d.set_item("dataset_id", r.dataset_id.to_string())?;
-    d.set_item("commit", r.forked_from.seq)?;
-    d.set_item("source_quads", r.source_quads)?;
-    d.set_item("quads", r.quads)?;
-    d.set_item("graphs", r.graphs)?;
-    d.set_item("millis", r.millis)?;
-    d.set_item("method", r.method.name())?;
-    Ok(d)
-}
-
-// --------------------------------------------------------------- text, vector ----
-
-#[cfg(feature = "text")]
-pub fn enable_text<'py>(
-    py: Python<'py>,
-    ds: &sparkles::Dataset,
-    config: Option<&Bound<'py, PyAny>>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let cfg: sparkles::text::TextConfig = match config.filter(|c| !c.is_none()) {
-        Some(c) => from_py(c, "text index configuration")?,
-        None => Default::default(),
-    };
-    let status = py.detach(|| ds.store().enable_text(cfg)).py(py)?;
-    to_py(py, &status)
-}
-
-#[cfg(feature = "text")]
-pub fn rebuild_text<'py>(py: Python<'py>, ds: &sparkles::Dataset) -> PyResult<Bound<'py, PyAny>> {
-    let status = py.detach(|| ds.store().rebuild_text()).py(py)?;
-    to_py(py, &status)
-}
-
-#[cfg(feature = "text")]
-pub fn disable_text(py: Python<'_>, ds: &sparkles::Dataset) -> PyResult<()> {
-    py.detach(|| ds.store().disable_text()).py(py)
-}
-
-#[cfg(feature = "text")]
-pub fn text_status<'py>(
-    py: Python<'py>,
-    ds: &sparkles::Dataset,
-) -> PyResult<Option<Bound<'py, PyAny>>> {
-    ds.store().text_status().map(|s| to_py(py, &s)).transpose()
-}
-
-pub fn create_vector_index(
-    py: Python<'_>,
-    ds: &sparkles::Dataset,
-    name: &str,
-    predicate: oxrdf::NamedNode,
-    dimension: usize,
-    options: Option<&Bound<'_, PyAny>>,
-) -> PyResult<bool> {
-    let mut cfg = serde_json::to_value(sparkles::vector::config::VectorIndexConfig::new(
-        predicate.as_str(),
-        dimension,
-    ))
-    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    if let Some(o) = options.filter(|o| !o.is_none()) {
-        let extra: serde_json::Map<String, serde_json::Value> = from_py(o, "vector index options")?;
-        if let serde_json::Value::Object(m) = &mut cfg {
-            m.extend(extra);
-        }
-    }
-    let cfg: sparkles::vector::config::VectorIndexConfig = serde_json::from_value(cfg)
-        .map_err(|e| PyValueError::new_err(format!("invalid vector index options: {e}")))?;
-    py.detach(|| ds.store().create_vector_index(name, cfg))
-        .py(py)
-}
-
-pub fn vector_index<'py>(
-    py: Python<'py>,
-    ds: &sparkles::Dataset,
-    name: &str,
-    wait: bool,
-) -> PyResult<Option<Bound<'py, PyAny>>> {
-    let s = if wait {
-        py.detach(|| ds.store().wait_vector_index(name))
-    } else {
-        ds.store().vector_index(name)
-    };
-    s.map(|s| to_py(py, &s)).transpose()
-}
-
-pub fn vector_indexes<'py>(py: Python<'py>, ds: &sparkles::Dataset) -> PyResult<Bound<'py, PyAny>> {
-    to_py(py, &ds.store().vector_indexes())
-}
-
-// ---------------------------------------------------------- write validation ----
-
-/// The write-time validation of a dataset (the library's guard, which
-/// `sparkles::Dataset::open` installs from `validation.json`).
-pub use sparkles::write_guard::WriteGuard as Guard;
-
-/// Set, replace or (with `None` or mode `off`) remove the write-time validation.
-/// Returns `{"status": "installed" | "not-conforming" | "removed", "summary": …}` and
-/// the guard to keep.
-#[allow(unused_variables)]
-pub fn set_write_validation<'py>(
-    py: Python<'py>,
-    ds: &sparkles::Dataset,
-    config: Option<&Bound<'py, PyAny>>,
-) -> PyResult<(Bound<'py, PyDict>, Option<Option<Guard>>)> {
-    let config = config.filter(|c| !c.is_none());
-    let language = match config {
-        Some(c) => c
-            .get_item("language")
-            .ok()
-            .and_then(|l| l.extract::<String>().ok())
-            .unwrap_or_else(|| "shacl".into()),
-        None => "shacl".into(),
-    };
-    let d = PyDict::new(py);
-    let store = ds.store();
-    match language.as_str() {
-        "shex" => {
-            #[cfg(feature = "shex")]
-            {
-                use sparkles_shex::guard::{SetOutcome, ShexValidationConfig, set_config};
-                let cfg: Option<ShexValidationConfig> = config
-                    .map(|c| from_py(c, "write validation configuration"))
-                    .transpose()?;
-                let resolver = sparkles_shex::FileResolver::default();
-                let out = py
-                    .detach(|| set_config(store, cfg, &resolver))
-                    .map_err(|e| crate::errors::anyhow(py, e))?;
-                Ok(match out {
-                    SetOutcome::Installed(g, s) => {
-                        d.set_item("status", "installed")?;
-                        d.set_item("summary", to_py(py, &s)?)?;
-                        (d, Some(Some(Guard::Shex(g))))
-                    }
-                    SetOutcome::NotConforming(s) => {
-                        d.set_item("status", "not-conforming")?;
-                        d.set_item("summary", to_py(py, &s)?)?;
-                        (d, None)
-                    }
-                    SetOutcome::Removed => {
-                        d.set_item("status", "removed")?;
-                        (d, Some(None))
-                    }
-                })
-            }
-            #[cfg(not(feature = "shex"))]
-            {
-                Err(crate::errors::missing_feature(py, "shex"))
-            }
-        }
-        "shacl" => {
-            #[cfg(feature = "shacl")]
-            {
-                use sparkles_shacl::guard::{SetOutcome, ValidationConfig, set_config};
-                let cfg: Option<ValidationConfig> = config
-                    .map(|c| from_py(c, "write validation configuration"))
-                    .transpose()?;
-                let out = py
-                    .detach(|| set_config(store, cfg))
-                    .map_err(|e| crate::errors::anyhow(py, e))?;
-                Ok(match out {
-                    SetOutcome::Installed(g, s) => {
-                        d.set_item("status", "installed")?;
-                        d.set_item("summary", to_py(py, &s)?)?;
-                        (d, Some(Some(Guard::Shacl(g))))
-                    }
-                    SetOutcome::NotConforming(s) => {
-                        d.set_item("status", "not-conforming")?;
-                        d.set_item("summary", to_py(py, &s)?)?;
-                        (d, None)
-                    }
-                    SetOutcome::Removed => {
-                        d.set_item("status", "removed")?;
-                        (d, Some(None))
-                    }
-                })
-            }
-            #[cfg(not(feature = "shacl"))]
-            {
-                Err(crate::errors::missing_feature(py, "shacl"))
-            }
-        }
-        other => Err(PyValueError::new_err(format!(
-            "unknown write validation language {other:?}: use shacl or shex"
-        ))),
-    }
-}
-
-/// The installed guard's configuration and status.
-pub fn guard_status<'py>(py: Python<'py>, g: &Guard) -> PyResult<Bound<'py, PyDict>> {
-    Ok(to_py(py, &g.json())?.cast_into::<PyDict>()?)
+        .map(|c| PyCommit::from(c).annotated(ds.history().annotation(c.seq).as_ref()))
+        .collect())
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

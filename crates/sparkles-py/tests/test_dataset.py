@@ -264,7 +264,7 @@ def test_apply_patch() -> None:
     s = ds.apply_patch('TX .\nA <urn:a> <urn:p> "1" .\nA <urn:b> <urn:p> <urn:c> <urn:g> .\nTC .\n')
     assert (s.committed, s.commit, s.inserted, s.deleted, s.rows) == (True, 1, 2, 0, 4)
     assert len(ds) == 2
-    assert ds.commits(1)[0].kind == "patch"
+    assert ds.history.commits(1)[0].kind == "patch"
     # TA aborts the whole patch
     s = ds.apply_patch(b"A <urn:q> <urn:p> 1 . TA .")
     assert s.aborted and not s.committed and len(ds) == 2

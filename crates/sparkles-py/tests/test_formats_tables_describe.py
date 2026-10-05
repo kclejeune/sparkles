@@ -175,7 +175,7 @@ def test_a_broken_document_names_the_syntax() -> None:
 
 def test_shapes_are_not_read_in_jena_syntaxes() -> None:
     with pytest.raises(ValueError, match="shapes"):
-        sample().validate_shacl("", format="trix")
+        sample().validation.shacl("", format="trix")
 
 
 def test_csv_and_tsv_tables(tmp_path: Path) -> None:

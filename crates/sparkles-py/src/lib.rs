@@ -3,15 +3,26 @@
 //! it and defines the exception classes.
 
 mod admin;
+mod backups;
+mod branches;
+mod catalog;
 mod dataset;
 mod errors;
+mod graphql;
+mod handles;
+mod indexes;
 mod interrupt;
 mod io;
+mod queries;
 mod querybuilder;
+mod reasoning;
 mod results;
+mod schema;
 mod terms;
 mod txn;
+mod utilities;
 mod validate;
+mod validation;
 
 use pyo3::prelude::*;
 use pyo3::types::PyFrozenSet;
@@ -23,6 +34,8 @@ const FEATURES: &[(&str, bool)] = &[
     ("shex", cfg!(feature = "shex")),
     ("text", cfg!(feature = "text")),
     ("geo", cfg!(feature = "geo")),
+    ("backup", cfg!(feature = "backup")),
+    ("graphql", cfg!(feature = "graphql")),
     ("zstd", true),
     ("brotli", true),
 ];
@@ -30,11 +43,23 @@ const FEATURES: &[(&str, bool)] = &[
 #[pymodule(gil_used = true)]
 fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     terms::register(m)?;
+    utilities::register(m)?;
     io::register(m)?;
     results::register(m)?;
+    schema::register(m)?;
     validate::register(m)?;
+    validation::register(m)?;
     admin::register(m)?;
+    branches::register(m)?;
+    #[cfg(feature = "backup")]
+    backups::register(m)?;
+    catalog::register(m)?;
+    handles::register(m)?;
+    graphql::register(m)?;
+    indexes::register(m)?;
+    reasoning::register(m)?;
     querybuilder::register(m)?;
+    queries::register(m)?;
     m.add_class::<dataset::PyDataset>()?;
     m.add_class::<txn::PyTransaction>()?;
     m.add_class::<interrupt::PyCancelToken>()?;
