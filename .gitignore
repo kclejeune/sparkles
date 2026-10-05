@@ -1,4 +1,6 @@
 /target
+/crates/sparkles-ffi/target
+/crates/sparkles-node/target
 *.db/
 /data/
 .playwright-mcp/

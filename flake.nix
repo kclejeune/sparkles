@@ -73,6 +73,7 @@
           # Chromium for the Playwright UI tests (the dev shell and the `ui-e2e` check)
           # the JVM bindings: the native library, the jar and its check
           jvm = pkgs.callPackage ./nix/jvm.nix { inherit rustPlatform; };
+          node = pkgs.callPackage ./nix/node.nix { inherit rustPlatform; };
           playwrightBrowsers = pkgs.playwright-driver.browsers.override {
             withFirefox = false;
             withWebkit = false;
@@ -106,6 +107,9 @@
             sparkles-ffi = jvm.ffi;
             # the sparkles-jena jar (share/java) with the host's native library inside
             sparkles-jena = jvm.jar;
+            # the Node-API addon and installable JavaScript package archives
+            sparkles-node-native = node.native;
+            sparkles-node = node.packages;
             default = self'.packages.sparkles;
           };
 
@@ -150,8 +154,7 @@
             inherit (self'.packages) sparkles sparkles-cli;
             # the engine's unit tests, on the packages' dependency layer
             sparkles-tests = self'.packages.sparkles-cli.passthru.tests;
-            # rustfmt, as `mise run fmt:check` runs it (crates/sparkles-py and
-            # crates/sparkles-ffi are their own workspaces, outside `--all`)
+            # rustfmt, including the language-binding crates' separate workspaces.
             fmt = craneLib.cargoFmt {
               pname = "sparkles";
               version = (lib.importTOML ./Cargo.toml).workspace.package.version;
@@ -168,10 +171,12 @@
               postBuild = ''
                 cargo fmt --manifest-path crates/sparkles-py/Cargo.toml -- --check
                 cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml -- --check
+                cargo fmt --manifest-path crates/sparkles-node/Cargo.toml -- --check
               '';
             };
             # the wheel, installed, with the pytest suite as its check phase
             python-bindings = self'.packages.sparkles-py;
+            node-bindings = node.check;
             # THIRD_PARTY_LICENSES-UI.md is the notices file the UI build writes (the build
             # itself fails on a non-permissive license)
             ui-licenses = pkgs.runCommand "sparkles-ui-licenses" { } ''

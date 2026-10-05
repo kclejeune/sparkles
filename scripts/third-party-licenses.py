@@ -3,8 +3,9 @@
 `sparkles` binary links (the normal dependencies of sparkles-server with its default
 features, on every platform the flake builds for), from `cargo metadata`. Without an OUT
 argument it also writes crates/sparkles-py/THIRD_PARTY_LICENSES.md for the Python wheel and
-jvm/sparkles-jena/THIRD_PARTY_LICENSES.md for the JVM library's native part, each from its
-crate's own workspace and lock.
+jvm/sparkles-jena/THIRD_PARTY_LICENSES.md for the JVM library's native part and
+js/engine/THIRD_PARTY_LICENSES.md for the Node addon, each from its own workspace and
+lock and the targets its release workflow ships.
 
 Identical texts are printed once, with the crates that ship them. A crate whose package
 has no license file gets the standard text of its license (of the first of MIT,
@@ -37,6 +38,8 @@ ROOTS = [
     ),
     ("sparkles-fmt-wasm", ["wasm32-unknown-unknown"]),
 ]
+BINDING_TARGETS = [*ROOTS[0][1], "x86_64-pc-windows-msvc"]
+NODE_TARGETS = [*BINDING_TARGETS, "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 # file names (case-insensitive) that carry a license or a notice
 LICENSE_FILE = re.compile(r"^(licen[cs]e|copying|copyright|notice|unlicense)([-._].*)?$", re.I)
 
@@ -447,6 +450,13 @@ def write_or_check(out, text, n, check):
     print(f"{out}: {n} crates", file=sys.stderr)
 
 
+NODE_INTRO = (
+    "Third-party software in the Sparkles Node-API native engine.\n\n"
+    "These notices cover the Rust libraries linked into the native addon; "
+    "JavaScript dependencies retain their own license files.\n"
+)
+
+
 def main():
     args = sys.argv[1:]
     check = "--check" in args
@@ -462,7 +472,7 @@ def main():
     if not args:
         crate = os.path.join(ROOT, "crates", "sparkles-py")
         pkgs = {}
-        for t in ROOTS[0][1]:
+        for t in BINDING_TARGETS:
             # `mise run licenses` brings the lock up to date, as the py:* tasks do
             meta = metadata(t, os.path.join(crate, "Cargo.toml"), locked=check)
             for p in linked(meta, "sparkles-py"):
@@ -472,13 +482,24 @@ def main():
         # the JVM library's native part, from crates/sparkles-ffi (the notices travel in the jar)
         crate = os.path.join(ROOT, "crates", "sparkles-ffi")
         pkgs = {}
-        for t in ROOTS[0][1]:
+        for t in BINDING_TARGETS:
             meta = metadata(t, os.path.join(crate, "Cargo.toml"), locked=check)
             for p in linked(meta, "sparkles-ffi"):
                 pkgs[p["id"]] = p
         text = render(pkgs.values(), JAR_INTRO, "crates/sparkles-ffi/Cargo.lock")
         out = os.path.join(ROOT, "jvm", "sparkles-jena", "THIRD_PARTY_LICENSES.md")
         write_or_check(out, text, len(pkgs), check)
+        # The Node addon ships the same notices beside its platform binaries.
+        crate = os.path.join(ROOT, "crates", "sparkles-node")
+        pkgs = {}
+        for target in NODE_TARGETS:
+            meta = metadata(target, os.path.join(crate, "Cargo.toml"), locked=check)
+            for package in linked(meta, "sparkles-node"):
+                pkgs[package["id"]] = package
+        text = render(pkgs.values(), NODE_INTRO, "crates/sparkles-node/Cargo.lock")
+        out = os.path.join(ROOT, "js", "engine", "THIRD_PARTY_LICENSES.md")
+        write_or_check(out, text, len(pkgs), check)
+
 
 
 if __name__ == "__main__":

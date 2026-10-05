@@ -3,810 +3,810 @@
 
 ["backup.policy.next_runs"]
 python = "preview_schedule"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (standalone schedule-preview helper)"
+node = "planned: P05 follow-up (standalone policy schedule preview)"
 
 ["backup.repository.break_lock"]
 python = "BackupRepository.break_lock"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesBackupRepository.breakLock"
+node = "Repository.breakLock"
 
 ["backup.repository.gc"]
 python = "BackupRepository.gc"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesBackupRepository.gc"
+node = "Repository.gc"
 
 ["backup.repository.list"]
 python = "BackupRepository.backups"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesBackupRepository.list"
+node = "Repository.list"
 
 ["backup.repository.locks"]
 python = "BackupRepository.locks"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesBackupRepository.locks"
+node = "Repository.locks"
 
 ["backup.repository.test"]
 python = "BackupRepository.test"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesBackupRepository.test"
+node = "Repository.test"
 
 ["backup.repository.verify"]
 python = "BackupRepository.verify"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesBackupRepository.verify"
+node = "Repository.verify"
 
 ["backups.create_with"]
 python = "Dataset.backups.create"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.backups(repository).create"
+node = "Dataset.backups.create"
 
 ["backups.delete"]
 python = "Dataset.backups.delete"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.backups(repository).delete"
+node = "Dataset.backups.delete"
 
 ["backups.get"]
 python = "Dataset.backups.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.backups(repository).get"
+node = "Dataset.backups.get"
 
 ["backups.list"]
 python = "Dataset.backups.list"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.backups(repository).list"
+node = "Dataset.backups.list"
 
 ["backups.verify_with"]
 python = "Dataset.backups.verify"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.backups(repository).verify"
+node = "Dataset.backups.verify"
 
 ["branches.cherry_pick"]
 python = "Dataset.branches.cherry_pick"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().cherryPick"
+node = "Dataset.branches.cherryPick"
 
 ["branches.commit_graph"]
 python = "Dataset.branches.commit_graph"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (commit DAG document export)"
+node = "Dataset.branches.commitGraph"
 
 ["branches.create"]
 python = "Dataset.branches.create"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().create"
+node = "Dataset.branches.create"
 
 ["branches.delete"]
 python = "Dataset.branches.delete"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().delete"
+node = "Dataset.branches.delete"
 
 ["branches.get"]
 python = "Dataset.branches.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().get"
+node = "Dataset.branches.get"
 
 ["branches.list"]
 python = "Dataset.branches.list"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().list"
+node = "Dataset.branches.list"
 
 ["branches.merge"]
 python = "Dataset.branches.merge"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().merge"
+node = "Dataset.branches.merge"
 
 ["branches.preview_cherry_pick"]
 python = "Dataset.branches.preview_cherry_pick"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().previewCherryPick"
+node = "Dataset.branches.previewCherryPick"
 
 ["branches.preview_merge"]
 python = "Dataset.branches.preview_merge"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().previewMerge"
+node = "Dataset.branches.previewMerge"
 
 ["branches.preview_revert"]
 python = "Dataset.branches.preview_revert"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().previewRevert"
+node = "Dataset.branches.previewRevert"
 
 ["branches.revert"]
 python = "Dataset.branches.revert"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().revert"
+node = "Dataset.branches.revert"
 
 ["branches.settings"]
 python = "Dataset.branches.settings"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().settings"
+node = "Dataset.branches.exempt"
 
 ["branches.update"]
 python = "Dataset.branches.update"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branches().rename/protect/note"
+node = "Dataset.branches.rename/protect/note"
 
 ["catalog.apply_retention"]
 python = "Catalog.apply_retention"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.applyRetention"
+node = "planned: P05 follow-up (offline catalog policy retention)"
 
 ["catalog.attach"]
 python = "Catalog.attach"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.attach"
+node = "Catalog.attach"
 
 ["catalog.backup_files"]
 python = "Catalog.backup_files"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.backupFiles"
+node = "planned: P05 follow-up (internal catalog backup file collection)"
 
 ["catalog.clone_dataset"]
 python = "Catalog.clone_dataset"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.cloneDataset"
+node = "Catalog.clone"
 
 ["catalog.create"]
 python = "Catalog.create"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.create"
+node = "Catalog.create"
 
 ["catalog.delete"]
 python = "Catalog.delete"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.delete"
+node = "Catalog.delete"
 
 ["catalog.get"]
 python = "Catalog.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.get"
+node = "Catalog.get"
 
 ["catalog.get_by_id"]
 python = "Catalog.get_by_id"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.getById"
+node = "Catalog.getById"
 
 ["catalog.info"]
 python = "Catalog.info"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.info"
+node = "Catalog.info"
 
 ["catalog.inspect"]
 python = "Catalog.inspect"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.inspect"
+node = "Catalog.inspect"
 
 ["catalog.list"]
 python = "Catalog.list"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.list"
+node = "Catalog.list"
 
 ["catalog.memory"]
 python = "Catalog.memory"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.memory"
+node = "Catalog.memory"
 
 ["catalog.open"]
 python = "Catalog"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.open"
+node = "Catalog.open"
 
 ["catalog.rename"]
 python = "Catalog.rename"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.rename"
+node = "Catalog.rename"
 
 ["catalog.repositories"]
 python = "Catalog.repositories"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.repositories"
+node = "Catalog.repositories"
 
 ["catalog.reserve"]
 python = "Catalog.reserve"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.reserve"
+node = "planned: P05 follow-up (internal catalog reservation plumbing)"
 
 ["catalog.restore"]
 python = "Catalog.restore"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.restore"
+node = "Catalog.restore"
 
 ["catalog.run_policy"]
 python = "Catalog.run_policy"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.runPolicy"
+node = "planned: P05 follow-up (offline catalog policy runner)"
 
 ["dataset.apply_patch"]
 python = "Dataset.apply_patch"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.applyPatch"
+node = "Dataset.applyPatch"
 
 ["dataset.ask"]
 python = "Dataset.ask"
-jvm = "FfiDataset.prepareQuery"
-node = "planned: P05"
+jvm = "Jena QueryExec.dataset(ds).query(...).ask"
+node = "Dataset.ask"
 
 ["dataset.backup"]
 python = "Dataset.backup"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.backup"
+node = "Dataset.backup"
 
 ["dataset.branch"]
 python = "Dataset.branch"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.branch"
+node = "Dataset.branch"
 
 ["dataset.clear"]
 python = "Dataset.clear"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.clear"
+node = "Dataset.clear"
 
 ["dataset.clear_cache"]
 python = "Dataset.clear_cache"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (native result-cache management)"
+node = "Dataset.clearCache"
 
 ["dataset.clone_to_memory_with"]
 python = "Dataset.clone_to_memory"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (standalone memory clone; catalog.cloneDataset(inMemory=true) is shipped)"
+node = "Dataset.cloneToMemory"
 
 ["dataset.clone_to_with"]
 python = "Dataset.clone_to"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.cloneTo"
+node = "Dataset.cloneTo"
 
 ["dataset.compact_with"]
 python = "Dataset.compact"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.compact"
+node = "Dataset.compact"
 
 ["dataset.construct"]
 python = "Dataset.construct"
-jvm = "FfiDataset.prepareQuery"
-node = "planned: P05"
+jvm = "Jena QueryExec.dataset(ds).query(...).constructTriples/constructQuads"
+node = "Dataset.construct"
 
 ["dataset.dataset_id"]
 python = "Dataset.dataset_id"
-jvm = "FfiDataset.datasetId"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.datasetId"
+node = "Dataset.id"
 
 ["dataset.dump"]
 python = "Dataset.dump"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.dump"
+node = "Dataset.dump/dumpToFile/dumpToString"
 
 ["dataset.dump_graph"]
 python = "Dataset.dump"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.getGraph(graph).find + Jena RDFDataMgr.write"
+node = "Dataset.dump({fromGraph})"
 
 ["dataset.explain"]
 python = "Dataset.explain"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (native optimizer-plan document)"
+node = "Dataset.explain"
 
 ["dataset.head_commit"]
 python = "Dataset.head_commit"
-jvm = "FfiDataset.headCommit"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.headCommit"
+node = "Dataset.info / Dataset.history.commit"
 
 ["dataset.insert"]
 python = "Dataset.add"
-jvm = "FfiWriteTxn.apply"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.add"
+node = "Dataset.add/addAll"
 
 ["dataset.load_sources_receipt"]
 python = "Dataset.load_files"
-jvm = "FfiDataset.loadFiles"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.loadFiles/load"
+node = "Dataset.load/loadFiles"
 
 ["dataset.memory"]
 python = "Dataset.memory"
-jvm = "FfiDataset.memory"
-node = "planned: P05"
+jvm = "SparklesDatasets.memory"
+node = "Dataset.memory"
 
 ["dataset.open"]
 python = "Dataset.open"
-jvm = "FfiDataset.open"
-node = "planned: P05"
+jvm = "SparklesDatasets.open"
+node = "Dataset.open"
 
 ["dataset.prefixes"]
 python = "Dataset.prefixes"
-jvm = "FfiDataset.prefixes"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.prefixes"
+node = "Dataset.prefixes.list"
 
 ["dataset.quads"]
 python = "Dataset.quads_for_pattern"
-jvm = "FfiDataset.find"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.find"
+node = "Dataset.match"
 
 ["dataset.query_with"]
 python = "Dataset.query"
-jvm = "FfiDataset.prepareQuery"
-node = "planned: P05"
+jvm = "Jena QueryExec.dataset(ds).query(...).build"
+node = "Dataset.query"
 
 ["dataset.remove"]
 python = "Dataset.remove"
-jvm = "FfiWriteTxn.apply"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.delete"
+node = "Dataset.delete"
 
 ["dataset.remove_prefix"]
 python = "Dataset.remove_prefix"
-jvm = "FfiDataset.removePrefix"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.prefixes().delete"
+node = "Dataset.prefixes.delete"
 
 ["dataset.replace"]
 python = "Dataset.replace"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.addGraph"
+node = "Dataset.replace"
 
 ["dataset.select"]
 python = "Dataset.select"
-jvm = "FfiDataset.prepareQuery"
-node = "planned: P05"
+jvm = "Jena QueryExec.dataset(ds).query(...).select"
+node = "Dataset.select"
 
 ["dataset.set_prefix"]
 python = "Dataset.set_prefix"
-jvm = "FfiDataset.setPrefix"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.prefixes().add"
+node = "Dataset.prefixes.set"
 
 ["dataset.stats"]
 python = "Dataset.stats"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.stats"
+node = "Dataset.stats"
 
 ["dataset.transaction"]
 python = "Dataset.transaction"
-jvm = "FfiDataset.beginWrite"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.begin/commit/abort/end"
+node = "Dataset.transaction/beginTransaction"
 
 ["dataset.update_with"]
 python = "Dataset.update"
-jvm = "FfiWriteTxn.update"
-node = "planned: P05"
+jvm = "Jena UpdateAction.parseExecute / UpdateExec.dataset(ds)"
+node = "Dataset.update"
 
 ["fmt.format"]
 python = "skip: formatter and linter remain CLI tools"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (engine formatter helper)"
+node = "planned: P05 follow-up (standalone formatter)"
 
 ["fmt.lint"]
 python = "skip: formatter and linter remain CLI tools"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (engine linter helper)"
+node = "planned: P05 follow-up (standalone linter)"
 
 ["geo.convert"]
 python = "convert_geometries"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (native CRS conversion helper)"
+node = "planned: P05 follow-up (standalone geometry conversion)"
 
 ["graph.clear"]
 python = "Dataset.clear_graph"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.getGraph(graph).clear"
+node = "Dataset.clearGraph"
 
 ["graphql.config.get"]
 python = "Dataset.graphql.config.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.graphql().get"
+node = "Dataset.graphql.get"
 
 ["graphql.config.reset"]
 python = "Dataset.graphql.config.reset"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.graphql().reset"
+node = "Dataset.graphql.reset"
 
 ["graphql.draft"]
 python = "Dataset.graphql.draft"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.graphql().draft"
+node = "Dataset.graphql.draft"
 
 ["graphql.execute"]
 python = "Dataset.graphql.execute"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.graphql().execute"
+node = "Dataset.graphql.execute"
 
 ["graphql.put"]
 python = "Dataset.graphql.config.set"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.graphql().put"
+node = "Dataset.graphql.put"
 
 ["graphql.sdl"]
 python = "Dataset.graphql.sdl"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.graphql().sdl"
+node = "Dataset.graphql.sdl"
 
 ["graphql.versions"]
 python = "Dataset.graphql.versions"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.graphql().versions"
+node = "Dataset.graphql.versions"
 
 ["history.changes"]
 python = "Dataset.history.changes"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.history().changes"
+node = "Dataset.history.changes / Dataset.changes"
 
 ["history.commit"]
 python = "Dataset.history.commit"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.history().commit"
+node = "Dataset.history.commit"
 
 ["history.commits"]
 python = "Dataset.history.commits"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.history().commits/before/after"
+node = "Dataset.history.commits"
 
 ["history.diff"]
 python = "Dataset.history.diff"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.history().diff"
+node = "Dataset.history.diff"
 
 ["history.prune"]
 python = "Dataset.history.prune"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.history().prune"
+node = "Dataset.history.prune"
 
 ["history.query"]
 python = "Dataset.history.query"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.history().query"
+node = "Dataset.history.query"
 
 ["history.status"]
 python = "Dataset.history.status"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.history().status"
+node = "Dataset.history.status"
 
 ["history.tick"]
 python = "Dataset.history.tick"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.history().tick"
+node = "Dataset.history.tick"
 
 ["history.wait_for_commit"]
 python = "Dataset.history.wait_for_commit"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.history().waitForCommit"
+node = "Dataset.waitForCommit"
 
 ["indexes.geo.disable"]
 python = "Dataset.indexes.geo.disable"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().geo().disable"
+node = "Dataset.indexes.geo.disable"
 
 ["indexes.geo.enable"]
 python = "Dataset.indexes.geo.enable"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().geo().enable"
+node = "Dataset.indexes.geo.enable"
 
 ["indexes.geo.features"]
 python = "Dataset.indexes.geo.features"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (feature extraction iterator)"
+node = "Dataset.indexes.geo.features"
 
 ["indexes.geo.rebuild"]
 python = "Dataset.indexes.geo.rebuild"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().geo().rebuild"
+node = "Dataset.indexes.geo.rebuild"
 
 ["indexes.geo.status"]
 python = "Dataset.indexes.geo.status"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().geo().status"
+node = "Dataset.indexes.geo.status"
 
 ["indexes.text.disable"]
 python = "Dataset.indexes.text.disable"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().text().disable"
+node = "Dataset.indexes.text.disable"
 
 ["indexes.text.enable"]
 python = "Dataset.indexes.text.enable"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().text().enable"
+node = "Dataset.indexes.text.enable"
 
 ["indexes.text.rebuild"]
 python = "Dataset.indexes.text.rebuild"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().text().rebuild"
+node = "Dataset.indexes.text.rebuild"
 
 ["indexes.text.search"]
 python = "Dataset.indexes.text.search"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (direct text hit iterator; SPARQL text functions are shipped)"
+node = "Dataset.indexes.text.search"
 
 ["indexes.text.status"]
 python = "Dataset.indexes.text.status"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().text().status"
+node = "Dataset.indexes.text.status"
 
 ["indexes.vector.drop"]
 python = "Dataset.indexes.vector.drop"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().vector().delete"
+node = "Dataset.indexes.vector.drop"
 
 ["indexes.vector.embed_until_idle"]
 python = "Dataset.indexes.vector.embed_until_idle"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (embedding daemon control)"
+node = "Dataset.indexes.vector.embedUntilIdle (bounded waitMs; no AbortSignal)"
 
 ["indexes.vector.get"]
 python = "Dataset.indexes.vector.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().vector().get"
+node = "Dataset.indexes.vector.get"
 
 ["indexes.vector.list"]
 python = "Dataset.indexes.vector.list"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().vector().list"
+node = "Dataset.indexes.vector.list"
 
 ["indexes.vector.put"]
 python = "Dataset.indexes.vector.put"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().vector().put"
+node = "Dataset.indexes.vector.put"
 
 ["indexes.vector.rebuild"]
 python = "Dataset.indexes.vector.rebuild"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.indexes().vector().rebuild"
+node = "Dataset.indexes.vector.rebuild"
 
 ["indexes.vector.recall"]
 python = "Dataset.indexes.vector.recall"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (ANN diagnostic comparison)"
+node = "Dataset.indexes.vector.recall"
 
 ["indexes.vector.reembed"]
 python = "Dataset.indexes.vector.reembed"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (embedding regeneration)"
+node = "Dataset.indexes.vector.reembed"
 
 ["io.check_data"]
 python = "check_data"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (engine validation of RDF input)"
+node = "planned: P05 follow-up (standalone RDF syntax validation)"
 
 ["queries.delete"]
 python = "Dataset.queries.delete"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.queries().delete"
+node = "Dataset.queries.delete"
 
 ["queries.get"]
 python = "Dataset.queries.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.queries().get"
+node = "Dataset.queries.get"
 
 ["queries.list"]
 python = "Dataset.queries.list"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.queries().list"
+node = "Dataset.queries.list"
 
 ["queries.put"]
 python = "Dataset.queries.put"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.queries().put"
+node = "Dataset.queries.put"
 
 ["queries.run"]
 python = "Dataset.queries.run"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.queries().run"
+node = "Dataset.queries.run"
 
 ["queries.versions"]
 python = "Dataset.queries.versions"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.queries().versions"
+node = "Dataset.queries.versions"
 
 ["reasoning.clear"]
 python = "Dataset.reasoning.clear"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.reasoning().clear"
+node = "Dataset.reasoning.clear"
 
 ["reasoning.diagnostics"]
 python = "Dataset.reasoning.diagnostics"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (reasoning provenance diagnostics)"
+node = "Dataset.reasoning.diagnostics"
 
 ["reasoning.rdfs.get"]
 python = "Dataset.reasoning.rdfs.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.reasoning().rdfs().enabled"
+node = "Dataset.reasoning.rdfs.get"
 
 ["reasoning.rdfs.reset"]
 python = "Dataset.reasoning.rdfs.reset"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.reasoning().rdfs().reset"
+node = "Dataset.reasoning.rdfs.reset"
 
 ["reasoning.rdfs.set"]
 python = "Dataset.reasoning.rdfs.set"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.reasoning().rdfs().set"
+node = "Dataset.reasoning.rdfs.set"
 
 ["reasoning.run_with"]
 python = "Dataset.reasoning.run"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.reasoning().run"
+node = "Dataset.reasoning.run"
 
 ["reasoning.status"]
 python = "Dataset.reasoning.status"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (native materialization status)"
+node = "Dataset.reasoning.status"
 
 ["repositories.add"]
 python = "Catalog.repositories.add"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.repositories().add"
+node = "Catalog.repositories.add"
 
 ["repositories.get"]
 python = "Catalog.repositories.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.repositories().get"
+node = "Catalog.repositories.get"
 
 ["repositories.list"]
 python = "Catalog.repositories.list"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.repositories().list"
+node = "Catalog.repositories.list"
 
 ["repositories.open"]
 python = "Catalog.repositories.open"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.repositories().open"
+node = "Catalog.repositories.open"
 
 ["repositories.remove"]
 python = "Catalog.repositories.remove"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.repositories().remove"
+node = "Catalog.repositories.remove"
 
 ["repositories.update"]
 python = "Catalog.repositories.update"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.repositories().update"
+node = "Catalog.repositories.update"
 
 ["repositories.with_fixed"]
 python = "Catalog.repositories.with_fixed"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "SparklesCatalog.repositories().withFixed"
+node = "planned: P05 follow-up (fixed repository registries)"
 
 ["schema.classes"]
 python = "Dataset.schema.classes"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.schema().classes"
+node = "Dataset.schema.classes"
 
 ["schema.constraints"]
 python = "Dataset.schema.constraints"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.schema().constraints"
+node = "Dataset.schema.constraints"
 
 ["schema.diff"]
 python = "Dataset.schema.diff"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.schema().diff"
+node = "Dataset.schema.diff"
 
 ["schema.draft_shapes"]
 python = "Dataset.schema.draft_shapes"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.schema().draftShapes"
+node = "Dataset.schema.draftShapes"
 
 ["schema.predicates"]
 python = "Dataset.schema.predicates"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.schema().predicates"
+node = "Dataset.schema.predicates"
 
 ["schema.profiles"]
 python = "Dataset.schema.profiles"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.schema().profiles"
+node = "Dataset.schema.profiles"
 
 ["schema.report"]
 python = "Dataset.schema.report"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.schema().report"
+node = "Dataset.schema.report"
 
 ["settings.compaction.get"]
 python = "Dataset.settings.compaction.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.settings().compaction().get"
+node = "Dataset.settings.compaction.get"
 
 ["settings.compaction.reset"]
 python = "Dataset.settings.compaction.reset"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.settings().compaction().reset"
+node = "Dataset.settings.compaction.reset"
 
 ["settings.compaction.set"]
 python = "Dataset.settings.compaction.set"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.settings().compaction().set"
+node = "Dataset.settings.compaction.set"
 
 ["settings.describe.get"]
 python = "Dataset.settings.describe.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.settings().describe().get"
+node = "Dataset.settings.describe.get"
 
 ["settings.describe.reset"]
 python = "Dataset.settings.describe.reset"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.settings().describe().reset"
+node = "Dataset.settings.describe.reset"
 
 ["settings.describe.set"]
 python = "Dataset.settings.describe.set"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.settings().describe().set"
+node = "Dataset.settings.describe.set"
 
 ["settings.quota.get"]
 python = "Dataset.settings.quota.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.settings().quota().get"
+node = "Dataset.settings.quota.get"
 
 ["settings.quota.reset"]
 python = "Dataset.settings.quota.reset"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.settings().quota().reset"
+node = "Dataset.settings.quota.reset"
 
 ["settings.quota.set"]
 python = "Dataset.settings.quota.set"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.settings().quota().set"
+node = "Dataset.settings.quota.set"
 
 ["settings.retention.set"]
 python = "Dataset.settings.retention.set"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.settings().retention().set"
+node = "Dataset.settings.retention.set"
 
 ["snapshots.create"]
 python = "Dataset.snapshots.create"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.snapshots().create"
+node = "Dataset.snapshots.create"
 
 ["snapshots.delete"]
 python = "Dataset.snapshots.delete"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.snapshots().delete"
+node = "Dataset.snapshots.delete"
 
 ["snapshots.get"]
 python = "Dataset.snapshots.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.snapshots().get"
+node = "Dataset.snapshots.get"
 
 ["snapshots.list"]
 python = "Dataset.snapshots.list"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.snapshots().list"
+node = "Dataset.snapshots.list"
 
 ["sparql.parse_query"]
 python = "parse_query"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "Jena QueryFactory.create"
+node = "planned: P05 follow-up (standalone SPARQL query parsing)"
 
 ["sparql.parse_update"]
 python = "parse_update"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "Jena UpdateFactory.create"
+node = "planned: P05 follow-up (standalone SPARQL update parsing)"
 
 ["terms.check_iri"]
 python = "check_iri"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (engine IRI validation helper)"
+node = "planned: P05 follow-up (engine IRI validation helper)"
 
 ["terms.check_langtag"]
 python = "check_langtag"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "planned: P04 follow-up (engine language-tag validation helper)"
+node = "planned: P05 follow-up (engine language-tag validation helper)"
 
 ["validation.guard.get"]
 python = "Dataset.validation.guard.get"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.validation().guard().status"
+node = "Dataset.validation.guard.get"
 
 ["validation.guard.reset"]
 python = "Dataset.validation.guard.reset"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.validation().guard().reset"
+node = "Dataset.validation.guard.reset"
 
 ["validation.guard.set"]
 python = "Dataset.validation.guard.set"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.validation().guard().set"
+node = "Dataset.validation.guard.setShacl / setShex"
 
 ["validation.shacl"]
 python = "Dataset.validation.shacl"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.validation().shacl"
+node = "Dataset.validation.shacl"
 
 ["validation.shex"]
 python = "Dataset.validation.shex"
-jvm = "planned: P04 phase 3"
-node = "planned: P05"
+jvm = "DatasetGraphSparkles.validation().shex"
+node = "Dataset.validation.shex"

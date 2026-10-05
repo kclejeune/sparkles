@@ -4,7 +4,7 @@ Sparkles is a fast RDF, SPARQL and OWL database written in Rust. It reimplements
 [Apache Jena](https://jena.apache.org/) and Fuseki, with their protocols, semantics and
 operational model, on the index and execution architecture of
 [QLever](https://github.com/ad-freiburg/qlever). It ships as an embeddable library with
-Rust, Python and JVM APIs, a Fuseki-compatible server and CLI, and a web UI.
+Rust, Python, JVM and JavaScript APIs, a Fuseki-compatible server and CLI, and a web UI.
 
 > [!WARNING]
 > Sparkles is experimental. There are no releases, and the on-disk format, HTTP API, CLI
@@ -31,7 +31,7 @@ Rust, Python and JVM APIs, a Fuseki-compatible server and CLI, and a web UI.
    values come from the Oxigraph project's crates. Sparkles adds the storage, planner,
    executor, server, reasoner and UI.
 4. **Library first.** The engine is a library with no HTTP server. The server, the CLI
-   and the Python and JVM bindings are built on its public API, so an embedded program
+   and the Python, JVM and JavaScript bindings are built on its public API, so an embedded program
    gets the same features as the server.
 
 ## Features
@@ -46,13 +46,15 @@ Rust, Python and JVM APIs, a Fuseki-compatible server and CLI, and a web UI.
 * Branches that share their upstream's index until they compact, so creating one writes
   a few kilobytes, with fast-forward, squash, replayed and three-way merges, reverts and
   cherry-picks, renames, conflict resolution on the web UI's merge page, and a commit
-  graph of every branch ([API](docs/API.md#branches-and-merges)).
+  graph of every branch. In-memory datasets have isolated branches too
+  ([API](docs/API.md#branches-and-merges)).
 * RDF Patch applied as one commit, entity tags with `If-Match` writes, commit messages,
   and dry runs of any write that report its changes, validation and quota effect
   ([API](docs/API.md#write-previews)).
 * Parallel bulk loading from every W3C syntax and Jena's TriX, RDF Thrift, RDF Protobuf
   and RDF/JSON, CSV imports through CSVW or Tarql-style templates, and incremental,
-  deduplicated backups to a file system or S3 ([usage](docs/USAGE.md#backup-repositories)).
+  deduplicated backups to a file system or S3. A selected branch can be backed up and
+  restored as an independent dataset ([usage](docs/USAGE.md#backup-repositories)).
 
 **Query**
 * SPARQL 1.1 and SPARQL 1.2 / RDF 1.2: 482/482, 328/328, 157/157 and 269/269 on the W3C
@@ -109,7 +111,9 @@ Rust, Python and JVM APIs, a Fuseki-compatible server and CLI, and a web UI.
 * A JVM library, `sparkles-jena`, that gives Jena programs a `DatasetGraph` backed by
   Sparkles, so TDB2 code runs on it with a one-line change
   ([usage](docs/USAGE.md#jvm-apache-jena)).
-* Node.js and TypeScript bindings are planned.
+* Node.js and TypeScript packages with an embedded engine, RDF/JS terms, asynchronous
+  result streams and transactions, plus a remote client with generated API types
+  ([usage](docs/USAGE.md#javascript-and-typescript)).
 * A Rust client for Sparkles and any SPARQL endpoint ([usage](docs/USAGE.md#rust-client)).
 
 **Server and integrations**
@@ -317,6 +321,7 @@ with Dataset("mydb") as ds:
 | `crates/sparkles-client` | The Rust client of remote SPARQL endpoints | jena-rdfconnection (remote) |
 | `crates/sparkles-py` | The Python package (PyO3, its own cargo workspace) | — |
 | `crates/sparkles-ffi`, `jvm/` | The JVM bindings: the UniFFI native library and the Kotlin `sparkles-jena` library | jena-tdb2's `DatasetGraphTDB` |
+| `crates/sparkles-node`, `js/` | The Node-API addon, RDF/JS contracts and TypeScript engine and remote client packages | — |
 | `vendor/spargebra` | Oxigraph's SPARQL parser, vendored with fixes ([PATCHED.md](vendor/spargebra/PATCHED.md)) | ARQ's grammar |
 | `ui/` | The SvelteKit web UI | jena-fuseki-ui |
 

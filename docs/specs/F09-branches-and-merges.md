@@ -11,9 +11,9 @@
 > History panel's commit graph with `GET /$/commit-graph/{ds}`, squash merges, reverts,
 > replayed fast-forwards, renames, deletions that re-parent, predicates exempt from
 > conflicts, merges as tasks, per-branch gauges and the backup manifest's count of
-> left-out branches have shipped, and so have cherry-picks from Phase 3. Python,
-> in-memory branches, backups of branches and indexes built from the upstream's files
-> (Phase 2), and cross-server clones, relinking and virtual merge bases (Phase 3) are not
+> left-out branches have shipped, and so have Python bindings, in-memory branches,
+> selected-branch backups, upstream full-text/spatial/vector index reuse, and
+> cherry-picks from Phase 3. Cross-server clones, relinking and virtual merge bases are not
 > built.
 >
 > **User docs:** [API: Branches and merges](../API.md#branches-and-merges) ·
@@ -1064,8 +1064,9 @@ These are estimates for Phase 1 to confirm, on a 10.5M-quad dataset.
   `POST /$/revert/{ds}?branch=&commit=`.
 - `ff: "replay"`.
 - Renaming branches, and re-parenting children when a branch is deleted.
-- In-memory branches, which share the `Arc<Generation>` and clone the delta, so they cost
-  nothing until they diverge.
+- In-memory branches share immutable vocabulary and permutation indexes, copy the
+  inherited delta vocabulary, and retain a private generation identity, mutable index
+  state, history and validation guard. Creation cost follows the inherited delta.
 - Branch backups (§6.2), and merges as cancellable tasks with `Prefer: respond-async`.
 - Full-text and spatial indexes on a new branch built from the upstream's index files
   rather than from scratch. In Phase 1 a branch of a dataset with these indexes rebuilds
@@ -1542,8 +1543,10 @@ with 10,000 merges was not measured.
   preview and puts the merge fields under `merge`.
 * **Grants.** `branches` is a field of `[[grants]]` entries. A grant limited to branches
   alone, without graphs or endpoints, may be `admin`.
-* **Not built.** The raised minimum version in `dataset.json` (§5.1) remains. The
-  full-text, spatial and vector indexes of a branch are built when the branch opens.
+* **Subsequent storage work.** The reader requirement in `dataset.json` is now enforced
+  before recovery and updated before publishing branch metadata. New branches reuse
+  compatible upstream spatial/vector files and copy a pinned full-text checkpoint,
+  replaying inherited WAL changes; missing or incompatible indexes rebuild safely.
   Per-branch gauges, `sparkles_branch_held_bytes`, the backup manifest's count of
   left-out branches and the Backups panel's note came with Phase 2.
 
@@ -1666,6 +1669,49 @@ times the old build's as a geometric mean over 30 series. Eight interleaved load
   and `branch` labels, not a `branch` label on the per-dataset families, which keep their
   series. `sparkles_branch_held_bytes` counts upstream generations that links read and
   retired branches, not generations kept by base pins.
-* **Not built.** A rename button in the UI's Branches panel, since another change is
-  reworking that panel. Python, in-memory branches, backups of branches and indexes
-  built from the upstream's files remain for later work.
+* The Branches panel supports renames, and Python bindings and the remaining Phase 2
+  storage work are implemented, as described below.
+
+
+**Phase 2: memory branches, standalone backups and index reuse.**
+
+* Memory branches share immutable base vocabulary and mapped permutation indexes.
+  Their inherited append vocabulary is copied to prevent one branch's rollback from
+  truncating another's terms. Each branch has a private generation identity, delta,
+  result cache, history, spatial/vector state and independently forked validation guard.
+  RDFS configuration is inherited with a separate schema cache. Fork snapshots remain
+  available for merges beyond history-ring eviction and release their holds once no
+  live or retired branch needs them. Ordinals remain monotonic after deletion.
+* `/$/backups/{ds}?branch=NAME`, the dataset backup handle, and
+  `sparkles backup create --branch NAME` capture a selected branch as a standalone
+  dataset. Linked branches and memory branches materialize a leased temporary
+  generation; branches with their own persistent generation upload its files.
+  Persistent materialization retains the persistent source type. The manifest's
+  optional `dataset.branch` records the owning dataset UUID, captured branch UUID/name
+  and next ordinal. Automatic restore always gives a branch backup a fresh dataset
+  UUID, records `forkedFrom`, restores only `main`, and reserves inherited blank-node
+  ordinals. Explicit identity preservation is refused for branch backups. Scheduled
+  policies continue to capture `main` only.
+* Compatible upstream spatial and vector files are mapped read-only with independent
+  overlays. Reconfiguration and damaged-file fallback never modify upstream files.
+  Full-text seeding pins committed segment metadata, copies and verifies that exact
+  checkpoint, and replays every inherited WAL segment through the fork. A checkpoint
+  after the fork or without complete replay coverage causes a safe rebuild.
+* `dataset.json.minimumReader` defaults to 1 for legacy metadata. Branch-table
+  publication requires reader 2, and a newer requirement or unknown dataset metadata
+  format is refused before recovery mutates files. Restore checks the requirement
+  before reidentification, even when integrity checking is disabled. Binaries predating
+  this check still ignore the field, so the downgrade restriction remains necessary.
+* Clone and backup capture admission follows cancellation and deadlines while waiting
+  for a writer; the core options also support immediate no-wait refusal. Default
+  capture APIs retain their existing behavior.
+
+Cross-server clones, relinking and virtual merge bases remain Phase 3 work.
+
+
+Memory branch creation publishes the initialized store and branch entry together, so
+concurrent branch readers cannot fall through to opening a directory. Scoped backup
+creation keeps the branch selector in its Location, including for dataset administrators.
+Memory branch backups preserve graph-sourced ShEx validation settings as well as inline
+schemas. Focused concurrency, authenticated link-following and restore/write-rejection
+regressions cover these cases.

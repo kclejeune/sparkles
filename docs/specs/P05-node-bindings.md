@@ -1,16 +1,15 @@
 # P05: Node.js and TypeScript bindings
 
-> **Status:** specified
+> **Status:** implemented with documented deferrals
 >
-> **Phases:** Nothing is built. Phase 1 is the embedded engine package for Node.js on
-> Linux and macOS, with queries, updates, loads, transactions and RDF/JS terms, and the
-> package of the remote client. Phase 2 adds every platform, Bun and Deno in CI, streams
-> wherever data goes in or out, an RDF/JS `Source` for Comunica and the rest of the
-> engine's API. Phase 3 is an optional WebAssembly build of an in-memory engine. §12
-> describes what stands in the way of a browser build, and that part is documented, not
-> committed to.
+> **Phases:** The embedded engine, shared RDF/JS model and remote client are built.
+> Phase 2 adds administration, bounded RDF streams, RDF/JS Source/Store adapters,
+> commit notification feeds and a broader native runtime/platform CI matrix. Internal
+> catalog/policy APIs and standalone utility helpers remain deferred. Phase 3 Wasm
+> and the UI client migration remain optional follow-up work.
 >
-> **User docs:** none.
+> **User docs:** [engine](../../js/engine/README.md),
+> [client](../../js/client/README.md), [common](../../js/common/README.md).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end will record how it lands.
@@ -1239,4 +1238,37 @@ OpenAPI description of [X03](X03-openapi-and-completions.md). Receipts are those
 
 ## Outcome
 
-Nothing is built.
+The workspace now builds `@sparkles-rdf/common`, `@sparkles-rdf/engine` and
+`@sparkles-rdf/client`. The engine uses a separate Node-API Cargo workspace and
+keeps JavaScript handles local to their environment. Rust-only persistent store
+sharing supports aliases and workers; transaction ownership checks reject unsafe
+snapshot capture and writes from an active callback. Queued writers preserve FIFO
+order and cancellation, and closing datasets terminates transactions, results,
+loads, dumps and commit-feed waits.
+
+Queries use pull-driven batches and lazy RDF/JS term decoding. Receipts and count
+fields use lossless `bigint`; common terms accept foreign RDF/JS factories,
+directional literals and RDF 1.2 triple terms. Loads/dumps and standalone
+parse/serialize use bounded queues, backpressure and stream cancellation. Catalog
+and repository handles expose lifecycle-aware dataset and backup operations.
+History, snapshots, branches/merges, stored queries, settings, schema, GraphQL,
+validation, reasoning and indexes have concrete administration methods. RDF/JS
+Source and Store adapters support Comunica queries and updates, and change feeds
+wait for engine commit notifications. The vector embedding executor uses a bounded
+`waitMs` argument rather than advertising an abort control the underlying executor
+cannot honor.
+
+Platform package manifests and gated CI cover Linux glibc/musl x64/arm64, macOS
+x64/arm64 and Windows x64 MSVC, testing Node 22/24/26 plus Bun and Deno. Installed
+archive checks exercise runtime loading and strict TypeScript declarations, including
+the typed OpenAPI client. Local execution is on Linux x64 glibc; other native targets
+are configured for CI and have not been executed locally. No npm publication occurred.
+
+Concrete facade coverage is 148 of 162 mapping entries. Deferred entries are internal
+catalog reservation and backup-file plumbing, catalog policy/retention runners,
+fixed repository registries and policy schedule previews, and standalone formatter,
+geometry conversion, RDF syntax checking, SPARQL parsing and IRI/language-tag checking
+utilities. These are documented deviations; full Rust/Python facade parity is not
+claimed. The optional browser/Wasm engine and UI transport migration remain deferred.
+The comparative performance harness and publication gate also remain follow-up work.
+

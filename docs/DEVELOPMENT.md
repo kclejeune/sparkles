@@ -99,7 +99,7 @@ runs every hook over the whole tree.
 ## Testing
 
 ```sh
-mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, Python and JVM binding tests, license notices
+mise run ci            # formatting, clippy, all workspace tests, UI, Python, JVM and JavaScript tests, license notices
 mise run lint:features # clippy over feature combinations (in ci)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites, SHACL 1.2 list tests, SHACLC pairs
@@ -189,6 +189,31 @@ to the archive and points the patch at it. `mise run py:wheel-test -- <wheel or 
 <python>...` installs a package into a fresh virtual environment for each interpreter
 and runs the pytest suite against the installation (`scripts/py-wheel-test.sh`).
 
+#### Release workflow
+
+`.github/workflows/python-wheels.yml` runs on pull requests that touch the crates, on
+`py-v*` tags and by hand. It builds abi3 wheels with maturin-action for manylinux 2.28
+and musllinux 1.2 on x86_64 and aarch64, macOS x86_64 and arm64, and Windows x64, and
+the source distribution. The arm64 Linux wheels build on GitHub's arm64 runners, so
+their tests run natively. Each job installs what it built with `py-wheel-test.sh` and
+runs the tests on CPython 3.10 and 3.14 where the runner has both. The musllinux
+wheels are tested in an Alpine container, and the sdist job builds a wheel from the
+sdist before testing it. Every package is uploaded as an artifact.
+
+The publish job sends the artifacts to PyPI with trusted publishing, and as committed it
+never runs. It needs a `py-v<version>` tag that matches the crate's version, the
+repository variable `PYPI_PUBLISH` set to `true`, and a `pypi` environment that PyPI
+trusts for the `sparkles-rdf` project. No token is stored. To publish, register the
+workflow as a trusted publisher on PyPI, create the `pypi` environment, preferably with
+required reviewers, set the variable, and push the tag.
+
+The x86_64 manylinux and musllinux builds can be reproduced locally with Docker in the
+`quay.io/pypa/manylinux_2_28_x86_64` and `musllinux_1_2_x86_64` images, with
+`maturin build --compatibility manylinux_2_28` or `musllinux_1_2`. Both were built that
+way, the musllinux one from the sdist, and passed the suite on CPython 3.10 and 3.14 and
+in Alpine. The macOS, Windows and aarch64 wheels are built only by the workflow.
+`actionlint` checks the workflow file.
+
 ### JVM bindings
 
 `crates/sparkles-ffi` is the native library of the JVM bindings
@@ -217,30 +242,45 @@ in-memory TDB2 dataset. `cargo run --release --example perf --manifest-path
 crates/sparkles-ffi/Cargo.toml --target-dir target -- DATA.nt QUERIES.tsv 10` times the same
 queries through the Rust API. Each line of `QUERIES.tsv` is a name, a tab and a query.
 
-#### Release workflow
+The build assembles `sparkles-jena`, `sparkles-jena-natives` and a Fuseki bundle,
+`sparkles-jena-all`. Source and Dokka documentation jars accompany the SDK. Native
+resources have SHA-256 checksums; Gradle dependency locks and verification metadata
+pin the release graph. The compatibility workflow uses Java 17/Jena 5.6 and Java
+21/Jena 6.2 while emitting Java 17 SDK class files. Nix builds include the host's native
+library. Maven publication requires the explicitly enabled release environment,
+credentials and signing key. Ordinary builds and tests do not publish artifacts.
 
-`.github/workflows/python-wheels.yml` runs on pull requests that touch the crates, on
-`py-v*` tags and by hand. It builds abi3 wheels with maturin-action for manylinux 2.28
-and musllinux 1.2 on x86_64 and aarch64, macOS x86_64 and arm64, and Windows x64, and
-the source distribution. The arm64 Linux wheels build on GitHub's arm64 runners, so
-their tests run natively. Each job installs what it built with `py-wheel-test.sh` and
-runs the tests on CPython 3.10 and 3.14 where the runner has both. The musllinux
-wheels are tested in an Alpine container, and the sdist job builds a wheel from the
-sdist before testing it. Every package is uploaded as an artifact.
+### JavaScript bindings
 
-The publish job sends the artifacts to PyPI with trusted publishing, and as committed it
-never runs. It needs a `py-v<version>` tag that matches the crate's version, the
-repository variable `PYPI_PUBLISH` set to `true`, and a `pypi` environment that PyPI
-trusts for the `sparkles-rdf` project. No token is stored. To publish, register the
-workflow as a trusted publisher on PyPI, create the `pypi` environment, preferably with
-required reviewers, set the variable, and push the tag.
+`crates/sparkles-node` is a separate Cargo workspace with its own lockfile. The
+`js/` pnpm workspace contains `@sparkles-rdf/common`, `@sparkles-rdf/engine` and
+`@sparkles-rdf/client`. Node 24 is pinned for these tasks.
 
-The x86_64 manylinux and musllinux builds can be reproduced locally with Docker in the
-`quay.io/pypa/manylinux_2_28_x86_64` and `musllinux_1_2_x86_64` images, with
-`maturin build --compatibility manylinux_2_28` or `musllinux_1_2`. Both were built that
-way, the musllinux one from the sdist, and passed the suite on CPython 3.10 and 3.14 and
-in Alpine. The macOS, Windows and aarch64 wheels are built only by the workflow.
-`actionlint` checks the workflow file.
+```sh
+pnpm --dir js install --frozen-lockfile
+mise run node:build         # host addon and TypeScript packages
+mise run node:test          # registered runtime/protocol/lifecycle tests
+mise run node:lint          # default-feature and feature-free native checks
+mise run node:client:gen    # regenerate from docs/openapi.json
+mise run node:client:check  # verify generated types are current
+mise run node:fmt:check
+```
+
+`scripts/node-native.sh` builds into the root `target` directory and stages the host
+addon under `js/engine/native`. Its default is release mode; `NODE_PROFILE=dev` uses
+the debug build. `SPARKLES_NODE_NATIVE` selects an explicit addon path. The package
+loader also resolves a platform-specific npm package. Generated addons and package
+archives are ignored by Git. `mise run node:lock` refreshes the native lockfile.
+
+The runtime suite checks transactions, cancellation, worker cleanup, streams, RDF/JS
+terms and adapters. Packed-package checks install concrete archives into a fresh
+project and compile a consumer of their published declarations. The remote client has
+protocol and streaming-parser tests, and its generated administrative types are
+checked against the OpenAPI document. The release workflow builds the native target
+matrix and runs runtime checks; publication requires a matching release tag and the
+explicitly enabled npm environment.
+
+### Browser integration tests
 
 `mise run ui:e2e` builds the UI and a debug server. It starts `sparkles serve` on a free
 port of 127.0.0.1 with a temporary data directory, a small dataset, and an auth
@@ -455,6 +495,9 @@ The flake is built on flake-parts, rust-overlay and crane, with the toolchain fr
     host's native library inside. Its Maven dependencies are pinned in
     `nix/jvm-deps.json`, which `mise run jvm:nix-deps` refreshes through
     `gradle.fetchDeps`.
+  * `sparkles-node-native`: the host's Node-API library in `lib/`.
+  * `sparkles-node`: npm archives for the JavaScript packages, the host addon and
+    their pinned runtime/type dependencies.
 * **Other outputs:**
   * `overlays.default`;
   * a dev shell;
@@ -463,9 +506,11 @@ The flake is built on flake-parts, rust-overlay and crane, with the toolchain fr
     * `sparkles-tests`, which runs the unit tests of the engine and the facade
       (`cargo test -p sparkles-core -p sparkles --lib`);
     * `fmt`, which runs rustfmt over the workspace, `crates/sparkles-py` and
-      `crates/sparkles-ffi` as `mise run fmt:check` does;
+      `crates/sparkles-ffi` and `crates/sparkles-node` as `mise run fmt:check` does;
     * `python-bindings`, which builds `sparkles-py` and runs the pytest suite on the
       installed package;
+    * `node-bindings`, which installs the packed JavaScript packages offline and
+      checks their runtime behavior and declarations;
     * on Linux, `jvm-bindings`, which builds `sparkles-jena` and runs its tests and the
       Java sample's tests offline;
     * `ui-licenses`, which checks that `THIRD_PARTY_LICENSES-UI.md` matches the UI build;
@@ -540,7 +585,8 @@ project's `LICENSE`, as `pyproject.toml` declares. It writes
 `jvm/sparkles-jena/THIRD_PARTY_LICENSES.md` for the JVM library from the lock of
 `crates/sparkles-ffi`, and the jar carries it in `META-INF` with the project's `LICENSE`.
 Crates that state MPL-2.0 without a license file, such as UniFFI's, get the MPL-2.0 text
-that another crate ships. `licenses:check` checks all three files.
+that another crate ships. It also writes `js/engine/THIRD_PARTY_LICENSES.md` from the
+Node addon's own lockfile. `licenses:check` checks all four Rust notices files.
 
 [`THIRD_PARTY_LICENSES-UI.md`](../THIRD_PARTY_LICENSES-UI.md) does the same for the npm
 packages whose code or fonts end up in the embedded web UI. These are CodeMirror,

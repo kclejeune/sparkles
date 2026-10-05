@@ -1,19 +1,15 @@
 # P04: JVM bindings behind Apache Jena's API
 
-> **Status:** implemented in part (Phase 1)
+> **Status:** implemented in part (integration and primary administration)
 >
-> **Phases:** Phase 1 shipped on Linux x86_64. It is the `sparkles-ffi` crate, the Kotlin
-> library `sparkles-jena` with a Sparkles-backed `DatasetGraph`, Jena transactions, query
-> and update engines that run whole requests in Sparkles with a fallback to ARQ, bulk
-> loads, commit receipts, an in-process import of TDB2 databases, a jar with the host's
-> native library, Jena's contract tests, a Java sample and a flake package and check. The
-> [Outcome](#outcome) records how it landed. Phase 2 adds the other four platforms, the
-> assembler type for Fuseki, refined fallback detection, point-in-time reads, dumps,
-> DESCRIBE in the engine and the publishing workflow. Phase 3 adds reasoning, validation,
-> index administration and history from Java, ARQ fallbacks that still run basic graph
-> patterns in Sparkles, Java functions called from the engine, and musl builds. Its
-> administration parts bind the handles of [P06](P06-library-admin-api.md) rather than the
-> JSON-string methods of §4.5.
+> **Phases:** The engine/Jena contract surface, Fuseki assembler, historical reads,
+> dumps, native DESCRIBE and refined ARQ fallback are implemented. Typed catalog,
+> branches, backups, settings, history, indexes, stored queries, schema, GraphQL,
+> reasoning and validation extend the SDK. Release workflows assemble five native
+> platforms, classifier jars, a Fuseki bundle and source/documentation artifacts;
+> Linux is validated locally. Helper parity, batched fallback graph patterns,
+> Java callbacks, musl and comparative performance targets remain follow-up work.
+> The [Outcome](#outcome) records the supported scope and deferrals.
 >
 > **User docs:** [Usage: JVM](../USAGE.md#jvm-apache-jena) ·
 > [Features](../FEATURES.md#known-gaps) · [Development](../DEVELOPMENT.md#jvm-bindings)
@@ -1435,7 +1431,9 @@ its items are independent.
 
 ## Outcome
 
-**Delivered.** Phase 1 landed on 2026-10-03 on Linux x86_64, as §8 lists it:
+**Delivered.** The initial implementation landed on 2026-10-03 on Linux x86_64.
+The integration and administration extension below follows on 2026-10-05. The initial
+engine and Jena contract surface includes:
 
 * the engine APIs of §2.3. `QueryOptions::union_default_graph` overrides the store's
   setting for one request, and the result cache keys on it. `sparkles::embed` in the
@@ -1490,9 +1488,11 @@ its items are independent.
 * Reads in a write transaction run on the caller's thread over a view of the
   transaction's state. The view is taken on the worker once after each change, so a run
   of reads costs one thread hop rather than one per read.
-* One jar. `sparkles-jena` carries the host's native library as a resource, and the
-  separate natives artifact, its classifier jars and `sparkles-jena-all` wait for the
-  platforms and the Fuseki bundle of Phase 2.
+* `sparkles-jena` contains SDK and generated native bindings, while
+  `sparkles-jena-natives` contains native resources and platform classifiers.
+  `sparkles-jena-all` bundles the SDK, Kotlin/JNA/JSpecify runtime and native resources
+  for Fuseki; Jena and SLF4J remain supplied by its host. Every bundled jar's legal
+  notices are preserved under an artifact-specific directory in `META-INF/licenses`.
 * The query engine accepts every query on a `DatasetGraphSparkles` and builds ARQ's plan
   itself when it falls back, rather than declining in `accept`. The fallback plan then
   applies the union default graph, as §3.7 asks.
@@ -1506,8 +1506,9 @@ its items are independent.
 * Sparkles parses ARQ's `LET`, so A7's late check is tested with ARQ's two-argument
   `IRI()`, which Sparkles rejects.
 * IRIs cross unchecked, because Jena accepts relative IRIs and the contract tests use them.
-* The crate's cargo features are `text` and `geo`. `reasoning`, `shacl` and `shex` come
-  with the functions of Phase 3 that need them.
+* Default native features are `text`, `geo`, `reasoning`, `shacl`, `shex`, `backup`
+  and `graphql`. The same methods remain exported in a feature-disabled build and
+  return an unsupported-feature exception.
 * `Sparkles.NO_CACHE` turns the result cache off for a request, which the performance
   check uses.
 * Three inherited tests are disabled with their reasons. `promote_active_writer_1`
@@ -1517,8 +1518,57 @@ its items are independent.
 * The Nix build compiles the library and the generator in one cargo build with the
   `bindgen` feature, and runs the generator with `--metadata-no-deps` and the crate's
   `bindgen.toml`, which names the crate's root.
-* Dependency locking, dependency verification metadata, Dokka and the module descriptor
-  are left for the publishing work of Phase 2.
+* Gradle dependency locks and SHA256 verification metadata pin the release graph.
+  Dokka produces public HTML documentation and its Maven documentation jar. The
+  main artifact currently supplies an automatic JPMS module name; an explicit
+  descriptor remains deferred.
+
+**Integration and administration extension.** The JVM SDK now includes:
+
+* a Fuseki assembler (`urn:x-sparkles:assembler#DatasetSparkles`) and a client integration
+  suite exercising ordinary Jena `RDFConnection` query, update, graph-store replacement,
+  deletion and construction against reference memory datasets, embedded Sparkles and
+  a real loopback Fuseki instance; the full 77-case standalone HTTP harness remains a
+  separate expansion;
+* Java-extension-aware ARQ fallback, registered IRI overrides, context/query hooks,
+  `Op` execution, native DESCRIBE and execution counters. Fallback still uses Jena's
+  ordinary graph access rather than the proposed batched BGP stage generator;
+* point-in-time read handles and `Sparkles.AT`, commit history/status/diff/change pages,
+  named snapshots, native streamed dumps, compaction, clones and repository backups;
+* typed catalog handles, identity-aware dataset wrapper sharing, metadata inspection,
+  reservations, clone/restore, repository registration, policy execution and retention;
+  datasets keep their branches. Persistent rename requires all dataset handles to
+  close, as the core directory-move contract requires;
+* branch creation/deletion/rename/protection/notes, merge exemption settings, merge,
+  revert and cherry-pick, including previews and structured conflict reports. Metadata
+  ownership checks run before snapshot acquisition so a transaction cannot block on
+  its own branch writer;
+* compaction/quota/retention/DESCRIBE settings; versioned stored queries with checked
+  parameters; schema reports, pages, diffs, profiles and shape drafts; versioned GraphQL
+  configuration, SDL, drafts and execution;
+* text/vector/geo index lifecycle methods, native reasoning and RDFS configuration,
+  SHACL and ShEx result records and SHACL write guards; `SparklesOperation` provides
+  cancellation, deadlines and progress. Nested administration documents use Jena JSON
+  trees rather than requiring serialized JSON strings;
+* reproducible host Nix packaging and release workflow jobs for Linux x86_64/aarch64,
+  macOS x86_64/aarch64 and Windows x86_64, with aggregate natives, classifier and Fuseki
+  bundle jars, source/docs artifacts, signed publishing behind a release gate, and
+  Java17/Jena5.6 plus Java21/Jena6.2 compatibility jobs. The other operating systems
+  are workflow targets; they have not been built locally on the Linux host.
+
+The SDK's writer ownership checks cover aliases, branches and long captures. Dataset,
+query, sink, historical view, repository and reservation handles have explicit close
+semantics. Bounded child-JVM tests check capture misuse without allowing a native
+writer wait to hang the suite. Native default and feature-disabled builds are linted.
+
+This is the primary administration surface, not complete P06 helper parity. Outstanding
+helpers include direct index iterators/diagnostics, native cache/EXPLAIN control,
+standalone memory clone, schedule-preview and commit-DAG documents, formatter/RDF/term
+validation utilities, embedding regeneration and reasoning diagnostics. Java callbacks
+await P03; batched fallback BGPs, musl, JNI, mimalloc and worker-free transactions remain
+separate extensions. The earlier throughput numbers below are a loaded-machine sanity
+check. No quiet-machine performance conclusion or JNI/allocator change follows from
+concurrent implementation tests.
 
 **Performance.** A sanity check, not the benchmark of §5.4, ran on 2026-10-03 with the
 data of `scripts/bench.sh` at its default size (1,052,801 triples) and its 28 queries,

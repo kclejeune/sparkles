@@ -2695,9 +2695,11 @@ lists commits without taking the database lock, so it works next to a running se
 The design and its rationale are in [F09 Branches and merges](specs/F09-branches-and-merges.md).
 
 A **branch** is a named, writable line of commits that starts from a commit of another
-branch. Every persistent dataset has the branch `main`, which is the dataset as clients
-have always seen it, so a client that never names a branch sees no change. In-memory
-datasets have no other branches and answer `501` with code `branches-unsupported`.
+branch. Every dataset has the branch `main`, which is the dataset as clients have
+always seen it, so a client that never names a branch sees no change. Persistent and
+in-memory datasets support the same branch operations. Memory branches share immutable
+index and vocabulary data while keeping writes, history, caches and validation state
+independent; they disappear when the catalog closes.
 
 A new branch writes no index. Its first generation is linked: it reads the index files
 of the generation that holds its starting commit, and it replays that generation's
@@ -3106,9 +3108,20 @@ without their counts.
 
 ### Storage, history and access
 
-A backup to a [backup repository](#backup-repositories) copies `main` only. Its
-manifest records the number of other branches it left out in `branchesOmitted`, which
-`GET` of the backup shows.
+A backup to a [backup repository](#backup-repositories) captures one branch as a
+standalone dataset: `main` by default, or the branch selected with `?branch=NAME` on
+`/$/backups/{ds}`. The same selector scopes listing and per-backup actions. Scheduled
+policies continue to capture `main`. A branch capture includes `dataset.branch` with
+the enclosing dataset UUID, captured branch UUID and name, and the reserved blank-node
+allocation range. Restoring it creates a fresh dataset identity and records the captured
+branch and commit as `forkedFrom`; keeping its identity is refused. The manifest's
+`branchesOmitted` records the other branches left out. A backup never restores a whole
+branch tree.
+
+New backups include `dataset.nextOrdinal`, the first unused branch blank-node ordinal.
+Restores reserve all earlier allocation ranges, including those of merged or deleted
+branches, so new branches cannot reuse blank-node identities from the captured data.
+Older manifests may omit this field.
 
 The metrics `sparkles_branch_quads`, `sparkles_branch_delta_quads`,
 `sparkles_branch_wal_bytes` and `sparkles_branch_disk_bytes` carry `dataset` and
@@ -5946,6 +5959,14 @@ selectors are refused because every validated write would run them.
 | GET | `/$/validation/{ds}` | `{ language, config, status }`, or `{ config: null }`. `status` holds the mode, the shape count, the `baseline` of the last commit with its counts by severity, counters and warnings. It also holds `lastCheck`, the last validated write, and `recentRejections`, the last ten rejected writes. Each of these has the time, the commit kind, the status, the strategy, the counts, the focus nodes validated, the fallback reason and the first result. SHACL adds `incremental`, with the number of shapes validated incrementally and the shapes validated in full on every write. ShEx adds `associations`, the size of the result map. |
 | PUT | `/$/validation/{ds}` | Sets the configuration, in either language, and replaces the other language's files. The current data is validated under the writer lock. A `reject` configuration on data that does not pass is refused with `409` and the summary. `400` for a bad configuration, or for shapes or a schema that cannot be used. `501` for a language this binary was built without. |
 | DELETE | `/$/validation/{ds}` | Turns validation off (`204`) and removes every validation file. |
+
+The dataset page's **Write-time validation** panel lets an administrator configure or
+disable the guard on a writable server. It supports both languages, their source graphs
+or inline shapes/schema, mode, baseline, data selection, inferences, timeout and report
+limit. Memory guard configurations returned by `GET` include their inline source, so
+settings can be edited without supplying the source again. Persistent configurations
+retain the copied source file. Rejected updates in the query page show the structured
+focus-node, path, message and shape results.
 
 **Writes** are validated once per request, on the final state, before any byte is
 written. This covers updates, Graph Store PUT/POST/DELETE, uploads and applied RDF

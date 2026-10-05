@@ -130,21 +130,23 @@ run = "prek run --all-files"
 
 [tasks.fmt]
 description = "Format Rust and UI code"
-depends = ["ui:fmt"]
-# crates/sparkles-py and crates/sparkles-ffi are their own workspaces, outside `--all`
+depends = ["ui:fmt", "node:fmt"]
+# Language-binding crates are their own workspaces, outside `--all`
 run = [
   "cargo fmt --all",
   "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml",
   "cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml",
+  "cargo fmt --manifest-path crates/sparkles-node/Cargo.toml",
 ]
 
 [tasks."fmt:check"]
 description = "Check formatting (CI)"
-depends = ["ui:fmt:check"]
+depends = ["ui:fmt:check", "node:fmt:check"]
 run = [
   "cargo fmt --all --check",
   "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml --check",
   "cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml --check",
+  "cargo fmt --manifest-path crates/sparkles-node/Cargo.toml --check",
 ]
 
 [tasks."fmt:jsonld-compare"]
@@ -211,8 +213,8 @@ description = "Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectio
 run = "scripts/test-jena-clients.sh"
 
 [tasks.ci]
-description = "Everything CI should run: formatting, lints, cited paths in the docs, the formatter's browser build, Rust, UI, Python and JVM binding tests, third-party license notices up to date"
-depends = ["fmt:check", "lint", "lint:features", "lint:doc-paths", "fmt:wasm", "test", "ui:test", "py:lint", "py:test", "jvm:lint", "jvm:rust-test", "jvm:test", "licenses:check"]
+description = "Everything CI should run: formatting, lints, cited paths in the docs, the formatter's browser build, Rust, UI, Python, JVM and Node binding tests, third-party license notices up to date"
+depends = ["fmt:check", "lint", "lint:features", "lint:doc-paths", "fmt:wasm", "test", "ui:test", "py:lint", "py:test", "jvm:lint", "jvm:rust-test", "jvm:test", "node:lint", "node:test", "node:client:check", "licenses:check"]
 
 # ------------------------------------------------------------------- Python bindings ----
 # crates/sparkles-py is its own cargo workspace (see its Cargo.toml). These tasks build it
@@ -298,6 +300,60 @@ run = [
 [tasks."jvm:nix-deps"]
 description = "Refresh nix/jvm-deps.json, the Gradle dependencies the Nix build of the jar fetches (after jvm/ dependencies change)"
 run = "nix build .#sparkles-jena.mitmCache.updateScript -o target/jvm-nix-deps-update && target/jvm-nix-deps-update"
+
+# --------------------------------------------------------------------- Node bindings ----
+
+[tasks."node:native"]
+tools = { node = "24" }
+description = "Build and stage the host's Node-API addon (NODE_PROFILE=dev for a debug build)"
+run = "scripts/node-native.sh"
+
+[tasks."node:build"]
+tools = { node = "24" }
+description = "Build the shared RDF/JS contracts, remote client and native engine packages"
+depends = ["node:native"]
+run = "pnpm --dir js build"
+
+[tasks."node:test"]
+tools = { node = "24" }
+description = "Test Node bindings, remote client and transaction/lifecycle contracts"
+depends = ["node:build"]
+dir = "js"
+run = "node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs"
+
+[tasks."node:lint"]
+description = "Clippy on the Node addon with default features and with none"
+run = [
+  "cargo clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets -- -D warnings",
+  "cargo clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
+]
+
+[tasks."node:client:gen"]
+tools = { node = "24" }
+description = "Regenerate the remote TypeScript client's OpenAPI types"
+run = "pnpm --dir js client:gen"
+
+[tasks."node:client:check"]
+tools = { node = "24" }
+description = "Check that the TypeScript client's generated OpenAPI types are current"
+run = "pnpm --dir js client:check"
+
+[tasks."node:fmt"]
+tools = { node = "24" }
+description = "Format the JavaScript and TypeScript bindings"
+run = "pnpm --dir js format"
+
+[tasks."node:fmt:check"]
+tools = { node = "24" }
+description = "Check JavaScript and TypeScript formatting"
+run = "pnpm --dir js format:check"
+
+[tasks."node:lock"]
+description = "Refresh the Node addon's Cargo.lock from the workspace's lock"
+run = [
+  "cp Cargo.lock crates/sparkles-node/Cargo.lock",
+  "cargo metadata --manifest-path crates/sparkles-node/Cargo.toml --format-version 1 > /dev/null",
+]
 
 # -------------------------------------------------------------------------- build / run ----
 

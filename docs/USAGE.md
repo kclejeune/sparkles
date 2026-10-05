@@ -3,7 +3,7 @@
 This guide covers operating the `sparkles` binary. It describes running the server, the
 command-line tools, automatic compaction, the formatter and linter, backups, outbound
 requests, path search, integrity checks, the MCP server, embedding the library, the
-Python package, the JVM library for Apache Jena, the Rust client, Docker and deploying on
+Python package, the JVM library for Apache Jena, the JavaScript packages, the Rust client, Docker and deploying on
 NixOS. [API.md](API.md)
 specifies the HTTP API.
 [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
@@ -52,6 +52,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Blank node labels](#blank-node-labels)
   * [Jena exceptions](#jena-exceptions)
   * [Differences from TDB2](#differences-from-tdb2)
+* [JavaScript and TypeScript](#javascript-and-typescript)
 * [Rust client](#rust-client)
 * [Docker](#docker)
 * [Deploying on NixOS](#deploying-on-nixos)
@@ -1137,10 +1138,12 @@ triples. On a server, `POST /{ds}/upload` takes tables too
 ## Branches and merges
 
 A branch lets a change take several steps, or several people, before it reaches the data
-everyone reads. Every persistent dataset has the branch `main`. A new branch starts from
-a commit of another branch and shares that branch's index files until it compacts, so
-creating one is cheap at any size. Reads and writes choose a branch with `--branch` on
-the command line, `?branch=NAME` over HTTP, or the endpoint URL `/{ds}@{branch}/sparql`.
+everyone reads. Every persistent or in-memory dataset has the branch `main`. A new
+persistent branch starts from a commit of another branch and shares that branch's index
+files until it compacts. In-memory branches share immutable base state, copy the
+inherited append vocabulary, and keep their writes, indexes and validation state
+separate. Reads and writes choose a branch with `--branch` on the command line,
+`?branch=NAME` over HTTP, or the endpoint URL `/{ds}@{branch}/sparql`.
 [API.md](API.md#branches-and-merges) describes the routes, the merge rules and the
 conflict report.
 
@@ -1483,6 +1486,7 @@ sparkles repo verify local --level data          # every backup, plus orphaned b
 sparkles repo gc local --dry-run --grace 24h     # delete blobs no backup references
 sparkles repo locks local [--break ID]
 sparkles backup create  --loc db --repo local [--name N] [--note T] [--dataset NAME]  # refused while a server has db open
+sparkles backup create  --loc db --branch dev --repo local  # standalone capture of dev
 sparkles backup list    --repo file:///srv/backups/r [--dataset ds | --dataset-id UUID] [--policy P]
 sparkles backup show    --repo local b2
 sparkles backup verify  --repo local b2 --level restore   # exists | data | restore; exit 1 on failure
@@ -1498,6 +1502,13 @@ dataset in the target data directory already has it. `--check quick|full|none` p
 integrity check that runs before the restored database is published. `sparkles serve`
 holds a lock on `<data>/sparkles-server.lock`, which allows one server per data
 directory, and `restore --data` refuses while a server holds it.
+
+A backup captures one selected branch; the default and scheduled policies capture
+`main`. A linked branch is materialized into standalone files without changing its
+source. Its manifest records the owning dataset and branch identity. Restoring a branch
+with `auto` or `new` gives it a fresh dataset id and records the captured branch as its
+origin; `keep` is refused. This preserves its blank-node labels without attaching the
+restore to the source's branch history.
 
 A server started with `sparkles serve --backup-config FILE` serves the file's
 repositories and policies through its API, read-only. It also accepts repositories
@@ -2540,8 +2551,7 @@ run in Sparkles' planner and executor, and a query that uses a function register
 in Java runs in ARQ instead.
 
 The library is written in Kotlin and is meant to be used from Java. It needs Java 17 or
-later, and it is built and tested against Jena 5.6. Testing with Jena 6, which needs
-Java 21, is planned. The native part is the
+later. The compatibility workflow uses Jena 5.6 on Java 17 and Jena 6.2 on Java 21. The native part is the
 `crates/sparkles-ffi` crate, which the library calls through UniFFI and JNA. The library
 is not published to Maven Central. Build the jar from the repository:
 
@@ -2550,9 +2560,11 @@ mise run jvm:build            # jvm/sparkles-jena/build/libs/sparkles-jena-0.1.0
 nix build .#sparkles-jena     # or the flake's package, in result/share/java
 ```
 
-The jar holds the native library for the platform it was built on, and the build has
-been tested on Linux x86_64. It extracts the library into the temporary directory on
-first use. The system property `sparkles.native.dir` chooses another directory, and
+The SDK jar depends on `sparkles-jena-natives`, which holds verified platform libraries.
+The release workflow gathers five platform builds; the Nix package includes its host
+library. `sparkles-jena-all` bundles the SDK, supporting libraries and available natives
+for Fuseki. Local checks run on Linux x86_64. The loader extracts the native library into
+the temporary directory on first use. The system property `sparkles.native.dir` chooses another directory, and
 `sparkles.native.path` names a library file to load instead, such as one built for
 another platform with `cargo build --release --manifest-path crates/sparkles-ffi/Cargo.toml`.
 On Java 24 and later, the JVM warns when JNA loads native code unless the program runs
@@ -2626,8 +2638,8 @@ commit's data alive.
 
 A query through `QueryExecution` or `QueryExec` runs in Sparkles when the dataset is a
 `DatasetGraphSparkles` or a plain wrapper of one. Its solutions come back to Jena in
-batches. Jena builds the result of a CONSTRUCT, ASK or DESCRIBE query from those
-solutions, as it does for TDB2. Timeouts and `abort()` cancel the native query.
+batches. Graph queries and DESCRIBE run in the engine when the query takes the native
+path. Timeouts and `abort()` cancel the native query.
 
 A query runs in ARQ over the dataset's `find()` when it uses something that Sparkles
 cannot see. The first case is a function that Jena's `FunctionRegistry` knows and
@@ -2656,6 +2668,7 @@ in the dataset's `getContext()` or on one execution.
 | `Sparkles.INCLUDE_INFERRED` | The reasoner's `urn:x-sparkles:inferred` graph is part of the default graph. |
 | `Sparkles.MAX_ROWS`, `MAX_MEMORY_BYTES`, `MAX_ROWS_PRODUCED` | The request's budgets. |
 | `Sparkles.NO_CACHE` | The request neither reads nor fills the result cache. |
+| `Sparkles.AT` | A historical reference such as `snapshot:before-edit` or `commit:42`. |
 | `ARQ.httpServiceAllowed` | `false` refuses SERVICE. |
 
 The union default graph has TDB2's scope. It changes what queries and updates see as the
@@ -2676,6 +2689,57 @@ dataset, and `headCommit()` returns the newest commit.
 Sparkles database in one commit. It reads the TDB2 database with Jena's own code, so
 literals come back as TDB2 stored them, and it copies the prefixes. It returns an
 `ImportReport` with the counts, the receipt and the time taken.
+
+### Catalog, history and administration
+
+`SparklesCatalog` manages datasets, with branches under each dataset. Its handles expose
+repositories, backup/restore, clones, reservations and offline policies. Dataset handles
+provide history and snapshots, branches and merges, settings, stored queries, schema and
+GraphQL, index administration, reasoning and validation. Nested administrative documents
+use Jena `JsonObject` / `JsonArray` trees; callers do not supply serialized JSON strings.
+
+```java
+try (var catalog = SparklesCatalog.open(Path.of("catalog"))) {
+    var ds = catalog.get("wiki");
+    if (ds == null) ds = catalog.create("wiki");
+    UpdateAction.parseExecute("INSERT DATA { <urn:example:s> <urn:example:p> 1 }", ds);
+    ds.snapshots().create("before-edit");
+    try (var past = ds.at("snapshot:before-edit")) {
+        try (var query = QueryExec.dataset(past).query("ASK { ?s ?p ?o }").build()) {
+            System.out.println(query.ask());
+        }
+    }
+    ds.branches().create("draft");
+    try (var draft = ds.branch("draft")) {
+        UpdateAction.parseExecute("INSERT DATA { <urn:example:new> <urn:example:p> 2 }", draft);
+    }
+    System.out.println(ds.branches().previewMerge("draft"));
+    System.out.println(ds.schema().report());
+}
+```
+
+Catalog-returned handles close with the catalog. Close branch and historical views
+explicitly. Persistent renames require every handle to the dataset to be closed first.
+Aliases to one UUID share transaction ownership: snapshot-capturing operations and branch
+previews reject the transaction owner before waiting for its writer lock. Read-only
+options prevent dataset mutations; backup repository operations retain their own controls.
+
+`SparklesOperation` carries cancellation, a deadline and progress for long operations.
+`ds.dump(output, lang)` streams bounded native byte batches into a caller-owned output;
+`ds.dump(path)` infers the format from the path. Historical views are read-only.
+
+### Fuseki assembler
+
+With the bundle on Fuseki's classpath, a dataset can be opened from an assembler file:
+
+```turtle
+@prefix sparkles: <urn:x-sparkles:assembler#> .
+<#dataset> a sparkles:DatasetSparkles ; sparkles:location "DB" .
+```
+
+Use `sparkles:memory true` instead of `location` for an in-memory dataset. The assembler
+also accepts `readOnly`, `autocommit`, `unionDefaultGraph`, `fallback` and
+`blankNodeLabels`, and merges Jena context settings.
 
 ### Blank node labels
 
@@ -2724,6 +2788,75 @@ The other classes are `SparklesInvalidException`, `SparklesWriteRejectedExceptio
   SPARQL Update in Sparkles or of bulk loads, as in TDB2.
 * A query keeps its whole result in native memory while Jena reads it. That memory is
   outside the Java heap and `-Xmx`, and `Sparkles.MAX_MEMORY_BYTES` bounds it.
+
+## JavaScript and TypeScript
+
+The JavaScript packages share RDF/JS terms, bindings, errors and the `SparqlDataset`
+query/update interface. `@sparkles-rdf/engine` embeds the native engine through Node-API;
+`@sparkles-rdf/client` speaks HTTP with Fetch and Web Streams; `@sparkles-rdf/common`
+contains their shared contracts. They are ES modules with TypeScript declarations.
+The engine requires Node.js 22.12 or later; the client also runs in browsers with Fetch
+and Web Streams. Packages are built locally and by the gated release workflow; they
+have not been published to npm.
+
+```ts
+import { Dataset } from '@sparkles-rdf/engine';
+
+await using ds = Dataset.memory(); // or await Dataset.open('mydb')
+await ds.update('INSERT DATA { <urn:alice> <urn:name> "Alice" }');
+const rows = await ds.select('SELECT ?s ?name { ?s <urn:name> ?name }');
+for await (const row of rows) console.log(row.get('name')?.value);
+
+const { receipt } = await ds.transaction(async tx => {
+  await tx.update('INSERT DATA { <urn:bob> <urn:name> "Bob" }');
+}, { timeout: 1000, message: 'Add Bob' });
+console.log(receipt.commit.seq); // bigint
+```
+
+Engine calls that access storage return promises and run outside the JavaScript thread.
+Query results arrive in bounded batches; breaking iteration or calling `close()` releases
+native result memory. Counts and commit sequences use bigint. Query options include
+`signal`, a timeout in milliseconds, RDF/JS `factory`, initial bindings, graph selection,
+historical `at` reads and resource budgets. A transaction uses `tx` for its reads and
+writes, and rolls back when its callback fails or its controls interrupt it. Finish the
+transaction before calling dataset operations that acquire its writer lock.
+
+`load` accepts paths, RDF text, byte arrays, Node Readables and Web streams. `dump`
+returns a Web byte stream, and `dumpToFile` writes a path. `match` streams RDF/JS quads;
+`source()` supplies an RDF/JS source for Comunica. Dataset administration is grouped under
+handles such as `snapshots`, `history`, `branches`, `indexes`, `reasoning`, `validation`
+and `settings`. See the [engine package](../js/engine/README.md) for its complete surface.
+
+```ts
+import { SparklesClient } from '@sparkles-rdf/client';
+
+const client = new SparklesClient('http://localhost:3030');
+const wiki = client.dataset('wiki', 'work');
+const rows = await wiki.select('SELECT ?s { ?s ?p ?o }', { timeout: 1000 });
+for await (const row of rows) console.log(row.get('s')?.value);
+
+const { data, error } = await client.api.GET('/$/datasets/{name}', {
+  params: { path: { name: 'wiki' } },
+});
+```
+
+The remote result interface is the same as the engine's, and closes its HTTP body on
+completion or early exit. Native-only options are rejected explicitly. The client adds
+Graph Store operations, branch-aware history, Basic or bearer authentication, cookie
+session CSRF handling, and safe-read retries. Its generated `api` covers the complete
+administrative HTTP surface and returns `{ data, error, response }`. Plain SPARQL
+endpoints use `SparklesClient.endpoint(url, { updateUrl, graphStoreUrl })`. See the
+[client package](../js/client/README.md) for protocol limits and cancellation semantics.
+
+`mise run node:build` builds all three packages and the host addon. `nix build
+.#sparkles-node` builds npm archives with the host addon and their pinned dependencies.
+[DEVELOPMENT.md](DEVELOPMENT.md#javascript-bindings) describes building and testing them.
+
+`parse(input, options)` yields RDF/JS quads without loading a dataset; `serialize(quads,
+options)` returns a Web byte stream. Both use bounded queues and accept cancellation and
+timeouts. Close unfinished iterators or cancel unfinished streams. Full native facade
+parity, offline Node policy runners and standalone formatting utilities remain follow-up
+work; the package README describes the supported operations.
 
 ## Rust client
 

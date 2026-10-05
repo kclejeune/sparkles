@@ -1761,3 +1761,10 @@ tests, 342 UI tests, JVM tests, feature checks, formatting, lint and license che
 Nix checks pass on x86_64 Linux, including 177 packaged Python tests, 34 browser tests,
 Jena clients and the NixOS VM tests. W3C, SHACL and ShEx conformance runs pass with
 their existing documented exclusions. The checked-in OpenAPI description is current.
+
+
+The JVM and Node packages now bind the primary catalog and dataset administration
+handles. `bindings.toml` records concrete names for 144 JVM and 148 Node entries out of
+162; remaining helper and policy/utility entries retain explicit follow-up reasons.
+Python remains the strict full-parity surface. The corresponding binding specs describe
+their supported controls, lifetime rules and deferred APIs.

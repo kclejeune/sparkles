@@ -8,9 +8,9 @@ repos:
     hooks:
       - id: cargo-fmt
         name: cargo fmt
-        # formats the whole workspace (a second or so) and the Python and JVM bindings' crates,
+        # formats the whole workspace and the Python, JVM and Node bindings' crates,
         # which are their own workspaces; vendor/ is outside all of them
-        entry: sh -c 'cargo fmt --all && cargo fmt --manifest-path crates/sparkles-py/Cargo.toml && cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml'
+        entry: sh -c 'cargo fmt --all && cargo fmt --manifest-path crates/sparkles-py/Cargo.toml && cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml && cargo fmt --manifest-path crates/sparkles-node/Cargo.toml'
         language: system
         types: [rust]
         exclude: ^vendor/
@@ -23,6 +23,13 @@ repos:
         entry: mise x -- ui/node_modules/.bin/oxfmt --no-error-on-unmatched-pattern
         language: system
         files: ^ui/.*\.(js|mjs|cjs|ts|mts|cts|jsx|tsx|svelte|json|jsonc|json5|css|scss|less|html|vue|md|mdx|ya?ml|toml|graphql)$
+
+      - id: oxfmt-js
+        name: oxfmt (JavaScript packages)
+        entry: mise run node:fmt
+        language: system
+        files: ^js/.*\.(js|mjs|cjs|ts|mts|cts|json|jsonc|md|ya?ml)$
+        pass_filenames: false
 
       - id: nixfmt
         name: nixfmt

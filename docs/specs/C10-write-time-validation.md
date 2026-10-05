@@ -1,17 +1,17 @@
 # C10: Write-time SHACL validation
 
-> **Status:** implemented in part
+> **Status:** implemented
 >
 > **Phases:** Phase 1 shipped. It covers the store's write guard, full SHACL validation of
 > every write's post-state, `/$/validation/{ds}`, `sparkles validation`, metrics, logs and
-> `bench:shacl-write`. Phase 2 shipped in most parts: the predicate relevance filter,
+> `bench:shacl-write`. Phase 2 shipped: the predicate relevance filter,
 > incremental validation with its fallbacks, the persisted baseline, grandfather mode and
 > a status panel on the dataset page. Phase 3 shipped: localizable SHACL-SPARQL,
 > `sh:targetWhere`, the refinement of F3, the `unvalidated` catalog flag,
 > `serve --validate` and mixed shapes sources. ShEx later became a second guard language
 > ([G02](G02-shex.md)), and its guard is incremental too. The focus-node histogram of
-> §2.6 came last. The panel's configuration form and a results table for a `422` on the
-> query page are not built.
+> §2.6, the panel's configuration form and the query page's results table for a `422`
+> are also implemented, for both SHACL and ShEx.
 >
 > **User docs:** [API: Write-time validation](../API.md#write-time-validation) ·
 > [API: Metrics](../API.md#metrics) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
@@ -1191,8 +1191,7 @@ counted set and are not observed. The buckets are powers of ten from 1 to 1,000,
 because F7 caps an incremental validation at 50,000 focus nodes and a full validation can
 reach millions. `obs_tests::validation_metrics_count_writes_by_status_and_severity`
 checks that two incremental writes of one new person each land in the first bucket. The
-configuration form of the panel and the `422` results table on the query page are still
-not built.
+configuration form and the `422` results table were completed later, as recorded below.
 
 **Phase 3 shipped on 2026-10-02.**
 
@@ -1278,3 +1277,20 @@ is now an error rather than Turtle. `sparkles validation --shapes` takes the syn
 the file name. The list constraints of SHACL 1.2 are validated incrementally: they read
 `rdf:first` and `rdf:rest` along each value node's list, and `sh:memberShape` nests the
 member shape's reads under `path/rdf:rest*/rdf:first`.
+
+**Guard configuration and rejected-write results.** The dataset page now configures
+SHACL and ShEx guards with source text or dataset graphs, mode, baseline, severity,
+data graphs, inference inclusion, timeout and report limit. ShEx also exposes the
+shape map and base IRI. Editing settings retains the installed source, its hashes and
+its prefix map; changing the source replaces that metadata. Memory datasets return
+reusable inline sources, and memory SHACLC shapes are converted to Turtle when copied
+into backup sidecars. Administrator permissions and writable dataset state govern the
+form. A strict-baseline installation that fails leaves the existing configuration
+intact and shows its report.
+
+The query editor renders a rejected write's SHACL or ShEx results as a table, including
+focus node, shape, path or status, message, truncation and the prefixes of the dataset
+and branch that produced the report. The original error stays visible. Unit, mock
+browser and real-server browser tests cover source retention, configuration conflicts,
+memory datasets and rejected writes that leave the data unchanged. Rust regressions
+cover editable memory sources, ShExJ prefix preservation and SHACLC backup conversion.
