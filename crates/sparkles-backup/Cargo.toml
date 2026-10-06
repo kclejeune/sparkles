@@ -23,6 +23,11 @@ chrono-tz.workspace = true
 croner.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+aws-lc-rs = { version = "=1.18.1", optional = true }
+argon2 = { version = "=0.6.0", optional = true, features = ["zeroize"] }
+zeroize = { version = "=1.9.0", optional = true }
+getrandom = { version = "=0.4.3", optional = true }
+base64 = { version = "=0.23.1", optional = true }
 
 # statvfs (free space before a restore) and gethostname (lock holders)
 [target.'cfg(unix)'.dependencies]
@@ -33,6 +38,7 @@ tempfile.workspace = true
 
 [features]
 default = ["fs", "s3"]
+encryption = ["dep:aws-lc-rs", "dep:argon2", "dep:zeroize", "dep:getrandom", "dep:base64"]
 # `fs` repositories (a local or mounted directory)
 fs = ["object_store/fs"]
 # `s3` repositories (AWS S3 and S3-compatible services: MinIO, Cloudflare R2, Ceph RGW)

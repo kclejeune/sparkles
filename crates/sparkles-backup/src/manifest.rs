@@ -8,6 +8,7 @@ use crate::layout::{
     valid_blob_id, valid_generation,
 };
 use crate::{BackupError, Code, Manifest, Repository};
+use futures::TryStreamExt;
 use object_store::{GetOptions, ObjectMeta, ObjectStore};
 use std::collections::HashSet;
 
@@ -67,11 +68,25 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_format: u32) -> Result<()>
             ),
         ));
     }
-    if m.encryption.as_ref().is_some_and(|e| !e.is_null()) {
-        return bad(
-            "encryption",
-            "the backup is encrypted; this build cannot read it".into(),
-        );
+    if let Some(encryption) = m.encryption.as_ref().filter(|e| !e.is_null()) {
+        #[cfg(feature = "encryption")]
+        let supported = encryption.as_object().is_some_and(|e| e.len() == 2)
+            && encryption.get("scheme").and_then(|e| e.as_str()) == Some("sparkles-repo-v1")
+            && encryption
+                .get("epoch")
+                .and_then(|e| e.as_u64())
+                .is_some_and(|e| (1..=u32::MAX as u64).contains(&e));
+        #[cfg(not(feature = "encryption"))]
+        let supported = {
+            let _ = encryption;
+            false
+        };
+        if !supported {
+            return bad(
+                "encryption",
+                "unsupported backup encryption metadata".into(),
+            );
+        }
     }
     if !valid_backup_name(&m.name) {
         return bad("name", format!("{:?} is not a valid backup name", m.name));
@@ -218,6 +233,16 @@ pub(crate) async fn fetch(
     name: &str,
     meta: Option<&ObjectMeta>,
 ) -> Result<(Manifest, ObjectMeta, bool)> {
+    let security = repo.security().await?;
+    fetch_with_security(repo, name, meta, &security).await
+}
+
+pub(crate) async fn fetch_with_security(
+    repo: &Repository,
+    name: &str,
+    meta: Option<&ObjectMeta>,
+    security: &crate::security::Security,
+) -> Result<(Manifest, ObjectMeta, bool)> {
     let missing = || {
         BackupError::new(
             Code::NoSuchBackup,
@@ -227,10 +252,17 @@ pub(crate) async fn fetch(
     if !valid_backup_name(name) {
         return Err(missing());
     }
-    if let Some(meta) = meta
-        && let Some(m) = repo.cache.get(name, &version_of(meta), meta.size)
-    {
-        return Ok((m, meta.clone(), false));
+    if let Some(meta) = meta {
+        if security.encrypted() {
+            if let Some(bytes) = repo.cache.get_sealed(name, &version_of(meta), meta.size) {
+                // Corrupted local caches are misses, not authoritative repository failures.
+                if let Ok(m) = security.open_manifest(name, &bytes) {
+                    return Ok((m, meta.clone(), false));
+                }
+            }
+        } else if let Some(m) = repo.cache.get(name, &version_of(meta), meta.size) {
+            return Ok((m, meta.clone(), false));
+        }
     }
     let got = match repo
         .store
@@ -241,16 +273,32 @@ pub(crate) async fn fetch(
         Err(object_store::Error::NotFound { .. }) => return Err(missing()),
         Err(e) => return Err(e.into()),
     };
-    if got.meta.size > MAX_MANIFEST_BYTES {
+    let limit = security.manifest_limit();
+    if got.meta.size > limit {
         return Err(BackupError::invalid_backup(
             "manifest",
             format!("larger than {MAX_MANIFEST_BYTES} bytes"),
         ));
     }
     let meta = got.meta.clone();
-    let bytes = got.bytes().await?;
-    let m = parse(&bytes)?;
-    repo.cache.put(name, &version_of(&meta), meta.size, &m);
+    let mut stream = got.into_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.try_next().await? {
+        if (bytes.len() as u64).saturating_add(chunk.len() as u64) > limit {
+            return Err(BackupError::invalid_backup(
+                "manifest",
+                "stored-size limit exceeded",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let m = security.open_manifest(name, &bytes)?;
+    if security.encrypted() {
+        repo.cache
+            .put_sealed(name, &version_of(&meta), meta.size, &bytes);
+    } else {
+        repo.cache.put(name, &version_of(&meta), meta.size, &m);
+    }
     Ok((m, meta, true))
 }
 

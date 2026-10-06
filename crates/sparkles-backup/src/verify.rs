@@ -1,6 +1,6 @@
 //! Verifying backups and repositories.
 
-use crate::blob::{self, HEADER_LEN};
+use crate::blob::HEADER_LEN;
 use crate::error::{Code, Result};
 use crate::layout;
 use crate::{
@@ -93,6 +93,7 @@ impl Repository {
     ) -> Result<VerifyReport> {
         let ctl = &o.ctl;
         let mut req = VerifyRequests::default();
+        let security = self.security().await?;
         let whole_repo = names.is_empty();
 
         // the manifests
@@ -183,7 +184,10 @@ impl Repository {
                 .await?;
             req.list += 1;
             for (id, &size) in &needed {
-                if !listed.get(id).is_some_and(|&s| plausible_size(size, s)) {
+                if !listed
+                    .get(id)
+                    .is_some_and(|&s| security.plausible_size(size, s))
+                {
                     missing.insert(id.clone());
                 }
             }
@@ -198,11 +202,12 @@ impl Repository {
                 orphans = Some(Orphans { blobs, bytes });
             }
         } else if o.level == VerifyLevel::Exists {
+            let security = &security;
             let heads: Vec<(String, bool)> = futures::stream::iter(needed.iter())
                 .map(|(id, &size)| async move {
                     ctl.check()?;
                     match self.store.head(&layout::blob_key(id)).await {
-                        Ok(m) => Ok((id.clone(), plausible_size(size, m.size))),
+                        Ok(m) => Ok((id.clone(), security.plausible_size(size, m.size))),
                         Err(e) if crate::repo::is_not_found(&e) => Ok((id.clone(), false)),
                         Err(e) => Err(BackupError::from(e)),
                     }
@@ -224,9 +229,10 @@ impl Repository {
             let total = todo.len();
             let mut done = 0usize;
             let mut results = futures::stream::iter(todo)
-                .map(
-                    |(id, size)| async move { (id.clone(), self.check_blob(&id, size, ctl).await) },
-                )
+                .map(|(id, size)| {
+                    let security = security.clone();
+                    async move { (id.clone(), self.check_blob(&id, size, ctl, security).await) }
+                })
                 .buffer_unordered(self.config.concurrency());
             while let Some((id, r)) = results.next().await {
                 req.get += 1;
@@ -308,7 +314,13 @@ impl Repository {
     }
 
     /// Download blob `id` and check it decodes to `size` bytes with that hash.
-    async fn check_blob(&self, id: &str, size: u64, ctl: &crate::Ctl) -> Result<BlobState> {
+    async fn check_blob(
+        &self,
+        id: &str,
+        size: u64,
+        ctl: &crate::Ctl,
+        security: crate::security::Security,
+    ) -> Result<BlobState> {
         ctl.check()?;
         self.download.take(size, ctl).await?;
         let got = match self.store.get(&layout::blob_key(id)).await {
@@ -316,9 +328,21 @@ impl Repository {
             Err(e) if crate::repo::is_not_found(&e) => return Ok(BlobState::Missing),
             Err(e) => return Err(e.into()),
         };
-        let stored = got.bytes().await?;
+        let limit = security.blob_limit(size)?;
+        if got.meta.size > limit {
+            return Ok(BlobState::Corrupt);
+        }
+        let mut stream = got.into_stream();
+        let mut stored = Vec::new();
+        while let Some(chunk) = stream.try_next().await? {
+            ctl.check()?;
+            if (stored.len() as u64).saturating_add(chunk.len() as u64) > limit {
+                return Ok(BlobState::Corrupt);
+            }
+            stored.extend_from_slice(&chunk);
+        }
         let id = id.to_string();
-        let ok = tokio::task::spawn_blocking(move || blob::decode(&stored, &id, size).is_ok())
+        let ok = tokio::task::spawn_blocking(move || security.decode(&stored, &id, size).is_ok())
             .await
             .map_err(|e| BackupError::internal(format!("a verify worker failed: {e}")))?;
         Ok(if ok {

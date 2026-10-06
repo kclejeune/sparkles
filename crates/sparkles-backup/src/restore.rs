@@ -7,7 +7,7 @@
 //! written, and each file's own SHA-256 after. The directory is published by the
 //! caller with a rename, so a failed restore never leaves a partial database behind.
 
-use crate::blob::{self, HEADER_LEN, Hasher};
+use crate::blob::Hasher;
 use crate::error::Result;
 use crate::layout::blob_key;
 use crate::lock::{self};
@@ -186,7 +186,8 @@ impl Repository {
         o: &RestoreOptions,
         t0: Instant,
     ) -> std::result::Result<RestoreReport, Failure> {
-        let (m, _, _) = manifest::fetch(self, name, None).await?;
+        let security = self.security().await?;
+        let (m, _, _) = manifest::fetch_with_security(self, name, None, &security).await?;
         manifest::validate(
             &m,
             self.marker.piece_bytes,
@@ -200,7 +201,7 @@ impl Repository {
             &format!("restoring {name}"),
         )?;
         o.ctl.report(0.02, "downloading");
-        self.download(&m, tmp, &o.ctl).await?;
+        self.download(&m, tmp, &o.ctl, &security).await?;
         o.ctl.check()?;
 
         let source = ForkedFrom {
@@ -317,6 +318,7 @@ impl Repository {
         m: &Manifest,
         dir: &Path,
         ctl: &Ctl,
+        security: &crate::security::Security,
     ) -> std::result::Result<(), Failure> {
         // every path was validated: a root file, or a file of the one generation
         let files: Arc<Vec<(PathBuf, File)>> = {
@@ -351,7 +353,7 @@ impl Repository {
             .map(|(i, id, size, off, path)| {
                 let (files, done) = (files.clone(), done.clone());
                 async move {
-                    let plain = self.fetch_blob(&id, size, &path, ctl).await?;
+                    let plain = self.fetch_blob(&id, size, &path, ctl, security).await?;
                     if !plain.is_empty() {
                         blocking(move || Ok(write_at(&files[i].1, &plain, off)?)).await?;
                     }
@@ -435,10 +437,11 @@ impl Repository {
         size: u64,
         path: &str,
         ctl: &Ctl,
+        security: &crate::security::Security,
     ) -> std::result::Result<Vec<u8>, Failure> {
         // the largest stored form of `size` bytes this build writes (an LZ4 frame is
         // kept only when smaller than the plaintext); anything bigger is not read
-        let cap = HEADER_LEN as u64 + size + size / 64 + 4096;
+        let cap = security.blob_limit(size)?;
         let mut attempt = 0;
         loop {
             ctl.check()?;
@@ -466,11 +469,11 @@ impl Repository {
                 let mut too_big = false;
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk.map_err(BackupError::from)?;
-                    buf.extend_from_slice(&chunk);
-                    if buf.len() as u64 > cap {
+                    if (buf.len() as u64).saturating_add(chunk.len() as u64) > cap {
                         too_big = true;
                         break;
                     }
+                    buf.extend_from_slice(&chunk);
                     since += chunk.len();
                     if since >= CANCEL_EVERY {
                         since = 0;
@@ -480,7 +483,7 @@ impl Repository {
                 if too_big {
                     Err("stored size is too large".to_string())
                 } else {
-                    blob::decode(&buf, id, size).map_err(|e| e.to_string())
+                    security.decode(&buf, id, size).map_err(|e| e.to_string())
                 }
             };
             match result {

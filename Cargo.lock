@@ -200,6 +200,7 @@ dependencies = [
  "blake2",
  "cpufeatures",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -3895,18 +3896,23 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
 name = "sparkles-backup"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "async-trait",
+ "aws-lc-rs",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "chrono-tz",
  "croner",
  "futures",
+ "getrandom 0.4.3",
  "libc",
  "lz4_flex 0.14.0",
  "object_store",
@@ -3920,6 +3926,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

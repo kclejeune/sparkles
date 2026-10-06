@@ -10,6 +10,7 @@ use crate::Manifest;
 use object_store::ObjectMeta;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -19,6 +20,7 @@ pub struct ManifestCache {
     /// `<cache_dir>/<repository id>`; `None`: memory only
     pub(crate) dir: Option<PathBuf>,
     mem: Mutex<HashMap<String, Entry>>,
+    sealed: Mutex<HashMap<String, SealedEntry>>,
 }
 
 /// One cached manifest, as kept in memory and written to `<name>.json`.
@@ -27,6 +29,14 @@ struct Entry {
     version: String,
     size: u64,
     manifest: Manifest,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedEntry {
+    version: String,
+    size: u64,
+    envelope: Vec<u8>,
 }
 
 impl std::fmt::Debug for ManifestCache {
@@ -53,6 +63,7 @@ impl ManifestCache {
         ManifestCache {
             dir,
             mem: Mutex::default(),
+            sealed: Mutex::default(),
         }
     }
 
@@ -112,9 +123,55 @@ impl ManifestCache {
         self.mem.lock().unwrap().insert(name.to_string(), e);
     }
 
+    // The disk contains only authenticated ciphertext for an encrypted repository.
+    pub(crate) fn get_sealed(&self, name: &str, version: &str, size: u64) -> Option<Vec<u8>> {
+        let matches = |e: &SealedEntry| {
+            e.version == version && e.size == size && e.envelope.len() as u64 == size
+        };
+        if let Some(e) = self.sealed.lock().unwrap().get(name).filter(|e| matches(e)) {
+            return Some(e.envelope.clone());
+        }
+        let path = self.file(name)?;
+        // JSON byte arrays can take four times their binary length.
+        let limit = crate::layout::MAX_MANIFEST_BYTES.saturating_mul(8);
+        let file = std::fs::File::open(path).ok()?;
+        if file.metadata().ok()?.len() > limit {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::take(file, limit + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > limit {
+            return None;
+        }
+        let e: SealedEntry = serde_json::from_slice(&bytes).ok()?;
+        if !matches(&e) {
+            return None;
+        }
+        let envelope = e.envelope.clone();
+        self.sealed.lock().unwrap().insert(name.to_string(), e);
+        Some(envelope)
+    }
+
+    pub(crate) fn put_sealed(&self, name: &str, version: &str, size: u64, envelope: &[u8]) {
+        let e = SealedEntry {
+            version: version.to_string(),
+            size,
+            envelope: envelope.to_vec(),
+        };
+        if let Some(path) = self.file(name)
+            && let Err(err) = write_atomic(&path, &e)
+        {
+            tracing::warn!(target: "sparkles::backup", "manifest cache {}: {err}", path.display());
+        }
+        self.sealed.lock().unwrap().insert(name.to_string(), e);
+    }
+
     /// Forget `name` (after a delete).
     pub fn remove(&self, name: &str) {
         self.mem.lock().unwrap().remove(name);
+        self.sealed.lock().unwrap().remove(name);
         if let Some(path) = self.file(name)
             && let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -124,7 +181,7 @@ impl ManifestCache {
     }
 }
 
-fn write_atomic(path: &std::path::Path, e: &Entry) -> std::io::Result<()> {
+fn write_atomic(path: &std::path::Path, e: &impl Serialize) -> std::io::Result<()> {
     let dir = path.parent().expect("a cache file has a directory");
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(

@@ -68,6 +68,9 @@ pub async fn repo_with(store: Arc<dyn ObjectStore>, f: impl FnOnce(&mut RepoConf
         download: Throttle::unlimited(),
         requests: Default::default(),
         conditional: std::sync::atomic::AtomicU8::new(crate::repo::COND_UNKNOWN),
+        key_options: Default::default(),
+        #[cfg(feature = "encryption")]
+        native_root: None,
     }
 }
 

@@ -60,6 +60,9 @@ pub enum Code {
     NotImplemented,
     /// a storage backend error after retries (502; the message has no URL query strings)
     RepositoryUnavailable,
+    RepositoryKeyRequired,
+    WrongRepositoryKey,
+    LastKeySlot,
     /// the commit catalog could not be flushed at capture (503, retryable)
     CatalogLagging,
     /// as many backup tasks as the server takes run or wait already (503, retryable)
@@ -73,7 +76,7 @@ pub enum Code {
 }
 
 impl Code {
-    pub const ALL: [Code; 35] = [
+    pub const ALL: [Code; 38] = [
         Code::InvalidName,
         Code::InvalidConfig,
         Code::InvalidRequest,
@@ -104,6 +107,9 @@ impl Code {
         Code::BackupUnsupported,
         Code::NotImplemented,
         Code::RepositoryUnavailable,
+        Code::RepositoryKeyRequired,
+        Code::WrongRepositoryKey,
+        Code::LastKeySlot,
         Code::CatalogLagging,
         Code::TooManyTasks,
         Code::Cancelled,
@@ -143,6 +149,9 @@ impl Code {
             Code::BackupUnsupported => "backup-unsupported",
             Code::NotImplemented => "not-implemented",
             Code::RepositoryUnavailable => "repository-unavailable",
+            Code::RepositoryKeyRequired => "repository-key-required",
+            Code::WrongRepositoryKey => "wrong-repository-key",
+            Code::LastKeySlot => "last-key-slot",
             Code::CatalogLagging => "catalog-lagging",
             Code::TooManyTasks => "too-many-tasks",
             Code::Cancelled => "cancelled",
@@ -172,8 +181,13 @@ impl Code {
             | Code::DatasetExists
             | Code::DatasetBusy
             | Code::NotManaged
-            | Code::DuplicateDatasetId => 409,
-            Code::IncompatibleRepository | Code::IncompatibleFormat | Code::InvalidBackup => 422,
+            | Code::DuplicateDatasetId
+            | Code::RepositoryKeyRequired
+            | Code::LastKeySlot => 409,
+            Code::IncompatibleRepository
+            | Code::IncompatibleFormat
+            | Code::InvalidBackup
+            | Code::WrongRepositoryKey => 422,
             Code::InsufficientStorage => 507,
             Code::BackupUnsupported | Code::NotImplemented => 501,
             Code::RepositoryUnavailable => 502,

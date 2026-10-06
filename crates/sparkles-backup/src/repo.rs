@@ -66,6 +66,11 @@ pub struct Repository {
     /// conditional-write support as last detected: [`COND_UNKNOWN`], [`COND_YES`] or
     /// [`COND_NO`] (the connection test, or a create answered `NotImplemented`)
     pub(crate) conditional: AtomicU8,
+    pub(crate) key_options: crate::security::KeyOptions,
+    /// Canonical native backend root and its opened directory identity. Custom
+    /// stores never receive a path-based marker publication capability.
+    #[cfg(feature = "encryption")]
+    pub(crate) native_root: Option<(std::path::PathBuf, Arc<std::fs::File>)>,
 }
 
 pub(crate) const COND_UNKNOWN: u8 = 0;
@@ -766,13 +771,74 @@ impl Repository {
     /// configurations never write (an empty location is then `409 not-a-repository`).
     /// Does not run the connection test.
     pub async fn open(cfg: &RepoConfig, env: &OpenEnv) -> Result<Repository> {
+        Self::open_with_keys(cfg, env, crate::security::KeyOptions::None).await
+    }
+
+    /// Open or initialize a repository with explicit resolved local key inputs.
+    /// Secret provider lookup and operator configuration are owned by the caller.
+    #[cfg(feature = "encryption")]
+    pub async fn open_encrypted(
+        cfg: &RepoConfig,
+        env: &OpenEnv,
+        options: &crate::crypto::EncryptionOptions,
+    ) -> Result<Repository> {
+        options.check(false)?;
+        Self::open_with_keys(
+            cfg,
+            env,
+            crate::security::KeyOptions::Local(Arc::new(options.clone())),
+        )
+        .await
+    }
+
+    async fn open_with_keys(
+        cfg: &RepoConfig,
+        env: &OpenEnv,
+        key_options: crate::security::KeyOptions,
+    ) -> Result<Repository> {
         cfg.validate(&env.forbid_under)?;
+        #[cfg(feature = "encryption")]
+        let native_root = if cfg!(feature = "fs") && env.store.is_none() && cfg.kind == RepoType::Fs
+        {
+            let path = cfg
+                .path
+                .as_ref()
+                .ok_or_else(|| invalid("path", "required for fs repositories"))?;
+            let unavailable = |e: std::io::Error| {
+                BackupError::new(
+                    Code::RepositoryUnavailable,
+                    format!("repository unavailable: {path}: {e}"),
+                )
+            };
+            if !cfg.readonly {
+                std::fs::create_dir_all(path).map_err(unavailable)?;
+            }
+            let root = std::fs::canonicalize(path).map_err(unavailable)?;
+            let directory = Arc::new(std::fs::File::open(&root).map_err(unavailable)?);
+            Some((root, directory))
+        } else {
+            None
+        };
         let (inner, attempts) = match &env.store {
             Some(s) => (
                 limited(s.clone(), cfg.concurrency()),
                 instrumented::LOCAL_ATTEMPTS,
             ),
             None => {
+                #[cfg(feature = "encryption")]
+                let pinned = {
+                    let mut pinned = cfg.clone();
+                    if let Some((root, _)) = &native_root {
+                        pinned.path = Some(
+                            root.to_str()
+                                .ok_or_else(|| invalid("path", "filesystem path is not UTF-8"))?
+                                .into(),
+                        );
+                    }
+                    pinned
+                };
+                #[cfg(feature = "encryption")]
+                let cfg = &pinned;
                 let s = build_store_with(cfg, env.outbound.as_ref())?;
                 let attempts = match cfg.kind {
                     // the HTTP client retries (RetryConfig)
@@ -785,7 +851,34 @@ impl Repository {
         let requests = env.requests.clone().unwrap_or_default();
         let store: Arc<dyn ObjectStore> =
             Arc::new(RepoStore::new(inner, requests.clone(), attempts));
-        let marker = attach_or_init(&store, cfg, env).await?;
+        let marker = {
+            #[cfg(feature = "encryption")]
+            if let crate::security::KeyOptions::Local(options) = &key_options {
+                crate::crypto::repository::attach_or_init(
+                    &store,
+                    cfg,
+                    env,
+                    options,
+                    native_root.as_ref(),
+                )
+                .await?
+            } else {
+                attach_or_init(&store, cfg, env).await?
+            }
+            #[cfg(not(feature = "encryption"))]
+            {
+                attach_or_init(&store, cfg, env).await?
+            }
+        };
+        #[cfg(feature = "encryption")]
+        if marker
+            .encryption
+            .as_ref()
+            .is_some_and(|value| !value.is_null())
+            && matches!(key_options, crate::security::KeyOptions::None)
+        {
+            return Err(crate::crypto::slots::required());
+        }
         let cache_dir = env
             .cache_dir
             .as_ref()
@@ -804,6 +897,9 @@ impl Repository {
             } else {
                 COND_NO
             }),
+            key_options,
+            #[cfg(feature = "encryption")]
+            native_root,
         })
     }
 
@@ -1046,6 +1142,7 @@ impl Repository {
     /// left out; a manifest that does not parse, or whose `name` is not its key's, is an
     /// `Err` in its entry. Also returns the number of `GET`s made.
     pub(crate) async fn scan_manifests(&self) -> Result<(Vec<ManifestEntry>, u64)> {
+        let security = self.security().await?;
         let metas: Vec<ObjectMeta> = self
             .store
             .list(Some(&Key::from(layout::BACKUPS)))
@@ -1058,7 +1155,14 @@ impl Repository {
                 continue;
             };
             let version = crate::cache::version_of(&meta);
-            match self.cache.get(&name, &version, meta.size) {
+            let cached = if security.encrypted() {
+                self.cache
+                    .get_sealed(&name, &version, meta.size)
+                    .and_then(|bytes| security.open_manifest(&name, &bytes).ok())
+            } else {
+                self.cache.get(&name, &version, meta.size)
+            };
+            match cached {
                 Some(m) => hits.push(ManifestEntry {
                     manifest: named(&name, m).map(Arc::new),
                     name,
@@ -1067,9 +1171,14 @@ impl Repository {
             }
         }
         let gets = misses.len() as u64;
+        let security = &security;
         let fetched: Vec<ManifestEntry> = futures::stream::iter(misses)
             .map(|(name, meta)| async move {
-                let manifest = self.fetch_manifest(&name, Some(&meta)).await.map(Arc::new);
+                let manifest =
+                    crate::manifest::fetch_with_security(self, &name, Some(&meta), security)
+                        .await
+                        .and_then(|(m, _, _)| named(&name, m))
+                        .map(Arc::new);
                 ManifestEntry { name, manifest }
             })
             .buffer_unordered(self.config.concurrency())

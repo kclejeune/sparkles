@@ -822,6 +822,14 @@ pub enum LockKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LockOperation {
+    #[cfg(feature = "encryption")]
+    KeyAdd,
+    #[cfg(feature = "encryption")]
+    KeyRemove,
+    #[cfg(feature = "encryption")]
+    KeyRotate,
+    #[cfg(feature = "encryption")]
+    KeyRetire,
     Create,
     Restore,
     Verify,

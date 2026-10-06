@@ -25,6 +25,8 @@ pub mod blob;
 pub mod cache;
 pub mod capture;
 pub mod create;
+#[cfg(feature = "encryption")]
+pub mod crypto;
 pub mod error;
 #[cfg(test)]
 mod fixture;
@@ -35,6 +37,7 @@ pub mod manifest;
 pub mod policy;
 pub mod repo;
 pub mod restore;
+mod security;
 pub mod throttle;
 pub mod types;
 pub mod verify;

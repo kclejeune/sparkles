@@ -495,6 +495,43 @@ async fn read_only_repositories_do_not_write() {
 }
 
 /// `fs` repositories: created with their directory, blobs as files.
+#[cfg(feature = "fs")]
+#[tokio::test]
+async fn filesystem_setup_errors_preserve_unavailable_classification() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ancestor = tmp.path().join("file");
+    std::fs::write(&ancestor, b"occupied").unwrap();
+    for (path, readonly) in [
+        (ancestor.join("repo"), false),
+        (tmp.path().join("missing"), true),
+    ] {
+        let mut cfg = RepoConfig::from_url("local", &format!("file://{}", path.display())).unwrap();
+        cfg.readonly = readonly;
+        let err = Repository::open(&cfg, &OpenEnv::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::RepositoryUnavailable, "{err}");
+        assert!(err.message().contains(path.to_str().unwrap()), "{err}");
+        assert!(!path.exists());
+        #[cfg(feature = "encryption")]
+        {
+            use sparkles_backup::crypto::{EncryptionOptions, LocalKey, LocalKeySource};
+            let keys = EncryptionOptions {
+                keys: vec![LocalKey::new("online", LocalKeySource::File, [17; 32]).unwrap()],
+                single_key_ok: true,
+                ..Default::default()
+            };
+            let err = Repository::open_encrypted(&cfg, &OpenEnv::default(), &keys)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::RepositoryUnavailable, "{err}");
+            assert!(err.message().contains(path.to_str().unwrap()), "{err}");
+            assert!(!path.exists());
+        }
+    }
+}
+
+/// `fs` repositories: created with their directory, blobs as files.
 #[tokio::test]
 async fn fs_repository() {
     let tmp = tempfile::tempdir().unwrap();

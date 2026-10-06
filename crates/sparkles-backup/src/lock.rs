@@ -369,6 +369,14 @@ fn op_name(o: LockOperation) -> &'static str {
         LockOperation::Verify => "verify",
         LockOperation::Delete => "delete",
         LockOperation::Gc => "gc",
+        #[cfg(feature = "encryption")]
+        LockOperation::KeyAdd => "keyadd",
+        #[cfg(feature = "encryption")]
+        LockOperation::KeyRemove => "keyremove",
+        #[cfg(feature = "encryption")]
+        LockOperation::KeyRotate => "keyrotate",
+        #[cfg(feature = "encryption")]
+        LockOperation::KeyRetire => "keyretire",
     }
 }
 

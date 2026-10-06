@@ -207,7 +207,7 @@ pub struct Marker {
     /// `sha256`
     pub hash: String,
     pub piece_bytes: u64,
-    /// reserved for client-side encryption; this build requires `null`
+    /// Optional client encryption descriptor; plaintext repositories store `null`.
     #[serde(default)]
     pub encryption: Option<J>,
 }
@@ -254,11 +254,28 @@ impl Marker {
                 self.format
             ));
         }
+        if self.encryption.as_ref().is_some_and(|e| !e.is_null()) {
+            #[cfg(feature = "encryption")]
+            {
+                crate::crypto::slots::Descriptor::parse(
+                    self.encryption.as_ref().expect("checked"),
+                )?;
+                if self.format != 1
+                    || self.id.is_nil()
+                    || chrono::DateTime::parse_from_rfc3339(&self.created).is_err()
+                    || self.hash != "hmac-sha256"
+                    || self.piece_bytes == 0
+                    || self.piece_bytes > crate::crypto::objects::MAX_PIECE_BYTES
+                {
+                    return bad("invalid encrypted repository hash or piece size".into());
+                }
+                return Ok(());
+            }
+            #[cfg(not(feature = "encryption"))]
+            return bad("the repository is encrypted; this build cannot read it".into());
+        }
         if self.hash != "sha256" {
             return bad(format!("unsupported blob hash {:?}", self.hash));
-        }
-        if self.encryption.as_ref().is_some_and(|e| !e.is_null()) {
-            return bad("the repository is encrypted; this build cannot read it".into());
         }
         if self.piece_bytes == 0 || self.piece_bytes > 5 << 30 {
             return bad(format!("invalid pieceBytes {}", self.piece_bytes));

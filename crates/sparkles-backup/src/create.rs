@@ -111,13 +111,23 @@ fn read_piece(f: &CapturedFile, off: u64, len: u64, cancel: &AtomicBool) -> Resu
 
 /// Hash `f` over `[0, len)` in one pass: the ids of the segments ending at `ends`
 /// (ascending, the last at most `len`), and the whole-file hash.
+#[cfg(test)]
 fn hash_segments(
     f: &CapturedFile,
     ends: &[u64],
     cancel: &AtomicBool,
 ) -> Result<(Vec<String>, String)> {
+    hash_segments_secure(f, ends, cancel, &crate::security::Security::default())
+}
+
+fn hash_segments_secure(
+    f: &CapturedFile,
+    ends: &[u64],
+    cancel: &AtomicBool,
+    security: &crate::security::Security,
+) -> Result<(Vec<String>, String)> {
     let mut whole = Hasher::new();
-    let mut seg = Hasher::new();
+    let mut seg = security.id_hasher();
     let mut ids = Vec::with_capacity(ends.len());
     let mut next = ends.iter().copied().peekable();
     let mut buf = vec![0u8; CHUNK.min(f.len.max(1) as usize)];
@@ -137,7 +147,7 @@ fn hash_segments(
                 Some(&end) if end <= chunk_end => {
                     let take = (end - (pos + at as u64)) as usize;
                     seg.update(&buf[at..at + take]);
-                    ids.push(std::mem::take(&mut seg).finish());
+                    ids.push(std::mem::replace(&mut seg, security.id_hasher()).finish());
                     at += take;
                     next.next();
                 }
@@ -151,14 +161,14 @@ fn hash_segments(
     }
     // segments ending at the current position (empty ones)
     while next.next_if(|&e| e <= pos).is_some() {
-        ids.push(std::mem::take(&mut seg).finish());
+        ids.push(std::mem::replace(&mut seg, security.id_hasher()).finish());
     }
     Ok((ids, whole.finish()))
 }
 
 /// The blob object of `plain` as a payload: an LZ4 frame if that saves at least 10 %,
 /// else the plaintext itself behind the header (without copying it).
-fn encode(plain: Bytes) -> PutPayload {
+pub(crate) fn encode(plain: Bytes) -> PutPayload {
     use std::io::Write;
     let len = plain.len() as u64;
     if !plain.is_empty() {
@@ -255,6 +265,7 @@ impl Repository {
         created: String,
     ) -> Result<BackupSummary> {
         let ctl = &o.ctl;
+        let security = self.security().await?;
         let key = layout::manifest_key(&o.name);
         match self.store.head(&key).await {
             Ok(_) => return Err(exists(&o.name)),
@@ -309,9 +320,18 @@ impl Repository {
             sparkles.backup.name = %o.name, files = files.len(), reused = tracing::field::Empty);
         let (parent, plans) = async {
             let mut ms = self.manifests().await?;
-            ms.retain(|m| m.dataset.id == dataset_id);
+            ms.retain(|m| {
+                m.dataset.id == dataset_id
+                    && m.encryption
+                        .as_ref()
+                        .and_then(|e| e.get("epoch"))
+                        .and_then(|e| e.as_u64())
+                        == security.epoch().map(u64::from)
+            });
             crate::repo::sort_newest_first(&mut ms);
-            let parent = ms.into_iter().next();
+            let parent = ms
+                .into_iter()
+                .find(|m| crate::manifest::validate(m, piece, index_format).is_ok());
             let mut plans = Vec::with_capacity(files.len());
             for (i, f) in files.iter().enumerate() {
                 let prior = parent
@@ -324,7 +344,8 @@ impl Repository {
                     });
                 let plan = match (f.kind, prior) {
                     (FileKind::Append, Some(prior)) if prior.size > 0 && prior.size <= f.len => {
-                        self.plan_append(&files, i, prior, piece, ctl).await?
+                        self.plan_append(&files, i, prior, piece, ctl, &security)
+                            .await?
                     }
                     _ => FilePlan {
                         reused: Vec::new(),
@@ -387,7 +408,14 @@ impl Repository {
             let mut results = futures::stream::iter(units)
                 .map(|u| {
                     let known = (parent_ids.clone(), seen.clone());
-                    self.upload_unit(files.clone(), u, known, o.min_free_disk_bytes, ctl)
+                    self.upload_unit(
+                        files.clone(),
+                        u,
+                        known,
+                        o.min_free_disk_bytes,
+                        ctl,
+                        security.clone(),
+                    )
                 })
                 .buffered(self.config.concurrency());
             while let Some(up) = results.try_next().await? {
@@ -475,20 +503,28 @@ impl Repository {
                     rebuild_on_restore: true,
                 }),
             },
-            encryption: None,
+            encryption: security
+                .epoch()
+                .map(|epoch| serde_json::json!({"scheme":"sparkles-repo-v1","epoch":epoch})),
             branches_omitted,
         };
         ctl.check()?;
         ctl.report(0.97, "writing the manifest");
         let body = Bytes::from(
-            serde_json::to_vec(&manifest)
-                .map_err(|e| BackupError::internal(format!("manifest: {e}")))?,
+            security.seal_manifest(
+                &o.name,
+                serde_json::to_vec(&manifest)
+                    .map_err(|e| BackupError::internal(format!("manifest: {e}")))?,
+            )?,
         );
         let size = body.len() as u64;
         let span = tracing::info_span!("backup.manifest", sparkles.repository = %self.config.name,
             sparkles.backup.name = %o.name);
         let e_tag = async {
-            match self.create_object(&key, PutPayload::from(body)).await? {
+            match self
+                .create_object(&key, PutPayload::from(body.clone()))
+                .await?
+            {
                 Some(put) => Ok(put.e_tag),
                 None => {
                     // ours after a retried request, or a concurrent writer's
@@ -502,7 +538,11 @@ impl Repository {
         .instrument(span)
         .await?;
         if let Some(tag) = &e_tag {
-            self.cache.put(&o.name, tag, size, &manifest);
+            if security.encrypted() {
+                self.cache.put_sealed(&o.name, tag, size, &body);
+            } else {
+                self.cache.put(&o.name, tag, size, &manifest);
+            }
         }
         drop(lease);
         tracing::info!(
@@ -531,6 +571,7 @@ impl Repository {
         prior: &FileEntry,
         piece: u64,
         ctl: &Ctl,
+        security: &crate::security::Security,
     ) -> Result<FilePlan> {
         let f = &files[i];
         let scratch = || FilePlan {
@@ -562,7 +603,9 @@ impl Repository {
             return Ok(scratch());
         }
         let (files2, cancel) = (files.clone(), ctl.cancel.clone());
-        let (ids, whole) = blocking(move || hash_segments(&files2[i], &ends, &cancel)).await?;
+        let security = security.clone();
+        let (ids, whole) =
+            blocking(move || hash_segments_secure(&files2[i], &ends, &cancel, &security)).await?;
         if ids.iter().zip(&prior.blobs).any(|(id, b)| id != &b.id) {
             tracing::warn!(
                 target: "sparkles::backup",
@@ -619,13 +662,15 @@ impl Repository {
         known: (Arc<HashSet<String>>, Arc<Mutex<HashSet<String>>>),
         reserve: Option<u64>,
         ctl: &Ctl,
+        security: crate::security::Security,
     ) -> Result<Uploaded> {
         let (parent_ids, seen) = known;
         ctl.check()?;
         let cancel = ctl.cancel.clone();
+        let hasher = security.clone();
         let (plain, id) = blocking(move || {
             let plain = read_piece(&files[unit.file], unit.off, unit.len, &cancel)?;
-            let id = blob::blob_id(&plain);
+            let id = hasher.blob_id(&plain);
             Ok((Bytes::from(plain), id))
         })
         .await?;
@@ -654,7 +699,7 @@ impl Repository {
             }
         }
         let p2 = plain.clone();
-        let payload = blocking(move || Ok(encode(p2))).await?;
+        let payload = blocking(move || security.encode(p2)).await?;
         let stored = payload.content_length() as u64;
         self.check_space(stored, reserve, true)?;
         self.upload.take(stored, ctl).await?;

@@ -162,7 +162,10 @@ async fn unsupported_dataset_metadata_is_refused_even_without_integrity_checks()
     fixture::make_db(&source);
     let repo = fixture::memory_repo().await;
     let original = std::fs::read(source.join("dataset.json")).unwrap();
-    for (field, value) in [("format", 2), ("minimumReader", 3)] {
+    for (field, value) in [
+        ("format", 2),
+        ("minimumReader", sparkles_core::commit::DATASET_READER + 1),
+    ] {
         let mut capture = crate::Source::from_closed_dir(&source).unwrap();
         let mut metadata: serde_json::Value = serde_json::from_slice(&original).unwrap();
         metadata[field] = value.into();
