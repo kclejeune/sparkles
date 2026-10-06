@@ -58,3 +58,33 @@ use `update(..., {dryRun: ...})` or explicit branch preview methods. Conditional
 `ifHead` applies to ordinary writes and patches; administration operations reject
 it when their engine facade cannot honor it. Set `ifHead` when beginning a
 transaction; `tx.update` rejects `dryRun` and `ifHead` before mutation.
+
+Standalone `parseQuery` and `parseUpdate` validate with the engine's SPARQL parser
+and return normalized documents; both accept `baseIri` and `prefixes`. `checkData`
+checks RDF syntax and returns the first issue (with `bigint` line/column), or
+`null`. `checkIri` and `checkLangtag` return errors and normalization warnings.
+`convertGeometries` converts geometry literals to CRS84 GeoJSON, preserving numeric
+coordinates and reporting invalid literals individually. These helpers run on Rust
+threads and do not require a dataset.
+
+`format(text, language, options)` returns formatted text, warnings and a mapped
+byte cursor. It exposes the engine formatter options and a millisecond `timeout`.
+`lint(text, language, {levels, timeout})` returns source diagnostics and edits;
+`levels` overrides each rule's severity, including `off`. Unsupported languages
+and invalid options fail explicitly. `previewSchedule(schedule, {timezone,
+count, after})` returns up to 1,000 future UTC instants, with a deterministic
+`after` value for previews and tests.
+
+`catalog.repositories.withFixed(configs)` installs immutable operator-defined
+repositories in the shared registry. `catalog.runPolicy(policy, {signal, timeout})`
+executes an offline manual backup policy, using the dataset writer admission queue
+and rejecting capture from a transaction callback. Cancellation can occur after
+individual backups have completed. `catalog.applyRetention(policy, {dryRun})`
+defaults to a preview; pass `dryRun: false` to delete the selected backups. Retention
+waits for completion and has no cancellation control. Policy receipts, backup byte
+counts and durations use `bigint`.
+
+For catalog integrations, `catalog.reserve(name, 'clone' | 'restore', holder)`
+returns a name claim with `close()` and async disposal; closing its catalog releases
+the claim. `catalog.backupFiles()` lists legacy catalog backup-file paths without
+reading file contents.

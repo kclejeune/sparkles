@@ -7,6 +7,8 @@ mod environment;
 mod rdf;
 mod streams;
 mod terms;
+mod utilities;
+pub use utilities::utility;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;

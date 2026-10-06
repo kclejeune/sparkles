@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]
 napi = { version = "3", default-features = false, features = ["napi9", "tokio_rt"] }
 napi-derive = "3"
 sparkles = { path = "../sparkles", features = ["zstd", "brotli"] }
+sparkles-fmt = { path = "../sparkles-fmt" }
 oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
 oxrdfio = { version = "0.2", features = ["rdf-12"] }
 parking_lot = "0.12"

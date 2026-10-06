@@ -8,6 +8,9 @@ import {
   type CommitChanges,
 } from './admin.js';
 export * from './admin.js';
+export * from './utilities.js';
+export type { BackupPolicy, PolicyRun, RetentionReport, RetentionBackup } from './policy.js';
+import { policyResult, type BackupPolicy, type PolicyRun, type RetentionReport } from './policy.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Readable } from 'node:stream';
 import type * as RDF from '@rdfjs/types';
@@ -1262,10 +1265,30 @@ export interface CatalogDatasetInfo {
   attached: boolean;
   reservedBy: string | null;
 }
+/** A name claim; close releases it, including when its catalog closes. */
+export class CatalogReservation {
+  private closed = false;
+  /** @internal */ constructor(
+    private handle: any,
+    public readonly name: string,
+    private release: () => void,
+  ) {}
+  close() {
+    if (!this.closed) {
+      this.closed = true;
+      this.handle.close();
+      this.release();
+    }
+  }
+  async [Symbol.asyncDispose]() {
+    this.close();
+  }
+}
 export class Catalog {
   private closed = false;
   private tokens = new Set<any>();
   private repositoriesOwned = new Set<Repository>();
+  private reservations = new Set<CatalogReservation>();
   private datasets = new Set<Dataset>();
   private operations = new Set<Promise<unknown>>();
   private closePromise?: Promise<void>;
@@ -1331,6 +1354,106 @@ export class Catalog {
   }
   list() {
     return this.admin<CatalogDatasetInfo[]>('list');
+  }
+  /** Collect legacy catalog backup-file paths without reading their contents. */
+  backupFiles() {
+    return this.admin<{ name: string; path: string }[]>('backupFiles');
+  }
+  reserve(name: string, kind: 'clone' | 'restore', holder: string) {
+    this.check();
+    try {
+      const reservation = new CatalogReservation(
+        this.handle.reserve(name, kind, holder),
+        name,
+        () => this.reservations.delete(reservation),
+      );
+      this.reservations.add(reservation);
+      return reservation;
+    } catch (e) {
+      throw nativeError(e);
+    }
+  }
+  /** Offline retention is a blocking repository operation; dryRun defaults true. */
+  applyRetention(
+    policy: BackupPolicy,
+    options: { dryRun?: boolean } = {},
+  ): Promise<RetentionReport> {
+    this.check();
+    for (const key of Object.keys(options))
+      if (key !== 'dryRun') throw new UnsupportedError(`Retention does not support ${key}`);
+    return this.track(
+      (async () => {
+        try {
+          return policyResult(
+            JSON.parse(
+              await this.handle.applyRetention(JSON.stringify(policy), options.dryRun ?? true),
+            ),
+          );
+        } catch (e) {
+          throw nativeError(e);
+        }
+      })(),
+    );
+  }
+  /** Execute one manual policy run with cancellation and writer admission. */
+  async runPolicy(policy: BackupPolicy, options: OperationOptions = {}): Promise<PolicyRun> {
+    this.check();
+    for (const key of Object.keys(options))
+      if (key !== 'signal' && key !== 'timeout')
+        throw new UnsupportedError(`Policy runs do not support ${key}`);
+    options.signal?.throwIfAborted();
+    wireOptions(options);
+    const started = Date.now();
+    // Reject same-family transaction owners before capture waits on its writer.
+    for (const info of await this.list())
+      if (
+        (policy.datasets ?? ['*']).some((p) =>
+          new RegExp(
+            '^' +
+              p
+                .split('*')
+                .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+                .join('.*') +
+              '$',
+          ).test(info.name),
+        )
+      )
+        await this.checkFamily(info.name);
+    this.check();
+    options.signal?.throwIfAborted();
+    const remaining =
+      options.timeout === undefined ? undefined : options.timeout - (Date.now() - started);
+    if (remaining !== undefined && remaining <= 0) throw new QueryTimeoutError();
+    const wire = wireOptions({ ...options, timeout: remaining });
+    const token = new native.Cancellation();
+    this.tokens.add(token);
+    let timedOut = false;
+    const abort = () => token.cancel();
+    options.signal?.addEventListener('abort', abort, { once: true });
+    const timer =
+      remaining === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            abort();
+          }, remaining);
+    return this.track(
+      (async () => {
+        try {
+          return policyResult(
+            JSON.parse(await this.handle.runPolicy(JSON.stringify(policy), wire, token)),
+          );
+        } catch (e) {
+          if (options.signal?.aborted) throw options.signal.reason;
+          if (timedOut) throw new QueryTimeoutError();
+          throw nativeError(e);
+        } finally {
+          this.tokens.delete(token);
+          if (timer) clearTimeout(timer);
+          options.signal?.removeEventListener('abort', abort);
+        }
+      })(),
+    );
   }
   info(name: string) {
     return this.admin<CatalogDatasetInfo | null>('info', { name });
@@ -1420,6 +1543,9 @@ export class Catalog {
       update: (name: string, config: Configuration) =>
         cat.admin<Configuration>('repositories.update', { name, config }),
       remove: (name: string) => cat.admin<boolean>('repositories.remove', { name }),
+      /** Add immutable operator-defined entries to this catalog's shared registry. */
+      withFixed: (entries: Configuration[]) =>
+        cat.admin<Configuration[]>('repositories.withFixed', { entries }),
       async open(name: string) {
         cat.check();
         return cat.track(
@@ -1496,6 +1622,8 @@ export class Catalog {
   close() {
     return (this.closePromise ??= (async () => {
       this.closed = true;
+      for (const reservation of this.reservations) reservation.close();
+      this.reservations.clear();
       for (const token of this.tokens) token.cancel();
       await Promise.allSettled([...this.datasets].map((ds) => ds.close()));
       await Promise.allSettled([...this.operations]);

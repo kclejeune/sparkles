@@ -78,6 +78,17 @@ pub struct NativeCatalog {
     state: Mutex<Option<Arc<CatalogState>>>,
     read_only: bool,
 }
+#[napi]
+pub struct NativeReservation {
+    reservation: Mutex<Option<sparkles::catalog::Reservation>>,
+}
+#[napi]
+impl NativeReservation {
+    #[napi]
+    pub fn close(&self) {
+        self.reservation.lock().take();
+    }
+}
 impl NativeCatalog {
     fn get(&self, write: bool) -> napi::Result<Arc<CatalogState>> {
         if write && self.read_only {
@@ -93,6 +104,25 @@ impl NativeCatalog {
 }
 #[napi]
 impl NativeCatalog {
+    #[napi]
+    pub fn reserve(
+        &self,
+        name: String,
+        kind: String,
+        holder: String,
+    ) -> napi::Result<NativeReservation> {
+        let state = self.get(true)?;
+        let kind = match kind.as_str() {
+            "clone" => sparkles::catalog::ReservationKind::Clone,
+            "restore" => sparkles::catalog::ReservationKind::Restore,
+            _ => return Err(invalid("reservation kind must be clone or restore")),
+        };
+        Ok(NativeReservation {
+            reservation: Mutex::new(Some(
+                state.catalog.reserve(&name, kind, &holder).map_err(err)?,
+            )),
+        })
+    }
     #[napi]
     pub async fn inspect(path: String) -> napi::Result<String> {
         blocking(move || {
@@ -250,7 +280,7 @@ impl NativeCatalog {
     pub async fn admin(&self, op: String, args: String) -> napi::Result<String> {
         let state = self.get(!matches!(
             op.as_str(),
-            "list" | "info" | "repositories.list" | "repositories.get"
+            "list" | "info" | "backupFiles" | "repositories.list" | "repositories.get"
         ))?;
         let a = parse(&args)?;
         blocking(move || {
@@ -263,6 +293,14 @@ impl NativeCatalog {
                 "list" => Value::Array(state.catalog.list().into_iter().map(info).collect()),
                 "info" => state.catalog.info(name()?).map(info).unwrap_or(Value::Null),
                 "delete" => json!(state.catalog.delete(name()?)?),
+                "backupFiles" => json!(
+                    state
+                        .catalog
+                        .backup_files()?
+                        .into_iter()
+                        .map(|f| json!({"name":f.name,"path":f.path}))
+                        .collect::<Vec<_>>()
+                ),
                 #[cfg(feature = "backup")]
                 "repositories.list" => serde_json::to_value(state.catalog.repositories()?.list())
                     .map_err(|e| EngineError::invalid(e.to_string()))?,
@@ -290,6 +328,14 @@ impl NativeCatalog {
                 .map_err(|e| EngineError::invalid(e.to_string()))?,
                 #[cfg(feature = "backup")]
                 "repositories.remove" => json!(state.catalog.repositories()?.remove(name()?)?),
+                #[cfg(feature = "backup")]
+                "repositories.withFixed" => {
+                    let entries: Vec<sparkles::backup::RepoConfig> =
+                        serde_json::from_value(a["entries"].clone())
+                            .map_err(|e| EngineError::invalid(e.to_string()))?;
+                    serde_json::to_value(state.catalog.repositories()?.with_fixed(&entries)?.list())
+                        .map_err(|e| EngineError::invalid(e.to_string()))?
+                }
                 _ => return Err(EngineError::unsupported("unknown catalog operation")),
             };
             Ok(v.to_string())
@@ -305,6 +351,79 @@ impl NativeCatalog {
 #[cfg(feature = "backup")]
 #[napi]
 impl NativeCatalog {
+    #[napi]
+    pub fn run_policy<'env>(
+        &self,
+        env: &'env Env,
+        policy: String,
+        options: String,
+        cancel: &Cancellation,
+    ) -> napi::Result<PromiseRaw<'env, String>> {
+        let state = self.get(true)?;
+        let policy: sparkles::backup::PolicyConfig =
+            serde_json::from_str(&policy).map_err(|e| invalid(e.to_string()))?;
+        let v = parse(&options)?;
+        if !v["dryRun"].is_null() || !v["ifHead"].is_null() {
+            return Err(err(EngineError::unsupported(
+                "policy runs do not support dryRun or ifHead",
+            )));
+        }
+        let flag = cancel.flag.clone();
+        // A capture takes core writer locks. Share Node's admission order with all
+        // dataset wrappers, and use one stable order across concurrent policy runs.
+        let mut shared = std::collections::BTreeMap::new();
+        for info in state.catalog.list() {
+            if !policy
+                .datasets
+                .iter()
+                .any(|p| sparkles::backup::policy::matches_dataset(p, &info.name))
+            {
+                continue;
+            }
+            if let Some(ds) = state.catalog.get(&info.name) {
+                let key = ds.dataset_id().to_string();
+                shared
+                    .entry(key)
+                    .or_insert(wrap(ds, state.options.clone(), self.read_only).get(false)?);
+            }
+        }
+        env.spawn_future(async move {
+            let shared = shared.into_values().collect::<Vec<_>>();
+            let mut permits = Vec::new();
+            for item in &shared {
+                permits.push(permit(item.writers.clone(), &v, &flag).await?);
+            }
+            let result = off_runtime(move || {
+                let ctl = sparkles::task::Control {
+                    deadline: write_options(&v, flag.clone())?.deadline,
+                    ..sparkles::task::Control::with_cancel(flag)
+                };
+                Ok(lossless(
+                    serde_json::to_value(state.catalog.run_policy(&policy, &ctl)?)
+                        .map_err(|e| EngineError::invalid(e.to_string()))?,
+                )
+                .to_string())
+            })
+            .await;
+            drop(permits);
+            drop(shared);
+            result
+        })
+    }
+    #[napi]
+    pub async fn apply_retention(&self, policy: String, dry_run: bool) -> napi::Result<String> {
+        let state = self.get(!dry_run)?;
+        let policy: sparkles::backup::PolicyConfig =
+            serde_json::from_str(&policy).map_err(|e| invalid(e.to_string()))?;
+        off_runtime(move || {
+            Ok(lossless(
+                serde_json::to_value(state.catalog.apply_retention(&policy, dry_run)?)
+                    .map_err(|e| EngineError::invalid(e.to_string()))?,
+            )
+            .to_string())
+        })
+        .await
+    }
     #[napi]
     pub async fn repository(&self, name: String) -> napi::Result<crate::backups::NativeRepository> {
         let state = self.get(false)?;
