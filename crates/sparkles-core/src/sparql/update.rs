@@ -359,18 +359,19 @@ fn run_op(
             }
         }
         GraphUpdateOperation::DeleteData { data } => {
-            let view = txn.view();
+            // This operation resolves terms only. Retaining a full transaction view
+            // would share every delta tree while the deletions mutate those trees.
             for q in data {
-                let s = view.lookup_term(&Term::NamedNode(q.subject.clone()));
-                let p = view.lookup_term(&Term::NamedNode(q.predicate.clone()));
+                let s = txn.lookup_term(&Term::NamedNode(q.subject.clone()));
+                let p = txn.lookup_term(&Term::NamedNode(q.predicate.clone()));
                 let o = match &q.object {
-                    GroundTerm::NamedNode(n) => view.lookup_term(&Term::NamedNode(n.clone())),
-                    GroundTerm::Literal(l) => view.lookup_term(&Term::Literal(l.clone())),
-                    t @ GroundTerm::Triple(_) => view.lookup_term(&super::plan::ground_term(t)),
+                    GroundTerm::NamedNode(n) => txn.lookup_term(&Term::NamedNode(n.clone())),
+                    GroundTerm::Literal(l) => txn.lookup_term(&Term::Literal(l.clone())),
+                    t @ GroundTerm::Triple(_) => txn.lookup_term(&super::plan::ground_term(t)),
                 };
                 let g = match &q.graph_name {
                     GraphName::DefaultGraph => Some(Id::DEFAULT_GRAPH),
-                    GraphName::NamedNode(n) => view.lookup_term(&Term::NamedNode(n.clone())),
+                    GraphName::NamedNode(n) => txn.lookup_term(&Term::NamedNode(n.clone())),
                 };
                 if let (Some(s), Some(p), Some(o), Some(g)) = (s, p, o, g) {
                     if txn.delete([s, p, o, g])? {

@@ -4197,12 +4197,22 @@ fn apply(delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
     for p in Perm::ALL {
         let k = p.to_key(q);
         let i = p.index();
-        if insert {
-            if delta.del[i].remove(&k).is_none() && !in_base {
+        // The invariants above determine the only set this operation can change.
+        // Even an absent removal can copy shared persistent-tree nodes, so avoid
+        // touching the opposite set when the immutable base proves absence.
+        match (insert, in_base) {
+            (true, false) => {
                 delta.ins[i].insert(k);
             }
-        } else if delta.ins[i].remove(&k).is_none() && in_base {
-            delta.del[i].insert(k);
+            (true, true) => {
+                delta.del[i].remove(&k);
+            }
+            (false, false) => {
+                delta.ins[i].remove(&k);
+            }
+            (false, true) => {
+                delta.del[i].insert(k);
+            }
         }
     }
 }
@@ -4486,6 +4496,20 @@ impl WriteTxn<'_> {
         Ok(Id::delta(self.base.generation.dvocab.insert(key)?))
     }
 
+    /// Resolve a term against this writer's vocabulary without retaining a data view.
+    /// Like a fresh transaction view, this sees vocabulary added by earlier operations.
+    pub(crate) fn lookup_term(&self, term: &Term) -> Option<Id> {
+        match term {
+            Term::BlankNode(b) => parse_bnode_label(b.as_str()),
+            _ => {
+                if let Some(id) = id::inline_id(term) {
+                    return Some(id);
+                }
+                self.lookup_key(&id::term_key(term))
+            }
+        }
+    }
+
     /// The id of a term key the store or this transaction has, without adding it.
     pub fn lookup_key(&self, key: &[u8]) -> Option<Id> {
         if let Ok(i) = self.base.generation.vocab.find(key) {
@@ -4549,6 +4573,8 @@ impl WriteTxn<'_> {
     }
 
     fn in_base(&self, q: &[Id; 4]) -> Result<bool> {
+        #[cfg(test)]
+        tests::WRITE_BASE_PROBES.with(|n| n.set(n.get() + 1));
         self.base
             .perm(Perm::Spo)
             .contains(&self.base.cache, &Perm::Spo.to_key(q))
@@ -4564,6 +4590,22 @@ impl WriteTxn<'_> {
             return Ok(false);
         }
         self.in_base(q)
+    }
+
+    /// Physical-base membership for an effective change, or `None` for a no-op.
+    /// Every delta is relative to the physical index: inserts are absent from it,
+    /// and deletions are present in it, including replayed and linked overlays.
+    fn change_base(&self, q: &[Id; 4], insert: bool) -> Result<Option<bool>> {
+        let k = Perm::Spo.to_key(q);
+        let i = Perm::Spo.index();
+        if self.delta.ins[i].contains(&k) {
+            return Ok((!insert).then_some(false));
+        }
+        if self.delta.del[i].contains(&k) {
+            return Ok(insert.then_some(true));
+        }
+        let in_base = self.in_base(q)?;
+        Ok((in_base != insert).then_some(in_base))
     }
 
     /// Whether the quad was present in the committed snapshot this transaction started
@@ -4586,10 +4628,9 @@ impl WriteTxn<'_> {
         if let Some(r) = self.requested.as_mut() {
             r.push(q);
         }
-        if self.contains(&q)? {
+        let Some(ib) = self.change_base(&q, true)? else {
             return Ok(false);
-        }
-        let ib = self.in_base(&q)?;
+        };
         // re-adding a quad this transaction deleted cancels that deletion
         if self.present_at_start(&q, ib) {
             self.net_del -= 1;
@@ -4607,10 +4648,9 @@ impl WriteTxn<'_> {
         if let Some(r) = self.requested.as_mut() {
             r.push(q);
         }
-        if !self.contains(&q)? {
+        let Some(ib) = self.change_base(&q, false)? else {
             return Ok(false);
-        }
-        let ib = self.in_base(&q)?;
+        };
         // deleting a quad this transaction added cancels that insertion
         if self.present_at_start(&q, ib) {
             self.net_del += 1;
@@ -4795,7 +4835,7 @@ impl WriteTxn<'_> {
         }
         let w = &mut *self.guard;
         if let Some(wal) = w.wal.as_mut() {
-            let mut data = Vec::with_capacity(self.log.len() * WAL_REC);
+            let mut data = Vec::with_capacity((self.log.len() + 1) * WAL_REC);
             let mut rec = [0u8; WAL_REC];
             for (op, q) in &self.log {
                 rec[0] = *op;
@@ -5590,6 +5630,80 @@ pub(crate) fn replay_wal(
 mod tests {
     use super::*;
     use crate::io::RdfFormat;
+
+    std::thread_local! {
+        pub(super) static WRITE_BASE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn effective_changes_reuse_delta_membership_and_probe_base_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let store = Store::open(&path, StoreOptions::default()).unwrap();
+        let base_quad = quad("base", "p", "object");
+        store
+            .load(&[Source::from_bytes(
+                format!("{base_quad} .\n").into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .unwrap();
+        let mut w = store.write();
+        let base = w.encode_quad(&base_quad, &mut Default::default()).unwrap();
+        let added = w
+            .encode_quad(&quad("added", "p", "object"), &mut Default::default())
+            .unwrap();
+        assert!(w.delete(base).unwrap());
+        assert!(w.insert(added).unwrap());
+        w.commit().unwrap();
+        drop(store);
+        // Admission now starts from nonempty del/ins reconstructed by WAL replay.
+        let store = Store::open(&path, StoreOptions::default()).unwrap();
+        let held = store.snapshot();
+        let mut w = store.write();
+        let sequence = [
+            (base, false, false, 0),
+            (base, true, true, 0),
+            (base, true, false, 1),
+            (base, false, true, 1),
+            (added, true, false, 0),
+            (added, false, true, 0),
+            (added, false, false, 1),
+            (added, true, true, 1),
+        ];
+        let mut expected = std::collections::BTreeSet::from([added]);
+        for (q, insert, changed, probes) in sequence {
+            WRITE_BASE_PROBES.with(|n| n.set(0));
+            assert_eq!(
+                if insert { w.insert(q) } else { w.delete(q) }.unwrap(),
+                changed
+            );
+            assert_eq!(WRITE_BASE_PROBES.with(|n| n.get()), probes);
+            if insert {
+                expected.insert(q);
+            } else {
+                expected.remove(&q);
+            }
+            let view = w.view();
+            for p in Perm::ALL {
+                let actual: std::collections::BTreeSet<_> = view
+                    .scan_keys(p, &[])
+                    .unwrap()
+                    .iter()
+                    .map(|k| p.to_quad(k))
+                    .collect();
+                assert_eq!(actual, expected, "{p:?}");
+            }
+        }
+        assert!(!w.commit().unwrap().committed, "all changes cancel");
+        assert_eq!(store.snapshot().commit, held.commit);
+        for p in Perm::ALL {
+            assert_eq!(
+                held.scan_keys(p, &[]).unwrap(),
+                store.snapshot().scan_keys(p, &[]).unwrap()
+            );
+        }
+    }
 
     const TTL: &str = r#"
 @prefix ex: <http://ex.org/> .
