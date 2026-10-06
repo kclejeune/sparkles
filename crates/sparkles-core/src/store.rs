@@ -1017,7 +1017,7 @@ struct WriterState {
     /// the store is being dropped: a backup lease released later must not collect
     closed: bool,
     /// while a compaction runs: each commit's changes, for it to carry over
-    tap: Option<Vec<compaction::TapCommit>>,
+    tap: Option<compaction::Tap>,
 }
 
 impl WriterState {
@@ -1630,6 +1630,7 @@ impl Store {
             }
         }
         store.collect_history(gen_no, head.seq);
+        store.release_link_if_rebuilt();
         if let Err(e) = store.recover_change_log() {
             // history queries report the commits it could not record
             tracing::warn!(target: "sparkles::store", error = %e, "could not recover the change log");
@@ -4813,11 +4814,15 @@ impl WriteTxn<'_> {
             }
         }
         if let Some(tap) = self.guard.tap.as_mut() {
-            tap.push(compaction::TapCommit {
-                info: c,
-                next_bnode,
-                changes: self.log.clone(),
-            });
+            if tap.active.load(Ordering::Acquire) {
+                tap.commits.push(compaction::TapCommit {
+                    info: c,
+                    next_bnode,
+                    changes: self.log.clone(),
+                });
+            } else {
+                self.guard.tap = None;
+            }
         }
         if let Some(log) = self.store.changelog.as_ref().filter(|l| l.is_enabled()) {
             // the background writer turns the ids into keys

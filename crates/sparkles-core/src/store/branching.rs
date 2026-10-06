@@ -918,14 +918,29 @@ impl BranchSet {
     /// The merge bases of two commits: the common ancestors that no other common
     /// ancestor descends from.
     pub(crate) fn merge_bases(&self, a: CommitRef, b: CommitRef) -> Result<Vec<CommitRef>> {
-        let (a, b) = (self.normalize(a), self.normalize(b));
+        self.merge_bases_of(&[a], b)
+    }
+
+    /// Best common ancestors of a virtual commit with `parents`, and commit `b`.
+    /// A virtual commit descends from every parent but has no persisted identity.
+    pub(crate) fn merge_bases_of(
+        &self,
+        parents: &[CommitRef],
+        b: CommitRef,
+    ) -> Result<Vec<CommitRef>> {
         let mut calc = FrontierCalc {
             set: self,
             merges: HashMap::new(),
             memo: HashMap::new(),
         };
-        let fa = calc.frontier(a)?;
-        let fb = calc.frontier(b)?;
+        let mut fa = Frontier::new();
+        for a in parents {
+            for (id, seq) in calc.frontier(self.normalize(*a))? {
+                let current = fa.entry(id).or_insert(0);
+                *current = (*current).max(seq);
+            }
+        }
+        let fb = calc.frontier(self.normalize(b))?;
         let mut cands: Vec<CommitRef> = Vec::new();
         for (id, va) in fa.iter() {
             if let Some(vb) = fb.get(id) {
@@ -1851,6 +1866,7 @@ impl Store {
                     format: 1,
                     base_seq: start.commit.seq,
                     segments: start.segments.clone(),
+                    overlay: None,
                 };
                 write_synced(
                     &gdir.join(LINK_FILE),
@@ -2201,6 +2217,33 @@ impl Store {
 
     /// After a rebuild of a linked branch: once its linked generation is gone from its
     /// history, the branch no longer reads the upstream, and its holds are released.
+    pub(crate) fn add_relink_hold(&self, id: uuid::Uuid, segment: &Segment) -> Result<()> {
+        let set = self.owned_set()?;
+        {
+            let mut table = set.table.lock();
+            let mut next = table.clone();
+            let entry = next
+                .branches
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| branch::no_such_branch(&id.to_string()))?;
+            let hold = GenHold {
+                branch_id: segment.branch_id,
+                generation: segment.generation.clone(),
+            };
+            if !entry.holds.contains(&hold) {
+                entry.holds.push(hold);
+            }
+            set.save(&next)?;
+            *table = next;
+        }
+        set.refresh_holds(self);
+        Ok(())
+    }
+
+    /// Reconcile holds with every retained linked generation, including a relinked
+    /// current generation. Failed publication can leave a conservative extra hold;
+    /// opening/rebuilding the branch releases it after recovery has selected CURRENT.
     pub(crate) fn release_link_if_rebuilt(&self) {
         let Some(ident) = &self.branching.ident else {
             return;
@@ -2208,26 +2251,48 @@ impl Store {
         let Some(set) = self.branching.set() else {
             return;
         };
-        // a retained generation that is linked still reads the upstream
-        let linked_retained = self.history.as_ref().is_some_and(|h| {
-            h.lock()
-                .gens
-                .values()
-                .any(|g| g.dir.join(LINK_FILE).exists())
-        });
-        if self.snapshot().generation.linked().is_some() || linked_retained {
-            return;
+        let mut holds = Vec::new();
+        let dirs: Vec<_> = self
+            .history
+            .as_ref()
+            .map(|history| {
+                history
+                    .lock()
+                    .gens
+                    .values()
+                    .map(|g| g.dir.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for dir in dirs {
+            let link = match link::read_link(&dir) {
+                Ok(Some(link)) => link,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(target: "sparkles::store::branching", "could not reconcile branch link holds: {error}");
+                    return; // unreadable metadata must never release a hold
+                }
+            };
+            for segment in link.segments {
+                let hold = GenHold {
+                    branch_id: segment.branch_id,
+                    generation: segment.generation,
+                };
+                if !holds.contains(&hold) {
+                    holds.push(hold);
+                }
+            }
         }
         {
             let mut t = set.table.lock();
             let Some(i) = t.branches.iter().position(|e| e.id == self.dataset_id) else {
                 return;
             };
-            if t.branches[i].holds.is_empty() {
+            if t.branches[i].holds == holds {
                 return;
             }
             let mut next = t.clone();
-            next.branches[i].holds.clear();
+            next.branches[i].holds = holds;
             if let Err(e) = set.save(&next) {
                 tracing::warn!(target: "sparkles::store::branching",
                     branch = self.branch_name(),
@@ -2239,7 +2304,7 @@ impl Store {
         }
         tracing::info!(target: "sparkles::store::branching",
             branch = self.branch_name(),
-            "the branch owns its index and released its holds"
+            "reconciled the branch's upstream generation holds"
         );
         let _ = ident;
         // the upstream stores collect at their next collection point

@@ -773,7 +773,7 @@ fn a17_criss_cross_merges_need_a_chosen_base() {
 }
 
 #[test]
-fn a17_true_criss_cross_is_ambiguous() {
+fn a17_true_criss_cross_uses_a_virtual_base() {
     let (_dir, s) = setup();
     s.create_branch("dev", &BranchOptions::default()).unwrap();
     let dev = s.branch("dev").unwrap();
@@ -832,22 +832,622 @@ fn a17_true_criss_cross_is_ambiguous() {
     }
     apply(&s, "+<urn:m2> <urn:p> <urn:x> .");
     apply(&dev, "+<urn:d2> <urn:p> <urn:x> .");
-    let e = s.merge("dev", "main", &Default::default()).unwrap_err();
-    assert_eq!(code(&e), "ambiguous-merge-base");
-    let Error::Branch(b) = &e else { unreachable!() };
-    assert_eq!(b.candidates.len(), 2);
-    let pick = &b.candidates[0];
-    let o = MergeOptions {
-        base: Some(CommitRef {
-            branch_id: pick.branch_id,
-            seq: pick.seq,
-        }),
-        ..Default::default()
-    };
-    merged(merge(&s, "dev", "main", &o));
+    assert_eq!(s.merge_base("dev", "main").unwrap().len(), 2);
+    let head = s.head_commit().seq;
+    let preview = s.preview_merge("dev", "main", &Default::default()).unwrap();
+    assert!(preview.base.is_none());
+    assert_eq!(preview.conflicts_found, 0);
+    assert_eq!(s.head_commit().seq, head, "a virtual base never commits");
+    let report = merged(merge(&s, "dev", "main", &Default::default()));
+    assert!(report.base.is_none());
+    assert_eq!(report.inserted, 1);
     for x in ["urn:m1", "urn:m2", "urn:d1", "urn:d2"] {
         assert!(has(&s, x), "{x}");
     }
+}
+
+/// Make a merge with a historical second parent to construct genuine criss-cross
+/// histories, without publishing fake merge records or bypassing the merge planner.
+fn merge_historical(s: &Store, source: &str, seq: u64, target: &str, o: &MergeOptions) {
+    let set = s.owned_set().unwrap();
+    let source = s.branch(source).unwrap();
+    let target = s.branch(target).unwrap();
+    let sc = CommitRef {
+        branch_id: source.dataset_id(),
+        seq,
+    };
+    let tc = CommitRef {
+        branch_id: target.dataset_id(),
+        seq: target.head_commit().seq,
+    };
+    let base = set.merge_bases(sc, tc).unwrap()[0];
+    let report =
+        crate::branch::MergeReport::new(set.named(sc), set.named(tc), Some(set.named(base)));
+    let step = s
+        .three_way(
+            set,
+            &target,
+            report,
+            base,
+            sc,
+            tc,
+            o,
+            false,
+            merge::Writing {
+                kind: CommitKind::Merge,
+                message: "historical merge".into(),
+                record: Some(branching::MergeRec {
+                    seq: 0,
+                    source: sc,
+                    resolved: 0,
+                    flags: 0,
+                }),
+                force: true,
+                what: "historical merge".into(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(step, merge::Step::Done(MergeOutcome::Merged(_))));
+}
+
+#[test]
+fn virtual_base_conflicts_fail_closed_and_explicit_base_remains_available() {
+    let (_dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(
+        &s,
+        &format!(
+            "-<urn:a> <urn:age> {} .\n+<urn:a> <urn:age> {} .",
+            int(30),
+            int(31)
+        ),
+    );
+    apply(
+        &dev,
+        &format!(
+            "-<urn:a> <urn:age> {} .\n+<urn:a> <urn:age> {} .",
+            int(30),
+            int(32)
+        ),
+    );
+    let m1 = s.head_commit().seq;
+    let theirs = MergeOptions {
+        on_conflict: Some(Take::Theirs),
+        ..Default::default()
+    };
+    merged(merge(&s, "dev", "main", &theirs));
+    merge_historical(&s, "main", m1, "dev", &theirs);
+    let before = dump(&s);
+    let head = s.head_commit().seq;
+    // A final merge rule must not silently resolve ambiguity in the ancestors.
+    let e = s.merge("dev", "main", &theirs).unwrap_err();
+    assert_eq!(code(&e), "ambiguous-merge-base");
+    let Error::Branch(e) = e else { unreachable!() };
+    assert_eq!(e.candidates.len(), 2);
+    assert_eq!(s.head_commit().seq, head);
+    assert_eq!(dump(&s), before);
+    let explicit = MergeOptions {
+        base: Some(CommitRef {
+            branch_id: e.candidates[0].branch_id,
+            seq: e.candidates[0].seq,
+        }),
+        ..theirs
+    };
+    merged(merge(&s, "dev", "main", &explicit));
+}
+
+#[test]
+fn recursive_virtual_bases_preserve_blank_nodes_and_survive_restart() {
+    let (dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&s, "+_:main <urn:p> \"main\" .");
+    apply(&dev, "+_:dev <urn:p> \"dev\" .");
+    for level in 0..4 {
+        let before = s.head_commit().seq;
+        merged(merge(&s, "dev", "main", &Default::default()));
+        merge_historical(&s, "main", before, "dev", &Default::default());
+        apply(&s, &format!("+<urn:m{level}> <urn:p> <urn:x> ."));
+        apply(&dev, &format!("+<urn:d{level}> <urn:p> <urn:x> ."));
+        assert_eq!(s.merge_base("main", "dev").unwrap().len(), 2);
+    }
+    let expected: BTreeSet<_> = dump(&s).union(&dump(&dev)).cloned().collect();
+    drop(dev);
+    drop(s);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    let cancelled = MergeOptions {
+        cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
+    };
+    assert!(matches!(
+        s.merge("dev", "main", &cancelled),
+        Err(Error::Cancelled)
+    ));
+    let limited = MergeOptions {
+        max_quads: 1,
+        ..Default::default()
+    };
+    assert!(matches!(
+        s.merge("dev", "main", &limited),
+        Err(Error::BudgetExceeded(_))
+    ));
+    let before = s.head_commit().seq;
+    let report = merged(merge(&s, "dev", "main", &Default::default()));
+    assert!(report.base.is_none());
+    assert_eq!(s.head_commit().seq, before + 1);
+    assert_eq!(dump(&s), expected);
+    assert_eq!(dump(&s).iter().filter(|q| q.starts_with("_:b")).count(), 2);
+}
+
+#[test]
+fn three_virtual_base_candidates_merge_symmetrically() {
+    let (_dir, s) = setup();
+    s.create_branch("a", &BranchOptions::default()).unwrap();
+    s.create_branch("b", &BranchOptions::default()).unwrap();
+    let a = s.branch("a").unwrap();
+    let b = s.branch("b").unwrap();
+    apply(&s, "+<urn:main1> <urn:p> <urn:x> .");
+    apply(&a, "+<urn:a1> <urn:p> <urn:x> .");
+    apply(&b, "+<urn:b1> <urn:p> <urn:x> .");
+    let main1 = s.head_commit().seq;
+    merged(merge(&s, "a", "main", &Default::default()));
+    merged(merge(&s, "b", "main", &Default::default()));
+    merge_historical(&s, "main", main1, "a", &Default::default());
+    merged(merge(&s, "b", "a", &Default::default()));
+    apply(&s, "+<urn:main2> <urn:p> <urn:x> .");
+    apply(&a, "+<urn:a2> <urn:p> <urn:x> .");
+    assert_eq!(s.merge_base("main", "a").unwrap().len(), 3);
+    let left = s.preview_merge("a", "main", &Default::default()).unwrap();
+    let right = s.preview_merge("main", "a", &Default::default()).unwrap();
+    assert!(left.base.is_none() && right.base.is_none());
+    assert_eq!((left.inserted, left.deleted), (1, 0));
+    assert_eq!((right.inserted, right.deleted), (1, 0));
+    assert_eq!(left.conflicts_found + right.conflicts_found, 0);
+    merged(merge(&s, "a", "main", &Default::default()));
+    for term in ["urn:main1", "urn:main2", "urn:a1", "urn:a2", "urn:b1"] {
+        assert!(has(&s, term));
+    }
+}
+
+#[test]
+fn memory_virtual_base_retains_fork_snapshots() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&s, "+<urn:m> <urn:p> <urn:x> .");
+    apply(&dev, "+<urn:d> <urn:p> <urn:x> .");
+    let before = s.head_commit().seq;
+    merged(merge(&s, "dev", "main", &Default::default()));
+    merge_historical(&s, "main", before, "dev", &Default::default());
+    apply(&s, "+<urn:m2> <urn:p> <urn:x> .");
+    apply(&dev, "+<urn:d2> <urn:p> <urn:x> .");
+    let report = merged(merge(&s, "dev", "main", &Default::default()));
+    assert!(report.base.is_none());
+    assert_eq!(report.inserted, 1);
+    for term in ["urn:m", "urn:d", "urn:m2", "urn:d2"] {
+        assert!(has(&s, term));
+    }
+}
+
+#[test]
+fn relink_preserves_history_blank_nodes_and_child_branches_after_restart() {
+    let (dir, s) = setup();
+    s.compact().unwrap();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&dev, "+_:dev <urn:p> \"first\" .");
+    let pinned = dev.head_commit().seq;
+    dev.create_snapshot("before", &At::Head, None).unwrap();
+    let before = dump(&dev);
+    apply(&dev, "+<urn:dev> <urn:p> <urn:branch-only> .");
+    let head = dev.head_commit().seq;
+    let id = dev.dataset_id();
+    let expected = dump(&dev);
+    apply(
+        &s,
+        "-<urn:b> <urn:name> \"B\" .\n+<urn:main> <urn:p> <urn:main-only> .",
+    );
+    s.compact().unwrap();
+    let shared = s.snapshot().generation.name.clone();
+    let report = s.relink_branch("dev", &Default::default()).unwrap();
+    assert_eq!(report.mode, "relink");
+    assert_eq!((dev.dataset_id(), dev.head_commit().seq), (id, head));
+    assert_eq!(dump(&dev), expected);
+    assert_eq!(
+        dump_snap(
+            &dev.snapshot_at(&At::Commit(pinned), &Default::default())
+                .unwrap()
+                .0
+        ),
+        before
+    );
+    assert!(
+        dev.snapshot()
+            .generation
+            .linked()
+            .unwrap()
+            .base_dir()
+            .ends_with(&shared)
+    );
+    assert!(
+        !dev.snapshot()
+            .generation
+            .dir
+            .as_ref()
+            .unwrap()
+            .join("spo.dat")
+            .exists()
+    );
+    s.create_branch(
+        "child",
+        &BranchOptions {
+            from: "dev".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(dump(&s.branch("child").unwrap()), expected);
+    drop(dev);
+    drop(s);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    assert_eq!(dump(&dev), expected);
+    assert_eq!(dump(&s.branch("child").unwrap()), expected);
+    assert_eq!(
+        dump_snap(
+            &dev.snapshot_at(&At::Snapshot("before".into()), &Default::default())
+                .unwrap()
+                .0
+        ),
+        before
+    );
+    apply(&dev, "+_:dev <urn:p> \"second\" .");
+    let nodes: BTreeSet<_> = dump(&dev)
+        .iter()
+        .filter(|line| line.starts_with("_:b"))
+        .map(|line| line.split(' ').next().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        nodes.len(),
+        2,
+        "blank-node allocation must not reuse overlay IDs"
+    );
+    s.compact().unwrap();
+    assert!(
+        dir.path().join("ds").join(&shared).exists(),
+        "the relinked generation stays held"
+    );
+}
+
+#[test]
+fn relink_catches_up_concurrent_branch_commits_without_changing_their_identity() {
+    let (_dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&dev, "+<urn:before> <urn:p> <urn:x> .");
+    apply(&s, "+<urn:upstream> <urn:p> <urn:x> .");
+    s.compact().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let done_rx = Arc::new(Mutex::new(done_rx));
+    dev.set_failpoint(
+        "compact-built",
+        Some(Arc::new(move |_| {
+            ready_tx.send(()).unwrap();
+            done_rx
+                .lock()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        })),
+    );
+    std::thread::scope(|scope| {
+        let build = scope.spawn(|| s.relink_branch("dev", &Default::default()).unwrap());
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let receipt = apply(&dev, "+_:during <urn:p> \"catch-up\" .");
+        done_tx.send(()).unwrap();
+        let report = build.join().unwrap();
+        assert_eq!(report.caught_up_commits, 1);
+        assert_eq!(dev.head_commit().seq, receipt.commit.seq);
+        assert_eq!(
+            dev.commit(receipt.commit.seq).unwrap().kind,
+            receipt.commit.kind
+        );
+    });
+    assert!(has(&dev, "catch-up"));
+    assert!(!has(&dev, "upstream"));
+}
+
+#[test]
+fn relink_crash_boundaries_recover_the_same_state_and_pins() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    for point in [
+        "compact-built",
+        "compact-before-current",
+        "relink-held",
+        "relink-current",
+    ] {
+        let (dir, s) = setup();
+        s.create_branch("dev", &BranchOptions::default()).unwrap();
+        let dev = s.branch("dev").unwrap();
+        apply(&dev, "+_:dev <urn:p> \"before-crash\" .");
+        dev.create_snapshot("keep", &At::Head, None).unwrap();
+        let expected = dump(&dev);
+        let head = dev.head_commit().seq;
+        apply(&s, "+<urn:later> <urn:p> <urn:x> .");
+        s.compact().unwrap();
+        dev.set_failpoint(point, Some(Arc::new(|_| panic!("crash"))));
+        assert!(
+            catch_unwind(AssertUnwindSafe(
+                || s.relink_branch("dev", &Default::default())
+            ))
+            .is_err()
+        );
+        drop(dev);
+        drop(s);
+        let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+        let dev = s.branch("dev").unwrap();
+        assert_eq!(dev.head_commit().seq, head, "{point}");
+        assert_eq!(dump(&dev), expected, "{point}");
+        assert_eq!(
+            dump_snap(
+                &dev.snapshot_at(&At::Snapshot("keep".into()), &Default::default())
+                    .unwrap()
+                    .0
+            ),
+            expected,
+            "{point}"
+        );
+        apply(&dev, "+_:fresh <urn:p> \"after-crash\" .");
+        assert_eq!(
+            dump(&dev)
+                .iter()
+                .filter(|line| line.starts_with("_:b"))
+                .count(),
+            2,
+            "{point}"
+        );
+    }
+}
+
+#[test]
+fn cancelled_relink_and_damaged_overlay_fail_closed() {
+    let (dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&dev, "+<urn:branch> <urn:p> <urn:x> .");
+    s.compact().unwrap();
+    let generation = dev.snapshot().generation.name.clone();
+    let cancelled = CompactOptions {
+        cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
+    };
+    assert!(matches!(
+        s.relink_branch("dev", &cancelled),
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(dev.snapshot().generation.name, generation);
+    s.relink_branch("dev", &Default::default()).unwrap();
+    let overlay = dev
+        .snapshot()
+        .generation
+        .dir
+        .as_ref()
+        .unwrap()
+        .join(link::OVERLAY_FILE);
+    s.create_branch(
+        "child",
+        &BranchOptions {
+            from: "dev".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(dev);
+    drop(s);
+    let mut bytes = std::fs::read(&overlay).unwrap();
+    bytes[0] ^= 1;
+    std::fs::write(&overlay, &bytes).unwrap();
+    assert!(matches!(
+        link::read_link_file(overlay.parent().unwrap()),
+        Err(Error::Corrupt(_))
+    ));
+    for quick in [false, true] {
+        let report = crate::check::check(
+            &dir.path().join("ds"),
+            &crate::check::CheckOptions { quick },
+        )
+        .unwrap();
+        assert_eq!(report.status, crate::check::Status::Error);
+        assert!(report.checks.iter().any(|c| {
+            c.name == "branches"
+                && c.issues
+                    .iter()
+                    .any(|i| i.message.contains("invalid base overlay"))
+        }));
+    }
+    assert_eq!(std::fs::read(&overlay).unwrap(), bytes);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    assert!(matches!(s.branch("dev"), Err(Error::Corrupt(_))));
+    assert!(matches!(s.branch("child"), Err(Error::Corrupt(_))));
+}
+
+#[test]
+fn relink_capture_materializes_parent_and_child_without_overlay_dependencies() {
+    let (dir, s) = setup();
+    s.create_branch("dev", &Default::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&dev, "+_:dev <urn:p> \"first\" .");
+    apply(&s, "+<urn:main-only> <urn:p> <urn:x> .");
+    s.compact().unwrap();
+    s.relink_branch("dev", &Default::default()).unwrap();
+    s.create_branch(
+        "child",
+        &BranchOptions {
+            from: "dev".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for name in ["dev", "child"] {
+        let branch = s.branch(name).unwrap();
+        let expected = dump(&branch);
+        let capture = branch
+            .materialized_backup_capture(
+                name,
+                &MemoryCaptureOptions {
+                    tmp_dir: dir.path().join(format!("scratch-{name}")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(capture.materialized && !capture.in_memory);
+        assert!(
+            !capture
+                .files
+                .iter()
+                .any(|file| file.path.ends_with("link.json") || file.path.ends_with("base.delta"))
+        );
+        let path = dir.path().join(format!("restored-{name}"));
+        capture.write_to(&path).unwrap();
+        let restored = Store::open(&path, Default::default()).unwrap();
+        assert_eq!(dump(&restored), expected);
+        assert!(restored.snapshot().generation.linked().is_none());
+        apply(&restored, "+_:fresh <urn:p> \"second\" .");
+        assert_eq!(
+            dump(&restored)
+                .iter()
+                .filter(|q| q.starts_with("_:b"))
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn relink_cancellation_waiting_for_branch_writer_does_not_wait_for_its_release() {
+    let (_dir, s) = setup();
+    s.create_branch("dev", &Default::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    let writer = dev.write();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let flag = cancel.clone();
+        scope.spawn(|| {
+            tx.send(s.relink_branch(
+                "dev",
+                &CompactOptions {
+                    cancel: Some(flag),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap(),
+            Err(Error::Cancelled)
+        ));
+        drop(writer);
+    });
+}
+
+#[test]
+fn late_rebuild_cancellation_does_not_wait_for_retained_writer() {
+    let mut blocked = Vec::new();
+    for relink in [false, true] {
+        for point in [
+            "compact-indexed",
+            "compact-catching-up",
+            "compact-caught-up",
+        ] {
+            let (_dir, s) = setup();
+            s.create_branch("dev", &Default::default()).unwrap();
+            let dev = s.branch("dev").unwrap();
+            let before = dump(&dev);
+            let generation = dev.snapshot().generation.name.clone();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let resume_rx = Mutex::new(resume_rx);
+            dev.set_failpoint(
+                point,
+                Some(Arc::new(move |_| {
+                    entered_tx.send(()).unwrap();
+                    resume_rx.lock().recv().unwrap();
+                })),
+            );
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let options = CompactOptions {
+                        cancel: Some(cancel.clone()),
+                        ..Default::default()
+                    };
+                    let result = if relink {
+                        s.relink_branch("dev", &options)
+                    } else {
+                        dev.compact_with(&options)
+                    };
+                    result_tx.send(result).unwrap();
+                });
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+                let mut writer = dev.write();
+                // Admission waits are deliberately entered with cancellation still off;
+                // the cleanup checkpoint cancels before the worker can leave its hook.
+                if point == "compact-indexed" {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                resume_tx.send(()).unwrap();
+                if point != "compact-indexed" {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                let result = result_rx.recv_timeout(std::time::Duration::from_millis(300));
+                if result.is_err() {
+                    blocked.push((relink, point));
+                }
+                // A retained writer is still usable after rebuild cancellation. This also
+                // drains an inactive tap lazily without waiting for its former run.
+                let g = writer
+                    .intern(&Term::NamedNode(
+                        NamedNode::new("urn:cancel-writer").unwrap(),
+                    ))
+                    .unwrap();
+                let p = writer
+                    .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+                    .unwrap();
+                let o = writer
+                    .intern(&Term::NamedNode(NamedNode::new("urn:o").unwrap()))
+                    .unwrap();
+                writer.insert([g, p, o, Id::DEFAULT_GRAPH]).unwrap();
+                writer.commit().unwrap();
+                let result = result.unwrap_or_else(|_| {
+                    result_rx
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap()
+                });
+                assert!(matches!(result, Err(Error::Cancelled)));
+            });
+            dev.set_failpoint(point, None);
+            assert_eq!(dev.snapshot().generation.name, generation);
+            assert!(dump(&dev).is_superset(&before));
+            assert!(dev.writer.lock().tap.is_none());
+            assert!(!dev.compaction.running.load(Ordering::Acquire));
+            let after = dump(&dev);
+            s.relink_branch("dev", &Default::default()).unwrap();
+            assert_eq!(dump(&dev), after);
+        }
+    }
+    assert!(
+        blocked.is_empty(),
+        "cancellation waited for writer: {blocked:?}"
+    );
 }
 
 #[test]

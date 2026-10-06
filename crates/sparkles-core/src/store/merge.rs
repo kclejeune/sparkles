@@ -28,6 +28,14 @@ pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 /// A toggle set: each quad whose presence differs, and whether it was added.
 pub(crate) type Toggles = FxHashMap<QuadKey, bool>;
 
+/// An unpersisted merge base, expressed as changes from one real ancestor. Keeping
+/// only toggles avoids materializing the dataset or allocating new blank-node ids.
+#[derive(Clone)]
+struct VirtualBase {
+    anchor: CommitRef,
+    changes: Toggles,
+}
+
 /// A group of quads that conflicts as one value: graph, subject and, for a cell, the
 /// predicate.
 type GroupKey = (Arc<[u8]>, Arc<[u8]>, Option<Arc<[u8]>>);
@@ -48,6 +56,18 @@ fn toggle(t: &mut Toggles, k: QuadKey, added: bool) {
             e.insert(added);
         }
     }
+}
+
+fn check_toggle_budget(t: &Toggles, o: &DiffOptions) -> Result<()> {
+    o.check()?;
+    if o.max_quads > 0 && t.len() as u64 > o.max_quads {
+        return Err(Error::BudgetExceeded(crate::Budget {
+            kind: crate::BudgetKind::Rows,
+            limit: o.max_quads,
+            requested: t.len() as u64,
+        }));
+    }
+    Ok(())
 }
 
 pub(crate) fn gone(e: Error) -> Error {
@@ -156,6 +176,98 @@ struct KeyedResolution {
 }
 
 impl Store {
+    /// Changes from virtual state `from` to virtual state `to`.
+    fn virtual_toggles(
+        &self,
+        set: &BranchSet,
+        from: &VirtualBase,
+        to: &VirtualBase,
+        o: &DiffOptions,
+    ) -> Result<Toggles> {
+        o.check()?;
+        let mut changes: Toggles = from
+            .changes
+            .iter()
+            .map(|(k, add)| (k.clone(), !add))
+            .collect();
+        for (k, add) in self.toggles(set, from.anchor, to.anchor, o)? {
+            toggle(&mut changes, k, add);
+        }
+        for (k, add) in &to.changes {
+            toggle(&mut changes, k.clone(), *add);
+        }
+        check_toggle_budget(&changes, o)?;
+        Ok(changes)
+    }
+
+    /// Recursively merge best common ancestors. Conflicting ancestor cells cannot
+    /// be represented as RDF conflict markers, so they fail closed and allow the
+    /// caller to select an explicit real base. Final-merge resolutions never bias
+    /// this synthesis. No writes, guards or durable merge records run here.
+    fn virtual_base(
+        &self,
+        set: &BranchSet,
+        bases: &[CommitRef],
+        snap: &Snapshot,
+        o: &DiffOptions,
+        memo: &mut FxHashMap<Vec<CommitRef>, VirtualBase>,
+        depth: usize,
+    ) -> Result<VirtualBase> {
+        o.check()?;
+        if bases.is_empty() || depth > 64 {
+            return Err(branch::conflict(
+                "ambiguous-merge-base",
+                "cannot reconstruct a virtual merge base; choose an explicit base",
+            ));
+        }
+        if let Some(base) = memo.get(bases) {
+            return Ok(base.clone());
+        }
+        let mut out = VirtualBase {
+            anchor: bases[0],
+            changes: Toggles::default(),
+        };
+        let mut parents = vec![bases[0]];
+        let strict = MergeOptions {
+            include_inferences: true,
+            ..Default::default()
+        };
+        for candidate in &bases[1..] {
+            o.check()?;
+            let ancestors = set.merge_bases_of(&parents, *candidate)?;
+            let common = self.virtual_base(set, &ancestors, snap, o, memo, depth + 1)?;
+            let theirs = VirtualBase {
+                anchor: *candidate,
+                changes: Toggles::default(),
+            };
+            let ours = self.virtual_toggles(set, &common, &out, o)?;
+            let theirs = self.virtual_toggles(set, &common, &theirs, o)?;
+            // With no resolutions and a fail-on-conflict rule, plan_merge never
+            // reads `snap`: object replacement and dropped blank-node subgraphs
+            // are impossible. It only compares the complete toggle groups.
+            let plan = plan_merge(snap, ours, theirs, &strict, &FxHashSet::default())?;
+            if !plan.remaining.is_empty() {
+                let mut error = BranchError {
+                    kind: BranchErrorKind::Conflict,
+                    code: "ambiguous-merge-base",
+                    message: "merge bases conflict; choose an explicit base".into(),
+                    conflicts: None,
+                    candidates: bases.iter().map(|b| set.named(*b)).collect(),
+                    inherited: None,
+                };
+                error.candidates.sort_by_key(|b| (b.branch_id, b.seq));
+                return Err(Error::Branch(Box::new(error)));
+            }
+            for (k, add) in plan.changes {
+                toggle(&mut out.changes, k, add);
+            }
+            check_toggle_budget(&out.changes, o)?;
+            parents.push(*candidate);
+        }
+        memo.insert(bases.to_vec(), out.clone());
+        Ok(out)
+    }
+
     /// The net changes from commit `a` to commit `b`, any two commits of the dataset:
     /// walks of the logs along their first-parent chains from the newest commit both
     /// chains share.
@@ -363,6 +475,7 @@ impl Store {
                 seq: t_head,
             });
             let bases = set.merge_bases(sc, tc)?;
+            let mut virtual_base = None;
             let base = match (o.base, bases.len()) {
                 (Some(b), _) => {
                     let b = set.normalize(b);
@@ -377,6 +490,25 @@ impl Store {
                     b
                 }
                 (None, 1) => bases[0],
+                (None, n) if n > 1 => {
+                    let dopts = DiffOptions {
+                        max_quads: o.max_quads,
+                        cancel: o.cancel.clone(),
+                        deadline: o.deadline,
+                        ..Default::default()
+                    };
+                    let combined = self.virtual_base(
+                        &set,
+                        &bases,
+                        &tgt.snapshot(),
+                        &dopts,
+                        &mut FxHashMap::default(),
+                        0,
+                    )?;
+                    let anchor = combined.anchor;
+                    virtual_base = Some(combined);
+                    anchor
+                }
                 (None, _) => {
                     let mut e = BranchError {
                         kind: BranchErrorKind::Conflict,
@@ -404,13 +536,13 @@ impl Store {
                     branch_id: tid,
                     seq: t_head,
                 },
-                Some(set.named(base)),
+                virtual_base.is_none().then(|| set.named(base)),
             );
-            if base == sc {
+            if virtual_base.is_none() && base == sc {
                 report.up_to_date = true;
                 return Ok(MergeOutcome::UpToDate(report));
             }
-            let ff = base == tc;
+            let ff = virtual_base.is_none() && base == tc;
             if o.ff_only && !ff {
                 return Err(branch::conflict(
                     "not-fast-forward",
@@ -419,6 +551,12 @@ impl Store {
             }
             report.fast_forward = ff;
             if o.replay {
+                if virtual_base.is_some() {
+                    return Err(branch::conflict(
+                        "cannot-replay",
+                        "a replay requires one real merge base",
+                    ));
+                }
                 return self.replay(&set, &tgt, report, base, sc, tc, o, preview);
             }
             report.squashed = o.squash;
@@ -447,7 +585,18 @@ impl Store {
                     what,
                 }
             };
-            match self.three_way(&set, &tgt, report, base, sc, tc, o, preview, writing)? {
+            match self.three_way_with_base(
+                &set,
+                &tgt,
+                report,
+                base,
+                virtual_base.as_ref(),
+                sc,
+                tc,
+                o,
+                preview,
+                writing,
+            )? {
                 Step::Done(out) => return Ok(out),
                 Step::Moved => continue,
             }
@@ -466,8 +615,25 @@ impl Store {
         &self,
         set: &BranchSet,
         tgt: &Store,
+        report: MergeReport,
+        base: CommitRef,
+        theirs: CommitRef,
+        tc: CommitRef,
+        o: &MergeOptions,
+        preview: bool,
+        w: Writing,
+    ) -> Result<Step> {
+        self.three_way_with_base(set, tgt, report, base, None, theirs, tc, o, preview, w)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn three_way_with_base(
+        &self,
+        set: &BranchSet,
+        tgt: &Store,
         mut report: MergeReport,
         base: CommitRef,
+        virtual_base: Option<&VirtualBase>,
         theirs: CommitRef,
         tc: CommitRef,
         o: &MergeOptions,
@@ -482,15 +648,27 @@ impl Store {
             deadline: o.deadline,
             ..Default::default()
         };
-        let t_o = if base == tc {
-            Toggles::default()
-        } else {
-            self.toggles(set, base, tc, &dopts)?
+        let changes_to = |head| match virtual_base {
+            Some(v) => self.virtual_toggles(
+                set,
+                v,
+                &VirtualBase {
+                    anchor: head,
+                    changes: Toggles::default(),
+                },
+                &dopts,
+            ),
+            None => self.toggles(set, base, head, &dopts),
         };
-        let t_t = if base == theirs {
+        let t_o = if virtual_base.is_none() && base == tc {
             Toggles::default()
         } else {
-            self.toggles(set, base, theirs, &dopts)?
+            changes_to(tc)?
+        };
+        let t_t = if virtual_base.is_none() && base == theirs {
+            Toggles::default()
+        } else {
+            changes_to(theirs)?
         };
         let snap = tgt.snapshot();
         o.progress.report(0.5, "finding conflicts");

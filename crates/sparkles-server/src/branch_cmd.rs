@@ -3,7 +3,7 @@
 //! open a database.
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{Value as J, json};
 use sparkles::branch::{
     BranchInfo, BranchOptions, ConflictReport, ConflictScope, MAIN, MergeOptions, MergeOutcome,
@@ -115,8 +115,24 @@ pub struct Target {
     pub insecure_http: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum RelinkFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum BranchCmd {
+    /// Relink a persistent linked branch to main's current index, preserving its state
+    Relink {
+        /// Existing database directory (offline only)
+        #[arg(long)]
+        loc: PathBuf,
+        name: String,
+        #[arg(long, value_enum, default_value_t = RelinkFormat::Text)]
+        format: RelinkFormat,
+    },
     /// List the branches (reads the files when a server holds the database)
     List {
         #[command(flatten)]
@@ -194,6 +210,23 @@ pub enum BranchCmd {
 
 pub fn run_branch(cmd: BranchCmd, opts: StoreOptions) -> Result<()> {
     match cmd {
+        BranchCmd::Relink { loc, name, format } => {
+            if name == MAIN {
+                bail!("relinking requires a persistent linked branch; main cannot be relinked");
+            }
+            if !loc.join("CURRENT").is_file() {
+                bail!("{} is not a Sparkles database (no CURRENT)", loc.display());
+            }
+            let report = relink_local(loc, name.clone(), opts)?;
+            match format {
+                RelinkFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+                RelinkFormat::Text => println!(
+                    "relinked branch {name} into {} ({} quads, base commit {})",
+                    report.generation, report.quads, report.base_commit
+                ),
+            }
+            Ok(())
+        }
         BranchCmd::List { target, format } => {
             let list = match &target.loc {
                 Some(loc) => match Store::open(loc, opts) {
@@ -396,6 +429,87 @@ pub fn run_branch(cmd: BranchCmd, opts: StoreOptions) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Keep signal handling active while the blocking facade waits for writer admission.
+fn relink_local(
+    loc: PathBuf,
+    name: String,
+    opts: StoreOptions,
+) -> Result<sparkles::store::CompactReport> {
+    relink_controlled(move |control| {
+        control.check()?;
+        let dataset = sparkles::Dataset::from_store(Store::open(&loc, opts)?);
+        Ok(dataset.relink_branch_with(&name, &Default::default(), &control)?)
+    })
+}
+
+fn relink_controlled(
+    work: impl FnOnce(sparkles::task::Control) -> Result<sparkles::store::CompactReport>
+    + Send
+    + 'static,
+) -> Result<sparkles::store::CompactReport> {
+    use sparkles::task::{Control, Progress};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let control = Control {
+        progress: Progress::new(|_, message| eprintln!("{message}")),
+        ..Control::none()
+    };
+    let cancel = control.cancel.clone();
+    // Unix registration happens before work starts, including before its first report.
+    #[cfg(unix)]
+    let mut interrupts = {
+        let _entered = rt.enter();
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?
+    };
+    let signals = async move {
+        loop {
+            #[cfg(unix)]
+            let received = interrupts.recv().await.is_some();
+            #[cfg(not(unix))]
+            let received = tokio::signal::ctrl_c().await.is_ok();
+            if !received {
+                break;
+            }
+            if cancel.is_cancelled() {
+                std::process::exit(130);
+            }
+            cancel.cancel();
+            eprintln!("cancelling (Ctrl-C again to quit)");
+        }
+    };
+    relink_job(rt, control, signals, work)
+}
+
+fn relink_job(
+    rt: tokio::runtime::Runtime,
+    control: sparkles::task::Control,
+    signals: impl std::future::Future<Output = ()> + Send + 'static,
+    work: impl FnOnce(sparkles::task::Control) -> Result<sparkles::store::CompactReport>
+    + Send
+    + 'static,
+) -> Result<sparkles::store::CompactReport> {
+    rt.block_on(async move {
+        let listener = tokio::spawn(signals);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        // A plain worker avoids entering the blocking facade from a Tokio context.
+        let worker = std::thread::Builder::new()
+            .name("branch-relink".into())
+            .stack_size(crate::THREAD_STACK)
+            .spawn(move || {
+                let result = work(control);
+                let _ = send.send(result);
+            })?;
+        let result = receive.await;
+        listener.abort();
+        let _ = listener.await;
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("branch relink worker panicked"))?;
+        result.context("branch relink worker stopped without a result")?
+    })
 }
 
 /// A branch as the server's API gives it.
@@ -1288,4 +1402,129 @@ fn exempt_predicates(ps: &[String]) -> Result<Vec<oxrdf::NamedNode>> {
             oxrdf::NamedNode::new(p).with_context(|| format!("--exempt: not an IRI: {p}"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod relink_tests {
+    use super::*;
+
+    #[test]
+    fn memory_branches_stay_unsupported() {
+        let dataset = sparkles::Dataset::from_store(Store::in_memory(Default::default()));
+        dataset.create_branch("dev", &Default::default()).unwrap();
+        let branch = dataset.branch("dev").unwrap();
+        let before = (branch.dataset_id(), branch.head_commit().seq);
+        let result = relink_controlled(move |control| {
+            Ok(dataset.relink_branch_with("dev", &Default::default(), &control)?)
+        });
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<sparkles::Error>(),
+            Some(sparkles::Error::Unsupported(_))
+        ));
+        assert_eq!((branch.dataset_id(), branch.head_commit().seq), before);
+    }
+
+    /// Exercise the actual terminal signal pump in an isolated test process: a writer
+    /// retained in another process would prevent the CLI from opening the directory.
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_c_reaps_relink_worker_before_retained_writer_release() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "SPARKLES_TEST_RELINK_SIGNAL_CHILD";
+        if let Ok(held) = std::env::var(CHILD) {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("db"), Default::default()).unwrap();
+            store.compact().unwrap();
+            let dataset = sparkles::Dataset::from_store(store);
+            dataset.create_branch("dev", &Default::default()).unwrap();
+            let branch = dataset.branch("dev").unwrap();
+            let before = (branch.dataset_id(), branch.head_commit().seq);
+            let current = branch.snapshot().generation.name.clone();
+            let writer = if held == "main" {
+                dataset.store().write()
+            } else {
+                branch.store().write()
+            };
+            let worker_dataset = dataset.clone();
+            let error = relink_controlled(move |control| {
+                Ok(worker_dataset.relink_branch_with("dev", &Default::default(), &control)?)
+            })
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<sparkles::Error>(),
+                Some(sparkles::Error::Cancelled)
+            ));
+            assert_eq!(branch.snapshot().generation.name, current);
+            // Reading the guarded head would itself wait for this retained writer.
+            assert_eq!((branch.dataset_id(), branch.snapshot().commit), before);
+            drop(writer);
+            dataset
+                .relink_branch_with("dev", &Default::default(), &sparkles::task::Control::none())
+                .unwrap();
+            branch
+                .update("INSERT DATA { <urn:after-cancel> <urn:p> 1 }")
+                .unwrap();
+            return;
+        }
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for held in ["main", "branch"] {
+            let mut child = Child(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "branch_cmd::relink_tests::ctrl_c_reaps_relink_worker_before_retained_writer_release",
+                        "--exact",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, held)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let stderr = child.0.stderr.take().unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut log = String::new();
+                for line in BufReader::new(stderr).lines() {
+                    let line = line.unwrap();
+                    if line == "relinking branch" {
+                        let _ = send.send(());
+                    }
+                    log.push_str(&line);
+                    log.push('\n');
+                }
+                log
+            });
+            receive
+                .recv_timeout(Duration::from_secs(10))
+                .expect("relink worker must report after signal registration");
+            // Give the worker time to reach the writer wait; the retained lock also
+            // prevents an early successful publication if scheduling is delayed.
+            std::thread::sleep(Duration::from_millis(50));
+            // SAFETY: signal only this owned, still-running child process.
+            assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGINT) }, 0);
+            let start = Instant::now();
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "{held} writer cancellation blocked"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let log = reader.join().unwrap();
+            assert!(status.success(), "{held}: {log}");
+            assert!(log.contains("cancelling (Ctrl-C again to quit)"), "{log}");
+        }
+    }
 }

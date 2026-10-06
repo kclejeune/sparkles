@@ -11,9 +11,26 @@
 
 use super::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// The file of a linked generation.
 pub(crate) const LINK_FILE: &str = "link.json";
+pub(crate) const OVERLAY_FILE: &str = "base.delta";
+
+pub(crate) fn overlay_checksum(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Overlay {
+    pub bytes: u64,
+    pub sha256: String,
+    pub next_bnode: u64,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +39,8 @@ pub(crate) struct LinkFile {
     /// the commit the linked generation starts at (the branch's starting commit)
     pub base_seq: u64,
     pub segments: Vec<Segment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<Overlay>,
 }
 
 /// One upstream log segment of a linked generation.
@@ -89,9 +108,9 @@ pub(crate) fn read_link(gen_dir: &Path) -> Result<Option<LinkFile>> {
     };
     let f: LinkFile = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
-    if f.format != 1 {
+    if !matches!((f.format, f.overlay.is_some()), (1, false) | (2, true)) {
         return Err(Error::Corrupt(format!(
-            "{} has format {}, this build reads 1",
+            "{} has unsupported format {} or incompatible overlay metadata",
             path.display(),
             f.format
         )));
@@ -157,6 +176,13 @@ impl Generation {
         g.dir = Some(gen_dir.to_path_buf());
         let mut delta = Delta::default();
         for s in &file.segments {
+            // A child of a relinked branch inherits its immutable base overlay as
+            // well as its log. The layered vocabulary keeps the same prefix IDs.
+            if let Some(inherited) = read_link(&s.dir(&ds_root))?
+                && let Some(overlay) = inherited.overlay
+            {
+                apply_overlay(&s.dir(&ds_root), &overlay, &mut g, cache, &mut delta)?;
+            }
             let path = s.dir(&ds_root).join("wal.log");
             let from = wal::WalPoint {
                 seq: s.base_seq,
@@ -169,6 +195,9 @@ impl Generation {
                 folding: false,
             };
             wal::apply_forward(&path, &g, cache, &mut delta, from, to, &mut |_| Ok(()))?;
+        }
+        if let Some(overlay) = &file.overlay {
+            apply_overlay(gen_dir, overlay, &mut g, cache, &mut delta)?;
         }
         g.link = Some(Arc::new(Linked {
             file,
@@ -201,13 +230,74 @@ impl Generation {
     }
 }
 
+fn apply_overlay(
+    dir: &Path,
+    overlay: &Overlay,
+    generation: &mut Generation,
+    cache: &BlockCache,
+    delta: &mut Delta,
+) -> Result<()> {
+    let bytes = checked_overlay(dir, overlay)?;
+    for rec in bytes.as_chunks::<WAL_REC>().0 {
+        let q = wal::record_quad(rec);
+        let in_base = generation
+            .perm(Perm::Spo)
+            .contains(cache, &Perm::Spo.to_key(&q))?;
+        apply(delta, &q, rec[0] == WAL_INSERT, in_base);
+    }
+    generation.meta.next_bnode = generation.meta.next_bnode.max(overlay.next_bnode);
+    Ok(())
+}
+
+fn checked_overlay(dir: &Path, overlay: &Overlay) -> Result<Vec<u8>> {
+    let path = dir.join(OVERLAY_FILE);
+    let bytes = std::fs::read(&path)?;
+    if bytes.len() as u64 != overlay.bytes
+        || !bytes.len().is_multiple_of(WAL_REC)
+        || overlay_checksum(&bytes) != overlay.sha256
+    {
+        return Err(Error::Corrupt(format!(
+            "{}: invalid base overlay length or checksum",
+            path.display()
+        )));
+    }
+    for rec in bytes.as_chunks::<WAL_REC>().0 {
+        if !matches!(rec[0], WAL_INSERT | WAL_DELETE) {
+            return Err(Error::Corrupt(format!(
+                "{}: invalid base overlay operation",
+                path.display()
+            )));
+        }
+    }
+    Ok(bytes)
+}
+
 /// The segments of the linked generation in `gen_dir`, as (directory relative to the
 /// dataset, log bytes, delta terms), for `sparkles check` (`None` when not linked).
 pub fn read_link_file(gen_dir: &Path) -> Result<Option<Vec<(String, u64, u64)>>> {
-    Ok(read_link(gen_dir)?.map(|f| {
-        f.segments
+    let Some(file) = read_link(gen_dir)? else {
+        return Ok(None);
+    };
+    if let Some(overlay) = &file.overlay {
+        checked_overlay(gen_dir, overlay)?;
+    }
+    let dataset_root = dataset_root_of(
+        gen_dir
+            .parent()
+            .ok_or_else(|| Error::Corrupt("linked generation lacks a branch directory".into()))?,
+    )?;
+    for segment in &file.segments {
+        let dir = segment.dir(&dataset_root);
+        if let Some(parent) = read_link(&dir)?
+            && let Some(overlay) = parent.overlay
+        {
+            checked_overlay(&dir, &overlay)?;
+        }
+    }
+    Ok(Some(
+        file.segments
             .into_iter()
             .map(|s| (s.path, s.wal_end, s.dvocab_len))
-            .collect()
-    }))
+            .collect(),
+    ))
 }

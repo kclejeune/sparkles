@@ -1863,7 +1863,22 @@ impl Checker<'_> {
             let first = std::fs::read_to_string(dir.join("CURRENT"))
                 .map(|c| dir.join(c.trim()))
                 .unwrap_or_else(|_| dir.join("gen-0001"));
-            if let Ok(Some(link)) = crate::store::read_link_file(&first) {
+            let link = match crate::store::read_link_file(&first) {
+                Ok(link) => link,
+                Err(e) => {
+                    run.add(
+                        Issue::error(format!("branch {name}: {e}")).file(
+                            first
+                                .join("link.json")
+                                .strip_prefix(self.root)
+                                .unwrap()
+                                .to_string_lossy(),
+                        ),
+                    );
+                    None
+                }
+            };
+            if let Some(link) = link {
                 linked += 1;
                 for seg in link {
                     let sdir = self.root.join(&seg.0);

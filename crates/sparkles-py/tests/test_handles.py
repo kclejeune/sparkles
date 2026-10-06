@@ -240,6 +240,36 @@ def test_stored_query_progress_and_pre_cancel() -> None:
         ds.queries.run("all", cancel=token)
 
 
+def test_branch_relink_preserves_state_identity_and_restarts(tmp_path: Path) -> None:
+    path = tmp_path / "db"
+    with Dataset(path) as ds:
+        ds.load(DATA, "turtle")
+        ds.branches.create("work")
+        work = ds.branch("work")
+        work.update('INSERT DATA { _:branch <urn:p> "branch" }')
+        identity, head, size = work.dataset_id, work.head_commit.seq, len(work)
+        ds.update('INSERT DATA { <urn:main> <urn:p> "main" }')
+        ds.compact()
+        token = CancelToken()
+        token.cancel()
+        with pytest.raises(CancelledError):
+            ds.branches.relink("work", cancel=token)
+        seen = []
+        report = ds.branches.relink("work", progress=lambda f, m: seen.append(f))
+        assert report["mode"] == "relink" and report["quads"] == size
+        assert seen[0] == 0 and seen[-1] == 1
+        assert work.dataset_id == identity and work.head_commit.seq == head
+        assert len(work) == size
+        assert not work.ask('ASK { <urn:main> <urn:p> "main" }')
+        work.close()
+    with Dataset(path) as ds:
+        with ds.branch("work") as work:
+            assert work.dataset_id == identity and work.head_commit.seq == head
+            assert len(work) == size
+            work.update('INSERT DATA { _:later <urn:p> "later" }')
+            assert len(work) == size + 1
+
+
 def test_branch_conflict_preview_contains_cells(tmp_path: Path) -> None:
     with Dataset(tmp_path / "db") as ds:
         ds.load('<urn:a> <urn:p> "base" .', "turtle")

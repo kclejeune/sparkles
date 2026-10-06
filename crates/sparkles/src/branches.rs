@@ -116,6 +116,40 @@ impl Dataset {
         Ok(info)
     }
 
+    /// Relink a persistent linked branch to main's current immutable index without
+    /// changing its head, identity or state. Ordinary compaction still builds an
+    /// independent index. Historical pins and concurrent writes remain readable.
+    pub fn relink_branch(
+        &self,
+        name: &str,
+        options: &crate::store::CompactOptions,
+    ) -> Result<crate::store::CompactReport> {
+        self.store().relink_branch(name, options)
+    }
+
+    /// [`relink_branch`](Self::relink_branch) with shared cancellation and progress.
+    pub fn relink_branch_with(
+        &self,
+        name: &str,
+        options: &crate::store::CompactOptions,
+        ctl: &crate::task::Control,
+    ) -> Result<crate::store::CompactReport> {
+        ctl.check()?;
+        let mut options = options.clone();
+        options.cancel = Some(ctl.cancel.flag());
+        let progress = ctl.progress.clone();
+        if progress.is_some() {
+            progress.report(0.0, "relinking branch");
+            let p = progress.clone();
+            options.progress = Some(std::sync::Arc::new(move |message: &str| {
+                p.report(0.0, message)
+            }));
+        }
+        let report = self.store().relink_branch(name, &options)?;
+        progress.report(1.0, "relinked branch");
+        Ok(report)
+    }
+
     /// Merge branch `source` into `target` (see [`Store::merge`](crate::store::Store::merge)).
     pub fn merge(&self, source: &str, target: &str, o: &MergeOptions) -> Result<MergeOutcome> {
         self.store().merge(source, target, o)

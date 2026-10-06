@@ -114,6 +114,21 @@ impl PyBranches {
         })
         .py(py)
     }
+    #[pyo3(signature=(name,*,cancel=None,progress=None,timeout=None))]
+    fn relink<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        cancel: Option<&Bound<'py, PyAny>>,
+        progress: Option<&Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.locking(py, &[&name])?;
+        let report = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
+            ds.relink_branch_with(&name, &Default::default(), &ctl)
+        })?;
+        admin::to_py(py, &report)
+    }
     #[pyo3(signature=(*,branches=None,before=None,limit=100))]
     fn commit_graph<'py>(
         &self,

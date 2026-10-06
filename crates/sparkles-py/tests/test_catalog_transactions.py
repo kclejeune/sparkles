@@ -74,6 +74,7 @@ with Catalog(path / "catalog") as cat:
     }
     if kind == "persistent":
         calls.update({
+            "relink": lambda: ds.branches.relink("work"),
             "preview_merge": lambda: ds.branches.preview_merge("work"),
             "preview_revert": lambda: ds.branches.preview_revert(first),
             "preview_cherry_pick": lambda: ds.branches.preview_cherry_pick("work", work_commit),
@@ -111,6 +112,8 @@ with Catalog(path / "catalog") as cat:
         for operation in ("clone", "memory_clone", "catalog_clone", "backup_create", "backup_policy", "backup_catalog_policy")
     ]
     + [
+        ("relink", "persistent", "main"),
+        ("relink", "persistent", "work"),
         ("preview_merge", "persistent", "main"),
         ("preview_merge", "persistent", "work"),
         ("preview_revert", "persistent", "main"),

@@ -423,8 +423,9 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 
 // ------------------------------------------------------------- dataset.json ------
 
-/// Dataset capabilities supported by this reader (1: legacy, 2: branches).
-pub const DATASET_READER: u32 = 2;
+/// Dataset capabilities supported by this reader (1: legacy, 2: branches,
+/// 3: relinked generations with an immutable base overlay).
+pub const DATASET_READER: u32 = 3;
 fn legacy_reader() -> u32 {
     1
 }
@@ -446,11 +447,15 @@ pub fn check_dataset_compatibility(root: &Path) -> Result<()> {
 
 /// Publish the minimum reader needed by branches before publishing their table.
 pub(crate) fn require_branch_reader(root: &Path) -> Result<()> {
+    require_reader(root, 2)
+}
+
+pub(crate) fn require_reader(root: &Path, reader: u32) -> Result<()> {
     let Some(mut ds) = read_dataset(root)? else {
         return Ok(());
     };
-    if ds.minimum_reader < 2 {
-        ds.minimum_reader = 2;
+    if ds.minimum_reader < reader {
+        ds.minimum_reader = reader;
         write_dataset(root, &ds)?;
     }
     Ok(())

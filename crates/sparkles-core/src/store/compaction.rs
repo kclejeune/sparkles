@@ -12,6 +12,7 @@
 //! dataset's own settings ([`CompactionSettings`]) live in `compaction.json`. The server
 //! runs the policy; the C13 spec has the design.
 
+use super::link::{LINK_FILE, LinkFile, OVERLAY_FILE, Overlay, Segment};
 use super::partial::{self, PartialMode};
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -399,6 +400,13 @@ pub(crate) struct TapCommit {
     pub changes: Vec<(u8, [Id; 4])>,
 }
 
+/// A run owns its tap through an identity token. Cancellation can disable it
+/// without waiting for a transaction that retained the writer mutex.
+pub(crate) struct Tap {
+    pub active: Arc<AtomicBool>,
+    pub commits: Vec<TapCommit>,
+}
+
 /// What the store tracks for the compaction policy, readable without the writer lock.
 pub(crate) struct Track {
     /// the commit the current generation's base holds
@@ -598,16 +606,26 @@ struct Run<'a> {
     store: &'a Store,
     dir: Option<PathBuf>,
     published: bool,
+    started: bool,
+    active: Arc<AtomicBool>,
 }
 
 impl Drop for Run<'_> {
     fn drop(&mut self) {
         let s = self.store;
-        if !self.published {
-            s.writer.lock().tap = None;
+        if !self.published && self.started {
+            self.active.store(false, Ordering::Release);
+            if let Some(mut w) = s.writer.try_lock()
+                && w.tap
+                    .as_ref()
+                    .is_some_and(|tap| Arc::ptr_eq(&tap.active, &self.active))
+            {
+                w.tap = None;
+            }
             if let Some(dir) = &self.dir {
                 let _ = std::fs::remove_dir_all(dir);
             }
+            s.release_link_if_rebuilt();
         }
         s.compaction.reserved.store(0, Ordering::Relaxed);
         if self.dir.is_some() {
@@ -634,6 +652,12 @@ struct CatchUp {
     oldest_ms: Option<i64>,
 }
 
+struct RelinkSource {
+    segment: Segment,
+    generation: Arc<Generation>,
+    _lease: LeaseGuard,
+}
+
 impl CatchUp {
     fn translate(&mut self, id: Id, view: &Snapshot) -> Result<Id> {
         if !matches!(id.tag(), Tag::Vocab | Tag::Delta) {
@@ -655,9 +679,15 @@ impl CatchUp {
 
     /// Carry `batch` (in commit order) over; `view` is a snapshot of the old generation
     /// that knows every term the batch names.
-    fn apply(&mut self, batch: &[TapCommit], view: &Snapshot) -> Result<()> {
+    fn apply(&mut self, batch: &[TapCommit], view: &Snapshot, o: &CompactOptions) -> Result<()> {
         let mut rec = [0u8; WAL_REC];
         for c in batch {
+            if o.cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+            {
+                return Err(Error::Cancelled);
+            }
             if c.info.seq != self.last + 1 {
                 return Err(Error::Corrupt(format!(
                     "compaction: commit {} follows commit {}",
@@ -665,7 +695,14 @@ impl CatchUp {
                 )));
             }
             let mut data = Vec::with_capacity((c.changes.len() + 1) * WAL_REC);
-            for (op, q) in &c.changes {
+            for (i, (op, q)) in c.changes.iter().enumerate() {
+                if i % 1024 == 0
+                    && o.cancel
+                        .as_ref()
+                        .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+                {
+                    return Err(Error::Cancelled);
+                }
                 let n = [
                     self.translate(q[0], view)?,
                     self.translate(q[1], view)?,
@@ -739,6 +776,7 @@ enum How {
         rewritten: u64,
         copied: u64,
     },
+    Relink,
 }
 
 impl How {
@@ -746,23 +784,24 @@ impl How {
         match self {
             How::Full(_) => "full",
             How::Partial { .. } => "partial",
+            How::Relink => "relink",
         }
     }
     fn full_reason(&self) -> Option<String> {
         match self {
             How::Full(why) => Some(why.clone()),
-            How::Partial { .. } => None,
+            How::Partial { .. } | How::Relink => None,
         }
     }
     fn rewritten(&self) -> u64 {
         match self {
-            How::Full(_) => 0,
+            How::Full(_) | How::Relink => 0,
             How::Partial { rewritten, .. } => *rewritten,
         }
     }
     fn copied(&self) -> u64 {
         match self {
-            How::Full(_) => 0,
+            How::Full(_) | How::Relink => 0,
             How::Partial { copied, .. } => *copied,
         }
     }
@@ -780,6 +819,68 @@ fn lower_priority() {
 }
 
 impl Store {
+    /// Move a persistent linked branch onto main's current immutable index, while
+    /// preserving its state, identity, commits and historical pins. This explicit
+    /// operation shares index files and stores only a translated sparse base overlay;
+    /// ordinary compaction continues to build an independent index. Concurrent writes
+    /// are caught up before publication, as in [`compact_with`](Self::compact_with).
+    pub fn relink_branch(&self, name: &str, o: &CompactOptions) -> Result<CompactReport> {
+        self.owned_set()?;
+        if name == crate::branch::MAIN || self.root.is_none() {
+            return Err(Error::Unsupported(
+                "relinking requires a persistent linked branch".into(),
+            ));
+        }
+        let target = self.branch(name)?;
+        if target.snapshot().generation.linked().is_none() {
+            return Err(Error::Unsupported(
+                "the branch already owns its index".into(),
+            ));
+        }
+        let source = {
+            let _w = self.lock_writer(&crate::guard::WriteOptions {
+                cancel: o.cancel.clone(),
+                ..Default::default()
+            })?;
+            let snapshot = self.snapshot();
+            let generation = snapshot.generation.clone();
+            let dir = generation.dir.as_ref().ok_or_else(|| {
+                Error::Unsupported("relinking requires a persistent upstream".into())
+            })?;
+            let (_, base, _) = commit::read_gen_commit(dir)?
+                .ok_or_else(|| Error::Corrupt("upstream generation lacks a base commit".into()))?;
+            let number = commit::generation_number(&generation.name);
+            let history = self
+                .history
+                .as_ref()
+                .expect("a persistent store has history");
+            let id = history.lock().lease_for(number, "relink", true);
+            let collector = self.collector();
+            RelinkSource {
+                segment: Segment {
+                    branch_id: self.dataset_id,
+                    generation: generation.name.clone(),
+                    path: generation.name.clone(),
+                    base_seq: base.seq,
+                    end_seq: base.seq,
+                    wal_end: 0,
+                    dvocab_len: 0,
+                },
+                generation,
+                _lease: LeaseGuard {
+                    generation: number,
+                    label: "relink".into(),
+                    release: Some(Box::new(move || {
+                        if let Some(c) = collector {
+                            c.release(id);
+                        }
+                    })),
+                },
+            }
+        };
+        target.compact_inner(o, Some((self, source)))
+    }
+
     /// The dataset's own compaction settings (`compaction.json` of a persistent store).
     pub fn compaction_settings(&self) -> CompactionSettings {
         self.compaction.settings.lock().clone()
@@ -985,6 +1086,14 @@ impl Store {
     /// and says why in [`CompactReport::abandoned`]. Only one compaction of a store runs
     /// at a time ([`Error::Conflict`] otherwise).
     pub fn compact_with(&self, o: &CompactOptions) -> Result<CompactReport> {
+        self.compact_inner(o, None)
+    }
+
+    fn compact_inner(
+        &self,
+        o: &CompactOptions,
+        relink: Option<(&Store, RelinkSource)>,
+    ) -> Result<CompactReport> {
         let t0 = Instant::now();
         if self.compaction.running.swap(true, Ordering::Acquire) {
             return Err(Error::Conflict(
@@ -995,11 +1104,16 @@ impl Store {
             store: self,
             dir: None,
             published: false,
+            started: false,
+            active: Arc::new(AtomicBool::new(true)),
         };
         let cancelled = || o.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
         // start: the snapshot to build, with the tap on from its commit
         let (snap0, base, next_bnode, name, dir, tmp) = {
-            let mut w = self.writer.lock();
+            let mut w = self.lock_writer(&crate::guard::WriteOptions {
+                cancel: o.cancel.clone(),
+                ..Default::default()
+            })?;
             if w.poisoned {
                 return Err(Error::Poisoned);
             }
@@ -1028,7 +1142,11 @@ impl Store {
                     (t.path().to_path_buf(), "mem".to_string(), Some(t))
                 }
             };
-            w.tap = Some(Vec::new());
+            w.tap = Some(Tap {
+                active: run.active.clone(),
+                commits: Vec::new(),
+            });
+            run.started = true;
             (snap, w.head, w.next_bnode, name, dir, tmp)
         };
         if self.root.is_some() {
@@ -1045,9 +1163,14 @@ impl Store {
         let mode = o
             .partial
             .unwrap_or_else(|| self.compaction.settings.lock().partial.unwrap_or_default());
-        let (meta, how) = match &pool {
-            Some(p) => p.install(|| self.build_new(&snap0, &dir, next_bnode, o, mode)),
-            None => self.build_new(&snap0, &dir, next_bnode, o, mode),
+        let (meta, how) = match &relink {
+            Some((main, source)) => self
+                .build_relinked(main, source, &snap0, &dir, &name, next_bnode, o)
+                .map(|meta| (meta, How::Relink)),
+            None => match &pool {
+                Some(p) => p.install(|| self.build_new(&snap0, &dir, next_bnode, o, mode)),
+                None => self.build_new(&snap0, &dir, next_bnode, o, mode),
+            },
         }?;
         let mut build = tb.elapsed();
         self.failpoint("compact-built");
@@ -1066,7 +1189,20 @@ impl Store {
             }
         }
         let persistent = self.root.is_some();
-        let mut gen_ = Generation::open(&dir, &name, persistent)?;
+        let mut gen_ = match super::link::read_link(&dir)? {
+            Some(file) => Generation::open_linked(
+                &dir,
+                &name,
+                self.root.as_ref().expect("relinking is persistent"),
+                file,
+                false,
+                &self.cache,
+            )?,
+            None => Generation::open(&dir, &name, persistent)?,
+        };
+        if let Some((_, source)) = &relink {
+            gen_.share_blocks_with(&source.generation);
+        }
         gen_._tmp = tmp;
         let gen_ = Arc::new(gen_);
         // the spatial index base of the new generation, built now rather than at the
@@ -1092,7 +1228,7 @@ impl Store {
         let mut cu = CatchUp {
             gen_: gen_.clone(),
             cache: self.cache.clone(),
-            delta: Delta::default(),
+            delta: gen_.base_delta(),
             wal: if persistent {
                 Some(BufWriter::new(wal::open_for_append(&dir.join("wal.log"))?))
             } else {
@@ -1107,7 +1243,12 @@ impl Store {
             oldest_ms: None,
         };
         let superseded = |w: &WriterState| -> Option<String> {
-            if self.snapshot().generation.uid != snap0.generation.uid || w.tap.is_none() {
+            if self.snapshot().generation.uid != snap0.generation.uid
+                || !w
+                    .tap
+                    .as_ref()
+                    .is_some_and(|tap| Arc::ptr_eq(&tap.active, &run.active))
+            {
                 Some("a bulk commit rebuilt the dataset during the build".into())
             } else if w.poisoned {
                 Some("the store stopped taking writes".into())
@@ -1128,15 +1269,19 @@ impl Store {
             if cancelled() {
                 return Err(Error::Cancelled);
             }
+            self.failpoint("compact-catching-up");
             let (batch, view) = {
-                let mut w = self.writer.lock();
+                let mut w = self.lock_writer(&crate::guard::WriteOptions {
+                    cancel: o.cancel.clone(),
+                    ..Default::default()
+                })?;
                 if let Some(why) = superseded(&w) {
                     return Ok(abandoned(why));
                 }
-                let batch = std::mem::take(w.tap.as_mut().expect("checked above"));
+                let batch = std::mem::take(&mut w.tap.as_mut().expect("checked above").commits);
                 (batch, self.snapshot())
             };
-            cu.apply(&batch, &view)?;
+            cu.apply(&batch, &view, o)?;
             if batch.len() < LAST_ROUND {
                 break;
             }
@@ -1146,7 +1291,10 @@ impl Store {
         // log must hold them durably before that log can go
         self.sync_change_log()?;
         // the switch, under the writer lock
-        let mut w = self.writer.lock();
+        let mut w = self.lock_writer(&crate::guard::WriteOptions {
+            cancel: o.cancel.clone(),
+            ..Default::default()
+        })?;
         let tl = Instant::now();
         if let Some(why) = superseded(&w) {
             return Ok(abandoned(why));
@@ -1154,9 +1302,12 @@ impl Store {
         if cancelled() {
             return Err(Error::Cancelled);
         }
-        let rest = std::mem::take(w.tap.as_mut().expect("checked above"));
+        let rest = std::mem::take(&mut w.tap.as_mut().expect("checked above").commits);
         let view = self.snapshot();
-        cu.apply(&rest, &view)?;
+        cu.apply(&rest, &view, o)?;
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
         cu.sync()?;
         w.next_bnode = w.next_bnode.max(cu.next_bnode);
         let new_no = commit::generation_number(&name);
@@ -1171,6 +1322,15 @@ impl Store {
             sync_dir(&dir)?;
             sync_dir(root)?;
             self.failpoint("compact-before-current");
+            if let Some((main, source)) = &relink {
+                commit::require_reader(main.root.as_ref().expect("persistent main"), 3)?;
+                commit::require_reader(root, 3)?;
+                main.add_relink_hold(self.dataset_id, &source.segment)?;
+                self.failpoint("relink-held");
+                if cancelled() {
+                    return Err(Error::Cancelled);
+                }
+            }
             if let Err(e) = write_atomic(&root.join("CURRENT"), name.as_bytes()) {
                 let switched =
                     std::fs::read_to_string(root.join("CURRENT")).is_ok_and(|c| c.trim() == name);
@@ -1182,6 +1342,10 @@ impl Store {
                     run.published = true;
                 }
                 return Err(e);
+            }
+            run.published = true;
+            if relink.is_some() {
+                self.failpoint("relink-current");
             }
             let wal = cu.wal.take().expect("a persistent store has a log");
             w.trim_wal();
@@ -1324,6 +1488,86 @@ impl Store {
         Ok((meta, How::Full(why)))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn build_relinked(
+        &self,
+        main: &Store,
+        source: &RelinkSource,
+        snapshot: &Snapshot,
+        dir: &Path,
+        name: &str,
+        next_bnode: u64,
+        o: &CompactOptions,
+    ) -> Result<IndexMeta> {
+        let interrupt = self.compaction_interrupt(o, dir);
+        interrupt()?;
+        let changes = main.toggles(
+            main.owned_set()?,
+            crate::branch::CommitRef {
+                branch_id: source.segment.branch_id,
+                seq: source.segment.base_seq,
+            },
+            crate::branch::CommitRef {
+                branch_id: self.dataset_id,
+                seq: snapshot.commit,
+            },
+            &super::diff::DiffOptions {
+                cancel: o.cancel.clone(),
+                ..Default::default()
+            },
+        )?;
+        write_synced(&dir.join("delta.vocab"), &[])?;
+        let mut file = LinkFile {
+            format: 1,
+            base_seq: snapshot.commit,
+            segments: vec![source.segment.clone()],
+            overlay: None,
+        };
+        let generation = Generation::open_linked(
+            dir,
+            name,
+            self.root.as_ref().expect("persistent branch"),
+            file.clone(),
+            false,
+            &self.cache,
+        )?;
+        let mut changes: Vec<_> = changes.into_iter().collect();
+        changes.sort_unstable_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+        let mut bytes = Vec::with_capacity(changes.len() * WAL_REC);
+        for (i, (key, insert)) in changes.into_iter().enumerate() {
+            if i % 4096 == 0 {
+                interrupt()?;
+            }
+            let ids = [
+                relink_id(&generation, &key[1])?,
+                relink_id(&generation, &key[2])?,
+                relink_id(&generation, &key[3])?,
+                relink_id(&generation, &key[0])?,
+            ];
+            bytes.push(if insert { WAL_INSERT } else { WAL_DELETE });
+            for id in ids {
+                bytes.extend_from_slice(&id.0.to_le_bytes());
+            }
+        }
+        generation.dvocab.sync()?;
+        file.format = 2;
+        file.overlay = Some(Overlay {
+            bytes: bytes.len() as u64,
+            sha256: super::link::overlay_checksum(&bytes),
+            next_bnode,
+        });
+        write_synced(&dir.join(OVERLAY_FILE), &bytes)?;
+        write_synced(
+            &dir.join(LINK_FILE),
+            &serde_json::to_vec_pretty(&file).expect("serializes"),
+        )?;
+        interrupt()?;
+        let mut meta = generation.meta.clone();
+        meta.next_bnode = next_bnode;
+        meta.prefixes = self.prefixes();
+        Ok(meta)
+    }
+
     /// Build the generation of `snap` in `dir`, under the build limits of `o`.
     fn build_compacted(
         &self,
@@ -1354,7 +1598,7 @@ impl Store {
     fn base_snapshot(&self, gen_: &Arc<Generation>, seq: u64) -> Snapshot {
         Snapshot {
             generation: gen_.clone(),
-            delta: Delta::default(),
+            delta: gen_.base_delta(),
             version: 0,
             cache: self.cache.clone(),
             results: self.results.clone(),
@@ -1421,6 +1665,30 @@ fn build_pool(o: &CompactOptions, threads: usize) -> Result<Option<rayon::Thread
         .build()
         .map(Some)
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))
+}
+
+/// Translate a vocabulary key into the relinked generation without renumbering
+/// stored blank nodes or canonical inline literals.
+fn relink_id(generation: &Generation, key: &[u8]) -> Result<Id> {
+    if key.is_empty() {
+        return Ok(Id::DEFAULT_GRAPH);
+    }
+    if key[0] == b'_' {
+        let bytes: [u8; 8] = key
+            .get(1..9)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| Error::Corrupt("invalid stored blank-node key".into()))?;
+        return Ok(Id::new(Tag::BNode, u64::from_be_bytes(bytes)));
+    }
+    if key[0] == b'"'
+        && let Some(id) = crate::id::inline_id(&crate::id::key_to_term(key))
+    {
+        return Ok(id);
+    }
+    if let Ok(id) = generation.vocab.find(key) {
+        return Ok(Id::vocab(id));
+    }
+    Ok(Id::delta(generation.dvocab.insert(key)?))
 }
 
 /// Remove the unfinished builds of compactions that a crash interrupted: directories
