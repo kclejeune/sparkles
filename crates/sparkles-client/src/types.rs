@@ -21,13 +21,20 @@ pub struct Commit {
     pub timestamp: Option<String>,
     /// `update`, `gsp-put`, `upload`, …
     pub kind: String,
-    pub inserted: u64,
-    pub deleted: u64,
-    /// The dataset's size after the commit.
-    pub quads: u64,
+    /// Absent when the caller's grants cover only part of the dataset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inserted: Option<u64>,
+    /// Absent when the caller's grants cover only part of the dataset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<u64>,
+    /// The dataset's size after the commit; absent for a graph-restricted caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quads: Option<u64>,
     pub generation: String,
     pub bulk: bool,
-    pub exact: bool,
+    /// Absent with the dataset-wide counts for a graph-restricted caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<bool>,
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]

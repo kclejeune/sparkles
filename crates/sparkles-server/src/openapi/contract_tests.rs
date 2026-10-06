@@ -141,6 +141,31 @@ async fn call(app: &axum::Router, method: &str, uri: &str, body: Option<J>) -> (
     call_as(app, method, uri, body, None).await
 }
 
+#[test]
+fn commit_schema_preserves_hidden_counts_without_accepting_invalid_counts() {
+    let doc = build("test");
+    let schema = &doc["components"]["schemas"]["Commit"];
+    let mut commit = json!({
+        "seq": 2, "parent": 1, "ref": "commit:2", "kind": "update",
+        "generation": "gen-0001", "bulk": false
+    });
+    assert_eq!(mismatch(&doc, schema, &commit, "$"), None);
+    for (field, value) in [
+        ("inserted", json!(0)),
+        ("deleted", json!(1)),
+        ("quads", json!(10)),
+        ("exact", json!(false)),
+    ] {
+        commit[field] = value;
+    }
+    assert_eq!(mismatch(&doc, schema, &commit, "$"), None);
+    commit["quads"] = json!("hidden");
+    assert!(mismatch(&doc, schema, &commit, "$").is_some());
+    commit.as_object_mut().unwrap().remove("quads");
+    commit.as_object_mut().unwrap().remove("seq");
+    assert!(mismatch(&doc, schema, &commit, "$").is_some());
+}
+
 /// `call` with an `Accept` header.
 async fn call_as(
     app: &axum::Router,

@@ -2018,18 +2018,21 @@
             "type": "boolean"
           },
           "deleted": {
+            "description": "Omitted when the caller's grants cover only part of the dataset.",
             "type": "integer"
           },
           "digest": {
             "type": "string"
           },
           "exact": {
+            "description": "Omitted with the dataset-wide counts for graph-restricted callers.",
             "type": "boolean"
           },
           "generation": {
             "type": "string"
           },
           "inserted": {
+            "description": "Omitted when the caller's grants cover only part of the dataset.",
             "type": "integer"
           },
           "kind": {
@@ -2064,6 +2067,7 @@
             ]
           },
           "quads": {
+            "description": "The dataset size after the commit; omitted for graph-restricted callers.",
             "type": "integer"
           },
           "reconstructed": {
@@ -2092,12 +2096,8 @@
           "parent",
           "ref",
           "kind",
-          "inserted",
-          "deleted",
-          "quads",
           "generation",
-          "bulk",
-          "exact"
+          "bulk"
         ],
         "type": "object"
       },

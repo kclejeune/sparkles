@@ -500,10 +500,22 @@ async fn routes_that_cover_every_graph_refuse_a_limited_view() {
     // commits without counts
     let r = get("/$/commits/graphs", "gra").await.json();
     assert!(r["commits"][0]["seq"].is_u64(), "{r}");
-    assert!(r["commits"][0].get("quads").is_none(), "{r}");
-    assert!(r["commits"][0].get("inserted").is_none(), "{r}");
+    for field in ["quads", "inserted", "deleted", "exact"] {
+        assert!(r["commits"][0].get(field).is_none(), "{field}: {r}");
+    }
+    let page: sparkles_client::CommitList = serde_json::from_value(r).unwrap();
+    let commit = &page.commits[0];
+    assert_eq!(commit.quads, None);
+    assert_eq!(commit.inserted, None);
+    assert_eq!(commit.deleted, None);
+    assert_eq!(commit.exact, None);
     let r = get("/$/commits/graphs", "gfull").await.json();
     assert!(r["commits"][0]["quads"].is_u64(), "{r}");
+    let page: sparkles_client::CommitList = serde_json::from_value(r).unwrap();
+    assert!(page.commits[0].quads.is_some());
+    assert!(page.commits[0].inserted.is_some());
+    assert!(page.commits[0].deleted.is_some());
+    assert!(page.commits[0].exact.is_some());
 }
 
 #[tokio::test]

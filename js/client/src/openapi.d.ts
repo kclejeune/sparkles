@@ -2852,11 +2852,14 @@ export interface components {
         };
         Commit: {
             bulk: boolean;
-            deleted: number;
+            /** @description Omitted when the caller's grants cover only part of the dataset. */
+            deleted?: number;
             digest?: string;
-            exact: boolean;
+            /** @description Omitted with the dataset-wide counts for graph-restricted callers. */
+            exact?: boolean;
             generation: string;
-            inserted: number;
+            /** @description Omitted when the caller's grants cover only part of the dataset. */
+            inserted?: number;
             /**
              * @example create
              * @example baseline
@@ -2879,7 +2882,8 @@ export interface components {
             kind: string;
             message?: string;
             parent: number | null;
-            quads: number;
+            /** @description The dataset size after the commit; omitted for graph-restricted callers. */
+            quads?: number;
             /**
              * @description Read back from the change log.
              * @constant

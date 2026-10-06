@@ -2642,11 +2642,11 @@ type Commit = {
   kind: "create" | "baseline" | "update" | "gsp-put" | "gsp-post" | "gsp-delete"
       | "upload" | "load" | "reason" | "reason-clear" | "transaction" | "embed" | "patch"
       | "merge" | "revert" | "cherry-pick" | "unknown";
-  inserted: number; deleted: number;   // net change relative to the parent
-  quads: number;                        // dataset size after the commit
+  inserted?: number; deleted?: number; // net change; omitted for graph-restricted callers
+  quads?: number;                       // dataset size; omitted for graph-restricted callers
   generation: string;                   // index generation it was made in
   bulk: boolean;                        // made by rebuilding the index
-  exact: boolean;                       // false: a bulk commit that also deleted
+  exact?: boolean;                      // false: a bulk commit that also deleted; omitted with counts
   unvalidated?: true;                   // the write bypassed write-time validation
   message?: string;                     // the writer's commit message
   digest?: string;                      // change digest (hex SHA-256), when enabled

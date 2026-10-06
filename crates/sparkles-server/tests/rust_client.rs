@@ -98,7 +98,7 @@ async fn async_client_against_a_server() {
     assert_eq!(r.commit_seq, Some(1));
     assert_eq!(r.committed, Some(true));
     let c = r.commit.unwrap();
-    assert_eq!((c.seq, c.inserted, c.kind.as_str()), (1, 2, "update"));
+    assert_eq!((c.seq, c.inserted, c.kind.as_str()), (1, Some(2), "update"));
     assert_eq!(r.body["inserted"], 2);
     assert!(r.dataset_id.is_some());
 
@@ -225,7 +225,7 @@ async fn async_client_against_a_server() {
         g.clone()
     )));
     let r = ds.delete_graph(g.clone()).await.unwrap();
-    assert_eq!(r.commit.unwrap().deleted, 1);
+    assert_eq!(r.commit.unwrap().deleted, Some(1));
     let e = ds.get_graph(g.clone()).await.unwrap_err();
     assert_eq!(e.status(), Some(404));
 
@@ -247,7 +247,7 @@ async fn async_client_against_a_server() {
     let ttl = dir.path().join("more.ttl");
     std::fs::write(&ttl, "<http://e/b> <http://e/name> \"Bob\" .\n").unwrap();
     let r = ds.load(&ttl).await.unwrap();
-    assert_eq!(r.commit.unwrap().inserted, 1);
+    assert_eq!(r.commit.unwrap().inserted, Some(1));
     let nq = dir.path().join("more.nq.gz");
     let mut gz = flate2::write::GzEncoder::new(
         std::fs::File::create(&nq).unwrap(),
@@ -257,7 +257,7 @@ async fn async_client_against_a_server() {
         .unwrap();
     gz.finish().unwrap();
     let r = ds.load(&nq).await.unwrap();
-    assert_eq!(r.commit.unwrap().inserted, 1);
+    assert_eq!(r.commit.unwrap().inserted, Some(1));
 
     // an upload with a CSV table
     let r = ds
@@ -271,7 +271,7 @@ async fn async_client_against_a_server() {
         .await
         .unwrap();
     assert_eq!(r.committed, Some(true));
-    assert!(r.commit.unwrap().inserted >= 2);
+    assert!(r.commit.unwrap().inserted.unwrap() >= 2);
 
     // a batch is one commit
     let head = ds.info().await.unwrap().head.unwrap();
@@ -289,7 +289,7 @@ async fn async_client_against_a_server() {
         .await
         .unwrap();
     assert_eq!(r.commit_seq, Some(head + 1));
-    assert_eq!(r.commit.unwrap().inserted, 2);
+    assert_eq!(r.commit.unwrap().inserted, Some(2));
 
     // A7: a stored query by name, with a typed parameter
     ds.put_stored_query(
