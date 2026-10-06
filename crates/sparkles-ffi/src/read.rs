@@ -8,7 +8,7 @@ use crate::labels::Labels;
 use oxrdf::{NamedOrBlankNode, Term};
 use parking_lot::Mutex;
 use sparkles::QuadIter;
-use sparkles::embed::{GraphMatch, QuadPattern, count_in, quads_in};
+use sparkles::embed::{GraphMatch, QuadPattern, contains_in, count_in, quads_in};
 use sparkles::id::Id;
 use sparkles::store::Snapshot;
 use std::sync::Arc;
@@ -205,7 +205,10 @@ impl SnapReader<'_> {
     }
 
     pub fn contains(&self, pattern: &[u8]) -> FfiResult<bool> {
-        Ok(self.count(pattern)? > 0)
+        match self.pattern(pattern)? {
+            Some(p) => Ok(contains_in(self.snap, &p)?),
+            None => Ok(false),
+        }
     }
 
     /// The named graphs that have quads, as a batch of one column.

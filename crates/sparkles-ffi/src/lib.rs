@@ -17,6 +17,12 @@ mod backups;
 mod branches;
 mod catalog;
 mod documents;
+mod helpers;
+pub use helpers::{
+    DiagnosticsRequest, EmbeddingEnvironment, GeoFeaturesRequest, RecallRequest, TextSearchRequest,
+    check_data, check_iri, check_langtag, convert_geometries, format_document, lint_document,
+    preview_schedule,
+};
 mod history;
 mod settings;
 pub use admin::{

@@ -88,13 +88,16 @@ internal class Handle(val key: String?, val ffi: FfiDataset, val options: Sparkl
         closed = true
         for (sink in sinks.values.toList()) sink.close()
         sinks.clear()
-        for (t in openWrites) {
+        for (t in openWrites.toList()) {
             try {
                 t.write?.abort()
             } catch (_: RuntimeException) {
+            } finally {
+                t.release()
             }
         }
         openWrites.clear()
+        txns.get()?.let { if (it.mode == ReadWrite.WRITE && !it.active) txns.remove() }
         ffi.close()
     }
 }
@@ -112,10 +115,11 @@ internal class TxnState(val handle: Handle, val type: TxnType) {
     @Volatile
     var active = true
 
-    val writer = TermWriter()
+    private var writer: TermWriter? = null
     var ops = 0
 
     fun addOp(op: Int, g: org.apache.jena.graph.Node?, s: org.apache.jena.graph.Node, p: org.apache.jena.graph.Node, o: org.apache.jena.graph.Node) {
+        val writer = this.writer ?: TermWriter().also { this.writer = it }
         writer.buf.put(op)
         writer.graph(g)
         writer.term(s)
@@ -128,6 +132,7 @@ internal class TxnState(val handle: Handle, val type: TxnType) {
     /** Send the buffered writes to the worker. */
     fun flush() {
         if (ops == 0) return
+        val writer = checkNotNull(this.writer)
         val bytes = writer.buf.toByteArray()
         writer.reset()
         ops = 0

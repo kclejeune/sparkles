@@ -22,6 +22,19 @@ public data class VectorOptions @JvmOverloads public constructor(
 public data class VectorStatus(public val name: String, public val dimension: Int, public val metric: String, public val state: String)
 private fun io.github.kclejeune.sparkles.jena.internal.ffi.VectorInfo.toStatus(): VectorStatus = VectorStatus(name, dimension.toInt(), metric, state)
 public class SparklesVectorIndexes internal constructor(private val owner: DatasetGraphSparkles) {
+    @JvmOverloads public fun recall(name: String, options: RecallOptions = RecallOptions()): org.apache.jena.atlas.json.JsonObject = SparklesOperation().use { recall(name, options, it) }
+    public fun recall(name: String, options: RecallOptions, operation: SparklesOperation): org.apache.jena.atlas.json.JsonObject {
+        owner.checkCapture("indexes.vector.recall"); require(options.samples > 0 && options.k > 0 && (options.ef == null || options.ef > 0))
+        return document(ffi { owner.handle.ffi.vectorRecall(name, io.github.kclejeune.sparkles.jena.internal.ffi.RecallRequest(options.samples.toUInt(), options.k.toUInt(), options.ef?.toUInt()), operation.native) }).asObject
+    }
+    public fun reembed(name: String) { owner.checkNoTxn("indexes.vector.reembed"); ffi { owner.handle.ffi.vectorReembed(name) } }
+    public fun embeddingStatus(name: String): org.apache.jena.atlas.json.JsonObject? { owner.checkOpen(); return ffi { owner.handle.ffi.vectorEmbeddingStatus(name) }?.let { document(it).asObject } }
+    public fun setEmbeddingEnvironment(environment: EmbeddingEnvironment?) {
+        owner.checkNoTxn("indexes.vector.embeddingEnvironment")
+        ffi { owner.handle.ffi.vectorEmbeddingEnvironment(environment?.let { io.github.kclejeune.sparkles.jena.internal.ffi.EmbeddingEnvironment(it.enabled, it.allowPrivate, it.secrets) }) }
+    }
+    @JvmOverloads public fun embedUntilIdle(timeoutMillis: Long = 3600000) { SparklesOperation(timeoutMillis).use { embedUntilIdle(it) } }
+    public fun embedUntilIdle(operation: SparklesOperation) { owner.checkNoTxn("indexes.vector.embedUntilIdle"); ffi { owner.handle.ffi.vectorEmbedUntilIdle(operation.native) } }
     public fun list(): List<VectorStatus> { owner.checkOpen(); return ffi { owner.handle.ffi.vectorList() }.map { it.toStatus() } }
     public fun get(name: String): VectorStatus? { owner.checkOpen(); return ffi { owner.handle.ffi.vectorGet(name) }?.toStatus() }
     public fun put(name: String, options: VectorOptions): Boolean {
@@ -36,6 +49,10 @@ public data class GeoOptions @JvmOverloads public constructor(public val wgs84: 
 public data class GeoStatus(public val enabled: Boolean, public val state: String)
 private fun io.github.kclejeune.sparkles.jena.internal.ffi.GeoInfo.toStatus(): GeoStatus = GeoStatus(enabled, state)
 public class SparklesGeoIndex internal constructor(private val owner: DatasetGraphSparkles) {
+    public fun features(options: GeoFeaturesOptions): org.apache.jena.atlas.json.JsonObject {
+        owner.checkCapture("indexes.geo.features"); require(options.bbox.size == 4 && options.bbox.all { it.isFinite() } && options.limit in 0..50000 && (options.tolerance == null || options.tolerance.isFinite() && options.tolerance >= 0))
+        return document(ffi { owner.handle.ffi.geoFeatures(io.github.kclejeune.sparkles.jena.internal.ffi.GeoFeaturesRequest(options.bbox, options.graph, options.predicate, options.limit.toUInt(), options.tolerance)) }).asObject
+    }
     public fun status(): GeoStatus? { owner.checkOpen(); return ffi { owner.handle.ffi.geoStatus() }?.toStatus() }
     @JvmOverloads public fun enable(options: GeoOptions = GeoOptions()): GeoStatus { owner.checkNoTxn("indexes.geo.enable"); return ffi { owner.handle.ffi.geoEnable(GeoSettings(options.wgs84, options.queryRewrite)) }.toStatus() }
     public fun disable() { owner.checkNoTxn("indexes.geo.disable"); ffi { owner.handle.ffi.geoDisable() } }
@@ -46,6 +63,12 @@ public enum class ReasonProfile { RDFS, RDFS_SIMPLE, OWL_RL, RULES }
 public data class ReasonOptions @JvmOverloads public constructor(public val profile: ReasonProfile = ReasonProfile.RDFS, public val rules: String? = null, public val incremental: Boolean = false)
 public data class ReasonReport(public val profile: String, public val inferred: Long, public val iterations: Long, public val millis: Long, public val warnings: List<String>)
 public class SparklesReasoning internal constructor(private val owner: DatasetGraphSparkles) {
+    public fun status(): org.apache.jena.atlas.json.JsonObject? { owner.checkOpen(); return ffi { owner.handle.ffi.reasonStatus() }?.let { document(it).asObject } }
+    @JvmOverloads public fun diagnostics(options: DiagnosticsOptions = DiagnosticsOptions()): org.apache.jena.atlas.json.JsonObject = SparklesOperation().use { diagnostics(options, it) }
+    public fun diagnostics(options: DiagnosticsOptions, operation: SparklesOperation): org.apache.jena.atlas.json.JsonObject {
+        owner.checkCapture("reasoning.diagnostics"); require(options.limit in 0..10000)
+        return document(ffi { owner.handle.ffi.reasonDiagnostics(io.github.kclejeune.sparkles.jena.internal.ffi.DiagnosticsRequest(options.checks, options.limit.toUInt(), options.includeInferences, options.graphs, options.closure), operation.native) }).asObject
+    }
     public fun rdfs(): SparklesRdfs = SparklesRdfs(owner)
     @JvmOverloads public fun run(options: ReasonOptions = ReasonOptions()): ReasonReport = SparklesOperation().use { run(options, it) }
     public fun run(options: ReasonOptions, operation: SparklesOperation): ReasonReport {

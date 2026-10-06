@@ -18,6 +18,7 @@ import org.apache.jena.riot.Lang
 import org.apache.jena.riot.RDFDataMgr
 import org.apache.jena.sparql.JenaTransactionException
 import org.apache.jena.sparql.core.Quad
+import org.apache.jena.sparql.core.Transactional.Promote
 import org.apache.jena.sparql.exec.QueryExec
 import org.apache.jena.sparql.exec.UpdateExec
 import org.apache.jena.sparql.expr.NodeValue
@@ -69,6 +70,34 @@ class AcceptanceTest {
         assertEquals(listOf(iri("g")), Txn.calculateRead(dsg) { Iter.toList(dsg.listGraphNodes()) })
         assertTrue(Txn.calculateRead(dsg) { dsg.defaultGraph.isEmpty })
         assertEquals(1L, dsg.size())
+    }
+
+    @Test
+    fun graph_existence_checks_follow_the_transaction_view() {
+        val dsg = memory()
+        assertTrue(dsg.isEmpty)
+        assertTrue(dsg.unionGraph.isEmpty)
+        Txn.executeWrite(dsg) {
+            dsg.add(Quad.create(Quad.defaultGraphIRI, iri("default"), iri("p"), iri("o")))
+            assertFalse(dsg.isEmpty)
+            assertFalse(dsg.defaultGraph.isEmpty)
+            assertTrue(dsg.unionGraph.isEmpty)
+            assertFalse(dsg.contains(Quad.unionGraph, iri("default"), null, null))
+            dsg.add(Quad.create(iri("g"), iri("named"), iri("p"), iri("o")))
+            assertFalse(dsg.unionGraph.isEmpty)
+            assertFalse(dsg.getGraph(iri("g")).isEmpty)
+            assertTrue(dsg.containsGraph(iri("g")))
+            assertFalse(dsg.containsGraph(iri("missing")))
+        }
+        Txn.executeWrite(dsg) {
+            dsg.getGraph(iri("g")).clear()
+            assertTrue(dsg.getGraph(iri("g")).isEmpty)
+            assertTrue(dsg.unionGraph.isEmpty)
+            assertFalse(dsg.containsGraph(iri("g")))
+            assertFalse(dsg.isEmpty)
+        }
+        assertFalse(dsg.isEmpty)
+        assertTrue(dsg.unionGraph.isEmpty)
     }
 
     @Test
@@ -230,6 +259,123 @@ class AcceptanceTest {
             }
         }
         assertTrue(dsg.contains(q2))
+    }
+
+    @Test
+    fun isolated_promotion_captures_the_start_of_both_promotable_types() {
+        val dsg = memory()
+        Txn.executeWrite(dsg) { dsg.add(Quad.create(Quad.defaultGraphIRI, iri("seed"), iri("p"), iri("o"))) }
+        for (type in listOf(TxnType.READ_PROMOTE, TxnType.READ_COMMITTED_PROMOTE)) {
+            val q = Quad.create(Quad.defaultGraphIRI, iri("promoted$type"), iri("p"), iri("o"))
+            dsg.begin(type)
+            assertTrue(dsg.promote(Promote.ISOLATED))
+            dsg.add(q)
+            dsg.commit()
+            assertTrue(dsg.contains(q))
+
+            dsg.begin(type)
+            val outside = Quad.create(Quad.defaultGraphIRI, iri("outside$type"), iri("p"), iri("o"))
+            val other = Thread { Txn.executeWrite(dsg) { dsg.add(outside) } }
+            other.start()
+            other.join(5000)
+            assertFalse(other.isAlive, "concurrent commit did not finish")
+            assertFalse(dsg.promote(Promote.ISOLATED))
+            assertFalse(dsg.contains(outside), "failed promotion preserves its original snapshot")
+            dsg.end()
+            assertTrue(dsg.contains(outside))
+        }
+    }
+
+    @Test
+    fun explicit_read_empty_write_and_buffered_write_lifecycle() {
+        val dsg = memory()
+        val seed = Quad.create(Quad.defaultGraphIRI, iri("seed"), iri("p"), iri("o"))
+        val first = Quad.create(Quad.defaultGraphIRI, iri("first"), iri("p"), iri("o"))
+        val second = Quad.create(Quad.defaultGraphIRI, iri("second"), iri("p"), iri("o"))
+        val aborted = Quad.create(Quad.defaultGraphIRI, iri("aborted"), iri("p"), iri("o"))
+        Txn.executeWrite(dsg) { dsg.add(seed) }
+        dsg.begin(TxnType.READ)
+        assertFalse(dsg.promote(Promote.ISOLATED))
+        assertFalse(dsg.promote(Promote.READ_COMMITTED))
+        assertThrows(JenaTransactionException::class.java) { dsg.add(first) }
+        assertTrue(dsg.contains(seed))
+        dsg.end()
+
+        val seq = dsg.headCommit().seq
+        dsg.begin(TxnType.WRITE)
+        dsg.commit()
+        assertEquals(seq, dsg.headCommit().seq)
+        assertFalse(dsg.lastReceipt()!!.isCommitted())
+        Txn.executeWrite(dsg) {
+            dsg.add(first)
+            assertTrue(dsg.contains(first)) // flush before reading the write view
+            dsg.add(second)
+            assertTrue(dsg.contains(second)) // reuse the buffer after that flush
+        }
+        assertTrue(dsg.contains(first))
+        assertTrue(dsg.contains(second))
+        dsg.begin(TxnType.WRITE)
+        dsg.add(aborted)
+        assertTrue(dsg.contains(aborted))
+        dsg.abort()
+        assertFalse(dsg.contains(aborted))
+    }
+
+    @Test
+    fun close_aborts_a_buffered_write_after_a_read(@TempDir dir: Path) {
+        val db = dir.resolve("close-buffer")
+        val seed = Quad.create(Quad.defaultGraphIRI, iri("seed"), iri("p"), iri("o"))
+        val pending = Quad.create(Quad.defaultGraphIRI, iri("pending"), iri("p"), iri("o"))
+        SparklesDatasets.open(db).use { dsg ->
+            Txn.executeWrite(dsg) { dsg.add(seed) }
+            dsg.begin(TxnType.READ)
+            assertTrue(dsg.contains(seed))
+            dsg.end()
+            dsg.begin(TxnType.WRITE)
+            dsg.add(pending)
+            assertTrue(dsg.contains(pending))
+        }
+        SparklesDatasets.open(db).use { dsg ->
+            assertTrue(dsg.contains(seed))
+            assertFalse(dsg.contains(pending))
+        }
+    }
+
+    @Test
+    fun closing_one_alias_preserves_the_other_alias_write(@TempDir dir: Path) {
+        val db = dir.resolve("alias-write")
+        val pending = Quad.create(Quad.defaultGraphIRI, iri("pending"), iri("p"), iri("o"))
+        val first = SparklesDatasets.open(db)
+        SparklesDatasets.open(db).use { alias ->
+            first.begin(TxnType.WRITE)
+            first.add(pending)
+            first.close()
+            assertTrue(alias.contains(pending))
+            alias.commit()
+            assertTrue(alias.contains(pending))
+        }
+        first.close()
+        SparklesDatasets.open(db).use { assertTrue(it.contains(pending)) }
+    }
+
+    @Test
+    fun retained_read_iterator_survives_owner_close_until_read_ends(@TempDir dir: Path) {
+        val db = dir.resolve("retained-read")
+        val dsg = SparklesDatasets.open(db)
+        Txn.executeWrite(dsg) {
+            repeat(1000) { dsg.add(Quad.create(Quad.defaultGraphIRI, iri("s$it"), iri("p"), iri("o"))) }
+        }
+        dsg.begin(TxnType.READ)
+        val iter = dsg.find(null, null, null, null)
+        dsg.close()
+        try {
+            assertEquals(1000, Iter.count(iter))
+        } finally {
+            Iter.close(iter)
+            dsg.end()
+        }
+        dsg.close()
+        SparklesDatasets.open(db).use { assertEquals(1000, it.defaultGraph.size()) }
     }
 
     @Test

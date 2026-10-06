@@ -38,12 +38,14 @@ serde_json = "1"
 sparkles-reasoner = { path = "../sparkles-reasoner", optional = true }
 sparkles-shacl = { path = "../sparkles-shacl", optional = true }
 sparkles-shex = { path = "../sparkles-shex", optional = true }
+sparkles-fmt = { path = "../sparkles-fmt", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
-default = ["text", "geo", "reasoning", "shacl", "shex", "backup", "graphql"]
+default = ["text", "geo", "reasoning", "shacl", "shex", "backup", "graphql", "fmt"]
+fmt = ["sparkles/fmt", "dep:sparkles-fmt"]
 graphql = ["sparkles/graphql"]
 reasoning = ["sparkles/reasoning", "dep:sparkles-reasoner"]
 shacl = ["sparkles/shacl", "dep:sparkles-shacl"]

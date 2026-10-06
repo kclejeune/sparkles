@@ -18,6 +18,10 @@ public data class ConflictCell(public val graph: String?, public val subject: St
 public data class MergeReport(public val merged: Boolean, public val upToDate: Boolean, public val fastForward: Boolean, public val squashed: Boolean, public val inserted: Long, public val deleted: Long, public val conflictsFound: Long, public val conflictsResolved: Long, public val conflicts: List<ConflictCell>, public val truncated: Boolean, public val receipt: CommitReceipt?)
 private fun io.github.kclejeune.sparkles.jena.internal.ffi.MergeInfo.toReport(): MergeReport = MergeReport(merged, upToDate, fastForward, squashed, inserted.toLong(), deleted.toLong(), conflictsFound.toLong(), conflictsResolved.toLong(), conflicts.map { ConflictCell(it.graph, it.subject, it.predicate, it.base, it.ours, it.theirs) }, truncated, receipt?.toReceipt())
 public class SparklesBranches internal constructor(private val owner: DatasetGraphSparkles) {
+    @JvmOverloads public fun commitGraph(branches: List<String>? = null, before: String? = null, limit: Int = 100): org.apache.jena.atlas.json.JsonObject {
+        require(limit >= 0); owner.checkCapture("branches.commitGraph"); Registry.checkNoTransactionsForDataset(owner.handle.ownerDatasetId)
+        return document(ffi { owner.handle.ffi.commitGraph(branches, before, limit.toUInt()) }).asObject
+    }
     public fun list(): List<BranchInfo> { owner.checkCapture("branches.list"); Registry.checkNoTransactionsForDataset(owner.handle.ownerDatasetId); return ffi { owner.handle.ffi.branchesList() }.map { it.toInfo() } }
     public fun get(name: String): BranchInfo { capture(listOf(name)); return ffi { owner.handle.ffi.branchesGet(name) }.toInfo() }
     @JvmOverloads public fun create(name: String, from: String = "main", at: String = "head", protected: Boolean = false, note: String? = null): BranchInfo {

@@ -34,7 +34,7 @@ internal class GraphViewSparkles(private val dsg: DatasetGraphSparkles, private 
     override fun graphBaseContains(t: Triple): Boolean =
         dsg.contains(node, t.subject, t.predicate, t.`object`)
 
-    override fun isEmpty(): Boolean = graphBaseSize() == 0
+    override fun isEmpty(): Boolean = !dsg.contains(node, null, null, null)
 
     override fun performAdd(t: Triple) {
         if (Quad.isUnionGraph(gn)) throw AddDeniedException("Can't update the union graph of a dataset")

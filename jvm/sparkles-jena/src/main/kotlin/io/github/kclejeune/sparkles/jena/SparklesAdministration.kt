@@ -94,6 +94,11 @@ public class SparklesIndexes internal constructor(private val owner: DatasetGrap
     public fun geo(): SparklesGeoIndex = SparklesGeoIndex(owner)
 }
 public class SparklesTextIndex internal constructor(private val owner: DatasetGraphSparkles) {
+    @JvmOverloads public fun search(query: String, options: TextSearchOptions = TextSearchOptions()): org.apache.jena.atlas.json.JsonObject = SparklesOperation().use { search(query, options, it) }
+    public fun search(query: String, options: TextSearchOptions, operation: SparklesOperation): org.apache.jena.atlas.json.JsonObject {
+        owner.checkCapture("indexes.text.search"); require(options.limit >= 0)
+        return document(ffi { owner.handle.ffi.textSearch(io.github.kclejeune.sparkles.jena.internal.ffi.TextSearchRequest(query, options.predicates, options.language, options.graph, options.limit.toUInt(), options.highlight), operation.native) }).asObject
+    }
     public fun status(): TextStatus? { owner.checkOpen(); return ffi { owner.handle.ffi.textStatus() }?.toStatus() }
     @JvmOverloads
     public fun enable(options: TextOptions = TextOptions()): TextStatus {

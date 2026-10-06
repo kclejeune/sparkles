@@ -110,6 +110,49 @@ pub fn count_in(snap: &Arc<Snapshot>, pattern: &QuadPattern) -> Result<u64> {
     Ok(n)
 }
 
+/// Whether a pattern matches any quad on `snap`. Stops at the first match without
+/// decoding terms or counting the remaining matches, including in a union graph.
+pub fn contains_in(snap: &Arc<Snapshot>, pattern: &QuadPattern) -> Result<bool> {
+    let Some(plan) = pattern.plan(snap) else {
+        return Ok(false);
+    };
+    if !plan.named_only && plan.bound.iter().all(Option::is_none) {
+        return Ok(!snap.is_empty());
+    }
+    if plan.named_only && plan.bound.iter().all(Option::is_none) {
+        // Named graph IDs sort after the default graph. Use the graph-first index
+        // to skip its entire range, including when there are no named graphs.
+        let mut found = false;
+        snap.scan_between(
+            crate::index::Perm::Gspo,
+            [Id::DEFAULT_GRAPH.0 + 1, 0, 0, 0],
+            [u64::MAX; 4],
+            |chunk| {
+                found = match chunk {
+                    crate::store::Chunk::Block(_, start, end) => start < end,
+                    crate::store::Chunk::Row(_) => true,
+                };
+                Ok(!found)
+            },
+        )?;
+        return Ok(found);
+    }
+    if plan.bound.iter().all(Option::is_some) {
+        return snap.contains(&plan.bound.map(|id| Id(id.unwrap())));
+    }
+    let mut found = false;
+    snap.scan(plan.perm, &plan.prefix, |chunk| {
+        found = match chunk {
+            crate::store::Chunk::Block(block, start, end) => {
+                (start..end).any(|i| plan.matches(&plan.perm.to_quad(&block.key(i))))
+            }
+            crate::store::Chunk::Row(key) => plan.matches(&plan.perm.to_quad(&key)),
+        };
+        Ok(!found)
+    })?;
+    Ok(found)
+}
+
 impl QuadIter {
     /// The next matching quad as ids (subject, predicate, object, graph), without
     /// decoding its terms. A binding that sends terms once per batch decodes each
@@ -460,6 +503,7 @@ mod tests {
                 .unwrap();
             assert_eq!(quads.len(), want, "{p:?}");
             assert_eq!(count_in(&snap, &p).unwrap(), want as u64, "{p:?}");
+            assert_eq!(contains_in(&snap, &p).unwrap(), want > 0, "{p:?}");
             let mut it = quads_in(snap.clone(), &p);
             let mut ids = 0;
             while let Some(q) = it.next_ids() {
@@ -469,6 +513,48 @@ mod tests {
             }
             assert_eq!(ids, want);
         }
+    }
+
+    #[test]
+    fn existence_respects_union_graph_and_transaction_snapshots() {
+        let ds = data();
+        let before = ds.snapshot();
+        let default_only = pat(GraphMatch::Any, Some("a"), Some("p"));
+        let union_default_only = pat(GraphMatch::Union, Some("a"), Some("p"));
+        assert!(contains_in(&before, &default_only).unwrap());
+        assert!(!contains_in(&before, &union_default_only).unwrap());
+        let full = QuadPattern {
+            graph: GraphMatch::Named(n("g2").into()),
+            subject: Some(n("b").into()),
+            predicate: Some(n("p")),
+            object: Some(Literal::new_simple_literal("3").into()),
+        };
+        assert!(contains_in(&before, &full).unwrap());
+        ds.transaction(|tx| {
+            tx.remove_matching(&pat(GraphMatch::Any, Some("b"), None))?;
+            assert!(!contains_in(&tx.snapshot(), &full)?);
+            assert!(!contains_in(
+                &tx.snapshot(),
+                &pat(GraphMatch::Union, Some("b"), None)
+            )?);
+            assert!(contains_in(&before, &full)?);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!contains_in(&ds.snapshot(), &full).unwrap());
+        assert!(contains_in(&before, &full).unwrap());
+        ds.transaction(|tx| {
+            tx.remove_matching(&pat(GraphMatch::Union, None, None))?;
+            assert!(!contains_in(
+                &tx.snapshot(),
+                &pat(GraphMatch::Union, None, None)
+            )?);
+            assert!(contains_in(&tx.snapshot(), &QuadPattern::any())?);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!contains_in(&ds.snapshot(), &pat(GraphMatch::Union, None, None)).unwrap());
+        assert!(contains_in(&before, &pat(GraphMatch::Union, None, None)).unwrap());
     }
 
     #[test]

@@ -3064,6 +3064,7 @@ dependencies = [
  "spargebra",
  "sparkles-backup",
  "sparkles-core",
+ "sparkles-fmt",
  "sparkles-graphql",
  "sparkles-reasoner",
  "sparkles-shacl",
@@ -3160,11 +3161,27 @@ dependencies = [
  "serde",
  "serde_json",
  "sparkles",
+ "sparkles-fmt",
  "sparkles-reasoner",
  "sparkles-shacl",
  "sparkles-shex",
  "tempfile",
  "uniffi",
+]
+
+[[package]]
+name = "sparkles-fmt"
+version = "0.1.0"
+dependencies = [
+ "json-event-parser",
+ "lz4_flex 0.14.0",
+ "oxrdf",
+ "oxsdatatypes",
+ "oxttl",
+ "rayon",
+ "spargebra",
+ "thiserror 2.0.21",
+ "unicode-width",
 ]
 
 [[package]]

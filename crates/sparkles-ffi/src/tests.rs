@@ -212,6 +212,28 @@ fn write_read_and_query() {
     let mut quad = Vec::new();
     quad_items(&mut quad, Some(&g), &iri("s1"), &iri("q"), &iri("o"));
     assert!(ds.contains(quad).unwrap());
+    assert!(
+        ds.contains(pattern(G::Named(&g), None, None, None))
+            .unwrap()
+    );
+    assert!(ds.contains(pattern(G::Union, None, None, None)).unwrap());
+    // A union existence check must ignore triples found only in the default graph.
+    assert!(
+        ds.contains(pattern(G::Any, Some(&iri("s9")), None, None))
+            .unwrap()
+    );
+    assert!(
+        !ds.contains(pattern(G::Union, Some(&iri("s9")), None, None))
+            .unwrap()
+    );
+    assert!(
+        !ds.contains(pattern(G::Any, Some(&iri("missing")), None, None))
+            .unwrap()
+    );
+    assert!(
+        !ds.contains(pattern(G::Any, Some(&lit), None, None))
+            .unwrap()
+    );
     assert_eq!(
         rows(&ds.graph_names().unwrap(), &mut Vec::new()),
         vec![vec![Some(g.clone())]]
@@ -228,6 +250,8 @@ fn write_read_and_query() {
     w.commit().unwrap();
     assert_eq!(rt.count(pattern(G::Any, None, None, None)).unwrap(), 12);
     assert_eq!(ds.count(pattern(G::Any, None, None, None)).unwrap(), 2);
+    assert!(rt.contains(pattern(G::Default, None, None, None)).unwrap());
+    assert!(!ds.contains(pattern(G::Default, None, None, None)).unwrap());
 }
 
 #[test]

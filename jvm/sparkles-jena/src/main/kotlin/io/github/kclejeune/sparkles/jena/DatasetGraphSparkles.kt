@@ -102,7 +102,7 @@ public class DatasetGraphSparkles internal constructor(
 
     override fun contains(quad: Quad): Boolean = contains(quad.graph, quad.subject, quad.predicate, quad.`object`)
 
-    override fun isEmpty(): Boolean = countQuads(null, null, null, null) == 0L
+    override fun isEmpty(): Boolean = !contains(null, null, null, null)
 
     /** The number of named graphs, as Jena's `DatasetGraph.size` means. */
     override fun size(): Long = graphNames().size.toLong()
@@ -242,12 +242,11 @@ public class DatasetGraphSparkles internal constructor(
             val w = ffi { handle.ffi.beginWrite(null, true) }
                 ?: throw JenaTransactionException("the write transaction did not start")
             t.write = w
-            t.baseSeq = w.baseSeq().toLong()
             handle.openWrites.add(t)
         } else {
             val r = pinned?.fork() ?: ffi { handle.ffi.beginRead() }
             t.read = r
-            t.baseSeq = r.commitSeq().toLong()
+            if (type != TxnType.READ) t.baseSeq = r.commitSeq().toLong()
         }
         handle.txns.set(t)
     }
@@ -457,6 +456,16 @@ public class DatasetGraphSparkles internal constructor(
         checkNoTxn("compact")
         ffi { handle.ffi.compact(operation.native) }
     }
+    /** Drop cached query results without changing the dataset. */
+    public fun clearCache() { checkOpen(); ffi { handle.ffi.clearCache() } }
+    public fun explain(query: String): org.apache.jena.atlas.json.JsonObject = SparklesOperation().use { explain(query, it) }
+    public fun explain(query: String, operation: SparklesOperation): org.apache.jena.atlas.json.JsonObject { checkCapture("explain"); return document(ffi { handle.ffi.explain(query, operation.native) }).asObject }
+    public fun cloneToMemory(): DatasetGraphSparkles = SparklesOperation().use { cloneToMemory(it) }
+    public fun cloneToMemory(operation: SparklesOperation): DatasetGraphSparkles {
+        checkCapture("cloneToMemory")
+        return DatasetGraphSparkles(Registry.fromNative(ffi { handle.ffi.cloneToMemory(operation.native) }, options), options)
+    }
+
     public fun cloneTo(path: Path): Unit = SparklesOperation().use { cloneTo(path, it) }
     public fun cloneTo(path: Path, operation: SparklesOperation) {
         checkCapture("cloneTo")

@@ -14,6 +14,7 @@ import io.github.kclejeune.sparkles.jena.Sparkles;
 import io.github.kclejeune.sparkles.jena.SparklesBulkSink;
 import io.github.kclejeune.sparkles.jena.SparklesDatasets;
 import io.github.kclejeune.sparkles.jena.SparklesError;
+import io.github.kclejeune.sparkles.jena.SparklesHelpers;
 import io.github.kclejeune.sparkles.jena.SparklesFallback;
 import io.github.kclejeune.sparkles.jena.SparklesOptions;
 import java.io.ByteArrayInputStream;
@@ -37,6 +38,18 @@ import org.junit.jupiter.api.Test;
 class SparklesApiTest {
     private static Node iri(String local) {
         return NodeFactory.createURI("http://example.org/" + local);
+    }
+
+    @Test
+    void facadeHelpersAreUsableFromJava() {
+        assertEquals("en-US", SparklesHelpers.checkLanguageTag("EN-us").getString("canonical"));
+        assertTrue(SparklesHelpers.format("ask{}", "sparql").getString("text").contains("ASK"));
+        try (DatasetGraphSparkles source = SparklesDatasets.memory();
+                DatasetGraphSparkles clone = source.cloneToMemory()) {
+            assertFalse(source.datasetId().equals(clone.datasetId()));
+            assertNotNull(source.explain("ASK {}").get("plan"));
+            assertNotNull(source.branches().commitGraph().get("branches"));
+        }
     }
 
     @Test
