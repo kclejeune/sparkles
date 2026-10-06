@@ -1,17 +1,20 @@
 # F11: Encryption at rest and encrypted backups
 
-> **Status:** specified
+> **Status:** implemented in part
 >
-> **Phases:** Nothing is built. Phase 1 encrypts backup repositories on the client, the
-> part of [F05](F05-snapshot-repositories.md) Phase 3 that matters most because backups
-> leave the host. Phase 2 adds content-defined chunking and write-only repositories to
-> backups. Phase 3 encrypts database directories. Phase 4 encrypts the full-text, vector
-> and spatial index files.
+> **Phases:** Part of Phase 1 is built: an optional local-key/passphrase encrypted
+> repository engine in `sparkles-backup`, local provider lookup and offline key/backup
+> CLI commands, and trusted operator TOML server support. Authorized API/UI/Nix
+> integration and further operator recovery workflows remain. Phase 2 content-defined chunking and write-only
+> repositories, Phase 3 database-directory encryption, and Phase 4 full-text/vector/spatial
+> file encryption remain unbuilt.
 >
-> **User docs:** none.
+> **User docs:** [Encrypted repositories](../USAGE.md#encrypted-repositories).
+> The engine uses `sparkles-backup/encryption`; the facade and CLI/server use
+> `backup-encryption`.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
-> at the end will record how it lands.
+> at the end records the delivered scope and remaining work.
 
 This spec's sources are NIST SP 800-38D, the XChaCha20-Poly1305
 draft, the public documentation of AWS KMS, Google Cloud KMS, HashiCorp Vault Transit,
@@ -1471,4 +1474,98 @@ they hold.
 
 ## Outcome
 
-Nothing is built.
+The optional `sparkles-backup` `encryption` feature implements the local encrypted
+repository engine from part of Phase 1. Existing defaults and plaintext repositories
+retain their behavior. `Repository::open_encrypted` accepts explicitly resolved local
+32-byte keys or passphrases. The facade adds reference-only file, environment, systemd
+credential, passphrase-file and literal-argv command providers. The offline CLI and
+trusted operator TOML server path resolve them before opening the engine. Both
+encryption features remain off by default.
+This delivers part of the operator workflow, with further Phase 1 work remaining.
+
+Repositories use random master keys and wrapped keyslots, the specified AES-256-GCM,
+HKDF-SHA256 and HMAC-SHA256 scheme, keyed blob and append IDs, authenticated manifests,
+and encrypted manifest caches. Create, list, restore, verification and garbage collection
+support encrypted objects. Fixed-piece chunking remains; rotation excludes cross-epoch
+append/dedup parents. Additive key listing, addition, removal, rotation and epoch retirement
+use exclusive leases and recoverable publication intents. Retirement proves that no
+remaining manifest or blob needs the epoch, validates all surviving deletion targets
+before mutation, and permits independent offline recovery credentials to remain offline.
+Unleased readers retry inconsistent marker/slot snapshots during management publication.
+Native filesystem management pins the backend's canonical root, holds an advisory lock
+and validates the exclusive lease before durable atomic marker replacement; custom
+object stores retain conditional updates. Rotation and retirement survive interruption
+before or after publication. A retargeted configured filesystem alias fails closed.
+
+The offline CLI supports encrypted initialization, ordinary backup operations,
+configured policy execution and key listing/addition/removal/master rotation/epoch
+retirement. Policy execution retains the protected repository handle, resolves only
+selected credentials/providers after acquiring the stopped catalog lock, refuses key
+overrides and validates catalog/repository locations and protected key inputs before
+initialization. The explicit opened-repository API also validates current live attachment
+roots; session-only attachments are not persisted for offline discovery. Creation, retention
+and GC share cancellation; encrypted repository execution failures use static text. Added recovery references
+remain offline, and passphrase additions retry using the existing slot salt. TOML
+retains provider references in `ConfiguredRepository`; plain projections are now
+fallible and reject encrypted tables. Explicit retaining registry methods support trusted
+server TOML without exposing provider references in API views or persistence. API
+registration/update and managed API JSON reject encryption metadata, including null,
+before it can be silently projected into plaintext configuration.
+
+Trusted configured encrypted repositories support the existing server backup, restore,
+verify, GC and scheduled-policy flows on persistent backends. Cache misses resolve
+providers outside registry locks, including background startup/reload reachability checks;
+listener startup does not wait for those background checks. A per-generation async gate
+single-flights provider/KDF/open work. Every encrypted SIGHUP reload invalidates handles,
+even with unchanged references, and retains known UUID checks for the same location.
+Generation checks before engine open and before return/cache reject stale completions;
+operations already underway may finish on retained handles. Status/test-report writes are
+also generation guarded, and encrypted reachability/connection-test errors use static
+text. Secret files under server data, repositories or attached datasets are refused.
+Configured encrypted memory repositories are refused because reload/restart cannot
+preserve their ephemeral data/identity.
+
+Command cleanup kills the provider group and retains sole child ownership until it is
+reaped, including dropped resolution futures and runtime shutdown. A failed cleanup
+thread spawn reaps synchronously rather than abandoning the child.
+
+Task cancellation reaches provider resolution and cache waits from backup/restore/verify/GC
+and scheduled-policy list/retention. Engine opening retains existing backend deadlines and
+checks cancellation before cache publication. A canceled final capture/retention operation
+classifies the policy as canceled and suppresses subsequent retention/GC; ordinary
+recoverable dataset failures retain their behavior.
+
+Parsing, ciphertext and Argon2 inputs are bounded before expensive allocation or key
+derivation. Secret diagnostics are redacted. Long-lived keys and retained passphrases
+occupy dedicated locked pages excluded from dumps and are zeroized before release.
+That backend currently supports Linux/Android; unsupported protection fails explicitly
+rather than silently weakening it. Passphrase work runs on blocking workers limited to
+two simultaneous key jobs. This implementation does not establish FIPS operational
+compliance or protect against privileged access to a running process.
+
+Engine validation passes 131 encryption-enabled tests and 35 focused crypto tests with
+the minimal filesystem feature set. Trusted-server acceptance passes 73 encrypted server
+backup tests (including 17 encryption cases) and 56 default server backup tests. The
+offline-policy additions pass 17 encrypted CLI tests, 15 default CLI tests and 20 server
+policy tests. Fresh-catalog repository identity validation passes nine focused facade
+policy tests on each default and encrypted build. Strict Clippy passes for the relevant
+engine, facade and server targets; default/minimal engine checks also pass. Coverage
+includes published crypto vectors,
+authenticated corruption and identity/name swaps, wrong/missing keys, input bounds,
+sealed caches, create/restore/verify/GC, durable initialization/rotation/retirement
+boundaries, stale handles, cancellation, independent protected pages, malformed retirement
+targets and unavailable offline recovery credentials. Native tests cover actual filesystem
+rotation/retirement/reopen, concurrent rotations, configured alias retargeting, lost/expired
+leases during preparation, dropped preparation cleanup, actual lease retention during
+canceled/dropped post-rename sync, durable retry before rotation/retirement cleanup and
+initializer cleanup that preserves a concurrently rotated marker. Identical local key bytes
+recover historical/current epochs across file, environment, credential and command providers
+without changing stored slot provenance. Independent review also exercises mixed-epoch reads,
+retirement recovery and provider migration through public interfaces.
+
+Remaining Phase 1 work includes Vault, authorized API provider/key-management workflows,
+UI/Nix wiring, paper export and operator recovery workflows, metrics/audit, non-Linux
+protected-memory backends, FIPS operational-mode evidence and representative performance
+measurements.
+Cloud KMS providers and all later phases remain unimplemented. No complete Phase 1
+claim is made.

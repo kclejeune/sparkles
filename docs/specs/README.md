@@ -41,8 +41,7 @@ behaviour, and the Outcome explains the difference.
 | `X` | Internal engineering that does not derive from any other database product: compression codecs, the formatter, the linter, and the OpenAPI description with shell completions. |
 
 Numbers are stable. Gaps in the numbering are roadmap items without a spec: writes and a
-property-graph representation for the Cypher frontend, a Datalog frontend, and the
-extension API for functions, property functions and aggregates (P03). G01
+property-graph representation for the Cypher frontend and a Datalog frontend. G01
 replaced the narrower geospatial item on that list.
 
 ## Specs
@@ -54,6 +53,7 @@ there is no code yet.
 
 | Spec | Summary | Status |
 |---|---|---|
+| [P03](P03-query-extensions.md) | Per-query registered scalar functions, property functions and aggregates, with budgets, access-filtered reads and batched binding callbacks | partial: Rust scalars, aggregates and properties |
 | [CI](CI-commit-identity.md) | Durable dataset ids, a gap-free commit sequence, commit receipts and headers, `/$/commits` and `sparkles log`, commit messages, change digests, entity tags, the catalog horizon and the change feed | implemented (Phases 1–3) |
 | [C01](C01-observability-and-budgets.md) | Request ids, access log, Prometheus metrics, readiness, OpenTelemetry, memory and result-size budgets, cancellation on disconnect | implemented in part |
 | [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, a SHACL constraints layer, subject classes per predicate, class profiles, schema diffs between commits, reports kept up to date from the changes, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented |
@@ -76,9 +76,9 @@ there is no code yet.
 | [F06](F06-snapshots-and-point-in-time.md) | Point-in-time reads with `?at=`, named snapshots, a retention window, diffs between commits as JSON or RDF Patch, a change feed, a change log and history queries | implemented in part (Phases 1–3; full-text search at pins and pin rebasing deferred) |
 | [F07](F07-path-search.md) | Paths as solutions through `SERVICE path:search`: one, all or the k shortest paths, or every path up to a length, over chosen predicates and directions, with ends bound by the query and weights on reifiers | implemented in part (Phase 1, part of Phase 2) |
 | [F08](F08-embeddings-on-write.md) | Vectors computed from selected literals by an OpenAI-compatible embeddings endpoint after each commit, with catch-up, re-embedding, status, metrics, chunking, rate limits and text queries | implemented (Phases 1 and 2) |
-| [F09](F09-branches-and-merges.md) | Persistent and memory branches, shared immutable indexes, three-way and replayed merges, conflict resolution, protection, renames, independent branch backups and the commit graph | implemented in part (Phases 1–2, cherry-picks from Phase 3) |
+| [F09](F09-branches-and-merges.md) | Persistent and memory branches, shared immutable indexes, three-way and replayed merges, recursive virtual bases, explicit Rust/offline CLI relinking, independent branch backups and the commit graph | implemented in part (Phases 1–2 and parts of Phase 3) |
 | [F10](F10-replication.md) | Applying RDF Patch through Fuseki's `patch` operation, with `H prev` as a concurrency check, then read replicas that pull commits as RDF Patch, keep the primary's commit ids, bootstrap from a generation copy or a backup, and are promoted by hand | implemented in part (Phase 1; Phases 2 and 3 deferred) |
-| [F11](F11-encryption-at-rest.md) | Client-side encrypted backup repositories with keyed blob ids, content-defined chunking, and AES-256-GCM encryption at rest for dataset files under KMS-wrapped per-dataset keys | specified |
+| [F11](F11-encryption-at-rest.md) | Client-side encrypted backup repositories with keyed blob ids, content-defined chunking, and AES-256-GCM encryption at rest for dataset files under KMS-wrapped per-dataset keys | implemented in part (local encrypted engine, local providers, offline CLI and trusted server TOML; authorized API/UI/Nix and further phases remain) |
 | [G01](G01-geosparql.md) | GeoSPARQL 1.1 functions, Jena's spatial extensions, a spatial index, spatial joins and the UI's maps | implemented in part (Phases 1–2, part of Phase 3) |
 | [G02](G02-shex.md) | ShEx 2.1 validation: ShExC, ShExJ and ShExR, shape maps, `POST /{ds}/shex` and write-time ShEx, with schemas in ShExR graphs of the dataset | implemented in part (Phases 1–2, Phase 3 except ShEx 2.2) |
 | [G03](G03-shaclc.md) | The SHACL Compact Syntax (`text/shaclc`) read and written wherever shapes go in or come out, and the SHACL 1.2 list constraints | implemented in part (Phase 1) |

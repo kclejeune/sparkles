@@ -13,8 +13,9 @@
 > conflicts, merges as tasks, per-branch gauges and the backup manifest's count of
 > left-out branches have shipped, and so have Python bindings, in-memory branches,
 > selected-branch backups, upstream full-text/spatial/vector index reuse, and
-> cherry-picks from Phase 3. Cross-server clones, relinking and virtual merge bases are not
-> built.
+> cherry-picks and automatic recursive virtual merge bases from Phase 3. Explicit
+> relinking is implemented in Rust and the offline CLI for persistent linked branches;
+> its HTTP and foreign-binding surfaces remain follow-ups. Cross-server clones are not built.
 >
 > **User docs:** [API: Branches and merges](../API.md#branches-and-merges) ·
 > [Usage: Branches and merges](../USAGE.md#branches-and-merges) ·
@@ -1706,7 +1707,30 @@ times the old build's as a geometric mean over 30 series. Eight interleaved load
   for a writer; the core options also support immediate no-wait refusal. Default
   capture APIs retain their existing behavior.
 
-Cross-server clones, relinking and virtual merge bases remain Phase 3 work.
+**Phase 3: recursive virtual bases and explicit Rust relinking.** Multiple best
+common ancestors are recursively synthesized from sparse changes without publishing
+a commit. Conflict-free synthesis reports `base: null`; conflicting ancestors refuse
+with real candidates and retain explicit-base selection. Replay requires a real base.
+Synthesis checks cancellation, deadlines, changed-quad budgets and bounded recursion.
+Tests cover two/three best ancestors, recursive histories, memory stores, restart,
+blank-node identity and conservative ancestor conflict refusal.
+
+`Dataset::relink_branch` and `Store::relink_branch` explicitly move a persistent
+currently linked branch onto main's captured immutable index. A new linked generation
+contains a translated sparse `base.delta` overlay; compaction catch-up and atomic
+CURRENT publication preserve branch identity, head and concurrent writes. Ordinary
+compaction still builds an independent index. Main, memory and independent-index
+branches are refused by this initial scope. Old upstream holds remain while historical
+generations need them. Reader 3 is required before publication, and link format 2
+authenticates the immutable overlay's length/checksum. Children inherit overlays and
+WAL segments; standalone backups materialize their complete state. Restart, crash
+boundaries, cancellation, concurrent writes, history, corruption, child branches and
+materialized parent/child backup regressions pass. Core integrity checks report corrupt
+link metadata and overlays. The offline `sparkles branch relink --loc db NAME` command
+uses the controlled facade with responsive Ctrl-C handling, progress on stderr and
+text/JSON reports. It requires an existing database and exclusive directory lock;
+remote mode and a global branch selector are refused. HTTP/foreign bindings and
+cross-server clones remain Phase 3 work.
 
 
 Memory branch creation publishes the initialized store and branch entry together, so

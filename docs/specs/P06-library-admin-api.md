@@ -1764,7 +1764,8 @@ their existing documented exclusions. The checked-in OpenAPI description is curr
 
 
 The JVM and Node packages now bind the primary catalog and dataset administration
-handles. `bindings.toml` records concrete names for 144 JVM and 148 Node entries out of
-162; remaining helper and policy/utility entries retain explicit follow-up reasons.
-Python remains the strict full-parity surface. The corresponding binding specs describe
+handles. `bindings.toml` records concrete decisions for all 162 entries of the original
+administration surface in Python, JVM and Node. Deferred helper and policy/utility
+entries have been implemented. The newer explicit Rust branch-relink operation has
+a separate binding follow-up entry. The corresponding binding specs describe
 their supported controls, lifetime rules and deferred APIs.

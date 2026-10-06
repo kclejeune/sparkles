@@ -1172,8 +1172,22 @@ but merges. `branch protect NAME [--off]`, `branch show NAME`, `branch rename NA
 delete NAME [--force] [--reparent]` complete the set. A rename keeps the branch's
 commits and storage, and the old name stops working. `--reparent` deletes a branch that
 other branches start from: they take its upstream, and its storage stays while their
-history needs it, and every branch command works against a server with
+history needs it. These commands also work against a server with
 `--server URL --dataset NAME`.
+
+A persistent branch that still shares an index can move onto main's current index
+without changing its data, UUID or commit head:
+
+```sh
+sparkles branch relink --loc db dev
+sparkles branch relink --loc db dev --format json
+```
+
+Relinking runs offline against an existing database and requires its exclusive
+directory lock. It preserves branch writes as a sparse overlay and retains older
+indexes while readers or history need them. Main and branches with independent
+indexes are refused. Progress goes to stderr; Ctrl-C cancels the operation. Ordinary
+compaction still builds an independent index. HTTP relinking remains unavailable.
 
 `merge` prints the result, or the conflicts that stopped it:
 
@@ -1203,6 +1217,11 @@ parent, so the source stays ahead of the target and keeps its own history to its
 `--dry-run` shows what the merge would do. The exit status is 0 after
 a merge or when the target is already up to date, 2 when conflicts stopped the merge,
 and 1 on any other error.
+
+Criss-cross histories automatically use a recursive virtual merge base when their
+common ancestors combine without conflicts. Conflicting ancestors require explicit
+base selection. A virtual base is reported as `null` and creates no stored commit;
+replay requires a real base.
 
 `sparkles revert N` undoes commit N of the `--branch` branch, `main` by default, with
 a new commit of kind `revert`. Later changes to the same cells conflict as in a merge,
@@ -1493,7 +1512,8 @@ sparkles backup verify  --repo local b2 --level restore   # exists | data | rest
 sparkles backup restore --repo local b2 --to /srv/dr/ds [--replace]
 sparkles backup restore --repo local b2 --data /srv/sparkles [--as ds]  # into a stopped server
 sparkles backup delete  --repo local b1          # blobs go at the next gc
-sparkles backup policy list | show P | history P # policies of the config file (run: on a server)
+sparkles backup policy list | show P | history P # policies of the config file
+sparkles backup policy run P --data /srv/sparkles --backup-config backup.toml [--json]
 sparkles backup policy preview '30 2 * * *' --tz Europe/Berlin [--count 5]
 ```
 
@@ -1502,6 +1522,13 @@ dataset in the target data directory already has it. `--check quick|full|none` p
 integrity check that runs before the restored database is published. `sparkles serve`
 holds a lock on `<data>/sparkles-server.lock`, which allows one server per data
 directory, and `restore --data` refuses while a server holds it.
+
+`backup policy run` opens an existing stopped catalog with the same directory lock.
+It uses the named TOML policy and its configured repositories, captures the selected
+datasets, applies retention and runs configured garbage collection. Manual execution
+also permits a policy whose scheduler is disabled. Unchanged datasets can be skipped.
+JSON output includes the per-dataset results; backup or retention failures produce a
+nonzero exit status. Ctrl-C cancels the operation and preserves completed backups.
 
 A backup captures one selected branch; the default and scheduled policies capture
 `main`. A linked branch is materialized into standalone files without changing its
@@ -1539,6 +1566,112 @@ file. Write it by hand, or run
 `sparkles repo add … --credentials-name minio --credentials …` on the same file. Start the
 server with the file, or send it SIGHUP. Then `POST /$/repositories` with
 `"credentials": {"source": "named", "name": "minio"}`.
+
+### Encrypted repositories
+
+Build the CLI with `--features backup-encryption` to enable encrypted repositories.
+This feature is off in the default build and currently requires Linux or Android for
+protected key memory. Existing plaintext repositories keep their behavior. The offline
+CLI and trusted operator `serve --backup-config FILE` configuration support the same
+local key providers. HTTP registration and updates reject encryption metadata; keys
+and provider references remain operator-controlled.
+
+Store keys outside datasets, catalogs and the backup repository. Key files must be
+regular files with no group or other permissions. Each local key is exactly 32 raw
+bytes, 64 hexadecimal characters, or canonical base64 encoding of 32 bytes; text
+encodings permit surrounding ASCII whitespace. Passphrase files contain 1–4096 exact
+bytes: a final newline is part of the passphrase. Provider output is limited to 4096
+bytes. Configuration and flags contain references, never inline key material.
+
+```sh
+sparkles repo add secure --path /srv/backups/secure --encrypt \
+  --key-file /run/keys/backup-online --key-file /run/keys/backup-recovery
+sparkles backup create --loc db --repo secure --name b1
+sparkles repo key list --repo secure --json
+sparkles repo key add --repo secure --passphrase-file /run/keys/recovery-phrase --key-label offline
+sparkles repo key rotate-master --repo secure
+sparkles repo key remove --repo secure --slot UUID
+sparkles repo key retire --repo secure --epoch 1
+```
+
+Initialization requires two independent input references unless `--single-key-ok`
+explicitly accepts one. Keep an independent recovery key offline; a key added with
+`repo key add` is wrapped into each readable epoch without adding its reference to
+the online config. `--key-label` is required when adding a key. Repeating an addition
+with the same label and key completes an interrupted addition without duplicates.
+Removing a slot refuses to remove the last available wrap of an epoch. Rotation
+changes the master-key epoch for new backups; historical backups remain readable.
+Retirement requires that no remaining manifest or blob references that epoch. Delete
+obsolete backups and run garbage collection before retiring their epoch. Unavailable
+offline recovery inputs do not prevent retirement once that proof succeeds.
+
+Creation and `repo key add` also accept `--key-env VARIABLE`, `--key-credential NAME`
+(from `$CREDENTIALS_DIRECTORY`), or `--key-command-argv '["/absolute/provider","argument"]'`.
+Commands execute the literal argv without a shell, with a default 10-second timeout
+(`--key-command-timeout`, 1–300 seconds). They receive no stdin; stderr is discarded.
+Timeout or cancellation kills the provider process group and reaps the provider.
+Put secrets in the provider's input source, never in its argv. Credential names are
+simple identifiers and their files must remain inside the credential directory.
+
+A local key can move between file, environment, credential and command providers
+without changing its bytes or adding a slot. The slot retains its original source
+metadata; authenticated key bytes determine whether it opens.
+
+Ordinary repository commands can override configured references with
+`--repository-key-file`, `--repository-key-env`, `--repository-credential`,
+`--repository-passphrase-file`, or `--repository-key-command-argv`; command timeout
+uses `--repository-key-command-timeout`. Passphrase recovery also needs the original
+slot label, because it identifies the stored Argon2 salt:
+
+```sh
+sparkles backup restore --repo file:///srv/backups/secure b1 --to /srv/recovered \
+  --repository-passphrase-file /run/keys/recovery-phrase --repository-key-label offline
+```
+
+`backup policy run` also supports a configured encrypted repository. It uses the
+policy's named repository and resolves only that repository's configured credentials
+and key providers after acquiring the stopped catalog's lock. Repository key override
+flags are refused for policy runs. Key files must stay outside the catalog and configured
+repository directories; file-input checks also reject keys stored inside another Sparkles
+dataset. Session-only catalog attachments are not rediscovered by an offline run.
+Retention and garbage
+collection share cancellation with backup creation; completed backups are preserved.
+
+The Rust TOML API retains references in `ConfiguredRepository`, returned by
+`RepoToml::configured` and `ConfigFile::configured_repositories`. Plain projections
+`RepoToml::to_config` and `ConfigFile::repository_configs` now return `Result` and
+reject encrypted tables, preventing accidental conversion to a plaintext repository.
+CLI list/show output includes references and public keyslot metadata; it contains no
+resolved keys or passphrases. Cloud KMS, Vault and database-directory encryption
+remain unavailable.
+
+### Encrypted repositories in the server
+
+With `backup-encryption` enabled, `serve --backup-config FILE` also opens encrypted
+repositories defined in that trusted operator TOML. The same reference-only file,
+environment, systemd credential, passphrase-file and literal command providers are
+available for persistent repositories; encrypted `type = "memory"` is refused because
+it cannot retain its identity/data across reload or restart. The server resolves inputs
+on cache misses, including background startup and SIGHUP reachability checks, and caches
+the protected repository handle. Listener startup does not wait for those background
+checks. It uses that handle for backup, restore, verification, GC and scheduled policies. Secret files
+must remain outside server data and repository directories. API repository registration
+and updates reject an `encryption` field; provider references and key management remain
+operator-controlled.
+
+SIGHUP validates the replacement configuration before changing the registry and drops
+encrypted handles even when their source references are unchanged. Use it after replacing
+key-file contents or credential inputs. A missing or wrong input reports an unavailable
+or locked repository; it never opens a plaintext replacement. Same-location reloads keep
+the registered repository UUID check. Backup and scheduled-policy task cancellation
+interrupts provider commands and waiting for another repository opener; engine opening retains its
+existing backend deadlines and checks cancellation before publishing the cache result. Already-admitted operations can finish using their
+retained handles; later opens use the new configuration generation, and an old-generation
+open that finishes after reload cannot be returned or cached for the replacement entry.
+
+The existing plaintext-only Rust registry `load`/`replace_config` methods remain checked.
+Server integrations retaining trusted encryption references use `load_configured` and
+`replace_configured`; API views and API persistence exclude those references.
 
 ## Outbound requests (SERVICE and LOAD)
 
@@ -2081,6 +2214,185 @@ opts.default_graph_extra.clear();                  // without the inferences
 opts.rdfs = None;                                  // and without RDFS on read
 ds.query_with(q, &opts)?;
 ```
+
+### Registered scalar functions
+
+Rust applications can register scalar functions by absolute IRI for one query. Build
+an immutable registry and pass it through `QueryOptions::extensions`; separate
+registries may implement the same IRI differently. Running results retain their
+registry even after the application drops its reference.
+
+```rust
+use oxrdf::Term;
+use sparkles::Dataset;
+use sparkles::sparql::QueryOptions;
+use sparkles::sparql::extensions::{
+    ExtensionRegistry, ScalarContext, ScalarDescriptor, Volatility,
+};
+
+let ds = Dataset::memory();
+let mut registry = ExtensionRegistry::builder();
+let mut identity = ScalarDescriptor::new(
+    "urn:app:identity",
+    1..=1,
+    |ctx: &ScalarContext<'_>, args: &[Term]| {
+        ctx.check()?;
+        Ok(args[0].clone())
+    },
+)?;
+identity.volatility = Volatility::Immutable;
+registry.register_scalar(identity)?;
+let options = QueryOptions {
+    extensions: Some(registry.build()),
+    ..ds.query_options()
+};
+let result = ds.query_with(
+    "SELECT (<urn:app:identity>(\"hello\") AS ?value) WHERE {}",
+    &options,
+)?;
+```
+
+Callbacks receive owned RDF terms and a context with cancellation, deadline and
+budget checks. A domain error returns `ScalarError::Expression` and follows SPARQL's
+expression-error rules; execution errors abort the query. A fatal callback failure
+also prevents a captured write transaction from committing, even if application
+code catches the query error. Nested queries or writes on that dataset family are
+rejected. Callbacks are trusted application code and must check cancellation during
+their own long-running work.
+
+`Volatile` is the default volatility. Queries that invoke registered functions bypass
+result caching. The batch interface currently receives one argument row per call.
+Registration applies to direct IRI calls; dynamic dispatch and foreign-language
+callback adapters remain separate work.
+
+### Registered aggregates
+
+Rust applications can register an aggregate by absolute IRI in the same per-query registry. Each group receives its own owned accumulator. Explicit `AGG` syntax keeps parsed and prepared queries independent of the registry supplied at execution:
+
+```rust
+use oxrdf::{Literal, Term};
+use sparkles::{Dataset, sparql::QueryOptions};
+use sparkles::sparql::extensions::{
+    AggregateAccumulator, AggregateContext, AggregateDescriptor,
+    ExtensionRegistry, ScalarError, ScalarResult,
+};
+
+struct CountValues(i64);
+impl AggregateAccumulator for CountValues {
+    fn add(&mut self, ctx: &AggregateContext<'_>, _: &Term)
+        -> Result<(), ScalarError>
+    {
+        ctx.check()?;
+        self.0 += 1;
+        Ok(())
+    }
+    fn finish(&mut self, _: &AggregateContext<'_>) -> ScalarResult {
+        Ok(Literal::from(self.0).into())
+    }
+}
+
+let ds = Dataset::memory();
+let mut registry = ExtensionRegistry::builder();
+registry.register_aggregate(AggregateDescriptor::new(
+    "urn:app:count-values", 1,
+    |_: &AggregateContext<'_>| {
+        Ok(Box::new(CountValues(0)) as Box<dyn AggregateAccumulator>)
+    },
+)?)?;
+let options = QueryOptions {
+    extensions: Some(registry.build()),
+    ..ds.query_options()
+};
+let result = ds.query_with(
+    "SELECT (AGG <urn:app:count-values>(DISTINCT ?v) AS ?count) \
+     WHERE { VALUES ?v { 1 2 2 } }",
+    &options,
+)?;
+```
+
+Registered aggregates accept one argument and run sequentially with singleton batches.
+Empty ungrouped input creates and finalizes one accumulator; grouped empty input
+creates none. Unbound or expression-error arguments make that group's result unbound.
+
+Use `context.retain(bytes)` before retaining additional state. The engine releases
+those charges when the accumulator is destroyed. Cancellation, execution or protocol
+errors and failing destructors abort the query and prevent partial transaction commits.
+The scalar callback's dataset-family guards and query lifetime also apply to aggregates.
+
+Registration cannot override built-in scalar or aggregate IRIs. Dynamic registered
+dispatch, foreign adapters and parallel partial aggregation remain separate work.
+
+### Registered property functions
+
+Rust applications can register a fixed predicate IRI that expands each input solution into zero or more solutions. Declare the subject and object argument shapes, required inputs and permitted outputs in the per-query registry. A shape is either one RDF term or a bounded query-written RDF list; the two sides support at most 128 arguments in total.
+
+The example below emits a descending sequence from each bound count:
+
+```rust
+use oxrdf::{Literal, Term};
+use sparkles::{Dataset, sparql::QueryOptions};
+use sparkles::sparql::extensions::{ArgumentShape, ExtensionRegistry, PropertyContext,
+    PropertyDescriptor, PropertyFunction, PropertyInput, PropertyPosition, PropertyRow,
+    PropertyStream, ScalarError};
+
+struct Sequence;
+struct Remaining(u64);
+impl PropertyFunction for Sequence {
+    fn open<'query>(&self, context: PropertyContext<'query>, input: PropertyInput)
+        -> Result<Box<dyn PropertyStream + 'query>, ScalarError>
+    {
+        context.check()?;
+        let Some(Term::Literal(count)) = &input.subject[0] else {
+            return Err(ScalarError::Expression);
+        };
+        let count = count.value().parse().map_err(|_| ScalarError::Expression)?;
+        context.retain(64)?;
+        Ok(Box::new(Remaining(count)))
+    }
+}
+impl PropertyStream for Remaining {
+    fn next(&mut self, context: &PropertyContext<'_>)
+        -> Result<Option<PropertyRow>, ScalarError>
+    {
+        context.check()?;
+        if self.0 == 0 { return Ok(None); }
+        let value = self.0;
+        self.0 -= 1;
+        Ok(Some(PropertyRow { subject: vec![None],
+            object: vec![Some(Literal::from(value).into())] }))
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let ds = Dataset::memory();
+    let mut registry = ExtensionRegistry::builder();
+    registry.register_property(PropertyDescriptor::new(
+        "urn:app:sequence", ArgumentShape::Term, ArgumentShape::Term,
+        vec![PropertyPosition::Subject(0)], vec![PropertyPosition::Object(0)], Sequence,
+    )?)?;
+    let options = QueryOptions { extensions: Some(registry.build()),
+        max_rows_produced: Some(10_000), ..ds.query_options() };
+    let result = ds.query_with(
+        "SELECT ?n WHERE { VALUES ?count { 2 0 } ?count <urn:app:sequence> ?n } ORDER BY ?n",
+        &options,
+    )?;
+    assert_eq!(result.rows(), vec![
+        vec![Some(Literal::from(1u64).into())],
+        vec![Some(Literal::from(2u64).into())],
+    ]);
+    Ok(())
+}
+```
+
+Only a fixed registered predicate in a basic graph pattern invokes the callback. Variable predicates and property paths retain ordinary RDF matching. The engine plans ordinary triple patterns first and then attaches callbacks in dependency order within that group. Missing required inputs or cyclic dependencies fail planning; an input variable present in the schema but unbound in a row skips that invocation. Duplicate input solutions open separate streams and duplicate output rows retain their multiplicity.
+
+`None` in an output slot preserves its binding. Returned bound values must match existing values, and only declared output positions may bind new values. `ScalarError::Expression` discards all provisional rows from that invocation. Execution errors, invalid outputs, panics, cancellation, exceeded budgets and failing destructors abort the query and prevent partial update commits. Streams run synchronously and sequentially; results are materialized before the query returns.
+
+`context.view().scan(subject, predicate, object)` provides a read-only SPO cursor for the captured active graph and the caller's graph, triple and dataset restrictions. `next_batch()` returns at most 1024 triples and 1 MiB of RDF data per page. Contexts, cursors and batches borrow the query and cannot outlive it. Scanned permitted candidates, including duplicates collapsed in a merged graph, spend the shared work budget; traversal through excluded keys checks cancellation and deadlines without disclosing their count. Use `context.charge(bytes)` for temporary application buffers or `context.retain(bytes)` before retaining additional callback state. Callbacks remain responsible for checking controls inside their own long work. Composite literals also spend conservatively estimated parsing memory, so a literal below the byte ceiling can still exceed a finite query memory budget.
+
+Volatility defaults to `Volatile`; queries invoking registered callbacks bypass result caching and unsafe callback-moving optimizations. OPTIONAL and LATERAL preserve per-input calls. EXISTS retains its dynamic planning: missing required input errors arise when that subplan is entered. Registered property functions have a separate IRI category from scalar functions and aggregates. Foreign callback adapters and cross-row batching remain future work.
+
+### Dataset administration
 
 A dataset's administration goes through handles that `Dataset` returns. Each handle is
 cheap to clone and can move to another thread. Settings have `get`, `set` and `reset`,
@@ -2685,6 +2997,11 @@ outside a Jena transaction and throw `JenaTransactionException` when the thread 
 one. `lastReceipt()` returns the receipt of the last commit the thread made on the
 dataset, and `headCommit()` returns the newest commit.
 
+For RDF files on disk, use `loadFiles`: it passes file paths directly to the native
+parsers and index builder. The stream overload buffers the entire input in JVM memory
+before sending it to Rust. `bulkSink` parses through Jena and converts its nodes into
+native batches. Opening an existing Sparkles directory reuses its native indices.
+
 `SparklesDatasets.importTdb2(tdbDir, sparklesDir)` copies a TDB2 database into an empty
 Sparkles database in one commit. It reads the TDB2 database with Jena's own code, so
 literals come back as TDB2 stored them, and it copies the prefixes. It returns an
@@ -2854,9 +3171,10 @@ endpoints use `SparklesClient.endpoint(url, { updateUrl, graphStoreUrl })`. See 
 
 `parse(input, options)` yields RDF/JS quads without loading a dataset; `serialize(quads,
 options)` returns a Web byte stream. Both use bounded queues and accept cancellation and
-timeouts. Close unfinished iterators or cancel unfinished streams. Full native facade
-parity, offline Node policy runners and standalone formatting utilities remain follow-up
-work; the package README describes the supported operations.
+timeouts. Close unfinished iterators or cancel unfinished streams. Catalog policy and
+retention runners, fixed repository registries and standalone formatting, linting,
+parsing and validation helpers are also available; the package README describes their
+options and controls.
 
 ## Rust client
 

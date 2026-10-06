@@ -6,9 +6,11 @@
 > CLI, the server and the Backups panel. Most of Phase 2 shipped with it: lifecycle
 > policies, garbage collection, locks and the full Backups page, with `gcs` and `azure` as
 > experimental build features. Full backups of in-memory datasets followed. These were not
-> built: "back up all datasets" as one request, the CLI's `--server` mode, offline
-> `backup policy run`, and all of Phase 3 (client-side encryption, content-defined
-> chunking, repository copy, server backups).
+> built: "back up all datasets" as one request, the CLI's `--server` mode,
+> content-defined chunking, repository copy and server backups. An optional local-key
+> encrypted repository engine is now built under [F11](F11-encryption-at-rest.md);
+> local key providers, offline operator commands and trusted TOML server integration
+> are also built. API-managed encrypted configuration and later encrypted phases remain open.
 >
 > **User docs:** [API: Backup repositories](../API.md#backup-repositories) ·
 > [Usage: Backup repositories](../USAGE.md#backup-repositories) ·
@@ -1774,6 +1776,20 @@ service. Open question 7 covers an in-process emulator instead.
 * `sparkles repo` and `sparkles backup create|list|show|restore|verify|delete|policy`;
 * a Backups page with Backups, Repositories, Policies and Activity tabs, plus a panel on
   the dataset page.
+
+Offline `backup policy run P --data DIR --backup-config FILE` also uses the shared
+catalog policy engine. It requires an existing stopped catalog, holds its directory
+lock and retains the TOML repository configuration. It resolves credentials and
+optional encryption providers only for the selected repository, then passes that
+opened repository to the shared engine without registering it in the catalog.
+Configured repository names and persisted location/UUID identities are validated
+before execution. Manual execution permits scheduler-disabled policies. A plain
+worker thread runs the blocking facade while the CLI runtime services Ctrl-C;
+Tokio blocking workers still carry an async runtime handle and cannot call this
+facade. Results include selected datasets, unchanged skips and retention. Backup
+or retention errors produce a nonzero exit status. Process-level tests cover
+two selected datasets, shared run identity, unchanged skips, a held catalog lock,
+missing catalogs, read-only failure reports and released repository locks.
 
 The maintainer decided that the whole UI of §6 belongs in the first delivery, which
 pulled lifecycle policies, garbage collection and lock management forward from Phase 2.

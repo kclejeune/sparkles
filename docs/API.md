@@ -2896,6 +2896,12 @@ kind `merge` on the target, also when the target already holds every change of t
 source in another history. When the source's changes are already in the target, the
 merge writes nothing and answers `upToDate: true`.
 
+When a criss-cross history has several best common ancestors, Sparkles recursively
+combines them into a virtual merge base if their changes can be combined without
+cell conflicts. It publishes no synthetic commit, and the report's `base` is `null`.
+Conflicting ancestors still return `ambiguous-merge-base` with real `candidates`;
+an explicit `base` selects one of them. Replayed fast-forwards require a real base.
+
 **Replayed fast-forwards.** With `ff: "replay"`, a merge whose target holds the state of
 the merge base replays the source's commits after the base one by one, each as its own
 commit on the target with the original's kind, message and author, instead of making
@@ -3010,7 +3016,7 @@ its own range, so labels never collide across branches.
 | Conflicts remain after `onConflict` and `resolutions` | 409 | `merge-conflict` |
 | `ff: "only"` and the target has moved | 409 | `not-fast-forward` |
 | `expect` names a head that is no longer the head | 409 | `head-moved` |
-| Several merge bases and no `base` | 409 | `ambiguous-merge-base`, with `candidates` |
+| Common ancestors cannot form a conflict-free virtual base and no explicit `base` | 409 | `ambiguous-merge-base`, with `candidates` |
 | The merge base is no longer reconstructable | 410 | `merge-base-gone` |
 | The target's validation refuses the result | 422 | as for any write |
 | The change sets exceed `--max-rows` or the quota | 507 | `budget` |
@@ -4052,7 +4058,7 @@ Errors are `{error, code, requestId}`. Some codes add `task`, `holder`, `policie
 | 403 | `server-read-only` |
 | 404 | `no-such-repository`, `no-such-backup` (also for a backup of another dataset), `no-such-policy`, `no-such-dataset`, `no-such-lock` |
 | 409 | `repository-exists`, `policy-exists`, `not-a-repository` (a location with other files), `location-immutable`, `repository-in-use` (with `policies` or `task`), `read-only-config`, `backup-exists`, `backup-in-progress` (with `task`), `backup-busy` (with `task`), `repository-read-only`, `repository-locked` (a conflicting lock outlived the 10 min wait, with `holder`), `dataset-exists`, `dataset-busy` (with `task`), `not-managed`, `duplicate-dataset-id`, `policy-running` (with `task`) |
-| 422 | `incompatible-repository` (a newer repository format, or encryption), `incompatible-format` (an index format this build cannot read), `invalid-backup` (a manifest that fails validation, with `field`) |
+| 422 | `incompatible-repository` (an unsupported repository format or encryption configuration), `incompatible-format` (an index format this build cannot read), `invalid-backup` (a manifest that fails validation, with `field`) |
 | 500 | `restore-mismatch`, `internal` |
 | 501 | `not-implemented` (backup repositories are not enabled on this server) |
 | 502 | `repository-unavailable`: a storage error after retries. The message never includes URL query strings. |
@@ -4228,7 +4234,7 @@ at the next start, and `.kept-*` for `keepReplaced`. Restore-level verifications
 fails at startup, and an offline `sparkles backup restore --data` refuses to write into
 it.
 
-A repository's own layout (format 1) is shared by the server and the CLI:
+A plaintext repository's layout (format 1) is shared by the server and the CLI:
 
 ```text
 <prefix>/
@@ -4243,6 +4249,12 @@ A repository's own layout (format 1) is shared by the server and the CLI:
 A blob is a 16-byte header followed by its payload. The header holds `SPKB`, format 1, the
 codec (raw or LZ4), the encryption (none) and the plaintext length. A blob's id is the
 SHA-256 of the plaintext, so writers that compress differently still deduplicate.
+
+Trusted server TOML can configure encrypted repositories in builds with
+`backup-encryption`; API registration and updates reject encryption metadata. See
+[encrypted repositories](USAGE.md#encrypted-repositories) for configuration and
+[the encryption design and outcome](specs/F11-encryption-at-rest.md#outcome) for the
+encrypted format and supported scope.
 
 ## Full-text search
 

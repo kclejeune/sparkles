@@ -7,7 +7,7 @@
 > branches, backups, settings, history, indexes, stored queries, schema, GraphQL,
 > reasoning and validation extend the SDK. Release workflows assemble five native
 > platforms, classifier jars, a Fuseki bundle and source/documentation artifacts;
-> Linux is validated locally. Helper parity, batched fallback graph patterns,
+> Linux is validated locally. Administration helpers are implemented; batched fallback graph patterns,
 > Java callbacks, musl and comparative performance targets remain follow-up work.
 > The [Outcome](#outcome) records the supported scope and deferrals.
 >
@@ -963,10 +963,12 @@ The other costs are these.
 | writes in a transaction | sent at 4096 operations or 1 MiB | the same |
 | `bulkSink()` | sent at 65,536 quads | the same |
 
-The term table of a result holds at most `termCacheSize` nodes, 262,144 by default. At
+The term table of a result resets at the next batch after reaching `termCacheSize`
+nodes, 262,144 by default, so it can exceed that threshold by one batch. At
 roughly 100 to 200 bytes per node with its strings, a full table costs about 25 to 50 MB
-of heap for one result. A larger table converts results with many distinct terms
-slightly faster and costs more heap, and the option exposes that trade.
+of heap for one result. A larger table can avoid decoding repeated terms again across
+batches and costs more heap. Results containing only unique terms get no reuse benefit;
+the option exposes that trade.
 
 ### 5.3 Targets
 
@@ -1561,10 +1563,12 @@ query, sink, historical view, repository and reservation handles have explicit c
 semantics. Bounded child-JVM tests check capture misuse without allowing a native
 writer wait to hang the suite. Native default and feature-disabled builds are linted.
 
-This is the primary administration surface, not complete P06 helper parity. Outstanding
-helpers include direct index iterators/diagnostics, native cache/EXPLAIN control,
-standalone memory clone, schedule-preview and commit-DAG documents, formatter/RDF/term
-validation utilities, embedding regeneration and reasoning diagnostics. Java callbacks
+The administration helper surface also includes direct index iterators/diagnostics,
+native cache/EXPLAIN control, standalone memory clone, schedule-preview and commit-DAG
+documents, formatter/linter/RDF/term validation utilities, geometry conversion,
+embedding regeneration and reasoning diagnostics. All 162 entries of the original
+administration mapping now have concrete JVM decisions. The newer Rust branch-relink
+operation remains an explicit binding follow-up. Java callbacks
 await P03; batched fallback BGPs, musl, JNI, mimalloc and worker-free transactions remain
 separate extensions. The earlier throughput numbers below are a loaded-machine sanity
 check. No quiet-machine performance conclusion or JNI/allocator change follows from

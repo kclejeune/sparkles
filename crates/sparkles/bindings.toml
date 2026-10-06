@@ -1,10 +1,15 @@
 # P06 library surface. Concrete names describe the shipped bindings.
 # Planned entries are intentional and become required in their binding phase.
 
+["dataset.relink_branch"]
+python = "Dataset.branches.relink"
+jvm = "planned: explicit persistent branch relinking binding"
+node = "planned: explicit persistent branch relinking binding"
+
 ["backup.policy.next_runs"]
 python = "preview_schedule"
-jvm = "planned: P04 follow-up (standalone schedule-preview helper)"
-node = "planned: P05 follow-up (standalone policy schedule preview)"
+jvm = "SparklesHelpers.previewSchedule"
+node = "previewSchedule"
 
 ["backup.repository.break_lock"]
 python = "BackupRepository.break_lock"
@@ -68,7 +73,7 @@ node = "Dataset.branches.cherryPick"
 
 ["branches.commit_graph"]
 python = "Dataset.branches.commit_graph"
-jvm = "planned: P04 follow-up (commit DAG document export)"
+jvm = "SparklesBranches.commitGraph"
 node = "Dataset.branches.commitGraph"
 
 ["branches.create"]
@@ -129,7 +134,7 @@ node = "Dataset.branches.rename/protect/note"
 ["catalog.apply_retention"]
 python = "Catalog.apply_retention"
 jvm = "SparklesCatalog.applyRetention"
-node = "planned: P05 follow-up (offline catalog policy retention)"
+node = "Catalog.applyRetention"
 
 ["catalog.attach"]
 python = "Catalog.attach"
@@ -139,7 +144,7 @@ node = "Catalog.attach"
 ["catalog.backup_files"]
 python = "Catalog.backup_files"
 jvm = "SparklesCatalog.backupFiles"
-node = "planned: P05 follow-up (internal catalog backup file collection)"
+node = "Catalog.backupFiles"
 
 ["catalog.clone_dataset"]
 python = "Catalog.clone_dataset"
@@ -204,7 +209,7 @@ node = "Catalog.repositories"
 ["catalog.reserve"]
 python = "Catalog.reserve"
 jvm = "SparklesCatalog.reserve"
-node = "planned: P05 follow-up (internal catalog reservation plumbing)"
+node = "Catalog.reserve"
 
 ["catalog.restore"]
 python = "Catalog.restore"
@@ -214,7 +219,7 @@ node = "Catalog.restore"
 ["catalog.run_policy"]
 python = "Catalog.run_policy"
 jvm = "SparklesCatalog.runPolicy"
-node = "planned: P05 follow-up (offline catalog policy runner)"
+node = "Catalog.runPolicy"
 
 ["dataset.apply_patch"]
 python = "Dataset.apply_patch"
@@ -243,12 +248,12 @@ node = "Dataset.clear"
 
 ["dataset.clear_cache"]
 python = "Dataset.clear_cache"
-jvm = "planned: P04 follow-up (native result-cache management)"
+jvm = "DatasetGraphSparkles.clearCache"
 node = "Dataset.clearCache"
 
 ["dataset.clone_to_memory_with"]
 python = "Dataset.clone_to_memory"
-jvm = "planned: P04 follow-up (standalone memory clone; catalog.cloneDataset(inMemory=true) is shipped)"
+jvm = "DatasetGraphSparkles.cloneToMemory"
 node = "Dataset.cloneToMemory"
 
 ["dataset.clone_to_with"]
@@ -283,7 +288,7 @@ node = "Dataset.dump({fromGraph})"
 
 ["dataset.explain"]
 python = "Dataset.explain"
-jvm = "planned: P04 follow-up (native optimizer-plan document)"
+jvm = "DatasetGraphSparkles.explain"
 node = "Dataset.explain"
 
 ["dataset.head_commit"]
@@ -368,18 +373,18 @@ node = "Dataset.update"
 
 ["fmt.format"]
 python = "skip: formatter and linter remain CLI tools"
-jvm = "planned: P04 follow-up (engine formatter helper)"
-node = "planned: P05 follow-up (standalone formatter)"
+jvm = "SparklesHelpers.format"
+node = "format"
 
 ["fmt.lint"]
 python = "skip: formatter and linter remain CLI tools"
-jvm = "planned: P04 follow-up (engine linter helper)"
-node = "planned: P05 follow-up (standalone linter)"
+jvm = "SparklesHelpers.lint"
+node = "lint"
 
 ["geo.convert"]
 python = "convert_geometries"
-jvm = "planned: P04 follow-up (native CRS conversion helper)"
-node = "planned: P05 follow-up (standalone geometry conversion)"
+jvm = "SparklesHelpers.convertGeometries"
+node = "convertGeometries"
 
 ["graph.clear"]
 python = "Dataset.clear_graph"
@@ -478,7 +483,7 @@ node = "Dataset.indexes.geo.enable"
 
 ["indexes.geo.features"]
 python = "Dataset.indexes.geo.features"
-jvm = "planned: P04 follow-up (feature extraction iterator)"
+jvm = "SparklesGeoIndex.features"
 node = "Dataset.indexes.geo.features"
 
 ["indexes.geo.rebuild"]
@@ -508,7 +513,7 @@ node = "Dataset.indexes.text.rebuild"
 
 ["indexes.text.search"]
 python = "Dataset.indexes.text.search"
-jvm = "planned: P04 follow-up (direct text hit iterator; SPARQL text functions are shipped)"
+jvm = "SparklesTextIndex.search"
 node = "Dataset.indexes.text.search"
 
 ["indexes.text.status"]
@@ -523,7 +528,7 @@ node = "Dataset.indexes.vector.drop"
 
 ["indexes.vector.embed_until_idle"]
 python = "Dataset.indexes.vector.embed_until_idle"
-jvm = "planned: P04 follow-up (embedding daemon control)"
+jvm = "SparklesVectorIndexes.embedUntilIdle"
 node = "Dataset.indexes.vector.embedUntilIdle (bounded waitMs; no AbortSignal)"
 
 ["indexes.vector.get"]
@@ -548,18 +553,18 @@ node = "Dataset.indexes.vector.rebuild"
 
 ["indexes.vector.recall"]
 python = "Dataset.indexes.vector.recall"
-jvm = "planned: P04 follow-up (ANN diagnostic comparison)"
+jvm = "SparklesVectorIndexes.recall"
 node = "Dataset.indexes.vector.recall"
 
 ["indexes.vector.reembed"]
 python = "Dataset.indexes.vector.reembed"
-jvm = "planned: P04 follow-up (embedding regeneration)"
+jvm = "SparklesVectorIndexes.reembed"
 node = "Dataset.indexes.vector.reembed"
 
 ["io.check_data"]
 python = "check_data"
-jvm = "planned: P04 follow-up (engine validation of RDF input)"
-node = "planned: P05 follow-up (standalone RDF syntax validation)"
+jvm = "SparklesHelpers.checkData"
+node = "checkData"
 
 ["queries.delete"]
 python = "Dataset.queries.delete"
@@ -598,7 +603,7 @@ node = "Dataset.reasoning.clear"
 
 ["reasoning.diagnostics"]
 python = "Dataset.reasoning.diagnostics"
-jvm = "planned: P04 follow-up (reasoning provenance diagnostics)"
+jvm = "SparklesReasoning.diagnostics"
 node = "Dataset.reasoning.diagnostics"
 
 ["reasoning.rdfs.get"]
@@ -623,7 +628,7 @@ node = "Dataset.reasoning.run"
 
 ["reasoning.status"]
 python = "Dataset.reasoning.status"
-jvm = "planned: P04 follow-up (native materialization status)"
+jvm = "SparklesReasoning.status"
 node = "Dataset.reasoning.status"
 
 ["repositories.add"]
@@ -659,7 +664,7 @@ node = "Catalog.repositories.update"
 ["repositories.with_fixed"]
 python = "Catalog.repositories.with_fixed"
 jvm = "SparklesCatalog.repositories().withFixed"
-node = "planned: P05 follow-up (fixed repository registries)"
+node = "Catalog.repositories.withFixed"
 
 ["schema.classes"]
 python = "Dataset.schema.classes"
@@ -769,22 +774,22 @@ node = "Dataset.snapshots.list"
 ["sparql.parse_query"]
 python = "parse_query"
 jvm = "Jena QueryFactory.create"
-node = "planned: P05 follow-up (standalone SPARQL query parsing)"
+node = "parseQuery"
 
 ["sparql.parse_update"]
 python = "parse_update"
 jvm = "Jena UpdateFactory.create"
-node = "planned: P05 follow-up (standalone SPARQL update parsing)"
+node = "parseUpdate"
 
 ["terms.check_iri"]
 python = "check_iri"
-jvm = "planned: P04 follow-up (engine IRI validation helper)"
-node = "planned: P05 follow-up (engine IRI validation helper)"
+jvm = "SparklesHelpers.checkIri"
+node = "checkIri"
 
 ["terms.check_langtag"]
 python = "check_langtag"
-jvm = "planned: P04 follow-up (engine language-tag validation helper)"
-node = "planned: P05 follow-up (engine language-tag validation helper)"
+jvm = "SparklesHelpers.checkLanguageTag"
+node = "checkLangtag"
 
 ["validation.guard.get"]
 python = "Dataset.validation.guard.get"

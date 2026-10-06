@@ -4,8 +4,8 @@
 >
 > **Phases:** The embedded engine, shared RDF/JS model and remote client are built.
 > Phase 2 adds administration, bounded RDF streams, RDF/JS Source/Store adapters,
-> commit notification feeds and a broader native runtime/platform CI matrix. Internal
-> catalog/policy APIs and standalone utility helpers remain deferred. Phase 3 Wasm
+> commit notification feeds, catalog/policy APIs, standalone utility helpers and a
+> broader native runtime/platform CI matrix. Phase 3 Wasm
 > and the UI client migration remain optional follow-up work.
 >
 > **User docs:** [engine](../../js/engine/README.md),
@@ -1264,11 +1264,12 @@ archive checks exercise runtime loading and strict TypeScript declarations, incl
 the typed OpenAPI client. Local execution is on Linux x64 glibc; other native targets
 are configured for CI and have not been executed locally. No npm publication occurred.
 
-Concrete facade coverage is 148 of 162 mapping entries. Deferred entries are internal
-catalog reservation and backup-file plumbing, catalog policy/retention runners,
-fixed repository registries and policy schedule previews, and standalone formatter,
-geometry conversion, RDF syntax checking, SPARQL parsing and IRI/language-tag checking
-utilities. These are documented deviations; full Rust/Python facade parity is not
-claimed. The optional browser/Wasm engine and UI transport migration remain deferred.
+All 162 entries of the original administration mapping now have concrete Node
+decisions. Catalog reservation and backup-file plumbing, policy/retention runners,
+fixed repository registries, schedule previews, formatter/linter, geometry conversion,
+RDF syntax checking, SPARQL parsing and IRI/language-tag checking are implemented.
+Policy execution shares dataset writer admission and rejects transaction-owner
+captures; controls unsupported by retention are rejected before mutation. The newer
+Rust branch-relink operation remains an explicit binding follow-up. The optional
+browser/Wasm engine and UI transport migration remain deferred.
 The comparative performance harness and publication gate also remain follow-up work.
-

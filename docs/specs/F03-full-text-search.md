@@ -665,6 +665,13 @@ subject filters inside the search. The rest is as designed: `text.json` and `tex
 Two Phase 2 items came with it or soon after: `PUT`/`DELETE /$/text/{ds}`, and the UI with
 an admin panel and ranked search in Explore. Clones keep text search enabled (`89b455c`).
 
+Internal recovery preparation now distinguishes reusable indexes from recovery needs
+before allocating a writer, expanding WAL changes or cleaning staging directories.
+Unavailable text views retain their snapshot state and refuse searches with 503;
+ready result-cache entries cannot bypass that refusal. Startup still rebuilds
+synchronously. Background recovery requires bounded journaling, worker admission and
+guarded publication/close handling before it can replace that fallback.
+
 **Deviations, and why.**
 - *Commit path.* A Tantivy commit with an fsync on every write cost too much (§5.3, open
   question 11). The first change (`8f3eb13`) stopped fsyncing index commits. The WAL is the

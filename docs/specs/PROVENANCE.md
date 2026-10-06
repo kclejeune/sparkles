@@ -1489,6 +1489,15 @@ implementation landed.
   - a bundled Swagger UI or Redoc;
   - Nushell completions, which need another crate.
 
+## Query extensions
+
+- **Spec:** [P03-query-extensions.md](P03-query-extensions.md), written on
+  2026-10-05 independently from Sparkles' query options, expression dispatcher,
+  extension catalog and binding lifecycle code; the W3C SPARQL 1.1 Query standard;
+  Apache Jena's published scalar/property-function documentation; and DataFusion's
+  published volatility documentation. The spec links those primary sources.
+- **Implementation:** not started. No external code copied and no new dependencies.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):
