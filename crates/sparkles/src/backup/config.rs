@@ -129,6 +129,102 @@ pub struct RepoToml {
     pub max_upload_bytes_per_sec: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_download_bytes_per_sec: Option<u64>,
+    /// Client encryption references; resolved only by an encryption-aware opener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<RepositoryEncryption>,
+}
+
+/// References to online repository key inputs; secrets are never inline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryEncryption {
+    pub keys: Vec<KeyInput>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub single_key_ok: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyInput {
+    pub label: String,
+    pub key: KeySource,
+}
+
+/// Operator-controlled locations, not key material. Commands execute an argv directly.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum KeySource {
+    File {
+        path: String,
+    },
+    Env {
+        var: String,
+    },
+    Credential {
+        name: String,
+    },
+    /// Exact bytes including any final newline, 1..4096 bytes.
+    PassphraseFile {
+        path: String,
+    },
+    Command {
+        argv: Vec<String>,
+        #[serde(default = "command_timeout")]
+        timeout_secs: u64,
+    },
+}
+fn command_timeout() -> u64 {
+    10
+}
+
+impl RepositoryEncryption {
+    pub fn validate(&self) -> Result<()> {
+        if self.keys.is_empty() || self.keys.len() > 8 {
+            bail!("encryption requires 1..8 key references");
+        }
+        let mut labels = std::collections::HashSet::new();
+        for input in &self.keys {
+            if input.label.is_empty()
+                || input.label.len() > 128
+                || input.label.chars().any(char::is_control)
+                || !labels.insert(&input.label)
+            {
+                bail!("encryption key labels must be distinct printable names of 1..128 bytes");
+            }
+            match &input.key {
+                KeySource::File { path } | KeySource::PassphraseFile { path }
+                    if !Path::new(path).is_absolute() =>
+                {
+                    bail!("encryption key file must be absolute")
+                }
+                KeySource::Env { var }
+                    if var.is_empty()
+                        || var.len() > 128
+                        || !var.bytes().enumerate().all(|(i, b)| {
+                            b.is_ascii_alphabetic() || b == b'_' || (i > 0 && b.is_ascii_digit())
+                        }) =>
+                {
+                    bail!("invalid encryption environment variable name")
+                }
+                KeySource::Credential { name }
+                    if !sparkles_backup::layout::valid_repo_name(name) =>
+                {
+                    bail!("invalid encryption credential name")
+                }
+                KeySource::Command { argv, timeout_secs }
+                    if argv.is_empty()
+                        || argv.len() > 64
+                        || !Path::new(&argv[0]).is_absolute()
+                        || argv.iter().any(|a| a.len() > 4096 || a.contains('\0'))
+                        || !(1..=300).contains(timeout_secs) =>
+                {
+                    bail!("invalid encryption command argv or timeout")
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `credentials = { source = … }`
@@ -191,7 +287,28 @@ impl From<&Credentials> for CredentialsToml {
 
 impl RepoToml {
     /// The API form of the table `[repositories.<name>]`.
-    pub fn to_config(&self, name: &str) -> RepoConfig {
+    /// Reject encrypted metadata rather than erase it; use `configured` to retain it.
+    pub fn to_config(&self, name: &str) -> Result<RepoConfig> {
+        if self.encryption.is_some() {
+            bail!(
+                "repository {name:?}: encrypted configuration requires an encryption-aware opener"
+            );
+        }
+        Ok(self.base_config(name))
+    }
+
+    /// Owned references for an opener that explicitly supports encryption.
+    pub fn configured(&self, name: &str) -> Result<ConfiguredRepository> {
+        if let Some(settings) = &self.encryption {
+            settings.validate()?;
+        }
+        Ok(ConfiguredRepository {
+            config: self.base_config(name),
+            encryption: self.encryption.clone(),
+        })
+    }
+
+    fn base_config(&self, name: &str) -> RepoConfig {
         RepoConfig {
             name: name.to_string(),
             kind: self.kind,
@@ -232,7 +349,34 @@ impl RepoToml {
             max_concurrency: c.max_concurrency,
             max_upload_bytes_per_sec: c.max_upload_bytes_per_sec,
             max_download_bytes_per_sec: c.max_download_bytes_per_sec,
+            encryption: None,
         }
+    }
+}
+
+/// A retaining projection; only source references, never resolved secret values.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConfiguredRepository {
+    #[serde(flatten)]
+    pub config: RepoConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<RepositoryEncryption>,
+}
+impl std::ops::Deref for ConfiguredRepository {
+    type Target = RepoConfig;
+    fn deref(&self) -> &RepoConfig {
+        &self.config
+    }
+}
+impl ConfiguredRepository {
+    /// Round-trip references without discarding encryption metadata.
+    pub fn to_toml(&self) -> Result<RepoToml> {
+        if let Some(settings) = &self.encryption {
+            settings.validate()?;
+        }
+        let mut table = RepoToml::from_config(&self.config);
+        table.encryption = self.encryption.clone();
+        Ok(table)
     }
 }
 
@@ -362,6 +506,11 @@ impl ConfigFile {
             }
         }
         for (name, r) in &f.repositories {
+            if let Some(encryption) = &r.encryption {
+                encryption
+                    .validate()
+                    .with_context(|| format!("repository {name:?} encryption"))?;
+            }
             if let Some(CredentialsToml::Named { name: n }) = &r.credentials
                 && !f.credentials.contains_key(n)
             {
@@ -382,10 +531,17 @@ impl ConfigFile {
     }
 
     /// The repositories in API form.
-    pub fn repository_configs(&self) -> Vec<RepoConfig> {
+    pub fn repository_configs(&self) -> Result<Vec<RepoConfig>> {
         self.repositories
             .iter()
             .map(|(n, r)| r.to_config(n))
+            .collect()
+    }
+
+    pub fn configured_repositories(&self) -> Result<Vec<ConfiguredRepository>> {
+        self.repositories
+            .iter()
+            .map(|(name, r)| r.configured(name))
             .collect()
     }
 
@@ -438,6 +594,33 @@ pub fn load(path: &Path) -> Result<ConfigFile> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn encrypted_references_roundtrip_and_plaintext_projection_refuses_erasure() {
+        let text = "version = 1\n[repositories.enc]\ntype = \"fs\"\npath = \"/srv/backups\"\n[repositories.enc.encryption]\nsingle_key_ok = true\nkeys = [{ label = \"online\", key = { source = \"env\", var = \"REPO_KEY\" } }]\n";
+        let file = super::ConfigFile::parse(text).unwrap();
+        assert!(file.repository_configs().is_err());
+        assert!(file.repositories["enc"].to_config("enc").is_err());
+        let entries = file.configured_repositories().unwrap();
+        assert!(entries[0].encryption.is_some());
+        assert_eq!(entries[0].to_toml().unwrap(), file.repositories["enc"]);
+        assert_eq!(
+            super::ConfigFile::parse(&file.to_text().unwrap()).unwrap(),
+            file
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(super::super::registry::Registry::load(tmp.path(), Some(&file)).is_err());
+        let registry = super::super::registry::Registry::load(tmp.path(), None).unwrap();
+        assert!(registry.replace_config(&file).is_err());
+        assert!(registry.repos.read().is_empty());
+        assert!(super::ConfigFile::parse(&text.replace("REPO_KEY", "../invalid")).is_err());
+        assert!(
+            super::ConfigFile::parse(&text.replace(
+                "var = \"REPO_KEY\"",
+                "var = \"REPO_KEY\", value = \"inline-key\""
+            ))
+            .is_err()
+        );
+    }
     use super::*;
 
     const EXAMPLE: &str = r#"
@@ -493,7 +676,7 @@ gc_after_retention = true
     #[test]
     fn the_example_parses_and_converts() {
         let f = ConfigFile::parse(EXAMPLE).unwrap();
-        let repos = f.repository_configs();
+        let repos = f.repository_configs().unwrap();
         let s3 = repos.iter().find(|r| r.name == "s3-main").unwrap();
         assert_eq!(s3.kind, RepoType::S3);
         assert_eq!(s3.sse, Some(Sse::AwsKms));
@@ -541,7 +724,7 @@ gc_after_retention = true
             api: f.api.clone(),
             ..Default::default()
         };
-        for r in f.repository_configs() {
+        for r in f.repository_configs().unwrap() {
             again
                 .repositories
                 .insert(r.name.clone(), RepoToml::from_config(&r));

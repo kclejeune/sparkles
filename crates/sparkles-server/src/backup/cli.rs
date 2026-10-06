@@ -14,7 +14,9 @@
 //! `sparkles backup --loc DB --out DIR` (no subcommand) keeps writing a compressed
 //! N-Quads dump, zstd by default (handled in `main.rs`).
 
-use super::config::{self, ConfigFile, RepoToml};
+use super::config::{
+    self, ConfigFile, ConfiguredRepository, KeyInput, KeySource, RepoToml, RepositoryEncryption,
+};
 use crate::state;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
@@ -47,6 +49,126 @@ pub struct ConfigArg {
         global = true
     )]
     pub backup_config: Option<PathBuf>,
+    /// Override online key references when opening a repository (repeatable).
+    #[arg(long, global = true)]
+    pub repository_key_file: Vec<PathBuf>,
+    #[arg(long, global = true)]
+    pub repository_key_env: Vec<String>,
+    #[arg(long, global = true)]
+    pub repository_credential: Vec<String>,
+    /// Exact bytes including a final newline.
+    #[arg(long, global = true)]
+    pub repository_passphrase_file: Vec<PathBuf>,
+    /// JSON argv array, executed directly without a shell; references only.
+    #[arg(long, global = true)]
+    pub repository_key_command_argv: Option<String>,
+    #[arg(long, global = true, default_value_t = 10)]
+    pub repository_key_command_timeout: u64,
+    #[arg(long, global = true)]
+    pub repository_single_key_ok: bool,
+    /// Exact slot label for a passphrase override (one source).
+    #[arg(long, global = true)]
+    pub repository_key_label: Option<String>,
+}
+
+#[derive(Args, Clone, Debug, Default)]
+pub struct NewKeyArgs {
+    #[arg(long)]
+    pub key_file: Vec<PathBuf>,
+    #[arg(long)]
+    pub key_env: Vec<String>,
+    #[arg(long)]
+    pub key_credential: Vec<String>,
+    /// Exact bytes including a final newline.
+    #[arg(long)]
+    pub passphrase_file: Vec<PathBuf>,
+    /// JSON argv array; put secrets in the provider, never in argv.
+    #[arg(long)]
+    pub key_command_argv: Option<String>,
+    #[arg(long, default_value_t = 10)]
+    pub key_command_timeout: u64,
+    /// A custom label when adding exactly one input.
+    #[arg(long)]
+    pub key_label: Option<String>,
+    #[arg(long)]
+    pub single_key_ok: bool,
+}
+impl NewKeyArgs {
+    fn references(&self) -> Result<Option<RepositoryEncryption>> {
+        let mut keys = Vec::new();
+        for (i, path) in self.key_file.iter().enumerate() {
+            keys.push(KeyInput {
+                label: format!("file-{}", i + 1),
+                key: KeySource::File {
+                    path: std::path::absolute(path)?.to_string_lossy().into_owned(),
+                },
+            });
+        }
+        for (i, var) in self.key_env.iter().enumerate() {
+            keys.push(KeyInput {
+                label: format!("env-{}", i + 1),
+                key: KeySource::Env { var: var.clone() },
+            });
+        }
+        for (i, name) in self.key_credential.iter().enumerate() {
+            keys.push(KeyInput {
+                label: format!("credential-{}", i + 1),
+                key: KeySource::Credential { name: name.clone() },
+            });
+        }
+        for (i, path) in self.passphrase_file.iter().enumerate() {
+            keys.push(KeyInput {
+                label: format!("passphrase-{}", i + 1),
+                key: KeySource::PassphraseFile {
+                    path: std::path::absolute(path)?.to_string_lossy().into_owned(),
+                },
+            });
+        }
+        if let Some(argv) = &self.key_command_argv {
+            let argv = serde_json::from_str(argv)
+                .map_err(|_| anyhow!("key command must be a JSON argv array"))?;
+            keys.push(KeyInput {
+                label: "command-1".into(),
+                key: KeySource::Command {
+                    argv,
+                    timeout_secs: self.key_command_timeout,
+                },
+            });
+        }
+        if keys.is_empty() {
+            if self.key_label.is_some() || self.single_key_ok {
+                bail!("key label/single-key override requires a key source");
+            }
+            return Ok(None);
+        }
+        if let Some(label) = &self.key_label {
+            if keys.len() != 1 {
+                bail!("--key-label requires exactly one new key source");
+            }
+            keys[0].label = label.clone();
+        }
+        let settings = RepositoryEncryption {
+            keys,
+            single_key_ok: self.single_key_ok,
+        };
+        settings.validate()?;
+        Ok(Some(settings))
+    }
+}
+impl ConfigArg {
+    fn keys(&self) -> Result<Option<RepositoryEncryption>> {
+        NewKeyArgs {
+            key_file: self.repository_key_file.clone(),
+            key_env: self.repository_key_env.clone(),
+            key_credential: self.repository_credential.clone(),
+            passphrase_file: self.repository_passphrase_file.clone(),
+            key_command_argv: self.repository_key_command_argv.clone(),
+            key_command_timeout: self.repository_key_command_timeout,
+            single_key_ok: self.repository_single_key_ok,
+            key_label: self.repository_key_label.clone(),
+        }
+        .references()
+    }
 }
 
 /// How a subcommand prints its result.
@@ -110,6 +232,20 @@ pub enum RepoCmd {
         /// Attach only: fail unless the location already holds a repository
         #[arg(long)]
         no_init: bool,
+        /// Initialize a client-encrypted repository (feature backup-encryption).
+        #[arg(long)]
+        encrypt: bool,
+        #[command(flatten)]
+        keys: NewKeyArgs,
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(flatten)]
+        out: OutputArg,
+    },
+    /// Manage encrypted repository recovery slots; secrets never appear in output.
+    Key {
+        #[command(subcommand)]
+        command: RepoKeyCmd,
         #[command(flatten)]
         config: ConfigArg,
         #[command(flatten)]
@@ -182,6 +318,36 @@ pub enum RepoCmd {
         config: ConfigArg,
         #[command(flatten)]
         out: OutputArg,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RepoKeyCmd {
+    List {
+        #[arg(long)]
+        repo: String,
+    },
+    Add {
+        #[arg(long)]
+        repo: String,
+        #[command(flatten)]
+        keys: NewKeyArgs,
+    },
+    Remove {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        slot: Uuid,
+    },
+    RotateMaster {
+        #[arg(long)]
+        repo: String,
+    },
+    Retire {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        epoch: u32,
     },
 }
 
@@ -307,8 +473,13 @@ pub enum PolicyCmd {
     List,
     /// Show a policy, its next runs and what its retention keeps
     Show { policy: String },
-    /// Run a policy now (runs on a server: POST /$/backup-policies/{p}/run)
-    Run { policy: String },
+    /// Run a configured policy against a stopped catalog
+    Run {
+        policy: String,
+        /// Data directory of a stopped server
+        #[arg(long, alias = "data-dir", value_name = "DIR")]
+        data: PathBuf,
+    },
     /// A policy's backups in its repository, by run, with the retention verdicts
     History { policy: String },
     /// The next runs of a schedule, and its description
@@ -340,12 +511,9 @@ struct Cli {
 
 impl Cli {
     fn new() -> Result<Cli> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let cancel = Arc::new(AtomicBool::new(false));
-        let c = cancel.clone();
-        rt.spawn(async move {
+        let cli = Self::with_cancel(Arc::new(AtomicBool::new(false)))?;
+        let c = cli.cancel.clone();
+        cli.rt.spawn(async move {
             while tokio::signal::ctrl_c().await.is_ok() {
                 if c.swap(true, Ordering::Relaxed) {
                     std::process::exit(130);
@@ -353,6 +521,15 @@ impl Cli {
                 eprintln!("cancelling (Ctrl-C again to quit)");
             }
         });
+        Ok(cli)
+    }
+
+    /// A policy worker drives provider/open I/O here while the owning CLI runtime
+    /// keeps servicing signals. Both runtimes share the same cancellation flag.
+    fn with_cancel(cancel: Arc<AtomicBool>) -> Result<Cli> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
         Ok(Cli { rt, cancel })
     }
 
@@ -369,13 +546,46 @@ impl Cli {
     }
 
     /// Open (attach to) a repository; `init` also initializes an empty location.
-    fn open(&self, cfg: &RepoConfig, init: bool) -> Result<Repository> {
+    fn open(&self, cfg: &ConfiguredRepository, init: bool) -> Result<Repository> {
+        self.open_forbidden(cfg, init, &[])
+    }
+    fn open_forbidden(
+        &self,
+        cfg: &ConfiguredRepository,
+        init: bool,
+        forbidden: &[PathBuf],
+    ) -> Result<Repository> {
         let env = OpenEnv {
             cache_dir: cache_dir(),
             init: init || cfg.kind == RepoType::Memory,
             ..Default::default()
         };
-        self.block_on(Repository::open(cfg, &env))
+        if let Some(settings) = &cfg.encryption {
+            #[cfg(feature = "backup-encryption")]
+            {
+                let mut roots = forbidden.to_vec();
+                if let Some(path) = &cfg.path {
+                    roots.push(path.into());
+                }
+                let context = sparkles::backup::keys::KeyContext::from_environment(roots);
+                let keys = self.block_on(sparkles::backup::keys::resolve(
+                    settings,
+                    &context,
+                    &self.ctl(),
+                ))?;
+                return self
+                    .block_on(Repository::open_encrypted(&cfg.config, &env, &keys))
+                    .map_err(Into::into);
+            }
+            #[cfg(not(feature = "backup-encryption"))]
+            {
+                let _ = (settings, forbidden);
+                bail!(
+                    "encrypted repository operation requires a build with backup-encryption enabled"
+                );
+            }
+        }
+        self.block_on(Repository::open(&cfg.config, &env))
             .with_context(|| format!("repository {}", describe_repo(cfg)))
     }
 }
@@ -485,14 +695,24 @@ fn save_config(path: &Path, f: &ConfigFile) -> Result<()> {
 }
 
 /// The configuration of `--repo`: a URL, or a name from the config file.
-fn resolve(repo: &str, c: &ConfigArg) -> Result<RepoConfig> {
+fn resolve(repo: &str, c: &ConfigArg) -> Result<ConfiguredRepository> {
     if repo.contains("://") {
-        return Ok(RepoConfig::from_url(URL_REPO_NAME, repo)?);
+        return Ok(ConfiguredRepository {
+            config: RepoConfig::from_url(URL_REPO_NAME, repo)?,
+            encryption: c.keys()?,
+        });
     }
     let path = config_path(c)?;
     let f = load_existing(&path)?;
     match f.repositories.get(repo) {
-        Some(r) => f.resolve_credentials(r.to_config(repo)),
+        Some(r) => {
+            let mut retained = r.configured(repo)?;
+            retained.config = f.resolve_credentials(retained.config)?;
+            if let Some(overrides) = c.keys()? {
+                retained.encryption = Some(overrides);
+            }
+            Ok(retained)
+        }
         None => bail!(
             "no repository {repo:?} in {} (known: {}); a URL (file:///dir, s3://bucket/prefix) works too",
             path.display(),
@@ -582,6 +802,100 @@ fn table(rows: &[Vec<String>]) -> String {
     out
 }
 
+#[cfg(not(feature = "backup-encryption"))]
+fn run_repo_key(_command: RepoKeyCmd, _config: &ConfigArg, _out: &OutputArg) -> Result<()> {
+    bail!("encrypted repository operation requires a build with backup-encryption enabled")
+}
+
+#[cfg(feature = "backup-encryption")]
+fn run_repo_key(command: RepoKeyCmd, config: &ConfigArg, out: &OutputArg) -> Result<()> {
+    let new_settings = match &command {
+        RepoKeyCmd::Add { keys, .. } => {
+            if keys.key_label.is_none() {
+                bail!("key add requires --key-label for the independent recovery slot");
+            }
+            let settings = keys
+                .references()?
+                .ok_or_else(|| anyhow!("a new recovery key source is required"))?;
+            if settings.keys.len() != 1 {
+                bail!("key add accepts exactly one recovery input");
+            }
+            Some(settings)
+        }
+        _ => None,
+    };
+    let name = match &command {
+        RepoKeyCmd::List { repo }
+        | RepoKeyCmd::Add { repo, .. }
+        | RepoKeyCmd::Remove { repo, .. }
+        | RepoKeyCmd::RotateMaster { repo }
+        | RepoKeyCmd::Retire { repo, .. } => repo,
+    };
+    let cfg = resolve(name, config)?;
+    let cli = Cli::new()?;
+    let repo = cli.open(&cfg, false)?;
+    match command {
+        RepoKeyCmd::List { .. } => {
+            let slots = cli.block_on(repo.key_list())?;
+            if out.is_json() {
+                return print_json(&json!({"slots":slots}));
+            }
+            for slot in slots {
+                println!(
+                    "{} · epoch {} · {} · {} · {}",
+                    slot.id, slot.epoch, slot.label, slot.source, slot.kek_id
+                );
+            }
+        }
+        RepoKeyCmd::Add { .. } => {
+            let settings = new_settings.expect("validated key-add input");
+            let mut roots = Vec::new();
+            if let Some(path) = &cfg.path {
+                roots.push(path.into());
+            }
+            let context = sparkles::backup::keys::KeyContext::from_environment(roots);
+            let inputs = cli.block_on(sparkles::backup::keys::resolve(
+                &settings,
+                &context,
+                &cli.ctl(),
+            ))?;
+            let added = if let Some(key) = inputs.keys.first() {
+                cli.block_on(repo.key_add(key, &cli.ctl()))?
+            } else {
+                cli.block_on(repo.key_add_passphrase(&inputs.passphrases[0], &cli.ctl()))?
+            };
+            if out.is_json() {
+                return print_json(&json!({"slots":added}));
+            }
+            for slot in added {
+                println!("added {} · epoch {} · {}", slot.id, slot.epoch, slot.label);
+            }
+        }
+        RepoKeyCmd::Remove { slot, .. } => {
+            let removed = cli.block_on(repo.key_remove(slot, &cli.ctl()))?;
+            if out.is_json() {
+                return print_json(&json!({"slot":slot,"removed":removed}));
+            }
+            println!("slot {slot} · removed {removed}");
+        }
+        RepoKeyCmd::RotateMaster { .. } => {
+            let epoch = cli.block_on(repo.key_rotate(&cli.ctl()))?;
+            if out.is_json() {
+                return print_json(&json!({"epoch":epoch}));
+            }
+            println!("active epoch {epoch}");
+        }
+        RepoKeyCmd::Retire { epoch, .. } => {
+            cli.block_on(repo.key_retire(epoch, &cli.ctl()))?;
+            if out.is_json() {
+                return print_json(&json!({"epoch":epoch,"retired":true}));
+            }
+            println!("retired epoch {epoch}");
+        }
+    }
+    Ok(())
+}
+
 fn verify_level(s: &str) -> VerifyLevel {
     match s {
         "data" => VerifyLevel::Data,
@@ -616,9 +930,30 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
             credentials_name,
             readonly,
             no_init,
+            encrypt,
+            keys,
             config,
             out,
         } => {
+            let encryption = keys.references()?;
+            if encrypt != encryption.is_some() {
+                bail!("--encrypt requires key source references; key sources require --encrypt");
+            }
+            if !no_init
+                && encryption
+                    .as_ref()
+                    .is_some_and(|s| s.keys.len() == 1 && !s.single_key_ok)
+            {
+                bail!(
+                    "initializing with one key requires --single-key-ok or an independent second key source"
+                );
+            }
+            #[cfg(not(feature = "backup-encryption"))]
+            if encrypt {
+                bail!(
+                    "encrypted repository operation requires a build with backup-encryption enabled"
+                );
+            }
             let mut cfg = RepoConfig {
                 name: name.clone(),
                 conditional_writes: true,
@@ -671,7 +1006,7 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
             if let Some((other, _)) = f
                 .repositories
                 .iter()
-                .find(|(n, r)| r.to_config(n).same_location(&cfg))
+                .find(|(n, r)| r.configured(n).is_ok_and(|r| r.same_location(&cfg)))
             {
                 bail!(
                     "repository {other:?} of {} already is at {}",
@@ -680,7 +1015,11 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
                 );
             }
             let cli = Cli::new()?;
-            let repo = cli.open(&f.resolve_credentials(cfg.clone())?, !no_init && !readonly)?;
+            let retained = ConfiguredRepository {
+                config: f.resolve_credentials(cfg.clone())?,
+                encryption: encryption.clone(),
+            };
+            let repo = cli.open(&retained, !no_init && !readonly)?;
             let test = cli.block_on(repo.test())?;
             if !test.ok {
                 print_test(&test);
@@ -690,8 +1029,9 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
                     path.display()
                 );
             }
-            f.repositories
-                .insert(name.clone(), RepoToml::from_config(&cfg));
+            let mut table = RepoToml::from_config(&cfg);
+            table.encryption = encryption;
+            f.repositories.insert(name.clone(), table);
             save_config(&path, &f)?;
             if out.is_json() {
                 print_json(&json!({
@@ -723,7 +1063,7 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
         RepoCmd::List { config, out } => {
             let path = config_path(&config)?;
             let f = load_or_empty(&path)?;
-            let repos = f.repository_configs();
+            let repos = f.configured_repositories()?;
             if out.is_json() {
                 return print_json(&json!({ "config": path, "repositories": repos }));
             }
@@ -748,6 +1088,11 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
             print!("{}", table(&rows));
             Ok(())
         }
+        RepoCmd::Key {
+            command,
+            config,
+            out,
+        } => run_repo_key(command, &config, &out),
         RepoCmd::Show { name, config, out } => repo_show(&name, &config, &out),
         RepoCmd::Test { repo, config, out } => {
             let cfg = resolve(&repo, &config)?;
@@ -1088,7 +1433,7 @@ fn repo_show(name: &str, c: &ConfigArg, out: &OutputArg) -> Result<()> {
     let cli = Cli::new()?;
     let opened = cli.open(&cfg, false);
     let mut view = sparkles_backup::types::Repository {
-        config: cfg.clone(),
+        config: cfg.config.clone(),
         source: sparkles_backup::ConfigSource::Config,
         id: None,
         status: sparkles_backup::RepoStatus {
@@ -1463,7 +1808,7 @@ fn create(
     }
     let cfg = resolve(repo, config)?;
     let cli = Cli::new()?;
-    let r = cli.open(&cfg, true)?;
+    let r = cli.open_forbidden(&cfg, true, &[loc.to_path_buf()])?;
     // opens the database (the "in use by another process" error while a server has it)
     let src = Source::from_closed_branch(
         loc,
@@ -1588,7 +1933,7 @@ fn refuse_if_open(dir: &Path) -> Result<()> {
 /// `--to DIR [--replace]`: restore next to DIR, then rename (or swap) it into place.
 /// `auto` identity keeps the id here (no registry to compare with).
 fn restore_to(
-    cfg: &RepoConfig,
+    cfg: &ConfiguredRepository,
     a: RestoreArgs,
     to: &Path,
     replace: bool,
@@ -1629,7 +1974,7 @@ fn restore_to(
         std::fs::remove_dir_all(&tmp)?;
     }
     let cli = Cli::new()?;
-    let r = cli.open(cfg, false)?;
+    let r = cli.open_forbidden(cfg, false, std::slice::from_ref(&to))?;
     let o = RestoreOptions {
         identity: a.identity,
         check: a.check,
@@ -1655,7 +2000,7 @@ fn restore_to(
 
 /// Restore into the catalog of a stopped server, using its registry and identity rules.
 fn restore_data(
-    cfg: &RepoConfig,
+    cfg: &ConfiguredRepository,
     a: RestoreArgs,
     data: &Path,
     as_name: Option<String>,
@@ -1663,7 +2008,7 @@ fn restore_data(
 ) -> Result<()> {
     let catalog = sparkles::Catalog::open(data, a.opts.into())?;
     let cli = Cli::new()?;
-    let repo = cli.open(cfg, false)?;
+    let repo = cli.open_forbidden(cfg, false, &[data.to_path_buf()])?;
     let req = sparkles_backup::RestoreRequest {
         target: as_name,
         identity: a.identity,
@@ -1707,9 +2052,162 @@ fn run_policy(cmd: PolicyCmd, c: &ConfigArg, out: &OutputArg) -> Result<()> {
             }
             Ok(())
         }
-        PolicyCmd::Run { policy } => bail!(
-            "policies run on a server: POST /$/backup-policies/{policy}/run (running one offline is not supported yet)"
-        ),
+        PolicyCmd::Run { policy: name, data } => {
+            if c.keys()?.is_some() {
+                bail!(
+                    "repository key overrides are unavailable for policy run; use offline repository commands"
+                );
+            }
+            let path = config_path(c)?;
+            let f = load_or_empty(&path)?;
+            let p = f
+                .policy_configs()
+                .into_iter()
+                .find(|p| p.name == name)
+                .ok_or_else(|| anyhow!("no policy {name:?} in {}", path.display()))?;
+            policy::check_policy(&p)?;
+            if !data.join("config.json").is_file() {
+                bail!(
+                    "{} is not a managed catalog (config.json is missing)",
+                    data.display()
+                );
+            }
+            let repositories = f.configured_repositories()?;
+            #[cfg(not(feature = "backup-encryption"))]
+            if repositories.iter().any(|r| r.encryption.is_some()) {
+                bail!(
+                    "encrypted policy configuration requires a build with backup-encryption enabled"
+                );
+            }
+            for cfg in &repositories {
+                cfg.validate(std::slice::from_ref(&data)).map_err(|error| {
+                    if cfg.encryption.is_some() {
+                        anyhow!(sparkles_backup::BackupError::new(
+                            error.code(),
+                            "encrypted policy repository configuration is invalid"
+                        ))
+                    } else {
+                        anyhow!(error)
+                    }
+                })?;
+            }
+            let mut selected = repositories
+                .iter()
+                .find(|r| r.name == p.repository)
+                .cloned()
+                .ok_or_else(|| anyhow!("policy repository is not configured"))?;
+            let mut forbidden = vec![data.clone()];
+            forbidden.extend(
+                repositories
+                    .iter()
+                    .filter_map(|r| r.path.as_ref().map(PathBuf::from)),
+            );
+            let cli = Cli::new()?;
+            let ctl = cli.ctl().control();
+            // Keep the signal runtime responsive while the blocking facade opens
+            // its catalog and drives repository operations on its own runtime.
+            let (send, receive) = tokio::sync::oneshot::channel();
+            // Tokio blocking workers still carry a runtime handle. The facade
+            // requires a plain thread because it drives its own async runtime.
+            let worker = std::thread::spawn(move || {
+                let result = (|| -> Result<_> {
+                    let catalog = sparkles::Catalog::open(&data, StoreOptions::default().into())?;
+                    // Preserve namespace collisions without projecting encrypted
+                    // references into an ordinary plaintext registry entry.
+                    let registered = catalog.repositories()?;
+                    {
+                        let entries = registered.registry.repos.read();
+                        if repositories.iter().any(|r| entries.contains_key(&r.name)) {
+                            bail!(
+                                "a configured policy repository name is already registered in the catalog"
+                            );
+                        }
+                    }
+                    let mut dataset_roots = vec![data.clone()];
+                    dataset_roots.extend(
+                        catalog
+                            .list()
+                            .into_iter()
+                            .filter_map(|dataset| dataset.path),
+                    );
+                    for configured in &repositories {
+                        configured.validate(&dataset_roots).map_err(|error| {
+                            if configured.encryption.is_some() {
+                                anyhow!(sparkles_backup::BackupError::new(
+                                    error.code(),
+                                    "encrypted policy repository configuration is invalid"
+                                ))
+                            } else {
+                                anyhow!(error)
+                            }
+                        })?;
+                    }
+                    forbidden.extend(dataset_roots);
+                    ctl.check()?;
+                    let worker_cli = Cli::with_cancel(ctl.cancel.flag())?;
+                    let encrypted = selected.encryption.is_some();
+                    let opened = (|| -> Result<_> {
+                        selected.config = f.resolve_credentials(selected.config)?;
+                        worker_cli.open_forbidden(&selected, !selected.readonly, &forbidden)
+                    })();
+                    let repository = Arc::new(opened.map_err(|e| {
+                        if !encrypted {
+                            return e;
+                        }
+                        let code = e
+                            .downcast_ref::<sparkles_backup::BackupError>()
+                            .map(|e| e.code())
+                            .unwrap_or(sparkles_backup::Code::RepositoryUnavailable);
+                        anyhow!(sparkles_backup::BackupError::new(
+                            code,
+                            match code {
+                                sparkles_backup::Code::Cancelled =>
+                                    "encrypted policy opening was cancelled",
+                                sparkles_backup::Code::WrongRepositoryKey =>
+                                    "encrypted policy key did not unlock the repository",
+                                sparkles_backup::Code::RepositoryKeyRequired =>
+                                    "encrypted policy key input is unavailable",
+                                _ => "encrypted policy repository could not be opened",
+                            }
+                        ))
+                    })?);
+                    ctl.check()?;
+                    Ok(catalog.run_policy_in(&p, repository, &ctl)?)
+                })();
+                let _ = send.send(result);
+            });
+            let result = cli.block_on(receive);
+            worker
+                .join()
+                .map_err(|_| anyhow!("backup policy worker failed"))?;
+            let report = result??;
+            if out.is_json() {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "policy {} · run {} · {:?}",
+                    report.policy, report.id, report.result
+                );
+                for ds in &report.datasets {
+                    println!(
+                        "  {} · {:?}{}",
+                        ds.dataset,
+                        ds.result,
+                        ds.reason
+                            .as_ref()
+                            .map(|r| format!(" · {r}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            if report.result != sparkles_backup::RunResult::Ok {
+                bail!("policy run finished with {:?}", report.result);
+            }
+            if let Some(error) = report.retention.as_ref().and_then(|r| r.error.as_ref()) {
+                bail!("policy retention failed: {error}");
+            }
+            Ok(())
+        }
         PolicyCmd::List => {
             let path = config_path(c)?;
             let f = load_or_empty(&path)?;
@@ -1814,17 +2312,7 @@ fn run_policy(cmd: PolicyCmd, c: &ConfigArg, out: &OutputArg) -> Result<()> {
                 .get(&name)
                 .map(|p| p.to_config(&name))
                 .ok_or_else(|| anyhow!("no policy {name:?} in {}", path.display()))?;
-            let repo = f
-                .repositories
-                .get(&p.repository)
-                .map(|r| r.to_config(&p.repository))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "repository {:?} of policy {name} is not in {}",
-                        p.repository,
-                        path.display()
-                    )
-                })?;
+            let repo = resolve(&p.repository, c)?;
             let cli = Cli::new()?;
             let r = cli.open(&repo, false)?;
             let list = cli.block_on(r.list(&ListFilter {

@@ -1373,3 +1373,30 @@ async fn end_to_end_policy_run() {
     let (_, j) = call("GET", "/$/repositories/mem/backups?policy=p", J::Null).await;
     assert_eq!(j["backups"].as_array().unwrap().len(), 1, "{j}");
 }
+
+#[test]
+fn real_policy_discovery_reads_published_state_without_waiting_for_writer() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(
+            directory.path(),
+            StoreOptions::default(),
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    let dataset = state.create("ds", crate::state::DbType::Mem).unwrap();
+    let writer = dataset.store.write();
+    let result = std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let state = &state;
+        let worker = scope.spawn(move || send.send(ServerEngine.datasets(state)).unwrap());
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        drop(writer);
+        worker.join().unwrap();
+        result
+    });
+    let rows = result.expect("scheduled policy metadata waited for the retained writer");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].head, 0);
+}

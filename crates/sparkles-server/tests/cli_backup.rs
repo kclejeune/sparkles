@@ -12,7 +12,531 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
 
+#[cfg(all(
+    feature = "backup-encryption",
+    any(target_os = "linux", target_os = "android")
+))]
+fn private_key(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+#[test]
+#[cfg(not(feature = "backup-encryption"))]
+fn encrypted_commands_refuse_before_provider_access_in_default_builds() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let repo = h.join("encrypted");
+    let missing = h.join("missing-key");
+    let o = expect(
+        h,
+        &[
+            "repo",
+            "add",
+            "enc",
+            "--path",
+            s(&repo),
+            "--encrypt",
+            "--key-file",
+            s(&missing),
+            "--single-key-ok",
+        ],
+        1,
+    );
+    assert!(stderr(&o).contains("backup-encryption"));
+    assert!(!repo.exists());
+    let o = expect(h, &["repo", "key", "list", "--repo", "enc"], 1);
+    assert!(stderr(&o).contains("backup-encryption"));
+}
+
+#[test]
+#[cfg(not(feature = "backup-encryption"))]
+fn encrypted_configuration_is_rejected_by_the_server_without_opening_it() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let config = h.join("encrypted.toml");
+    std::fs::write(&config,format!("version=1\n[repositories.enc]\ntype='fs'\npath='{}'\n[repositories.enc.encryption]\nkeys=[{{label='online',key={{source='file',path='{}'}}}}]\n",h.join("encrypted").display(),h.join("missing-key").display())).unwrap();
+    let o = expect(
+        h,
+        &[
+            "serve",
+            "--data",
+            s(&h.join("data")),
+            "--backup-config",
+            s(&config),
+        ],
+        1,
+    );
+    assert!(stderr(&o).contains("backup-encryption"), "{}", stderr(&o));
+    assert!(!h.join("encrypted").exists());
+}
+
+#[test]
+#[cfg(all(
+    feature = "backup-encryption",
+    any(target_os = "linux", target_os = "android")
+))]
+fn encrypted_cli_roundtrip_rotation_and_independent_recovery() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let repo = h.join("encrypted");
+    let key = h.join("online-key");
+    private_key(&key, &[61; 32]);
+    let phrase = h.join("offline-phrase");
+    private_key(&phrase, b"exact offline recovery\n");
+    let refused = expect(
+        h,
+        &[
+            "repo",
+            "add",
+            "enc",
+            "--path",
+            s(&repo),
+            "--encrypt",
+            "--key-file",
+            s(&key),
+        ],
+        1,
+    );
+    assert!(stderr(&refused).contains("single-key-ok"));
+    assert!(!repo.exists());
+    expect(
+        h,
+        &[
+            "repo",
+            "add",
+            "enc",
+            "--path",
+            s(&repo),
+            "--encrypt",
+            "--key-file",
+            s(&key),
+            "--single-key-ok",
+        ],
+        0,
+    );
+    let db = database(h);
+    expect(
+        h,
+        &[
+            "backup", "create", "--loc", &db, "--repo", "enc", "--name", "b1",
+        ],
+        0,
+    );
+    expect(h, &["repo", "verify", "enc", "--level", "data"], 0);
+    let added = json_of(&expect(
+        h,
+        &[
+            "repo",
+            "key",
+            "add",
+            "--repo",
+            "enc",
+            "--passphrase-file",
+            s(&phrase),
+            "--key-label",
+            "offline",
+            "--json",
+        ],
+        0,
+    ));
+    assert_eq!(added["slots"].as_array().unwrap().len(), 1);
+    let again = json_of(&expect(
+        h,
+        &[
+            "repo",
+            "key",
+            "add",
+            "--repo",
+            "enc",
+            "--passphrase-file",
+            s(&phrase),
+            "--key-label",
+            "offline",
+            "--json",
+        ],
+        0,
+    ));
+    assert_eq!(added, again);
+    let slots = json_of(&expect(
+        h,
+        &["repo", "key", "list", "--repo", "enc", "--json"],
+        0,
+    ));
+    let online = slots["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["source"] == "file")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::fs::rename(&key, h.join("online-key-offline")).unwrap();
+    expect(h, &["backup", "list", "--repo", "enc"], 1);
+    let restored = h.join("restored");
+    expect(
+        h,
+        &[
+            "backup",
+            "restore",
+            "--repo",
+            "enc",
+            "b1",
+            "--to",
+            s(&restored),
+            "--repository-passphrase-file",
+            s(&phrase),
+            "--repository-key-label",
+            "offline",
+        ],
+        0,
+    );
+    assert_eq!(count(h, &restored), 2);
+    let wrong = h.join("wrong-key");
+    private_key(&wrong, &[62; 32]);
+    expect(
+        h,
+        &[
+            "backup",
+            "list",
+            "--repo",
+            "enc",
+            "--repository-key-file",
+            s(&wrong),
+        ],
+        1,
+    );
+    expect(
+        h,
+        &[
+            "repo",
+            "key",
+            "remove",
+            "--repo",
+            "enc",
+            "--slot",
+            &online,
+            "--repository-passphrase-file",
+            s(&phrase),
+            "--repository-key-label",
+            "offline",
+        ],
+        0,
+    );
+    expect(
+        h,
+        &[
+            "repo",
+            "key",
+            "rotate-master",
+            "--repo",
+            "enc",
+            "--repository-passphrase-file",
+            s(&phrase),
+            "--repository-key-label",
+            "offline",
+        ],
+        0,
+    );
+    expect(
+        h,
+        &[
+            "backup",
+            "create",
+            "--loc",
+            &db,
+            "--repo",
+            "enc",
+            "--name",
+            "b2",
+            "--repository-passphrase-file",
+            s(&phrase),
+            "--repository-key-label",
+            "offline",
+        ],
+        0,
+    );
+    expect(
+        h,
+        &[
+            "repo",
+            "key",
+            "retire",
+            "--repo",
+            "enc",
+            "--epoch",
+            "1",
+            "--repository-passphrase-file",
+            s(&phrase),
+            "--repository-key-label",
+            "offline",
+        ],
+        1,
+    );
+    expect(
+        h,
+        &[
+            "backup",
+            "delete",
+            "--repo",
+            "enc",
+            "b1",
+            "--repository-passphrase-file",
+            s(&phrase),
+            "--repository-key-label",
+            "offline",
+        ],
+        0,
+    );
+    // Age native blob mtimes deterministically; GC still retains referenced blobs.
+    let mut blob_dirs = vec![repo.join("blobs")];
+    while let Some(directory) = blob_dirs.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                blob_dirs.push(path);
+            } else {
+                std::fs::File::open(path)
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new().set_modified(
+                            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                        ),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    expect(
+        h,
+        &[
+            "repo",
+            "gc",
+            "enc",
+            "--grace",
+            "1s",
+            "--repository-passphrase-file",
+            s(&phrase),
+            "--repository-key-label",
+            "offline",
+        ],
+        0,
+    );
+    expect(
+        h,
+        &[
+            "repo",
+            "key",
+            "retire",
+            "--repo",
+            "enc",
+            "--epoch",
+            "1",
+            "--repository-passphrase-file",
+            s(&phrase),
+            "--repository-key-label",
+            "offline",
+        ],
+        0,
+    );
+    expect(
+        h,
+        &[
+            "repo",
+            "verify",
+            "enc",
+            "--level",
+            "data",
+            "--repository-passphrase-file",
+            s(&phrase),
+            "--repository-key-label",
+            "offline",
+        ],
+        0,
+    );
+    let config = std::fs::read_to_string(h.join("config/sparkles/backup.toml")).unwrap();
+    assert!(!config.contains("exact offline recovery"));
+    assert!(!config.contains("offline-phrase")); // independent recovery input was never persisted online
+    let mut todo = vec![repo];
+    while let Some(path) = todo.pop() {
+        for file in std::fs::read_dir(path).unwrap().flatten() {
+            if file.path().is_dir() {
+                todo.push(file.path());
+                continue;
+            }
+            let bytes = std::fs::read(file.path()).unwrap();
+            assert!(!bytes.windows(5).any(|w| w == b"urn:a"));
+            assert!(!bytes.windows(22).any(|w| w == b"exact offline recovery"));
+        }
+    }
+}
+
 /// The binary with its home, config and cache directories inside `home`.
+#[test]
+#[cfg(all(
+    feature = "backup-encryption",
+    any(target_os = "linux", target_os = "android")
+))]
+fn encrypted_cli_resolves_env_credential_command_and_refuses_dataset_keys() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let repo = h.join("encrypted");
+    let credentials = h.join("credentials");
+    std::fs::create_dir(&credentials).unwrap();
+    private_key(&credentials.join("online"), &[77; 32]);
+    let command = h.join("provider");
+    std::fs::write(
+        &command,
+        "#!/bin/sh\nprintf '4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d'\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |args: &[&str]| {
+        let o = sparkles(h)
+            .env("F11_TEST_KEY", "4d".repeat(32))
+            .env("CREDENTIALS_DIRECTORY", &credentials)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{args:?}: {}", stderr(&o));
+        o
+    };
+    run(&[
+        "repo",
+        "add",
+        "enc",
+        "--path",
+        s(&repo),
+        "--encrypt",
+        "--key-env",
+        "F11_TEST_KEY",
+        "--single-key-ok",
+    ]);
+    let recovery_file = h.join("env-recovery-key");
+    private_key(&recovery_file, &[77; 32]);
+    let recovered = sparkles(h)
+        .env_remove("F11_TEST_KEY")
+        .args([
+            "repo",
+            "key",
+            "list",
+            "--repo",
+            "enc",
+            "--repository-key-file",
+            s(&recovery_file),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+    assert!(
+        json_of(&recovered)["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|slot| slot["source"] == "env")
+    );
+    let db = database(h);
+    run(&[
+        "backup",
+        "create",
+        "--loc",
+        &db,
+        "--repo",
+        "enc",
+        "--name",
+        "env-backup",
+    ]);
+    let restored = h.join("env-recovered");
+    let recovered = sparkles(h)
+        .env_remove("F11_TEST_KEY")
+        .args([
+            "backup",
+            "restore",
+            "--repo",
+            "enc",
+            "env-backup",
+            "--to",
+            s(&restored),
+            "--repository-key-file",
+            s(&recovery_file),
+        ])
+        .output()
+        .unwrap();
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+    assert_eq!(count(h, &restored), 2);
+    run(&[
+        "repo",
+        "key",
+        "add",
+        "--repo",
+        "enc",
+        "--key-credential",
+        "online",
+        "--key-label",
+        "credential",
+    ]);
+    run(&[
+        "repo",
+        "key",
+        "list",
+        "--repo",
+        "enc",
+        "--repository-credential",
+        "online",
+    ]);
+    let argv = serde_json::to_string(&vec![s(&command)]).unwrap();
+    run(&[
+        "repo",
+        "key",
+        "add",
+        "--repo",
+        "enc",
+        "--key-command-argv",
+        &argv,
+        "--key-label",
+        "command",
+    ]);
+    run(&[
+        "repo",
+        "key",
+        "list",
+        "--repo",
+        "enc",
+        "--repository-key-command-argv",
+        &argv,
+    ]);
+    let configuration = std::fs::read_to_string(h.join("config/sparkles/backup.toml")).unwrap();
+    assert!(configuration.contains("F11_TEST_KEY"));
+    assert!(!configuration.contains(&"4d".repeat(32)));
+    let unsafe_key = Path::new(&db).join("key");
+    private_key(&unsafe_key, &[77; 32]);
+    let refused = h.join("refused");
+    let o = expect(
+        h,
+        &[
+            "repo",
+            "add",
+            "bad",
+            "--path",
+            s(&refused),
+            "--encrypt",
+            "--key-file",
+            s(&unsafe_key),
+            "--single-key-ok",
+        ],
+        1,
+    );
+    assert!(stderr(&o).contains("dataset"), "{}", stderr(&o));
+    assert!(!refused.exists());
+}
+
 fn sparkles(home: &Path) -> Command {
     let mut c = Command::new(BIN);
     c.env("HOME", home)
@@ -825,7 +1349,7 @@ fn the_config_file_is_rewritten_in_place() {
     expect(
         h,
         &["backup", "policy", "run", "nightly", "--backup-config", c],
-        1,
+        2,
     );
 
     // a repository a policy uses stays
@@ -851,6 +1375,173 @@ fn the_config_file_is_rewritten_in_place() {
         .output()
         .unwrap();
     assert!(stdout(&o).contains("main"), "{}", stdout(&o));
+}
+
+#[test]
+fn offline_policy_run_backs_up_selected_datasets_and_skips_unchanged() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let data = h.join("catalog");
+    {
+        let catalog = sparkles::Catalog::open(&data, Default::default()).unwrap();
+        for name in ["a", "b", "excluded"] {
+            catalog
+                .create(name, &Default::default())
+                .unwrap()
+                .update("INSERT DATA { <urn:s> <urn:p> 1 }")
+                .unwrap();
+        }
+    }
+    let cfg = h.join("backup.toml");
+    let repo = h.join("repo");
+    expect(
+        h,
+        &[
+            "repo",
+            "add",
+            "local",
+            "--path",
+            s(&repo),
+            "--backup-config",
+            s(&cfg),
+        ],
+        0,
+    );
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str("\n[policies.manual]\nrepository = \"local\"\ndatasets = [\"a\", \"b\"]\nschedule = \"every 1h\"\nenabled = false\nskip_unchanged = true\n");
+    std::fs::write(&cfg, text).unwrap();
+    let args = [
+        "backup",
+        "policy",
+        "run",
+        "manual",
+        "--data",
+        s(&data),
+        "--backup-config",
+        s(&cfg),
+        "--json",
+    ];
+    let report = json_of(&expect(h, &args, 0));
+    assert_eq!(report["result"], "ok");
+    assert_eq!(report["trigger"], "manual");
+    let datasets = report["datasets"].as_array().unwrap();
+    assert_eq!(datasets.len(), 2);
+    assert_eq!(datasets[0]["dataset"], "a");
+    assert_eq!(datasets[1]["dataset"], "b");
+    assert!(datasets.iter().all(|d| d["result"] == "ok"));
+    let listed = json_of(&expect(
+        h,
+        &[
+            "backup",
+            "list",
+            "--repo",
+            "local",
+            "--backup-config",
+            s(&cfg),
+            "--json",
+        ],
+        0,
+    ));
+    let backups = listed["backups"].as_array().unwrap();
+    assert_eq!(backups.len(), 2);
+    assert!(
+        backups
+            .iter()
+            .all(|b| b["policy"] == "manual" && b["run"] == report["id"])
+    );
+    let again = json_of(&expect(h, &args, 0));
+    assert_eq!(again["result"], "ok");
+    assert!(
+        again["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["result"] == "skipped" && d["reason"] == "unchanged")
+    );
+    let catalog = sparkles::Catalog::open(&data, Default::default()).unwrap();
+    let blocked = expect(h, &args, 1);
+    assert!(!stderr(&blocked).is_empty());
+    assert_eq!(catalog.list().len(), 3);
+    let listed = json_of(&expect(
+        h,
+        &[
+            "backup",
+            "list",
+            "--repo",
+            "local",
+            "--backup-config",
+            s(&cfg),
+            "--json",
+        ],
+        0,
+    ));
+    assert_eq!(listed["backups"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn offline_policy_run_rejects_missing_catalog_and_reports_backup_failures() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let data = h.join("catalog");
+    let cfg = h.join("backup.toml");
+    let repo = h.join("repo");
+    expect(
+        h,
+        &[
+            "repo",
+            "add",
+            "local",
+            "--path",
+            s(&repo),
+            "--backup-config",
+            s(&cfg),
+        ],
+        0,
+    );
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str("\n[policies.manual]\nrepository = \"local\"\nschedule = \"every 1h\"\n");
+    std::fs::write(&cfg, &text).unwrap();
+    let args = [
+        "backup",
+        "policy",
+        "run",
+        "manual",
+        "--data",
+        s(&data),
+        "--backup-config",
+        s(&cfg),
+        "--json",
+    ];
+    let o = expect(h, &args, 1);
+    assert!(stderr(&o).contains("not a managed catalog"));
+    assert!(!data.exists());
+    {
+        let catalog = sparkles::Catalog::open(&data, Default::default()).unwrap();
+        catalog.create("a", &Default::default()).unwrap();
+    }
+    // A read-only repository can open and list, but every attempted backup fails.
+    text = text.replace(
+        "[repositories.local]",
+        "[repositories.local]\nreadonly = true",
+    );
+    std::fs::write(&cfg, text).unwrap();
+    let report = json_of(&expect(h, &args, 1));
+    assert_eq!(report["result"], "failed");
+    assert_eq!(report["datasets"][0]["result"], "failed");
+    assert!(report["datasets"][0]["reason"].is_string());
+    let locks = json_of(&expect(
+        h,
+        &[
+            "repo",
+            "locks",
+            "local",
+            "--backup-config",
+            s(&cfg),
+            "--json",
+        ],
+        0,
+    ));
+    assert_eq!(locks["locks"].as_array().unwrap().len(), 0);
 }
 
 #[test]
@@ -1039,4 +1730,466 @@ fn selected_branch_backup_is_standalone_and_restores_with_fresh_identity() {
     assert_ne!(restored.dataset_id(), branch_id);
     assert_eq!(restored.forked_from().unwrap().id, branch_id);
     assert_eq!(restored.branches().unwrap().len(), 1);
+}
+
+fn encrypted_policy_config(
+    home: &Path,
+    source: sparkles::backup::config::KeySource,
+    datasets: &[&str],
+) -> (PathBuf, PathBuf) {
+    use sparkles::backup::config::{ConfigFile, KeyInput, RepoToml, RepositoryEncryption};
+    let repo = home.join("policy-encrypted");
+    let config = home.join("policy-encrypted.toml");
+    let mut file = ConfigFile {
+        version: 1,
+        ..Default::default()
+    };
+    let mut table = RepoToml::from_config(
+        &sparkles::backup::RepoConfig::from_url("enc", &file_url(&repo)).unwrap(),
+    );
+    table.encryption = Some(RepositoryEncryption {
+        keys: vec![KeyInput {
+            label: "online-private-reference".into(),
+            key: source,
+        }],
+        single_key_ok: true,
+    });
+    file.repositories.insert("enc".into(), table);
+    let policy: sparkles::backup::PolicyConfig = serde_json::from_value(serde_json::json!({
+        "name":"manual", "repository":"enc", "datasets":datasets, "schedule":"every 1h",
+        "enabled":false, "skipUnchanged":true, "nameTemplate":"{policy}-{dataset}-{run}",
+        "retention":{"minCount":0,"maxCount":1}, "gcAfterRetention":true
+    }))
+    .unwrap();
+    file.policies.insert(
+        "manual".into(),
+        sparkles::backup::config::PolicyToml::from_config(&policy),
+    );
+    std::fs::write(&config, file.to_text().unwrap()).unwrap();
+    (config, repo)
+}
+
+fn policy_args<'a>(config: &'a Path, data: &'a Path) -> Vec<&'a str> {
+    vec![
+        "backup",
+        "policy",
+        "run",
+        "manual",
+        "--data",
+        s(data),
+        "--backup-config",
+        s(config),
+        "--json",
+    ]
+}
+
+fn finish_policy_child(mut child: Child) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("policy CLI exceeded bounded wait: {}", stderr(&output));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn bounded_policy(home: &Path, config: &Path, data: &Path, code: i32) -> Output {
+    let child = sparkles(home)
+        .args(policy_args(config, data))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = finish_policy_child(child);
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    output
+}
+
+#[test]
+#[cfg(not(feature = "backup-encryption"))]
+fn encrypted_offline_policy_default_off_refuses_before_mutation() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let data = h.join("catalog");
+    {
+        let catalog = sparkles::Catalog::open(&data, Default::default()).unwrap();
+        catalog.create("unselected", &Default::default()).unwrap();
+    }
+    let before = std::fs::read(data.join("config.json")).unwrap();
+    let (config, repo) = encrypted_policy_config(
+        h,
+        sparkles::backup::config::KeySource::Command {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("touch {}", h.join("provider-ran").display()),
+            ],
+            timeout_secs: 1,
+        },
+        &["*"],
+    );
+    let output = bounded_policy(h, &config, &data, 1);
+    assert!(stderr(&output).contains("backup-encryption"));
+    assert!(!repo.exists());
+    assert!(!h.join("provider-ran").exists());
+    assert_eq!(before, std::fs::read(data.join("config.json")).unwrap());
+}
+
+#[test]
+#[cfg(all(
+    feature = "backup-encryption",
+    any(target_os = "linux", target_os = "android")
+))]
+fn encrypted_offline_policy_roundtrip_epochs_retention_and_selected_only_inputs() {
+    use sparkles::backup::config::{
+        ConfigFile, KeyInput, KeySource, RepoToml, RepositoryEncryption,
+    };
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let data = h.join("catalog");
+    {
+        let catalog = sparkles::Catalog::open(&data, Default::default()).unwrap();
+        for name in ["a", "b", "excluded"] {
+            catalog
+                .create(name, &Default::default())
+                .unwrap()
+                .update("INSERT DATA { <urn:s> <urn:p> 1 }")
+                .unwrap();
+        }
+    }
+    let key = h.join("policy-key");
+    private_key(&key, &[98; 32]);
+    let (config, repo) = encrypted_policy_config(
+        h,
+        KeySource::File {
+            path: s(&key).into(),
+        },
+        &["a", "b"],
+    );
+    let mut file = ConfigFile::parse(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let unused_repo = h.join("unused-repository");
+    let mut unused = RepoToml::from_config(
+        &sparkles::backup::RepoConfig::from_url("unused", &file_url(&unused_repo)).unwrap(),
+    );
+    unused.encryption = Some(RepositoryEncryption {
+        keys: vec![KeyInput {
+            label: "unused".into(),
+            key: KeySource::Command {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("touch {}", h.join("unused-provider-ran").display()),
+                ],
+                timeout_secs: 1,
+            },
+        }],
+        single_key_ok: true,
+    });
+    file.repositories.insert("unused".into(), unused);
+    std::fs::write(&config, file.to_text().unwrap()).unwrap();
+    let first = json_of(&bounded_policy(h, &config, &data, 0));
+    let rows = first["datasets"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row["result"] == "ok"));
+    let epoch_one_b = rows.iter().find(|row| row["dataset"] == "b").unwrap()["backup"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let marker: J =
+        serde_json::from_slice(&std::fs::read(repo.join("sparkles-repo.json")).unwrap()).unwrap();
+    assert!(!marker["encryption"].is_null());
+    assert!(!unused_repo.exists());
+    assert!(!h.join("unused-provider-ran").exists());
+    let second = json_of(&bounded_policy(h, &config, &data, 0));
+    assert!(
+        second["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["result"] == "skipped" && row["reason"] == "unchanged")
+    );
+    expect(
+        h,
+        &[
+            "repo",
+            "key",
+            "rotate-master",
+            "--repo",
+            "enc",
+            "--backup-config",
+            s(&config),
+        ],
+        0,
+    );
+    {
+        let catalog = sparkles::Catalog::open(&data, Default::default()).unwrap();
+        catalog
+            .get("a")
+            .unwrap()
+            .update("INSERT DATA { <urn:second> <urn:p> 2 }")
+            .unwrap();
+    }
+    let third = json_of(&bounded_policy(h, &config, &data, 0));
+    let rows = third["datasets"].as_array().unwrap();
+    let epoch_two_a = rows.iter().find(|row| row["dataset"] == "a").unwrap()["backup"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(third["retention"]["deleted"].as_array().unwrap().len(), 1);
+    assert_eq!(third["gc"]["task"], "completed");
+    for (name, expected) in [(&epoch_one_b, 1), (&epoch_two_a, 2)] {
+        let restored = h.join(format!("restore-{expected}"));
+        expect(
+            h,
+            &[
+                "backup",
+                "restore",
+                "--repo",
+                "enc",
+                name,
+                "--to",
+                s(&restored),
+                "--backup-config",
+                s(&config),
+            ],
+            0,
+        );
+        assert_eq!(count(h, &restored), expected);
+    }
+    expect(
+        h,
+        &[
+            "repo",
+            "verify",
+            "enc",
+            "--level",
+            "data",
+            "--backup-config",
+            s(&config),
+        ],
+        2,
+    );
+    let locks = json_of(&expect(
+        h,
+        &[
+            "repo",
+            "locks",
+            "enc",
+            "--backup-config",
+            s(&config),
+            "--json",
+        ],
+        0,
+    ));
+    assert!(locks["locks"].as_array().unwrap().is_empty());
+    let original_config = std::fs::read_to_string(&config).unwrap();
+    let mut read_only = ConfigFile::parse(&original_config).unwrap();
+    read_only.repositories.get_mut("enc").unwrap().readonly = true;
+    read_only.policies.get_mut("manual").unwrap().skip_unchanged = false;
+    std::fs::write(&config, read_only.to_text().unwrap()).unwrap();
+    let failed = json_of(&bounded_policy(h, &config, &data, 1));
+    assert!(
+        failed["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["reason"] == "encrypted repository backup failed")
+    );
+    assert!(!failed.to_string().contains(s(&key)));
+    assert!(!failed.to_string().contains("online-private-reference"));
+    std::fs::write(&config, original_config).unwrap();
+    // Existing wrong/missing keys fail statically and never replace the marker.
+    let marker_before = std::fs::read(repo.join("sparkles-repo.json")).unwrap();
+    private_key(&key, &[99; 32]);
+    let wrong = bounded_policy(h, &config, &data, 1);
+    assert!(stderr(&wrong).contains("encrypted policy key did not unlock"));
+    assert!(!stderr(&wrong).contains(s(&key)));
+    assert!(!stderr(&wrong).contains("online-private-reference"));
+    std::fs::remove_file(&key).unwrap();
+    let missing = bounded_policy(h, &config, &data, 1);
+    assert!(!stderr(&missing).contains(s(&key)));
+    assert_eq!(
+        marker_before,
+        std::fs::read(repo.join("sparkles-repo.json")).unwrap()
+    );
+}
+
+#[test]
+#[cfg(all(
+    feature = "backup-encryption",
+    any(target_os = "linux", target_os = "android")
+))]
+fn encrypted_offline_policy_validates_catalog_roots_and_overrides_before_open() {
+    use sparkles::backup::config::KeySource;
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let data = h.join("catalog");
+    let external = h.join("external-dataset");
+    {
+        let catalog = sparkles::Catalog::open(&data, Default::default()).unwrap();
+        catalog.create("managed", &Default::default()).unwrap();
+        catalog
+            .attach(
+                "external",
+                sparkles::catalog::Attach::Directory(external.clone()),
+            )
+            .unwrap();
+    }
+    let key = external.join("private-key");
+    private_key(&key, &[78; 32]);
+    let (config, repo) = encrypted_policy_config(
+        h,
+        KeySource::File {
+            path: s(&key).into(),
+        },
+        &["external"],
+    );
+    let refused = bounded_policy(h, &config, &data, 1);
+    assert!(!stderr(&refused).contains(s(&key)));
+    assert!(!repo.exists());
+    let override_key = h.join("valid-override");
+    private_key(&override_key, &[78; 32]);
+    let args = policy_args(&config, &data);
+    let output = expect(
+        h,
+        &[
+            args.as_slice(),
+            &["--repository-key-file", s(&override_key)],
+        ]
+        .concat(),
+        1,
+    );
+    assert!(stderr(&output).contains("key overrides are unavailable"));
+    assert!(!repo.exists());
+    let mut file =
+        sparkles::backup::config::ConfigFile::parse(&std::fs::read_to_string(&config).unwrap())
+            .unwrap();
+    file.repositories.get_mut("enc").unwrap().path =
+        Some(s(&external.join("backup-inside-dataset")).into());
+    std::fs::write(&config, file.to_text().unwrap()).unwrap();
+    bounded_policy(h, &config, &data, 1);
+    assert!(!external.join("backup-inside-dataset").exists());
+    // A held catalog lock and namespace collision must precede provider access/init.
+    file.repositories.get_mut("enc").unwrap().path = Some(s(&repo).into());
+    file.repositories
+        .get_mut("enc")
+        .unwrap()
+        .encryption
+        .as_mut()
+        .unwrap()
+        .keys[0]
+        .key = KeySource::File {
+        path: s(&override_key).into(),
+    };
+    std::fs::write(&config, file.to_text().unwrap()).unwrap();
+    let catalog = sparkles::Catalog::open(&data, Default::default()).unwrap();
+    bounded_policy(h, &config, &data, 1);
+    assert!(!repo.exists());
+    catalog
+        .repositories()
+        .unwrap()
+        .add(
+            sparkles::backup::RepoConfig::from_url("enc", &file_url(&h.join("registered")))
+                .unwrap(),
+        )
+        .unwrap();
+    drop(catalog);
+    let collision = bounded_policy(h, &config, &data, 1);
+    assert!(
+        stderr(&collision).contains("already registered"),
+        "{}",
+        stderr(&collision)
+    );
+    assert!(!repo.exists());
+}
+
+#[test]
+#[cfg(all(
+    feature = "backup-encryption",
+    any(target_os = "linux", target_os = "android")
+))]
+fn encrypted_offline_zero_dataset_policy_provider_cancellation_is_reaped_and_redacted() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let data = h.join("catalog");
+    {
+        let catalog = sparkles::Catalog::open(&data, Default::default()).unwrap();
+        catalog.create("unselected", &Default::default()).unwrap();
+    }
+    let pidfile = h.join("provider-pid");
+    let script = h.join("provider-script");
+    std::fs::write(&script, "echo $$ > \"$1\"\nexec sleep 30\n").unwrap();
+    let (config, repo) = encrypted_policy_config(
+        h,
+        sparkles::backup::config::KeySource::Command {
+            argv: vec!["/bin/sh".into(), s(&script).into(), s(&pidfile).into()],
+            timeout_secs: 20,
+        },
+        &["missing-*"],
+    );
+    let child = sparkles(h)
+        .args(policy_args(&config, &data))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pidfile.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !pidfile.exists() {
+        let output = finish_policy_child(child);
+        panic!(
+            "provider must start before cancellation: {}",
+            stderr(&output)
+        );
+    }
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let output = finish_policy_child(child);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("cancelled"), "{}", stderr(&output));
+    assert!(!stderr(&output).contains(s(&script)));
+    assert!(!repo.exists());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "provider must be reaped"
+    );
+    let key = h.join("recovery-key");
+    private_key(&key, &[83; 32]);
+    let mut file =
+        sparkles::backup::config::ConfigFile::parse(&std::fs::read_to_string(&config).unwrap())
+            .unwrap();
+    file.repositories
+        .get_mut("enc")
+        .unwrap()
+        .encryption
+        .as_mut()
+        .unwrap()
+        .keys[0]
+        .key = sparkles::backup::config::KeySource::File {
+        path: s(&key).into(),
+    };
+    std::fs::write(&config, file.to_text().unwrap()).unwrap();
+    let report = json_of(&bounded_policy(h, &config, &data, 0));
+    assert!(report["datasets"].as_array().unwrap().is_empty());
 }

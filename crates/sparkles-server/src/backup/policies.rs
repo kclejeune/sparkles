@@ -76,6 +76,27 @@ pub trait Engine: Send + Sync {
         repo: &str,
         policy: &str,
     ) -> Result<Vec<BackupSummary>, BackupError>;
+    /// Task-aware provider/cache wait; legacy fake engines keep their implementation.
+    fn list_with_ctl(
+        &self,
+        st: &Arc<AppState>,
+        repo: &str,
+        policy: &str,
+        ctl: &sparkles_backup::Ctl,
+    ) -> Result<Vec<BackupSummary>, BackupError> {
+        ctl.check()?;
+        self.list(st, repo, policy)
+    }
+    fn delete_with_ctl(
+        &self,
+        st: &Arc<AppState>,
+        repo: &str,
+        name: &str,
+        ctl: &sparkles_backup::Ctl,
+    ) -> Result<bool, BackupError> {
+        ctl.check()?;
+        self.delete(st, repo, name)
+    }
     /// Back up `dataset` to `repo` (`409 backup-exists` when the name is taken).
     fn create(
         &self,
@@ -119,7 +140,7 @@ impl Engine for ServerEngine {
             .map(|d| DatasetInfo {
                 name: d.name.clone(),
                 id: d.store.dataset_id(),
-                head: d.store.head_commit().seq,
+                head: d.store.snapshot().commit,
             })
             .collect()
     }
@@ -130,8 +151,18 @@ impl Engine for ServerEngine {
         repo: &str,
         policy: &str,
     ) -> Result<Vec<BackupSummary>, BackupError> {
+        self.list_with_ctl(st, repo, policy, &sparkles_backup::Ctl::default())
+    }
+
+    fn list_with_ctl(
+        &self,
+        st: &Arc<AppState>,
+        repo: &str,
+        policy: &str,
+        ctl: &sparkles_backup::Ctl,
+    ) -> Result<Vec<BackupSummary>, BackupError> {
         let b = backup_state(st)?;
-        let r = b.repo(repo)?;
+        let r = b.repo_with_ctl(repo, ctl)?;
         let filter = ListFilter {
             policy: Some(policy.to_string()),
             ..Default::default()
@@ -152,8 +183,21 @@ impl Engine for ServerEngine {
     }
 
     fn delete(&self, st: &Arc<AppState>, repo: &str, name: &str) -> Result<bool, BackupError> {
+        self.delete_with_ctl(st, repo, name, &sparkles_backup::Ctl::default())
+    }
+
+    fn delete_with_ctl(
+        &self,
+        st: &Arc<AppState>,
+        repo: &str,
+        name: &str,
+        ctl: &sparkles_backup::Ctl,
+    ) -> Result<bool, BackupError> {
         let b = backup_state(st)?;
-        match block_on(b, super::ops::delete(st, b, repo, name, "policy retention")) {
+        match block_on(
+            b,
+            super::ops::delete_with_ctl(st, b, repo, name, "policy retention", ctl),
+        ) {
             Ok(()) => Ok(true),
             Err(e) if e.code() == Code::NoSuchBackup => Ok(false),
             Err(e) => Err(e),
@@ -796,7 +840,15 @@ impl sparkles::backup::policy::Engine for PolicyEngine<'_> {
             .collect()
     }
     fn list(&self, repo: &str, policy: &str) -> Result<Vec<BackupSummary>, BackupError> {
-        self.engine.list(self.st, repo, policy)
+        match self.run {
+            Some(run) => self.engine.list_with_ctl(
+                self.st,
+                repo,
+                policy,
+                &sparkles_backup::Ctl::with_cancel(run.h.cancel_flag()),
+            ),
+            None => self.engine.list(self.st, repo, policy),
+        }
     }
     fn create(
         &self,
@@ -807,7 +859,15 @@ impl sparkles::backup::policy::Engine for PolicyEngine<'_> {
         self.engine.create(self.st, repo, dataset, o)
     }
     fn delete(&self, repo: &str, backup: &str) -> Result<bool, BackupError> {
-        self.engine.delete(self.st, repo, backup)
+        match self.run {
+            Some(run) => self.engine.delete_with_ctl(
+                self.st,
+                repo,
+                backup,
+                &sparkles_backup::Ctl::with_cancel(run.h.cancel_flag()),
+            ),
+            None => self.engine.delete(self.st, repo, backup),
+        }
     }
     fn busy(&self, repo: &str) -> HashSet<String> {
         self.engine.busy(self.st, repo)

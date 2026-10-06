@@ -175,7 +175,7 @@ fn create_in(
     tmp: &std::path::Path,
     ctl: Ctl,
 ) -> Result<(BackupSummary, Outcome), BackupError> {
-    let repo = b.repo(repo_name)?;
+    let repo = b.repo_with_ctl(repo_name, &ctl)?;
     let o = CreateOptions {
         name: a.name,
         note: a.note,
@@ -286,7 +286,8 @@ fn restore_in(
     h: &TaskHandle,
 ) -> Result<(J, Outcome), BackupError> {
     let t0 = Instant::now();
-    let repo = b.repo(&a.repo)?;
+    let c = ctl(h, 0.0, 0.9);
+    let repo = b.repo_with_ctl(&a.repo, &c)?;
     let databases = st.data_dir.join("databases");
     let tmp = databases.join(format!(
         "{}{}-{}",
@@ -297,7 +298,6 @@ fn restore_in(
     if tmp.exists() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
-    let c = ctl(h, 0.0, 0.9);
     let mut store_opts = st.store_opts.clone();
     store_opts.min_free_disk_bytes = st
         .limits
@@ -393,7 +393,8 @@ fn verify_in(
     level: VerifyLevel,
     h: &TaskHandle,
 ) -> Result<(VerifyReport, Outcome), BackupError> {
-    let repo = b.repo(repo_name)?;
+    let c = ctl(h, 0.0, 1.0);
+    let repo = b.repo_with_ctl(repo_name, &c)?;
     // a `restore`-level verification restores into `<data>/tmp/verify-*` (removed by
     // the next start if the server stops meanwhile)
     let tmp = st.data_dir.join("tmp");
@@ -404,7 +405,7 @@ fn verify_in(
         level,
         tmp_dir: Some(tmp),
         store_opts: st.store_opts.clone(),
-        ctl: ctl(h, 0.0, 1.0),
+        ctl: c,
     };
     let report = b.block_on(repo.verify(names, &o))??;
     let at = sparkles_backup::now_rfc3339();
@@ -438,16 +439,18 @@ pub fn gc(
     started: Option<Started>,
 ) -> Result<GcReport, BackupError> {
     let b = backup_state(st)?;
+    let generation = b.registry.repos.read().get(repo).map(|e| e.generation());
     let _slot = b.slots.acquire(h, started)?;
     let t0 = Instant::now();
     let what = format!("GC of {repo}{}", if dry_run { " (dry run)" } else { "" });
     tracing::info!(target: "sparkles::backup", "{what}: started");
     let r = (|| {
-        let r = b.repo(repo)?;
+        let c = ctl(h, 0.0, 1.0);
+        let r = b.repo_with_ctl(repo, &c)?;
         let o = GcOptions {
             dry_run,
             grace,
-            ctl: ctl(h, 0.0, 1.0),
+            ctl: c,
         };
         let report = b.block_on(r.gc(&o))??;
         Ok((report, Outcome::default()))
@@ -458,10 +461,12 @@ pub fn gc(
         && !dry_run
     {
         b.registry.update(repo, |e| {
-            e.last_gc = Some(LastGc {
-                report: report.clone(),
-                finished: sparkles_backup::now_rfc3339(),
-            })
+            if Some(e.generation()) == generation {
+                e.last_gc = Some(LastGc {
+                    report: report.clone(),
+                    finished: sparkles_backup::now_rfc3339(),
+                });
+            }
         });
         tracing::info!(
             target: "sparkles::audit",
@@ -544,6 +549,17 @@ pub async fn delete(
     name: &str,
     principal: &str,
 ) -> Result<(), BackupError> {
+    delete_with_ctl(st, b, repo, name, principal, &Ctl::default()).await
+}
+
+pub async fn delete_with_ctl(
+    st: &AppState,
+    b: &Arc<BackupState>,
+    repo: &str,
+    name: &str,
+    principal: &str,
+    ctl: &Ctl,
+) -> Result<(), BackupError> {
     if let Some(t) = b.backup_busy(repo, name) {
         return Err(
             BackupError::new(Code::BackupBusy, format!("task {t} uses {name}")).with("task", t),
@@ -551,7 +567,7 @@ pub async fn delete(
     }
     let t0 = Instant::now();
     let r = async {
-        let r = b.open_repo(repo).await?;
+        let r = b.open_repo_with_ctl(repo, ctl).await?;
         if !r.delete(name).await? {
             return Err(BackupError::new(
                 Code::NoSuchBackup,

@@ -13,7 +13,7 @@
 //! (config and API), [`Registry::replace_config`] swaps in a reloaded config file, and
 //! [`Registry::policy_users`] names the policies that back up into a repository.
 
-use super::config::ConfigFile;
+use super::config::{ConfigFile, ConfiguredRepository, RepositoryEncryption};
 use crate::catalog::write_file_atomic;
 use anyhow::{Context, bail};
 use parking_lot::{Mutex, RwLock};
@@ -25,6 +25,15 @@ use sparkles_backup::{
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .expect("repository generation exhausted")
+}
 use uuid::Uuid;
 
 /// `repositories.json`
@@ -34,6 +43,9 @@ pub const VERIFY_FILE: &str = "verify.json";
 
 /// A registered repository.
 pub struct RepoEntry {
+    generation: u64,
+    opening: Arc<tokio::sync::Mutex<()>>,
+    encryption: Option<RepositoryEncryption>,
     pub config: RepoConfig,
     pub source: ConfigSource,
     /// the opened repository, once opened successfully
@@ -56,6 +68,9 @@ impl RepoEntry {
             ..Default::default()
         };
         RepoEntry {
+            generation: next_generation(),
+            opening: Arc::new(tokio::sync::Mutex::new(())),
+            encryption: None,
             config,
             source,
             opened: None,
@@ -64,6 +79,21 @@ impl RepoEntry {
             stats: None,
             last_gc: None,
         }
+    }
+
+    /// Cache identity across replacement/removal/reload, including unchanged encrypted references.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Serialize cache misses for this generation without holding a registry lock.
+    pub fn opening_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.opening.clone()
+    }
+
+    /// Trusted operator references, excluded from API views and API persistence.
+    pub fn encryption(&self) -> Option<&RepositoryEncryption> {
+        self.encryption.as_ref()
     }
 
     /// The API form (`Repository`), with the policies that use it.
@@ -140,12 +170,38 @@ pub struct Registry {
 }
 
 /// An entry of `repositories.json`.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct StoredRepo {
     #[serde(flatten)]
     config: RepoConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<Uuid>,
+}
+
+impl<'de> Deserialize<'de> for StoredRepo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value
+            .as_object()
+            .is_some_and(|v| v.contains_key("encryption"))
+        {
+            return Err(serde::de::Error::custom(
+                "API repository persistence does not support encryption metadata",
+            ));
+        }
+        #[derive(Deserialize)]
+        struct Plain {
+            #[serde(flatten)]
+            config: RepoConfig,
+            #[serde(default)]
+            id: Option<Uuid>,
+        }
+        let plain: Plain = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            config: plain.config,
+            id: plain.id,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -322,8 +378,45 @@ impl Registry {
     /// changes then. Repositories whose settings did not change keep their opened
     /// handle and status.
     pub fn replace_config(&self, config: &ConfigFile) -> anyhow::Result<()> {
+        // Preserve the legacy plaintext-only projection and its early rejection.
+        let new_repos = config
+            .repository_configs()?
+            .into_iter()
+            .map(|config| ConfiguredRepository {
+                config,
+                encryption: None,
+            })
+            .collect();
+        self.replace_entries(config, new_repos)
+    }
+
+    /// Load trusted operator references without enabling providers for API entries.
+    /// Legacy `load` remains plaintext-only.
+    pub fn load_configured(dir: &Path, config: Option<&ConfigFile>) -> anyhow::Result<Registry> {
+        let reg = Self::load(dir, None)?;
+        if let Some(config) = config {
+            reg.replace_configured(config)?;
+        }
+        Ok(reg)
+    }
+
+    /// Replace trusted TOML entries. Encrypted handles are invalidated on every reload,
+    /// even if references are identical, so replaced key material is resolved again.
+    pub fn replace_configured(&self, config: &ConfigFile) -> anyhow::Result<()> {
+        let new_repos = config.configured_repositories()?;
+        if !cfg!(feature = "backup-encryption") && new_repos.iter().any(|r| r.encryption.is_some())
+        {
+            bail!("encrypted repository configuration requires the backup-encryption feature");
+        }
+        self.replace_entries(config, new_repos)
+    }
+
+    fn replace_entries(
+        &self,
+        config: &ConfigFile,
+        new_repos: Vec<ConfiguredRepository>,
+    ) -> anyhow::Result<()> {
         let _guard = self.mutation.lock();
-        let new_repos = config.repository_configs();
         let new_policies = config.policy_configs();
         let mut repos = self.repos.write();
         let mut policies = self.policies.write();
@@ -361,16 +454,25 @@ impl Registry {
         for r in new_repos {
             let e = match old.remove(&r.name) {
                 // unchanged: keep the opened repository and what is known about it
-                Some(e) if e.config == r => e,
+                Some(e)
+                    if r.encryption.is_none() && e.encryption.is_none() && e.config == r.config =>
+                {
+                    e
+                }
                 Some(e) => {
-                    let mut n = RepoEntry::new(r, ConfigSource::Config);
+                    let mut n = RepoEntry::new(r.config, ConfigSource::Config);
+                    n.encryption = r.encryption;
                     // the same location keeps its id (and the check that it did not change)
                     if n.config.same_location(&e.config) {
                         n.id = e.id;
                     }
                     n
                 }
-                None => RepoEntry::new(r, ConfigSource::Config),
+                None => {
+                    let mut n = RepoEntry::new(r.config, ConfigSource::Config);
+                    n.encryption = r.encryption;
+                    n
+                }
             };
             repos.insert(e.config.name.clone(), e);
         }
@@ -399,6 +501,8 @@ impl Registry {
                 && old.credentials.get(name) != api.credentials.get(name)
             {
                 e.opened = None;
+                e.generation = next_generation();
+                e.opening = Arc::new(tokio::sync::Mutex::new(()));
             }
         }
         Ok(())
@@ -563,6 +667,69 @@ pub fn read_api_policies(dir: &Path) -> anyhow::Result<Vec<PolicyConfig>> {
 mod tests {
     use super::*;
     use sparkles_backup::{RepoType, VerifyLevel, VerifyStatus};
+
+    #[test]
+    fn api_persistence_rejects_encryption_even_null_but_keeps_unknown_field_compatibility() {
+        let dir = tempfile::tempdir().unwrap();
+        for encryption in [
+            serde_json::Value::Null,
+            serde_json::json!({"keys": [{"key": {"source":"file", "path":"/private/never-read"}}]}),
+        ] {
+            std::fs::write(dir.path().join(REPOSITORIES_FILE), serde_json::to_vec(&serde_json::json!({"version":1,"repositories":[{"name":"api","type":"fs","path":"/srv/plain","encryption":encryption}]})).unwrap()).unwrap();
+            let err = Registry::load(dir.path(), None).err().unwrap();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("does not support encryption metadata"),
+                "{message}"
+            );
+            assert!(!message.contains("/private/never-read"));
+        }
+        std::fs::write(dir.path().join(REPOSITORIES_FILE), br#"{"version":1,"repositories":[{"name":"api","type":"fs","path":"/srv/plain","futureSetting":true}]}"#).unwrap();
+        assert!(Registry::load(dir.path(), None).is_ok());
+    }
+
+    #[test]
+    fn trusted_encryption_projection_is_explicit_and_feature_checked_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(
+            "version=1\n[repositories.enc]\ntype='fs'\npath='/srv/enc'\n[repositories.enc.encryption]\nsingle_key_ok=true\nkeys=[{label='online',key={source='file',path='/private/key'}}]\n",
+        );
+        assert!(Registry::load(dir.path(), Some(&c)).is_err());
+        let reg = Registry::default();
+        reg.repos.write().insert(
+            "api".into(),
+            RepoEntry::new(fs_repo("api", "/srv/api"), ConfigSource::Api),
+        );
+        let result = reg.replace_configured(&c);
+        if !cfg!(feature = "backup-encryption") {
+            assert!(result.is_err());
+            assert_eq!(reg.repos.read().len(), 1);
+            assert!(reg.repos.read().contains_key("api"));
+        } else {
+            result.unwrap();
+            let id = Uuid::new_v4();
+            reg.update("enc", |e| e.id = Some(id));
+            let token = reg.repos.read()["enc"].generation();
+            reg.replace_configured(&c).unwrap();
+            let entries = reg.repos.read();
+            assert_ne!(entries["enc"].generation(), token);
+            assert_eq!(entries["enc"].id, Some(id));
+            assert!(entries["enc"].encryption().is_some());
+            assert!(
+                !serde_json::to_string(&entries["enc"].view(Vec::new()))
+                    .unwrap()
+                    .contains("/private/key")
+            );
+            drop(entries);
+            let plain = config("version=1\n[repositories.enc]\ntype='fs'\npath='/srv/enc'\n");
+            reg.replace_configured(&plain).unwrap();
+            assert_eq!(reg.repos.read()["enc"].id, Some(id));
+            assert!(reg.repos.read()["enc"].encryption().is_none());
+            let token = reg.repos.read()["enc"].generation();
+            reg.replace_configured(&plain).unwrap();
+            assert_eq!(reg.repos.read()["enc"].generation(), token);
+        }
+    }
 
     fn fs_repo(name: &str, path: &str) -> RepoConfig {
         RepoConfig {

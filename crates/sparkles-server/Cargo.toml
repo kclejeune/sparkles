@@ -149,6 +149,7 @@ mcp = ["dep:rmcp", "dep:tokio-util"]
 # backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
 # `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
 backup = ["dep:sparkles-backup", "dep:toml", "sparkles/backup"]
+backup-encryption = ["backup", "sparkles/backup-encryption", "sparkles-backup/encryption"]
 # the formatter: `sparkles fmt`, `sparkles lsp` and `POST /$/format`
 fmt = [
     "sparkles/fmt",

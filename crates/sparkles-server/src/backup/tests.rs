@@ -327,6 +327,55 @@ async fn registrations_are_checked_before_any_repository_is_touched() {
     expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
 }
 
+/// Unsupported encryption metadata must not be projected into a plaintext config.
+#[tokio::test]
+async fn encryption_requests_never_register_or_replace_plaintext_repositories() {
+    let s = server(Opts {
+        repos: vec![fs_repo("local", "/srv/r")],
+        ..Default::default()
+    });
+    let destination = tempfile::tempdir().unwrap();
+    let untouched = destination.path().join("must-not-be-created");
+    let registry_file = s
+        .dir
+        .path()
+        .join("backup")
+        .join(registry::REPOSITORIES_FILE);
+    let original = std::fs::read(&registry_file).unwrap();
+    for encryption in [
+        json!({"keys": [{"source": "env", "name": "PRIVATE_PROVIDER_REFERENCE"}]}),
+        J::Bool(false),
+        J::Null,
+    ] {
+        let mut body = fs_repo("secure", untouched.to_str().unwrap());
+        body["encryption"] = encryption.clone();
+        let response = post(&s.app, "/$/repositories", body).await;
+        expect(&response, StatusCode::BAD_REQUEST, "invalid-config");
+        assert!(
+            !response
+                .body
+                .to_string()
+                .contains("PRIVATE_PROVIDER_REFERENCE")
+        );
+        assert!(!untouched.exists());
+        assert_eq!(s.b().registry.repos.read().len(), 1);
+
+        let mut body = fs_repo("local", "/srv/r");
+        body["readonly"] = J::Bool(true);
+        body["encryption"] = encryption;
+        let response = call(&s.app, "PUT", "/$/repositories/local", None, body).await;
+        expect(&response, StatusCode::BAD_REQUEST, "invalid-config");
+        assert!(
+            !response
+                .body
+                .to_string()
+                .contains("PRIVATE_PROVIDER_REFERENCE")
+        );
+        assert!(!s.b().registry.repos.read()["local"].config.readonly);
+        assert_eq!(std::fs::read(&registry_file).unwrap(), original);
+    }
+}
+
 /// A body that is not JSON answers `400 invalid-request` on every route that reads one.
 #[tokio::test]
 async fn malformed_bodies_are_invalid_requests() {

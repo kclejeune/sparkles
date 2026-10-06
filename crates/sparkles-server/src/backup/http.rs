@@ -179,7 +179,25 @@ pub fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, BackupError> {
 /// `400 invalid-request`, one that is not a configuration (an unknown type, a field of
 /// the wrong type) `400 invalid-config`.
 fn parse_config<T: DeserializeOwned>(body: &[u8]) -> Result<T, BackupError> {
+    let value: J = parse_as(body, Code::InvalidConfig)?;
+    reject_repository_encryption(&value)?;
+    // Keep the original typed parser's duplicate-field and shape validation.
     parse_as(body, Code::InvalidConfig)
+}
+
+/// Provider references are operator configuration. Never discard an encryption
+/// request while projecting an API body into the plaintext repository config.
+fn reject_repository_encryption(value: &J) -> Result<(), BackupError> {
+    if value
+        .as_object()
+        .is_some_and(|object| object.contains_key("encryption"))
+    {
+        return Err(BackupError::new(
+            Code::InvalidConfig,
+            "repository encryption is not supported through the HTTP API",
+        ));
+    }
+    Ok(())
 }
 
 /// Parse a JSON body; `shape` is the code of a body that is JSON but not a `T`.
@@ -471,6 +489,7 @@ async fn put_repository(
         .into());
     }
     let mut v: J = parse(&body)?;
+    reject_repository_encryption(&v)?;
     let Some(obj) = v.as_object_mut() else {
         return Err(BackupError::new(Code::InvalidConfig, "the body must be a JSON object").into());
     };
@@ -560,13 +579,48 @@ async fn remove_repository(
 /// `POST /$/repositories/{repo}/test` → `TestReport`
 async fn test_repository(State(st): St, Path(name): Path<String>) -> Res {
     let b = backups(&st)?;
-    b.registry.config(&name)?;
-    let report = match b.open_repo(&name).await {
-        Ok(r) => r.test().await?,
+    let (generation, mut encrypted) = {
+        let repositories = b.registry.repos.read();
+        let entry = repositories
+            .get(&name)
+            .ok_or_else(|| no_such_repository(&name))?;
+        (entry.generation(), entry.encryption().is_some())
+    };
+    let mut report = match b.open_repo(&name).await {
+        Ok(r) => {
+            encrypted |= r
+                .marker()
+                .encryption
+                .as_ref()
+                .is_some_and(|value| !value.is_null());
+            r.test().await.map_err(|e| {
+                if encrypted {
+                    BackupError::new(e.code(), "encrypted repository connection check failed")
+                } else {
+                    e
+                }
+            })?
+        }
         Err(e) if e.code() == Code::NotImplemented => return Err(e.into()),
         Err(e) => failed_test(&e),
     };
-    b.registry.update(&name, |e| record_test(e, &report));
+    if encrypted {
+        for step in &mut report.steps {
+            if !step.ok
+                && step
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error != "skipped")
+            {
+                step.error = Some("encrypted repository connection check failed".into());
+            }
+        }
+    }
+    b.registry.update(&name, |e| {
+        if e.generation() == generation {
+            record_test(e, &report);
+        }
+    });
     if report.ok {
         b.refresh_later(&name);
     }

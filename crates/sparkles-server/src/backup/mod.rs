@@ -18,6 +18,12 @@
 
 pub mod cli;
 pub mod config;
+#[cfg(all(
+    test,
+    feature = "backup-encryption",
+    any(target_os = "linux", target_os = "android")
+))]
+mod encryption_tests;
 pub mod http;
 pub mod metrics;
 pub mod ops;
@@ -106,7 +112,7 @@ impl BackupState {
         if let (Some(f), Some(p)) = (&file, &config_path) {
             validate_file(f, data_dir).with_context(|| format!("backup config {}", p.display()))?;
         }
-        let registry = registry::Registry::load(&dir, file.as_ref())?;
+        let registry = registry::Registry::load_configured(&dir, file.as_ref())?;
         let max_tasks = max_tasks.max(1);
         let policies = policies::Policies::load(&dir, &registry)?;
         let mut forbid = vec![data_dir.to_path_buf()];
@@ -162,11 +168,22 @@ impl BackupState {
     /// repository that cannot be opened is `502 repository-unavailable` (and marked
     /// unreachable). Opening is lazy and cached; a config reload drops the cache of
     /// changed entries. Blocks: for task threads (handlers use [`open_repo`](Self::open_repo)).
+    #[allow(dead_code)] // Preserve the default-control convenience API for embedders.
     pub fn repo(&self, name: &str) -> Result<Arc<Repository>, BackupError> {
+        self.repo_with_ctl(name, &sparkles_backup::Ctl::default())
+    }
+
+    /// Open from a task thread, allowing cancellation during provider resolution/cache wait.
+    pub fn repo_with_ctl(
+        &self,
+        name: &str,
+        ctl: &sparkles_backup::Ctl,
+    ) -> Result<Arc<Repository>, BackupError> {
+        ctl.check()?;
         if let Some(r) = self.registry.repo(name)? {
             return Ok(r);
         }
-        self.block_on(self.open_repo(name))?
+        self.block_on(self.open_repo_with_ctl(name, ctl))?
     }
 
     /// Also keep `fs` repositories out of the directory of config file `file` (the
@@ -310,21 +327,98 @@ impl BackupState {
     /// location that lost its marker is reported, not re-created), and its marker must
     /// keep the id first seen.
     pub async fn open_repo(&self, name: &str) -> Result<Arc<Repository>, BackupError> {
-        let (cfg, known, source) = {
+        self.open_repo_with_ctl(name, &sparkles_backup::Ctl::default())
+            .await
+    }
+
+    /// Cancellation covers cache wait and provider lookup. Engine open keeps its existing
+    /// backend deadlines; cancellation is checked again before publishing its result.
+    pub async fn open_repo_with_ctl(
+        &self,
+        name: &str,
+        ctl: &sparkles_backup::Ctl,
+    ) -> Result<Arc<Repository>, BackupError> {
+        ctl.check()?;
+        let (generation, gate) = {
+            let repos = self.registry.repos.read();
+            let entry = repos
+                .get(name)
+                .ok_or_else(|| registry::no_such_repository(name))?;
+            if let Some(repo) = &entry.opened {
+                return Ok(repo.clone());
+            }
+            (entry.generation(), entry.opening_gate())
+        };
+        let acquire = gate.lock();
+        tokio::pin!(acquire);
+        let _opening = loop {
+            ctl.check()?;
+            tokio::select! {
+                guard = &mut acquire => break guard,
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        };
+        ctl.check()?;
+        let (cfg, known, source, encryption) = {
             let repos = self.registry.repos.read();
             let e = repos
                 .get(name)
                 .ok_or_else(|| registry::no_such_repository(name))?;
+            if e.generation() != generation {
+                return Err(configuration_changed());
+            }
             if let Some(r) = &e.opened {
                 return Ok(r.clone());
             }
-            (e.config.clone(), e.id, e.source)
+            (e.config.clone(), e.id, e.source, e.encryption().cloned())
         };
         let env = self.open_env(&cfg, source, known.is_none() && !cfg.readonly);
         let opened = match self.prepare(&cfg, source) {
-            Ok(c) => Repository::open(&c, &env).await,
+            Ok(c) => {
+                if let Some(settings) = &encryption {
+                    #[cfg(feature = "backup-encryption")]
+                    {
+                        use sparkles::backup::keys::{KeyContext, resolve};
+                        let mut forbidden = vec![self.data_dir.clone()];
+                        forbidden.extend(
+                            self.registry
+                                .repos
+                                .read()
+                                .values()
+                                .filter_map(|e| e.config.path.as_ref().map(PathBuf::from)),
+                        );
+                        let context = KeyContext::from_environment(forbidden);
+                        match resolve(settings, &context, ctl).await {
+                            Ok(keys) if self.current_generation(name, generation) => {
+                                ctl.check()?;
+                                Repository::open_encrypted(&c, &env, &keys).await
+                            }
+                            Ok(_) => return Err(configuration_changed()),
+                            Err(_) if ctl.is_cancelled() => Err(BackupError::cancelled()),
+                            Err(_) => Err(BackupError::new(
+                                Code::RepositoryKeyRequired,
+                                "encrypted repository key input is unavailable",
+                            )),
+                        }
+                    }
+                    #[cfg(not(feature = "backup-encryption"))]
+                    {
+                        let _ = settings;
+                        Err(BackupError::new(
+                            Code::InvalidConfig,
+                            "encrypted repository configuration requires the backup-encryption feature",
+                        ))
+                    }
+                } else if self.current_generation(name, generation) {
+                    ctl.check()?;
+                    Repository::open(&c, &env).await
+                } else {
+                    return Err(configuration_changed());
+                }
+            }
             Err(e) => Err(e),
         };
+        ctl.check()?;
         let r = match opened {
             Ok(r) if known.is_some_and(|k| k != r.id()) => Err(BackupError::new(
                 Code::RepositoryUnavailable,
@@ -337,11 +431,29 @@ impl BackupState {
             )),
             r => r,
         };
-        let r = r.map(Arc::new);
+        // Provider references and engine diagnostic details stay out of API errors/status.
+        let r = r.map(Arc::new).map_err(|err| {
+            if encryption.is_some() {
+                BackupError::new(
+                    err.code(),
+                    match err.code() {
+                        Code::WrongRepositoryKey => {
+                            "encrypted repository key did not unlock the repository"
+                        }
+                        Code::RepositoryKeyRequired => {
+                            "encrypted repository key input is unavailable"
+                        }
+                        _ => "encrypted repository could not be opened",
+                    },
+                )
+            } else {
+                err
+            }
+        });
         let learned = self.registry.update(name, |e| {
             // a change of the settings in the meantime wins
-            if e.config != cfg {
-                return false;
+            if e.generation() != generation || e.config != cfg {
+                return None;
             }
             match &r {
                 Ok(repo) => {
@@ -349,20 +461,33 @@ impl BackupState {
                     e.id = Some(repo.id());
                     e.opened = Some(repo.clone());
                     e.mark_reachable(None);
-                    new && e.source == sparkles_backup::ConfigSource::Api
+                    Some(new && e.source == sparkles_backup::ConfigSource::Api)
                 }
                 Err(err) => {
-                    e.mark_unreachable(err.message());
-                    false
+                    if err.code() != Code::Cancelled {
+                        e.mark_unreachable(err.message());
+                    }
+                    Some(false)
                 }
             }
         });
-        if learned == Some(true)
+        if !matches!(learned, Some(Some(_))) {
+            return Err(configuration_changed());
+        }
+        if learned == Some(Some(true))
             && let Err(e) = self.registry.save_repositories(&self.dir)
         {
             tracing::warn!(target: "sparkles::backup", "saving the repository registry: {e:#}");
         }
         r
+    }
+
+    fn current_generation(&self, name: &str, generation: u64) -> bool {
+        self.registry
+            .repos
+            .read()
+            .get(name)
+            .is_some_and(|e| e.generation() == generation)
     }
 
     /// Re-read what is known about repository `name`: reachability, totals (`stats`)
@@ -374,10 +499,22 @@ impl BackupState {
         let stats = repo.stats().await;
         let last_gc = repo.last_gc().await;
         self.registry.update(name, |e| {
+            // An admitted old handle may finish; its statistics cannot overwrite a reload.
+            if !e
+                .opened
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &repo))
+            {
+                return;
+            }
             match stats {
                 Ok(s) => e.stats = Some(s),
                 Err(err) if err.code() == Code::RepositoryUnavailable => {
-                    e.mark_unreachable(err.message())
+                    e.mark_unreachable(if e.encryption().is_some() {
+                        "encrypted repository statistics are unavailable"
+                    } else {
+                        err.message()
+                    })
                 }
                 Err(err) => {
                     tracing::debug!(target: "sparkles::backup", "statistics of {name}: {err}")
@@ -412,7 +549,7 @@ impl BackupState {
         let f = config::load(p)?;
         validate_file(&f, &self.data_dir)
             .with_context(|| format!("backup config {}", p.display()))?;
-        self.registry.replace_config(&f)
+        self.registry.replace_configured(&f)
     }
 
     // ------------------------------------------------------------- claims ------
@@ -710,7 +847,16 @@ impl Drop for Slot<'_> {
 /// Check every repository of a config file (the checks of an API registration) and
 /// every policy's repository.
 fn validate_file(f: &config::ConfigFile, data_dir: &Path) -> anyhow::Result<()> {
-    for r in f.repository_configs() {
+    #[cfg(not(feature = "backup-encryption"))]
+    if let Some((name, _)) = f.repositories.iter().find(|(_, r)| r.encryption.is_some()) {
+        anyhow::bail!(
+            "repository {name:?}: encrypted repository configuration requires the backup-encryption feature"
+        );
+    }
+    for r in f.configured_repositories()? {
+        if r.encryption.is_some() && r.kind == RepoType::Memory {
+            anyhow::bail!("encrypted server repositories require a persistent backend");
+        }
         r.validate(&[data_dir.to_path_buf()])
             .map_err(|e| anyhow::anyhow!("repository {:?}: {e}", r.name))?;
     }
@@ -728,6 +874,13 @@ fn validate_file(f: &config::ConfigFile, data_dir: &Path) -> anyhow::Result<()> 
             .map_err(|e| anyhow::anyhow!("credentials {name:?}: {e}"))?;
     }
     Ok(())
+}
+
+fn configuration_changed() -> BackupError {
+    BackupError::new(
+        Code::RepositoryUnavailable,
+        "repository configuration changed while opening; retry",
+    )
 }
 
 /// A stable hash of the data directory (`holder.server` of this server's locks).
@@ -787,7 +940,7 @@ pub fn start(st: &Arc<AppState>, h: &Handle) {
                                 let names: Vec<String> =
                                     b.registry.repos.read().keys().cloned().collect();
                                 for n in names {
-                                    b.refresh(&n).await;
+                                    b.refresh_later(&n);
                                 }
                             }
                             Ok(Err(e)) => tracing::error!(

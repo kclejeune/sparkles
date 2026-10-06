@@ -199,6 +199,9 @@ pub fn run(
             },
         });
     }
+    // A cancellation during the final create has no next dataset to observe it.
+    // Classify it before retention, which must not delete after cancellation.
+    cancelled |= ctl.check().is_err();
     let ok = run
         .datasets
         .iter()
@@ -209,18 +212,6 @@ pub fn run(
         .iter()
         .filter(|d| d.result == DatasetRunResult::Failed)
         .count();
-    run.result = if disabled {
-        RunResult::Skipped
-    } else if failed == 0 && !cancelled {
-        RunResult::Ok
-    } else if ok == 0 {
-        RunResult::Failed
-    } else {
-        RunResult::Partial
-    };
-    if cancelled {
-        run.reason = Some("cancelled".into());
-    }
     if !cancelled && !disabled {
         ctl.progress.report(0.95, "retention");
         let retention = match apply_retention(engine, p, false, engine.now()) {
@@ -233,13 +224,27 @@ pub fn run(
                 error: Some(e.message().into()),
             },
         };
-        if p.gc_after_retention && !retention.deleted.is_empty() {
+        if p.gc_after_retention && !retention.deleted.is_empty() && ctl.check().is_ok() {
             run.gc = engine
                 .start_gc(&p.repository)
                 .ok()
                 .map(|task| RunGc { task });
         }
         run.retention = Some(retention);
+    }
+    // Retention may also observe cancellation during its final list/delete.
+    cancelled |= ctl.check().is_err();
+    run.result = if disabled {
+        RunResult::Skipped
+    } else if failed == 0 && !cancelled {
+        RunResult::Ok
+    } else if ok == 0 {
+        RunResult::Failed
+    } else {
+        RunResult::Partial
+    };
+    if cancelled {
+        run.reason = Some("cancelled".into());
     }
     run.finished = Some(time(engine.now()));
     Ok(run)
@@ -271,27 +276,38 @@ pub fn matches_dataset(pattern: &str, name: &str) -> bool {
 struct CatalogEngine<'a> {
     catalog: &'a crate::Catalog,
     repository: std::sync::Arc<Repository>,
+    selected: Option<&'a [String]>,
+    ctl: Ctl,
 }
 impl Engine for CatalogEngine<'_> {
     fn datasets(&self) -> Vec<DatasetInfo> {
         self.catalog
             .list()
             .into_iter()
+            // Only committed, published state matters for skip_unchanged. Reading
+            // the snapshot preserves the family guard without waiting for a writer.
+            .filter(|d| {
+                self.selected
+                    .is_none_or(|patterns| patterns.iter().any(|p| matches_dataset(p, &d.name)))
+            })
             .filter_map(|d| {
                 self.catalog.get(&d.name).map(|ds| DatasetInfo {
                     name: d.name,
                     id: d.id,
-                    head: ds.head_commit().seq,
+                    head: ds.snapshot().commit,
                 })
             })
             .collect()
     }
     fn list(&self, _: &str, policy: &str) -> std::result::Result<Vec<BackupSummary>, BackupError> {
-        block_on(self.repository.list(&ListFilter {
+        self.ctl.check()?;
+        let listed = block_on(self.repository.list(&ListFilter {
             policy: Some(policy.into()),
             ..Default::default()
         }))
-        .map_err(to_backup)?
+        .map_err(to_backup)??;
+        self.ctl.check()?;
+        Ok(listed)
     }
     fn create(
         &self,
@@ -308,13 +324,20 @@ impl Engine for CatalogEngine<'_> {
             .map_err(to_backup)
     }
     fn delete(&self, _: &str, backup: &str) -> std::result::Result<bool, BackupError> {
-        block_on(self.repository.delete(backup)).map_err(to_backup)?
+        self.ctl.check()?;
+        let deleted = block_on(self.repository.delete(backup)).map_err(to_backup)??;
+        self.ctl.check()?;
+        Ok(deleted)
     }
     fn busy(&self, _: &str) -> HashSet<String> {
         HashSet::new()
     }
     fn start_gc(&self, _: &str) -> std::result::Result<String, BackupError> {
-        block_on(self.repository.gc(&GcOptions::default())).map_err(to_backup)??;
+        block_on(self.repository.gc(&GcOptions {
+            ctl: self.ctl.clone(),
+            ..Default::default()
+        }))
+        .map_err(to_backup)??;
         Ok("completed".into())
     }
 }
@@ -335,11 +358,68 @@ pub fn to_backup(e: Error) -> BackupError {
 impl crate::Catalog {
     pub fn run_policy(&self, p: &PolicyConfig, ctl: &Control) -> Result<PolicyRun> {
         ctl.check()?;
+        self.run_policy_in(p, self.repositories()?.open(&p.repository)?, ctl)
+    }
+
+    /// Run a policy against an explicitly opened repository, retaining its protected
+    /// keys for the complete run without storing provider references in the catalog.
+    /// The handle must match the policy name and any registered identity/location.
+    pub fn run_policy_in(
+        &self,
+        p: &PolicyConfig,
+        repository: std::sync::Arc<Repository>,
+        ctl: &Control,
+    ) -> Result<PolicyRun> {
+        ctl.check()?;
+        check_policy(p).map_err(error)?;
+        if repository.config().name != p.repository {
+            return Err(error(BackupError::new(
+                Code::InvalidRequest,
+                "the opened repository does not match the policy repository name",
+            )));
+        }
+        // Load persisted registration metadata even for a freshly opened catalog.
+        // This never opens a repository backend or resolves provider inputs.
+        let registered = self.repositories()?;
+        {
+            let entries = registered.registry.repos.read();
+            if let Some(entry) = entries.get(&p.repository)
+                && (!entry.config.same_location(repository.config())
+                    || entry.id.is_some_and(|id| id != repository.id()))
+            {
+                return Err(error(BackupError::new(
+                    Code::InvalidRequest,
+                    "the opened repository does not match the registered repository identity",
+                )));
+            }
+        }
+        let encrypted = repository
+            .marker()
+            .encryption
+            .as_ref()
+            .is_some_and(|value| !value.is_null());
+        let mut forbidden = self
+            .dir()
+            .map(|dir| vec![dir.to_path_buf()])
+            .unwrap_or_default();
+        forbidden.extend(self.list().into_iter().filter_map(|dataset| dataset.path));
+        repository.config().validate(&forbidden).map_err(|e| {
+            error(if encrypted {
+                BackupError::new(
+                    e.code(),
+                    "encrypted policy repository configuration is invalid",
+                )
+            } else {
+                e
+            })
+        })?;
         let engine = CatalogEngine {
             catalog: self,
-            repository: self.repositories()?.open(&p.repository)?,
+            repository,
+            selected: Some(&p.datasets),
+            ctl: ctl.into(),
         };
-        let report = run(
+        let mut report = run(
             &engine,
             p,
             RunTrigger::Manual,
@@ -348,7 +428,25 @@ impl crate::Catalog {
             ctl,
             || true,
         )
-        .map_err(error)?;
+        .map_err(|e| {
+            error(if encrypted {
+                BackupError::new(e.code(), "encrypted repository policy execution failed")
+            } else {
+                e
+            })
+        })?;
+        if encrypted {
+            for dataset in &mut report.datasets {
+                if dataset.result == DatasetRunResult::Failed && dataset.reason.is_some() {
+                    dataset.reason = Some("encrypted repository backup failed".into());
+                }
+            }
+            if let Some(retention) = &mut report.retention
+                && retention.error.is_some()
+            {
+                retention.error = Some("encrypted repository retention failed".into());
+            }
+        }
         ctl.check()?;
         ctl.progress.report(1.0, "policy completed");
         Ok(report)
@@ -357,7 +455,520 @@ impl crate::Catalog {
         let engine = CatalogEngine {
             catalog: self,
             repository: self.repositories()?.open(&p.repository)?,
+            selected: None,
+            ctl: Ctl::default(),
         };
         apply_retention(&engine, p, dry_run, Utc::now()).map_err(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[derive(Clone, Copy)]
+    enum StopAt {
+        Create,
+        List,
+        Delete,
+        AfterDelete,
+        OrdinaryFailure,
+    }
+    struct StoppingEngine {
+        control: Control,
+        stop: StopAt,
+        listed: std::cell::Cell<usize>,
+        deleted: std::cell::Cell<usize>,
+        gc: std::cell::Cell<usize>,
+    }
+    fn summary(name: &str, completed: &str) -> BackupSummary {
+        BackupSummary {
+            name: name.into(),
+            repository: "local".into(),
+            dataset: sparkles_backup::DatasetRef {
+                branch: None,
+                name: "ds".into(),
+                id: Uuid::from_u128(1),
+                kind: "persistent".into(),
+            },
+            commit: sparkles_backup::CommitRef {
+                seq: 1,
+                timestamp: completed.into(),
+                quads: 1,
+                reference: "commit:1".into(),
+            },
+            created: completed.into(),
+            completed: completed.into(),
+            millis: 1,
+            logical_bytes: 1,
+            added_bytes: 1,
+            policy: Some("nightly".into()),
+            run: None,
+            note: None,
+            same_lineage: None,
+            verified: None,
+        }
+    }
+    impl Engine for StoppingEngine {
+        fn datasets(&self) -> Vec<DatasetInfo> {
+            vec![DatasetInfo {
+                name: "ds".into(),
+                id: Uuid::from_u128(1),
+                head: 1,
+            }]
+        }
+        fn list(&self, _: &str, _: &str) -> std::result::Result<Vec<BackupSummary>, BackupError> {
+            self.listed.set(self.listed.get() + 1);
+            if matches!(self.stop, StopAt::List) {
+                self.control.cancel.cancel();
+                return Err(BackupError::cancelled());
+            }
+            Ok(vec![
+                summary("new", "2026-10-05T00:00:00Z"),
+                summary("old", "2025-10-05T00:00:00Z"),
+            ])
+        }
+        fn create(
+            &self,
+            _: &str,
+            _: &str,
+            o: CreateOptions,
+        ) -> std::result::Result<BackupSummary, BackupError> {
+            if matches!(self.stop, StopAt::Create) {
+                self.control.cancel.cancel();
+                return Err(BackupError::cancelled());
+            }
+            if matches!(self.stop, StopAt::OrdinaryFailure) {
+                return Err(BackupError::new(
+                    Code::RepositoryUnavailable,
+                    "normal failure",
+                ));
+            }
+            Ok(summary(&o.name, "2026-10-05T00:00:00Z"))
+        }
+        fn delete(&self, _: &str, _: &str) -> std::result::Result<bool, BackupError> {
+            self.deleted.set(self.deleted.get() + 1);
+            if matches!(self.stop, StopAt::Delete | StopAt::AfterDelete) {
+                self.control.cancel.cancel();
+                if matches!(self.stop, StopAt::Delete) {
+                    return Err(BackupError::cancelled());
+                }
+            }
+            Ok(true)
+        }
+        fn busy(&self, _: &str) -> HashSet<String> {
+            HashSet::new()
+        }
+        fn start_gc(&self, _: &str) -> std::result::Result<String, BackupError> {
+            self.gc.set(self.gc.get() + 1);
+            Ok("gc".into())
+        }
+    }
+    fn stopping_run(stop: StopAt) -> (PolicyRun, StoppingEngine) {
+        let control = Control::default();
+        let engine = StoppingEngine {
+            control: control.clone(),
+            stop,
+            listed: std::cell::Cell::new(0),
+            deleted: std::cell::Cell::new(0),
+            gc: std::cell::Cell::new(0),
+        };
+        let policy: PolicyConfig = serde_json::from_value(serde_json::json!({"name":"nightly","repository":"local","datasets":["ds"],"schedule":"0 0 * * *","nameTemplate":"new","retention":{"maxCount":1},"gcAfterRetention":true})).unwrap();
+        let report = run(
+            &engine,
+            &policy,
+            RunTrigger::Schedule,
+            None,
+            Utc::now(),
+            &control,
+            || true,
+        )
+        .unwrap();
+        (report, engine)
+    }
+    #[test]
+    fn cancellation_during_final_capture_skips_retention_and_is_classified() {
+        let (report, engine) = stopping_run(StopAt::Create);
+        assert_eq!(report.reason.as_deref(), Some("cancelled"));
+        assert_eq!(report.result, RunResult::Failed);
+        assert!(report.retention.is_none());
+        assert_eq!(engine.listed.get(), 0);
+        assert_eq!(engine.deleted.get(), 0);
+        assert_eq!(engine.gc.get(), 0);
+    }
+    #[test]
+    fn cancellation_during_final_retention_list_or_delete_is_classified_and_skips_gc() {
+        for stop in [StopAt::List, StopAt::Delete, StopAt::AfterDelete] {
+            let (report, engine) = stopping_run(stop);
+            assert_eq!(report.reason.as_deref(), Some("cancelled"));
+            assert_eq!(report.result, RunResult::Partial);
+            assert_eq!(engine.listed.get(), 1);
+            assert_eq!(engine.gc.get(), 0);
+            assert!(report.gc.is_none());
+        }
+    }
+    #[test]
+    fn ordinary_capture_failure_keeps_recoverable_failure_and_retention_semantics() {
+        let (report, engine) = stopping_run(StopAt::OrdinaryFailure);
+        assert_eq!(report.reason, None);
+        assert_eq!(report.result, RunResult::Failed);
+        assert_eq!(report.datasets[0].reason.as_deref(), Some("normal failure"));
+        assert!(report.retention.is_some());
+        assert_eq!(engine.listed.get(), 1);
+        assert_eq!(engine.deleted.get(), 1);
+        assert_eq!(engine.gc.get(), 1);
+    }
+
+    #[test]
+    fn policy_discovery_does_not_capture_unselected_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = crate::Catalog::memory(Default::default());
+        let options = crate::catalog::CreateDataset {
+            kind: crate::catalog::DatasetKind::Memory,
+            ..Default::default()
+        };
+        catalog.create("selected", &options).unwrap();
+        let unrelated = catalog.create("other", &options).unwrap();
+        catalog
+            .repositories()
+            .unwrap()
+            .add(
+                serde_json::from_value(serde_json::json!({
+                    "name":"local", "type":"fs", "path":directory.path()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let patterns = vec!["sel*".to_string()];
+        let mut engine = CatalogEngine {
+            catalog: &catalog,
+            repository: catalog.repositories().unwrap().open("local").unwrap(),
+            selected: Some(&patterns),
+            ctl: Ctl::default(),
+        };
+        let writer = unrelated.store().write();
+        let rows = std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let selected_engine = &engine;
+            let capture = scope.spawn(move || send.send(selected_engine.datasets()).unwrap());
+            let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+            // Release the held writer even on failure before joining the reader.
+            drop(writer);
+            capture.join().unwrap();
+            result.expect("unselected dataset writer must not block policy discovery")
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "selected");
+        assert_eq!(rows[0].head, 0);
+        engine.selected = None;
+        assert_eq!(engine.datasets().len(), 2);
+    }
+
+    fn manual_policy(repository: &str, datasets: &[&str]) -> PolicyConfig {
+        serde_json::from_value(serde_json::json!({
+            "name":"manual", "repository":repository, "datasets":datasets,
+            "schedule":"every 1h", "nameTemplate":"{policy}-{dataset}-{run}"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn explicit_policy_repository_matches_name_location_and_registered_uuid() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = crate::Catalog::memory(Default::default());
+        let config = |name: &str, path: &str| {
+            serde_json::from_value(serde_json::json!({
+                "name":name,"type":"fs","path":root.path().join(path)
+            }))
+            .unwrap()
+        };
+        let repositories = catalog.repositories().unwrap();
+        repositories.add(config("local", "one")).unwrap();
+        let registered = repositories.open("local").unwrap();
+        let policy = manual_policy("local", &["*"]);
+        let other = std::sync::Arc::new(
+            super::super::open(
+                &config("local", "two"),
+                &OpenEnv {
+                    init: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            to_backup(
+                catalog
+                    .run_policy_in(&policy, other, &Control::default())
+                    .unwrap_err()
+            )
+            .code(),
+            Code::InvalidRequest
+        );
+        let wrong_name = manual_policy("other", &["*"]);
+        assert_eq!(
+            to_backup(
+                catalog
+                    .run_policy_in(&wrong_name, registered.clone(), &Control::default())
+                    .unwrap_err()
+            )
+            .code(),
+            Code::InvalidRequest
+        );
+        repositories
+            .registry
+            .repos
+            .write()
+            .get_mut("local")
+            .unwrap()
+            .id = Some(Uuid::new_v4());
+        assert_eq!(
+            to_backup(
+                catalog
+                    .run_policy_in(&policy, registered, &Control::default())
+                    .unwrap_err()
+            )
+            .code(),
+            Code::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn selected_writer_does_not_block_published_policy_metadata_or_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = crate::Catalog::memory(Default::default());
+        let ds = catalog
+            .create(
+                "selected",
+                &crate::catalog::CreateDataset {
+                    kind: crate::catalog::DatasetKind::Memory,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ds.update("INSERT DATA { <urn:s> <urn:p> 1 }").unwrap();
+        let repository = std::sync::Arc::new(
+            super::super::open(
+                &serde_json::from_value(
+                    serde_json::json!({"name":"local","type":"fs","path":root.path()}),
+                )
+                .unwrap(),
+                &OpenEnv {
+                    init: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let patterns = vec!["selected".to_string()];
+        let engine = CatalogEngine {
+            catalog: &catalog,
+            repository: repository.clone(),
+            selected: Some(&patterns),
+            ctl: Ctl::default(),
+        };
+        let control = Control::default();
+        let writer = ds.store().write();
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let metadata = scope.spawn(move || send.send(engine.datasets()).unwrap());
+            let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+            // If metadata ever regresses, release the writer before joining.
+            if result.is_err() {
+                drop(writer);
+                metadata.join().unwrap();
+                panic!("selected writer blocked committed metadata");
+            }
+            metadata.join().unwrap();
+            let rows = result.unwrap();
+            assert_eq!(rows[0].head, 1);
+            let (send, receive) = std::sync::mpsc::channel();
+            let policy = manual_policy("local", &["selected"]);
+            let worker_control = control.clone();
+            let catalog = &catalog;
+            let run = scope.spawn(move || {
+                send.send(catalog.run_policy_in(&policy, repository, &worker_control))
+                    .unwrap()
+            });
+            control.cancel.cancel();
+            let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+            drop(writer);
+            run.join().unwrap();
+            assert!(matches!(
+                result.expect("policy cancellation waited for selected writer"),
+                Err(Error::Cancelled)
+            ));
+        });
+    }
+
+    #[test]
+    fn zero_dataset_policy_gc_observes_control_and_releases_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = crate::Catalog::memory(Default::default());
+        let ds = catalog
+            .create(
+                "ds",
+                &crate::catalog::CreateDataset {
+                    kind: crate::catalog::DatasetKind::Memory,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ds.update("INSERT DATA { <urn:s> <urn:p> 1 }").unwrap();
+        let repository = std::sync::Arc::new(
+            super::super::open(
+                &serde_json::from_value(
+                    serde_json::json!({"name":"local","type":"fs","path":root.path()}),
+                )
+                .unwrap(),
+                &OpenEnv {
+                    init: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let mut policy = manual_policy("local", &["ds"]);
+        catalog
+            .run_policy_in(&policy, repository.clone(), &Control::default())
+            .unwrap();
+        catalog
+            .run_policy_in(&policy, repository.clone(), &Control::default())
+            .unwrap();
+        policy.datasets = vec!["absent".into()];
+        policy.retention.min_count = 0;
+        policy.retention.max_count = Some(1);
+        policy.gc_after_retention = true;
+        let mut control = Control::default();
+        let cancel = control.cancel.clone();
+        control.progress = crate::task::Progress::new(move |_, message| {
+            if message == "reading manifests" {
+                cancel.cancel();
+            }
+        });
+        assert!(matches!(
+            catalog.run_policy_in(&policy, repository.clone(), &control),
+            Err(Error::Cancelled)
+        ));
+        assert!(
+            super::super::block_on(repository.locks())
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn explicit_policy_repository_cannot_be_inside_live_attached_dataset() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = crate::Catalog::memory(Default::default());
+        let external = root.path().join("external");
+        catalog
+            .attach(
+                "external",
+                crate::catalog::Attach::Directory(external.clone()),
+            )
+            .unwrap();
+        let repository = std::sync::Arc::new(
+            super::super::open(
+                &RepoConfig::from_url(
+                    "local",
+                    &format!("file://{}", external.join("backup").display()),
+                )
+                .unwrap(),
+                &OpenEnv {
+                    init: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let result = catalog.run_policy_in(
+            &manual_policy("local", &["external"]),
+            repository.clone(),
+            &Control::default(),
+        );
+        assert_eq!(to_backup(result.unwrap_err()).code(), Code::InvalidConfig);
+        assert!(
+            super::super::block_on(repository.list(&ListFilter::default()))
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fresh_catalog_policy_validates_persisted_repository_without_opening_it() {
+        for same_location in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path().join("catalog");
+            let registered_path = root.path().join("registered");
+            let config =
+                RepoConfig::from_url("local", &format!("file://{}", registered_path.display()))
+                    .unwrap();
+            let catalog = crate::Catalog::open(&data, Default::default()).unwrap();
+            catalog.create("ds", &Default::default()).unwrap();
+            let repositories = catalog.repositories().unwrap();
+            repositories.add(config.clone()).unwrap();
+            let old_id = repositories.open("local").unwrap().id();
+            drop(repositories);
+            drop(catalog);
+            let registry_path = data
+                .join("backup")
+                .join(super::super::registry::REPOSITORIES_FILE);
+            let registry_before = std::fs::read(&registry_path).unwrap();
+            let supplied_config = if same_location {
+                // A replacement marker must not satisfy the persisted expected UUID.
+                std::fs::remove_dir_all(&registered_path).unwrap();
+                config
+            } else {
+                RepoConfig::from_url(
+                    "local",
+                    &format!("file://{}", root.path().join("other").display()),
+                )
+                .unwrap()
+            };
+            let supplied = std::sync::Arc::new(
+                super::super::open(
+                    &supplied_config,
+                    &OpenEnv {
+                        init: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            );
+            assert_ne!(supplied.id(), old_id);
+            let catalog = crate::Catalog::open(&data, Default::default()).unwrap();
+            assert!(
+                catalog.inner.repositories.lock().is_none(),
+                "fixture must begin with lazy metadata"
+            );
+            let result = catalog.run_policy_in(
+                &manual_policy("local", &["absent"]),
+                supplied.clone(),
+                &Control::default(),
+            );
+            // Guard loads metadata only; neither backend admission nor a registry save
+            // may replace its remembered UUID/config or open the registered location.
+            assert_eq!(std::fs::read(&registry_path).unwrap(), registry_before);
+            assert!(
+                super::super::block_on(supplied.list(&ListFilter::default()))
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                to_backup(result.unwrap_err()).code(),
+                Code::InvalidRequest,
+                "same_location={same_location}"
+            );
+            let loaded = catalog.repositories().unwrap();
+            let entries = loaded.registry.repos.read();
+            let entry = entries.get("local").unwrap();
+            assert_eq!(entry.id, Some(old_id));
+            assert!(
+                entry.opened.is_none(),
+                "metadata guard must not open registered backend"
+            );
+        }
     }
 }

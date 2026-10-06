@@ -150,7 +150,7 @@ impl Backups<'_> {
                 vec![DatasetInfo {
                     name: self.0.ds.name().unwrap_or("dataset").into(),
                     id: self.0.ds.dataset_id(),
-                    head: self.0.ds.head_commit().seq,
+                    head: self.0.ds.snapshot().commit,
                 }]
             }
             fn list(
@@ -207,5 +207,62 @@ impl Backups<'_> {
         ctl.check()?;
         ctl.progress.report(1.0, "policy completed");
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod policy_metadata_tests {
+    use crate::backup::{self, OpenEnv, PolicyConfig, RepoConfig};
+    use crate::task::Control;
+
+    #[test]
+    fn retained_writer_does_not_strand_single_dataset_policy_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = crate::Catalog::memory(Default::default());
+        let dataset = catalog
+            .create(
+                "ds",
+                &crate::catalog::CreateDataset {
+                    kind: crate::catalog::DatasetKind::Memory,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let config =
+            RepoConfig::from_url("local", &format!("file://{}", root.path().display())).unwrap();
+        let repository = backup::open(
+            &config,
+            &OpenEnv {
+                init: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let policy: PolicyConfig = serde_json::from_value(serde_json::json!({"name":"manual","repository":"local","datasets":["ds"],"schedule":"every 1h"})).unwrap();
+        let control = Control::default();
+        let writer = dataset.store().write();
+        let result = std::thread::scope(|scope| {
+            let (started_send, started_receive) = std::sync::mpsc::channel();
+            let (send, receive) = std::sync::mpsc::channel();
+            let ctl = &control;
+            let dataset = &dataset;
+            let repository = &repository;
+            let worker = scope.spawn(move || {
+                started_send.send(()).unwrap();
+                send.send(dataset.backups(repository).run_policy(&policy, ctl))
+                    .unwrap();
+            });
+            started_receive.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            control.cancel.cancel();
+            let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+            drop(writer);
+            worker.join().unwrap();
+            result
+        });
+        assert!(matches!(
+            result.expect("single policy cancellation waited for the retained writer"),
+            Err(crate::Error::Cancelled)
+        ));
     }
 }
