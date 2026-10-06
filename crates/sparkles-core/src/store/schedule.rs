@@ -46,7 +46,7 @@ impl Store {
                 "pin schedules need a dataset with history".into(),
             ));
         };
-        let _w = self.writer.lock();
+        let _w = self.guarded_writer();
         let mut h = hist.lock();
         crate::history::write_file(
             root,
@@ -117,14 +117,14 @@ impl Store {
         }
         if let Some(hist) = &self.history {
             {
-                let w = self.writer.lock();
+                let w = self.guarded_writer();
                 let current = commit::generation_number(&self.snapshot().generation.name);
                 self.collect_locked(&mut hist.lock(), current, w.head.seq);
             }
             report.pruned = self.prune_commits_with(false)?;
             report.warmed = self.warm_snapshots();
         } else if let Some(m) = &self.mem_history {
-            let head = self.writer.lock().head.seq;
+            let head = self.guarded_writer().head.seq;
             let mut m = m.lock();
             let cat = self.catalog.lock();
             let ts = |s: u64| cat.get(s).map(|c| c.timestamp_ms);
@@ -138,7 +138,7 @@ impl Store {
         let (Some(root), Some(hist)) = (&self.root, &self.history) else {
             return Ok(self.mem_expire(now));
         };
-        let w = self.writer.lock();
+        let w = self.guarded_writer();
         let current = commit::generation_number(&self.snapshot().generation.name);
         let mut h = hist.lock();
         let gone: Vec<String> = h

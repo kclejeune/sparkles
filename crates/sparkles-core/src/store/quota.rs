@@ -292,7 +292,7 @@ impl Store {
     /// store.
     pub fn set_quota(&self, max_bytes: Option<u64>) -> Result<QuotaStatus> {
         // the writer lock orders the change after any commit being checked
-        let _w = self.writer.lock();
+        let _w = self.guarded_writer();
         self.quota.set(max_bytes)?;
         Ok(self.quota.status())
     }

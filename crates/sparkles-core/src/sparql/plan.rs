@@ -285,6 +285,7 @@ pub struct Agg {
     pub distinct: bool,
     /// ARQ's FOLD: `expr` is the list element or the map key
     pub fold: Option<Box<Fold>>,
+    pub registered: Option<std::sync::Arc<super::extensions::AggregateDescriptor>>,
 }
 
 /// The parts of ARQ's `FOLD(expr, value ORDER BY …)` besides its first expression.
@@ -465,6 +466,7 @@ pub enum Kind {
     /// a property function of ARQ's library (`list:member`, `apf:strSplit`, …); child 0,
     /// if any, is the rest of the group, which binds variables the call reads
     PropertyFn(Box<super::arqpf::PfSpec>),
+    RegisteredProperty(Box<super::propertyext::Spec>),
     /// paths as solutions (`SERVICE path:search`); child 0, if any, is the rest of the
     /// group, which binds the source or the target
     PathSearch(Box<super::pathsearch::PathSearchSpec>),
@@ -588,6 +590,7 @@ impl Node {
             Kind::Path { .. } => "TransitivePath",
             Kind::Lateral(_) => "Lateral",
             Kind::PropertyFn(_) => "PropertyFunction",
+            Kind::RegisteredProperty(_) => "RegisteredPropertyFunction",
             Kind::Service { .. } => "Service",
             Kind::TextSearch(_) => "TextSearch",
             Kind::VectorSearch(_) => "VectorSearch",
@@ -645,6 +648,7 @@ pub struct Planner<'a> {
     /// `LATERAL`'s substitutions, where a variable a sub-select does not project is a
     /// different variable. Initial bindings and EXISTS substitute everywhere.
     pub scoped: FxHashSet<VarId>,
+    pub(super) property_inputs: FxHashSet<VarId>,
     bnode_scope: u32,
     /// RDF 1.2 triple-term patterns created while translating triple patterns
     unpacks: std::cell::RefCell<Vec<UnpackItem>>,
@@ -669,6 +673,7 @@ impl<'a> Planner<'a> {
             ctx,
             subst: FxHashMap::default(),
             scoped: FxHashSet::default(),
+            property_inputs: FxHashSet::default(),
             bnode_scope: 0,
             unpacks: Default::default(),
             source: None,
@@ -817,6 +822,14 @@ impl<'a> Planner<'a> {
                 let n = super::lateral::plan(self, l, right, g)?;
                 Ok(self.apply_filters(n, top))
             }
+            GP::Filter { expr, inner } if self.ctx.calls_extensions => {
+                // Keep application calls at their algebra operator, including AND
+                // short-circuiting. No sampling, conjunct reordering or pushdown.
+                let child = self.plan(inner, g, Vec::new())?;
+                let expression = self.compile(expr, g);
+                let node = self.apply_filters(child, vec![expression]);
+                Ok(self.apply_filters(node, filters))
+            }
             GP::Filter { expr, inner } => {
                 let mut fs = filters;
                 fs.extend(self.compile(expr, g).conjuncts());
@@ -826,7 +839,9 @@ impl<'a> Planner<'a> {
                 left,
                 right,
                 expression,
-            } if super::arqpf::reads_left(self, left, right) => {
+            } if super::arqpf::reads_left(self, left, right)
+                || super::propertyext::reads_left(self, left, right) =>
+            {
                 // ARQ evaluates the OPTIONAL per left row, so that the property functions
                 // of the right side read the left side's values
                 let certain = certain_vars(left, self.ctx);
@@ -1079,7 +1094,17 @@ impl<'a> Planner<'a> {
                 for (v, _) in &hidden {
                     self.subst.remove(v);
                 }
+                let hidden_inputs: Vec<_> = self
+                    .property_inputs
+                    .iter()
+                    .filter(|v| self.scoped.contains(v) && !vars.contains(v))
+                    .copied()
+                    .collect();
+                for v in &hidden_inputs {
+                    self.property_inputs.remove(v);
+                }
                 let child = self.plan(inner, g, Vec::new());
+                self.property_inputs.extend(hidden_inputs);
                 self.subst.extend(hidden);
                 let child = child?;
                 let n = project(child, vars, self.ctx);
@@ -1120,6 +1145,7 @@ impl<'a> Planner<'a> {
                                 expr: None,
                                 distinct: *distinct,
                                 fold: None,
+                                registered: None,
                             },
                             AggregateExpression::FunctionCall {
                                 name,
@@ -1130,6 +1156,15 @@ impl<'a> Planner<'a> {
                                 expr: Some(self.compile(expr, g)),
                                 distinct: *distinct,
                                 fold: None,
+                                registered: match name {
+                                    AggregateFunction::Custom(iri) => self
+                                        .ctx
+                                        .extensions
+                                        .as_ref()
+                                        .and_then(|r| r.aggregate(iri.as_str()))
+                                        .cloned(),
+                                    _ => None,
+                                },
                             },
                             AggregateExpression::Fold {
                                 expr,
@@ -1152,6 +1187,7 @@ impl<'a> Planner<'a> {
                                         })
                                         .collect(),
                                 })),
+                                registered: None,
                             },
                         };
                         (self.ctx.var(v.as_str()), agg)
@@ -1261,6 +1297,15 @@ impl<'a> Planner<'a> {
         use GraphPattern as GP;
         match gp {
             GP::Bgp { patterns } => {
+                if super::propertyext::has_calls(self.ctx, patterns) {
+                    let (calls, rest) = super::propertyext::take_calls(self.ctx, patterns)?;
+                    self.collect(&GP::Bgp { patterns: rest }, g, items)?;
+                    let input = self.plan_group(std::mem::take(items), Vec::new())?;
+                    items.push(Item::Node(super::propertyext::attach(
+                        self, input, calls, g,
+                    )?));
+                    return Ok(());
+                }
                 // ARQ's property function library: the variables bound before a call
                 // are those of the group's earlier elements
                 let members;
@@ -1966,19 +2011,22 @@ impl<'a> Planner<'a> {
         let NamedNodePattern::Variable(v) = name else {
             return true;
         };
-        fn plain(gp: &GraphPattern) -> bool {
+        fn plain(gp: &GraphPattern, ctx: &Ctx) -> bool {
             match gp {
                 // ARQ's property functions read lists per graph
-                GraphPattern::Bgp { patterns } => !super::arqpf::has_calls(patterns),
+                GraphPattern::Bgp { patterns } => {
+                    !super::arqpf::has_calls(patterns)
+                        && !super::propertyext::has_calls(ctx, patterns)
+                }
                 GraphPattern::Path { .. } => true,
-                GraphPattern::Join { left, right } => plain(left) && plain(right),
-                GraphPattern::Filter { inner, expr } => plain(inner) && !has_exists(expr),
+                GraphPattern::Join { left, right } => plain(left, ctx) && plain(right, ctx),
+                GraphPattern::Filter { inner, expr } => plain(inner, ctx) && !has_exists(expr),
                 _ => false,
             }
         }
         let mut names = Vec::new();
         collect_pattern_vars(inner, &mut names);
-        plain(inner) && !names.iter().any(|n| n == v.as_str())
+        plain(inner, self.ctx) && !names.iter().any(|n| n == v.as_str())
     }
 
     /// One row per named graph of the active dataset (bound to the graph variable), or
@@ -4155,7 +4203,17 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
             .collect::<Vec<_>>()
             .join(" "),
         aggs.iter()
-            .map(|(v, a)| format!("?{}={:?}", ctx.var_name(*v), a.func))
+            .map(|(v, a)| {
+                let name = format!("?{}={:?}", ctx.var_name(*v), a.func);
+                if let Some(descriptor) = &a.registered {
+                    format!(
+                        "{name} [aggregate {:?}; singleton batch]",
+                        descriptor.volatility
+                    )
+                } else {
+                    name
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ")
     );
@@ -4805,8 +4863,11 @@ pub fn short(t: &Term) -> String {
 }
 
 /// Evaluate `EXISTS { pattern }` for one outer binding (substitution semantics).
-pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id]) -> Result<bool> {
+pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -> Result<bool> {
     let mut p = Planner::new(ctx);
+    if ctx.calls_extensions {
+        p.property_inputs.extend(schema.iter().copied());
+    }
     for (v, id) in spec.vars.iter().zip(key) {
         if !id.is_undef() {
             p.subst.insert(*v, *id);

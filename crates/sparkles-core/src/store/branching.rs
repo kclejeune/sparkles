@@ -1203,6 +1203,7 @@ impl Store {
 
     /// The branch set, if this is a dataset's own persistent store.
     pub(crate) fn owned_set(&self) -> Result<&Arc<BranchSet>> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         match &self.branching.set {
             SetRef::Owner(s) => Ok(s),
             SetRef::Member(_) => Err(branch::invalid_branch(
@@ -1218,6 +1219,7 @@ impl Store {
 
     /// The branch set this store belongs to, if any.
     pub fn branch_set(&self) -> Option<Arc<BranchSet>> {
+        crate::sparql::extensions::assert_family(self.owner_dataset_id());
         self.branching.set()
     }
 
@@ -1749,6 +1751,7 @@ impl Store {
             .guard_required
             .store(up.guard_required.load(Ordering::Relaxed), Ordering::Relaxed);
         let mut state = (*store.snapshot()).clone();
+        state.dataset_id = self.owner_dataset_id();
         state.delta = snap.delta.clone();
         state.delta_stats = snap.delta_stats.clone();
         state.version = snap.version;
@@ -1938,7 +1941,7 @@ impl Store {
                 "branches need a persistent dataset",
             ));
         };
-        let w = self.writer.lock();
+        let w = self.guarded_writer();
         let head = w.head;
         let r = match self.resolve_with(at, head) {
             Err(e) => match branch::inherited_commit(&e) {

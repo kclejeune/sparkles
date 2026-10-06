@@ -124,6 +124,7 @@ pub enum Func {
     Builtin(Function),
     Cast(NamedNode),
     Ext(String),
+    Registered(Arc<super::extensions::ScalarDescriptor>),
 }
 
 impl Expr {
@@ -326,6 +327,14 @@ impl Expr {
                     }
                     Expr::Call(Func::Cast(n), _) => {
                         let _ = write!(s, "{n}");
+                    }
+                    Expr::Call(Func::Registered(d), _) => {
+                        let _ = write!(
+                            s,
+                            "<{}> [scalar {:?}; singleton batch]",
+                            d.iri.as_str(),
+                            d.volatility
+                        );
                     }
                     Expr::Call(Func::Ext(n), _) => {
                         let _ = write!(s, "<{n}>");
@@ -600,13 +609,22 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         }
         Expr::Exists(spec) => {
             let key: Vec<Id> = spec.vars.iter().map(|&v| spec.value(row, v)).collect();
-            if let Some(&r) = spec.memo.lock().get(&key) {
+            if !ctx.calls_extensions
+                && let Some(&r) = spec.memo.lock().get(&key)
+            {
                 return Ok(b(r));
             }
-            let r = super::exists::per_row(|| super::plan::eval_exists(ctx, spec, &key))
-                .map_err(|_| TypeError)?;
+            let r = super::exists::per_row(|| {
+                super::plan::eval_exists(ctx, spec, &key, &row.table.vars)
+            })
+            .map_err(|error| {
+                if ctx.calls_extensions {
+                    ctx.fail_extension(super::extensions::ScalarError::from_engine(&error));
+                }
+                TypeError
+            })?;
             let mut m = spec.memo.lock();
-            if m.len() < 100_000 {
+            if !ctx.calls_extensions && m.len() < 100_000 {
                 m.insert(key, r);
             }
             Ok(b(r))
@@ -840,7 +858,76 @@ fn call(f: &Func, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         Func::Builtin(f) => builtin(f, args, row, ctx),
         Func::Cast(dt) => cast(dt, arg(args, 0, row, ctx)?.into_owned(), ctx),
         Func::Ext(iri) => extension(iri, args, row, ctx),
+        Func::Registered(descriptor) => registered(descriptor, args, row, ctx),
     }
+}
+
+fn registered(
+    descriptor: &super::extensions::ScalarDescriptor,
+    args: &[Expr],
+    row: &Row<'_>,
+    ctx: &Ctx,
+) -> EvalResult<Val> {
+    use super::extensions::{CallbackGuard, MAX_BATCH_BYTES, ScalarContext, ScalarError};
+    if !descriptor.arity.contains(&args.len()) {
+        return Err(TypeError);
+    }
+    let fail = |error: ScalarError| {
+        ctx.fail_extension(error);
+        TypeError
+    };
+    ctx.check().map_err(|e| fail(e.into()))?;
+    let input = ctx
+        .charge(
+            (args.len() * std::mem::size_of::<Term>() + std::mem::size_of::<Vec<Term>>()) as u64,
+        )
+        .map_err(|e| fail(e.into()))?;
+    let mut terms = Vec::with_capacity(args.len());
+    let mut bytes = 0u64;
+    for arg in args {
+        let val = eval(arg, row, ctx)?;
+        let term = match val {
+            Val::Id(id) | Val::Dec(id, _) => ctx.term(id).ok_or(TypeError)?,
+            Val::V(v) => v.to_term(),
+        };
+        let cost = super::extensions::term_bytes(&term).map_err(&fail)?;
+        bytes = bytes.saturating_add(cost);
+        if bytes > MAX_BATCH_BYTES {
+            return Err(fail(ScalarError::Execution(
+                "callback input exceeds batch byte ceiling".into(),
+            )));
+        }
+        input
+            .add(cost.saturating_sub(std::mem::size_of::<Term>() as u64))
+            .map_err(|e| fail(e.into()))?;
+        terms.push(term);
+    }
+    let context = ScalarContext { ctx };
+    let _owner = CallbackGuard::enter(ctx);
+    let arguments = [terms];
+    let results = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        descriptor.implementation.call_batch(&context, &arguments)
+    }))
+    .map_err(|_| fail(ScalarError::Execution("callback panicked".into())))?;
+    ctx.check().map_err(|e| fail(e.into()))?;
+    if results.len() != 1 {
+        return Err(fail(ScalarError::Execution(
+            "callback output cardinality does not match input".into(),
+        )));
+    }
+    let term = results.into_iter().next().unwrap().map_err(fail)?;
+    let bytes = super::extensions::term_bytes(&term).map_err(&fail)?;
+    if bytes > MAX_BATCH_BYTES {
+        return Err(fail(ScalarError::Execution(
+            "callback output exceeds batch byte ceiling".into(),
+        )));
+    }
+    let _output = ctx.charge(bytes).map_err(|e| fail(e.into()))?;
+    let id = ctx
+        .intern_callback_term(&term, &arguments[0])
+        .map_err(|e| fail(e.into()))?;
+    drop(input);
+    Ok(Val::Id(id))
 }
 
 fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
@@ -1951,7 +2038,15 @@ impl Compiler<'_> {
                 let args: Vec<Expr> = args.iter().map(|x| self.compile(x)).collect();
                 let f = match f {
                     Function::Custom(n) if is_cast(n.as_str()) => Func::Cast(n.clone()),
-                    Function::Custom(n) => Func::Ext(n.as_str().to_string()),
+                    Function::Custom(n) => match self
+                        .ctx
+                        .extensions
+                        .as_ref()
+                        .and_then(|r| r.scalar(n.as_str()))
+                    {
+                        Some(d) => Func::Registered(d.clone()),
+                        None => Func::Ext(n.as_str().to_string()),
+                    },
                     f => Func::Builtin(f.clone()),
                 };
                 Expr::Call(f, args)

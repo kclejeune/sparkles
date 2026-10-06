@@ -145,6 +145,7 @@ impl ResultCache {
 /// Same result for the same variable bindings (no RAND/NOW/UUID/BNODE/EXISTS).
 pub(crate) fn deterministic(e: &Expr) -> bool {
     match e {
+        Expr::Call(Func::Registered(_), _) => false,
         Expr::Call(Func::Builtin(f), args) => {
             !matches!(
                 f,
@@ -407,6 +408,7 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             // a remote loop's results are the endpoint's
             l.service.is_none() && super::exists::pure_pattern(&l.pattern)
         }
+        Kind::RegisteredProperty(_) => false,
         Kind::PropertyFn(spec) => {
             let _ = write!(s, "{:?}", spec);
             true
@@ -442,7 +444,8 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
                 }
             }
             aggs.iter().all(|(_, a)| {
-                a.expr.as_ref().is_none_or(deterministic)
+                a.registered.is_none()
+                    && a.expr.as_ref().is_none_or(deterministic)
                     && a.fold.as_ref().is_none_or(|f| {
                         f.value.as_ref().is_none_or(deterministic)
                             && f.order.iter().all(|(e, _)| deterministic(e))

@@ -482,6 +482,10 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             counters = Some(c);
             t
         }
+        Kind::RegisteredProperty(spec) => {
+            let input = child(0, &mut infos)?;
+            super::propertyext::run(ctx, spec, &input, &n.vars)?
+        }
         Kind::PropertyFn(spec) => {
             let input = match n.children.len() {
                 0 => None,
@@ -3424,6 +3428,7 @@ fn group(
             // FOLD evaluates its expressions itself, in its ORDER BY's order
             Some(e)
                 if agg.fold.is_none()
+                    && agg.registered.is_none()
                     && t.len() >= super::exprcache::MIN_ROWS
                     && super::exprcache::eligible(&[e]).is_ok() =>
             {
@@ -3448,7 +3453,14 @@ fn group(
         ctx.check()?;
         let rows = &rows[start[g] as usize..start[g + 1] as usize];
         for ((_, agg), arg) in aggs.iter().zip(&args) {
-            row.push(aggregate(ctx, t, &map, rows, agg, arg.as_ref()));
+            row.push(if let Some(descriptor) = &agg.registered {
+                super::registeredagg::aggregate(ctx, t, &map, rows, agg, descriptor)?
+            } else {
+                aggregate(ctx, t, &map, rows, agg, arg.as_ref())
+            });
+            if ctx.calls_extensions {
+                ctx.check()?;
+            }
         }
         out.push_row(&row);
     }
@@ -3463,7 +3475,8 @@ pub fn incremental_group_ok(keys: &[VarId], aggs: &[(VarId, Agg)], input: &[VarI
     keys.len() <= 1
         && keys.iter().all(|k| input.contains(k))
         && aggs.iter().all(|(_, a)| {
-            !a.distinct
+            a.registered.is_none()
+                && !a.distinct
                 && match &a.expr {
                     None => matches!(a.func, AggregateFunction::Count),
                     Some(Expr::Var(v)) => {

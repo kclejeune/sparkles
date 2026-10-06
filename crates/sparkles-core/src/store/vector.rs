@@ -125,7 +125,7 @@ impl Store {
     pub fn create_vector_index(&self, name: &str, cfg: VectorIndexConfig) -> Result<bool> {
         validate_name(name)?;
         cfg.validate()?;
-        let _w = self.writer.lock();
+        let _w = self.guarded_writer();
         let mut map = self.vector.indexes.write();
         if let Some((other, _)) = map
             .iter()
@@ -194,7 +194,7 @@ impl Store {
 
     /// Drop vector index `name`: its configuration and files go (`404` if unknown).
     pub fn drop_vector_index(&self, name: &str) -> Result<()> {
-        let _w = self.writer.lock();
+        let _w = self.guarded_writer();
         let mut map = self.vector.indexes.write();
         let Some(old) = map.remove(name) else {
             return Err(Error::NotFound(format!("no vector index {name}")));

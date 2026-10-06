@@ -82,6 +82,13 @@ fn left_names(p: &Planner<'_>, left: &GraphPattern) -> FxHashSet<String> {
 /// Whether `Lateral(left, right)` has the solutions of the join of `left` and `right`
 /// (see the module documentation).
 pub(super) fn join_equivalent(p: &Planner<'_>, left: &GraphPattern, right: &GraphPattern) -> bool {
+    if p.ctx
+        .extensions
+        .as_ref()
+        .is_some_and(|r| r.references(right))
+    {
+        return false;
+    }
     let lv = left_names(p, left);
     if mentioned(right).iter().all(|n| !lv.contains(n)) {
         return true;
@@ -147,9 +154,28 @@ fn plan_with(
         .map(|n| ctx.var(n))
         .filter(|v| left.vars.contains(v))
         .collect();
-    // the right side planned without substitution, for its variables and estimates
-    let r = p.plan(right, g, Vec::new())?;
-    if keys.is_empty() && optional.is_none() {
+    // Schema-only outer inputs allow planning required property arguments without
+    // executing callbacks. Actual bound substitutions are installed per left row.
+    let calls_extensions = ctx.extensions.as_ref().is_some_and(|r| r.references(right));
+    let old_inputs = p.property_inputs.clone();
+    let old_scoped = if calls_extensions {
+        Some(p.scoped.clone())
+    } else {
+        None
+    };
+    if calls_extensions {
+        p.property_inputs.extend(keys.iter().copied());
+        if !unscoped {
+            p.scoped.extend(keys.iter().copied());
+        }
+    }
+    let planned = p.plan(right, g, Vec::new());
+    p.property_inputs = old_inputs;
+    if let Some(scoped) = old_scoped {
+        p.scoped = scoped;
+    }
+    let r = planned?;
+    if keys.is_empty() && optional.is_none() && !calls_extensions {
         return Ok(super::plan::join(left, r, ctx));
     }
     let mut vars = left.vars.clone();
@@ -235,11 +261,20 @@ pub(super) fn run(
     let cols: Vec<Option<usize>> = spec.keys.iter().map(|k| l.col_of(*k)).collect();
     let mut groups: FxHashMap<Vec<Id>, Vec<usize>> = FxHashMap::default();
     let mut order: Vec<Vec<Id>> = Vec::new();
+    let calls_extensions = ctx
+        .extensions
+        .as_ref()
+        .is_some_and(|r| r.references(&spec.pattern));
     for i in 0..l.len() {
-        let key: Vec<Id> = cols
+        let mut key: Vec<Id> = cols
             .iter()
             .map(|c| c.map_or(Id::UNDEF, |c| l.cols[c][i]))
             .collect();
+        // Callback observations belong to each solution, including duplicate rows.
+        // The private suffix is not substituted into any SPARQL variable.
+        if calls_extensions {
+            key.push(Id(i as u64));
+        }
         groups
             .entry(key)
             .or_insert_with_key(|k| {
@@ -255,6 +290,12 @@ pub(super) fn run(
         let mut p = Planner::new(ctx);
         p.subst.extend(spec.outer.iter().copied());
         p.scoped.extend(spec.outer_scoped.iter().copied());
+        if calls_extensions {
+            p.property_inputs.extend(spec.keys.iter().copied());
+            if !spec.unscoped {
+                p.scoped.extend(spec.keys.iter().copied());
+            }
+        }
         for (k, id) in spec.keys.iter().zip(key) {
             if !id.is_undef() {
                 p.subst.insert(*k, *id);

@@ -382,6 +382,7 @@ pub struct PlanWarning {
 }
 
 pub struct Ctx {
+    pub extensions: Option<Arc<super::extensions::ExtensionRegistry>>,
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
     values: Vec<RwLock<FxHashMap<Id, Value>>>,
@@ -445,11 +446,28 @@ pub struct Ctx {
     /// the small input of a variable and the patterns probed with its values (see
     /// [`super::keyprobe`])
     pub(super) probes: parking_lot::Mutex<FxHashMap<VarId, super::keyprobe::VarProbe>>,
+    // Keep callback bookkeeping after the ordinary execution fields. The registry
+    // stays first so its user-owned callbacks keep their existing drop order.
+    pub(crate) extension_failure: Option<super::extensions::Failure>,
+    pub(crate) calls_extensions: bool,
+    pub(crate) extension_families: Vec<uuid::Uuid>,
+    pub(crate) extension_ancestors: Vec<super::extensions::Failure>,
+    pub(crate) extension_writers: Vec<(uuid::Uuid, super::extensions::Failure)>,
+    callback_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
+    callback_terms: parking_lot::Mutex<FxHashMap<Id, u64>>,
 }
 
 impl Ctx {
     pub fn new(snap: Arc<Snapshot>) -> Ctx {
         Ctx {
+            extension_families: Vec::new(),
+            extension_writers: Vec::new(),
+            extension_ancestors: Vec::new(),
+            extensions: None,
+            extension_failure: Default::default(),
+            calls_extensions: false,
+            callback_bnodes: Default::default(),
+            callback_terms: Default::default(),
             snap,
             local: RwLock::new(AppendVocab::default()),
             values: (0..VALUE_SHARDS)
@@ -488,6 +506,152 @@ impl Ctx {
         }
     }
 
+    pub(crate) fn fail_extension(&self, error: super::extensions::ScalarError) {
+        let error = error.bounded();
+        if !matches!(error, super::extensions::ScalarError::Expression) {
+            if let Some(failure) = &self.extension_failure {
+                failure.lock().get_or_insert(error.clone());
+            }
+            for ancestor in &self.extension_ancestors {
+                ancestor.lock().get_or_insert(error.clone());
+            }
+            for (_, writer) in self
+                .extension_writers
+                .iter()
+                .filter(|(id, _)| *id == self.snap.dataset_id)
+            {
+                writer.lock().get_or_insert(error.clone());
+            }
+        }
+    }
+
+    pub(crate) fn configure_extensions(&mut self, pattern: &spargebra::algebra::GraphPattern) {
+        self.calls_extensions = self
+            .extensions
+            .as_ref()
+            .is_some_and(|r| !r.is_empty() && r.references(pattern));
+        if self.calls_extensions {
+            self.extension_failure = Some(Default::default());
+            self.extension_families = super::extensions::captured_families(self.snap.dataset_id);
+            self.extension_writers = super::extensions::captured_writers();
+            self.extension_ancestors = super::extensions::captured_ancestors();
+            self.use_cache = false;
+            self.opt.expr_cache = false;
+            self.opt.sampled_filters = false;
+            self.opt.decorrelate_exists = false;
+            self.opt.count_filter_runs = false;
+            self.opt.filter_scan_runs = false;
+            // Ranking the first key separately can evaluate it twice and omit calls
+            // from later keys on discarded rows.
+            self.opt.topk_first_key = false;
+        }
+    }
+
+    pub(crate) fn retain_callback_bytes(&self, id: Id, bytes: u64) -> Result<()> {
+        let mut retained = self.callback_terms.lock();
+        if retained.contains_key(&id) {
+            return Ok(());
+        }
+        let charge = self.charge(bytes)?;
+        retained.insert(id, bytes);
+        // This vocabulary belongs to Ctx and is released with it; unlike temporary
+        // callback batches it must remain charged for the rest of query execution.
+        std::mem::forget(charge);
+        Ok(())
+    }
+
+    /// Callback blank nodes may refer back to nodes it received, but arbitrary labels
+    /// cannot forge stored identities. Newly returned labels live in this query only.
+    pub(crate) fn intern_callback_term(&self, term: &Term, arguments: &[Term]) -> Result<Id> {
+        self.check()?;
+        fn permit(label: &str, out: &mut FxHashMap<String, Id>, charge: &Charge<'_>) -> Result<()> {
+            if let Some(payload) = id::parse_bnode_payload(label)
+                && !out.contains_key(label)
+            {
+                charge.add(label.len() as u64 + 96)?;
+                out.insert(label.to_owned(), Id::bnode(payload));
+            }
+            Ok(())
+        }
+        fn collect(
+            term: &Term,
+            out: &mut FxHashMap<String, Id>,
+            charge: &Charge<'_>,
+        ) -> Result<()> {
+            match term {
+                Term::BlankNode(b) => permit(b.as_str(), out, charge)?,
+                Term::Triple(t) => {
+                    collect(&t.subject.clone().into(), out, charge)?;
+                    collect(&t.object, out, charge)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        let allowed_charge = self.charge(0)?;
+        let mut allowed = FxHashMap::default();
+        for term in arguments {
+            collect(term, &mut allowed, &allowed_charge)?;
+            let mut failure = None;
+            let _parsed = super::cdt::callback_relabel_term(self, term, &mut |b| {
+                if failure.is_none() {
+                    failure = permit(b, &mut allowed, &allowed_charge).err();
+                }
+                b.to_owned()
+            })?;
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+        let mut failure = None;
+        let mut choose = |b: &str| {
+            if let Some(id) = allowed.get(b) {
+                return *id;
+            }
+            let mut nodes = self.callback_bnodes.lock();
+            if let Some(id) = nodes.get(b) {
+                return *id;
+            }
+            // Keep label-map ownership charged independently of returned values.
+            // A failed conversion can never allocate new unaccounted identities.
+            if failure.is_some() {
+                return Id::bnode(0);
+            }
+            match self.charge(b.len() as u64 + 96) {
+                Ok(charge) => {
+                    let id = self.fresh_bnode();
+                    nodes.insert(b.to_owned(), id);
+                    std::mem::forget(charge);
+                    id
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    Id::bnode(0)
+                }
+            }
+        };
+        let _mapped_charge =
+            self.charge(super::extensions::term_bytes(term).map_err(|e| e.engine())?)?;
+        let term = self.map_bnodes(term, &mut choose);
+        let relabeled = super::cdt::callback_relabel_term(self, &term, &mut |b| {
+            id::bnode_label(choose(b).payload())
+        })?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let mapped = relabeled.term.as_ref().unwrap_or(&term);
+        let bytes = super::extensions::term_bytes(mapped).map_err(|e| e.engine())?;
+        self.check()?;
+        let _output = self.charge(bytes)?;
+        let id = self.intern_term(mapped);
+        if id.tag() == Tag::Local
+            || (id.tag() == Tag::BNode && id.payload() & Id::LOCAL_BNODE_BIT != 0)
+        {
+            self.retain_callback_bytes(id, bytes)?;
+        }
+        Ok(id)
+    }
+
     /// Record a warning for the plan (once, however often it is raised).
     pub fn warn(&self, w: PlanWarning) {
         let mut ws = self.warnings.lock();
@@ -519,6 +683,12 @@ impl Ctx {
 
     #[inline]
     pub fn check(&self) -> Result<()> {
+        if self.calls_extensions
+            && let Some(state) = &self.extension_failure
+            && let Some(failure) = state.lock().as_ref()
+        {
+            return Err(failure.engine());
+        }
         if self.cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
@@ -913,15 +1083,22 @@ impl Charge<'_> {
             return Ok(());
         }
         let ctx = self.ctx;
-        let live = ctx
+        // Validate local ownership before publishing a global increment. Rejected
+        // requests never transiently wrap or consume another thread's allowance.
+        let owned = self
+            .bytes
+            .get()
+            .checked_add(bytes)
+            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+        let prior = ctx
             .mem_live
-            .fetch_add(bytes, Ordering::Relaxed)
-            .saturating_add(bytes);
-        if live > ctx.mem_limit {
-            ctx.mem_live.fetch_sub(bytes, Ordering::Relaxed);
-            return Err(ctx.memory_exceeded(live));
-        }
-        self.bytes.set(self.bytes.get() + bytes);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                live.checked_add(bytes)
+                    .filter(|next| *next <= ctx.mem_limit)
+            })
+            .map_err(|live| ctx.memory_exceeded(live.saturating_add(bytes)))?;
+        let live = prior + bytes;
+        self.bytes.set(owned);
         ctx.note_peak(live);
         Ok(())
     }
@@ -953,4 +1130,63 @@ pub enum TermKind {
     Literal,
     /// RDF 1.2 triple term
     Triple,
+}
+
+#[cfg(test)]
+mod charge_tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn rejected_finite_and_unlimited_overflow_leave_accounting_reusable() {
+        for limit in [100, u64::MAX] {
+            let store = Store::in_memory(StoreOptions::default());
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = limit;
+            let charge = ctx.charge(80).unwrap();
+            assert!(charge.add(u64::MAX).is_err());
+            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 80);
+            assert_eq!(charge.bytes.get(), 80);
+            charge.add(20).unwrap();
+            drop(charge);
+            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+            // A different guard can overflow the global count while its own count
+            // is representable. Failure must not corrupt either guard's release.
+            let first = ctx.charge(limit).unwrap();
+            assert!(ctx.charge(1).is_err());
+            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), limit);
+            drop(first);
+            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+            drop(ctx.charge(1).unwrap());
+            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_rejections_do_not_wrap_or_steal_live_charges() {
+        for limit in [100, u64::MAX] {
+            let store = Store::in_memory(StoreOptions::default());
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = limit;
+            let owner = ctx.charge(limit - 10).unwrap();
+            let barrier = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let ctx = &ctx;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..500 {
+                            assert!(ctx.charge(11).is_err());
+                            assert!(ctx.charge(u64::MAX).is_err());
+                            drop(ctx.charge(1).unwrap());
+                        }
+                    });
+                }
+            });
+            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), limit - 10);
+            drop(owner);
+            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+        }
+    }
 }

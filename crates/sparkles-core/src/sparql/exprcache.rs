@@ -120,6 +120,7 @@ impl Report {
 pub fn impurity(e: &Expr) -> Option<&'static str> {
     match e {
         Expr::Exists(_) => Some("EXISTS"),
+        Expr::Call(Func::Registered(_), _) => Some("application function"),
         Expr::Call(Func::Builtin(f), args) => match f {
             Function::Rand => Some("RAND"),
             Function::Uuid => Some("UUID"),

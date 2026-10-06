@@ -1647,6 +1647,20 @@ impl fmt::Display for AggregateExpression {
                 }
             }
             Self::FunctionCall {
+                name: AggregateFunction::Custom(iri),
+                expr,
+                distinct,
+            } if arq_aggregate_keyword(iri).is_none() => {
+                // Application aggregate syntax must remain independent of the
+                // execution registry when this algebra is formatted and parsed.
+                // A plain IRI call would otherwise be parsed as a scalar call.
+                if *distinct {
+                    write!(f, "AGG {iri}(DISTINCT {expr})")
+                } else {
+                    write!(f, "AGG {iri}({expr})")
+                }
+            }
+            Self::FunctionCall {
                 name,
                 expr,
                 distinct,

@@ -325,6 +325,7 @@ impl Request<'_> {
             ctx.opt = o;
         }
         ctx.base_iri = self.base.clone();
+        ctx.extensions = self.opts.extensions.clone();
         ctx
     }
 }
@@ -400,6 +401,7 @@ fn run_op(
             // the WHERE clause reads what the graph view's protections leave visible
             let snap = txn.read_view()?;
             let mut ctx = req.ctx(snap);
+            ctx.configure_extensions(pattern);
             if let Some(QueryDataset { default, named }) = using {
                 ctx.dataset.default = Some(
                     default
@@ -421,7 +423,14 @@ fn run_op(
             }
             let pattern = super::rdfs::apply(&ctx, pattern);
             let node = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new())?;
-            let (table, _) = super::exec::execute(&ctx, &node)?;
+            let executed = super::exec::execute(&ctx, &node);
+            if let Err(error) = &executed
+                && ctx.calls_extensions
+            {
+                ctx.fail_extension(super::extensions::ScalarError::from_engine(error));
+            }
+            let (table, _) = executed?;
+            ctx.check()?;
             // a graph a template takes from a variable is checked for every solution,
             // before anything else of the quad is looked up
             let access = req.opts.graphs.clone();

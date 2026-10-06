@@ -1941,7 +1941,7 @@ impl Store {
             ));
         }
         // the writer lock keeps commits out while the log starts or stops
-        let w = self.writer.lock();
+        let w = self.guarded_writer();
         log.flush(false)?;
         log.set_settings(s, w.head.seq)?;
         drop(w);

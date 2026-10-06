@@ -618,6 +618,97 @@ pub fn relabel_term(t: &Term, f: &mut dyn FnMut(&str) -> String) -> Option<Term>
     }
 }
 
+/// Callback-only parsing guard. Ordinary CDT operations retain their existing
+/// path. Its deliberately conservative estimate covers vector capacity, owned
+/// RDF values, datatype strings and nested lexical copies, rather than pretending
+/// that the opaque literal's lexical size measures its materialized parser heap.
+pub(crate) struct CallbackRelabel<'q> {
+    pub term: Option<Term>,
+    _charge: super::ctx::Charge<'q>,
+}
+
+pub(crate) fn callback_relabel_term<'q>(
+    ctx: &'q Ctx,
+    term: &Term,
+    f: &mut dyn FnMut(&str) -> String,
+) -> crate::error::Result<CallbackRelabel<'q>> {
+    fn lexical_depth(ctx: &Ctx, lex: &str, inherited: usize) -> crate::error::Result<usize> {
+        // The preflight only retains one decoded string at each nesting level.
+        // Charge it before using the existing string decoder, including growth.
+        let _preflight = ctx.charge((lex.len() as u64).saturating_mul(2) + 256)?;
+        let mut parser = Parser { s: lex, i: 0 };
+        let mut depth = inherited;
+        let mut peak = depth;
+        while let Some(c) = parser.peek() {
+            ctx.check()?;
+            match c {
+                '[' | '{' => {
+                    depth += 1;
+                    if depth > 128 {
+                        return Err(crate::error::Error::invalid(
+                            "callback composite literal exceeds nesting ceiling",
+                        ));
+                    }
+                    peak = peak.max(depth);
+                    parser.i += 1;
+                }
+                ']' | '}' => {
+                    depth = depth.saturating_sub(1).max(inherited);
+                    parser.i += 1;
+                }
+                '"' | '\'' => {
+                    let Some(value) = parser.string() else { break };
+                    if parser.rest().starts_with("^^") {
+                        parser.i += 2;
+                        let Some(datatype) = parser.iri() else { break };
+                        if is_cdt(&datatype) {
+                            // Quoted nested CDTs are opaque to the outer parser's
+                            // bracket depth; check their decoded forms as well.
+                            peak = peak.max(lexical_depth(ctx, &value, depth)?);
+                        }
+                    }
+                }
+                '<' => {
+                    let Some(end) = parser.rest().find('>') else {
+                        break;
+                    };
+                    parser.i += end + 1;
+                }
+                _ => parser.i += c.len_utf8(),
+            }
+        }
+        Ok(peak)
+    }
+    fn estimate(ctx: &Ctx, term: &Term) -> crate::error::Result<u64> {
+        match term {
+            Term::Literal(l) if may_name_bnodes(l) => {
+                let depth = lexical_depth(ctx, l.value(), 0)?;
+                // An element consumes at least one input byte. Four vector slots
+                // per byte cover both parsed and rewritten list/map capacities;
+                // 128 covers term metadata, implicit datatype and label growth.
+                // Nested lexical copies add four bytes per byte and depth level.
+                let per_byte = 4 * std::mem::size_of::<(Term, Elem)>()
+                    + 4 * std::mem::size_of::<Elem>()
+                    + 128
+                    + 4 * depth;
+                Ok((l.value().len() as u64)
+                    .saturating_mul(per_byte as u64)
+                    .saturating_add(1024))
+            }
+            Term::Triple(t) => estimate(ctx, &t.object),
+            _ => Ok(0),
+        }
+    }
+    ctx.check()?;
+    let charge = ctx.charge(estimate(ctx, term)?)?;
+    let term = relabel_term(term, f);
+    ctx.check()?;
+    Ok(CallbackRelabel {
+        term,
+        _charge: charge,
+    })
+}
+
 fn relabel_lexical(lex: &str, dt: &str, f: &mut dyn FnMut(&str) -> String) -> Option<String> {
     let mut changed = false;
     if dt == LIST {

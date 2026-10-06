@@ -87,7 +87,7 @@ impl Store {
         o: &crate::history::SnapshotOptions,
     ) -> Result<(NamedSnapshot, bool)> {
         let mem = self.mem_history.as_ref().expect("an in-memory store");
-        let w = self.writer.lock();
+        let w = self.guarded_writer();
         let r = self.resolve_with(at, w.head)?;
         let seq = r.commit.seq;
         let live = self.snapshot();
@@ -137,7 +137,7 @@ impl Store {
 
     pub(super) fn mem_set_retention(&self, r: Retention) {
         let Some(mem) = &self.mem_history else { return };
-        let head = self.writer.lock().head.seq;
+        let head = self.guarded_writer().head.seq;
         let now = self.now_ms();
         let mut m = mem.lock();
         m.retention = r;

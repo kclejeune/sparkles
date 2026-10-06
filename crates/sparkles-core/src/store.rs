@@ -266,6 +266,8 @@ impl Delta {
 /// A consistent, immutable view of the store.
 #[derive(Clone)]
 pub struct Snapshot {
+    /// Dataset family identity (shared by its branches and derived views).
+    pub dataset_id: uuid::Uuid,
     pub generation: Arc<Generation>,
     pub delta: Delta,
     pub version: u64,
@@ -1225,6 +1227,7 @@ impl Store {
         let store = Store {
             root: None,
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
+                dataset_id,
                 generation: gen_,
                 delta: Delta::default(),
                 version: 0,
@@ -1556,6 +1559,10 @@ impl Store {
         let store = Store {
             root: Some(root.to_path_buf()),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
+                dataset_id: branching
+                    .ident
+                    .as_ref()
+                    .map_or(dataset_id, |i| i.dataset_id),
                 generation: gen_,
                 delta,
                 version,
@@ -1963,6 +1970,7 @@ impl Store {
         let bytes = delta_bytes(&delta);
         let dvocab_len = generation.dvocab.len();
         let snap = Arc::new(Snapshot {
+            dataset_id: self.owner_dataset_id(),
             generation,
             delta,
             version: 0,
@@ -2269,7 +2277,7 @@ impl Store {
             ));
         };
         // no rebuild may run while the pin is being established
-        let w = self.writer.lock();
+        let w = self.guarded_writer();
         let head = w.head;
         let r = self.resolve_with(at, head)?;
         let seq = r.commit.seq;
@@ -2339,7 +2347,7 @@ impl Store {
         let (Some(root), Some(hist)) = (&self.root, &self.history) else {
             return Ok(self.mem_delete_snapshot(name));
         };
-        let w = self.writer.lock();
+        let w = self.guarded_writer();
         let current = commit::generation_number(&self.snapshot().generation.name);
         let mut h = hist.lock();
         let Some(pin) = h.pins.remove(name) else {
@@ -2385,7 +2393,7 @@ impl Store {
             ));
         };
         {
-            let w = self.writer.lock();
+            let w = self.guarded_writer();
             let current = commit::generation_number(&self.snapshot().generation.name);
             let mut h = hist.lock();
             let old = h.retention;
@@ -2419,7 +2427,7 @@ impl Store {
             ));
         };
         {
-            let _w = self.writer.lock();
+            let _w = self.guarded_writer();
             let mut h = hist.lock();
             let old = h.catalog;
             h.catalog = c;
@@ -2452,7 +2460,7 @@ impl Store {
         let Some(hist) = &self.history else {
             return Ok(0);
         };
-        let w = self.writer.lock();
+        let w = self.guarded_writer();
         let head = w.head.seq;
         let now = self.now_ms();
         let cutoff = {
@@ -2570,7 +2578,7 @@ impl Store {
 
     /// The latest commit.
     pub fn head_commit(&self) -> CommitInfo {
-        self.writer.lock().head
+        self.guarded_writer().head
     }
 
     /// A receiver that sees each newly published commit's number (the newest only, as
@@ -2665,6 +2673,7 @@ impl Store {
     /// Replace the wall clock used for commit timestamps (tests).
     #[doc(hidden)]
     pub fn set_clock(&self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
+        crate::sparql::extensions::assert_family(self.owner_dataset_id());
         *self.clock.lock() = Some(clock);
     }
 
@@ -2794,7 +2803,7 @@ impl Store {
         // an online rebuild of the current index finishes first (it builds in `text.new`)
         let current = self.text.load_full();
         let _rebuild = current.as_ref().map(|t| t.lock_rebuild());
-        let _w = self.writer.lock();
+        let _w = self.guarded_writer();
         self.text.store(None);
         if let Some(root) = &self.root {
             write_atomic(
@@ -2817,7 +2826,7 @@ impl Store {
     pub fn disable_text(&self) -> Result<()> {
         let current = self.text.load_full();
         let _rebuild = current.as_ref().map(|t| t.lock_rebuild());
-        let _w = self.writer.lock();
+        let _w = self.guarded_writer();
         self.text.store(None);
         let mut s = (*self.snapshot()).clone();
         s.text = None;
@@ -2847,12 +2856,12 @@ impl Store {
         // before the writer lock, which a rebuild holding this waits for
         let guard = ti.lock_rebuild();
         let start = {
-            let _w = self.writer.lock();
+            let _w = self.guarded_writer();
             ti.start_journal(&guard);
             self.snapshot()
         };
         let built = ti.build(&guard, &start)?;
-        let _w = self.writer.lock();
+        let _w = self.guarded_writer();
         if !self
             .text
             .load()
@@ -2903,6 +2912,7 @@ impl Store {
     #[cfg(feature = "text")]
     #[doc(hidden)]
     pub fn set_text_ticks(&self, on: bool) {
+        crate::sparql::extensions::assert_family(self.owner_dataset_id());
         if let Some(ti) = self.text.load_full() {
             ti.set_ticks(on);
         }
@@ -2933,8 +2943,14 @@ impl Store {
         &self.results
     }
 
+    fn guarded_writer(&self) -> MutexGuard<'_, WriterState> {
+        crate::sparql::extensions::assert_family(self.owner_dataset_id());
+        self.writer.lock()
+    }
+
     /// Current read snapshot.
     pub fn snapshot(&self) -> Arc<Snapshot> {
+        crate::sparql::extensions::assert_family(self.owner_dataset_id());
         self.current.load_full()
     }
 
@@ -2946,6 +2962,7 @@ impl Store {
     /// [`StoreOptions::max_prefixes`], or with a name or IRI past its length limit, a
     /// prefix is left out (the data is not refused over its prefixes).
     pub fn add_prefixes(&self, p: BTreeMap<String, String>) -> Result<()> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         if p.is_empty() {
             return Ok(());
         }
@@ -2986,6 +3003,7 @@ impl Store {
     /// Set (or replace) one prefix. Prefixes are metadata: no commit is made. A new
     /// prefix past [`StoreOptions::max_prefixes`] is refused.
     pub fn set_prefix(&self, prefix: &str, iri: &str) -> Result<()> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         if prefix.len() > MAX_PREFIX_NAME_BYTES || !valid_prefix_name(prefix) {
             return Err(Error::invalid(format!("invalid prefix name {prefix:?}")));
         }
@@ -3015,6 +3033,7 @@ impl Store {
 
     /// Remove one prefix; returns whether it was defined.
     pub fn remove_prefix(&self, prefix: &str) -> Result<bool> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         let mut cur = self.prefixes.lock();
         if !cur.contains_key(prefix) {
             return Ok(false);
@@ -3054,7 +3073,7 @@ impl Store {
     /// [`write_as`](Self::write_as) with options for the write guard.
     pub fn write_with(&self, kind: CommitKind, opts: crate::guard::WriteOptions) -> WriteTxn<'_> {
         let waiting = Waiting::new(&self.writers_waiting);
-        let guard = self.writer.lock();
+        let guard = self.guarded_writer();
         drop(waiting);
         self.begin(guard, kind, opts)
     }
@@ -3080,6 +3099,7 @@ impl Store {
     /// The writer lock, waited for in slices while `o` can be cancelled or time out.
     /// Then the write's precondition, if it has one, is checked on the head snapshot.
     fn lock_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         let w = {
             // counted while it waits, so a long holder of the lock can give way
             let _waiting = Waiting::new(&self.writers_waiting);
@@ -3087,7 +3107,7 @@ impl Store {
                 o.check()?;
                 self.writer.try_lock().ok_or(Error::WriterBusy)?
             } else if o.cancel.is_none() && o.deadline.is_none() {
-                self.writer.lock()
+                self.guarded_writer()
             } else {
                 loop {
                     o.check()?;
@@ -3185,6 +3205,7 @@ impl Store {
         let mark = base.generation.dvocab.mark();
         let start_bnode = guard.next_bnode;
         WriteTxn {
+            _callback_owner: crate::sparql::extensions::WriterOwner::enter(self.owner_dataset_id()),
             store: self,
             delta: base.delta.clone(),
             base,
@@ -3212,6 +3233,7 @@ impl Store {
 
     /// Install (or remove) the write guard run before every commit.
     pub fn set_guard(&self, g: Option<Arc<dyn crate::guard::CommitGuard>>) {
+        crate::sparql::extensions::assert_family(self.owner_dataset_id());
         *self.guard.write() = g;
     }
 
@@ -3222,6 +3244,7 @@ impl Store {
     /// Install (or remove) the observer told the outcome of every guard decision; it
     /// stays when the guard itself is replaced.
     pub fn set_guard_observer(&self, o: Option<Arc<dyn crate::guard::GuardObserver>>) {
+        crate::sparql::extensions::assert_family(self.owner_dataset_id());
         *self.guard_observer.write() = o;
     }
 
@@ -3234,11 +3257,13 @@ impl Store {
     /// without the validator's feature). Commits refused for want of the guard then
     /// fail with [`Error::GuardMissing`] carrying this reason.
     pub fn set_guard_missing_reason(&self, reason: Option<String>) {
+        crate::sparql::extensions::assert_family(self.owner_dataset_id());
         *self.guard_missing_reason.write() = reason;
     }
 
     /// Mark whether this dataset requires a guard (set with its configuration).
     pub fn set_guard_required(&self, required: bool) {
+        crate::sparql::extensions::assert_family(self.owner_dataset_id());
         self.guard_required.store(required, Ordering::Relaxed);
     }
 
@@ -3679,6 +3704,7 @@ impl Store {
         let head_seq = w.head.seq;
         let candidate = || {
             Arc::new(Snapshot {
+                dataset_id: self.owner_dataset_id(),
                 generation: gen_.clone(),
                 delta: Delta::default(),
                 version: 0,
@@ -3806,6 +3832,7 @@ impl Store {
         let old_name = snap.generation.name.clone();
         let dvocab_len = gen_.dvocab.len();
         let mut new_snap = Snapshot {
+            dataset_id: self.owner_dataset_id(),
             generation: gen_,
             delta: Delta::default(),
             version: snap.version + 1,
@@ -4039,7 +4066,7 @@ impl Store {
     /// Returns its number of entries, or `None` when the generation already has one or
     /// the store is in memory.
     pub fn add_vocab_index(&self) -> Result<Option<usize>> {
-        let _w = self.writer.lock();
+        let _w = self.guarded_writer();
         let snap = self.snapshot();
         let Some(dir) = snap.generation.dir.as_ref() else {
             return Ok(None);
@@ -4182,6 +4209,7 @@ fn apply(delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
 
 /// The single write transaction. Changes are invisible until [`commit`](Self::commit).
 pub struct WriteTxn<'s> {
+    _callback_owner: crate::sparql::extensions::WriterOwner,
     store: &'s Store,
     base: Arc<Snapshot>,
     delta: Delta,
@@ -4332,6 +4360,7 @@ impl WriteTxn<'_> {
     /// version, so cached results must neither be read nor written through this view.
     pub fn view(&self) -> Snapshot {
         Snapshot {
+            dataset_id: self.base.dataset_id,
             generation: self.base.generation.clone(),
             delta: self.delta.clone(),
             version: self.base.version,
@@ -4652,6 +4681,7 @@ impl WriteTxn<'_> {
     }
 
     fn commit_inner(mut self) -> Result<Receipt> {
+        self._callback_owner.check()?;
         if self.guard.poisoned {
             return Err(Error::Poisoned);
         }
@@ -4849,6 +4879,7 @@ impl WriteTxn<'_> {
         }
         let version = self.base.version + 1;
         let mut snap = Snapshot {
+            dataset_id: self.base.dataset_id,
             generation: gen_.clone(),
             delta: std::mem::take(&mut self.delta),
             version,
@@ -5162,7 +5193,7 @@ impl Drop for Store {
         // a lease guard outliving the store must not collect in a directory that another
         // process (or a restore's swap) may own next
         {
-            let mut w = self.writer.lock();
+            let mut w = self.guarded_writer();
             w.closed = true;
             w.trim_wal();
         }
@@ -5396,6 +5427,7 @@ pub(crate) fn replay_wal(
     // commit's net counts), from its first change in the transaction
     let mut start: rustc_hash::FxHashMap<Key, bool> = Default::default();
     let probe = Snapshot {
+        dataset_id: uuid::Uuid::nil(),
         generation: from.generation.clone(),
         delta: Delta::default(),
         version: 0,

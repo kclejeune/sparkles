@@ -14,6 +14,7 @@ pub mod exec;
 mod exists;
 pub mod expr;
 mod exprcache;
+pub mod extensions;
 mod fnformat;
 mod fnlib;
 pub mod geojoin;
@@ -28,7 +29,9 @@ mod keyprobe;
 pub mod lateral;
 pub mod pathsearch;
 pub mod plan;
+mod propertyext;
 pub mod rdfs;
+mod registeredagg;
 pub mod results;
 mod sample;
 pub mod stats;
@@ -58,6 +61,8 @@ pub use table::Table;
 
 #[derive(Clone, Debug, Default)]
 pub struct QueryOptions {
+    /// Immutable application scalar and aggregate callbacks resolved for this query only.
+    pub extensions: Option<Arc<extensions::ExtensionRegistry>>,
     pub timeout: Option<Duration>,
     /// options for write guards (updates)
     pub write: crate::guard::WriteOptions,
@@ -404,6 +409,7 @@ fn make_ctx(
         None => None,
     };
     ctx.use_cache = !opts.no_cache;
+    ctx.extensions = opts.extensions.clone();
     if let Some(s) = &opts.service_scope {
         ctx.service_scope = s.clone();
     }
@@ -571,7 +577,10 @@ fn execute_parsed(
 ) -> Result<QueryResult> {
     let t1 = Instant::now();
     let (pattern, dataset, base) = split(parsed);
-    let ctx = Arc::new(make_ctx(snap, opts, dataset, base)?);
+    extensions::check_family(snap.dataset_id)?;
+    let mut ctx = make_ctx(snap, opts, dataset, base)?;
+    ctx.configure_extensions(pattern);
+    let ctx = Arc::new(ctx);
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
     let mut planner = Planner::new(&ctx);
     planner.source = Some(parsed);
@@ -669,6 +678,7 @@ fn execute_parsed(
     };
     result.mem_peak_bytes = ctx.mem_peak();
     result.rows_produced = ctx.rows_produced();
+    ctx.check()?;
     Ok(result)
 }
 
@@ -690,7 +700,9 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
     let depth = depth::check_query(&parsed)?;
     depth::with_stack(depth, || {
         let (pattern, dataset, base) = split(&parsed);
-        let ctx = make_ctx(snap, opts, dataset, base)?;
+        extensions::check_family(snap.dataset_id)?;
+        let mut ctx = make_ctx(snap, opts, dataset, base)?;
+        ctx.configure_extensions(pattern);
         crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
         let mut planner = Planner::new(&ctx);
         planner.source = Some(&parsed);

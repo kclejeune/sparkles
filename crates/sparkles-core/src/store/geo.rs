@@ -89,7 +89,7 @@ impl Store {
     /// Turn the spatial index off: queries run without it, and `geo.json` is removed.
     pub fn disable_geo(&self) -> Result<()> {
         {
-            let _w = self.writer.lock();
+            let _w = self.guarded_writer();
             #[cfg(feature = "geo")]
             if let Some(old) = self.geo.swap(None) {
                 old.retired.store(true, Ordering::SeqCst);
@@ -134,7 +134,7 @@ impl Store {
         return Err(crate::geo::not_built());
         #[cfg(feature = "geo")]
         {
-            let w = self.writer.lock();
+            let w = self.guarded_writer();
             let Some(idx) = self.geo.load_full() else {
                 return Err(crate::error::Error::invalid("spatial index is not enabled"));
             };
@@ -478,7 +478,7 @@ impl Store {
     fn install_geo(&self, mut cfg: GeoConfig, epoch: u64) -> (Arc<GeoIndex>, Arc<Snapshot>) {
         // the server can switch query rewrite off whatever `geo.json` says
         cfg.query_rewrite &= self.opts.geo_query_rewrite;
-        let _w = self.writer.lock();
+        let _w = self.guarded_writer();
         let idx = Arc::new(GeoIndex::new(cfg, epoch, self.opts.geo_budget_bytes));
         #[cfg(any(test, feature = "failpoints"))]
         idx.paused
