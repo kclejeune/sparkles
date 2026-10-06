@@ -54,10 +54,11 @@ pub fn search_in(
     if view.uncommitted {
         return Err(super::uncommitted_changes());
     }
+    let ready = view.ready(snap.commit)?;
     if view.seq != snap.commit {
         return Err(unavailable("dataset", "stale", view.seq, snap.commit));
     }
-    let sh = &view.index;
+    let sh = &ready.index;
     for p in &spec.predicates {
         if !sh.config.predicates.contains(p) {
             return Err(Error::invalid(format!(

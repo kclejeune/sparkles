@@ -368,6 +368,12 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             true
         }
         Kind::TextSearch(t) => {
+            // An immutable unavailable view must never reuse a ready view's result,
+            // even when its generation, commit and epoch otherwise match.
+            #[cfg(feature = "text")]
+            if ctx.snap.text.as_ref().is_some_and(|v| !v.is_available()) {
+                return false;
+            }
             // the view's epoch changes with every rebuild of the index
             let epoch = ctx.snap.text.as_ref().map_or(0, |v| v.epoch);
             let _ = write!(s, "{:?}{:?}{:?}{}", t.graph, t.graph_var, t.subject, epoch);

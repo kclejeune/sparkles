@@ -489,32 +489,82 @@ pub struct TextView {
     pub seq: u64,
     /// +1 per rebuild (part of result-cache keys)
     pub epoch: u64,
-    /// the batch the view belongs to: the searcher, once its commits are sealed
     #[cfg(feature = "text")]
-    pub(crate) slot: std::sync::Arc<imp::Slot>,
-    #[cfg(feature = "text")]
-    pub(crate) index: std::sync::Arc<imp::Shared>,
-    /// the index that seals the batch on demand
-    #[cfg(feature = "text")]
-    pub(crate) owner: std::sync::Weak<imp::Inner>,
+    source: ViewSource,
     /// the view of a write transaction that has changed data since `seq`, which the
     /// index does not cover: searches are refused
     #[cfg_attr(not(feature = "text"), allow(dead_code))]
     pub(crate) uncommitted: bool,
 }
 
+#[cfg(feature = "text")]
+#[derive(Clone)]
+enum ViewSource {
+    Ready(ReadyView),
+    Unavailable(UnavailableState),
+}
+
+#[cfg(feature = "text")]
+#[derive(Clone)]
+struct ReadyView {
+    /// The batch's searcher, once its commits are sealed.
+    slot: std::sync::Arc<imp::Slot>,
+    index: std::sync::Arc<imp::Shared>,
+    /// The index that seals the batch on demand.
+    owner: std::sync::Weak<imp::Inner>,
+}
+
+/// Immutable snapshot availability, independent of a future replacement index.
+#[cfg(feature = "text")]
+#[derive(Clone, Copy, Debug)]
+enum UnavailableState {
+    Rebuilding,
+    Failed,
+}
+
+#[cfg(feature = "text")]
+impl UnavailableState {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rebuilding => "rebuilding",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 impl TextView {
+    #[cfg(feature = "text")]
+    pub(crate) fn is_available(&self) -> bool {
+        matches!(self.source, ViewSource::Ready(_))
+    }
+
+    #[cfg(feature = "text")]
+    fn unavailable(seq: u64, epoch: u64, state: UnavailableState) -> Self {
+        Self {
+            seq,
+            epoch,
+            source: ViewSource::Unavailable(state),
+            uncommitted: false,
+        }
+    }
+
+    #[cfg(feature = "text")]
+    fn ready(&self, data_seq: u64) -> Result<&ReadyView> {
+        match &self.source {
+            ViewSource::Ready(ready) => Ok(ready),
+            ViewSource::Unavailable(state) => {
+                Err(unavailable("dataset", state.name(), self.seq, data_seq))
+            }
+        }
+    }
+
     /// This view for a write transaction with uncommitted changes.
     pub(crate) fn with_uncommitted_changes(&self) -> TextView {
         TextView {
             seq: self.seq,
             epoch: self.epoch,
             #[cfg(feature = "text")]
-            slot: self.slot.clone(),
-            #[cfg(feature = "text")]
-            index: self.index.clone(),
-            #[cfg(feature = "text")]
-            owner: self.owner.clone(),
+            source: self.source.clone(),
             uncommitted: true,
         }
     }
@@ -533,7 +583,13 @@ pub(crate) fn uncommitted_changes() -> Error {
 
 impl std::fmt::Debug for TextView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TextView(seq {}, epoch {})", self.seq, self.epoch)
+        let mut view = f.debug_struct("TextView");
+        view.field("seq", &self.seq).field("epoch", &self.epoch);
+        #[cfg(feature = "text")]
+        if let ViewSource::Unavailable(state) = &self.source {
+            view.field("unavailable", state);
+        }
+        view.finish()
     }
 }
 
@@ -876,15 +932,16 @@ mod imp {
     impl super::TextView {
         /// The searcher of this view, sealing its batch first if needed.
         pub(crate) fn resolved(&self) -> Result<&Resolved> {
-            if self.slot.0.get().is_none() {
-                match self.owner.upgrade() {
-                    Some(owner) => owner.seal_for(&self.slot),
+            let ready = self.ready(self.seq)?;
+            if ready.slot.0.get().is_none() {
+                match ready.owner.upgrade() {
+                    Some(owner) => owner.seal_for(&ready.slot),
                     None => {
-                        let _ = self.slot.0.set(None);
+                        let _ = ready.slot.0.set(None);
                     }
                 }
             }
-            match self.slot.0.get() {
+            match ready.slot.0.get() {
                 Some(Some(r)) => Ok(r),
                 _ => Err(unavailable("dataset", "stale", self.seq, self.seq)),
             }
@@ -1498,7 +1555,10 @@ mod imp {
         config: &TextConfig,
         seq: u64,
     ) -> Result<bool> {
-        let Some(owner) = view.owner.upgrade() else {
+        let Ok(ready) = view.ready(seq) else {
+            return Ok(false);
+        };
+        let Some(owner) = ready.owner.upgrade() else {
             return Ok(false);
         };
         let Some(source) = owner.root.as_ref() else {
@@ -1559,6 +1619,103 @@ mod imp {
         Ok(true)
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RecoveryReason {
+        InMemory,
+        Missing,
+        Unreadable,
+        Metadata,
+        Format,
+        Configuration,
+        Ahead,
+        WalCoverage,
+        Initialization,
+        CatchUp,
+    }
+
+    /// Read-only evidence, before any writer or rebuild admission.
+    struct ExistingIndex {
+        index: Index,
+        fields: Fields,
+        dir: LazySyncDir,
+        payload: Payload,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum OpenClassification {
+        Ready { seq: u64, epoch: u64 },
+        NeedsRecovery(RecoveryReason),
+    }
+
+    /// Pure classification: no filesystem access, writer creation, WAL expansion or
+    /// cleanup. A later recovery worker can consume the same decision after admission.
+    fn classify_open(
+        payload: std::result::Result<&Payload, RecoveryReason>,
+        expected_config: &str,
+        head: u64,
+        first_wal: Option<u64>,
+    ) -> OpenClassification {
+        let p = match payload {
+            Ok(p) => p,
+            Err(reason) => return OpenClassification::NeedsRecovery(reason),
+        };
+        let reason = if p.format != FORMAT {
+            Some(RecoveryReason::Format)
+        } else if p.config != expected_config {
+            Some(RecoveryReason::Configuration)
+        } else if p.seq > head {
+            Some(RecoveryReason::Ahead)
+        } else if p.seq < head && first_wal.is_none_or(|first| first > p.seq + 1) {
+            Some(RecoveryReason::WalCoverage)
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => OpenClassification::NeedsRecovery(reason),
+            None => OpenClassification::Ready {
+                seq: p.seq,
+                epoch: p.epoch,
+            },
+        }
+    }
+
+    fn inspect_existing(
+        root: Option<&Path>,
+        config: &TextConfig,
+    ) -> std::result::Result<ExistingIndex, RecoveryReason> {
+        let root = root.ok_or(RecoveryReason::InMemory)?;
+        if !root.join("text").exists() {
+            return Err(RecoveryReason::Missing);
+        }
+        let (index, fields, dir) = open_index(root, config)
+            .inspect_err(|e| tracing::warn!(target: "sparkles::text::imp", "{e}; rebuilding"))
+            .map_err(|_| RecoveryReason::Unreadable)?;
+        if dir.is_marked() {
+            verify(&index)
+                .inspect_err(|e| tracing::warn!(target: "sparkles::text::imp", "{e}; rebuilding"))
+                .map_err(|_| RecoveryReason::Unreadable)?;
+        }
+        let meta = index.load_metas().map_err(|_| RecoveryReason::Metadata)?;
+        let payload = meta.payload.as_deref().ok_or(RecoveryReason::Metadata)?;
+        let payload = serde_json::from_str(payload).map_err(|_| RecoveryReason::Metadata)?;
+        Ok(ExistingIndex {
+            index,
+            fields,
+            dir,
+            payload,
+        })
+    }
+
+    impl RecoveryReason {
+        fn view(self, seq: u64) -> TextView {
+            let state = match self {
+                Self::Initialization | Self::CatchUp => UnavailableState::Failed,
+                _ => UnavailableState::Rebuilding,
+            };
+            TextView::unavailable(seq, 0, state)
+        }
+    }
+
     impl TextIndex {
         /// Open the index of a store at its current state `snap` (`root` = `None` for an
         /// in-memory store). An index on disk with the same configuration is reused:
@@ -1572,12 +1729,21 @@ mod imp {
             snap: &Snapshot,
             wal: &[(u64, Vec<[Id; 4]>)],
         ) -> Result<(TextIndex, Arc<TextView>)> {
+            let hash = config_hash(&config);
+            let existing = inspect_existing(root, &config);
+            let mut classification = classify_open(
+                existing.as_ref().map(|e| &e.payload).map_err(|r| *r),
+                &hash,
+                snap.commit,
+                wal.first().map(|(seq, _)| *seq),
+            );
+            // Classification is complete before any writable index, expanded WAL or
+            // interrupted-build cleanup. Startup remains synchronous in this slice.
             if let Some(r) = root {
                 for stale in ["text.new", "text.old"] {
                     let _ = std::fs::remove_dir_all(r.join(stale));
                 }
             }
-            let hash = config_hash(&config);
             let ti = |live: Live, epoch: u64| {
                 Arc::new(Inner {
                     root: root.map(Path::to_path_buf),
@@ -1592,57 +1758,51 @@ mod imp {
                     rebuilding: Default::default(),
                 })
             };
-            let reusable = root.filter(|r| r.join("text").exists()).and_then(|r| {
-                let (index, fields, dir) = open_index(r, &config)
-                    .inspect_err(
-                        |e| tracing::warn!(target: "sparkles::text::imp", "{e}; rebuilding"),
-                    )
-                    .ok()?;
-                if dir.is_marked()
-                    && let Err(e) = verify(&index)
-                {
-                    tracing::warn!(target: "sparkles::text::imp", "{e}; rebuilding");
-                    return None;
-                }
-                let meta = index.load_metas().ok()?;
-                let p: Payload = serde_json::from_str(meta.payload.as_deref()?).ok()?;
-                if p.format != FORMAT || p.config != hash || p.seq > snap.commit {
-                    return None;
-                }
-                // the quads changed since the index's commit: all in the WAL, or rebuild
-                let mut touched = Vec::new();
-                if p.seq < snap.commit {
-                    if wal.first().is_none_or(|(first, _)| *first > p.seq + 1) {
-                        return None;
+            if let OpenClassification::Ready { seq, epoch } = classification {
+                let ExistingIndex {
+                    index, fields, dir, ..
+                } = existing.expect("ready classification has existing index evidence");
+                match live_of(index, fields, &config, Some(dir), seq) {
+                    Ok(live) => {
+                        let t = ti(live, epoch);
+                        let mut touched = Vec::new();
+                        if seq < snap.commit {
+                            tracing::info!(
+                                target: "sparkles::text::imp",
+                                "full-text index is at commit {seq}, the data at {}: catching up from the WAL",
+                                snap.commit
+                            );
+                            for (_, qs) in wal.iter().filter(|(s, _)| *s > seq) {
+                                touched.extend(qs.iter().map(|q| (*q, true)));
+                            }
+                        }
+                        // A verified or caught-up index is durable before it is used.
+                        match t
+                            .apply(snap, &touched)
+                            .and_then(|v| t.checkpoint().map(|()| v))
+                        {
+                            Ok(view) => return Ok((TextIndex::start(t), view)),
+                            Err(e) => {
+                                tracing::warn!(target: "sparkles::text::imp", "full-text index: {e}; rebuilding");
+                                classification =
+                                    OpenClassification::NeedsRecovery(RecoveryReason::CatchUp);
+                            }
+                        }
                     }
-                    for (_, qs) in wal.iter().filter(|(seq, _)| *seq > p.seq) {
-                        touched.extend(qs.iter().map(|q| (*q, true)));
-                    }
-                }
-                let live = live_of(index, fields, &config, Some(dir), p.seq).ok()?;
-                Some((live, p.epoch, p.seq, touched))
-            });
-            if let Some((live, epoch, seq, touched)) = reusable {
-                let t = ti(live, epoch);
-                if seq < snap.commit {
-                    tracing::info!(
-                        target: "sparkles::text::imp",
-                        "full-text index is at commit {seq}, the data at {}: catching up from the WAL",
-                        snap.commit
-                    );
-                }
-                // a verified or caught-up index is made durable before it is used
-                match t
-                    .apply(snap, &touched)
-                    .and_then(|v| t.checkpoint().map(|()| v))
-                {
-                    Ok(view) => return Ok((TextIndex::start(t), view)),
-                    Err(e) => {
-                        tracing::warn!(target: "sparkles::text::imp", "full-text index: {e}; rebuilding")
+                    Err(_) => {
+                        classification =
+                            OpenClassification::NeedsRecovery(RecoveryReason::Initialization);
                     }
                 }
-            } else if root.is_some_and(|r| r.join("text").exists()) {
-                tracing::info!(target: "sparkles::text::imp", "full-text index is missing, damaged or behind the WAL; rebuilding");
+            }
+            if let OpenClassification::NeedsRecovery(reason) = classification {
+                // This unavailable view is not published yet: synchronous recovery below
+                // must finish before open returns. It is ready for a later owned recovery
+                // protocol without inventing an empty searchable placeholder.
+                tracing::debug!(target: "sparkles::text::imp", ?reason, view = ?reason.view(snap.commit), "full-text index needs recovery");
+                if root.is_some_and(|r| r.join("text").exists()) {
+                    tracing::info!(target: "sparkles::text::imp", "full-text index is missing, damaged or behind the WAL; rebuilding");
+                }
             }
             // an empty placeholder until the rebuild below swaps the real one in
             let (index, fields) = new_index(None, &config)?;
@@ -1830,9 +1990,11 @@ mod imp {
             Arc::new(TextView {
                 seq,
                 epoch: self.epoch.load(Ordering::SeqCst),
-                slot,
-                index: live.shared.clone(),
-                owner: Arc::downgrade(self),
+                source: ViewSource::Ready(ReadyView {
+                    slot,
+                    index: live.shared.clone(),
+                    owner: Arc::downgrade(self),
+                }),
                 uncommitted: false,
             })
         }
@@ -2310,10 +2472,10 @@ mod imp {
             let searcher = live.reader.searcher();
             let stale = self.stale.lock().clone();
             let seq = view.map_or(0, |v| v.seq);
-            let state = if stale.is_some() || seq != store_seq {
-                "stale"
-            } else {
-                "ready"
+            let state = match view.map(|v| &v.source) {
+                Some(ViewSource::Unavailable(state)) => state.name(),
+                _ if stale.is_some() || seq != store_seq => "stale",
+                _ => "ready",
             };
             TextStatus {
                 enabled: true,
@@ -2370,6 +2532,203 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn open_classification_is_metadata_only() {
+            let mut p = Payload {
+                format: FORMAT,
+                seq: 10,
+                epoch: 7,
+                config: "matching".into(),
+            };
+            assert_eq!(
+                classify_open(Ok(&p), "matching", 12, Some(11)),
+                OpenClassification::Ready { seq: 10, epoch: 7 }
+            );
+            assert_eq!(
+                classify_open(Ok(&p), "matching", 10, None),
+                OpenClassification::Ready { seq: 10, epoch: 7 }
+            );
+            for reason in [
+                RecoveryReason::Missing,
+                RecoveryReason::Unreadable,
+                RecoveryReason::Metadata,
+            ] {
+                assert_eq!(
+                    classify_open(Err(reason), "matching", 12, Some(11)),
+                    OpenClassification::NeedsRecovery(reason)
+                );
+            }
+            for first in [None, Some(12)] {
+                assert_eq!(
+                    classify_open(Ok(&p), "matching", 12, first),
+                    OpenClassification::NeedsRecovery(RecoveryReason::WalCoverage)
+                );
+            }
+            assert_eq!(
+                classify_open(Ok(&p), "matching", 9, None),
+                OpenClassification::NeedsRecovery(RecoveryReason::Ahead)
+            );
+            assert_eq!(
+                classify_open(Ok(&p), "different", 10, None),
+                OpenClassification::NeedsRecovery(RecoveryReason::Configuration)
+            );
+            p.format = FORMAT + 1;
+            assert_eq!(
+                classify_open(Ok(&p), "matching", 10, None),
+                OpenClassification::NeedsRecovery(RecoveryReason::Format)
+            );
+        }
+
+        #[test]
+        fn inspection_does_not_admit_a_writer_or_cleanup_staging() {
+            fn files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+                fn visit(
+                    root: &Path,
+                    path: &Path,
+                    result: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+                ) {
+                    for entry in std::fs::read_dir(path).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            result
+                                .insert(path.strip_prefix(root).unwrap().to_path_buf(), Vec::new());
+                            visit(root, &path, result);
+                        } else {
+                            result.insert(
+                                path.strip_prefix(root).unwrap().to_path_buf(),
+                                std::fs::read(path).unwrap(),
+                            );
+                        }
+                    }
+                }
+                let mut result = Default::default();
+                visit(root, root, &mut result);
+                result
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            let store =
+                crate::store::Store::open(&root, crate::store::StoreOptions::default()).unwrap();
+            let cfg = TextConfig::default();
+            store.enable_text(cfg.clone()).unwrap();
+            let seq = store.snapshot().commit;
+            drop(store);
+            for stage in ["text.new", "text.old"] {
+                std::fs::create_dir(root.join(stage)).unwrap();
+                std::fs::write(root.join(stage).join("retained"), stage).unwrap();
+            }
+            let before = files(&root);
+            let evidence = inspect_existing(Some(&root), &cfg).unwrap_or_else(|r| panic!("{r:?}"));
+            assert!(matches!(
+                classify_open(Ok(&evidence.payload), &config_hash(&cfg), seq, None),
+                OpenClassification::Ready { .. }
+            ));
+            assert_eq!(files(&root), before);
+            // Evidence opens only a read-only directory, leaving writer admission free.
+            let writer: IndexWriter<TantivyDocument> = evidence.index.writer(32 << 20).unwrap();
+            drop(writer);
+            // Acquiring a writer above may create locks: take a fresh image to test the
+            // next inspection rather than attribute those explicit writes to inspection.
+            drop(evidence);
+            let after_writer = files(&root);
+            let evidence = inspect_existing(Some(&root), &cfg).unwrap_or_else(|r| panic!("{r:?}"));
+            assert_eq!(files(&root), after_writer);
+            assert_eq!(
+                before.get(Path::new("text.new/retained")),
+                files(&root).get(Path::new("text.new/retained"))
+            );
+            drop(evidence);
+            std::fs::remove_dir_all(root.join("text")).unwrap();
+            let before = files(&root);
+            assert!(matches!(
+                inspect_existing(Some(&root), &cfg),
+                Err(RecoveryReason::Missing)
+            ));
+            assert_eq!(files(&root), before);
+        }
+
+        #[test]
+        fn unavailable_snapshots_never_search_or_reuse_ready_results() {
+            use crate::sparql::{QueryOptions, query};
+            let store = crate::store::Store::in_memory(crate::store::StoreOptions {
+                result_cache_bytes: 1 << 20,
+                result_cache_min_ms: 0.0,
+                ..Default::default()
+            });
+            store
+                .load(&[crate::io::Source::from_bytes(
+                    b"<urn:s> <urn:p> \"fox\" .".to_vec(),
+                    crate::io::RdfFormat::NTriples,
+                    None,
+                )])
+                .unwrap();
+            let q = "SELECT ?s { ?s <http://jena.apache.org/text#query> \"fox\" }";
+            assert!(matches!(
+                query(store.snapshot(), q, &QueryOptions::default()),
+                Err(Error::Invalid(_))
+            ));
+            store.enable_text(TextConfig::default()).unwrap();
+            let ready = store.snapshot();
+            for _ in 0..2 {
+                assert_eq!(
+                    query(ready.clone(), q, &QueryOptions::default())
+                        .unwrap()
+                        .rows()
+                        .len(),
+                    1
+                );
+            }
+            assert!(
+                ready.results.hits() > 0,
+                "fixture must have a ready cache hit"
+            );
+            for state in [UnavailableState::Rebuilding, UnavailableState::Failed] {
+                let mut held = (*ready).clone();
+                held.text = Some(Arc::new(TextView::unavailable(
+                    held.commit,
+                    ready.text.as_ref().unwrap().epoch,
+                    state,
+                )));
+                let held = Arc::new(held);
+                let hits = held.results.hits();
+                for _ in 0..2 {
+                    assert!(
+                        matches!(query(held.clone(), q, &QueryOptions::default()), Err(Error::TextUnavailable(m)) if m.contains(state.name()))
+                    );
+                    // A newer ready publication cannot make the retained view searchable.
+                    assert_eq!(
+                        query(ready.clone(), q, &QueryOptions::default())
+                            .unwrap()
+                            .rows()
+                            .len(),
+                        1
+                    );
+                }
+                assert_eq!(
+                    held.results.hits(),
+                    hits + 2,
+                    "only the two ready queries may hit the cache"
+                );
+                assert!(held.text.as_ref().unwrap().resolved().is_err());
+                let plain = query(
+                    held.clone(),
+                    "ASK { <urn:s> <urn:p> \"fox\" }",
+                    &QueryOptions::default(),
+                )
+                .unwrap();
+                assert!(plain.boolean);
+                let changed = held.text.as_ref().unwrap().with_uncommitted_changes();
+                assert!(!changed.is_available());
+                assert!(changed.uncommitted);
+                let mut historical = (*held).clone();
+                historical.historical = true;
+                assert!(matches!(
+                    query(Arc::new(historical), q, &QueryOptions::default()),
+                    Err(Error::HistoryUnsupported(_))
+                ));
+            }
+        }
 
         fn tokens(a: Analyzer, text: &str) -> Vec<(usize, String)> {
             let mut an = language_analyzer(a);
