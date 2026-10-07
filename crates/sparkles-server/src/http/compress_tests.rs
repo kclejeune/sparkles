@@ -193,7 +193,7 @@ async fn decompressed_size_is_capped() {
         );
         assert_eq!(count(&st), 0, "{uri}");
     }
-    // the same size uncompressed is not limited by this cap
+    // RDF source bytes are capped even when they arrive uncompressed.
     let r = send(
         &app,
         Request::post("/c/data?default")
@@ -202,7 +202,8 @@ async fn decompressed_size_is_capped() {
             .unwrap(),
     )
     .await;
-    assert!(r.status.is_success(), "{} {}", r.status, r.text());
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", r.text());
+    assert_eq!(count(&st), 0);
     // compressed data inside an uncompressed body (magic bytes) is capped too
     let (_d, st, app) = server(Some(64 << 10));
     let r = send(

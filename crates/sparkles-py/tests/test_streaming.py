@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import csv
+import bz2
 import gzip
 import io
 import json
+import lzma
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -97,6 +99,40 @@ def test_failed_file_object_load_changes_nothing() -> None:
     with pytest.raises(RdfSyntaxError):
         ds.load(io.BytesIO(nt(100) + b"broken"), "nt")
     assert len(ds) == 0
+
+
+@pytest.mark.parametrize("mode", ["auto", "streaming", "buffered"])
+@pytest.mark.parametrize("compress,extension", [(lzma.compress, "xz"), (bz2.compress, "bz2")])
+def test_load_modes_with_native_compression(mode, compress, extension, tmp_path: Path) -> None:
+    data = compress(nt(100))
+    path = tmp_path / f"data.nt.{extension}"
+    path.write_bytes(data)
+    ds = Dataset()
+    assert ds.load(path=path, parse_mode=mode, auto_buffer_bytes=1024) == 100
+    assert ds.load_files([path], parse_mode=mode, auto_buffer_bytes=0) == 0
+    assert Dataset().load(Chunks(data), "nt", parse_mode=mode) == 100
+
+
+class BoundedReads(Chunks):
+    def read(self, n: int = -1) -> bytes:
+        assert n >= 0, "the loader requested the whole file"
+        return super().read(n)
+
+
+def test_replayable_and_table_file_objects_use_bounded_reads() -> None:
+    assert Dataset().load(BoundedReads(nt(100)), "nt", parse_mode="buffered") == 100
+    assert Dataset().load(BoundedReads(b"id,name\n1,Alice\n2,Bob\n"), "csv", key="id", base_iri="http://e/") == 4
+
+
+def test_jsonld_streaming_profile_is_opt_in() -> None:
+    late = b'{"@id":"urn:s","p":"value","@context":{"p":"urn:p"}}'
+    ordered = b'{"@context":{"p":"urn:p"},"@id":"urn:s","p":"value"}'
+    assert Dataset().load(late, "jsonld", parse_mode="streaming") == 1
+    ds = Dataset()
+    with pytest.raises(RdfSyntaxError):
+        ds.load(late, "jsonld-streaming", parse_mode="streaming")
+    assert len(ds) == 0
+    assert ds.load(ordered, "jsonld-streaming", parse_mode="streaming") == 1
 
 
 # -------------------------------------------------------------- results output ----

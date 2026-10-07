@@ -582,7 +582,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/compaction/{ds}`         | *Extension.* `CompactionStatus`: the dataset's automatic compaction, its settings and what it sees. See [Automatic compaction](#automatic-compaction). |
 | PUT    | `/$/compaction/{ds}`         | *Extension.* Replaces the dataset's own compaction settings with the JSON object's. Returns `CompactionStatus`. |
 | DELETE | `/$/compaction/{ds}`         | *Extension.* Removes the dataset's own compaction settings, so the server's apply. Returns `CompactionStatus`. |
-| POST   | `/$/backup/{ds}`             | Writes an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` with zstd level 3. A build without zstd writes gzip (`.nq.gz`). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec. The extension follows the codec, so `compression=gzip` gives Fuseki's `.nq.gz`. Levels are 0–9 for gzip, 1–19 for zstd and 0–11 for brotli. lz4 and none take no level. Any other level is a `400`. Returns a cancellable `Task` whose message gives the size and time. `409` while a backup of the dataset is queued or running. `507` when the data directory's file system has less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are described under [Backup repositories](#backup-repositories). |
+| POST   | `/$/backup/{ds}`             | Writes an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` with zstd level 3. A build without zstd writes gzip (`.nq.gz`). `?compression=gzip\|xz\|bzip2\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec. The extension follows the codec, so `compression=gzip` gives Fuseki's `.nq.gz`. Levels are 0–9 for gzip and xz, 1–9 for bzip2, 1–19 for zstd and 0–11 for brotli. lz4 and none take no level. Any other level is a `400`. Returns a cancellable `Task` whose message gives the size and time. `409` while a backup of the dataset is queued or running. `507` when the data directory's file system has less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are described under [Backup repositories](#backup-repositories). |
 | POST   | `/$/backups/{ds}`            | Fuseki's alias of `/$/backup/{ds}` when the request has no JSON body. A JSON body (an `application/json` content type, or a body that is a JSON object) makes it a backup into a repository instead; see [Backup routes](#backup-routes). |
 | GET/POST | `/$/backups-list`          | Fuseki's list of the N-Quads backups in `<data>/backups`: `{ "backups": [string] }`, file names sorted. A caller without `server-admin` sees the files of the datasets it administers. |
 | GET/POST | `/$/validate/query`, `/$/validate/update`, `/$/validate/iri`, `/$/validate/data`, `/$/validate/langtag` | Fuseki's validators. See [Validators](#validators). |
@@ -6661,7 +6661,7 @@ request.
 | `--http-compression auto\|off` | `auto` | |
 | `--http-compression-level fastest\|default\|best\|N` | `default` | zstd 3, brotli 4, gzip 6. A number applies to whichever algorithm is chosen. |
 | `--http-compression-algorithms` | `zstd,br,gzip,deflate` | The encodings offered. |
-| `--max-decompressed-mb` | `65536` | Cap on a compressed request body or upload after decompression. `0` means none. |
+| `--max-decompressed-mb` | `65536` | Cap on compressed request bodies after decompression and on RDF source bytes, including plain RDF. `0` means none. |
 | `--max-query-body-mb` | `16` | Largest body of a SPARQL query, `/{ds}/explain`, `/{ds}/shacl` or `/{ds}/shex` request. `0` means none. |
 | `--max-update-body-mb` | `256` | Largest body of a SPARQL update. `0` means none. |
 | `--max-admin-body-mb` | `16` | Largest body of an admin request (`/$/…`) or a `/{ds}/prefixes` change. `0` means none. |
@@ -6672,8 +6672,8 @@ request.
 **Request bodies** of updates, queries, Graph Store PUT/POST and uploads may be sent with
 `Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
 `Accept-Encoding` header naming the supported ones. RDF bodies and uploaded files are also
-recognised as compressed by their first bytes (gzip, zstd, LZ4 frames). Uploads are also
-recognised by file name (`.gz`, `.zst`, `.br`, `.lz4`). A body that decompresses past
+recognised as compressed by their first bytes (gzip, xz, bzip2, zstd, LZ4 frames). Uploads are also
+recognised by file name (`.gz`, `.xz`, `.bz2`, `.zst`, `.br`, `.lz4`). A body that decompresses past
 `--max-decompressed-mb` fails with `413` and commits nothing.
 
 **Body ceilings.** A body that is read whole has the ceiling of its request class:
@@ -6694,7 +6694,7 @@ Graph Store PUT/POST, including through `/{ds}`, and `/{ds}/upload` are the bulk
 endpoints. Their bodies stream to a temporary file instead, up to `--max-upload-mb`, or
 the request fails with `413`. That limit counts bytes after HTTP decompression. Its
 default of 4096 (4 GiB) is the body limit of the bundled NixOS nginx virtual host, and `0`
-means unlimited. Files compressed inside the body are capped separately by
+means unlimited. RDF sources, including files compressed inside the body and plain RDF, are capped separately by
 `--max-decompressed-mb` as they are parsed. Before each 64 MiB of a spooled body is
 written to the temporary directory, the server checks that the file system keeps
 `--min-free-disk-mb` free (default 1024, `0` for no check). Otherwise the request fails
@@ -6712,12 +6712,42 @@ pass. A persistent dataset can also have a storage quota of its own (see
 [Storage quotas](#storage-quotas)).
 
 **Files.** `sparkles load` reads the same codecs, chosen with
-`--compression auto|none|gzip|zstd|brotli|lz4`. `auto` goes by magic bytes, then by the
+`--compression auto|none|gzip|xz|bzip2|zstd|brotli|lz4`. `auto` goes by magic bytes, then by the
 extension. Brotli has no magic bytes, so it needs `.br` or `--compression brotli`. When a
 file's name and its data disagree, the data wins and a warning is logged. An explicit
-`--compression` that disagrees is an error. Compressed N-Triples and N-Quads are
-decompressed and parsed as a stream, so they need neither an uncompressed copy nor memory
-for their decompressed size. Other compressed formats are decompressed into memory first.
+`--compression` that disagrees is an error. Every supported RDF syntax accepts incremental reader parsing. `--parse-mode auto`
+keeps parallel mapped-file parsing for plain N-Triples, N-Quads and Turtle, and bounded
+parallel blocks for compressed line formats. Other compressed documents use a slice
+parser below 128 MiB of actual decompressed input for Turtle/TriG, or 8 MiB for other
+syntaxes, and a reader at or above that threshold. Plain non-splittable files use the
+same size cutoffs. Reader input uses a 128 KiB buffer while preserving the syntax
+parser's token limits. `--auto-buffer-bytes BYTES` (`Source.auto_buffer_bytes` in Rust,
+`auto_buffer_bytes` in Python) overrides the per-source cutoff; zero skips probing.
+This allowance is per load, so concurrent loads can each use it. Lower it or select
+streaming when budgeting memory across concurrent loads. Already-owned plain bytes
+are borrowed without copying; small transactional loads and Python file objects use
+readers in automatic mode.
+`--parse-mode streaming` always uses a sequential reader; `--parse-mode buffered`
+explicitly selects a whole-document slice parser. Buffered compressed inputs need RAM
+for their full decompressed size. These policies affect input parsing; transactional
+changes, vocabulary, blank-node identity maps and index-building batches use additional
+memory. `Source.max_decompressed` bounds plain as well as decompressed input bytes.
+
+JSON-LD's ordinary reader preserves arbitrary key order and can retain a large object
+while resolving late contexts. For ordered streaming JSON-LD, use
+`load --jsonld-streaming`, `convert --syntax jsonld-streaming`, or the RDF content type
+`application/ld+json; profile="http://www.w3.org/ns/json-ld#streaming"`. The explicit
+profile validates its key ordering; it does not silently reinterpret ordinary JSON-LD.
+See the [W3C streaming JSON-LD note](https://www.w3.org/TR/json-ld11-streaming/).
+Individual literals, contexts and blank-node maps can still be large. RDF/JSON input
+emits statements incrementally instead of collecting its subject/predicate tree.
+Repeated subject/predicate keys, which violate that format's unique-key requirements,
+contribute all encountered statements in the lenient decoder.
+
+XZ files decode incrementally with a 256 MiB decoder-memory cap, independently of the
+input-byte ceiling. Bzip2 files also decode incrementally. Both accept concatenated
+streams. They are file/payload codecs, not additional HTTP Content-Encoding tokens.
+Large transcoded Graph Store bodies spill to disk based on their actual output size.
 
 `sparkles load --lenient` skips the validation of IRIs and language tags. It is meant for
 data whose IRIs are not all valid RFC 3987 IRIs; DBpedia, for example, has some that

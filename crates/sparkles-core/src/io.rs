@@ -10,11 +10,47 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 /// Minimum bytes per chunk before splitting a document for parallel parsing.
 const PARALLEL_MIN_CHUNK: usize = 8 << 20;
+
+/// Input parsing policy. Streaming avoids a whole decompressed document buffer;
+/// individual terms and syntax-specific parser state still occupy memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParseMode {
+    /// Keep the parallel mapped-file path for uncompressed line formats and
+    /// Turtle. Compressed line formats use bounded parallel blocks. Other inputs
+    /// buffer at most 128 MiB for Turtle/TriG or 8 MiB for other syntaxes
+    /// before selecting a reader parser; sources can override this allowance.
+    #[default]
+    Auto,
+    /// Parse directly from a reader, one quad at a time, in every RDF syntax.
+    Streaming,
+    /// Use the whole-document slice parser, decompressing into memory if needed.
+    Buffered,
+}
+
+impl std::str::FromStr for ParseMode {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "streaming" => Ok(Self::Streaming),
+            "buffered" => Ok(Self::Buffered),
+            _ => Err(Error::invalid(
+                "parse mode must be auto, streaming or buffered",
+            )),
+        }
+    }
+}
+
+/// Input buffering for reader parsing. The syntax parser retains its own token limits.
+const INPUT_BUFFER_BYTES: usize = 128 << 10;
+const AUTO_BUFFER_BYTES: usize = 8 << 20;
+const TURTLE_AUTO_BUFFER_BYTES: usize = 128 << 20;
 
 pub enum SourceData {
     File(PathBuf),
@@ -27,7 +63,17 @@ pub struct Source {
     /// The compression of the data: `None` detects it (magic bytes, then the file
     /// extension); a codec is checked against the magic bytes.
     pub compression: Option<Codec>,
-    /// Fail past this many decompressed bytes (compressed data only).
+    /// How the input is parsed. Automatic selection preserves parallel parsing
+    /// without allocating an arbitrarily large decompressed document.
+    pub parse_mode: ParseMode,
+    /// Automatic whole-document buffering allowance in decoded bytes. None selects
+    /// 128 MiB for Turtle/TriG or 8 MiB for other syntaxes; zero skips probing.
+    /// Applies to bulk parsing of compressed structured documents and plain
+    /// non-splittable files. Mapped parallel input and compressed line blocks keep
+    /// their existing paths. Transaction callbacks use a reader in automatic mode.
+    /// This is per source, not a shared memory budget for concurrent loads.
+    pub auto_buffer_bytes: Option<usize>,
+    /// Fail past this many decompressed bytes (input bytes for plain data).
     pub max_decompressed: Option<u64>,
     /// Load triples into this graph (default graph if `None`). Named graphs from quad
     /// formats are kept.
@@ -42,6 +88,13 @@ pub struct Source {
 }
 
 impl Source {
+    fn buffer_limit(&self) -> usize {
+        self.auto_buffer_bytes.unwrap_or(match self.format {
+            RdfFormat::Turtle | RdfFormat::TriG => TURTLE_AUTO_BUFFER_BYTES,
+            _ => AUTO_BUFFER_BYTES,
+        })
+    }
+
     pub fn from_path(path: &Path, graph: Option<NamedNode>) -> Result<Source> {
         let (format, _) = format_for_path(path).ok_or_else(|| {
             Error::invalid(format!("cannot determine RDF format of {}", path.display()))
@@ -51,6 +104,8 @@ impl Source {
             data: SourceData::File(path.to_path_buf()),
             format,
             compression: None,
+            parse_mode: ParseMode::Auto,
+            auto_buffer_bytes: None,
             max_decompressed: None,
             graph,
             base: Some(format!("file://{}", abs.display())),
@@ -64,6 +119,8 @@ impl Source {
             data: SourceData::Bytes(bytes),
             format,
             compression: None,
+            parse_mode: ParseMode::Auto,
+            auto_buffer_bytes: None,
             max_decompressed: None,
             graph,
             base: None,
@@ -76,20 +133,22 @@ impl Source {
     /// else the magic bytes, else the file extension. Logs a warning when the file
     /// name and the data disagree.
     pub fn codec(&self) -> Result<Codec> {
-        let mut prefix = [0u8; 4];
+        let mut prefix = [0u8; Codec::MAGIC_LEN];
         let (n, path) = match &self.data {
             SourceData::Bytes(b) => {
-                let n = b.len().min(4);
+                let n = b.len().min(prefix.len());
                 prefix[..n].copy_from_slice(&b[..n]);
                 (n, None)
             }
             SourceData::File(p) => {
                 let mut f = File::open(p)?;
                 let mut n = 0;
-                while n < 4 {
-                    match f.read(&mut prefix[n..])? {
-                        0 => break,
-                        k => n += k,
+                while n < prefix.len() {
+                    match f.read(&mut prefix[n..]) {
+                        Ok(0) => break,
+                        Ok(k) => n += k,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e.into()),
                     }
                 }
                 (n, Some(p.as_path()))
@@ -114,7 +173,7 @@ impl Source {
 /// name `path`, which may be a URL path), and the bytes read from `r` to tell: they come
 /// before the rest of `r`.
 pub fn sniff_codec(r: &mut impl Read, path: Option<&Path>, name: &str) -> Result<(Codec, Vec<u8>)> {
-    let mut head = [0u8; 4];
+    let mut head = [0u8; Codec::MAGIC_LEN];
     let mut n = 0;
     while n < head.len() {
         match r.read(&mut head[n..]) {
@@ -181,7 +240,8 @@ pub fn format_for_path(path: &Path) -> Option<(RdfFormat, Option<Codec>)> {
     Some((f, codec))
 }
 
-/// Parse a media type (ignoring parameters) into an RDF format.
+/// Parse a media type into an RDF format. JSON-LD profile parameters are retained,
+/// including `http://www.w3.org/ns/json-ld#streaming`.
 pub fn format_for_media_type(mt: &str) -> Option<RdfFormat> {
     let base = mt.split(';').next()?.trim().to_ascii_lowercase();
     match base.as_str() {
@@ -193,29 +253,58 @@ pub fn format_for_media_type(mt: &str) -> Option<RdfFormat> {
         "application/n-quads" | "text/x-nquads" => Some(RdfFormat::NQuads),
         "application/trig" => Some(RdfFormat::TriG),
         "application/rdf+xml" | "application/xml" | "text/xml" => Some(RdfFormat::RdfXml),
-        "application/ld+json" | "application/json" => Some(RdfFormat::JsonLd {
-            profile: oxrdfio::JsonLdProfileSet::empty(),
-        }),
+        "application/ld+json" | "application/json" => {
+            let mut profile = oxrdfio::JsonLdProfileSet::empty();
+            for param in mt.split(';').skip(1) {
+                if let Some((key, value)) = param.split_once('=')
+                    && key.trim().eq_ignore_ascii_case("profile")
+                {
+                    for iri in value.trim().trim_matches('"').split_ascii_whitespace() {
+                        if let Some(p) = oxrdfio::JsonLdProfile::from_iri(iri) {
+                            profile |= p;
+                        }
+                    }
+                }
+            }
+            Some(RdfFormat::JsonLd { profile })
+        }
         _ => RdfFormat::from_media_type(&base),
     }
 }
 
-enum Loaded {
+enum Loaded<'a> {
     Map(Mmap),
     Vec(Vec<u8>),
+    Slice(&'a [u8]),
 }
-impl AsRef<[u8]> for Loaded {
+impl AsRef<[u8]> for Loaded<'_> {
     fn as_ref(&self) -> &[u8] {
         match self {
             Loaded::Map(m) => m,
             Loaded::Vec(v) => v,
+            Loaded::Slice(s) => s,
         }
     }
 }
 
-fn load_bytes(src: &Source) -> Result<Loaded> {
+fn load_bytes(src: &Source) -> Result<Loaded<'_>> {
     let codec = src.codec()?;
-    let inflate = |r: &mut dyn Read| -> Result<Loaded> {
+    if codec == Codec::None
+        && let Some(limit) = src.max_decompressed
+    {
+        let requested = match &src.data {
+            SourceData::Bytes(b) => b.len() as u64,
+            SourceData::File(p) => std::fs::metadata(p)?.len(),
+        };
+        if requested > limit {
+            return Err(Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::DecompressedBytes,
+                limit,
+                requested,
+            }));
+        }
+    }
+    let inflate = |r: &mut dyn Read| -> Result<Loaded<'_>> {
         let mut out = Vec::new();
         codec
             .reader(r, src.max_decompressed)?
@@ -224,7 +313,7 @@ fn load_bytes(src: &Source) -> Result<Loaded> {
         Ok(Loaded::Vec(out))
     };
     match &src.data {
-        SourceData::Bytes(b) if codec == Codec::None => Ok(Loaded::Vec(b.clone())),
+        SourceData::Bytes(b) if codec == Codec::None => Ok(Loaded::Slice(b)),
         SourceData::Bytes(b) => inflate(&mut &b[..]),
         SourceData::File(p) => {
             let mut f = File::open(p)?;
@@ -250,14 +339,101 @@ pub trait QuadSink: Send {
 /// parallel (QLever-style parallel parsing). `make_sink` is called once per chunk.
 /// Returns the prefixes declared in the document.
 ///
-/// Compressed N-Triples and N-Quads are decompressed and parsed as a stream of blocks
-/// (see [`STREAM_BLOCK`]), so their decompressed size is not bounded by memory; other
-/// compressed documents are decompressed into memory first.
+/// Every syntax supports reader parsing. Automatic selection keeps the parallel
+/// mapped-file path for uncompressed line formats and Turtle, and bounded blocks
+/// for compressed line formats. Other compressed documents are buffered only up to
+/// the source's buffering allowance, then parsed incrementally. Ordinary JSON-LD may retain an
+/// object to resolve late contexts; its streaming profile avoids that reordering.
 pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
     src: &Source,
     parallelism: usize,
     make_sink: F,
 ) -> Result<BTreeMap<String, String>> {
+    let parser = source_parser(src)?;
+    let codec = src.codec()?;
+    let buffer_limit = src.buffer_limit();
+    let line_based = matches!(src.format, RdfFormat::NTriples | RdfFormat::NQuads);
+    if src.parse_mode == ParseMode::Streaming {
+        let mut sink = make_sink();
+        let prefixes = parse_reader(src, parser, source_reader(src, codec)?, |q| sink.quad(q))?;
+        sink.finish()?;
+        return Ok(prefixes);
+    }
+    if src.parse_mode == ParseMode::Auto && line_based && codec != Codec::None {
+        let block = STREAM_BLOCK.max(parallelism.max(1) * PARALLEL_MIN_CHUNK);
+        parse_stream(
+            src,
+            parser,
+            parallelism,
+            block,
+            PARALLEL_MIN_CHUNK,
+            make_sink,
+        )?;
+        return Ok(BTreeMap::new());
+    }
+    let splittable = matches!(
+        src.format,
+        RdfFormat::NTriples | RdfFormat::NQuads | RdfFormat::Turtle
+    );
+    let mapped_size = match &src.data {
+        SourceData::File(p) if codec == Codec::None => Some(std::fs::metadata(p)?.len()),
+        _ => None,
+    };
+    let bytes = if src.parse_mode == ParseMode::Buffered
+        || (codec == Codec::None && (splittable || matches!(src.data, SourceData::Bytes(_))))
+        || mapped_size.is_some_and(|n| n < buffer_limit as u64)
+    {
+        load_bytes(src)?
+    } else if codec == Codec::None || buffer_limit == 0 {
+        let mut sink = make_sink();
+        let prefixes = parse_reader(src, parser, source_reader(src, codec)?, |q| sink.quad(q))?;
+        sink.finish()?;
+        return Ok(prefixes);
+    } else {
+        // Probe the *decompressed* size, never an estimated compression ratio.
+        // Replay the prefix into the same decoder when the input is large.
+        let mut reader = source_reader(src, codec)?;
+        let mut head = Vec::with_capacity(INPUT_BUFFER_BYTES.min(buffer_limit));
+        let mut block = vec![0u8; INPUT_BUFFER_BYTES];
+        while head.len() < buffer_limit {
+            let remaining = (buffer_limit - head.len()).min(block.len());
+            match reader.read(&mut block[..remaining]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if head.len() + n > head.capacity() {
+                        let capacity = head
+                            .capacity()
+                            .saturating_mul(2)
+                            .max(head.len() + n)
+                            .min(buffer_limit);
+                        head.reserve_exact(capacity - head.len());
+                    }
+                    head.extend_from_slice(&block[..n]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(crate::codec::io_error(e)),
+            }
+        }
+        if head.len() == buffer_limit {
+            let mut sink = make_sink();
+            let prefixes = parse_reader(
+                src,
+                parser,
+                PrefixReader {
+                    prefix: Some(Cursor::new(head)),
+                    reader,
+                },
+                |q| sink.quad(q),
+            )?;
+            sink.finish()?;
+            return Ok(prefixes);
+        }
+        Loaded::Vec(head)
+    };
+    parse_slice(src, parser, bytes.as_ref(), parallelism, make_sink)
+}
+
+fn source_parser(src: &Source) -> Result<RdfParser> {
     let mut parser = RdfParser::from_format(src.format);
     if let Some(base) = &src.base {
         parser = parser
@@ -270,21 +446,104 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
     if src.lenient {
         parser = parser.lenient();
     }
-    let line_based = matches!(src.format, RdfFormat::NTriples | RdfFormat::NQuads);
-    if line_based && src.codec()? != Codec::None {
-        let block = STREAM_BLOCK.max(parallelism.max(1) * PARALLEL_MIN_CHUNK);
-        parse_stream(
-            src,
-            parser,
-            parallelism,
-            block,
-            PARALLEL_MIN_CHUNK,
-            make_sink,
-        )?;
-        return Ok(BTreeMap::new());
+    Ok(parser)
+}
+
+fn source_reader(src: &Source, codec: Codec) -> Result<Box<dyn Read + '_>> {
+    let raw: Box<dyn Read + '_> = match &src.data {
+        SourceData::File(p) => Box::new(File::open(p)?),
+        SourceData::Bytes(b) => Box::new(b.as_slice()),
+    };
+    // A smaller byte budget must still allow early quads to reach the sink.
+    let capacity = src.max_decompressed.map_or(INPUT_BUFFER_BYTES, |limit| {
+        limit.min(INPUT_BUFFER_BYTES as u64).max(1) as usize
+    });
+    Ok(Box::new(BufReader::with_capacity(
+        capacity,
+        codec.reader(raw, src.max_decompressed)?,
+    )))
+}
+
+/// Release the decoded probe as soon as replay is complete, instead of retaining
+/// a potentially 128 MiB prefix throughout the remaining parse.
+struct PrefixReader<R> {
+    prefix: Option<Cursor<Vec<u8>>>,
+    reader: R,
+}
+
+impl<R: Read> Read for PrefixReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if let Some(prefix) = &mut self.prefix {
+            let n = prefix.read(buf)?;
+            if prefix.position() == prefix.get_ref().len() as u64 {
+                self.prefix = None;
+            }
+            if n > 0 {
+                return Ok(n);
+            }
+        }
+        self.reader.read(buf)
     }
-    let bytes = load_bytes(src)?;
-    let slice = bytes.as_ref();
+}
+
+/// Parse one source into a synchronous callback, without collecting its quads.
+/// Useful for transactions whose mutable writer cannot be sent to parser workers.
+/// Automatic mode uses the reader path here; explicit buffered mode is respected.
+pub fn parse_source_into(
+    src: &Source,
+    sink: impl FnMut(Quad) -> Result<()>,
+) -> Result<BTreeMap<String, String>> {
+    if src.parse_mode == ParseMode::Buffered {
+        let bytes = load_bytes(src)?;
+        crate::nesting::check(src.format, bytes.as_ref(), &src.name)?;
+        let mut parsed = source_parser(src)?.for_slice(bytes.as_ref());
+        let mut sink = sink;
+        for q in parsed.by_ref() {
+            sink(q.map_err(|e| Error::RdfParse(format!("{}: {e}", src.name)))?)?;
+        }
+        return Ok(parsed
+            .prefixes()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect());
+    }
+    parse_reader(
+        src,
+        source_parser(src)?,
+        source_reader(src, src.codec()?)?,
+        sink,
+    )
+}
+
+fn parse_reader(
+    src: &Source,
+    parser: RdfParser,
+    reader: impl Read,
+    mut sink: impl FnMut(Quad) -> Result<()>,
+) -> Result<BTreeMap<String, String>> {
+    let mut parsed = parser.for_reader(crate::nesting::Guarded::rdf(reader, src.format, &src.name));
+    for q in parsed.by_ref() {
+        let q = q.map_err(|e| match e {
+            oxrdfio::RdfParseError::Io(e) => crate::codec::io_error(e),
+            e => Error::RdfParse(format!("{}: {e}", src.name)),
+        })?;
+        sink(q)?;
+    }
+    Ok(parsed
+        .prefixes()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect())
+}
+
+fn parse_slice<S: QuadSink, F: Fn() -> S + Sync>(
+    src: &Source,
+    parser: RdfParser,
+    slice: &[u8],
+    parallelism: usize,
+    make_sink: F,
+) -> Result<BTreeMap<String, String>> {
     crate::nesting::check(src.format, slice, &src.name)?;
     let prefixes = Mutex::new(BTreeMap::new());
     let splittable = matches!(
@@ -525,6 +784,9 @@ impl DataSyntax {
             "json-ld" | "jsonld" => RdfFormat::JsonLd {
                 profile: oxrdfio::JsonLdProfileSet::empty(),
             },
+            "jsonld-streaming" | "json-ld-streaming" => RdfFormat::JsonLd {
+                profile: oxrdfio::JsonLdProfile::Streaming.into(),
+            },
             "n3" => RdfFormat::N3,
             "rdf/json" | "rdfjson" | "rj" => return Some(DataSyntax::Jena(JenaFormat::RdfJson)),
             "trix" => return Some(DataSyntax::Jena(JenaFormat::TriX)),
@@ -578,6 +840,25 @@ pub fn check_data(syntax: DataSyntax, text: &str, base: Option<&str>) -> Option<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replay_releases_probe_and_preserves_empty_reads() {
+        use super::PrefixReader;
+        use std::io::{Cursor, Read};
+        let mut reader = PrefixReader {
+            prefix: Some(Cursor::new(b"head".to_vec())),
+            reader: Cursor::new(b"tail"),
+        };
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert!(reader.prefix.is_some());
+        let mut block = [0; 4];
+        assert_eq!(reader.read(&mut block).unwrap(), 4);
+        assert_eq!(&block, b"head");
+        assert!(reader.prefix.is_none());
+        assert_eq!(reader.read(&mut block).unwrap(), 4);
+        assert_eq!(&block, b"tail");
+        assert_eq!(reader.read(&mut block).unwrap(), 0);
+    }
+
     use super::*;
 
     #[test]

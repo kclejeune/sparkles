@@ -415,7 +415,7 @@ impl PyDataset {
 
     /// Load RDF from `input` (str, bytes or a binary file object) or the file at
     /// `path`; returns the number of new quads.
-    #[pyo3(signature = (input = None, format = None, *, path = None, base_iri = None, to_graph = None, compression = None, lenient = false, mapping = None, template = None, key = None))]
+    #[pyo3(signature = (input = None, format = None, *, path = None, base_iri = None, to_graph = None, compression = None, lenient = false, mapping = None, template = None, key = None, parse_mode = "auto", auto_buffer_bytes = None))]
     #[allow(clippy::too_many_arguments)]
     fn load(
         &self,
@@ -430,7 +430,10 @@ impl PyDataset {
         mapping: Option<PathBuf>,
         template: Option<PathBuf>,
         key: Option<String>,
+        parse_mode: &str,
+        auto_buffer_bytes: Option<usize>,
     ) -> PyResult<u64> {
+        let mode: sparkles::io::ParseMode = parse_mode.parse().py(py)?;
         let graph = opt(to_graph, iri_from_py)?;
         let table = crate::io::table_kind(format, path.as_deref())?;
         if let Some(kind) = table {
@@ -443,9 +446,18 @@ impl PyDataset {
                 compression: codec_from_py(py, compression)?,
             };
             let ds = self.ds_for_write(py)?;
-            return crate::io::load_table(py, input, path.as_deref(), &args, graph, move |src| {
-                ds.store().load(&[src])
-            });
+            return crate::io::load_table(
+                py,
+                input,
+                path.as_deref(),
+                &args,
+                graph,
+                move |mut src| {
+                    src.parse_mode = mode;
+                    src.auto_buffer_bytes = auto_buffer_bytes;
+                    ds.store().load(&[src])
+                },
+            );
         }
         if mapping.is_some() || template.is_some() || key.is_some() {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -453,6 +465,7 @@ impl PyDataset {
             ));
         }
         if let Some(i) = input.filter(|i| !i.is_none())
+            && mode != sparkles::io::ParseMode::Buffered
             && path.is_none()
             && crate::io::is_file_object(i)?
         {
@@ -483,7 +496,7 @@ impl PyDataset {
                 .py(py);
         }
         // the spool of an input in one of Jena's syntaxes lives until the load ends
-        let (src, _spool) = source_from_py(
+        let (mut src, _spool) = source_from_py(
             py,
             input,
             format,
@@ -493,18 +506,23 @@ impl PyDataset {
             compression,
             lenient,
         )?;
+        src.parse_mode = mode;
+        src.auto_buffer_bytes = auto_buffer_bytes;
         let ds = self.ds_for_write(py)?;
         py.detach(|| ds.store().load(&[src])).py(py)
     }
 
     /// Load many files in one commit (the parallel bulk path); returns the new quads.
-    #[pyo3(signature = (paths, *, to_graph = None))]
+    #[pyo3(signature = (paths, *, to_graph = None, parse_mode = "auto", auto_buffer_bytes = None))]
     fn load_files(
         &self,
         py: Python<'_>,
         paths: Vec<PathBuf>,
         to_graph: Option<&Bound<'_, PyAny>>,
+        parse_mode: &str,
+        auto_buffer_bytes: Option<usize>,
     ) -> PyResult<u64> {
+        let mode: sparkles::io::ParseMode = parse_mode.parse().py(py)?;
         let graph = opt(to_graph, iri_from_py)?;
         let sources = paths
             .iter()
@@ -519,6 +537,11 @@ impl PyDataset {
                     None,
                     false,
                 )
+                .map(|(mut source, spool)| {
+                    source.parse_mode = mode;
+                    source.auto_buffer_bytes = auto_buffer_bytes;
+                    (source, spool)
+                })
             })
             .collect::<PyResult<Vec<_>>>()?;
         let (sources, _spools): (Vec<_>, Vec<_>) = sources.into_iter().unzip();

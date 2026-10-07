@@ -2137,6 +2137,8 @@ impl Spooled {
                     data: sparkles::io::SourceData::File(f.path().to_path_buf()),
                     format,
                     compression: None,
+                    parse_mode: sparkles::io::ParseMode::Auto,
+                    auto_buffer_bytes: None,
                     max_decompressed,
                     graph,
                     base: None,
@@ -2153,13 +2155,44 @@ impl Spooled {
 /// N-Triples, in memory or in a temporary file as the body was.
 fn transcode_body(body: Spooled, fmt: jena_formats::JenaFormat, quads: bool) -> ApiResult<Spooled> {
     use std::io::Write;
+    // Compact wire encodings can expand far beyond the request's in-memory size.
+    // Spill based on the actual *output*, including a single very large write.
+    struct Writer(Spooled);
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            match &mut self.0 {
+                Spooled::Memory(b) if b.len().saturating_add(bytes.len()) <= SPOOL_AFTER => {
+                    b.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Spooled::Memory(b) => {
+                    let mut file = tempfile::Builder::new()
+                        .prefix("sparkles-transcode-")
+                        .tempfile()?;
+                    file.write_all(b)?;
+                    file.write_all(bytes)?;
+                    self.0 = Spooled::File(file);
+                    Ok(bytes.len())
+                }
+                Spooled::File(file) => file.write(bytes),
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            match &mut self.0 {
+                Spooled::Memory(_) => Ok(()),
+                Spooled::File(file) => file.flush(),
+            }
+        }
+    }
     let bad = |e: jena_formats::DecodeError| err(StatusCode::BAD_REQUEST, e.to_string());
     let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     match body {
         Spooled::Memory(b) => {
-            let mut out = Vec::with_capacity(b.len().saturating_mul(2));
+            let mut out = Writer(Spooled::Memory(Vec::with_capacity(
+                b.len().min(SPOOL_AFTER),
+            )));
             jena_formats::transcode(fmt, &b[..], quads, &mut out).map_err(bad)?;
-            Ok(Spooled::Memory(out))
+            Ok(out.0)
         }
         Spooled::File(f) => {
             let src = std::fs::File::open(f.path()).map_err(io)?;
@@ -2743,14 +2776,19 @@ async fn gsp_on(
             let format = match jena {
                 Some(_) if quads => RdfFormat::NQuads,
                 Some(_) => RdfFormat::NTriples,
-                None => sparkles::io::format_for_media_type(&ct)
-                    .or_else(|| params.get("format").and_then(results::rdf_format_from_name))
-                    .ok_or_else(|| {
-                        err(
-                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                            format!("unsupported content type '{ct}'"),
-                        )
-                    })?,
+                None => sparkles::io::format_for_media_type(
+                    headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or(&ct),
+                )
+                .or_else(|| params.get("format").and_then(results::rdf_format_from_name))
+                .ok_or_else(|| {
+                    err(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        format!("unsupported content type '{ct}'"),
+                    )
+                })?,
             };
             let replace = method == Method::PUT;
             let wanted = receipt_wanted(&params, &headers);
@@ -2928,6 +2966,7 @@ async fn upload(
         .tempdir()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut plain_format = None;
     let mut graph: Option<String> = params.get("graph").map(str::to_string);
     let mut budget = BodyBudget::new(&st.limits);
     // a CSVW mapping or CONSTRUCT template for the upload's CSV and TSV files
@@ -2992,13 +3031,22 @@ async fn upload(
         let table = sparkles::tabular::tabular_media_type(&ct);
         let format = match (jena, table) {
             (Some(_), _) | (_, Some(_)) => None,
-            (None, None) => Some(sparkles::io::format_for_media_type(&ct).ok_or_else(|| {
-                err(
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    format!("unsupported content type '{ct}'"),
+            (None, None) => Some(
+                sparkles::io::format_for_media_type(
+                    headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or(&ct),
                 )
-            })?),
+                .ok_or_else(|| {
+                    err(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        format!("unsupported content type '{ct}'"),
+                    )
+                })?,
+            ),
         };
+        plain_format = format;
         let body = spool_after(request.into_body(), 0, &mut budget).await?;
         let ext = match (jena, format) {
             _ if table == Some(sparkles::tabular::TabularKind::Csv) => "csv",
@@ -3061,6 +3109,9 @@ async fn upload(
             .iter()
             .map(|p| {
                 Source::from_path(p, g.clone()).map(|mut s| {
+                    if let Some(format) = plain_format {
+                        s.format = format;
+                    }
                     s.max_decompressed = st.limits.max_decompressed_bytes;
                     s
                 })
@@ -3783,7 +3834,8 @@ fn backup_level(codec: sparkles::codec::Codec, level: Option<&str>) -> ApiResult
         return Ok(None);
     };
     let range = match codec {
-        Codec::Gzip => 0..=9,
+        Codec::Gzip | Codec::Xz => 0..=9,
+        Codec::Bzip2 => 1..=9,
         Codec::Zstd => 1..=19,
         Codec::Brotli => 0..=11,
         Codec::Lz4 | Codec::None => {
@@ -4669,6 +4721,44 @@ mod validation_tests;
 #[cfg(test)]
 mod spool_tests {
     use super::*;
+
+    #[test]
+    fn small_wire_body_spools_when_transcoded_output_expands() {
+        let literal = "\n".repeat(5 << 20);
+        let mut writer =
+            jena_formats::RdfWriter::new(jena_formats::JenaFormat::Protobuf, Vec::new());
+        for subject in ["urn:s", "urn:t"] {
+            writer
+                .quad(&oxrdf::Quad::new(
+                    oxrdf::NamedNode::new(subject).unwrap(),
+                    oxrdf::NamedNode::new("urn:p").unwrap(),
+                    oxrdf::Literal::new_simple_literal(literal.clone()),
+                    oxrdf::GraphName::DefaultGraph,
+                ))
+                .unwrap();
+        }
+        let body = writer.finish().unwrap();
+        assert!(body.len() < SPOOL_AFTER);
+        let Ok(Spooled::File(file)) = transcode_body(
+            Spooled::Memory(body),
+            jena_formats::JenaFormat::Protobuf,
+            true,
+        ) else {
+            panic!("expanded RDF output must spill to disk");
+        };
+        assert!(file.as_file().metadata().unwrap().len() > SPOOL_AFTER as u64);
+        let mut parser =
+            oxrdfio::RdfParser::from_format(RdfFormat::NQuads).for_reader(file.reopen().unwrap());
+        assert_eq!(
+            parser.next().unwrap().unwrap().object,
+            oxrdf::Literal::new_simple_literal(literal).into()
+        );
+        assert!(parser.next().unwrap().is_ok());
+        assert!(parser.next().is_none());
+        let path = file.path().to_path_buf();
+        drop(file);
+        assert!(!path.exists());
+    }
 
     #[tokio::test]
     async fn large_bodies_are_spooled_to_a_file() {

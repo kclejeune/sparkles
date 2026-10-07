@@ -789,7 +789,7 @@ enum LogFormat {
 /// Compression of a dump or backup.
 #[derive(clap::Args, Clone, Debug)]
 struct CompressArgs {
-    /// none, gzip, zstd, brotli or lz4 (default: from the file extension, or the
+    /// none, gzip, xz, bzip2, zstd, brotli or lz4 (default: from the file extension, or the
     /// command's default)
     #[arg(long)]
     compress: Option<String>,
@@ -993,7 +993,7 @@ enum Cmd {
         /// Response encodings offered, comma-separated
         #[arg(long, default_value = "zstd,br,gzip,deflate", value_name = "LIST")]
         http_compression_algorithms: String,
-        /// Largest decompressed size of a compressed request body or uploaded file, in MiB
+        /// Largest decompressed request body or RDF source size, including plain RDF, in MiB
         /// (0: unlimited)
         #[arg(long, default_value_t = 65536)]
         max_decompressed_mb: u64,
@@ -1232,9 +1232,21 @@ enum Cmd {
         #[command(flatten)]
         csv: csv_cmd::CsvArgs,
         /// Compression of the files: auto (magic bytes, then the extension), none, gzip,
-        /// zstd, brotli or lz4
+        /// xz, bzip2, zstd, brotli or lz4
         #[arg(long, default_value = "auto")]
         compression: String,
+        /// Input parsing: auto preserves parallel file parsing and streams large
+        /// compressed documents; streaming uses a reader; buffered holds the whole
+        /// decompressed document in memory
+        #[arg(long, default_value = "auto", value_name = "auto|streaming|buffered")]
+        parse_mode: sparkles::io::ParseMode,
+        /// Per-source auto buffering cutoff in decompressed bytes (Turtle/TriG:
+        /// 134217728; other structured formats: 8388608); zero skips probing
+        #[arg(long, value_name = "BYTES")]
+        auto_buffer_bytes: Option<usize>,
+        /// JSON-LD inputs obey the streaming profile's context/type key ordering
+        #[arg(long)]
+        jsonld_streaming: bool,
         /// Skip the validation of IRIs and language tags, for data whose IRIs are not all
         /// valid (DBpedia's, for one); syntax errors still fail the load
         #[arg(long)]
@@ -2735,6 +2747,9 @@ fn run() -> Result<()> {
             files,
             csv,
             compression,
+            parse_mode,
+            auto_buffer_bytes,
+            jsonld_streaming,
             lenient,
             check,
             strict,
@@ -2760,6 +2775,14 @@ fn run() -> Result<()> {
                 tools::convert::precheck(files, explicit, lenient, strict)?;
             }
             let Some(loc) = loc else {
+                if parse_mode != sparkles::io::ParseMode::Auto
+                    || auto_buffer_bytes.is_some()
+                    || jsonld_streaming
+                {
+                    bail!(
+                        "--parse-mode, --auto-buffer-bytes and --jsonld-streaming apply to a local database (--loc) only"
+                    );
+                }
                 if lenient {
                     bail!("--lenient applies to a local database (--loc) only");
                 }
@@ -2795,6 +2818,13 @@ fn run() -> Result<()> {
                     // a converted table is plain N-Triples
                     s.compression = if converted { None } else { explicit };
                     s.lenient = lenient;
+                    s.parse_mode = parse_mode;
+                    s.auto_buffer_bytes = auto_buffer_bytes;
+                    if jsonld_streaming
+                        && let oxrdfio::RdfFormat::JsonLd { profile } = &mut s.format
+                    {
+                        *profile |= oxrdfio::JsonLdProfile::Streaming;
+                    }
                     // fail before loading anything
                     s.codec()?;
                     Ok(s)

@@ -9180,7 +9180,9 @@
               "state": {
                 "enum": [
                   "ready",
-                  "stale"
+                  "stale",
+                  "rebuilding",
+                  "failed"
                 ],
                 "type": "string"
               },
@@ -12271,6 +12273,8 @@
             "schema": {
               "enum": [
                 "gzip",
+                "xz",
+                "bzip2",
                 "zstd",
                 "brotli",
                 "lz4",

@@ -321,7 +321,7 @@ fn indexes(put: &mut dyn FnMut(&str, J)) {
                         &["enabled", "state", "docs", "seq", "storeSeq", "epoch", "diskBytes", "segments", "config", "formatVersion"],
                         json!({
                             "enabled": { "const": true },
-                            "state": string_enum(&["ready", "stale"]),
+                            "state": string_enum(&["ready", "stale", "rebuilding", "failed"]),
                             "docs": int(),
                             "seq": { "type": "integer", "description": "The commit the index reflects." },
                             "storeSeq": int(),

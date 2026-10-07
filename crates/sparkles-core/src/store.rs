@@ -3222,6 +3222,9 @@ impl Store {
             self.drain_group(&mut guard, Some(&opts))?;
         }
         self.check_write_options(&opts)?;
+        if guard.poisoned {
+            return Err(Error::Poisoned);
+        }
         Ok(self.begin(guard, kind, opts))
     }
 
@@ -3580,19 +3583,37 @@ impl Store {
         } else {
             let mut txn = self.try_write_with(kind, o.clone())?;
             let mut prefixes = BTreeMap::new();
-            for s in sources {
-                o.check()?;
-                let (quads, p) = crate::io::parse_to_vec(s)?;
-                self.check_memory_before(quads.len())?;
-                prefixes.extend(p);
-                let mut labels = std::collections::HashMap::new();
-                for (i, q) in quads.iter().enumerate() {
-                    if i % 65_536 == 65_535 {
-                        o.check()?;
-                    }
-                    let ids = txn.encode_quad(q, &mut labels)?;
-                    txn.insert(ids)?;
+            let mut parsed = 0;
+            let prepared = (|| -> Result<()> {
+                for s in sources {
+                    o.check()?;
+                    let mut labels = std::collections::HashMap::new();
+                    let p = crate::io::parse_source_into(s, |q| {
+                        parsed += 1;
+                        if parsed % 65_536 == 1 {
+                            o.check()?;
+                        }
+                        self.check_memory_before(parsed)?;
+                        let ids = txn.encode_quad(&q, &mut labels)?;
+                        txn.insert(ids)?;
+                        Ok(())
+                    })?;
+                    prefixes.extend(p);
                 }
+                Ok(())
+            })();
+            if let Err(error) = prepared {
+                // No uncommitted views escape this loader. Remove its terms while
+                // holding the writer lock; earlier group-commit terms precede mark.
+                if let Err(rollback_error) = txn.base.generation.dvocab.rollback(&txn.mark) {
+                    // A partial file rollback may leave append state inconsistent.
+                    // Refuse subsequent writes until the store is reopened.
+                    txn.guard.poisoned = true;
+                    tracing::error!(target: "sparkles::store", "failed load ({error}) could not remove its terms: {rollback_error}");
+                    return Err(rollback_error);
+                }
+                txn.guard.next_bnode = txn.start_bnode;
+                return Err(error);
             }
             let r = txn.commit()?;
             self.add_prefixes(prefixes)?;
@@ -4690,6 +4711,9 @@ impl WriteTxn<'_> {
     }
 
     pub fn intern_key(&mut self, key: &[u8]) -> Result<Id> {
+        if self.guard.poisoned {
+            return Err(Error::Poisoned);
+        }
         if let Ok(i) = self.base.generation.vocab.find(key) {
             return Ok(Id::vocab(i));
         }
@@ -5880,6 +5904,20 @@ pub(crate) fn replay_wal(
 mod tests {
     use super::*;
     use crate::io::RdfFormat;
+
+    #[test]
+    fn poisoned_writer_refuses_transaction_admission_and_vocabulary_appends() {
+        let store = Store::in_memory(StoreOptions::default());
+        store.writer.lock().poisoned = true;
+        assert!(matches!(
+            store.try_write_with(CommitKind::Load, Default::default()),
+            Err(Error::Poisoned)
+        ));
+        let before = store.snapshot().generation.dvocab.len();
+        let mut txn = store.write();
+        assert!(matches!(txn.intern_key(b"unused"), Err(Error::Poisoned)));
+        assert_eq!(store.snapshot().generation.dvocab.len(), before);
+    }
 
     std::thread_local! {
         pub(super) static WRITE_BASE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

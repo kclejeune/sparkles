@@ -274,6 +274,7 @@ pub fn source_from_py(
         return Ok((src, Some(spool)));
     }
     let format = rdf_only(format, "datasets")?;
+    let mut spool = None;
     let mut src = match (input, path) {
         (Some(_), Some(_)) => return Err(PyValueError::new_err("give input or path, not both")),
         (None, None) => return Err(PyValueError::new_err("give input or path")),
@@ -299,6 +300,21 @@ pub fn source_from_py(
             src.graph = graph;
             src
         }
+        (Some(i), None) if is_file_object(i)? => {
+            let Some(f) = format else {
+                return Err(PyValueError::new_err(
+                    "format is required when loading from input",
+                ));
+            };
+            let (tmp, mut out) = Spool::create()?;
+            let mut reader = PyFileReader::new(i.clone().unbind());
+            py.detach(|| std::io::copy(&mut reader, &mut out))?;
+            let mut src = Source::from_bytes(Vec::new(), f, graph);
+            src.data = SourceData::File(tmp.0.clone());
+            src.name = "<file object>".into();
+            spool = Some(tmp);
+            src
+        }
         (Some(i), None) => {
             let Some(f) = format else {
                 return Err(PyValueError::new_err(
@@ -313,7 +329,7 @@ pub fn source_from_py(
     }
     src.compression = codec_from_py(py, compression)?;
     src.lenient = lenient;
-    Ok((src, None))
+    Ok((src, spool))
 }
 
 /// The decompressed bytes of an input in one of Jena's syntaxes, its name for errors, and
@@ -452,11 +468,14 @@ impl Spool {
         loop {
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let p = dir.join(format!("sparkles-load-{}-{n}.nq", std::process::id()));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&p)
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&p) {
                 Ok(f) => return Ok((Spool(p), f)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -859,14 +878,7 @@ pub fn load_table(
             (r, Options::for_file(mapping, p))
         }
         (Some(i), None) => {
-            let bytes = input_bytes(i)?;
-            let codec = match args.compression {
-                Some(c) => c,
-                None => Codec::sniff(&bytes).unwrap_or(Codec::None),
-            };
-            let r = codec
-                .reader_send(std::io::Cursor::new(bytes), None)
-                .py(py)?;
+            let (r, _, _) = jena_raw(py, Some(i), None, args.compression.map(Codec::name))?;
             (r, Options::new(mapping, "<input>"))
         }
     };

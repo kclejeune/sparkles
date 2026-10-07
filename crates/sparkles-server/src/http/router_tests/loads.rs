@@ -100,3 +100,33 @@ async fn prefixes_are_capped() {
     assert_eq!(r.status, StatusCode::OK);
     assert!(r.text().contains(&format!("@prefix p{}:", max - 1)));
 }
+
+#[tokio::test]
+async fn jsonld_streaming_profile_survives_graph_store_and_plain_upload() {
+    let media = "application/ld+json; profile=\"http://www.w3.org/ns/json-ld#streaming\"";
+    let late = r#"{"@id":"urn:s","p":"value","@context":{"p":"urn:p"}}"#;
+    let ordered = r#"{"@context":{"p":"urn:p"},"@id":"urn:s","p":"value"}"#;
+    for route in ["/ds/data?default", "/ds/upload"] {
+        let server = with_file_loads(FileLoads::default());
+        let request = |content_type: &str, body: &str| {
+            Request::post(route)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body.to_owned()))
+                .unwrap()
+        };
+        let response = send(&server.app, request(media, late)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{route}: {}",
+            response.text()
+        );
+        assert_eq!(server.state.get("ds").unwrap().store.snapshot().len(), 0);
+        let response = send(&server.app, request(media, ordered)).await;
+        assert!(response.status.is_success(), "{route}: {}", response.text());
+        assert_eq!(server.state.get("ds").unwrap().store.snapshot().len(), 1);
+        // General JSON-LD keeps its unordered-context behavior.
+        let response = send(&server.app, request("application/ld+json", late)).await;
+        assert!(response.status.is_success(), "{route}: {}", response.text());
+    }
+}

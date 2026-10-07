@@ -353,6 +353,23 @@ Only measured numbers go into `docs/BENCHMARKS.md`.
 The `zstd` feature (libzstd, a C build) and the `brotli` feature are off in the
 `sparkles` library and on in the server.
 
+**Additional file codecs.** The shared codec module also reads and writes xz
+(`xz`, `.xz`) and bzip2 (`bzip2` or `bz2`, `.bz2`). Both are available in minimal
+library builds. xz uses `liblzma` with static linking and pregenerated bindings,
+adding a C build dependency; bzip2 uses the Rust `libbz2-rs-sys` backend through
+`bzip2`. This supersedes the original no-new-C-dependencies goal for native xz
+support. Six magic bytes identify xz (`fd 37 7a 58 5a 00`); bzip2 is `BZh` followed
+by a block-size digit from `1` to `9`. Both decoders read concatenated streams to
+EOF, reject truncated later members and trailing garbage, and enforce the same
+decompressed-byte limit as the other codecs. xz decoder working memory is capped
+at 256 MiB independently of the decompressed-byte limit; custom dictionaries
+above that bound fail instead of allocating unbounded memory. Writer levels are
+clamped to 0–9 for xz and 1–9 for bzip2, defaulting to 6; both writers are
+single-threaded and `finish` writes the footer and flushes the destination.
+Neither adds an HTTP `Content-Encoding` token or response-negotiation algorithm.
+See the [liblzma stream API](https://docs.rs/liblzma/latest/liblzma/stream/struct.Stream.html)
+and [bzip2 multi-stream API](https://docs.rs/bzip2/latest/bzip2/read/struct.MultiBzDecoder.html).
+
 **Deviations and decisions.**
 - A body that inflates past `--max-decompressed-mb` gets `413` and commits nothing. That
   matches the other request-body limits. A2 asked for `507`.

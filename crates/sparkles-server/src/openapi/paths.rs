@@ -890,7 +890,7 @@ fn admin(p: &mut Paths) {
         .see("datasets-admin")
         .query(
             "compression",
-            json!({ "type": "string", "enum": ["gzip", "zstd", "brotli", "lz4", "none"] }),
+            json!({ "type": "string", "enum": ["gzip", "xz", "bzip2", "zstd", "brotli", "lz4", "none"] }),
             "The codec.",
         )
         .query("level", int(), "The codec's level.")

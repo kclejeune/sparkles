@@ -1,7 +1,8 @@
 //! Compression codecs shared by inputs (files, request bodies), dumps and backups:
-//! gzip, zstd, brotli and the LZ4 frame format.
+//! gzip, xz, bzip2, zstd, brotli and the LZ4 frame format.
 //!
-//! gzip and LZ4 are always built. zstd (`zstd` feature, libzstd) and brotli (`brotli`
+//! gzip, xz, bzip2 and LZ4 are always built. xz statically links liblzma; bzip2
+//! uses the Rust libbz2 implementation. zstd (`zstd` feature, libzstd) and brotli (`brotli`
 //! feature, pure Rust) are optional in the library and enabled by the server; without
 //! them their inputs fail with [`Error::Unsupported`].
 
@@ -17,13 +18,15 @@ pub enum Codec {
     #[default]
     None,
     Gzip,
+    Xz,
+    Bzip2,
     Zstd,
     Brotli,
     Lz4,
 }
 
 /// A codec-specific level, clamped to the codec's range (gzip 0–9, zstd −7–22,
-/// brotli 0–11; LZ4 has none).
+/// brotli 0–11, xz 0–9, bzip2 1–9; LZ4 has none).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Level(pub i32);
 
@@ -34,25 +37,37 @@ pub trait FinishWrite: Write {
 }
 
 impl Codec {
-    pub const ALL: [Codec; 5] = [
+    /// Number of bytes sufficient to identify every codec with a magic number.
+    pub const MAGIC_LEN: usize = 6;
+
+    /// Maximum memory used by an xz decoder, independent of the output byte limit.
+    /// This accommodates every standard xz preset, including level 9, while
+    /// rejecting inputs that demand unusually large custom dictionaries.
+    pub const XZ_MEMORY_LIMIT: u64 = 256 << 20;
+
+    pub const ALL: [Codec; 7] = [
         Codec::None,
         Codec::Gzip,
+        Codec::Xz,
+        Codec::Bzip2,
         Codec::Zstd,
         Codec::Brotli,
         Codec::Lz4,
     ];
 
-    /// `none`, `gzip`/`gz`, `zstd`/`zst`, `brotli`/`br` or `lz4`.
+    /// `none`, `gzip`/`gz`, `xz`, `bzip2`/`bz2`, `zstd`/`zst`, `brotli`/`br` or `lz4`.
     pub fn parse(s: &str) -> Result<Codec> {
         Ok(match s.to_ascii_lowercase().as_str() {
             "none" | "identity" => Codec::None,
             "gzip" | "gz" => Codec::Gzip,
+            "xz" => Codec::Xz,
+            "bzip2" | "bz2" => Codec::Bzip2,
             "zstd" | "zst" => Codec::Zstd,
             "brotli" | "br" => Codec::Brotli,
             "lz4" => Codec::Lz4,
             _ => {
                 return Err(Error::invalid(format!(
-                    "unknown compression {s:?} (none, gzip, zstd, brotli, lz4)"
+                    "unknown compression {s:?} (none, gzip, xz, bzip2, zstd, brotli, lz4)"
                 )));
             }
         })
@@ -62,6 +77,8 @@ impl Codec {
         match self {
             Codec::None => "none",
             Codec::Gzip => "gzip",
+            Codec::Xz => "xz",
+            Codec::Bzip2 => "bzip2",
             Codec::Zstd => "zstd",
             Codec::Brotli => "brotli",
             Codec::Lz4 => "lz4",
@@ -73,19 +90,21 @@ impl Codec {
         match self {
             Codec::None => "",
             Codec::Gzip => ".gz",
+            Codec::Xz => ".xz",
+            Codec::Bzip2 => ".bz2",
             Codec::Zstd => ".zst",
             Codec::Brotli => ".br",
             Codec::Lz4 => ".lz4",
         }
     }
 
-    /// The HTTP `Content-Encoding` token (LZ4 has none).
+    /// The HTTP `Content-Encoding` token (xz, bzip2 and LZ4 have none).
     pub fn content_encoding(self) -> Option<&'static str> {
         match self {
             Codec::Gzip => Some("gzip"),
             Codec::Zstd => Some("zstd"),
             Codec::Brotli => Some("br"),
-            Codec::None | Codec::Lz4 => None,
+            Codec::None | Codec::Xz | Codec::Bzip2 | Codec::Lz4 => None,
         }
     }
 
@@ -119,11 +138,14 @@ impl Codec {
         name
     }
 
-    /// The codec of a stream from its first bytes (4 are enough). Brotli has no magic
+    /// The codec of a stream from its first bytes ([`MAGIC_LEN`](Self::MAGIC_LEN)
+    /// are enough). Brotli has no magic
     /// number, so it is never detected.
     pub fn sniff(prefix: &[u8]) -> Option<Codec> {
         match prefix {
             [0x1f, 0x8b, ..] => Some(Codec::Gzip),
+            [0xfd, b'7', b'z', b'X', b'Z', 0x00, ..] => Some(Codec::Xz),
+            [b'B', b'Z', b'h', b'1'..=b'9', ..] => Some(Codec::Bzip2),
             [0x28, 0xb5, 0x2f, 0xfd, ..] => Some(Codec::Zstd),
             // zstd skippable frame: 0x184D2A5?
             [b0, 0x2a, 0x4d, 0x18, ..] if b0 & 0xf0 == 0x50 => Some(Codec::Zstd),
@@ -193,7 +215,7 @@ impl Codec {
         match self {
             Codec::None => 1,
             Codec::Gzip => 8,
-            Codec::Zstd | Codec::Brotli => 10,
+            Codec::Xz | Codec::Bzip2 | Codec::Zstd | Codec::Brotli => 10,
             Codec::Lz4 => 4,
         }
     }
@@ -227,10 +249,13 @@ impl Codec {
     /// A decompressing reader. Concatenated frames are read to the end. With `limit`,
     /// reading past `limit` decompressed bytes fails with
     /// [`BudgetKind::DecompressedBytes`].
+    /// xz also limits decoder working memory to [`XZ_MEMORY_LIMIT`](Self::XZ_MEMORY_LIMIT).
     pub fn reader<'a>(self, r: impl Read + 'a, limit: Option<u64>) -> Result<Box<dyn Read + 'a>> {
         let r: Box<dyn Read + 'a> = match self {
             Codec::None => Box::new(r),
             Codec::Gzip => Box::new(flate2::read::MultiGzDecoder::new(io::BufReader::new(r))),
+            Codec::Xz => Box::new(xz_reader(r)?),
+            Codec::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(r)),
             Codec::Lz4 => Box::new(Lz4Frames(Some(lz4_flex::frame::FrameDecoder::new(
                 io::BufReader::new(r),
             )))),
@@ -261,6 +286,8 @@ impl Codec {
         let r: Box<dyn Read + Send + 'a> = match self {
             Codec::None => Box::new(r),
             Codec::Gzip => Box::new(flate2::read::MultiGzDecoder::new(io::BufReader::new(r))),
+            Codec::Xz => Box::new(xz_reader(r)?),
+            Codec::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(r)),
             Codec::Lz4 => Box::new(Lz4Frames(Some(lz4_flex::frame::FrameDecoder::new(
                 io::BufReader::new(r),
             )))),
@@ -300,6 +327,14 @@ impl Codec {
                 ))
             }
             Codec::Lz4 => Box::new(lz4_flex::frame::FrameEncoder::new(w)),
+            Codec::Xz => Box::new(liblzma::write::XzEncoder::new(
+                w,
+                level.map_or(6, |l| l.0.clamp(0, 9)) as u32,
+            )),
+            Codec::Bzip2 => Box::new(bzip2::write::BzEncoder::new(
+                w,
+                bzip2::Compression::new(level.map_or(6, |l| l.0.clamp(1, 9)) as u32),
+            )),
             #[cfg(feature = "zstd")]
             Codec::Zstd => {
                 let l = level.map_or(3, |l| l.0.clamp(-7, 22));
@@ -362,6 +397,26 @@ impl<W: Write> FinishWrite for lz4_flex::frame::FrameEncoder<W> {
     }
 }
 
+impl<W: Write> FinishWrite for liblzma::write::XzEncoder<W> {
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        (*self).finish()?.flush()
+    }
+}
+
+impl<W: Write> FinishWrite for bzip2::write::BzEncoder<W> {
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        (*self).finish()?.flush()
+    }
+}
+
+fn xz_reader<R: Read>(r: R) -> io::Result<liblzma::read::XzDecoder<R>> {
+    let stream = liblzma::stream::Stream::new_stream_decoder(
+        Codec::XZ_MEMORY_LIMIT,
+        liblzma::stream::CONCATENATED,
+    )?;
+    Ok(liblzma::read::XzDecoder::new_stream(r, stream))
+}
+
 #[cfg(feature = "zstd")]
 impl<W: Write> FinishWrite for zstd::stream::write::Encoder<'_, W> {
     fn finish(self: Box<Self>) -> io::Result<()> {
@@ -411,16 +466,26 @@ struct LimitedRead<R> {
 
 impl<R: Read> Read for LimitedRead<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.read += n as u64;
-        if self.read > self.limit {
-            return Err(io::Error::other(Error::BudgetExceeded(Budget {
-                kind: BudgetKind::DecompressedBytes,
-                limit: self.limit,
-                requested: self.read,
-            })));
+        if buf.is_empty() {
+            return Ok(0);
         }
-        Ok(n)
+        // Return all bytes within the budget even when a buffered consumer asks
+        // for more. Once exhausted, probe a single byte to distinguish EOF from
+        // an over-limit stream without substantial decoder read-ahead.
+        if self.read <= self.limit {
+            let remaining = self.limit - self.read;
+            let len = remaining.max(1).min(buf.len() as u64) as usize;
+            let n = self.inner.read(&mut buf[..len])?;
+            self.read = self.read.saturating_add(n as u64);
+            if self.read <= self.limit {
+                return Ok(n);
+            }
+        }
+        Err(io::Error::other(Error::BudgetExceeded(Budget {
+            kind: BudgetKind::DecompressedBytes,
+            limit: self.limit,
+            requested: self.read,
+        })))
     }
 }
 
@@ -440,6 +505,32 @@ pub fn io_error(e: io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn buffered_reads_return_remaining_budget_and_distinguish_eof() {
+        for data in [b"abc".as_slice(), b"abcd".as_slice()] {
+            let mut limited = Codec::None.reader(data, Some(3)).unwrap();
+            let mut large = [0; 128 << 10];
+            assert_eq!(limited.read(&mut large).unwrap(), 3);
+            assert_eq!(&large[..3], b"abc");
+            assert_eq!(limited.read(&mut []).unwrap(), 0);
+            if data.len() == 3 {
+                assert_eq!(limited.read(&mut large).unwrap(), 0);
+            } else {
+                let error = io_error(limited.read(&mut large).unwrap_err());
+                assert!(matches!(
+                    error,
+                    Error::BudgetExceeded(Budget {
+                        limit: 3,
+                        requested: 4,
+                        ..
+                    })
+                ));
+                assert!(limited.read(&mut large).is_err());
+                assert_eq!(limited.read(&mut []).unwrap(), 0);
+            }
+        }
+    }
+
     use super::*;
 
     fn roundtrip(c: Codec) {
@@ -469,6 +560,12 @@ mod tests {
             .unwrap();
         assert_eq!(back.len(), data.len() * copies, "{c}");
         assert_eq!(&back[..data.len()], &data[..]);
+        let mut send_back = Vec::new();
+        c.reader_send(&two[..], None)
+            .unwrap()
+            .read_to_end(&mut send_back)
+            .unwrap();
+        assert_eq!(send_back, back, "Send reader: {c}");
         // a limit below the decompressed size is a budget error
         let e = c
             .reader(&out[..], Some(1000))
@@ -501,9 +598,23 @@ mod tests {
         let p = Path::new;
         assert_eq!(Codec::from_extension(p("a.ttl.ZST")), Some(Codec::Zstd));
         assert_eq!(Codec::from_extension(p("a.nq.gz")), Some(Codec::Gzip));
+        assert_eq!(Codec::from_extension(p("a.rdf.XZ")), Some(Codec::Xz));
+        assert_eq!(Codec::from_extension(p("a.nt.bz2")), Some(Codec::Bzip2));
         assert_eq!(Codec::from_extension(p("a.ttl")), None);
         assert_eq!(Codec::strip_extension("a.ttl.br"), "a.ttl");
+        assert_eq!(Codec::strip_extension("a.rdf.XZ"), "a.rdf");
+        assert_eq!(Codec::strip_extension("a.nt.bz2"), "a.nt");
         assert_eq!(Codec::parse("zst").unwrap(), Codec::Zstd);
+        assert_eq!(Codec::parse("xz").unwrap(), Codec::Xz);
+        assert_eq!(Codec::parse("BZ2").unwrap(), Codec::Bzip2);
+        assert_eq!(Codec::parse("bzip2").unwrap(), Codec::Bzip2);
+        assert_eq!(Codec::sniff(b"\xfd7zXZ\0"), Some(Codec::Xz));
+        assert_eq!(Codec::sniff(b"\xfd7zX"), None);
+        assert_eq!(Codec::sniff(b"BZh9"), Some(Codec::Bzip2));
+        assert_eq!(Codec::sniff(b"BZh0"), None);
+        assert_eq!(Codec::Xz.content_encoding(), None);
+        assert_eq!(Codec::Bzip2.content_encoding(), None);
+        assert_eq!(Codec::from_content_encoding("xz"), None);
         assert!(Codec::parse("compress").is_err());
         let gz = [0x1f, 0x8b, 8, 0];
         // magic wins over the name, with a warning
@@ -513,6 +624,13 @@ mod tests {
         // an explicit codec that disagrees with the data is an error
         assert!(Codec::detect(Some(Codec::Brotli), &gz, None).is_err());
         assert!(Codec::detect(Some(Codec::Zstd), b"<a> ", None).is_err());
+        assert!(Codec::detect(Some(Codec::Xz), &gz, None).is_err());
+        assert_eq!(
+            Codec::detect(None, b"\xfd7zXZ\0", Some(p("x.rdf.bz2")))
+                .unwrap()
+                .0,
+            Codec::Xz
+        );
         // brotli only by name or choice
         assert_eq!(
             Codec::detect(None, b"\x0b\x02", Some(p("x.nt.br")))
@@ -524,5 +642,153 @@ mod tests {
             Codec::detect(None, b"<a> <b>", None).unwrap(),
             (Codec::None, None)
         );
+    }
+
+    fn compressed(c: Codec, data: &[u8], level: Option<Level>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut writer = c.writer(&mut out, level, 1).unwrap();
+        writer.write_all(data).unwrap();
+        writer.finish().unwrap();
+        out
+    }
+
+    struct ShortReads<R>(R);
+
+    impl<R: Read> Read for ShortReads<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let len = buf.len().min(1);
+            self.0.read(&mut buf[..len])
+        }
+    }
+
+    #[test]
+    fn xz_and_bzip2_read_all_members_from_fragmented_input() {
+        for c in [Codec::Xz, Codec::Bzip2] {
+            let mut input = compressed(c, b"first", None);
+            // xz permits padding between streams, in multiples of four bytes.
+            if c == Codec::Xz {
+                input.extend_from_slice(&[0; 4]);
+            }
+            input.extend(compressed(c, b"second", None));
+            let mut reader = c.reader_send(ShortReads(&input[..]), Some(11)).unwrap();
+            let mut output = String::new();
+            reader.read_to_string(&mut output).unwrap();
+            assert_eq!(output, "firstsecond", "{c}");
+        }
+    }
+
+    #[test]
+    fn xz_and_bzip2_reject_truncated_members_and_trailing_garbage() {
+        for c in [Codec::Xz, Codec::Bzip2] {
+            let first = compressed(c, b"first", None);
+            let second = compressed(c, b"second", None);
+            let mut truncated = first.clone();
+            truncated.extend_from_slice(&second[..second.len() - 2]);
+            let mut garbage = first;
+            garbage.extend_from_slice(b"not a compressed stream");
+            for input in [truncated, garbage] {
+                assert!(
+                    c.reader(&input[..], None)
+                        .unwrap()
+                        .read_to_end(&mut Vec::new())
+                        .is_err(),
+                    "{c} must not silently accept a broken later member"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn xz_and_bzip2_levels_are_clamped_and_finished() {
+        for c in [Codec::Xz, Codec::Bzip2] {
+            for level in [-1, 10] {
+                let out = compressed(c, b"complete archive", Some(Level(level)));
+                let mut back = Vec::new();
+                c.reader(&out[..], None)
+                    .unwrap()
+                    .read_to_end(&mut back)
+                    .unwrap();
+                assert_eq!(back, b"complete archive", "{c}, level {level}");
+            }
+        }
+    }
+
+    #[test]
+    fn xz_and_bzip2_produce_output_before_consuming_the_input() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counted<R> {
+            reader: R,
+            consumed: Arc<AtomicUsize>,
+        }
+        impl<R: Read> Read for Counted<R> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let n = self.reader.read(buf)?;
+                self.consumed.fetch_add(n, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+
+        // Incompressible input spanning many bzip2 blocks. A single highly
+        // compressible block would not distinguish incremental reading from
+        // eagerly consuming the entire compressed source.
+        let mut seed = 0x12345678u32;
+        let input: Vec<u8> = (0..2 << 20)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        for c in [Codec::Xz, Codec::Bzip2] {
+            let archive = compressed(c, &input, Some(Level(0)));
+            let consumed = Arc::new(AtomicUsize::new(0));
+            let mut reader = c
+                .reader_send(
+                    Counted {
+                        reader: &archive[..],
+                        consumed: consumed.clone(),
+                    },
+                    None,
+                )
+                .unwrap();
+            assert_eq!(consumed.load(Ordering::Relaxed), 0, "{c}");
+            let mut byte = [0];
+            reader.read_exact(&mut byte).unwrap();
+            assert_eq!(byte[0], input[0], "{c}");
+            assert!(
+                consumed.load(Ordering::Relaxed) < archive.len() / 2,
+                "{c} consumed the input before producing output"
+            );
+        }
+    }
+
+    #[test]
+    fn xz_dictionary_memory_is_capped_before_allocation() {
+        let mut archive = compressed(Codec::Xz, b"small output", Some(Level(0)));
+        let header_len = (usize::from(archive[12]) + 1) * 4;
+        let header = &mut archive[12..12 + header_len];
+        // An ordinary xz encoder writes one LZMA2 filter with one property byte.
+        assert_eq!(&header[1..4], &[0, 0x21, 1]);
+        header[4] = 40; // Valid LZMA2 property requesting a 4 GiB dictionary.
+        let crc_offset = header_len - 4;
+        // XZ block-header CRC32 (IEEE): recompute it so the decoder reaches the
+        // dictionary limit rather than rejecting a malformed header checksum.
+        let mut crc = !0u32;
+        for &byte in &header[..crc_offset] {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        header[crc_offset..].copy_from_slice(&(!crc).to_le_bytes());
+        let error = Codec::Xz
+            .reader(&archive[..], None)
+            .unwrap()
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
+        assert!(error.to_string().contains("memory"), "{error}");
     }
 }

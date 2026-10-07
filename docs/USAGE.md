@@ -513,6 +513,34 @@ sparkles describe-settings --loc db --set mode=scbd   # how DESCRIBE describes a
 sparkles ping    127.0.0.1:3030               # GET /$/ready over HTTP, then HTTPS; exit 0 on 200 (health checks)
 ```
 
+Loading supports reader parsing for every RDF syntax and native `.xz` and `.bz2`
+compression, alongside gzip, zstd, brotli and LZ4. The default `--parse-mode auto`
+preserves parallel parsing where possible and streams large compressed documents.
+Structured documents buffer below 128 MiB decompressed for Turtle/TriG, or 8 MiB
+for other syntaxes, before switching to readers with 128 KiB input buffering.
+`--auto-buffer-bytes BYTES` overrides that cutoff; zero skips probing. The allowance
+is per source; reduce it when several loads share a memory budget. Mapped plain
+Turtle and bounded parallel compressed N-Triples/N-Quads retain their existing paths.
+Use `--parse-mode streaming` for a sequential reader or `--parse-mode buffered` to
+explicitly permit a whole decompressed document in RAM. Parsing streams do not remove
+the memory needed for index-building batches or transactional changes.
+
+```sh
+sparkles load --loc db --parse-mode streaming clusters.rdf.xz
+sparkles load --loc db --parse-mode auto data.ttl.gz
+sparkles load --loc db --parse-mode streaming --jsonld-streaming ordered.jsonld.gz
+```
+
+Ordinary JSON-LD retains arbitrary key-order semantics and may buffer a large object.
+`--jsonld-streaming` validates the streaming profile's context/type ordering. Python
+`Dataset.load` and `load_files` also accept `parse_mode="auto"`, `"streaming"` or
+`"buffered"`, plus `auto_buffer_bytes` for the automatic cutoff;
+`format="jsonld-streaming"` selects ordered streaming JSON-LD for `load` and
+`sparkles.parse`. Large individual terms and blank-node identity maps
+still consume memory. [Input parsing and compression](API.md#compression) describes
+selection and limits.
+
+
 `sparkles query --loc` runs a query as the server runs one on the dataset. RDFS on read
 follows the database's `rdfs.json`, the materialized inferences of `sparkles infer` are
 part of the default graph while `reasoning.json` records them, and DESCRIBE follows

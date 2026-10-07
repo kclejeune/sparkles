@@ -958,52 +958,247 @@ impl<R: Read> ProtoReader<R> {
 // ------------------------------------------------------------------ RDF/JSON ------
 
 fn read_rdf_json(input: impl Read, sink: &mut dyn FnMut(Quad) -> Res<()>) -> Res<()> {
-    use serde_json::Value as J;
-    let doc: J = serde_json::from_reader(input)
-        .map_err(|e| DecodeError(format!("invalid RDF/JSON: {e}")))?;
-    let J::Object(subjects) = doc else {
-        return bad("RDF/JSON: the document is not an object");
+    rdf_json::read(input, sink)
+}
+
+/// Consume the nested subject/predicate/object containers without retaining them.
+/// Repeated container keys (nonconforming RDF/JSON) contribute every statement; term
+/// fields retain the old last-value behavior. No graph-wide key set is allocated.
+mod rdf_json {
+    use super::*;
+    use serde::de::{
+        self, Deserialize, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor,
     };
-    let mut terms = Terms::default();
-    for (s, preds) in subjects {
-        let J::Object(preds) = preds else {
-            return bad(format!(
-                "RDF/JSON: the value of subject {s} is not an object"
-            ));
-        };
-        for (p, objects) in preds {
-            let J::Array(objects) = objects else {
-                return bad(format!(
-                    "RDF/JSON: the value of predicate {p} is not an array"
-                ));
+    use std::fmt;
+
+    struct Context<'a> {
+        terms: Terms,
+        sink: &'a mut dyn FnMut(Quad) -> Res<()>,
+        failure: Option<DecodeError>,
+    }
+
+    impl Context<'_> {
+        fn emit<E: de::Error>(&mut self, s: &str, p: &str, object: WireTerm) -> Result<(), E> {
+            let subject = match s.strip_prefix("_:") {
+                Some(label) => WireTerm::BNode(label.to_owned()),
+                None => WireTerm::Iri(s.to_owned()),
             };
-            for o in objects {
-                let get = |k: &str| o.get(k).and_then(J::as_str).map(str::to_string);
-                let value = get("value")
-                    .ok_or_else(|| DecodeError("RDF/JSON: an object without value".into()))?;
-                let obj = match get("type").as_deref() {
-                    Some("uri") => WireTerm::Iri(value),
-                    Some("bnode") => {
-                        WireTerm::BNode(value.strip_prefix("_:").unwrap_or(&value).to_string())
-                    }
-                    Some("literal") => WireTerm::Literal {
-                        lex: value,
-                        lang: get("lang"),
-                        dir: get("direction"),
-                        datatype: get("datatype"),
-                        dt_prefix: None,
-                    },
-                    t => return bad(format!("RDF/JSON: unknown object type {t:?}")),
-                };
-                let subject = match s.strip_prefix("_:") {
-                    Some(l) => WireTerm::BNode(l.to_string()),
-                    None => WireTerm::Iri(s.clone()),
-                };
-                sink(terms.quad(subject, WireTerm::Iri(p.clone()), obj, None)?)?;
-            }
+            let result = self
+                .terms
+                .quad(subject, WireTerm::Iri(p.to_owned()), object, None)
+                .and_then(|q| (self.sink)(q));
+            result.map_err(|error| {
+                let message = error.to_string();
+                self.failure = Some(error);
+                E::custom(message)
+            })
         }
     }
-    Ok(())
+
+    struct Subjects<'a, 'sink>(&'a mut Context<'sink>);
+
+    impl<'de> DeserializeSeed<'de> for Subjects<'_, '_> {
+        type Value = ();
+        fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Subjects<'_, '_> {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("RDF/JSON: the document is not an object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(subject) = map.next_key::<String>()? {
+                map.next_value_seed(Predicates {
+                    context: self.0,
+                    subject: &subject,
+                })?;
+            }
+            Ok(())
+        }
+    }
+
+    struct Predicates<'a, 'sink> {
+        context: &'a mut Context<'sink>,
+        subject: &'a str,
+    }
+
+    impl<'de> DeserializeSeed<'de> for Predicates<'_, '_> {
+        type Value = ();
+        fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Predicates<'_, '_> {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "RDF/JSON: the value of subject {} is not an object",
+                self.subject
+            )
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(predicate) = map.next_key::<String>()? {
+                map.next_value_seed(Objects {
+                    context: self.context,
+                    subject: self.subject,
+                    predicate: &predicate,
+                })?;
+            }
+            Ok(())
+        }
+    }
+
+    struct Objects<'a, 'sink> {
+        context: &'a mut Context<'sink>,
+        subject: &'a str,
+        predicate: &'a str,
+    }
+
+    impl<'de> DeserializeSeed<'de> for Objects<'_, '_> {
+        type Value = ();
+        fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_seq(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Objects<'_, '_> {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "RDF/JSON: the value of predicate {} is not an array",
+                self.predicate
+            )
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while let Some(object) = seq.next_element::<Object>()? {
+                self.context.emit(self.subject, self.predicate, object.0)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Preserve `Value::as_str` for known fields while discarding other JSON values
+    /// incrementally. Even a large extension field must not become a retained tree.
+    struct StringField(Option<String>);
+
+    impl<'de> Deserialize<'de> for StringField {
+        fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            d.deserialize_any(StringField(None))
+        }
+    }
+
+    impl<'de> Visitor<'de> for StringField {
+        type Value = StringField;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a JSON value")
+        }
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(StringField(Some(value.to_owned())))
+        }
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+            Ok(StringField(Some(value)))
+        }
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(self)
+        }
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(self)
+        }
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(self)
+        }
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(self)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(self)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(self)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(self)
+        }
+    }
+
+    struct Object(WireTerm);
+
+    impl<'de> Deserialize<'de> for Object {
+        fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct Fields;
+            impl<'de> Visitor<'de> for Fields {
+                type Value = Object;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("RDF/JSON: an object without value")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Object, A::Error> {
+                    let (mut value, mut kind, mut lang, mut dir, mut datatype) =
+                        (None, None, None, None, None);
+                    while let Some(key) = map.next_key::<String>()? {
+                        let field = match key.as_str() {
+                            "value" => &mut value,
+                            "type" => &mut kind,
+                            "lang" => &mut lang,
+                            "direction" => &mut dir,
+                            "datatype" => &mut datatype,
+                            _ => {
+                                map.next_value::<IgnoredAny>()?;
+                                continue;
+                            }
+                        };
+                        *field = map.next_value::<StringField>()?.0;
+                    }
+                    let value = value
+                        .ok_or_else(|| de::Error::custom("RDF/JSON: an object without value"))?;
+                    Ok(Object(match kind.as_deref() {
+                        Some("uri") => WireTerm::Iri(value),
+                        Some("bnode") => {
+                            WireTerm::BNode(value.strip_prefix("_:").unwrap_or(&value).to_owned())
+                        }
+                        Some("literal") => WireTerm::Literal {
+                            lex: value,
+                            lang,
+                            dir,
+                            datatype,
+                            dt_prefix: None,
+                        },
+                        kind => {
+                            return Err(de::Error::custom(format!(
+                                "RDF/JSON: unknown object type {kind:?}"
+                            )));
+                        }
+                    }))
+                }
+            }
+            d.deserialize_map(Fields)
+        }
+    }
+
+    pub(super) fn read(input: impl Read, sink: &mut dyn FnMut(Quad) -> Res<()>) -> Res<()> {
+        let mut context = Context {
+            terms: Terms::default(),
+            sink,
+            failure: None,
+        };
+        let mut reader = serde_json::Deserializer::from_reader(BufReader::new(input));
+        Subjects(&mut context)
+            .deserialize(&mut reader)
+            .and_then(|()| reader.end())
+            .map_err(|error| {
+                context
+                    .failure
+                    .take()
+                    .unwrap_or_else(|| DecodeError(format!("invalid RDF/JSON: {error}")))
+            })
+    }
 }
 
 // ------------------------------------------------------------------- writers ------
@@ -1494,6 +1689,169 @@ mod tests {
             transcode(JenaFormat::RdfJson, &bytes[..], false, &mut out).unwrap(),
             4
         );
+    }
+
+    #[test]
+    fn rdf_json_emits_before_reading_the_rest_of_an_object_array() {
+        use std::cell::Cell;
+
+        struct Gated<'a> {
+            first: &'a [u8],
+            rest: &'a [u8],
+            emitted: &'a Cell<usize>,
+        }
+        impl Read for Gated<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if !self.first.is_empty() {
+                    return self.first.read(out);
+                }
+                if self.emitted.get() == 0 {
+                    return Err(io::Error::other(
+                        "read ahead before emitting the first quad",
+                    ));
+                }
+                self.rest.read(out)
+            }
+        }
+        let emitted = Cell::new(0);
+        let input = Gated {
+            first: br#"{"http://e/s":{"http://e/p":[{"type":"literal","value":"first"},"#,
+            rest: br#"{"type":"literal","value":"second"}]}}"#,
+            emitted: &emitted,
+        };
+        read_rdf_json(input, &mut |_| {
+            emitted.set(emitted.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(emitted.get(), 2);
+    }
+
+    #[test]
+    fn rdf_json_repeated_containers_contribute_all_statements() {
+        // The RDF/JSON Note specifies unique container keys. Retain every occurrence
+        // leniently, rather than buffering a graph to discard overwritten containers.
+        let input = br#"{
+            "http://e/s":{"http://e/p":[{"type":"literal","value":"a"}],
+                          "http://e/p":[{"type":"literal","value":"b"}]},
+            "http://e/s":{"http://e/p":[{"type":"literal","value":"c"}]}
+        }"#;
+        let mut out = Vec::new();
+        assert_eq!(
+            transcode(JenaFormat::RdfJson, &input[..], false, &mut out).unwrap(),
+            3
+        );
+        let text = String::from_utf8(out).unwrap();
+        for value in ["a", "b", "c"] {
+            assert!(text.contains(&format!("\"{value}\"")), "{text}");
+        }
+    }
+
+    #[test]
+    fn rdf_json_term_fields_keep_last_values_and_ignore_extensions() {
+        let input = br#"{"_:b":{"http://e/p":[
+            {"type":"uri","type":"literal","value":"discarded","value":false,
+             "value":"kept","lang":[{"ignored":"extension"}],"datatype":null,
+             "other":{"nested":[1,true,null,{"value":"ignored"}]}}
+        ],"http://e/q":[{"type":"bnode","value":"_:b"}]}}"#;
+        let mut quads = Vec::new();
+        read_rdf_json(&input[..], &mut |q| {
+            quads.push(q);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(quads.len(), 2);
+        assert_eq!(quads[0].object, Literal::new_simple_literal("kept").into());
+        let NamedOrBlankNode::BlankNode(subject) = &quads[0].subject else {
+            panic!("expected blank subject");
+        };
+        assert_eq!(quads[1].subject, quads[0].subject);
+        assert_eq!(quads[1].object, Term::BlankNode(subject.clone()));
+    }
+
+    #[test]
+    fn rdf_json_validates_shapes_terms_and_document_end() {
+        for (input, expected) in [
+            ("[]", "document is not an object"),
+            (
+                r#"{"http://e/s":[]}"#,
+                "value of subject http://e/s is not an object",
+            ),
+            (
+                r#"{"http://e/s":{"http://e/p":{}}}"#,
+                "value of predicate http://e/p is not an array",
+            ),
+            (
+                r#"{"http://e/s":{"http://e/p":[{"type":"literal"}]}}"#,
+                "an object without value",
+            ),
+            (
+                r#"{"http://e/s":{"http://e/p":[null]}}"#,
+                "an object without value",
+            ),
+            (
+                r#"{"http://e/s":{"http://e/p":[{"type":"literal","value":"x","value":false}]}}"#,
+                "an object without value",
+            ),
+            (
+                r#"{"http://e/s":{"http://e/p":[{"type":"literal","type":null,"value":"x"}]}}"#,
+                "unknown object type None",
+            ),
+            (
+                r#"{"http://e/s":{"http://e/p":[{"type":"other","value":"x"}]}}"#,
+                "unknown object type",
+            ),
+            (
+                r#"{"relative":{"http://e/p":[{"type":"literal","value":"x"}]}}"#,
+                "invalid IRI",
+            ),
+            (
+                r#"{"http://e/s":{"relative":[{"type":"literal","value":"x"}]}}"#,
+                "invalid IRI",
+            ),
+            (
+                r#"{"http://e/s":{"http://e/p":[{"type":"uri","value":"relative"}]}}"#,
+                "invalid IRI",
+            ),
+            (
+                r#"{"http://e/s":{"http://e/p":[{"type":"literal","value":"x","lang":"!"}]}}"#,
+                "invalid language tag",
+            ),
+            (
+                r#"{"http://e/s":{"http://e/p":[{"type":"literal","value":"x","datatype":"relative"}]}}"#,
+                "invalid datatype IRI",
+            ),
+            (
+                r#"{"http://e/s":{"http://e/p":[{"type":"literal","value":"x","lang":"en","direction":"up"}]}}"#,
+                "invalid base direction",
+            ),
+            ("{} true", "trailing characters"),
+        ] {
+            let error = read_rdf_json(input.as_bytes(), &mut |_| Ok(())).unwrap_err();
+            assert!(error.to_string().contains(expected), "{input}: {error}");
+        }
+    }
+
+    #[test]
+    fn rdf_json_stops_on_sink_failure_and_rejects_a_malformed_tail() {
+        let input = br#"{"http://e/s":{"http://e/p":[{"type":"literal","value":"x"},"#;
+        let mut emitted = 0;
+        let error = read_rdf_json(&input[..], &mut |_| {
+            emitted += 1;
+            bad("sink refused the quad")
+        })
+        .unwrap_err();
+        assert_eq!(emitted, 1);
+        assert_eq!(error.to_string(), "sink refused the quad");
+        emitted = 0;
+        assert!(
+            read_rdf_json(&input[..], &mut |_| {
+                emitted += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(emitted, 1);
     }
 
     /// A Thrift stream as Jena writes it, with a prefix declaration, a prefix name,

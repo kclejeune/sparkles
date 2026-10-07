@@ -460,8 +460,10 @@ class Dataset:
         mapping: _Path | None = None,
         template: _Path | None = None,
         key: str | None = None,
+        parse_mode: str = "auto",
+        auto_buffer_bytes: int | None = None,
     ) -> int: ...
-    def load_files(self, paths: Iterable[_Path], *, to_graph: NamedNode | str | None = None) -> int: ...
+    def load_files(self, paths: Iterable[_Path], *, to_graph: NamedNode | str | None = None, parse_mode: str = "auto", auto_buffer_bytes: int | None = None) -> int: ...
     def query(
         self,
         query: str,

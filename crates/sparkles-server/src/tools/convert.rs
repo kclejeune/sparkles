@@ -109,7 +109,7 @@ pub struct ConvertArgs {
     #[arg(long, visible_alias = "union")]
     merge: bool,
     /// Compression of the inputs: auto (magic bytes, then the extension), none, gzip,
-    /// zstd, brotli or lz4
+    /// xz, bzip2, zstd, brotli or lz4
     #[arg(long, default_value = "auto", value_name = "CODEC")]
     compression: String,
     /// Compress the output: gzip (the default when no codec is named), zstd, brotli or
@@ -133,6 +133,9 @@ pub fn rdf_syntax(name: &str) -> Option<RdfFormat> {
         "trig" => RdfFormat::TriG,
         "rdf/xml" | "rdfxml" | "rdf" | "xml" | "owl" => RdfFormat::RdfXml,
         "json-ld" | "jsonld" | "json" => jsonld,
+        "jsonld-streaming" | "json-ld-streaming" => RdfFormat::JsonLd {
+            profile: oxrdfio::JsonLdProfile::Streaming.into(),
+        },
         "n3" => RdfFormat::N3,
         other => {
             return sparkles::io::format_for_media_type(other)
@@ -421,6 +424,8 @@ impl Input {
             data: SourceData::File(self.path.clone()?),
             format: self.format,
             compression,
+            parse_mode: sparkles::io::ParseMode::Auto,
+            auto_buffer_bytes: None,
             max_decompressed: None,
             graph: None,
             base: self.base.clone(),
@@ -585,6 +590,8 @@ fn file_reader(p: &Path, name: &str, compression: Option<Codec>) -> Result<Box<d
         data: SourceData::File(p.to_path_buf()),
         format: RdfFormat::NQuads,
         compression,
+        parse_mode: sparkles::io::ParseMode::Auto,
+        auto_buffer_bytes: None,
         max_decompressed: None,
         graph: None,
         base: None,
@@ -599,7 +606,7 @@ fn file_reader(p: &Path, name: &str, compression: Option<Codec>) -> Result<Box<d
 /// Standard input, decompressed.
 fn stdin_reader(compression: Option<Codec>) -> Result<Box<dyn Read + Send>> {
     let mut stdin = std::io::stdin();
-    let mut head = [0u8; 4];
+    let mut head = [0u8; Codec::MAGIC_LEN];
     let mut n = 0;
     while n < head.len() {
         match stdin.read(&mut head[n..])? {

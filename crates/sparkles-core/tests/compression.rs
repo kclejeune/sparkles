@@ -82,19 +82,37 @@ fn decompressed_size_is_capped() {
     let big: String = (0..20_000)
         .map(|i| format!("<urn:s{i}> <urn:p> \"{i}\" .\n"))
         .collect();
-    let store = Store::in_memory(StoreOptions::default());
-    let mut s = Source::from_bytes(
-        compress(Codec::Gzip, big.as_bytes()),
-        sparkles_core::io::RdfFormat::NTriples,
-        None,
-    );
-    s.max_decompressed = Some(10_000);
-    let e = store.load(&[s]).unwrap_err();
-    assert!(
-        matches!(e, sparkles_core::Error::BudgetExceeded(b) if b.kind == sparkles_core::error::BudgetKind::DecompressedBytes),
-        "{e}"
-    );
-    assert_eq!(store.snapshot().len(), 0);
+    for codec in Codec::ALL.into_iter().filter(|c| c.supported()) {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut s = Source::from_bytes(
+            compress(codec, big.as_bytes()),
+            sparkles_core::io::RdfFormat::NTriples,
+            None,
+        );
+        s.max_decompressed = Some(10_000);
+        let e = store
+            .load(&[s])
+            .expect_err(&format!("{codec} must enforce the input byte limit"));
+        assert!(
+            matches!(e, sparkles_core::Error::BudgetExceeded(b) if b.kind == sparkles_core::error::BudgetKind::DecompressedBytes),
+            "{codec}: {e}"
+        );
+        assert_eq!(store.snapshot().len(), 0, "{codec}");
+    }
+}
+
+#[test]
+fn a_broken_later_compressed_member_commits_nothing() {
+    const NT: &str = "<urn:a> <urn:p> \"first\" .\n";
+    for codec in [Codec::Xz, Codec::Bzip2] {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = compress(codec, NT.as_bytes());
+        let later = compress(codec, b"<urn:b> <urn:p> \"second\" .\n");
+        data.extend_from_slice(&later[..later.len() - 2]);
+        let source = Source::from_bytes(data, sparkles_core::io::RdfFormat::NTriples, None);
+        assert!(store.load(&[source]).is_err(), "{codec}");
+        assert_eq!(store.snapshot().len(), 0, "{codec}");
+    }
 }
 
 #[test]
