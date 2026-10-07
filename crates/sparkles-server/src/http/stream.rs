@@ -4,7 +4,8 @@
 //! A whole body keeps the ordinary behavior: `Content-Length`, a proper error status when
 //! serialization fails, and a complete request report. A streamed body starts with what
 //! was buffered and continues in [`CHUNK`]-sized pieces through a bounded channel, so
-//! memory stays flat. An error after the switch aborts the transfer (the client sees a
+//! serialized-body buffering stays bounded. The query result itself may already be
+//! materialized. An error after the switch aborts the transfer (the client sees a
 //! truncated response), and a client that goes away stops the serialization.
 
 use super::{ApiError, ApiResult, err};
@@ -52,6 +53,7 @@ pub struct SwitchWriter {
     threshold: usize,
     signal: Option<oneshot::Sender<Outcome>>,
     tx: Option<mpsc::Sender<Chunk>>,
+    deferred: bool,
 }
 
 fn gone() -> io::Error {
@@ -59,6 +61,12 @@ fn gone() -> io::Error {
 }
 
 impl SwitchWriter {
+    /// A capped synchronous trial reached its byte threshold and will be retried
+    /// on the blocking pool. That trial must not report final serialization timing.
+    pub(super) fn deferred(&self) -> bool {
+        self.deferred
+    }
+
     fn send_chunk(&mut self) -> io::Result<()> {
         let Some(tx) = &self.tx else {
             return Ok(());
@@ -73,7 +81,33 @@ impl SwitchWriter {
 
 impl Write for SwitchWriter {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(b);
+        if self.signal.is_none() && self.tx.is_none() {
+            // A quick result is tried synchronously, but its row count says nothing
+            // about literal size. Stop before allocating beyond the byte threshold;
+            // the caller retries this immutable result through the bounded stream.
+            if b.len() > self.threshold.saturating_sub(self.buf.len()) {
+                self.deferred = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "response requires streaming",
+                ));
+            }
+            self.buf.extend_from_slice(b);
+            return Ok(b.len());
+        }
+        // A serializer may hand us one enormous literal/body. Consume only the
+        // prefix needed to switch, or to fill a streamed chunk, rather than
+        // copying that entire slice before applying backpressure. `write_all`
+        // retries the rest through the ordinary Write contract.
+        let room = if self.tx.is_some() {
+            CHUNK - self.buf.len()
+        } else {
+            self.threshold
+                .saturating_sub(self.buf.len())
+                .saturating_add(1)
+        };
+        let n = b.len().min(room);
+        self.buf.extend_from_slice(&b[..n]);
         if self.tx.is_none() && self.buf.len() > self.threshold {
             // switch to streaming: hand the receiver to the handler first
             let (tx, rx) = mpsc::channel(4);
@@ -84,7 +118,7 @@ impl Write for SwitchWriter {
         } else if self.tx.is_some() && self.buf.len() >= CHUNK {
             self.send_chunk()?;
         }
-        Ok(b.len())
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -131,6 +165,7 @@ where
             threshold,
             signal: Some(signal),
             tx: None,
+            deferred: false,
         };
         // disconnects are noticed through the channel, not a cancellation flag
         let mut w = LimitedWriter::new(sw, limit, None::<Arc<AtomicBool>>);
@@ -192,27 +227,65 @@ where
     }
 }
 
-/// Serialize a body with `write` on the current thread, whole, under the result-size
-/// `limit`: for results small enough that a thread hand-off would cost more than the
-/// serialization.
-pub fn serialize_now<F>(limit: Option<u64>, write: F) -> ApiResult<Serialized>
+/// Try a quick result on the current thread, buffering at most [`STREAM_AFTER`]
+/// bytes. A larger result retries its repeatable serializer on the blocking pool,
+/// where it can apply channel backpressure. Real errors retain their usual behavior.
+pub async fn serialize_quick<F, D>(
+    limit: Option<u64>,
+    write: F,
+    on_stream_end: D,
+) -> ApiResult<Serialized>
 where
-    F: FnOnce(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()>,
+    F: Fn(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
+    D: FnOnce(StreamEnd) + Send + 'static,
 {
     let t0 = Instant::now();
-    // no signal, and a threshold it never passes: the writer only buffers
+    if let Some(body) = try_serialize_now(STREAM_AFTER, limit, &write)? {
+        Ok(body)
+    } else {
+        let trial_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let body = serialize(limit, write, move |mut end| {
+            end.serialize_ms += trial_ms;
+            on_stream_end(end);
+        })
+        .await?;
+        Ok(match body {
+            Serialized::Whole { body, serialize_ms } => Serialized::Whole {
+                body,
+                serialize_ms: trial_ms + serialize_ms,
+            },
+            body => body,
+        })
+    }
+}
+
+fn try_serialize_now<F>(
+    threshold: usize,
+    limit: Option<u64>,
+    write: &F,
+) -> ApiResult<Option<Serialized>>
+where
+    F: Fn(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()>,
+{
+    let t0 = Instant::now();
+    // No signal: reaching the threshold aborts this bounded trial.
     let sw = SwitchWriter {
         buf: Vec::new(),
-        threshold: usize::MAX,
+        threshold,
         signal: None,
         tx: None,
+        deferred: false,
     };
     let mut w = LimitedWriter::new(sw, limit, None::<Arc<AtomicBool>>);
-    match write(&mut w).map_err(|e| w.classify(e)) {
-        Ok(()) => Ok(Serialized::Whole {
+    let result = write(&mut w).map_err(|e| w.classify(e));
+    if w.get_ref().deferred() {
+        return Ok(None);
+    }
+    match result {
+        Ok(()) => Ok(Some(Serialized::Whole {
             body: w.into_inner().buf,
             serialize_ms: t0.elapsed().as_secs_f64() * 1000.0,
-        }),
+        })),
         Err(e) => Err(ApiError::from(e)),
     }
 }
@@ -272,6 +345,60 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn quick_trial_accepts_the_byte_boundary_and_preserves_real_errors() {
+        let write = |w: &mut LimitedWriter<SwitchWriter>| {
+            w.write_all(&[b'x'; 100])?;
+            Ok(())
+        };
+        let Ok(Some(Serialized::Whole { body, .. })) = try_serialize_now(100, None, &write) else {
+            panic!("exactly the threshold should remain whole");
+        };
+        assert_eq!(body, vec![b'x'; 100]);
+        assert!(matches!(try_serialize_now(99, None, &write), Ok(None)));
+        assert!(matches!(
+            try_serialize_now(100, Some(50), &write),
+            Err(ApiError(StatusCode::INSUFFICIENT_STORAGE, _))
+        ));
+        let fail = |_: &mut LimitedWriter<SwitchWriter>| Err(Error::invalid("boom"));
+        assert!(matches!(
+            try_serialize_now(100, None, &fail),
+            Err(ApiError(StatusCode::BAD_REQUEST, _))
+        ));
+    }
+
+    #[tokio::test]
+    async fn quick_large_answer_retries_once_as_a_bounded_stream() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let size = STREAM_AFTER + CHUNK * 8 + 17;
+        let input = vec![b'x'; size];
+        let (seen, on_end) = ends();
+        let Ok(Serialized::Streamed(body)) = serialize_quick(
+            None,
+            move |w| {
+                count.fetch_add(1, Ordering::Relaxed);
+                w.write_all(&input)?;
+                Ok(())
+            },
+            on_end,
+        )
+        .await
+        else {
+            panic!("few cells with huge bytes must stream");
+        };
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            axum::body::to_bytes(body, usize::MAX).await.unwrap().len(),
+            size
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].bytes, size as u64);
+        assert!(seen[0].error.is_none() && !seen[0].disconnected);
+    }
+
     #[tokio::test]
     async fn large_bodies_stream_and_report_their_end() {
         let (seen, on_end) = ends();
@@ -286,6 +413,74 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].bytes, 200_000);
         assert!(seen[0].error.is_none() && !seen[0].disconnected);
+    }
+
+    // A serializer can issue one write_all for a very large literal. Bound each
+    // underlying write even then, and apply channel backpressure before consuming
+    // the rest of that literal.
+    async fn single_large_write() -> (
+        mpsc::Receiver<Chunk>,
+        tokio::task::JoinHandle<io::Result<()>>,
+        usize,
+    ) {
+        let (signal, outcome) = oneshot::channel();
+        let size = CHUNK * 8 + 17;
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut w = SwitchWriter {
+                buf: Vec::new(),
+                threshold: 100,
+                signal: Some(signal),
+                tx: None,
+                deferred: false,
+            };
+            w.write_all(&vec![b'x'; size])?;
+            w.send_chunk()
+        });
+        let Outcome::Stream(rx) = outcome.await.unwrap() else {
+            panic!("expected a stream");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while rx.len() < 4 && !producer.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("producer should fill the bounded channel");
+        (rx, producer, size)
+    }
+
+    #[tokio::test]
+    async fn a_single_large_write_has_bounded_chunks_and_backpressure() {
+        let (mut rx, producer, size) = single_large_write().await;
+        assert_eq!(rx.len(), 4);
+        assert!(
+            !producer.is_finished(),
+            "the full channel must block writes"
+        );
+        let mut bytes = Vec::new();
+        let mut chunks = 0;
+        while let Some(chunk) = rx.recv().await {
+            let chunk = chunk.unwrap();
+            assert!(chunk.len() <= if chunks == 0 { 101 } else { CHUNK });
+            bytes.extend_from_slice(&chunk);
+            chunks += 1;
+        }
+        producer.await.unwrap().unwrap();
+        assert_eq!(bytes, vec![b'x'; size]);
+    }
+
+    #[tokio::test]
+    async fn disconnect_interrupts_a_single_large_write() {
+        let (rx, producer, _) = single_large_write().await;
+        assert_eq!(rx.len(), 4);
+        assert!(!producer.is_finished());
+        drop(rx);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), producer)
+            .await
+            .expect("disconnect must unblock the producer")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[tokio::test]

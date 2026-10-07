@@ -954,6 +954,149 @@ fn updates() {
 }
 
 #[test]
+fn native_json_writer_matches_document_values_for_all_result_kinds() {
+    fn document(r: &QueryResult, send: Option<usize>) -> serde_json::Value {
+        // Compare both encodings after the same JSON parser: without the
+        // float_roundtrip feature, parsing a serialized f64 can differ by 1 ULP
+        // from the directly constructed Value's number.
+        serde_json::from_slice(&serde_json::to_vec(&results::sparkles_json(r, send)).unwrap())
+            .unwrap()
+    }
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        br#"
+        <urn:s> <urn:p> _:b, "quote \" slash \\ newline \n", "right"@en--rtl,
+            "left"@fr--ltr, "42"^^<urn:datatype>,
+            <<( _:b <urn:p> <<( <urn:n> <urn:p> "nested" )>> )>> .
+        "#
+        .to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    for text in [
+        "SELECT ?s ?p ?o ?unbound WHERE { ?s ?p ?o }",
+        "SELECT * WHERE {}",
+        "SELECT ?s WHERE { ?s ?p ?o FILTER(false) }",
+        "ASK { ?s ?p ?o }",
+        "ASK { <urn:absent> ?p ?o }",
+        "CONSTRUCT { ?s <urn:copy> ?o . GRAPH <urn:g> { ?s <urn:copy> ?o } } WHERE { ?s <urn:p> ?o }",
+        "DESCRIBE <urn:s>",
+    ] {
+        let r = q(&s, text);
+        for send in [None, Some(0), Some(1), Some(3), Some(usize::MAX)] {
+            let mut out = Vec::new();
+            results::write_native_json(&r, &mut out, send, None).unwrap();
+            let got: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(got, document(&r, send), "{text}, {send:?}");
+        }
+    }
+    // Cover all graph-name representations, including the null default graph
+    // accepted by the explicit native document interface.
+    let mut r = q(&s, "CONSTRUCT { ?s <urn:p> ?o } WHERE { ?s <urn:p> ?o }");
+    let t = &r.triples[0];
+    r.quads = [
+        GraphName::DefaultGraph,
+        GraphName::NamedNode(oxrdf::NamedNode::new("urn:g").unwrap()),
+        GraphName::BlankNode(BlankNode::new("graph").unwrap()),
+    ]
+    .into_iter()
+    .map(|g| t.clone().in_graph(g))
+    .collect();
+    for send in [None, Some(r.triples.len()), Some(r.triples.len() + 2)] {
+        let mut out = Vec::new();
+        results::write_native_json(&r, &mut out, send, None).unwrap();
+        let got: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(got, document(&r, send));
+    }
+    let mut out = Vec::new();
+    results::write_native_json(
+        &r,
+        &mut out,
+        Some(1),
+        Some(results::NativeJsonMetadata {
+            commit: 7,
+            dataset_id: "dataset",
+        }),
+    )
+    .unwrap();
+    let got: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let mut want = document(&r, Some(1));
+    want["meta"]["commit"] = 7.into();
+    want["meta"]["datasetId"] = "dataset".into();
+    want["meta"]["timing"] = got["meta"]["timing"].clone();
+    assert_eq!(got, want);
+    let timing = &got["meta"]["timing"];
+    let serialize_ms = timing["serializeMs"].as_f64().unwrap();
+    assert!(serialize_ms >= 0.0);
+    assert!((timing["totalMs"].as_f64().unwrap() - r.timing.total_ms - serialize_ms).abs() < 1e-9);
+}
+
+#[test]
+fn native_json_streaming_stops_on_writer_error_and_cancel() {
+    use crate::error::Error;
+    use std::io::{self, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Sink {
+        bytes: Vec<u8>,
+        fail_after: Option<usize>,
+        cancel: Option<Arc<AtomicBool>>,
+    }
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let left = self.fail_after.map_or(usize::MAX, |n| n - self.bytes.len());
+            if left == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "receiver dropped",
+                ));
+            }
+            let n = buf.len().min(2).min(left);
+            self.bytes.extend_from_slice(&buf[..n]);
+            if self.bytes.len() >= 1024
+                && let Some(cancel) = &self.cancel
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let s = Store::in_memory(StoreOptions::default());
+    let literal = serde_json::to_string(&"\n".repeat(40_000)).unwrap();
+    let mut r = q(
+        &s,
+        &format!("SELECT ?o WHERE {{ VALUES ?o {{ {literal} }} }}"),
+    );
+    // The inaccessible second row is a sentinel: eager preparation would decode it
+    // before the writer sees any bytes and panic. A failed/cancelled sink must stop
+    // in the first row instead. This deliberately modifies a test-only table.
+    r.table.len = 2;
+    let mut sink = Sink {
+        bytes: Vec::new(),
+        fail_after: Some(128),
+        cancel: None,
+    };
+    let error = results::write_native_json(&r, &mut sink, None, None).unwrap_err();
+    assert!(matches!(error, Error::Io(e) if e.kind() == io::ErrorKind::BrokenPipe));
+    assert_eq!(sink.bytes.len(), 128);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let sink = Sink {
+        bytes: Vec::new(),
+        fail_after: None,
+        cancel: Some(cancel.clone()),
+    };
+    let mut w = results::LimitedWriter::new(sink, None, Some(cancel));
+    let error =
+        results::write_solutions(&r, results::SolutionsFormat::Sparkles, &mut w, None).unwrap_err();
+    assert!(matches!(w.classify(error), Error::Cancelled));
+    assert!((1024..=65_536).contains(&w.written()));
+}
+
+#[test]
 fn result_formats() {
     let s = store();
     let r = q(&s, "SELECT ?n WHERE { ex:carol foaf:name ?n }");
@@ -1476,6 +1619,107 @@ fn cached_results_obey_the_row_budget() {
         "{:?}",
         r.err()
     );
+}
+
+#[test]
+fn construct_budgets_count_decoded_literals_and_template_fanout() {
+    use crate::error::{BudgetKind, Error};
+    let s = Store::in_memory(StoreOptions::default());
+    let literal = "x".repeat(4096);
+    let where_clause = format!("WHERE {{ VALUES ?o {{ \"{literal}\" }} }}");
+    let opts = QueryOptions {
+        max_memory_bytes: Some(1024),
+        ..Default::default()
+    };
+    // The one-row ID table fits; retaining two decoded graph copies does not.
+    assert_eq!(
+        query(s.snapshot(), &format!("SELECT ?o {where_clause}"), &opts)
+            .unwrap()
+            .len(),
+        1
+    );
+    for template in ["<urn:s> <urn:p> ?o", "GRAPH <urn:g> { <urn:s> <urn:p> ?o }"] {
+        let text = format!("CONSTRUCT {{ {template} }} {where_clause}");
+        assert!(matches!(
+            query(s.snapshot(), &text, &opts),
+            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+        ));
+        let full = query(s.snapshot(), &text, &QueryOptions::default()).unwrap();
+        assert_eq!(full.len(), 1);
+        assert!(full.mem_peak_bytes > literal.len() as u64 * 2);
+    }
+
+    // One input solution can emit many distinct rows, across both graph kinds.
+    let triples: String = (0..20).map(|i| format!("?s <urn:p{i}> 1 . ")).collect();
+    for template in [triples.clone(), format!("GRAPH <urn:g> {{ {triples} }}")] {
+        let text = format!("CONSTRUCT {{ {template} }} WHERE {{ VALUES ?s {{ <urn:s> }} }}");
+        let full = query(s.snapshot(), &text, &QueryOptions::default()).unwrap();
+        assert_eq!(full.len(), 20);
+        for (opts, kind) in [
+            (
+                QueryOptions {
+                    max_rows: Some(8),
+                    ..Default::default()
+                },
+                BudgetKind::Rows,
+            ),
+            (
+                QueryOptions {
+                    max_rows_produced: Some(8),
+                    ..Default::default()
+                },
+                BudgetKind::RowsProduced,
+            ),
+        ] {
+            assert!(matches!(
+                query(s.snapshot(), &text, &opts),
+                Err(Error::BudgetExceeded(b)) if b.kind == kind
+            ));
+        }
+    }
+    // Failed graph assembly does not leak its charges into another query.
+    assert_eq!(
+        query(
+            s.snapshot(),
+            "CONSTRUCT { <urn:s> <urn:p> 1 } WHERE {}",
+            &opts
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn construct_checks_cancellation_after_where_execution() {
+    use crate::error::Error;
+    use std::sync::atomic::Ordering;
+    let s = Store::in_memory(StoreOptions::default());
+    let r = query(
+        s.snapshot(),
+        "SELECT ?s WHERE { VALUES ?s { <urn:s> } }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let Query::Construct { template, .. } = parse_query(
+        "CONSTRUCT { ?s <urn:p> 1 } WHERE { VALUES ?s { <urn:s> } }",
+        None,
+        &[],
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    r.ctx.cancel.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        construct(&r.ctx, &r.table, &template, &[]),
+        Err(Error::Cancelled)
+    ));
+    let mut ctx = Ctx::new(s.snapshot());
+    ctx.deadline = Some(Instant::now() - Duration::from_secs(1));
+    assert!(matches!(
+        construct(&ctx, &Table::unit(), &template, &[]),
+        Err(Error::Timeout)
+    ));
 }
 
 #[test]

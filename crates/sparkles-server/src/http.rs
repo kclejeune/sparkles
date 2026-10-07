@@ -1241,7 +1241,10 @@ pub(crate) async fn run_query(
         geo_work: crate::geo::plan_work(&r.plan),
         ..Default::default()
     };
+    // The repeatable serializer owns and borrows the immutable result on each
+    // attempt; a bounded trial can retry without cloning its tables.
     let dataset_id = ds.store.dataset_id().to_string();
+    let attempted_ms = std::cell::Cell::new(0.0);
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let ts = std::time::Instant::now();
         let written = if thrift {
@@ -1257,28 +1260,32 @@ pub(crate) async fn run_query(
                 send,
                 &prefixes,
                 seq,
-                dataset_id,
+                &dataset_id,
             )
         };
         // phase spans once serialization has ended (the request span is current here)
-        crate::otel::query_done(t0, &r, ts.elapsed().as_secs_f64() * 1000.0);
+        attempted_ms.set(attempted_ms.get() + ts.elapsed().as_secs_f64() * 1000.0);
+        if !w.get_ref().deferred() {
+            crate::otel::query_done(t0, &r, attempted_ms.get());
+        }
         written
     };
     // weak: the serializer thread must not keep the server state (and its stores' locks)
     // alive after the response
     let (metrics_st, name) = (Arc::downgrade(&st), ds.name.clone());
-    // a small result of a query run in place is serialized in place too
+    let on_stream_end = move |end: stream::StreamEnd| {
+        if let Some(st) = metrics_st.upgrade() {
+            st.metrics
+                .add_response_bytes(Some(&name), Op::Query, end.bytes);
+        }
+        stream_end_log("query", &end);
+    };
+    // Try small answers in place; actual encoded bytes decide whether the answer
+    // must switch to the blocking serializer, even with very few result cells.
     let body = if in_place && cells <= inline::QUICK_RESULT_CELLS {
-        stream::serialize_now(limit, write)?
+        stream::serialize_quick(limit, write, on_stream_end).await?
     } else {
-        stream::serialize(limit, write, move |end| {
-            if let Some(st) = metrics_st.upgrade() {
-                st.metrics
-                    .add_response_bytes(Some(&name), Op::Query, end.bytes);
-            }
-            stream_end_log("query", &end);
-        })
-        .await?
+        stream::serialize(limit, write, on_stream_end).await?
     };
     let (body, report) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
@@ -1331,23 +1338,18 @@ fn serialize_result(
     send: Option<usize>,
     prefixes: &std::collections::BTreeMap<String, String>,
     seq: u64,
-    dataset_id: String,
+    dataset_id: &str,
 ) -> sparkles::Result<()> {
     if sparkles_doc {
-        // Build the document once, then patch the serialization time into it.
-        let ts = std::time::Instant::now();
-        let mut doc = results::sparkles_json(r, send);
-        let ser_ms = ts.elapsed().as_secs_f64() * 1000.0;
-        if let Some(timing) = doc.pointer_mut("/meta/timing").and_then(J::as_object_mut) {
-            let total = timing.get("totalMs").and_then(J::as_f64).unwrap_or(0.0);
-            timing.insert("serializeMs".into(), ser_ms.into());
-            timing.insert("totalMs".into(), (total + ser_ms).into());
-        }
-        if let Some(meta) = doc.pointer_mut("/meta").and_then(J::as_object_mut) {
-            meta.insert("commit".into(), seq.into());
-            meta.insert("datasetId".into(), dataset_id.into());
-        }
-        serde_json::to_writer(w, &doc).map_err(|e| Error::Io(e.into()))
+        results::write_native_json(
+            r,
+            w,
+            send,
+            Some(results::NativeJsonMetadata {
+                commit: seq,
+                dataset_id,
+            }),
+        )
     } else if is_graph {
         match rfmt {
             OutFormat::Rdf(f) => results::write_graph(r, f, prefixes, w),

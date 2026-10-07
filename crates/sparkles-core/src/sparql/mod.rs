@@ -71,13 +71,15 @@ pub struct QueryOptions {
     /// protocol `named-graph-uri` (overrides FROM NAMED)
     pub named_graph_uris: Vec<String>,
     pub base_iri: Option<String>,
+    /// Maximum rows in an intermediate table or distinct CONSTRUCT graph output.
     pub max_rows: Option<usize>,
-    /// Budget for the estimated memory of intermediate results (`None`: unlimited);
+    /// Budget for the estimated memory of intermediate results and retained CONSTRUCT
+    /// output (`None`: unlimited);
     /// exceeding it fails with [`Error::BudgetExceeded`].
     pub max_memory_bytes: Option<u64>,
-    /// Budget for the rows all operators of a query produce together (`None`:
-    /// unlimited); exceeding it fails with [`Error::BudgetExceeded`]. An update's WHERE
-    /// clauses share one count.
+    /// Budget for the rows all operators of a query produce together, including
+    /// distinct CONSTRUCT output (`None`: unlimited); exceeding it fails with
+    /// [`Error::BudgetExceeded`]. An update's WHERE clauses share one count.
     pub max_rows_produced: Option<u64>,
     pub allow_service: bool,
     /// Refuse SERVICE with [`Error::NotPermitted`] (the caller lacks the permission;
@@ -259,9 +261,11 @@ pub struct QueryResult {
     pub quads: Vec<Quad>,
     pub plan: PlanInfo,
     pub timing: Timing,
-    /// Peak estimated memory of intermediate results (see [`QueryOptions::max_memory_bytes`]).
+    /// Peak estimated memory of intermediate results and CONSTRUCT output (see
+    /// [`QueryOptions::max_memory_bytes`]).
     pub mem_peak_bytes: u64,
-    /// Rows produced by all operators (see [`QueryOptions::max_rows_produced`]).
+    /// Rows produced by all operators and distinct CONSTRUCT output (see
+    /// [`QueryOptions::max_rows_produced`]).
     pub rows_produced: u64,
     /// DESCRIBE: the result stopped at [`describe::DescribeOptions::max_triples`]
     pub describe_truncated: bool,
@@ -655,7 +659,7 @@ fn execute_parsed(
             graph_templates,
             ..
         } => {
-            (result.triples, result.quads) = construct(&ctx, &table, template, graph_templates);
+            (result.triples, result.quads) = construct(&ctx, &table, template, graph_templates)?;
         }
         Query::Describe { .. } => {
             // a dataset the query or the protocol gave, or the inference overlay
@@ -758,13 +762,42 @@ fn construct(
     t: &Table,
     template: &[TriplePattern],
     graphs: &[GraphTemplate],
-) -> (Vec<Triple>, Vec<Quad>) {
+) -> Result<(Vec<Triple>, Vec<Quad>)> {
+    ctx.check()?;
+    // The WHERE table stays live while decoded graph terms and their duplicate
+    // sets are built. Unlike ID tables, giant literals need their lexical bytes
+    // counted, and a template can emit many graph rows per input solution.
+    let held = ctx.charge(t.mem_bytes())?;
     let map = t.var_map(ctx.nvars());
     let mut seen = FxHashSet::default();
     let mut out = Vec::new();
     let mut seen_quads = FxHashSet::default();
     let mut quads = Vec::new();
+    let emit = |tr: Triple,
+                out: &mut Vec<Triple>,
+                seen: &mut FxHashSet<Triple>,
+                other: usize|
+     -> Result<()> {
+        if !seen.contains(&tr) {
+            ctx.check_rows(out.len().saturating_add(other).saturating_add(1))?;
+            ctx.produced(1)?;
+            // Two retained copies (output and set), plus container overhead.
+            held.add(graph_triple_bytes(&tr).saturating_mul(2).saturating_add(64))?;
+            seen.insert(tr.clone());
+            out.push(tr);
+        }
+        Ok(())
+    };
+    let mut work = 0usize;
+    let mut check = || -> Result<()> {
+        work = work.wrapping_add(1);
+        if work & 1023 == 0 {
+            ctx.check()?;
+        }
+        Ok(())
+    };
     for i in 0..t.len() {
+        check()?;
         let mut bnodes: FxHashMap<String, BlankNode> = FxHashMap::default();
         let inst = |tp: &TermPattern, bnodes: &mut FxHashMap<String, BlankNode>| -> Option<Term> {
             instantiate(
@@ -802,13 +835,13 @@ fn construct(
             Some(Triple::new(s, p, o))
         };
         for tp in template {
-            if let Some(tr) = triple(tp, &mut bnodes)
-                && seen.insert(tr.clone())
-            {
-                out.push(tr);
+            check()?;
+            if let Some(tr) = triple(tp, &mut bnodes) {
+                emit(tr, &mut out, &mut seen, quads.len())?;
             }
         }
         for g in graphs {
+            check()?;
             let name = match inst(&g.name, &mut bnodes) {
                 Some(Term::NamedNode(n))
                     if n.as_str() == ctx::DEFAULT_GRAPH_IRI
@@ -821,23 +854,53 @@ fn construct(
                 _ => continue,
             };
             for tp in &g.triples {
+                check()?;
                 let Some(tr) = triple(tp, &mut bnodes) else {
                     continue;
                 };
                 if name == GraphName::DefaultGraph {
-                    if seen.insert(tr.clone()) {
-                        out.push(tr);
-                    }
+                    emit(tr, &mut out, &mut seen, quads.len())?;
                 } else {
+                    let bytes = graph_triple_bytes(&tr).saturating_add(match &name {
+                        GraphName::NamedNode(n) => 64 + n.as_str().len() as u64,
+                        GraphName::BlankNode(b) => 64 + b.as_str().len() as u64,
+                        GraphName::DefaultGraph => 0,
+                    });
                     let q = tr.in_graph(name.clone());
-                    if seen_quads.insert(q.clone()) {
+                    if !seen_quads.contains(&q) {
+                        ctx.check_rows(out.len().saturating_add(quads.len()).saturating_add(1))?;
+                        ctx.produced(1)?;
+                        held.add(bytes.saturating_mul(2).saturating_add(64))?;
+                        seen_quads.insert(q.clone());
                         quads.push(q);
                     }
                 }
             }
         }
     }
-    (out, quads)
+    ctx.check()?;
+    Ok((out, quads))
+}
+
+/// Conservative retained term estimate for graph output, including RDF-star
+/// components and literal payloads. Terms already decoded here need no validation
+/// or additional clones just to estimate their memory.
+fn graph_triple_bytes(t: &Triple) -> u64 {
+    fn term(t: oxrdf::TermRef<'_>) -> u64 {
+        use oxrdf::TermRef;
+        let payload = match t {
+            TermRef::NamedNode(n) => n.as_str().len() as u64,
+            TermRef::BlankNode(b) => b.as_str().len() as u64,
+            TermRef::Literal(l) => (l.value().len() as u64)
+                .saturating_add(l.datatype().as_str().len() as u64)
+                .saturating_add(l.language().map_or(0, |s| s.len() as u64)),
+            TermRef::Triple(t) => graph_triple_bytes(t),
+        };
+        64u64.saturating_add(payload)
+    }
+    term(t.subject.as_ref().into())
+        .saturating_add(term(t.predicate.as_ref().into()))
+        .saturating_add(term(t.object.as_ref()))
 }
 
 #[cfg(test)]

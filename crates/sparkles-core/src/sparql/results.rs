@@ -5,6 +5,8 @@ use crate::error::{Budget, BudgetKind, Error, Result};
 use crate::id::{Id, Tag};
 use oxrdf::{Term, Variable};
 use oxrdfio::{RdfFormat, RdfSerializer};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
 use serde_json::{Value as J, json};
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use std::borrow::Cow;
@@ -12,6 +14,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SolutionsFormat {
@@ -77,8 +80,12 @@ pub fn rdf_format_from_name(s: &str) -> Option<RdfFormat> {
         "application/n-quads" | "nquads" | "nq" => RdfFormat::NQuads,
         "application/trig" | "trig" => RdfFormat::TriG,
         "application/rdf+xml" | "rdfxml" | "xml" => RdfFormat::RdfXml,
-        "application/ld+json" | "jsonld" | "json-ld" => RdfFormat::JsonLd {
+        "application/ld+json" => return crate::io::format_for_media_type(s),
+        "jsonld" | "json-ld" => RdfFormat::JsonLd {
             profile: oxrdfio::JsonLdProfileSet::empty(),
+        },
+        "jsonld-streaming" | "json-ld-streaming" => RdfFormat::JsonLd {
+            profile: oxrdfio::JsonLdProfile::Streaming.into(),
         },
         _ => return None,
     })
@@ -132,6 +139,11 @@ impl<W: Write> LimitedWriter<W> {
     /// Bytes written so far.
     pub fn written(&self) -> u64 {
         self.written
+    }
+
+    /// Inspect the underlying writer without consuming it.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
     }
 
     /// An error of a serializer writing through this adapter: caused by the limit ->
@@ -214,8 +226,7 @@ pub fn write_solutions(
     send: Option<usize>,
 ) -> Result<()> {
     if fmt == SolutionsFormat::Sparkles {
-        serde_json::to_writer(&mut w, &sparkles_json(r, send)).map_err(|e| Error::Io(e.into()))?;
-        return Ok(());
+        return write_native_json(r, w, send, None);
     }
     let f = match fmt {
         SolutionsFormat::Json => QueryResultsFormat::Json,
@@ -482,6 +493,240 @@ pub fn write_jena_graph(
     }
     out.finish().map_err(io)?;
     Ok(())
+}
+
+/// Extra metadata for an HTTP native response. Its timing includes serialization
+/// through the result rows; metadata is written last so that no document must be
+/// retained just to patch the timing.
+pub struct NativeJsonMetadata<'a> {
+    pub commit: u64,
+    pub dataset_id: &'a str,
+}
+
+/// Write the rich native result without building an intermediate JSON document.
+/// SELECT decodes one cell at a time; graph results and plan metadata are borrowed.
+/// The query's underlying result tables/graphs are already materialized.
+pub fn write_native_json(
+    r: &QueryResult,
+    w: impl Write,
+    send: Option<usize>,
+    metadata: Option<NativeJsonMetadata<'_>>,
+) -> Result<()> {
+    let n = send.map_or(r.len(), |s| s.min(r.len()));
+    serde_json::to_writer(
+        w,
+        &NativeJson {
+            r,
+            n,
+            metadata,
+            started: Instant::now(),
+        },
+    )
+    .map_err(|e| Error::Io(e.into()))
+}
+
+struct NativeJson<'a> {
+    r: &'a QueryResult,
+    n: usize,
+    metadata: Option<NativeJsonMetadata<'a>>,
+    started: Instant,
+}
+
+impl Serialize for NativeJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let r = self.r;
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("queryType", &r.kind)?;
+        match r.kind {
+            QueryKind::Select => {
+                map.serialize_entry("vars", &r.vars)?;
+                map.serialize_entry("rows", &NativeRows { r, n: self.n })?;
+            }
+            QueryKind::Ask => map.serialize_entry("boolean", &r.boolean)?,
+            _ => {
+                map.serialize_entry(
+                    "triples",
+                    &NativeGraphRows::Triples(&r.triples[..self.n.min(r.triples.len())]),
+                )?;
+                if !r.quads.is_empty() {
+                    let n = self.n.saturating_sub(r.triples.len()).min(r.quads.len());
+                    map.serialize_entry("quads", &NativeGraphRows::Quads(&r.quads[..n]))?;
+                }
+            }
+        }
+        let mut timing = r.timing.clone();
+        if self.metadata.is_some() {
+            timing.serialize_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+            timing.total_ms += timing.serialize_ms;
+        }
+        map.serialize_entry(
+            "meta",
+            &NativeMeta {
+                total_rows: r.len(),
+                sent_rows: self.n,
+                timing: &timing,
+                plan: &r.plan,
+                memory: NativeMemory {
+                    peak_bytes: r.mem_peak_bytes,
+                },
+                rows_produced: r.rows_produced,
+                commit: self.metadata.as_ref().map(|m| m.commit),
+                dataset_id: self.metadata.as_ref().map(|m| m.dataset_id),
+            },
+        )?;
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeMeta<'a> {
+    total_rows: usize,
+    sent_rows: usize,
+    timing: &'a super::Timing,
+    plan: &'a super::PlanInfo,
+    memory: NativeMemory,
+    rows_produced: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dataset_id: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeMemory {
+    peak_bytes: u64,
+}
+
+struct NativeRows<'a> {
+    r: &'a QueryResult,
+    n: usize,
+}
+
+impl Serialize for NativeRows<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.n))?;
+        for i in 0..self.n {
+            seq.serialize_element(&NativeRow { r: self.r, i })?;
+        }
+        seq.end()
+    }
+}
+
+struct NativeRow<'a> {
+    r: &'a QueryResult,
+    i: usize,
+}
+
+impl Serialize for NativeRow<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.r.table.width()))?;
+        for col in &self.r.table.cols {
+            let term = self.r.term(col[self.i]);
+            seq.serialize_element(&term.as_ref().map(|t| NativeTerm(t.as_ref())))?;
+        }
+        seq.end()
+    }
+}
+
+enum NativeGraphRows<'a> {
+    Triples(&'a [oxrdf::Triple]),
+    Quads(&'a [oxrdf::Quad]),
+}
+
+impl Serialize for NativeGraphRows<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(match self {
+            Self::Triples(rows) => rows.len(),
+            Self::Quads(rows) => rows.len(),
+        }))?;
+        match self {
+            Self::Triples(rows) => {
+                for row in *rows {
+                    let t = row.as_ref();
+                    seq.serialize_element(&[
+                        NativeTerm(t.subject.into()),
+                        NativeTerm(t.predicate.into()),
+                        NativeTerm(t.object),
+                    ])?;
+                }
+            }
+            Self::Quads(rows) => {
+                for row in *rows {
+                    let q = row.as_ref();
+                    let graph = match q.graph_name {
+                        oxrdf::GraphNameRef::NamedNode(n) => Some(NativeTerm(n.into())),
+                        oxrdf::GraphNameRef::BlankNode(b) => Some(NativeTerm(b.into())),
+                        oxrdf::GraphNameRef::DefaultGraph => None,
+                    };
+                    seq.serialize_element(&[
+                        Some(NativeTerm(q.subject.into())),
+                        Some(NativeTerm(q.predicate.into())),
+                        Some(NativeTerm(q.object)),
+                        graph,
+                    ])?;
+                }
+            }
+        }
+        seq.end()
+    }
+}
+
+struct NativeTerm<'a>(oxrdf::TermRef<'a>);
+
+impl Serialize for NativeTerm<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use oxrdf::TermRef;
+        let mut map = s.serialize_map(None)?;
+        match self.0 {
+            TermRef::NamedNode(n) => {
+                map.serialize_entry("type", "uri")?;
+                map.serialize_entry("value", n.as_str())?;
+            }
+            TermRef::BlankNode(b) => {
+                map.serialize_entry("type", "bnode")?;
+                map.serialize_entry("value", b.as_str())?;
+            }
+            TermRef::Literal(l) => {
+                map.serialize_entry("type", "literal")?;
+                map.serialize_entry("value", l.value())?;
+                if let Some(lang) = l.language() {
+                    map.serialize_entry("xml:lang", lang)?;
+                    if let Some(d) = l.direction() {
+                        map.serialize_entry(
+                            "its:dir",
+                            match d {
+                                oxrdf::BaseDirection::Ltr => "ltr",
+                                oxrdf::BaseDirection::Rtl => "rtl",
+                            },
+                        )?;
+                    }
+                } else if l.datatype() != oxrdf::vocab::xsd::STRING {
+                    map.serialize_entry("datatype", l.datatype().as_str())?;
+                }
+            }
+            TermRef::Triple(t) => {
+                #[derive(Serialize)]
+                struct TripleValue<'a> {
+                    subject: NativeTerm<'a>,
+                    predicate: NativeTerm<'a>,
+                    object: NativeTerm<'a>,
+                }
+                let t = t.as_ref();
+                map.serialize_entry("type", "triple")?;
+                map.serialize_entry(
+                    "value",
+                    &TripleValue {
+                        subject: NativeTerm(t.subject.into()),
+                        predicate: NativeTerm(t.predicate.into()),
+                        object: NativeTerm(t.object),
+                    },
+                )?;
+            }
+        }
+        map.end()
+    }
 }
 
 pub fn term_json(t: &Term) -> J {
