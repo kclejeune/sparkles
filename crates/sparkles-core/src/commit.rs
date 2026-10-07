@@ -1014,7 +1014,8 @@ impl Catalog {
         crate::store::write_synced(path, &buf)
     }
 
-    /// Append a commit (called with the writer lock held, after the commit is durable).
+    /// Append a durable commit, in sequence order under the catalog mutex.
+    /// Publication is serialized by the writer or the opt-in prefix coordinator.
     /// A file error is logged and retried with the next append; it never fails the commit.
     pub fn append(&mut self, c: CommitInfo) {
         if c.default_graph {

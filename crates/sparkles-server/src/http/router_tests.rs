@@ -28,6 +28,7 @@ mod fuseki;
 mod geo;
 #[cfg(feature = "geo")]
 mod geo_convert;
+mod group_commit;
 mod inline;
 mod loads;
 #[cfg(feature = "mcp")]

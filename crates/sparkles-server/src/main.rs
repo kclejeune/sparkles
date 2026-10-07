@@ -139,6 +139,9 @@ struct Cli {
     /// journal commit, which on ext4 and XFS takes a fraction of the time
     #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_WAL_PREALLOC_BYTES >> 10)]
     wal_prealloc_kb: u64,
+    /// Experimental durable grouping of concurrent ordinary WAL commits
+    #[arg(long, global = true, hide = true)]
+    experimental_group_commit: bool,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
@@ -1792,6 +1795,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         max_prefixes: cli.max_prefixes,
         commit_digests: cli.commit_digests,
         wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
+        experimental_group_commit: cli.experimental_group_commit,
         change_log: !cli.no_change_log,
         change_log_max_bytes: cli.change_log_mb << 20,
         ..Default::default()
@@ -4552,4 +4556,27 @@ fn print_table(
     }
     tools::table::write_table(&r.vars, &r.rows(), &store.prefixes(), out)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod experimental_group_options_tests {
+    use super::*;
+    #[test]
+    fn durable_grouping_requires_explicit_cli_opt_in() {
+        // The complete CLI parser needs the same stack as the server workers,
+        // rather than the test harness's smaller default thread stack.
+        std::thread::Builder::new()
+            .stack_size(THREAD_STACK)
+            .spawn(|| {
+                let ordinary = Cli::try_parse_from(["sparkles", "serve"]).unwrap();
+                assert!(!store_opts(&ordinary).experimental_group_commit);
+                let grouped =
+                    Cli::try_parse_from(["sparkles", "--experimental-group-commit", "serve"])
+                        .unwrap();
+                assert!(store_opts(&grouped).experimental_group_commit);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }

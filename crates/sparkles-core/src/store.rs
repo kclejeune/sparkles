@@ -27,6 +27,7 @@ mod describe;
 mod diff;
 mod embed;
 mod geo;
+mod group;
 mod history_query;
 mod link;
 mod mem_history;
@@ -936,6 +937,9 @@ pub struct StoreOptions {
     /// its last commit ends: replay, readers and backups stop at the first zero
     /// record, and an open truncates the zero tail.
     pub wal_prealloc_bytes: u64,
+    /// Experimental durable prefix grouping for ordinary persistent WAL writes.
+    /// Off by default; unsupported operations drain and use the ordinary commit path.
+    pub experimental_group_commit: bool,
     /// Record each commit's net changes in the change log ([`ChangeLog`]), which history
     /// queries read and which outlives compactions. A dataset's `changelog.json` can
     /// turn it off or on.
@@ -995,6 +999,7 @@ impl Default for StoreOptions {
             vector_files: true,
             commit_digests: false,
             wal_prealloc_bytes: DEFAULT_WAL_PREALLOC_BYTES,
+            experimental_group_commit: false,
             change_log: true,
             change_log_max_bytes: DEFAULT_CHANGE_LOG_MAX_BYTES,
             change_log_segment_bytes: 16 << 20,
@@ -1012,10 +1017,15 @@ struct WriterState {
     /// the WAL file's length: past `wal_len` it holds preallocated zero bytes
     wal_alloc: u64,
     next_bnode: u64,
-    /// the latest commit
+    /// Latest admitted commit; speculative only while `staged` exists.
+    /// General writer admission drains before exposing it as durable metadata.
     head: CommitInfo,
     /// a WAL or generation write failed after a commit started: refuse further writes
     poisoned: bool,
+    /// Reused only for commits introducing persisted vocabulary entries.
+    vocab_sync: crate::vocab::LazySync,
+    /// Private speculative state: readers and receipts only see the synced prefix.
+    staged: Option<Arc<Snapshot>>,
     /// the store is being dropped: a backup lease released later must not collect
     closed: bool,
     /// while a compaction runs: each commit's changes, for it to carry over
@@ -1080,6 +1090,7 @@ type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 pub struct Store {
     root: Option<PathBuf>,
     opts: StoreOptions,
+    group: Option<Box<group::Coordinator>>,
     // `current`, `writer`, `catalog`, `clock` and `history` are shared (weakly) with
     // backup lease guards, whose drop collects history without a `&Store`
     current: Arc<ArcSwap<Snapshot>>,
@@ -1226,6 +1237,7 @@ impl Store {
         let changelog = Some(ChangeLog::memory(dataset_id, limits));
         let store = Store {
             root: None,
+            group: None,
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
                 dataset_id,
                 generation: gen_,
@@ -1252,6 +1264,8 @@ impl Store {
                 next_bnode,
                 head: root,
                 poisoned: false,
+                vocab_sync: Default::default(),
+                staged: None,
                 closed: false,
                 tap: None,
             })),
@@ -1558,6 +1572,9 @@ impl Store {
         }
         let store = Store {
             root: Some(root.to_path_buf()),
+            group: opts
+                .experimental_group_commit
+                .then(|| Box::new(group::Coordinator::default())),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
                 dataset_id: branching
                     .ident
@@ -1587,6 +1604,8 @@ impl Store {
                 next_bnode,
                 head,
                 poisoned: false,
+                vocab_sync: Default::default(),
+                staged: None,
                 closed: false,
                 tap: None,
             })),
@@ -2945,7 +2964,9 @@ impl Store {
 
     fn guarded_writer(&self) -> MutexGuard<'_, WriterState> {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
-        self.writer.lock()
+        let mut w = self.writer.lock();
+        self.drain_group(&mut w, None).ok();
+        w
     }
 
     /// Current read snapshot.
@@ -3073,7 +3094,11 @@ impl Store {
     /// [`write_as`](Self::write_as) with options for the write guard.
     pub fn write_with(&self, kind: CommitKind, opts: crate::guard::WriteOptions) -> WriteTxn<'_> {
         let waiting = Waiting::new(&self.writers_waiting);
-        let guard = self.guarded_writer();
+        crate::sparql::extensions::assert_family(self.owner_dataset_id());
+        let mut guard = self.writer.lock();
+        if !self.group_admission(kind, &opts, &guard) {
+            self.drain_group(&mut guard, None).ok();
+        }
         drop(waiting);
         self.begin(guard, kind, opts)
     }
@@ -3092,13 +3117,17 @@ impl Store {
         kind: CommitKind,
         opts: crate::guard::WriteOptions,
     ) -> Result<WriteTxn<'_>> {
-        let guard = self.lock_writer(&opts)?;
+        let mut guard = self.raw_writer(&opts)?;
+        if !self.group_admission(kind, &opts, &guard) {
+            self.drain_group(&mut guard, Some(&opts))?;
+        }
+        self.check_write_options(&opts)?;
         Ok(self.begin(guard, kind, opts))
     }
 
     /// The writer lock, waited for in slices while `o` can be cancelled or time out.
     /// Then the write's precondition, if it has one, is checked on the head snapshot.
-    fn lock_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
+    fn raw_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         let w = {
             // counted while it waits, so a long holder of the lock can give way
@@ -3107,7 +3136,7 @@ impl Store {
                 o.check()?;
                 self.writer.try_lock().ok_or(Error::WriterBusy)?
             } else if o.cancel.is_none() && o.deadline.is_none() {
-                self.guarded_writer()
+                self.writer.lock()
             } else {
                 loop {
                     o.check()?;
@@ -3120,6 +3149,17 @@ impl Store {
                 }
             }
         };
+        Ok(w)
+    }
+
+    fn lock_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
+        let mut w = self.raw_writer(o)?;
+        self.drain_group(&mut w, Some(o))?;
+        self.check_write_options(o)?;
+        Ok(w)
+    }
+
+    fn check_write_options(&self, o: &crate::guard::WriteOptions) -> Result<()> {
         // a dry run reports the precondition with the rest of its preview
         if let Some(p) = &o.precondition
             && o.dry_run.is_none()
@@ -3129,7 +3169,53 @@ impl Store {
         if let Some(m) = &o.message {
             crate::annotations::validate_message(m)?;
         }
-        Ok(w)
+        Ok(())
+    }
+
+    fn drain_group(
+        &self,
+        w: &mut WriterState,
+        o: Option<&crate::guard::WriteOptions>,
+    ) -> Result<()> {
+        if let Some(group) = &self.group {
+            if let Err(e) = group.drain(self, o) {
+                if group.failed() {
+                    w.poisoned = true;
+                    let durable = self.current.load().commit;
+                    if let Some(head) = self.catalog.lock().get(durable) {
+                        w.head = head;
+                    }
+                    w.staged = None;
+                }
+                return Err(e);
+            }
+            w.staged = None;
+        }
+        Ok(())
+    }
+
+    fn group_admission(
+        &self,
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+        w: &WriterState,
+    ) -> bool {
+        self.group.is_some()
+            && !w.poisoned
+            && w.wal.is_some()
+            && w.tap.is_none()
+            && matches!(kind, CommitKind::Transaction | CommitKind::Update)
+            && !o.bypass_validation
+            && o.dry_run.is_none()
+            && o.message.is_none()
+            && o.precondition.is_none()
+            && o.graphs.is_none()
+            && !self.commit_digests()
+            && !self.guard_required()
+            && self.guard.read().is_none()
+            && self.text.load().is_none()
+            && self.geo.load().is_none()
+            && self.embed.works.lock().is_empty()
     }
 
     /// What stops a rebuild into `dir` early: the write's cancellation and deadline, and
@@ -3201,7 +3287,7 @@ impl Store {
         kind: CommitKind,
         opts: crate::guard::WriteOptions,
     ) -> WriteTxn<'a> {
-        let base = self.snapshot();
+        let base = guard.staged.clone().unwrap_or_else(|| self.snapshot());
         let mark = base.generation.dvocab.mark();
         let start_bnode = guard.next_bnode;
         WriteTxn {
@@ -3211,7 +3297,7 @@ impl Store {
             base,
             mark,
             start_bnode,
-            guard,
+            guard: TxnGuard(Some(guard)),
             log: Vec::new(),
             bulk: Vec::new(),
             kind,
@@ -4217,13 +4303,27 @@ fn apply(delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
     }
 }
 
+struct TxnGuard<'a>(Option<MutexGuard<'a, WriterState>>);
+
+impl<'a> std::ops::Deref for TxnGuard<'a> {
+    type Target = MutexGuard<'a, WriterState>;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("transaction writer held")
+    }
+}
+impl std::ops::DerefMut for TxnGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("transaction writer held")
+    }
+}
+
 /// The single write transaction. Changes are invisible until [`commit`](Self::commit).
 pub struct WriteTxn<'s> {
     _callback_owner: crate::sparql::extensions::WriterOwner,
     store: &'s Store,
     base: Arc<Snapshot>,
     delta: Delta,
-    guard: MutexGuard<'s, WriterState>,
+    guard: TxnGuard<'s>,
     log: Vec<(u8, [Id; 4])>,
     /// large insert batches applied by rebuilding the generation on commit
     bulk: Vec<[Id; 4]>,
@@ -4722,8 +4822,20 @@ impl WriteTxn<'_> {
 
     fn commit_inner(mut self) -> Result<Receipt> {
         self._callback_owner.check()?;
-        if self.guard.poisoned {
+        if self.guard.poisoned || self.store.group.as_ref().is_some_and(|g| g.failed()) {
             return Err(Error::Poisoned);
+        }
+        let grouped = self.bulk.is_empty()
+            && !self.force
+            && self.merge.is_none()
+            && self.wal_bytes() <= group::MAX_BYTES
+            && self
+                .store
+                .group_admission(self.kind, &self.opts, &self.guard);
+        // A dependent no-op, preview, validation, bulk rebuild or other fallback
+        // cannot acknowledge or capture a speculative predecessor.
+        if !grouped || (self.net_ins == 0 && self.net_del == 0) {
+            self.store.drain_group(&mut self.guard, Some(&self.opts))?;
         }
         // a commit with a merge record (a merge, or a commit a merge replays) passes
         if (self.is_dirty() || self.force) && self.merge.is_none() {
@@ -4749,6 +4861,12 @@ impl WriteTxn<'_> {
                 &self.opts,
                 head,
             )?;
+            if grouped && validation.is_none() {
+                return self.publish_grouped();
+            }
+            if grouped {
+                self.store.drain_group(&mut self.guard, Some(&self.opts))?;
+            }
             return self.publish_log(validation);
         }
         // Build the new generation from this transaction's view (base + uncommitted delta)
@@ -4833,7 +4951,7 @@ impl WriteTxn<'_> {
             }
             self.store.failpoint("merge-recorded");
         }
-        let w = &mut *self.guard;
+        let w = &mut **self.guard;
         if let Some(wal) = w.wal.as_mut() {
             let mut data = Vec::with_capacity((self.log.len() + 1) * WAL_REC);
             let mut rec = [0u8; WAL_REC];
@@ -4862,7 +4980,7 @@ impl WriteTxn<'_> {
                     wal::write_commit(wal.get_ref(), w.wal_len, &mut w.wal_alloc, &data, prealloc)
                 })
                 .map_err(Error::from)
-                .and_then(|_| sync_commit(wal.get_ref(), &gen_.dvocab));
+                .and_then(|_| sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync));
             if let Err(e) = written {
                 w.poisoned = true;
                 let _ = self.store.annotations.lock().undo(c.seq);
@@ -5202,8 +5320,14 @@ impl Collector {
         };
         // the store's drop marks the writer closed under this lock, so the directory is
         // still this store's (and locked) while the collection runs
-        let Some(w) = writer.try_lock() else { return };
-        if w.closed {
+        let Some(mut w) = writer.try_lock() else {
+            return;
+        };
+        // A completed idle group needs no later write to resume collection.
+        if w.staged.is_some() && current.load().commit == w.head.seq {
+            w.staged = None;
+        }
+        if w.closed || w.staged.is_some() {
             return;
         }
         let now = match &*clock.lock() {
@@ -5235,6 +5359,9 @@ impl Drop for Store {
         {
             let mut w = self.guarded_writer();
             w.closed = true;
+            // Backup leases may retain WriterState after the store closes.
+            // Shut down the owned worker now, rather than with that last lease.
+            w.vocab_sync = Default::default();
             w.trim_wal();
         }
         if let Some(log) = &self.changelog
@@ -5328,6 +5455,25 @@ pub(crate) fn wal_point(
 /// durable without the terms it names: replay treats a last commit naming delta ids
 /// that `delta.vocab` lacks as a torn tail, like one whose checksum fails. The commit is
 /// acknowledged only after both syncs succeed, so no acknowledged commit is dropped.
+fn sync_commit_reused(
+    wal: &File,
+    dvocab: &DeltaVocab,
+    worker: &mut crate::vocab::LazySync,
+) -> Result<()> {
+    if !dvocab.needs_sync() {
+        return Ok(wal.sync_data()?);
+    }
+    let pending = dvocab.sync_on(worker);
+    let synced = wal.sync_data();
+    let vocab = match pending {
+        Some(pending) => pending.wait(),
+        None => dvocab.sync(),
+    };
+    // Always await both, including when WAL sync fails, before releasing ownership.
+    synced?;
+    vocab
+}
+
 fn sync_commit(wal: &File, dvocab: &DeltaVocab) -> Result<()> {
     if !dvocab.needs_sync() {
         return Ok(wal.sync_data()?);
@@ -5849,6 +5995,62 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
                 "{s} after reopen: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn vocabulary_worker_is_lazy_reused_and_generation_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        store.load(&[src()]).unwrap();
+        assert!(store.guarded_writer().vocab_sync.thread_id().is_none());
+        let commit = |s: &str, o: &str| {
+            let mut t = store.write();
+            let q = t
+                .encode_quad(&quad(s, "p", o), &mut Default::default())
+                .unwrap();
+            t.insert(q).unwrap();
+            t.commit().unwrap()
+        };
+        // Terms in the bulk-built base do not create the worker.
+        let mut t = store.write();
+        let q = t
+            .encode_quad(&quad("a", "p", "b"), &mut Default::default())
+            .unwrap();
+        t.insert(q).unwrap();
+        t.commit().unwrap();
+        assert!(store.guarded_writer().vocab_sync.thread_id().is_none());
+        commit("fresh1", "fresh-object1");
+        let id = store.guarded_writer().vocab_sync.thread_id().unwrap();
+        commit("fresh2", "fresh-object2");
+        assert_eq!(store.guarded_writer().vocab_sync.thread_id(), Some(id));
+        store.compact().unwrap();
+        commit("fresh3", "fresh-object3");
+        assert_eq!(store.guarded_writer().vocab_sync.thread_id(), Some(id));
+        let head = store.snapshot().commit;
+        let len = store.snapshot().len();
+        drop(store);
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(reopened.snapshot().commit, head);
+        assert_eq!(reopened.snapshot().len(), len);
+        assert!(reopened.guarded_writer().vocab_sync.thread_id().is_none());
+    }
+
+    #[test]
+    fn vocabulary_worker_spawn_failure_keeps_commits_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        store.guarded_writer().vocab_sync.fail_spawn = true;
+        let mut txn = store.write();
+        let q = txn
+            .encode_quad(&quad("s", "p", "o"), &mut Default::default())
+            .unwrap();
+        txn.insert(q).unwrap();
+        let receipt = txn.commit().unwrap();
+        assert!(store.guarded_writer().vocab_sync.thread_id().is_none());
+        drop(store);
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, receipt.commit.seq);
+        assert_eq!(store.snapshot().len(), 1);
     }
 
     #[test]

@@ -8,6 +8,9 @@
 //!   are in insertion order. Persisted as a length-prefixed log.
 //! * [`LocalVocab`] — per-query dictionary for computed terms.
 
+mod sync;
+pub(crate) use sync::{LazySync, PendingSync};
+
 use crate::error::Result;
 use memmap2::Mmap;
 use parking_lot::RwLock;
@@ -914,6 +917,7 @@ pub struct VocabMark {
     entries: u64,
     bytes: u64,
     unsynced: bool,
+    dirty_version: u64,
 }
 
 /// The persisted, append-only delta vocabulary (terms introduced by updates).
@@ -922,7 +926,7 @@ pub struct VocabMark {
 /// reader's snapshot remains valid while the writer appends.
 pub struct DeltaVocab {
     inner: RwLock<AppendVocab>,
-    file: Option<parking_lot::Mutex<DeltaFile>>,
+    file: Option<Arc<parking_lot::Mutex<DeltaFile>>>,
 }
 
 /// The append handle of a delta vocabulary file.
@@ -932,8 +936,73 @@ struct DeltaFile {
     len: u64,
     /// entries were appended since the last [`DeltaVocab::sync`]
     unsynced: bool,
+    /// Monotonic mutation version, including rollback; never restored from a mark.
+    dirty_version: u64,
+    version_exhausted: bool,
+    /// Serializes fences and destructive rollback, not append/mark/flush.
+    sync_gate: Arc<parking_lot::Mutex<()>>,
+    #[cfg(test)]
+    sync_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     fail_next_sync: bool,
+}
+
+impl DeltaFile {
+    fn dirty(&mut self) -> Result<()> {
+        self.unsynced = true;
+        match self.dirty_version.checked_add(1) {
+            Some(version) if !self.version_exhausted => self.dirty_version = version,
+            _ => {
+                self.version_exhausted = true;
+                return Err(
+                    std::io::Error::other("delta vocabulary dirty version exhausted").into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn sync(file: &Arc<parking_lot::Mutex<Self>>) -> Result<()> {
+        // Never acquire this gate while retaining the append mutex. Rollback uses
+        // the same order, so a captured prefix cannot be truncated under its fence.
+        let gate = file.lock().sync_gate.clone();
+        let _fence = gate.lock();
+        let (fd, version, end) = {
+            let mut f = file.lock();
+            if f.version_exhausted {
+                return Err(
+                    std::io::Error::other("delta vocabulary dirty version exhausted").into(),
+                );
+            }
+            if !f.unsynced {
+                return Ok(());
+            }
+            f.w.flush()?;
+            (f.w.get_ref().try_clone()?, f.dirty_version, f.len)
+        };
+        #[cfg(test)]
+        {
+            let (hook, failed) = {
+                let mut f = file.lock();
+                (f.sync_hook.clone(), std::mem::take(&mut f.fail_next_sync))
+            };
+            if let Some(hook) = hook {
+                hook();
+            }
+            if failed {
+                return Err(std::io::Error::other("injected sync failure").into());
+            }
+        }
+        // The exact descriptor keeps this generation alive. Subsequent appenders
+        // can proceed; syncing extra suffix bytes never publishes that suffix.
+        fd.sync_data()?;
+        let mut f = file.lock();
+        debug_assert!(f.len >= end, "rollback must serialize with prefix sync");
+        if f.dirty_version == version && !f.version_exhausted {
+            f.unsynced = false;
+        }
+        Ok(())
+    }
 }
 
 impl DeltaVocab {
@@ -997,13 +1066,18 @@ impl DeltaVocab {
         let len = f.metadata()?.len();
         Ok(DeltaVocab {
             inner: RwLock::new(v),
-            file: Some(parking_lot::Mutex::new(DeltaFile {
+            file: Some(Arc::new(parking_lot::Mutex::new(DeltaFile {
                 w: BufWriter::new(f),
                 len,
                 unsynced: false,
+                dirty_version: 0,
+                version_exhausted: false,
+                sync_gate: Arc::new(parking_lot::Mutex::new(())),
+                #[cfg(test)]
+                sync_hook: None,
                 #[cfg(test)]
                 fail_next_sync: false,
-            })),
+            }))),
         })
     }
 
@@ -1075,7 +1149,7 @@ impl DeltaVocab {
         let (id, new) = self.inner.write().insert(key);
         if new && let Some(f) = &self.file {
             let mut f = f.lock();
-            f.unsynced = true;
+            f.dirty()?;
             f.w.write_all(&(key.len() as u32).to_le_bytes())?;
             f.w.write_all(key)?;
             f.len += 4 + key.len() as u64;
@@ -1093,12 +1167,14 @@ impl DeltaVocab {
                     entries,
                     bytes: f.len,
                     unsynced: f.unsynced,
+                    dirty_version: f.dirty_version,
                 }
             }
             None => VocabMark {
                 entries,
                 bytes: 0,
                 unsynced: false,
+                dirty_version: 0,
             },
         }
     }
@@ -1107,6 +1183,10 @@ impl DeltaVocab {
     /// those ids). Entries still in the write buffer are dropped unwritten; when the
     /// buffer already spilled past the mark, the file is truncated back to it.
     pub fn rollback(&self, m: &VocabMark) -> Result<()> {
+        // Only destructive rollback waits for an in-flight fence. Normal writers
+        // can mark and append while it runs; marks never restore the version.
+        let gate = self.file.as_ref().map(|f| f.lock().sync_gate.clone());
+        let _fence = gate.as_ref().map(|g| g.lock());
         let mut inner = self.inner.write();
         if inner.len() <= m.entries {
             return Ok(());
@@ -1117,6 +1197,8 @@ impl DeltaVocab {
         };
         let mut guard = f.lock();
         let f = &mut *guard;
+        debug_assert!(f.dirty_version >= m.dirty_version);
+        f.dirty()?;
         // take the buffered bytes out without writing them (`into_parts` does not flush)
         let dup = f.w.get_ref().try_clone()?;
         let old = std::mem::replace(&mut f.w, BufWriter::new(dup));
@@ -1141,27 +1223,31 @@ impl DeltaVocab {
     /// does nothing: an `fdatasync` of a file with nothing to write still costs a device
     /// cache flush on some file systems, and every commit calls this.
     pub fn sync(&self) -> Result<()> {
-        if let Some(f) = &self.file {
-            let mut f = f.lock();
-            if !f.unsynced {
-                return Ok(());
-            }
-            f.w.flush()?;
-            #[cfg(test)]
-            if f.fail_next_sync {
-                f.fail_next_sync = false;
-                return Err(std::io::Error::other("injected sync failure").into());
-            }
-            f.w.get_ref().sync_data()?;
-            f.unsynced = false;
+        match &self.file {
+            Some(file) => DeltaFile::sync(file),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    /// Schedule this exact generation's append file on a reusable fence worker.
+    /// Publication still waits for completion; grouped writers may append a suffix.
+    pub(crate) fn sync_on(&self, worker: &mut LazySync) -> Option<PendingSync> {
+        self.file
+            .as_ref()
+            .and_then(|file| worker.start(file.clone()))
     }
 
     /// Whether entries were inserted since the last [`sync`](Self::sync), that is,
     /// whether the next one writes and syncs anything.
     pub fn needs_sync(&self) -> bool {
         self.file.as_ref().is_some_and(|f| f.lock().unsynced)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sync_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        if let Some(f) = &self.file {
+            f.lock().sync_hook = Some(hook);
+        }
     }
 
     /// Make the next [`sync`](Self::sync) with new entries fail after writing them to
