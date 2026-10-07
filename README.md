@@ -138,7 +138,7 @@ Rust, Python, JVM and JavaScript APIs, a Fuseki-compatible server and CLI, and a
 |---|---|
 | [Apache Jena / Fuseki](https://jena.apache.org/) | The same protocols, endpoints, admin API, CLI model and ARQ extensions, on sorted columnar indexes. Faster on every benchmark query at 10.5M triples, by a median of 60×. Reasoning is materialized, apart from RDFS on read, and there is no ontology API or JavaScript functions. |
 | [QLever](https://github.com/ad-freiburg/qlever) | The same index and execution architecture, plus exact term identity, MVCC updates, the Graph Store Protocol, reasoning and validation. Faster on all 28 benchmark queries and all 20 WatDiv templates at 10.5M triples, using about 40% more server memory. Intermediate results are materialized, not streamed. |
-| [Oxigraph](https://github.com/oxigraph/oxigraph) | Sparkles uses Oxigraph's parsers and SPARQL parser with its own storage and planner. Faster on every benchmark query at 10.5M triples, by a median of 87×. Sparkles fsyncs its writes and Oxigraph does not, and Oxigraph commits a stream of single-triple updates 2.7× faster. There is no WebAssembly build. |
+| [Oxigraph](https://github.com/oxigraph/oxigraph) | Sparkles uses Oxigraph's parsers and SPARQL parser with its own storage and planner. Faster on every benchmark query at 10.5M triples, by a median of 87×. Sparkles synchronizes its writes; Oxigraph's default acknowledgments do not synchronize its WAL. [Write throughput](docs/BENCHMARKS.md#http-write-snapshot) depends on batch size, client count and vocabulary growth. There is no WebAssembly build. |
 | [Fluree](https://github.com/fluree/db) | Both keep history and branches. Sparkles adds full W3C SPARQL conformance and Fuseki compatibility, and has no policies stored in the data or clustering. Faster on every benchmark query Fluree completes at 10.5M triples, by a median of 7.7×. |
 
 [docs/COMPARISON.md](docs/COMPARISON.md) lists the gaps per engine and where Sparkles
@@ -165,6 +165,14 @@ English DBpedia (1.24 billion triples) it loads in 596 s against QLever's 1,674 
 Fluree's 2,919 s, and is faster than QLever on 28 of 29 warm queries and 26 of 31 cold
 ones. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every number, the memory tradeoff and
 every query where Sparkles loses or ties.
+
+On the 1.05M-triple HTTP write workload, default durable writes reach about
+1,000 single-triple transactions/s or 54,000–59,000 effective changes/s in
+100-change batches with one client. With four clients issuing 50,000 single-quad
+requests, opt-in group commit reaches 529–543 acknowledged transactions/s versus
+221–232 by default, while preserving durable acknowledgments.
+[The write measurements](docs/BENCHMARKS.md#http-write-snapshot) include workload
+details, repeat variability and a separate Oxigraph reference.
 
 ## Getting started
 

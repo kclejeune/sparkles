@@ -6,6 +6,8 @@ measured on 2026-10-03 on `forge`, with Sparkles at commit `98a75c1a`.
 [Sparkles HTTP latency](#sparkles-http-latency) gives Sparkles-only measurements from
 2026-10-05 with a different timing method. Feature and configuration comparisons
 explain the effects of caching, loading, query execution and storage settings.
+[HTTP writes](#http-write-snapshot) gives a separately dated snapshot of durable
+batches and concurrent commit grouping.
 [Other measurements](#other-measurements) includes separately dated measurements,
 mostly on a different machine. Each section states its scope and method.
 
@@ -495,6 +497,10 @@ All query answers matched the checked reference results.
 
 ## Updates and mixed load
 
+The multi-engine tables in this section are from the 2026-10-03 comparison.
+[HTTP write snapshot](#http-write-snapshot) reports separately dated Sparkles write
+measurements with explicit client counts, CPU placement and batch sizes.
+
 The `updates` mode copies each engine's store, commits the same 5,000 single-triple
 `INSERT DATA` and `DELETE DATA` requests to it, one request each, and then runs the full
 query suite on the changed store. In Sparkles the commits stay in the in-memory delta,
@@ -561,6 +567,164 @@ Sparkles serves 4.0× QLever's reads under a concurrent writer at 1.05M and 2.8�
 Oxigraph commits more writes per second at both sizes, and Fluree does at 10.5M, but
 their reads are far slower. At 10.5M no Oxigraph reader finished within the 30 s. QLever
 failed 23,929 reads and 827 writes at 1.05M, and its log does not say why.
+
+### HTTP write snapshot
+
+The one-client table below uses the 1.05M-triple dataset on the same Intel i5-13500
+host. These are release-build measurements from 2026-10-06, using rustc 1.99.0 and
+default server features. Rows are separately collected cohorts; the query tables retain
+their separately stated scope. Each run starts from its own durably copied store. Sparkles starts from a compacted base;
+automatic compaction remains enabled and no compaction runs during these measurements.
+The server uses one logical CPU and the HTTP client uses a separate logical CPU. Result
+caches are disabled. Preparation, exports, validation and process shutdown occur outside
+the request timers.
+
+Every Sparkles acknowledgment follows synchronization of the write-ahead log and any new
+vocabulary data. Full before/after states and effective changes are checked against the
+operation manifest. The batched runs check exact per-request changes and contiguous
+commit headers; the original serial run checks successful request totals and the
+corresponding commit-head advance. These ordinary rows verify the complete state and
+stop the owned server afterward; they do not include a separate reopen check. The
+concurrent-reader workload below adds actual close/reopen and history verification. None
+of these checks is a power-loss test.
+
+| Default writes, one client | Effective changes per run | Changes per request | Fresh processes | Effective changes/s | Request p50 (ms) | Request p99 (ms) |
+|---|---:|---:|---:|---:|---:|---:|
+| Single-triple insert/delete churn | 5,000 | 1 | 2 | 1,046–1,062 | 0.856–0.870 | 1.536–1.609 |
+| Inserts introducing a new literal | 50,000 | 100 | 2 | 53,979–59,414 | 1.493–1.515 | 3.964–7.118 |
+| Insert/delete batches | 50,000 | 100 | 4 | 54,972–58,586 | 1.516–1.548 | 2.857–3.981 |
+
+The batched rows contain 500 acknowledged transactions each. The fresh-literal manifest
+preserves existing subjects and the predicate, introducing one new literal per inserted
+quad. The insert/delete manifest is a separate workload. A request can contain multiple
+DATA operations but commits once. Throughput counts effective changes, so it is not
+interchangeable with transactions per second.
+
+Ranges show the lowest and highest observed process results; latency ranges contain each
+process's own percentile. They are not confidence intervals or percentiles pooled across
+processes. The batched runs are short, and their p99 varies substantially even when
+their median stays close. These measurements do not establish an advantage for every
+write workload or sustained operation over hours.
+
+On the same fresh-literal manifest, request size, client count and CPU placement, two
+Oxigraph 0.5.11 processes produced 34,641 and 58,853 effective changes/s, with request
+medians of 2.591 and 1.617 ms. Its default RocksDB acknowledgments do not synchronize
+the WAL, so their durability contract differs from Sparkles'. The observed throughput
+ranges overlap. These separate engine runs are a small reference, not an interleaved
+statistical comparison.
+
+At 10.5M triples, the one-client tests use the existing store fixture and the same
+one-CPU server/separate-CPU client placement. Startup logs show age-triggered compaction
+admission, without a completion timestamp. These rows retain that maintenance
+qualification and are separate from the prepared compacted 1.05M table.
+
+| Default writes at 10.5M, one client | Effective changes per run | Changes per request | Fresh processes | Effective changes/s | Request p50 (ms) | Request p99 (ms) |
+|---|---:|---:|---:|---:|---:|---:|
+| Single-triple insert/delete churn | 5,000 | 1 | 2 | 320–494 | 2.154–2.351 | 5.989–7.733 |
+| Insert/delete batches | 50,000 | 100 | 2 | 45,788–46,123 | 1.613–1.622 | 16.070–16.364 |
+
+Each batched request performs 50 effective inserts and 50 effective deletes. Every run
+passes the same count, commit-head and complete-state checks. The serial repeats vary
+considerably, and the batched p99 is much higher than its median. No corresponding
+Oxigraph run at this size is included in this snapshot.
+
+### Concurrent durable commits
+
+At 1.05M triples, this workload applies the same 50,000 fresh-literal changes as the
+one-client batch table, using four clients and one quad per request. The server uses ten logical CPUs and
+the client process uses a separate logical CPU. It begins from a durably copied
+compacted base with automatic compaction enabled; pre/post and post-close checks show no
+pending, running or completed automatic compaction. The same binary runs in
+default/group/group/default order, with two fresh processes per setting. The only
+server-option difference is `--experimental-group-commit`. Grouping is off by default
+and seals immediately, without an artificial collection delay.
+
+| 50,000 effective changes, four writers | Default | Experimental group commit |
+|---|---:|---:|
+| Acknowledged transactions/s | 221.5–231.8 | 529.0–543.3 |
+| Request p50 (ms) | 19.016–19.211 | 9.051–9.104 |
+| Request p99 (ms) | 39.972–41.342 | 15.693–15.894 |
+| Write interval (s) | 215.7–225.8 | 92.0–94.5 |
+
+Across these two processes per setting, mean transaction throughput is 2.37× the default
+and the mean of process medians is about 53% lower. These are descriptive comparisons of
+this workload, not significance estimates. Each process completes exactly 50,000
+effective inserts with contiguous receipts and the correct complete final state.
+Ordinary acknowledgment durability is preserved; group commit can share synchronization
+across eligible commits while publishing each acknowledged prefix. This workload has no
+concurrent readers; the reader test below is separate. It does not establish a gain for
+serial clients, all write shapes or hours of operation.
+
+At 10.5M triples, the same manifest, four clients, CPU placement and run order produce
+the following results, again with two fresh processes per setting:
+
+| 10.5M, 50,000 effective changes, four writers | Default | Experimental group commit |
+|---|---:|---:|
+| Acknowledged transactions/s | 201.1–204.0 | 402.3–406.9 |
+| Request p50 (ms) | 19.338–19.415 | 9.709–9.735 |
+| Request p99 (ms) | 41.066–41.200 | 16.089–16.171 |
+
+Mean transaction throughput is 2.00× the default, with mean process medians about 50%
+lower and mean process p99 about 61% lower. All 200,000 effective inserts across the
+four processes pass complete-state and contiguous-receipt checks. This uses the existing
+10.5M fixture, whose startup logs show age-triggered compaction admission without a
+completion timestamp; it does not have the prepared 1.05M fixture's maintenance guards.
+
+### Concurrent writers with snapshot readers
+
+This workload inserts 5,000 fresh quads using four writer clients while two scalar
+readers each issue up to 25 queries/s. Reads count the inserted namespace and verify the
+count against the commit snapshot reported in the response. It uses fresh subjects, a
+fresh predicate and fresh objects; its vocabulary workload differs from the one-client
+fresh-literal table. The server uses ten logical CPUs and the client process uses a
+separate CPU. Result caching and reasoning are disabled. Connections are opened per
+request.
+
+The same Sparkles binary runs with the default writer and with experimental group
+commit, in default/group/group/default order. Group commit remains opt-in and preserves
+the acknowledgment durability contract.
+
+| 1.05M, 5,000-quads run, four writers + two readers | Default | Experimental group commit |
+|---|---:|---:|
+| Single-quad requests: acknowledged transactions/s | 1,375–1,386 | 3,344–3,365 |
+| Single-quad requests: writer p50 (ms) | 2.796–2.810 | 1.142–1.143 |
+| Single-quad requests: reader p50 (ms) | 0.845–0.862 | 0.545–0.585 |
+| Single-quad requests: completed reader responses during writes | 182 per run | 76 per run |
+| 100-quad requests: acknowledged transactions/s | 742–752 | 1,186–1,233 |
+| 100-quad requests: effective changes/s | 74,231–75,187 | 118,627–123,253 |
+
+The 1.05M single-quad runs last about 3.61–3.64 s by default and 1.49–1.50 s with group commit.
+Their reader rate is deliberately limited; the shorter write interval explains why fewer
+read responses fit within it. Readers observe advancing commit snapshots, with full
+state, history and reopen checks afterward.
+
+The 100-quad runs have only 50 transactions and last about 41–67 ms. They produce only
+two to four reader responses, so their throughput is a short-burst observation and their
+reader tails are not a sustained-load estimate. Both settings pass the same receipt and
+state checks. These results do not replace the separate 30-second star-join mixed-load
+comparison.
+
+At 10.5M triples, the same 5,000-change, single-quad reader workload uses the existing
+store fixture. Startup logs show age-triggered compaction admitted about 23–25 s before
+the write timer, but do not record its completion. These rows therefore have a different
+startup and maintenance qualification from the compacted 1.05M controls above.
+
+| 10.5M, 5,000 single-quad requests, four writers + two readers | Default | Experimental group commit |
+|---|---:|---:|
+| Acknowledged transactions/s | 202–231 | 370–386 |
+| Writer p50 (ms) | 19.093–19.274 | 9.932–10.315 |
+| Writer p99 (ms) | 40.221–40.947 | 15.735–17.861 |
+| Reader p50 (ms) | 0.917–0.936 | 0.895–1.000 |
+| Reader p99 (ms) | 1.410–1.549 | 1.960–2.143 |
+| Completed reader responses during writes | 1,084–1,240 | 648–678 |
+
+Both runs per setting pass the full-state, receipt, snapshot-count, history and actual
+reopen checks. Mean write throughput with grouping is about 75% higher in these rows.
+Reader medians are similar; reader p99 is higher by about 0.57 ms in the mean of process
+percentiles. The write intervals are 21.7–24.8 s by default and 12.9–13.5 s with
+grouping. Readers maintain the scheduled rate of about 50 queries/s in total and observe
+advancing snapshots throughout. These results establish productive reads under this
+load, rather than saturated query throughput.
 
 ## Cold starts
 
@@ -1043,9 +1207,11 @@ those cases.
 * **Other standard benchmarks.** WatDiv's basic testing is covered. LUBM, BSBM, SP²Bench,
   WatDiv's stress testing and the Wikidata query log are not. The synthetic suite has a
   fairly regular shape, and its 28 queries are hand-picked.
-* **Large writes and long runs.** The update runs use single-triple commits for at most
-  30 s or 5,000 commits. Large batches, hours of sustained writes and compaction under
-  load were not compared with other engines.
+* **Write scope and long runs.** HTTP tests include 5,000 single-triple changes,
+  50,000 effective changes in 100-change batches, and 50,000 single-quad changes
+  from four concurrent writers. The separate snapshot-reader workload contains
+  5,000 changes and is short. Hours of sustained writes and compaction under load
+  were not compared with other engines.
 * **Spatial queries and inference-time reasoning.** GeoSPARQL workloads were not compared
   with other engines. The sections below give the spatial index's commit cost and the
   GeoSPARQL Compliance Benchmark results. Sparkles' only query-time reasoning is RDFS on
