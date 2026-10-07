@@ -467,7 +467,11 @@ impl Snapshot {
                 id::inline_to_literal(id).map(Term::Literal)
             }
             Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
-            Tag::Vocab | Tag::Delta => self.key(id).map(|k| id::key_to_term(&k)),
+            Tag::Vocab => self
+                .generation
+                .vocab
+                .get_with(id.payload(), id::key_to_term),
+            Tag::Delta => self.key(id).map(|k| id::key_to_term(&k)),
             _ => None,
         }
     }

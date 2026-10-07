@@ -383,20 +383,55 @@ impl Vocab {
         let mut pos = self.block_offset(b);
         let start = b * FC_BLOCK;
         let n = FC_BLOCK.min((self.len as usize) - start);
-        let mut key: Vec<u8> = Vec::with_capacity(64);
+        // Single-key callers own this fresh buffer throughout their scan.
+        let mut key = Vec::with_capacity(64);
         for i in 0..n {
-            let shared = read_varint(data, &mut pos) as usize;
-            let len = read_varint(data, &mut pos) as usize;
-            key.truncate(shared);
-            key.extend_from_slice(&data[pos..pos + len]);
-            pos += len;
+            Self::reconstruct_key(data, &mut pos, &mut key);
             if !f(i, &key) {
                 return;
             }
         }
     }
 
+    /// One front-coded key; shared by the fresh-buffer and reusable-buffer loops.
+    #[inline(always)]
+    fn reconstruct_key(data: &[u8], pos: &mut usize, key: &mut Vec<u8>) {
+        let shared = read_varint(data, pos) as usize;
+        let len = read_varint(data, pos) as usize;
+        key.truncate(shared);
+        key.extend_from_slice(&data[*pos..*pos + len]);
+        *pos += len;
+    }
+
+    /// Each block starts with an empty reconstruction, while capacity can be reused
+    /// by a sorted decode across blocks. Single-key callers retain a local buffer.
+    #[inline(always)]
+    fn scan_block_with_scratch(
+        &self,
+        b: usize,
+        key: &mut Vec<u8>,
+        mut f: impl FnMut(usize, &[u8]) -> bool,
+    ) {
+        key.clear();
+        let data = self.data.as_slice();
+        let mut pos = self.block_offset(b);
+        let start = b * FC_BLOCK;
+        let n = FC_BLOCK.min((self.len as usize) - start);
+        for i in 0..n {
+            Self::reconstruct_key(data, &mut pos, key);
+            if !f(i, key) {
+                return;
+            }
+        }
+    }
+
     pub fn get(&self, id: u64) -> Option<Vec<u8>> {
+        self.get_with(id, |key| key.to_vec())
+    }
+
+    /// Decode a key while its block scratch is borrowed, avoiding an intermediate
+    /// owned key when the caller immediately converts it to another owned value.
+    pub(crate) fn get_with<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
         if id >= self.len {
             return None;
         }
@@ -405,7 +440,7 @@ impl Vocab {
         let mut out = None;
         self.scan_block(b, |i, k| {
             if i == want {
-                out = Some(k.to_vec());
+                out = Some(f(k));
                 false
             } else {
                 true
@@ -434,6 +469,12 @@ impl Vocab {
         } else {
             Ahead::default()
         };
+        // Empty and entirely out-of-range passes need no reconstruction storage.
+        let mut key = if ids.first().is_some_and(|&id| id < self.len) {
+            Vec::with_capacity(64)
+        } else {
+            Vec::new()
+        };
         let mut i = 0;
         while i < ids.len() {
             let id = ids[i];
@@ -447,7 +488,7 @@ impl Vocab {
             let wanted = &ids[i..j];
             let last = (wanted[wanted.len() - 1] as usize) % FC_BLOCK;
             let mut w = 0;
-            self.scan_block(b, |pos, k| {
+            self.scan_block_with_scratch(b, &mut key, |pos, k| {
                 if w < wanted.len() && (wanted[w] as usize) % FC_BLOCK == pos {
                     f(wanted[w], k);
                     w += 1;
@@ -1321,6 +1362,198 @@ mod tests {
         assert_eq!(DeltaVocab::open_read_only(&path).unwrap().len(), 4);
         assert_eq!(DeltaVocab::open(&path).unwrap().len(), 4);
         assert_eq!(std::fs::read(&path).unwrap(), odd);
+    }
+
+    #[test]
+    fn borrowed_key_decode_matches_owned_for_term_kinds() {
+        use oxrdf::{BaseDirection, BlankNode, Literal, NamedNode, Term, Triple};
+        let terms = [
+            Term::NamedNode(NamedNode::new_unchecked("urn:iri:é")),
+            Term::BlankNode(BlankNode::new_unchecked("b2a")),
+            Term::Literal(Literal::new_simple_literal("quoted \" é\n")),
+            Term::Literal(Literal::new_language_tagged_literal_unchecked("chat", "fr")),
+            Term::Literal(Literal::new_directional_language_tagged_literal_unchecked(
+                "مرحبا",
+                "ar",
+                BaseDirection::Rtl,
+            )),
+            Term::Literal(Literal::new_typed_literal(
+                "custom",
+                NamedNode::new_unchecked("urn:datatype"),
+            )),
+            Term::Triple(Box::new(Triple::new(
+                NamedNode::new_unchecked("urn:s"),
+                NamedNode::new_unchecked("urn:p"),
+                Literal::new_simple_literal("nested"),
+            ))),
+        ];
+        let mut keys: Vec<_> = terms.iter().map(crate::id::term_key).collect();
+        keys.sort();
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = VocabWriter::create(dir.path()).unwrap();
+        for key in &keys {
+            w.push(key).unwrap();
+        }
+        w.finish().unwrap();
+        let v = Vocab::open(dir.path()).unwrap();
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                v.get_with(i as u64, crate::id::key_to_term),
+                Some(crate::id::key_to_term(key))
+            );
+            assert_eq!(v.get(i as u64).as_ref(), Some(key));
+        }
+        for term in terms {
+            let id = v.find(&crate::id::term_key(&term)).unwrap();
+            assert_eq!(v.get_with(id, crate::id::key_to_term), Some(term));
+        }
+    }
+
+    #[test]
+    fn borrowed_key_decode_same_block_partial_tail_and_invalid_bytes() {
+        let mut keys: Vec<Vec<u8>> = (0..(FC_BLOCK * 2 + 3))
+            .map(|i| format!("<urn:{i:04}:{}", "x".repeat(i % 91)).into_bytes())
+            .collect();
+        keys.extend([b"<urn:invalid:\xff".to_vec(), b"opaque:\xfe".to_vec()]);
+        keys.sort();
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = VocabWriter::create(dir.path()).unwrap();
+        for key in &keys {
+            w.push(key).unwrap();
+        }
+        w.finish().unwrap();
+        let v = Vocab::open(dir.path()).unwrap();
+        // Repeated nonmonotonic lookups reconstruct the full key independently;
+        // variable common prefixes, spill-sized keys and invalid UTF-8 stay opaque.
+        for i in (0..keys.len()).rev().chain(0..keys.len()) {
+            assert_eq!(v.get_with(i as u64, |k| k.to_vec()), Some(keys[i].clone()));
+            assert_eq!(
+                v.get_with(i as u64, crate::id::key_to_term),
+                v.get(i as u64).as_deref().map(crate::id::key_to_term)
+            );
+        }
+        for id in [v.len(), v.len() + 1, u64::MAX] {
+            assert_eq!(
+                v.get_with(id, |_| panic!("out-of-range callback")),
+                None::<Vec<u8>>
+            );
+            assert_eq!(v.get(id), None);
+        }
+    }
+
+    #[test]
+    fn sorted_scratch_preserves_dense_sparse_partial_and_invalid_suffix() {
+        let keys: Vec<Vec<u8>> = (0..FC_BLOCK * 3 + 7)
+            .map(|i| {
+                let mut key = format!("<urn:{i:05}:é:").into_bytes();
+                key.extend_from_slice(&vec![b'x'; if i < FC_BLOCK { 300 } else { i % 29 }]);
+                if i % 17 == 0 {
+                    key.push(0xff);
+                }
+                key
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = VocabWriter::create(dir.path()).unwrap();
+        for k in &keys {
+            w.push(k).unwrap();
+        }
+        w.finish().unwrap();
+        let v = Vocab::open(dir.path()).unwrap();
+        let cases = [
+            (0..v.len()).collect::<Vec<_>>(),
+            vec![
+                0,
+                1,
+                (FC_BLOCK - 1) as u64,
+                FC_BLOCK as u64,
+                v.len() - 1,
+                v.len(),
+                u64::MAX,
+            ],
+            (0..v.len()).step_by(19).collect(),
+            vec![],
+            vec![v.len(), u64::MAX],
+        ];
+        for ahead in [false, true] {
+            for ids in &cases {
+                let mut got = Vec::new();
+                v.get_sorted_with_ahead(ids, |id, key| got.push((id, key.to_vec())), ahead);
+                let expected: Vec<_> = ids
+                    .iter()
+                    .copied()
+                    .take_while(|&id| id < v.len())
+                    .map(|id| (id, keys[id as usize].clone()))
+                    .collect();
+                assert_eq!(got, expected);
+                for (id, key) in got {
+                    assert_eq!(v.get(id), Some(key));
+                }
+            }
+        }
+        let empty = Vocab::empty();
+        empty.get_sorted(&[0, u64::MAX], |_, _| panic!("empty vocabulary callback"));
+    }
+
+    #[test]
+    fn sorted_scratch_reuses_capacity_resets_blocks_and_stops_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = VocabWriter::create(dir.path()).unwrap();
+        let keys: Vec<Vec<u8>> = (0..FC_BLOCK * 2 + 5)
+            .map(|i| {
+                format!(
+                    "<urn:{i:05}:{}",
+                    "x".repeat(if i < FC_BLOCK { 300 } else { 1 })
+                )
+                .into_bytes()
+            })
+            .collect();
+        for key in &keys {
+            w.push(key).unwrap();
+        }
+        w.finish().unwrap();
+        let mut v = Vocab::open(dir.path()).unwrap();
+        let mut scratch = Vec::with_capacity(512);
+        let pointer = scratch.as_ptr();
+        let capacity = scratch.capacity();
+        for b in 0..v.num_blocks() {
+            let mut seen = 0;
+            v.scan_block_with_scratch(b, &mut scratch, |i, key| {
+                assert_eq!(i, 0);
+                assert_eq!(key, keys[b * FC_BLOCK]);
+                seen += 1;
+                false
+            });
+            assert_eq!(seen, 1);
+            assert_eq!(scratch.as_ptr(), pointer);
+            assert_eq!(scratch.capacity(), capacity);
+        }
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            v.scan_block_with_scratch(0, &mut scratch, |_, _| panic!("callback"));
+        }));
+        assert!(panic.is_err());
+        v.scan_block_with_scratch(1, &mut scratch, |i, key| {
+            assert_eq!(i, 0);
+            assert_eq!(key, keys[FC_BLOCK]);
+            false
+        });
+        // Even a nonzero first shared length retains the old fresh-buffer behavior.
+        // This checks reset semantics, without claiming malformed vocab validation.
+        let mut data = v.data.as_slice().to_vec();
+        let at = v.block_offset(1);
+        assert_eq!(data[at], 0);
+        data[at] = 3;
+        v.data = Bytes::Vec(data);
+        scratch.extend_from_slice(b"previous block content");
+        let mut single = Vec::new();
+        v.scan_block(1, |_, key| {
+            single.extend_from_slice(key);
+            false
+        });
+        v.scan_block_with_scratch(1, &mut scratch, |_, key| {
+            assert_eq!(key, single);
+            false
+        });
     }
 
     #[test]
