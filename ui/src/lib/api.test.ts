@@ -284,6 +284,10 @@ describe('commits and full-text admin', () => {
     expect(await api.textStatus('ds')).toBeNull();
     stubFetch(() => jsonResponse({ enabled: true, state: 'ready', docs: 3 }));
     expect(await api.textStatus('ds')).toMatchObject({ state: 'ready', docs: 3 });
+    for (const state of ['rebuilding', 'failed'] as const) {
+      stubFetch(() => jsonResponse({ enabled: true, state, docs: 0, message: state }));
+      expect(await api.textStatus('ds')).toMatchObject({ state, message: state });
+    }
     stubFetch(() => jsonResponse({ error: 'built without full-text search' }, 501));
     const e = await api.textStatus('ds').catch((x) => x);
     expect(e.status).toBe(501);

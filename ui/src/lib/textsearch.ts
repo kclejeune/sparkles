@@ -187,8 +187,8 @@ export function textErrorHint(e: unknown): { title: string; hint?: string } {
           };
     case 503:
       return {
-        title: 'The full-text index is being rebuilt or is behind the data.',
-        hint: `Text queries are refused rather than answered from a stale index. Try again when the rebuild has finished. (${e.message})`,
+        title: 'The full-text index is being rebuilt, is behind the data, or has failed.',
+        hint: `Text queries are refused while the index is unavailable. Check the Full-text search panel; wait for recovery or retry a failed rebuild. (${e.message})`,
       };
     case 501:
       return { title: 'This server was built without full-text search.' };

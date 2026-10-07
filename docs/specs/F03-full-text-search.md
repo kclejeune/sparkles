@@ -1,7 +1,6 @@
 # F03: Full-text search (Tantivy, `text:query`)
 
-> **Status:** implemented in part (Phases 1 and 2 apart from a background rebuild at
-> open, most of Phase 3)
+> **Status:** implemented in part (Phases 1 and 2, most of Phase 3)
 >
 > **Phases:** Phase 1 shipped. It covers the `text` cargo feature, `text:query`, per-quad
 > documents kept current in the commit path, catch-up or rebuild at open,
@@ -13,8 +12,9 @@
 > `spk:hybridSearch` ([F04](F04-vector-search.md#outcome)). On 2026-10-03 `text` on
 > dataset creation, online rebuilds with a journal, variable query strings with
 > bound-subject pushdown, incremental bulk maintenance and rebuilds over the literal
-> range shipped, and so did a `porter` analyzer for English. A background rebuild at
-> open, facets, search at historical snapshots and an opt-in stale mode are not built.
+> range shipped, and so did a `porter` analyzer for English. Missing/damaged indexes
+> now recover in the background at persistent open. Facets, search at historical
+> snapshots and an opt-in stale mode are not built.
 >
 > **User docs:** [API: Full-text search](../API.md#full-text-search) · [Features](../FEATURES.md#sparql-arq-equivalent) · [Benchmarks: Full-text index and observability](../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
 >
@@ -665,12 +665,49 @@ subject filters inside the search. The rest is as designed: `text.json` and `tex
 Two Phase 2 items came with it or soon after: `PUT`/`DELETE /$/text/{ds}`, and the UI with
 an admin panel and ranked search in Explore. Clones keep text search enabled (`89b455c`).
 
-Internal recovery preparation now distinguishes reusable indexes from recovery needs
-before allocating a writer, expanding WAL changes or cleaning staging directories.
-Unavailable text views retain their snapshot state and refuse searches with 503;
-ready result-cache entries cannot bypass that refusal. Startup still rebuilds
-synchronously. Background recovery requires bounded journaling, worker admission and
-guarded publication/close handling before it can replace that fallback.
+**Background startup recovery.** Persistent open classifies the derived index before
+allocating its writer or cleaning staging. Healthy verification and covered WAL catch-up
+remain synchronous. Missing, damaged, ahead, mismatched and uncovered indexes instead
+publish configured unavailable views and recover from RDF on one process-wide worker.
+Linked inherited WAL changes are loaded only for a reusable index needing catch-up.
+Missing linked indexes rebuild in their own directory without checkpointing the upstream.
+Restored datasets whose backups omit `text/` use the same configured recovery path.
+
+RDF reads and writes remain available. Text searches return 503 while rebuilding or after
+failure; disabled text search still returns 400. Retained unavailable snapshots stay
+unavailable, and ready cache entries cannot bypass this state. Concurrent effective quad
+changes feed a bounded journal, with final presence checked against the caught-up snapshot.
+Generation changes and journal overflow restart the build within a fixed budget. Admission
+allows one worker and sixteen weak queued jobs; only an active job pins a snapshot. The
+active build uses at most two indexing threads with a shared 64 MiB writer arena budget
+(one thread on a single-CPU host). Its journal holds at most 131,072 changed quads, with three build attempts, eight catch-up rounds and
+a final writer-held tail of at most 1,024 records. Exhaustion leaves `failed` text status;
+an explicit rebuild retries it. Native logs retain failure details.
+
+Ready publication verifies the current owner and generation under writer admission, then
+completes the directory rename/fsync fence. Disable, reconfigure and Store close cancel
+and join recovery before releasing the root or staging owner. A queued manual join releases
+the lifecycle lock, so disable/reconfigure can cancel it without waiting for another
+dataset's build. Retry metadata updates preserve concurrent RDF publication and keep group
+admission excluded continuously. A ready view's owner also distinguishes same-commit
+configuration replacements in the result cache. Same-family callbacks are refused before
+lifecycle locks or joins and keep their query/commit failure sticky.
+
+Explicit enable/reconfigure remain synchronous. Explicit rebuild is a synchronous online
+build or a join/retry of startup recovery. HTTP task cancellation retains the existing
+synchronous native rebuild behavior; this change introduces no per-waiter Ctl API.
+An admitted directory publication fence completes before automatic cancellation returns.
+Disk reserve is checked at recovery checkpoints, and an authoritative dataset quota check
+refuses growing ready publication. Derived staging can consume transient disk space before
+that final check; refusal removes staging and preserves RDF. This does not add a hard
+build-space reservation.
+
+Native controls cover missing/damaged indexes, concurrent writes, generation and journal
+restart, queue failure, cancellation and close, owner/cache isolation, failed installation,
+metadata/WAL classification, lazy linked catch-up, callback refusal, quota/reserve refusal
+and explicit retry. Child-process interruption at build and both directory-renaming
+boundaries survives reopen with the same RDF identity/head. These are process-crash
+checks, not simulated power-loss measurements.
 
 **Deviations, and why.**
 - *Commit path.* A Tantivy commit with an fsync on every write cost too much (§5.3, open
@@ -683,9 +720,9 @@ guarded publication/close handling before it can replace that fallback.
   exactly its own documents, so read-your-writes holds.
   [COMPARISON.md](../COMPARISON.md#divergences-from-jena--qlever-decisions) records this as
   a design decision.
-- *States.* `TextStatus.state` is `ready` or `stale`. Rebuilds run as background tasks
-  (`202` with a `text-rebuild` task) instead of using the spec's `rebuilding` and `failed`
-  states.
+- *States.* Ready indexes report `ready` or `stale`; automatic startup recovery reports
+  `rebuilding` or `failed`. Explicit HTTP rebuilds still return `202` with a
+  `text-rebuild` task.
 - *Limits.* `maxHits` is reported through the shared budget error (`507`, row budget) that
   came with per-request budgets ([C01](C01-observability-and-budgets.md)).
 - *Historical reads.* A `text:query` against an `?at=` snapshot

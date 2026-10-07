@@ -137,6 +137,10 @@ describe('textErrorHint', () => {
     expect(syntax.hint).toContain('query syntax');
     const busy = textErrorHint(new ApiError(503, 'full-text index of x is stale'));
     expect(busy.title).toContain('being rebuilt');
+    const failed = textErrorHint(new ApiError(503, 'full-text recovery failed'));
+    expect(failed.title).toContain('failed');
+    expect(failed.hint).toContain('Full-text search panel');
+    expect(failed.hint).toContain('retry a failed rebuild');
     expect(textErrorHint(new ApiError(501, 'built without')).title).toContain('without');
   });
 });

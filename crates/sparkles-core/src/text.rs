@@ -21,6 +21,14 @@
 //! checkpointed about once a second, and on open an index that may hold unsynced data is
 //! verified, then caught up from the WAL (which also covers what was only staged). It is
 //! rebuilt from RDF only when it is missing, damaged, or behind the WAL.
+//!
+//! Persistent [`crate::store::Store::open`] queues that RDF rebuild on a bounded
+//! background worker. RDF snapshots remain usable; configured text searches return
+//! [`crate::Error::TextUnavailable`] while recovering or after a failed attempt.
+//! An unavailable view stays unavailable even after a newer view becomes ready.
+//! A reusable index is still verified and caught up synchronously before open returns.
+//! Explicit enable/reconfigure builds synchronously; explicit rebuild either builds
+//! online or joins/retries startup recovery before returning.
 
 use crate::error::{Error, Result};
 
@@ -489,6 +497,9 @@ pub struct TextView {
     pub seq: u64,
     /// +1 per rebuild (part of result-cache keys)
     pub epoch: u64,
+    /// Unique configured owner, including replacements at the same RDF head.
+    #[cfg(feature = "text")]
+    pub(crate) owner: u64,
     #[cfg(feature = "text")]
     source: ViewSource,
     /// the view of a write transaction that has changed data since `seq`, which the
@@ -543,9 +554,25 @@ impl TextView {
         Self {
             seq,
             epoch,
+            owner: 0,
             source: ViewSource::Unavailable(state),
             uncommitted: false,
         }
+    }
+
+    #[cfg(feature = "text")]
+    pub(crate) fn recovering(seq: u64, owner: u64, failed: bool) -> std::sync::Arc<Self> {
+        let mut view = Self::unavailable(
+            seq,
+            0,
+            if failed {
+                UnavailableState::Failed
+            } else {
+                UnavailableState::Rebuilding
+            },
+        );
+        view.owner = owner;
+        std::sync::Arc::new(view)
     }
 
     #[cfg(feature = "text")]
@@ -563,6 +590,8 @@ impl TextView {
         TextView {
             seq: self.seq,
             epoch: self.epoch,
+            #[cfg(feature = "text")]
+            owner: self.owner,
             #[cfg(feature = "text")]
             source: self.source.clone(),
             uncommitted: true,
@@ -667,7 +696,7 @@ pub use imp::TextIndex;
 #[cfg(feature = "text")]
 pub(crate) use imp::read_config as imp_read_config;
 #[cfg(feature = "text")]
-pub(crate) use imp::seed_branch;
+pub(crate) use imp::{cleanup_staging, next_owner};
 #[cfg(feature = "text")]
 pub use search::{search, search_in};
 
@@ -992,6 +1021,7 @@ mod imp {
     pub(crate) struct Inner {
         root: Option<PathBuf>,
         config: TextConfig,
+        owner: u64,
         live: Mutex<Live>,
         epoch: AtomicU64,
         /// set when an update's text maintenance failed: queries get 503 until a rebuild
@@ -1036,7 +1066,12 @@ mod imp {
         started: Instant,
     }
 
-    /// A dataset's full-text index.
+    /// A ready dataset full-text index, including its checkpoint worker.
+    ///
+    /// Missing or damaged configured indexes on persistent Store open are represented
+    /// by unavailable [`TextView`]s until background recovery publishes a ready index.
+    /// No placeholder `TextIndex` is exposed during that recovery. Explicit
+    /// [`TextIndex::open`] remains synchronous, including its RDF rebuild fallback.
     pub struct TextIndex {
         inner: Arc<Inner>,
         /// the commit tick: dropping the sender stops it
@@ -1546,79 +1581,6 @@ mod imp {
         }
     }
 
-    /// Copy a pinned committed Tantivy checkpoint into a branch-owned directory.
-    /// Segment metadata is kept alive throughout copying, so upstream merges cannot
-    /// garbage-collect its files. A checkpoint after the fork cannot seed that fork.
-    pub(crate) fn seed_branch(
-        view: &super::TextView,
-        root: &Path,
-        config: &TextConfig,
-        seq: u64,
-    ) -> Result<bool> {
-        let Ok(ready) = view.ready(seq) else {
-            return Ok(false);
-        };
-        let Some(owner) = ready.owner.upgrade() else {
-            return Ok(false);
-        };
-        let Some(source) = owner.root.as_ref() else {
-            return Ok(false);
-        };
-        let (index, meta) = {
-            let live = owner.live.lock();
-            let Some(writer) = live.writer.as_ref() else {
-                return Ok(false);
-            };
-            let index = writer.index().clone();
-            let meta = index.load_metas().map_err(text_err)?;
-            (index, meta)
-        };
-        let Some(payload) = meta
-            .payload
-            .as_deref()
-            .and_then(|p| serde_json::from_str::<Payload>(p).ok())
-        else {
-            return Ok(false);
-        };
-        if payload.format != FORMAT || payload.seq > seq || payload.config != config_hash(config) {
-            return Ok(false);
-        }
-        verify(&index)?;
-        let tmp = tempfile::Builder::new()
-            .prefix(".text-seed-")
-            .tempdir_in(root)?;
-        let mut files = std::collections::HashSet::new();
-        for segment in &meta.segments {
-            for file in segment.list_files() {
-                if segment.delete_opstamp().is_none()
-                    && file.extension().is_some_and(|e| e == "del")
-                {
-                    continue;
-                }
-                if files.insert(file.clone()) {
-                    std::fs::copy(source.join("text").join(&file), tmp.path().join(&file))?;
-                    std::fs::File::open(tmp.path().join(&file))?.sync_all()?;
-                }
-            }
-        }
-        files.insert(std::path::PathBuf::from("meta.json"));
-        crate::store::write_synced(
-            &tmp.path().join("meta.json"),
-            &serde_json::to_vec(&meta).map_err(text_err)?,
-        )?;
-        crate::store::write_synced(
-            &tmp.path().join(".managed.json"),
-            &serde_json::to_vec(&files).map_err(text_err)?,
-        )?;
-        // Verify the exact checkpoint being published, rather than whichever
-        // checkpoint the upstream has advanced to during copying.
-        verify(&Index::open_in_dir(tmp.path()).map_err(text_err)?)?;
-        crate::store::sync_dir(tmp.path())?;
-        std::fs::rename(tmp.path(), root.join("text"))?;
-        crate::store::sync_dir(root)?;
-        Ok(true)
-    }
-
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum RecoveryReason {
         InMemory,
@@ -1716,49 +1678,88 @@ mod imp {
         }
     }
 
+    pub(crate) fn next_owner() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .expect("text owner identity exhausted")
+    }
+
+    fn inner_of(root: Option<&Path>, config: TextConfig, live: Live, epoch: u64) -> Arc<Inner> {
+        Arc::new(Inner {
+            root: root.map(Path::to_path_buf),
+            config,
+            owner: next_owner(),
+            live: Mutex::new(live),
+            epoch: AtomicU64::new(epoch),
+            stale: Mutex::new(None),
+            last_rebuild: Mutex::new(None),
+            fail_next_commit: Default::default(),
+            ticks: AtomicBool::new(true),
+            journal: Default::default(),
+            rebuilding: Default::default(),
+        })
+    }
+
+    type WalChanges = [(u64, Vec<[Id; 4]>)];
+
     impl TextIndex {
+        /// Reuse/verify/catch up an existing persistent index synchronously. `None`
+        /// requests background RDF recovery without allocating a placeholder writer.
+        pub(crate) fn open_ready<'a>(
+            root: &Path,
+            config: TextConfig,
+            snap: &Snapshot,
+            first_wal_seq: Option<u64>,
+            load_wal: impl FnOnce() -> Result<std::borrow::Cow<'a, WalChanges>>,
+        ) -> Result<Option<(TextIndex, Arc<TextView>)>> {
+            Self::open_inner(Some(root), config, snap, first_wal_seq, load_wal, true)
+        }
+
         /// Open the index of a store at its current state `snap` (`root` = `None` for an
         /// in-memory store). An index on disk with the same configuration is reused:
         /// verified first when it may hold unsynced writes, then caught up from `wal` when
         /// it is behind. `wal` holds the quads each commit of the WAL changed, oldest
         /// first, by commit. Otherwise the index is rebuilt. Returns the index and `snap`'s
-        /// view.
+        /// view. This method completes that fallback synchronously; persistent
+        /// [`crate::store::Store::open`] instead queues missing/damaged-index recovery.
         pub fn open(
             root: Option<&Path>,
             config: TextConfig,
             snap: &Snapshot,
             wal: &[(u64, Vec<[Id; 4]>)],
         ) -> Result<(TextIndex, Arc<TextView>)> {
+            Ok(Self::open_inner(
+                root,
+                config,
+                snap,
+                wal.first().map(|(seq, _)| *seq),
+                || Ok(std::borrow::Cow::Borrowed(wal)),
+                false,
+            )?
+            .expect("synchronous text open builds on fallback"))
+        }
+
+        fn open_inner<'a>(
+            root: Option<&Path>,
+            config: TextConfig,
+            snap: &Snapshot,
+            first_wal_seq: Option<u64>,
+            load_wal: impl FnOnce() -> Result<std::borrow::Cow<'a, WalChanges>>,
+            background: bool,
+        ) -> Result<Option<(TextIndex, Arc<TextView>)>> {
             let hash = config_hash(&config);
             let existing = inspect_existing(root, &config);
             let mut classification = classify_open(
                 existing.as_ref().map(|e| &e.payload).map_err(|r| *r),
                 &hash,
                 snap.commit,
-                wal.first().map(|(seq, _)| *seq),
+                first_wal_seq,
             );
-            // Classification is complete before any writable index, expanded WAL or
-            // interrupted-build cleanup. Startup remains synchronous in this slice.
-            if let Some(r) = root {
-                for stale in ["text.new", "text.old"] {
-                    let _ = std::fs::remove_dir_all(r.join(stale));
-                }
-            }
-            let ti = |live: Live, epoch: u64| {
-                Arc::new(Inner {
-                    root: root.map(Path::to_path_buf),
-                    config: config.clone(),
-                    live: Mutex::new(live),
-                    epoch: AtomicU64::new(epoch),
-                    stale: Mutex::new(None),
-                    last_rebuild: Mutex::new(None),
-                    fail_next_commit: Default::default(),
-                    ticks: AtomicBool::new(true),
-                    journal: Default::default(),
-                    rebuilding: Default::default(),
-                })
-            };
+            let ti = |live: Live, epoch: u64| inner_of(root, config.clone(), live, epoch);
             if let OpenClassification::Ready { seq, epoch } = classification {
+                if let Some(root) = root {
+                    cleanup_staging(root)?;
+                }
                 let ExistingIndex {
                     index, fields, dir, ..
                 } = existing.expect("ready classification has existing index evidence");
@@ -1772,6 +1773,9 @@ mod imp {
                                 "full-text index is at commit {seq}, the data at {}: catching up from the WAL",
                                 snap.commit
                             );
+                            // Inherited linked-branch changes are materialized only
+                            // after reusable metadata proves covered catch-up necessary.
+                            let wal = load_wal()?;
                             for (_, qs) in wal.iter().filter(|(s, _)| *s > seq) {
                                 touched.extend(qs.iter().map(|q| (*q, true)));
                             }
@@ -1781,7 +1785,7 @@ mod imp {
                             .apply(snap, &touched)
                             .and_then(|v| t.checkpoint().map(|()| v))
                         {
-                            Ok(view) => return Ok((TextIndex::start(t), view)),
+                            Ok(view) => return Ok(Some((TextIndex::start(t), view))),
                             Err(e) => {
                                 tracing::warn!(target: "sparkles::text::imp", "full-text index: {e}; rebuilding");
                                 classification =
@@ -1796,20 +1800,25 @@ mod imp {
                 }
             }
             if let OpenClassification::NeedsRecovery(reason) = classification {
-                // This unavailable view is not published yet: synchronous recovery below
-                // must finish before open returns. It is ready for a later owned recovery
-                // protocol without inventing an empty searchable placeholder.
+                // Classify before allocating a placeholder. Persistent Store open
+                // publishes a recovery view; explicit open builds before returning.
                 tracing::debug!(target: "sparkles::text::imp", ?reason, view = ?reason.view(snap.commit), "full-text index needs recovery");
                 if root.is_some_and(|r| r.join("text").exists()) {
                     tracing::info!(target: "sparkles::text::imp", "full-text index is missing, damaged or behind the WAL; rebuilding");
                 }
+            }
+            if background {
+                return Ok(None);
+            }
+            if let Some(root) = root {
+                cleanup_staging(root)?;
             }
             // an empty placeholder until the rebuild below swaps the real one in
             let (index, fields) = new_index(None, &config)?;
             let t = ti(live_of(index, fields, &config, None, 0)?, 0);
             let built = t.build(snap)?;
             let view = t.install(built, snap, &[])?;
-            Ok((TextIndex::start(t), view))
+            Ok(Some((TextIndex::start(t), view)))
         }
 
         /// Start the tick that seals batches and checkpoints the index about once a
@@ -1984,12 +1993,227 @@ mod imp {
         }
     }
 
+    fn payload(config: &TextConfig, seq: u64, epoch: u64) -> String {
+        serde_json::to_string(&Payload {
+            format: FORMAT,
+            seq,
+            epoch,
+            config: config_hash(config),
+        })
+        .unwrap()
+    }
+
+    pub(crate) fn cleanup_staging(root: &Path) -> Result<()> {
+        for name in ["text.new", "text.old"] {
+            match std::fs::remove_dir_all(root.join(name)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn build_index(
+        root: Option<&Path>,
+        config: &TextConfig,
+        epoch: u64,
+        snap: &Snapshot,
+        threads: usize,
+        memory_budget: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Built> {
+        let t0 = std::time::Instant::now();
+        let new_dir = root.map(|r| r.join("text.new"));
+        let (index, fields) = new_index(new_dir.as_deref(), config)?;
+        let mut docs = 0u64;
+        {
+            let mut writer: IndexWriter<TantivyDocument> = index
+                .writer_with_num_threads(threads, memory_budget)
+                .map_err(text_err)?;
+            let mut terms = Terms::default();
+            let mut visits = 0usize;
+            let mut add = |q: &[Id; 4]| -> Result<()> {
+                if visits.is_multiple_of(1024) {
+                    check()?;
+                }
+                visits += 1;
+                if let Some(Doc { doc: Some(d), .. }) = terms.document(snap, &fields, config, q) {
+                    writer.add_document(d).map_err(text_err)?;
+                    docs += 1;
+                }
+                Ok(())
+            };
+            for_each_candidate(snap, config, &mut add)?;
+            check()?;
+            let payload = payload(config, snap.commit, epoch);
+            let mut prepared = writer.prepare_commit().map_err(text_err)?;
+            prepared.set_payload(&payload);
+            prepared.commit().map_err(text_err)?;
+            check()?;
+            writer.wait_merging_threads().map_err(text_err)?;
+        }
+        Ok(Built {
+            index,
+            fields,
+            dir: new_dir,
+            epoch,
+            docs,
+            started: t0,
+        })
+    }
+
+    impl TextIndex {
+        pub(crate) fn recovery_build(
+            root: &Path,
+            config: &TextConfig,
+            snap: &Snapshot,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<Built> {
+            check()?;
+            cleanup_staging(root)?;
+            // Bound automatic recovery to two writer threads within the existing
+            // 64 MiB total arena budget. Single-CPU hosts keep one writer.
+            let threads = std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(2);
+            build_index(Some(root), config, 1, snap, threads, 64 << 20, check)
+        }
+
+        pub(crate) fn recovery_catch_up(
+            built: &mut Built,
+            config: &TextConfig,
+            head: &Snapshot,
+            journal: &[[Id; 4]],
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<()> {
+            catch_up(
+                &built.index,
+                &built.fields,
+                config,
+                head,
+                journal,
+                built.epoch,
+                check,
+            )
+        }
+
+        /// Caller owns final writer admission and completes this durability fence even
+        /// if cancellation arrives after admission. No detached worker publishes.
+        pub(crate) fn recovery_install(
+            root: &Path,
+            config: TextConfig,
+            built: Built,
+            head: &Snapshot,
+        ) -> Result<(Self, Arc<TextView>)> {
+            let Built {
+                index,
+                fields,
+                dir,
+                epoch,
+                docs,
+                started,
+            } = built;
+            let (index, fields, dir) = publish_built(Some(root), &config, index, fields, dir)?;
+            let live = live_of(index, fields, &config, dir, head.commit)?;
+            let inner = inner_of(Some(root), config, live, epoch);
+            *inner.last_rebuild.lock() = Some(RebuildInfo {
+                at: crate::commit::rfc3339_ms(crate::commit::now_ms()),
+                ms: started.elapsed().as_secs_f64() * 1000.,
+                docs,
+            });
+            let view = {
+                let live = inner.live.lock();
+                inner.view_in(&live, head.commit, live.last.clone())
+            };
+            Ok((Self::start(inner), view))
+        }
+    }
+
+    fn catch_up(
+        index: &Index,
+        fields: &Fields,
+        config: &TextConfig,
+        head: &Snapshot,
+        journal: &[[Id; 4]],
+        epoch: u64,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let mut writer: IndexWriter<TantivyDocument> = index
+            .writer_with_num_threads(1, 32 << 20)
+            .map_err(text_err)?;
+        writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+        let mut terms = Terms::default();
+        let mut seen = FxHashSet::default();
+        for (i, q) in journal.iter().enumerate() {
+            if i % 1024 == 0 {
+                check()?;
+            }
+            if !seen.insert(*q) {
+                continue;
+            }
+            let Some(Doc {
+                key,
+                doc: Some(doc),
+                ..
+            }) = terms.document(head, fields, config, q)
+            else {
+                continue;
+            };
+            writer.delete_term(Term::from_field_bytes(fields.key, &key));
+            if head.contains(q)? {
+                writer.add_document(doc).map_err(text_err)?;
+            }
+        }
+        check()?;
+        let mut prepared = writer.prepare_commit().map_err(text_err)?;
+        prepared.set_payload(&payload(config, head.commit, epoch));
+        prepared.commit().map_err(text_err)?;
+        writer.wait_merging_threads().map_err(text_err)?;
+        Ok(())
+    }
+
+    fn publish_built(
+        root: Option<&Path>,
+        config: &TextConfig,
+        index: Index,
+        fields: Fields,
+        new_dir: Option<PathBuf>,
+    ) -> Result<(Index, Fields, Option<LazySyncDir>)> {
+        match (root, new_dir) {
+            (Some(root), Some(new_dir)) => {
+                drop(index);
+                crate::store::sync_dir(&new_dir)?;
+                let cur = root.join("text");
+                let old = root.join("text.old");
+                if cur.exists() {
+                    std::fs::rename(&cur, &old)?;
+                    #[cfg(test)]
+                    crate::store::text_recovery::hook(root, "old-renamed");
+                }
+                std::fs::rename(&new_dir, &cur)?;
+                #[cfg(test)]
+                crate::store::text_recovery::hook(root, "current-renamed");
+                crate::store::sync_dir(root)?;
+                match std::fs::remove_file(marker(root)) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                    _ => {}
+                }
+                crate::store::sync_dir(root)?;
+                let (index, fields, dir) = open_index(root, config)?;
+                let _ = std::fs::remove_dir_all(old);
+                Ok((index, fields, Some(dir)))
+            }
+            _ => Ok((index, fields, None)),
+        }
+    }
+
     impl Inner {
         /// A view of commit `seq` in `slot`.
         fn view_in(self: &Arc<Self>, live: &Live, seq: u64, slot: Arc<Slot>) -> Arc<TextView> {
             Arc::new(TextView {
                 seq,
                 epoch: self.epoch.load(Ordering::SeqCst),
+                owner: self.owner,
                 source: ViewSource::Ready(ReadyView {
                     slot,
                     index: live.shared.clone(),
@@ -2316,43 +2540,18 @@ mod imp {
         /// Build the index of `snap` in `text.new/` (in memory for an in-memory store),
         /// with several writer threads, and commit it. The current index is not touched.
         fn build(self: &Arc<Self>, snap: &Snapshot) -> Result<Built> {
-            let t0 = std::time::Instant::now();
-            let new_dir = self.root.as_ref().map(|r| r.join("text.new"));
-            let (index, fields) = new_index(new_dir.as_deref(), &self.config)?;
             let threads = std::thread::available_parallelism()
                 .map_or(1, |n| n.get())
                 .min(8);
-            let mut docs = 0u64;
-            let epoch = self.epoch.load(Ordering::SeqCst) + 1;
-            {
-                let mut writer: IndexWriter<TantivyDocument> = index
-                    .writer_with_num_threads(threads, threads * (64 << 20))
-                    .map_err(text_err)?;
-                let mut terms = Terms::default();
-                let mut add = |q: &[Id; 4]| -> Result<()> {
-                    if let Some(Doc { doc: Some(d), .. }) =
-                        terms.document(snap, &fields, &self.config, q)
-                    {
-                        writer.add_document(d).map_err(text_err)?;
-                        docs += 1;
-                    }
-                    Ok(())
-                };
-                for_each_candidate(snap, &self.config, &mut add)?;
-                let payload = self.payload_with(snap.commit, epoch);
-                let mut prepared = writer.prepare_commit().map_err(text_err)?;
-                prepared.set_payload(&payload);
-                prepared.commit().map_err(text_err)?;
-                writer.wait_merging_threads().map_err(text_err)?;
-            }
-            Ok(Built {
-                index,
-                fields,
-                dir: new_dir,
-                epoch,
-                docs,
-                started: t0,
-            })
+            build_index(
+                self.root.as_deref(),
+                &self.config,
+                self.epoch.load(Ordering::SeqCst) + 1,
+                snap,
+                threads,
+                threads * (64 << 20),
+                &|| Ok(()),
+            )
         }
 
         /// Put a built index in place of the current one, after bringing it from its
@@ -2374,35 +2573,9 @@ mod imp {
                 started: t0,
             } = built;
             if !journal.is_empty() {
-                let mut writer: IndexWriter<TantivyDocument> = index
-                    .writer_with_num_threads(1, 32 << 20)
-                    .map_err(text_err)?;
-                // writes wait for this step: the index's own writer merges later
-                writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
-                let mut terms = Terms::default();
-                let mut seen = FxHashSet::default();
-                for q in journal {
-                    if !seen.insert(*q) {
-                        continue;
-                    }
-                    let Some(Doc {
-                        key,
-                        doc: Some(doc),
-                        ..
-                    }) = terms.document(head, &fields, &self.config, q)
-                    else {
-                        continue;
-                    };
-                    writer.delete_term(Term::from_field_bytes(fields.key, &key));
-                    if head.contains(q)? {
-                        writer.add_document(doc).map_err(text_err)?;
-                    }
-                }
-                let payload = self.payload_with(head.commit, epoch);
-                let mut prepared = writer.prepare_commit().map_err(text_err)?;
-                prepared.set_payload(&payload);
-                prepared.commit().map_err(text_err)?;
-                writer.wait_merging_threads().map_err(text_err)?;
+                catch_up(&index, &fields, &self.config, head, journal, epoch, &|| {
+                    Ok(())
+                })?;
             }
             let snap = head;
             self.epoch.store(epoch, Ordering::SeqCst);
@@ -2414,39 +2587,11 @@ mod imp {
                     let _ = slot.0.set(None);
                 }
             }
-            let old = match (&self.root, new_dir) {
-                (Some(root), Some(new_dir)) => {
-                    // swap directories, then reopen the index in its final place
-                    let cur = root.join("text");
-                    let old = root.join("text.old");
-                    drop(index);
-                    crate::store::sync_dir(&new_dir)?;
-                    if cur.exists() {
-                        std::fs::rename(&cur, &old)?;
-                    }
-                    std::fs::rename(&new_dir, &cur)?;
-                    crate::store::sync_dir(root)?;
-                    // the new index was synced by its build: a marker left by the old one
-                    // is stale
-                    match std::fs::remove_file(marker(root)) {
-                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                        _ => {}
-                    }
-                    crate::store::sync_dir(root)?;
-                    let (index, fields, dir) = open_index(root, &self.config)?;
-                    *live = live_of(index, fields, &self.config, Some(dir), snap.commit)?;
-                    Some(old)
-                }
-                _ => {
-                    *live = live_of(index, fields, &self.config, None, snap.commit)?;
-                    None
-                }
-            };
+            let (index, fields, dir) =
+                publish_built(self.root.as_deref(), &self.config, index, fields, new_dir)?;
+            *live = live_of(index, fields, &self.config, dir, snap.commit)?;
             let view = self.view_in(&live, snap.commit, live.last.clone());
             drop(live);
-            if let Some(old) = old {
-                let _ = std::fs::remove_dir_all(old);
-            }
             *self.stale.lock() = None;
             *self.last_rebuild.lock() = Some(RebuildInfo {
                 at: crate::commit::rfc3339_ms(crate::commit::now_ms()),

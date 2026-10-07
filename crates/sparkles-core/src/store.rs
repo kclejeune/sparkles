@@ -40,6 +40,8 @@ mod preview;
 mod quota;
 mod replay;
 mod schedule;
+#[cfg(feature = "text")]
+pub(crate) mod text_recovery;
 // the geometry tests are the only users
 #[cfg(all(test, feature = "geo"))]
 mod test_support;
@@ -1116,7 +1118,14 @@ pub struct Store {
     /// test hook replacing the wall clock (milliseconds since the epoch)
     clock: Arc<Mutex<Option<Clock>>>,
     /// full-text index, when enabled for this dataset
+    #[cfg(feature = "text")]
+    text: Arc<arc_swap::ArcSwapOption<crate::text::TextIndex>>,
+    #[cfg(not(feature = "text"))]
     text: arc_swap::ArcSwapOption<crate::text::TextIndex>,
+    #[cfg(feature = "text")]
+    text_recovery: Arc<arc_swap::ArcSwapOption<text_recovery::Recovery>>,
+    #[cfg(feature = "text")]
+    text_lifecycle: Mutex<()>,
     /// spatial index, when enabled for this dataset
     geo: arc_swap::ArcSwapOption<crate::geo::GeoIndex>,
     /// configured vector indexes (`vector.json`)
@@ -1283,6 +1292,10 @@ impl Store {
             annotations: Mutex::new(crate::annotations::Annotations::memory(opts.commit_digests)),
             clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
+            #[cfg(feature = "text")]
+            text_recovery: Default::default(),
+            #[cfg(feature = "text")]
+            text_lifecycle: Default::default(),
             geo: Default::default(),
             vector: Default::default(),
             embed: Default::default(),
@@ -1319,6 +1332,11 @@ impl Store {
     }
 
     /// Open (or create) a persistent store rooted at `root`.
+    ///
+    /// With the `text` feature, a configured missing/damaged text index recovers in
+    /// the background. RDF queries/writes remain available; text queries report
+    /// [`Error::TextUnavailable`] until a ready view is published. Healthy index
+    /// verification and covered WAL catch-up still complete before this returns.
     pub fn open(root: &Path, opts: StoreOptions) -> Result<Store> {
         if branching::read_branch_file(root)?.is_some() {
             return Err(crate::branch::invalid_branch(format!(
@@ -1623,6 +1641,10 @@ impl Store {
             annotations: Mutex::new(annotations),
             clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
+            #[cfg(feature = "text")]
+            text_recovery: Default::default(),
+            #[cfg(feature = "text")]
+            text_lifecycle: Default::default(),
             geo: Default::default(),
             vector: Default::default(),
             embed: Default::default(),
@@ -1670,6 +1692,12 @@ impl Store {
         store.open_vectors();
         if head.seq == 0 {
             store.digest_root(&head);
+        }
+        // All startup snapshot writers finish before text's background publisher
+        // is admitted; open_geo must not overwrite a newly recovered text view.
+        #[cfg(feature = "text")]
+        if let Some(job) = store.text_recovery.load_full() {
+            store.enqueue_text_recovery(&job);
         }
         Ok(store)
     }
@@ -2713,8 +2741,17 @@ impl Store {
                 return Ok(());
             };
             let snap = self.snapshot();
-            let mut touched = Vec::new();
-            if let Some(link) = snap.generation.linked() {
+            let first_wal_seq = snap
+                .generation
+                .linked()
+                .and_then(|link| link.file.segments.iter().find(|s| s.wal_end > 0))
+                .and_then(|segment| segment.base_seq.checked_add(1))
+                .or_else(|| wal.first().map(|(seq, _)| *seq));
+            let load_wal = || {
+                let Some(link) = snap.generation.linked() else {
+                    return Ok(std::borrow::Cow::Borrowed(wal));
+                };
+                let mut touched = Vec::new();
                 let dataset_root = link::dataset_root_of(root)?;
                 for segment in &link.file.segments {
                     let path = segment.dir(&dataset_root).join("wal.log");
@@ -2744,25 +2781,28 @@ impl Store {
                         ));
                     }
                 }
-                if !root.join("text").exists()
-                    && let (Some(ident), Some(set)) = (&self.branching.ident, self.branch_set())
-                    && let Some(source) = set.current_of(ident.from.branch_id)
-                    && let Some(view) = &source.text
-                    && let Err(e) = crate::text::seed_branch(view, root, &cfg, snap.commit)
-                {
-                    tracing::warn!(target: "sparkles::store", "cannot reuse upstream text index: {e}; rebuilding");
-                }
-            }
-            touched.extend_from_slice(wal);
-            match crate::text::TextIndex::open(Some(root), cfg, &snap, &touched) {
-                Ok((ti, view)) => {
+                touched.extend_from_slice(wal);
+                Ok(std::borrow::Cow::Owned(touched))
+            };
+            match crate::text::TextIndex::open_ready(
+                root,
+                cfg.clone(),
+                &snap,
+                first_wal_seq,
+                load_wal,
+            ) {
+                Ok(Some((ti, view))) => {
                     self.text.store(Some(Arc::new(ti)));
                     let mut s = (*snap).clone();
                     s.text = Some(view);
                     self.current.store(Arc::new(s));
                 }
+                Ok(None) => {
+                    self.register_text_recovery(cfg);
+                }
                 Err(e) => {
-                    tracing::error!(target: "sparkles::store", "full-text index of {}: {e}", root.display())
+                    tracing::error!(target: "sparkles::store", "full-text startup: {e}; recovering");
+                    self.register_text_recovery(cfg);
                 }
             }
         }
@@ -2782,7 +2822,10 @@ impl Store {
     /// Apply a WAL commit's changes to the full-text index and give `snap` its view.
     fn maintain_text(&self, snap: &mut Snapshot, log: &[(u8, [Id; 4])]) {
         #[cfg(feature = "text")]
-        if let Some(ti) = self.text.load_full() {
+        if let Some(job) = self.text_recovery.load_full().filter(|j| j.pending()) {
+            job.record(snap, log);
+            snap.text = Some(job.view(snap.commit));
+        } else if let Some(ti) = self.text.load_full() {
             let prev = snap.text.take();
             snap.text = ti.apply_commit(snap, log, prev.as_ref());
         }
@@ -2795,7 +2838,10 @@ impl Store {
     /// previous view stays, and text queries report the index as stale).
     fn rebuild_text_locked(&self, snap: &mut Snapshot, old: &Snapshot) {
         #[cfg(feature = "text")]
-        if let Some(ti) = self.text.load_full() {
+        if let Some(job) = self.text_recovery.load_full().filter(|j| j.pending()) {
+            job.changed_generation();
+            snap.text = Some(job.view(snap.commit));
+        } else if let Some(ti) = self.text.load_full() {
             let incremental = ti.apply_bulk(old, snap).unwrap_or_else(|e| {
                 tracing::warn!(target: "sparkles::store", "full-text index after a bulk commit: {e}; rebuilding");
                 None
@@ -2820,9 +2866,13 @@ impl Store {
     }
 
     /// Enable (or reconfigure) full-text search and build the index from the current
-    /// state. The configuration is kept in `text.json`.
+    /// state. The configuration is kept in `text.json`. This synchronous operation
+    /// cancels and joins startup recovery before installing the requested configuration.
     #[cfg(feature = "text")]
     pub fn enable_text(&self, cfg: crate::text::TextConfig) -> Result<crate::text::TextStatus> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        let _lifecycle = self.text_lifecycle.lock();
+        self.stop_text_recovery();
         // an online rebuild of the current index finishes first (it builds in `text.new`)
         let current = self.text.load_full();
         let _rebuild = current.as_ref().map(|t| t.lock_rebuild());
@@ -2844,9 +2894,13 @@ impl Store {
         Ok(ti.status(Some(&view), snap.commit))
     }
 
-    /// Turn full-text search off and delete its index.
+    /// Turn full-text search off and delete its index. Cancels and joins startup
+    /// recovery before removing its configuration and derived files.
     #[cfg(feature = "text")]
     pub fn disable_text(&self) -> Result<()> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        let _lifecycle = self.text_lifecycle.lock();
+        self.stop_text_recovery();
         let current = self.text.load_full();
         let _rebuild = current.as_ref().map(|t| t.lock_rebuild());
         let _w = self.guarded_writer();
@@ -2870,8 +2924,39 @@ impl Store {
     /// are then applied to it, and it takes the current index's place. Writes wait only
     /// for that last step, unless a compaction or bulk commit changed the store's
     /// generation meanwhile: the index is then built again with writes waiting.
+    ///
+    /// During startup recovery, this synchronous method joins the queued/running
+    /// recovery, or retries a failed attempt. The join releases the lifecycle lock
+    /// so another caller can disable/reconfigure and cancel it. This method has no
+    /// per-waiter cancellation token; cancelling an HTTP task retains the existing
+    /// synchronous rebuild behavior. Store close and disable/reconfigure cancel the
+    /// automatic job, joining any admitted directory publication fence.
     #[cfg(feature = "text")]
     pub fn rebuild_text(&self) -> Result<crate::text::TextStatus> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        let lifecycle = self.text_lifecycle.lock();
+        if let Some(job) = self.retry_text_recovery() {
+            // Joining a queued global-worker job must never prevent another caller
+            // from disabling/reconfiguring this dataset and cancelling the join.
+            drop(lifecycle);
+            #[cfg(test)]
+            text_recovery::hook(
+                self.root.as_deref().expect("persistent recovery"),
+                "manual-join",
+            );
+            job.wait()?;
+            let _lifecycle = self.text_lifecycle.lock();
+            if !self
+                .text_recovery
+                .load()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &job))
+            {
+                return Err(Error::Cancelled);
+            }
+            return self.text_status().ok_or(Error::Cancelled);
+        }
+        let _lifecycle = lifecycle;
         let ti = self
             .text
             .load_full()
@@ -2911,13 +2996,24 @@ impl Store {
     /// Full-text status (`None`: not enabled).
     #[cfg(feature = "text")]
     pub fn text_status(&self) -> Option<crate::text::TextStatus> {
-        let ti = self.text.load_full()?;
         let snap = self.snapshot();
-        Some(ti.status(snap.text.as_deref(), snap.commit))
+        if let Some(job) = self.text_recovery.load_full().filter(|job| job.pending()) {
+            return Some(job.status(snap.commit));
+        }
+        if let Some(ti) = self.text.load_full() {
+            return Some(ti.status(snap.text.as_deref(), snap.commit));
+        }
+        self.text_recovery
+            .load_full()
+            .map(|job| job.status(snap.commit))
     }
 
     /// Whether full-text search is enabled.
     pub fn text_enabled(&self) -> bool {
+        #[cfg(feature = "text")]
+        if self.text_recovery.load().is_some() {
+            return true;
+        }
         self.text.load().is_some()
     }
 
@@ -3217,7 +3313,7 @@ impl Store {
             && !self.commit_digests()
             && !self.guard_required()
             && self.guard.read().is_none()
-            && self.text.load().is_none()
+            && !self.text_enabled()
             && self.geo.load().is_none()
             && self.embed.works.lock().is_empty()
     }
@@ -5358,6 +5454,10 @@ impl Collector {
 
 impl Drop for Store {
     fn drop(&mut self) {
+        #[cfg(feature = "text")]
+        self.stop_text_recovery();
+        // Checkpoint/join derived writers while the dataset OS lock is still held.
+        self.text.store(None);
         // a lease guard outliving the store must not collect in a directory that another
         // process (or a restore's swap) may own next
         {

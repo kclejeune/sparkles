@@ -1385,6 +1385,11 @@ impl Store {
             mask: None,
             change_log: self.changelog.clone(),
         };
+        #[cfg(feature = "text")]
+        if let Some(job) = self.text_recovery.load_full().filter(|j| j.pending()) {
+            job.changed_generation();
+            new_snap.text = Some(job.view(new_snap.commit));
+        }
         self.switch_geo_locked(&mut new_snap, &view, geo);
         let quads = new_snap.len();
         self.current.store(Arc::new(new_snap));

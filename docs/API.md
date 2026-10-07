@@ -4411,6 +4411,19 @@ SELECT ?s ?score ?label WHERE {
   updates the index by the documents it adds and removes when they are few next to the
   index, and rebuilds it otherwise. Enabling or reconfiguring an index builds it with
   writes waiting.
+* **Startup recovery.** Persistent open verifies and catches up a reusable index
+  synchronously. A missing, damaged, ahead or uncovered index instead rebuilds from RDF
+  on a bounded background worker. RDF reads/writes remain available; configured text
+  searches return `503` while `rebuilding` or `failed`. Disabled search still returns
+  `400`. Retained unavailable snapshots stay unavailable after a newer view becomes
+  ready. A failed or queue-exhausted attempt can be retried with the rebuild endpoint
+  or `sparkles text-index --loc DB --rebuild`. Missing indexes after backup restore and
+  in linked branches use this same recovery path.
+  Explicit enable/reconfigure remain synchronous inside their task, while an explicit
+  rebuild joins/retries startup recovery or runs its existing online build. Cancelling
+  an HTTP task retains the existing synchronous native rebuild behavior; there is no
+  per-waiter cancellation token. Disable/reconfigure/close cancel automatic recovery
+  and join its cleanup, completing an admitted publication fence before returning.
 * **Durability.** Index commits are not fsynced. The write-ahead log is the durable
   record. The index is checkpointed (synced) about once a second while writes continue,
   before compaction and on close. After a crash, an index with unsynced changes, marked
@@ -4445,7 +4458,7 @@ type TextConfig = {
   languages?: "all" | string[] | { [tag: string]: string };  // stemmed languages; a change rebuilds
 };
 type TextStatus = {
-  enabled: true; state: "ready" | "stale"; docs: number;
+  enabled: true; state: "ready" | "stale" | "rebuilding" | "failed"; docs: number;
   seq: number; storeSeq: number;       // ready when equal: the commit the index reflects
   epoch: number; diskBytes: number; segments: number;
   config: TextConfig; formatVersion: 2;

@@ -1876,6 +1876,10 @@ fn text_index(
     let configured = !predicates.is_empty() || !exclude_graph.is_empty() || !languages.is_empty();
     let s = match store.text_status() {
         Some(_) if !configured && rebuild => store.rebuild_text()?,
+        Some(s) if !configured && matches!(s.state.as_str(), "rebuilding" | "failed") => {
+            // This command completes recovery before dropping the store.
+            store.rebuild_text()?
+        }
         Some(s) if !configured => s,
         _ => {
             let mut cfg = TextConfig::default();

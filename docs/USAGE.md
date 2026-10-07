@@ -519,6 +519,17 @@ part of the default graph while `reasoning.json` records them, and DESCRIBE foll
 `describe.json`. `--rdfs` or `--rdfs-graph` sets RDFS on read for the one query instead.
 `sparkles queries run` follows the same settings.
 
+Opening a persistent dataset with a missing or damaged configured text index starts
+background recovery. RDF queries and writes remain available, while text queries return
+`503` until a ready view is published. `rebuilding` and `failed` are configured states;
+a disabled index still gives `400`. Plain `sparkles text-index --loc DB` joins
+pending recovery or retries a failed attempt before exiting. `--rebuild` explicitly
+requests a rebuild, including when the index is already ready. Enabling or changing
+its configuration builds synchronously. Closing the dataset or disabling/reconfiguring
+text search cancels automatic recovery and joins its cleanup. An admitted directory
+publication fence completes before cancellation returns. The HTTP rebuild task keeps
+its existing synchronous native cancellation behavior ([API](API.md#full-text-search)).
+
 `sparkles dump` writes N-Quads by default. `--format`, or the extension of `--out`, picks
 another syntax: TriG, N-Triples, Turtle, JSON-LD, RDF/XML, TriX, RDF Thrift (`rt`), RDF
 Protobuf (`rpb`) or RDF/JSON (`rj`). A compression extension after it, as in

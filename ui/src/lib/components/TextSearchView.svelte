@@ -7,6 +7,7 @@
   import { shortLabel } from '$lib/graph';
   import { displayIri, type PrefixMap } from '$lib/rdf';
   import { LatestRun } from '$lib/supersede';
+  import { poll } from '$lib/poll';
   import { textErrorHint, textSearch, type TextHit } from '$lib/textsearch';
   import Icon from './Icon.svelte';
   import TermView from './TermView.svelte';
@@ -29,6 +30,7 @@
 
   let status = $state<api.TextStatus | null | 'unsupported' | undefined>(undefined);
   let statusError = $state<string | null>(null);
+  let panel = $state<HTMLElement>();
   let predicate = $state('');
   let lang = $state('');
   let limit = $state(50);
@@ -44,10 +46,14 @@
   let debounce: ReturnType<typeof setTimeout> | undefined;
 
   async function loadStatus(name: string) {
+    const owns = runs.claim('text-status');
     try {
-      status = await api.textStatus(name);
+      const next = await api.textStatus(name);
+      if (!owns() || name !== ds) return;
+      status = next;
       statusError = null;
     } catch (e) {
+      if (!owns() || name !== ds) return;
       if (e instanceof api.ApiError && e.status === 501) status = 'unsupported';
       else statusError = api.errorMessage(e);
     }
@@ -56,6 +62,7 @@
   $effect(() => {
     const name = ds;
     status = undefined;
+    statusError = null;
     predicate = '';
     hits = null;
     void loadStatus(name);
@@ -114,7 +121,15 @@
 
   onMount(() => {
     if (query.trim()) void run();
+    const recovery = poll(() => loadStatus(ds), {
+      interval: 2000,
+      when: () => !!status && typeof status === 'object' && status.state === 'rebuilding',
+      target: () => panel,
+      immediate: false,
+    });
     return () => {
+      recovery.stop();
+      runs.claim('text-status');
       clearTimeout(debounce);
       ctl?.abort();
     };
@@ -123,7 +138,7 @@
   const datasetHref = $derived(resolve('/datasets/[name]', { name: ds }));
 </script>
 
-<div class="wrap">
+<div class="wrap" bind:this={panel}>
   <form
     class="bar"
     onsubmit={(e) => {
@@ -190,6 +205,9 @@
           <Icon name="alert" size={14} /> The index is {status.state}{status.message
             ? ` (${status.message})`
             : ''}. Searches answer 503 until it is rebuilt.
+          {#if status.state === 'failed'}
+            <a href={datasetHref}>Retry the rebuild in the Full-text search panel.</a>
+          {/if}
         </div>
       {/if}
       {#if error}

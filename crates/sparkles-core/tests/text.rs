@@ -19,6 +19,19 @@ ex:g1 { ex:b4 rdfs:label "Fox in Socks" }
 
 const P: &str = "PREFIX ex: <http://example.org/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX text: <http://jena.apache.org/text#> ";
 
+/// These ready-index behavior fixtures wait only for the new startup recovery path.
+/// Dedicated native recovery tests retain/unavailable snapshots before this fence.
+fn ready_open(root: &std::path::Path, options: StoreOptions) -> sparkles_core::Result<Store> {
+    let store = Store::open(root, options)?;
+    if store
+        .text_status()
+        .is_some_and(|status| status.state == "rebuilding" || status.state == "failed")
+    {
+        store.rebuild_text()?;
+    }
+    Ok(store)
+}
+
 fn load(s: &Store) {
     s.load(&[Source::from_bytes(
         DATA.as_bytes().to_vec(),
@@ -365,7 +378,7 @@ fn persistence_compaction_bulk_and_recovery() {
         ..Default::default()
     };
     {
-        let s = Store::open(&root, opts()).unwrap();
+        let s = ready_open(&root, opts()).unwrap();
         load(&s);
         s.enable_text(TextConfig::default()).unwrap();
         let epoch = s.text_status().unwrap().epoch;
@@ -393,7 +406,7 @@ fn persistence_compaction_bulk_and_recovery() {
     }
     // reopen: the index is reused as it is
     {
-        let s = Store::open(&root, opts()).unwrap();
+        let s = ready_open(&root, opts()).unwrap();
         assert!(s.text_enabled());
         assert_eq!(rows(&s, "SELECT ?s { ?s text:query \"fox\" }"), ["b1"]);
         // A12: a failed text update leaves the index stale (queries refuse), and the
@@ -411,7 +424,7 @@ fn persistence_compaction_bulk_and_recovery() {
     }
     // reopen: the index is behind, and catches up from the WAL instead of a rebuild
     {
-        let s = Store::open(&root, opts()).unwrap();
+        let s = ready_open(&root, opts()).unwrap();
         let st = s.text_status().unwrap();
         assert_eq!(st.state, "ready");
         assert!(st.last_rebuild.is_none());
@@ -419,7 +432,7 @@ fn persistence_compaction_bulk_and_recovery() {
     }
     // a deleted index is rebuilt too
     std::fs::remove_dir_all(root.join("text")).unwrap();
-    let s = Store::open(&root, opts()).unwrap();
+    let s = ready_open(&root, opts()).unwrap();
     assert_eq!(rows(&s, "SELECT ?s { ?s text:query \"fox\" }"), ["b1"]);
     s.disable_text().unwrap();
     assert!(!root.join("text").exists() && !root.join("text.json").exists());
@@ -486,7 +499,7 @@ fn commits_skip_fsync_until_a_checkpoint() {
     let root = dir.path().join("db");
     let marker = root.join("text.dirty");
     {
-        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        let s = ready_open(&root, StoreOptions::default()).unwrap();
         load(&s);
         s.enable_text(TextConfig::default()).unwrap();
         s.set_text_ticks(false);
@@ -508,7 +521,7 @@ fn commits_skip_fsync_until_a_checkpoint() {
     }
     // so does closing the store
     assert!(!marker.exists());
-    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let s = ready_open(&root, StoreOptions::default()).unwrap();
     let st = s.text_status().unwrap();
     assert_eq!(
         (st.state.as_str(), st.last_rebuild.is_none()),
@@ -525,7 +538,7 @@ fn crash_images_are_verified_caught_up_or_rebuilt() {
     let root = dir.path().join("db");
     let img = |n: &str| dir.path().join(n);
     {
-        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        let s = ready_open(&root, StoreOptions::default()).unwrap();
         load(&s);
         s.enable_text(TextConfig::default()).unwrap();
         s.set_text_ticks(false);
@@ -558,7 +571,7 @@ fn crash_images_are_verified_caught_up_or_rebuilt() {
     ] {
         let root = img(name);
         assert!(root.join("text.dirty").exists(), "{name}");
-        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        let s = ready_open(&root, StoreOptions::default()).unwrap();
         let st = s.text_status().unwrap();
         assert_eq!(st.state, "ready", "{name}");
         assert_eq!(st.last_rebuild.is_some(), rebuilt, "{name}");
@@ -961,7 +974,7 @@ fn staged_and_kept_documents_are_recovered_after_a_crash() {
     let img = |n: &str| dir.path().join(n);
     let head;
     {
-        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        let s = ready_open(&root, StoreOptions::default()).unwrap();
         load(&s);
         s.enable_text(TextConfig::default()).unwrap();
         s.set_text_ticks(false);
@@ -991,7 +1004,7 @@ fn staged_and_kept_documents_are_recovered_after_a_crash() {
         let root = img(name);
         // the crash lost what the index had only staged or kept
         let payload = text_payload_seq(&root);
-        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        let s = ready_open(&root, StoreOptions::default()).unwrap();
         let data = s.snapshot().commit;
         assert!(payload < data && data <= head, "{name}: {payload} {data}");
         let st = s.text_status().unwrap();
@@ -1014,7 +1027,7 @@ fn staged_and_kept_documents_are_recovered_after_a_crash() {
 fn large_batches_are_committed_by_the_write() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
-    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let s = ready_open(&root, StoreOptions::default()).unwrap();
     load(&s);
     s.enable_text(TextConfig::default()).unwrap();
     s.set_text_ticks(false);
@@ -1155,7 +1168,7 @@ fn bulk_commits_update_the_index_by_their_changes() {
         .clone()
     };
     {
-        let s = Store::open(&root, opts()).unwrap();
+        let s = ready_open(&root, opts()).unwrap();
         load(&s);
         s.enable_text(TextConfig::default()).unwrap();
         // the first big load is indexed by a rebuild, since the index was nearly empty
@@ -1203,7 +1216,7 @@ fn bulk_commits_update_the_index_by_their_changes() {
         assert_eq!(st.docs, 30_050 + 6 - 1 + 30);
     }
     // reopened without a rebuild or catch-up: the bulk commits were synced
-    let s = Store::open(&root, opts()).unwrap();
+    let s = ready_open(&root, opts()).unwrap();
     let st = s.text_status().unwrap();
     assert!(st.last_rebuild.is_none());
     assert_eq!((st.state.as_str(), st.docs), ("ready", 30_050 + 6 - 1 + 30));
@@ -1221,7 +1234,7 @@ fn bulk_commits_update_the_index_by_their_changes() {
 fn rebuilds_run_while_writes_go_on() {
     let dir = tempfile::tempdir().unwrap();
     let s =
-        std::sync::Arc::new(Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap());
+        std::sync::Arc::new(ready_open(&dir.path().join("db"), StoreOptions::default()).unwrap());
     let mut base = String::new();
     for i in 0..20_000 {
         base.push_str(&format!(
@@ -1454,7 +1467,7 @@ fn batch_insert_timing() {
     }
     for text in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+        let s = ready_open(&dir.path().join("db"), StoreOptions::default()).unwrap();
         s.load(&[Source::from_bytes(
             base.clone().into_bytes(),
             RdfFormat::NTriples,
@@ -1533,9 +1546,9 @@ fn batch_insert_timing() {
 }
 
 #[test]
-fn linked_branch_text_seeds_a_checkpoint_and_replays_uncheckpointed_changes() {
+fn missing_linked_branch_text_recovers_without_checkpointing_upstream() {
     let dir = tempfile::tempdir().unwrap();
-    let s = Store::open(dir.path(), Default::default()).unwrap();
+    let s = ready_open(dir.path(), Default::default()).unwrap();
     load(&s);
     s.compact().unwrap();
     s.enable_text(Default::default()).unwrap();
@@ -1544,9 +1557,12 @@ fn linked_branch_text_seeds_a_checkpoint_and_replays_uncheckpointed_changes() {
     sparkles_core::sparql::update::update(&s, &format!("{P}DELETE DATA {{ ex:b1 rdfs:label \"The Quick Brown Fox\"@en }}; INSERT DATA {{ ex:new rdfs:label \"silver fox\" }}"), &Default::default()).unwrap();
     s.create_branch("work", &Default::default()).unwrap();
     let work = s.branch("work").unwrap();
+    if work.text_status().unwrap().state != "ready" {
+        work.rebuild_text().unwrap();
+    }
     assert!(
-        work.text_status().unwrap().last_rebuild.is_none(),
-        "copied checkpoint was caught up without rebuilding"
+        work.text_status().unwrap().last_rebuild.is_some(),
+        "missing branch index rebuilt in its owned directory"
     );
     assert_eq!(
         sorted(rows(&work, "SELECT ?s { ?s text:query \"fox\" }")),
@@ -1573,7 +1589,7 @@ fn linked_branch_text_seeds_a_checkpoint_and_replays_uncheckpointed_changes() {
 #[test]
 fn linked_branch_text_rebuilds_when_upstream_checkpoint_is_after_the_fork() {
     let dir = tempfile::tempdir().unwrap();
-    let s = Store::open(dir.path(), Default::default()).unwrap();
+    let s = ready_open(dir.path(), Default::default()).unwrap();
     load(&s);
     s.compact().unwrap();
     s.enable_text(Default::default()).unwrap();
@@ -1595,6 +1611,9 @@ fn linked_branch_text_rebuilds_when_upstream_checkpoint_is_after_the_fork() {
     )
     .unwrap();
     let branch = s.branch("past").unwrap();
+    if branch.text_status().unwrap().state != "ready" {
+        branch.rebuild_text().unwrap();
+    }
     assert!(branch.text_status().unwrap().last_rebuild.is_some());
     assert!(rows(&branch, "SELECT ?s { ?s text:query \"futurefox\" }").is_empty());
     assert_eq!(

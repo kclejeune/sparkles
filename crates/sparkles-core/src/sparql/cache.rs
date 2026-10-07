@@ -376,6 +376,12 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             }
             // the view's epoch changes with every rebuild of the index
             let epoch = ctx.snap.text.as_ref().map_or(0, |v| v.epoch);
+            #[cfg(feature = "text")]
+            let _ = write!(
+                s,
+                "owner:{};",
+                ctx.snap.text.as_ref().map_or(0, |v| v.owner)
+            );
             let _ = write!(s, "{:?}{:?}{:?}{}", t.graph, t.graph_var, t.subject, epoch);
             true
         }

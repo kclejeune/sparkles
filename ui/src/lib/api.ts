@@ -2102,7 +2102,7 @@ export const geoConvert = (literals: { value: string; datatype: string }[], sign
 
 // --- full-text search --------------------------------------------------------------
 
-export type TextState = 'ready' | 'stale' | 'failed';
+export type TextState = 'ready' | 'stale' | 'rebuilding' | 'failed';
 
 export type TextConfig = {
   /** Default "all". */
