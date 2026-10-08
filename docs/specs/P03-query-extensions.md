@@ -1,13 +1,13 @@
 # P03: Registered query functions, property functions and aggregates
 
-> **Status:** partially implemented (Rust scalar, aggregate and property registries)
+> **Status:** implemented in part (Rust scalar, aggregate and property registries)
 >
-> **Phases:** Rust scalar registry first; property functions and aggregates next;
-> foreign-language callbacks after the Rust execution contract is tested. Rust
-> direct-IRI scalar registration and explicit single-argument `AGG` registration
-> and captured-view property functions are implemented; dynamic registered dispatch
-> and foreign callbacks remain open. Existing built-in
-> extension IRIs continue to work.
+> **Phases:** The Rust scalar registry comes first. Property functions and aggregates
+> follow it. Foreign-language callbacks come after the Rust execution contract is
+> tested. Rust scalar registration by direct IRI, single-argument aggregates called
+> with `AGG`, and property functions over the captured view are implemented. Dynamic
+> registered dispatch and foreign callbacks remain open. Existing built-in extension
+> IRIs continue to work.
 >
 > **User docs:** [Registered scalar functions](../USAGE.md#registered-scalar-functions),
 > [registered aggregates](../USAGE.md#registered-aggregates),
@@ -96,8 +96,14 @@ The first Rust slice resolves registered scalars through direct IRI calls. Dynam
 dispatch through `fn:apply` or `afn:eval` retains the existing built-in catalog;
 registered dynamic dispatch requires a separate optimizer/cache activation design.
 
-Input batches and decoded output batches have both row and byte ceilings. The
-engine charges input/output terms and retained property-function buffers against
+Input batches and decoded output batches have both row and byte ceilings. The byte
+ceiling is 1 MiB. One argument row whose terms exceed it, or one returned term that
+exceeds it, aborts the query in the same way as an exhausted budget. It is not an
+expression error that leaves a BIND variable unbound, because the row never reaches
+the callback and its answer is unknown. Like other fatal failures, it prevents an
+enclosing write transaction from committing.
+
+The engine charges input/output terms and retained property-function buffers against
 the query budget before exposing them to another operator. Accumulators explicitly
 charge retained memory. A callback retaining application-owned copies outside that
 accounting is trusted code; the engine cannot bound its private heap. Inputs remain
@@ -217,7 +223,7 @@ their public APIs are enabled.
   query calls and batched versus scalar foreign dispatch. Public claims use measured
   results; no transport change is selected from loaded-machine timings.
 
-## 9. Delivery and outcome
+## 9. Delivery
 
 Phase 1 implements Rust registries, scalar calls, error mapping, cache bypass and
 planner safeguards with A1–A5, A8–A10. Phase 2 adds property functions and aggregates
@@ -225,7 +231,9 @@ with the access-filtered context and their lifetime/budget tests. Phase 3 adds J
 callbacks first, then Python/Node adapters once their dispatch contracts are proved.
 Each phase updates API docs, extension descriptions and binding-map coverage.
 
-**Outcome:** the Rust scalar slice provides immutable registry builders and identities,
+## Outcome
+
+The Rust scalar slice provides immutable registry builders and identities,
 arity/collision checks, owned RDF terms, volatile-by-default descriptors, callback
 error/panic handling, bounded argument/output terms and cancellation/memory charging.
 Queries that reference callbacks bypass caches and unsafe optimizer rewrites;
@@ -243,9 +251,11 @@ accumulators. Explicit `AGG <iri>(expr)` syntax supports one argument and keeps
 prepared syntax independent of execution registrations. Factory, add, finalization
 and destruction share the guarded panic, fatal-error, cancellation and budget
 boundaries. DISTINCT, empty groups, domain errors, retained state and received
-blank-node identity are covered. Non-keyword custom aggregate formatting preserves
-`AGG` across parse/format/reparse without a mutable parser registry. Execution
-supplies singleton batches, with no parallel partial aggregation. Twenty-four
+blank-node identity are covered. The formatter writes application aggregates with
+`AGG`, so they survive parsing, formatting and parsing again without a mutable
+parser registry. The built-in GeoSPARQL and `afn:` aggregate IRIs keep the standard
+`<iri>(…)` call form, which endpoints other than Jena accept in SERVICE requests.
+Execution supplies singleton batches, with no parallel partial aggregation. Twenty-four
 focused aggregate regressions pass alongside the scalar and existing ARQ suites;
 the full core and formatter suites and default/minimal/featured strict lint pass.
 
@@ -286,7 +296,9 @@ Thirty-five property, twenty-four aggregate and twenty scalar regressions pass
 (79 focused), alongside 820 full core tests with 11 existing ignored tests and
 95 feature-focused tests. Strict default/minimal/featured all-target lint,
 formatting and diff checks pass. Ordinary/unused-registry layout remains unchanged;
-no callback-CDT throughput improvement is claimed.
+no callback-CDT throughput improvement is claimed. For A9, the W3C SPARQL 1.0 and 1.1
+query evaluation tests also run with an empty registry installed, both eagerly and
+through cursors, and match the expected results.
 
 Dynamic registered dispatch, foreign-language callbacks, cross-row batching,
 broader aggregate arities and direct-IRI aggregate classification remain open.

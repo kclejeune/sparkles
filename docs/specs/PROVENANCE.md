@@ -1496,7 +1496,10 @@ implementation landed.
   extension catalog and binding lifecycle code; the W3C SPARQL 1.1 Query standard;
   Apache Jena's published scalar/property-function documentation; and DataFusion's
   published volatility documentation. The spec links those primary sources.
-- **Implementation:** not started. No external code copied and no new dependencies.
+- **Implementation:** implemented in part. The Rust scalar, aggregate and property
+  function registries are built on Sparkles' own expression dispatcher, aggregate
+  evaluation and planner. Dynamic registered dispatch and foreign-language callbacks
+  are not built. The implementation adds no dependency.
 
 ## Streaming query execution
 
@@ -1504,22 +1507,20 @@ implementation landed.
   written on 2026-10-07 as internal engineering from Sparkles at `a6b6b449`:
   the native SPARQL executor/planner, snapshot block/delta scans, query context and
   vocabulary, result writers, bounded HTTP serialization and embedding APIs.
-  Existing C01, C12/C12b, F06, F11, G06, P03 and P06 specs supply semantic,
-  access, budget, history, encryption and lifecycle requirements. The internal
-  O12 roadmap and query memory audit informed the phased scope.
-- **Implementation:** snapshot-owning SELECT/graph cursors, standard/native writers,
-  HTTP/CLI and foreign binding integration share the existing planner/executor.
-  Resumable joins and charged blocking operators use explicit budget failure;
-  disk spill is not implemented. Batch-local expression
-  reuse and vocabulary key tests adapt Sparkles exprcache/keyfilter code; checked
-  front-coded reconstruction reserves scratch before growth. No external engine
-  source was read or copied for that implementation. Budgeted regex expressions
-  use `regex-automata` 0.4.18 (MIT OR Apache-2.0), already a transitive dependency
-  of `regex`, now declared directly. Its local `meta::Regex`/`Cache` size and
-  configuration API documentation, PikeVM capture-slot sizing, Searcher empty-match
-  handling and capture interpolation APIs informed the query-owned cache and
-  conservative reservations. No regex implementation source was copied. Later spill
-  designs must record any adopted implementation or dependency before landing.
+  The existing C01, C12, C12b, F06, F11, G06, P03 and P06 specs supply its semantic,
+  access, budget, history, encryption and lifecycle requirements.
+- **Implementation:** implemented in part. Snapshot-owning SELECT and graph cursors,
+  standard and native writers, and the HTTP, CLI and foreign binding integrations
+  share the existing planner and executor. Joins and charged blocking operators fail
+  explicitly when they exceed the query budget, because disk spill is not built.
+  Batch-local expression reuse and vocabulary key tests adapt Sparkles' own
+  exprcache and keyfilter code. Budgeted regex expressions use `regex-automata`
+  0.4.18 (MIT OR Apache-2.0), which was already a transitive dependency of `regex`
+  and is now declared directly. Its published API documentation for `meta::Regex`
+  and `Cache` sizing and configuration, PikeVM capture slots, empty-match handling
+  in `Searcher` and capture interpolation informed the query-owned cache and its
+  conservative reservations. A later spill design must record any adopted
+  implementation or dependency before it lands.
 - **Rejected:** pagination of a completed table as an execution solution,
   repeated prefix execution, immediate replacement of the eager executor,
   unbounded background queues, hidden materialization/state growth, and guessed

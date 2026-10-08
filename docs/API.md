@@ -1495,11 +1495,12 @@ Query parameters beyond the standard protocol:
   fill. Scans, FILTER/BIND without EXISTS, projection, OFFSET/LIMIT, VALUES, UNION,
   merge joins and eligible OPTIONAL joins are incremental. Hash joins retain their
   build side, DISTINCT retains seen keys, and eligible aggregates retain group state;
-  each allocation counts against the query budget. Sorting, DESCRIBE and unsupported
-  operator shapes use visible, budgeted materialization. Exceeding the budget fails
-  the query; there is no disk spill. Streaming does not guarantee constant memory for
-  every query. SELECT in RDF Thrift is unsupported in streaming mode and returns `501`;
-  an invalid mode returns `400`.
+  each allocation counts against the query budget. Sorting reads its whole input into
+  budgeted state before the first row. DESCRIBE and unsupported operator shapes use
+  visible, budgeted materialization. Exceeding the budget fails the query, and there is
+  no disk spill. Streaming does not guarantee constant memory for every query. SELECT
+  in SPARQL Results Thrift is unsupported in streaming mode and returns `501`. An
+  invalid mode returns `400`.
 
   `auto` selects streaming for plain SELECT scans/projections estimated to return
   at least one million rows, using immutable blocks without a pending delta. It also
@@ -1508,7 +1509,8 @@ Query parameters beyond the standard protocol:
   disabled or bypassed. Cached aggregate queries retain eager execution. Both paths require
   whole-block graph predicates, no restored initial bindings or offset, enough memory
   for block ownership and batches of at least 4,096 rows and 128 KiB. Other plans use
-  eager execution. This conservative policy
+  eager execution. A request for SPARQL Results Thrift also uses eager execution,
+  because that encoding has no streaming writer. This conservative policy
   can change as additional query shapes meet the performance gate.
 
   Memory and physical-work budgets cover the whole cursor, including retained batches

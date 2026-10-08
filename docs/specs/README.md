@@ -54,7 +54,7 @@ landing gates are being validated.
 
 | Spec | Summary | Status |
 |---|---|---|
-| [P03](P03-query-extensions.md) | Per-query registered scalar functions, property functions and aggregates, with budgets, access-filtered reads and batched binding callbacks | partial: Rust scalars, aggregates and properties |
+| [P03](P03-query-extensions.md) | Per-query registered scalar functions, property functions and aggregates, with budgets, access-filtered reads and batched binding callbacks | implemented in part (Rust scalars, aggregates and properties) |
 | [CI](CI-commit-identity.md) | Durable dataset ids, a gap-free commit sequence, commit receipts and headers, `/$/commits` and `sparkles log`, commit messages, change digests, entity tags, the catalog horizon and the change feed | implemented (Phases 1–3) |
 | [C01](C01-observability-and-budgets.md) | Request ids, access log, Prometheus metrics, readiness, OpenTelemetry, memory and result-size budgets, cancellation on disconnect | implemented in part |
 | [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, a SHACL constraints layer, subject classes per predicate, class profiles, schema diffs between commits, reports kept up to date from the changes, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented |
@@ -96,7 +96,7 @@ landing gates are being validated.
 | [X02](X02-formatter.md) | `sparkles fmt`, `POST /$/format`, `sparkles lsp` and the UI's Format button for SPARQL and RDF | implemented |
 | [X03](X03-openapi-and-completions.md) | An OpenAPI 3.1 description at `/$/openapi.json`, kept equal to the route table by a test and checked in, `sparkles openapi`, shell completions and man pages | implemented in part (Phase 1, part of Phase 2) |
 | [X04](X04-linter.md) | `sparkles lint` for SPARQL, Turtle and TriG, with severities per rule, safe fixes, diagnostics and quick fixes in `sparkles lsp`, `POST /$/lint` and the query editor | implemented |
-| [X05](X05-streaming-query-execution.md) | Snapshot-owning SELECT/graph cursors, resumable joins, charged operator state, writer/HTTP backpressure, bindings and measured automatic selection | implemented (Phases 1–4; explicit budget failure instead of disk spill; performance-qualified automatic selection) |
+| [X05](X05-streaming-query-execution.md) | Snapshot-owning SELECT/graph cursors, resumable joins, charged operator state, writer/HTTP backpressure, bindings and measured automatic selection | implemented in part (Phases 1, 2 and 4, and Phase 3 without disk spill) |
 
 [PROVENANCE.md](PROVENANCE.md) is the provenance record for all of these
 specs, the allocator, the vendored spargebra and the development tools.

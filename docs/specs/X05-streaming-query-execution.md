@@ -1,20 +1,18 @@
 # X05: Streaming query execution
 
-> **Status:** implemented, Phases 1–4. Growing state uses explicit budget failure
-> rather than disk spill. Eager execution remains the default; automatic selection
-> is restricted to measured eligible cases. Explicit streaming does not yet match
-> eager complete-response performance on every workload.
+> **Status:** implemented in part (Phases 1, 2 and 4, and Phase 3 without disk spill).
+> Growing state fails explicitly when it exceeds the query budget, because disk spill
+> was not built. Eager execution remains the default, and automatic selection is
+> restricted to measured eligible cases. On some workloads, explicit streaming takes
+> longer than eager execution to deliver a complete response.
 >
-> **Phases:** 1. Opt-in SELECT cursors and resumable scans/unary operators.
-> 2. Writer and HTTP integration with backpressure.
-> 3. Incremental joins and budgeted state/spill for blocking operators.
-> 4. Graph queries, binding integration and measured automatic selection.
+> **Phases:** Phase 1 adds opt-in SELECT cursors with resumable scans and unary
+> operators. Phase 2 integrates result writers and HTTP with backpressure. Phase 3 adds
+> incremental joins, budgeted state for blocking operators and disk spill. Phase 4 adds
+> graph queries, binding integration and measured automatic selection.
 >
 > **User docs:** [API](../API.md#applicationx-sparklesjson-ui-result-format),
 > [Usage](../USAGE.md#incremental-query-execution). Existing query APIs remain eager.
->
-> This specifies the architectural work previously called O12 in the optimization
-> roadmap. O12 remains a roadmap label; X05 is the feature's stable spec ID.
 
 ## 1. Purpose and scope
 
@@ -128,8 +126,13 @@ Zero-column solutions carry an explicit row count, including duplicates.
 The cursor owns its captured snapshot and execution state, without borrowing a live
 Dataset handle or holding a writer lock. Commits and compaction after open cannot
 change its answer. Dropping the Dataset handle does not invalidate a live cursor.
-Snapshots and returned batches may pin a generation until their last owner drops;
-this resource consequence is documented.
+Snapshots and returned batches keep their generation's memory and open files until
+their last owner drops. Generation collection does not wait for them. When history no
+longer needs a generation, collection removes its directory even while a cursor still
+reads it. The cursor keeps working because Unix keeps a removed file's data for the
+processes that have it open or mapped, and the disk space returns when the last owner
+drops. This relies on Unix file semantics. A platform that cannot remove open files
+would need collection to defer the generations that live snapshots read.
 
 The cursor supports movement between threads (`Send`) and sequential pulls through
 `&mut self`; concurrent pulls are not supported. Each pull and guarded teardown must
@@ -158,6 +161,9 @@ the failure remains recorded. `collect` refuses a Failed/Stopped cursor or one t
 has already delivered a batch to another consumer. Otherwise it drains and collects
 the complete answer; it cannot recover previously yielded rows or return only the
 remainder as a successful complete `QueryResult`.
+The Python cursor wrappers differ at this point because Python's iteration protocol
+cannot carry a status. After a failure, each later `next()` raises an error that names
+the original failure, so a loop cannot end as if the answer were complete.
 Close is idempotent and preserves a prior Complete or Failed state. Stats never drain
 the cursor. Completion may be known with the last batch; it need not await an extra
 pull when the root has already proved exhaustion.
@@ -209,7 +215,13 @@ Each physical node records its production mode (incremental or materialized), wh
 first output requires its full input, retained state (fixed buffers, growing budgeted
 state or spill), and the reason for a barrier. A supported external sort may consume
 all input before emitting incremental output without materializing a complete RAM
-table; report its blocking startup separately from eager fallback.
+table. Its blocking startup is reported separately from eager fallback.
+
+The native ORDER BY reads cursor batches into charged state, sorts them and then
+emits batches. Its plan node reports that it needs its full input before output and
+gives the reason, while `materializes` stays false because no eager subtree runs. The
+policy that rejects materialization therefore admits it. An ORDER key that evaluates
+EXISTS runs subqueries outside the cursor, so that sort counts as materialization.
 The root plan summarizes whether any subtree materializes and whether state can grow
 with input/result cardinality. Partial runtime counts are explicitly partial.
 
@@ -311,11 +323,18 @@ The rich Sparkles JSON format follows with results first and final metadata afte
 successful exhaustion. Final timing/count/plan fields cannot be fabricated at open.
 Jena binary formats require their own cursor adapters before being supported.
 
-HTTP uses the explicit query parameter `execution=eager|streaming`; omission initially
-means eager. Invalid values are rejected. The streaming mode permits visible budgeted
-fallback, as in §4.2; it does not guarantee constant memory. Unsupported query forms
-or negotiated encodings are refused before execution with an actionable error, rather
-than silently selecting eager execution. The initial phase supports SELECT and the
+HTTP uses the explicit query parameter `execution=eager|streaming|auto`. Omitting it
+means eager, and invalid values are rejected. The streaming mode permits visible
+budgeted fallback, as in §4.2, and does not guarantee constant memory. When streaming
+is requested explicitly, unsupported query forms or negotiated encodings are refused
+before execution with an actionable error, rather than silently selecting eager
+execution.
+
+The `auto` mode streams only the plans that the measured admission rules accept, which
+the API documentation lists, and runs every other query eagerly. It also runs eagerly
+when the negotiated encoding has no cursor writer. SPARQL Results Thrift is such an
+encoding, so `auto` with Thrift returns an eager answer while `streaming` with Thrift
+is refused. The initial phase supports SELECT and the
 four standard encodings; native JSON is enabled only with its completed adapter.
 Update OpenAPI and API/usage docs when the option lands. Authorization, historical
 snapshot resolution, substitutions and dataset defaults follow the existing handler.
@@ -434,7 +453,9 @@ and rollback. Any change of the default has its own documented acceptance decisi
   completion record. Verify resolved identity/history/auth and `send` stop semantics.
 - **A11 — Capability honesty:** strict fallback policy rejects an unsupported static
   plan at open and a dynamic barrier before its execution. Allowed fallback appears in
-  the plan and remains budgeted. Access redaction conceals protected details.
+  the plan and remains budgeted. A budgeted native sort is reported as a full-input
+  barrier, not as fallback, and the strict policy admits it. Access redaction conceals
+  protected details.
 - **A12 — Writer parity:** parse completed JSON/XML/CSV/TSV and native JSON outputs and
   compare answers to eager output. Encoded byte counts match result-byte enforcement;
   metadata is final only for the appropriate completion state.
@@ -473,8 +494,7 @@ Investigate repeatable smaller losses as well. This is an admission target, not 
 of statistical significance: evidence must distinguish variance from a stable cost.
 An unresolved regression keeps the affected path opt-in or on the eager default.
 Sweep batch targets before promoting the provisional defaults or adding auto thresholds.
-Public BENCHMARKS/README tables change only after completed representative runs; raw
-investigation logs and implementation-session decisions remain under `docs/plans`.
+Public BENCHMARKS and README tables change only after completed representative runs.
 
 ## 11. Alternatives and decisions
 
@@ -501,9 +521,7 @@ semantic and resource contracts come from existing specs:
 [C12b](C12b-triple-access-control.md), [F06](F06-snapshots-and-point-in-time.md),
 [F11](F11-encryption-at-rest.md), [G06](G06-arq-query-extensions.md),
 [P03](P03-query-extensions.md) and [P06](P06-library-admin-api.md).
-The initial scope was informed by the internal O12 roadmap and the loading/query memory
-audit. No external engine source was read or copied to write this design; no new
-dependency is proposed for Phases 1–2. [PROVENANCE](PROVENANCE.md) records this source set.
+Phases 1 and 2 add no dependency. [PROVENANCE](PROVENANCE.md) records this source set.
 
 ## Outcome
 
@@ -517,12 +535,17 @@ cover production and consumer waits; memory accounting uses conservative reserva
 Plain immutable SELECT scans return read-only views of decoded index block columns.
 Returned batches share the block's retained memory reservation; loading another block
 requires another reservation while consumers retain previous batches. Other scans copy
-passing columns and preserve full resume keys. Native
-resumable merge/hash/cross/OPTIONAL/semi/anti/MINUS joins preserve duplicates, unbound
-compatibility and stable expansion across batches. DISTINCT owns a charged key set.
-Eligible plain-variable groups retain aggregate state rather than input rows. Blocking
-sorts consume normal input batches even when the requested output prefix is small,
-reserve input/keys/reordering state and visibly report their materialization barrier.
+passing columns and preserve full resume keys.
+
+Merge joins resume both inputs across batches. Hash, cross, OPTIONAL, semi, anti and
+MINUS joins first collect their build input into charged state. They then resume the
+probe input and the expansion of matching rows across batches, so neither the join's
+output nor its matching row pairs are materialized. All of these joins preserve
+duplicates and unbound compatibility. DISTINCT owns a charged key set. Eligible
+plain-variable groups retain aggregate state rather than input rows. Blocking sorts
+consume normal input batches even when the requested output prefix is small. They
+reserve their input, keys and reordering state, and they report their full-input
+barrier separately from eager fallback, so the strict policy admits them.
 Growing state fails explicitly when its reservation exceeds the budget; disk spill is
 not implemented. Unsupported operators and EXISTS expressions remain visible lazy eager
 barriers, rejected before demand under strict policy.
@@ -553,7 +576,15 @@ bounded batching contract. Python rejects snapshot capture inside an owned trans
 The ordinary query path remains eager. Auto selects large plain immutable SELECT scans
 and uncached eligible single-key OPTIONAL COUNT queries under the measured batch,
 graph-predicate and memory conditions documented in the API. Aggregate admission preserves
-enabled result caches. Correctness and resource gates passed across core, HTTP and
+enabled result caches. Over HTTP, auto falls back to eager execution when the negotiated
+encoding is SPARQL Results Thrift, which has no cursor writer.
+
+The W3C SPARQL 1.0 and 1.1 query evaluation tests run through cursors at batch sizes
+of 1, 2, 3 and 4,096 rows and match the expected results. The 53 queries that need
+eager fallback are counted, and they run with fallback allowed. A seeded differential
+compares cursor and eager answers at the same batch sizes over generated VALUES,
+scans, property path sequences, joins, OPTIONAL, MINUS and UNION with unbound
+columns. Correctness and resource gates passed across core, HTTP and
 bindings. The Sparkles-only benchmark refresh covers 1.05M, 10.5M and full DBpedia,
 plus specialized suites and matched JVM controls. [BENCHMARKS](../BENCHMARKS.md#streaming-execution)
 reports representative current mode costs without tying them to an implementation session.
