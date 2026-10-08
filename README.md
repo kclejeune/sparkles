@@ -147,9 +147,9 @@ departs from Jena and QLever on purpose.
 ## Performance
 
 These measurements use one Intel i5-13500 with 15 GiB of RAM and result caches off.
-Sparkles ran on 2026-10-08 with a release build; other-engine values retain the matching
-2026-10-03 data, queries and method. They are dated references, not new interleaved runs.
-At 10.5M triples:
+Sparkles ran on 2026-10-08 with a release build at commit `ff7acde4`. The other engines'
+values are from 2026-10-03, with the same data, queries and method, so they are dated
+references rather than new interleaved runs. At 10.5M triples:
 
 | | Sparkles | Best of the others |
 |---|---|---|
@@ -160,12 +160,18 @@ At 10.5M triples:
 | Throughput, 16 clients | **241 q/s** | QLever 92 q/s |
 | Server memory after the run | 840 MiB, 379 MiB of it block cache | **QLever 653 MiB** |
 
-Sparkles trades memory for speed by default, with a 1 GiB block cache per dataset. The
-English DBpedia measurements (1.24 billion triples), refreshed on 2026-10-08, gave a 1,248 s load
-against QLever's 1,674 s and Fluree's 2,919 s; Sparkles was faster on all 29 agreeing warm
-queries and 18 of 31 cold ones. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every number,
-the memory tradeoff and
-every query where Sparkles loses or ties.
+Sparkles trades memory for speed by default, with a 1 GiB block cache per dataset. On
+English DBpedia (1.24 billion triples), the 2026-10-08 run loaded the data in 1,248 s,
+against QLever's 1,674 s and Fluree's 2,919 s. Sparkles was faster than QLever on all 29
+agreeing warm queries and on 18 of 31 cold ones.
+
+Those DBpedia results regressed against the run of 2026-10-03 at commit `98a75c1a`,
+which loaded the same data in 596 s and was faster than QLever on 26 of 31 cold queries.
+The new load used about the same CPU time while keeping fewer cores busy. That is
+consistent with I/O stalls, but the cause has not been established and is under
+investigation ([details](docs/BENCHMARKS.md#changes-against-the-run-of-2026-10-03)).
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every number, the memory tradeoff and every
+query where Sparkles loses or ties.
 
 On the 1.05M-triple HTTP write workload, default durable writes reach about
 1,000 single-triple transactions/s or 54,000–59,000 effective changes/s in
