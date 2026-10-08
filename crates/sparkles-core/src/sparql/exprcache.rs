@@ -799,16 +799,13 @@ fn cursor_integer_distinct(
     }
     // Evaluate only observed IDs, never hypothetical holes in the integer range.
     // Direct slot lookup avoids hashing or sorting thousands of repeated numerals.
-    let slot = t.cols[column]
-        .iter()
-        .enumerate()
-        .map(|(row, id)| {
-            if row.is_multiple_of(1024) {
-                ctx.check()?;
-            }
-            Ok(positions[(id.payload() - lo) as usize])
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut slot = Vec::with_capacity(t.len());
+    for (row, id) in t.cols[column].iter().enumerate() {
+        if row.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        slot.push(positions[(id.payload() - lo) as usize]);
+    }
     values.sorted = vec![v];
     report.push(ctx, exprs, t.len(), Ok(values.len));
     Ok(Some(Distinct {
