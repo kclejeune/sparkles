@@ -1075,6 +1075,41 @@ fn validate(b: &BackupState, p: &mut PolicyConfig) -> Result<(Schedule, Tz), Api
     }
 }
 
+/// The config-file policies that select dataset `ds` by its exact name. The server
+/// cannot rewrite them, so a rename of `ds` would silently stop its backups.
+pub fn config_policies_naming(b: &BackupState, ds: &str) -> Vec<String> {
+    b.registry
+        .policies
+        .read()
+        .iter()
+        .filter(|(_, e)| {
+            e.source == ConfigSource::Config && e.config.datasets.iter().any(|d| d == ds)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// After dataset `from` was renamed `to`: the API policies that name `from` exactly
+/// name `to` instead, and `policies.json` is written again. A glob such as `wiki-*`
+/// is left as it is, so whether it still selects the dataset depends on the new name.
+pub fn rename_dataset(b: &BackupState, from: &str, to: &str) -> anyhow::Result<()> {
+    let mut changed = false;
+    for e in b.registry.policies.write().values_mut() {
+        if e.source != ConfigSource::Api {
+            continue;
+        }
+        for d in e.config.datasets.iter_mut().filter(|d| d.as_str() == from) {
+            *d = to.to_string();
+            changed = true;
+        }
+    }
+    if changed {
+        write_api_policies(&b.dir, &b.registry)?;
+        tracing::info!(target: "sparkles::backup", "backup policies now name /{to} instead of /{from}");
+    }
+    Ok(())
+}
+
 fn save(b: &BackupState) -> Result<(), ApiErr> {
     write_api_policies(&b.dir, &b.registry).map_err(|e| {
         fail(BackupError::internal(format!(

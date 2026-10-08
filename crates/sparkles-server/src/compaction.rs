@@ -111,6 +111,24 @@ enum Decision {
 }
 
 impl AutoCompact {
+    /// Carry what the scheduler knows of a renamed dataset and its branches (keys
+    /// `from` and `from@branch`) over to the new name.
+    pub fn rename(&self, from: &str, to: &str) {
+        let mut states = self.states.lock();
+        let keys: Vec<String> = states
+            .keys()
+            .filter(|k| {
+                k.strip_prefix(from)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('@'))
+            })
+            .cloned()
+            .collect();
+        for k in keys {
+            let s = states.remove(&k).expect("listed");
+            states.insert(format!("{to}{}", &k[from.len()..]), s);
+        }
+    }
+
     /// The policy that applies to `ds`: the server's with the dataset's own settings.
     pub fn policy_for(&self, ds: &Dataset) -> CompactionPolicy {
         self.policy.with(&ds.dataset.settings().compaction().get())

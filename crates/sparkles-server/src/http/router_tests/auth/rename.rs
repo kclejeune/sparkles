@@ -1,4 +1,5 @@
-//! Renames require server administration and refuse named or wildcard grants.
+//! Renames require server administration and refuse grants that cover only one
+//! of the two names.
 use super::*;
 async fn rename(s: &AuthServer, source: &str, target: &str, user: &str) -> R {
     call(
@@ -50,4 +51,23 @@ async fn rename_refuses_an_active_minted_scope() {
     let r = rename(&s, "ungranted", "renamed", "alice").await;
     assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
     assert!(r.text().contains("token") && r.text().contains("ungranted"));
+}
+#[tokio::test]
+async fn grants_covering_both_names_do_not_block_a_rename() {
+    let s = auth_server();
+    drop(s.state.create("ungranted", DbType::Persistent).unwrap());
+    let token = tokens::mint_as(
+        &s.app,
+        &[("authorization", &b("alice"))],
+        r#"{"name":"everything","datasets":{"*":"read"},"expiresIn":"1d"}"#,
+    )
+    .await;
+    assert_eq!(token.status, StatusCode::CREATED, "{}", token.text());
+    // `*` covers the new name as it covered the old one
+    let r = rename(&s, "ungranted", "renamed", "alice").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // so does bob's `team-*` grant for a rename within it
+    drop(s.state.create("team-x", DbType::Persistent).unwrap());
+    let r = rename(&s, "team-x", "team-y", "alice").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
 }

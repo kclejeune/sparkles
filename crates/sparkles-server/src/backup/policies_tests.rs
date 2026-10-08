@@ -556,6 +556,59 @@ async fn bad_policies_are_refused() {
 }
 
 #[tokio::test]
+async fn a_dataset_rename_rewrites_exact_policy_names_and_respects_the_config_file() {
+    let s = setup("2026-09-30T12:05:00Z");
+    drop(
+        s.st.create("wiki", crate::state::DbType::Persistent)
+            .unwrap(),
+    );
+    let mut exact = nightly();
+    exact["datasets"] = json!(["wiki", "other"]);
+    let mut glob = nightly();
+    glob["name"] = "globbed".into();
+    glob["datasets"] = json!(["wi*"]);
+    for p in [exact, glob] {
+        let (st, j) = s.call("POST", "/$/backup-policies", Some(p)).await;
+        assert_eq!(st, StatusCode::CREATED, "{j}");
+    }
+    let (st, j) = s
+        .call(
+            "POST",
+            "/$/datasets/wiki/rename",
+            Some(json!({"name": "docs"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    let (_, j) = s.call("GET", "/$/backup-policies/nightly", None).await;
+    assert_eq!(j["datasets"], json!(["docs", "other"]));
+    let (_, j) = s.call("GET", "/$/backup-policies/globbed", None).await;
+    assert_eq!(j["datasets"], json!(["wi*"]));
+    let saved = read_api_policies(&s.backup_dir()).unwrap();
+    assert_eq!(saved[1].datasets, ["docs", "other"]);
+    // the server cannot rewrite the config file, so a policy there blocks the rename
+    let mut pinned: PolicyConfig = serde_json::from_value(nightly()).unwrap();
+    pinned.name = "pinned".into();
+    pinned.datasets = vec!["docs".into()];
+    s.b().registry.policies.write().insert(
+        "pinned".into(),
+        PolicyEntry {
+            config: pinned,
+            source: ConfigSource::Config,
+        },
+    );
+    let (st, j) = s
+        .call(
+            "POST",
+            "/$/datasets/docs/rename",
+            Some(json!({"name": "wiki"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{j}");
+    assert!(j.to_string().contains("pinned"), "{j}");
+    assert!(s.st.get("docs").is_some());
+}
+
+#[tokio::test]
 async fn config_file_policies_are_read_only() {
     let s = setup("2026-09-30T12:05:00Z");
     let config: PolicyConfig = serde_json::from_value(nightly()).unwrap();

@@ -468,9 +468,11 @@ async fn restoring_guard(
     let Some(ds) = crate::obs::ds_param(route, req.uri()) else {
         return next.run(req).await;
     };
-    // A rename must close the dataset, so this request cannot retain its handle.
-    // The catalog checks reservations and live handles atomically during rename.
-    if route == Some("/$/datasets/{ds}/rename") {
+    // A rename or delete must close the dataset, so this request cannot retain its
+    // handle. The catalog checks reservations and live handles atomically.
+    if route == Some("/$/datasets/{ds}/rename")
+        || (route == Some("/$/datasets/{ds}") && req.method() == axum::http::Method::DELETE)
+    {
         return next.run(req).await;
     }
     let checked = st
@@ -3700,12 +3702,13 @@ async fn rename_dataset(
         .to_string();
     #[cfg(feature = "auth")]
     if let Some(auth) = &st.auth {
-        let policy = auth.policy();
-        let mut grants = policy.dataset_grants_naming(&name);
-        grants.extend(policy.dataset_grants_naming(&target));
+        // A grant or token scope that covers both names, such as `*`, keeps applying
+        // after the rename. Only those that cover one name and not the other change
+        // who may reach the dataset.
+        let mut grants = auth.policy().dataset_grants_changing(&name, &target);
         for token in auth.tokens.list(|t| t.expires_at() > auth.now()) {
             for pattern in token.scope.datasets.keys() {
-                if crate::auth::glob(pattern, &name) || crate::auth::glob(pattern, &target) {
+                if crate::auth::glob(pattern, &name) != crate::auth::glob(pattern, &target) {
                     grants.push(format!("token {}: dataset grant {pattern}", token.id));
                 }
             }

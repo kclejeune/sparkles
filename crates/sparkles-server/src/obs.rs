@@ -811,6 +811,14 @@ impl Metrics {
         self.datasets.write().remove(dataset);
     }
 
+    /// Carry a renamed dataset's series over to its new name.
+    pub fn rename(&self, from: &str, to: &str) {
+        let mut m = self.datasets.write();
+        if let Some(series) = m.remove(from) {
+            m.insert(to.to_string(), series);
+        }
+    }
+
     pub fn active(&self, op: Op) -> i64 {
         self.active[op.index()].load(Ordering::Relaxed)
     }
@@ -2051,5 +2059,14 @@ mod tests {
         assert_eq!(m.series(Some("a")).0, "a");
         m.forget("a");
         assert_eq!(m.series(Some("c")).0, "c");
+    }
+
+    #[test]
+    fn a_rename_carries_the_series_over() {
+        let m = Metrics::new(true, 10);
+        let a = m.series(Some("a")).1;
+        m.rename("a", "b");
+        assert!(Arc::ptr_eq(&a, &m.series(Some("b")).1));
+        assert!(!Arc::ptr_eq(&a, &m.series(Some("a")).1));
     }
 }

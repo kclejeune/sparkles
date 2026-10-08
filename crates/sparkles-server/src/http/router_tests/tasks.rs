@@ -195,33 +195,3 @@ async fn restoring_datasets_answer_503() {
     drop(restoring);
     assert_eq!(ask(s.app.clone()).await.status, StatusCode::OK);
 }
-
-#[tokio::test]
-async fn detach_and_reattach_for_a_swap() {
-    let dir = tempfile::tempdir().unwrap();
-    let st = Arc::new(
-        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
-    );
-    st.create("p", DbType::Persistent).unwrap();
-    st.attach("m", DbType::Mem, None).unwrap();
-    let app = router(st.clone());
-    // only managed persistent datasets can be swapped
-    assert!(st.detach_for_swap("m").is_none());
-    assert!(st.detach_for_swap("nope").is_none());
-    let ds = st.detach_for_swap("p").unwrap();
-    assert_eq!(
-        get(&app, "/$/datasets/p").await.status,
-        StatusCode::NOT_FOUND
-    );
-    // the database stays locked while the old store is alive
-    assert!(st.reattach("p").is_err());
-    drop(ds);
-    st.reattach("p").unwrap();
-    assert_eq!(get(&app, "/$/datasets/p").await.status, StatusCode::OK);
-    assert!(st.reattach("p").is_err(), "already registered");
-    // the persisted registry never lost it
-    drop(app);
-    drop(st);
-    let st = AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
-    assert!(st.get("p").is_some());
-}

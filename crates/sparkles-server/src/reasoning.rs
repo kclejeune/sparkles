@@ -418,6 +418,14 @@ impl AutoReason {
         }
     }
 
+    /// Keep a renamed dataset's stale period, so its planned run is not put off.
+    pub fn rename(&self, from: &str, to: &str) {
+        let mut p = self.pending.lock();
+        if let Some(pending) = p.remove(from) {
+            p.insert(to.to_string(), pending);
+        }
+    }
+
     /// RFC 3339 time of the next planned run of a dataset, if one is planned.
     fn scheduled(&self, name: &str, t: AutoTiming) -> Option<String> {
         let p = self.pending.lock();
@@ -573,4 +581,29 @@ pub fn diagnostics_render(
         inf["commitsSince"] = f.commits_since.into();
     }
     (d.report, j)
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+
+    #[test]
+    fn a_rename_keeps_the_stale_period() {
+        let auto = AutoReason::new(Duration::from_secs(5), None);
+        let since = Instant::now() - Duration::from_secs(50);
+        auto.pending.lock().insert(
+            "wiki".into(),
+            Pending {
+                head: 3,
+                changed: since,
+                since,
+                task: None,
+                failed: None,
+            },
+        );
+        auto.rename("wiki", "docs");
+        let p = auto.pending.lock();
+        assert!(!p.contains_key("wiki"));
+        assert_eq!(p["docs"].since, since);
+    }
 }

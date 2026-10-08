@@ -176,8 +176,12 @@ fn summarize(g: &Grants) -> String {
 }
 
 impl Policy {
-    /// Grants naming this dataset, including wildcard and branch-scoped grants.
-    pub fn dataset_grants_naming(&self, ds: &str) -> Vec<String> {
+    /// The grants and protections whose dataset pattern covers one of datasets `old`
+    /// and `new` but not the other: a rename from `old` to `new` changes who they let
+    /// reach the dataset, or what they hide. A pattern that covers both names, such as
+    /// `*`, applies the same way after the rename and is not listed.
+    pub fn dataset_grants_changing(&self, old: &str, new: &str) -> Vec<String> {
+        let changes = |pattern: &str| super::glob(pattern, old) != super::glob(pattern, new);
         let mut out = Vec::new();
         let mut look = |who: String, g: &Grants| {
             for pattern in g
@@ -186,7 +190,7 @@ impl Policy {
                 .map(|(p, _)| p)
                 .chain(g.restricted.iter().map(|r| &r.dataset))
             {
-                if super::glob(pattern, ds) {
+                if changes(pattern) {
                     out.push(format!("{who}: dataset grant {pattern}"));
                 }
             }
@@ -200,6 +204,13 @@ impl Policy {
         }
         for token in self.static_tokens.values() {
             look(format!("token {}", token.id), &token.grants);
+        }
+        if let Some(ps) = &self.protections {
+            for (pattern, _) in &ps.list {
+                if changes(pattern) {
+                    out.push(format!("protection of {pattern}"));
+                }
+            }
         }
         out.sort();
         out.dedup();

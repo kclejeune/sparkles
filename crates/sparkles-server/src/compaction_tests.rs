@@ -371,3 +371,18 @@ fn the_flags_make_the_policy() {
         .state();
     assert!(bad.is_err());
 }
+
+#[test]
+fn a_rename_carries_the_scheduler_state_of_the_dataset_and_its_branches() {
+    let ac = AutoCompact::default();
+    for (k, runs) in [("wiki", 1), ("wiki@dev", 2), ("wiki2", 3)] {
+        ac.states.lock().entry(k.into()).or_default().automatic_runs = runs;
+    }
+    ac.rename("wiki", "docs");
+    let states = ac.states.lock();
+    let mut keys: Vec<_> = states.keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["docs", "docs@dev", "wiki2"]);
+    assert_eq!(states["docs@dev"].automatic_runs, 2);
+    assert_eq!(states["wiki2"].automatic_runs, 3);
+}

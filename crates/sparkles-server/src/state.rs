@@ -4,7 +4,7 @@ use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use sparkles::store::StoreOptions;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "backup")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -218,11 +218,27 @@ fn rooted_in_cancel(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Removes a dataset name from [`AppState`]'s leaving set when dropped.
+struct Leaving<'a> {
+    st: &'a AppState,
+    name: String,
+}
+
+impl Drop for Leaving<'_> {
+    fn drop(&mut self) {
+        self.st.leaving.lock().remove(&self.name);
+    }
+}
+
 pub struct AppState {
     pub data_dir: PathBuf,
     pub catalog: sparkles::Catalog,
-    /// HTTP routing state and observers, keyed by dataset name.
+    /// HTTP routing state and observers, keyed by dataset name. Only map lookups and
+    /// changes happen under this lock, never catalog work or file system work.
     routing: Mutex<BTreeMap<String, Arc<Dataset>>>,
+    /// Datasets being deleted or renamed. Lookups do not find them, so no request can
+    /// take a handle that would make the delete or rename fail.
+    leaving: Mutex<BTreeSet<String>>,
     pub tasks: Mutex<Vec<Task>>,
     task_counter: AtomicU64,
     pub started: Instant,
@@ -462,6 +478,7 @@ impl AppState {
             data_dir: data_dir.to_path_buf(),
             catalog: sparkles::Catalog::open(data_dir, store_opts.clone().into())?,
             routing: Mutex::new(BTreeMap::new()),
+            leaving: Mutex::new(BTreeSet::new()),
             tasks: Mutex::new(Vec::new()),
             task_counter: AtomicU64::new(1),
             started: Instant::now(),
@@ -510,6 +527,7 @@ impl AppState {
             data_dir: PathBuf::new(),
             catalog: sparkles::Catalog::memory(store_opts.clone().into()),
             routing: Mutex::new(BTreeMap::new()),
+            leaving: Mutex::new(BTreeSet::new()),
             tasks: Mutex::new(Vec::new()),
             task_counter: AtomicU64::new(1),
             started: Instant::now(),
@@ -644,13 +662,21 @@ impl AppState {
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<Dataset>> {
-        let mut routing = self.routing.lock();
+        if self.leaving.lock().contains(name) {
+            return None;
+        }
         let dataset = self.catalog.get(name)?;
         let info = self.catalog.info(name)?;
+        let mut routing = self.routing.lock();
         if let Some(ds) = routing.get(name)
             && ds.store.dataset_id() == dataset.dataset_id()
         {
             return Some(ds.clone());
+        }
+        // A delete or rename may have started since the check above. Its wrapper is
+        // not cached, and the catalog refuses the delete or rename while it lives.
+        if self.leaving.lock().contains(name) {
+            return None;
         }
         let ds = self.wrap_dataset(name, info.kind, dataset, info.attached);
         // A request that passed the restore guard can reach this lookup after the
@@ -724,60 +750,123 @@ impl AppState {
         self.catalog.attach(name, source)?;
         Ok(self.get(name).expect("attached"))
     }
+    /// Mark `name` as leaving until the guard drops. A second delete or rename of the
+    /// same dataset is refused meanwhile.
+    fn leave(&self, name: &str) -> Result<Leaving<'_>> {
+        if !self.leaving.lock().insert(name.to_string()) {
+            return Err(sparkles::Error::Conflict(format!(
+                "dataset /{name} is already being deleted or renamed"
+            ))
+            .into());
+        }
+        Ok(Leaving {
+            st: self,
+            name: name.to_string(),
+        })
+    }
+
+    /// Delete a dataset. Lookups stop finding it first, then its cached routing object
+    /// is dropped and the catalog unregisters it and removes its files. The routing
+    /// lock is held only for the map change, so other requests go on during a slow
+    /// delete. Requests still holding the dataset make the delete fail with a conflict.
     pub fn delete(&self, name: &str) -> Result<bool> {
-        // Close cached routing handles before the catalog removes the directory.
-        // Keep lookups out until the registry mutation finishes, so they cannot
-        // repopulate the cache with a dataset being deleted.
-        let mut routing = self.routing.lock();
-        let cached = routing.remove(name);
+        let leaving = self.leave(name)?;
+        let cached = self.routing.lock().remove(name);
+        // Only a managed persistent dataset has files that an old handle could write.
+        if cached.as_ref().is_some_and(|ds| {
+            ds.kind == DbType::Persistent && !ds.ephemeral && Arc::strong_count(ds) > 1
+        }) {
+            self.routing
+                .lock()
+                .insert(name.to_string(), cached.expect("checked"));
+            return Err(sparkles::Error::Conflict(format!(
+                "dataset /{name} still has live requests"
+            ))
+            .into());
+        }
         let offline = cached
             .as_ref()
             .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
         drop(cached);
-        let deleted = match self.catalog.delete(name) {
-            Ok(deleted) => deleted,
+        #[cfg(test)]
+        tests::delete_hook(name);
+        let deleted = self.catalog.delete(name);
+        drop(leaving);
+        match deleted {
+            Ok(deleted) => {
+                if deleted {
+                    self.metrics.forget(name);
+                }
+                Ok(deleted)
+            }
             Err(e) => {
-                drop(routing);
                 if let Some(ds) = self.get(name) {
                     ds.offline.store(offline, Ordering::Relaxed);
                 }
-                return Err(e.into());
+                Err(e.into())
             }
-        };
-        drop(routing);
-        if deleted {
-            self.metrics.forget(name);
         }
-        Ok(deleted)
-    }
-    #[cfg(test)]
-    pub fn detach_for_swap(&self, name: &str) -> Option<Arc<Dataset>> {
-        let dataset = self.catalog.detach_for_swap(name)?;
-        let cached = self.routing.lock().remove(name);
-        cached.or_else(|| Some(self.wrap_dataset(name, DbType::Persistent, dataset, false)))
     }
 
+    /// The configuration that a rename of `from` would leave pointing at nothing, and
+    /// which the server cannot rewrite: backup policies of the config file that name
+    /// the dataset exactly.
+    pub fn rename_blockers(&self, from: &str) -> Vec<String> {
+        #[cfg(feature = "backup")]
+        if let Some(b) = &self.backup {
+            return crate::backup::policies::config_policies_naming(b, from)
+                .into_iter()
+                .map(|p| format!("backup policy {p} of the config file names /{from}"))
+                .collect();
+        }
+        let _ = from;
+        Vec::new()
+    }
+
+    /// Rename a dataset and carry the server's state kept under its name over to the
+    /// new name: the request metrics, the compaction scheduler's state, a pending
+    /// automatic reasoning run and the backup policies made through the API that name
+    /// it exactly. Policies that select it with a glob are left as they are.
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let mut routing = self.routing.lock();
-        if routing
-            .get(from)
-            .is_some_and(|ds| Arc::strong_count(ds) > 1)
-        {
+        let blockers = self.rename_blockers(from);
+        if !blockers.is_empty() {
+            return Err(sparkles::Error::Conflict(format!(
+                "rename is blocked by {}; change it there first",
+                blockers.join("; ")
+            ))
+            .into());
+        }
+        let leaving = self.leave(from)?;
+        let cached = self.routing.lock().remove(from);
+        if cached.as_ref().is_some_and(|ds| Arc::strong_count(ds) > 1) {
+            self.routing
+                .lock()
+                .insert(from.to_string(), cached.expect("checked"));
             return Err(sparkles::Error::Conflict(format!(
                 "dataset /{from} still has live requests"
             ))
             .into());
         }
-        let offline = routing
-            .get(from)
+        let offline = cached
+            .as_ref()
             .is_some_and(|ds| ds.offline.load(Ordering::Relaxed));
-        drop(routing.remove(from));
+        drop(cached);
         let result = self.catalog.rename(from, to);
-        drop(routing);
+        drop(leaving);
         match result {
             Ok(ds) => {
                 drop(ds);
-                self.metrics.forget(from);
+                self.metrics.rename(from, to);
+                self.compaction.rename(from, to);
+                if let Some(auto) = &self.auto_reason {
+                    auto.rename(from, to);
+                }
+                #[cfg(feature = "backup")]
+                if let Some(b) = &self.backup
+                    && let Err(e) = crate::backup::policies::rename_dataset(b, from, to)
+                {
+                    tracing::warn!("backup policies still name /{from}: {e:#}");
+                }
                 if let Some(ds) = self.get(to) {
                     ds.offline.store(offline, Ordering::Relaxed);
                 }
@@ -790,11 +879,6 @@ impl AppState {
                 Err(e.into())
             }
         }
-    }
-    #[cfg(test)]
-    pub fn reattach(&self, name: &str) -> Result<Arc<Dataset>> {
-        self.catalog.reattach(name)?;
-        Ok(self.get(name).expect("reattached"))
     }
     pub fn reserved_by(&self, name: &str) -> Option<String> {
         self.catalog.reserved_by(name)
@@ -1229,4 +1313,69 @@ impl TaskHandle {
 
 pub fn uptime_secs(state: &AppState) -> u64 {
     state.started.elapsed().as_secs()
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    type Hook = (String, Box<dyn FnOnce() + Send>);
+    static DELETE_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Runs the hook installed for dataset `name`, where a delete starts its catalog
+    /// work.
+    pub(crate) fn delete_hook(name: &str) {
+        let hook = {
+            let mut h = DELETE_HOOK.lock();
+            if h.as_ref().is_some_and(|(n, _)| n == name) {
+                h.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, f)) = hook {
+            f();
+        }
+    }
+
+    #[test]
+    fn a_slow_delete_does_not_block_lookups_of_other_datasets() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        let target = "slow-delete-target";
+        drop(st.create(target, DbType::Persistent).unwrap());
+        drop(st.create("bystander", DbType::Persistent).unwrap());
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        *DELETE_HOOK.lock() = Some((
+            target.to_string(),
+            Box::new(move || {
+                entered.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }),
+        ));
+        let deleter = {
+            let st = st.clone();
+            std::thread::spawn(move || st.delete(target).unwrap())
+        };
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (found, found_rx) = mpsc::channel();
+        {
+            let st = st.clone();
+            std::thread::spawn(move || found.send(st.get("bystander").is_some()));
+        }
+        let lookup = found_rx.recv_timeout(Duration::from_secs(5));
+        // the dataset being deleted is not found while the delete runs
+        let gone = st.get(target).is_none();
+        release.send(()).unwrap();
+        assert!(deleter.join().unwrap());
+        assert_eq!(lookup, Ok(true), "a lookup waited for the delete");
+        assert!(gone);
+        assert!(st.get(target).is_none());
+        assert!(!dir.path().join("databases").join(target).exists());
+    }
 }
