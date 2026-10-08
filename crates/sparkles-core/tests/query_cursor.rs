@@ -479,8 +479,8 @@ fn graph_union_dedup_and_repeated_variables_survive_boundaries() {
             bag(all(open(&s, q, 1)))
         );
     }
-    // GRAPH ?g currently plans a join to eligible graph names, so it exercises
-    // the explicitly allowed join fallback until the join cursor phase lands.
+    // GRAPH ?g plans a merge join to eligible graph names over sorted inputs. The
+    // sorts block before output but run natively, so nothing falls back to eager.
     let q = "SELECT ?g ?s WHERE { GRAPH ?g { ?s <urn:p> ?s } }";
     let cursor = select_cursor(
         s.snapshot(),
@@ -492,7 +492,7 @@ fn graph_union_dedup_and_repeated_variables_survive_boundaries() {
         },
     )
     .unwrap();
-    assert!(cursor.plan().has_materialization());
+    assert!(!cursor.plan().has_materialization(), "{:#?}", cursor.plan());
     assert_eq!(
         bag(all(cursor)),
         bag(query(s.snapshot(), q, &Default::default()).unwrap().rows())
@@ -856,7 +856,7 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
 #[test]
 fn eager_fallback_is_visible_lazy_and_budgeted() {
     let s = store(100);
-    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o)";
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p>+ ?o }";
     assert!(matches!(
         select_cursor(s.snapshot(), q, &Default::default(), &options(2)),
         Err(Error::Unsupported(_))
@@ -1797,10 +1797,48 @@ fn streaming_ask_stops_after_a_qualifying_solution() {
         "ASK {}",
     ] {
         let expected = query(s.snapshot(), q, &Default::default()).unwrap().boolean;
-        let r = ask_streaming(s.snapshot(), q, &Default::default(), &options(1)).unwrap();
+        let r = ask_streaming(s.snapshot(), q, &Default::default(), &Default::default()).unwrap();
         assert_eq!(r.boolean, expected);
-        assert!(r.rows_produced < 20);
+        assert!(r.rows_produced < 20, "{q}: {}", r.rows_produced);
     }
+    // An application callback in the filter runs for the qualifying solution, not for
+    // the rest of a default-sized batch, so its call count and errors do not depend on
+    // the batch size.
+    use sparkles_core::sparql::extensions::{ExtensionRegistry, ScalarContext, ScalarDescriptor};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let mut registry = ExtensionRegistry::builder();
+    registry
+        .register_scalar(
+            ScalarDescriptor::new(
+                "urn:test:count",
+                1..=1,
+                move |_: &ScalarContext<'_>, _: &[Term]| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(oxrdf::Literal::from(true).into())
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let opts = QueryOptions {
+        extensions: Some(registry.build()),
+        ..Default::default()
+    };
+    let r = ask_streaming(
+        s.snapshot(),
+        "ASK { ?s <urn:p> ?o FILTER(<urn:test:count>(?o)) }",
+        &opts,
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(r.boolean);
+    assert!(
+        calls.load(Ordering::SeqCst) < 20,
+        "{} callback calls",
+        calls.load(Ordering::SeqCst)
+    );
 }
 
 #[test]
@@ -1949,10 +1987,44 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            "SELECT * {?s ?p ?o} ORDER BY ?s",
+            "SELECT * {?s <urn:p>+ ?o}",
             &Default::default(),
             &strict,
             ExecutionMode::Auto,
+        ),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn strict_policy_admits_a_budgeted_sort_and_reports_it_as_blocking() {
+    let s = store(50);
+    for q in [
+        "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o)",
+        "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY ?o LIMIT 7",
+    ] {
+        let c = open(&s, q, 3);
+        let plan = c.plan();
+        assert!(!plan.has_materialization(), "{q}");
+        fn blocking(plan: &sparkles_core::sparql::CursorPlan) -> bool {
+            (plan.full_input_before_output && plan.reason.is_some())
+                || plan.children.iter().any(blocking)
+        }
+        assert!(blocking(plan), "{q}");
+        assert_eq!(
+            all(c),
+            query(s.snapshot(), q, &Default::default()).unwrap().rows(),
+            "{q}"
+        );
+    }
+    // An ORDER key that evaluates EXISTS runs subqueries outside the cursor, so the
+    // strict policy still refuses it.
+    assert!(matches!(
+        select_cursor(
+            s.snapshot(),
+            "SELECT ?s WHERE { ?s <urn:p> ?o } ORDER BY (EXISTS { ?s <urn:q> ?x })",
+            &Default::default(),
+            &options(2),
         ),
         Err(Error::Unsupported(_))
     ));

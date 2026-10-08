@@ -6678,7 +6678,10 @@ type CursorPlan = {
 ```
 
 `complete` says whether an operator's counts cover its entire execution. Counts on a
-stopped cursor are partial. `growingState` warns of retained state such as generated
+stopped cursor are partial. `materializes` marks an eager fallback subtree. A native
+ORDER BY consumes its whole input into budgeted state before its first row, so it
+reports `fullInputBeforeOutput` and a `reason` while `materializes` stays false. The
+strict policy that refuses eager fallback admits such a sort. `growingState` warns of retained state such as generated
 strings; batch size alone does not bound that state.
 
 ## Explain

@@ -1151,10 +1151,16 @@ impl Operator {
         let incremental_group = group::eligible(&node);
         let native_blocking =
             matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. }) && node.children.len() == 1;
+        // A native sort consumes cursor batches into charged state. It blocks before
+        // its first output but is not an eager fallback, so strict policy admits it
+        // unless an ORDER key evaluates EXISTS, which runs whole subqueries.
+        let exists_keys = matches!(&node.kind, Kind::OrderBy { keys, .. }
+            if keys.iter().any(|(key, _)| key.has_exists()));
         let materializes = !supported(&node.kind)
             && !incremental_merge
             && !incremental_binary
-            && !incremental_group;
+            && !incremental_group
+            && (!native_blocking || exists_keys);
         if materializes && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
                 "cursor requires materialization at {}; use AllowMaterialization or eager execution",
@@ -1172,6 +1178,7 @@ impl Operator {
             node.kind,
             Kind::Extend(..) | Kind::Filter(_) | Kind::RangeScan(..) | Kind::Distinct
         ) || materializes
+            || native_blocking
             || incremental_merge
             || incremental_binary
             || incremental_group;
@@ -1192,7 +1199,7 @@ impl Operator {
                 .map(|n| Self::build(ctx, n, fallback))
                 .collect::<Result<Vec<_>>>()?
         };
-        let reason = materializes.then(|| {
+        let reason = (materializes || native_blocking).then(|| {
             if native_blocking {
                 format!(
                     "{} consumes all input under the memory budget before output",
@@ -1296,7 +1303,7 @@ impl Operator {
             full_input_before_output: self.materializes
                 || matches!(
                     self.state,
-                    State::Binary(_) | State::Group(_) | State::Scalar(_)
+                    State::Binary(_) | State::Group(_) | State::Scalar(_) | State::Blocking { .. }
                 ),
             growing_state: self.growing,
             complete: false,
