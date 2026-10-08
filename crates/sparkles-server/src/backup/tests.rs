@@ -829,28 +829,34 @@ async fn a_polling_client_never_sees_the_dataset_missing_during_a_swap() {
                     assert_eq!(r.body["code"], "dataset-restoring", "{}", r.body);
                 }
                 *seen.entry(r.status.as_u16()).or_default() += 1;
-                // In-process router calls can finish without yielding, unlike HTTP.
-                // Let the swap completion and this test's timers run under load.
+                // In-process router calls can finish without yielding, unlike HTTP, so
+                // a poller that never yields would keep its worker from other tasks.
                 tokio::task::yield_now().await;
             }
             seen
         }));
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // a long request holds the dataset for a while: the swap drains it
+    // a long request holds the dataset: the swap drains it, and requests that arrive
+    // meanwhile are answered 503
     let held = s.st.get("ds").unwrap();
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
-        drop(held);
-    });
     let st = s.st.clone();
     let t = tmp.clone();
-    let ds =
-        tokio::task::spawn_blocking(move || swap::replace_in_place(&st, "ds", &t, "77", false))
-            .await
-            .unwrap()
-            .unwrap();
-    release.join().unwrap();
+    let swap =
+        tokio::task::spawn_blocking(move || swap::replace_in_place(&st, "ds", &t, "77", false));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while s.st.catalog.restoring_by("ds").is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the swap never started"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let r = get(&s.app, "/$/datasets/ds").await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.body);
+    assert_eq!(r.body["code"], "dataset-restoring");
+    drop(held);
+    let ds = swap.await.unwrap().unwrap();
     assert_eq!(ds.store.dataset_id(), new_id);
     drop(ds);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -865,7 +871,6 @@ async fn a_polling_client_never_sees_the_dataset_missing_during_a_swap() {
         total.keys().all(|s| *s == 200 || *s == 503),
         "statuses seen: {total:?}"
     );
-    assert!(total.get(&503).is_some_and(|n| *n > 0), "{total:?}");
     let r = get(&s.app, "/$/datasets/ds").await;
     assert_eq!(r.body["id"], new_id.to_string().as_str());
     assert_eq!(r.body["quads"], 3);
