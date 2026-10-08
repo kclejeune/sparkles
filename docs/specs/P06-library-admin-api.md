@@ -22,8 +22,8 @@
 > handles, and the API guide documents dataset rename. Existing file formats are
 > unchanged.
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section
-> at the end records how it lands.
+> The [Outcome](#outcome) section at the end records how the design landed and where
+> the implementation differs from it.
 
 This spec draws on the Sparkles code, the checked-in OpenAPI description
 (`docs/openapi.json`, from [X03](X03-openapi-and-completions.md)), the UI's API modules,
@@ -839,31 +839,45 @@ impl Catalog {
     pub fn open(dir: impl AsRef<Path>, opts: CatalogOptions) -> Result<Catalog>;
     pub fn memory(opts: CatalogOptions) -> Catalog;
     pub fn inspect(dir: impl AsRef<Path>) -> Result<Vec<DatasetInfo>>;
+    pub fn set_defaults(&self, dataset: DatasetOptions);
+    pub fn dir(&self) -> Option<&Path>;
 
     pub fn list(&self) -> Vec<DatasetInfo>;
     pub fn info(&self, name: &str) -> Option<DatasetInfo>;
     pub fn get(&self, name: &str) -> Option<Dataset>;
+    pub fn get_by_id(&self, id: Uuid) -> Option<Dataset>;
+    pub fn get_for_request(&self, name: &str) -> std::result::Result<Option<Dataset>, String>;
+    pub fn in_use(&self, name: &str) -> bool;
     pub fn create(&self, name: &str, req: &CreateDataset) -> Result<Dataset>;
     pub fn attach(&self, name: &str, source: Attach) -> Result<Dataset>;
     pub fn delete(&self, name: &str) -> Result<bool>;
     pub fn rename(&self, from: &str, to: &str) -> Result<Dataset>;
+    pub fn save(&self) -> Result<()>;
     pub fn reserve(&self, name: &str, kind: ReservationKind, holder: &str)
         -> Result<Reservation>;
+    pub fn reserved_by(&self, name: &str) -> Option<String>;
+    pub fn restoring_by(&self, name: &str) -> Option<String>;
     pub fn clone_dataset(&self, src: &str, dst: &str, req: &CloneRequest, ctl: &Control)
         -> Result<Dataset>;
+    pub fn clone_reserved(&self, src: &str, r: Reservation, req: &CloneRequest,
+        ctl: &Control) -> Result<Dataset>;
     pub fn backup_files(&self) -> Result<Vec<BackupFile>>;
-    pub fn dir(&self) -> Option<&Path>;
 
     #[cfg(feature = "backup")]
-    pub fn repositories(&self) -> Repositories;
+    pub fn repositories(&self) -> Result<Repositories>;
+    #[cfg(feature = "backup")]
+    pub fn share_repositories(&self, registry: Arc<Registry>) -> Result<()>;
     #[cfg(feature = "backup")]
     pub fn restore(&self, repo: &Repository, backup: &str, req: &RestoreRequest,
         ctl: &Control) -> Result<Dataset>;
     #[cfg(feature = "backup")]
     pub fn run_policy(&self, policy: &PolicyConfig, ctl: &Control) -> Result<PolicyRun>;
     #[cfg(feature = "backup")]
+    pub fn run_policy_in(&self, policy: &PolicyConfig, repository: Arc<Repository>,
+        ctl: &Control) -> Result<PolicyRun>;
+    #[cfg(feature = "backup")]
     pub fn apply_retention(&self, policy: &PolicyConfig, dry_run: bool)
-        -> Result<RetentionReport>;
+        -> Result<RetentionResponse>;
 }
 
 pub struct DatasetInfo {
@@ -877,17 +891,36 @@ pub struct DatasetInfo {
 ```
 
 `Catalog::open` creates `<dir>/databases` when it is missing, takes the catalog lock
-(§5.4), removes `.clone-*` directories left by a stopped server, as `AppState::new` does
-now, and opens every dataset in `config.json`. `Catalog::memory` has no directory and
+(§5.4), removes the `.clone-*` and `.deleted-*` directories left by a stopped process,
+and opens every dataset in `config.json`. `Catalog::memory` has no directory and
 holds in-memory and attached datasets only, as `AppState::standalone` does for
 `sparkles mcp`. `inspect` reads `config.json` without the lock, for a tool that lists the
 datasets of a running server's directory.
+
+Some of these methods exist for a caller that splits the catalog's work across tasks.
+`clone_reserved` runs a clone under a reservation that the caller made before queuing
+the task, and `run_policy_in` runs a policy against a repository the caller already
+opened. `share_repositories` lets the server's backup registry and the catalog's
+`repositories()` use one registry. `get_for_request` checks for a restore reservation
+and looks the dataset up under one lock, and `in_use` reports whether a dataset has
+handles besides the catalog's own. `set_defaults` replaces the options of datasets
+created or attached later, and `save` writes `config.json` again after a program
+changed a dataset's reasoning record. The server and the CLI also call a few hidden
+methods, such as `clone_from_reserved`, `restore_report`, `download_restore`,
+`publish_restored` and `replace_restored_reserved`, that expose the steps of a clone
+or restore separately. They are not part of the supported surface. The registry helpers
+that would bypass the catalog's locking, such as adopting a directory or detaching a
+dataset for a swap, are private to the crate.
 
 `create` takes the kind and the index configurations that `POST /$/datasets` accepts
 today, such as `geo`. `attach` registers a directory or a new in-memory store without
 writing the registry, for `serve --loc` and `--mem`. `delete` removes the entry from the
 registry first and then the directory, and puts the entry back if the registry write
-fails, as the server does.
+fails. Like `rename`, it refuses a managed persistent dataset that still has live
+handles, so that no old handle can write into a dataset created later under the same
+name. It renames the directory to `databases/.deleted-<uuid>` while it holds the
+registry lock and removes that directory after it releases the lock, so a large delete
+does not hold up other catalog operations.
 
 `reserve` holds a name for a dataset that a long task will create. Clones and restores
 reserve their target, and a create, rename or second reservation of that name fails with
@@ -972,6 +1005,9 @@ lock that the store uses, with the process id inside. The rules are these.
   today, and their `--server` form goes over HTTP. Catalog commands (Phase 3) fail on the
   catalog lock and offer `--server` in the same way. `Catalog::inspect` reads the
   registry without a lock, which is safe because the registry is replaced atomically.
+  A running catalog may be renaming or restoring a dataset at that moment, so the
+  dataset's directory can be missing. `inspect` leaves such a dataset out of its
+  listing rather than failing.
 * **A CLI while the server is stopped.** A command may open one store under the
   directory without the catalog, which takes that store's lock only. If the server starts
   meanwhile, it fails to open that dataset with the store's message, as it does today.
@@ -1719,10 +1755,29 @@ catalog lock errors are subclasses of dataset lock errors.
 ### Phase 3: dataset management and startup
 
 `POST /$/datasets/{ds}/rename` preserves dataset identity and needs server
-administration. It refuses configured grants or active minted token scopes covering
-either name, including wildcard and restricted dataset grants, and lists the blockers.
-It also refuses live views and reservations, preserves the offline state and refreshes
-routing and metric labels. The OpenAPI description includes this operation.
+administration. It refuses configured grants, protections and active minted token
+scopes whose pattern covers one of the two names and not the other, and lists the
+blockers. A pattern that covers both names, such as `*`, applies the same way after
+the rename and does not block it. A backup policy of the config file that names the
+dataset exactly also blocks it, because the server cannot rewrite that file. The rename
+refuses live views and reservations and preserves the offline state. It carries the
+request metrics, the compaction scheduler's state and a pending automatic reasoning run
+over to the new name, and rewrites the API backup policies that name the dataset
+exactly. Policies that select it with a glob stay as written. The OpenAPI description
+includes this operation.
+
+The server holds its routing lock only to change its routing map. A delete or rename
+first marks the name as leaving, so lookups neither find nor cache the dataset, and then
+runs the catalog operation without the lock. A slow delete of a large dataset therefore
+does not hold up requests to other datasets. The HTTP handlers run that work on blocking
+threads.
+
+The catalog keeps a dataset registered in every `config.json` it writes while the
+dataset is detached for an in-place restore, and the swap's rollback saves the registry
+again. A rename publishes the reopened store only after the registry names it. When a
+rename's rollback cannot reopen the store, the dataset stays registered, its name stays
+taken, and the next `Catalog::open` recovers the directory. Unit tests inject failures
+after the directory move and during the rollback to cover these paths.
 
 `sparkles dataset list|create|delete|rename|clone --data-dir` manages a stopped catalog.
 The same commands accept `--server` and the existing remote-client credentials. Remote

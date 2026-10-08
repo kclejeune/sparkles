@@ -37,9 +37,12 @@ It closes the known gap "Embedding: Sparkles is Rust only" in
 [FEATURES.md](../FEATURES.md#known-gaps) for Python, and the Embedding row of the
 Oxigraph comparison in [COMPARISON.md](../COMPARISON.md).
 
-P06 Phase 2 replaces the flat administration methods described here with native
-property handles. See [P06](P06-library-admin-api.md#9-phase-2-closing-the-python-gaps)
-and the current [Python guide](../USAGE.md#python) for the shipped names.
+P06 Phase 2 replaced the flat administration methods that this spec and its Outcome
+name, such as `reason`, `validate_shacl`, `set_retention` and `enable_text`, with native
+property handles, and it kept no aliases. The table in
+[Names after P06](#names-after-p06) maps each of them to its handle. See
+[P06](P06-library-admin-api.md#9-phase-2-closing-the-python-gaps) and the current
+[Python guide](../USAGE.md#python) for the full surface.
 
 ## 1. Summary, goals, non-goals
 
@@ -812,3 +815,26 @@ N-Quads. The tests check that a file object streams in each binary syntax and Tr
 a truncated stream fails as a syntax error, and, in a child process with its own
 `TMPDIR`, that parsing a large RDF Thrift file grows the peak memory by less than a
 quarter of the N-Quads' size and that a load removes its temporary file.
+
+### Names after P06
+
+[P06](P06-library-admin-api.md#phase-2-native-python-handles) Phase 2 moved the
+administration methods named above onto property handles of `Dataset` and removed the
+flat names. The query, load, dump, transaction and term APIs are unchanged, and
+`head_commit`, `clone_to`, `compact`, `embed` and `apply_patch` stay on `Dataset`.
+
+| Name in this spec | Current name |
+|---|---|
+| `reason(profile, rules=…)` | `ds.reasoning.run(profile, rules=…)` |
+| `validate_shacl(…)` | `ds.validation.shacl(…)` |
+| `validate_shex(…)` | `ds.validation.shex(…)` |
+| `write_validation()`, `set_write_validation(config)` | `ds.validation.guard.get()`, `.set(config)`, `.reset()` |
+| `commits(…)` | `ds.history.commits(…)` |
+| `create_snapshot(name)` and the other snapshot methods | `ds.snapshots.create(name)`, `.list()`, `.delete(name)` |
+| `set_retention(…)` | `ds.settings.retention.set(…)` |
+| `enable_text(config)`, `text_status()` | `ds.indexes.text.enable(config)`, `.status()` |
+| the vector index methods, `reembed_vector_index(name)` | `ds.indexes.vector`, `ds.indexes.vector.reembed(name)` |
+
+Reports that the flat methods returned with snake_case keys are camelCase dictionaries
+now, such as `sourceQuads` in the report of `clone_to`. `ds.validation.guard.reset()`
+returns `None`, where `set_write_validation(None)` returned a status dictionary.
