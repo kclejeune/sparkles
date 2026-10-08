@@ -1546,7 +1546,7 @@ fn batch_insert_timing() {
 }
 
 #[test]
-fn missing_linked_branch_text_recovers_without_checkpointing_upstream() {
+fn linked_branch_text_seeds_a_checkpoint_and_replays_uncheckpointed_changes() {
     let dir = tempfile::tempdir().unwrap();
     let s = ready_open(dir.path(), Default::default()).unwrap();
     load(&s);
@@ -1557,12 +1557,11 @@ fn missing_linked_branch_text_recovers_without_checkpointing_upstream() {
     sparkles_core::sparql::update::update(&s, &format!("{P}DELETE DATA {{ ex:b1 rdfs:label \"The Quick Brown Fox\"@en }}; INSERT DATA {{ ex:new rdfs:label \"silver fox\" }}"), &Default::default()).unwrap();
     s.create_branch("work", &Default::default()).unwrap();
     let work = s.branch("work").unwrap();
-    if work.text_status().unwrap().state != "ready" {
-        work.rebuild_text().unwrap();
-    }
+    let status = work.text_status().unwrap();
+    assert_eq!(status.state, "ready", "a seeded branch opens ready");
     assert!(
-        work.text_status().unwrap().last_rebuild.is_some(),
-        "missing branch index rebuilt in its owned directory"
+        status.last_rebuild.is_none(),
+        "copied checkpoint was caught up without rebuilding"
     );
     assert_eq!(
         sorted(rows(&work, "SELECT ?s { ?s text:query \"fox\" }")),
@@ -1619,5 +1618,63 @@ fn linked_branch_text_rebuilds_when_upstream_checkpoint_is_after_the_fork() {
     assert_eq!(
         sorted(rows(&branch, "SELECT ?s { ?s text:query \"fox\" }")),
         ["b1"]
+    );
+}
+
+/// A branch whose own index is gone, and whose upstream checkpoint is past the fork
+/// point, recovers in the background. The upstream checkpoint is never copied, even
+/// when its sequence number is below the branch's head, since it holds upstream
+/// commits the branch does not have.
+#[test]
+fn missing_branch_text_recovers_without_copying_a_checkpoint_past_the_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    {
+        let s = ready_open(root, Default::default()).unwrap();
+        load(&s);
+        s.compact().unwrap();
+        s.enable_text(Default::default()).unwrap();
+        s.create_branch("work", &Default::default()).unwrap();
+        let work = s.branch("work").unwrap();
+        for i in 0..3 {
+            sparkles_core::sparql::update::update(
+                &work,
+                &format!("{P}INSERT DATA {{ ex:w{i} rdfs:label \"branchfox\" }}"),
+                &Default::default(),
+            )
+            .unwrap();
+        }
+        sparkles_core::sparql::update::update(
+            &s,
+            &format!("{P}INSERT DATA {{ ex:future rdfs:label \"futurefox\" }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        s.rebuild_text().unwrap();
+        assert!(s.snapshot().commit < work.snapshot().commit);
+    }
+    for e in std::fs::read_dir(root.join("branches")).unwrap() {
+        let text = e.unwrap().path().join("text");
+        if text.exists() {
+            std::fs::remove_dir_all(text).unwrap();
+        }
+    }
+    let s = Store::open(root, Default::default()).unwrap();
+    let work = s.branch("work").unwrap();
+    // A seeded index would open ready without a rebuild. Background recovery is
+    // either still running or has finished with a rebuild.
+    let status = work.text_status().unwrap();
+    assert!(
+        status.state == "rebuilding" || status.last_rebuild.is_some(),
+        "{status:?}"
+    );
+    if status.state != "ready" {
+        work.rebuild_text().unwrap();
+    }
+    assert!(work.text_status().unwrap().last_rebuild.is_some());
+    assert!(rows(&work, "SELECT ?s { ?s text:query \"futurefox\" }").is_empty());
+    assert_eq!(
+        rows(&work, "SELECT ?s { ?s text:query \"branchfox\" }").len(),
+        3
     );
 }

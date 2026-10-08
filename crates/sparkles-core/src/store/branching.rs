@@ -641,6 +641,17 @@ impl BranchSet {
         holds_in(&t, id)
     }
 
+    /// The current snapshot of the open store `id` (the dataset's own store for its
+    /// id), or `None` when that store is not open.
+    #[cfg(feature = "text")]
+    pub(crate) fn current_of(&self, id: uuid::Uuid) -> Option<Arc<Snapshot>> {
+        if id == self.dataset_id {
+            self.main_current.lock().upgrade().map(|c| c.load_full())
+        } else {
+            self.stores.lock().get(&id).map(|s| s.snapshot())
+        }
+    }
+
     /// Remember the dataset's own store's current state (at its open).
     pub(crate) fn set_main(&self, current: &Arc<ArcSwap<Snapshot>>) {
         *self.main_current.lock() = Arc::downgrade(current);

@@ -2,14 +2,27 @@
 use super::*;
 use crate::text::{TextConfig, TextIndex, TextStatus, TextView};
 use parking_lot::Condvar;
-use std::sync::{OnceLock, Weak, mpsc};
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::{OnceLock, Weak};
+use std::time::{Duration, Instant};
 
-const QUEUE: usize = 16;
 const JOURNAL: usize = 131_072;
 const FINAL_TAIL: usize = 1_024;
 const ATTEMPTS: usize = 3;
 const ROUNDS: usize = 8;
+/// Delays before the automatic retries of a run that exhausted its restart budget.
+#[cfg(not(test))]
+const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+];
+#[cfg(test)]
+const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(5),
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+];
 
 type IndexSlot = arc_swap::ArcSwapOption<TextIndex>;
 type RecoverySlot = arc_swap::ArcSwapOption<Recovery>;
@@ -27,6 +40,8 @@ struct State {
     done: bool,
     cancelled: bool,
     failure: Option<&'static str>,
+    /// automatic retries scheduled after exhausted runs
+    retries: usize,
 }
 
 pub(super) struct Recovery {
@@ -159,7 +174,10 @@ impl Recovery {
         Ok(())
     }
 
-    fn run(self: &Arc<Self>) -> Result<()> {
+    /// One run of at most [`ATTEMPTS`] builds. `Ok(false)` means the run used up its
+    /// restarts, because the generation changed, the journal overflowed, or catch-up
+    /// could not get within [`FINAL_TAIL`] quads of the head in [`ROUNDS`] rounds.
+    fn run(self: &Arc<Self>) -> Result<bool> {
         let writer = self.writer.upgrade().ok_or(Error::Cancelled)?;
         let current = self.current.upgrade().ok_or(Error::Cancelled)?;
         let slot = self.slot.upgrade().ok_or(Error::Cancelled)?;
@@ -182,7 +200,6 @@ impl Recovery {
             let mut built =
                 TextIndex::recovery_build(&self.root, &self.config, &start, &|| self.check())?;
             hook(&self.root, "built");
-            let mut retry = false;
             for _round in 0..ROUNDS {
                 let (head, changes) = {
                     let _w = self.lock(&writer)?;
@@ -190,7 +207,6 @@ impl Recovery {
                     let head = current.load_full();
                     let mut j = self.journal.lock();
                     if j.invalid || head.generation.uid != start.generation.uid {
-                        retry = true;
                         break;
                     }
                     (
@@ -202,12 +218,20 @@ impl Recovery {
                     self.check()
                 })?;
                 hook(&self.root, "caught-up");
+                // The quota walk measures the whole dataset directory. It runs before
+                // the final writer admission so writes do not wait for it. The tail
+                // applied under the writer lock adds at most FINAL_TAIL quads.
+                if let Some(quota) = self.quota.upgrade() {
+                    quota.check_rebuild(
+                        Some(&self.root.join("text")),
+                        &self.root.join("text.new"),
+                    )?;
+                }
                 let _w = self.lock(&writer)?;
                 self.owns(&slot)?;
                 let head = current.load_full();
                 let mut journal = self.journal.lock();
                 if journal.invalid || head.generation.uid != start.generation.uid {
-                    retry = true;
                     break;
                 }
                 if journal.quads.len() > FINAL_TAIL {
@@ -220,12 +244,6 @@ impl Recovery {
                 self.check()?;
                 hook(&self.root, "publishing");
                 TextIndex::recovery_catch_up(&mut built, &self.config, &head, &tail, &|| Ok(()))?;
-                if let Some(quota) = self.quota.upgrade() {
-                    quota.check_rebuild(
-                        Some(&self.root.join("text")),
-                        &self.root.join("text.new"),
-                    )?;
-                }
                 let (ti, view) =
                     TextIndex::recovery_install(&self.root, self.config.clone(), built, &head)?;
                 index.store(Some(Arc::new(ti)));
@@ -234,20 +252,68 @@ impl Recovery {
                 current.store(Arc::new(snapshot));
                 self.ready.store(true, Ordering::Release);
                 *self.journal.lock() = Journal::default();
-                return Ok(());
+                return Ok(true);
             }
+            // A restart, for a changed generation or an exhausted catch-up alike.
             drop(built);
             *self.journal.lock() = Journal::default();
             crate::text::cleanup_staging(&self.root)?;
-            if !retry {
-                return Err(Error::TextUnavailable(
-                    "text recovery catch-up budget exceeded; retry rebuild".into(),
-                ));
+        }
+        Ok(false)
+    }
+
+    /// Publish this job's current state in the store's snapshot, so that text queries
+    /// report a failure without waiting for the next commit. The writer lock keeps a
+    /// concurrent commit from publishing an older view after this one.
+    fn publish_state(self: &Arc<Self>) {
+        let (Some(writer), Some(current), Some(slot)) = (
+            self.writer.upgrade(),
+            self.current.upgrade(),
+            self.slot.upgrade(),
+        ) else {
+            return;
+        };
+        let _w = loop {
+            if !self.active.load(Ordering::Acquire) {
+                return;
+            }
+            if let Some(w) = writer.try_lock_for(Duration::from_millis(10)) {
+                if w.closed {
+                    return;
+                }
+                break w;
+            }
+        };
+        if !slot.load().as_ref().is_some_and(|c| Arc::ptr_eq(c, self)) {
+            return;
+        }
+        loop {
+            let previous = current.load_full();
+            if previous.text.as_ref().is_none_or(|v| v.owner != self.owner) {
+                return;
+            }
+            let mut snapshot = (*previous).clone();
+            snapshot.text = Some(self.view(snapshot.commit));
+            let observed = current.compare_and_swap(&previous, Arc::new(snapshot));
+            if Arc::ptr_eq(&observed, &previous) {
+                return;
             }
         }
-        Err(Error::TextUnavailable(
-            "text recovery restart budget exceeded; retry rebuild".into(),
-        ))
+    }
+
+    /// Mark the job failed, publish that state and wake its waiters.
+    fn fail(self: &Arc<Self>, reason: &'static str) {
+        {
+            let mut state = self.state.lock();
+            if self.active.load(Ordering::Acquire) {
+                state.failure = Some(reason);
+            }
+        }
+        self.publish_state();
+        let mut state = self.state.lock();
+        state.running = false;
+        state.done = true;
+        self.done.notify_all();
     }
 
     fn execute(self: Arc<Self>) {
@@ -256,6 +322,10 @@ impl Recovery {
             if !self.active.load(Ordering::Acquire) {
                 state.done = true;
                 self.done.notify_all();
+                return;
+            }
+            // An explicit rebuild may queue a job again while a worker is taking it.
+            if state.running || state.done {
                 return;
             }
             state.running = true;
@@ -276,7 +346,7 @@ impl Recovery {
                     .unwrap_or("non-string panic");
                 tracing::error!(target: "sparkles::text", root = %self.root.display(), %cause, "background text recovery panicked");
             }
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
         }
         let cleanup = crate::text::cleanup_staging(&self.root);
         if let Err(error) = &cleanup {
@@ -285,19 +355,50 @@ impl Recovery {
         if let Some(quota) = self.quota.upgrade() {
             quota.invalidate();
         }
-        let mut state = self.state.lock();
-        if (!matches!(result, Ok(Ok(()))) || cleanup.is_err())
-            && self.active.load(Ordering::Acquire)
-        {
-            state.failure = Some("full-text recovery failed; retry rebuild");
+        match (&result, &cleanup) {
+            (Ok(Ok(true)), Ok(())) => {}
+            (Ok(Ok(false)), Ok(())) => {
+                let mut state = self.state.lock();
+                if self.active.load(Ordering::Acquire) && state.retries < RETRY_DELAYS.len() {
+                    let delay = RETRY_DELAYS[state.retries];
+                    state.retries += 1;
+                    tracing::info!(target: "sparkles::text", root = %self.root.display(), retry = state.retries, ?delay, "background text recovery exhausted its restarts; retrying later");
+                    // Waiters keep waiting: the job is not done until a retry ends.
+                    state.running = false;
+                    drop(state);
+                    if !enqueue(&self, delay) {
+                        self.fail("full-text recovery queue unavailable; retry rebuild");
+                    }
+                    return;
+                }
+                drop(state);
+                self.fail("full-text recovery restart budget exceeded; retry rebuild");
+                return;
+            }
+            _ => {
+                self.fail("full-text recovery failed; retry rebuild");
+                return;
+            }
         }
+        let mut state = self.state.lock();
         state.running = false;
         state.done = true;
         self.done.notify_all();
     }
 
     pub(super) fn status(&self, seq: u64) -> TextStatus {
-        let failed = self.state.lock().failure;
+        let (failed, retries) = {
+            let state = self.state.lock();
+            (state.failure, state.retries)
+        };
+        let message = failed.map(str::to_owned).or_else(|| {
+            (retries > 0).then(|| {
+                format!(
+                    "full-text recovery retry {retries} of {}",
+                    RETRY_DELAYS.len()
+                )
+            })
+        });
         TextStatus {
             enabled: true,
             state: if failed.is_some() {
@@ -315,34 +416,95 @@ impl Recovery {
             config: self.config.clone(),
             format_version: 2,
             last_rebuild: None,
-            message: failed.map(str::to_owned),
+            message,
         }
     }
 }
 
-fn enqueue(job: &Arc<Recovery>) -> bool {
-    static WORKER: OnceLock<Mutex<Option<mpsc::SyncSender<Weak<Recovery>>>>> = OnceLock::new();
-    let mut worker = WORKER.get_or_init(Default::default).lock();
-    if let Some(sender) = worker.as_ref() {
-        return sender.try_send(Arc::downgrade(job)).is_ok();
+/// The process-wide recovery queue. It holds weak entries, so a closed store's job
+/// leaves it, and a job is queued at most once. It has no bound, so a job is never
+/// refused for lack of room.
+#[derive(Default)]
+struct Queue {
+    jobs: VecDeque<(Weak<Recovery>, Instant)>,
+    workers: usize,
+}
+
+struct Pool {
+    queue: Mutex<Queue>,
+    ready: Condvar,
+}
+
+fn pool() -> &'static Pool {
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    POOL.get_or_init(|| Pool {
+        queue: Default::default(),
+        ready: Condvar::new(),
+    })
+}
+
+/// Recovery workers: one per four CPUs, at least one and at most two. Each build
+/// uses up to two indexing threads of its own. Tests use one worker, so that a
+/// paused job holds back the jobs queued behind it.
+fn pool_size() -> usize {
+    if cfg!(test) {
+        return 1;
     }
-    let (tx, rx) = mpsc::sync_channel::<Weak<Recovery>>(QUEUE);
-    if std::thread::Builder::new()
-        .name("sparkles-text-recovery".into())
-        .spawn(move || {
-            while let Ok(weak) = rx.recv() {
-                if let Some(job) = weak.upgrade() {
-                    job.execute();
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .div_ceil(4)
+        .clamp(1, 2)
+}
+
+fn work(pool: &'static Pool) {
+    loop {
+        let job = {
+            let mut q = pool.queue.lock();
+            loop {
+                q.jobs.retain(|(job, _)| job.strong_count() > 0);
+                let now = Instant::now();
+                if let Some(i) = q.jobs.iter().position(|(_, at)| *at <= now) {
+                    break q.jobs.remove(i).expect("position is in range").0;
+                }
+                match q.jobs.iter().map(|(_, at)| *at).min() {
+                    Some(at) => {
+                        pool.ready.wait_until(&mut q, at);
+                    }
+                    None => pool.ready.wait(&mut q),
                 }
             }
-        })
-        .is_err()
-    {
+        };
+        if let Some(job) = job.upgrade() {
+            job.execute();
+        }
+    }
+}
+
+/// Queue `job` to start after `delay`. A job already queued keeps one entry, at the
+/// earlier of the two start times. Fails only when no worker thread can start.
+fn enqueue(job: &Arc<Recovery>, delay: Duration) -> bool {
+    let pool = pool();
+    let mut q = pool.queue.lock();
+    while q.workers < pool_size() {
+        let spawned = std::thread::Builder::new()
+            .name("sparkles-text-recovery".into())
+            .spawn(move || work(pool));
+        if spawned.is_err() {
+            break;
+        }
+        q.workers += 1;
+    }
+    if q.workers == 0 {
         return false;
     }
-    let queued = tx.try_send(Arc::downgrade(job)).is_ok();
-    *worker = Some(tx);
-    queued
+    let at = Instant::now() + delay;
+    let weak = Arc::downgrade(job);
+    match q.jobs.iter_mut().find(|(j, _)| Weak::ptr_eq(j, &weak)) {
+        Some((_, queued)) => *queued = (*queued).min(at),
+        None => q.jobs.push_back((weak, at)),
+    }
+    pool.ready.notify_all();
+    true
 }
 
 impl Store {
@@ -365,10 +527,8 @@ impl Store {
     }
 
     pub(super) fn enqueue_text_recovery(&self, job: &Arc<Recovery>) {
-        if !enqueue(job) {
-            let mut state = job.state.lock();
-            state.failure = Some("full-text recovery queue unavailable; retry rebuild");
-            state.done = true;
+        if !enqueue(job, Duration::ZERO) {
+            job.fail("full-text recovery queue unavailable; retry rebuild");
         }
     }
 
@@ -399,6 +559,10 @@ impl Store {
             hook(&job.root, "retry-replacing");
             self.start_text_recovery(config)
         } else {
+            // A job waiting out a retry delay starts now for an explicit rebuild.
+            if !job.state.lock().running {
+                enqueue(&job, Duration::ZERO);
+            }
             job
         })
     }
@@ -513,7 +677,7 @@ mod tests {
         let root = dir.path();
         populate(root);
         std::fs::remove_dir_all(root.join("text")).unwrap();
-        let mut pause = Pause::new(root, "publishing");
+        let mut pause = Pause::new(root, "caught-up");
         let store = Store::open(
             root,
             StoreOptions {
@@ -540,9 +704,10 @@ mod tests {
                 .unwrap()
                 .boolean
         );
+        // The failure is published at once, without waiting for a commit.
         assert!(matches!(
             query(store.snapshot(), QUERY, &Default::default()),
-            Err(Error::TextUnavailable(_))
+            Err(Error::TextUnavailable(m)) if m.contains("failed")
         ));
         store.set_quota(Some(0)).unwrap();
         store.rebuild_text().unwrap();
@@ -704,9 +869,12 @@ mod tests {
         pause.reached();
         let job = s.text_recovery.load_full().unwrap();
         let weak = Arc::downgrade(&job);
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counted = builds.clone();
         hooks().lock().insert(
             (root.to_path_buf(), "built"),
             Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
                 if let Some(job) = weak.upgrade() {
                     job.changed_generation();
                 }
@@ -714,10 +882,16 @@ mod tests {
         );
         pause.resume();
         assert!(job.wait().is_err());
+        // Each automatic retry is another full run of restarts.
+        assert_eq!(job.state.lock().retries, RETRY_DELAYS.len());
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            ATTEMPTS * (1 + RETRY_DELAYS.len())
+        );
         assert_eq!(s.text_status().unwrap().state, "failed");
         assert!(matches!(
             query(s.snapshot(), QUERY, &Default::default()),
-            Err(Error::TextUnavailable(_))
+            Err(Error::TextUnavailable(m)) if m.contains("failed")
         ));
         update(
             &s,
@@ -726,6 +900,79 @@ mod tests {
         hooks().lock().remove(&(root.to_path_buf(), "built"));
         assert_eq!(s.rebuild_text().unwrap().state, "ready");
         assert_eq!(count(&s), 2);
+    }
+
+    #[test]
+    fn exhausted_run_retries_automatically_after_a_delay() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        std::fs::remove_dir_all(root.join("text")).unwrap();
+        let mut pause = Pause::new(root, "admitted");
+        let s = Store::open(root, Default::default()).unwrap();
+        pause.reached();
+        let job = s.text_recovery.load_full().unwrap();
+        let weak = Arc::downgrade(&job);
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counted = builds.clone();
+        hooks().lock().insert(
+            (root.to_path_buf(), "built"),
+            Arc::new(move || {
+                // Only the first run is disturbed on every attempt.
+                if counted.fetch_add(1, Ordering::SeqCst) < ATTEMPTS
+                    && let Some(job) = weak.upgrade()
+                {
+                    job.changed_generation();
+                }
+            }),
+        );
+        pause.resume();
+        job.wait().unwrap();
+        hooks().lock().remove(&(root.to_path_buf(), "built"));
+        assert_eq!(job.state.lock().retries, 1);
+        assert_eq!(builds.load(Ordering::SeqCst), ATTEMPTS + 1);
+        assert_eq!(s.text_status().unwrap().state, "ready");
+        assert_eq!(count(&s), 1);
+    }
+
+    #[test]
+    fn exhausted_catch_up_rounds_restart_while_attempts_remain() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        std::fs::remove_dir_all(root.join("text")).unwrap();
+        let mut pause = Pause::new(root, "admitted");
+        let s = Store::open(root, Default::default()).unwrap();
+        pause.reached();
+        let job = s.text_recovery.load_full().unwrap();
+        let snapshot = s.snapshot();
+        let weak = Arc::downgrade(&job);
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let counted = rounds.clone();
+        hooks().lock().insert(
+            (root.to_path_buf(), "caught-up"),
+            Arc::new(move || {
+                // Writes outpace catch-up for every round of the first attempt.
+                if counted.fetch_add(1, Ordering::SeqCst) < ROUNDS
+                    && let Some(job) = weak.upgrade()
+                {
+                    job.record(
+                        &snapshot,
+                        &vec![(WAL_INSERT, [Id::DEFAULT_GRAPH; 4]); FINAL_TAIL + 1],
+                    );
+                }
+            }),
+        );
+        pause.resume();
+        job.wait().unwrap();
+        hooks().lock().remove(&(root.to_path_buf(), "caught-up"));
+        // The second attempt of the same run published, without an automatic retry.
+        assert_eq!(job.state.lock().retries, 0);
+        assert_eq!(rounds.load(Ordering::SeqCst), ROUNDS + 1);
+        assert_eq!(s.text_status().unwrap().state, "ready");
+        assert_eq!(count(&s), 1);
     }
 
     #[test]
@@ -869,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_bound_and_queued_close_release_store_lock_without_waiting() {
+    fn queue_is_unbounded_and_queued_close_releases_store_lock_without_waiting() {
         let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let busy = dir.path().join("busy");
@@ -883,7 +1130,8 @@ mod tests {
         let first = Store::open(&busy, Default::default()).unwrap();
         pause.reached();
         let mut stores = Vec::new();
-        for i in 0..QUEUE + 1 {
+        // More jobs than the old queue bound of 16 wait behind the paused one.
+        for i in 0..20 {
             let root = dir.path().join(format!("queued-{i}"));
             std::fs::create_dir(&root).unwrap();
             write_atomic(
@@ -892,10 +1140,7 @@ mod tests {
             )
             .unwrap();
             let store = Store::open(&root, Default::default()).unwrap();
-            assert_eq!(
-                store.text_status().unwrap().state,
-                if i == QUEUE { "failed" } else { "rebuilding" }
-            );
+            assert_eq!(store.text_status().unwrap().state, "rebuilding");
             assert!(
                 store
                     .text_recovery
@@ -915,8 +1160,10 @@ mod tests {
         drop(lock);
         pause.resume();
         wait(&first);
+        // Every queued job finishes on its own, without an explicit rebuild.
         for s in &stores {
-            s.rebuild_text().unwrap();
+            wait(s);
+            assert!(s.text_status().unwrap().last_rebuild.is_some());
         }
     }
 

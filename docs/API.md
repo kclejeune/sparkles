@@ -4449,9 +4449,13 @@ SELECT ?s ?score ?label WHERE {
   on a bounded background worker. RDF reads/writes remain available; configured text
   searches return `503` while `rebuilding` or `failed`. Disabled search still returns
   `400`. Retained unavailable snapshots stay unavailable after a newer view becomes
-  ready. A failed or queue-exhausted attempt can be retried with the rebuild endpoint
-  or `sparkles text-index --loc DB --rebuild`. Missing indexes after backup restore and
-  in linked branches use this same recovery path.
+  ready. A recovery that keeps restarting because writes or compactions outpace it is
+  retried automatically up to three times, after 5, 30 and 120 seconds. A failed attempt
+  can be retried with the rebuild endpoint or `sparkles text-index --loc DB --rebuild`.
+  A new linked branch copies its upstream's checkpoint when that checkpoint is at or
+  before the fork point and catches it up before the branch opens, so its text search
+  is ready at once. Missing indexes after backup restore, and branch indexes that cannot
+  be copied, use the background recovery path.
   Explicit enable/reconfigure remain synchronous inside their task, while an explicit
   rebuild joins/retries startup recovery or runs its existing online build. Cancelling
   an HTTP task retains the existing synchronous native rebuild behavior; there is no

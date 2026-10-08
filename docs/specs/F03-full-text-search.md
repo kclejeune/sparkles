@@ -668,21 +668,36 @@ an admin panel and ranked search in Explore. Clones keep text search enabled (`8
 **Background startup recovery.** Persistent open classifies the derived index before
 allocating its writer or cleaning staging. Healthy verification and covered WAL catch-up
 remain synchronous. Missing, damaged, ahead, mismatched and uncovered indexes instead
-publish configured unavailable views and recover from RDF on one process-wide worker.
-Linked inherited WAL changes are loaded only for a reusable index needing catch-up.
-Missing linked indexes rebuild in their own directory without checkpointing the upstream.
-Restored datasets whose backups omit `text/` use the same configured recovery path.
+publish configured unavailable views and recover from RDF on a small process-wide worker
+pool. Linked inherited WAL changes are loaded only for a reusable index needing catch-up.
+A new linked branch copies its upstream's committed checkpoint into its own directory
+when the upstream store is open with a ready index and that checkpoint is at or before
+the fork point. The copy is then caught up from the inherited WAL before the branch
+opens, so the branch serves text searches at once. A checkpoint past the fork point may
+hold upstream commits the branch lacks, so it is never copied. When no checkpoint can be
+copied, the branch index rebuilds in the background in its own directory, and the
+upstream is never checkpointed by the branch. Restored datasets whose backups omit
+`text/` use the same configured recovery path.
 
 RDF reads and writes remain available. Text searches return 503 while rebuilding or after
 failure; disabled text search still returns 400. Retained unavailable snapshots stay
 unavailable, and ready cache entries cannot bypass this state. Concurrent effective quad
 changes feed a bounded journal, with final presence checked against the caught-up snapshot.
-Generation changes and journal overflow restart the build within a fixed budget. Admission
-allows one worker and sixteen weak queued jobs; only an active job pins a snapshot. The
-active build uses at most two indexing threads with a shared 64 MiB writer arena budget
-(one thread on a single-CPU host). Its journal holds at most 131,072 changed quads, with three build attempts, eight catch-up rounds and
-a final writer-held tail of at most 1,024 records. Exhaustion leaves `failed` text status;
-an explicit rebuild retries it. Native logs retain failure details.
+Generation changes, journal overflow and catch-up that cannot close on the head all
+restart the build within a fixed budget. The pool has one worker per four CPUs, with at
+least one and at most two. Its queue holds weak entries without a bound, so a dataset is
+never failed because many datasets need recovery at once, and the entry of a closed store
+is dropped. A job is queued once even when requested again. Only an active job pins a
+snapshot. Each active build uses at most two indexing threads with a shared 64 MiB writer
+arena budget, or one thread on a single-CPU host. Its journal holds at most 131,072
+changed quads. A run allows three build attempts, eight catch-up rounds per attempt and a
+final writer-held tail of at most 1,024 records. When a run uses up its attempts, the job
+is queued again after 5 seconds, then 30 seconds, then 120 seconds, and the status message
+names the retry. After the third retry fails the text status is `failed`, and an explicit
+rebuild retries it. An explicit rebuild during a retry delay starts the retry at once.
+Other failures, such as a quota or disk reserve refusal, are not retried automatically.
+A failure is published in the dataset's snapshot when it is recorded, so text searches
+report `failed` without waiting for another commit. Native logs retain failure details.
 
 Ready publication verifies the current owner and generation under writer admission, then
 completes the directory rename/fsync fence. Disable, reconfigure and Store close cancel
@@ -697,13 +712,18 @@ Explicit enable/reconfigure remain synchronous. Explicit rebuild is a synchronou
 build or a join/retry of startup recovery. HTTP task cancellation retains the existing
 synchronous native rebuild behavior; this change introduces no per-waiter Ctl API.
 An admitted directory publication fence completes before automatic cancellation returns.
+Cancellation is checked between batches of documents and before each blocking step of a
+build. Tantivy segment merges and the publication fence cannot be interrupted, so a close
+or disable that arrives during them waits for them to finish.
 Disk reserve is checked at recovery checkpoints, and an authoritative dataset quota check
-refuses growing ready publication. Derived staging can consume transient disk space before
+refuses growing ready publication. The quota check walks the dataset directory before the
+final writer admission, so writes do not wait for it. Derived staging can consume transient disk space before
 that final check; refusal removes staging and preserves RDF. This does not add a hard
 build-space reservation.
 
 Native controls cover missing/damaged indexes, concurrent writes, generation and journal
-restart, queue failure, cancellation and close, owner/cache isolation, failed installation,
+restart, catch-up round restart, delayed automatic retries, more queued jobs than one
+worker can take, branch checkpoint seeding, cancellation and close, owner/cache isolation, failed installation,
 metadata/WAL classification, lazy linked catch-up, callback refusal, quota/reserve refusal
 and explicit retry. Child-process interruption at build and both directory-renaming
 boundaries survives reopen with the same RDF identity/head. These are process-crash

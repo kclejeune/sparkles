@@ -2784,6 +2784,20 @@ impl Store {
                 touched.extend_from_slice(wal);
                 Ok(std::borrow::Cow::Owned(touched))
             };
+            // A new linked branch starts from a copy of its upstream's checkpoint when
+            // that checkpoint is at or before the fork point, and catches up from the
+            // inherited WAL below. A checkpoint after the fork point may hold upstream
+            // commits that the branch does not have, so it is never copied. Without a usable checkpoint the index recovers in the background.
+            if snap.generation.linked().is_some()
+                && !root.join("text").exists()
+                && let (Some(ident), Some(set)) = (&self.branching.ident, self.branch_set())
+                && let Some(source) = set.current_of(ident.from.branch_id)
+                && let Some(view) = &source.text
+                && let Err(e) =
+                    crate::text::seed_branch(view, root, &cfg, ident.from.seq.min(snap.commit))
+            {
+                tracing::warn!(target: "sparkles::store", "cannot reuse upstream text index: {e}; recovering in the background");
+            }
             match crate::text::TextIndex::open_ready(
                 root,
                 cfg.clone(),
