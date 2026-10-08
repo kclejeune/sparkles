@@ -3196,7 +3196,7 @@ impl Store {
         let waiting = Waiting::new(&self.writers_waiting);
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
         let mut guard = self.writer.lock();
-        if !self.group_admission(kind, &opts, &guard) {
+        if !self.speculative_base(kind, &opts, &guard) {
             self.drain_group(&mut guard, None).ok();
         }
         drop(waiting);
@@ -3218,7 +3218,7 @@ impl Store {
         opts: crate::guard::WriteOptions,
     ) -> Result<WriteTxn<'_>> {
         let mut guard = self.raw_writer(&opts)?;
-        if !self.group_admission(kind, &opts, &guard) {
+        if !self.speculative_base(kind, &opts, &guard) {
             self.drain_group(&mut guard, Some(&opts))?;
         }
         self.check_write_options(&opts)?;
@@ -3295,6 +3295,22 @@ impl Store {
             w.staged = None;
         }
         Ok(())
+    }
+
+    /// Whether a new write transaction may start from the speculative head that group
+    /// commit has written but not yet synced. Only SPARQL updates do. An update's caller
+    /// sees nothing of the state it reads, and its commit fails with its predecessor's.
+    /// An explicit transaction hands that state to its caller through
+    /// [`WriteTxn::view`] and queries, and could be dropped without committing, so the
+    /// caller would have seen data that a failed sync then lost. It waits for the
+    /// pending sync instead, and its own commit can still join a group.
+    fn speculative_base(
+        &self,
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+        w: &WriterState,
+    ) -> bool {
+        kind == CommitKind::Update && self.group_admission(kind, o, w)
     }
 
     fn group_admission(

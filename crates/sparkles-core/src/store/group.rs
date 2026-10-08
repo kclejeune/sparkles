@@ -377,6 +377,10 @@ mod tests {
             ..Default::default()
         }
     }
+    /// A transaction of the kind that may begin from an unsynced group head.
+    fn speculative(s: &Store) -> WriteTxn<'_> {
+        s.write_with(CommitKind::Update, Default::default())
+    }
     fn insert(s: &Store, name: &str) -> Result<Receipt> {
         insert_author(s, name, None)
     }
@@ -548,7 +552,7 @@ mod tests {
         let suffix = {
             let s = s.clone();
             thread::spawn(move || {
-                let mut t = s.write();
+                let mut t = speculative(&s);
                 t.encode_quad(
                     &Quad::new(
                         NamedNode::new("urn:aborted").unwrap(),
@@ -607,7 +611,7 @@ mod tests {
         };
         hit.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(s.snapshot().commit, 0, "synced but not yet published");
-        let held = s.write();
+        let held = speculative(&s);
         assert_eq!(held.view().len(), 1, "private writer sees its predecessor");
         go.send(()).unwrap();
         let receipt = received
@@ -722,6 +726,35 @@ mod tests {
     }
 
     #[test]
+    fn explicit_transaction_never_sees_a_prefix_whose_fence_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let (hit, go) = pause(&s, "group-sealed");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "one"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        s.snapshot().generation.dvocab.fail_next_sync();
+        let (began, seen) = mpsc::channel();
+        let reader = {
+            let s = s.clone();
+            thread::spawn(move || {
+                // read, then dropped without committing
+                let t = s.write();
+                began.send(t.view().len()).unwrap();
+            })
+        };
+        // The transaction waits for the pending fence before it exposes any state.
+        assert!(seen.recv_timeout(Duration::from_millis(50)).is_err());
+        go.send(()).unwrap();
+        assert!(first.join().unwrap().is_err());
+        assert_eq!(seen.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+        reader.join().unwrap();
+        assert_eq!(s.snapshot().commit, 0);
+    }
+
+    #[test]
     fn preview_and_capture_admission_drain_the_durable_prefix() {
         for capture in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -747,7 +780,7 @@ mod tests {
                         done.send(c.commit.seq).unwrap();
                     } else {
                         // Switch to a preview after beginning from the staged head.
-                        let t = s.write();
+                        let t = speculative(&s);
                         assert_eq!(t.view().len(), 1);
                         let preview = t.preview(Default::default()).unwrap();
                         done.send(preview.head.seq).unwrap();
@@ -960,7 +993,7 @@ mod tests {
         capture.join().unwrap();
         assert_eq!(s.snapshot().commit, 0);
         // Cancellation did not retain the writer or damage the speculative head.
-        let held = s.write();
+        let held = speculative(&s);
         assert_eq!(held.view().len(), 1);
         go.send(()).unwrap();
         first.join().unwrap();
