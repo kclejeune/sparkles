@@ -259,7 +259,9 @@ pub fn write_cursor_solutions(
                 break;
             };
             let decoded = batch.decoded()?;
-            let _row_storage = cursor.charge(batch.width() as u64 * 64 + 128)?;
+            let _row_storage = cursor.charge(
+                batch.width() as u64 * std::mem::size_of::<(usize, Cow<'_, Term>)>() as u64 + 128,
+            )?;
             let mut terms = Vec::with_capacity(batch.width());
             for row in 0..batch.len().min(remaining) {
                 if row.is_multiple_of(1024) {
@@ -271,16 +273,20 @@ pub fn write_cursor_solutions(
                 };
                 let _charge = (bytes != 0).then(|| cursor.charge(bytes)).transpose()?;
                 for col in 0..batch.width() {
-                    terms.push(match &decoded {
+                    let term = match &decoded {
                         Some(d) => d.term(row, col),
                         None => Ok(batch.term(row, col)?.map(Cow::Owned)),
-                    }?);
+                    }?;
+                    if let Some(term) = term {
+                        terms.push((col, term));
+                    }
                 }
                 serializer
-                    .serialize(variables.iter().zip(&terms).filter_map(|(variable, term)| {
-                        term.as_ref()
-                            .map(|t| (variable.as_ref(), t.as_ref().as_ref()))
-                    }))
+                    .serialize(
+                        terms
+                            .iter()
+                            .map(|(col, term)| (variables[*col].as_ref(), term.as_ref().as_ref())),
+                    )
                     .map_err(io)?;
                 // Release owned fallbacks before their row reservation drops;
                 // keep only the adapter capacity for the next row.
