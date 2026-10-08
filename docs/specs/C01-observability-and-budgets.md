@@ -889,6 +889,12 @@ Expect `outcome="cancelled"` = 1 and `sparkles_requests_active{operation="query"
 
 ## Outcome
 
+**Executor extension in progress.** [X05](X05-streaming-query-execution.md) specifies
+cursor-owned batches and state, cumulative limits across batches, and reporting at
+response completion. Its opt-in SELECT cursor and HTTP integration are undergoing
+validation; ordinary query APIs remain eager. X05 extends the budget contract without treating a batch
+as a fresh row/work allowance or bounded serialization as bounded execution.
+
 **Delivered.** Phase 1 landed on 2026-09-30 in four commits. The engine budgets and the
 result-size writer came first. The server's request ids, access log, metrics, readiness
 and budgets came next, and the Server page panels in the UI last. The Phase 2 UI work

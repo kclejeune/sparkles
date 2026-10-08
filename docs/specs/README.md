@@ -38,7 +38,7 @@ behaviour, and the Outcome explains the difference.
 | `F` | Larger data features: a Cypher frontend, full-text and vector search, path search, embeddings computed on write, backups to object storage, retained history and point-in-time reads, branches and merges, replication, and encryption at rest. |
 | `G` | Gaps against Apache Jena that were out of scope for the first version: GeoSPARQL, ShEx, the SHACL Compact Syntax, the command-line tools, the converter of Fuseki configurations and the SERVICE enhancer. |
 | `P` | Bindings and clients for other programs. These are the Python package that embeds the engine, the Rust client of remote servers, the JVM library that embeds the engine behind Apache Jena's API, the Node.js packages for the embedded engine and a remote client, and the administration API that all of them share. |
-| `X` | Internal engineering that does not derive from any other database product: compression codecs, the formatter, the linter, and the OpenAPI description with shell completions. |
+| `X` | Internal engineering that does not derive from any other database product: compression codecs, the formatter, the linter, the OpenAPI description with shell completions, and streaming query execution. |
 
 Numbers are stable. Gaps in the numbering are roadmap items without a spec: writes and a
 property-graph representation for the Cypher frontend and a Datalog frontend. G01
@@ -46,10 +46,11 @@ replaced the narrower geospatial item on that list.
 
 ## Specs
 
-A spec's status is one of three values. *Implemented* means every phase shipped.
+A spec's status describes its delivery. *Implemented* means every phase shipped.
 *Implemented in part* means the first phase shipped and some later phases or items were
 not built; the status block says which. *Specified* means the design is written and
-there is no code yet.
+there is no code yet. *Implementation in progress* means code exists locally while its
+landing gates are being validated.
 
 | Spec | Summary | Status |
 |---|---|---|
@@ -95,6 +96,7 @@ there is no code yet.
 | [X02](X02-formatter.md) | `sparkles fmt`, `POST /$/format`, `sparkles lsp` and the UI's Format button for SPARQL and RDF | implemented |
 | [X03](X03-openapi-and-completions.md) | An OpenAPI 3.1 description at `/$/openapi.json`, kept equal to the route table by a test and checked in, `sparkles openapi`, shell completions and man pages | implemented in part (Phase 1, part of Phase 2) |
 | [X04](X04-linter.md) | `sparkles lint` for SPARQL, Turtle and TriG, with severities per rule, safe fixes, diagnostics and quick fixes in `sparkles lsp`, `POST /$/lint` and the query editor | implemented |
+| [X05](X05-streaming-query-execution.md) | Snapshot-owning SELECT/graph cursors, resumable joins, charged operator state, writer/HTTP backpressure, bindings and measured automatic selection | implemented (Phases 1–4; explicit budget failure instead of disk spill; performance-qualified automatic selection) |
 
 [PROVENANCE.md](PROVENANCE.md) is the provenance record for all of these
 specs, the allocator, the vendored spargebra and the development tools.

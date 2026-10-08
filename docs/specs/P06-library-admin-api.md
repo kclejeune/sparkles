@@ -1437,6 +1437,13 @@ and the wheel measurements.
 
 ## Outcome
 
+**Incremental SELECT surface.** [X05](X05-streaming-query-execution.md) adds the
+opt-in `Dataset::select_cursor` and `select_cursor_with` methods. They capture the
+same dataset defaults as `query_with` and return snapshot-owning ID batches with term
+resolution, limits, close and final stats. The binding decisions are explicitly
+planned in `bindings.toml`; existing collected binding results are unchanged.
+
+
 Phases 1, 2 and 3 are implemented. The notes below record the implementation
 decisions and measurements. The catalog, Python handles, dataset CLI and HTTP rename
 are available. Catalog opening remains eager after the startup measurements below.

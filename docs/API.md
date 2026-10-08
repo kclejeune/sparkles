@@ -1488,8 +1488,39 @@ Query parameters beyond the standard protocol:
 
   A write whose client disconnects is cancelled and commits nothing, even while it waits
   for the dataset's writer lock. A commit that has already started completes.
+* `execution=eager|streaming|auto` selects query execution. The default is `eager`.
+  `streaming` supports SELECT in JSON, XML, CSV, TSV and native Sparkles JSON,
+  ASK, and CONSTRUCT/DESCRIBE in RDF or native Sparkles JSON. It pulls
+  bounded batches from a captured snapshot and pauses execution when response buffers
+  fill. Scans, FILTER/BIND without EXISTS, projection, OFFSET/LIMIT, VALUES, UNION,
+  merge joins and eligible OPTIONAL joins are incremental. Hash joins retain their
+  build side, DISTINCT retains seen keys, and eligible aggregates retain group state;
+  each allocation counts against the query budget. Sorting, DESCRIBE and unsupported
+  operator shapes use visible, budgeted materialization. Exceeding the budget fails
+  the query; there is no disk spill. Streaming does not guarantee constant memory for
+  every query. SELECT in RDF Thrift is unsupported in streaming mode and returns `501`;
+  an invalid mode returns `400`.
+
+  `auto` selects streaming for plain SELECT scans/projections estimated to return
+  at least one million rows, using immutable blocks without a pending delta. It also
+  selects eligible `COUNT(*)` queries over a single-key OPTIONAL between two plain
+  scans when their estimated work reaches one million rows and result caching is
+  disabled or bypassed. Cached aggregate queries retain eager execution. Both paths require
+  whole-block graph predicates, no restored initial bindings or offset, enough memory
+  for block ownership and batches of at least 4,096 rows and 128 KiB. Other plans use
+  eager execution. This conservative policy
+  can change as additional query shapes meet the performance gate.
+
+  Memory and physical-work budgets cover the whole cursor, including retained batches
+  and generated terms. Deadlines include consumer waits. Errors before response
+  commitment use the normal status and JSON error; later errors abort the body transfer.
+  Treat a failed or truncated transfer as a partial answer. Final access logs and
+  metrics wait for both the producer and response body to finish. Cursor requests bypass
+  the full-result cache. Stored-query runs accept the same option.
 * `send=<n>` caps the number of rows serialized. The UI uses it so that a huge result does
-  not hang the browser. `meta.totalRows` still reports the full count.
+  not hang the browser. Eager native metadata reports the full count. Streaming stops
+  production at the requested prefix; `meta.status` is `stopped` and `meta.totalRows`
+  is `null` unless the cursor has exhausted. SPARQL LIMIT completes the query normally.
 * `reasoning=true|false` includes or excludes materialized inferences. The default is
   `true` if the dataset has any.
 * `nocache=true` bypasses the query result cache, so nothing is read from it or stored in
@@ -6597,10 +6628,12 @@ type SparklesResult = {
   rows?: (Term | null)[][];               // SELECT; null = unbound
   boolean?: boolean;                      // ASK
   triples?: [Term, Term, Term][];         // CONSTRUCT / DESCRIBE
+  quads?: [Term, Term, Term, Term | null][]; // streaming graph results; null default graph
   meta: {
-    totalRows: number; sentRows: number;
+    totalRows: number | null; sentRows: number;
+    status?: "complete" | "stopped";        // streaming only; totalRows null when stopped
     timing: { parseMs: number; planMs: number; execMs: number; serializeMs: number; totalMs: number };
-    plan: PlanNode;                        // executed operator tree
+    plan: PlanNode | CursorPlan;           // eager or streaming operator tree
     memory: { peakBytes: number };         // peak estimated memory of intermediate results
     rowsProduced: number;                  // rows produced by all operators, summed
   };
@@ -6627,6 +6660,26 @@ type PlanNode = {
   warnings?: { code: string; message: string }[];       // root only: notes about the plan
 };
 ```
+
+Native streaming responses put `rows` before `meta`. They include final counts and
+capabilities only after successful production. They do not carry success metadata
+when production or serialization fails. `commit` and `datasetId` identify the captured
+snapshot, as on eager HTTP responses. Graph responses emit an empty `triples` array
+and put all results in `quads`, using a null graph for default-graph statements.
+Streaming plans use:
+
+```ts
+type CursorPlan = {
+  operator: PlanNode;
+  materializes: boolean; fullInputBeforeOutput: boolean; growingState: boolean;
+  complete: boolean; reason: string | null;
+  children: CursorPlan[];
+};
+```
+
+`complete` says whether an operator's counts cover its entire execution. Counts on a
+stopped cursor are partial. `growingState` warns of retained state such as generated
+strings; batch size alone does not bound that state.
 
 ## Explain
 

@@ -47,6 +47,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 
 | Feature | Status |
 |---|---|
+| Snapshot-owning SELECT and graph cursors in Rust, Python and Node, opt-in JVM SELECT pulls, and HTTP/CLI execution selection. Direct result writers use bounded output buffers, backpressure, cumulative budgets and body-lifetime cancellation. Joins resume across batches; hash joins, DISTINCT and eligible aggregates retain charged state. Sorting and unsupported shapes expose budgeted materialization, failing explicitly when the budget is exceeded. Automatic execution selects measured eligible large immutable scans and uncached OPTIONAL COUNT queries. Eager remains the default; explicit streaming can cost more on some workloads. Disk spill is not implemented. | ✅ |
 | The value space: numeric promotion, comparisons, effective boolean values and the total order for ORDER BY. | ✅ |
 | SPARQL 1.1 Query: BGP, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries, GROUP BY and aggregates, ORDER BY, DISTINCT, LIMIT/OFFSET and EXISTS. | ✅ |
 | RDF 1.2 and SPARQL 1.2 in every RDF syntax. This covers triple terms (`<<( s p o )>>`), the reification syntax `<< >>`, annotations, base-direction literals (`"x"@en--rtl`), and the functions `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, `LANGDIR`, `hasLANG`, `hasLANGDIR` and `STRLANGDIR`. | ✅ |

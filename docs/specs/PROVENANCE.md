@@ -1498,6 +1498,33 @@ implementation landed.
   published volatility documentation. The spec links those primary sources.
 - **Implementation:** not started. No external code copied and no new dependencies.
 
+## Streaming query execution
+
+- **Spec:** [X05-streaming-query-execution.md](X05-streaming-query-execution.md),
+  written on 2026-10-07 as internal engineering from Sparkles at `a6b6b449`:
+  the native SPARQL executor/planner, snapshot block/delta scans, query context and
+  vocabulary, result writers, bounded HTTP serialization and embedding APIs.
+  Existing C01, C12/C12b, F06, F11, G06, P03 and P06 specs supply semantic,
+  access, budget, history, encryption and lifecycle requirements. The internal
+  O12 roadmap and query memory audit informed the phased scope.
+- **Implementation:** snapshot-owning SELECT/graph cursors, standard/native writers,
+  HTTP/CLI and foreign binding integration share the existing planner/executor.
+  Resumable joins and charged blocking operators use explicit budget failure;
+  disk spill is not implemented. Batch-local expression
+  reuse and vocabulary key tests adapt Sparkles exprcache/keyfilter code; checked
+  front-coded reconstruction reserves scratch before growth. No external engine
+  source was read or copied for that implementation. Budgeted regex expressions
+  use `regex-automata` 0.4.18 (MIT OR Apache-2.0), already a transitive dependency
+  of `regex`, now declared directly. Its local `meta::Regex`/`Cache` size and
+  configuration API documentation, PikeVM capture-slot sizing, Searcher empty-match
+  handling and capture interpolation APIs informed the query-owned cache and
+  conservative reservations. No regex implementation source was copied. Later spill
+  designs must record any adopted implementation or dependency before landing.
+- **Rejected:** pagination of a completed table as an execution solution,
+  repeated prefix execution, immediate replacement of the eager executor,
+  unbounded background queues, hidden materialization/state growth, and guessed
+  automatic row-count thresholds. See X05 §11.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):

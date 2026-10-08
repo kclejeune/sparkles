@@ -2254,6 +2254,81 @@ opts.rdfs = None;                                  // and without RDFS on read
 ds.query_with(q, &opts)?;
 ```
 
+### Incremental query execution
+
+Rust callers can open a cursor and consume one owned batch at a time:
+
+```rust
+let mut cursor = ds.select_cursor("SELECT ?s ?o { ?s <urn:p> ?o }")?;
+while let Some(batch) = cursor.next_batch()? {
+    for row in 0..batch.len() {
+        let subject = batch.term(row, 0)?;
+        let object = batch.term(row, 1)?;
+        // Process this row before requesting more.
+    }
+}
+let stats = cursor.stats();
+```
+
+The cursor owns its snapshot; writes and compaction do not change the answer. Batches
+keep term resolution valid after cursor close. Retained batches count against the same
+memory budget, so release them when processed. Owned terms copied out are application
+memory. `close()` stops production, and drop closes automatically. A pull error is
+returned once; later pulls return no batch, while status/stats retain the failure.
+`collect()` explicitly materializes a fresh cursor and refuses partial consumption.
+
+`select_cursor_with(query, &QueryOptions, &CursorOptions)` sets budgets, batch targets
+and fallback policy. Defaults target 4,096 rows and 1 MiB of IDs per batch. Unsupported
+operators execute through a visible, budgeted eager fallback on demand; use
+`FallbackPolicy::RejectMaterialization` to reject those plans at open. Scans, range
+scans, VALUES, FILTER/BIND without EXISTS, projection, OFFSET/LIMIT and UNION are
+incremental. Merge joins and eligible OPTIONAL joins resume across batches; hash joins
+retain their build side. DISTINCT retains seen keys and eligible aggregates retain
+group state. Sorting and unsupported operator shapes materialize with visible plan
+barriers. Retained state and query-created terms are budgeted; exceeding the budget
+fails explicitly, without disk spill. Ordinary `query`/`select` APIs remain eager.
+Native transaction cursors are not supported.
+
+`graph_cursor` and `graph_cursor_with` return decoded quad batches for CONSTRUCT and
+DESCRIBE. CONSTRUCT consumes WHERE solutions incrementally and budgets its duplicate
+set; DESCRIBE uses a visible materialization barrier. `query_cursor_with` dispatches
+SELECT, graph and ASK queries. ASK stops after a qualifying solution.
+
+`results::write_cursor_solutions` writes JSON, XML, CSV, TSV or native Sparkles JSON
+directly from batches. A writer error can leave partial output; check its returned
+result. For native snapshot metadata, use `results::write_cursor_native_json`.
+
+HTTP clients opt in explicitly:
+
+```sh
+curl --fail --get http://localhost:3030/ds/sparql \
+  --data-urlencode 'query=SELECT ?s ?o { ?s <urn:p> ?o }' \
+  --data-urlencode 'execution=streaming' --data-urlencode 'format=json'
+```
+
+A slow reader pauses the producer once bounded output buffers fill. Disconnects and
+deadlines stop production even during that wait. A late error aborts the response;
+only a successful transfer is a complete answer. With `send=N`, native metadata reports
+`stopped` and an unknown total when the cursor stops at the requested prefix. See
+[API.md](API.md#applicationx-sparklesjson-ui-result-format) for metadata and plan fields.
+The CLI accepts `sparkles query --execution streaming` or `--execution auto` locally
+and through `--server`. HTTP accepts `execution=auto` too. Auto selects pull execution
+for plain SELECT scans/projections estimated to return at least one million rows
+from immutable blocks with no pending delta, whole-block graph predicates and no
+restored initial bindings or offset. It requires enough memory for block ownership
+and batches of at least 4,096 rows and 128 KiB. Eligible `COUNT(*)` queries over a
+single-key OPTIONAL between two plain scans also qualify when estimated work reaches
+one million rows and result caching is disabled or bypassed. Other plans remain eager.
+Rust callers select the same policy with
+`query_execution_with` and `ExecutionMode::Auto`.
+
+Python exposes `Dataset.select_cursor` and `Dataset.graph_cursor`, with iteration,
+`close()`, context-manager support, stats and direct serialization. Node accepts
+`execution: 'streaming' | 'auto'` in query options and offers `queryToStream` for
+serialized output. JVM/Jena callers opt in with the context symbol
+`Sparkles.STREAMING_EXECUTION`; Jena consumes SELECT batches and handles graph query
+forms through its existing adapters. Close cursors or iterators when stopping early.
+
 ### Registered scalar functions
 
 Rust applications can register scalar functions by absolute IRI for one query. Build
