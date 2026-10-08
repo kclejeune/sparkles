@@ -969,32 +969,33 @@ pub fn write_output<'py>(
     codec: Option<Codec>,
     f: impl FnOnce(&mut dyn Write) -> sparkles::Result<u64> + Send,
 ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+    let buf = py.detach(|| write_to(out, codec, f)).py(py)?;
+    Ok(buf.map(|buf| PyBytes::new(py, &buf)))
+}
+
+/// Write to `out` on the calling thread, which must not hold the GIL. A Python file
+/// object takes the GIL for each write. Returns the bytes for `Output::Bytes`.
+pub fn write_to(
+    out: Output,
+    codec: Option<Codec>,
+    f: impl FnOnce(&mut dyn Write) -> sparkles::Result<u64>,
+) -> sparkles::Result<Option<Vec<u8>>> {
     match out {
         Output::Bytes => {
-            let codec = codec.unwrap_or(Codec::None);
-            let buf = py
-                .detach(|| {
-                    let mut buf = Vec::new();
-                    write_through(&mut buf, codec, f).map(|_| buf)
-                })
-                .py(py)?;
-            Ok(Some(PyBytes::new(py, &buf)))
+            let mut buf = Vec::new();
+            write_through(&mut buf, codec.unwrap_or(Codec::None), f)?;
+            Ok(Some(buf))
         }
         Output::Path(p) => {
             let codec = codec
                 .or_else(|| Codec::from_extension(&p))
                 .unwrap_or(Codec::None);
-            py.detach(|| {
-                let file = std::fs::File::create(&p)?;
-                write_through(file, codec, f)
-            })
-            .py(py)?;
+            let file = std::fs::File::create(&p)?;
+            write_through(file, codec, f)?;
             Ok(None)
         }
         Output::File(obj) => {
-            let codec = codec.unwrap_or(Codec::None);
-            py.detach(|| write_through(PyFileWriter(obj), codec, f))
-                .py(py)?;
+            write_through(PyFileWriter(obj), codec.unwrap_or(Codec::None), f)?;
             Ok(None)
         }
     }

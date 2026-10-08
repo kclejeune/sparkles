@@ -53,7 +53,13 @@ def test_cursor_close_context_cancel_and_fused_error():
     with pytest.raises(CancelledError):
         next(cursor)
     assert cursor.status == "failed"
-    assert list(cursor) == []
+    # A failed cursor keeps failing rather than ending like a complete one.
+    with pytest.raises(InvalidInputError, match="cursor failed"):
+        next(cursor)
+    with pytest.raises(InvalidInputError, match="cursor failed"):
+        list(cursor)
+    cursor.close()
+    assert cursor.status == "failed"
 
 
 def test_cursor_serialization_and_transaction_guard():
@@ -113,3 +119,24 @@ def test_graph_cursor_snapshot_dedup_pending_close_and_formats():
     c = ds.graph_cursor(q, batch_rows=1)
     ds.close()
     assert len(list(c)) == 3
+
+
+def test_cursor_serialization_to_a_bad_path_fails_the_cursor(tmp_path):
+    ds = Dataset()
+    ds.load("<urn:s1> <urn:p> 1 . <urn:s2> <urn:p> 2 .", "ttl")
+    bad = tmp_path / "missing" / "out.json"
+    for cursor in [
+        ds.select_cursor("SELECT * WHERE { ?s ?p ?o }", batch_rows=1),
+        ds.graph_cursor("CONSTRUCT WHERE { ?s ?p ?o }", batch_rows=1),
+    ]:
+        with pytest.raises(OSError):
+            cursor.serialize(bad)
+        assert cursor.status == "failed"
+        stats = cursor.stats()
+        assert stats["status"] == "failed"
+        assert stats["error"]
+        assert stats["emittedRows"] == 0
+        with pytest.raises(InvalidInputError, match="cursor failed"):
+            next(cursor)
+        cursor.close()
+        assert cursor.status == "failed"

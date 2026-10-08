@@ -2,7 +2,7 @@
 use crate::admin;
 use crate::errors::{EngineResult, invalid};
 use crate::interrupt;
-use crate::io::{output_from_py, write_output};
+use crate::io::{Output, output_from_py, write_to};
 use crate::results::PyQuerySolution;
 use crate::terms::PyVariable;
 use pyo3::prelude::*;
@@ -11,7 +11,7 @@ use sparkles::sparql::results::{SolutionsFormat, write_cursor_solutions};
 use sparkles::sparql::{
     CursorStats, CursorStatus, GraphBatch, GraphCursor, QueryBatch, QueryCursor,
 };
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{Arc, Mutex, PoisonError, atomic::AtomicBool};
 
 struct State {
     cursor: Option<QueryCursor>,
@@ -37,6 +37,127 @@ impl State {
             status
         }
     }
+}
+
+/// The engine cursor operations that both Python wrappers share.
+trait EngineCursor: Send + 'static {
+    fn stats(&self) -> CursorStats;
+    fn plan_json(&self) -> sparkles::Result<String>;
+    fn close(&mut self);
+}
+
+impl EngineCursor for QueryCursor {
+    fn stats(&self) -> CursorStats {
+        QueryCursor::stats(self)
+    }
+    fn plan_json(&self) -> sparkles::Result<String> {
+        QueryCursor::plan_json(self)
+    }
+    fn close(&mut self) {
+        QueryCursor::close(self)
+    }
+}
+
+impl EngineCursor for GraphCursor {
+    fn stats(&self) -> CursorStats {
+        GraphCursor::stats(self)
+    }
+    fn plan_json(&self) -> sparkles::Result<String> {
+        GraphCursor::plan_json(self)
+    }
+    fn close(&mut self) {
+        GraphCursor::close(self)
+    }
+}
+
+/// Wrapper state that records the outcome of a serialization.
+trait Slot: Send + 'static {
+    type Cursor: EngineCursor;
+    fn finish_serialize(&mut self, stats: CursorStats, plan: Option<String>);
+}
+
+impl Slot for State {
+    type Cursor = QueryCursor;
+    fn finish_serialize(&mut self, stats: CursorStats, plan: Option<String>) {
+        self.serializing = false;
+        self.emitted = stats.emitted_rows;
+        self.stats = stats;
+        if let Some(plan) = plan {
+            self.plan = plan;
+        }
+    }
+}
+
+impl Slot for GraphState {
+    type Cursor = GraphCursor;
+    fn finish_serialize(&mut self, stats: CursorStats, plan: Option<String>) {
+        self.serializing = false;
+        self.emitted = stats.emitted_rows;
+        self.stats = stats;
+        if let Some(plan) = plan {
+            self.plan = plan;
+        }
+    }
+}
+
+/// Owns a cursor taken for serialization and settles the wrapper state when dropped,
+/// on every path: success, an output or engine error, a panic, or a job that never
+/// ran. A serialization that did not finish leaves the cursor Failed.
+struct Serializing<S: Slot> {
+    state: Arc<Mutex<S>>,
+    cursor: Option<S::Cursor>,
+    error: Option<String>,
+}
+
+impl<S: Slot> Serializing<S> {
+    fn new(state: Arc<Mutex<S>>, cursor: S::Cursor) -> Self {
+        Self {
+            state,
+            cursor: Some(cursor),
+            error: Some("serialization stopped before it finished".into()),
+        }
+    }
+
+    /// Write the cursor's output to `out`, recording whether it finished.
+    fn run(
+        mut self,
+        out: Output,
+        write: impl FnOnce(&mut S::Cursor, &mut dyn std::io::Write) -> sparkles::Result<u64>,
+    ) -> sparkles::Result<Option<Vec<u8>>> {
+        let cursor = self
+            .cursor
+            .as_mut()
+            .expect("cursor taken for serialization");
+        let result = write_to(out, None, |w| write(cursor, w));
+        self.error = result.as_ref().err().map(ToString::to_string);
+        result
+    }
+}
+
+impl<S: Slot> Drop for Serializing<S> {
+    fn drop(&mut self) {
+        let Some(mut cursor) = self.cursor.take() else {
+            return;
+        };
+        cursor.close();
+        let mut stats = cursor.stats();
+        if let Some(error) = self.error.take() {
+            stats.status = CursorStatus::Failed;
+            stats.error.get_or_insert(error);
+        }
+        let plan = cursor.plan_json().ok();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.finish_serialize(stats, plan);
+    }
+}
+
+/// The error raised when iteration continues after a failure, so that a failed
+/// cursor never looks like a complete one.
+fn failed(stats: &CursorStats) -> sparkles::Error {
+    sparkles::Error::invalid(format!(
+        "the cursor failed: {}",
+        stats.error.as_deref().unwrap_or("unknown error")
+    ))
 }
 
 #[pyclass(module = "sparkles", name = "QueryCursor")]
@@ -120,10 +241,10 @@ impl PyQueryCursor {
                     .state
                     .try_lock()
                     .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?;
-                Ok(state
+                state
                     .cursor
                     .as_ref()
-                    .map_or_else(|| Ok(state.plan.clone()), QueryCursor::plan_json)?)
+                    .map_or_else(|| Ok(state.plan.clone()), QueryCursor::plan_json)
             })
             .py(py)?;
         py.import("json")?.call_method1("loads", (plan,))
@@ -143,6 +264,9 @@ impl PyQueryCursor {
                 return Err(sparkles::Error::invalid("the cursor is being serialized"));
             }
             let Some(mut cursor) = state.cursor.take() else {
+                if state.stats.status == CursorStatus::Failed {
+                    return Err(failed(&state.stats));
+                }
                 return Ok(None);
             };
             let result: sparkles::Result<Option<Vec<Option<oxrdf::Term>>>> = (|| {
@@ -163,20 +287,24 @@ impl PyQueryCursor {
                 state.emitted += 1;
                 Ok(Some(values))
             })();
-            if result.is_err()
-                || (cursor.status() != CursorStatus::Open
-                    && state.stats.status == CursorStatus::Open)
-            {
-                state.plan = cursor.plan_json()?;
-            }
+            // Record the outcome before anything else can fail, and keep the
+            // execution error as the one raised.
             if let Err(error) = &result {
                 cursor.close();
                 state.batch = None;
                 state.stats = cursor.stats();
                 state.stats.status = CursorStatus::Failed;
                 state.stats.error = Some(error.to_string());
+                if let Ok(plan) = cursor.plan_json() {
+                    state.plan = plan;
+                }
             } else {
+                let finished = cursor.status() != CursorStatus::Open
+                    && state.stats.status == CursorStatus::Open;
                 state.stats = cursor.stats();
+                if finished && let Ok(plan) = cursor.plan_json() {
+                    state.plan = plan;
+                }
                 state.cursor = Some(cursor);
             }
             result
@@ -197,7 +325,9 @@ impl PyQueryCursor {
                 if let Some(mut cursor) = state.cursor.take() {
                     cursor.close();
                     state.stats = cursor.stats();
-                    state.plan = cursor.plan_json()?;
+                    if let Ok(plan) = cursor.plan_json() {
+                        state.plan = plan;
+                    }
                     if pending && state.stats.status == CursorStatus::Complete {
                         state.stats.status = CursorStatus::Stopped;
                     }
@@ -253,17 +383,13 @@ impl PyQueryCursor {
                 Some(cursor)
             })
             .ok_or_else(|| invalid(py, "serialize a fresh open cursor before iterating it"))?;
-        let state = self.state.clone();
-        write_output(py, out, None, move |writer| {
-            let mut cursor = cursor;
-            let result = write_cursor_solutions(&mut cursor, fmt, writer, None);
-            let mut state = state.lock().unwrap();
-            state.serializing = false;
-            state.stats = cursor.stats();
-            state.plan = cursor.plan_json()?;
-            state.emitted = state.stats.emitted_rows;
-            result.map(|_| 0)
-        })
+        let job = Serializing::new(self.state.clone(), cursor);
+        let buf = interrupt::run(py, &self.cancel, move || {
+            job.run(out, |cursor, writer| {
+                write_cursor_solutions(cursor, fmt, writer, None).map(|_| 0)
+            })
+        })?;
+        Ok(buf.map(|buf| PyBytes::new(py, &buf)))
     }
 }
 
@@ -363,10 +489,10 @@ impl PyGraphCursor {
                     .state
                     .try_lock()
                     .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?;
-                Ok(state
+                state
                     .cursor
                     .as_ref()
-                    .map_or_else(|| Ok(state.plan.clone()), GraphCursor::plan_json)?)
+                    .map_or_else(|| Ok(state.plan.clone()), GraphCursor::plan_json)
             })
             .py(py)?;
         py.import("json")?.call_method1("loads", (plan,))
@@ -386,6 +512,9 @@ impl PyGraphCursor {
                 return Err(sparkles::Error::invalid("the cursor is being serialized"));
             }
             let Some(mut cursor) = state.cursor.take() else {
+                if state.stats.status == CursorStatus::Failed {
+                    return Err(failed(&state.stats));
+                }
                 return Ok(None);
             };
             let result: sparkles::Result<Option<oxrdf::Quad>> = (|| {
@@ -406,20 +535,24 @@ impl PyGraphCursor {
                 state.emitted += 1;
                 Ok(Some(values))
             })();
-            if result.is_err()
-                || (cursor.status() != CursorStatus::Open
-                    && state.stats.status == CursorStatus::Open)
-            {
-                state.plan = cursor.plan_json()?;
-            }
+            // Record the outcome before anything else can fail, and keep the
+            // execution error as the one raised.
             if let Err(error) = &result {
                 cursor.close();
                 state.batch = None;
                 state.stats = cursor.stats();
                 state.stats.status = CursorStatus::Failed;
                 state.stats.error = Some(error.to_string());
+                if let Ok(plan) = cursor.plan_json() {
+                    state.plan = plan;
+                }
             } else {
+                let finished = cursor.status() != CursorStatus::Open
+                    && state.stats.status == CursorStatus::Open;
                 state.stats = cursor.stats();
+                if finished && let Ok(plan) = cursor.plan_json() {
+                    state.plan = plan;
+                }
                 state.cursor = Some(cursor);
             }
             result
@@ -442,7 +575,9 @@ impl PyGraphCursor {
                 if let Some(mut cursor) = state.cursor.take() {
                     cursor.close();
                     state.stats = cursor.stats();
-                    state.plan = cursor.plan_json()?;
+                    if let Ok(plan) = cursor.plan_json() {
+                        state.plan = plan;
+                    }
                     if pending && state.stats.status == CursorStatus::Complete {
                         state.stats.status = CursorStatus::Stopped;
                     }
@@ -502,39 +637,33 @@ impl PyGraphCursor {
                 Some(cursor)
             })
             .ok_or_else(|| invalid(py, "serialize a fresh open cursor before iterating it"))?;
-        let state = self.state.clone();
-        write_output(py, out, None, move |writer| {
-            let mut cursor = cursor;
-            let result = if native {
-                sparkles::sparql::results::write_cursor_graph_native_json(
-                    &mut cursor,
-                    writer,
-                    None,
-                    None,
-                )
-            } else if let Some(fmt) = fmt {
-                sparkles::sparql::cursor::graph::write_cursor_graph(
-                    &mut cursor,
-                    fmt,
-                    writer,
-                    None,
-                    &[],
-                )
-            } else {
-                sparkles::sparql::results::write_cursor_jena_graph(
-                    &mut cursor,
-                    jena.unwrap(),
-                    writer,
-                    None,
-                )
-            };
-            let mut state = state.lock().unwrap();
-            state.serializing = false;
-            state.stats = cursor.stats();
-            state.plan = cursor.plan_json()?;
-            state.emitted = state.stats.emitted_rows;
-            result.map(|_| 0)
-        })
+        let job = Serializing::new(self.state.clone(), cursor);
+        let buf = interrupt::run(py, &self.cancel, move || {
+            job.run(out, |cursor, writer| {
+                if native {
+                    sparkles::sparql::results::write_cursor_graph_native_json(
+                        cursor, writer, None, None,
+                    )
+                } else if let Some(fmt) = fmt {
+                    sparkles::sparql::cursor::graph::write_cursor_graph(
+                        cursor,
+                        fmt,
+                        writer,
+                        None,
+                        &[],
+                    )
+                } else {
+                    sparkles::sparql::results::write_cursor_jena_graph(
+                        cursor,
+                        jena.unwrap(),
+                        writer,
+                        None,
+                    )
+                }
+                .map(|_| 0)
+            })
+        })?;
+        Ok(buf.map(|buf| PyBytes::new(py, &buf)))
     }
 }
 

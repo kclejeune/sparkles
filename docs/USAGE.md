@@ -2345,7 +2345,10 @@ Rust callers select the same policy with
 `query_execution_with` and `ExecutionMode::Auto`.
 
 Python exposes `Dataset.select_cursor` and `Dataset.graph_cursor`, with iteration,
-`close()`, context-manager support, stats and direct serialization. Node accepts
+`close()`, context-manager support, stats and direct serialization. A Python cursor
+that failed, in iteration or in `serialize()`, reports the status `failed` and raises
+`InvalidInputError` on every later `next()`, so a loop cannot mistake it for a complete
+answer. `serialize()` responds to Ctrl-C like a query does. Node accepts
 `execution: 'streaming' | 'auto'` in query options and offers `queryToStream` for
 serialized output. JVM/Jena callers opt in with the context symbol
 `Sparkles.STREAMING_EXECUTION`; Jena consumes SELECT batches and handles graph query
