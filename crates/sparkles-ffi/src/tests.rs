@@ -513,3 +513,89 @@ fn named_snapshots_forks_history_and_streaming_dump() {
     control.cancel();
     assert!(ds.compact(control).is_err());
 }
+
+#[test]
+fn select_cursor_batches_restart_and_pin_the_prepared_snapshot() {
+    let ds = FfiDataset::memory(opts(BlankNodeMode::Dataset));
+    let data = (0..100)
+        .map(|i| format!("<http://ex.org/s{i}> <http://ex.org/p> {i} .\n"))
+        .collect::<String>();
+    ds.load_bytes(data.into_bytes(), "text/turtle".into(), None, None)
+        .unwrap();
+    let query = ds
+        .prepare_query("SELECT ?s ?o { ?s <http://ex.org/p> ?o }".into(), qopts())
+        .unwrap();
+    let cursor = query.open_cursor(2, 1 << 20, false).unwrap();
+    assert_eq!(cursor.variables(), vec!["s", "o"]);
+    assert_eq!(cursor.status().unwrap(), "open");
+    let statistics: serde_json::Value =
+        serde_json::from_str(&cursor.stats_json().unwrap()).unwrap();
+    assert_eq!(statistics["stats"]["rowsProduced"], 0);
+    assert!(serde_json::from_str::<serde_json::Value>(&cursor.plan_json().unwrap()).is_ok());
+    ds.load_bytes(
+        b"<http://ex.org/late> <http://ex.org/p> 101 .".to_vec(),
+        "text/turtle".into(),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut dictionary = Vec::new();
+    let mut got = Vec::new();
+    loop {
+        let batch = cursor.next_batch(3).unwrap();
+        assert_ne!(batch.batch[1] & encode::FLAG_RESTART, 0);
+        let decoded = rows(&batch.batch, &mut dictionary);
+        assert!(decoded.len() <= 3);
+        assert!(dictionary.len() <= 6);
+        got.extend(decoded);
+        if batch.done {
+            break;
+        }
+    }
+    assert_eq!(got.len(), 100);
+    assert_eq!(cursor.status().unwrap(), "complete");
+    cursor.release();
+    assert_eq!(cursor.status().unwrap(), "complete");
+    assert!(cursor.next_batch(3).unwrap().done);
+}
+
+#[test]
+fn select_cursor_cancel_is_fused_and_transactions_reject_cursor_escape() {
+    let ds = FfiDataset::memory(opts(BlankNodeMode::Dataset));
+    let query = ds
+        .prepare_query("SELECT ?x { VALUES ?x { 1 2 3 } }".into(), qopts())
+        .unwrap();
+    let cursor = query.open_cursor(1, 1 << 20, false).unwrap();
+    assert!(!cursor.next_batch(1).unwrap().done);
+    cursor.cancel();
+    assert_eq!(
+        cursor.next_batch(1).err().unwrap().kind(),
+        ErrorKind::Cancelled
+    );
+    assert_eq!(cursor.status().unwrap(), "failed");
+    assert!(cursor.next_batch(1).unwrap().done);
+    let tx = ds.begin_write(None, true).unwrap().unwrap();
+    let query = tx
+        .prepare_query("SELECT ?x { VALUES ?x { 1 } }".into(), qopts())
+        .unwrap();
+    assert_eq!(
+        query.open_cursor(1, 1 << 20, false).err().unwrap().kind(),
+        ErrorKind::Invalid
+    );
+    assert!(query.execute(1).unwrap().done);
+    tx.abort();
+}
+
+#[test]
+fn select_cursor_pending_batch_is_open_until_delivered_or_closed() {
+    let ds = FfiDataset::memory(opts(BlankNodeMode::Dataset));
+    let q = ds
+        .prepare_query("SELECT ?x { VALUES ?x { 1 2 3 } }".into(), qopts())
+        .unwrap();
+    let cursor = q.open_cursor(4096, 1 << 20, false).unwrap();
+    assert!(!cursor.next_batch(1).unwrap().done);
+    assert_eq!(cursor.status().unwrap(), "open");
+    cursor.release();
+    assert_eq!(cursor.status().unwrap(), "stopped");
+    assert!(cursor.next_batch(1).unwrap().done);
+}

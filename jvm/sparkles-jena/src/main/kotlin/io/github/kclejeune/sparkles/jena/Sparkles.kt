@@ -35,6 +35,14 @@ public object Sparkles {
     @JvmField
     public val MAX_ROWS_PRODUCED: Symbol = Symbol.create(NS + "maxRowsProduced")
 
+    /** Use a fallible engine cursor for query solutions (Boolean; default false). */
+    @JvmField
+    public val STREAMING_EXECUTION: Symbol = Symbol.create(NS + "streamingExecution")
+
+    /** Reject plans that require full materialization in streaming mode (Boolean). */
+    @JvmField
+    public val STREAMING_STRICT: Symbol = Symbol.create(NS + "streamingStrict")
+
     /** Neither read nor write Sparkles' result cache (a Boolean), as for benchmarks. */
     @JvmField
     public val NO_CACHE: Symbol = Symbol.create(NS + "noCache")

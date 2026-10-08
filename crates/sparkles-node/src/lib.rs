@@ -210,6 +210,52 @@ fn query_options(v: &Value, flag: Arc<AtomicBool>) -> sparkles::Result<QueryOpti
     }
     Ok(o)
 }
+fn open_query_cursor(
+    ds: &Dataset,
+    text: &str,
+    v: &Value,
+    flag: Arc<AtomicBool>,
+) -> sparkles::Result<sparkles::sparql::QueryExecution> {
+    let opts = query_options(v, flag)?;
+    let mode = if v["execution"].as_str() == Some("auto") {
+        sparkles::sparql::ExecutionMode::Auto
+    } else {
+        sparkles::sparql::ExecutionMode::Streaming
+    };
+    let cursor_opts = sparkles::sparql::CursorOptions {
+        batch_rows: v["batchSize"]
+            .as_u64()
+            .unwrap_or(4096)
+            .try_into()
+            .map_err(|_| EngineError::invalid("batchSize is too large"))?,
+        batch_bytes: v["batchBytes"]
+            .as_u64()
+            .unwrap_or(1 << 20)
+            .try_into()
+            .map_err(|_| EngineError::invalid("batchBytes is too large"))?,
+        fallback: if v["allowMaterialization"].as_bool() == Some(false) {
+            sparkles::sparql::FallbackPolicy::RejectMaterialization
+        } else {
+            sparkles::sparql::FallbackPolicy::AllowMaterialization
+        },
+    };
+    if let Some(at) = v["at"].as_str() {
+        let history = sparkles::history::HistoryOptions {
+            cancel: opts.cancel.clone(),
+            deadline: opts.timeout.and_then(|t| Instant::now().checked_add(t)),
+        };
+        let snapshot = ds.store().snapshot_at(&at.parse()?, &history)?.0;
+        sparkles::sparql::query_execution(
+            snapshot,
+            text,
+            &ds.with_query_defaults(&opts),
+            &cursor_opts,
+            mode,
+        )
+    } else {
+        ds.query_execution_with(text, &opts, &cursor_opts, mode)
+    }
+}
 fn normalize_store_options(mut v: Value) -> Value {
     let defaults = sparkles::store::StoreOptions::default();
     if v["unionDefaultGraph"].is_null() {
@@ -367,6 +413,17 @@ impl NativeDataset {
         let shared = self.get(false)?;
         let v = parse(&options)?;
         let flag = cancel.flag.clone();
+        match v["execution"].as_str().unwrap_or("eager") {
+            "eager" => {}
+            "streaming" | "auto" => {
+                let permit = permit(READERS.clone(), &v, &flag).await?;
+                let cancellation = flag.clone();
+                let cursor =
+                    blocking(move || open_query_cursor(&shared.ds, &text, &v, flag)).await?;
+                return NativeResult::streaming(cursor, permit, cancellation).map_err(err);
+            }
+            _ => return Err(invalid("execution must be eager, streaming or auto")),
+        }
         let _permit = permit(READERS.clone(), &v, &flag).await?;
         let result = blocking(move || {
             let opts = query_options(&v, flag)?;
@@ -545,8 +602,96 @@ fn quad_pattern(v: &Value) -> sparkles::Result<QuadPattern> {
     })
 }
 
+fn query_result_row(r: &QueryResult, pos: usize) -> Option<Vec<Value>> {
+    if r.kind == QueryKind::Select {
+        if pos < r.table.len() {
+            Some(
+                r.table
+                    .row(pos)
+                    .iter()
+                    .map(|id| {
+                        r.term(*id)
+                            .as_ref()
+                            .map(terms::encode)
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    } else if pos < r.triples.len() {
+        let t = &r.triples[pos];
+        Some(vec![terms::encode_quad(&oxrdf::Quad::new(
+            t.subject.clone(),
+            t.predicate.clone(),
+            t.object.clone(),
+            oxrdf::GraphName::DefaultGraph,
+        ))])
+    } else {
+        r.quads
+            .get(pos - r.triples.len())
+            .map(|q| vec![terms::encode_quad(q)])
+    }
+}
+
+struct SelectCursor {
+    cursor: sparkles::sparql::QueryCursor,
+    batch: Option<sparkles::sparql::QueryBatch>,
+    row: usize,
+}
+impl SelectCursor {
+    fn stats_json(&self, sent: usize, closing: bool) -> sparkles::Result<String> {
+        let mut stats = self.cursor.stats();
+        if self
+            .batch
+            .as_ref()
+            .is_some_and(|batch| self.row < batch.len())
+            && stats.status == sparkles::sparql::CursorStatus::Complete
+        {
+            stats.status = if closing {
+                sparkles::sparql::CursorStatus::Stopped
+            } else {
+                sparkles::sparql::CursorStatus::Open
+            };
+        }
+        Ok(format!(
+            "{{\"stats\":{},\"plan\":{},\"sentRows\":{sent}}}",
+            serde_json::to_string(&stats).unwrap(),
+            self.cursor.plan_json()?
+        ))
+    }
+}
+struct GraphStream {
+    cursor: sparkles::sparql::GraphCursor,
+    batch: Option<sparkles::sparql::GraphBatch>,
+    row: usize,
+}
+impl GraphStream {
+    fn stats_json(&self, sent: usize, closing: bool) -> sparkles::Result<String> {
+        let mut stats = self.cursor.stats();
+        if self.batch.as_ref().is_some_and(|b| self.row < b.len())
+            && stats.status == sparkles::sparql::CursorStatus::Complete
+        {
+            stats.status = if closing {
+                sparkles::sparql::CursorStatus::Stopped
+            } else {
+                sparkles::sparql::CursorStatus::Open
+            };
+        }
+        Ok(format!(
+            "{{\"stats\":{},\"plan\":{},\"sentRows\":{sent}}}",
+            serde_json::to_string(&stats).unwrap(),
+            self.cursor.plan_json()?
+        ))
+    }
+}
 enum Rows {
+    Streaming(Box<SelectCursor>),
+    Graph(Box<GraphStream>),
+    Ask(Box<sparkles::sparql::AskResult>),
     Query(Box<QueryResult>),
+    Collected(Box<sparkles::sparql::MaterializedResult>),
     Scan(Box<sparkles::QuadIter>),
 }
 struct Cursor {
@@ -557,6 +702,9 @@ struct Cursor {
 pub struct NativeResult {
     cursor: Arc<Mutex<Option<Cursor>>>,
     metadata: String,
+    statistics: Arc<Mutex<Option<String>>>,
+    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 impl NativeResult {
     fn query(result: QueryResult) -> Self {
@@ -572,7 +720,73 @@ impl NativeResult {
                 pos: 0,
             }))),
             metadata,
+            statistics: Default::default(),
+            permit: Default::default(),
+            cancel: None,
         }
+    }
+    fn streaming(
+        execution: sparkles::sparql::QueryExecution,
+        permit: OwnedSemaphorePermit,
+        cancel: Arc<AtomicBool>,
+    ) -> sparkles::Result<Self> {
+        use sparkles::sparql::QueryExecution;
+        let (kind, variables, value) = match &execution {
+            QueryExecution::Eager(r) => {
+                let r = r.result();
+                (
+                    if r.kind == QueryKind::Select {
+                        "bindings"
+                    } else if r.kind == QueryKind::Ask {
+                        "boolean"
+                    } else {
+                        "quads"
+                    },
+                    r.vars.clone(),
+                    (r.kind == QueryKind::Ask).then_some(r.boolean),
+                )
+            }
+            QueryExecution::Select(c) => ("bindings", c.variables().to_vec(), None),
+            QueryExecution::Graph(_) => ("quads", Vec::new(), None),
+            QueryExecution::Ask(r) => ("boolean", Vec::new(), Some(r.value())),
+        };
+        let chosen = if matches!(execution, QueryExecution::Eager(_)) {
+            "eager"
+        } else {
+            "streaming"
+        };
+        let size = match &execution {
+            QueryExecution::Eager(r) => format!(",\"size\":{}", r.result().len()),
+            _ => String::new(),
+        };
+        let metadata = format!(
+            "{{\"type\":{kind:?},\"variables\":{},\"value\":{},\"execution\":{chosen:?}{size},\"timing\":{},\"plan\":{}}}",
+            serde_json::to_string(&variables).unwrap(),
+            serde_json::to_string(&value).unwrap(),
+            serde_json::to_string(&execution.stats().timing).unwrap(),
+            execution.plan_json()?
+        );
+        let rows = match execution {
+            QueryExecution::Eager(r) => Rows::Collected(r),
+            QueryExecution::Select(cursor) => Rows::Streaming(Box::new(SelectCursor {
+                cursor: *cursor,
+                batch: None,
+                row: 0,
+            })),
+            QueryExecution::Graph(cursor) => Rows::Graph(Box::new(GraphStream {
+                cursor: *cursor,
+                batch: None,
+                row: 0,
+            })),
+            QueryExecution::Ask(result) => Rows::Ask(result),
+        };
+        Ok(Self {
+            cursor: Arc::new(Mutex::new(Some(Cursor { rows, pos: 0 }))),
+            metadata,
+            statistics: Default::default(),
+            permit: Arc::new(Mutex::new(Some(permit))),
+            cancel: Some(cancel),
+        })
     }
     fn scan(scan: sparkles::QuadIter) -> Self {
         Self {
@@ -581,6 +795,16 @@ impl NativeResult {
                 pos: 0,
             }))),
             metadata: json!({"type":"quads"}).to_string(),
+            statistics: Default::default(),
+            permit: Default::default(),
+            cancel: None,
+        }
+    }
+}
+impl Drop for NativeResult {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -592,16 +816,54 @@ impl NativeResult {
     }
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
         let cursor = self.cursor.clone();
+        let statistics = self.statistics.clone();
+        let permit = self.permit.clone();
         blocking(move || {
-            cursor.lock().take();
+            if let Some(mut cursor) = cursor.lock().take() {
+                match &mut cursor.rows {
+                    Rows::Streaming(state) => {
+                        state.cursor.close();
+                        *statistics.lock() = Some(state.stats_json(cursor.pos, true)?);
+                    }
+                    Rows::Graph(state) => {
+                        state.cursor.close();
+                        *statistics.lock() = Some(state.stats_json(cursor.pos, true)?);
+                    }
+                    _ => {}
+                }
+            }
+            permit.lock().take();
             Ok(())
+        })
+        .await
+    }
+    #[napi]
+    pub async fn stats(&self) -> napi::Result<String> {
+        let cursor = self.cursor.clone();
+        let statistics = self.statistics.clone();
+        let metadata = self.metadata.clone();
+        blocking(move || {
+            if let Some(cursor) = cursor.lock().as_ref() {
+                match &cursor.rows {
+                    Rows::Streaming(state) => return state.stats_json(cursor.pos, false),
+                    Rows::Graph(state) => return state.stats_json(cursor.pos, false),
+                    _ => {}
+                }
+            }
+            Ok(statistics.lock().as_ref().cloned().unwrap_or(metadata))
         })
         .await
     }
     #[napi]
     pub async fn next_batch(&self, max_rows: u32, max_bytes: u32) -> napi::Result<String> {
         let cursor = self.cursor.clone();
+        let statistics = self.statistics.clone();
+        let permit = self.permit.clone();
+        let cancel = self.cancel.clone();
         blocking(move || {
             let mut lock = cursor.lock();
             let Some(c) = lock.as_mut() else {
@@ -614,43 +876,60 @@ impl NativeResult {
             while rows.len() < (max_rows.clamp(1, 65536) as usize)
                 && bytes < (max_bytes.clamp(1024, 16 << 20) as usize)
             {
+                if cancel
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    return Err(EngineError::Cancelled);
+                }
                 let row: Option<Vec<Value>> = match &mut c.rows {
+                    Rows::Streaming(state) => {
+                        if state
+                            .batch
+                            .as_ref()
+                            .is_none_or(|batch| state.row == batch.len())
+                        {
+                            state.batch = None;
+                            state.row = 0;
+                            state.batch = state.cursor.next_batch()?;
+                        }
+                        match &state.batch {
+                            None => None,
+                            Some(batch) => {
+                                let row = batch
+                                    .row(state.row)?
+                                    .into_iter()
+                                    .map(|term| {
+                                        term.as_ref().map(terms::encode).unwrap_or(Value::Null)
+                                    })
+                                    .collect();
+                                state.row += 1;
+                                Some(row)
+                            }
+                        }
+                    }
+                    Rows::Graph(state) => {
+                        if state.batch.as_ref().is_none_or(|b| state.row == b.len()) {
+                            state.batch = None;
+                            state.row = 0;
+                            state.batch = state.cursor.next_batch()?;
+                        }
+                        state.batch.as_ref().map(|batch| {
+                            let value = terms::encode_quad(&batch.quads()[state.row]);
+                            state.row += 1;
+                            vec![value]
+                        })
+                    }
+                    Rows::Ask(result) => {
+                        debug_assert_eq!(result.result().kind, QueryKind::Ask);
+                        None
+                    }
                     Rows::Scan(scan) => scan
                         .next()
                         .transpose()?
                         .map(|q| vec![terms::encode_quad(&q)]),
-                    Rows::Query(r) => {
-                        if r.kind == QueryKind::Select {
-                            if c.pos < r.table.len() {
-                                Some(
-                                    r.table
-                                        .row(c.pos)
-                                        .iter()
-                                        .map(|id| {
-                                            r.term(*id)
-                                                .as_ref()
-                                                .map(terms::encode)
-                                                .unwrap_or(Value::Null)
-                                        })
-                                        .collect(),
-                                )
-                            } else {
-                                None
-                            }
-                        } else if c.pos < r.triples.len() {
-                            let t = &r.triples[c.pos];
-                            Some(vec![terms::encode_quad(&oxrdf::Quad::new(
-                                t.subject.clone(),
-                                t.predicate.clone(),
-                                t.object.clone(),
-                                oxrdf::GraphName::DefaultGraph,
-                            ))])
-                        } else {
-                            r.quads
-                                .get(c.pos - r.triples.len())
-                                .map(|q| vec![terms::encode_quad(q)])
-                        }
-                    }
+                    Rows::Query(r) => query_result_row(r, c.pos),
+                    Rows::Collected(r) => query_result_row(r.result(), c.pos),
                 };
                 let Some(row) = row else { break };
                 c.pos += 1;
@@ -672,9 +951,20 @@ impl NativeResult {
                     };
                     cells.push(id);
                 }
+                bytes += cells.len() * 12 + 16;
                 rows.push(cells);
             }
             if rows.is_empty() {
+                match &c.rows {
+                    Rows::Streaming(state) => {
+                        *statistics.lock() = Some(state.stats_json(c.pos, false)?)
+                    }
+                    Rows::Graph(state) => {
+                        *statistics.lock() = Some(state.stats_json(c.pos, false)?)
+                    }
+                    _ => {}
+                }
+                permit.lock().take();
                 lock.take();
                 return Ok("null".into());
             }
@@ -756,6 +1046,11 @@ impl NativeTransaction {
     ) -> napi::Result<NativeResult> {
         let worker = self.inner.clone();
         let v = parse(&options)?;
+        if v["execution"].as_str().is_some_and(|mode| mode != "eager") {
+            return Err(invalid(
+                "finish the transaction before opening a streaming cursor",
+            ));
+        }
         let flag = cancel.flag.clone();
         blocking(move || {
             let worker = worker.lock();

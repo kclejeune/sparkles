@@ -488,6 +488,9 @@ export interface OperationOptions {
   timeout?: number;
 }
 export interface QueryOptions extends OperationOptions {
+  /** Opt-in engine cursor; existing calls use eager execution. */
+  execution?: 'eager' | 'streaming' | 'auto';
+  allowMaterialization?: boolean;
   unionDefaultGraph?: boolean;
   noCache?: boolean;
   baseIri?: string;
@@ -540,6 +543,8 @@ export interface IterableResult<T> extends AsyncIterable<T>, AsyncIterator<T> {
   readonly size?: number;
   readonly plan?: unknown;
   readonly timing?: unknown;
+  /** Live execution metadata when supported by the engine. */
+  stats?(): Promise<unknown>;
   toArray(): Promise<T[]>;
   close(): Promise<void>;
 }

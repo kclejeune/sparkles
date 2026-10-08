@@ -200,6 +200,9 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
   async [Symbol.asyncDispose]() {
     await this.close();
   }
+  async stats(): Promise<unknown> {
+    return JSON.parse(await this.handle.stats());
+  }
   async toArray() {
     const result: T[] = [];
     for await (const value of this) result.push(value);

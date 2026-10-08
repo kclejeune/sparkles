@@ -234,6 +234,36 @@ class QuerySolutions:
         """Write the solutions as SPARQL results (json, xml, csv or tsv); consumes them."""
 
 @final
+class QueryCursor:
+    """Fallible SELECT iteration over bounded batches of a captured snapshot."""
+    @property
+    def variables(self) -> list[Variable]: ...
+    @property
+    def status(self) -> str: ...
+    def stats(self) -> dict[str, Any]: ...
+    def plan(self) -> dict[str, Any]: ...
+    def __iter__(self) -> QueryCursor: ...
+    def __next__(self) -> QuerySolution: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> QueryCursor: ...
+    def __exit__(self, *args: Any) -> bool: ...
+    def serialize(self, output: str | PathLike[str] | BinaryIO | None = None, format: str = "json") -> bytes | None: ...
+
+@final
+class GraphCursor:
+    """Fallible graph iteration over bounded batches of a captured snapshot."""
+    @property
+    def status(self) -> str: ...
+    def stats(self) -> dict[str, Any]: ...
+    def plan(self) -> dict[str, Any]: ...
+    def __iter__(self) -> GraphCursor: ...
+    def __next__(self) -> Quad: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> GraphCursor: ...
+    def __exit__(self, *args: Any) -> bool: ...
+    def serialize(self, output: str | PathLike[str] | BinaryIO | None = None, format: str = "turtle") -> bytes | None: ...
+
+@final
 class QueryTriples:
     """The triples of a CONSTRUCT or DESCRIBE query."""
 
@@ -500,6 +530,48 @@ class Dataset:
         at: int | str | None = None,
         describe: _Describe | None = None,
     ) -> QuerySolutions: ...
+    def select_cursor(
+        self,
+        query: str,
+        *,
+        base_iri: str | None = None,
+        prefixes: Mapping[str, str] | None = None,
+        bindings: Mapping[str | Variable, _Term] | None = None,
+        default_graph: Iterable[NamedNode | str] | None = None,
+        named_graphs: Iterable[NamedNode | str] | None = None,
+        include_inferred: bool = False,
+        timeout: float | None = None,
+        max_rows: int | None = None,
+        max_memory_bytes: int | None = None,
+        max_rows_produced: int | None = None,
+        cancel: CancelToken | None = None,
+        at: int | str | None = None,
+        describe: _Describe | None = None,
+        batch_rows: int = 4096,
+        batch_bytes: int = 1048576,
+        allow_materialization: bool = True,
+    ) -> QueryCursor: ...
+    def graph_cursor(
+        self,
+        query: str,
+        *,
+        base_iri: str | None = None,
+        prefixes: Mapping[str, str] | None = None,
+        bindings: Mapping[str | Variable, _Term] | None = None,
+        default_graph: Iterable[NamedNode | str] | None = None,
+        named_graphs: Iterable[NamedNode | str] | None = None,
+        include_inferred: bool = False,
+        timeout: float | None = None,
+        max_rows: int | None = None,
+        max_memory_bytes: int | None = None,
+        max_rows_produced: int | None = None,
+        cancel: CancelToken | None = None,
+        at: int | str | None = None,
+        describe: _Describe | None = None,
+        batch_rows: int = 4096,
+        batch_bytes: int = 1048576,
+        allow_materialization: bool = True,
+    ) -> GraphCursor: ...
     def ask(
         self,
         query: str,

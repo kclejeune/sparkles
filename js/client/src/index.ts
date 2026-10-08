@@ -189,6 +189,11 @@ function params(options: QueryOptions | UpdateOptions, sparkles: boolean): URLSe
       throw new UnsupportedError(`Plain SPARQL endpoints do not support ${key}`);
   }
   const q = options as QueryOptions;
+  if (q.execution !== undefined) {
+    if (!sparkles && q.execution !== 'eager')
+      throw new InvalidInputError('Streaming execution requires a Sparkles endpoint');
+    if (sparkles) p.set('execution', q.execution);
+  }
   if (q.unionDefaultGraph !== undefined)
     throw new UnsupportedError('Remote queries cannot override the union default graph setting');
   if (q.noCache !== undefined) {

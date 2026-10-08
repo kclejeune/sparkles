@@ -9,6 +9,7 @@ import io.github.kclejeune.sparkles.jena.internal.RowDecoder
 import io.github.kclejeune.sparkles.jena.internal.ffi.ErrorKind
 import io.github.kclejeune.sparkles.jena.internal.ffi.FfiException
 import io.github.kclejeune.sparkles.jena.internal.ffi.FfiQuery
+import io.github.kclejeune.sparkles.jena.internal.ffi.FfiSelectCursor
 import io.github.kclejeune.sparkles.jena.internal.ffi.FfiQueryKind
 import io.github.kclejeune.sparkles.jena.internal.ffi.InternalException
 import io.github.kclejeune.sparkles.jena.internal.ffi.QueryOpts
@@ -167,6 +168,7 @@ internal class QueryIterSparkles(
     private val cancelSignal = Context.getCancelSignal(context)
     private val parent: Binding? = input.takeUnless { it.isEmpty }
     private var ffiQuery: FfiQuery? = dsg.source().prepareQuery(text, opts)
+    private var cursor: FfiSelectCursor? = null
     private var started = false
     private var done = false
     private var delegate: QueryIterator? = null
@@ -178,6 +180,10 @@ internal class QueryIterSparkles(
     private fun start() {
         started = true
         val q = ffiQuery ?: return
+        if (context.get<Boolean>(Sparkles.STREAMING_EXECUTION) == true) {
+            startCursor(q)
+            return
+        }
         val signal = cancelSignal
         if (signal != null) CancelWatcher.watch(q, signal)
         val e = try {
@@ -209,6 +215,35 @@ internal class QueryIterSparkles(
         }
     }
 
+    private fun startCursor(q: FfiQuery) {
+        val signal = cancelSignal
+        if (signal != null) CancelWatcher.watch(q, signal)
+        val first = try {
+            val c = q.openCursor(4096u, 1048576uL, context.get<Boolean>(Sparkles.STREAMING_STRICT) != true)
+            cursor = c
+            vars = c.variables().map { Var.alloc(it) }.toTypedArray()
+            c.nextBatch(FIRST_ROWS.toUInt())
+        } catch (e: FfiException.Engine) {
+            if (e.kind == ErrorKind.SPARQL_SYNTAX || e.kind == ErrorKind.UNSUPPORTED) {
+                fallBack(e.detail)
+                return
+            }
+            release()
+            throw mapError(e)
+        } catch (e: InternalException) {
+            release()
+            throw SparklesInternalException("Internal", e.message ?: "a failure in the native library")
+        } finally {
+            CancelWatcher.unwatch(q)
+        }
+        batch = decoder.decode(first.batch)
+        row = 0
+        if (first.done) {
+            done = true
+            release()
+        }
+    }
+
     private fun fallBack(why: String) {
         release()
         if (mode == SparklesFallback.NEVER) {
@@ -223,10 +258,15 @@ internal class QueryIterSparkles(
     private fun fetch(): Boolean {
         if (done) return false
         val q = ffiQuery ?: return false
+        val watch = cursor != null && cancelSignal != null
+        if (watch) CancelWatcher.watch(q, cancelSignal)
         val b = try {
-            q.nextBatch(LATER_ROWS.toUInt())
+            cursor?.nextBatch(LATER_ROWS.toUInt()) ?: q.nextBatch(LATER_ROWS.toUInt())
         } catch (e: FfiException.Engine) {
+            release()
             throw mapError(e)
+        } finally {
+            if (watch) CancelWatcher.unwatch(q)
         }
         batch = decoder.decode(b.batch)
         row = 0
@@ -257,6 +297,11 @@ internal class QueryIterSparkles(
     }
 
     private fun release() {
+        cursor?.let {
+            it.release()
+            it.close()
+        }
+        cursor = null
         ffiQuery?.let {
             it.release()
             it.close()
@@ -271,6 +316,7 @@ internal class QueryIterSparkles(
 
     override fun requestCancel() {
         delegate?.cancel()
+        cursor?.cancel()
         ffiQuery?.cancel()
     }
 

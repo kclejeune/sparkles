@@ -351,6 +351,16 @@ python = "Dataset.select"
 jvm = "Jena QueryExec.dataset(ds).query(...).select"
 node = "Dataset.select"
 
+["dataset.select_cursor"]
+python = "planned: native batch iteration with cursor ownership and transaction guards"
+jvm = "planned: native SELECT cursor integration behind Jena iteration"
+node = "planned: native async batch cursor with abort and early close"
+
+["dataset.select_cursor_with"]
+python = "planned: cursor query budgets and batch/fallback options"
+jvm = "planned: cursor query budgets and batch/fallback options"
+node = "planned: cursor query budgets and batch/fallback options"
+
 ["dataset.set_prefix"]
 python = "Dataset.set_prefix"
 jvm = "DatasetGraphSparkles.prefixes().add"

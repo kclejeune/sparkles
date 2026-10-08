@@ -233,6 +233,9 @@ pub struct PyQuerySolution {
 }
 
 impl PyQuerySolution {
+    pub(crate) fn new(vars: Arc<[String]>, values: Vec<Option<Term>>) -> Self {
+        Self { vars, values }
+    }
     fn index(&self, key: &Bound<'_, PyAny>) -> PyResult<usize> {
         if let Ok(i) = key.extract::<isize>() {
             let n = self.values.len() as isize;

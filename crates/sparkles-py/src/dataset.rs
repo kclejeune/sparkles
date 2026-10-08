@@ -630,6 +630,146 @@ impl PyDataset {
         self.run_query(py, query, args, Some(&[QueryKind::Select]))
     }
 
+    /// Open a fallible SELECT iterator over bounded engine batches.
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None, batch_rows = 4096, batch_bytes = 1048576, allow_materialization = true))]
+    #[allow(clippy::too_many_arguments)]
+    fn select_cursor<'py>(
+        &self,
+        py: Python<'py>,
+        query: &str,
+        base_iri: Option<String>,
+        prefixes: Option<BTreeMap<String, String>>,
+        bindings: Option<Bound<'py, PyAny>>,
+        default_graph: Option<Bound<'py, PyAny>>,
+        named_graphs: Option<Bound<'py, PyAny>>,
+        include_inferred: bool,
+        timeout: Option<f64>,
+        max_rows: Option<usize>,
+        max_memory_bytes: Option<u64>,
+        max_rows_produced: Option<u64>,
+        cancel: Option<Bound<'py, PyAny>>,
+        at: Option<Bound<'py, PyAny>>,
+        describe: Option<Bound<'py, PyAny>>,
+        batch_rows: usize,
+        batch_bytes: usize,
+        allow_materialization: bool,
+    ) -> PyResult<crate::query_cursor::PyQueryCursor> {
+        let args = query_args(
+            base_iri,
+            prefixes,
+            bindings,
+            default_graph,
+            named_graphs,
+            include_inferred,
+            timeout,
+            max_rows,
+            max_memory_bytes,
+            max_rows_produced,
+            cancel,
+            at,
+            describe,
+        );
+        let ds = self.ds_for_write(py)?;
+        let (mut opts, at) = query_options(&args)?;
+        apply_defaults(&mut opts, &ds.query_options(), &args)?;
+        let cancel = opts.cancel.clone().unwrap_or_default();
+        opts.cancel = Some(cancel.clone());
+        let query = query.to_string();
+        let cursor_opts = sparkles::sparql::CursorOptions {
+            batch_rows,
+            batch_bytes,
+            fallback: if allow_materialization {
+                sparkles::sparql::FallbackPolicy::AllowMaterialization
+            } else {
+                sparkles::sparql::FallbackPolicy::RejectMaterialization
+            },
+        };
+        let cursor = interrupt::run(py, &cancel, move || {
+            let snapshot = match at {
+                None => ds.snapshot(),
+                Some(at) => {
+                    let history = HistoryOptions {
+                        cancel: opts.cancel.clone(),
+                        deadline: opts.timeout.map(|t| Instant::now() + t),
+                    };
+                    ds.store().snapshot_at(&at, &history)?.0
+                }
+            };
+            sparkles::sparql::select_cursor(snapshot, &query, &opts, &cursor_opts)
+        })?;
+        crate::query_cursor::PyQueryCursor::new(cursor, cancel).py(py)
+    }
+
+    /// Open a fallible CONSTRUCT / DESCRIBE iterator over bounded engine batches.
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None, batch_rows = 4096, batch_bytes = 1048576, allow_materialization = true))]
+    #[allow(clippy::too_many_arguments)]
+    fn graph_cursor<'py>(
+        &self,
+        py: Python<'py>,
+        query: &str,
+        base_iri: Option<String>,
+        prefixes: Option<BTreeMap<String, String>>,
+        bindings: Option<Bound<'py, PyAny>>,
+        default_graph: Option<Bound<'py, PyAny>>,
+        named_graphs: Option<Bound<'py, PyAny>>,
+        include_inferred: bool,
+        timeout: Option<f64>,
+        max_rows: Option<usize>,
+        max_memory_bytes: Option<u64>,
+        max_rows_produced: Option<u64>,
+        cancel: Option<Bound<'py, PyAny>>,
+        at: Option<Bound<'py, PyAny>>,
+        describe: Option<Bound<'py, PyAny>>,
+        batch_rows: usize,
+        batch_bytes: usize,
+        allow_materialization: bool,
+    ) -> PyResult<crate::query_cursor::PyGraphCursor> {
+        let args = query_args(
+            base_iri,
+            prefixes,
+            bindings,
+            default_graph,
+            named_graphs,
+            include_inferred,
+            timeout,
+            max_rows,
+            max_memory_bytes,
+            max_rows_produced,
+            cancel,
+            at,
+            describe,
+        );
+        let ds = self.ds_for_write(py)?;
+        let (mut opts, at) = query_options(&args)?;
+        apply_defaults(&mut opts, &ds.query_options(), &args)?;
+        let cancel = opts.cancel.clone().unwrap_or_default();
+        opts.cancel = Some(cancel.clone());
+        let query = query.to_string();
+        let cursor_opts = sparkles::sparql::CursorOptions {
+            batch_rows,
+            batch_bytes,
+            fallback: if allow_materialization {
+                sparkles::sparql::FallbackPolicy::AllowMaterialization
+            } else {
+                sparkles::sparql::FallbackPolicy::RejectMaterialization
+            },
+        };
+        let cursor = interrupt::run(py, &cancel, move || {
+            let snapshot = match at {
+                None => ds.snapshot(),
+                Some(at) => {
+                    let history = HistoryOptions {
+                        cancel: opts.cancel.clone(),
+                        deadline: opts.timeout.map(|t| Instant::now() + t),
+                    };
+                    ds.store().snapshot_at(&at, &history)?.0
+                }
+            };
+            sparkles::sparql::graph_cursor(snapshot, &query, &opts, &cursor_opts)
+        })?;
+        crate::query_cursor::PyGraphCursor::new(cursor, cancel).py(py)
+    }
+
     /// Run an ASK query.
     #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None))]
     #[allow(clippy::too_many_arguments)]

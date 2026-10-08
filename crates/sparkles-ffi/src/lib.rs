@@ -41,10 +41,12 @@ pub use branches::{BranchInfo, ConflictCell, MergeInfo, MergeSettings};
 pub use catalog::{CatalogFile, DatasetInfo, FfiCatalog, FfiReservation, catalog_inspect};
 pub use documents::{BoundQuery, QueryChange, SchemaRequest};
 pub use settings::{CompactionSettings, QuotaInfo, RetentionSettings, SnapshotSchedule};
+mod cursor;
 mod labels;
 mod query;
 mod read;
 
+pub use cursor::FfiSelectCursor;
 pub use error::{ErrorKind, FfiError, FfiResult};
 pub use query::{Execution, FfiQuery, FfiQueryKind, QueryOpts, Timing};
 pub use read::{Batch, FfiCursor, FindResult};
@@ -740,14 +742,16 @@ impl FfiWriteTxn {
     /// A query that sees the transaction's changes.
     pub fn prepare_query(&self, text: String, options: QueryOpts) -> FfiResult<Arc<FfiQuery>> {
         let snap = self.view()?;
-        Ok(Arc::new(FfiQuery::prepare(
+        let mut query = FfiQuery::prepare(
             snap,
             text,
             &options,
             &self.ds.ds,
             self.labels(),
             self.ds.term_cache(),
-        )?))
+        )?;
+        query.forbid_cursor();
+        Ok(Arc::new(query))
     }
 
     /// Run a SPARQL Update request in the transaction. A syntax error changes nothing;

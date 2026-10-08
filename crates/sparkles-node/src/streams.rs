@@ -8,6 +8,10 @@ use std::io::{Read, Write};
 use tokio::sync::{mpsc, oneshot};
 
 const CHUNK: usize = 64 << 10;
+enum StreamResult {
+    Eager(QueryResult),
+    Streaming(sparkles::sparql::QueryExecution),
+}
 pub(crate) fn format(v: &Value) -> sparkles::Result<sparkles::io::RdfFormat> {
     sparkles::sparql::results::rdf_format_from_name(v["format"].as_str().unwrap_or("nq"))
         .ok_or_else(|| EngineError::invalid("unsupported RDF format"))
@@ -132,6 +136,7 @@ impl Write for Sink {
 pub struct NativeByteStream {
     receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<sparkles::Result<Vec<u8>>>>>,
     flag: Arc<AtomicBool>,
+    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
 }
 #[napi]
 impl NativeByteStream {
@@ -139,16 +144,21 @@ impl NativeByteStream {
     pub fn next<'env>(&self, env: &'env Env) -> napi::Result<PromiseRaw<'env, Option<Buffer>>> {
         let receiver = self.receiver.clone();
         let flag = self.flag.clone();
+        let permit = self.permit.clone();
         env.spawn_future(async move {
             let mut receiver = receiver.lock().await;
             loop {
                 if flag.load(Ordering::Relaxed) {
                     receiver.close();
+                    permit.lock().take();
                     return Err(err(EngineError::Cancelled));
                 }
                 if let Ok(value) =
                     tokio::time::timeout(Duration::from_millis(10), receiver.recv()).await
                 {
+                    if value.as_ref().is_none_or(|value| value.is_err()) {
+                        permit.lock().take();
+                    }
                     return value.transpose().map(|v| v.map(Buffer::from)).map_err(err);
                 }
             }
@@ -157,6 +167,7 @@ impl NativeByteStream {
     #[napi]
     pub fn close(&self) {
         self.flag.store(true, Ordering::Relaxed);
+        self.permit.lock().take();
         if let Ok(mut receiver) = self.receiver.try_lock() {
             receiver.close();
         }
@@ -165,6 +176,7 @@ impl NativeByteStream {
 impl Drop for NativeByteStream {
     fn drop(&mut self) {
         self.flag.store(true, Ordering::Relaxed);
+        self.permit.lock().take();
         if let Ok(mut receiver) = self.receiver.try_lock() {
             receiver.close();
         }
@@ -341,6 +353,7 @@ impl NativeDataset {
         Ok(NativeByteStream {
             receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
             flag,
+            permit: Default::default(),
         })
     }
     #[napi]
@@ -393,12 +406,23 @@ impl NativeDataset {
         let shared = self.get(false)?;
         let v = parse(&options)?;
         let flag = cancel.flag.clone();
-        let _permit = permit(READERS.clone(), &v, &flag).await?;
+        let stream_permit = permit(READERS.clone(), &v, &flag).await?;
         let result = blocking({
             let shared = shared.clone();
             let flag = flag.clone();
             let v = v.clone();
-            move || shared.ds.query_with(&text, &query_options(&v, flag)?)
+            move || match v["execution"].as_str().unwrap_or("eager") {
+                "streaming" | "auto" => {
+                    open_query_cursor(&shared.ds, &text, &v, flag).map(StreamResult::Streaming)
+                }
+                "eager" => shared
+                    .ds
+                    .query_with(&text, &query_options(&v, flag)?)
+                    .map(StreamResult::Eager),
+                _ => Err(EngineError::invalid(
+                    "execution must be eager, streaming or auto",
+                )),
+            }
         })
         .await?;
         let (sender, receiver) = mpsc::channel(2);
@@ -415,19 +439,93 @@ impl NativeDataset {
                     let accept = v["accept"]
                         .as_str()
                         .unwrap_or("application/sparql-results+json");
-                    if result.kind == QueryKind::Select || result.kind == QueryKind::Ask {
-                        let fmt = sparkles::sparql::results::SolutionsFormat::from_name(accept)
-                            .ok_or_else(|| EngineError::invalid("invalid result format"))?;
-                        sparkles::sparql::results::write_solutions(&result, fmt, &mut sink, None)?;
-                    } else {
-                        let fmt = sparkles::sparql::results::rdf_format_from_name(accept)
-                            .ok_or_else(|| EngineError::invalid("invalid RDF result format"))?;
-                        sparkles::sparql::results::write_graph(
-                            &result,
-                            fmt,
-                            &shared.ds.prefixes(),
-                            &mut sink,
-                        )?;
+                    match result {
+                        StreamResult::Streaming(mut execution) => {
+                            use sparkles::sparql::{QueryExecution, results};
+                            match &mut execution {
+                                QueryExecution::Eager(result) => {
+                                    let result = result.result();
+                                    if matches!(result.kind, QueryKind::Select | QueryKind::Ask) {
+                                        let fmt = results::SolutionsFormat::from_name(accept)
+                                            .ok_or_else(|| {
+                                                EngineError::invalid("invalid result format")
+                                            })?;
+                                        results::write_solutions(result, fmt, &mut sink, None)?;
+                                    } else {
+                                        let fmt = results::rdf_format_from_name(accept)
+                                            .ok_or_else(|| {
+                                                EngineError::invalid("invalid RDF result format")
+                                            })?;
+                                        results::write_graph(
+                                            result,
+                                            fmt,
+                                            &shared.ds.prefixes(),
+                                            &mut sink,
+                                        )?;
+                                    }
+                                }
+                                QueryExecution::Select(cursor) => {
+                                    let fmt = results::SolutionsFormat::from_name(accept)
+                                        .ok_or_else(|| {
+                                            EngineError::invalid("invalid result format")
+                                        })?;
+                                    results::write_cursor_solutions(cursor, fmt, &mut sink, None)?;
+                                }
+                                QueryExecution::Ask(result) => {
+                                    let fmt = results::SolutionsFormat::from_name(accept)
+                                        .ok_or_else(|| {
+                                            EngineError::invalid("invalid result format")
+                                        })?;
+                                    results::write_solutions(
+                                        result.result(),
+                                        fmt,
+                                        &mut sink,
+                                        None,
+                                    )?;
+                                }
+                                QueryExecution::Graph(cursor)
+                                    if accept
+                                        == results::SolutionsFormat::Sparkles.media_type() =>
+                                {
+                                    results::write_cursor_graph_native_json(
+                                        cursor, &mut sink, None, None,
+                                    )?;
+                                }
+                                QueryExecution::Graph(cursor) => {
+                                    let fmt =
+                                        results::rdf_format_from_name(accept).ok_or_else(|| {
+                                            EngineError::invalid("invalid RDF result format")
+                                        })?;
+                                    let prefixes =
+                                        shared.ds.prefixes().into_iter().collect::<Vec<_>>();
+                                    sparkles::sparql::cursor::graph::write_cursor_graph(
+                                        cursor, fmt, &mut sink, None, &prefixes,
+                                    )?;
+                                }
+                            }
+                        }
+                        StreamResult::Eager(result) => {
+                            if result.kind == QueryKind::Select || result.kind == QueryKind::Ask {
+                                let fmt = sparkles::sparql::results::SolutionsFormat::from_name(
+                                    accept,
+                                )
+                                .ok_or_else(|| EngineError::invalid("invalid result format"))?;
+                                sparkles::sparql::results::write_solutions(
+                                    &result, fmt, &mut sink, None,
+                                )?;
+                            } else {
+                                let fmt = sparkles::sparql::results::rdf_format_from_name(accept)
+                                    .ok_or_else(|| {
+                                    EngineError::invalid("invalid RDF result format")
+                                })?;
+                                sparkles::sparql::results::write_graph(
+                                    &result,
+                                    fmt,
+                                    &shared.ds.prefixes(),
+                                    &mut sink,
+                                )?;
+                            }
+                        }
                     }
                     if workerflag.load(Ordering::Relaxed) {
                         return Err(EngineError::Cancelled);
@@ -443,6 +541,7 @@ impl NativeDataset {
         Ok(NativeByteStream {
             receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
             flag,
+            permit: Arc::new(Mutex::new(Some(stream_permit))),
         })
     }
 }

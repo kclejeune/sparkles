@@ -131,6 +131,7 @@ pub struct FfiQuery {
     term_cache: usize,
     state: Mutex<Option<State>>,
     executed: AtomicBool,
+    cursor_allowed: bool,
 }
 
 impl FfiQuery {
@@ -159,7 +160,12 @@ impl FfiQuery {
             term_cache,
             state: Mutex::new(None),
             executed: AtomicBool::new(false),
+            cursor_allowed: true,
         })
+    }
+
+    pub(crate) fn forbid_cursor(&mut self) {
+        self.cursor_allowed = false;
     }
 
     fn batch(&self, st: &mut State, max: u32) -> Vec<u8> {
@@ -217,6 +223,45 @@ impl FfiQuery {
 
 #[uniffi::export]
 impl FfiQuery {
+    /// Open an opt-in SELECT cursor without executing the whole result. The
+    /// prepared query's snapshot, defaults, bindings and cancellation are reused.
+    pub fn open_cursor(
+        &self,
+        batch_rows: u32,
+        batch_bytes: u64,
+        allow_materialization: bool,
+    ) -> FfiResult<Arc<crate::FfiSelectCursor>> {
+        if !self.cursor_allowed {
+            return Err(FfiError::new(
+                ErrorKind::Invalid,
+                "finish the transaction before opening a streaming cursor",
+            ));
+        }
+        if self.executed.swap(true, Ordering::SeqCst) {
+            return Err(FfiError::new(
+                ErrorKind::Invalid,
+                "the query has been executed already",
+            ));
+        }
+        let options = sparkles::sparql::CursorOptions {
+            batch_rows: batch_rows as usize,
+            batch_bytes: batch_bytes
+                .try_into()
+                .map_err(|_| FfiError::new(ErrorKind::Invalid, "batch_bytes is too large"))?,
+            fallback: if allow_materialization {
+                sparkles::sparql::FallbackPolicy::AllowMaterialization
+            } else {
+                sparkles::sparql::FallbackPolicy::RejectMaterialization
+            },
+        };
+        let cursor =
+            sparkles::sparql::select_cursor(self.snap.clone(), &self.text, &self.opts, &options)?;
+        Ok(Arc::new(crate::FfiSelectCursor::new(
+            cursor,
+            self.labels.clone(),
+            self.cancel.clone(),
+        )))
+    }
     /// Run the query and return the first `first_rows` rows. The result table is freed
     /// in the same call when no rows remain.
     pub fn execute(&self, first_rows: u32) -> FfiResult<Execution> {
