@@ -2,7 +2,7 @@
   "date": "2026-10-04",
   "host": "forge",
   "baseline_commit": "2fafbe8c",
-  "candidate": "uncommitted performance changes accompanying IMPLEMENTATION_REVIEW.md",
+  "candidate": "working-tree vocabulary read-ahead changes on top of 2fafbe8c, later committed as 31c94cac",
   "candidate_binary_sha256": "572a746f8cab3ccba27eb6ae967bbdcb7527724f6e08b148420b48fadf863fa6",
   "timer": "HTTP request through complete response, excluding server/client process startup",
   "result_cache_mb": 0,
