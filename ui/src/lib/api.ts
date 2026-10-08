@@ -1681,17 +1681,23 @@ export type Commit = {
   /** RFC 3339 UTC with milliseconds, never decreasing along the sequence. */
   timestamp: string;
   kind: CommitKind;
-  /** Net change relative to the parent. */
-  inserted: number;
-  deleted: number;
-  /** Dataset size after the commit. */
-  quads: number;
+  /**
+   * Net change relative to the parent. The counts cover every graph, so the server
+   * leaves them out for a caller whose grants cover only some graphs.
+   */
+  inserted?: number;
+  deleted?: number;
+  /** Dataset size after the commit, absent for a caller restricted to some graphs. */
+  quads?: number;
   /** Index generation the commit was made in. */
   generation: string;
   /** Made by rebuilding the index. */
   bulk: boolean;
-  /** false: a bulk commit that also deleted, whose counts may include a quad twice. */
-  exact: boolean;
+  /**
+   * false: a bulk commit that also deleted, whose counts may include a quad twice.
+   * Absent with the counts for a caller restricted to some graphs.
+   */
+  exact?: boolean;
   /** Rebuilt from a write-ahead log record without commit metadata. */
   reconstructed?: boolean;
   /** The write skipped the dataset's write-time validation (a bypass). */

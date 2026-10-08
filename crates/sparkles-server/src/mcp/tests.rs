@@ -2045,3 +2045,22 @@ async fn profiles_and_schema_diffs() {
     let (_, meta) = c.error("diff_schema", json!({"from": true})).await;
     assert_eq!(meta["code"], "bad-argument");
 }
+
+/// A caller restricted to some graphs gets commits without their counts, which the
+/// output schema of list_commits must still accept.
+#[test]
+fn list_commits_requires_only_what_redaction_keeps() {
+    let tools = schemas::tools(&McpConfig::default());
+    let tool = tools.iter().find(|t| t.name == "list_commits").unwrap();
+    let item = &tool.output.as_ref().unwrap()["properties"]["commits"]["items"];
+    let mut commit = json!({
+        "seq": 1, "timestamp": "2026-01-01T00:00:00.000Z", "kind": "update",
+        "inserted": 1, "deleted": 0, "quads": 1,
+    });
+    crate::http::redact_commit_json(&mut commit);
+    for key in item["required"].as_array().unwrap() {
+        let key = key.as_str().unwrap();
+        assert!(commit.get(key).is_some(), "{key} is required but redacted");
+    }
+    assert!(item["properties"]["quads"].is_object());
+}

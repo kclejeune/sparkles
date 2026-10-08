@@ -349,9 +349,11 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 json!({"type":"object","required":["dataset","head","firstRetained","complete","commits","next"],"properties":{
                 "dataset":{"type":"string"},"head":{"type":"integer"},"firstRetained":{"type":"integer"},
                 "complete":{"type":"boolean"},
-                "commits":{"type":"array","items":{"type":"object","required":["seq","timestamp","kind","inserted","deleted","quads"],"properties":{
+                "commits":{"type":"array","items":{"type":"object","required":["seq","timestamp","kind"],"properties":{
                     "seq":{"type":"integer"},"timestamp":{"type":"string"},"kind":{"type":"string"},
-                    "inserted":{"type":"integer"},"deleted":{"type":"integer"},"quads":{"type":"integer"}}}},
+                    "inserted":{"type":"integer","description":"Absent for a caller whose grants cover only some graphs"},
+                    "deleted":{"type":"integer","description":"Absent for a caller whose grants cover only some graphs"},
+                    "quads":{"type":"integer","description":"Absent for a caller whose grants cover only some graphs"}}}},
                 "next":{"type":["object","null"],"properties":{"before":{"type":"integer"}}},
                 "readable":{"type":"array","description":"The commits whose state `at` and `atCommit` can read","items":{"type":"object","required":["from","to"],"properties":{"from":{"type":"integer"},"to":{"type":"integer"}}}},
                 "snapshots":{"type":"array","description":"Named snapshots, newest first (read with at=snapshot:<name>)","items":{"type":"object","required":["name","commit"],"properties":{"name":{"type":"string"},"commit":{"type":"integer"}}}}}}),

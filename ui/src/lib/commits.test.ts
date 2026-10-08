@@ -53,6 +53,12 @@ describe('commit formatting', () => {
     const bypassed = commitFlags(commit(2, { unvalidated: true }));
     expect(bypassed.map((f) => [f.label, f.warn])).toEqual([['unvalidated', true]]);
   });
+
+  it('does not flag a redacted commit without counts as inexact', () => {
+    const { inserted, deleted, quads, exact, ...redacted } = commit(3);
+    void [inserted, deleted, quads, exact];
+    expect(commitFlags(redacted)).toEqual([]);
+  });
 });
 
 describe('history paging', () => {

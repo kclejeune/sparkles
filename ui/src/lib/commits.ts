@@ -46,7 +46,7 @@ export function commitFlags(c: Commit): CommitFlag[] {
       label: 'bulk',
       title: 'Made by rebuilding the index rather than through the write-ahead log',
     });
-  if (!c.exact)
+  if (c.exact === false)
     out.push({
       label: 'inexact',
       warn: true,

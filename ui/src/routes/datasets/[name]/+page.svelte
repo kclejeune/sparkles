@@ -1323,7 +1323,8 @@ ex:PersonShape a sh:NodeShape ;
             {#if uploadReceipt && !uploading}
               <p class="receipt faint" class:none={!uploadReceipt.committed}>
                 <Icon name={uploadReceipt.committed ? 'check' : 'info'} size={13} />
-                Last upload: {receiptSummary(uploadReceipt)}{uploadReceipt.committed
+                Last upload: {receiptSummary(uploadReceipt)}{uploadReceipt.committed &&
+                uploadReceipt.commit.quads !== undefined
                   ? ` (${uploadReceipt.commit.quads.toLocaleString('en-US')} quads after)`
                   : ''}
               </p>
