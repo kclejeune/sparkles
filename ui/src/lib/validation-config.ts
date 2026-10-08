@@ -2,7 +2,7 @@ import type { ValidationConfig, ValidationSource, WriteValidation } from './api'
 
 export type GuardForm = {
   language: 'shacl' | 'shex';
-  mode: 'warn' | 'reject';
+  mode: 'warn' | 'reject' | 'off';
   baseline: 'strict' | 'grandfather';
   threshold: 'violation' | 'warning' | 'info';
   includeInferences: boolean;
@@ -24,7 +24,7 @@ export function guardForm(v: WriteValidation | null): GuardForm {
   const src = v?.language === 'shex' ? c?.schema : c?.shapes;
   return {
     language: v?.language ?? 'shacl',
-    mode: c?.mode === 'reject' ? 'reject' : 'warn',
+    mode: c?.mode === 'reject' || c?.mode === 'off' ? c.mode : 'warn',
     baseline: c?.baseline ?? 'strict',
     threshold: c?.threshold ?? 'violation',
     includeInferences: c?.includeInferences ?? false,

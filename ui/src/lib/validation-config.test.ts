@@ -7,6 +7,15 @@ const validation = (
 ): WriteValidation => ({ language, config, status: {} as WriteValidation['status'] });
 
 describe('editable guard configuration', () => {
+  it('keeps every mode, so re-saving an off guard leaves it off', () => {
+    for (const mode of ['off', 'warn', 'reject'] as const) {
+      const v = validation('shacl', { mode, shapes: { inline: '', format: 'text/turtle' } });
+      const f = guardForm(v);
+      expect(f.mode).toBe(mode);
+      expect(guardConfig({ ...f, text: '<urn:s> a <urn:C> .' }, v).mode).toBe(mode);
+    }
+    expect(guardForm(null).mode).toBe('warn');
+  });
   it('retains installed sources and advanced settings', () => {
     const v = validation('shex', {
       mode: 'reject',

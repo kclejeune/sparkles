@@ -56,7 +56,9 @@
     >
     <label
       >Mode <select class="select" bind:value={form.mode}
-        ><option value="warn">Warn</option><option value="reject">Reject</option></select
+        ><option value="warn">Warn</option><option value="reject">Reject</option><option value="off"
+          >Off</option
+        ></select
       ></label
     >
     <label
