@@ -16,6 +16,11 @@ def test_recreated_alias_returns_the_current_dataset(tmp_path: Path, kind: str) 
         old = cat.create("wiki", kind=kind)
         old.update("INSERT DATA { <urn:old> <urn:p> 1 }")
         old_id = old.dataset_id
+        if kind == "persistent":
+            # a live handle could write into the new directory, so delete refuses
+            with pytest.raises(sparkles.ConflictError, match="live handles"):
+                cat.delete("wiki")
+            old.close()
         assert cat.delete("wiki")
         current = cat.create("wiki", kind=kind)
         assert current is not old
@@ -27,7 +32,9 @@ def test_recreated_alias_returns_the_current_dataset(tmp_path: Path, kind: str) 
         current.update("INSERT DATA { <urn:new> <urn:p> 2 }")
         assert current.ask("ASK { <urn:new> <urn:p> 2 }")
         assert not current.ask("ASK { <urn:old> ?p ?o }")
-        assert len(old) == 1
+        if kind == "mem":
+            # an in-memory dataset keeps no files, so its old handle may live on
+            assert len(old) == 1
     assert old.closed and current.closed
 
 

@@ -315,6 +315,15 @@ impl Catalog {
         }
         Ok(self.get(name))
     }
+    /// Whether a registered dataset has handles besides the catalog's own, including
+    /// branch handles. A rename or delete of a persistent dataset refuses while it has.
+    pub fn in_use(&self, name: &str) -> bool {
+        self.inner
+            .entries
+            .read()
+            .get(name)
+            .is_some_and(|e| e.dataset.in_use())
+    }
     pub fn get_by_id(&self, id: Uuid) -> Option<Dataset> {
         self.inner
             .entries

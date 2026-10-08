@@ -14,6 +14,20 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 pub(crate) type DatasetGroup = Arc<Mutex<Vec<Py<PyAny>>>>;
 
+/// Track `obj` in `group` by a weak reference, dropping the references of objects that
+/// are gone so that the group does not grow with every lookup.
+fn track(py: Python<'_>, group: &DatasetGroup, obj: &Bound<'_, PyAny>) -> PyResult<()> {
+    let weak = py
+        .import("weakref")?
+        .getattr("ref")?
+        .call1((obj,))?
+        .unbind();
+    let mut g = group.lock().unwrap();
+    g.retain(|w| w.bind(py).call0().is_ok_and(|o| !o.is_none()));
+    g.push(weak);
+    Ok(())
+}
+
 pub(crate) fn owned(
     py: Python<'_>,
     ds: sparkles::Dataset,
@@ -24,12 +38,7 @@ pub(crate) fn owned(
     dataset.group = group.clone();
     let obj = Py::new(py, dataset)?;
     if let Some(group) = group {
-        let weak = py
-            .import("weakref")?
-            .getattr("ref")?
-            .call1((obj.bind(py),))?
-            .unbind();
-        group.lock().unwrap().push(weak);
+        track(py, &group, obj.bind(py).as_any())?;
     }
     Ok(obj)
 }
@@ -212,7 +221,9 @@ impl PyCatalog {
     }
     fn delete(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
         let cat = self.catalog(py)?;
-        py.detach(|| cat.delete(name)).py(py)
+        let deleted = py.detach(|| cat.delete(name)).py(py)?;
+        self.cache.lock().unwrap().remove(name);
+        Ok(deleted)
     }
     fn rename(&self, py: Python<'_>, name: &str, new_name: &str) -> PyResult<Py<PyDataset>> {
         let cat = self.catalog(py)?;
@@ -313,6 +324,18 @@ impl PyCatalog {
         timeout: Option<f64>,
     ) -> PyResult<Py<PyDataset>> {
         let cat = self.catalog(py)?;
+        // The in-place swap waits up to 30 s for handles to close, which suits a
+        // server's requests. Handles this thread holds would never close while it
+        // waits, so refuse at once, as a rename does.
+        if in_place && cat.in_use(&name) {
+            let err = crate::errors::new_err(
+                py,
+                "BackupError",
+                format!("dataset /{name} still has live handles; close them first"),
+            );
+            let _ = err.value(py).setattr("code", "dataset-busy");
+            return Err(err);
+        }
         let repo = repository.borrow(py).repo.clone();
         let target = name.clone();
         let req = sparkles::backup::RestoreRequest {
@@ -391,12 +414,7 @@ impl PyCatalog {
                 name: name.into(),
             },
         )?;
-        let weak = py
-            .import("weakref")?
-            .getattr("ref")?
-            .call1((obj.bind(py),))?
-            .unbind();
-        self.group.lock().unwrap().push(weak);
+        track(py, &self.group, obj.bind(py).as_any())?;
         Ok(obj)
     }
 }

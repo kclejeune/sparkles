@@ -84,6 +84,25 @@ def test_clone(tmp_path: Path) -> None:
         assert names(copy) == ["A"]
 
 
+def test_clone_can_exclude_the_inferences(tmp_path: Path) -> None:
+    inferred = NamedNode("urn:x-sparkles:inferred")
+    with Dataset(tmp_path / "db") as ds:
+        ds.load(
+            "@prefix ex: <http://ex.org/> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+            "ex:Dog rdfs:subClassOf ex:Animal . ex:rex a ex:Dog .",
+            "turtle",
+        )
+        inferred_quads = ds.reasoning.run("rdfs").inferred
+        assert inferred_quads > 0 and inferred in ds.named_graphs()
+        kept = ds.clone_to(tmp_path / "kept")
+        dropped = ds.clone_to(tmp_path / "dropped", inferences="drop")
+        assert kept["quads"] == dropped["quads"] + inferred_quads
+        assert dropped["sourceQuads"] == kept["sourceQuads"]
+    with Dataset(tmp_path / "dropped") as copy:
+        assert inferred not in copy.named_graphs()
+        assert len(copy) == 2
+
+
 # ----------------------------------------------------------- text and vectors ----
 
 
@@ -213,8 +232,10 @@ def test_shacl_write_validation(tmp_path: Path) -> None:
     assert ds.validation.guard.get() is not None
     with pytest.raises(WriteRejectedError):
         ds.add(Triple(ex("carol"), RDF_TYPE, ex("Person")))
-    ds.validation.guard.reset()
+    assert ds.validation.guard.reset() is None
     assert ds.validation.guard.get() is None
+    # resetting an absent guard is not an error
+    assert ds.validation.guard.reset() is None
     ds.add(Triple(ex("carol"), RDF_TYPE, ex("Person")))
     # a configuration the data does not meet is refused in reject mode
     out = ds.validation.guard.set({"mode": "reject", "shapes": {"inline": SHAPES}})

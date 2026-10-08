@@ -50,6 +50,39 @@ def test_catalog_ownership_lock_and_identity(tmp_path: Path) -> None:
         assert cat.get("copy") is None
 
 
+def test_delete_refuses_live_handles(tmp_path: Path) -> None:
+    with Catalog(tmp_path / "catalog") as cat:
+        ds = cat.create("wiki")
+        ds.load(DATA, "turtle")
+        # an old handle could otherwise write into a dataset created later as /wiki
+        with pytest.raises(ConflictError, match="live handles"):
+            cat.delete("wiki")
+        assert len(cat["wiki"]) == 2
+        ds.close()
+        assert cat.delete("wiki")
+        assert cat.get("wiki") is None
+        assert len(cat.create("wiki")) == 0
+
+
+@pytest.mark.skipif("backup" not in sparkles.FEATURES, reason="built without backup")
+def test_in_place_restore_fails_fast_while_the_caller_holds_the_dataset(tmp_path: Path) -> None:
+    repo = sparkles.BackupRepository.open((tmp_path / "repo").as_uri())
+    with Catalog(tmp_path / "catalog") as cat:
+        ds = cat.create("wiki")
+        ds.load(DATA, "turtle")
+        ds.backups(repo).create("one")
+        ds.update("INSERT DATA { <urn:later> <urn:p> 1 }")
+        started = time.monotonic()
+        with pytest.raises(sparkles.BackupError) as error:
+            cat.restore(repo, "one", name="wiki", in_place=True)
+        assert error.value.code == "dataset-busy"
+        assert time.monotonic() - started < 10
+        assert len(ds) == 3
+        ds.close()
+        restored = cat.restore(repo, "one", name="wiki", in_place=True)
+        assert len(restored) == 2
+
+
 def test_native_properties_replace_and_settings(tmp_path: Path) -> None:
     with Dataset(tmp_path / "db") as ds:
         ds.load(DATA, "turtle")
