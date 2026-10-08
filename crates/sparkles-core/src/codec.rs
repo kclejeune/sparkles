@@ -38,7 +38,8 @@ pub trait FinishWrite: Write {
 
 impl Codec {
     /// Number of bytes sufficient to identify every codec with a magic number.
-    pub const MAGIC_LEN: usize = 6;
+    /// bzip2 needs the most: its 4-byte header and the 6-byte magic that follows.
+    pub const MAGIC_LEN: usize = 10;
 
     /// Maximum memory used by an xz decoder, independent of the output byte limit.
     /// This accommodates every standard xz preset, including level 9, while
@@ -145,7 +146,15 @@ impl Codec {
         match prefix {
             [0x1f, 0x8b, ..] => Some(Codec::Gzip),
             [0xfd, b'7', b'z', b'X', b'Z', 0x00, ..] => Some(Codec::Xz),
-            [b'B', b'Z', b'h', b'1'..=b'9', ..] => Some(Codec::Bzip2),
+            // The 4-byte header alone is printable text that a CSV or Turtle file can
+            // start with, so the magic of the first block (the digits of pi) or of
+            // the end of an empty stream (those of the square root of pi) must follow.
+            [b'B', b'Z', b'h', b'1'..=b'9', rest @ ..]
+                if rest.starts_with(&[0x31, 0x41, 0x59, 0x26, 0x53, 0x59])
+                    || rest.starts_with(&[0x17, 0x72, 0x45, 0x38, 0x50, 0x90]) =>
+            {
+                Some(Codec::Bzip2)
+            }
             [0x28, 0xb5, 0x2f, 0xfd, ..] => Some(Codec::Zstd),
             // zstd skippable frame: 0x184D2A5?
             [b0, 0x2a, 0x4d, 0x18, ..] if b0 & 0xf0 == 0x50 => Some(Codec::Zstd),
@@ -610,8 +619,25 @@ mod tests {
         assert_eq!(Codec::parse("bzip2").unwrap(), Codec::Bzip2);
         assert_eq!(Codec::sniff(b"\xfd7zXZ\0"), Some(Codec::Xz));
         assert_eq!(Codec::sniff(b"\xfd7zX"), None);
-        assert_eq!(Codec::sniff(b"BZh9"), Some(Codec::Bzip2));
+        assert_eq!(
+            Codec::sniff(b"BZh91AY&SY\x01\x02"),
+            Some(Codec::Bzip2),
+            "first block"
+        );
+        assert_eq!(
+            Codec::sniff(b"BZh9\x17\x72\x45\x38\x50\x90\0\0\0\0"),
+            Some(Codec::Bzip2),
+            "empty stream"
+        );
+        assert_eq!(Codec::sniff(b"BZh9"), None);
         assert_eq!(Codec::sniff(b"BZh0"), None);
+        // a CSV header that starts like a bzip2 header is text
+        let csv = b"BZh1,count\nx,1\n";
+        assert_eq!(Codec::sniff(csv), None);
+        assert_eq!(
+            Codec::detect(None, &csv[..Codec::MAGIC_LEN], Some(p("x.csv"))).unwrap(),
+            (Codec::None, None)
+        );
         assert_eq!(Codec::Xz.content_encoding(), None);
         assert_eq!(Codec::Bzip2.content_encoding(), None);
         assert_eq!(Codec::from_content_encoding("xz"), None);
@@ -658,6 +684,21 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             let len = buf.len().min(1);
             self.0.read(&mut buf[..len])
+        }
+    }
+
+    #[test]
+    fn real_bzip2_streams_are_sniffed_at_every_level() {
+        for level in [1, 9] {
+            for data in [&b""[..], b"<a> <b> <c> .\n"] {
+                let out = compressed(Codec::Bzip2, data, Some(Level(level)));
+                assert_eq!(
+                    Codec::sniff(&out[..Codec::MAGIC_LEN]),
+                    Some(Codec::Bzip2),
+                    "level {level}, {} bytes",
+                    data.len()
+                );
+            }
         }
     }
 
