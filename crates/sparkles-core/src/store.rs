@@ -4213,11 +4213,15 @@ impl Store {
         };
         let mut out = Vec::new();
         #[cfg(feature = "text")]
-        let text_cfg = self
-            .text
-            .load()
-            .as_ref()
-            .map(|ti| serde_json::to_vec_pretty(ti.config()).unwrap());
+        // a configured index that is still recovering keeps its configuration too
+        let text_cfg = match self.text.load().as_ref() {
+            Some(ti) => Some(serde_json::to_vec_pretty(ti.config()).unwrap()),
+            None => self
+                .text_recovery
+                .load()
+                .as_ref()
+                .map(|job| serde_json::to_vec_pretty(job.config()).unwrap()),
+        };
         #[cfg(not(feature = "text"))]
         let text_cfg = read("text.json")?;
         if let Some(cfg) = text_cfg {

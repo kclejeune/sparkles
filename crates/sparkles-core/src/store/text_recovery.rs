@@ -62,6 +62,11 @@ pub(super) struct Recovery {
 }
 
 impl Recovery {
+    /// The configuration this recovery builds.
+    pub(super) fn config(&self) -> &TextConfig {
+        &self.config
+    }
+
     fn new(store: &Store, config: TextConfig) -> Arc<Self> {
         Arc::new(Self {
             root: store.root.clone().expect("persistent recovery"),
