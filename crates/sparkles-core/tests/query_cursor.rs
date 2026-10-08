@@ -2225,3 +2225,61 @@ fn optional_count_merges_preserve_multiplicity_with_short_and_long_key_gaps() {
         }
     }
 }
+
+/// Generation collection does not wait for live cursors. On Unix the cursor keeps
+/// reading its generation's open and mapped files after the directory is removed.
+#[cfg(unix)]
+#[test]
+fn cursor_reads_its_generation_after_compactions_retire_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(
+        dir.path(),
+        StoreOptions {
+            history_max_generations: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let data = (0..20_000)
+        .map(|i| format!("<urn:s:{i}> <urn:p> \"value {i}\" .\n"))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.compact().unwrap();
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let snapshot = s.snapshot();
+    let generation = snapshot
+        .generation
+        .dir
+        .clone()
+        .expect("a sealed generation");
+    let expected = bag(query(snapshot.clone(), q, &Default::default())
+        .unwrap()
+        .rows());
+    let mut cursor = select_cursor(snapshot, q, &Default::default(), &options(7)).unwrap();
+    let mut got = Vec::new();
+    let first = cursor.next_batch().unwrap().unwrap();
+    got.extend((0..first.len()).map(|i| first.row(i).unwrap()));
+    for round in 0..3 {
+        sparkles_core::sparql::update::update(
+            &s,
+            &format!("INSERT DATA {{ <urn:new:{round}> <urn:p> {round} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        s.compact().unwrap();
+    }
+    assert!(
+        !generation.exists(),
+        "{} should be retired",
+        generation.display()
+    );
+    while let Some(batch) = cursor.next_batch().unwrap() {
+        got.extend((0..batch.len()).map(|i| batch.row(i).unwrap()));
+    }
+    assert_eq!(bag(got), expected);
+}
