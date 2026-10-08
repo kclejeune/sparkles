@@ -1348,6 +1348,11 @@ kept as `forkedFrom`. The clone carries no history: commit records, named snapsh
 retention settings, older generations, the WAL and caches stay with the source. Clone at
 `at=` to start from a past state. Full-text search, the spatial index and the vector
 indexes stay enabled with the same configuration, and the clone builds its own indexes.
+The clone task builds the full-text index before it completes, so text queries on the
+clone work as soon as the task is done. Cancelling the task or passing its deadline
+stops that build too, and the time it takes counts in the reported `millis`. The spatial
+and vector indexes build in the background once the clone is open, and queries give the
+same answers without them in the meantime.
 
 **How the copy is made.** A source whose quads are all in its current generation has had
 no change since its last compaction or bulk load. A clone of such a source, at the head
@@ -4467,7 +4472,8 @@ SELECT ?s ?score ?label WHERE {
   can be retried with the rebuild endpoint or `sparkles text-index --loc DB --rebuild`.
   A new linked branch copies its upstream's checkpoint when that checkpoint is at or
   before the fork point and catches it up before the branch opens, so its text search
-  is ready at once. Missing indexes after backup restore, and branch indexes that cannot
+  is ready at once. A clone builds its index before the clone completes, so the clone
+  is ready at once as well. Missing indexes after backup restore, and branch indexes that cannot
   be copied, use the background recovery path.
   Enabling or reconfiguring an index still builds it synchronously inside its task. An
   explicit rebuild joins a running startup recovery, retries a failed one, or otherwise

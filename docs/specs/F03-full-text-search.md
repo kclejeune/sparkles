@@ -676,8 +676,13 @@ the fork point. The copy is then caught up from the inherited WAL before the bra
 opens, so the branch serves text searches at once. A checkpoint past the fork point may
 hold upstream commits the branch lacks, so it is never copied. When no checkpoint can be
 copied, the branch index rebuilds in the background in its own directory, and the
-upstream is never checkpointed by the branch. Restored datasets whose backups omit
-`text/` use the same configured recovery path.
+upstream is never checkpointed by the branch. A clone builds its full-text index from
+its own data before `Store::clone_to` returns, and opening the clone then reuses that
+index. The source's checkpoint is not copied, because it names a commit of the source and
+the clone starts again at commit 0. The build honours the clone's cancel flag and
+deadline, and a clone stopped during it leaves no directory behind. In-memory clones
+enable text search synchronously. Restored datasets whose backups omit `text/` use the
+same configured recovery path.
 
 RDF reads and writes remain available. Text searches return 503 while rebuilding or after
 failure; disabled text search still returns 400. Retained unavailable snapshots stay

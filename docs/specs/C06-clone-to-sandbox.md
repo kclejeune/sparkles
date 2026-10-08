@@ -563,6 +563,10 @@ with `forkedFrom: null`.
   so `text:query` silently stopped working on the clone. The clone now copies the text
   configuration and rebuilds the index on first open. The §2.1 table had left this to
   the text spec.
+- When text indexes began to recover in the background at open, a new clone answered
+  text queries with `503` until that recovery finished. The clone now builds its text
+  index before it completes, under the clone's cancel flag and deadline, so the clone
+  serves text queries as soon as it exists.
 - Later work made clone tasks cancellable until the copy is in place
   (`DELETE /$/tasks/{id}`).
 - A clone that would leave less than `--min-free-disk-mb` free is refused with `507`
