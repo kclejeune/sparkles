@@ -95,7 +95,8 @@ impl Fixture {
     }
 }
 fn private_key(path: &Path, byte: u8) {
-    std::fs::write(path, [byte; 32]).unwrap();
+    // Printable raw keys are refused as likely passwords, so write hex.
+    std::fs::write(path, format!("{byte:02x}").repeat(32)).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 fn file_settings(path: &Path) -> RepositoryEncryption {

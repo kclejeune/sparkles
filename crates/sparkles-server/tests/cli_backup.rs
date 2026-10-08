@@ -17,7 +17,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
     any(target_os = "linux", target_os = "android")
 ))]
 fn private_key(path: &Path, bytes: &[u8]) {
-    std::fs::write(path, bytes).unwrap();
+    // Printable raw keys are refused as likely passwords, so write hex.
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(path, hex).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

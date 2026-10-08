@@ -17,6 +17,22 @@ use zeroize::Zeroizing;
 
 const LIMIT: usize = 4096;
 
+/// The only environment variables a key command receives. Everything else, such
+/// as other repositories' `env` keys and cloud credentials, is withheld.
+pub const COMMAND_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "XDG_RUNTIME_DIR",
+    "CREDENTIALS_DIRECTORY",
+];
+
+/// A key file may belong to the user the process runs as, or to root.
+#[cfg(unix)]
+fn owner_allowed(owner: u32, effective: u32) -> bool {
+    owner == effective || owner == 0
+}
+
 /// Locations secrets may not occupy. Credential names resolve below one explicit root.
 #[derive(Clone, Debug, Default)]
 pub struct KeyContext {
@@ -65,11 +81,21 @@ fn read_private(
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if meta.permissions().mode() & 0o077 != 0 {
             bail!(
                 "{}",
                 unavailable(label, "key file must not be group/world accessible")
+            );
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if !owner_allowed(meta.uid(), unsafe { libc::geteuid() }) {
+            bail!(
+                "{}",
+                unavailable(
+                    label,
+                    "key file must be owned by the user running sparkles or by root"
+                )
             );
         }
     }
@@ -124,9 +150,28 @@ fn read_private(
     Ok(bytes)
 }
 
-fn decode_key(bytes: &[u8], label: &str) -> Result<[u8; 32]> {
+/// Decode a 32-byte key given as raw bytes, 64 hexadecimal digits or canonical
+/// base64. Raw input that is entirely printable ASCII is refused, because it is
+/// almost certainly a typed password rather than random key bytes. A random
+/// 32-byte key is all printable with a probability of about 10^-13.
+fn decode_key(bytes: &[u8], label: &str) -> Result<Zeroizing<[u8; 32]>> {
+    let text = bytes
+        .iter()
+        .all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace());
+    let mut key = Zeroizing::new([0; 32]);
+    if bytes.len() == 32 && !text {
+        key.copy_from_slice(bytes);
+        return Ok(key);
+    }
     if bytes.len() == 32 {
-        return Ok(bytes.try_into().expect("checked raw length"));
+        bail!(
+            "{}",
+            unavailable(
+                label,
+                "a 32-character text key is not accepted as raw bytes; \
+                 encode the key as 64 hexadecimal digits or canonical base64"
+            )
+        );
     }
     let first = bytes
         .iter()
@@ -137,7 +182,6 @@ fn decode_key(bytes: &[u8], label: &str) -> Result<[u8; 32]> {
         .rposition(|b| !b.is_ascii_whitespace())
         .map_or(first, |i| i + 1);
     let bytes = &bytes[first..last];
-    let mut key = Zeroizing::new([0; 32]);
     if bytes.len() == 64 && bytes.iter().all(u8::is_ascii_hexdigit) {
         fn digit(b: u8) -> u8 {
             if b.is_ascii_digit() {
@@ -164,7 +208,7 @@ fn decode_key(bytes: &[u8], label: &str) -> Result<[u8; 32]> {
         }
         key.copy_from_slice(&decoded);
     }
-    Ok(*key)
+    Ok(key)
 }
 
 /// Own the provider through cleanup even when its caller future is dropped. Tokio's
@@ -256,6 +300,12 @@ async fn command(
     label: &str,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.env_clear();
+    for name in COMMAND_ENVIRONMENT {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
     cmd.args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -465,9 +515,9 @@ mod tests {
     }
     #[test]
     fn key_encodings_are_strict_and_errors_do_not_echo_inputs() {
-        assert_eq!(decode_key(&[7; 32], "test").unwrap(), [7; 32]);
+        assert_eq!(*decode_key(&[7; 32], "test").unwrap(), [7; 32]);
         assert_eq!(
-            decode_key(
+            *decode_key(
                 b" 0707070707070707070707070707070707070707070707070707070707070707\n",
                 "test"
             )
@@ -475,9 +525,19 @@ mod tests {
             [7; 32]
         );
         assert_eq!(
-            decode_key(STANDARD.encode([7; 32]).as_bytes(), "test").unwrap(),
+            *decode_key(STANDARD.encode([7; 32]).as_bytes(), "test").unwrap(),
             [7; 32]
         );
+        // A typed 32-character password must not silently become the key.
+        let mut typed = *b"correct horse battery staple 12\n";
+        for password in [b"correct-horse-battery-staple-123".as_slice(), &typed] {
+            let error = decode_key(password, "test").unwrap_err().to_string();
+            assert!(error.contains("hexadecimal"), "{error}");
+            assert!(!error.contains("horse"));
+        }
+        // One non-text byte makes it raw key material again.
+        typed[0] = 0x80;
+        assert_eq!(decode_key(&typed, "test").unwrap().as_slice(), &typed);
         for input in [
             b"secret-needle-invalid".as_slice(),
             b"AA==",
@@ -487,6 +547,31 @@ mod tests {
             let error = decode_key(input, "test").unwrap_err().to_string();
             assert!(!error.contains("secret-needle"));
         }
+    }
+    #[test]
+    fn key_files_must_belong_to_the_effective_user_or_root() {
+        assert!(owner_allowed(1000, 1000));
+        assert!(owner_allowed(0, 1000));
+        assert!(owner_allowed(0, 0));
+        assert!(!owner_allowed(1001, 1000));
+        assert!(!owner_allowed(1000, 0));
+    }
+    #[tokio::test]
+    async fn key_commands_receive_only_the_allowed_environment() {
+        let output = command(&["/usr/bin/env".into()], 5, &Ctl::default(), "test")
+            .await
+            .unwrap();
+        let text = String::from_utf8(output.to_vec()).unwrap();
+        for line in text.lines() {
+            let name = line.split_once('=').map_or(line, |(name, _)| name);
+            assert!(COMMAND_ENVIRONMENT.contains(&name), "leaked {name}");
+        }
+        // Cargo gives every test process variables outside the allowlist.
+        assert!(std::env::vars_os().any(|(name, _)| {
+            !COMMAND_ENVIRONMENT
+                .iter()
+                .any(|allowed| name.to_str() == Some(allowed))
+        }));
     }
     #[tokio::test]
     async fn private_files_credentials_bounds_and_forbidden_roots() {
