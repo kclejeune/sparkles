@@ -1030,6 +1030,89 @@ fn memory_virtual_base_retains_fork_snapshots() {
     }
 }
 
+/// A criss-cross whose ancestors both changed the same cell, which the merges
+/// accepted under `o`. The next merge under `o` synthesizes the virtual base with
+/// the same options, so it merges instead of reporting an ambiguous base.
+fn criss_cross_same_cell(p: &str, o: &MergeOptions) {
+    let (_dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&s, &format!("+<urn:a> <{p}> <urn:T1> ."));
+    apply(&dev, &format!("+<urn:a> <{p}> <urn:T2> ."));
+    let m1 = s.head_commit().seq;
+    merged(merge(&s, "dev", "main", o));
+    merge_historical(&s, "main", m1, "dev", o);
+    apply(&s, "+<urn:m2> <urn:p> <urn:x> .");
+    apply(&dev, "+<urn:d2> <urn:p> <urn:x> .");
+    assert_eq!(s.merge_base("dev", "main").unwrap().len(), 2);
+    let report = merged(merge(&s, "dev", "main", o));
+    assert!(report.base.is_none());
+    assert_eq!((report.inserted, report.deleted), (1, 0));
+    for term in ["urn:T1", "urn:T2", "urn:m2", "urn:d2"] {
+        assert!(has(&s, term), "{term}");
+    }
+}
+
+#[test]
+fn virtual_base_honours_exempt_predicates() {
+    let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    let o = MergeOptions {
+        exempt: vec![NamedNode::new(rdf_type).unwrap()],
+        ..Default::default()
+    };
+    criss_cross_same_cell(rdf_type, &o);
+}
+
+#[test]
+fn virtual_base_honours_the_quad_scope() {
+    let o = MergeOptions {
+        scope: ConflictScope::Quad,
+        ..Default::default()
+    };
+    criss_cross_same_cell("urn:kind", &o);
+}
+
+#[test]
+fn virtual_base_carries_deletes_of_both_ancestors() {
+    let (_dir, s) = setup();
+    apply(&s, "+<urn:c> <urn:p> <urn:x> .\n+<urn:e> <urn:p> <urn:x> .");
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    // each side deletes a different quad that the other keeps
+    apply(
+        &s,
+        "-<urn:c> <urn:p> <urn:x> .\n+<urn:m1> <urn:p> <urn:x> .",
+    );
+    apply(
+        &dev,
+        &format!(
+            "-<urn:e> <urn:p> <urn:x> .\n-<urn:a> <urn:age> {} .",
+            int(30)
+        ),
+    );
+    let m1 = s.head_commit().seq;
+    merged(merge(&s, "dev", "main", &Default::default()));
+    merge_historical(&s, "main", m1, "dev", &Default::default());
+    // after the criss-cross each side deletes one more quad
+    apply(&s, "-<urn:b> <urn:name> \"B\" .");
+    apply(&dev, "-<urn:m1> <urn:p> <urn:x> .");
+    assert_eq!(s.merge_base("dev", "main").unwrap().len(), 2);
+    let preview = s.preview_merge("dev", "main", &Default::default()).unwrap();
+    assert!(preview.base.is_none());
+    assert_eq!((preview.inserted, preview.deleted), (0, 1));
+    let report = merged(merge(&s, "dev", "main", &Default::default()));
+    assert!(report.base.is_none());
+    assert_eq!((report.inserted, report.deleted), (0, 1));
+    // nothing deleted on either side comes back
+    for term in ["urn:c>", "urn:e>", "urn:age", "urn:name", "urn:m1"] {
+        assert!(!has(&s, term), "{term}");
+    }
+    // and the other way, main's later delete reaches dev
+    let back = merged(merge(&s, "main", "dev", &Default::default()));
+    assert_eq!(back.deleted, 1);
+    assert_eq!(dump(&s), dump(&dev));
+}
+
 #[test]
 fn relink_preserves_history_blank_nodes_and_child_branches_after_restart() {
     let (dir, s) = setup();

@@ -203,12 +203,16 @@ impl Store {
     /// Recursively merge best common ancestors. Conflicting ancestor cells cannot
     /// be represented as RDF conflict markers, so they fail closed and allow the
     /// caller to select an explicit real base. Final-merge resolutions never bias
-    /// this synthesis. No writes, guards or durable merge records run here.
+    /// this synthesis, but the merge's conflict scope and exempt predicates apply,
+    /// so that ancestors which merged cleanly under them merge cleanly here too.
+    /// No writes, guards or durable merge records run here.
+    #[allow(clippy::too_many_arguments)]
     fn virtual_base(
         &self,
         set: &BranchSet,
         bases: &[CommitRef],
         snap: &Snapshot,
+        mo: &MergeOptions,
         o: &DiffOptions,
         memo: &mut FxHashMap<Vec<CommitRef>, VirtualBase>,
         depth: usize,
@@ -230,12 +234,14 @@ impl Store {
         let mut parents = vec![bases[0]];
         let strict = MergeOptions {
             include_inferences: true,
+            scope: mo.scope,
             ..Default::default()
         };
+        let exempt = exempt_keys(set, mo);
         for candidate in &bases[1..] {
             o.check()?;
             let ancestors = set.merge_bases_of(&parents, *candidate)?;
-            let common = self.virtual_base(set, &ancestors, snap, o, memo, depth + 1)?;
+            let common = self.virtual_base(set, &ancestors, snap, mo, o, memo, depth + 1)?;
             let theirs = VirtualBase {
                 anchor: *candidate,
                 changes: Toggles::default(),
@@ -245,7 +251,7 @@ impl Store {
             // With no resolutions and a fail-on-conflict rule, plan_merge never
             // reads `snap`: object replacement and dropped blank-node subgraphs
             // are impossible. It only compares the complete toggle groups.
-            let plan = plan_merge(snap, ours, theirs, &strict, &FxHashSet::default())?;
+            let plan = plan_merge(snap, ours, theirs, &strict, &exempt)?;
             if !plan.remaining.is_empty() {
                 let mut error = BranchError {
                     kind: BranchErrorKind::Conflict,
@@ -501,6 +507,7 @@ impl Store {
                         &set,
                         &bases,
                         &tgt.snapshot(),
+                        o,
                         &dopts,
                         &mut FxHashMap::default(),
                         0,
