@@ -5700,11 +5700,55 @@ pub(crate) struct Replay {
     pub index: wal::WalIndex,
 }
 
+/// Whether damage found at record `at` of a WAL, in the transaction that would be commit
+/// `seq`, is a torn tail rather than corruption.
+///
+/// A crash can only damage commits that were not yet durable. A commit is durable once
+/// a sync that started after it was written succeeds, and that sync covers every commit
+/// before it too. So the damaged commit and everything after it were never
+/// acknowledged, unless some later record proves the damaged commit was durable. Each
+/// checksummed commit record after the damage says how many commits just before it may
+/// not have been durable when it was written (see [`commit::seal_wal_commit_unfenced`]).
+/// Ordinary commits are synced one at a time, so the next commit record always proves
+/// its predecessors durable, and damage before the last commit stays corruption. Group
+/// commit writes up to a bounded number of commits before their shared sync, and their
+/// records admit it, so damage anywhere in that unsynced suffix is a torn tail.
+///
+/// A record from a release without commit metadata carries no count. It is taken to
+/// prove its predecessors durable, which keeps such logs as strict as they always were.
+pub(crate) fn wal_torn_from(buf: &[u8], at: usize, seq: u64) -> bool {
+    let recs = buf.as_chunks::<WAL_REC>().0;
+    for (i, rec) in recs.iter().enumerate().skip(at + 1) {
+        if rec[0] != WAL_COMMIT {
+            continue;
+        }
+        // The damage may have taken the previous commit record with it, so the
+        // transaction starts after the run of data records before this one.
+        let start = recs[at + 1..i]
+            .iter()
+            .rposition(|r| !matches!(r[0], WAL_INSERT | WAL_DELETE))
+            .map_or(at + 1, |p| at + 2 + p);
+        match commit::open_wal_commit(rec, &buf[start * WAL_REC..i * WAL_REC]) {
+            // the damaged commit's own record, after damage among its data, fails
+            Some(Err(())) => {}
+            Some(Ok((s, ..))) => {
+                let durable = s.checked_sub(1 + commit::wal_commit_unfenced(rec));
+                if durable.is_some_and(|d| d >= seq) {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Replay the records of a generation's WAL (`buf`) onto its base index, when the store
-/// opens. A checksum mismatch in the final transaction is a torn tail and ends the
-/// replay; one before it is [`Error::Corrupt`]. `check` runs every 64 Ki records with
-/// the delta so far. The same inputs always give the same commit numbers, and
-/// [`wal::WalCursor`] numbers the commits of past-state reads and diffs the same way.
+/// opens. Damage to a commit that may not have been durable ends the replay as a torn
+/// tail, and damage to one that a later record proves durable is [`Error::Corrupt`]
+/// (see [`wal_torn_from`]). `check` runs every 64 Ki records with the delta so far. The
+/// same inputs always give the same commit numbers, and [`wal::WalCursor`] numbers the
+/// commits of past-state reads and diffs the same way.
 pub(crate) fn replay_wal(
     from: &ReplayFrom<'_>,
     buf: &[u8],
@@ -5712,17 +5756,6 @@ pub(crate) fn replay_wal(
 ) -> Result<Replay> {
     let cache = from.cache;
     let recs = buf.as_chunks::<WAL_REC>().0;
-    // the last complete transaction may be torn; damage before it is corruption
-    let last_commit = recs.iter().rposition(|r| r[0] == WAL_COMMIT);
-    // where the last transaction starts: a commit that overwrites preallocated space may
-    // reach the disk in any order of its pages, so a crash can leave zeros in the middle
-    // of it, before its commit record. It was never acknowledged, and is torn.
-    let last_txn = last_commit.map(|l| {
-        recs[..l]
-            .iter()
-            .rposition(|r| r[0] == WAL_COMMIT)
-            .map_or(0, |p| p + 1)
-    });
     let dvocab_len = from.generation.dvocab.len();
     let mut out = Replay {
         delta: from.start.clone(),
@@ -5761,6 +5794,8 @@ pub(crate) fn replay_wal(
     };
     let mut quads = out.base_quads;
     let mut seen_v2 = false;
+    // the commit the transaction being read would be
+    let next_seq = |out: &Replay| out.commits.last().map_or(from.base.seq, |c| c.seq) + 1;
     for (i, rec) in recs.iter().enumerate() {
         if i % 65_536 == 65_535 {
             check(i as u64 + 1, &out.delta)?;
@@ -5775,8 +5810,8 @@ pub(crate) fn replay_wal(
             WAL_COMMIT => {
                 let meta = commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]);
                 if matches!(meta, Some(Err(()))) {
-                    if Some(i) == last_commit {
-                        break; // torn tail
+                    if wal_torn_from(buf, i, next_seq(&out)) {
+                        break;
                     }
                     return Err(Error::Corrupt(format!(
                         "{}: checksum mismatch in the transaction ending at byte {}",
@@ -5785,12 +5820,12 @@ pub(crate) fn replay_wal(
                     )));
                 }
                 // A commit's new terms and its WAL records are synced at the same time
-                // (see `sync_commit`): after a crash, the last commit may name terms
-                // that did not reach `delta.vocab`. It was never acknowledged.
+                // (see `sync_commit`): after a crash, a commit that was not durable yet
+                // may name terms that did not reach `delta.vocab`.
                 let needs = delta_ids_end(pending.iter().map(|(_, q)| q));
                 if needs > dvocab_len {
-                    if Some(i) == last_commit {
-                        break; // torn tail
+                    if wal_torn_from(buf, i, next_seq(&out)) {
+                        break;
                     }
                     return Err(Error::Corrupt(format!(
                         "{}: the transaction ending at byte {} names delta term {}, beyond the {dvocab_len} terms of delta.vocab",
@@ -5883,18 +5918,21 @@ pub(crate) fn replay_wal(
                 });
                 txn_start = i + 1;
             }
-            // zeros in the last transaction: torn
-            _ if last_txn.is_some_and(|t| i >= t) && wal::is_zero_record(rec) => break,
-            // damage before the last commit record is not a torn tail: truncating here
-            // would drop the committed transactions after it
-            op if last_commit.is_some_and(|l| i < l) => {
+            // A commit that overwrites preallocated space may reach the disk in any
+            // order of its pages, so a crash can leave zeros in the middle of it, before
+            // its commit record. Space preallocated after the last commit is zeros too.
+            // Truncating damage that a later record proves durable would drop the
+            // committed transactions after it.
+            op => {
+                if wal_torn_from(buf, i, next_seq(&out)) {
+                    break;
+                }
                 return Err(Error::Corrupt(format!(
                     "{}: unknown record type {op} at byte {}, before the last commit",
                     from.path.display(),
                     i * WAL_REC
                 )));
             }
-            _ => break,
         }
     }
     Ok(out)

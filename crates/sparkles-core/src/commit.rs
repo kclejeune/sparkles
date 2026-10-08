@@ -1232,7 +1232,8 @@ pub(crate) const WAL_FLAG_UNVALIDATED: u8 = 1;
 
 /// Fill bytes 9..33 of a WAL commit record (`rec[0]` = op, `rec[1..9]` = next blank
 /// node): seq, timestamp, kind, version, flags (byte 27) and a CRC over the
-/// transaction's data records followed by bytes 0..29 of this record.
+/// transaction's data records followed by bytes 0..29 of this record. Byte 28 is zero,
+/// which says that every commit before this one was durable when it was written.
 pub(crate) fn seal_wal_commit(
     rec: &mut [u8; 33],
     seq: u64,
@@ -1241,14 +1242,38 @@ pub(crate) fn seal_wal_commit(
     flags: u8,
     data: &[u8],
 ) {
+    seal_wal_commit_unfenced(rec, seq, ts, kind, flags, 0, data);
+}
+
+/// [`seal_wal_commit`] for a commit written while the `unfenced` commits just before it
+/// may not have reached the disk yet, as group commit does. The count goes in byte 28.
+/// Replay reads it with [`wal_commit_unfenced`] to learn which commits were durable
+/// when the record was written. Releases that predate the count wrote zero there, and
+/// they synced every commit before writing the next one, so zero is accurate for them.
+pub(crate) fn seal_wal_commit_unfenced(
+    rec: &mut [u8; 33],
+    seq: u64,
+    ts: i64,
+    kind: CommitKind,
+    flags: u8,
+    unfenced: u8,
+    data: &[u8],
+) {
     rec[9..17].copy_from_slice(&seq.to_le_bytes());
     rec[17..25].copy_from_slice(&ts.to_le_bytes());
     rec[25] = kind.code();
     rec[26] = WAL_COMMIT_V2;
     rec[27] = flags;
-    rec[28] = 0;
+    rec[28] = unfenced;
     let crc = crc32(&[data, &rec[..29]]);
     rec[29..33].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// How many commits just before a version-2 WAL commit record may not have been
+/// durable when the record was written (see [`seal_wal_commit_unfenced`]). Only a
+/// record whose checksum matches says anything.
+pub(crate) fn wal_commit_unfenced(rec: &[u8]) -> u64 {
+    rec[28] as u64
 }
 
 /// Commit metadata of a WAL commit record (seq, timestamp, kind and flags): `None` for

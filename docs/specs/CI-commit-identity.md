@@ -420,16 +420,22 @@ record (`op = 3`) puts its 24 spare bytes to use. Today they are always zero.
 | 17..25 | `timestamp_ms` i64 LE (Unix epoch, already clamped) |
 | 25 | `kind` code |
 | 26 | record version `2` (`0` = legacy record) |
-| 27..29 | reserved, zero |
+| 27 | flags (`1` = the write bypassed write-time validation) |
+| 28 | how many commits just before this one may not have been durable when it was written |
 | 29..33 | CRC-32 (IEEE, `flate2::Crc`) over this transaction's data records followed by bytes 0..29 of this record |
 
 Replay in `Store::open` groups records into transactions as it does today, and checks each
 commit record:
 
-* A CRC mismatch or a truncated transaction **in the last transaction** is a torn tail.
-  Replay truncates to the previous commit, as today.
-* A CRC mismatch **before** the last transaction is `Error::Corrupt`. Dropping
-  acknowledged commits silently would reuse their ids.
+* Damage to a transaction is a torn tail when no later commit record shows that the
+  transaction was durable. Damage here means a CRC mismatch, zero or unknown records, or
+  delta ids beyond `delta.vocab`. Replay truncates to the previous commit. Damage in the
+  last transaction is always a torn tail.
+* Damage that a later commit record shows was durable is `Error::Corrupt`. Dropping
+  acknowledged commits silently would reuse their ids. A commit record with byte 28 set
+  to `n` shows that commits up to its own seq minus `n + 1` were durable. Ordinary
+  commits write zero there, because each is synced before the next is written, so damage
+  before the last transaction stays corruption for them.
 * In a version 2 record, `seq` must equal the previous seq + 1. The first one must equal
   the generation's `base_seq + 1`. Anything else is `Error::Corrupt`.
 * Version 0 records are legacy records, handled as in §5.6.
@@ -791,6 +797,14 @@ record `forkedFrom` ([C06](C06-clone-to-sandbox.md)), backups and restores
   quads". POST and upload report the commit's net inserted count, which equals the old
   number.
 - `sparkles log` lists 20 commits unless `--limit` says otherwise.
+- Byte 28 of the commit record, reserved in §5.3 as first written, counts the commits
+  before it that may not have been durable yet. Experimental group commit writes up to
+  64 commits before their shared sync, so a crash can damage any of them, not just the
+  last. Replay treats such damage as a torn tail unless a later commit record shows the
+  damaged commit was durable. The count reaches the disk with the next sync, so the
+  records of the most recent group cannot prove each other durable. Damage to them after
+  they were acknowledged, which only a failing disk causes, is truncated like a torn last
+  transaction.
 
 **Open questions.** Directory copies still share an id (question 1). Clones, and restores
 into a new lineage, mint a new id and record `forkedFrom`. Default response bodies are

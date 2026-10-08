@@ -1167,8 +1167,9 @@ impl Checker<'_> {
             }
         };
         // a writer syncs a commit's new delta terms together with its WAL records, so
-        // after a crash only the last commit can name terms that delta.vocab lacks (a
-        // torn tail). Counted again now, it covers every commit before that.
+        // after a crash only commits that were not durable yet can name terms that
+        // delta.vocab lacks (a torn tail). Counted again now, it covers every commit
+        // before them.
         let dvocab_len = match std::fs::read(dir.join("delta.vocab")) {
             Ok(b) => Some(delta_entries(&b).0.len() as u64),
             Err(_) => self.dvocab_len,
@@ -1189,14 +1190,11 @@ impl Checker<'_> {
         let preallocated = buf.len() - logical;
         let buf = &buf[..logical];
         let recs = buf.as_chunks::<WAL_REC>().0;
-        let last_commit = recs.iter().rposition(|r| r[0] == WAL_COMMIT);
-        // the last transaction, where a crash can leave zeros before its commit record
-        let last_txn = last_commit.map(|l| {
-            recs[..l]
-                .iter()
-                .rposition(|r| r[0] == WAL_COMMIT)
-                .map_or(0, |p| p + 1)
-        });
+        // whether damage at record `i` is a torn tail that open truncates, by the rule
+        // open uses
+        let torn_at = |i: usize, prev_seq: Option<u64>| {
+            crate::store::wal_torn_from(buf, i, prev_seq.map_or(0, |s| s + 1))
+        };
         let (mut prev_seq, mut prev_ts) = (base_seq, base_ts);
         let mut commits: Vec<(u64, i64, u8)> = Vec::new();
         let (mut folded, mut data_recs) = (0usize, 0usize);
@@ -1239,13 +1237,16 @@ impl Checker<'_> {
                     let n = i - txn_start;
                     let n = format!("{n} data record{}", if n == 1 { "" } else { "s" });
                     let meta = commit::open_wal_commit(rec, data);
-                    let is_last = Some(i) == last_commit;
                     let issues = std::mem::take(&mut txn_issues);
                     let missing_terms = std::mem::take(&mut txn_missing_terms);
-                    if is_last && missing_terms && matches!(meta, Some(Ok(_))) {
+                    // damage that no later commit record shows was durable is a torn tail
+                    let torn_here = (matches!(meta, Some(Err(())))
+                        || (missing_terms && matches!(meta, Some(Ok(_)))))
+                        && torn_at(i, prev_seq);
+                    if torn_here && missing_terms && matches!(meta, Some(Ok(_))) {
                         run.add(
                             Issue::warning(format!(
-                                "the final transaction ({n} from offset {}) names delta terms that delta.vocab lacks: they did not reach the disk before a crash, so it is treated as torn and truncated on open",
+                                "the transaction ({n} from offset {}) names delta terms that delta.vocab lacks, and no later commit shows it was durable: the terms did not reach the disk before a crash, so it is treated as torn and truncated on open",
                                 txn_start * WAL_REC
                             ))
                             .file(&file)
@@ -1255,17 +1256,17 @@ impl Checker<'_> {
                         torn = true;
                         break;
                     }
-                    // a torn final transaction is truncated whole, whatever ids it names
-                    if !(is_last && matches!(meta, Some(Err(())))) {
+                    // a torn transaction is truncated whole, whatever ids it names
+                    if !torn_here {
                         for issue in issues {
                             run.add(issue);
                         }
                     }
                     match meta {
-                        Some(Err(())) if is_last => {
+                        Some(Err(())) if torn_here => {
                             run.add(
                                 Issue::warning(format!(
-                                    "the final transaction ({n} from offset {}) fails its checksum: it is treated as torn and truncated on open",
+                                    "the transaction ({n} from offset {}) fails its checksum, and no later commit shows it was durable: it is treated as torn and truncated on open",
                                     txn_start * WAL_REC
                                 ))
                                 .file(&file)
@@ -1330,23 +1331,11 @@ impl Checker<'_> {
                     good = (i + 1) * WAL_REC;
                     txn_start = i + 1;
                 }
-                _ if zero(rec) && last_txn.is_some_and(|t| i >= t) => {
-                    run.add(
-                        Issue::warning(format!(
-                            "record {i} is zeros inside the last transaction, which did not reach the disk whole: the tail from offset {good} is truncated on open"
-                        ))
-                        .file(&file)
-                        .offset(at)
-                        .row(i as u64),
-                    );
-                    torn = true;
-                    break;
-                }
                 op => {
-                    if last_commit.is_some_and(|l| i < l) {
+                    if !torn_at(i, prev_seq) {
                         run.add(
                             Issue::error(format!(
-                                "record {i} has unknown type {op}, before the last commit record: open refuses the database"
+                                "record {i} has unknown type {op}, and a later commit record shows its transaction was durable: open refuses the database"
                             ))
                             .file(&file)
                             .offset(at)
@@ -1354,9 +1343,16 @@ impl Checker<'_> {
                         );
                         continue;
                     }
+                    let what = if zero(rec) {
+                        "is zeros, so its transaction did not reach the disk whole".to_string()
+                    } else {
+                        format!(
+                            "has unknown type {op}, and no later commit shows its transaction was durable"
+                        )
+                    };
                     run.add(
                         Issue::warning(format!(
-                            "record {i} has unknown type {op} after the last commit: the tail from offset {good} is truncated on open"
+                            "record {i} {what}: the tail from offset {good} is truncated on open"
                         ))
                         .file(&file)
                         .offset(at)

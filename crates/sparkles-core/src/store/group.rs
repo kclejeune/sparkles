@@ -10,6 +10,8 @@ use std::time::Duration;
 
 pub(super) const MAX_BYTES: u64 = 4 << 20;
 const MAX_COMMITS: usize = 64;
+/// The most commits a WAL commit record can say may not be durable before it.
+const MAX_UNFENCED: u64 = u8::MAX as u64;
 
 #[derive(Default)]
 pub(super) struct Ticket(AtomicU8);
@@ -248,12 +250,25 @@ impl Store {
 }
 
 impl WriteTxn<'_> {
+    /// Commits written before the next one that may not be durable yet. Only fenced
+    /// commits are published, so the published head is durable.
+    fn unfenced(&self, store: &Store) -> u64 {
+        self.guard
+            .head
+            .seq
+            .saturating_sub(store.current.load().commit)
+    }
+
     pub(super) fn publish_grouped(&mut self) -> Result<Receipt> {
         let store = self.store;
         let group = store.group.as_ref().expect("grouped admission enabled");
-        if group.full(self.wal_bytes()) {
+        // The commit record counts the commits before it that may not be durable yet
+        // in one byte, which a full queue keeps far below its limit.
+        if group.full(self.wal_bytes()) || self.unfenced(store) >= MAX_UNFENCED {
             store.drain_group(&mut self.guard, Some(&self.opts))?;
         }
+        // Publication only lowers the count, so reading it early stays conservative.
+        let unfenced = u8::try_from(self.unfenced(store)).expect("drained above");
         self.check_storage()?;
         let generation = self.base.generation.clone();
         if generation.dvocab.needs_sync() {
@@ -277,7 +292,15 @@ impl WriteTxn<'_> {
         }
         rec[0] = WAL_COMMIT;
         rec[1..9].copy_from_slice(&w.next_bnode.to_le_bytes());
-        commit::seal_wal_commit(&mut rec, c.seq, c.timestamp_ms, c.kind, 0, &data);
+        commit::seal_wal_commit_unfenced(
+            &mut rec,
+            c.seq,
+            c.timestamp_ms,
+            c.kind,
+            0,
+            unfenced,
+            &data,
+        );
         data.extend_from_slice(&rec);
         let before = w.wal_alloc;
         if let Err(e) = wal.flush().and_then(|_| {
@@ -1252,6 +1275,142 @@ mod tests {
             }
             // Process exit is not a power-loss simulation: complete unacked
             // suffixes may recover, but no acknowledged prefix may disappear.
+        }
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    fn wal_path(root: &Path) -> PathBuf {
+        let cur = std::fs::read_to_string(root.join("CURRENT")).unwrap();
+        root.join(cur.trim()).join("wal.log")
+    }
+
+    /// The record range of each transaction in a WAL, its commit record included.
+    fn transactions(buf: &[u8]) -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        for (i, rec) in buf.as_chunks::<WAL_REC>().0.iter().enumerate() {
+            if rec[0] == WAL_COMMIT {
+                out.push(start..i + 1);
+                start = i + 1;
+            }
+        }
+        out
+    }
+
+    /// What `sparkles check` says about a WAL, which must agree with open.
+    fn wal_check(root: &Path) -> crate::check::Status {
+        let opts = crate::check::CheckOptions { quick: false };
+        let report = crate::check::check(root, &opts).unwrap();
+        report.get("wal").expect("a wal check").status
+    }
+
+    fn has(snap: &Snapshot, name: &str) -> bool {
+        let Some(s) = snap.lookup_iri(&format!("urn:{name}")) else {
+            return false;
+        };
+        let q = [
+            s,
+            snap.lookup_iri("urn:p").unwrap(),
+            snap.lookup_iri("urn:o").unwrap(),
+            Id::DEFAULT_GRAPH,
+        ];
+        snap.contains(&q).unwrap()
+    }
+
+    #[test]
+    fn damage_inside_an_unfenced_suffix_is_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = Arc::new(Store::open(&root, options()).unwrap());
+        insert(&s, "one").unwrap();
+        let (hit, go) = pause(&s, "group-sealed");
+        let second = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "two"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        let later: Vec<_> = ["three", "four", "five"]
+            .into_iter()
+            .map(|name| {
+                let s = s.clone();
+                thread::spawn(move || insert(&s, name))
+            })
+            .collect();
+        queued(&s, 3);
+        // Power loss now could keep any subset of the pages of commits 2 to 5,
+        // which no sync has covered yet. Only commit 1 was acknowledged.
+        let crashed = dir.path().join("crashed");
+        copy_dir(&root, &crashed);
+        go.send(()).unwrap();
+        second.join().unwrap().unwrap();
+        for t in later {
+            t.join().unwrap().unwrap();
+        }
+        let buf = std::fs::read(wal_path(&crashed)).unwrap();
+        let txns = transactions(&buf);
+        assert_eq!(txns.len(), 5);
+        type Damage = fn(&mut [u8]);
+        let damages: [(&str, Damage); 2] = [
+            ("zeroed pages", |b| b.fill(0)),
+            ("a checksum mismatch", |b| b[5] ^= 0x55),
+        ];
+        for (what, damage) in damages {
+            let case = dir.path().join(what.replace(' ', "-"));
+            copy_dir(&crashed, &case);
+            let mut bad = buf.clone();
+            let third = &txns[2];
+            damage(&mut bad[third.start * WAL_REC..third.end * WAL_REC]);
+            std::fs::write(wal_path(&case), &bad).unwrap();
+            assert_eq!(wal_check(&case), crate::check::Status::Warning, "{what}");
+            let s = Store::open(&case, Default::default())
+                .unwrap_or_else(|e| panic!("{what} in the unfenced suffix: {e}"));
+            let snap = s.snapshot();
+            assert_eq!(snap.commit, 2, "{what}");
+            assert!(has(&snap, "one") && has(&snap, "two"), "{what}");
+            assert_eq!(snap.len(), 2, "{what}");
+            assert_eq!(
+                std::fs::metadata(wal_path(&case)).unwrap().len(),
+                (txns[1].end * WAL_REC) as u64,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn damage_a_later_grouped_record_proves_durable_is_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        {
+            let s = Store::open(&root, options()).unwrap();
+            for name in ["one", "two", "three"] {
+                insert(&s, name).unwrap();
+            }
+        }
+        let path = wal_path(&root);
+        let buf = std::fs::read(&path).unwrap();
+        let txns = transactions(&buf);
+        assert_eq!(txns.len(), 3);
+        // Commit 3 was written after commit 2 was acknowledged, and its record says so.
+        let mut bad = buf.clone();
+        bad[txns[1].start * WAL_REC..txns[1].end * WAL_REC].fill(0);
+        std::fs::write(&path, &bad).unwrap();
+        assert_eq!(wal_check(&root), crate::check::Status::Error);
+        match Store::open(&root, Default::default()) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("wal.log"), "{m}"),
+            Err(e) => panic!("expected corruption, got {e}"),
+            Ok(_) => panic!("damage before the durable point must not be truncated"),
         }
     }
 }
