@@ -20,7 +20,6 @@ use object_store::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 #[path = "local.rs"]
 pub(super) mod local;
@@ -163,8 +162,10 @@ impl Retirement {
                 .as_ref()
                 .ok_or_else(slots::incompatible)?,
         )?;
-        let mut expected = old.clone();
+        // The tag changes with the epoch list, so compare the unsigned descriptors.
+        let mut expected = old.unsigned();
         expected.epochs.retain(|e| e.epoch != self.epoch);
+        let new = new.unsigned();
         if self.previous.id != id
             || self.next.id != id
             || self.epoch == old.active()
@@ -360,6 +361,7 @@ async fn recover(
         )?,
         slots,
         options,
+        &std::collections::BTreeMap::new(),
     )
     .await?;
     for slot in &intent.slots {
@@ -375,7 +377,7 @@ async fn recover(
 impl Repository {
     fn encryption_options(&self) -> Result<&EncryptionOptions> {
         match &self.key_options {
-            crate::security::KeyOptions::Local(options) => Ok(options),
+            crate::security::KeyOptions::Local(keys) => Ok(&keys.options),
             _ => Err(slots::config("repository is not encrypted")),
         }
     }
@@ -486,8 +488,7 @@ impl Repository {
         supplied.check(false)?;
         let guard = self.key_guard(LockOperation::KeyAdd, ctl).await?;
         let result = async {
-            let options = self.encryption_options()?;
-            let snapshot = repository::open_snapshot(&self.store, self.marker.id, options).await?;
+            let snapshot = self.security().await?.sealed.expect("encrypted");
             if snapshot.keys.len() != snapshot.descriptor.epochs.len() {
                 return Err(slots::required());
             }
@@ -595,7 +596,7 @@ impl Repository {
                 let epoch = self.security().await?.epoch().expect("encrypted");
                 return Ok(epoch);
             }
-            let snapshot = repository::open_snapshot(&self.store, self.marker.id, options).await?;
+            let snapshot = self.security().await?.sealed.expect("encrypted");
             let existing = repository::read_slots(&self.store).await?;
             let count = options.keys.len() + options.passphrases.len();
             if existing.len() + count > slots::MAX_SLOTS
@@ -612,15 +613,8 @@ impl Repository {
                 .unwrap_or(0)
                 .checked_add(1)
                 .ok_or_else(|| slots::config("epoch number exhausted"))?;
-            let keys = EpochKeys::new(
-                self.marker.id,
-                epoch,
-                Zeroizing::new(primitive::random::<32>()?),
-            )?;
-            let slots = repository::wrap_slots(Arc::new(keys), options).await?;
-            let (previous, _) = marker(&self.store).await?;
-            let mut next = previous.clone();
-            let mut descriptor = snapshot.descriptor;
+            let keys = EpochKeys::new(self.marker.id, epoch, primitive::random_key()?)?;
+            let mut descriptor = snapshot.descriptor.clone();
             for old in &mut descriptor.epochs {
                 old.state = "retired".into();
             }
@@ -629,6 +623,10 @@ impl Repository {
                 state: "active".into(),
                 created: crate::now_rfc3339(),
             });
+            descriptor.sign(&keys)?;
+            let slots = repository::wrap_slots(Arc::new(keys), options).await?;
+            let (previous, _) = marker(&self.store).await?;
+            let mut next = previous.clone();
             next.encryption = Some(serde_json::to_value(descriptor).expect("serializes"));
             let intent = Rotation {
                 format: 1,
@@ -722,6 +720,7 @@ impl Repository {
             let mut next = previous.clone();
             let mut descriptor = snapshot.descriptor.clone();
             descriptor.epochs.retain(|e| e.epoch != epoch);
+            descriptor.sign(snapshot.active())?;
             next.encryption = Some(serde_json::to_value(descriptor).expect("serializes"));
             let retired = repository::read_slots(&self.store)
                 .await?
@@ -762,6 +761,12 @@ impl Repository {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    async fn sign_active(repo: &Repository, descriptor: &mut Descriptor) {
+        let snapshot = repo.security().await.unwrap().sealed.unwrap();
+        descriptor
+            .sign(snapshot.key(descriptor.active()).unwrap())
+            .unwrap();
+    }
     #[cfg(all(feature = "fs", any(target_os = "linux", target_os = "android")))]
     async fn filesystem(path: &std::path::Path, options: &EncryptionOptions) -> Repository {
         Repository::open_encrypted(
@@ -801,13 +806,9 @@ mod tests {
                 state: "active".into(),
                 created: crate::now_rfc3339(),
             });
+            let keys = EpochKeys::new(repo.id(), 2, primitive::random_key().unwrap()).unwrap();
+            descriptor.sign(&keys).unwrap();
             next.encryption = Some(serde_json::to_value(descriptor).unwrap());
-            let keys = EpochKeys::new(
-                repo.id(),
-                2,
-                Zeroizing::new(primitive::random::<32>().unwrap()),
-            )
-            .unwrap();
             let intent = Rotation {
                 format: 1,
                 kind: "sparkles-repo-rotation".into(),
@@ -849,6 +850,7 @@ mod tests {
             let mut next = previous.clone();
             let mut descriptor = Descriptor::parse(previous.encryption.as_ref().unwrap()).unwrap();
             descriptor.epochs.retain(|e| e.epoch != 1);
+            sign_active(&repo, &mut descriptor).await;
             next.encryption = Some(serde_json::to_value(descriptor).unwrap());
             let intent = Retirement {
                 previous,
@@ -1411,6 +1413,7 @@ mod tests {
         let mut next = previous.clone();
         let mut descriptor = Descriptor::parse(previous.encryption.as_ref().unwrap()).unwrap();
         descriptor.epochs.retain(|e| e.epoch != 1);
+        sign_active(&repo, &mut descriptor).await;
         next.encryption = Some(serde_json::to_value(descriptor).unwrap());
         let mut slots = repository::read_slots(&repo.store).await.unwrap();
         slots.sort_by_key(|slot| slot.epoch);
@@ -1475,13 +1478,9 @@ mod tests {
                 state: "active".into(),
                 created: crate::now_rfc3339(),
             });
+            let keys = EpochKeys::new(repo.id(), 2, primitive::random_key().unwrap()).unwrap();
+            descriptor.sign(&keys).unwrap();
             next.encryption = Some(serde_json::to_value(descriptor).unwrap());
-            let keys = EpochKeys::new(
-                repo.id(),
-                2,
-                Zeroizing::new(primitive::random::<32>().unwrap()),
-            )
-            .unwrap();
             let slots = opts
                 .keys
                 .iter()
@@ -1557,6 +1556,7 @@ mod tests {
             let mut next = previous.clone();
             let mut descriptor = Descriptor::parse(previous.encryption.as_ref().unwrap()).unwrap();
             descriptor.epochs.retain(|e| e.epoch != 1);
+            sign_active(&repo, &mut descriptor).await;
             next.encryption = Some(serde_json::to_value(descriptor).unwrap());
             let slots = repository::read_slots(&repo.store)
                 .await

@@ -8,6 +8,8 @@ use zeroize::Zeroizing;
 
 pub const MAX_SLOTS: usize = 32;
 pub const MAX_SLOT_BYTES: usize = 16384;
+/// The slot format written for new slots. Format 1 slots remain readable.
+pub const SLOT_FORMAT: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -45,8 +47,14 @@ impl std::fmt::Debug for LocalKey {
     }
 }
 impl LocalKey {
-    pub fn new(label: impl Into<String>, source: LocalKeySource, key: [u8; 32]) -> Result<Self> {
-        let key = Zeroizing::new(key);
+    /// Pass a [`Zeroizing`] buffer to avoid leaving an unzeroized copy of the key
+    /// with the caller. A plain array is accepted for compatibility and tests.
+    pub fn new(
+        label: impl Into<String>,
+        source: LocalKeySource,
+        key: impl Into<Zeroizing<[u8; 32]>>,
+    ) -> Result<Self> {
+        let key = key.into();
         let label = label.into();
         check_label(&label)?;
         Ok(Self {
@@ -120,7 +128,7 @@ impl EncryptionOptions {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Descriptor {
     pub scheme: String,
@@ -130,8 +138,14 @@ pub(crate) struct Descriptor {
     pub epochs: Vec<Epoch>,
     pub padding: String,
     pub write_only: bool,
+    /// HMAC-SHA256 over the repository id and every other descriptor field, under a
+    /// subkey of the active epoch's master key. Descriptors written before this field
+    /// existed have none. They are accepted until this host has seen an authenticated
+    /// descriptor for the repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Epoch {
     pub epoch: u32,
@@ -152,6 +166,7 @@ impl Descriptor {
             }],
             padding: "padme".into(),
             write_only: false,
+            mac: None,
         }
     }
     pub fn parse(value: &serde_json::Value) -> Result<Self> {
@@ -172,8 +187,17 @@ impl Descriptor {
                     || !matches!(e.state.as_str(), "active" | "retired")
                     || chrono::DateTime::parse_from_rfc3339(&e.created).is_err()
             })
+            || value
+                .mac
+                .as_ref()
+                .is_some_and(|mac| mac.len() != 64 || !is_lower_hex(mac))
         {
             return Err(incompatible());
+        }
+        // Rotation always activates a new highest epoch and retirement never removes
+        // the active one, so an older epoch can never legitimately become active again.
+        if value.active() != value.max_epoch() {
+            return Err(tampered("the active key epoch is not the newest epoch"));
         }
         Ok(value)
     }
@@ -184,6 +208,75 @@ impl Descriptor {
             .expect("descriptor checked")
             .epoch
     }
+    pub fn max_epoch(&self) -> u32 {
+        self.epochs.iter().map(|e| e.epoch).max().unwrap_or(0)
+    }
+    /// The same descriptor without its authentication tag.
+    pub fn unsigned(&self) -> Self {
+        Self {
+            mac: None,
+            ..self.clone()
+        }
+    }
+    fn signed_bytes(&self, repository: Uuid) -> Vec<u8> {
+        let mut bytes = DESCRIPTOR_INFO.to_vec();
+        bytes.push(0);
+        bytes.extend_from_slice(repository.as_bytes());
+        bytes.extend_from_slice(&serde_json::to_vec(&self.unsigned()).expect("serializes"));
+        bytes
+    }
+    fn mac_key(keys: &EpochKeys) -> Result<Zeroizing<[u8; 32]>> {
+        primitive::derive(keys.master.as_ref(), &[], DESCRIPTOR_INFO)
+    }
+    /// Authenticate the descriptor under the active epoch's master key.
+    pub fn sign(&mut self, keys: &EpochKeys) -> Result<()> {
+        if keys.epoch != self.active() {
+            return Err(config("descriptor must be signed by its active epoch"));
+        }
+        let tag = primitive::mac(
+            Self::mac_key(keys)?.as_ref(),
+            &self.signed_bytes(keys.repository),
+        );
+        self.mac = Some(crate::blob::hex(&tag));
+        Ok(())
+    }
+    /// Check the tag, when present, under the active epoch's master key. A missing
+    /// tag marks a legacy descriptor, and the caller decides whether to accept it.
+    pub fn verify(&self, keys: &EpochKeys) -> Result<()> {
+        let Some(mac) = &self.mac else {
+            return Ok(());
+        };
+        let tag = mac
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                std::str::from_utf8(pair)
+                    .ok()
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(incompatible)?;
+        if keys.epoch != self.active()
+            || !primitive::mac_verify(
+                Self::mac_key(keys)?.as_ref(),
+                &self.signed_bytes(keys.repository),
+                &tag,
+            )
+        {
+            return Err(tampered(
+                "repository key epoch metadata failed authentication",
+            ));
+        }
+        Ok(())
+    }
+}
+
+const DESCRIPTOR_INFO: &[u8] = b"sparkles/f07/repo/descriptor";
+
+fn is_lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -269,7 +362,7 @@ impl Slot {
             .split_once(':')
             .ok_or_else(|| config("invalid key fingerprint"))?;
         if slot.kind != "sparkles-key-slot"
-            || slot.format != 1
+            || !matches!(slot.format, 1 | SLOT_FORMAT)
             || slot.id.is_nil()
             || slot.epoch == 0
             || chrono::DateTime::parse_from_rfc3339(&slot.created).is_err()
@@ -325,27 +418,53 @@ impl Slot {
         kdf: Option<Argon>,
     ) -> Result<Self> {
         check_label(label)?;
-        let id = Uuid::new_v4();
         let nonce = primitive::random::<12>()?;
-        let ct = primitive::seal(
-            kek,
-            nonce,
-            &slot_aad(keys.repository, keys.epoch, id),
-            keys.master.as_ref(),
-        )?;
-        Ok(Self {
+        let mut slot = Self {
             kind: "sparkles-key-slot".into(),
-            format: 1,
-            id,
+            format: SLOT_FORMAT,
+            id: Uuid::new_v4(),
             epoch: keys.epoch,
             label: label.into(),
             created: crate::now_rfc3339(),
             source: source.into(),
             kek_id: fingerprint(source, kek),
             nonce: STANDARD.encode(nonce),
-            ct: STANDARD.encode(ct),
+            ct: String::new(),
             kdf,
-        })
+        };
+        let ct = primitive::seal(kek, nonce, &slot.aad(keys.repository), keys.master.as_ref())?;
+        slot.ct = STANDARD.encode(ct);
+        Ok(slot)
+    }
+    /// Associated data of the wrap. Format 1 binds the repository, epoch and slot id.
+    /// Format 2 also binds the label, creation time, source, `kekId` and KDF
+    /// parameters, so they cannot be edited without the slot failing to open.
+    fn aad(&self, repository: Uuid) -> Vec<u8> {
+        let mut bytes = repository.as_bytes().to_vec();
+        bytes.extend_from_slice(&self.epoch.to_le_bytes());
+        bytes.extend_from_slice(self.id.as_bytes());
+        if self.format >= SLOT_FORMAT {
+            let kdf = self
+                .kdf
+                .as_ref()
+                .map(|kdf| serde_json::to_vec(kdf).expect("serializes"))
+                .unwrap_or_default();
+            bytes.extend_from_slice(b"sparkles/f07/slot-metadata");
+            for field in [
+                self.label.as_bytes(),
+                self.created.as_bytes(),
+                self.source.as_bytes(),
+                self.kek_id.as_bytes(),
+                &kdf,
+            ] {
+                bytes.extend_from_slice(&(field.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(field);
+            }
+        }
+        bytes
+    }
+    pub fn is_passphrase(&self) -> bool {
+        self.kdf.is_some()
     }
     pub fn open(&self, repository: Uuid, options: &EncryptionOptions) -> Result<Option<EpochKeys>> {
         let mut keks = Vec::new();
@@ -362,14 +481,9 @@ impl Slot {
                 // Provider metadata records provenance, not permission to use
                 // resolved bytes. Match fingerprints with the stored prefix below
                 // so a file/env/credential migration preserves existing wraps.
-                keks.push(Zeroizing::new(
-                    input
-                        .secret
-                        .as_ref()
-                        .as_ref()
-                        .try_into()
-                        .expect("key length"),
-                ));
+                let mut kek = Zeroizing::new([0; 32]);
+                kek.copy_from_slice(input.secret.as_ref().as_ref());
+                keks.push(kek);
             }
         }
         for kek in keks {
@@ -381,21 +495,13 @@ impl Slot {
                 .try_into()
                 .map_err(|_| config("invalid key slot nonce"))?;
             let ct = super::objects::decode_bounded(&self.ct, 48)?;
-            let master = primitive::open(
-                kek.as_ref(),
-                nonce,
-                &slot_aad(repository, self.epoch, self.id),
-                &ct,
-            )?;
-            let master: [u8; 32] = master
-                .as_slice()
-                .try_into()
-                .map_err(|_| config("invalid repository master key"))?;
-            return Ok(Some(EpochKeys::new(
-                repository,
-                self.epoch,
-                Zeroizing::new(master),
-            )?));
+            let opened = primitive::open(kek.as_ref(), nonce, &self.aad(repository), &ct)?;
+            if opened.len() != 32 {
+                return Err(config("invalid repository master key"));
+            }
+            let mut master = Zeroizing::new([0; 32]);
+            master.copy_from_slice(&opened);
+            return Ok(Some(EpochKeys::new(repository, self.epoch, master)?));
         }
         Ok(None)
     }
@@ -411,12 +517,6 @@ impl Slot {
     }
 }
 
-fn slot_aad(repo: Uuid, epoch: u32, slot: Uuid) -> Vec<u8> {
-    let mut bytes = repo.as_bytes().to_vec();
-    bytes.extend_from_slice(&epoch.to_le_bytes());
-    bytes.extend_from_slice(slot.as_bytes());
-    bytes
-}
 fn fingerprint(source: &str, key: &[u8]) -> String {
     format!(
         "{source}:{}",
@@ -434,6 +534,10 @@ pub(crate) fn required() -> BackupError {
 }
 pub(crate) fn config(message: &str) -> BackupError {
     BackupError::new(Code::InvalidConfig, message)
+}
+/// Repository key metadata that fails authentication or consistency checks.
+pub(crate) fn tampered(message: &str) -> BackupError {
+    BackupError::invalid_backup("encryption", message)
 }
 pub(crate) fn incompatible() -> BackupError {
     BackupError::new(
@@ -473,6 +577,63 @@ mod tests {
             ..Default::default()
         };
         assert!(slot.open(repo, &wrong).unwrap().is_none());
+    }
+    #[test]
+    fn new_slots_bind_their_metadata_and_legacy_slots_still_open() {
+        let repo = Uuid::new_v4();
+        let master = EpochKeys::new(repo, 1, Zeroizing::new([6; 32])).unwrap();
+        let key = LocalKey::new("ops", LocalKeySource::File, Zeroizing::new([8; 32])).unwrap();
+        let opts = EncryptionOptions {
+            keys: vec![key.clone()],
+            single_key_ok: true,
+            ..Default::default()
+        };
+        let slot = Slot::local(&master, &key).unwrap();
+        assert_eq!(slot.format, SLOT_FORMAT);
+        assert!(slot.open(repo, &opts).unwrap().is_some());
+        for edit in [
+            (|s: &mut Slot| s.label = "relabeled".into()) as fn(&mut Slot),
+            |s| s.created = "2001-01-01T00:00:00Z".into(),
+            |s| s.format = 1,
+        ] {
+            let mut bad = slot.clone();
+            edit(&mut bad);
+            assert!(bad.open(repo, &opts).is_err());
+        }
+        // A format 1 slot binds only the repository, epoch and slot id.
+        let mut legacy = slot.clone();
+        legacy.format = 1;
+        let nonce: [u8; 12] = STANDARD.decode(&legacy.nonce).unwrap().try_into().unwrap();
+        legacy.ct = STANDARD.encode(
+            primitive::seal(&[8; 32], nonce, &legacy.aad(repo), master.master.as_ref()).unwrap(),
+        );
+        let legacy = Slot::parse(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(legacy.open(repo, &opts).unwrap().is_some());
+    }
+    #[test]
+    fn descriptor_tags_bind_repository_and_epochs() {
+        let repo = Uuid::new_v4();
+        let keys = EpochKeys::new(repo, 1, Zeroizing::new([4; 32])).unwrap();
+        let mut descriptor = Descriptor::new();
+        descriptor.sign(&keys).unwrap();
+        let parsed = Descriptor::parse(&serde_json::to_value(&descriptor).unwrap()).unwrap();
+        parsed.verify(&keys).unwrap();
+        let other = EpochKeys::new(Uuid::new_v4(), 1, Zeroizing::new([4; 32])).unwrap();
+        assert!(parsed.verify(&other).is_err());
+        let mut changed = parsed.clone();
+        changed.epochs[0].created = "2001-01-01T00:00:00Z".into();
+        assert!(changed.verify(&keys).is_err());
+        let mut older_active = descriptor.unsigned();
+        older_active.epochs[0].state = "retired".into();
+        older_active.epochs.push(Epoch {
+            epoch: 2,
+            state: "active".into(),
+            created: crate::now_rfc3339(),
+        });
+        assert!(Descriptor::parse(&serde_json::to_value(&older_active).unwrap()).is_ok());
+        older_active.epochs[0].state = "active".into();
+        older_active.epochs[1].state = "retired".into();
+        assert!(Descriptor::parse(&serde_json::to_value(&older_active).unwrap()).is_err());
     }
     #[test]
     fn malicious_argon_parameters_are_rejected_before_derivation() {

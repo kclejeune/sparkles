@@ -19,10 +19,19 @@ impl hkdf::KeyType for KeyLength {
     }
 }
 
+/// Random public values such as salts and nonces. Use [`random_key`] for secrets,
+/// because this returns an ordinary array that is copied without zeroization.
 pub fn random<const N: usize>() -> Result<[u8; N]> {
-    let mut bytes = Zeroizing::new([0; N]);
+    let mut bytes = [0; N];
     getrandom::fill(bytes.as_mut()).map_err(|_| crypto_error())?;
-    Ok(*bytes)
+    Ok(bytes)
+}
+
+/// A random secret key, filled in place inside its zeroizing buffer.
+pub fn random_key() -> Result<Zeroizing<[u8; KEY_BYTES]>> {
+    let mut bytes = Zeroizing::new([0; KEY_BYTES]);
+    getrandom::fill(bytes.as_mut()).map_err(|_| crypto_error())?;
+    Ok(bytes)
 }
 
 pub fn derive(secret: &[u8], salt: &[u8], info: &[u8]) -> Result<Zeroizing<[u8; KEY_BYTES]>> {
@@ -41,6 +50,11 @@ pub fn mac(key: &[u8], bytes: &[u8]) -> [u8; KEY_BYTES] {
     let mut out = [0; KEY_BYTES];
     out.copy_from_slice(tag.as_ref());
     out
+}
+
+/// Constant-time HMAC-SHA256 tag check.
+pub fn mac_verify(key: &[u8], bytes: &[u8], tag: &[u8]) -> bool {
+    hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, key), bytes, tag).is_ok()
 }
 
 pub fn seal(key: &[u8], nonce: [u8; 12], aad: &[u8], plain: &[u8]) -> Result<Vec<u8>> {

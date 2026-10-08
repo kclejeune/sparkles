@@ -656,3 +656,174 @@ async fn rotation_waits_for_an_admitted_create_and_new_writers_capture_the_new_e
         2
     );
 }
+
+async fn marker_value(store: &InMemory) -> serde_json::Value {
+    let bytes = store
+        .get(&layout::marker_key())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+async fn put_marker(store: &InMemory, marker: &serde_json::Value) {
+    store
+        .put(
+            &layout::marker_key(),
+            PutPayload::from(serde_json::to_vec(marker).unwrap()),
+        )
+        .await
+        .unwrap();
+}
+async fn try_open(
+    store: Arc<InMemory>,
+    cache: Option<std::path::PathBuf>,
+    options: &EncryptionOptions,
+) -> crate::Result<Repository> {
+    Repository::open_encrypted(
+        &RepoConfig {
+            name: "encrypted".into(),
+            kind: RepoType::Memory,
+            conditional_writes: true,
+            ..Default::default()
+        },
+        &OpenEnv {
+            store: Some(store),
+            cache_dir: cache,
+            ..Default::default()
+        },
+        options,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn descriptor_tampering_and_epoch_rollback_fail_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = Some(tmp.path().join("cache"));
+    let store = Arc::new(InMemory::new());
+    let opts = options(90);
+    let repo = open(store.clone(), cache.clone(), &opts).await;
+    let id = repo.id();
+    let rotated = repo.key_rotate(&Ctl::default()).await.unwrap();
+    assert_eq!(rotated, 2);
+    let good = marker_value(&store).await;
+    assert!(good["encryption"]["mac"].is_string());
+
+    // An older epoch cannot become active while a newer one is listed, even with
+    // the tag removed.
+    let mut flipped = good.clone();
+    flipped["encryption"]["epochs"][0]["state"] = "active".into();
+    flipped["encryption"]["epochs"][1]["state"] = "retired".into();
+    put_marker(&store, &flipped).await;
+    assert!(repo.security().await.is_err());
+    flipped["encryption"].as_object_mut().unwrap().remove("mac");
+    put_marker(&store, &flipped).await;
+    assert!(repo.security().await.is_err());
+    assert!(try_open(store.clone(), None, &opts).await.is_err());
+
+    // Without the descriptor the repository would look like a plaintext one.
+    for stripped in [serde_json::Value::Null, serde_json::json!({})] {
+        let mut marker = good.clone();
+        if stripped.is_null() {
+            marker["encryption"] = stripped;
+        } else {
+            marker.as_object_mut().unwrap().remove("encryption");
+        }
+        put_marker(&store, &marker).await;
+        assert!(repo.security().await.is_err());
+        assert!(try_open(store.clone(), None, &opts).await.is_err());
+    }
+    put_marker(&store, &good).await;
+    assert_eq!(repo.security().await.unwrap().epoch(), Some(2));
+
+    // The epoch-1 master key leaks; the operator has rotated and now retires it.
+    let leaked = {
+        let snapshot = repo.security().await.unwrap().sealed.unwrap();
+        let mut key = zeroize::Zeroizing::new([0; 32]);
+        key.copy_from_slice(snapshot.key(1).unwrap().master.as_ref());
+        key
+    };
+    let all_slots = repository::read_slots(&repo.store).await.unwrap();
+    let old_slots: Vec<_> = all_slots.iter().filter(|s| s.epoch == 1).cloned().collect();
+    let new_slots: Vec<_> = all_slots.iter().filter(|s| s.epoch == 2).cloned().collect();
+    repo.key_retire(1, &Ctl::default()).await.unwrap();
+    let retired = marker_value(&store).await;
+    for slot in &old_slots {
+        repository::put_slot(&repo.store, slot).await.unwrap();
+    }
+
+    // Re-adding the retired epoch next to the active one breaks the tag, and
+    // removing the tag is refused once this host has seen an authenticated one.
+    let mut readded = retired.clone();
+    readded["encryption"]["epochs"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, good["encryption"]["epochs"][0].clone());
+    put_marker(&store, &readded).await;
+    assert!(repo.security().await.is_err());
+    readded["encryption"].as_object_mut().unwrap().remove("mac");
+    put_marker(&store, &readded).await;
+    assert!(repo.security().await.is_err());
+    floor::forget(id);
+    assert!(try_open(store.clone(), cache.clone(), &opts).await.is_err());
+
+    // The attacker signs a descriptor that lists only the leaked epoch with the
+    // leaked key, and removes the newer epoch's slots. The tag verifies, so only
+    // the epoch floor stops later backups from being sealed under the leaked key.
+    let mut rollback = slots::Descriptor::parse(&good["encryption"]).unwrap();
+    rollback.epochs.truncate(1);
+    rollback.epochs[0].state = "active".into();
+    rollback
+        .sign(&objects::EpochKeys::new(id, 1, leaked).unwrap())
+        .unwrap();
+    let mut forged = good.clone();
+    forged["encryption"] = serde_json::to_value(&rollback).unwrap();
+    for slot in &new_slots {
+        store.delete(&repository::slot_key(slot.id)).await.unwrap();
+    }
+    put_marker(&store, &forged).await;
+    let error = repo.security().await.err().unwrap();
+    assert!(error.to_string().contains("older than"), "{error}");
+    let error = try_open(store.clone(), None, &opts).await.err().unwrap();
+    assert!(error.to_string().contains("older than"), "{error}");
+    // After a restart the record in the cache directory still refuses it.
+    floor::forget(id);
+    assert!(try_open(store.clone(), cache.clone(), &opts).await.is_err());
+}
+
+#[tokio::test]
+async fn unlocked_master_keys_are_cached_until_the_descriptor_changes() {
+    let store = Arc::new(InMemory::new());
+    let opts = options(91);
+    let repo = open(store.clone(), None, &opts).await;
+    let first = repo.security().await.unwrap().sealed.unwrap();
+    let again = repo.security().await.unwrap().sealed.unwrap();
+    assert!(Arc::ptr_eq(&first, &again));
+    let other = open(store.clone(), None, &opts).await;
+    assert_eq!(other.key_rotate(&Ctl::default()).await.unwrap(), 2);
+    let rotated = repo.security().await.unwrap().sealed.unwrap();
+    assert!(!Arc::ptr_eq(&first, &rotated));
+    assert_eq!(rotated.descriptor.active(), 2);
+    // The epoch-1 keys survive the refresh instead of being unwrapped again.
+    assert!(Arc::ptr_eq(&first.keys[&1], &rotated.keys[&1]));
+}
+
+#[tokio::test]
+async fn planted_passphrase_slots_are_refused_before_key_derivation() {
+    let store = Arc::new(InMemory::new());
+    let phrase = Passphrase::new("phrase", b"correct horse".to_vec()).unwrap();
+    let opts = EncryptionOptions {
+        passphrases: vec![phrase],
+        single_key_ok: true,
+        ..Default::default()
+    };
+    let repo = open(store.clone(), None, &opts).await;
+    let mut planted = repository::read_slots(&repo.store).await.unwrap()[0].clone();
+    assert_eq!(planted.format, slots::SLOT_FORMAT);
+    planted.id = uuid::Uuid::new_v4();
+    repository::put_slot(&repo.store, &planted).await.unwrap();
+    let error = try_open(store, None, &opts).await.err().unwrap();
+    assert!(error.to_string().contains("share one label"), "{error}");
+}

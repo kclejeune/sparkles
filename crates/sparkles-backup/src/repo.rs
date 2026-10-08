@@ -786,7 +786,9 @@ impl Repository {
         Self::open_with_keys(
             cfg,
             env,
-            crate::security::KeyOptions::Local(Arc::new(options.clone())),
+            crate::security::KeyOptions::Local(Arc::new(crate::crypto::KeyState::new(
+                options.clone(),
+            ))),
         )
         .await
     }

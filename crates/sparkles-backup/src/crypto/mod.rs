@@ -1,13 +1,14 @@
 //! Client-encrypted repository engine. Provider lookup and public configuration
 //! wiring are separate; this module accepts explicit local secret inputs.
 
+mod floor;
 mod manage;
 mod memory;
 pub(crate) mod objects;
 mod primitive;
 pub(crate) mod repository;
 pub(crate) mod slots;
-pub(crate) use repository::{Snapshot, open_snapshot};
+pub(crate) use repository::{KeyState, Snapshot};
 pub use slots::{EncryptionOptions, KeySlotSummary, LocalKey, LocalKeySource, Passphrase};
 
 #[cfg(test)]

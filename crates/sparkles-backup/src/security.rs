@@ -11,7 +11,7 @@ pub(crate) enum KeyOptions {
     #[default]
     None,
     #[cfg(feature = "encryption")]
-    Local(Arc<crate::crypto::EncryptionOptions>),
+    Local(Arc<crate::crypto::KeyState>),
 }
 
 #[derive(Clone, Default)]
@@ -163,11 +163,12 @@ impl Repository {
     pub(crate) async fn security(&self) -> Result<Security> {
         let _ = &self.key_options;
         #[cfg(feature = "encryption")]
-        if let KeyOptions::Local(options) = &self.key_options {
+        if let KeyOptions::Local(keys) = &self.key_options {
             return Ok(Security {
-                sealed: Some(Arc::new(
-                    crate::crypto::open_snapshot(&self.store, self.marker.id, options).await?,
-                )),
+                sealed: Some(
+                    keys.snapshot(&self.store, self.marker.id, self.cache.dir.as_deref())
+                        .await?,
+                ),
             });
         }
         Ok(Security::default())

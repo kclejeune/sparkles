@@ -18,7 +18,6 @@ use std::{
     sync::Arc,
 };
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 pub(super) const INIT: &str = "sparkles-repo-init.json";
 const MAX_INIT_BYTES: u64 = 1 << 20;
@@ -135,13 +134,34 @@ pub(super) fn unlock(
     descriptor: Descriptor,
     slots: &[Slot],
     options: &EncryptionOptions,
+    known: &BTreeMap<u32, Arc<EpochKeys>>,
 ) -> Result<Snapshot> {
     options.check(false)?;
-    let known: HashSet<_> = descriptor.epochs.iter().map(|epoch| epoch.epoch).collect();
-    let mut keys = BTreeMap::<u32, Arc<EpochKeys>>::new();
+    let epochs: HashSet<_> = descriptor.epochs.iter().map(|epoch| epoch.epoch).collect();
+    // A passphrase label wraps at most one slot per epoch, which key addition
+    // enforces. Refuse planted duplicates before any Argon2 work, so a writer to the
+    // bucket cannot multiply the cost of an unlock.
+    let mut phrases = HashSet::new();
     for slot in slots {
-        if !known.contains(&slot.epoch) {
+        if !epochs.contains(&slot.epoch) {
             return Err(slots::config("key slot refers to an unknown epoch"));
+        }
+        if slot.is_passphrase() && !phrases.insert((slot.epoch, slot.label.as_str())) {
+            return Err(slots::config(
+                "several passphrase slots share one label in an epoch",
+            ));
+        }
+    }
+    // Master keys already unlocked by this handle stay valid: an epoch's key never
+    // changes, and every slot that wraps it is bound to the repository and epoch.
+    let mut keys: BTreeMap<u32, Arc<EpochKeys>> = known
+        .iter()
+        .filter(|(epoch, _)| epochs.contains(epoch))
+        .map(|(epoch, key)| (*epoch, key.clone()))
+        .collect();
+    for slot in slots {
+        if slot.is_passphrase() && keys.contains_key(&slot.epoch) {
+            continue;
         }
         if let Some(key) = slot.open(repository, options)? {
             if let Some(previous) = keys.get(&slot.epoch) {
@@ -153,7 +173,7 @@ pub(super) fn unlock(
             }
         }
     }
-    if !keys.contains_key(&descriptor.active()) {
+    let Some(active) = keys.get(&descriptor.active()) else {
         return Err(BackupError::new(
             Code::WrongRepositoryKey,
             "the supplied key opens no active repository slot",
@@ -166,7 +186,8 @@ pub(super) fn unlock(
                 .map(|slot| slot.kek_id.clone())
                 .collect::<Vec<_>>(),
         ));
-    }
+    };
+    descriptor.verify(active)?;
     Ok(Snapshot { descriptor, keys })
 }
 
@@ -175,9 +196,11 @@ pub(super) async fn unlock_async(
     descriptor: Descriptor,
     slots: Vec<Slot>,
     options: &EncryptionOptions,
+    known: &BTreeMap<u32, Arc<EpochKeys>>,
 ) -> Result<Snapshot> {
     let options = options.clone();
-    super::blocking(move || unlock(repository, descriptor, &slots, &options)).await
+    let known = known.clone();
+    super::blocking(move || unlock(repository, descriptor, &slots, &options, &known)).await
 }
 pub(super) async fn wrap_slots(
     keys: Arc<EpochKeys>,
@@ -197,10 +220,15 @@ pub(super) async fn wrap_slots(
     .await
 }
 
+/// Unlock the current marker's epochs. `dir` is the repository's local cache
+/// directory, which holds the epoch floor. `known` holds master keys this handle
+/// already unlocked, which are reused instead of opening their slots again.
 pub(crate) async fn open_snapshot(
     store: &Arc<dyn ObjectStore>,
     id: Uuid,
     options: &EncryptionOptions,
+    dir: Option<&std::path::Path>,
+    known: &BTreeMap<u32, Arc<EpochKeys>>,
 ) -> Result<Snapshot> {
     for attempt in 0..8 {
         let marker =
@@ -211,6 +239,7 @@ pub(crate) async fn open_snapshot(
         }
         let descriptor =
             Descriptor::parse(marker.encryption.as_ref().ok_or_else(slots::incompatible)?)?;
+        super::floor::check(id, dir, &descriptor)?;
         let mut slots = read_slots(store).await?;
         if let Some(intent) = super::manage::read_rotation(store).await? {
             intent.check(id)?;
@@ -240,12 +269,12 @@ pub(crate) async fn open_snapshot(
         let latest = parse_marker(
             &read_bounded(store, &layout::marker_key(), MAX_SLOT_BYTES as u64).await?,
         )?;
-        let known = descriptor
+        let listed = descriptor
             .epochs
             .iter()
             .map(|e| e.epoch)
             .collect::<HashSet<_>>();
-        if latest != marker || slots.iter().any(|slot| !known.contains(&slot.epoch)) {
+        if latest != marker || slots.iter().any(|slot| !listed.contains(&slot.epoch)) {
             if attempt < 7 {
                 tokio::task::yield_now().await;
                 continue;
@@ -254,9 +283,64 @@ pub(crate) async fn open_snapshot(
                 "repository epoch metadata changed or contains an unknown slot",
             ));
         }
-        return unlock_async(id, descriptor, slots, options).await;
+        let snapshot = unlock_async(id, descriptor, slots, options, known).await?;
+        super::floor::record(id, dir, &snapshot.descriptor);
+        return Ok(snapshot);
     }
     unreachable!("bounded loop returns")
+}
+
+/// The resolved key inputs of one repository handle and the master keys they
+/// unlocked. Master keys are kept for the handle's lifetime and refreshed only when
+/// the marker's descriptor changes, so passphrase derivation and protected-page
+/// allocation happen once per epoch rather than once per operation.
+pub(crate) struct KeyState {
+    pub options: EncryptionOptions,
+    cache: tokio::sync::Mutex<Option<Arc<Snapshot>>>,
+}
+impl std::ops::Deref for KeyState {
+    type Target = EncryptionOptions;
+    fn deref(&self) -> &EncryptionOptions {
+        &self.options
+    }
+}
+impl KeyState {
+    pub fn new(options: EncryptionOptions) -> Self {
+        Self {
+            options,
+            cache: tokio::sync::Mutex::new(None),
+        }
+    }
+    /// The snapshot for the current marker. A cached snapshot is reused while the
+    /// descriptor is unchanged. A changed descriptor is verified again in full.
+    pub async fn snapshot(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        id: Uuid,
+        dir: Option<&std::path::Path>,
+    ) -> Result<Arc<Snapshot>> {
+        let marker = parse_marker(
+            &read_bounded(store, &layout::marker_key(), MAX_SLOT_BYTES as u64).await?,
+        )?;
+        if marker.id != id {
+            return Err(slots::config("repository identity changed"));
+        }
+        let descriptor =
+            Descriptor::parse(marker.encryption.as_ref().ok_or_else(slots::incompatible)?)?;
+        let mut cache = self.cache.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.descriptor == descriptor
+        {
+            return Ok(cached.clone());
+        }
+        let known = cache
+            .as_ref()
+            .map(|cached| cached.keys.clone())
+            .unwrap_or_default();
+        let fresh = Arc::new(open_snapshot(store, id, &self.options, dir, &known).await?);
+        *cache = Some(fresh.clone());
+        Ok(fresh)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -272,10 +356,12 @@ pub(crate) async fn attach_or_init(
     store: &Arc<dyn ObjectStore>,
     cfg: &RepoConfig,
     env: &OpenEnv,
-    options: &EncryptionOptions,
+    keys: &KeyState,
     native_root: Option<&(std::path::PathBuf, Arc<std::fs::File>)>,
 ) -> Result<Marker> {
+    let options = &keys.options;
     options.check(false)?;
+    let dir = |id: Uuid| env.cache_dir.as_ref().map(|d| d.join(id.to_string()));
     match store.get(&layout::marker_key()).await {
         Ok(got) => {
             if got.meta.size > MAX_SLOT_BYTES as u64 {
@@ -290,7 +376,8 @@ pub(crate) async fn attach_or_init(
                     "encryption cannot be enabled on an existing plaintext repository",
                 ));
             }
-            open_snapshot(store, marker.id, options).await?;
+            keys.snapshot(store, marker.id, dir(marker.id).as_deref())
+                .await?;
             return Ok(marker);
         }
         Err(error) if is_not_found(&error) => {}
@@ -321,7 +408,8 @@ pub(crate) async fn attach_or_init(
             let marker = parse_marker(
                 &read_bounded(store, &layout::marker_key(), MAX_SLOT_BYTES as u64).await?,
             )?;
-            open_snapshot(store, marker.id, options).await?;
+            keys.snapshot(store, marker.id, dir(marker.id).as_deref())
+                .await?;
             return Ok(marker);
         }
         match read_bounded_optional(store, &intent_key, MAX_INIT_BYTES).await? {
@@ -338,7 +426,8 @@ pub(crate) async fn attach_or_init(
                         .await?
                 {
                     let marker = parse_marker(&bytes)?;
-                    open_snapshot(store, marker.id, options).await?;
+                    keys.snapshot(store, marker.id, dir(marker.id).as_deref())
+                        .await?;
                     return Ok(marker);
                 }
                 return Err(BackupError::new(
@@ -351,11 +440,13 @@ pub(crate) async fn attach_or_init(
     if intent.is_none() {
         options.check(true)?;
         let repository = Uuid::new_v4();
-        let master = EpochKeys::new(repository, 1, Zeroizing::new(primitive::random::<32>()?))?;
+        let master = EpochKeys::new(repository, 1, primitive::random_key()?)?;
+        let mut descriptor = Descriptor::new();
+        descriptor.sign(&master)?;
         let slots = wrap_slots(Arc::new(master), options).await?;
         let mut marker = Marker::new(repository, crate::now_rfc3339());
         marker.hash = "hmac-sha256".into();
-        marker.encryption = Some(serde_json::to_value(Descriptor::new()).expect("serializes"));
+        marker.encryption = Some(serde_json::to_value(descriptor).expect("serializes"));
         let proposed = Intent {
             format: 1,
             kind: "sparkles-repo-initialization".into(),
@@ -385,7 +476,8 @@ pub(crate) async fn attach_or_init(
                     let marker = parse_marker(
                         &read_bounded(store, &layout::marker_key(), MAX_SLOT_BYTES as u64).await?,
                     )?;
-                    open_snapshot(store, marker.id, options).await?;
+                    keys.snapshot(store, marker.id, dir(marker.id).as_deref())
+                        .await?;
                     return Ok(marker);
                 }
             }
@@ -414,7 +506,14 @@ pub(crate) async fn attach_or_init(
             &serde_json::to_vec(slot).map_err(|_| slots::config("invalid initialization slot"))?,
         )?);
     }
-    unlock_async(intent.marker.id, descriptor, checked.clone(), options).await?;
+    unlock_async(
+        intent.marker.id,
+        descriptor,
+        checked.clone(),
+        options,
+        &BTreeMap::new(),
+    )
+    .await?;
     let allowed: HashSet<_> = checked
         .iter()
         .map(|slot| slot_key(slot.id))
@@ -448,7 +547,8 @@ pub(crate) async fn attach_or_init(
     let winner =
         parse_marker(&read_bounded(store, &layout::marker_key(), MAX_SLOT_BYTES as u64).await?)
             .map_err(|_| slots::incompatible())?;
-    open_snapshot(store, winner.id, options).await?;
+    keys.snapshot(store, winner.id, dir(winner.id).as_deref())
+        .await?;
     if winner.id != intent.marker.id {
         return Err(slots::config("repository initialization identity changed"));
     }
@@ -617,8 +717,7 @@ mod tests {
                 slots::LocalKey::new("recovery", slots::LocalKeySource::File, [32; 32]).unwrap(),
             );
             let id = Uuid::new_v4();
-            let keys =
-                EpochKeys::new(id, 1, Zeroizing::new(primitive::random::<32>().unwrap())).unwrap();
+            let keys = EpochKeys::new(id, 1, primitive::random_key().unwrap()).unwrap();
             let mut marker = Marker::new(id, crate::now_rfc3339());
             marker.hash = "hmac-sha256".into();
             marker.encryption = Some(serde_json::to_value(Descriptor::new()).unwrap());
@@ -655,14 +754,15 @@ mod tests {
             };
             let wrong = super::super::tests::options(33);
             assert!(
-                attach_or_init(&store, &cfg, &env, &wrong, None)
+                attach_or_init(&store, &cfg, &env, &KeyState::new(wrong), None)
                     .await
                     .is_err()
             );
             assert!(store.head(&layout::marker_key()).await.is_err());
-            let recovered = attach_or_init(&store, &cfg, &env, &options, None)
-                .await
-                .unwrap();
+            let recovered =
+                attach_or_init(&store, &cfg, &env, &KeyState::new(options.clone()), None)
+                    .await
+                    .unwrap();
             assert_eq!(recovered.id, id);
             assert_eq!(read_slots(&store).await.unwrap().len(), 2);
             assert!(store.head(&Key::from(INIT)).await.is_err());
