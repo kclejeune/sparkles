@@ -2188,8 +2188,15 @@ impl Spooled {
 }
 
 /// A body in one of Jena's syntaxes ([`jena_formats`]) as N-Quads (`quads`) or
-/// N-Triples, in memory or in a temporary file as the body was.
-fn transcode_body(body: Spooled, fmt: jena_formats::JenaFormat, quads: bool) -> ApiResult<Spooled> {
+/// N-Triples, in memory or in a temporary file as the body was. The output counts
+/// against `max_decompressed` as it is written, because a compact wire encoding can
+/// expand far beyond its request size, and is refused with 413 past it.
+fn transcode_body(
+    body: Spooled,
+    fmt: jena_formats::JenaFormat,
+    quads: bool,
+    max_decompressed: Option<u64>,
+) -> ApiResult<Spooled> {
     use std::io::Write;
     // Compact wire encodings can expand far beyond the request's in-memory size.
     // Spill based on the actual *output*, including a single very large write.
@@ -2220,15 +2227,58 @@ fn transcode_body(body: Spooled, fmt: jena_formats::JenaFormat, quads: bool) -> 
             }
         }
     }
+    // Stops the output at the cap, before the bytes past it reach memory or disk.
+    struct Capped<W> {
+        inner: W,
+        left: Option<u64>,
+        exceeded: bool,
+    }
+    impl<W: Write> Write for Capped<W> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Some(left) = &mut self.left else {
+                return self.inner.write(bytes);
+            };
+            if bytes.len() as u64 > *left {
+                self.exceeded = true;
+                return Err(std::io::Error::other("decompressed size limit"));
+            }
+            let n = self.inner.write(bytes)?;
+            *left -= n as u64;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    let too_large = || {
+        err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "decompressed request body exceeds --max-decompressed-mb",
+        )
+    };
     let bad = |e: jena_formats::DecodeError| err(StatusCode::BAD_REQUEST, e.to_string());
     let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    fn capped<W>(inner: W, left: Option<u64>) -> Capped<W> {
+        Capped {
+            inner,
+            left,
+            exceeded: false,
+        }
+    }
     match body {
         Spooled::Memory(b) => {
-            let mut out = Writer(Spooled::Memory(Vec::with_capacity(
-                b.len().min(SPOOL_AFTER),
-            )));
-            jena_formats::transcode(fmt, &b[..], quads, &mut out).map_err(bad)?;
-            Ok(out.0)
+            let mut out = capped(
+                Writer(Spooled::Memory(Vec::with_capacity(
+                    b.len().min(SPOOL_AFTER),
+                ))),
+                max_decompressed,
+            );
+            let r = jena_formats::transcode(fmt, &b[..], quads, &mut out);
+            if out.exceeded {
+                return Err(too_large());
+            }
+            r.map_err(bad)?;
+            Ok(out.inner.0)
         }
         Spooled::File(f) => {
             let src = std::fs::File::open(f.path()).map_err(io)?;
@@ -2240,9 +2290,14 @@ fn transcode_body(body: Spooled, fmt: jena_formats::JenaFormat, quads: bool) -> 
                 .prefix("sparkles-body-")
                 .tempfile_in(dir)
                 .map_err(io)?;
-            let mut w = std::io::BufWriter::new(tmp.as_file_mut());
-            jena_formats::transcode(fmt, src, quads, &mut w).map_err(bad)?;
-            w.flush().map_err(io)?;
+            let mut w = std::io::BufWriter::new(capped(tmp.as_file_mut(), max_decompressed));
+            let r = jena_formats::transcode(fmt, src, quads, &mut w);
+            let flushed = w.flush();
+            if w.get_ref().exceeded {
+                return Err(too_large());
+            }
+            r.map_err(bad)?;
+            flushed.map_err(io)?;
             drop(w);
             Ok(Spooled::File(tmp))
         }
@@ -2849,7 +2904,7 @@ async fn gsp_on(
                     _ => None,
                 };
                 let body = match jena {
-                    Some(j) => transcode_body(body, j, quads)?,
+                    Some(j) => transcode_body(body, j, quads, st.limits.max_decompressed_bytes)?,
                     None => body,
                 };
                 let (src, _spooled) =
@@ -4758,9 +4813,9 @@ mod validation_tests;
 mod spool_tests {
     use super::*;
 
-    #[test]
-    fn small_wire_body_spools_when_transcoded_output_expands() {
-        let literal = "\n".repeat(5 << 20);
+    /// A protobuf body with two copies of `literal`, which N-Quads escapes to twice its
+    /// size when it is newlines.
+    fn expanding_body(literal: &str) -> Vec<u8> {
         let mut writer =
             jena_formats::RdfWriter::new(jena_formats::JenaFormat::Protobuf, Vec::new());
         for subject in ["urn:s", "urn:t"] {
@@ -4768,17 +4823,45 @@ mod spool_tests {
                 .quad(&oxrdf::Quad::new(
                     oxrdf::NamedNode::new(subject).unwrap(),
                     oxrdf::NamedNode::new("urn:p").unwrap(),
-                    oxrdf::Literal::new_simple_literal(literal.clone()),
+                    oxrdf::Literal::new_simple_literal(literal),
                     oxrdf::GraphName::DefaultGraph,
                 ))
                 .unwrap();
         }
-        let body = writer.finish().unwrap();
+        writer.finish().unwrap()
+    }
+
+    #[test]
+    fn transcoded_output_stops_at_the_decompressed_cap() {
+        let body = expanding_body(&"\n".repeat(5 << 20));
+        let cap = SPOOL_AFTER as u64 + (1 << 20);
+        for spooled in [false, true] {
+            let body = if spooled {
+                let mut f = tempfile::NamedTempFile::new().unwrap();
+                std::io::Write::write_all(&mut f, &body).unwrap();
+                Spooled::File(f)
+            } else {
+                Spooled::Memory(body.clone())
+            };
+            match transcode_body(body, jena_formats::JenaFormat::Protobuf, true, Some(cap)) {
+                Err(ApiError(status, _)) => {
+                    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{spooled}")
+                }
+                Ok(_) => panic!("output past the cap must be refused ({spooled})"),
+            }
+        }
+    }
+
+    #[test]
+    fn small_wire_body_spools_when_transcoded_output_expands() {
+        let literal = "\n".repeat(5 << 20);
+        let body = expanding_body(&literal);
         assert!(body.len() < SPOOL_AFTER);
         let Ok(Spooled::File(file)) = transcode_body(
             Spooled::Memory(body),
             jena_formats::JenaFormat::Protobuf,
             true,
+            None,
         ) else {
             panic!("expanded RDF output must spill to disk");
         };
