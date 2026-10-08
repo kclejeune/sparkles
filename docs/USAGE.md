@@ -1616,9 +1616,13 @@ local key providers. HTTP registration and updates reject encryption metadata; k
 and provider references remain operator-controlled.
 
 Store keys outside datasets, catalogs and the backup repository. Key files must be
-regular files with no group or other permissions. Each local key is exactly 32 raw
-bytes, 64 hexadecimal characters, or canonical base64 encoding of 32 bytes; text
-encodings permit surrounding ASCII whitespace. Passphrase files contain 1–4096 exact
+regular files with no group or other permissions, owned by the user that runs
+Sparkles or by root. Each local key is exactly 32 raw bytes, 64 hexadecimal characters,
+or canonical base64 encoding of 32 bytes; text encodings permit surrounding ASCII
+whitespace. Raw input made only of printable ASCII is refused, because a typed
+32-character password would otherwise become the key. If an existing key is such
+text, give the same bytes in hex instead, for example with `xxd -p -c 64 key`, and
+the existing slots keep opening. Passphrase files contain 1–4096 exact
 bytes: a final newline is part of the passphrase. Provider output is limited to 4096
 bytes. Configuration and flags contain references, never inline key material.
 
@@ -1649,8 +1653,26 @@ Creation and `repo key add` also accept `--key-env VARIABLE`, `--key-credential 
 Commands execute the literal argv without a shell, with a default 10-second timeout
 (`--key-command-timeout`, 1–300 seconds). They receive no stdin; stderr is discarded.
 Timeout or cancellation kills the provider process group and reaps the provider.
-Put secrets in the provider's input source, never in its argv. Credential names are
+A provider starts with an empty environment plus `PATH`, `HOME`, `LANG`,
+`XDG_RUNTIME_DIR` and `CREDENTIALS_DIRECTORY` when Sparkles has them, so it never sees
+other repositories' `--key-env` keys or cloud credentials. A provider that needs
+another non-secret setting can take it through `/usr/bin/env NAME=value` in its argv.
+Variables named by `--key-env` stay in the Sparkles process environment after they are
+read. Put secrets in the provider's input source, never in its argv. Credential names are
 simple identifiers and their files must remain inside the credential directory.
+
+Rotation is protected against rollback. The marker records which key epoch is active,
+and that record is authenticated by the active master key. Each host also remembers
+the newest epoch it has seen for each repository, in memory and in
+`.key-epoch.json` inside the repository's cache directory. After a rotation, a bucket
+writer who holds the old key cannot make Sparkles seal new backups with it again. If a
+whole repository is deliberately restored from an older copy of its bucket, delete that
+file and restart before opening it. Repositories created by earlier builds keep
+opening, and their marker gains the authentication tag on the next `repo key
+rotate-master` or `repo key retire`. Earlier builds cannot open a repository after that
+step or after `repo key add`, because new key slots use a newer format. Rollback of
+individual backups is not detected: a bucket writer can put back an older backup under
+its name.
 
 A local key can move between file, environment, credential and command providers
 without changing its bytes or adding a slot. The slot retains its original source

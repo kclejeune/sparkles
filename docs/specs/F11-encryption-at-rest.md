@@ -128,7 +128,35 @@ shapes and the reasoning rules. The keys that protect them are assets too.
 | Someone who can modify the disk while the host is down | XTS modes detect nothing. ZFS with GCM detects changed blocks. | Changed units are detected. Wholesale rollback is not (§4.4). | Changed blobs and manifests are detected. |
 | Root on the running host, or a memory dump | Not protected. | Not protected. | The repository key is in memory too. Write-only repositories (§6.5) keep old backups unreadable to a compromised writer. |
 
-### 2.3 What still leaks
+### 2.3 Rollback of a backup repository
+
+Someone with write access to the bucket cannot read or forge encrypted objects, but
+they can delete objects and put back older copies. Two kinds of rollback follow from
+that, and Sparkles treats them differently.
+
+**Manifests can be replayed.** An attacker can delete a backup and publish an older
+envelope under the same name, or restore a backup that retention deleted. The envelope
+still authenticates, because its associated data binds the repository, the epoch and
+the name but not a version. Detecting this needs a monotonic counter or index outside
+the bucket. Restoring the wrong generation of a backup is outside the threat model, and
+operators who need that assurance should compare backup times and ids with their own
+records.
+
+**Key epoch metadata is protected.** The marker's descriptor decides which epoch seals
+new backups, so rolling it back after a master-key rotation would make new backups use
+a key that may have leaked. Three checks prevent that. The descriptor carries an HMAC
+under a subkey of the active epoch's master key (§5.4). The active epoch must be the
+highest listed epoch, so a retired epoch can never become active again. Each host also
+records the highest epoch it has accepted for each repository id, and refuses a
+descriptor whose highest epoch is lower. The record also notes whether the host has
+seen an authenticated descriptor, after which a descriptor without a tag is refused.
+The record is kept in memory and in the repository's cache directory as
+`.key-epoch.json`. It is the check that stops an attacker who holds the leaked old
+master key, because that key can sign a descriptor that lists only its own epoch. A
+host that has never opened the repository, or whose cache directory was cleared, has
+no record and relies on the tag and the epoch ordering alone.
+
+### 2.4 What still leaks
 
 Encryption at rest hides content, not shape. An observer of the disk still sees file
 names (`gen-0004/spo.dat`), file sizes and how they grow, the number of generations,
@@ -301,7 +329,11 @@ gen-0004/spo.dat block 812 column 2 (dek v2)`. A query that touches it fails wit
 ### 4.5 Keys in memory
 
 Unwrapped keys live in `zeroize`-on-drop buffers. Their pages are locked with `mlock` and
-excluded from core dumps with `madvise(MADV_DONTDUMP)` on Linux. Decrypted data in caches
+excluded from core dumps with `madvise(MADV_DONTDUMP)` on Linux. Short-lived copies are
+not fully covered. Moving a buffer in Rust copies its bytes and leaves the old stack
+slot unzeroized, and key material read from a file, a command or the environment passes
+through ordinary heap buffers before it reaches a locked page. Those buffers are
+zeroized when dropped, but the guarantee is best effort rather than complete. Decrypted data in caches
 is ordinary heap memory and can reach swap, so §7.5 recommends encrypted swap. Keys
 never appear in logs, error messages, metrics, API responses or `Debug` output. The
 `Debug` implementation of a key prints its fingerprint.
@@ -319,7 +351,7 @@ master key and writes it, wrapped, into one key slot. A slot is an object
 `keys/<uuid>.json`:
 
 ```json
-{ "kind": "sparkles-key-slot", "format": 1, "id": "c1d2…", "epoch": 1,
+{ "kind": "sparkles-key-slot", "format": 2, "id": "c1d2…", "epoch": 1,
   "label": "ops key file", "created": "2026-10-02T12:00:00.000Z",
   "source": "file", "kekId": "file:9f2c41d07a1e",
   "nonce": "…", "ct": "…" }
@@ -334,11 +366,23 @@ master key and writes it, wrapped, into one key slot. A slot is an object
 | `aws-kms`, `gcp-kms` | The service's `Decrypt` of the stored ciphertext, with the repository id as encryption context or associated data | 1, behind cargo features |
 | `age` | An age X25519 stanza, opened with an age identity file | 2 |
 
-The associated data of every local wrap is `repository id ‖ epoch ‖ slot id`. A slot
-copied into another repository does not open there.
+The associated data of every local wrap starts with `repository id ‖ epoch ‖ slot id`. A
+slot copied into another repository does not open there. Format 2 slots also bind their
+metadata: the label, the creation time, the source, the `kekId` and the Argon2
+parameters follow as length-prefixed fields. A slot whose metadata was edited fails to
+open. Format 1 slots, written before this change, bind only the first three fields and
+stay readable. Their metadata can be relabeled by anyone with bucket access. Removing
+such a slot and adding the key again writes a format 2 slot.
+
+A passphrase label wraps at most one slot per epoch. Opening refuses a repository with
+two passphrase slots of the same label in one epoch before it runs any Argon2
+derivation, so planted slots cannot multiply the cost of an unlock.
 
 Opening a repository tries the configured key against the slots, and keeps the master
-key of every epoch it opens in memory for the repository's lifetime. `repo key add`
+key of every epoch it opens in memory for the repository's lifetime. Each operation
+reads the marker. When the descriptor is unchanged, the operation reuses the unlocked
+keys without listing slots, running Argon2 or locking new pages. A changed descriptor is
+verified again in full, and keys of epochs that were already unlocked are reused. `repo key add`
 creates a slot and needs an open slot first. `repo key remove` refuses to remove the
 last slot of an epoch that still holds backups (`409 last-key-slot`). `repo key list`
 shows each slot's id, label, source, `kekId` and creation time, never key material.
@@ -410,8 +454,17 @@ names the scheme:
 ```json
 "encryption": { "scheme": "sparkles-repo-v1", "cipher": "aes-256-gcm", "ids": "hmac-sha256",
                 "kdf": "hkdf-sha256", "epochs": [ { "epoch": 1, "state": "active", "created": "…" } ],
-                "padding": "padme", "writeOnly": false }
+                "padding": "padme", "writeOnly": false, "mac": "9a41…" }
 ```
+
+`mac` is the hex HMAC-SHA256 of `"sparkles/f07/repo/descriptor" ‖ 0x00 ‖ repository id ‖
+descriptor JSON without mac`, under `HKDF(master key of the active epoch, info =
+"sparkles/f07/repo/descriptor")`. A reader verifies it once the active epoch is
+unlocked. The active epoch must also be the highest listed epoch. §2.3 explains why
+these checks are needed and what the per-host epoch record adds. Descriptors written
+before the field existed have no `mac`. They still open, and the next `repo key
+rotate-master` or `repo key retire` writes a tagged descriptor. Builds that predate the
+field refuse a marker that has one, and also refuse format 2 key slots.
 
 A manifest in an encrypted repository is an envelope:
 
@@ -900,10 +953,20 @@ type KeySource =
   | { source: "age-identity"; path: string };        // Phase 2, repositories only
 ```
 
-A key file must not be group- or world-readable and must lie outside the data
-directory. Otherwise the server refuses it with a message that names the path. The
-`command` source covers hardware tokens, password managers and `systemd-creds decrypt`
-with a TPM2-sealed credential.
+A key file must not be group- or world-readable, must be owned by the user Sparkles runs
+as or by root, and must lie outside the data directory. Otherwise the server refuses it
+with a message that names the path. Raw 32-byte input that consists only of printable
+ASCII is refused, because it is almost certainly a typed password. A random key is all
+printable with a probability of about 10^-13. Such a key must be given as 64
+hexadecimal digits or base64 instead, which decode to the same bytes.
+
+The `command` source covers hardware tokens, password managers and `systemd-creds
+decrypt` with a TPM2-sealed credential. A key command starts with an empty environment
+plus `PATH`, `HOME`, `LANG`, `XDG_RUNTIME_DIR` and `CREDENTIALS_DIRECTORY` when the
+server has them. It therefore never sees `env` keys of other repositories or cloud
+credentials. An `env` key stays in the server's own environment after it is read,
+because removing variables from a multithreaded process is unsound. Other child
+processes and anyone who can read `/proc/<pid>/environ` can still see it.
 
 ### 8.2 Server and CLI
 
@@ -1539,8 +1602,23 @@ Parsing, ciphertext and Argon2 inputs are bounded before expensive allocation or
 derivation. Secret diagnostics are redacted. Long-lived keys and retained passphrases
 occupy dedicated locked pages excluded from dumps and are zeroized before release.
 That backend currently supports Linux/Android; unsupported protection fails explicitly
-rather than silently weakening it. Passphrase work runs on blocking workers limited to
-two simultaneous key jobs. This implementation does not establish FIPS operational
+rather than silently weakening it. Master keys are generated, decoded and unwrapped
+into zeroizing buffers, but moves and provider input buffers can leave transient copies,
+as §4.5 describes. Passphrase work runs on blocking workers limited to two
+simultaneous key jobs.
+
+The marker's descriptor is authenticated under the active epoch's master key, its
+active epoch must be the newest epoch, and each host keeps an epoch record per
+repository in memory and in the repository's cache directory (§2.3). Tamper tests
+cover a stripped descriptor, a flipped active epoch, a re-added retired epoch with its
+old slots restored, a removed tag, and a rollback signed with a leaked old master key.
+Repositories created before this change open unchanged and gain the tag on their next
+rotation or retirement. New key slots use format 2, which binds slot metadata into the
+wrap. Duplicate passphrase slots are refused before key derivation. Repository handles
+keep unlocked master keys for their lifetime and re-verify only when the descriptor
+changes. Key commands run with a minimal environment, key files must belong to the
+effective user or root, and printable 32-byte raw keys are refused. Manifest replay
+remains outside the threat model (§2.3). This implementation does not establish FIPS operational
 compliance or protect against privileged access to a running process.
 
 Engine validation passes 131 encryption-enabled tests and 35 focused crypto tests with
