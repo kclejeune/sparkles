@@ -68,9 +68,13 @@ impl Coordinator {
         Ok(())
     }
 
+    /// A later transaction's WAL write failed. No fence runs again, so the queued
+    /// commits fail. A prefix whose fence is already running keeps that fence's
+    /// outcome: when the sync succeeds, its commits are durable and are acknowledged.
     pub fn fail(&self) {
         let mut s = self.state.lock();
-        Self::fail_locked(&mut s);
+        s.failed = true;
+        Self::fail_queue(&mut s);
         self.changed.notify_all();
     }
 
@@ -81,14 +85,24 @@ impl Coordinator {
                 .0
                 .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
         }
+        Self::fail_queue(s);
+        s.commits = 0;
+        s.bytes = 0;
+    }
+
+    fn fail_queue(s: &mut State) {
         for p in s.queue.drain(..) {
             let _ = p
                 .ticket
                 .0
                 .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+            s.commits -= 1;
+            s.bytes -= p.bytes;
         }
-        s.commits = 0;
-        s.bytes = 0;
+    }
+
+    fn in_flight(s: &State, ticket: &Ticket) -> bool {
+        s.inflight.iter().any(|t| std::ptr::eq(&**t, ticket))
     }
 
     pub fn wait(&self, store: &Store, ticket: &Ticket) -> Result<()> {
@@ -119,9 +133,15 @@ impl Coordinator {
                 o.check()?;
             }
             {
-                let s = self.state.lock();
+                let mut s = self.state.lock();
                 if s.failed {
-                    return Err(Error::Poisoned);
+                    // A running fence can still publish its prefix. The caller resets
+                    // the writer's head to the durable one, so it waits for that.
+                    if !s.active {
+                        return Err(Error::Poisoned);
+                    }
+                    self.changed.wait_for(&mut s, Duration::from_millis(20));
+                    continue;
                 }
                 if !s.active && s.queue.is_empty() {
                     return Ok(());
@@ -151,6 +171,10 @@ impl Coordinator {
                 return Ok(false);
             }
             if s.failed {
+                // a sealed commit waits for its running fence, which may still succeed
+                if ticket.is_some_and(|t| Self::in_flight(&s, t)) {
+                    return Ok(false);
+                }
                 return Err(Error::Poisoned);
             }
             if s.active || s.queue.is_empty() {
@@ -177,7 +201,9 @@ impl Coordinator {
         store.failpoint("group-synced");
         let mut s = self.state.lock();
         let outcome = match synced {
-            Ok(()) if !s.failed => {
+            // A later write may have failed during the fence. That poisons the
+            // writer and fails the queue, but this prefix is durable all the same.
+            Ok(()) => {
                 // Keep failure/admission state serialized with publication. The
                 // writer itself remains free, including while a later txn is held.
                 for p in &batch {
@@ -193,7 +219,6 @@ impl Coordinator {
                 Self::fail_locked(&mut s);
                 Err(e)
             }
-            Ok(()) => Err(Error::Poisoned),
         };
         s.inflight.clear();
         s.active = false;
@@ -723,6 +748,42 @@ mod tests {
         assert_eq!(receipt.commit.seq, 1);
         first.join().unwrap();
         noop.join().unwrap();
+    }
+
+    #[test]
+    fn a_later_write_failure_keeps_the_running_fence_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let (hit, go) = pause(&s, "group-sealed");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "sealed"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        let queued_commit = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "queued"))
+        };
+        queued(&s, 1);
+        // The next transaction's WAL write fails: its descriptor is read-only.
+        let read_only = File::open(wal_path(dir.path())).unwrap();
+        s.writer.lock().wal = Some(BufWriter::new(read_only));
+        assert!(insert(&s, "failed").is_err());
+        go.send(()).unwrap();
+        // The sealed prefix's fence succeeded, so its commit is durable and acknowledged.
+        assert_eq!(first.join().unwrap().unwrap().commit.seq, 1);
+        // The queued commit is never fenced.
+        assert!(matches!(
+            queued_commit.join().unwrap(),
+            Err(Error::Poisoned)
+        ));
+        assert_eq!(s.snapshot().commit, 1);
+        assert_eq!(s.head_commit().seq, 1);
+        assert!(matches!(insert(&s, "later"), Err(Error::Poisoned)));
+        drop(s);
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert!(reopened.snapshot().commit >= 1);
+        assert!(has(&reopened.snapshot(), "sealed"));
     }
 
     #[test]
