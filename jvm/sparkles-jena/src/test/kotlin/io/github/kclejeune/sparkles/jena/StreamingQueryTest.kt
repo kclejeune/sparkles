@@ -1,5 +1,7 @@
 package io.github.kclejeune.sparkles.jena
 
+import org.apache.jena.graph.NodeFactory
+import org.apache.jena.graph.Triple
 import org.apache.jena.riot.Lang
 import org.apache.jena.sparql.core.Var
 import org.apache.jena.sparql.exec.QueryExec
@@ -37,10 +39,18 @@ class StreamingQueryTest {
 
     @Test fun streaming_construct_uses_incremental_where_solutions() {
         SparklesDatasets.memory().use { ds ->
-            ds.load(ByteArrayInputStream("<urn:s> <urn:p> 1 .".toByteArray()), Lang.TURTLE)
-            QueryExec.dataset(ds).query("CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }")
-                .context(Context().set(Sparkles.STREAMING_EXECUTION, true).set(Sparkles.FALLBACK, SparklesFallback.NEVER))
-                .build().use { assertTrue(it.constructTriples().hasNext()) }
+            val data = (0 until 5000).joinToString("\n") { "<urn:s$it> <urn:p> $it ." }
+            ds.load(ByteArrayInputStream(data.toByteArray()), Lang.TURTLE)
+            fun triples(streaming: Boolean): Set<Triple> =
+                QueryExec.dataset(ds).query("CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }")
+                    .context(Context().set(Sparkles.STREAMING_EXECUTION, streaming).set(Sparkles.FALLBACK, SparklesFallback.NEVER))
+                    .build().use { it.constructTriples().asSequence().toSet() }
+            val streamed = triples(true)
+            assertEquals(5000, streamed.size)
+            val q = NodeFactory.createURI("urn:q")
+            assertTrue(streamed.all { it.predicate == q })
+            assertTrue(Triple.create(NodeFactory.createURI("urn:s42"), q, NodeFactory.createLiteralDT("42", org.apache.jena.datatypes.xsd.XSDDatatype.XSDinteger)) in streamed)
+            assertEquals(triples(false), streamed)
         }
     }
 }
