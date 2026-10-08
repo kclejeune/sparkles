@@ -1085,7 +1085,6 @@ with strategy `incremental`, in < 5 ms.
     and applications", *IEEE Data Eng. Bull.* 18(2) (1995);
   * J. Corman, J. L. Reutter, O. Savković, "Semantics and validation of recursive SHACL",
     ISWC 2018.
-* TopBraid documentation was not consulted.
 
 ## Outcome
 

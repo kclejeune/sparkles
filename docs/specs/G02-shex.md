@@ -1551,9 +1551,7 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
 * **rudof**, https://github.com/rudof-project/rudof (commit `79a9e69`, 2026-09-30;
   crates 0.3.24; **MIT OR Apache-2.0**). Licenses, crate structure, dependency tree
   (built in a scratch consumer crate), trait signatures, documented algorithm and the
-  shexTest pass rates were inspected and measured. It is not a dependency. Its
-  `feasibility-model.md` credits a port of an Apache Jena fork (fhircat/jena). That
-  fork was not consulted.
+  shexTest pass rates were inspected and measured. It is not a dependency.
 * **Papers** (citations verified; content per the published PDFs and abstracts):
   * S. Staworko, I. Boneva, J. E. Labra Gayo, S. Hym, E. G. Prud'hommeaux, H. Solbrig,
     "Complexity and Expressiveness of ShEx for RDF", ICDT 2015, LIPIcs 31, pp. 195–211,

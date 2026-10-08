@@ -760,7 +760,6 @@ while `sparkles serve` holds the lock → succeeds and lists seqs 1, 0.
 * Cited from general knowledge, not fetched: RFC 3339, RFC 9562 (UUID), RFC 9110 (HTTP
   semantics, ETag), RFC 6648 (`X-` prefix), RFC 9651 (Structured Field Values), RFC 7089
   (Memento), W3C RDF Dataset Canonicalization (RDFC-1.0).
-* The project's earlier implementation review and feature plan were not read.
 
 ## Outcome
 

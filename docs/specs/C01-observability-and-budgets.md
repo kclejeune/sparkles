@@ -885,7 +885,6 @@ Expect `outcome="cancelled"` = 1 and `sparkles_requests_active{operation="query"
     and no validation of incoming ids.
   - `tracing-subscriber` 0.3.23 `Cargo.toml`: `json` pulls in `tracing-serde`, `serde`
     and `serde_json`.
-- The project's earlier feature-review notes were not read.
 
 ## Outcome
 

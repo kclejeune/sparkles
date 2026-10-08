@@ -439,8 +439,6 @@ implementation landed.
   - four papers on integrity checking and view maintenance, cited from general
     knowledge: Nicolas 1982; Blakeley, Larson and Tompa 1986; Gupta and Mumick 1995;
     Corman, Reutter and Savković 2018.
-
-  TopBraid's documentation was not consulted.
 - **Implementation:** from the spec plus Sparkles code only (2026-09-30). There are no
   new third-party dependencies. `sparkles-shacl` now uses `serde`, `serde_json`,
   `parking_lot`, `sha2` and `tempfile`, which were all already in the workspace.
@@ -483,13 +481,12 @@ implementation landed.
     a direct dependency of the `mcp` feature, for the token that ends the endpoint's
     streams at shutdown. It was already in the tree through rmcp. The transport, its
     session rules and the auth integration follow the C11 spec and the C09 permission
-    model. No other MCP server was consulted.
+    model.
   - **Phase 3** (2026-10-03): completions, `subscriptions/listen` and the tasks extension
     use rmcp 3.5's own handlers and its `task_manager`, with no new dependency. The
     stdio-to-HTTP bridge uses the CLI's `reqwest` client and the credentials code of
     `sparkles-client`. The header rules of the bridge follow the Streamable HTTP
-    transport of the MCP specification as rmcp checks them. No other MCP server or
-    bridge was consulted.
+    transport of the MCP specification as rmcp checks them.
 - **Rejected** (spec §9):
   - a hand-rolled JSON-RPC layer (the fallback, isolated behind `adapter.rs`);
   - rmcp `#[tool]` macros with `schemars`-derived schemas;
@@ -960,7 +957,7 @@ implementation landed.
   - the PyO3 0.29 user guide and API documentation, and the maturin 1.x user guide;
   - PEPs 384, 517, 561, 599, 600 and 639, and the CPython release schedule;
   - pyoxigraph's documentation (MIT OR Apache-2.0), read for the names and signatures of
-    its store, term, `parse`, `serialize` and `RdfFormat` API. Its source was not read;
+    its store, term, `parse`, `serialize` and `RdfFormat` API;
   - rdflib's documentation (BSD-3-Clause), read for `rdflib.term` and
     `Literal.toPython`.
 - **Implementation, Phase 1** (2026-10-02): from the spec and the Sparkles code. No code
@@ -1001,7 +998,7 @@ implementation landed.
   - the W3C SPARQL 1.1 Protocol, Graph Store HTTP Protocol and Query Results formats;
   - RFC 9110, RFC 7617, RFC 6750, RFC 8187 and draft-ietf-httpapi-ratelimit-headers;
   - Apache Jena's documentation of `RDFConnection` and `RDFLink` (Apache-2.0), read for
-    the operations and their names. Its source was not read;
+    the operations and their names;
   - Oxigraph's Rust API documentation and pyoxigraph's documentation (MIT OR
     Apache-2.0), read for `QueryResults` and streaming solutions;
   - the documentation of progenitor (MPL-2.0) and openapi-generator (Apache-2.0), read to
@@ -1228,8 +1225,7 @@ implementation landed.
     from working knowledge;
   - RFC 4180, RFC 6570, RFC 7111 and the IANA registration of
     `text/tab-separated-values`;
-  - Tarql's public documentation (Apache-2.0), for CONSTRUCT templates over rows. Its
-    source was not read;
+  - Tarql's public documentation (Apache-2.0), for CONSTRUCT templates over rows;
   - the W3C R2RML Recommendation and the RML and YARRRML specifications, at the level of
     their overviews, for the rejected alternative;
   - the Sparkles code and specs C01 and C15.

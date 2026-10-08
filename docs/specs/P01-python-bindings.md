@@ -609,7 +609,7 @@ passed to a term constructor raises `ValueError`, and a wrong argument type rais
   PEP 600 (manylinux), PEP 639 (license files), and the Python release schedule for end
   of life dates.
 * pyoxigraph's documentation (MIT OR Apache-2.0): the `Store`, term, `parse`,
-  `serialize` and `RdfFormat` API, read for names and signatures. Its source was not read.
+  `serialize` and `RdfFormat` API, read for names and signatures.
 * rdflib's documentation (BSD-3-Clause): `rdflib.term` and `Literal.toPython`, read for
   the term model and the native value mapping.
 * mypy's `stubtest` documentation.

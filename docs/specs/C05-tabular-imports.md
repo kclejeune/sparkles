@@ -474,8 +474,7 @@ parameter, are a non-goal for this phase.
 - RFC 4180 (CSV), RFC 6570 (URI templates), RFC 7111 (`#row=` fragments of `text/csv`)
   and the IANA registration of `text/tab-separated-values`.
 - Tarql's public documentation (Apache-2.0 project), for CONSTRUCT over rows, column
-  variables, `?ROWNUM`, unbound empty cells and the `VALUES` view of the table. Tarql's
-  source was not read.
+  variables, `?ROWNUM`, unbound empty cells and the `VALUES` view of the table.
 - The W3C R2RML Recommendation and the published RML and YARRRML specifications, at the
   level of their overviews, for the rejected alternative.
 - The `csv` crate's documentation (Unlicense OR MIT).

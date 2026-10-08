@@ -1,9 +1,9 @@
 # Audit: Apache Jena, QLever and Oxigraph → Sparkles
 
 This audit covers these source snapshots: Apache Jena `6.3.0-SNAPSHOT` (b1dcba53b5,
-2026‑09‑28), QLever (b0c6d0cd, 2026‑09) and Oxigraph (e0f286b0, 2026‑09‑23). Fluree was not
-audited (§2b). Each feature Sparkles added beyond this audit has a design spec in
-[`specs/`](specs/README.md), which also records how it was implemented.
+2026‑09‑28), QLever (b0c6d0cd, 2026‑09) and Oxigraph (e0f286b0, 2026‑09‑23). Each feature
+Sparkles added beyond these three projects has a design spec in
+[`specs/`](specs/README.md), which also records how it was implemented (§2b).
 
 ## 1. Apache Jena — functional inventory
 
@@ -90,10 +90,10 @@ with iterators, in `spareval`. Sparkles uses the libraries and replaces the data
 
 Oxigraph is one of the engines in the benchmarks (`docs/BENCHMARKS.md`).
 
-## 2b. Fluree — not audited
+## 2b. Features beyond the audited projects
 
 [Fluree DB](https://github.com/fluree/db) is licensed under BUSL-1.1, and Sparkles does
-not depend on it. Some features that other databases offer were added to Sparkles:
+not depend on it. Sparkles added several features that Fluree and other databases offer:
 durable commit ids, point-in-time reads and named snapshots, full-text and vector search,
 dataset access control, an MCP server, and backups to object storage. Their specs were
 written from the W3C and IETF standards, the documentation of permissively licensed
@@ -103,7 +103,7 @@ libraries, published papers and Sparkles' existing code. The specs are in
 [F04](specs/F04-vector-search.md), [C09](specs/C09-dataset-access-control.md),
 [C11](specs/C11-mcp-server.md), [F05](specs/F05-snapshot-repositories.md)), and
 [`specs/PROVENANCE.md`](specs/PROVENANCE.md) records the sources of each. Fluree appears
-only as a benchmark engine, downloaded at benchmark time, and in
+as a benchmark engine, downloaded at benchmark time, and in
 [COMPARISON.md](COMPARISON.md#vs-fluree), which draws on its public documentation.
 
 ## 3. Language decision: Rust
