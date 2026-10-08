@@ -593,6 +593,7 @@ pub fn filter(
 /// Batch-local FILTER reuse stores only IDs, slots and booleans. A conservative
 /// reservation covers distinct construction and key-test scratch until expansion.
 /// Mixed/impure conjuncts stay row-by-row; no decoded-value cache survives a batch.
+#[inline(never)]
 fn cursor_filter(
     ctx: &Ctx,
     t: &Table,
@@ -620,7 +621,12 @@ fn cursor_filter(
         _ => distinct(ctx, t, &refs, false, report, true)?,
     };
     let Some(d) = d else {
-        return Ok(None);
+        drop(_held);
+        return if key_bytes.is_none() {
+            cursor_numeric_filter(ctx, t, exprs).map(|keep| keep.map(|keep| (keep, Vec::new())))
+        } else {
+            Ok(None)
+        };
     };
     let vals = match (key_bytes, v) {
         (Some(_), Some(v)) => {
@@ -640,6 +646,110 @@ fn cursor_filter(
         .rows(t.len()),
         Vec::new(),
     )))
+}
+
+/// Batch-local numeric dictionary evaluation after ordinary distinct reuse was
+/// declined. Shared eager row evaluation stays unchanged; optional memory failure
+/// returns to scalar filtering and no decoded dictionary crosses a batch.
+#[inline(never)]
+fn cursor_numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<Vec<bool>>> {
+    fn numeric(e: &Expr) -> bool {
+        match e {
+            Expr::Var(_) => true,
+            Expr::Const(id) => matches!(
+                id.tag(),
+                crate::id::Tag::Int | crate::id::Tag::Decimal | crate::id::Tag::Double
+            ),
+            Expr::Lit(_, value) => matches!(
+                value,
+                super::value::Value::Integer(_)
+                    | super::value::Value::Decimal(_)
+                    | super::value::Value::Float(_)
+                    | super::value::Value::Double(_)
+            ),
+            Expr::Arith(a, b, _)
+            | Expr::Cmp(a, b, _)
+            | Expr::Eq(a, b)
+            | Expr::And(a, b)
+            | Expr::Or(a, b) => numeric(a) && numeric(b),
+            Expr::Neg(e) | Expr::Pos(e) | Expr::Not(e) => numeric(e),
+            Expr::Call(
+                super::expr::Func::Builtin(
+                    spargebra::algebra::Function::Abs
+                    | spargebra::algebra::Function::Floor
+                    | spargebra::algebra::Function::Ceil
+                    | spargebra::algebra::Function::Round,
+                ),
+                args,
+            ) => args.iter().all(numeric),
+            _ => false,
+        }
+    }
+    if !ctx.is_cursor() || !ctx.opt.expr_cache || t.len() < 4096 || !exprs.iter().all(numeric) {
+        return Ok(None);
+    }
+    let bytes = t.len() as u64 * (std::mem::size_of::<Option<super::value::Value>>() as u64 + 2)
+        + ctx.nvars() as u64 * 16
+        + exprs.len() as u64 * 8
+        + t.width() as u64 * std::mem::size_of::<Option<Vec<Option<super::value::Value>>>>() as u64
+        + 4096;
+    let Ok(_charge) = ctx.retained_charge(bytes) else {
+        return Ok(None);
+    };
+    let Ok(Some(var)) = eligible(&exprs.iter().collect::<Vec<_>>()) else {
+        return Ok(None);
+    };
+    let Some(column) = t.col_of(var) else {
+        return Ok(None);
+    };
+    let values = match cursor_dictionary_values(ctx, t, &Expr::Var(var)) {
+        Ok(Some(values)) => values,
+        Ok(None) => return Ok(None),
+        Err(crate::Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if values.vals.iter().flatten().any(|v| {
+        !matches!(
+            v,
+            super::value::Value::Integer(_)
+                | super::value::Value::Decimal(_)
+                | super::value::Value::Float(_)
+                | super::value::Value::Double(_)
+                | super::value::Value::Bool(_)
+        )
+    }) {
+        return Ok(None);
+    }
+    let mut decoded = Vec::with_capacity(t.len());
+    for row in 0..t.len() {
+        if row.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        decoded.push(values.get(row).clone());
+    }
+    let mut cols = vec![None; t.width()];
+    cols[column] = Some(decoded);
+    let map = t.var_map(ctx.nvars());
+    let keep = super::exec::map_rows(
+        ctx,
+        t.len(),
+        t.len() > super::exec::PAR_THRESHOLD && exprs.iter().all(Expr::parallel),
+        |i| {
+            let row = super::expr::Row {
+                table: t,
+                i,
+                map: &map,
+                dec: Some(&cols),
+            };
+            exprs
+                .iter()
+                .all(|e| super::expr::ebv(e, &row, ctx).unwrap_or(false))
+        },
+    )?;
+    ctx.check()?;
+    Ok(Some(keep))
 }
 
 /// The caller holds the cursor reservation through expansion. Keep this batch

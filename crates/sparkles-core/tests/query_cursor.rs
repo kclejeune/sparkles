@@ -1422,6 +1422,124 @@ fn retained_order_keys_match_eager_and_fail_without_partial_success() {
 }
 
 #[test]
+fn dictionary_inputs_match_eager_for_mixed_expressions_and_budget_decline() {
+    use sparkles_core::id::Id;
+    let s = store(0);
+    let data = (0..5000)
+        .map(|i| format!(
+            "<urn:s:{i}> <urn:value> \"{}.12345678901234567890\"^^<http://www.w3.org/2001/XMLSchema#decimal> ; <urn:name> \"name {i} {}\" .\n",
+            i, "x".repeat(96)
+        ))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let mut tx = s.write();
+    let subject = tx
+        .intern(&oxrdf::NamedNode::new_unchecked("urn:delta").into())
+        .unwrap();
+    for (predicate, object) in [
+        (
+            "urn:value",
+            oxrdf::Literal::new_typed_literal(
+                "3.12345678901234567890",
+                oxrdf::NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#decimal"),
+            ),
+        ),
+        ("urn:name", oxrdf::Literal::new_simple_literal("delta name")),
+    ] {
+        let p = tx
+            .intern(&oxrdf::NamedNode::new_unchecked(predicate).into())
+            .unwrap();
+        let o = tx.intern(&object.into()).unwrap();
+        tx.insert([subject, p, o, Id::DEFAULT_GRAPH]).unwrap();
+    }
+    tx.commit().unwrap();
+    for (q, ordered) in [
+        (
+            "SELECT ?s { ?s <urn:value> ?v FILTER(?v > 4000 && ?v < 4900) }",
+            false,
+        ),
+        (
+            "SELECT ?s { ?s <urn:value> ?v ; <urn:name> ?n FILTER(STRLEN(?n) > ?v) }",
+            false,
+        ),
+        (
+            "SELECT ?s ?x { ?s <urn:value> ?v ; <urn:name> ?n BIND(?v + STRLEN(?n) AS ?x) }",
+            false,
+        ),
+        (
+            "SELECT ?s { ?s <urn:value> ?v ; <urn:name> ?n } ORDER BY (?v + STRLEN(?n)) ?s LIMIT 10",
+            true,
+        ),
+        (
+            "SELECT ?s { ?s <urn:value> ?v ; <urn:name> ?original BIND(CONCAT(?original, \" suffix\") AS ?n) FILTER(STRLEN(?n) > ?v) }",
+            false,
+        ),
+    ] {
+        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+
+        for (memory, reuse, batch) in [
+            (32 << 20, true, 4096),
+            (32 << 20, false, 4096),
+            (32 << 20, true, 31),
+        ] {
+            let opts = QueryOptions {
+                max_memory_bytes: Some(memory),
+                optimizations: Some(sparkles_core::sparql::Optimizations {
+                    expr_cache: reuse,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let cursor_opts = if ordered {
+                CursorOptions {
+                    batch_rows: batch,
+                    ..Default::default()
+                }
+            } else {
+                options(batch)
+            };
+            let mut cursor = select_cursor(s.snapshot(), q, &opts, &cursor_opts).unwrap();
+            let mut answer = Vec::new();
+            while let Some(b) = cursor.next_batch().unwrap() {
+                for row in 0..b.len() {
+                    answer.push(b.row(row).unwrap());
+                }
+            }
+            if ordered {
+                assert_eq!(answer, expected, "{q}; reuse {reuse}; batch {batch}");
+            } else {
+                assert_eq!(
+                    bag(answer),
+                    bag(expected.clone()),
+                    "{q}; reuse {reuse}; batch {batch}"
+                );
+            }
+            assert!(cursor.stats().mem_peak_bytes <= memory);
+        }
+    }
+    let q = "SELECT ?s { ?s <urn:value> ?v FILTER(?v > 4000 && ?v < 4900) }";
+    let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+    let opts = QueryOptions {
+        max_memory_bytes: Some(1 << 20),
+        ..Default::default()
+    };
+    let mut cursor = select_cursor(s.snapshot(), q, &opts, &options(4096)).unwrap();
+    let mut answer = Vec::new();
+    while let Some(b) = cursor.next_batch().unwrap() {
+        for row in 0..b.len() {
+            answer.push(b.row(row).unwrap());
+        }
+    }
+    assert_eq!(bag(answer), expected);
+    assert!(cursor.stats().mem_peak_bytes <= 1 << 20);
+}
+
+#[test]
 fn dictionary_numeric_topk_preserves_exact_order_and_non_numeric_fallbacks() {
     let s = store(0);
     let data = (0..5000).map(|i| {

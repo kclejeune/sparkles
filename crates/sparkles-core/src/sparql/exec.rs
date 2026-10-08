@@ -20,7 +20,7 @@ use std::cmp::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-const PAR_THRESHOLD: usize = 16_384;
+pub(super) const PAR_THRESHOLD: usize = 16_384;
 
 /// Parallel iterators over rows hand out pieces of at least this many rows, so a small
 /// input is processed on the calling thread: waking the pool for it would cost more
@@ -30,7 +30,7 @@ pub(super) const PAR_MIN_LEN: usize = 4096;
 /// Map `f` over rows `0..n` (in parallel when `par`) in chunks, checking cancellation and
 /// the deadline between chunks: one clock read per chunk rather than per row, while an
 /// expensive expression still stops within one chunk of the deadline.
-fn map_rows<T: Send>(
+pub(super) fn map_rows<T: Send>(
     ctx: &Ctx,
     n: usize,
     par: bool,
