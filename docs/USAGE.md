@@ -3,9 +3,8 @@
 This guide covers operating the `sparkles` binary. It describes running the server, the
 command-line tools, automatic compaction, the formatter and linter, backups, outbound
 requests, path search, integrity checks, the MCP server, embedding the library, the
-Python package, the JVM library for Apache Jena, the JavaScript packages, the Rust client, Docker and deploying on
-NixOS. [API.md](API.md)
-specifies the HTTP API.
+Python package, the JVM library for Apache Jena, the JavaScript packages, the Rust
+client, Docker and deploying on NixOS. [API.md](API.md) specifies the HTTP API.
 [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
 
 Sparkles is experimental. The on-disk format, HTTP API and CLI may change between commits
@@ -513,17 +512,18 @@ sparkles describe-settings --loc db --set mode=scbd   # how DESCRIBE describes a
 sparkles ping    127.0.0.1:3030               # GET /$/ready over HTTP, then HTTPS; exit 0 on 200 (health checks)
 ```
 
-Loading supports reader parsing for every RDF syntax and native `.xz` and `.bz2`
-compression, alongside gzip, zstd, brotli and LZ4. The default `--parse-mode auto`
-preserves parallel parsing where possible and streams large compressed documents.
-Structured documents buffer below 128 MiB decompressed for Turtle/TriG, or 8 MiB
-for other syntaxes, before switching to readers with 128 KiB input buffering.
-`--auto-buffer-bytes BYTES` overrides that cutoff; zero skips probing. The allowance
-is per source; reduce it when several loads share a memory budget. Mapped plain
-Turtle and bounded parallel compressed N-Triples/N-Quads retain their existing paths.
-Use `--parse-mode streaming` for a sequential reader or `--parse-mode buffered` to
-explicitly permit a whole decompressed document in RAM. Parsing streams do not remove
-the memory needed for index-building batches or transactional changes.
+Every RDF syntax can be parsed incrementally from a reader. Loading reads `.xz` and
+`.bz2` files as well as gzip, zstd, brotli and LZ4. The default `--parse-mode auto`
+parses in parallel where it can and streams large compressed documents. A document is
+read into memory whole when its decompressed size is below 128 MiB for Turtle and TriG,
+or below 8 MiB for other syntaxes. Larger documents are parsed from a reader with a
+128 KiB input buffer. `--auto-buffer-bytes BYTES` changes that cutoff, and zero skips
+the size check. The cutoff applies to each source separately, so lower it when several
+loads share a memory budget. Plain Turtle is still parsed from a memory-mapped file, and
+compressed N-Triples and N-Quads are still parsed in bounded parallel blocks. Use
+`--parse-mode streaming` to always parse with a sequential reader, or `--parse-mode
+buffered` to allow a whole decompressed document in RAM. Streaming the parse does not
+reduce the memory that index-building batches or transactional changes need.
 
 ```sh
 sparkles load --loc db --parse-mode streaming clusters.rdf.xz
@@ -531,15 +531,14 @@ sparkles load --loc db --parse-mode auto data.ttl.gz
 sparkles load --loc db --parse-mode streaming --jsonld-streaming ordered.jsonld.gz
 ```
 
-Ordinary JSON-LD retains arbitrary key-order semantics and may buffer a large object.
-`--jsonld-streaming` validates the streaming profile's context/type ordering. Python
-`Dataset.load` and `load_files` also accept `parse_mode="auto"`, `"streaming"` or
-`"buffered"`, plus `auto_buffer_bytes` for the automatic cutoff;
-`format="jsonld-streaming"` selects ordered streaming JSON-LD for `load` and
-`sparkles.parse`. Large individual terms and blank-node identity maps
-still consume memory. [Input parsing and compression](API.md#compression) describes
-selection and limits.
-
+Ordinary JSON-LD allows keys in any order, so the parser may hold a large object in
+memory. `--jsonld-streaming` reads the streaming profile instead and checks that each
+object puts its context and type keys first. Python's `Dataset.load` and `load_files`
+also accept `parse_mode="auto"`, `"streaming"` or `"buffered"`, and `auto_buffer_bytes`
+sets the automatic cutoff. `format="jsonld-streaming"` selects ordered streaming JSON-LD
+for `load` and `sparkles.parse`. Very large terms and the map of blank-node labels still
+take memory. [Input parsing and compression](API.md#compression) describes how the
+parser is chosen and its limits.
 
 `sparkles query --loc` runs a query as the server runs one on the dataset. RDFS on read
 follows the database's `rdfs.json`, the materialized inferences of `sparkles infer` are
@@ -547,16 +546,18 @@ part of the default graph while `reasoning.json` records them, and DESCRIBE foll
 `describe.json`. `--rdfs` or `--rdfs-graph` sets RDFS on read for the one query instead.
 `sparkles queries run` follows the same settings.
 
-Opening a persistent dataset with a missing or damaged configured text index starts
-background recovery. RDF queries and writes remain available, while text queries return
-`503` until a ready view is published. `rebuilding` and `failed` are configured states;
-a disabled index still gives `400`. Plain `sparkles text-index --loc DB` joins
-pending recovery or retries a failed attempt before exiting. `--rebuild` explicitly
-requests a rebuild, including when the index is already ready. Enabling or changing
-its configuration builds synchronously. Closing the dataset or disabling/reconfiguring
-text search cancels automatic recovery and joins its cleanup. An admitted directory
-publication fence completes before cancellation returns. The HTTP rebuild task keeps
-its existing synchronous native cancellation behavior ([API](API.md#full-text-search)).
+When a persistent dataset opens and its configured text index is missing or damaged,
+Sparkles rebuilds the index in the background. RDF queries and writes keep working,
+and text queries return `503` until the rebuilt index is ready. The index reports the
+state `rebuilding` or `failed` meanwhile. A disabled index still answers `400`.
+`sparkles text-index --loc DB` with no other flags waits for a pending rebuild, or
+retries a failed one, before it exits. `--rebuild` asks for a rebuild even when the
+index is ready. Enabling the index or changing its configuration builds it before the
+command returns. Closing the dataset, disabling text search or changing its
+configuration cancels the background rebuild and waits for its cleanup. If the rebuild
+has already started publishing the new index files, that step finishes before the
+cancellation returns. Cancelling the HTTP rebuild task behaves as it did before, and
+the native rebuild stops synchronously ([API](API.md#full-text-search)).
 
 `sparkles dump` writes N-Quads by default. `--format`, or the extension of `--out`, picks
 another syntax: TriG, N-Triples, Turtle, JSON-LD, RDF/XML, TriX, RDF Thrift (`rt`), RDF
@@ -1179,9 +1180,9 @@ triples. On a server, `POST /{ds}/upload` takes tables too
 A branch lets a change take several steps, or several people, before it reaches the data
 everyone reads. Every persistent or in-memory dataset has the branch `main`. A new
 persistent branch starts from a commit of another branch and shares that branch's index
-files until it compacts. In-memory branches share immutable base state, copy the
-inherited append vocabulary, and keep their writes, indexes and validation state
-separate. Reads and writes choose a branch with `--branch` on the command line,
+files until it compacts. An in-memory branch shares the unchanging base data of the
+branch it starts from and copies the vocabulary of terms added since. Its writes,
+indexes and validation state stay separate. Reads and writes choose a branch with `--branch` on the command line,
 `?branch=NAME` over HTTP, or the endpoint URL `/{ds}@{branch}/sparql`.
 [API.md](API.md#branches-and-merges) describes the routes, the merge rules and the
 conflict report.
@@ -1222,11 +1223,12 @@ sparkles branch relink --loc db dev
 sparkles branch relink --loc db dev --format json
 ```
 
-Relinking runs offline against an existing database and requires its exclusive
-directory lock. It preserves branch writes as a sparse overlay and retains older
-indexes while readers or history need them. Main and branches with independent
-indexes are refused. Progress goes to stderr; Ctrl-C cancels the operation. Ordinary
-compaction still builds an independent index. HTTP relinking remains unavailable.
+Relinking works on a stopped database and takes its exclusive directory lock. The
+branch's own writes are kept as a sparse overlay on main's index, and older indexes stay
+on disk while readers or history need them. `main` and branches that already have their
+own index cannot be relinked. Progress goes to stderr, and Ctrl-C cancels the
+operation. Ordinary compaction still gives a branch an index of its own. The server
+has no relink route.
 
 `merge` prints the result, or the conflicts that stopped it:
 
@@ -1257,10 +1259,10 @@ parent, so the source stays ahead of the target and keeps its own history to its
 a merge or when the target is already up to date, 2 when conflicts stopped the merge,
 and 1 on any other error.
 
-Criss-cross histories automatically use a recursive virtual merge base when their
-common ancestors combine without conflicts. Conflicting ancestors require explicit
-base selection. A virtual base is reported as `null` and creates no stored commit;
-replay requires a real base.
+When two branches have merged into each other, they can have several best common
+ancestors. If those ancestors' changes combine without conflicts, the merge combines
+them into a virtual merge base. Otherwise, the merge needs an explicit base. A virtual
+base is reported as `null` and is not stored as a commit. `--replay` needs a real base.
 
 `sparkles revert N` undoes commit N of the `--branch` branch, `main` by default, with
 a new commit of kind `revert`. Later changes to the same cells conflict as in a merge,
@@ -1562,19 +1564,22 @@ integrity check that runs before the restored database is published. `sparkles s
 holds a lock on `<data>/sparkles-server.lock`, which allows one server per data
 directory, and `restore --data` refuses while a server holds it.
 
-`backup policy run` opens an existing stopped catalog with the same directory lock.
-It uses the named TOML policy and its configured repositories, captures the selected
-datasets, applies retention and runs configured garbage collection. Manual execution
-also permits a policy whose scheduler is disabled. Unchanged datasets can be skipped.
-JSON output includes the per-dataset results; backup or retention failures produce a
-nonzero exit status. Ctrl-C cancels the operation and preserves completed backups.
+`backup policy run` opens the data directory of a stopped server and takes the same
+directory lock. It runs the named policy from the TOML file against the repositories
+that file configures. It backs up the selected datasets, applies retention and runs
+garbage collection when the policy asks for it. A policy whose schedule is disabled can
+still be run this way. Datasets that have not changed since their last backup can be
+skipped. JSON output lists the result for each dataset, and the exit status is nonzero
+when a backup or retention step fails. Ctrl-C cancels the run and keeps the backups
+that already finished.
 
-A backup captures one selected branch; the default and scheduled policies capture
-`main`. A linked branch is materialized into standalone files without changing its
-source. Its manifest records the owning dataset and branch identity. Restoring a branch
-with `auto` or `new` gives it a fresh dataset id and records the captured branch as its
-origin; `keep` is refused. This preserves its blank-node labels without attaching the
-restore to the source's branch history.
+A backup captures one branch, and both the default and scheduled policies capture
+`main`. A branch that still shares its upstream's index is written out as standalone
+files, and the branch itself is left unchanged. The manifest records the dataset and
+branch the backup came from. Restoring a branch backup with `--identity auto` or `new`
+gives it a fresh dataset id and records the captured branch as its origin. `keep` is
+refused. The restored dataset keeps its blank-node labels but is not attached to the
+source's branch history.
 
 A server started with `sparkles serve --backup-config FILE` serves the file's
 repositories and policies through its API, read-only. It also accepts repositories
@@ -1609,22 +1614,22 @@ server with the file, or send it SIGHUP. Then `POST /$/repositories` with
 ### Encrypted repositories
 
 Build the CLI with `--features backup-encryption` to enable encrypted repositories.
-This feature is off in the default build and currently requires Linux or Android for
-protected key memory. Existing plaintext repositories keep their behavior. The offline
-CLI and trusted operator `serve --backup-config FILE` configuration support the same
-local key providers. HTTP registration and updates reject encryption metadata; keys
-and provider references remain operator-controlled.
+The feature is off in the default build. It requires Linux or Android, because it keeps
+keys in protected memory. Plaintext repositories behave as before. The CLI and a server
+started with `serve --backup-config FILE` support the same local key providers. The
+HTTP API refuses encryption settings when it registers or updates a repository, so only
+the operator controls keys and the references to them.
 
-Store keys outside datasets, catalogs and the backup repository. Key files must be
-regular files with no group or other permissions, owned by the user that runs
-Sparkles or by root. Each local key is exactly 32 raw bytes, 64 hexadecimal characters,
-or canonical base64 encoding of 32 bytes; text encodings permit surrounding ASCII
-whitespace. Raw input made only of printable ASCII is refused, because a typed
-32-character password would otherwise become the key. If an existing key is such
-text, give the same bytes in hex instead, for example with `xxd -p -c 64 key`, and
-the existing slots keep opening. Passphrase files contain 1–4096 exact
-bytes: a final newline is part of the passphrase. Provider output is limited to 4096
-bytes. Configuration and flags contain references, never inline key material.
+Store keys outside datasets, catalogs and the backup repository. A key file must be a
+regular file owned by the user that runs Sparkles or by root, with no group or other
+permissions. Each local key is exactly 32 raw bytes, 64 hexadecimal characters, or the
+canonical base64 encoding of 32 bytes. The hex and base64 forms may have ASCII
+whitespace around them. Raw input made only of printable ASCII is refused, because a
+typed 32-character password would otherwise become the key. If an existing key is such
+text, give the same bytes in hex instead, for example with `xxd -p -c 64 key`, and the
+existing slots keep opening. A passphrase file holds 1 to 4096 bytes, used exactly as
+written, so a final newline is part of the passphrase. Provider output is limited to
+4096 bytes. Configuration and flags hold references to keys, never the keys themselves.
 
 ```sh
 sparkles repo add secure --path /srv/backups/secure --encrypt \
@@ -1637,22 +1642,24 @@ sparkles repo key remove --repo secure --slot UUID
 sparkles repo key retire --repo secure --epoch 1
 ```
 
-Initialization requires two independent input references unless `--single-key-ok`
-explicitly accepts one. Keep an independent recovery key offline; a key added with
-`repo key add` is wrapped into each readable epoch without adding its reference to
-the online config. `--key-label` is required when adding a key. Repeating an addition
-with the same label and key completes an interrupted addition without duplicates.
-Removing a slot refuses to remove the last available wrap of an epoch. Rotation
-changes the master-key epoch for new backups; historical backups remain readable.
-Retirement requires that no remaining manifest or blob references that epoch. Delete
-obsolete backups and run garbage collection before retiring their epoch. Unavailable
-offline recovery inputs do not prevent retirement once that proof succeeds.
+Creating an encrypted repository requires two independent keys unless
+`--single-key-ok` accepts one. Keep a recovery key offline. `repo key add` wraps a key
+into every readable epoch without adding its reference to the online configuration,
+and it requires `--key-label`. Running the same addition again with the same label and
+key finishes an interrupted addition without creating a duplicate. `repo key remove`
+refuses to remove the last available wrap of an epoch. Rotation starts a new
+master-key epoch for new backups, and older backups stay readable. An epoch can be
+retired only when no remaining manifest or blob refers to it, so delete obsolete
+backups and run garbage collection first. Once that check succeeds, retirement goes
+ahead even when offline recovery keys are not available.
 
 Creation and `repo key add` also accept `--key-env VARIABLE`, `--key-credential NAME`
-(from `$CREDENTIALS_DIRECTORY`), or `--key-command-argv '["/absolute/provider","argument"]'`.
-Commands execute the literal argv without a shell, with a default 10-second timeout
-(`--key-command-timeout`, 1–300 seconds). They receive no stdin; stderr is discarded.
-Timeout or cancellation kills the provider process group and reaps the provider.
+(from `$CREDENTIALS_DIRECTORY`), or
+`--key-command-argv '["/absolute/provider","argument"]'`. Sparkles runs the command's
+argv as given, without a shell. The timeout is 10 seconds by default and
+`--key-command-timeout` sets it between 1 and 300 seconds. The command gets no stdin,
+and its stderr is discarded. On a timeout or cancellation, Sparkles kills the
+provider's process group and reaps the provider.
 A provider starts with an empty environment plus `PATH`, `HOME`, `LANG`,
 `XDG_RUNTIME_DIR` and `CREDENTIALS_DIRECTORY` when Sparkles has them, so it never sees
 other repositories' `--key-env` keys or cloud credentials. A provider that needs
@@ -1675,13 +1682,13 @@ individual backups is not detected: a bucket writer can put back an older backup
 its name.
 
 A local key can move between file, environment, credential and command providers
-without changing its bytes or adding a slot. The slot retains its original source
-metadata; authenticated key bytes determine whether it opens.
+without changing its bytes or adding a slot. The slot still records the original
+source, but only the key bytes decide whether it opens.
 
-Ordinary repository commands can override configured references with
+Other repository commands can override the configured references with
 `--repository-key-file`, `--repository-key-env`, `--repository-credential`,
-`--repository-passphrase-file`, or `--repository-key-command-argv`; command timeout
-uses `--repository-key-command-timeout`. Passphrase recovery also needs the original
+`--repository-passphrase-file` or `--repository-key-command-argv`.
+`--repository-key-command-timeout` sets the command's timeout. Passphrase recovery also needs the original
 slot label, because it identifies the stored Argon2 salt:
 
 ```sh
@@ -1689,50 +1696,55 @@ sparkles backup restore --repo file:///srv/backups/secure b1 --to /srv/recovered
   --repository-passphrase-file /run/keys/recovery-phrase --repository-key-label offline
 ```
 
-`backup policy run` also supports a configured encrypted repository. It uses the
-policy's named repository and resolves only that repository's configured credentials
-and key providers after acquiring the stopped catalog's lock. Repository key override
-flags are refused for policy runs. Key files must stay outside the catalog and configured
-repository directories; file-input checks also reject keys stored inside another Sparkles
-dataset. Session-only catalog attachments are not rediscovered by an offline run.
-Retention and garbage
-collection share cancellation with backup creation; completed backups are preserved.
+`backup policy run` also works with a configured encrypted repository. After it takes
+the stopped catalog's lock, it reads the credentials and key providers of the policy's
+repository and of no other. The repository key override flags are refused for policy
+runs. Key files must stay outside the catalog and the configured repository
+directories, and a key file stored inside another Sparkles dataset is also refused. An
+offline run does not see datasets that a server attached only for its session. Ctrl-C
+cancels retention and garbage collection as it cancels backups, and completed backups
+are kept.
 
-The Rust TOML API retains references in `ConfiguredRepository`, returned by
-`RepoToml::configured` and `ConfigFile::configured_repositories`. Plain projections
+The Rust TOML API keeps key references in `ConfiguredRepository`, which
+`RepoToml::configured` and `ConfigFile::configured_repositories` return.
 `RepoToml::to_config` and `ConfigFile::repository_configs` now return `Result` and
-reject encrypted tables, preventing accidental conversion to a plaintext repository.
-CLI list/show output includes references and public keyslot metadata; it contains no
-resolved keys or passphrases. Cloud KMS, Vault and database-directory encryption
-remain unavailable.
+refuse encrypted tables, so an encrypted repository cannot be turned into a plaintext
+one by accident. `repo list` and `repo show` print key references and the public
+metadata of key slots, never resolved keys or passphrases. Sparkles has no support for
+cloud KMS, Vault or encrypting the database directory.
 
 ### Encrypted repositories in the server
 
-With `backup-encryption` enabled, `serve --backup-config FILE` also opens encrypted
-repositories defined in that trusted operator TOML. The same reference-only file,
-environment, systemd credential, passphrase-file and literal command providers are
-available for persistent repositories; encrypted `type = "memory"` is refused because
-it cannot retain its identity/data across reload or restart. The server resolves inputs
-on cache misses, including background startup and SIGHUP reachability checks, and caches
-the protected repository handle. Listener startup does not wait for those background
-checks. It uses that handle for backup, restore, verification, GC and scheduled policies. Secret files
-must remain outside server data and repository directories. API repository registration
-and updates reject an `encryption` field; provider references and key management remain
-operator-controlled.
+With `backup-encryption` enabled, `serve --backup-config FILE` also opens the encrypted
+repositories that the operator defines in that file. Persistent repositories can use
+the same key file, environment variable, systemd credential, passphrase file and
+command providers, all given as references. An encrypted `type = "memory"` repository
+is refused, because it cannot keep its identity and data across a reload or restart.
+The server reads the keys when it first needs a repository, including the background
+checks at startup and after SIGHUP, and then caches the opened repository in protected
+memory. The listener starts without waiting for those checks. Backups, restores,
+verification, garbage collection and scheduled policies all use the cached repository.
+Secret files must stay outside the server's data directory and the repository
+directories. The API refuses an `encryption` field when it registers or updates a
+repository, so key references and key management stay with the operator.
 
-SIGHUP validates the replacement configuration before changing the registry and drops
-encrypted handles even when their source references are unchanged. Use it after replacing
-key-file contents or credential inputs. A missing or wrong input reports an unavailable
-or locked repository; it never opens a plaintext replacement. Same-location reloads keep
-the registered repository UUID check. Backup and scheduled-policy task cancellation
-interrupts provider commands and waiting for another repository opener; engine opening retains its
-existing backend deadlines and checks cancellation before publishing the cache result. Already-admitted operations can finish using their
-retained handles; later opens use the new configuration generation, and an old-generation
-open that finishes after reload cannot be returned or cached for the replacement entry.
+On SIGHUP, the server validates the new configuration before it changes the registry.
+It then drops every opened encrypted repository, even when its key references are the
+same, so send SIGHUP after replacing the contents of a key file or credential. A missing
+or wrong key makes the repository unavailable or locked, and the server never opens a
+plaintext repository in its place. A reload that keeps a repository at the same
+location still checks its registered UUID. Cancelling a backup or scheduled-policy task
+interrupts provider commands and the wait for another task that is opening the same
+repository. Opening the storage backend keeps its own deadlines, and the server checks
+for cancellation before it caches the result. Operations that had already started can
+finish with the repository they opened. Later operations open it with the new
+configuration, and an open that started before the reload is never returned or cached
+for the new entry.
 
-The existing plaintext-only Rust registry `load`/`replace_config` methods remain checked.
-Server integrations retaining trusted encryption references use `load_configured` and
-`replace_configured`; API views and API persistence exclude those references.
+The Rust registry methods `load` and `replace_config` still accept only plaintext
+repositories. A server integration that needs the trusted encryption references uses
+`load_configured` and `replace_configured`. API views and the registry the API persists
+leave those references out.
 
 ## Outbound requests (SERVICE and LOAD)
 
@@ -1988,7 +2000,8 @@ caller who may read the dataset, which a `queryText: false` index refuses.
 The next server start, or `sparkles vector embed --loc db`, catches their writes up, and
 sends nothing for text that was already embedded. The local commands use the local
 outbound policy, which allows private addresses, and take `--embedding-secret` for keys
-named by a secret. The Python package does the same with `Dataset.indexes.vector.embed_until_idle()`.
+named by a secret. The Python package does the same with
+`Dataset.indexes.vector.embed_until_idle()`.
 
 ## Checking a database
 
@@ -2292,33 +2305,39 @@ while let Some(batch) = cursor.next_batch()? {
 let stats = cursor.stats();
 ```
 
-The cursor owns its snapshot; writes and compaction do not change the answer. Batches
-keep term resolution valid after cursor close. Retained batches count against the same
-memory budget, so release them when processed. Owned terms copied out are application
-memory. `close()` stops production, and drop closes automatically. A pull error is
-returned once; later pulls return no batch, while status/stats retain the failure.
-`collect()` explicitly materializes a fresh cursor and refuses partial consumption.
+The cursor reads from its own snapshot, so later writes and compactions do not change
+the answer. A batch can still resolve its terms after the cursor is closed. Batches
+that the application keeps count against the query's memory budget, so drop them once
+they are processed. Terms copied out of a batch are ordinary application memory.
+`close()` stops the query, and dropping the cursor closes it. A failed pull returns the
+error once. Later pulls return no batch, and the cursor's status and stats still show
+the failure. `collect()` reads a fresh cursor into memory and refuses a cursor that has
+already returned batches.
 
-`select_cursor_with(query, &QueryOptions, &CursorOptions)` sets budgets, batch targets
-and fallback policy. Defaults target 4,096 rows and 1 MiB of IDs per batch. Unsupported
-operators execute through a visible, budgeted eager fallback on demand; use
-`FallbackPolicy::RejectMaterialization` to reject those plans at open. Scans, range
-scans, VALUES, FILTER/BIND without EXISTS, projection, OFFSET/LIMIT and UNION are
-incremental. Merge joins and eligible OPTIONAL joins resume across batches; hash joins
-retain their build side. DISTINCT retains seen keys and eligible aggregates retain
-group state. Sorting and unsupported operator shapes materialize with visible plan
-barriers. Retained state and query-created terms are budgeted; exceeding the budget
-fails explicitly, without disk spill. Ordinary `query`/`select` APIs remain eager.
-Native transaction cursors are not supported.
+`select_cursor_with(query, &QueryOptions, &CursorOptions)` sets the budgets, the batch
+size and the fallback policy. By default a batch aims for 4,096 rows and 1 MiB of IDs.
+An operator that the cursor cannot run incrementally falls back to eager execution
+when its input is first needed. The fallback shows in the plan and counts against the
+budget. `FallbackPolicy::RejectMaterialization` refuses such plans when the cursor
+opens. Scans, range scans, VALUES, FILTER and BIND without EXISTS, projection, OFFSET,
+LIMIT and UNION run incrementally. Merge joins and eligible OPTIONAL joins resume
+across batches. A hash join keeps its build side in memory, DISTINCT keeps the keys it
+has seen, and an eligible aggregate keeps its group state. Sorting and unsupported
+operators read their whole input first, and the plan marks where they do. Kept state
+and terms the query creates count against the budget. A query that exceeds the budget
+fails, and nothing spills to disk. The ordinary `query` and `select` calls still run
+eagerly. Cursors inside a native transaction are not supported.
 
-`graph_cursor` and `graph_cursor_with` return decoded quad batches for CONSTRUCT and
-DESCRIBE. CONSTRUCT consumes WHERE solutions incrementally and budgets its duplicate
-set; DESCRIBE uses a visible materialization barrier. `query_cursor_with` dispatches
-SELECT, graph and ASK queries. ASK stops after a qualifying solution.
+`graph_cursor` and `graph_cursor_with` return batches of decoded quads for CONSTRUCT
+and DESCRIBE. CONSTRUCT reads WHERE solutions incrementally, and the set it uses to drop
+duplicate triples counts against the budget. DESCRIBE reads its whole input first, and
+the plan shows this. `query_cursor_with` accepts SELECT, ASK and graph queries. ASK
+stops at the first matching solution.
 
 `results::write_cursor_solutions` writes JSON, XML, CSV, TSV or native Sparkles JSON
-directly from batches. A writer error can leave partial output; check its returned
-result. For native snapshot metadata, use `results::write_cursor_native_json`.
+straight from the batches. A writer error can leave partial output, so check the
+result it returns. `results::write_cursor_native_json` also writes the native snapshot
+metadata.
 
 HTTP clients opt in explicitly:
 
@@ -2328,38 +2347,42 @@ curl --fail --get http://localhost:3030/ds/sparql \
   --data-urlencode 'execution=streaming' --data-urlencode 'format=json'
 ```
 
-A slow reader pauses the producer once bounded output buffers fill. Disconnects and
-deadlines stop production even during that wait. A late error aborts the response;
-only a successful transfer is a complete answer. With `send=N`, native metadata reports
-`stopped` and an unknown total when the cursor stops at the requested prefix. See
-[API.md](API.md#applicationx-sparklesjson-ui-result-format) for metadata and plan fields.
-The CLI accepts `sparkles query --execution streaming` or `--execution auto` locally
-and through `--server`. HTTP accepts `execution=auto` too. Auto selects pull execution
-for plain SELECT scans/projections estimated to return at least one million rows
-from immutable blocks with no pending delta, whole-block graph predicates and no
-restored initial bindings or offset. It requires enough memory for block ownership
-and batches of at least 4,096 rows and 128 KiB. Eligible `COUNT(*)` queries over a
-single-key OPTIONAL between two plain scans also qualify when estimated work reaches
-one million rows and result caching is disabled or bypassed. Other plans remain eager.
-Rust callers select the same policy with
-`query_execution_with` and `ExecutionMode::Auto`.
+When a client reads slowly, the query pauses once the bounded output buffers are full.
+A disconnect or a deadline stops the query even while it waits. An error that happens
+after the response has started aborts the response, so only a transfer that finishes
+successfully is a complete answer. With `send=N`, the native metadata reports `stopped`
+and an unknown total when the cursor stops after the first N rows.
+[API.md](API.md#applicationx-sparklesjson-ui-result-format) describes the metadata and
+plan fields.
 
-Python exposes `Dataset.select_cursor` and `Dataset.graph_cursor`, with iteration,
-`close()`, context-manager support, stats and direct serialization. A Python cursor
-that failed, in iteration or in `serialize()`, reports the status `failed` and raises
-`InvalidInputError` on every later `next()`, so a loop cannot mistake it for a complete
-answer. `serialize()` responds to Ctrl-C like a query does. Node accepts
-`execution: 'streaming' | 'auto'` in query options and offers `queryToStream` for
-serialized output. JVM/Jena callers opt in with the context symbol
-`Sparkles.STREAMING_EXECUTION`; Jena consumes SELECT batches and handles graph query
-forms through its existing adapters. Close cursors or iterators when stopping early.
+The CLI accepts `sparkles query --execution streaming` or `--execution auto`, both
+locally and through `--server`, and HTTP accepts `execution=auto` as well. In auto mode,
+Sparkles streams a plain SELECT of scans and projections when it expects at least one
+million rows. The data must come from immutable blocks with no pending changes, any
+graph restriction must cover whole blocks, and the query must have no restored initial
+bindings or offset. There must also be enough memory to own the blocks and to hold
+batches of at least 4,096 rows and 128 KiB. A `COUNT(*)` over a single-key OPTIONAL
+between two plain scans also streams when its estimated work reaches one million rows
+and the result cache is off or bypassed. Every other plan runs eagerly. Rust callers
+choose the same policy with `query_execution_with` and `ExecutionMode::Auto`.
+
+Python has `Dataset.select_cursor` and `Dataset.graph_cursor`. A Python cursor can be
+iterated, closed with `close()`, used as a context manager, asked for stats and
+serialized directly. When a Python cursor fails, during iteration or in `serialize()`,
+its status becomes `failed` and every later `next()` raises `InvalidInputError`, so a
+loop cannot mistake it for a complete answer. `serialize()` responds to Ctrl-C as a
+query does. Node accepts `execution: 'streaming' | 'auto'` in its query options, and
+`queryToStream` returns serialized output. JVM callers turn streaming on with the
+context symbol `Sparkles.STREAMING_EXECUTION`. Jena then reads SELECT results in
+batches and handles graph queries through its usual adapters. Close cursors and
+iterators when stopping early.
 
 ### Registered scalar functions
 
 Rust applications can register scalar functions by absolute IRI for one query. Build
-an immutable registry and pass it through `QueryOptions::extensions`; separate
-registries may implement the same IRI differently. Running results retain their
-registry even after the application drops its reference.
+an immutable registry and pass it through `QueryOptions::extensions`. Two registries
+may implement the same IRI differently. A running result keeps its registry alive even
+after the application drops its own reference.
 
 ```rust
 use oxrdf::Term;
@@ -2391,22 +2414,26 @@ let result = ds.query_with(
 )?;
 ```
 
-Callbacks receive owned RDF terms and a context with cancellation, deadline and
-budget checks. A domain error returns `ScalarError::Expression` and follows SPARQL's
-expression-error rules; execution errors abort the query. A fatal callback failure
-also prevents a captured write transaction from committing, even if application
-code catches the query error. Nested queries or writes on that dataset family are
-rejected. Callbacks are trusted application code and must check cancellation during
-their own long-running work.
+A callback receives owned RDF terms and a context that checks cancellation, the
+deadline and the budget. For an error in the data, the callback returns
+`ScalarError::Expression`, which SPARQL treats like any other expression error. Any
+other error aborts the query. Such a failure also keeps a write transaction that the
+query belongs to from committing, even if the application catches the query error. A
+callback cannot run nested queries or writes on the same dataset or its branches.
+Callbacks are trusted application code and must check for cancellation during their
+own long-running work.
 
-`Volatile` is the default volatility. Queries that invoke registered functions bypass
-result caching. The batch interface currently receives one argument row per call.
-Registration applies to direct IRI calls; dynamic dispatch and foreign-language
-callback adapters remain separate work.
+The default volatility is `Volatile`. Queries that call registered functions skip the
+result cache. The batch interface receives one row of arguments per call. Registered
+functions are reached only by calling their IRI directly. Dynamic dispatch and
+callbacks written in other languages are not supported.
 
 ### Registered aggregates
 
-Rust applications can register an aggregate by absolute IRI in the same per-query registry. Each group receives its own owned accumulator. Explicit `AGG` syntax keeps parsed and prepared queries independent of the registry supplied at execution:
+Rust applications can register an aggregate by absolute IRI in the same per-query
+registry. Each group gets its own accumulator. A query calls a registered aggregate
+with the explicit `AGG` keyword, so parsing and preparing a query do not depend on the
+registry that is supplied when it runs:
 
 ```rust
 use oxrdf::{Literal, Term};
@@ -2449,21 +2476,28 @@ let result = ds.query_with(
 )?;
 ```
 
-Registered aggregates accept one argument and run sequentially with singleton batches.
-Empty ungrouped input creates and finalizes one accumulator; grouped empty input
-creates none. Unbound or expression-error arguments make that group's result unbound.
+A registered aggregate takes one argument and receives the values one at a time, in
+sequence. Without GROUP BY, empty input still creates one accumulator and finishes it.
+With GROUP BY, empty input creates none. An unbound argument or an expression error
+makes that group's result unbound.
 
-Use `context.retain(bytes)` before retaining additional state. The engine releases
-those charges when the accumulator is destroyed. Cancellation, execution or protocol
-errors and failing destructors abort the query and prevent partial transaction commits.
-The scalar callback's dataset-family guards and query lifetime also apply to aggregates.
+Call `context.retain(bytes)` before an accumulator keeps more state. The engine
+releases those bytes when the accumulator is destroyed. Cancellation, execution errors,
+protocol errors and failing destructors abort the query, and the transaction it belongs
+to does not commit partially. Aggregates follow the same rules as scalar callbacks for
+nested access to the dataset and for living no longer than the query.
 
-Registration cannot override built-in scalar or aggregate IRIs. Dynamic registered
-dispatch, foreign adapters and parallel partial aggregation remain separate work.
+Registration cannot override built-in scalar or aggregate IRIs. Dynamic dispatch,
+callbacks written in other languages and parallel partial aggregation are not
+supported.
 
 ### Registered property functions
 
-Rust applications can register a fixed predicate IRI that expands each input solution into zero or more solutions. Declare the subject and object argument shapes, required inputs and permitted outputs in the per-query registry. A shape is either one RDF term or a bounded query-written RDF list; the two sides support at most 128 arguments in total.
+Rust applications can register a fixed predicate IRI that turns each input solution
+into zero or more solutions. The per-query registry declares the shape of the subject
+and object arguments, which inputs are required and which outputs the function may
+bind. A shape is either one RDF term or a bounded RDF list written in the query. The two
+sides take at most 128 arguments in total.
 
 The example below emits a descending sequence from each bound count:
 
@@ -2523,13 +2557,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Only a fixed registered predicate in a basic graph pattern invokes the callback. Variable predicates and property paths retain ordinary RDF matching. The engine plans ordinary triple patterns first and then attaches callbacks in dependency order within that group. Missing required inputs or cyclic dependencies fail planning; an input variable present in the schema but unbound in a row skips that invocation. Duplicate input solutions open separate streams and duplicate output rows retain their multiplicity.
+The callback runs only for a fixed registered predicate in a basic graph pattern.
+Variable predicates and property paths still match RDF data as usual. Within a group,
+the engine plans the ordinary triple patterns first and then adds the callbacks in the
+order their inputs require. Planning fails when a required input is missing or when
+callbacks depend on each other in a cycle. When an input variable can be bound in the
+group but is unbound in a particular row, the callback is not called for that row. Each
+duplicate input solution opens its own stream, and duplicate output rows are kept.
 
-`None` in an output slot preserves its binding. Returned bound values must match existing values, and only declared output positions may bind new values. `ScalarError::Expression` discards all provisional rows from that invocation. Execution errors, invalid outputs, panics, cancellation, exceeded budgets and failing destructors abort the query and prevent partial update commits. Streams run synchronously and sequentially; results are materialized before the query returns.
+`None` in an output slot leaves that binding as it was. A returned value for a
+variable that is already bound must match it, and only the declared output positions
+may bind new values. When a call returns `ScalarError::Expression`, all the rows it had
+produced are discarded. Execution errors, invalid outputs, panics, cancellation,
+exceeded budgets and failing destructors abort the query, and an update that contains
+it does not commit partially. Streams run synchronously, one after another, and the
+results are fully built before the query returns.
 
-`context.view().scan(subject, predicate, object)` provides a read-only SPO cursor for the captured active graph and the caller's graph, triple and dataset restrictions. `next_batch()` returns at most 1024 triples and 1 MiB of RDF data per page. Contexts, cursors and batches borrow the query and cannot outlive it. Scanned permitted candidates, including duplicates collapsed in a merged graph, spend the shared work budget; traversal through excluded keys checks cancellation and deadlines without disclosing their count. Use `context.charge(bytes)` for temporary application buffers or `context.retain(bytes)` before retaining additional callback state. Callbacks remain responsible for checking controls inside their own long work. Composite literals also spend conservatively estimated parsing memory, so a literal below the byte ceiling can still exceed a finite query memory budget.
+`context.view().scan(subject, predicate, object)` gives a read-only SPO cursor over the
+query's active graph, limited to the graphs, triples and datasets the caller may read.
+Each `next_batch()` returns at most 1024 triples and 1 MiB of RDF data. Contexts,
+cursors and batches borrow the query and cannot outlive it. Every permitted triple the
+scan visits counts against the shared work budget, including duplicates that a merged
+graph collapses. Skipping triples the caller may not read still checks cancellation and
+deadlines, but it does not reveal how many there are. Use `context.charge(bytes)` for
+temporary application buffers, and call `context.retain(bytes)` before the callback
+keeps more state. Callbacks must still check for cancellation inside their own long
+work. Parsing a composite literal also counts a conservative memory estimate, so a
+literal below the byte ceiling can still exceed a finite query memory budget.
 
-Volatility defaults to `Volatile`; queries invoking registered callbacks bypass result caching and unsafe callback-moving optimizations. OPTIONAL and LATERAL preserve per-input calls. EXISTS retains its dynamic planning: missing required input errors arise when that subplan is entered. Registered property functions have a separate IRI category from scalar functions and aggregates. Foreign callback adapters and cross-row batching remain future work.
+The default volatility is `Volatile`. Queries that call registered callbacks skip the
+result cache and any optimization that would move a callback to another place in the
+plan. OPTIONAL and LATERAL still call the function once per input row. EXISTS is still
+planned when it runs, so a missing required input fails only when the query enters that
+EXISTS. Property function IRIs are registered separately from scalar function and
+aggregate IRIs. Callbacks written in other languages and batching calls across rows are
+not supported.
 
 ### Dataset administration
 
@@ -2563,19 +2625,20 @@ calls, the validators, the GraphQL configuration, `ds.backups(&repo)` with
 has. The default is empty. `ds.backups(&repo).create_with` captures a consistent state,
 including its reasoning record and validation configuration, and uploads it to the
 repository. `Catalog::restore` downloads and verifies a backup, then registers a new
-dataset or replaces an existing managed persistent dataset. A failed replacement
-reopens the original database. Live dataset or branch handles must be released before
-an in-place restore can close that store.
+dataset or replaces a persistent dataset that the catalog manages. If a replacement
+fails, the original database is reopened. An in-place restore has to close the store,
+so release every handle to the dataset and its branches first.
+
 `sparkles::terms` checks IRIs and language tags, and `sparkles::io::check_data` finds
 the first syntax error of RDF data, as the server's validators do.
 
-A catalog preserves the server's `config.json`, `databases/`, `backups/` and
-`backup/` layout. `Catalog::open` takes an exclusive `catalog.lock` before recovery or
-opening stores. A second opener returns `Error::Locked { path, pid }`. Every cloned
-catalog handle shares this lock. Keep data directories on a local disk.
-`Catalog::inspect` reads the registry without locking or opening databases, so it can
-list a running server's persistent datasets. Memory datasets report a nil UUID in this
-inspection because their identity is not persisted.
+A catalog uses the same `config.json`, `databases/`, `backups/` and `backup/` layout
+as the server. `Catalog::open` takes an exclusive `catalog.lock` before it recovers or
+opens any store, and a second opener gets `Error::Locked { path, pid }`. Clones of a
+catalog handle share the lock. Keep data directories on a local disk.
+`Catalog::inspect` reads the registry without locking it or opening databases, so it
+can list a running server's persistent datasets. It reports a nil UUID for memory
+datasets, because their identity is not stored.
 
 ```rust
 use sparkles::Catalog;
@@ -2596,23 +2659,26 @@ drop((ds, sandbox, dev));                         // release handles before a re
 let renamed = catalog.rename("wiki", "pages")?;  // UUID and commit IRIs stay valid
 ```
 
-`Catalog::memory` has no registry directory and accepts memory or attached datasets.
+`Catalog::memory` has no registry directory and holds only memory or attached datasets.
 `attach` opens an external directory or a temporary memory dataset without registering
 it on disk. A reservation holds a target name during a clone or restore and releases
-it on drop. Dataset names use 1 to 64 ASCII letters, digits, `_`, `-` and `.`, cannot
-start with `.`, and cannot be `ui` or `$`. A persistent rename refuses live handles,
-then closes the store, moves its directory and updates the registry.
+it when dropped. A dataset name has 1 to 64 ASCII letters, digits, `_`, `-` and `.`. It
+cannot start with `.` and cannot be `ui` or `$`. Renaming a persistent dataset fails
+while handles to it are open. Otherwise the rename closes the store, moves its
+directory and updates the registry.
 
-With feature `backup`, `catalog.repositories()` manages `backup/repositories.json`.
-Its `list`, `get`, `add`, `update`, `remove` and `open` calls share configuration and
-opened repository handles. `with_fixed` adds immutable operator-defined entries to
-the same namespace. `catalog.run_policy` backs up the datasets selected by a
-`PolicyConfig` and applies retention. `catalog.apply_retention` can preview deletions
-with `dry_run: true`. Embedders decide when to call these operations.
+With the feature `backup`, `catalog.repositories()` manages `backup/repositories.json`.
+Its `list`, `get`, `add`, `update`, `remove` and `open` calls share the configuration
+and the opened repositories. `with_fixed` adds read-only entries defined by the
+operator to the same set of names. `catalog.run_policy` backs up the datasets that a
+`PolicyConfig` selects and applies retention. `catalog.apply_retention` with
+`dry_run: true` lists what it would delete. The embedding application decides when to
+call these operations.
 
-The checked-in [binding surface](../crates/sparkles/bindings.toml) records each call's
-Python, JVM and Node name or planned phase. Tests require a decision for every OpenAPI
-library operation and require Python names to resolve in both the extension stub and native module.
+The [binding surface](../crates/sparkles/bindings.toml) file in the repository records
+each call's Python, JVM and Node name, or the phase in which it is planned. Tests check
+that every library operation in the OpenAPI document has an entry, and that each Python
+name exists in both the extension stub and the native module.
 [Spec P06](specs/P06-library-admin-api.md) describes the remaining binding phases.
 
 `Dataset::store()` and the `store`, `index` and `builder` modules give lower-level
@@ -2809,10 +2875,11 @@ node.
 
 ### Catalog and administration handles
 
-`Catalog` owns a registry of datasets; branches belong to each dataset. A context closes
-all dataset views it opened, including branch views. `Dataset.close()` also invalidates
-its administration handles. Closing a standalone main view leaves its branch views open.
-A rename or deletion refuses while a dataset view remains open; close the views first.
+A `Catalog` owns a registry of datasets, and each dataset owns its branches. Leaving a
+catalog's `with` block closes every dataset view it opened, including branch views.
+`Dataset.close()` also invalidates the dataset's administration handles. Closing a
+`main` view that was opened on its own leaves its branch views open. A rename or
+deletion fails while a view of the dataset is open, so close the views first.
 
 ```python
 from sparkles import Catalog, BackupRepository
@@ -2837,24 +2904,25 @@ with Catalog("server-data") as cat:
 ```
 
 `Catalog.inspect(path)` lists a registry without taking its lock. `get(name)` and
-`info(name)` return `None` for a missing dataset; `cat[name]` raises `KeyError`.
-`Catalog.memory()` manages temporary datasets. `attach` opens an external dataset;
-`clone_dataset` copies into another catalog name with a new identity. Repository
-configuration lives on `cat.repositories`, and backup schedules can be run with
-`cat.run_policy` or previewed with `sparkles.preview_schedule`.
+`info(name)` return `None` for a missing dataset, and `cat[name]` raises `KeyError`.
+`Catalog.memory()` manages temporary datasets. `attach` opens an external dataset, and
+`clone_dataset` copies a dataset to another name in the catalog with a new identity.
+Repository configuration is on `cat.repositories`. `cat.run_policy` runs a backup
+schedule, and `sparkles.preview_schedule` previews one.
 
-History diffs iterate over `(op, Quad)` pairs, where `op` is `"+"` or `"-"`.
-`history.changes(after)` returns a frozen page of commit changes; each commit change
-also iterates over those pairs. Snapshots, commits and backup records are immutable.
-`settings` groups compaction, DESCRIBE, quota, retention and change-log settings;
-`reasoning` groups materialization, status, diagnostics and RDFS configuration;
-`validation` groups SHACL, ShEx and write guards. `indexes.geo` controls spatial indexing.
-The flat administration methods have been replaced by these handles.
+A history diff iterates over `(op, Quad)` pairs, where `op` is `"+"` or `"-"`.
+`history.changes(after)` returns a fixed page of commit changes, and each commit change
+iterates over the same pairs. Snapshots, commits and backup records are immutable.
+`settings` holds the compaction, DESCRIBE, quota, retention and change-log settings.
+`reasoning` holds materialization, its status and diagnostics, and the RDFS
+configuration. `validation` holds SHACL, ShEx and the write guard, and `indexes.geo`
+controls spatial indexing. These handles replace the earlier flat administration
+methods.
 
-Long administration operations accept `cancel`, `progress` and `timeout`. Callbacks
-receive a fraction and a message; reports are throttled to one per 100 ms, with the
-completion report always delivered. A callback exception cancels the worker and is
-raised after it stops. Ctrl-C cancels work as it does for queries.
+Long administration operations accept `cancel`, `progress` and `timeout`. A progress
+callback receives a fraction and a message. Reports come at most once per 100 ms, and
+the final report is always delivered. An exception in a callback cancels the work and
+is raised once the work stops. Ctrl-C cancels the work as it does a query.
 
 ### History, snapshots and clones
 
@@ -2898,8 +2966,9 @@ the text index ([API](API.md#full-text-search)), the vector index configuration,
 ([API](API.md#write-time-validation)). A ShEx configuration has `"language": "shex"`,
 a `schema` and a `shapeMap`. Opening a database directory installs the write-time
 validation its `validation.json` sets up, as the server does. When the configuration
-cannot be loaded, the package warns and writes stay refused. `indexes.text.status/rebuild/disable` and `indexes.vector.drop/rebuild/reembed/list`
-complete the index administration.
+cannot be loaded, the package warns and writes stay refused. `indexes.text` also has
+`status`, `rebuild` and `disable`, and `indexes.vector` has `drop`, `rebuild`,
+`reembed` and `list`.
 
 ### Query builder
 
@@ -3002,8 +3071,8 @@ run in Sparkles' planner and executor, and a query that uses a function register
 in Java runs in ARQ instead.
 
 The library is written in Kotlin and is meant to be used from Java. It needs Java 17 or
-later. The compatibility workflow uses Jena 5.6 on Java 17 and Jena 6.2 on Java 21. The native part is the
-`crates/sparkles-ffi` crate, which the library calls through UniFFI and JNA. The library
+later. The compatibility workflow tests it with Jena 5.6 on Java 17 and Jena 6.2 on
+Java 21. The native part is the `crates/sparkles-ffi` crate, which the library calls through UniFFI and JNA. The library
 is not published to Maven Central. Build the jar from the repository:
 
 ```sh
@@ -3011,13 +3080,15 @@ mise run jvm:build            # jvm/sparkles-jena/build/libs/sparkles-jena-0.1.0
 nix build .#sparkles-jena     # or the flake's package, in result/share/java
 ```
 
-The SDK jar depends on `sparkles-jena-natives`, which holds verified platform libraries.
-The release workflow gathers five platform builds; the Nix package includes its host
-library. `sparkles-jena-all` bundles the SDK, supporting libraries and available natives
-for Fuseki. Local checks run on Linux x86_64. The loader extracts the native library into
-the temporary directory on first use. The system property `sparkles.native.dir` chooses another directory, and
-`sparkles.native.path` names a library file to load instead, such as one built for
-another platform with `cargo build --release --manifest-path crates/sparkles-ffi/Cargo.toml`.
+The SDK jar depends on `sparkles-jena-natives`, which holds the verified native
+libraries for each platform. The release workflow collects builds for five platforms,
+and the Nix package includes the library for the host it was built on. For Fuseki,
+`sparkles-jena-all` bundles the SDK, its supporting libraries and the native libraries
+that are available. Local checks run on Linux x86_64. The loader extracts the native
+library into the temporary directory on first use. The system property
+`sparkles.native.dir` chooses another directory, and `sparkles.native.path` names a
+library file to load instead, such as one built for another platform with
+`cargo build --release --manifest-path crates/sparkles-ffi/Cargo.toml`.
 On Java 24 and later, the JVM warns when JNA loads native code unless the program runs
 with `--enable-native-access=ALL-UNNAMED`.
 
@@ -3089,8 +3160,8 @@ commit's data alive.
 
 A query through `QueryExecution` or `QueryExec` runs in Sparkles when the dataset is a
 `DatasetGraphSparkles` or a plain wrapper of one. Its solutions come back to Jena in
-batches. Graph queries and DESCRIBE run in the engine when the query takes the native
-path. Timeouts and `abort()` cancel the native query.
+batches. CONSTRUCT and DESCRIBE queries also run in the engine when they take the
+native path. Timeouts and `abort()` cancel the native query.
 
 A query runs in ARQ over the dataset's `find()` when it uses something that Sparkles
 cannot see. The first case is a function that Jena's `FunctionRegistry` knows and
@@ -3136,10 +3207,10 @@ outside a Jena transaction and throw `JenaTransactionException` when the thread 
 one. `lastReceipt()` returns the receipt of the last commit the thread made on the
 dataset, and `headCommit()` returns the newest commit.
 
-For RDF files on disk, use `loadFiles`: it passes file paths directly to the native
-parsers and index builder. The stream overload buffers the entire input in JVM memory
-before sending it to Rust. `bulkSink` parses through Jena and converts its nodes into
-native batches. Opening an existing Sparkles directory reuses its native indices.
+For RDF files on disk, use `loadFiles`, which hands the file paths straight to the
+native parsers and index builder. The stream overload reads the entire input into JVM
+memory before it sends it to Rust. `bulkSink` parses with Jena and converts its nodes
+into native batches. Opening an existing Sparkles directory reuses its native indexes.
 
 `SparklesDatasets.importTdb2(tdbDir, sparklesDir)` copies a TDB2 database into an empty
 Sparkles database in one commit. It reads the TDB2 database with Jena's own code, so
@@ -3148,11 +3219,12 @@ literals come back as TDB2 stored them, and it copies the prefixes. It returns a
 
 ### Catalog, history and administration
 
-`SparklesCatalog` manages datasets, with branches under each dataset. Its handles expose
-repositories, backup/restore, clones, reservations and offline policies. Dataset handles
-provide history and snapshots, branches and merges, settings, stored queries, schema and
-GraphQL, index administration, reasoning and validation. Nested administrative documents
-use Jena `JsonObject` / `JsonArray` trees; callers do not supply serialized JSON strings.
+`SparklesCatalog` manages datasets, and each dataset owns its branches. The catalog's
+handles cover backup repositories, backups and restores, clones, name reservations and
+offline policy runs. A dataset's handles cover history and snapshots, branches and
+merges, settings, stored queries, schema and GraphQL, index administration, reasoning
+and validation. Nested administration documents are Jena `JsonObject` and `JsonArray`
+trees, so callers never pass serialized JSON strings.
 
 ```java
 try (var catalog = SparklesCatalog.open(Path.of("catalog"))) {
@@ -3174,15 +3246,17 @@ try (var catalog = SparklesCatalog.open(Path.of("catalog"))) {
 }
 ```
 
-Catalog-returned handles close with the catalog. Close branch and historical views
-explicitly. Persistent renames require every handle to the dataset to be closed first.
-Aliases to one UUID share transaction ownership: snapshot-capturing operations and branch
-previews reject the transaction owner before waiting for its writer lock. Read-only
-options prevent dataset mutations; backup repository operations retain their own controls.
+Handles that the catalog returns close with the catalog. Close branch and historical
+views yourself. Renaming a persistent dataset requires every handle to it to be closed
+first. Handles to the same dataset UUID share one transaction owner. If the thread that
+holds the write transaction calls an operation that captures a snapshot, or previews a
+branch merge, the call fails at once instead of waiting for the writer lock it already holds. Read-only
+options prevent changes to the dataset, while backup repository operations keep their
+own access controls.
 
 `SparklesOperation` carries cancellation, a deadline and progress for long operations.
-`ds.dump(output, lang)` streams bounded native byte batches into a caller-owned output;
-`ds.dump(path)` infers the format from the path. Historical views are read-only.
+`ds.dump(output, lang)` writes bounded batches of bytes from the engine into an output
+stream that the caller owns. `ds.dump(path)` takes the format from the path. Historical views are read-only.
 
 ### Fuseki assembler
 
@@ -3248,12 +3322,13 @@ The other classes are `SparklesInvalidException`, `SparklesWriteRejectedExceptio
 ## JavaScript and TypeScript
 
 The JavaScript packages share RDF/JS terms, bindings, errors and the `SparqlDataset`
-query/update interface. `@sparkles-rdf/engine` embeds the native engine through Node-API;
-`@sparkles-rdf/client` speaks HTTP with Fetch and Web Streams; `@sparkles-rdf/common`
-contains their shared contracts. They are ES modules with TypeScript declarations.
-The engine requires Node.js 22.12 or later; the client also runs in browsers with Fetch
-and Web Streams. Packages are built locally and by the gated release workflow; they
-have not been published to npm.
+interface for queries and updates. `@sparkles-rdf/engine` embeds the native engine
+through Node-API. `@sparkles-rdf/client` talks to a server over HTTP with Fetch and Web
+Streams. `@sparkles-rdf/common` holds the types and interfaces the other two share. All
+three are ES modules with TypeScript declarations. The engine requires Node.js 22.12 or
+later, and the client also runs in browsers that have Fetch and Web Streams. The
+packages are built locally and by the gated release workflow, and they are not
+published to npm.
 
 ```ts
 import { Dataset } from '@sparkles-rdf/engine';
@@ -3269,19 +3344,21 @@ const { receipt } = await ds.transaction(async tx => {
 console.log(receipt.commit.seq); // bigint
 ```
 
-Engine calls that access storage return promises and run outside the JavaScript thread.
-Query results arrive in bounded batches; breaking iteration or calling `close()` releases
-native result memory. Counts and commit sequences use bigint. Query options include
-`signal`, a timeout in milliseconds, RDF/JS `factory`, initial bindings, graph selection,
-historical `at` reads and resource budgets. A transaction uses `tx` for its reads and
-writes, and rolls back when its callback fails or its controls interrupt it. Finish the
-transaction before calling dataset operations that acquire its writer lock.
+Engine calls that touch storage return promises and run off the JavaScript thread.
+Query results arrive in bounded batches. Breaking out of the iteration or calling
+`close()` frees the native memory of the result. Counts and commit sequences are
+bigints. The query options include `signal`, a timeout in milliseconds, an RDF/JS
+`factory`, initial bindings, graph selection, historical reads with `at` and resource
+budgets. A transaction does its reads and writes through `tx`. It rolls back when its
+callback throws or when its signal or timeout interrupts it. Finish the transaction
+before calling a dataset operation that needs the writer lock.
 
 `load` accepts paths, RDF text, byte arrays, Node Readables and Web streams. `dump`
-returns a Web byte stream, and `dumpToFile` writes a path. `match` streams RDF/JS quads;
-`source()` supplies an RDF/JS source for Comunica. Dataset administration is grouped under
-handles such as `snapshots`, `history`, `branches`, `indexes`, `reasoning`, `validation`
-and `settings`. See the [engine package](../js/engine/README.md) for its complete surface.
+returns a Web byte stream, and `dumpToFile` writes to a path. `match` streams RDF/JS
+quads, and `source()` returns an RDF/JS source for Comunica. Dataset administration is
+grouped under handles such as `snapshots`, `history`, `branches`, `indexes`,
+`reasoning`, `validation` and `settings`. The [engine package](../js/engine/README.md)
+documents the full API.
 
 ```ts
 import { SparklesClient } from '@sparkles-rdf/client';
@@ -3296,24 +3373,26 @@ const { data, error } = await client.api.GET('/$/datasets/{name}', {
 });
 ```
 
-The remote result interface is the same as the engine's, and closes its HTTP body on
-completion or early exit. Native-only options are rejected explicitly. The client adds
-Graph Store operations, branch-aware history, Basic or bearer authentication, cookie
-session CSRF handling, and safe-read retries. Its generated `api` covers the complete
-administrative HTTP surface and returns `{ data, error, response }`. Plain SPARQL
-endpoints use `SparklesClient.endpoint(url, { updateUrl, graphStoreUrl })`. See the
-[client package](../js/client/README.md) for protocol limits and cancellation semantics.
+Remote results have the same interface as the engine's, and they close the HTTP body
+when iteration finishes or stops early. Options that only the native engine supports
+are rejected. The client adds Graph Store operations, history that follows branches,
+Basic or bearer authentication, CSRF handling for cookie sessions, and retries for
+safe reads. Its generated `api` covers every administration route of the HTTP API and
+returns `{ data, error, response }`. For a plain SPARQL endpoint, use
+`SparklesClient.endpoint(url, { updateUrl, graphStoreUrl })`. The
+[client package](../js/client/README.md) describes the protocol limits and how
+cancellation works.
 
 `mise run node:build` builds all three packages and the host addon. `nix build
 .#sparkles-node` builds npm archives with the host addon and their pinned dependencies.
 [DEVELOPMENT.md](DEVELOPMENT.md#javascript-bindings) describes building and testing them.
 
-`parse(input, options)` yields RDF/JS quads without loading a dataset; `serialize(quads,
-options)` returns a Web byte stream. Both use bounded queues and accept cancellation and
-timeouts. Close unfinished iterators or cancel unfinished streams. Catalog policy and
-retention runners, fixed repository registries and standalone formatting, linting,
-parsing and validation helpers are also available; the package README describes their
-options and controls.
+`parse(input, options)` yields RDF/JS quads without loading a dataset, and
+`serialize(quads, options)` returns a Web byte stream. Both use bounded queues and
+accept cancellation and timeouts. Close iterators and cancel streams that you do not
+read to the end. The engine package also runs catalog backup policies and retention,
+manages fixed repository registries, and has standalone helpers for formatting,
+linting, parsing and validation. Its README describes their options and controls.
 
 ## Rust client
 

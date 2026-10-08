@@ -564,7 +564,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | POST   | `/$/datasets`                | Creates a dataset. The form or JSON body has `dbName`, `dbType` = `persistent` \| `mem`, and optionally `geo` and `text`. Fuseki's `dbType` values `tdb2` and `tdb` mean `persistent`, and `dbName` and `dbType` may also be query parameters. `geo` = `true` adds a spatial index with the defaults, and `text` = `true` enables full-text search with the defaults. In a JSON body `geo` can also be a `GeoConfig` (see [GeoSPARQL](#geosparql)) and `text` a `TextConfig` (see [Full-text search](#full-text-search)). An invalid one is a `400` and creates no dataset, and a build without the `geo` or `text` feature returns `501`. A body in an RDF syntax is a Fuseki service description; see [Assembler bodies](#assembler-bodies). `201` on success, `409` if the dataset exists. |
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | POST   | `/$/datasets/{ds}?state=offline\|active` | Fuseki's dataset state. An offline dataset answers `503 {code: "dataset-offline"}` on its own endpoints (`/{ds}/…`) and keeps its admin routes. The state is not persisted, so a restart brings every dataset back. `400` without `state` or for another value. Needs `admin` on the dataset. |
-| POST   | `/$/datasets/{ds}/rename`    | JSON `{ "name": "new-name" }`. Preserves identity and data; `200` with `{ "name", "renamedFrom" }` and `Location`. Requires server administration. `400` for invalid names, `404` for a missing source. `409` for an existing target, live requests or views, reservations, a running compaction or reasoning task, a backup policy of the config file that names the dataset, or a grant, protection or active minted token scope that covers one of the two names and not the other. A pattern that covers both names, such as `*`, does not block a rename. The conflict lists the blockers. The rename carries the dataset's request metrics, compaction scheduler state and pending automatic reasoning run over to the new name, and rewrites the backup policies made through the API that name the dataset exactly. A policy that selects it with a glob is left as written, so it selects the dataset afterwards only if the glob matches the new name. |
+| POST   | `/$/datasets/{ds}/rename`    | Renames the dataset with the JSON body `{ "name": "new-name" }`, keeping its identity and data. Returns `200` with `{ "name", "renamedFrom" }` and `Location`. Requires server administration. `400` for invalid names, `404` for a missing source. `409` for an existing target, live requests or views, reservations, a running compaction or reasoning task, a backup policy of the config file that names the dataset, or a grant, protection or active minted token scope that covers one of the two names and not the other. A pattern that covers both names, such as `*`, does not block a rename. The conflict lists the blockers. The rename carries the dataset's request metrics, compaction scheduler state and pending automatic reasoning run over to the new name, and rewrites the backup policies made through the API that name the dataset exactly. A policy that selects it with a glob is left as written, so it selects the dataset afterwards only if the glob matches the new name. |
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. Requests to the dataset that arrive meanwhile answer `404`. A persistent dataset that a running request or task still holds answers `409`, so that no old handle can write into a dataset later created under the same name. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset, or some of its graphs, into a new persistent or in-memory dataset. Returns `202` with a `Task`. See [Clone](#clone). |
 | GET/POST | `/$/stats/{ds}`            | `DatasetStats`, which includes Fuseki's request counters in `datasets`. |
@@ -1488,41 +1488,45 @@ Query parameters beyond the standard protocol:
 
   A write whose client disconnects is cancelled and commits nothing, even while it waits
   for the dataset's writer lock. A commit that has already started completes.
-* `execution=eager|streaming|auto` selects query execution. The default is `eager`.
-  `streaming` supports SELECT in JSON, XML, CSV, TSV and native Sparkles JSON,
-  ASK, and CONSTRUCT/DESCRIBE in RDF or native Sparkles JSON. It pulls
-  bounded batches from a captured snapshot and pauses execution when response buffers
-  fill. Scans, FILTER/BIND without EXISTS, projection, OFFSET/LIMIT, VALUES, UNION,
-  merge joins and eligible OPTIONAL joins are incremental. Hash joins retain their
-  build side, DISTINCT retains seen keys, and eligible aggregates retain group state;
-  each allocation counts against the query budget. Sorting reads its whole input into
-  budgeted state before the first row. DESCRIBE and unsupported operator shapes use
-  visible, budgeted materialization. Exceeding the budget fails the query, and there is
-  no disk spill. Streaming does not guarantee constant memory for every query. SELECT
-  in SPARQL Results Thrift is unsupported in streaming mode and returns `501`. An
-  invalid mode returns `400`.
+* `execution=eager|streaming|auto` chooses how the query runs. The default is `eager`.
+  `streaming` supports SELECT in JSON, XML, CSV, TSV and native Sparkles JSON, ASK,
+  and CONSTRUCT and DESCRIBE in RDF or native Sparkles JSON. The query reads from a
+  snapshot taken when it starts, produces bounded batches, and pauses when the response
+  buffers are full. Scans, FILTER and BIND without EXISTS, projection, OFFSET, LIMIT,
+  VALUES, UNION, merge joins and eligible OPTIONAL joins run incrementally. A hash join
+  keeps its build side, DISTINCT keeps the keys it has seen, and an eligible aggregate
+  keeps its group state. All of that memory counts against the query budget. Sorting
+  reads its whole input into budgeted memory before the first row. DESCRIBE and
+  unsupported operators also read their whole input first, which the plan shows, and
+  that memory is budgeted too. A query that exceeds the budget fails, and nothing spills
+  to disk, so streaming does not keep every query in constant memory. SELECT in SPARQL
+  Results Thrift is not supported in streaming mode and returns `501`. An invalid mode
+  returns `400`.
 
-  `auto` selects streaming for plain SELECT scans/projections estimated to return
-  at least one million rows, using immutable blocks without a pending delta. It also
-  selects eligible `COUNT(*)` queries over a single-key OPTIONAL between two plain
-  scans when their estimated work reaches one million rows and result caching is
-  disabled or bypassed. Cached aggregate queries retain eager execution. Both paths require
-  whole-block graph predicates, no restored initial bindings or offset, enough memory
-  for block ownership and batches of at least 4,096 rows and 128 KiB. Other plans use
-  eager execution. A request for SPARQL Results Thrift also uses eager execution,
-  because that encoding has no streaming writer. This conservative policy
-  can change as additional query shapes meet the performance gate.
+  `auto` streams a plain SELECT of scans and projections when it expects at least one
+  million rows and the data comes from immutable blocks with no pending changes. It also
+  streams a `COUNT(*)` over a single-key OPTIONAL between two plain scans when the
+  estimated work reaches one million rows and the result cache is off or bypassed. An
+  aggregate query that the cache serves still runs eagerly. In both cases, any graph
+  restriction must cover whole blocks, the query must have no restored initial bindings
+  or offset, and there must be enough memory to own the blocks and to hold batches of at
+  least 4,096 rows and 128 KiB. Every other plan runs eagerly. A request for SPARQL
+  Results Thrift also runs eagerly, because that encoding has no streaming writer. The
+  policy is deliberately narrow, and it can widen as more query shapes prove faster when
+  streamed.
 
-  Memory and physical-work budgets cover the whole cursor, including retained batches
-  and generated terms. Deadlines include consumer waits. Errors before response
-  commitment use the normal status and JSON error; later errors abort the body transfer.
-  Treat a failed or truncated transfer as a partial answer. Final access logs and
-  metrics wait for both the producer and response body to finish. Cursor requests bypass
-  the full-result cache. Stored-query runs accept the same option.
+  The memory and work budgets cover the whole cursor, including batches it still holds
+  and terms it generates. The deadline includes time spent waiting for the client. An
+  error before the response starts gets the normal status and JSON error. A later error
+  aborts the body transfer, so treat a failed or truncated transfer as a partial answer.
+  The access log entry and the metrics are recorded once both the query and the response
+  body have finished. Streaming requests skip the full-result cache. Stored-query runs
+  accept the same option.
 * `send=<n>` caps the number of rows serialized. The UI uses it so that a huge result does
-  not hang the browser. Eager native metadata reports the full count. Streaming stops
-  production at the requested prefix; `meta.status` is `stopped` and `meta.totalRows`
-  is `null` unless the cursor has exhausted. SPARQL LIMIT completes the query normally.
+  not hang the browser. With eager execution, the native metadata reports the full count.
+  With streaming, the query stops after the first n rows. `meta.status` is then
+  `stopped`, and `meta.totalRows` is `null` unless the cursor had already reached the
+  end. A SPARQL LIMIT ends the query normally.
 * `reasoning=true|false` includes or excludes materialized inferences. The default is
   `true` if the dataset has any.
 * `nocache=true` bypasses the query result cache, so nothing is read from it or stored in
@@ -4288,11 +4292,12 @@ A blob is a 16-byte header followed by its payload. The header holds `SPKB`, for
 codec (raw or LZ4), the encryption (none) and the plaintext length. A blob's id is the
 SHA-256 of the plaintext, so writers that compress differently still deduplicate.
 
-Trusted server TOML can configure encrypted repositories in builds with
-`backup-encryption`; API registration and updates reject encryption metadata. See
-[encrypted repositories](USAGE.md#encrypted-repositories) for configuration and
-[the encryption design and outcome](specs/F11-encryption-at-rest.md#outcome) for the
-encrypted format and supported scope.
+In builds with `backup-encryption`, the operator's server TOML file can configure
+encrypted repositories. The API refuses encryption settings when it registers or
+updates a repository. [Encrypted repositories](USAGE.md#encrypted-repositories)
+describes the configuration, and
+[the encryption design and outcome](specs/F11-encryption-at-rest.md#outcome) describes
+the encrypted format and what it supports.
 
 ## Full-text search
 
@@ -6028,12 +6033,13 @@ selectors are refused because every validated write would run them.
 | DELETE | `/$/validation/{ds}` | Turns validation off (`204`) and removes every validation file. |
 
 The dataset page's **Write-time validation** panel lets an administrator configure or
-disable the guard on a writable server. It supports both languages, their source graphs
-or inline shapes/schema, mode, baseline, data selection, inferences, timeout and report
-limit. Memory guard configurations returned by `GET` include their inline source, so
-settings can be edited without supplying the source again. Persistent configurations
-retain the copied source file. Rejected updates in the query page show the structured
-focus-node, path, message and shape results.
+disable the guard on a writable server. It covers both SHACL and ShEx, with shapes or a
+schema taken from source graphs or given inline, and it sets the mode, baseline, data
+selection, inferences, timeout and report limit. For an in-memory dataset, `GET`
+returns the guard configuration with its inline source, so the settings can be edited
+without supplying the source again. A persistent dataset keeps its copy of the source
+file. When the guard rejects an update on the query page, the page shows each result's
+focus node, path, message and shape.
 
 **Writes** are validated once per request, on the final state, before any byte is
 written. This covers updates, Graph Store PUT/POST/DELETE, uploads and applied RDF
@@ -6672,12 +6678,12 @@ type PlanNode = {
 };
 ```
 
-Native streaming responses put `rows` before `meta`. They include final counts and
-capabilities only after successful production. They do not carry success metadata
-when production or serialization fails. `commit` and `datasetId` identify the captured
-snapshot, as on eager HTTP responses. Graph responses emit an empty `triples` array
-and put all results in `quads`, using a null graph for default-graph statements.
-Streaming plans use:
+A native streaming response puts `rows` before `meta`. It includes the final counts and
+capabilities only when the query has produced every row successfully. When the query or
+the serialization fails, the response carries no success metadata. `commit` and
+`datasetId` identify the snapshot the query read, as they do on eager HTTP responses. A
+graph query's response has an empty `triples` array and puts every result in `quads`,
+with a null graph for statements in the default graph. A streaming plan has this shape:
 
 ```ts
 type CursorPlan = {
@@ -6688,12 +6694,13 @@ type CursorPlan = {
 };
 ```
 
-`complete` says whether an operator's counts cover its entire execution. Counts on a
-stopped cursor are partial. `materializes` marks an eager fallback subtree. A native
-ORDER BY consumes its whole input into budgeted state before its first row, so it
-reports `fullInputBeforeOutput` and a `reason` while `materializes` stays false. The
-strict policy that refuses eager fallback admits such a sort. `growingState` warns of retained state such as generated
-strings; batch size alone does not bound that state.
+`complete` says whether an operator's counts cover its entire execution. The counts on a
+stopped cursor are partial. `materializes` marks a subtree that fell back to eager
+execution. A native ORDER BY reads its whole input into budgeted memory before its
+first row. It reports `fullInputBeforeOutput` and a `reason`, but `materializes` stays
+false, so the strict policy that refuses eager fallback still accepts the sort.
+`growingState` warns that an operator keeps state that grows as it runs, such as
+generated strings. The batch size alone does not limit that state.
 
 ## Explain
 
@@ -6739,9 +6746,10 @@ request.
 **Request bodies** of updates, queries, Graph Store PUT/POST and uploads may be sent with
 `Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
 `Accept-Encoding` header naming the supported ones. RDF bodies and uploaded files are also
-recognised as compressed by their first bytes (gzip, xz, bzip2, zstd, LZ4 frames). Uploads are also
-recognised by file name (`.gz`, `.xz`, `.bz2`, `.zst`, `.br`, `.lz4`). A body that decompresses past
-`--max-decompressed-mb` fails with `413` and commits nothing.
+recognised as compressed by their first bytes (gzip, xz, bzip2, zstd, LZ4 frames).
+Uploads are also recognised by file name (`.gz`, `.xz`, `.bz2`, `.zst`, `.br`, `.lz4`).
+A body that decompresses past `--max-decompressed-mb` fails with `413` and commits
+nothing.
 
 **Body ceilings.** A body that is read whole has the ceiling of its request class:
 
@@ -6761,12 +6769,12 @@ Graph Store PUT/POST, including through `/{ds}`, and `/{ds}/upload` are the bulk
 endpoints. Their bodies stream to a temporary file instead, up to `--max-upload-mb`, or
 the request fails with `413`. That limit counts bytes after HTTP decompression. Its
 default of 4096 (4 GiB) is the body limit of the bundled NixOS nginx virtual host, and `0`
-means unlimited. RDF sources, including files compressed inside the body and plain RDF, are capped separately by
-`--max-decompressed-mb` as they are parsed. A body in RDF Thrift, RDF Protobuf, RDF/JSON or TriX counts its
-N-Quads translation against that cap while the translation is written. Before each 64 MiB of a spooled body is
-written to the temporary directory, the server checks that the file system keeps
-`--min-free-disk-mb` free (default 1024, `0` for no check). Otherwise the request fails
-with `507`.
+means unlimited. `--max-decompressed-mb` caps the RDF sources separately as they are
+parsed, both files compressed inside the body and plain RDF. A body in RDF Thrift, RDF
+Protobuf, RDF/JSON or TriX is translated to N-Quads, and the translation counts against
+that cap as it is written. Before each 64 MiB of a spooled body is written to the
+temporary directory, the server checks that the file system keeps `--min-free-disk-mb`
+free (default 1024, `0` for no check). Otherwise the request fails with `507`.
 
 **Storage.** A commit to a persistent dataset is refused with `507 {code: "storage-full"}`
 when it would leave less than `--min-free-disk-mb` free on the data directory's file
@@ -6783,39 +6791,45 @@ pass. A persistent dataset can also have a storage quota of its own (see
 `--compression auto|none|gzip|xz|bzip2|zstd|brotli|lz4`. `auto` goes by magic bytes, then by the
 extension. Brotli has no magic bytes, so it needs `.br` or `--compression brotli`. When a
 file's name and its data disagree, the data wins and a warning is logged. An explicit
-`--compression` that disagrees is an error. Every supported RDF syntax accepts incremental reader parsing. `--parse-mode auto`
-keeps parallel mapped-file parsing for plain N-Triples, N-Quads and Turtle, and bounded
-parallel blocks for compressed line formats. Other compressed documents use a slice
-parser below 128 MiB of actual decompressed input for Turtle/TriG, or 8 MiB for other
-syntaxes, and a reader at or above that threshold. Plain non-splittable files use the
-same size cutoffs. Reader input uses a 128 KiB buffer while preserving the syntax
-parser's token limits. `--auto-buffer-bytes BYTES` (`Source.auto_buffer_bytes` in Rust,
-`auto_buffer_bytes` in Python) overrides the per-source cutoff; zero skips probing.
-This allowance is per load, so concurrent loads can each use it. Lower it or select
-streaming when budgeting memory across concurrent loads. Already-owned plain bytes
-are borrowed without copying; small transactional loads and Python file objects use
-readers in automatic mode.
-`--parse-mode streaming` always uses a sequential reader; `--parse-mode buffered`
-explicitly selects a whole-document slice parser. Buffered compressed inputs need RAM
-for their full decompressed size. These policies affect input parsing; transactional
-changes, vocabulary, blank-node identity maps and index-building batches use additional
-memory. `Source.max_decompressed` bounds plain as well as decompressed input bytes.
+`--compression` that disagrees is an error.
 
-JSON-LD's ordinary reader preserves arbitrary key order and can retain a large object
-while resolving late contexts. For ordered streaming JSON-LD, use
-`load --jsonld-streaming`, `convert --syntax jsonld-streaming`, or the RDF content type
-`application/ld+json; profile="http://www.w3.org/ns/json-ld#streaming"`. The explicit
-profile validates its key ordering; it does not silently reinterpret ordinary JSON-LD.
-See the [W3C streaming JSON-LD note](https://www.w3.org/TR/json-ld11-streaming/).
-Individual literals, contexts and blank-node maps can still be large. RDF/JSON input
-emits statements incrementally instead of collecting its subject/predicate tree.
-Repeated subject/predicate keys, which violate that format's unique-key requirements,
-contribute all encountered statements in the lenient decoder.
+Every supported RDF syntax can be parsed incrementally from a reader. With
+`--parse-mode auto`, plain N-Triples, N-Quads and Turtle are still parsed in parallel
+from a memory-mapped file, and compressed line formats in bounded parallel blocks.
+Other compressed documents are read whole into memory and parsed there when their
+actual decompressed size is below 128 MiB for Turtle and TriG, or 8 MiB for other
+syntaxes. At or above that size, they are parsed from a reader. Plain files that
+cannot be split use the same cutoffs. A reader parses from a 128 KiB buffer and keeps
+the syntax parser's token limits. `--auto-buffer-bytes BYTES` changes the cutoff for
+each source, as do `Source.auto_buffer_bytes` in Rust and `auto_buffer_bytes` in
+Python. Zero skips the size check. The cutoff applies to each load, so concurrent loads
+can each use that much memory. Lower it or choose streaming when several loads share a
+memory budget. Plain bytes that the caller already holds in memory are parsed without a
+copy. In automatic mode, small transactional loads and Python file objects are parsed
+from a reader. `--parse-mode streaming` always uses a sequential reader, and
+`--parse-mode buffered` always reads the whole document into memory first. A buffered
+compressed input needs RAM for its full decompressed size. These modes only affect
+parsing. Transactional changes, the vocabulary, the map of blank-node labels and
+index-building batches take memory of their own. `Source.max_decompressed` limits the
+input bytes of plain files as well as decompressed ones.
 
-XZ files decode incrementally with a 256 MiB decoder-memory cap, independently of the
-input-byte ceiling. Bzip2 files also decode incrementally. Both accept concatenated
-streams. They are file/payload codecs, not additional HTTP Content-Encoding tokens.
-Large transcoded Graph Store bodies spill to disk based on their actual output size.
+Ordinary JSON-LD allows keys in any order, so its reader may hold a large object in
+memory while it waits for a context that comes late. For ordered streaming JSON-LD,
+use `load --jsonld-streaming`, `convert --syntax jsonld-streaming`, or the RDF content
+type `application/ld+json; profile="http://www.w3.org/ns/json-ld#streaming"`. This
+profile checks the key order and is never applied silently to ordinary JSON-LD. See the
+[W3C streaming JSON-LD note](https://www.w3.org/TR/json-ld11-streaming/). Single
+literals, contexts and the map of blank-node labels can still be large. RDF/JSON input
+yields statements as it reads them instead of building the whole subject and predicate
+tree. The format requires unique keys, but the lenient decoder accepts a repeated
+subject or predicate key and keeps the statements from every occurrence.
+
+XZ files are decoded incrementally, and the decoder uses at most 256 MiB of memory,
+separately from the input-byte ceiling. Bzip2 files are also decoded incrementally.
+Both accept several concatenated streams in one file. They are codecs for files and
+payloads, not additional HTTP `Content-Encoding` values. A large Graph Store body that
+is translated to another syntax spills to disk once its translated output is large
+enough.
 
 `sparkles load --lenient` skips the validation of IRIs and language tags. It is meant for
 data whose IRIs are not all valid RFC 3987 IRIs; DBpedia, for example, has some that
