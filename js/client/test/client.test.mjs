@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SparklesClient, NotFoundError, factory } from '../dist/index.js';
+import { SparklesClient, NotFoundError, InvalidInputError, factory } from '../dist/index.js';
 
 const body = {
   head: { vars: ['s', 'x'] },
@@ -76,6 +76,32 @@ test('ASK, write receipts and typed admin fetch share authentication', async () 
   assert.equal(r.receipt.commit.seq, 1n);
   await client.api.GET('/$/datasets/{name}', { params: { path: { name: 'wiki' } } });
   assert(requests.every((r) => r.headers.get('authorization') === 'Bearer secret'));
+});
+test('credentials go only to configured origins and dot dataset names are rejected', async () => {
+  const requests = [];
+  const fetch = async (input, init) => {
+    const request = new Request(input, init);
+    requests.push(request);
+    return Response.json({ boolean: true });
+  };
+  const client = new SparklesClient('http://example.test', { token: 'secret', fetch });
+  await client.request('http://evil.test/steal');
+  await client.request('/$/ping');
+  assert.equal(requests[0].headers.get('authorization'), null);
+  assert.equal(requests[1].headers.get('authorization'), 'Bearer secret');
+  for (const name of ['.', '..']) assert.throws(() => client.dataset(name), InvalidInputError);
+  assert.equal(client.dataset('a/b').name, 'a/b');
+
+  requests.length = 0;
+  const plain = SparklesClient.endpoint('http://query.test/sparql', {
+    basic: { username: 'u', password: 'p' },
+    updateUrl: 'http://update.test/update',
+    fetch,
+  });
+  await plain.ask('ASK {}');
+  await plain.update('INSERT DATA {}').catch(() => {});
+  assert(requests.length >= 2);
+  assert(requests.every((r) => r.headers.get('authorization')?.startsWith('Basic ')));
 });
 test('404 means NotFound and unsafe updates are never retried', async () => {
   let calls = 0;

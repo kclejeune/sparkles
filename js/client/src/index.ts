@@ -269,6 +269,8 @@ export class SparklesClient {
   readonly api;
   private transport: typeof fetch;
   readonly baseUrl: string;
+  /** The origins that receive the configured credentials: the server's and the endpoint URLs'. */
+  private trusted = new Set<string>();
   constructor(
     baseUrl: string,
     private options: ClientOptions = {},
@@ -288,6 +290,7 @@ export class SparklesClient {
     )
       throw new InvalidInputError('maxRetries must be between 0 and 10');
     this.baseUrl = base.href.replace(/\/$/, '');
+    this.trusted.add(base.origin);
     const fetcher = options.fetch ?? globalThis.fetch;
     this.transport = async (input, init) => {
       const requestInit: (RequestInit & { duplex?: 'half' }) | undefined =
@@ -295,8 +298,12 @@ export class SparklesClient {
       const request = new Request(input, requestInit);
       checkSignal(request.signal);
       const headers = new Headers(request.headers);
-      auth(options).forEach((v, k) => headers.set(k, v));
+      // Credentials go only to configured origins, never to an absolute URL that a server
+      // response (such as a page's next link) or a caller supplied for another host.
+      const trusted = this.trusted.has(new URL(request.url).origin);
+      if (trusted) auth(options).forEach((v, k) => headers.set(k, v));
       if (
+        trusted &&
         options.credentials === 'include' &&
         !['GET', 'HEAD', 'OPTIONS'].includes(request.method)
       ) {
@@ -331,6 +338,8 @@ export class SparklesClient {
   dataset(name: string, branch?: string): RemoteDataset {
     if (!name || /[\u0000-\u001f]/.test(name))
       throw new InvalidInputError('Dataset name is required');
+    // A dot segment would normalize the request onto another path of the server.
+    if (name === '.' || name === '..') throw new InvalidInputError('Invalid dataset name');
     if (branch !== undefined && !branch) throw new InvalidInputError('Branch name is required');
     return new RemoteDataset(this, name, branch);
   }
@@ -339,10 +348,11 @@ export class SparklesClient {
     options: ClientOptions & { updateUrl?: string; graphStoreUrl?: string } = {},
   ): RemoteDataset {
     const endpoint = httpUrl(url);
-    if (options.updateUrl) httpUrl(options.updateUrl);
-    if (options.graphStoreUrl) httpUrl(options.graphStoreUrl);
+    const client = new SparklesClient(endpoint.origin, options);
+    if (options.updateUrl) client.trusted.add(httpUrl(options.updateUrl).origin);
+    if (options.graphStoreUrl) client.trusted.add(httpUrl(options.graphStoreUrl).origin);
     return new RemoteDataset(
-      new SparklesClient(endpoint.origin, options),
+      client,
       undefined,
       undefined,
       endpoint.href,
