@@ -1648,6 +1648,12 @@ impl Operator {
                     match self.children[*at].next(ctx, options, cap)? {
                         Some(mut b) => {
                             b.project(&self.vars)?;
+                            // Each arm may be sorted, but their concatenation is not.
+                            // A consumer such as a blocking sort reads a batch's order
+                            // as the order of the whole stream.
+                            if self.children.len() > 1 {
+                                b.table.sorted.clear();
+                            }
                             if self.children[*at].done {
                                 *at += 1;
                             }

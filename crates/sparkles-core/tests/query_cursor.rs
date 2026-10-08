@@ -2283,3 +2283,126 @@ fn cursor_reads_its_generation_after_compactions_retire_it() {
     }
     assert_eq!(bag(got), expected);
 }
+
+/// W3C pp31: a sort over UNION arms that are each sorted feeds a merge join. The
+/// concatenated arms must be sorted again, or the join misses matches.
+#[test]
+fn sort_over_union_arms_reorders_their_concatenation() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        b"@prefix : <http://www.example.org/> . :a :p1 :b . :b :p4 :c . :a :p2 :d . :d :p3 :c . :a :p1 :e .".to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q = "prefix : <http://www.example.org/> select ?t where { :a (:p1|:p2)/(:p3|:p4) ?t }";
+    let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+    assert_eq!(expected.len(), 2);
+    for rows in [1, 2, 4096] {
+        assert_eq!(bag(all(open(&s, q, rows))), expected, "{rows}");
+    }
+}
+
+/// A small seeded generator, so that a failing case can be replayed by its seed.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+const TERMS: [&str; 7] = [
+    "<urn:s:0>",
+    "<urn:s:1>",
+    "<urn:s:2>",
+    "0",
+    "1",
+    "2",
+    "UNDEF",
+];
+const VARS: [&str; 4] = ["?a", "?b", "?c", "?d"];
+
+fn random_pattern(rng: &mut Rng, depth: u32) -> String {
+    if depth == 0 || rng.below(3) == 0 {
+        if rng.below(3) == 0 {
+            let s = [VARS[rng.below(4) as usize], "<urn:s:0>"][rng.below(2) as usize];
+            let o = VARS[rng.below(4) as usize];
+            // Alternatives in a sequence plan sorted UNION arms under a merge join.
+            let p = [
+                "<urn:p>",
+                "<urn:q>",
+                "(<urn:q>|<urn:p>)/(<urn:q>|<urn:p>)",
+                "<urn:q>/(<urn:q>|<urn:p>)",
+            ][rng.below(4) as usize];
+            return format!("{s} {p} {o} .");
+        }
+        let width = 1 + rng.below(2) as usize;
+        let first = rng.below(4) as usize;
+        let vars: Vec<&str> = (0..width).map(|i| VARS[(first + i) % 4]).collect();
+        let rows = (0..rng.below(6))
+            .map(|_| {
+                let cells: Vec<&str> = (0..width).map(|_| TERMS[rng.below(7) as usize]).collect();
+                format!("({})", cells.join(" "))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!("VALUES ({}) {{ {rows} }}", vars.join(" "));
+    }
+    let left = random_pattern(rng, depth - 1);
+    let right = random_pattern(rng, depth - 1);
+    match rng.below(4) {
+        0 => format!("{{ {left} }} {{ {right} }}"),
+        1 => format!("{{ {left} }} OPTIONAL {{ {right} }}"),
+        2 => format!("{{ {left} }} MINUS {{ {right} }}"),
+        _ => format!("{{ {left} }} UNION {{ {right} }}"),
+    }
+}
+
+/// Seeded differential: cursor and eager answers agree as bags at batch sizes that put
+/// boundaries everywhere, over generated VALUES, scans, joins, OPTIONAL, MINUS and
+/// UNION with unbound columns.
+#[test]
+fn random_patterns_agree_between_cursor_and_eager_execution() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut rng = Rng(0x5eed_cafe_f00d_d00d);
+    let mut data = String::new();
+    for i in 0..3 {
+        for j in 0..3 {
+            if rng.below(2) == 0 {
+                data.push_str(&format!("<urn:s:{i}> <urn:p> {j} .\n"));
+            }
+            if rng.below(2) == 0 {
+                data.push_str(&format!("<urn:s:{i}> <urn:q> <urn:s:{j}> .\n"));
+            }
+        }
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    for seed in 1..=400u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let pattern = random_pattern(&mut rng, 3);
+        let q = format!("SELECT ?a ?b ?c ?d WHERE {{ {pattern} }}");
+        let expected = bag(query(s.snapshot(), &q, &Default::default())
+            .unwrap_or_else(|e| panic!("seed {seed}: {q}: {e}"))
+            .rows());
+        for rows in [1, 2, 3, 4096] {
+            let opts = CursorOptions {
+                batch_rows: rows,
+                ..Default::default()
+            };
+            let c = select_cursor(s.snapshot(), &q, &Default::default(), &opts)
+                .unwrap_or_else(|e| panic!("seed {seed}: {q}: {e}"));
+            assert_eq!(bag(all(c)), expected, "seed {seed}, {rows} rows: {q}");
+        }
+    }
+}
