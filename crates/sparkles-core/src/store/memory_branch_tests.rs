@@ -2,6 +2,7 @@ use super::branch_tests::{apply, code, dump, has, merge_historical, merged};
 use super::*;
 use crate::branch::{BranchOptions, DeleteOptions};
 use crate::history::At;
+use std::collections::BTreeSet;
 
 #[test]
 fn memory_branches_share_only_immutable_base_and_survive_rollback() {
@@ -474,4 +475,46 @@ fn memory_branch_indexes_build_outside_the_table_lock() {
     s.set_failpoint("memory-branch-indexes", None);
     assert_eq!(s.branches().unwrap().len(), 2);
     s.create_branch("next", &Default::default()).unwrap();
+}
+
+/// A persistent branch that compacted into its own index is backed up from its own
+/// files. The restored dataset keeps its head, the branch's commit records and its
+/// blank-node numbering.
+#[test]
+fn owned_index_branch_backup_restores_head_history_and_blank_nodes() {
+    let (tmp, s) = super::branch_tests::setup();
+    s.create_branch("work", &Default::default()).unwrap();
+    let work = s.branch("work").unwrap();
+    let fork = s.branch_info("work").unwrap().from.unwrap().seq;
+    apply(&work, "+_:x <urn:p> \"first\" .");
+    apply(&work, "+<urn:w> <urn:p> \"2\" .");
+    work.compact().unwrap();
+    assert!(work.snapshot().generation.linked().is_none());
+    apply(&work, "+_:y <urn:p> \"after compaction\" .");
+    let head = work.head_commit();
+    let expected = dump(&work);
+    let commits: Vec<_> = (0..=head.seq).map(|n| work.commit(n)).collect();
+    let cap = work
+        .backup_capture_with("backup", &Default::default())
+        .unwrap();
+    let out = tmp.path().join("copy");
+    cap.write_to(&out).unwrap();
+    drop(cap);
+    let restored = Store::open(&out, Default::default()).unwrap();
+    assert_eq!(restored.head_commit().seq, head.seq);
+    assert_eq!(restored.head_commit(), head);
+    assert_eq!(dump(&restored), expected);
+    // The branch's own commit records come along. The records of the commits it
+    // inherited stay with its upstream, as they do for the branch itself.
+    for (n, c) in commits.iter().enumerate() {
+        assert_eq!(restored.commit(n as u64), *c, "commit {n}");
+        assert_eq!(c.is_some(), n as u64 >= fork, "commit {n}");
+    }
+    apply(&restored, "+_:z <urn:p> \"restored\" .");
+    let nodes: BTreeSet<_> = dump(&restored)
+        .iter()
+        .filter(|l| l.starts_with("_:"))
+        .map(|l| l.split(' ').next().unwrap().to_string())
+        .collect();
+    assert_eq!(nodes.len(), 3, "a new blank node reuses no stored one");
 }
