@@ -9,13 +9,21 @@
 //!
 //! With the feature `geo` the same harness runs Oxigraph's GeoSPARQL tests, vendored in
 //! `testsuite/geosparql/oxigraph` (so never skipped).
+//!
+//! The query evaluation tests also run through streaming cursors at several batch
+//! sizes, compared with the expected results in the same way, and eagerly with an
+//! empty extension registry installed. A cursor pass first opens each query with the
+//! policy that refuses eager fallback. A query that needs fallback is counted in the
+//! pass's summary and then runs with fallback allowed, so it is still checked.
 
 use oxrdf::dataset::CanonicalizationAlgorithm;
 use oxrdf::vocab::rdf;
 use oxrdf::{Dataset, Graph, NamedNode, NamedOrBlankNode, Quad, Term, TermRef};
 use sparesults::{QueryResultsFormat, QueryResultsParser, SliceQueryResultsParserOutput};
 use sparkles_core::io::{RdfFormat, Source};
-use sparkles_core::sparql::{QueryKind, QueryOptions};
+use sparkles_core::sparql::{
+    CursorOptions, FallbackPolicy, QueryExecution, QueryKind, QueryOptions, query_cursor,
+};
 use sparkles_core::store::{Store, StoreOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -523,7 +531,109 @@ fn store_dataset(store: &Store) -> Dataset {
     d
 }
 
-fn run_query_test(t: &TestCase, m: &Manifest) -> Result<(), String> {
+/// How a suite runs its query evaluation tests.
+#[derive(Clone, Copy, Default)]
+struct Mode {
+    /// Pull answers through a streaming cursor with this batch row cap.
+    cursor: Option<usize>,
+    /// Install an empty extension registry, which must not change any answer.
+    registry: bool,
+}
+
+impl Mode {
+    fn eager() -> Mode {
+        Mode::default()
+    }
+}
+
+thread_local! {
+    /// Queries in the current cursor pass that needed eager fallback.
+    static FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A query's answer, from either execution mode.
+struct Answer {
+    kind: QueryKind,
+    boolean: bool,
+    vars: Vec<String>,
+    rows: Vec<Row>,
+    triples: Vec<oxrdf::Triple>,
+}
+
+fn eager_answer(store: &Store, qtext: &str, opts: &QueryOptions) -> Result<Answer, String> {
+    let r = sparkles_core::sparql::query(store.snapshot(), qtext, opts)
+        .map_err(|e| format!("error: {e}"))?;
+    let rows = (0..r.table.len())
+        .map(|i| {
+            (0..r.vars.len())
+                .map(|c| r.term(r.table.cols[c][i]))
+                .collect()
+        })
+        .collect();
+    Ok(Answer {
+        kind: r.kind,
+        boolean: r.boolean,
+        vars: r.vars.clone(),
+        rows,
+        triples: r.triples.clone(),
+    })
+}
+
+fn cursor_answer(
+    store: &Store,
+    qtext: &str,
+    opts: &QueryOptions,
+    batch_rows: usize,
+) -> Result<Answer, String> {
+    let strict = CursorOptions {
+        batch_rows,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let execution = match query_cursor(store.snapshot(), qtext, opts, &strict) {
+        Err(sparkles_core::Error::Unsupported(_)) => {
+            FALLBACKS.with(|n| n.set(n.get() + 1));
+            let allowed = CursorOptions {
+                fallback: FallbackPolicy::AllowMaterialization,
+                ..strict
+            };
+            query_cursor(store.snapshot(), qtext, opts, &allowed)
+        }
+        other => other,
+    }
+    .map_err(|e| format!("error: {e}"))?;
+    let mut answer = Answer {
+        kind: execution.kind(),
+        boolean: false,
+        vars: Vec::new(),
+        rows: Vec::new(),
+        triples: Vec::new(),
+    };
+    match execution {
+        QueryExecution::Select(mut cursor) => {
+            answer.vars = cursor.variables().to_vec();
+            while let Some(batch) = cursor.next_batch().map_err(|e| format!("error: {e}"))? {
+                for i in 0..batch.len() {
+                    answer
+                        .rows
+                        .push(batch.row(i).map_err(|e| format!("error: {e}"))?);
+                }
+            }
+        }
+        QueryExecution::Graph(mut cursor) => {
+            while let Some(batch) = cursor.next_batch().map_err(|e| format!("error: {e}"))? {
+                answer.triples.extend(batch.quads().iter().map(|q| {
+                    oxrdf::Triple::new(q.subject.clone(), q.predicate.clone(), q.object.clone())
+                }));
+            }
+        }
+        QueryExecution::Ask(result) => answer.boolean = result.value(),
+        QueryExecution::Eager(_) => return Err("streaming execution returned eagerly".into()),
+    }
+    Ok(answer)
+}
+
+fn run_query_test(t: &TestCase, m: &Manifest, mode: Mode) -> Result<(), String> {
     let action = as_subject(&m.obj(&t.entry, &format!("{MF}action")).ok_or("no action")?)
         .ok_or("bad action")?;
     let qurl = iri(&m.obj(&action, &format!("{QT}query")).ok_or("no query")?);
@@ -540,10 +650,15 @@ fn run_query_test(t: &TestCase, m: &Manifest) -> Result<(), String> {
     let opts = QueryOptions {
         base_iri: Some(qurl.clone()),
         timeout: Some(std::time::Duration::from_secs(20)),
+        extensions: mode
+            .registry
+            .then(|| sparkles_core::sparql::extensions::ExtensionRegistry::builder().build()),
         ..Default::default()
     };
-    let r = sparkles_core::sparql::query(store.snapshot(), &qtext, &opts)
-        .map_err(|e| format!("error: {e}"))?;
+    let r = match mode.cursor {
+        Some(batch_rows) => cursor_answer(&store, &qtext, &opts, batch_rows)?,
+        None => eager_answer(&store, &qtext, &opts)?,
+    };
     match (expected, r.kind) {
         (Expected::Boolean(b), QueryKind::Ask) => {
             if b == r.boolean {
@@ -553,14 +668,16 @@ fn run_query_test(t: &TestCase, m: &Manifest) -> Result<(), String> {
             }
         }
         (Expected::Solutions(vars, rows), QueryKind::Select) => {
-            let actual: Vec<Row> = (0..r.table.len())
-                .map(|i| {
+            let actual: Vec<Row> = r
+                .rows
+                .iter()
+                .map(|row| {
                     vars.iter()
                         .map(|v| {
                             r.vars
                                 .iter()
                                 .position(|x| x == v)
-                                .and_then(|c| r.term(r.table.cols[c][i]))
+                                .and_then(|c| row[c].clone())
                         })
                         .collect()
                 })
@@ -686,17 +803,24 @@ fn run_syntax_test(t: &TestCase, m: &Manifest, positive: bool, update: bool) -> 
 /// Run the W3C suite's `manifests` (relative to `SPARKLES_W3C_DIR`); skipped when the
 /// suite is not checked out.
 fn run_suite(name: &str, manifests: &[&str]) {
+    run_suite_mode(name, manifests, Mode::eager());
+}
+
+/// [`run_suite`] in `mode`.
+fn run_suite_mode(name: &str, manifests: &[&str], mode: Mode) {
     let Some(dir) = suite_dir() else {
         eprintln!("W3C test suite not found; skipping {name}");
         return;
     };
     let known = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/w3c-known-failures.txt");
-    run_suite_in(name, &dir, manifests, &known);
+    run_suite_in(name, &dir, manifests, &known, mode);
 }
 
 /// Run the manifests under `dir`; the tests named in `known_failures` (one short name
 /// per line, `#` comments, a reason after the name) may fail.
-fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Path) {
+/// Outside eager mode only the query evaluation tests run.
+fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Path, mode: Mode) {
+    FALLBACKS.with(|n| n.set(0));
     let mut tests = Vec::new();
     for m in manifests {
         collect_tests(&path_to_url(&dir.join(m)), &mut tests);
@@ -736,9 +860,13 @@ fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Pat
             _ => short,
         };
         let r = match t.kind.as_str() {
-            "QueryEvaluationTest" => {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_query_test(t, m)))
-                    .unwrap_or_else(|_| Err("panic".into()))
+            "QueryEvaluationTest" => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_query_test(t, m, mode)
+            }))
+            .unwrap_or_else(|_| Err("panic".into())),
+            _ if mode.cursor.is_some() || mode.registry => {
+                skip += 1;
+                continue;
             }
             "UpdateEvaluationTest" => {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_update_test(t, m)))
@@ -780,6 +908,12 @@ fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Pat
         "\n{name}: {pass} passed, {fail} failed, {skip} skipped ({} tests)",
         tests.len()
     );
+    if mode.cursor.is_some() {
+        eprintln!(
+            "{name}: {} queries needed eager fallback",
+            FALLBACKS.with(|n| n.get())
+        );
+    }
     if !fixed.is_empty() {
         eprintln!("now passing (remove from known failures): {fixed:?}");
     }
@@ -817,6 +951,54 @@ fn sparql10() {
     );
 }
 
+/// The query evaluation tests through streaming cursors, at batch sizes that put
+/// boundaries everywhere and at the default size.
+#[test]
+fn sparql_query_cursors() {
+    for batch_rows in [1, 2, 3, 4096] {
+        run_suite_mode(
+            &format!("SPARQL 1.0 and 1.1 query (cursor, {batch_rows} rows)"),
+            &[
+                "sparql10/manifest-evaluation.ttl",
+                "sparql11/manifest-sparql11-query.ttl",
+            ],
+            Mode {
+                cursor: Some(batch_rows),
+                ..Mode::default()
+            },
+        );
+    }
+}
+
+/// P03 A9: an installed registry that no query references changes no answer.
+#[test]
+fn sparql_query_with_an_unused_registry() {
+    for mode in [
+        Mode {
+            registry: true,
+            ..Mode::default()
+        },
+        Mode {
+            registry: true,
+            cursor: Some(3),
+        },
+    ] {
+        let label = if mode.cursor.is_some() {
+            "SPARQL 1.0 and 1.1 query (unused registry, cursor)"
+        } else {
+            "SPARQL 1.0 and 1.1 query (unused registry)"
+        };
+        run_suite_mode(
+            label,
+            &[
+                "sparql10/manifest-evaluation.ttl",
+                "sparql11/manifest-sparql11-query.ttl",
+            ],
+            mode,
+        );
+    }
+}
+
 #[test]
 fn sparql12() {
     run_suite("SPARQL 1.2", &["sparql12/manifest.ttl"]);
@@ -834,6 +1016,7 @@ fn geosparql_oxigraph() {
         &dir,
         &["manifest.ttl"],
         &dir.join("expected-failures.txt"),
+        Mode::eager(),
     );
 }
 
@@ -849,6 +1032,7 @@ fn sparql_cdts() {
         &dir,
         &["SPARQL-CDTs/manifest-all.ttl"],
         &dir.join("expected-failures.txt"),
+        Mode::eager(),
     );
 }
 
@@ -862,6 +1046,7 @@ fn arq_property_functions() {
         &dir,
         &["ARQ/PropertyFunctions/manifest.ttl"],
         &dir.join("expected-failures.txt"),
+        Mode::eager(),
     );
 }
 
