@@ -1083,11 +1083,15 @@ missing platform should fail with a message that names the platform.
 2. Otherwise it maps `os.name` and `os.arch` to one of the five platform directories. On
    Linux it checks for musl and fails with a clear message, because Phase 1 and Phase 2
    ship glibc builds only.
-3. It extracts the resource to
-   `<sparkles.native.dir or java.io.tmpdir>/sparkles-<version>-<sha256 prefix>/` under a
-   temporary name and renames it into place, so concurrent JVMs share one copy. An
-   existing file with the right hash is reused. Nothing is deleted on exit, because
-   Windows cannot delete a loaded DLL and the content-addressed name makes reuse safe.
+3. It extracts the resource into a new directory under `sparkles.native.dir` or
+   `java.io.tmpdir`. On POSIX systems the directory is created with mode 0700 and the file
+   with mode 0700, so no other user can replace the library between the check and the
+   load. The SHA-256 is computed from the bytes as they are written, and a mismatch
+   deletes the copy and fails. Each JVM extracts its own copy and never reuses a directory
+   it did not create, because a shared, predictable path lets a local attacker swap the
+   file after the hash check. The copy is deleted when the JVM exits. Windows cannot
+   delete a loaded DLL, so on Windows the loader also deletes this user's earlier copies
+   that no running JVM still holds open.
 4. It sets UniFFI's `uniffi.component.sparkles.libraryOverride` property to the absolute
    path, which makes the generated code's `Native.register` load that file.
 5. It calls `version()` and compares the native library's encoding version and crate

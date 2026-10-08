@@ -5,7 +5,12 @@ import java.io.File
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.StandardCopyOption
+import java.nio.channels.Channels
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.PosixFileAttributeView
+import java.nio.file.attribute.PosixFilePermissions
+import java.io.InputStream
+import java.security.DigestInputStream
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.Properties
@@ -14,10 +19,10 @@ import java.util.Properties
  * Finds the native library and makes the generated bindings load it (P04 §6.3).
  *
  * The system property `sparkles.native.path` names a library file to use as is.
- * Otherwise the library for this platform is extracted from the jar into
- * `<sparkles.native.dir or java.io.tmpdir>/sparkles-<version>-<hash>/`, under a
- * temporary name and renamed into place, so that JVMs share one copy and an existing
- * copy with the right hash is reused.
+ * Otherwise the library for this platform is extracted from the jar into a new
+ * directory under `sparkles.native.dir` or `java.io.tmpdir` that only the current user
+ * can write. Its SHA-256 is checked while it is written, and the copy is deleted when the
+ * JVM exits.
  */
 internal object NativeLoader {
     /** The UniFFI component's name, the namespace of the generated bindings. */
@@ -119,41 +124,76 @@ internal object NativeLoader {
         }
         val base = System.getProperty("sparkles.native.dir")?.takeIf { it.isNotBlank() }
             ?: System.getProperty("java.io.tmpdir")
-        val dir = Path.of(base, "sparkles-$version-${expected.take(16)}")
-        val target = dir.resolve(name)
-        stream.use { input ->
-            if (Files.isRegularFile(target) && sha256(target) == expected) return target.toFile()
-            Files.createDirectories(dir)
-            val tmp = Files.createTempFile(dir, name, ".tmp")
-            try {
-                Files.copy(input, tmp, StandardCopyOption.REPLACE_EXISTING)
-                if (sha256(tmp) != expected) {
-                    throw UnsatisfiedLinkError("the Sparkles native library in the jar does not match its SHA-256")
-                }
-                try {
-                    Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-                } catch (_: IOException) {
-                    // another JVM put it there first, or the file is in use (Windows)
-                    if (!(Files.isRegularFile(target) && sha256(target) == expected)) throw
-                        UnsatisfiedLinkError("cannot place the Sparkles native library at $target")
-                }
-            } finally {
-                Files.deleteIfExists(tmp)
-            }
-        }
-        return target.toFile()
+        return stream.use { extractTo(Path.of(base), name, it, expected) }.toFile()
     }
 
-    private fun sha256(p: Path): String {
-        val md = MessageDigest.getInstance("SHA-256")
-        Files.newInputStream(p).use { input ->
-            val buf = ByteArray(1 shl 16)
-            while (true) {
-                val n = input.read(buf)
-                if (n < 0) break
-                md.update(buf, 0, n)
-            }
+    /** Whether the file system supports POSIX permissions (not Windows). */
+    private fun isPosix(dir: Path): Boolean =
+        Files.getFileStore(dir).supportsFileAttributeView(PosixFileAttributeView::class.java)
+
+    /**
+     * Copy `input` into a new directory under `base` that only this user can write, and
+     * return the copy. The SHA-256 is computed from the bytes as they are written, and no
+     * other user can replace the file afterwards, so the file that is loaded is the file
+     * that was checked. The directory is never shared with another JVM or reused, which
+     * closes the window a predictable shared path would leave for a local attacker.
+     */
+    internal fun extractTo(base: Path, name: String, input: InputStream, expected: String): Path {
+        Files.createDirectories(base)
+        val posix = isPosix(base)
+        if (!posix) cleanStale(base)
+        val dir = if (posix) {
+            Files.createTempDirectory(base, EXTRACT_PREFIX, PosixFilePermissions.asFileAttribute(PRIVATE))
+        } else {
+            Files.createTempDirectory(base, EXTRACT_PREFIX)
         }
-        return md.digest().joinToString("") { "%02x".format(it) }
+        val target = dir.resolve(name)
+        try {
+            val md = MessageDigest.getInstance("SHA-256")
+            val attrs = if (posix) arrayOf(PosixFilePermissions.asFileAttribute(PRIVATE)) else emptyArray()
+            Files.newByteChannel(target, setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE), *attrs).use { ch ->
+                val out = Channels.newOutputStream(ch)
+                DigestInputStream(input, md).copyTo(out, 1 shl 16)
+                out.flush()
+            }
+            if (hex(md.digest()) != expected) {
+                throw UnsatisfiedLinkError("the Sparkles native library in the jar does not match its SHA-256")
+            }
+        } catch (e: Throwable) {
+            Files.deleteIfExists(target)
+            Files.deleteIfExists(dir)
+            throw e
+        }
+        // A loaded library can be unlinked on POSIX systems but not on Windows, where
+        // cleanStale removes copies that no running JVM holds open.
+        target.toFile().deleteOnExit()
+        dir.toFile().deleteOnExit()
+        return target
     }
+
+    /** Delete earlier extractions of this user that no process still has loaded (Windows). */
+    private fun cleanStale(base: Path) {
+        val me = System.getProperty("user.name")
+        try {
+            Files.newDirectoryStream(base, "$EXTRACT_PREFIX*").use { dirs ->
+                for (d in dirs) {
+                    try {
+                        if (!Files.isDirectory(d, java.nio.file.LinkOption.NOFOLLOW_LINKS)) continue
+                        if (!Files.getOwner(d).name.substringAfterLast('\\').equals(me, ignoreCase = true)) continue
+                        Files.list(d).use { files -> files.forEach { Files.deleteIfExists(it) } }
+                        Files.deleteIfExists(d)
+                    } catch (_: IOException) {
+                        // in use by another JVM, or not ours
+                    } catch (_: UnsupportedOperationException) {
+                    }
+                }
+            }
+        } catch (_: IOException) {
+        }
+    }
+
+    private const val EXTRACT_PREFIX = "sparkles-native-"
+    private val PRIVATE = PosixFilePermissions.fromString("rwx------")
+
+    private fun hex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }
 }

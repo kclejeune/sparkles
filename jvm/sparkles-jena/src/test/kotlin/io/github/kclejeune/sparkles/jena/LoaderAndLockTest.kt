@@ -1,7 +1,10 @@
 package io.github.kclejeune.sparkles.jena
 
 import io.github.kclejeune.sparkles.jena.internal.NativeLoader
+import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -36,6 +39,36 @@ class LoaderAndLockTest {
         assertEquals("sparkles_ffi.dll", NativeLoader.libraryName("windows-x86_64"))
         assertEquals("libsparkles_ffi.dylib", NativeLoader.libraryName("macos-aarch64"))
         assertEquals("libsparkles_ffi.so", NativeLoader.libraryName("linux-x86_64"))
+    }
+
+    private fun sha256(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    @Test
+    fun extraction_uses_a_fresh_private_directory_and_checks_the_written_bytes(@TempDir base: Path) {
+        val bytes = "not really a library".toByteArray()
+        val expected = sha256(bytes)
+        // A directory planted at a predictable name is never reused.
+        val planted = java.nio.file.Files.createDirectories(base.resolve("sparkles-native-planted"))
+        java.nio.file.Files.write(planted.resolve("libsparkles_ffi.so"), "evil".toByteArray())
+
+        val first = NativeLoader.extractTo(base, "libsparkles_ffi.so", bytes.inputStream(), expected)
+        val second = NativeLoader.extractTo(base, "libsparkles_ffi.so", bytes.inputStream(), expected)
+        assertNotEquals(first.parent, second.parent)
+        assertNotEquals(planted, first.parent)
+        assertArrayEquals(bytes, java.nio.file.Files.readAllBytes(first))
+        if (java.nio.file.Files.getFileStore(base).supportsFileAttributeView("posix")) {
+            val perms = java.nio.file.attribute.PosixFilePermissions.toString(java.nio.file.Files.getPosixFilePermissions(first.parent))
+            assertEquals("rwx------", perms)
+            val filePerms = java.nio.file.attribute.PosixFilePermissions.toString(java.nio.file.Files.getPosixFilePermissions(first))
+            assertEquals("rwx------", filePerms)
+        }
+
+        val before = java.nio.file.Files.list(base).use { it.count() }
+        assertThrows(UnsatisfiedLinkError::class.java) {
+            NativeLoader.extractTo(base, "libsparkles_ffi.so", "tampered".toByteArray().inputStream(), expected)
+        }
+        assertEquals(before, java.nio.file.Files.list(base).use { it.count() })
     }
 
     private fun probe(dir: Path): String {
