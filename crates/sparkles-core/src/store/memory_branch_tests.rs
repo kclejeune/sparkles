@@ -1,4 +1,4 @@
-use super::branch_tests::{apply, dump, has, merged};
+use super::branch_tests::{apply, code, dump, has, merge_historical, merged};
 use super::*;
 use crate::branch::{BranchOptions, DeleteOptions};
 use crate::history::At;
@@ -392,4 +392,86 @@ fn expired_memory_commit_resolution_and_snapshot_listing_do_not_deadlock() {
     for reader in readers {
         reader.join().unwrap();
     }
+}
+
+/// Only fork points are kept for merges beyond the commit ring. A merge base that is
+/// an earlier merge's source commit, or a criss-cross anchor, is read through the
+/// commit ring, and a merge after its eviction fails with `merge-base-gone`.
+#[test]
+fn memory_merge_bases_past_the_commit_ring_are_gone() {
+    let ring = StoreOptions {
+        memory_commit_ring: 2,
+        ..Default::default()
+    };
+    let churn = |s: &Store, dev: &Store, tag: &str| {
+        for i in 0..6 {
+            apply(s, &format!("+<urn:m{tag}{i}> <urn:p> \"{i}\" ."));
+            apply(dev, &format!("+<urn:d{tag}{i}> <urn:p> \"{i}\" ."));
+        }
+    };
+    // a base that is the source commit of an earlier merge
+    let s = Store::in_memory(ring.clone());
+    apply(&s, "+<urn:a> <urn:p> \"1\" .");
+    s.create_branch("dev", &Default::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&dev, "+<urn:d0> <urn:p> \"x\" .");
+    merged(s.merge("dev", "main", &Default::default()).unwrap());
+    churn(&s, &dev, "a");
+    let e = s.merge("dev", "main", &Default::default()).unwrap_err();
+    assert_eq!(code(&e), "merge-base-gone");
+    // a criss-cross, whose virtual base's anchors are ring commits too
+    let s = Store::in_memory(ring);
+    s.create_branch("dev", &Default::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&s, "+<urn:m> <urn:p> <urn:x> .");
+    apply(&dev, "+<urn:d> <urn:p> <urn:x> .");
+    let before = s.head_commit().seq;
+    merged(s.merge("dev", "main", &Default::default()).unwrap());
+    merge_historical(&s, "main", before, "dev", &Default::default());
+    churn(&s, &dev, "b");
+    assert_eq!(s.merge_base("dev", "main").unwrap().len(), 2);
+    let e = s.merge("dev", "main", &Default::default()).unwrap_err();
+    assert_eq!(code(&e), "merge-base-gone");
+    // the refused merge wrote nothing
+    assert!(!has(&s, "urn:db5"));
+}
+
+/// The branch table is not locked while a memory branch's store and indexes are
+/// built, and a creation that loses its name meanwhile publishes nothing.
+#[test]
+fn memory_branch_indexes_build_outside_the_table_lock() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let s = Store::in_memory(StoreOptions::default());
+    apply(&s, "+<urn:a> <urn:p> \"1\" .");
+    let (send, receive) = mpsc::channel();
+    let send = Mutex::new(send);
+    let once = AtomicBool::new(false);
+    s.set_failpoint(
+        "memory-branch-indexes",
+        Some(Arc::new(move |store: &Store| {
+            if once.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let set = store.branch_set().unwrap();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || tx.send(set.table_len()).unwrap());
+            let read = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            // a concurrent creation takes the name while the indexes build (skipped
+            // when the table is locked, which would deadlock)
+            let raced = read && store.create_branch("taken", &Default::default()).is_ok();
+            send.lock().send((read, raced)).unwrap();
+        })),
+    );
+    let lost = s.create_branch("taken", &Default::default());
+    let (read, raced) = receive.recv().unwrap();
+    assert!(read, "a table reader waited for the index build");
+    assert!(raced);
+    assert_eq!(
+        super::branch_tests::code(&lost.unwrap_err()),
+        "branch-exists"
+    );
+    s.set_failpoint("memory-branch-indexes", None);
+    assert_eq!(s.branches().unwrap().len(), 2);
+    s.create_branch("next", &Default::default()).unwrap();
 }

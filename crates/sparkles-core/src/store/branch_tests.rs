@@ -848,7 +848,7 @@ fn a17_true_criss_cross_uses_a_virtual_base() {
 
 /// Make a merge with a historical second parent to construct genuine criss-cross
 /// histories, without publishing fake merge records or bypassing the merge planner.
-fn merge_historical(s: &Store, source: &str, seq: u64, target: &str, o: &MergeOptions) {
+pub(super) fn merge_historical(s: &Store, source: &str, seq: u64, target: &str, o: &MergeOptions) {
     let set = s.owned_set().unwrap();
     let source = s.branch(source).unwrap();
     let target = s.branch(target).unwrap();

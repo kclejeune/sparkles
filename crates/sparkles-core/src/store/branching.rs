@@ -1702,20 +1702,42 @@ impl Store {
         let (snap, resolved) = self.branch_snapshot_at(&o.from, &o.at, &Default::default())?;
         let (_, owner_id) = self.branch_resolve(&o.from, &At::Commit(resolved.commit.seq))?;
         let up = self.branch_by_id(owner_id)?;
-        let mut t = set.table.lock();
-        if t.by_name(name).is_some() {
-            return Err(branch::conflict(
-                "branch-exists",
-                format!("branch {name} exists"),
-            ));
+        let admit = |t: &TableFile, ordinal: bool| {
+            if t.by_name(name).is_some() {
+                return Err(branch::conflict(
+                    "branch-exists",
+                    format!("branch {name} exists"),
+                ));
+            }
+            if 1 + t.branches.len() >= self.opts.max_branches
+                || (ordinal && t.next_ordinal > u16::MAX as u32)
+            {
+                return Err(branch::conflict(
+                    "branch-limit",
+                    "the dataset has used its branch limit",
+                ));
+            }
+            Ok(())
+        };
+        // Reserve the ordinal even if index configuration fails. The table lock is not
+        // held while the store and its indexes are built, so readers of the table do
+        // not wait for text, spatial or vector builds. No branch is published until
+        // all fallible initialization has completed.
+        let (ordinal, next) = {
+            let mut t = set.table.lock();
+            admit(&t, true)?;
+            let ordinal = t.next_ordinal as u16;
+            t.next_ordinal += 1;
+            (ordinal, t.next_ordinal)
+        };
+        self.branching
+            .next_ordinal
+            .store(next as u64, Ordering::Relaxed);
+        for s in set.open_stores() {
+            s.branching
+                .next_ordinal
+                .store(next as u64, Ordering::Relaxed);
         }
-        if 1 + t.branches.len() >= self.opts.max_branches || t.next_ordinal > u16::MAX as u32 {
-            return Err(branch::conflict(
-                "branch-limit",
-                "the dataset has used its branch limit",
-            ));
-        }
-        let ordinal = t.next_ordinal as u16;
         let id = uuid::Uuid::new_v4();
         let from = FromRef {
             branch_id: owner_id,
@@ -1760,24 +1782,17 @@ impl Store {
         state.commit = root.seq;
         state.cache = set.cache.clone();
         store.current.store(Arc::new(state));
-        t.next_ordinal += 1;
-        let next = t.next_ordinal;
-        // Reserve the ordinal even if index configuration fails. No branch is
-        // published until all fallible initialization has completed.
-        self.branching
-            .next_ordinal
-            .store(next as u64, Ordering::Relaxed);
-        for s in set.open_stores() {
-            s.branching
-                .next_ordinal
-                .store(next as u64, Ordering::Relaxed);
-        }
+        self.failpoint("memory-branch-indexes");
         up.configure_indexes(&store)?;
         *store.describe.write() = up.describe.read().clone();
         *store.compaction.settings.lock() = up.compaction.settings.lock().clone();
         if let (Some(src), Some(dst)) = (&up.mem_history, &store.mem_history) {
             dst.lock().retention = src.lock().retention;
         }
+        let mut t = set.table.lock();
+        // another creation may have taken the name or the last slot meanwhile
+        admit(&t, false)?;
+        let next = next.max(t.next_ordinal);
         t.branches.push(Entry {
             name: name.into(),
             id,
