@@ -141,8 +141,12 @@ impl Dataset {
         if progress.is_some() {
             progress.report(0.0, "relinking branch");
             let p = progress.clone();
+            // the fraction of each stage a relink reports, kept for other messages
+            let reached = std::sync::Mutex::new(0.0f32);
             options.progress = Some(std::sync::Arc::new(move |message: &str| {
-                p.report(0.0, message)
+                let mut reached = reached.lock().unwrap_or_else(|e| e.into_inner());
+                *reached = relink_fraction(message).unwrap_or(*reached).max(*reached);
+                p.report(*reached, message)
             }));
         }
         let report = self.store().relink_branch(name, &options)?;
@@ -265,10 +269,60 @@ impl Dataset {
     }
 }
 
+/// The fraction of a relink that a stage message of the store marks.
+fn relink_fraction(message: &str) -> Option<f32> {
+    use crate::store::{RELINK_CATCHING_UP, RELINK_READING, RELINK_WRITING};
+    [
+        (RELINK_READING, 0.05),
+        (RELINK_WRITING, 0.4),
+        (RELINK_CATCHING_UP, 0.8),
+    ]
+    .into_iter()
+    .find(|(stage, _)| message.starts_with(stage))
+    .map(|(_, fraction)| fraction)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Dataset;
     use crate::branch::{BranchOptions, MergeOutcome};
+
+    #[test]
+    fn relink_reports_the_fraction_of_each_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path().join("db")).unwrap();
+        ds.update("INSERT DATA { <urn:a> <urn:p> 1 }").unwrap();
+        ds.store().compact().unwrap();
+        ds.create_branch("dev", &BranchOptions::default()).unwrap();
+        ds.branch("dev")
+            .unwrap()
+            .update("INSERT DATA { <urn:b> <urn:p> 2 }")
+            .unwrap();
+        ds.update("INSERT DATA { <urn:c> <urn:p> 3 }").unwrap();
+        ds.store().compact().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let ctl = crate::task::Control {
+            progress: crate::task::Progress::new(move |f, m| {
+                record.lock().unwrap().push((f, m.to_string()))
+            }),
+            ..Default::default()
+        };
+        ds.relink_branch_with("dev", &Default::default(), &ctl)
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        let fractions: Vec<f32> = seen.iter().map(|(f, _)| *f).collect();
+        assert!(fractions.windows(2).all(|w| w[0] <= w[1]), "{seen:?}");
+        assert_eq!(fractions.first(), Some(&0.0));
+        assert_eq!(fractions.last(), Some(&1.0));
+        // each stage between the start and the end reports a fraction of its own
+        let stages: Vec<f32> = fractions
+            .iter()
+            .copied()
+            .filter(|f| *f > 0.0 && *f < 1.0)
+            .collect();
+        assert_eq!(stages, [0.05, 0.4, 0.8], "{seen:?}");
+    }
 
     #[test]
     fn a_dataset_bound_to_a_branch() {

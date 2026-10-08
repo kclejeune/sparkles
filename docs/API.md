@@ -2932,8 +2932,13 @@ merge writes nothing and answers `upToDate: true`.
 When a criss-cross history has several best common ancestors, Sparkles recursively
 combines them into a virtual merge base if their changes can be combined without
 cell conflicts. It publishes no synthetic commit, and the report's `base` is `null`.
-Conflicting ancestors still return `ambiguous-merge-base` with real `candidates`;
-an explicit `base` selects one of them. Replayed fast-forwards require a real base.
+The combination follows the merge's `scope` and exempt predicates, so ancestors that
+merged cleanly under them combine cleanly too. Conflicting ancestors still return
+`ambiguous-merge-base` with real `candidates`; an explicit `base` selects one of them.
+Replayed fast-forwards require a real base. On an in-memory dataset only the starting
+points of branches are kept for merges. A merge base that an earlier merge brought in,
+and the ancestors of a virtual base, are read from the commit ring of 65,536 commits per
+branch, and a merge that needs an evicted one returns `410 merge-base-gone`.
 
 **Replayed fast-forwards.** With `ff: "replay"`, a merge whose target holds the state of
 the merge base replays the source's commits after the base one by one, each as its own

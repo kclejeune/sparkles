@@ -14,8 +14,9 @@
 > left-out branches have shipped, and so have Python bindings, in-memory branches,
 > selected-branch backups, upstream full-text/spatial/vector index reuse, and
 > cherry-picks and automatic recursive virtual merge bases from Phase 3. Explicit
-> relinking is implemented in Rust and the offline CLI for persistent linked branches;
-> its HTTP and foreign-binding surfaces remain follow-ups. Cross-server clones are not built.
+> relinking is implemented in Rust, the offline CLI and the Python bindings for
+> persistent linked branches. Its HTTP surface and the Node and C bindings are not built,
+> and neither are cross-server clones.
 >
 > **User docs:** [API: Branches and merges](../API.md#branches-and-merges) ·
 > [Usage: Branches and merges](../USAGE.md#branches-and-merges) ·
@@ -265,7 +266,7 @@ in `GET /$/datasets` gain `branches`, the number of branches including `main`.
 | Conflicts remain after `onConflict` and `resolutions`. Nothing is written. | 409 | `merge-conflict` |
 | `ff: "only"` and the target has moved since the merge base. | 409 | `not-fast-forward` |
 | `expect` names a head that is no longer the head. | 409 | `head-moved` |
-| The branches have more than one best common ancestor and `base` is missing. | 409 | `ambiguous-merge-base` |
+| The branches have more than one best common ancestor, `base` is missing, and the ancestors conflict with each other, so no virtual base can be built (§4.3). | 409 | `ambiguous-merge-base` |
 | The merge base is no longer reconstructable. | 410 | `merge-base-gone` |
 | The target's write-time validation refuses the result. | 422 | as in [C10](C10-write-time-validation.md) |
 | The change sets or the result exceed a budget or the quota. | 507 | `budget`, as in [C01](C01-observability-and-budgets.md) |
@@ -612,9 +613,12 @@ the frontiers come from the in-memory table of merges in milliseconds.
 The common ancestors of two commits are the commits at or below the pointwise minimum of
 their frontiers. A **merge base** is a common ancestor that no other common ancestor
 descends from. Usually there is exactly one. After criss-cross merges there can be
-several, as in Git. Phase 1 then refuses the merge with `409 ambiguous-merge-base` and
-lists the candidates, and the caller picks one with `base`. Phase 3 can merge the
-candidates into a virtual base, as Git's recursive strategies do.
+several, as in Git. Phase 1 refused such a merge with `409 ambiguous-merge-base`. Since
+Phase 3 the candidates are merged into a virtual base, as Git's recursive strategies do,
+without writing a commit, and the report's `base` is `null`. The synthesis uses the
+merge's conflict scope and exempt predicates, but not its resolutions or `onConflict`.
+Only when the candidates conflict with each other is the merge refused with
+`409 ambiguous-merge-base`, listing the candidates, and the caller picks one with `base`.
 
 **Ahead** is the number of own commits of the source that the target does not descend
 from, counted over every branch in the source's frontier. **Behind** is the same count the
@@ -1239,8 +1243,10 @@ as for a branch that does not exist. Its update on `main` → `403`. A token wit
 restriction cannot create branches or merge.
 
 **A17. Criss-cross.** `main` and `dev` each merge the other after both made changes, then
-both change again. A merge → `409 ambiguous-merge-base` with two candidates. Repeating
-it with one of them as `base` merges.
+both change again. A merge uses a virtual base of the two candidates and reports
+`base: null`. When the two candidates changed the same cell differently, the merge →
+`409 ambiguous-merge-base` with two candidates, and repeating it with one of them as
+`base` merges.
 
 **A18. Quota.** With a dataset quota slightly above its current size, a linked branch's
 compaction is refused, `GET /$/compaction/ds?branch=dev` reports `quota`, and writes to
@@ -1681,12 +1687,19 @@ times the old build's as a geometric mean over 30 series. Eight interleaved load
   truncating another's terms. Each branch has a private generation identity, delta,
   result cache, history, spatial/vector state and independently forked validation guard.
   RDFS configuration is inherited with a separate schema cache. Fork snapshots remain
-  available for merges beyond history-ring eviction and release their holds once no
-  live or retired branch needs them. Ordinals remain monotonic after deletion.
+  available for merges beyond the eviction of the memory commit ring and release their
+  holds once no live or retired branch needs them. Only fork points are kept this way.
+  A merge base that is the source commit of an earlier merge, and the anchors of a
+  virtual base after a criss-cross, are read through the commit ring. Once such a
+  commit is evicted, a merge that needs it fails with `410 merge-base-gone`. The default
+  ring holds 65,536 commits per branch. Ordinals remain monotonic after deletion.
 * `/$/backups/{ds}?branch=NAME`, the dataset backup handle, and
   `sparkles backup create --branch NAME` capture a selected branch as a standalone
   dataset. Linked branches and memory branches materialize a leased temporary
-  generation; branches with their own persistent generation upload its files.
+  generation; branches with their own persistent generation upload its files. Such a
+  restored branch keeps its head, its blank-node numbering and its own commit records
+  from the fork point on. The records of the commits it inherited stay with its
+  upstream, as they do for the branch itself.
   Persistent materialization retains the persistent source type. The manifest's
   optional `dataset.branch` records the owning dataset UUID, captured branch UUID/name
   and next ordinal. Automatic restore always gives a branch backup a fresh dataset
@@ -1713,7 +1726,8 @@ a commit. Conflict-free synthesis reports `base: null`; conflicting ancestors re
 with real candidates and retain explicit-base selection. Replay requires a real base.
 Synthesis checks cancellation, deadlines, changed-quad budgets and bounded recursion.
 Tests cover two/three best ancestors, recursive histories, memory stores, restart,
-blank-node identity and conservative ancestor conflict refusal.
+blank-node identity, deletes on both sides, exempt predicates, the quad scope and
+conservative ancestor conflict refusal.
 
 `Dataset::relink_branch` and `Store::relink_branch` explicitly move a persistent
 currently linked branch onto main's captured immutable index. A new linked generation
@@ -1728,13 +1742,25 @@ boundaries, cancellation, concurrent writes, history, corruption, child branches
 materialized parent/child backup regressions pass. Core integrity checks report corrupt
 link metadata and overlays. The offline `sparkles branch relink --loc db NAME` command
 uses the controlled facade with responsive Ctrl-C handling, progress on stderr and
-text/JSON reports. It requires an existing database and exclusive directory lock;
-remote mode and a global branch selector are refused. HTTP/foreign bindings and
-cross-server clones remain Phase 3 work.
+text/JSON reports. The facade reports the fraction reached at each stage of the relink.
+It requires an existing database and exclusive directory lock, and remote mode and a
+global branch selector are refused. Python's `Branches.relink` uses the same facade.
+The HTTP surface, the Node and C bindings and cross-server clones are not built.
+
+The relink records its hold on main's generation before the branch's `CURRENT` names
+the relinked generation, so that main never collects a generation the branch reads. A
+crash between the two leaves a hold that no generation of the branch needs. Opening
+the dataset releases such holds, by comparing each branch's holds with the links of its
+published generations on disk. The reader requirement of 3 is also written before
+`CURRENT` and stays after such a crash, since lowering it would need proof that no
+relinked generation remains anywhere in the dataset.
 
 
 Memory branch creation publishes the initialized store and branch entry together, so
-concurrent branch readers cannot fall through to opening a directory. Scoped backup
+concurrent branch readers cannot fall through to opening a directory. The branch table
+is not locked while the new store's text, spatial and vector indexes are built. The
+ordinal is reserved first, and the name and branch limit are checked again before the
+entry is published. Scoped backup
 creation keeps the branch selector in its Location, including for dataset administrators.
 Memory branch backups preserve graph-sourced ShEx validation settings as well as inline
 schemas. Focused concurrency, authenticated link-following and restore/write-rejection

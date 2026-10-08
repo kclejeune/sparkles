@@ -1174,6 +1174,11 @@ impl Store {
         }?;
         let mut build = tb.elapsed();
         self.failpoint("compact-built");
+        if relink.is_some()
+            && let Some(p) = &o.progress
+        {
+            p(RELINK_CATCHING_UP);
+        }
         // the first rebuild of a linked branch adds a full index: refused over the quota
         if snap0.generation.link.is_some()
             && let (Some(limit), Some(root)) = (self.quota.limit(), &self.root)
@@ -1507,6 +1512,9 @@ impl Store {
     ) -> Result<IndexMeta> {
         let interrupt = self.compaction_interrupt(o, dir);
         interrupt()?;
+        if let Some(p) = &o.progress {
+            p(RELINK_READING);
+        }
         let changes = main.toggles(
             main.owned_set()?,
             crate::branch::CommitRef {
@@ -1537,6 +1545,9 @@ impl Store {
             false,
             &self.cache,
         )?;
+        if let Some(p) = &o.progress {
+            p(&format!("{RELINK_WRITING} ({} quads)", changes.len()));
+        }
         let mut changes: Vec<_> = changes.into_iter().collect();
         changes.sort_unstable_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
         let mut bytes = Vec::with_capacity(changes.len() * WAL_REC);
@@ -1673,6 +1684,13 @@ fn build_pool(o: &CompactOptions, threads: usize) -> Result<Option<rayon::Thread
         .map(Some)
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))
 }
+
+/// The progress messages of a relink, in the order it reports them.
+pub const RELINK_READING: &str = "relink: reading the branch's changes from main's index";
+/// See [`RELINK_READING`].
+pub const RELINK_WRITING: &str = "relink: writing the branch's changes as an overlay";
+/// See [`RELINK_READING`].
+pub const RELINK_CATCHING_UP: &str = "relink: catching up concurrent commits and publishing";
 
 /// Translate a vocabulary key into the relinked generation without renumbering
 /// stored blank nodes or canonical inline literals.

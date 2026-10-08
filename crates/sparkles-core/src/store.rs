@@ -65,8 +65,8 @@ pub use clone::{CloneMethod, CloneMode, CloneOptions, CloneReport};
 pub use commit_graph::{CommitGraph, CommitGraphOptions, GraphBranch, GraphCommit, GraphCursor};
 pub use compaction::{
     Blocker, COMPACTION_FILE, CompactOptions, CompactReport, CompactionMeasures, CompactionPolicy,
-    CompactionSettings, REBUILD_BUCKETS, RebuildHistogram, RebuildReason, SETTING_NAMES, Trigger,
-    TriggerKind,
+    CompactionSettings, REBUILD_BUCKETS, RELINK_CATCHING_UP, RELINK_READING, RELINK_WRITING,
+    RebuildHistogram, RebuildReason, SETTING_NAMES, Trigger, TriggerKind,
 };
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
