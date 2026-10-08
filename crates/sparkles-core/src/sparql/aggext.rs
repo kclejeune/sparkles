@@ -24,13 +24,14 @@
 
 use super::ctx::Ctx;
 use super::value::{Num, Value};
-use crate::geo::vocab::{AGGREGATES, GEOF};
 use crate::id::{Id, Tag};
 use oxrdf::NamedNode;
 use oxsdatatypes::{Decimal, Double};
 use rustc_hash::FxHashMap;
 use spargebra::SparqlParser;
-use spargebra::algebra::{ARQ_AGGREGATE_KEYWORDS, ARQ_AGGREGATE_NAMESPACE};
+use spargebra::algebra::{
+    ARQ_AGGREGATE_KEYWORDS, ARQ_AGGREGATE_NAMESPACE, BUILT_IN_AGGREGATE_IRIS,
+};
 use std::str::FromStr;
 
 /// ARQ's function library namespace (`afn:`), where ARQ registers its variance and
@@ -47,20 +48,38 @@ const STATS: [&str; 6] = [
     "var_pop",
 ];
 
-/// The parser with every custom aggregate IRI of this build registered.
+/// The parser with every custom aggregate IRI of this build registered. The GeoSPARQL
+/// and `afn:` aggregates are spargebra's built-in list, which the formatter writes in
+/// the standard call form, so that form parses back as the same aggregate.
 pub fn register(mut p: SparqlParser) -> SparqlParser {
-    for local in AGGREGATES {
-        p = p.with_custom_aggregate_function(NamedNode::new_unchecked(format!("{GEOF}{local}")));
+    for iri in BUILT_IN_AGGREGATE_IRIS {
+        p = p.with_custom_aggregate_function(NamedNode::new_unchecked(iri));
     }
     for (_, local) in ARQ_AGGREGATE_KEYWORDS {
         p = p.with_custom_aggregate_function(NamedNode::new_unchecked(format!(
             "{ARQ_AGGREGATE_NAMESPACE}{local}"
         )));
     }
-    for local in STATS {
-        p = p.with_custom_aggregate_function(NamedNode::new_unchecked(format!("{AFN}{local}")));
-    }
     p
+}
+
+#[cfg(test)]
+mod built_in_tests {
+    use super::*;
+    use crate::geo::vocab::{AGGREGATES, GEOF};
+
+    #[test]
+    fn built_in_aggregate_iris_are_the_geosparql_and_afn_aggregates() {
+        let mut expected = AGGREGATES
+            .iter()
+            .map(|local| format!("{GEOF}{local}"))
+            .chain(STATS.iter().map(|local| format!("{AFN}{local}")))
+            .collect::<Vec<_>>();
+        let mut listed = BUILT_IN_AGGREGATE_IRIS.map(String::from).to_vec();
+        expected.sort();
+        listed.sort();
+        assert_eq!(listed, expected);
+    }
 }
 
 /// One of ARQ's statistical aggregates.
@@ -103,7 +122,7 @@ pub(crate) fn aggregate(ctx: &Ctx, iri: &str, vals: &[std::result::Result<Id, ()
     }
     #[cfg(feature = "geo")]
     if let Some(id) = iri
-        .strip_prefix(GEOF)
+        .strip_prefix(crate::geo::vocab::GEOF)
         .and_then(|local| crate::geo::aggregates::evaluate(ctx, local, vals))
     {
         return id;

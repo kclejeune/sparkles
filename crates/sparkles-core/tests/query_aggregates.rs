@@ -818,15 +818,21 @@ fn invalid_and_oversized_output_terms_are_fatal_protocol_failures() {
 #[test]
 fn built_in_aggregate_formatting_keeps_keyword_and_custom_iri_semantics() {
     let store = Store::in_memory(StoreOptions::default());
-    for function in ["MEDIAN", "<http://jena.apache.org/ARQ/function#var_pop>"] {
+    // Built-in aggregate IRIs keep the standard call form that SERVICE endpoints
+    // other than Jena accept. Only IRIs the parser does not know use `AGG`.
+    for function in [
+        "MEDIAN",
+        "<http://jena.apache.org/ARQ/function#var_pop>",
+        "<http://www.opengis.net/def/function/geosparql/aggUnion>",
+    ] {
         let text = format!("SELECT ({function}(DISTINCT ?v) AS ?n) {{VALUES ?v {{1 2 2 3}}}}");
         let parsed = parse_query(&text, None, &[]).unwrap();
         let displayed = parsed.to_string();
-        if function == "MEDIAN" {
-            assert!(displayed.contains("MEDIAN(DISTINCT ?v)"));
-        } else {
-            assert!(displayed.contains(&format!("AGG {function}(DISTINCT ?v)")));
-        }
+        assert!(
+            displayed.contains(&format!("({function}(DISTINCT ?v)")),
+            "{displayed}"
+        );
+        assert!(!displayed.contains("AGG "), "{displayed}");
         let roundtrip = parse_query(&displayed, None, &[]).unwrap();
         assert_eq!(aggregate_ast(&parsed), aggregate_ast(&roundtrip));
         assert_eq!(

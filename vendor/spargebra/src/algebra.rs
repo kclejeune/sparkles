@@ -1650,9 +1650,13 @@ impl fmt::Display for AggregateExpression {
                 name: AggregateFunction::Custom(iri),
                 expr,
                 distinct,
-            } if arq_aggregate_keyword(iri).is_none() => {
-                // Application aggregate syntax must remain independent of the
-                // execution registry when this algebra is formatted and parsed.
+            } if arq_aggregate_keyword(iri).is_none()
+                && !BUILT_IN_AGGREGATE_IRIS.contains(&iri.as_str()) =>
+            {
+                // Built-in aggregate IRIs keep the standard call form, which other
+                // endpoints accept. Application aggregate syntax must remain
+                // independent of the execution registry when this algebra is
+                // formatted and parsed.
                 // A plain IRI call would otherwise be parsed as a scalar call.
                 if *distinct {
                     write!(f, "AGG {iri}(DISTINCT {expr})")
@@ -1734,6 +1738,28 @@ pub const ARQ_AGGREGATE_KEYWORDS: [(&str, &str); 8] = [
     ("VARIANCE", "variance"),
     ("VAR_SAMP", "var_samp"),
     ("VAR_POP", "var_pop"),
+];
+
+/// Aggregate IRIs from GeoSPARQL and from ARQ's function library (`afn:`) that are
+/// called in the standard form `<iri>(…)`. Processors that implement these libraries
+/// read such calls as aggregates, so the formatter writes them in that form. Other
+/// custom aggregates are written as ARQ's `AGG <iri>(…)`, which only ARQ accepts but
+/// which parses without registering the IRI. A parser that should read the standard
+/// form as an aggregate must register each IRI with
+/// [`SparqlParser::with_custom_aggregate_function`](crate::SparqlParser::with_custom_aggregate_function).
+pub const BUILT_IN_AGGREGATE_IRIS: [&str; 12] = [
+    "http://www.opengis.net/def/function/geosparql/aggBoundingBox",
+    "http://www.opengis.net/def/function/geosparql/aggBoundingCircle",
+    "http://www.opengis.net/def/function/geosparql/aggCentroid",
+    "http://www.opengis.net/def/function/geosparql/aggConcaveHull",
+    "http://www.opengis.net/def/function/geosparql/aggConvexHull",
+    "http://www.opengis.net/def/function/geosparql/aggUnion",
+    "http://jena.apache.org/ARQ/function#stdev",
+    "http://jena.apache.org/ARQ/function#stdev_samp",
+    "http://jena.apache.org/ARQ/function#stdev_pop",
+    "http://jena.apache.org/ARQ/function#variance",
+    "http://jena.apache.org/ARQ/function#var_samp",
+    "http://jena.apache.org/ARQ/function#var_pop",
 ];
 
 /// The ARQ keyword of a custom aggregate IRI, if it has one.
