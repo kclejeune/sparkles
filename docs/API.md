@@ -6748,7 +6748,8 @@ endpoints. Their bodies stream to a temporary file instead, up to `--max-upload-
 the request fails with `413`. That limit counts bytes after HTTP decompression. Its
 default of 4096 (4 GiB) is the body limit of the bundled NixOS nginx virtual host, and `0`
 means unlimited. RDF sources, including files compressed inside the body and plain RDF, are capped separately by
-`--max-decompressed-mb` as they are parsed. Before each 64 MiB of a spooled body is
+`--max-decompressed-mb` as they are parsed. A body in RDF Thrift, RDF Protobuf, RDF/JSON or TriX counts its
+N-Quads translation against that cap while the translation is written. Before each 64 MiB of a spooled body is
 written to the temporary directory, the server checks that the file system keeps
 `--min-free-disk-mb` free (default 1024, `0` for no check). Otherwise the request fails
 with `507`.
@@ -6836,7 +6837,8 @@ statuses are:
 * `412` for a failed `If-Match` or `If-None-Match`, with `{code: "precondition-failed"}`
   (see [Entity tags and conditional requests](#entity-tags-and-conditional-requests)), or
   an RDF Patch whose `prev` is not the head
-* `413` for a body over its ceiling, or a compressed body over `--max-decompressed-mb`
+* `413` for a body over its ceiling, or for RDF source bytes over `--max-decompressed-mb`,
+  whether the body was compressed or plain
 * `415` for an unsupported content type or `Content-Encoding`
 * `422` for a write that write-time validation rejects, and for output the formatter or
   the linter refuses
