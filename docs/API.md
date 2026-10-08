@@ -2735,8 +2735,8 @@ A **branch** is a named, writable line of commits that starts from a commit of a
 branch. Every dataset has the branch `main`, which is the dataset as clients have
 always seen it, so a client that never names a branch sees no change. Persistent and
 in-memory datasets support the same branch operations. Memory branches share immutable
-index and vocabulary data while keeping writes, history, caches and validation state
-independent; they disappear when the catalog closes.
+index and vocabulary data with their upstream. Their writes, history, caches and
+validation state are their own, and they disappear when the catalog closes.
 
 A new branch writes no index. Its first generation is linked: it reads the index files
 of the generation that holds its starting commit, and it replays that generation's
@@ -2937,8 +2937,9 @@ When a criss-cross history has several best common ancestors, Sparkles recursive
 combines them into a virtual merge base if their changes can be combined without
 cell conflicts. It publishes no synthetic commit, and the report's `base` is `null`.
 The combination follows the merge's `scope` and exempt predicates, so ancestors that
-merged cleanly under them combine cleanly too. Conflicting ancestors still return
-`ambiguous-merge-base` with real `candidates`; an explicit `base` selects one of them.
+merged cleanly under them combine cleanly too. When the ancestors conflict, the merge
+returns `ambiguous-merge-base` with the real `candidates`, and an explicit `base` selects
+one of them.
 Replayed fast-forwards require a real base. On an in-memory dataset only the starting
 points of branches are kept for merges. A merge base that an earlier merge brought in,
 and the ancestors of a virtual base, are read from the commit ring of 65,536 commits per
@@ -3159,10 +3160,11 @@ without their counts.
 A backup to a [backup repository](#backup-repositories) captures one branch as a
 standalone dataset: `main` by default, or the branch selected with `?branch=NAME` on
 `/$/backups/{ds}`. The same selector scopes listing and per-backup actions. Scheduled
-policies continue to capture `main`. A branch capture includes `dataset.branch` with
-the enclosing dataset UUID, captured branch UUID and name, and the reserved blank-node
-allocation range. Restoring it creates a fresh dataset identity and records the captured
-branch and commit as `forkedFrom`; keeping its identity is refused. The manifest's
+policies continue to capture `main`. A branch capture includes `dataset.branch`, which
+holds the UUID of the enclosing dataset, the UUID and name of the captured branch, and
+its reserved blank-node allocation range. Restoring it creates a new dataset identity and
+records the captured branch and commit as `forkedFrom`. A request to keep the captured
+identity is refused. The manifest's
 `branchesOmitted` records the other branches left out. A backup never restores a whole
 branch tree.
 
@@ -4454,23 +4456,25 @@ SELECT ?s ?score ?label WHERE {
   updates the index by the documents it adds and removes when they are few next to the
   index, and rebuilds it otherwise. Enabling or reconfiguring an index builds it with
   writes waiting.
-* **Startup recovery.** Persistent open verifies and catches up a reusable index
-  synchronously. A missing, damaged, ahead or uncovered index instead rebuilds from RDF
-  on a bounded background worker. RDF reads/writes remain available; configured text
-  searches return `503` while `rebuilding` or `failed`. Disabled search still returns
-  `400`. Retained unavailable snapshots stay unavailable after a newer view becomes
-  ready. A recovery that keeps restarting because writes or compactions outpace it is
+* **Startup recovery.** When a persistent dataset opens, a reusable index is verified
+  and caught up before the open returns. An index that is missing, damaged, ahead of the
+  store or not covering it is rebuilt from RDF by a background worker. RDF reads and
+  writes keep working during the rebuild. Text searches on a configured index return
+  `503` while the index is `rebuilding` or `failed`, and searches on a dataset without
+  an index still return `400`. A snapshot taken while the index was unavailable stays
+  unavailable even after a newer snapshot becomes ready. A recovery that keeps restarting because writes or compactions outpace it is
   retried automatically up to three times, after 5, 30 and 120 seconds. A failed attempt
   can be retried with the rebuild endpoint or `sparkles text-index --loc DB --rebuild`.
   A new linked branch copies its upstream's checkpoint when that checkpoint is at or
   before the fork point and catches it up before the branch opens, so its text search
   is ready at once. Missing indexes after backup restore, and branch indexes that cannot
   be copied, use the background recovery path.
-  Explicit enable/reconfigure remain synchronous inside their task, while an explicit
-  rebuild joins/retries startup recovery or runs its existing online build. Cancelling
-  an HTTP task retains the existing synchronous native rebuild behavior; there is no
-  per-waiter cancellation token. Disable/reconfigure/close cancel automatic recovery
-  and join its cleanup, completing an admitted publication fence before returning.
+  Enabling or reconfiguring an index still builds it synchronously inside its task. An
+  explicit rebuild joins a running startup recovery, retries a failed one, or otherwise
+  runs the usual online build. Cancelling the HTTP task does not stop a native rebuild
+  that has started, and waiters cannot cancel individually. Disabling, reconfiguring or
+  closing cancels automatic recovery and waits for its cleanup. If the recovery has
+  already begun publishing the new index, that step finishes before the call returns.
 * **Durability.** Index commits are not fsynced. The write-ahead log is the durable
   record. The index is checkpointed (synced) about once a second while writes continue,
   before compaction and on close. After a crash, an index with unsynced changes, marked
