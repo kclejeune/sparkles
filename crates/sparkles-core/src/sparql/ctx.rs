@@ -10,8 +10,8 @@ use crate::vocab::AppendVocab;
 use oxrdf::Term;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 /// Jena's IRI for the default graph (`Quad.defaultGraphIRI`).
@@ -455,6 +455,17 @@ pub struct Ctx {
     pub(crate) extension_writers: Vec<(uuid::Uuid, super::extensions::Failure)>,
     callback_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
     callback_terms: parking_lot::Mutex<FxHashMap<Id, u64>>,
+    // Opt-in cursor accounting stays after the ordinary execution fields.
+    cursor_memory: Option<Box<CursorMemory>>,
+}
+
+struct CursorMemory {
+    failure: parking_lot::Mutex<Option<Budget>>,
+    failed: AtomicBool,
+    decode_peak: parking_lot::Mutex<u64>,
+    decoded_reserved: AtomicU64,
+    owner: parking_lot::Mutex<Weak<Ctx>>,
+    regex: super::cursor_regex::RegexCache,
 }
 
 impl Ctx {
@@ -468,6 +479,7 @@ impl Ctx {
             calls_extensions: false,
             callback_bnodes: Default::default(),
             callback_terms: Default::default(),
+            cursor_memory: None,
             snap,
             local: RwLock::new(AppendVocab::default()),
             values: (0..VALUE_SHARDS)
@@ -655,7 +667,7 @@ impl Ctx {
     /// Record a warning for the plan (once, however often it is raised).
     pub fn warn(&self, w: PlanWarning) {
         let mut ws = self.warnings.lock();
-        if !ws.contains(&w) {
+        if !ws.contains(&w) && self.retain_cursor_bytes(w.message.len() as u64 + 128) {
             ws.push(w);
         }
     }
@@ -683,6 +695,7 @@ impl Ctx {
 
     #[inline]
     pub fn check(&self) -> Result<()> {
+        self.check_cursor_memory()?;
         if self.calls_extensions
             && let Some(state) = &self.extension_failure
             && let Some(failure) = state.lock().as_ref()
@@ -698,6 +711,158 @@ impl Ctx {
             return Err(Error::Timeout);
         }
         Ok(())
+    }
+
+    pub(super) fn enable_cursor_accounting(&mut self) -> Result<()> {
+        for shard in &self.values {
+            *shard.write() = FxHashMap::default();
+        }
+        let bytes = self.local.read().bytes() as u64;
+        std::mem::forget(self.charge(bytes)?);
+        self.cursor_memory = Some(Box::new(CursorMemory {
+            failure: Default::default(),
+            failed: AtomicBool::new(false),
+            decode_peak: Default::default(),
+            decoded_reserved: AtomicU64::new(0),
+            owner: Default::default(),
+            regex: Default::default(),
+        }));
+        self.use_cache = false;
+        self.opt.sampled_filters = false;
+        #[cfg(feature = "geo")]
+        {
+            let vertices = self.geo.op_vertices();
+            // Parsed geometry retention is separate from ID batches. Until its
+            // cache has charge-owning entries, cursor evaluation does not keep it.
+            self.geo = crate::geo::memo::GeoMemo::with_budget(0);
+            self.geo.set_op_vertices(vertices);
+        }
+        Ok(())
+    }
+
+    pub(super) fn is_cursor(&self) -> bool {
+        self.cursor_memory.is_some()
+    }
+
+    pub(super) fn attach_cursor_owner(self: &Arc<Self>) {
+        if let Some(memory) = &self.cursor_memory {
+            *memory.owner.lock() = Arc::downgrade(self);
+        }
+    }
+
+    /// A retained cache belongs to the plan, which may also occur in context
+    /// bookkeeping. Use a weak owner to avoid a plan/context reference cycle.
+    pub(super) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
+        let Some(memory) = &self.cursor_memory else {
+            return Ok(None);
+        };
+        let charge = self.charge(bytes)?;
+        let owner = memory.owner.lock().clone();
+        if owner.strong_count() == 0 {
+            return Err(Error::invalid("cursor context owner has not been attached"));
+        }
+        charge.bytes.set(0);
+        Ok(Some(RetainedCharge { owner, bytes }))
+    }
+
+    pub(super) fn cursor_regex(
+        &self,
+        pattern: &str,
+        flags: &str,
+    ) -> Result<Option<Arc<super::cursor_regex::RegexState>>> {
+        self.cursor_memory
+            .as_ref()
+            .expect("cursor regex context")
+            .regex
+            .get(self, pattern, flags)
+    }
+
+    pub(super) fn memory_remaining(&self) -> u64 {
+        self.mem_limit
+            .saturating_sub(self.mem_live.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn release_cursor_work(&self) {
+        if let Some(memory) = &self.cursor_memory {
+            memory.regex.clear();
+            let bytes = std::mem::take(&mut *memory.decode_peak.lock());
+            memory.decoded_reserved.store(0, Ordering::Release);
+            self.mem_live.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn check_cursor_memory(&self) -> Result<()> {
+        if let Some(memory) = &self.cursor_memory
+            && memory.failed.load(Ordering::Acquire)
+            && let Some(budget) = *memory.failure.lock()
+        {
+            return Err(Error::BudgetExceeded(budget));
+        }
+        Ok(())
+    }
+
+    pub(super) fn fail_cursor(&self, error: &Error) {
+        if let Some(memory) = &self.cursor_memory
+            && let Error::BudgetExceeded(budget) = error
+        {
+            memory.failure.lock().get_or_insert(*budget);
+            memory.failed.store(true, Ordering::Release);
+        }
+    }
+
+    // Infallible expression interning must not turn a resource failure into an
+    // ordinary unbound BIND. Record it, refuse allocation, and fail the next check.
+    pub(crate) fn retain_cursor_bytes(&self, bytes: u64) -> bool {
+        let Some(memory) = &self.cursor_memory else {
+            return true;
+        };
+        if memory.failed.load(Ordering::Acquire) {
+            return false;
+        }
+        match self.charge(bytes) {
+            Ok(charge) => {
+                std::mem::forget(charge);
+                true
+            }
+            Err(Error::BudgetExceeded(budget)) => {
+                memory.failure.lock().get_or_insert(budget);
+                memory.failed.store(true, Ordering::Release);
+                false
+            }
+            Err(_) => unreachable!("memory charge returns a budget error"),
+        }
+    }
+
+    /// Reserve a conservative high-water estimate for transient term decoding.
+    /// Cursor evaluation does not retain the eager per-ID value cache.
+    pub(super) fn cursor_decode(&self, bytes: usize) -> bool {
+        let Some(memory) = &self.cursor_memory else {
+            return true;
+        };
+        // Planning and serial pulls need only one value's envelope. A Rayon
+        // evaluation may hold a value on every worker plus the caller; admit
+        // that larger envelope only when parallel decoding actually starts.
+        let workers = if rayon::current_thread_index().is_some() {
+            rayon::current_num_threads() as u64 + 1
+        } else {
+            1
+        };
+        let need = (bytes as u64)
+            .saturating_mul(8)
+            .saturating_add(1024)
+            .saturating_mul(workers);
+        if memory.decoded_reserved.load(Ordering::Acquire) >= need {
+            return self.check_cursor_memory().is_ok();
+        }
+        let mut peak = memory.decode_peak.lock();
+        if need > *peak {
+            if !self.retain_cursor_bytes(need - *peak) {
+                return false;
+            }
+            *peak = need;
+            memory.decoded_reserved.store(need, Ordering::Release);
+        }
+        self.check_cursor_memory().is_ok()
     }
 
     /// The row limit of intermediate results.
@@ -717,6 +882,19 @@ impl Ctx {
     /// total passes [`Ctx::max_rows_produced`]. One atomic add per operator.
     #[inline]
     pub fn produced(&self, rows: usize) -> Result<()> {
+        if self.is_cursor() {
+            let prior = self
+                .rows_produced
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    n.checked_add(rows as u64)
+                })
+                .map_err(|_| self.produced_exceeded(u64::MAX))?;
+            let total = prior + rows as u64;
+            if total > self.max_rows_produced {
+                return Err(self.produced_exceeded(total));
+            }
+            return Ok(());
+        }
         let total = self
             .rows_produced
             .fetch_add(rows as u64, Ordering::Relaxed)
@@ -805,7 +983,7 @@ impl Ctx {
         }
     }
 
-    fn memory_exceeded(&self, requested: u64) -> Error {
+    pub(super) fn memory_exceeded(&self, requested: u64) -> Error {
         Error::BudgetExceeded(Budget {
             kind: BudgetKind::Memory,
             limit: self.mem_limit,
@@ -874,11 +1052,16 @@ impl Ctx {
     /// with the labels of those nodes, so the functions that read it find them.
     pub fn query_literal<'l>(&self, l: &'l oxrdf::Literal) -> std::borrow::Cow<'l, oxrdf::Literal> {
         match super::cdt::relabel_literal(l, &mut |b| {
-            let id = *self
-                .literal_bnodes
-                .lock()
-                .entry(b.to_string())
-                .or_insert_with(|| self.fresh_bnode());
+            let mut memo = self.literal_bnodes.lock();
+            let id = match memo.get(b) {
+                Some(id) => *id,
+                None if self.retain_cursor_bytes(b.len() as u64 + 128) => {
+                    let id = self.fresh_bnode();
+                    memo.insert(b.to_string(), id);
+                    id
+                }
+                None => Id::UNDEF,
+            };
             id::bnode_label(id.payload())
         }) {
             Some(l) => std::borrow::Cow::Owned(l),
@@ -911,6 +1094,9 @@ impl Ctx {
             if let Some(&id) = scope.get(b) {
                 return id;
             }
+            if !self.retain_cursor_bytes(b.len() as u64 + 128) {
+                return Id::UNDEF;
+            }
             let id = self.fresh_bnode();
             scope.insert(b.to_string(), id);
             id
@@ -937,14 +1123,16 @@ impl Ctx {
 
     /// A blank node of this query for a label from outside it.
     fn outside_bnode(&self, label: &str) -> Id {
-        if let Some(&id) = self.outside_bnodes.lock().get(label) {
+        let mut memo = self.outside_bnodes.lock();
+        if let Some(&id) = memo.get(label) {
             return id;
         }
-        *self
-            .outside_bnodes
-            .lock()
-            .entry(label.to_string())
-            .or_insert_with(|| self.fresh_bnode())
+        if !self.retain_cursor_bytes(label.len() as u64 + 128) {
+            return Id::UNDEF;
+        }
+        let id = self.fresh_bnode();
+        memo.insert(label.to_string(), id);
+        id
     }
 
     /// Id for a graph name, mapping Jena's special default-graph IRI.
@@ -963,7 +1151,14 @@ impl Ctx {
         if let Some(i) = self.local.read().find(key) {
             return Id::local(i);
         }
-        Id::local(self.local.write().insert(key).0)
+        let mut local = self.local.write();
+        if let Some(i) = local.find(key) {
+            return Id::local(i);
+        }
+        if !self.retain_cursor_bytes(key.len() as u64 + 96) {
+            return Id::UNDEF;
+        }
+        Id::local(local.insert(key).0)
     }
 
     pub fn intern_value(&self, v: &Value) -> Id {
@@ -983,19 +1178,114 @@ impl Ctx {
 
     /// `BNODE(str)`: one blank node per (solution, string).
     pub fn bnode_for_row(&self, row: Vec<Id>, s: &str) -> Id {
-        *self
-            .bnode_memo
-            .lock()
-            .entry((row, s.to_string()))
-            .or_insert_with(|| self.fresh_bnode())
+        let mut memo = self.bnode_memo.lock();
+        let key = (row, s.to_string());
+        if let Some(id) = memo.get(&key) {
+            return *id;
+        }
+        if !self.retain_cursor_bytes(key.0.len() as u64 * 8 + s.len() as u64 + 128) {
+            return Id::UNDEF;
+        }
+        let id = self.fresh_bnode();
+        memo.insert(key, id);
+        id
     }
 
     pub fn term(&self, id: Id) -> Option<Term> {
+        if self.is_cursor() {
+            return match id.tag() {
+                Tag::Local => {
+                    let local = self.local.read();
+                    let key = local.get(id.payload())?;
+                    self.cursor_decode(key.len()).then(|| id::key_to_term(key))
+                }
+                Tag::Vocab => self
+                    .with_cursor_vocab_key(id.payload(), |key| {
+                        self.cursor_decode(key.len()).then(|| id::key_to_term(key))
+                    })
+                    .inspect_err(|error| self.fail_cursor(error))
+                    .ok()
+                    .flatten()
+                    .flatten(),
+                Tag::Delta => self.snap.generation.dvocab.with(|vocab| {
+                    vocab
+                        .get(id.payload())
+                        .and_then(|key| self.cursor_decode(key.len()).then(|| id::key_to_term(key)))
+                }),
+                _ => self.snap.term(id),
+            };
+        }
         match id.tag() {
             Tag::Local => self.local.read().get(id.payload()).map(id::key_to_term),
             Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
             _ => self.snap.term(id),
         }
+    }
+
+    /// Reconstruction scratch is query-owned even when the vocabulary is mapped.
+    /// Twice the requested size covers old and new buffers during reallocation.
+    pub(super) fn with_cursor_vocab_key<T>(
+        &self,
+        id: u64,
+        f: impl FnMut(&[u8]) -> T,
+    ) -> Result<Option<T>> {
+        let scratch = self.charge(0)?;
+        let mut reserved = 0;
+        self.snap.generation.vocab.get_with_checked(
+            id,
+            |need| {
+                let bytes = (need as u64).saturating_mul(2);
+                scratch.add(bytes.saturating_sub(reserved))?;
+                reserved = bytes;
+                Ok(())
+            },
+            f,
+        )
+    }
+
+    pub(super) fn with_local_key<T>(&self, id: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
+        self.local.read().get(id).map(f)
+    }
+
+    /// Batch resolution is independent of a producer's sticky failure. Previously
+    /// returned IDs remain valid; each decode still reserves its transient bytes.
+    pub(super) fn batch_term(&self, id: Id) -> Result<Option<Term>> {
+        let decode = |key: &[u8]| -> Result<Option<Term>> {
+            let _charge = self.charge((key.len() as u64).saturating_mul(8).saturating_add(1024))?;
+            Ok(Some(id::key_to_term(key)))
+        };
+        match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).map_or(Ok(None), decode),
+            Tag::Vocab => self
+                .with_cursor_vocab_key(id.payload(), decode)?
+                .unwrap_or(Ok(None)),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|v| v.get(id.payload()).map_or(Ok(None), decode)),
+            Tag::Undef | Tag::Special => Ok(None),
+            _ => {
+                let _charge = self.charge(128)?;
+                Ok(self.snap.term(id))
+            }
+        }
+    }
+
+    pub(super) fn decoded_bytes(&self, id: Id) -> Result<u64> {
+        let size = match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).map_or(0, <[u8]>::len),
+            Tag::Vocab => self
+                .with_cursor_vocab_key(id.payload(), <[u8]>::len)?
+                .unwrap_or(0),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|v| v.get(id.payload()).map_or(0, <[u8]>::len)),
+            _ => 0,
+        };
+        Ok((size as u64).saturating_mul(8).saturating_add(128))
     }
 
     /// Decode an id into a value, with a per-query cache.
@@ -1009,6 +1299,28 @@ impl Ctx {
             Tag::DateTime | Tag::Date => id::inline_to_literal(id).map(|l| Value::from_literal(&l)),
             Tag::BNode => Some(Value::BNode(bnode_for(id).as_str().into())),
             _ => {
+                // Inline scalars need no retained cache or RDF round trip. Only
+                // dictionary/local values bypass the uncharged eager cache.
+                if self.is_cursor() {
+                    let decode =
+                        |key: &[u8]| self.cursor_decode(key.len()).then(|| Value::from_key(key));
+                    return match id.tag() {
+                        Tag::Vocab => match self.with_cursor_vocab_key(id.payload(), decode) {
+                            Ok(value) => value.flatten(),
+                            Err(error) => {
+                                self.fail_cursor(&error);
+                                None
+                            }
+                        },
+                        Tag::Delta => self
+                            .snap
+                            .generation
+                            .dvocab
+                            .with(|v| v.get(id.payload()).and_then(decode)),
+                        Tag::Local => self.local.read().get(id.payload()).and_then(decode),
+                        _ => unreachable!("dictionary value tag"),
+                    };
+                }
                 let shard = self.shard(id);
                 if let Some(v) = shard.read().get(&id) {
                     return Some(v.clone());
@@ -1112,6 +1424,85 @@ impl Drop for Charge<'_> {
     }
 }
 
+/// An owned charge that follows a cursor buffer across pulls and threads.
+pub(super) struct OwnedCharge {
+    ctx: Arc<Ctx>,
+    bytes: u64,
+}
+
+pub(super) struct RetainedCharge {
+    owner: Weak<Ctx>,
+    bytes: u64,
+}
+
+impl RetainedCharge {
+    pub(super) fn owner(&self) -> Option<Arc<Ctx>> {
+        self.owner.upgrade()
+    }
+
+    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+        let ctx = self
+            .owner
+            .upgrade()
+            .ok_or_else(|| Error::invalid("cursor context was released"))?;
+        if bytes > self.bytes {
+            let added = ctx.charge(bytes - self.bytes)?;
+            added.bytes.set(0);
+        } else {
+            ctx.mem_live
+                .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+impl Drop for RetainedCharge {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.owner.upgrade() {
+            ctx.mem_live.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+impl OwnedCharge {
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub(super) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
+        let mut owned = Self {
+            ctx: ctx.clone(),
+            bytes: 0,
+        };
+        owned.resize(bytes)?;
+        Ok(owned)
+    }
+
+    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+        if bytes > self.bytes {
+            let charge = self.ctx.charge(bytes - self.bytes)?;
+            charge.bytes.set(0);
+        } else {
+            self.ctx
+                .mem_live
+                .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    pub(super) fn retain(mut self) {
+        self.bytes = 0;
+    }
+}
+
+impl Drop for OwnedCharge {
+    fn drop(&mut self) {
+        self.ctx.mem_live.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 fn key_kind(k: &[u8]) -> TermKind {
     if id::is_key_iri(k) {
         TermKind::Iri
@@ -1136,6 +1527,27 @@ pub enum TermKind {
 mod charge_tests {
     use super::*;
     use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn retained_cursor_charges_release_and_do_not_keep_context_alive() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut context = Ctx::new(store.snapshot());
+        context.enable_cursor_accounting().unwrap();
+        let context = Arc::new(context);
+        context.attach_cursor_owner();
+        let before = context.mem_live.load(Ordering::Relaxed);
+        let mut retained = context.retained_charge(4096).unwrap().unwrap();
+        assert_eq!(context.mem_live.load(Ordering::Relaxed), before + 4096);
+        retained.resize(2048).unwrap();
+        assert_eq!(context.mem_live.load(Ordering::Relaxed), before + 2048);
+        drop(retained);
+        assert_eq!(context.mem_live.load(Ordering::Relaxed), before);
+        let retained = context.retained_charge(4096).unwrap();
+        let weak = Arc::downgrade(&context);
+        drop(context);
+        assert!(weak.upgrade().is_none());
+        drop(retained);
+    }
 
     #[test]
     fn rejected_finite_and_unlimited_overflow_leave_accounting_reusable() {

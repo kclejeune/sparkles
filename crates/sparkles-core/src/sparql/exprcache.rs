@@ -167,6 +167,7 @@ pub struct PerValue<T> {
     pub vals: Vec<T>,
     /// `None`: one value for every row
     slot: Option<Vec<u32>>,
+    _charge: Option<super::ctx::RetainedCharge>,
 }
 
 impl<T> PerValue<T> {
@@ -202,7 +203,10 @@ impl<T> PerValue<T> {
 
 /// Per-row results, or results per distinct value.
 pub enum Column<T> {
-    Rows(Vec<T>),
+    Rows {
+        vals: Vec<T>,
+        _charge: Option<super::ctx::RetainedCharge>,
+    },
     Values(PerValue<T>),
 }
 
@@ -210,7 +214,7 @@ impl<T> Column<T> {
     #[inline]
     pub fn get(&self, row: usize) -> &T {
         match self {
-            Column::Rows(v) => &v[row],
+            Column::Rows { vals: v, .. } => &v[row],
             Column::Values(p) => p.get(row),
         }
     }
@@ -238,13 +242,133 @@ pub fn per_value<T: Send>(
     report: &mut Report,
     eval: impl FnOnce(&Table) -> Result<Vec<T>>,
 ) -> Result<Option<PerValue<T>>> {
-    let Some(d) = distinct(ctx, t, exprs, always, report)? else {
+    let Some(d) = distinct(ctx, t, exprs, always, report, false)? else {
         return Ok(None);
     };
     let vals = eval(&d.values)?;
     debug_assert_eq!(vals.len(), d.values.len());
     ctx.check()?;
-    Ok(Some(PerValue { vals, slot: d.slot }))
+    Ok(Some(PerValue {
+        vals,
+        slot: d.slot,
+        _charge: None,
+    }))
+}
+
+/// Fixed-size numeric ORDER keys can reuse input IDs without retaining decoded
+/// strings or populating the eager value cache. Own the reservation with the
+/// returned values/slots; it must survive until the sort has finished.
+pub(super) fn cursor_numeric_values(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    report: &mut Report,
+    eval: impl FnOnce(&Table) -> Result<Vec<Option<super::value::Value>>>,
+) -> Result<Option<PerValue<Option<super::value::Value>>>> {
+    fn numeric(e: &Expr) -> bool {
+        match e {
+            Expr::Var(_) => true,
+            Expr::Const(id) => matches!(id.tag(), Tag::Int | Tag::Decimal | Tag::Double),
+            Expr::Lit(_, value) => matches!(
+                value,
+                super::value::Value::Integer(_)
+                    | super::value::Value::Decimal(_)
+                    | super::value::Value::Float(_)
+                    | super::value::Value::Double(_)
+            ),
+            Expr::Arith(a, b, _) => numeric(a) && numeric(b),
+            Expr::Neg(e) | Expr::Pos(e) => numeric(e),
+            Expr::Call(
+                Func::Builtin(Function::Abs | Function::Floor | Function::Ceil | Function::Round),
+                args,
+            ) => args.iter().all(numeric),
+            _ => false,
+        }
+    }
+    if !ctx.opt.expr_cache || t.len() < MIN_ROWS || !numeric(e) {
+        return Ok(None);
+    }
+    let Ok(Some(v)) = input(&[e]) else {
+        return Ok(None);
+    };
+    let Some(column) = t.col_of(v) else {
+        return Ok(None);
+    };
+    if !t.cols[column]
+        .iter()
+        .all(|id| matches!(id.tag(), Tag::Int | Tag::Decimal | Tag::Double | Tag::Undef))
+    {
+        return Ok(None);
+    }
+    let bytes = (t.len() as u64).saturating_mul(256).saturating_add(4096);
+    let Ok(mut charge) = ctx.retained_charge(bytes) else {
+        return Ok(None);
+    };
+    let d = match cursor_integer_distinct(ctx, t, &[e], v, report)? {
+        Some(d) => Some(d),
+        None => cursor_key_distinct(ctx, t, &[e], v, false, report)?,
+    };
+    let Some(d) = d else {
+        return Ok(None);
+    };
+    let vals = eval(&d.values)?;
+    ctx.check()?;
+    let retained = vals.capacity() as u64
+        * std::mem::size_of::<Option<super::value::Value>>() as u64
+        + d.slot.as_ref().map_or(0, |s| s.capacity() as u64 * 4)
+        + 4096;
+    if let Some(charge) = &mut charge {
+        charge.resize(retained)?;
+    }
+    Ok(Some(PerValue {
+        vals,
+        slot: d.slot,
+        _charge: charge,
+    }))
+}
+
+/// Cursor BIND reuse keeps only IDs and slots, with a conservative reservation
+/// covering the temporary distinct set/map, table, slots and expanded output.
+/// The reservation lives until the output is expanded; no entries cross batches.
+/// Unlike general value-key caching, this does not retain decoded heap values.
+pub(super) fn cursor_column(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    report: &mut Report,
+    eval: impl FnOnce(&Table) -> Result<Vec<Id>>,
+) -> Result<Option<Vec<Id>>> {
+    let Ok(v) = eligible(&[e]) else {
+        return Ok(None);
+    };
+    if !ctx.opt.expr_cache || t.len() < MIN_ROWS {
+        return Ok(None);
+    }
+    let bytes = (t.len() as u64).saturating_mul(128).saturating_add(1024);
+    let Ok(_held) = ctx.charge(bytes) else {
+        // Optional reuse may decline without consuming the remaining allowance.
+        return Ok(None);
+    };
+    let d = match v {
+        Some(v) => match cursor_integer_distinct(ctx, t, &[e], v, report)? {
+            Some(d) => Some(d),
+            None => cursor_key_distinct(ctx, t, &[e], v, false, report)?,
+        },
+        None => distinct(ctx, t, &[e], false, report, true)?,
+    };
+    let Some(d) = d else {
+        return Ok(None);
+    };
+    let vals = eval(&d.values)?;
+    debug_assert_eq!(vals.len(), d.values.len());
+    ctx.check()?;
+    // A cursor batch is small enough that scheduling the expansion on Rayon
+    // costs more than the ID copies. Keep the eager large-table path separate.
+    let rows = match d.slot {
+        Some(slot) => slot.iter().map(|&i| vals[i as usize]).collect(),
+        None => vec![vals[0]; t.len()],
+    };
+    Ok(Some(rows))
 }
 
 /// Whether the expressions are worth evaluating per value at all (pure, one input,
@@ -268,9 +392,10 @@ fn distinct(
     exprs: &[&Expr],
     always: bool,
     report: &mut Report,
+    cursor_reserved: bool,
 ) -> Result<Option<Distinct>> {
     let n = t.len();
-    if !ctx.opt.expr_cache || n < MIN_ROWS {
+    if !ctx.opt.expr_cache || (ctx.is_cursor() && !cursor_reserved) || n < MIN_ROWS {
         return Ok(None);
     }
     let v = match input(exprs) {
@@ -422,6 +547,9 @@ pub fn filter(
     if !ctx.opt.expr_cache || t.len() < MIN_ROWS {
         return Ok(None);
     }
+    if ctx.is_cursor() {
+        return cursor_filter(ctx, t, exprs, report);
+    }
     let mut groups: Vec<(Option<VarId>, Vec<&Expr>)> = Vec::new();
     let mut rest: Vec<&Expr> = Vec::new();
     for e in exprs {
@@ -439,7 +567,7 @@ pub fn filter(
     let mut keep: Option<Vec<bool>> = None;
     for (v, es) in groups {
         let owned: Vec<Expr> = es.iter().map(|e| (*e).clone()).collect();
-        let kf = v.and_then(|v| super::keyfilter::KeyFilter::new(&owned, v));
+        let kf = v.and_then(|v| super::keyfilter::KeyFilter::new_for(ctx, &owned, v));
         let hit = per_value(ctx, t, &es, kf.is_some(), report, |values| match (&kf, v) {
             (Some(kf), Some(v)) => key_filter_mask(ctx, kf, &values.cols[0], v, &owned),
             _ => super::exec::filter_mask(ctx, values, &owned),
@@ -462,6 +590,186 @@ pub fn filter(
     Ok(keep.map(|k| (k, rest.into_iter().cloned().collect())))
 }
 
+/// Batch-local FILTER reuse stores only IDs, slots and booleans. A conservative
+/// reservation covers distinct construction and key-test scratch until expansion.
+/// Mixed/impure conjuncts stay row-by-row; no decoded-value cache survives a batch.
+fn cursor_filter(
+    ctx: &Ctx,
+    t: &Table,
+    exprs: &[Expr],
+    report: &mut Report,
+) -> Result<Option<(Vec<bool>, Vec<Expr>)>> {
+    let Ok(_refs) = ctx.charge((exprs.len() as u64).saturating_mul(8)) else {
+        return Ok(None);
+    };
+    let refs: Vec<&Expr> = exprs.iter().collect();
+    let Ok(v) = eligible(&refs) else {
+        return Ok(None);
+    };
+    let key_bytes =
+        v.and_then(|v| super::keyfilter::KeyFilter::cursor_scratch_bytes(exprs, v, t.len()));
+    let bytes = (t.len() as u64)
+        .saturating_mul(128)
+        .saturating_add(1024)
+        .saturating_add(key_bytes.unwrap_or(0));
+    let Ok(_held) = ctx.charge(bytes) else {
+        return Ok(None);
+    };
+    let d = match (key_bytes, v) {
+        (Some(_), Some(v)) => cursor_key_distinct(ctx, t, &refs, v, true, report)?,
+        _ => distinct(ctx, t, &refs, false, report, true)?,
+    };
+    let Some(d) = d else {
+        return Ok(None);
+    };
+    let vals = match (key_bytes, v) {
+        (Some(_), Some(v)) => {
+            let kf = super::keyfilter::KeyFilter::new_for(ctx, exprs, v)
+                .expect("cursor key-test admission matches compilation");
+            key_filter_mask(ctx, &kf, &d.values.cols[0], v, exprs)?
+        }
+        _ => super::exec::filter_mask(ctx, &d.values, exprs)?,
+    };
+    ctx.check()?;
+    Ok(Some((
+        PerValue {
+            vals,
+            slot: d.slot,
+            _charge: None,
+        }
+        .rows(t.len()),
+        Vec::new(),
+    )))
+}
+
+/// The caller holds the cursor reservation through expansion. Keep this batch
+/// algorithm separate from eager distinct admission and its reuse estimator.
+fn cursor_integer_distinct(
+    ctx: &Ctx,
+    t: &Table,
+    exprs: &[&Expr],
+    v: VarId,
+    report: &mut Report,
+) -> Result<Option<Distinct>> {
+    let Some(column) = t.col_of(v) else {
+        return Ok(None);
+    };
+    let mut lo = u64::MAX;
+    let mut hi = 0;
+    for (row, id) in t.cols[column].iter().enumerate() {
+        if row.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        if id.tag() != Tag::Int {
+            return Ok(None);
+        }
+        lo = lo.min(id.payload());
+        hi = hi.max(id.payload());
+    }
+    let span = hi.saturating_sub(lo).saturating_add(1);
+    if span > (t.len() / 2).min(1 << 16) as u64 {
+        return Ok(None);
+    }
+    let mut positions = vec![u32::MAX; span as usize];
+    for (row, id) in t.cols[column].iter().enumerate() {
+        if row.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        positions[(id.payload() - lo) as usize] = 0;
+    }
+    let mut values = Table::new(vec![v]);
+    for (offset, slot) in positions.iter_mut().enumerate() {
+        if offset.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        if *slot != u32::MAX {
+            *slot = values.len as u32;
+            values.push_row(&[Id::new(Tag::Int, lo + offset as u64)]);
+        }
+    }
+    // Evaluate only observed IDs, never hypothetical holes in the integer range.
+    // Direct slot lookup avoids hashing or sorting thousands of repeated numerals.
+    let slot = t.cols[column]
+        .iter()
+        .enumerate()
+        .map(|(row, id)| {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            Ok(positions[(id.payload() - lo) as usize])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    values.sorted = vec![v];
+    report.push(ctx, exprs, t.len(), Ok(values.len));
+    Ok(Some(Distinct {
+        values,
+        slot: Some(slot),
+    }))
+}
+
+fn cursor_key_distinct(
+    ctx: &Ctx,
+    t: &Table,
+    exprs: &[&Expr],
+    v: VarId,
+    always: bool,
+    report: &mut Report,
+) -> Result<Option<Distinct>> {
+    let Some(c) = t.col_of(v) else {
+        return distinct(ctx, t, exprs, always, report, true);
+    };
+    if t.sorted.first() == Some(&v) {
+        return distinct(ctx, t, exprs, always, report, true);
+    }
+    let n = t.len();
+    if n > u32::MAX as usize {
+        report.push(ctx, exprs, n, Err("too many row positions".into()));
+        return Ok(None);
+    }
+    // Key tests admit unique inputs too: sort IDs with row positions once,
+    // avoiding a reuse estimate and two temporary hash tables.
+    let mut pairs: Vec<(Id, u32)> = t.cols[c]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i as u32))
+        .collect();
+    if n < 16_384 {
+        pairs.sort_unstable_by_key(|p| p.0);
+    } else {
+        pairs.par_sort_unstable_by_key(|p| p.0);
+    }
+    let mut uniq = Vec::with_capacity(n);
+    let mut slot = vec![0; n];
+    for (at, (id, row)) in pairs.into_iter().enumerate() {
+        if at.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        if uniq.last() != Some(&id) {
+            uniq.push(id);
+        }
+        slot[row as usize] = (uniq.len() - 1) as u32;
+    }
+    ctx.check()?;
+    if !always && uniq.len() > n / 4 * 3 {
+        report.push(
+            ctx,
+            exprs,
+            n,
+            Err(format!("{} distinct of {n} rows", uniq.len())),
+        );
+        return Ok(None);
+    }
+    report.push(ctx, exprs, n, Ok(uniq.len()));
+    let mut values = Table::new(vec![v]);
+    values.len = uniq.len();
+    values.cols[0] = uniq;
+    values.sorted = vec![v];
+    Ok(Some(Distinct {
+        values,
+        slot: Some(slot),
+    }))
+}
+
 /// Outcome of FILTER conjuncts over `v` (and no other variable) for each of the sorted
 /// distinct ids `uniq`, an error failing the filter; also whether they were tested on
 /// vocabulary keys.
@@ -471,7 +779,7 @@ pub(super) fn filter_values(
     v: VarId,
     exprs: &[Expr],
 ) -> Result<(Vec<bool>, bool)> {
-    if let Some(kf) = super::keyfilter::KeyFilter::new(exprs, v) {
+    if let Some(kf) = super::keyfilter::KeyFilter::new_for(ctx, exprs, v) {
         return Ok((key_filter_mask(ctx, &kf, uniq, v, exprs)?, true));
     }
     let mut values = Table::new(vec![v]);
@@ -528,24 +836,98 @@ pub(super) fn key_filter_mask(
         rest_hit = tail;
         at = e;
     }
-    read.into_par_iter()
-        .flat_map(|(h, ids)| h.par_chunks_mut(4096).zip(ids.par_chunks(4096)))
-        .for_each_init(
-            || kf.clone(),
-            |kf, (h, ids)| {
-                let payloads: Vec<u64> = ids.iter().map(|id| id.payload()).collect();
-                let mut j = 0;
-                vocab.get_sorted(&payloads, |p, k| {
+    if ctx.is_cursor() && uniq.len() <= 4096 {
+        // Ordinary cursor batches do not amortize task scheduling or a fresh
+        // regex worker cache. Search with the already admitted query cache.
+        for (h, ids) in read {
+            let _payload_charge = ctx.charge(ids.len() as u64 * 8 + 64)?;
+            let payloads: Vec<u64> = ids.iter().map(|id| id.payload()).collect();
+            let scratch = ctx.charge(0)?;
+            let mut reserved = 0;
+            let mut j = 0;
+            vocab.get_sorted_checked(
+                &payloads,
+                |need| {
+                    let bytes = (need as u64).saturating_mul(2);
+                    scratch.add(bytes.saturating_sub(reserved))?;
+                    reserved = bytes;
+                    ctx.check()
+                },
+                |p, key| {
                     while payloads[j] != p {
                         j += 1;
                     }
-                    h[j] = kf.test(k);
-                });
-            },
-        );
+                    if j.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    h[j] = kf.test(key);
+                    Ok::<_, crate::error::Error>(())
+                },
+            )?;
+        }
+    } else {
+        read.into_par_iter()
+            .flat_map(|(h, ids)| h.par_chunks_mut(4096).zip(ids.par_chunks(4096)))
+            .try_for_each_init(
+                || kf.clone(),
+                |kf, (h, ids)| {
+                    let payloads: Vec<u64> = ids.iter().map(|id| id.payload()).collect();
+                    let mut j = 0;
+                    let mut test = |p, k: &[u8]| {
+                        while payloads[j] != p {
+                            j += 1;
+                        }
+                        h[j] = kf.test(k);
+                    };
+                    if ctx.is_cursor() {
+                        let scratch = ctx.charge(0)?;
+                        let mut reserved = 0;
+                        let mut examined = 0usize;
+                        vocab.get_sorted_checked(
+                            &payloads,
+                            |need| {
+                                let bytes = (need as u64).saturating_mul(2);
+                                scratch.add(bytes.saturating_sub(reserved))?;
+                                reserved = bytes;
+                                Ok::<_, crate::error::Error>(())
+                            },
+                            |p, k| {
+                                if examined.is_multiple_of(1024) {
+                                    ctx.check()?;
+                                }
+                                examined += 1;
+                                test(p, k);
+                                Ok::<_, crate::error::Error>(())
+                            },
+                        )?;
+                    } else {
+                        vocab.get_sorted(&payloads, test);
+                    }
+                    Ok::<_, crate::error::Error>(())
+                },
+            )?;
+    }
     let mut rest = Table::new(vec![v]);
     let mut rest_at = Vec::new();
     for (i, id) in uniq.iter().enumerate().filter(|(i, _)| *i < lo || *i >= hi) {
+        if ctx.is_cursor() {
+            let test = match id.tag() {
+                Tag::Delta => ctx
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|vocab| vocab.get(id.payload()).map(|key| kf.test(key))),
+                Tag::Local => ctx.with_local_key(id.payload(), |key| kf.test(key)),
+                _ => None,
+            };
+            if let Some(test) = test {
+                hit[i] = test;
+                continue;
+            }
+            rest.push_row(&[*id]);
+            rest_at.push(i);
+            continue;
+        }
         match ctx.snap.key(*id) {
             Some(k) => hit[i] = kf.test(&k),
             None => {
@@ -563,6 +945,254 @@ pub(super) fn key_filter_mask(
         }
     }
     Ok(hit)
+}
+
+/// Charge-owning ORDER variable values, decoded once per sorted ID. Unlike the
+/// scalar cache, this operation-local bulk decoder never populates Ctx.values.
+pub(super) fn cursor_variable_values(
+    ctx: &Ctx,
+    table: &Table,
+    expr: &Expr,
+) -> Result<Option<PerValue<Option<super::value::Value>>>> {
+    cursor_values(ctx, table, expr, false)
+}
+
+/// Decode only dictionary-backed values. Inline numeric IDs keep their cheap
+/// direct path; their slots are the unbound sentinel and must not be read.
+pub(super) fn cursor_dictionary_values(
+    ctx: &Ctx,
+    table: &Table,
+    expr: &Expr,
+) -> Result<Option<PerValue<Option<super::value::Value>>>> {
+    cursor_values(ctx, table, expr, true)
+}
+
+fn cursor_values(
+    ctx: &Ctx,
+    table: &Table,
+    expr: &Expr,
+    dictionary_only: bool,
+) -> Result<Option<PerValue<Option<super::value::Value>>>> {
+    let Expr::Var(var) = expr else {
+        return Ok(None);
+    };
+    if !ctx.opt.expr_cache || table.len < MIN_ROWS {
+        return Ok(None);
+    }
+    let Some(column) = table.col_of(*var) else {
+        return Ok(None);
+    };
+    if table.len > u32::MAX as usize {
+        return Ok(None);
+    }
+    let ids = &table.cols[column];
+    let dictionary = |id: Id| matches!(id.tag(), Tag::Vocab | Tag::Delta | Tag::Local);
+    let count = if dictionary_only {
+        ids.iter().filter(|&&id| dictionary(id)).count()
+    } else {
+        table.len
+    };
+    if dictionary_only && count < 256 {
+        return Ok(None);
+    }
+    if !dictionary_only
+        && ids.iter().all(|id| {
+            matches!(
+                id.tag(),
+                Tag::Undef | Tag::Special | Tag::Int | Tag::Double | Tag::Decimal | Tag::Bool
+            )
+        })
+    {
+        let bytes = table.len as u64
+            * (std::mem::size_of::<Option<super::value::Value>>() as u64 * 2 + 8)
+            + 4096;
+        let Ok(charge) = ctx.retained_charge(bytes) else {
+            return Ok(None);
+        };
+        let vals = ids
+            .par_chunks(4096)
+            .map(|chunk| {
+                ctx.check()?;
+                Ok(chunk.iter().map(|&id| ctx.value(id)).collect::<Vec<_>>())
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        ctx.check()?;
+        return Ok(Some(PerValue {
+            vals,
+            slot: Some((0..table.len as u32).collect()),
+            _charge: charge,
+        }));
+    }
+    let base = count as u64 * 128 + table.len as u64 * 8 + 4096;
+    let Ok(mut charge) = ctx.retained_charge(base) else {
+        return Ok(None);
+    };
+    let mut pairs = table.cols[column]
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, id)| !dictionary_only || dictionary(id))
+        .map(|(row, id)| (id, row as u32))
+        .collect::<Vec<_>>();
+    if pairs.len() >= 16_384 {
+        pairs.par_sort_unstable();
+    } else {
+        pairs.sort_unstable();
+    }
+    ctx.check()?;
+    let mut unique = Vec::with_capacity(count + usize::from(dictionary_only));
+    if dictionary_only {
+        unique.push(Id::UNDEF);
+    }
+    let mut slots = vec![0u32; table.len];
+    for (row, &(id, position)) in pairs.iter().enumerate() {
+        if row.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        if unique.last() != Some(&id) {
+            unique.push(id);
+        }
+        slots[position as usize] = (unique.len() - 1) as u32;
+    }
+    let mut vals = vec![None; unique.len()];
+    let lo = unique.partition_point(|id| id.tag() < Tag::Vocab);
+    let hi = lo + unique[lo..].partition_point(|id| id.tag() == Tag::Vocab);
+    let payloads = unique[lo..hi]
+        .iter()
+        .map(|id| id.payload())
+        .collect::<Vec<_>>();
+    let scratch = ctx.charge(0)?;
+    let mut reserved = 0;
+    let mut bytes = base;
+    let mut at = lo;
+    let parallel_bytes = (payloads.len() as u64)
+        .saturating_mul(std::mem::size_of::<Option<super::value::Value>>() as u64 * 2)
+        .saturating_add(rayon::current_num_threads() as u64 * 2048);
+    let parallel = (payloads.len() >= 4096)
+        .then(|| ctx.charge(parallel_bytes).ok())
+        .flatten();
+    if let Some(_parallel) = parallel {
+        // First measure retained payload without constructing values. Admit the
+        // combined payload once, before parallel decoding, instead of contending
+        // on charge ownership and counters for every dictionary value.
+        let payload = payloads
+            .par_chunks(4096)
+            .map(|chunk| {
+                let scratch = ctx.charge(0)?;
+                let mut reserved = 0;
+                let mut bytes = 0u64;
+                ctx.snap.generation.vocab.get_sorted_checked(
+                    chunk,
+                    |need| {
+                        let need = need as u64 * 2;
+                        scratch.add(need.saturating_sub(reserved))?;
+                        reserved = need;
+                        ctx.check()
+                    },
+                    |_, key| {
+                        bytes = bytes.saturating_add(key.len() as u64 * 8 + 128);
+                        Ok::<_, crate::error::Error>(())
+                    },
+                )?;
+                ctx.check()?;
+                Ok(bytes)
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .fold(0u64, u64::saturating_add);
+        bytes = bytes.saturating_add(payload);
+        if let Some(charge) = &mut charge
+            && charge.resize(bytes).is_err()
+        {
+            return Ok(None);
+        }
+        let decoded = payloads
+            .par_chunks(4096)
+            .map(|chunk| {
+                let scratch = ctx.charge(0)?;
+                let mut reserved = 0;
+                let mut values = Vec::with_capacity(chunk.len());
+                ctx.snap.generation.vocab.get_sorted_checked(
+                    chunk,
+                    |need| {
+                        let need = need as u64 * 2;
+                        scratch.add(need.saturating_sub(reserved))?;
+                        reserved = need;
+                        ctx.check()
+                    },
+                    |_, key| {
+                        if values.len().is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        values.push(Some(super::value::Value::from_key(key)));
+                        Ok::<_, crate::error::Error>(())
+                    },
+                )?;
+                ctx.check()?;
+                Ok(values)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for value in decoded.into_iter().flatten() {
+            vals[at] = value;
+            at += 1;
+        }
+    } else {
+        let decoded = ctx.snap.generation.vocab.get_sorted_checked(
+            &payloads,
+            |need| {
+                let need = need as u64 * 2;
+                scratch.add(need.saturating_sub(reserved))?;
+                reserved = need;
+                ctx.check()
+            },
+            |_, key| {
+                if at.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                bytes = bytes.saturating_add(key.len() as u64 * 8 + 128);
+                if let Some(charge) = &mut charge {
+                    charge.resize(bytes)?;
+                }
+                vals[at] = Some(super::value::Value::from_key(key));
+                at += 1;
+                Ok::<_, crate::error::Error>(())
+            },
+        );
+        match decoded {
+            Err(crate::Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory => {
+                return Ok(None);
+            }
+            result => result?,
+        }
+    }
+    for row in (0..lo).chain(hi..unique.len()) {
+        if row.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        if !matches!(
+            unique[row].tag(),
+            Tag::Undef | Tag::Special | Tag::Int | Tag::Double | Tag::Decimal | Tag::Bool
+        ) {
+            bytes = bytes.saturating_add(ctx.decoded_bytes(unique[row])?);
+            if let Some(charge) = &mut charge {
+                charge.resize(bytes)?;
+            }
+        }
+        vals[row] = ctx.value(unique[row]);
+    }
+    ctx.check()?;
+    drop(pairs);
+    drop(unique);
+    drop(payloads);
+    drop(scratch);
+    Ok(Some(PerValue {
+        vals,
+        slot: Some(slots),
+        _charge: charge,
+    }))
 }
 
 #[cfg(test)]

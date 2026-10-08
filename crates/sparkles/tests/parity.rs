@@ -763,6 +763,8 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.dataset_id",
     "dataset.head_commit",
     "dataset.select",
+    "dataset.select_cursor",
+    "dataset.select_cursor_with",
     "dataset.ask",
     "dataset.construct",
     "dataset.transaction",
@@ -796,6 +798,8 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
     ds.dataset_id();
     ds.head_commit();
     ds.select("SELECT * {}");
+    ds.select_cursor("SELECT * {}");
+    ds.select_cursor_with("SELECT * {}", &Default::default(), &Default::default());
     ds.ask("ASK {}");
     ds.construct("CONSTRUCT {} {}");
     ds.transaction(|_| Ok(()));

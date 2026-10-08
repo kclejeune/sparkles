@@ -3458,7 +3458,7 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
         .filter(|e| super::exprcache::input(&[e]) == Ok(Some(v)))
         .cloned()
         .collect();
-    let prefixes = super::keyfilter::KeyFilter::new(&on_key, v)?.key_prefixes()?;
+    let prefixes = super::keyfilter::KeyFilter::new_for(ctx, &on_key, v)?.key_prefixes()?;
     let vocab = &ctx.snap.generation.vocab;
     let mut ids = vec![(0, Id::vocab(0).0 - 1)];
     for p in prefixes {

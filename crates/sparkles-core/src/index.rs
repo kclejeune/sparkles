@@ -226,6 +226,7 @@ pub fn bound_cols(lo: &Key, hi: &Key) -> ColMask {
 
 /// A decoded block: four columns of equal length. Columns a reader did not ask for (see
 /// [`BlockCache::get_cols`]) are empty and read as 0 through [`Block::key`].
+#[derive(Clone)]
 pub struct Block {
     pub cols: [Arc<[u64]>; 4],
     rows: usize,

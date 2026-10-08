@@ -461,6 +461,91 @@ impl Dataset {
         )
     }
 
+    /// Open a snapshot-owning SELECT batch cursor. Unsupported operators have
+    /// visible, budgeted eager fallback; the ordinary query APIs remain eager.
+    pub fn select_cursor(&self, query: &str) -> Result<crate::sparql::QueryCursor> {
+        self.select_cursor_with(query, &self.query_options(), &Default::default())
+    }
+
+    /// Open a SELECT cursor with explicit query budgets and batch/fallback options.
+    pub fn select_cursor_with(
+        &self,
+        query: &str,
+        opts: &QueryOptions,
+        cursor: &crate::sparql::CursorOptions,
+    ) -> Result<crate::sparql::QueryCursor> {
+        crate::sparql::select_cursor(
+            self.inner.store.snapshot(),
+            query,
+            &self.with_query_defaults(opts),
+            cursor,
+        )
+    }
+
+    pub fn query_cursor_with(
+        &self,
+        query: &str,
+        opts: &QueryOptions,
+        cursor: &crate::sparql::CursorOptions,
+    ) -> Result<crate::sparql::QueryExecution> {
+        crate::sparql::query_cursor(
+            self.inner.store.snapshot(),
+            query,
+            &self.with_query_defaults(opts),
+            cursor,
+        )
+    }
+
+    /// Open eager, explicit pull, or conservatively selected automatic execution.
+    pub fn query_execution_with(
+        &self,
+        query: &str,
+        opts: &QueryOptions,
+        cursor: &crate::sparql::CursorOptions,
+        mode: crate::sparql::ExecutionMode,
+    ) -> Result<crate::sparql::QueryExecution> {
+        crate::sparql::query_execution(
+            self.inner.store.snapshot(),
+            query,
+            &self.with_query_defaults(opts),
+            cursor,
+            mode,
+        )
+    }
+
+    /// Open a snapshot-owning CONSTRUCT/DESCRIBE cursor with default options.
+    pub fn graph_cursor(&self, query: &str) -> Result<crate::sparql::GraphCursor> {
+        self.graph_cursor_with(query, &self.query_options(), &Default::default())
+    }
+
+    pub fn graph_cursor_with(
+        &self,
+        query: &str,
+        opts: &QueryOptions,
+        cursor: &crate::sparql::CursorOptions,
+    ) -> Result<crate::sparql::GraphCursor> {
+        crate::sparql::graph_cursor(
+            self.inner.store.snapshot(),
+            query,
+            &self.with_query_defaults(opts),
+            cursor,
+        )
+    }
+
+    pub fn ask_streaming_with(
+        &self,
+        query: &str,
+        opts: &QueryOptions,
+        cursor: &crate::sparql::CursorOptions,
+    ) -> Result<QueryResult> {
+        crate::sparql::ask_streaming(
+            self.inner.store.snapshot(),
+            query,
+            &self.with_query_defaults(opts),
+            cursor,
+        )
+    }
+
     /// The options a query of this dataset runs with by default. They hold RDFS on read
     /// when the dataset has it set, the graph of materialized inferences
     /// ([`INFERRED_GRAPH`](crate::reasoning::INFERRED_GRAPH)) as part of the default

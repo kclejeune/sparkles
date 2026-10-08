@@ -19,7 +19,7 @@
 //! (`?r rdf:subject s ; rdf:predicate p ; rdf:object o`). Options add the labels of the
 //! IRIs the description links to, and bound its depth and its size.
 
-use super::ctx::{Ctx, PlanWarning, TermKind};
+use super::ctx::{Ctx, PlanWarning, RetainedCharge, TermKind};
 use super::plan::GraphFilter;
 use super::table::Table;
 use crate::error::{Error, Result};
@@ -207,6 +207,7 @@ impl DescribeOptions {
 pub(super) struct Described {
     pub triples: Vec<Triple>,
     pub truncated: bool,
+    pub _charge: Option<RetainedCharge>,
 }
 
 /// A graph a description reads: the query's default graph, or one named graph.
@@ -254,6 +255,8 @@ struct Describer<'a> {
     linked: FxHashSet<(Id, Source)>,
     queue: Vec<Item>,
     truncated: bool,
+    charge: Option<RetainedCharge>,
+    bytes: u64,
 }
 
 /// Describe the IRIs and blank nodes of the solutions `t`. `explicit` says whether the
@@ -266,6 +269,8 @@ pub(super) fn describe(
     opts: &DescribeOptions,
     explicit: bool,
 ) -> Result<Described> {
+    let _resource_charge =
+        ctx.retained_charge(t.mem_bytes().saturating_mul(8).saturating_add(4096))?;
     let mut resources: Vec<Id> = Vec::new();
     let mut seen_r = FxHashSet::default();
     for col in &t.cols {
@@ -344,14 +349,16 @@ pub(super) fn describe(
         linked: FxHashSet::default(),
         queue: Vec::new(),
         truncated: false,
+        charge: ctx.retained_charge(4096)?,
+        bytes: 4096,
     };
     for r in resources {
         if d.truncated {
             break;
         }
-        d.push(r, None, Dir::Out, 1);
+        d.push(r, None, Dir::Out, 1)?;
         if opts.mode == DescribeMode::Scbd {
-            d.push(r, None, Dir::In, 1);
+            d.push(r, None, Dir::In, 1)?;
         }
         d.run()?;
     }
@@ -370,13 +377,56 @@ pub(super) fn describe(
     Ok(Described {
         triples: d.out,
         truncated: d.truncated,
+        _charge: d.charge,
     })
 }
 
+struct Quads {
+    values: Vec<[Id; 4]>,
+    _charge: Option<RetainedCharge>,
+}
+impl std::ops::Deref for Quads {
+    type Target = [[Id; 4]];
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+struct QuadIter {
+    values: std::vec::IntoIter<[Id; 4]>,
+    _charge: Option<RetainedCharge>,
+}
+impl Iterator for QuadIter {
+    type Item = [Id; 4];
+    fn next(&mut self) -> Option<Self::Item> {
+        self.values.next()
+    }
+}
+impl IntoIterator for Quads {
+    type Item = [Id; 4];
+    type IntoIter = QuadIter;
+    fn into_iter(self) -> QuadIter {
+        QuadIter {
+            values: self.values.into_iter(),
+            _charge: self._charge,
+        }
+    }
+}
+
 impl Describer<'_> {
-    fn push(&mut self, node: Id, src: Option<Source>, dir: Dir, level: u32) {
+    fn reserve(&mut self, bytes: u64) -> Result<()> {
+        if let Some(charge) = &mut self.charge {
+            self.bytes = self.bytes.saturating_add(bytes);
+            charge.resize(self.bytes)?;
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, node: Id, src: Option<Source>, dir: Dir, level: u32) -> Result<()> {
         if self.opts.max_depth.is_some_and(|m| level > m) {
-            return;
+            return Ok(());
+        }
+        if self.queue.len() == self.queue.capacity() {
+            self.reserve((self.queue.capacity().max(4) as u64).saturating_mul(128))?;
         }
         self.queue.push(Item {
             node,
@@ -384,6 +434,7 @@ impl Describer<'_> {
             dir,
             level,
         });
+        Ok(())
     }
 
     /// The graphs `g` is part of: the default graph, a named graph, or both.
@@ -406,9 +457,21 @@ impl Describer<'_> {
 
     /// The quads whose permuted key starts with `prefix`, as `[s, p, o, g]`. The `rows`
     /// budget, the deadline and cancellation stop a scan of a hub's many quads.
-    fn quads(&self, perm: Perm, prefix: &[u64]) -> Result<Vec<[Id; 4]>> {
+    fn quads(&self, perm: Perm, prefix: &[u64]) -> Result<Quads> {
         let mut keys = Vec::new();
+        let mut charge = self.ctx.retained_charge(1024)?;
         self.ctx.snap.scan(perm, prefix, |c| {
+            let added = match &c {
+                Chunk::Block(_, s, e) => e - s,
+                Chunk::Row(_) => 1,
+            };
+            if let Some(charge) = &mut charge {
+                charge.resize(
+                    (keys.len().saturating_add(added) as u64)
+                        .saturating_mul(128)
+                        .saturating_add(1024),
+                )?;
+            }
             match c {
                 Chunk::Block(b, s, e) => keys.extend((s..e).map(|i| b.key(i))),
                 Chunk::Row(k) => keys.push(k),
@@ -417,7 +480,10 @@ impl Describer<'_> {
             self.ctx.check_rows(keys.len())?;
             Ok(true)
         })?;
-        Ok(keys.iter().map(|k| perm.to_quad(k)).collect())
+        Ok(Quads {
+            values: keys.iter().map(|k| perm.to_quad(k)).collect(),
+            _charge: charge,
+        })
     }
 
     fn run(&mut self) -> Result<()> {
@@ -431,6 +497,9 @@ impl Describer<'_> {
             let key = (it.node, it.src, it.dir);
             if self.visited.get(&key).is_some_and(|&l| l <= it.level) {
                 continue;
+            }
+            if !self.visited.contains_key(&key) {
+                self.reserve(256)?;
             }
             self.visited.insert(key, it.level);
             let perm = match it.dir {
@@ -451,19 +520,19 @@ impl Describer<'_> {
                     match it.dir {
                         Dir::Out if self.opts.mode != DescribeMode::Outgoing => {
                             if o.tag() == Tag::BNode {
-                                self.push(o, Some(src), Dir::Out, next);
+                                self.push(o, Some(src), Dir::Out, next)?;
                             }
                         }
                         Dir::In if s.tag() == Tag::BNode && s != it.node => {
-                            self.push(s, Some(src), Dir::In, next);
+                            self.push(s, Some(src), Dir::In, next)?;
                         }
                         _ => {}
                     }
                     if self.reifies.is_some() || self.statement.is_some() {
                         for r in self.reifiers_of(s, p, o, src)? {
-                            self.push(r, Some(src), Dir::Out, next);
+                            self.push(r, Some(src), Dir::Out, next)?;
                             if self.opts.mode == DescribeMode::Scbd {
-                                self.push(r, Some(src), Dir::In, next);
+                                self.push(r, Some(src), Dir::In, next)?;
                             }
                         }
                     }
@@ -478,13 +547,18 @@ impl Describer<'_> {
         if self.opts.labels {
             for x in [s, o] {
                 if self.ctx.kind(x) == TermKind::Iri {
+                    if !self.linked.contains(&(x, src)) {
+                        self.reserve(128)?;
+                    }
                     self.linked.insert((x, src));
                 }
             }
         }
-        if !self.seen.insert((s, p, o)) {
+        if self.seen.contains(&(s, p, o)) {
             return Ok(());
         }
+        self.reserve(128)?;
+        self.seen.insert((s, p, o));
         if self
             .opts
             .max_triples
@@ -492,6 +566,12 @@ impl Describer<'_> {
         {
             self.truncated = true;
             return Ok(());
+        }
+        if self.charge.is_some() {
+            let bytes = [s, p, o].iter().try_fold(512u64, |bytes, id| {
+                Ok::<_, Error>(bytes.saturating_add(self.ctx.decoded_bytes(*id)?.saturating_mul(4)))
+            })?;
+            self.reserve(bytes)?;
         }
         if let Some(q) = self.ctx.snap.quad_to_terms(&[s, p, o, Id::DEFAULT_GRAPH]) {
             self.out.push(Triple::new(q.subject, q.predicate, q.object));
@@ -503,6 +583,16 @@ impl Describer<'_> {
     /// and RDF 1.1's `?r rdf:subject s ; rdf:predicate p ; rdf:object o`.
     fn reifiers_of(&mut self, s: Id, p: Id, o: Id, src: Source) -> Result<Vec<Id>> {
         if !self.reifiers.contains_key(&(s, p, o)) {
+            let _decode_charge = if self.charge.is_some() {
+                let bytes = [s, p, o].iter().try_fold(1024u64, |bytes, id| {
+                    Ok::<_, Error>(
+                        bytes.saturating_add(self.ctx.decoded_bytes(*id)?.saturating_mul(8)),
+                    )
+                })?;
+                self.ctx.retained_charge(bytes)?
+            } else {
+                None
+            };
             let mut found: Vec<(Id, u64)> = Vec::new();
             if let Some(reifies) = self.reifies
                 && let Some(q) = self.ctx.snap.quad_to_terms(&[s, p, o, Id::DEFAULT_GRAPH])
@@ -510,6 +600,7 @@ impl Describer<'_> {
                 let tt = Term::Triple(Box::new(Triple::new(q.subject, q.predicate, q.object)));
                 if let Some(tt) = self.ctx.snap.lookup_term(&tt) {
                     for [r, _, _, g] in self.quads(Perm::Pos, &[reifies.0, tt.0])? {
+                        self.reserve(128)?;
                         found.push((r, g.0));
                     }
                 }
@@ -523,12 +614,15 @@ impl Describer<'_> {
                             .any(|q| q[3] == g))
                     };
                     if has(rp, p)? && has(ro, o)? {
+                        self.reserve(128)?;
                         found.push((r, g.0));
                     }
                 }
             }
+            self.reserve(256)?;
             self.reifiers.insert((s, p, o), found);
         }
+        self.reserve(self.reifiers[&(s, p, o)].len() as u64 * 32 + 256)?;
         Ok(self.reifiers[&(s, p, o)]
             .iter()
             .filter(|(_, g)| self.accepts(src, *g))
@@ -542,6 +636,9 @@ impl Describer<'_> {
             .iter()
             .filter_map(|p| self.ctx.snap.lookup_iri(p))
             .collect();
+        let _linked_charge = self
+            .ctx
+            .retained_charge(self.linked.len() as u64 * 64 + 256)?;
         let mut linked: Vec<(Id, Source)> = self.linked.iter().copied().collect();
         linked.sort_unstable_by_key(|(x, s)| {
             (

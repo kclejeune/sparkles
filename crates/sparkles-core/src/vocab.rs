@@ -455,6 +455,64 @@ impl Vocab {
         self.get_sorted_with_ahead(ids, f, true);
     }
 
+    /// Fallible cursor decoding: reserve reconstruction storage before growing it,
+    /// including intermediate keys needed to reach a selected front-coded key.
+    pub(crate) fn get_sorted_checked<E>(
+        &self,
+        ids: &[u64],
+        mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let mut ahead = self.ahead_for(ids);
+        let mut key = Vec::new();
+        let data = self.data.as_slice();
+        let mut i = 0;
+        while i < ids.len() && ids[i] < self.len {
+            let b = ids[i] as usize / FC_BLOCK;
+            ahead.at(self, b);
+            let end = ((b + 1) * FC_BLOCK) as u64;
+            let j = i + ids[i..].partition_point(|&x| x < end);
+            let wanted = &ids[i..j];
+            let last = (wanted[wanted.len() - 1] as usize % FC_BLOCK)
+                .min(FC_BLOCK.min(self.len as usize - b * FC_BLOCK) - 1);
+            let mut w = 0;
+            let mut pos = self.block_offset(b);
+            key.clear();
+            for at in 0..=last {
+                let shared = read_varint(data, &mut pos) as usize;
+                let len = read_varint(data, &mut pos) as usize;
+                let need = key.len().min(shared).saturating_add(len);
+                if need > key.capacity() {
+                    reserve(need)?;
+                    key.reserve_exact(need - key.len());
+                }
+                key.truncate(shared);
+                key.extend_from_slice(&data[pos..pos + len]);
+                pos += len;
+                if w < wanted.len() && wanted[w] as usize % FC_BLOCK == at {
+                    f(wanted[w], &key)?;
+                    w += 1;
+                }
+            }
+            i = j;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_with_checked<T, E>(
+        &self,
+        id: u64,
+        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut f: impl FnMut(&[u8]) -> T,
+    ) -> std::result::Result<Option<T>, E> {
+        let mut out = None;
+        self.get_sorted_checked(&[id], reserve, |_, key| {
+            out = Some(f(key));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// A serializer that already prefetched these blocks does not need dense hints
     /// or a per-block bitmap check on its decode's hot path.
     #[inline]
@@ -1365,6 +1423,48 @@ mod tests {
     }
 
     #[test]
+    fn checked_decode_reserves_intermediate_keys_before_growth() {
+        let keys = [
+            format!("\"a{}", "x".repeat(32 << 10)).into_bytes(),
+            b"\"b".to_vec(),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = VocabWriter::create(dir.path()).unwrap();
+        for key in &keys {
+            w.push(key).unwrap();
+        }
+        w.finish().unwrap();
+        let v = Vocab::open(dir.path()).unwrap();
+        let mut called = false;
+        let blocked = v.get_with_checked(
+            1,
+            |need| if need > 1024 { Err(need) } else { Ok(()) },
+            |_| called = true,
+        );
+        assert!(blocked.unwrap_err() > 32 << 10);
+        assert!(!called);
+        assert_eq!(
+            v.get_with_checked(1, |_| Ok::<_, ()>(()), |k| k.to_vec()),
+            Ok(Some(keys[1].clone()))
+        );
+        let mut got = Vec::new();
+        v.get_sorted_checked(
+            &[0, 1, 2, 15, u64::MAX],
+            |_| Ok::<_, ()>(()),
+            |id, k| {
+                got.push((id, k.to_vec()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(got, vec![(0, keys[0].clone()), (1, keys[1].clone())]);
+        assert_eq!(
+            v.get_with_checked(u64::MAX, |_| Err::<(), _>(()), |_| panic!("invalid key")),
+            Ok(None)
+        );
+    }
+
+    #[test]
     fn borrowed_key_decode_matches_owned_for_term_kinds() {
         use oxrdf::{BaseDirection, BlankNode, Literal, NamedNode, Term, Triple};
         let terms = [
@@ -1397,6 +1497,10 @@ mod tests {
         w.finish().unwrap();
         let v = Vocab::open(dir.path()).unwrap();
         for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                v.get_with_checked(i as u64, |_| Ok::<_, ()>(()), crate::id::key_to_term),
+                Ok(Some(crate::id::key_to_term(key)))
+            );
             assert_eq!(
                 v.get_with(i as u64, crate::id::key_to_term),
                 Some(crate::id::key_to_term(key))

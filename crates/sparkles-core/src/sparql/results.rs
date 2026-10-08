@@ -203,19 +203,102 @@ impl<W: Write> Write for LimitedWriter<W> {
         Ok(n)
     }
 
-    // serializers write many small pieces: hand them on whole, so a `Vec` appends them
-    // without the generic retry loop
+    // Admit the whole piece before writing, but count successful partial writes
+    // even if a later channel wait fails. A Vec still consumes it in one write.
     #[inline]
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         self.admit(buf.len())?;
-        self.inner.write_all(buf)?;
-        self.written += buf.len() as u64;
+        let mut remaining = buf;
+        while !remaining.is_empty() {
+            match self.inner.write(remaining) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    self.written += n as u64;
+                    remaining = &remaining[n..];
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
         Ok(())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
+}
+
+/// Consume SELECT batches directly, applying writer backpressure before requesting
+/// the next batch. A later error leaves partial bytes and no success terminator.
+pub fn write_cursor_solutions(
+    cursor: &mut super::QueryCursor,
+    fmt: SolutionsFormat,
+    mut writer: impl Write,
+    send: Option<usize>,
+) -> Result<super::CursorStats> {
+    let format = match fmt {
+        SolutionsFormat::Json => QueryResultsFormat::Json,
+        SolutionsFormat::Xml => QueryResultsFormat::Xml,
+        SolutionsFormat::Csv => QueryResultsFormat::Csv,
+        SolutionsFormat::Tsv => QueryResultsFormat::Tsv,
+        SolutionsFormat::Sparkles => return write_cursor_native_json(cursor, writer, send, None),
+    };
+    let variables: Vec<Variable> = cursor
+        .variables()
+        .iter()
+        .map(Variable::new_unchecked)
+        .collect();
+    let result = (|| {
+        cursor.check()?;
+        let mut serializer = QueryResultsSerializer::from_format(format)
+            .serialize_solutions_to_writer(&mut writer, variables.clone())
+            .map_err(io)?;
+        let mut remaining = send.unwrap_or(usize::MAX);
+        while remaining > 0 {
+            let Some(batch) = cursor.next_batch_at_most(remaining)? else {
+                break;
+            };
+            let decoded = batch.decoded()?;
+            let _row_storage = cursor.charge(batch.width() as u64 * 64 + 128)?;
+            let mut terms = Vec::with_capacity(batch.width());
+            for row in 0..batch.len().min(remaining) {
+                if row.is_multiple_of(1024) {
+                    cursor.check()?;
+                }
+                let bytes = match &decoded {
+                    Some(d) => d.row_bytes(row)?,
+                    None => batch.row_bytes(row)?,
+                };
+                let _charge = (bytes != 0).then(|| cursor.charge(bytes)).transpose()?;
+                for col in 0..batch.width() {
+                    terms.push(match &decoded {
+                        Some(d) => d.term(row, col),
+                        None => Ok(batch.term(row, col)?.map(Cow::Owned)),
+                    }?);
+                }
+                serializer
+                    .serialize(variables.iter().zip(&terms).filter_map(|(variable, term)| {
+                        term.as_ref()
+                            .map(|t| (variable.as_ref(), t.as_ref().as_ref()))
+                    }))
+                    .map_err(io)?;
+                // Release owned fallbacks before their row reservation drops;
+                // keep only the adapter capacity for the next row.
+                terms.clear();
+                remaining -= 1;
+            }
+        }
+        if remaining == 0 {
+            cursor.close();
+        }
+        cursor.check()?;
+        serializer.finish().map_err(io)?;
+        Ok(cursor.stats())
+    })();
+    if let Err(error) = &result {
+        cursor.fail_output(error);
+    }
+    result
 }
 
 /// Serialize SELECT / ASK results.
@@ -525,6 +608,238 @@ pub fn write_native_json(
     .map_err(|e| Error::Io(e.into()))
 }
 
+/// Consume native SELECT rows without collecting them. Metadata is written only
+/// after successful production; a consumer cap leaves `totalRows` unknown.
+pub fn write_cursor_native_json(
+    cursor: &mut super::QueryCursor,
+    mut writer: impl Write,
+    send: Option<usize>,
+    metadata: Option<NativeJsonMetadata<'_>>,
+) -> Result<super::CursorStats> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Meta<'a> {
+        total_rows: Option<u64>,
+        sent_rows: u64,
+        status: super::CursorStatus,
+        timing: &'a super::Timing,
+        plan: &'a super::CursorPlan,
+        memory: NativeMemory,
+        rows_produced: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        commit: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dataset_id: Option<&'a str>,
+    }
+    fn json(w: &mut impl Write, v: &impl Serialize) -> Result<()> {
+        serde_json::to_writer(w, v).map_err(|e| Error::Io(e.into()))
+    }
+    let started = Instant::now();
+    let initial_exec = cursor.stats().timing.exec_ms;
+    let result = (|| {
+        cursor.check()?;
+        writer.write_all(b"{\"queryType\":\"SELECT\",\"vars\":")?;
+        json(&mut writer, &cursor.variables())?;
+        writer.write_all(b",\"rows\":[")?;
+        let mut remaining = send.unwrap_or(usize::MAX);
+        let mut sent = 0u64;
+        while remaining > 0 {
+            let Some(batch) = cursor.next_batch_at_most(remaining)? else {
+                break;
+            };
+            let decoded = batch.decoded()?;
+            for row in 0..batch.len() {
+                if row.is_multiple_of(1024) {
+                    cursor.check()?;
+                }
+                if sent > 0 {
+                    writer.write_all(b",")?;
+                }
+                writer.write_all(b"[")?;
+                for col in 0..batch.width() {
+                    if col > 0 {
+                        writer.write_all(b",")?;
+                    }
+                    let bytes = match &decoded {
+                        Some(d) => d.cell_bytes(row, col)?,
+                        None => batch.cell_bytes(row, col)?,
+                    };
+                    let _charge = (bytes != 0).then(|| cursor.charge(bytes)).transpose()?;
+                    let term = match &decoded {
+                        Some(d) => d.term(row, col)?,
+                        None => batch.term(row, col)?.map(Cow::Owned),
+                    };
+                    // Keep the decoded cell charged through its serialization.
+                    json(
+                        &mut writer,
+                        &term.as_ref().map(|t| NativeTerm(t.as_ref().as_ref())),
+                    )?;
+                }
+                writer.write_all(b"]")?;
+                sent += 1;
+                remaining -= 1;
+            }
+        }
+        if remaining == 0 {
+            cursor.close();
+        }
+        cursor.check()?;
+        let stats = cursor.stats();
+        let mut timing = stats.timing.clone();
+        timing.serialize_ms =
+            (started.elapsed().as_secs_f64() * 1000.0 - (timing.exec_ms - initial_exec)).max(0.0);
+        writer.write_all(b"],\"meta\":")?;
+        super::depth::with_stack(cursor.stack_depth(), || {
+            json(
+                &mut writer,
+                &Meta {
+                    total_rows: (stats.status == super::CursorStatus::Complete).then_some(sent),
+                    sent_rows: sent,
+                    status: stats.status,
+                    timing: &timing,
+                    plan: cursor.plan(),
+                    memory: NativeMemory {
+                        peak_bytes: stats.mem_peak_bytes,
+                    },
+                    rows_produced: stats.rows_produced,
+                    commit: metadata.as_ref().map(|m| m.commit),
+                    dataset_id: metadata.as_ref().map(|m| m.dataset_id),
+                },
+            )
+        })?;
+        writer.write_all(b"}")?;
+        Ok(stats)
+    })();
+    if let Err(error) = &result {
+        cursor.fail_output(error);
+    }
+    result
+}
+
+/// Stream graph rows in the native document. Default graph rows are represented
+/// as quads with a null graph, so mixed graph output needs no partition buffer.
+pub fn write_cursor_graph_native_json(
+    cursor: &mut super::GraphCursor,
+    mut writer: impl Write,
+    send: Option<usize>,
+    metadata: Option<NativeJsonMetadata<'_>>,
+) -> Result<super::CursorStats> {
+    let result = super::depth::with_stack(cursor.stack_depth(), || {
+        cursor.check()?;
+        let _charge = cursor.charge(4096)?;
+        write!(writer, "{{\"queryType\":")?;
+        serde_json::to_writer(&mut writer, &cursor.kind()).map_err(|e| Error::Io(e.into()))?;
+        writer.write_all(b",\"triples\":[],\"quads\":[")?;
+        let mut sent = 0usize;
+        while send.is_none_or(|max| sent < max) {
+            let Some(batch) = cursor.next_at_most(send.map_or(usize::MAX, |max| max - sent))?
+            else {
+                break;
+            };
+            for quad in batch.quads() {
+                if sent.is_multiple_of(1024) {
+                    cursor.check()?;
+                }
+                if sent > 0 {
+                    writer.write_all(b",")?;
+                }
+                // Reuse the borrowed native term serializer, without a JSON tree.
+                serde_json::to_writer(&mut writer, &NativeQuad(quad))
+                    .map_err(|e| Error::Io(e.into()))?;
+                sent += 1;
+            }
+        }
+        if send.is_some_and(|max| sent >= max) {
+            cursor.close();
+        }
+        let stats = cursor.stats();
+        writer.write_all(b"],\"meta\":{")?;
+        write!(
+            writer,
+            "\"totalRows\":{},\"sentRows\":{sent},\"status\":",
+            if stats.status == super::CursorStatus::Complete {
+                sent.to_string()
+            } else {
+                "null".into()
+            }
+        )?;
+        serde_json::to_writer(&mut writer, &stats.status).map_err(|e| Error::Io(e.into()))?;
+        writer.write_all(b",\"timing\":")?;
+        serde_json::to_writer(&mut writer, &stats.timing).map_err(|e| Error::Io(e.into()))?;
+        writer.write_all(b",\"plan\":")?;
+        serde_json::to_writer(&mut writer, cursor.plan()).map_err(|e| Error::Io(e.into()))?;
+        write!(
+            writer,
+            ",\"memory\":{{\"peakBytes\":{}}},\"rowsProduced\":{},\"describeTruncated\":{}",
+            stats.mem_peak_bytes,
+            stats.rows_produced,
+            cursor.describe_truncated()
+        )?;
+        if let Some(meta) = metadata {
+            write!(writer, ",\"commit\":{},\"datasetId\":", meta.commit)?;
+            serde_json::to_writer(&mut writer, meta.dataset_id).map_err(|e| Error::Io(e.into()))?;
+        }
+        writer.write_all(b"}}")?;
+        Ok(stats)
+    });
+    if let Err(error) = &result {
+        cursor.fail_output(error);
+    }
+    result
+}
+
+/// Jena's wire formats stream one statement at a time. RDF/JSON groups objects
+/// by subject and predicate; reserve its retained representation before insertion.
+pub fn write_cursor_jena_graph(
+    cursor: &mut super::GraphCursor,
+    format: crate::jena_formats::JenaFormat,
+    output: impl Write,
+    send: Option<usize>,
+) -> Result<super::CursorStats> {
+    let result = super::depth::with_stack(cursor.stack_depth(), || {
+        let mut charge = cursor.charge(128 << 10)?;
+        let mut bytes = 128 << 10;
+        let mut writer = crate::jena_formats::RdfWriter::new(format, output);
+        let mut sent = 0usize;
+        while send.is_none_or(|max| sent < max) {
+            let Some(batch) = cursor.next_at_most(send.map_or(usize::MAX, |max| max - sent))?
+            else {
+                break;
+            };
+            for quad in batch.quads() {
+                if sent.is_multiple_of(1024) {
+                    cursor.check()?;
+                }
+                if format == crate::jena_formats::JenaFormat::RdfJson {
+                    bytes += super::graph_quad_bytes(quad).saturating_mul(4) + 1024;
+                    charge.resize(bytes)?;
+                }
+                if format.quads() {
+                    writer.quad(quad).map_err(io)?;
+                } else if quad.graph_name == oxrdf::GraphName::DefaultGraph {
+                    writer
+                        .triple(&oxrdf::Triple::new(
+                            quad.subject.clone(),
+                            quad.predicate.clone(),
+                            quad.object.clone(),
+                        ))
+                        .map_err(io)?;
+                }
+                sent += 1;
+            }
+        }
+        if send.is_some_and(|max| sent >= max) {
+            cursor.close();
+        }
+        writer.finish().map_err(io)?;
+        Ok(cursor.stats())
+    });
+    if let Err(error) = &result {
+        cursor.fail_output(error);
+    }
+    result
+}
+
 struct NativeJson<'a> {
     r: &'a QueryResult,
     n: usize,
@@ -627,6 +942,25 @@ impl Serialize for NativeRow<'_> {
             seq.serialize_element(&term.as_ref().map(|t| NativeTerm(t.as_ref())))?;
         }
         seq.end()
+    }
+}
+
+struct NativeQuad<'a>(&'a oxrdf::Quad);
+impl Serialize for NativeQuad<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let q = self.0.as_ref();
+        let graph = match q.graph_name {
+            oxrdf::GraphNameRef::NamedNode(n) => Some(NativeTerm(n.into())),
+            oxrdf::GraphNameRef::BlankNode(b) => Some(NativeTerm(b.into())),
+            oxrdf::GraphNameRef::DefaultGraph => None,
+        };
+        [
+            Some(NativeTerm(q.subject.into())),
+            Some(NativeTerm(q.predicate.into())),
+            Some(NativeTerm(q.object)),
+            graph,
+        ]
+        .serialize(s)
     }
 }
 

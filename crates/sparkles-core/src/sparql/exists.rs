@@ -89,7 +89,7 @@
 //! the rows are probed. A build that would exceed the budget, or fails for another
 //! reason than cancellation or a timeout, leaves the EXISTS to per-row evaluation.
 
-use super::ctx::{Charge, Ctx};
+use super::ctx::{Charge, Ctx, RetainedCharge};
 use super::exec::PAR_MIN_LEN;
 use super::expr::{ExistsSpec, Expr, Row, ebv};
 use super::plan::{ActiveGraph, Node, Planner, expr_vars};
@@ -173,6 +173,7 @@ struct Plan {
     /// variables an outer row must leave unbound for a probe
     risky: Vec<VarId>,
     node: Node,
+    _charge: Option<RetainedCharge>,
 }
 
 struct Build {
@@ -183,7 +184,13 @@ struct Build {
     /// distinct projections on all keys
     full: KeySet,
     /// distinct projections on the keys of a mask (bit i: `keys[i]`), built on demand
-    partial: Mutex<FxHashMap<u64, Arc<KeySet>>>,
+    partial: Mutex<FxHashMap<u64, Arc<Partial>>>,
+    _charge: Option<RetainedCharge>,
+}
+
+struct Partial {
+    set: KeySet,
+    _charge: Option<RetainedCharge>,
 }
 
 enum KeySet {
@@ -238,7 +245,7 @@ impl Build {
                 .partial
                 .lock()
                 .iter()
-                .map(|(m, s)| s.bytes(m.count_ones() as usize))
+                .map(|(m, s)| s.set.bytes(m.count_ones() as usize))
                 .sum::<u64>()
     }
 }
@@ -325,7 +332,12 @@ fn probe(ctx: &Ctx, t: &mut Table, e: &Expr, spec: &ExistsSpec, negated: bool) -
         return Ok(false);
     }
     // the key sets are alive while the rows are probed
-    let held = match ctx.charge(build.bytes()) {
+    let held = match ctx.charge(if ctx.is_cursor() {
+        // Retained key sets carry their own charges. Probe vectors are transient.
+        t.len() as u64 + (build.keys.len() + build.risky.len()) as u64 * 64 + 1024
+    } else {
+        build.bytes()
+    }) {
         Ok(h) => h,
         Err(Error::BudgetExceeded(_)) => {
             decor.note("its key set does not fit in the memory budget");
@@ -362,7 +374,7 @@ fn probe(ctx: &Ctx, t: &mut Table, e: &Expr, spec: &ExistsSpec, negated: bool) -
         (1u64 << width) - 1
     };
     let map = t.var_map(ctx.nvars());
-    let mut sets: FxHashMap<u64, Option<Arc<KeySet>>> = FxHashMap::default();
+    let mut sets: FxHashMap<u64, Option<Arc<Partial>>> = FxHashMap::default();
     let mut key: Vec<Id> = Vec::with_capacity(width);
     let mut keep = vec![false; t.len()];
     let (mut probed, mut per_row) = (0u64, 0u64);
@@ -389,10 +401,15 @@ fn probe(ctx: &Ctx, t: &mut Table, e: &Expr, spec: &ExistsSpec, negated: bool) -
                 } else if mask == all {
                     Some(build.full.contains(&key))
                 } else {
-                    sets.entry(mask)
-                        .or_insert_with(|| partial(&build, mask, &held))
-                        .as_ref()
-                        .map(|s| s.contains(&key))
+                    if let std::collections::hash_map::Entry::Vacant(entry) = sets.entry(mask) {
+                        if ctx.is_cursor() {
+                            held.add(128)?;
+                        }
+                        entry.insert(partial(ctx, &build, mask, &held));
+                    }
+                    sets.get(&mask)
+                        .and_then(Option::as_ref)
+                        .map(|s| s.set.contains(&key))
                 };
             }
         }
@@ -426,16 +443,26 @@ const RISKY_BOUND: &str = "the outer solutions bind a variable that only a FILTE
 
 /// The key set of the keys in `mask`, held by `held` (`None`: it does not fit in the
 /// memory budget, and its rows are evaluated per row).
-fn partial(build: &Build, mask: u64, held: &Charge<'_>) -> Option<Arc<KeySet>> {
-    if let Some(s) = build.partial.lock().get(&mask) {
+fn partial(ctx: &Ctx, build: &Build, mask: u64, held: &Charge<'_>) -> Option<Arc<Partial>> {
+    let mut partial = build.partial.lock();
+    if let Some(s) = partial.get(&mask) {
         return Some(s.clone());
     }
     let width = mask.count_ones() as usize;
     // reserve the estimate before building it (a projection has at most as many keys)
-    held.add(build.full.len() as u64 * (width as u64 * 8 + 16))
-        .ok()?;
-    let s = Arc::new(build.full.project(build.keys.len(), mask));
-    build.partial.lock().insert(mask, s.clone());
+    let charge = if ctx.is_cursor() {
+        ctx.retained_charge(build.full.len() as u64 * (width as u64 * 8 + 128) + 1024)
+            .ok()?
+    } else {
+        held.add(build.full.len() as u64 * (width as u64 * 8 + 16))
+            .ok()?;
+        None
+    };
+    let s = Arc::new(Partial {
+        set: build.full.project(build.keys.len(), mask),
+        _charge: charge,
+    });
+    partial.insert(mask, s.clone());
     Some(s)
 }
 
@@ -484,8 +511,20 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
     } else {
         ((cost / ROW_EVAL_COST).ceil() as usize).max(1)
     };
+    let _scratch = if ctx.is_cursor() {
+        match ctx.charge(need.min(t.len()) as u64 * (plan.keys.len() as u64 * 8 + 128) + 1024) {
+            Ok(charge) => Some(charge),
+            Err(Error::BudgetExceeded(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
     let mut seen: FxHashSet<Vec<Id>> = FxHashSet::default();
     for i in 0..t.len() {
+        if i % 1024 == 0 {
+            ctx.check()?;
+        }
         if seen.len() >= need {
             break;
         }
@@ -557,6 +596,9 @@ fn build(ctx: &Ctx, node: &Node, keys: Vec<VarId>, risky: Vec<VarId>) -> Result<
         return Err(Error::invalid("a key variable is unbound in a solution"));
     }
     let width = cols.len();
+    // The hash table may reserve almost twice its cardinality, and multi-column
+    // keys allocate individually. Reserve their construction before allocating.
+    let charge = ctx.retained_charge(t.len() as u64 * (width as u64 * 8 + 128) + 1024)?;
     let full = if width == 1 {
         KeySet::One(cols[0].iter().copied().collect())
     } else {
@@ -570,13 +612,16 @@ fn build(ctx: &Ctx, node: &Node, keys: Vec<VarId>, risky: Vec<VarId>) -> Result<
         KeySet::Many(s)
     };
     // fails over budget (and so falls back) before the solutions are dropped
-    held.add(full.bytes(width))?;
+    if !ctx.is_cursor() {
+        held.add(full.bytes(width))?;
+    }
     Ok(Build {
         keys,
         risky,
         solutions: t.len(),
         full,
         partial: Mutex::new(FxHashMap::default()),
+        _charge: charge,
     })
 }
 
@@ -584,6 +629,28 @@ fn build(ctx: &Ctx, node: &Node, keys: Vec<VarId>, risky: Vec<VarId>) -> Result<
 
 /// Check the pattern against the admitted algebra and plan it unsubstituted.
 fn admit(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<Plan, String> {
+    // Count the algebra's printed size without constructing a temporary String.
+    // This conservative reservation covers the newly planned tree and admission
+    // sets in addition to the existing EXISTS algebra already owned by the plan.
+    struct Size(u64);
+    impl std::fmt::Write for Size {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0 = self.0.saturating_add(text.len() as u64);
+            Ok(())
+        }
+    }
+    let charge = if ctx.is_cursor() {
+        let mut size = Size(0);
+        std::fmt::write(&mut size, format_args!("{}", spec.pattern)).map_err(|e| e.to_string())?;
+        ctx.retained_charge(
+            size.0
+                .saturating_mul(32)
+                .saturating_add(spec.vars.len() as u64 * 128 + 4096),
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
     if let ActiveGraph::Var(_) = spec.graph {
         return Err("its active graph is a variable".into());
     }
@@ -618,7 +685,12 @@ fn admit(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<Plan, String> {
         .filter(|v| spec.vars.contains(v))
         .collect();
     risky.sort_unstable();
-    Ok(Plan { keys, risky, node })
+    Ok(Plan {
+        keys,
+        risky,
+        node,
+        _charge: charge,
+    })
 }
 
 /// `cert(gp)` for an admitted pattern (see the module documentation); adds the risky

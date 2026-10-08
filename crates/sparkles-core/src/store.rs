@@ -6203,10 +6203,8 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         store.load(&[src()]).unwrap();
         let insert = |store: &Store, s: &str| {
             let mut t = store.write();
-            let q = t
-                .encode_quad(&quad(s, "p", "o"), &mut Default::default())
-                .unwrap();
-            assert!(t.insert(q).unwrap());
+            let q = t.encode_quad(&quad(s, "p", "o"), &mut Default::default())?;
+            assert!(t.insert(q)?);
             t.commit()
         };
         let head = insert(&store, "n1").unwrap().commit.seq;

@@ -21,6 +21,8 @@ memmap2.workspace = true
 lz4_flex.workspace = true
 rayon.workspace = true
 regex.workspace = true
+# Explicit caches and reported program size for budgeted cursor expressions.
+regex-automata = "0.4"
 memchr.workspace = true
 stacker.workspace = true
 serde.workspace = true

@@ -610,6 +610,7 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         Expr::Exists(spec) => {
             let key: Vec<Id> = spec.vars.iter().map(|&v| spec.value(row, v)).collect();
             if !ctx.calls_extensions
+                && !ctx.is_cursor()
                 && let Some(&r) = spec.memo.lock().get(&key)
             {
                 return Ok(b(r));
@@ -618,13 +619,14 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
                 super::plan::eval_exists(ctx, spec, &key, &row.table.vars)
             })
             .map_err(|error| {
+                ctx.fail_cursor(&error);
                 if ctx.calls_extensions {
                     ctx.fail_extension(super::extensions::ScalarError::from_engine(&error));
                 }
                 TypeError
             })?;
             let mut m = spec.memo.lock();
-            if !ctx.calls_extensions && m.len() < 100_000 {
+            if !ctx.calls_extensions && !ctx.is_cursor() && m.len() < 100_000 {
                 m.insert(key, r);
             }
             Ok(b(r))
@@ -1104,6 +1106,27 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 .as_deref()
                 .map_or(Some(""), Value::as_str)
                 .ok_or(TypeError)?;
+            if ctx.is_cursor() {
+                let re = ctx
+                    .cursor_regex(p.as_str().ok_or(TypeError)?, flags)
+                    .map_err(|error| {
+                        ctx.fail_cursor(&error);
+                        TypeError
+                    })?
+                    .ok_or(TypeError)?;
+                if re.is_match(ctx, "").map_err(|error| {
+                    ctx.fail_cursor(&error);
+                    TypeError
+                })? {
+                    return Err(TypeError);
+                }
+                let rep = xpath_replacement(r.as_str().ok_or(TypeError)?)?;
+                let output = re.replace(ctx, st, &rep).map_err(|error| {
+                    ctx.fail_cursor(&error);
+                    TypeError
+                })?;
+                return Ok(same_kind(l, output));
+            }
             let re = shared_regex(p.as_str().ok_or(TypeError)?, flags)?;
             if re.is_match("") {
                 return Err(TypeError);
@@ -1258,7 +1281,21 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 .as_deref()
                 .map_or(Some(""), Value::as_str)
                 .ok_or(TypeError)?;
-            b(shared_regex(p.as_str().ok_or(TypeError)?, flags)?.is_match(st))
+            if ctx.is_cursor() {
+                let re = ctx
+                    .cursor_regex(p.as_str().ok_or(TypeError)?, flags)
+                    .map_err(|error| {
+                        ctx.fail_cursor(&error);
+                        TypeError
+                    })?
+                    .ok_or(TypeError)?;
+                b(re.is_match(ctx, st).map_err(|error| {
+                    ctx.fail_cursor(&error);
+                    TypeError
+                })?)
+            } else {
+                b(shared_regex(p.as_str().ok_or(TypeError)?, flags)?.is_match(st))
+            }
         }
         F::Custom(iri) => return extension(iri.as_str(), args, row, ctx),
         // ---- SPARQL 1.2 -------------------------------------------------------------

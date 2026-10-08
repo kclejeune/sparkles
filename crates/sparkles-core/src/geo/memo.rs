@@ -75,6 +75,9 @@ impl GeoMemo {
         key: MemoKey,
         parse: impl FnOnce() -> Option<GeomRef>,
     ) -> Option<GeomRef> {
+        if self.budget == 0 {
+            return parse();
+        }
         if let Some(hit) = self.lru.lock().get(key) {
             return hit;
         }
@@ -144,6 +147,9 @@ pub(crate) fn note_crs_ref(ctx: &Ctx, crs_ref: &crate::geo::crs::CrsRef) {
             {
                 let mut seen = ctx.geo.noted_unknown.lock();
                 if seen.iter().any(|s| **s == **iri) {
+                    return;
+                }
+                if !ctx.retain_cursor_bytes(iri.len() as u64 + 64) {
                     return;
                 }
                 seen.push(iri.clone());
@@ -382,6 +388,19 @@ mod tests {
             CrsRef::Known(crate::geo::crs::CRS84),
             georust::Point::new(f64::from(n), 0.0).into(),
         ))
+    }
+
+    #[test]
+    fn zero_budget_parses_without_retention() {
+        let memo = GeoMemo::with_budget(0);
+        for _ in 0..2 {
+            assert!(
+                memo.get_or_parse(MemoKey::Id(Id(1)), || Some(point(0)))
+                    .is_some()
+            );
+            assert!(memo.is_empty());
+            assert_eq!(memo.bytes(), 0);
+        }
     }
 
     #[test]

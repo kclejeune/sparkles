@@ -7,6 +7,8 @@ pub mod catalog;
 pub mod cdt;
 pub mod charsets;
 pub mod ctx;
+pub mod cursor;
+mod cursor_regex;
 pub mod depth;
 pub mod describe;
 pub mod enhancer;
@@ -46,6 +48,11 @@ use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::store::Snapshot;
 pub use ctx::{Ctx, DatasetSpec, Optimizations};
+pub use cursor::{
+    AskResult, CursorOptions, CursorPlan, CursorStats, CursorStatus, ExecutionMode, FallbackPolicy,
+    GraphBatch, GraphCursor, MaterializedResult, QueryBatch, QueryCursor, QueryExecution,
+    ask_streaming, graph_cursor, query_cursor, query_execution, select_cursor,
+};
 pub use exec::PlanInfo;
 use oxrdf::{BlankNode, GraphName, NamedOrBlankNode, Quad, Term, Triple};
 use plan::{ActiveGraph, Planner};
@@ -534,11 +541,23 @@ pub fn query(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<QueryR
 /// order of first appearance in the query text. [`query`] applies this; callers of
 /// [`execute_query`] apply it themselves.
 pub fn select_star_order(q: &str, r: &mut QueryResult) {
+    let Some(order) = select_star_columns(q, &r.vars) else {
+        return;
+    };
+    r.vars = order.iter().map(|&i| r.vars[i].clone()).collect();
+    r.table.vars = order.iter().map(|&i| r.table.vars[i]).collect();
+    r.table.cols = order
+        .iter()
+        .map(|&i| std::mem::take(&mut r.table.cols[i]))
+        .collect();
+}
+
+fn select_star_columns(q: &str, vars: &[String]) -> Option<Vec<usize>> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE
         .get_or_init(|| regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap());
     if !re.is_match(q) {
-        return;
+        return None;
     }
     let pos = |v: &str| {
         [format!("?{v}"), format!("${v}")]
@@ -553,14 +572,9 @@ pub fn select_star_order(q: &str, r: &mut QueryResult) {
             .min()
             .unwrap_or(usize::MAX)
     };
-    let mut order: Vec<usize> = (0..r.vars.len()).collect();
-    order.sort_by_key(|&i| pos(&r.vars[i]));
-    r.vars = order.iter().map(|&i| r.vars[i].clone()).collect();
-    r.table.vars = order.iter().map(|&i| r.table.vars[i]).collect();
-    r.table.cols = order
-        .iter()
-        .map(|&i| std::mem::take(&mut r.table.cols[i]))
-        .collect();
+    let mut order: Vec<usize> = (0..vars.len()).collect();
+    order.sort_by_key(|&i| pos(&vars[i]));
+    Some(order)
 }
 
 pub fn execute_query(
@@ -573,18 +587,41 @@ pub fn execute_query(
     depth::with_stack(depth, || execute_parsed(snap, parsed, opts, parse_ms))
 }
 
-fn execute_parsed(
+struct PreparedQuery {
+    ctx: Arc<Ctx>,
+    node: plan::Node,
+    pattern: GraphPattern,
+    bound: Vec<(table::VarId, Id)>,
+    kind: QueryKind,
+}
+
+/// Semantic preparation shared by eager execution and snapshot-owning cursors.
+fn prepare_query(
     snap: Arc<Snapshot>,
     parsed: &Query,
     opts: &QueryOptions,
-    parse_ms: f64,
-) -> Result<QueryResult> {
-    let t1 = Instant::now();
+    cursor_started: Option<Instant>,
+    automatic: Option<&CursorOptions>,
+) -> Result<PreparedQuery> {
     let (pattern, dataset, base) = split(parsed);
     extensions::check_family(snap.dataset_id)?;
     let mut ctx = make_ctx(snap, opts, dataset, base)?;
+    if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
+        ctx.enable_cursor_accounting()?;
+        ctx.deadline = opts
+            .timeout
+            .map(|timeout| {
+                started
+                    .checked_add(timeout)
+                    .ok_or_else(|| Error::invalid("cursor timeout is too large"))
+            })
+            .transpose()?;
+    }
     ctx.configure_extensions(pattern);
-    let ctx = Arc::new(ctx);
+    let mut ctx = Arc::new(ctx);
+    if cursor_started.is_some() && automatic.is_none() {
+        ctx.attach_cursor_owner();
+    }
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
     let mut planner = Planner::new(&ctx);
     planner.source = Some(parsed);
@@ -610,7 +647,61 @@ fn execute_parsed(
     };
     let planned = rdfs::apply(&ctx, &pattern);
     let node = planner.plan(&planned, &ActiveGraph::Default, Vec::new())?;
+    if let Some(automatic) = automatic
+        && bound.is_empty()
+        && cursor::auto_streaming(&ctx, &node, kind, automatic)
+    {
+        let started = cursor_started.expect("automatic preparation start");
+        let mutable = Arc::get_mut(&mut ctx)
+            .ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
+        mutable.enable_cursor_accounting()?;
+        mutable.deadline = opts
+            .timeout
+            .map(|timeout| {
+                started
+                    .checked_add(timeout)
+                    .ok_or_else(|| Error::invalid("cursor timeout is too large"))
+            })
+            .transpose()?;
+        ctx.attach_cursor_owner();
+    }
+    ctx.check()?;
+    Ok(PreparedQuery {
+        ctx,
+        node,
+        pattern,
+        bound,
+        kind,
+    })
+}
+
+fn execute_parsed(
+    snap: Arc<Snapshot>,
+    parsed: &Query,
+    opts: &QueryOptions,
+    parse_ms: f64,
+) -> Result<QueryResult> {
+    let t1 = Instant::now();
+    let prepared = prepare_query(snap, parsed, opts, None, None)?;
     let plan_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    execute_prepared(parsed, opts, parse_ms, plan_ms, prepared)
+}
+
+fn execute_prepared(
+    parsed: &Query,
+    opts: &QueryOptions,
+    parse_ms: f64,
+    plan_ms: f64,
+    prepared: PreparedQuery,
+) -> Result<QueryResult> {
+    let PreparedQuery {
+        ctx,
+        node,
+        pattern,
+        bound,
+        kind,
+    } = prepared;
+    let (_, dataset, _) = split(parsed);
     let t2 = Instant::now();
     let (table, mut plan) = exec::execute(&ctx, &node)?;
     plan.warnings = ctx.warnings();
@@ -678,7 +769,7 @@ fn execute_parsed(
         plan_ms,
         exec_ms: t2.elapsed().as_secs_f64() * 1000.0,
         serialize_ms: 0.0,
-        total_ms: parse_ms + t1.elapsed().as_secs_f64() * 1000.0,
+        total_ms: parse_ms + plan_ms + t2.elapsed().as_secs_f64() * 1000.0,
     };
     result.mem_peak_bytes = ctx.mem_peak();
     result.rows_produced = ctx.rows_produced();
@@ -789,118 +880,179 @@ fn construct(
         Ok(())
     };
     let mut work = 0usize;
-    let mut check = || -> Result<()> {
-        work = work.wrapping_add(1);
-        if work & 1023 == 0 {
-            ctx.check()?;
-        }
-        Ok(())
-    };
     for i in 0..t.len() {
-        check()?;
-        let mut bnodes: FxHashMap<String, BlankNode> = FxHashMap::default();
-        let inst = |tp: &TermPattern, bnodes: &mut FxHashMap<String, BlankNode>| -> Option<Term> {
-            instantiate(
-                tp,
-                &mut |v| {
-                    let c = map.get(ctx.var(v) as usize).copied().flatten()?;
-                    let id = t.cols[c][i];
-                    if id.is_undef() { None } else { ctx.term(id) }
-                },
-                &mut |b| {
-                    Term::BlankNode(
-                        bnodes
-                            .entry(b.to_string())
-                            .or_insert_with(|| crate::store::bnode_for(ctx.fresh_bnode()))
-                            .clone(),
-                    )
-                },
-            )
-        };
-        let triple = |tp: &TriplePattern, bnodes: &mut FxHashMap<String, BlankNode>| {
-            let s = inst(&tp.subject, bnodes);
-            let p = match &tp.predicate {
-                NamedNodePattern::NamedNode(n) => Some(Term::NamedNode(n.clone())),
-                NamedNodePattern::Variable(v) => inst(&TermPattern::Variable(v.clone()), bnodes),
-            };
-            let o = inst(&tp.object, bnodes);
-            let (Some(s), Some(Term::NamedNode(p)), Some(o)) = (s, p, o) else {
-                return None;
-            };
-            let s = match s {
-                Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
-                Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
-                _ => return None,
-            };
-            Some(Triple::new(s, p, o))
-        };
-        for tp in template {
-            check()?;
-            if let Some(tr) = triple(tp, &mut bnodes) {
-                emit(tr, &mut out, &mut seen, quads.len())?;
+        construct_row(ctx, t, &map, i, template, graphs, &mut work, &mut |q| {
+            if q.graph_name == GraphName::DefaultGraph {
+                emit(
+                    Triple::new(q.subject, q.predicate, q.object),
+                    &mut out,
+                    &mut seen,
+                    quads.len(),
+                )?;
+            } else if !seen_quads.contains(&q) {
+                ctx.check_rows(out.len().saturating_add(quads.len()).saturating_add(1))?;
+                ctx.produced(1)?;
+                held.add(graph_quad_bytes(&q).saturating_mul(2).saturating_add(64))?;
+                seen_quads.insert(q.clone());
+                quads.push(q);
             }
-        }
-        for g in graphs {
-            check()?;
-            let name = match inst(&g.name, &mut bnodes) {
-                Some(Term::NamedNode(n))
-                    if n.as_str() == ctx::DEFAULT_GRAPH_IRI
-                        || n.as_str() == ctx::DEFAULT_GRAPH_NODE_IRI =>
-                {
-                    GraphName::DefaultGraph
-                }
-                Some(Term::NamedNode(n)) => GraphName::NamedNode(n),
-                Some(Term::BlankNode(b)) => GraphName::BlankNode(b),
-                _ => continue,
-            };
-            for tp in &g.triples {
-                check()?;
-                let Some(tr) = triple(tp, &mut bnodes) else {
-                    continue;
-                };
-                if name == GraphName::DefaultGraph {
-                    emit(tr, &mut out, &mut seen, quads.len())?;
-                } else {
-                    let bytes = graph_triple_bytes(&tr).saturating_add(match &name {
-                        GraphName::NamedNode(n) => 64 + n.as_str().len() as u64,
-                        GraphName::BlankNode(b) => 64 + b.as_str().len() as u64,
-                        GraphName::DefaultGraph => 0,
-                    });
-                    let q = tr.in_graph(name.clone());
-                    if !seen_quads.contains(&q) {
-                        ctx.check_rows(out.len().saturating_add(quads.len()).saturating_add(1))?;
-                        ctx.produced(1)?;
-                        held.add(bytes.saturating_mul(2).saturating_add(64))?;
-                        seen_quads.insert(q.clone());
-                        quads.push(q);
-                    }
-                }
-            }
-        }
+            Ok(())
+        })?;
     }
     ctx.check()?;
     Ok((out, quads))
 }
 
-/// Conservative retained term estimate for graph output, including RDF-star
-/// components and literal payloads. Terms already decoded here need no validation
-/// or additional clones just to estimate their memory.
-fn graph_triple_bytes(t: &Triple) -> u64 {
-    fn term(t: oxrdf::TermRef<'_>) -> u64 {
-        use oxrdf::TermRef;
-        let payload = match t {
-            TermRef::NamedNode(n) => n.as_str().len() as u64,
-            TermRef::BlankNode(b) => b.as_str().len() as u64,
-            TermRef::Literal(l) => (l.value().len() as u64)
-                .saturating_add(l.datatype().as_str().len() as u64)
-                .saturating_add(l.language().map_or(0, |s| s.len() as u64)),
-            TermRef::Triple(t) => graph_triple_bytes(t),
-        };
-        64u64.saturating_add(payload)
+/// The eager and pull graph APIs share template instantiation and per-solution
+/// blank-node identity. The emitter owns global deduplication and its budget.
+#[allow(clippy::too_many_arguments)]
+fn construct_row(
+    ctx: &Ctx,
+    t: &Table,
+    map: &[Option<usize>],
+    row: usize,
+    template: &[TriplePattern],
+    graphs: &[GraphTemplate],
+    work: &mut usize,
+    emit: &mut dyn FnMut(Quad) -> Result<()>,
+) -> Result<()> {
+    let mut check = || -> Result<()> {
+        *work = work.wrapping_add(1);
+        if *work & 1023 == 0 {
+            ctx.check()?;
+        }
+        Ok(())
+    };
+    check()?;
+    let mut bnodes: FxHashMap<String, BlankNode> = FxHashMap::default();
+    for tp in template {
+        check()?;
+        if let Some(triple) = template_triple(ctx, t, map, row, tp, &mut bnodes)? {
+            emit(triple.in_graph(GraphName::DefaultGraph))?;
+        }
     }
-    term(t.subject.as_ref().into())
-        .saturating_add(term(t.predicate.as_ref().into()))
-        .saturating_add(term(t.object.as_ref()))
+    for graph in graphs {
+        check()?;
+        let name = match template_term(ctx, t, map, row, &graph.name, &mut bnodes)? {
+            Some(Term::NamedNode(n))
+                if n.as_str() == ctx::DEFAULT_GRAPH_IRI
+                    || n.as_str() == ctx::DEFAULT_GRAPH_NODE_IRI =>
+            {
+                GraphName::DefaultGraph
+            }
+            Some(Term::NamedNode(n)) => GraphName::NamedNode(n),
+            Some(Term::BlankNode(b)) => GraphName::BlankNode(b),
+            _ => continue,
+        };
+        for tp in &graph.triples {
+            check()?;
+            if let Some(triple) = template_triple(ctx, t, map, row, tp, &mut bnodes)? {
+                emit(triple.in_graph(name.clone()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn template_term(
+    ctx: &Ctx,
+    t: &Table,
+    map: &[Option<usize>],
+    row: usize,
+    tp: &TermPattern,
+    bnodes: &mut FxHashMap<String, BlankNode>,
+) -> Result<Option<Term>> {
+    let mut failure = None;
+    let term = instantiate(
+        tp,
+        &mut |v| {
+            let c = map.get(ctx.var(v) as usize).copied().flatten()?;
+            let id = t.cols[c][row];
+            if id.is_undef() {
+                None
+            } else if ctx.is_cursor() {
+                match ctx.batch_term(id) {
+                    Ok(term) => term,
+                    Err(error) => {
+                        failure = Some(error);
+                        None
+                    }
+                }
+            } else {
+                ctx.term(id)
+            }
+        },
+        &mut |b| {
+            Term::BlankNode(
+                bnodes
+                    .entry(b.to_owned())
+                    .or_insert_with(|| crate::store::bnode_for(ctx.fresh_bnode()))
+                    .clone(),
+            )
+        },
+    );
+    if let Some(error) = failure {
+        Err(error)
+    } else {
+        Ok(term)
+    }
+}
+
+fn template_triple(
+    ctx: &Ctx,
+    t: &Table,
+    map: &[Option<usize>],
+    row: usize,
+    tp: &TriplePattern,
+    bnodes: &mut FxHashMap<String, BlankNode>,
+) -> Result<Option<Triple>> {
+    let s = template_term(ctx, t, map, row, &tp.subject, bnodes)?;
+    let p = match &tp.predicate {
+        NamedNodePattern::NamedNode(n) => Some(Term::NamedNode(n.clone())),
+        NamedNodePattern::Variable(v) => {
+            template_term(ctx, t, map, row, &TermPattern::Variable(v.clone()), bnodes)?
+        }
+    };
+    let o = template_term(ctx, t, map, row, &tp.object, bnodes)?;
+    let (Some(s), Some(Term::NamedNode(p)), Some(o)) = (s, p, o) else {
+        return Ok(None);
+    };
+    let subject = match s {
+        Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
+        Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
+        _ => return Ok(None),
+    };
+    Ok(Some(Triple::new(subject, p, o)))
+}
+
+fn graph_quad_bytes(q: &Quad) -> u64 {
+    graph_term_bytes(q.subject.as_ref().into())
+        .saturating_add(graph_term_bytes(q.predicate.as_ref().into()))
+        .saturating_add(graph_term_bytes(q.object.as_ref()))
+        .saturating_add(match &q.graph_name {
+            GraphName::NamedNode(n) => 64 + n.as_str().len() as u64,
+            GraphName::BlankNode(b) => 64 + b.as_str().len() as u64,
+            GraphName::DefaultGraph => 0,
+        })
+}
+
+/// Conservative retained term estimate, using borrowed terms without cloning.
+fn graph_term_bytes(t: oxrdf::TermRef<'_>) -> u64 {
+    use oxrdf::TermRef;
+    let payload = match t {
+        TermRef::NamedNode(n) => n.as_str().len() as u64,
+        TermRef::BlankNode(b) => b.as_str().len() as u64,
+        TermRef::Literal(l) => (l.value().len() as u64)
+            .saturating_add(l.datatype().as_str().len() as u64)
+            .saturating_add(l.language().map_or(0, |s| s.len() as u64)),
+        TermRef::Triple(t) => graph_triple_bytes(t),
+    };
+    64u64.saturating_add(payload)
+}
+fn graph_triple_bytes(t: &Triple) -> u64 {
+    graph_term_bytes(t.subject.as_ref().into())
+        .saturating_add(graph_term_bytes(t.predicate.as_ref().into()))
+        .saturating_add(graph_term_bytes(t.object.as_ref()))
 }
 
 #[cfg(test)]
