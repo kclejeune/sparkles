@@ -1,6 +1,6 @@
 # P06: Library administration API and parity
 
-> **Status:** Phases 1, 2 and 3 implemented.
+> **Status:** implemented (Phases 1, 2 and 3)
 >
 > **Phases:** The `sparkles` facade exposes `Dataset`, its administration handles and
 > `Catalog`. The server uses the catalog for dataset registration and reservations,

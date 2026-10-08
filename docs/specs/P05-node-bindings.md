@@ -1,6 +1,6 @@
 # P05: Node.js and TypeScript bindings
 
-> **Status:** implemented with documented deferrals
+> **Status:** implemented in part (Phases 1 and 2)
 >
 > **Phases:** The embedded engine, shared RDF/JS model and remote client are built.
 > Phase 2 adds administration, bounded RDF streams, RDF/JS Source/Store adapters,
