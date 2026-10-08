@@ -13,9 +13,6 @@
 >
 > **User docs:** [Usage: JVM](../USAGE.md#jvm-apache-jena) ·
 > [Features](../FEATURES.md#known-gaps) · [Development](../DEVELOPMENT.md#jvm-bindings)
->
-> This is the design as written before implementation. The [Outcome](#outcome) section
-> at the end records how it landed.
 
 This spec draws on the Sparkles code, Apache Jena's source (Apache-2.0, the 6.3.0-SNAPSHOT
 checkout and the release notes of 5.0 to 6.2), the UniFFI user guide and its Kotlin
@@ -1564,7 +1561,14 @@ engine and Jena contract surface includes:
 
 The SDK's writer ownership checks cover aliases, branches and long captures. Dataset,
 query, sink, historical view, repository and reservation handles have explicit close
-semantics. Bounded child-JVM tests check capture misuse without allowing a native
+semantics. Live handles on one native dataset share each thread's transaction, but a
+historical view from `at()` keeps a transaction of its own, so a read transaction on the
+view does not change what the live dataset reads or writes on that thread. When another
+thread closes the dataset, its open write transactions are aborted, and a later `commit()`,
+`add()` or buffered flush on them throws rather than succeeding silently.
+`DatasetGraphSparkles.applyPatch` applies an RDF Patch in one commit and returns a
+`PatchReport`, and the parity test checks that every concrete JVM and Node name in
+`crates/sparkles/bindings.toml` is declared in the binding's sources. Bounded child-JVM tests check capture misuse without allowing a native
 writer wait to hang the suite. Native default and feature-disabled builds are linted.
 
 The administration helper surface also includes direct index iterators/diagnostics,

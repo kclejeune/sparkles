@@ -10,9 +10,6 @@
 >
 > **User docs:** [engine](../../js/engine/README.md),
 > [client](../../js/client/README.md), [common](../../js/common/README.md).
->
-> This is the design as written before implementation. The [Outcome](#outcome) section
-> at the end will record how it lands.
 
 This spec's sources are the Sparkles code, the Python bindings of
 [P01](P01-python-bindings.md), the Rust client of [P02](P02-rust-client.md), the OpenAPI
@@ -512,7 +509,9 @@ the result comes back to the JavaScript thread through napi-rs's completion call
 waits for a writer. The addon limits how many run at a time with a semaphore, so that a
 burst of requests does not create hundreds of threads. The limit defaults to the number
 of available cores and is set with `configure({ maxConcurrentQueries })`. Queries beyond
-it wait in a queue without holding a thread. The engine's own parallel operators use
+it wait in a queue without holding a thread. A streaming result takes a permit only while
+it opens and while it computes a batch, and gives it back between pulls. An idle cursor
+therefore keeps its snapshot but never blocks other queries. The engine's own parallel operators use
 rayon's global pool, which is shared by all queries, as in the server.
 
 ### 5.2 Streams and backpressure
@@ -540,7 +539,8 @@ bounded.
 ThreadsafeFunctions are used only where Rust calls JavaScript on its own schedule. These
 are the `onProgress` callback of loads, compaction and index builds, and, in Phase 2, the
 change feed's notifications. Each uses a bounded queue and drops intermediate progress
-events when JavaScript falls behind, since only the latest matters.
+events when JavaScript falls behind, since only the latest matters. The `onProgress`
+callbacks are deferred, as the Outcome records.
 
 ### 5.3 Cancellation
 
@@ -1273,3 +1273,24 @@ captures; controls unsupported by retention are rejected before mutation. The ne
 Rust branch-relink operation remains an explicit binding follow-up. The optional
 browser/Wasm engine and UI transport migration remain deferred.
 The comparative performance harness and publication gate also remain follow-up work.
+
+`configure({ maxConcurrentQueries })` sets the number of queries that may run at once,
+and queries already running keep the permits of the old limit until they finish. A
+streaming result holds a reader permit only while it opens and while it computes a batch,
+and a `queryToStream` producer gives its permit back while it waits for the reader. An
+open cursor keeps its snapshot until it is drained, closed or collected, so callers that
+stop reading early should call `close()` or use `await using`. The result iterator asks
+for the next batch once half of the current batch has been consumed. Dumps and
+`queryToStream` serialize on Tokio's blocking pool. `catalog.reserve()` returns a promise,
+because a claim can touch the catalog's files. A panic inside the addon reaches
+JavaScript as an `InternalError` rather than as invalid input.
+
+The remote client sends its configured credentials only to the server's origin and to
+the origins of a plain endpoint's update and Graph Store URLs. An absolute URL from a
+server response, such as a page's `next` link, does not receive them. Dataset names `.`
+and `..` are rejected, because they would normalize onto another path. The real-server
+client test runs in `mise run node:test` and in the Linux x64 job of the Node workflow.
+
+The `onProgress` callbacks of §5.2 are deferred. Loads have no progress hook in the
+engine, so they need engine work before a ThreadsafeFunction can report anything, and
+compaction alone did not justify a separate callback path in the binding.
