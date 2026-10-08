@@ -62,7 +62,15 @@ public class DatasetGraphSparkles internal constructor(
         handle.checkOpen()
     }
 
-    internal fun txn(): TxnState? = handle.txns.get()
+    /**
+     * Where this dataset keeps each thread's transaction. Live datasets on one native handle
+     * share the handle's slot, so that every alias sees the thread's transaction. A pinned
+     * historical view has a slot of its own, because its read transaction is on another
+     * snapshot and must not change what the live dataset reads or writes.
+     */
+    private val txns: ThreadLocal<TxnState?> = if (pinned == null) handle.txns else ThreadLocal()
+
+    internal fun txn(): TxnState? = txns.get()
 
     /** What reads run on for this thread: its transaction, or the head snapshot. */
     internal fun source(): Source {
@@ -248,7 +256,7 @@ public class DatasetGraphSparkles internal constructor(
             t.read = r
             if (type != TxnType.READ) t.baseSeq = r.commitSeq().toLong()
         }
-        handle.txns.set(t)
+        txns.set(t)
     }
 
     override fun begin(readWrite: ReadWrite): Unit = begin(TxnType.convert(readWrite))
@@ -281,6 +289,7 @@ public class DatasetGraphSparkles internal constructor(
     override fun commit() {
         val t = txn() ?: throw JenaTransactionException("Not in an active transaction")
         try {
+            t.checkNotAbortedByClose()
             val w = t.write
             if (w != null) {
                 t.flush()
@@ -319,7 +328,7 @@ public class DatasetGraphSparkles internal constructor(
 
     private fun finish(t: TxnState) {
         t.release()
-        handle.txns.remove()
+        txns.remove()
     }
 
     override fun transactionMode(): ReadWrite? = txn()?.mode
@@ -491,6 +500,7 @@ public class DatasetGraphSparkles internal constructor(
     override fun close() {
         if (closed) return
         handle.closeSinksFor(this)
+        if (pinned != null) txns.get()?.let { finish(it) }
         pinned?.close()
         closed = true
         Registry.release(handle)

@@ -89,6 +89,7 @@ internal class Handle(val key: String?, val ffi: FfiDataset, val options: Sparkl
         for (sink in sinks.values.toList()) sink.close()
         sinks.clear()
         for (t in openWrites.toList()) {
+            t.abortedByClose = true
             try {
                 t.write?.abort()
             } catch (_: RuntimeException) {
@@ -104,9 +105,26 @@ internal class Handle(val key: String?, val ffi: FfiDataset, val options: Sparkl
 
 /** The transaction of one thread. */
 internal class TxnState(val handle: Handle, val type: TxnType) {
+    @Volatile
     var mode: ReadWrite = if (type == TxnType.WRITE) ReadWrite.WRITE else ReadWrite.READ
+
+    @Volatile
     var read: FfiReadTxn? = null
+
+    // Volatile because Handle.shutdown on another thread clears it when the dataset closes.
+    @Volatile
     var write: FfiWriteTxn? = null
+
+    /** True once another thread closed the dataset and aborted this write transaction. */
+    @Volatile
+    var abortedByClose = false
+
+    /** Throw if closing the dataset aborted this transaction, so that its writes are not lost silently. */
+    fun checkNotAbortedByClose() {
+        if (abortedByClose || (mode == ReadWrite.WRITE && write == null)) {
+            throw JenaTransactionException("the write transaction was aborted because the dataset was closed")
+        }
+    }
 
     /** The commit the transaction started from (for promotion). */
     var baseSeq: Long = 0
@@ -136,6 +154,7 @@ internal class TxnState(val handle: Handle, val type: TxnType) {
         val bytes = writer.buf.toByteArray()
         writer.reset()
         ops = 0
+        checkNotAbortedByClose()
         val w = write ?: return
         ffi { w.apply(bytes) }
     }
