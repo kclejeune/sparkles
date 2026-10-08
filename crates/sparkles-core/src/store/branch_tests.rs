@@ -1295,6 +1295,64 @@ fn relink_crash_boundaries_recover_the_same_state_and_pins() {
     }
 }
 
+/// A relink that crashed after recording its hold on main's generation, and before
+/// the branch's `CURRENT` named the relinked generation, leaves a hold that nothing
+/// needs. Main's open releases it even when the branch is never opened again, and
+/// main's next compaction can then collect that generation.
+#[test]
+fn main_open_releases_the_hold_of_an_unpublished_relink() {
+    let (dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    let dev = s.branch("dev").unwrap();
+    apply(&dev, "+<urn:dev> <urn:p> <urn:x> .");
+    apply(&s, "+<urn:later> <urn:p> <urn:x> .");
+    s.compact().unwrap();
+    let shared = s.snapshot().generation.name.clone();
+    let number = commit::generation_number(&shared);
+    let held = |s: &Store| {
+        let set = s.owned_set().unwrap();
+        set.holds_on(s.dataset_id())
+            .0
+            .iter()
+            .any(|(no, _)| *no == number)
+    };
+    // The image of the files at the crash point. An in-process failure releases the
+    // hold as it unwinds, so only a crash leaves it behind.
+    let image = dir.path().join("crash");
+    let (from, to) = (dir.path().join("ds"), image.clone());
+    dev.set_failpoint(
+        "relink-held",
+        Some(Arc::new(move |_| {
+            super::compaction_tests::copy_dir(&from, &to)
+        })),
+    );
+    s.relink_branch("dev", &Default::default()).unwrap();
+    drop(dev);
+    drop(s);
+    let held_on_disk = || {
+        let t: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(image.join(BRANCHES_FILE)).unwrap()).unwrap();
+        t["branches"].as_array().unwrap().iter().any(|e| {
+            e["holds"]
+                .as_array()
+                .is_some_and(|h| h.iter().any(|h| h["generation"] == shared.as_str()))
+        })
+    };
+    assert!(held_on_disk(), "the hold precedes the branch's CURRENT");
+    let s = Store::open(&image, StoreOptions::default()).unwrap();
+    assert!(!held(&s), "main's open released the stale hold");
+    assert!(!held_on_disk(), "the release is durable");
+    apply(&s, "+<urn:after> <urn:p> <urn:x> .");
+    s.compact().unwrap();
+    assert!(
+        !image.join(&shared).exists(),
+        "nothing holds the generation of the unpublished relink"
+    );
+    // the branch still reads its own linked generation
+    let dev = s.branch("dev").unwrap();
+    assert!(has(&dev, "urn:dev") && !has(&dev, "urn:later"));
+}
+
 #[test]
 fn cancelled_relink_and_damaged_overlay_fail_closed() {
     let (dir, s) = setup();

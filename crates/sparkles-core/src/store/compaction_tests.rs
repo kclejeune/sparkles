@@ -114,7 +114,7 @@ fn churn_known(s: &Store, i: usize) {
     upd(s, &u);
 }
 
-fn copy_dir(from: &Path, to: &Path) {
+pub(super) fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {
         let e = e.unwrap();

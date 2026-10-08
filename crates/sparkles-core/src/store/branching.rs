@@ -503,6 +503,62 @@ pub struct BranchSet {
     me: Weak<BranchSet>,
 }
 
+/// The generation holds that the generations of the branch rooted at `root` need: the
+/// segments of the links of its current generation and of the older ones still on
+/// disk. A generation numbered past `CURRENT` was never published, so its link holds
+/// nothing. `None` when anything cannot be read, so that no hold is released.
+fn link_holds_on_disk(root: &Path, id: uuid::Uuid) -> Option<Vec<GenHold>> {
+    let current = std::fs::read_to_string(root.join("CURRENT")).ok()?;
+    let current = commit::generation_number(current.trim());
+    let mut holds = Vec::new();
+    for (no, name, _, _) in crate::history::scan_generations(root, id).ok()? {
+        if no > current {
+            continue;
+        }
+        let Some(file) = link::read_link(&root.join(name)).ok()? else {
+            continue;
+        };
+        for segment in file.segments {
+            let hold = GenHold {
+                branch_id: segment.branch_id,
+                generation: segment.generation,
+            };
+            if !holds.contains(&hold) {
+                holds.push(hold);
+            }
+        }
+    }
+    Some(holds)
+}
+
+/// Drop the holds of listed and retired branches that none of their generations on
+/// disk need. A relink that crashed after recording its hold on the upstream's
+/// generation, and before its branch's `CURRENT` named the relinked generation,
+/// leaves such a hold, and the branch may never be opened again to release it.
+/// Holds are only ever removed here. Returns whether any changed.
+fn release_stale_holds(dir: &Path, table: &mut TableFile, broken: &HashSet<uuid::Uuid>) -> bool {
+    let mut changed = false;
+    for e in table.branches.iter_mut().chain(table.retired.iter_mut()) {
+        if e.holds.is_empty() || broken.contains(&e.id) {
+            continue;
+        }
+        let Some(needed) = link_holds_on_disk(&dir.join(e.id.to_string()), e.id) else {
+            continue;
+        };
+        let before = e.holds.len();
+        e.holds.retain(|h| needed.contains(h));
+        if e.holds.len() != before {
+            tracing::info!(target: "sparkles::store::branching",
+                branch = e.name,
+                released = before - e.holds.len(),
+                "released upstream generation holds that no generation of the branch needs"
+            );
+            changed = true;
+        }
+    }
+    changed
+}
+
 impl BranchSet {
     pub(crate) fn memory(
         dataset_id: uuid::Uuid,
@@ -607,6 +663,9 @@ impl BranchSet {
                     e.name
                 );
             }
+        }
+        if release_stale_holds(&dir, &mut table, &broken) {
+            write_table(root, &table)?;
         }
         Ok(Arc::new_cyclic(|me| BranchSet {
             memory: false,
