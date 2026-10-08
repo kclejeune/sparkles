@@ -103,11 +103,20 @@ struct RegistryEntry {
     reasoning: Option<crate::reasoning::ReasoningRecord>,
 }
 
+/// What `config.json` keeps for a persistent dataset whose store is closed while the
+/// catalog works on its directory, so that saves made meanwhile keep it registered.
+struct Detached {
+    reasoning: Option<crate::reasoning::ReasoningRecord>,
+}
+
 pub(crate) struct Inner {
     dir: Option<PathBuf>,
     options: RwLock<CatalogOptions>,
     entries: RwLock<BTreeMap<String, Entry>>,
     reservations: Mutex<BTreeMap<String, (ReservationKind, String)>>,
+    /// Persistent datasets taken out of `entries` for an in-place restore, or left
+    /// closed by a rename whose rollback could not reopen them.
+    detached: Mutex<BTreeMap<String, Detached>>,
     manage: Mutex<()>,
     #[cfg(feature = "backup")]
     pub(crate) repositories: Mutex<Option<crate::backup::Repositories>>,
@@ -157,7 +166,8 @@ impl Catalog {
         restore::recover(&dir).map_err(component)?;
         for e in std::fs::read_dir(dir.join("databases"))? {
             let e = e?;
-            if e.file_name().to_string_lossy().starts_with(".clone-") {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".clone-") || name.starts_with(TRASH_PREFIX) {
                 std::fs::remove_dir_all(e.path())?;
             }
         }
@@ -167,6 +177,7 @@ impl Catalog {
                 options: RwLock::new(options),
                 entries: RwLock::new(BTreeMap::new()),
                 reservations: Mutex::new(BTreeMap::new()),
+                detached: Mutex::new(BTreeMap::new()),
                 manage: Mutex::new(()),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
@@ -205,6 +216,7 @@ impl Catalog {
                 options: RwLock::new(options),
                 entries: RwLock::new(BTreeMap::new()),
                 reservations: Mutex::new(BTreeMap::new()),
+                detached: Mutex::new(BTreeMap::new()),
                 manage: Mutex::new(()),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
@@ -212,7 +224,8 @@ impl Catalog {
             }),
         }
     }
-    #[doc(hidden)]
+    /// Replace the options that datasets created or attached from now on open with.
+    /// Datasets that are already open keep their options.
     pub fn set_defaults(&self, dataset: DatasetOptions) {
         self.inner.options.write().dataset = dataset;
     }
@@ -221,36 +234,40 @@ impl Catalog {
     }
 
     /// Read the atomically replaced registry without opening stores or taking locks.
-    /// In-memory entries have no persisted identity, and report the nil UUID.
+    /// In-memory entries have no persisted identity, and report the nil UUID. A running
+    /// catalog may be renaming or restoring a persistent dataset, so its directory can
+    /// be missing for a moment. Such a dataset is left out of the listing.
     pub fn inspect(dir: impl AsRef<Path>) -> Result<Vec<DatasetInfo>> {
         let dir = dir.as_ref();
-        read_registry(dir)?
-            .datasets
-            .into_iter()
-            .map(|e| {
-                check_name(&e.name)?;
-                let path = (e.kind == DatasetKind::Persistent)
-                    .then(|| dir.join("databases").join(&e.name));
-                let id = match &path {
-                    Some(p) => {
-                        let file: serde_json::Value =
-                            serde_json::from_slice(&std::fs::read(p.join("dataset.json"))?)
-                                .map_err(|e| Error::Corrupt(e.to_string()))?;
-                        serde_json::from_value(file["id"].clone())
-                            .map_err(|e| Error::Corrupt(e.to_string()))?
-                    }
-                    None => Uuid::nil(),
-                };
-                Ok(DatasetInfo {
-                    name: e.name,
-                    id,
-                    kind: e.kind,
-                    path,
-                    attached: false,
-                    reserved_by: None,
-                })
-            })
-            .collect()
+        let mut out = Vec::new();
+        for e in read_registry(dir)?.datasets {
+            check_name(&e.name)?;
+            let path =
+                (e.kind == DatasetKind::Persistent).then(|| dir.join("databases").join(&e.name));
+            let id = match &path {
+                Some(p) => {
+                    let bytes = match std::fs::read(p.join("dataset.json")) {
+                        Ok(bytes) => bytes,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                    let file: serde_json::Value = serde_json::from_slice(&bytes)
+                        .map_err(|e| Error::Corrupt(e.to_string()))?;
+                    serde_json::from_value(file["id"].clone())
+                        .map_err(|e| Error::Corrupt(e.to_string()))?
+                }
+                None => Uuid::nil(),
+            };
+            out.push(DatasetInfo {
+                name: e.name,
+                id,
+                kind: e.kind,
+                path,
+                attached: false,
+                reserved_by: None,
+            });
+        }
+        Ok(out)
     }
     pub fn list(&self) -> Vec<DatasetInfo> {
         let r = self.inner.reservations.lock();
@@ -288,7 +305,9 @@ impl Catalog {
             .get(name)
             .map(|e| e.dataset.clone())
     }
-    #[doc(hidden)]
+    /// Look up a dataset for a request that must not reach a dataset being restored.
+    /// The reservation check and the lookup happen under one lock, so a restore cannot
+    /// start between them. The error is the holder of the restore reservation.
     pub fn get_for_request(&self, name: &str) -> std::result::Result<Option<Dataset>, String> {
         let r = self.inner.reservations.lock();
         if let Some((ReservationKind::Restore, h)) = r.get(name) {
@@ -340,6 +359,11 @@ impl Catalog {
                     ReservationKind::Clone => "created",
                     ReservationKind::Restore => "restored",
                 }
+            )));
+        }
+        if self.inner.detached.lock().contains_key(name) {
+            return Err(Error::Conflict(format!(
+                "dataset /{name} is registered but closed; reopen the catalog to recover it"
             )));
         }
         if check_directory && self.dir().is_some() && self.database_dir(name)?.exists() {
@@ -396,26 +420,59 @@ impl Catalog {
         );
         Ok(ds)
     }
+    /// Unregister a dataset and remove the directory of a managed persistent one.
+    /// Like [`rename`](Self::rename), it refuses while a managed persistent dataset has
+    /// live handles, including branch handles, so that no old handle can write into a
+    /// dataset later created under the same name. The directory is renamed aside while
+    /// the registry is locked and removed after the lock is released, so deleting a
+    /// large dataset does not hold up other catalog operations.
     pub fn delete(&self, name: &str) -> Result<bool> {
-        let _g = self.inner.manage.lock();
-        if let Some(holder) = self.reserved_by(name) {
-            return Err(Error::Conflict(format!(
-                "dataset /{name} is reserved by task {holder}"
-            )));
-        }
-        let Some(entry) = self.inner.entries.write().remove(name) else {
-            return Ok(false);
-        };
-        if let Err(e) = self.save_locked() {
-            self.inner.entries.write().insert(name.into(), entry);
-            return Err(e);
-        }
-        if entry.kind == DatasetKind::Persistent && !entry.attached {
-            let root = entry.dataset.store().root().map(Path::to_path_buf);
-            drop(entry);
-            if let Some(root) = root {
-                std::fs::remove_dir_all(root)?;
+        let trash = {
+            let _g = self.inner.manage.lock();
+            if let Some(holder) = self.reserved_by(name) {
+                return Err(Error::Conflict(format!(
+                    "dataset /{name} is reserved by task {holder}"
+                )));
             }
+            let entry = {
+                let mut map = self.inner.entries.write();
+                let Some(entry) = map.get(name) else {
+                    return Ok(false);
+                };
+                if entry.kind == DatasetKind::Persistent
+                    && !entry.attached
+                    && entry.dataset.in_use()
+                {
+                    return Err(Error::Conflict(format!(
+                        "dataset /{name} still has live handles"
+                    )));
+                }
+                map.remove(name).expect("checked")
+            };
+            if let Err(e) = self.save_locked() {
+                self.inner.entries.write().insert(name.into(), entry);
+                return Err(e);
+            }
+            if entry.kind == DatasetKind::Persistent && !entry.attached {
+                let root = entry.dataset.store().root().map(Path::to_path_buf);
+                // The handle was the last one, so dropping it closes the store.
+                drop(entry);
+                match root {
+                    Some(root) => Some(move_to_trash(&root)?),
+                    None => None,
+                }
+            } else {
+                None
+            }
+        };
+        delete_hook();
+        if let Some(trash) = trash
+            && let Err(e) = std::fs::remove_dir_all(&trash)
+        {
+            tracing::warn!(
+                "removing {}: {e} (the next open of the catalog removes it)",
+                trash.display()
+            );
         }
         Ok(true)
     }
@@ -427,30 +484,23 @@ impl Catalog {
         if self.reserved_by(from).is_some() {
             return Err(Error::Conflict(format!("dataset /{from} is reserved")));
         }
-        let mut map = self.inner.entries.write();
-        let entry = map
-            .get(from)
-            .ok_or_else(|| Error::NotFound(format!("no dataset /{from}")))?;
-        if entry.attached {
-            return Err(Error::Conflict(
-                "an attached dataset cannot be renamed".into(),
-            ));
-        }
-        if entry.kind == DatasetKind::Persistent && entry.dataset.in_use() {
-            return Err(Error::Conflict(format!(
-                "dataset /{from} still has live handles"
-            )));
-        }
-        if entry.kind == DatasetKind::Persistent {
-            rename::prepare(
-                self.dir().expect("persistent catalog"),
-                from,
-                to,
-                entry.dataset.dataset_id(),
-            )?;
-        }
-        let mut entry = map.remove(from).expect("checked");
-        drop(map);
+        let mut entry = {
+            let mut map = self.inner.entries.write();
+            let entry = map
+                .get(from)
+                .ok_or_else(|| Error::NotFound(format!("no dataset /{from}")))?;
+            if entry.attached {
+                return Err(Error::Conflict(
+                    "an attached dataset cannot be renamed".into(),
+                ));
+            }
+            if entry.kind == DatasetKind::Persistent && entry.dataset.in_use() {
+                return Err(Error::Conflict(format!(
+                    "dataset /{from} still has live handles"
+                )));
+            }
+            map.remove(from).expect("checked")
+        };
         if entry.kind == DatasetKind::Memory {
             entry.dataset.alias = Some(Arc::from(to));
             self.inner.entries.write().insert(to.into(), entry);
@@ -460,36 +510,97 @@ impl Catalog {
                 self.inner.entries.write().insert(from.into(), entry);
                 return Err(e);
             }
-        } else {
-            let old = self.database_dir(from)?;
-            let new = self.database_dir(to)?;
-            drop(entry);
-            rename::crash_point(1)?;
-            let moved = std::fs::rename(&old, &new);
-            if moved.is_ok() {
-                rename::crash_point(2)?;
-            }
-            let result = moved.map_err(Error::from).and_then(|()| {
-                sync_dir(old.parent().expect("database parent"))?;
-                self.reattach_locked(to)?;
-                self.save_locked()
-            });
-            if let Err(e) = result {
-                self.inner.entries.write().remove(to);
-                let dir = self.dir().expect("persistent catalog");
-                rename::recover(dir)?;
-                let registered = read_registry(dir)?
-                    .datasets
-                    .into_iter()
-                    .find(|e| e.name == from || e.name == to)
-                    .ok_or_else(|| Error::Corrupt("renamed dataset is unregistered".into()))?;
-                self.reattach_locked(&registered.name)?;
-                return Err(e);
-            }
-            rename::crash_point(3)?;
-            rename::finish(self.dir().expect("persistent catalog"))?;
+            return Ok(self.get(to).expect("renamed"));
         }
+        let dir = self.dir().expect("persistent catalog");
+        let reasoning = entry.dataset.reasoning_record();
+        if let Err(e) = rename::prepare(dir, from, to, entry.dataset.dataset_id()) {
+            self.inner.entries.write().insert(from.into(), entry);
+            return Err(e);
+        }
+        let old = self.database_dir(from)?;
+        let new = self.database_dir(to)?;
+        // The handle was the last one, so dropping it closes the store.
+        drop(entry);
+        rename::crash_point(1)?;
+        let moved = std::fs::rename(&old, &new);
+        if moved.is_ok() {
+            rename::crash_point(2)?;
+        }
+        let result = moved.map_err(Error::from).and_then(|()| {
+            sync_dir(old.parent().expect("database parent"))?;
+            rename::fail_point(rename::FAIL_AFTER_MOVE)?;
+            // Publish the reopened store only once the registry names it.
+            let ds = self.open_dataset(to, DatasetKind::Persistent, None)?;
+            self.inner.detached.lock().insert(
+                to.into(),
+                Detached {
+                    reasoning: ds.reasoning_record(),
+                },
+            );
+            let saved = self.save_locked();
+            self.inner.detached.lock().remove(to);
+            saved?;
+            self.inner.entries.write().insert(
+                to.into(),
+                Entry {
+                    dataset: ds,
+                    kind: DatasetKind::Persistent,
+                    attached: false,
+                },
+            );
+            Ok(())
+        });
+        if let Err(e) = result {
+            return Err(self.roll_back_rename(from, to, reasoning, e));
+        }
+        rename::crash_point(3)?;
+        rename::finish(dir)?;
         Ok(self.get(to).expect("renamed"))
+    }
+    /// Put a failed persistent rename back as `config.json` records it. When the store
+    /// cannot be reopened, the dataset stays registered in `config.json`, later saves
+    /// keep it there, and the next [`Catalog::open`] recovers the directory.
+    fn roll_back_rename(
+        &self,
+        from: &str,
+        to: &str,
+        reasoning: Option<crate::reasoning::ReasoningRecord>,
+        err: Error,
+    ) -> Error {
+        let dir = self.dir().expect("persistent catalog");
+        let registered = read_registry(dir).ok().and_then(|r| {
+            r.datasets
+                .into_iter()
+                .find(|e| e.name == from || e.name == to)
+        });
+        let reopened = (|| {
+            rename::recover(dir)?;
+            let name = registered
+                .as_ref()
+                .map(|r| r.name.clone())
+                .ok_or_else(|| Error::Corrupt("renamed dataset is unregistered".into()))?;
+            rename::fail_point(rename::FAIL_ROLLBACK_REOPEN)?;
+            self.reattach_locked(&name)
+        })();
+        match reopened {
+            Ok(()) => err,
+            Err(again) => {
+                let (name, reasoning) = match registered {
+                    Some(r) => (r.name, r.reasoning),
+                    None => (from.to_string(), reasoning),
+                };
+                self.inner
+                    .detached
+                    .lock()
+                    .insert(name.clone(), Detached { reasoning });
+                Error::Corrupt(format!(
+                    "renaming /{from} to /{to} failed: {err}; reopening the dataset failed too: \
+                     {again}. config.json still registers it as /{name}, and opening the \
+                     catalog again recovers its directory"
+                ))
+            }
+        }
     }
     pub fn reserve(&self, name: &str, kind: ReservationKind, holder: &str) -> Result<Reservation> {
         let _g = self.inner.manage.lock();
@@ -540,8 +651,7 @@ impl Catalog {
         }
         Ok(())
     }
-    #[doc(hidden)]
-    pub fn adopt(&self, reservation: Reservation) -> Result<Dataset> {
+    pub(crate) fn adopt(&self, reservation: Reservation) -> Result<Dataset> {
         let _g = self.inner.manage.lock();
         self.check_reservation(&reservation)?;
         let name = reservation.name();
@@ -564,8 +674,7 @@ impl Catalog {
         }
         result
     }
-    #[doc(hidden)]
-    pub fn adopt_memory(
+    pub(crate) fn adopt_memory(
         &self,
         reservation: Reservation,
         store: Store,
@@ -689,47 +798,70 @@ impl Catalog {
         files.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(files)
     }
-    #[doc(hidden)]
+    /// Write `config.json` again, with each dataset's current reasoning record. The
+    /// catalog saves after its own changes. Programs that change a dataset's reasoning
+    /// record outside the catalog call this to persist it.
     pub fn save(&self) -> Result<()> {
         let _g = self.inner.manage.lock();
         self.save_locked()
     }
     fn save_locked(&self) -> Result<()> {
         let Some(dir) = self.dir() else { return Ok(()) };
-        let reg = Registry {
-            datasets: self
-                .inner
-                .entries
-                .read()
-                .iter()
-                .filter(|(_, e)| !e.attached)
-                .map(|(name, e)| RegistryEntry {
+        let mut datasets: Vec<RegistryEntry> = self
+            .inner
+            .entries
+            .read()
+            .iter()
+            .filter(|(_, e)| !e.attached)
+            .map(|(name, e)| RegistryEntry {
+                name: name.clone(),
+                kind: e.kind,
+                reasoning: e.dataset.reasoning_record(),
+            })
+            .collect();
+        // A dataset closed for a swap or after a failed rename is still registered.
+        for (name, d) in self.inner.detached.lock().iter() {
+            if !datasets.iter().any(|e| &e.name == name) {
+                datasets.push(RegistryEntry {
                     name: name.clone(),
-                    kind: e.kind,
-                    reasoning: e.dataset.reasoning_record(),
-                })
-                .collect(),
-        };
+                    kind: DatasetKind::Persistent,
+                    reasoning: d.reasoning.clone(),
+                });
+            }
+        }
+        datasets.sort_by(|a, b| a.name.cmp(&b.name));
+        let reg = Registry { datasets };
         write_file_atomic(
             &dir.join("config.json"),
             &serde_json::to_vec_pretty(&reg).map_err(|e| Error::invalid(e.to_string()))?,
         )
     }
-    #[doc(hidden)]
-    pub fn detach_for_swap(&self, name: &str) -> Option<Dataset> {
+    /// Take a managed persistent dataset out of the lookup map for an in-place
+    /// restore. It stays registered in what [`save`](Self::save) writes until it is
+    /// reinserted or reattached.
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    pub(crate) fn detach_for_swap(&self, name: &str) -> Option<Dataset> {
         let _g = self.inner.manage.lock();
         let mut map = self.inner.entries.write();
-        if map
+        if !map
             .get(name)
             .is_some_and(|e| e.kind == DatasetKind::Persistent && !e.attached)
         {
-            map.remove(name).map(|e| e.dataset)
-        } else {
-            None
+            return None;
         }
+        let ds = map.remove(name)?.dataset;
+        self.inner.detached.lock().insert(
+            name.into(),
+            Detached {
+                reasoning: ds.reasoning_record(),
+            },
+        );
+        Some(ds)
     }
-    #[doc(hidden)]
-    pub fn reinsert(&self, name: &str, ds: Dataset) {
+    /// Put back a dataset taken out by [`detach_for_swap`](Self::detach_for_swap).
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    pub(crate) fn reinsert(&self, name: &str, ds: Dataset) {
+        let _g = self.inner.manage.lock();
         self.inner.entries.write().insert(
             name.into(),
             Entry {
@@ -738,9 +870,10 @@ impl Catalog {
                 attached: false,
             },
         );
+        self.inner.detached.lock().remove(name);
     }
-    #[doc(hidden)]
-    pub fn reattach(&self, name: &str) -> Result<Dataset> {
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    pub(crate) fn reattach(&self, name: &str) -> Result<Dataset> {
         let _g = self.inner.manage.lock();
         self.reattach_locked(name)?;
         Ok(self.get(name).expect("reattached"))
@@ -758,6 +891,7 @@ impl Catalog {
                 attached: false,
             },
         );
+        self.inner.detached.lock().remove(name);
         Ok(())
     }
 }
@@ -795,8 +929,7 @@ fn read_registry(dir: &Path) -> Result<Registry> {
         Err(e) => Err(e.into()),
     }
 }
-#[doc(hidden)]
-pub fn lock_dir(dir: &Path) -> Result<File> {
+pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
     let path = dir.join("catalog.lock");
     let mut file = OpenOptions::new()
         .create(true)
@@ -822,6 +955,35 @@ pub fn lock_dir(dir: &Path) -> Result<File> {
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
+/// Prefix of a deleted dataset's directory while it is being removed.
+const TRASH_PREFIX: &str = ".deleted-";
+
+/// Rename a deleted dataset's directory aside, so that its name is free at once and
+/// removing its files needs no lock.
+fn move_to_trash(root: &Path) -> Result<PathBuf> {
+    let parent = root.parent().expect("database parent");
+    let trash = parent.join(format!("{TRASH_PREFIX}{}", Uuid::new_v4()));
+    std::fs::rename(root, &trash)?;
+    sync_dir(parent)?;
+    Ok(trash)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs after a delete released the registry lock, before it removes the files.
+    static DELETE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn delete_hook() {
+    #[cfg(test)]
+    DELETE_HOOK.with_borrow_mut(|h| {
+        if let Some(h) = h {
+            h()
+        }
+    });
+}
+
 pub(crate) fn component(e: anyhow::Error) -> Error {
     match e.downcast::<Error>() {
         Ok(e) => e,
@@ -848,4 +1010,75 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The delete releases the registry lock before it removes the files, so other
+    /// catalog operations go on while a large dataset is removed.
+    #[test]
+    fn a_delete_removes_the_files_without_the_registry_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(cat.create("big", &Default::default()).unwrap());
+        let other = cat.clone();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let inside = seen.clone();
+        let databases = dir.path().join("databases");
+        DELETE_HOOK.set(Some(Box::new(move || {
+            // would deadlock if the delete still held the registry lock
+            drop(other.create("big", &Default::default()).unwrap());
+            for e in std::fs::read_dir(&databases).unwrap() {
+                inside
+                    .borrow_mut()
+                    .push(e.unwrap().file_name().to_string_lossy().into_owned());
+            }
+        })));
+        let deleted = cat.delete("big");
+        DELETE_HOOK.set(None);
+        assert!(deleted.unwrap());
+        let mut seen = seen.borrow().clone();
+        seen.sort();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].starts_with(TRASH_PREFIX), "{seen:?}");
+        assert_eq!(seen[1], "big");
+        // the trash is gone, and the new dataset is intact
+        let left: Vec<_> = std::fs::read_dir(dir.path().join("databases"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["big"]);
+        assert!(cat.get("big").is_some());
+    }
+
+    #[test]
+    fn trash_left_by_a_crash_is_removed_when_the_catalog_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let trash = dir
+            .path()
+            .join("databases")
+            .join(format!("{TRASH_PREFIX}x"));
+        std::fs::create_dir_all(trash.join("gen-0001")).unwrap();
+        drop(Catalog::open(dir.path(), Default::default()).unwrap());
+        assert!(!trash.exists());
+    }
+
+    #[test]
+    fn inspect_skips_a_dataset_whose_directory_is_moving() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(cat.create("a", &Default::default()).unwrap());
+        drop(cat.create("b", &Default::default()).unwrap());
+        drop(cat);
+        let databases = dir.path().join("databases");
+        std::fs::rename(databases.join("a"), databases.join(".replaced-a-1")).unwrap();
+        let names: Vec<_> = Catalog::inspect(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names, ["b"]);
+    }
 }

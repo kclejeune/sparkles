@@ -33,6 +33,36 @@ fn registry_roundtrip_and_lock_free_inspection() {
 }
 
 #[test]
+fn delete_refuses_live_handles_so_a_new_dataset_is_never_written_by_an_old_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+    let old = cat.create("wiki", &CreateDataset::default()).unwrap();
+    old.update("INSERT DATA { <urn:old> <urn:p> 1 }").unwrap();
+    assert!(matches!(cat.delete("wiki"), Err(Error::Conflict(m)) if m.contains("live handles")));
+    old.create_branch("dev", &Default::default()).unwrap();
+    let branch = old.branch("dev").unwrap();
+    drop(old);
+    assert!(matches!(cat.delete("wiki"), Err(Error::Conflict(_))));
+    assert!(cat.get("wiki").is_some());
+    drop(branch);
+    assert!(cat.delete("wiki").unwrap());
+    let new = cat.create("wiki", &CreateDataset::default()).unwrap();
+    assert_eq!(new.len(), 0);
+    // in-memory datasets keep no files, so a live handle does not block their delete
+    let mem = cat
+        .create(
+            "mem",
+            &CreateDataset {
+                kind: DatasetKind::Memory,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(cat.delete("mem").unwrap());
+    drop(mem);
+}
+
+#[test]
 fn reservations_validate_names_and_release_on_drop() {
     let cat = Catalog::memory(Default::default());
     for name in ["", "../outside", ".hidden", "ui", "$", "wiki@dev", "x/y"] {
@@ -141,12 +171,17 @@ fn orphan_directories_and_foreign_reservations_are_refused() {
         cat.create("orphan", &Default::default()),
         Err(Error::Conflict(_))
     ));
+    let source = cat.create("source", &Default::default()).unwrap();
     let other = Catalog::memory(Default::default());
     let r = other
         .reserve("foreign", ReservationKind::Clone, "task")
         .unwrap();
-    assert!(cat.adopt(r).is_err());
+    assert!(
+        cat.clone_reserved("source", r, &CloneRequest::default(), &Default::default())
+            .is_err()
+    );
     assert!(cat.get("foreign").is_none());
+    drop(source);
 }
 
 #[test]

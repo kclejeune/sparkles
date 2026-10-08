@@ -201,10 +201,15 @@ pub(crate) fn replace_with(
 }
 
 /// Reopen the old dataset `name` after a failed swap and return `err` (with the reopen
-/// failure, if any).
+/// failure, if any). The registry is saved again with the reopened dataset's record.
 fn reopen_after(st: &Catalog, name: &str, err: BackupError) -> BackupError {
     match st.reattach(name) {
-        Ok(_) => err,
+        Ok(_) => {
+            if let Err(e) = st.save() {
+                tracing::warn!(target: "sparkles::backup", "saving the dataset registry: {e:#}");
+            }
+            err
+        }
         Err(e) => BackupError::internal(format!(
             "{err}; reopening the old /{name} failed too: {e:#}"
         )),
@@ -324,6 +329,39 @@ mod tests {
         assert_eq!(ds.store().snapshot().len(), 1);
         let db = dir.path().join("databases");
         assert!(!db.join(".replaced-ds-9").exists() && !tmp.exists());
+    }
+
+    fn registered(dir: &Path) -> Vec<String> {
+        super::super::read_registry(dir)
+            .unwrap()
+            .datasets
+            .into_iter()
+            .map(|e| e.name)
+            .collect()
+    }
+
+    /// A registry save while a dataset is detached for its swap, by a create, delete
+    /// or rename of another dataset, keeps the detached dataset registered.
+    #[test]
+    fn saves_during_the_drain_keep_the_swapped_dataset_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        let ds = st.create("ds", &CreateDataset::default()).unwrap();
+        update(&ds, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        let id = ds.store().dataset_id();
+        drop(ds);
+        let restoring = st.reserve("ds", ReservationKind::Restore, "1").unwrap();
+        let old = st.detach_for_swap("ds").unwrap();
+        st.create("other", &CreateDataset::default()).unwrap();
+        assert_eq!(registered(dir.path()), ["ds", "other"]);
+        st.rename("other", "renamed").unwrap();
+        assert!(st.delete("renamed").unwrap());
+        assert_eq!(registered(dir.path()), ["ds"]);
+        // a crash now still finds the dataset
+        drop((old, restoring));
+        drop(st);
+        let st = state(dir.path());
+        assert_eq!(st.get("ds").unwrap().store().dataset_id(), id);
     }
 
     /// A crash after the first rename: the next start puts the old copy back.

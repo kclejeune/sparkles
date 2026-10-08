@@ -101,6 +101,24 @@ pub(super) fn recover(dir: &Path) -> Result<()> {
 #[cfg(test)]
 thread_local! {
     static CRASH_AFTER: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static FAIL_AT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// A failure after the directory moved, which the rename rolls back.
+pub(super) const FAIL_AFTER_MOVE: u8 = 1;
+/// A failure to reopen the store while rolling back.
+pub(super) const FAIL_ROLLBACK_REOPEN: u8 = 2;
+
+/// Fail like an I/O error would at `_point` in tests. Unlike [`crash_point`], the
+/// rename handles the error as it handles a real one.
+pub(super) fn fail_point(_point: u8) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_AT.get() & (1 << _point) != 0 {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "injected failure {_point}"
+        ))));
+    }
+    Ok(())
 }
 
 pub(super) fn crash_point(_stage: u8) -> Result<()> {
@@ -160,6 +178,62 @@ mod tests {
                 id
             );
         }
+    }
+
+    fn renamed_fixture() -> (tempfile::TempDir, Catalog, Uuid) {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        let ds = cat.create("before", &Default::default()).unwrap();
+        ds.update("INSERT DATA { <urn:s> <urn:p> 1 }").unwrap();
+        let id = ds.dataset_id();
+        (dir, cat, id)
+    }
+
+    #[test]
+    fn a_failure_after_the_move_rolls_back_to_the_old_alias() {
+        let (dir, cat, id) = renamed_fixture();
+        FAIL_AT.set(1 << FAIL_AFTER_MOVE);
+        let e = cat.rename("before", "after");
+        FAIL_AT.set(0);
+        assert!(matches!(e, Err(Error::Io(_))), "{:?}", e.err());
+        let ds = cat.get("before").unwrap();
+        assert_eq!((ds.dataset_id(), ds.len()), (id, 1));
+        assert!(cat.get("after").is_none());
+        assert!(!dir.path().join("databases/after").exists());
+        assert!(!dir.path().join(INTENT).exists());
+        drop(ds);
+        // the rollback leaves a catalog that can rename again
+        assert_eq!(cat.rename("before", "after").unwrap().dataset_id(), id);
+    }
+
+    #[test]
+    fn a_rollback_that_cannot_reopen_keeps_the_dataset_registered() {
+        let (dir, cat, id) = renamed_fixture();
+        FAIL_AT.set(1 << FAIL_AFTER_MOVE | 1 << FAIL_ROLLBACK_REOPEN);
+        let e = cat.rename("before", "after");
+        FAIL_AT.set(0);
+        let Err(Error::Corrupt(m)) = e else {
+            panic!("{:?}", e.err())
+        };
+        assert!(m.contains("registers it as /before"), "{m}");
+        assert!(cat.get("before").is_none() && cat.get("after").is_none());
+        // the name stays taken, and later saves keep the registration
+        assert!(matches!(
+            cat.create("before", &Default::default()),
+            Err(Error::Conflict(_))
+        ));
+        cat.create("other", &Default::default()).unwrap();
+        let names: Vec<_> = read_registry(dir.path())
+            .unwrap()
+            .datasets
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["before", "other"]);
+        drop(cat);
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(cat.get("before").unwrap().dataset_id(), id);
+        assert_eq!(cat.get("before").unwrap().len(), 1);
     }
 
     #[test]
