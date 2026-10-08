@@ -628,7 +628,7 @@ fn parameters() -> Map<String, J> {
         q(
             "execution",
             json!({ "type": "string", "enum": ["eager", "streaming", "auto"], "default": "eager" }),
-            "Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Streaming SELECT Thrift is unsupported. Deadlines include blocked response writes; late failures abort the body.",
+            "Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body.",
         ),
     );
     put(

@@ -3151,6 +3151,15 @@ export interface components {
             /** @description `true` for full-text search with the defaults, or a `TextConfig`. */
             text?: boolean | Record<string, never>;
         };
+        CursorPlan: {
+            children: components["schemas"]["CursorPlan"][];
+            complete: boolean;
+            fullInputBeforeOutput: boolean;
+            growingState: boolean;
+            materializes: boolean;
+            operator: components["schemas"]["PlanNode"];
+            reason?: string | null;
+        };
         DatasetInfo: {
             access?: components["schemas"]["Level"];
             /** @description Fuseki's dataset path, such as `/ds`. */
@@ -4710,11 +4719,17 @@ export interface components {
                 commit?: number;
                 datasetId?: string;
                 memory?: Record<string, never>;
-                plan?: components["schemas"]["PlanNode"];
+                plan?: components["schemas"]["PlanNode"] | components["schemas"]["CursorPlan"];
                 rowsProduced?: number;
                 sentRows?: number;
+                /**
+                 * @description Native streaming completion; absent on eager results.
+                 * @enum {string}
+                 */
+                status?: "complete" | "stopped";
                 timing?: Record<string, never>;
-                totalRows?: number;
+                /** @description Null when streaming stopped before exhaustion. */
+                totalRows?: number | null;
             } & {
                 [key: string]: unknown;
             };
@@ -4914,7 +4929,7 @@ export interface components {
             /** @description The commit the index reflects. */
             seq: number;
             /** @enum {string} */
-            state: "ready" | "stale";
+            state: "ready" | "stale" | "rebuilding" | "failed";
             storeSeq: number;
         };
         TokenCreated: components["schemas"]["TokenInfo"] & {
@@ -5623,6 +5638,8 @@ export interface components {
         dryRunHeader: boolean;
         /** @description The dataset name. */
         ds: string;
+        /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+        execution: "eager" | "streaming" | "auto";
         /** @description The response format, in place of `Accept`. Fuseki's `output` and `results` are the same parameter. */
         format: string;
         /** @description The rest of the path, which may hold slashes. The graph is the one whose IRI is the request URL without its query. */
@@ -5665,7 +5682,7 @@ export interface components {
         reference: string;
         /** @description The backup repository. */
         repo: string;
-        /** @description The most rows serialized. `meta.totalRows` still reports the full count. */
+        /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
         send: number;
         /** @description Seconds. Capped at the server's `--max-timeout`. */
         timeout: number;
@@ -6404,7 +6421,7 @@ export interface operations {
         parameters: {
             query?: {
                 /** @description The codec. */
-                compression?: "gzip" | "zstd" | "brotli" | "lz4" | "none";
+                compression?: "gzip" | "xz" | "bzip2" | "zstd" | "brotli" | "lz4" | "none";
                 /** @description The codec's level. */
                 level?: number;
             };
@@ -10771,8 +10788,10 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
-                /** @description The most rows serialized. `meta.totalRows` still reports the full count. */
+                /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                execution?: components["parameters"]["execution"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -10818,6 +10837,7 @@ export interface operations {
             408: components["responses"]["Timeout"];
             410: components["responses"]["Gone"];
             413: components["responses"]["PayloadTooLarge"];
+            501: components["responses"]["NotImplemented"];
             503: components["responses"]["Unavailable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
@@ -10923,8 +10943,10 @@ export interface operations {
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
-                /** @description The most rows serialized. `meta.totalRows` still reports the full count. */
+                /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                execution?: components["parameters"]["execution"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -12358,8 +12380,10 @@ export interface operations {
                 nocache?: components["parameters"]["nocache"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
-                /** @description The most rows serialized. `meta.totalRows` still reports the full count. */
+                /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                execution?: components["parameters"]["execution"];
                 /** @description Run an older version. */
                 version?: number;
             };
@@ -12421,8 +12445,10 @@ export interface operations {
                 nocache?: components["parameters"]["nocache"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
-                /** @description The most rows serialized. `meta.totalRows` still reports the full count. */
+                /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                execution?: components["parameters"]["execution"];
                 /** @description Run an older version. */
                 version?: number;
             };
@@ -12500,8 +12526,10 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
-                /** @description The most rows serialized. `meta.totalRows` still reports the full count. */
+                /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                execution?: components["parameters"]["execution"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -12542,6 +12570,7 @@ export interface operations {
             408: components["responses"]["Timeout"];
             410: components["responses"]["Gone"];
             413: components["responses"]["PayloadTooLarge"];
+            501: components["responses"]["NotImplemented"];
             503: components["responses"]["Unavailable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
@@ -12564,8 +12593,10 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
-                /** @description The most rows serialized. `meta.totalRows` still reports the full count. */
+                /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                execution?: components["parameters"]["execution"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -12606,6 +12637,7 @@ export interface operations {
             408: components["responses"]["Timeout"];
             410: components["responses"]["Gone"];
             413: components["responses"]["PayloadTooLarge"];
+            501: components["responses"]["NotImplemented"];
             503: components["responses"]["Unavailable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
@@ -12749,8 +12781,10 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
-                /** @description The most rows serialized. `meta.totalRows` still reports the full count. */
+                /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                execution?: components["parameters"]["execution"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -12791,6 +12825,7 @@ export interface operations {
             408: components["responses"]["Timeout"];
             410: components["responses"]["Gone"];
             413: components["responses"]["PayloadTooLarge"];
+            501: components["responses"]["NotImplemented"];
             503: components["responses"]["Unavailable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
@@ -12813,8 +12848,10 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
-                /** @description The most rows serialized. `meta.totalRows` still reports the full count. */
+                /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                execution?: components["parameters"]["execution"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -12855,6 +12892,7 @@ export interface operations {
             408: components["responses"]["Timeout"];
             410: components["responses"]["Gone"];
             413: components["responses"]["PayloadTooLarge"];
+            501: components["responses"]["NotImplemented"];
             503: components["responses"]["Unavailable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
