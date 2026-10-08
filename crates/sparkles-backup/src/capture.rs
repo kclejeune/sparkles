@@ -179,7 +179,7 @@ mod tests {
         }
         // the directory stays locked while the source lives
         let e = Store::open(&dir, StoreOptions::default()).err().unwrap();
-        assert!(e.to_string().contains("in use"), "{e}");
+        assert!(matches!(e, sparkles_core::Error::Locked { .. }), "{e}");
         drop(src);
         Store::open(&dir, StoreOptions::default()).unwrap();
     }
@@ -198,7 +198,7 @@ mod tests {
         db(&dir);
         let _open = Store::open(&dir, StoreOptions::default()).unwrap();
         let e = Source::from_closed_dir(&dir).unwrap_err();
-        assert_eq!(e.code(), Code::InvalidRequest);
+        assert_eq!(e.code(), Code::DatasetBusy);
     }
 
     #[test]

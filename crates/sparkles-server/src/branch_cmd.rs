@@ -232,7 +232,7 @@ pub fn run_branch(cmd: BranchCmd, opts: StoreOptions) -> Result<()> {
                 Some(loc) => match Store::open(loc, opts) {
                     Ok(s) => s.branches()?.iter().map(branch_json).collect(),
                     // held by a server: read the files
-                    Err(e) if e.to_string().contains("in use") => offline_list(loc)?,
+                    Err(sparkles::Error::Locked { .. }) => offline_list(loc)?,
                     Err(e) => return Err(e.into()),
                 },
                 None => {

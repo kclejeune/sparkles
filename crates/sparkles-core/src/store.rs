@@ -6640,7 +6640,7 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         let err = Store::open(dir.path(), StoreOptions::default())
             .err()
             .unwrap();
-        assert!(err.to_string().contains("in use"), "{err}");
+        assert!(matches!(err, Error::Locked { .. }), "{err}");
         drop(a);
         Store::open(dir.path(), StoreOptions::default()).unwrap();
     }
