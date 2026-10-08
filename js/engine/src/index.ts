@@ -41,16 +41,47 @@ import {
 } from '@sparkles-rdf/common';
 export * from '@sparkles-rdf/common';
 
-import { native } from './native.js';
+import {
+  native,
+  type NativeByteStream,
+  type NativeCancellation,
+  type NativeCatalog,
+  type NativeDataset,
+  type NativeRepository,
+  type NativeReservationHandle,
+  type NativeResult,
+  type NativeTransaction,
+} from './native.js';
 const transactionContext = new AsyncLocalStorage<ReadonlySet<string>>();
 const defaults = { batchSize: 1024, batchBytes: 1 << 20 };
-export function configure(options: { batchSize?: number; batchBytes?: number }) {
-  for (const key of ['batchSize', 'batchBytes'] as const)
-    if (options[key] !== undefined) {
-      if (!Number.isSafeInteger(options[key]) || options[key]! <= 0)
-        throw new InvalidInputError(`${key} must be positive`);
-      defaults[key] = options[key]!;
+export interface EngineConfiguration {
+  /** rows per streaming batch (default 1024) */
+  batchSize?: number;
+  /** bytes per streaming batch (default 1 MiB) */
+  batchBytes?: number;
+  /**
+   * queries that may run at once in this process (default: the number of cores). Queries
+   * already running keep their permits until they finish.
+   */
+  maxConcurrentQueries?: number;
+}
+export function configure(options: EngineConfiguration) {
+  for (const key of ['batchSize', 'batchBytes', 'maxConcurrentQueries'] as const) {
+    const value = options[key];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0))
+      throw new InvalidInputError(`${key} must be a positive integer`);
+  }
+  if (options.maxConcurrentQueries !== undefined) {
+    if (options.maxConcurrentQueries > 0xffff_ffff)
+      throw new InvalidInputError('maxConcurrentQueries is too large');
+    try {
+      native.setMaxConcurrentQueries(options.maxConcurrentQueries);
+    } catch (e) {
+      throw nativeError(e);
     }
+  }
+  for (const key of ['batchSize', 'batchBytes'] as const)
+    if (options[key] !== undefined) defaults[key] = options[key]!;
 }
 export interface DatasetOptions {
   readOnly?: boolean;
@@ -120,13 +151,18 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
   readonly timing: unknown;
   readonly plan: unknown;
   private batch: T[] = [];
+  /** the size of the batch being consumed, for the prefetch threshold */
+  private batchLength = 0;
+  /** the next batch, requested once half of the current one has been consumed */
+  private prefetched?: Promise<T[] | null>;
+  private exhausted = false;
   private closed = false;
   private queue: Promise<unknown> = Promise.resolve();
   private abort = () => {
     void this.close();
   };
   constructor(
-    private handle: any,
+    private handle: NativeResult,
     private options: QueryOptions,
     private onClose: () => void = () => {},
   ) {
@@ -142,42 +178,61 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
   [Symbol.asyncIterator]() {
     return this;
   }
+  /** Pull and decode one batch, or `null` once the cursor is drained. */
+  private async fetch(): Promise<T[] | null> {
+    const value = await this.handle.nextBatch(
+      this.options.batchSize ?? defaults.batchSize,
+      this.options.batchBytes ?? defaults.batchBytes,
+    );
+    const batch = JSON.parse(value);
+    if (!batch) return null;
+    const cache: (RDF.Term | undefined)[] = [];
+    const decode = (i: number) => (cache[i] ??= decodeTerm(batch.terms[i], this.options.factory));
+    return batch.rows.map((cells: number[]) =>
+      this.type === 'bindings'
+        ? new LazyBindings(
+            this.variables.map((v) => v.value),
+            cells,
+            decode,
+          )
+        : decode(cells[0]),
+    ) as T[];
+  }
   next(): Promise<IteratorResult<T>> {
     const task = this.queue.then(async () => {
       this.options.signal?.throwIfAborted();
       if (this.closed) return { done: true, value: undefined } as IteratorResult<T>;
       if (!this.batch.length) {
-        let value: string;
+        let batch: T[] | null;
         try {
-          value = await this.handle.nextBatch(
-            this.options.batchSize ?? defaults.batchSize,
-            this.options.batchBytes ?? defaults.batchBytes,
-          );
+          const pending = this.prefetched;
+          this.prefetched = undefined;
+          batch = this.exhausted ? null : await (pending ?? this.fetch());
         } catch (e) {
           await this.close();
           throw nativeError(e);
         }
         this.options.signal?.throwIfAborted();
         if (this.closed) return { done: true, value: undefined } as IteratorResult<T>;
-        const batch = JSON.parse(value);
-        if (!batch) {
+        if (!batch || !batch.length) {
           await this.close();
           return { done: true, value: undefined } as IteratorResult<T>;
         }
-        const cache: (RDF.Term | undefined)[] = [];
-        const decode = (i: number) =>
-          (cache[i] ??= decodeTerm(batch.terms[i], this.options.factory));
-        this.batch = batch.rows.map((cells: number[]) =>
-          this.type === 'bindings'
-            ? new LazyBindings(
-                this.variables.map((v) => v.value),
-                cells,
-                decode,
-              )
-            : decode(cells[0]),
-        ) as T[];
+        this.batch = batch;
+        this.batchLength = batch.length;
       }
-      return { done: false, value: this.batch.shift()! } as IteratorResult<T>;
+      const value = this.batch.shift()!;
+      // Once half of the batch has been consumed, ask for the next one, so that it is
+      // computed while the caller works through the rest.
+      if (!this.prefetched && !this.exhausted && this.batch.length <= this.batchLength / 2) {
+        const next = this.fetch().then((rows) => {
+          if (!rows) this.exhausted = true;
+          return rows;
+        });
+        next.catch(() => {});
+        this.prefetched = next;
+      }
+      return { done: false, value } as IteratorResult<T>;
     });
     this.queue = task.catch(() => {});
     return task;
@@ -190,6 +245,7 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
     if (this.closed) return;
     this.closed = true;
     this.batch = [];
+    this.prefetched = undefined;
     this.options.signal?.removeEventListener('abort', this.abort);
     try {
       await this.handle.close();
@@ -214,9 +270,9 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
 }
 
 abstract class Queryable implements SparqlDataset {
-  protected abstract read(text: string, options: QueryOptions): Promise<any>;
+  protected abstract read(text: string, options: QueryOptions): Promise<NativeResult>;
   abstract update(text: string, options?: UpdateOptions): Promise<UpdateResult>;
-  protected result(handle: any, options: QueryOptions): QueryResult {
+  protected result(handle: NativeResult, options: QueryOptions): QueryResult {
     const info = JSON.parse(handle.info());
     if (info.type === 'boolean') {
       handle.close();
@@ -277,7 +333,7 @@ export class Dataset extends Queryable {
   private family: string;
   private administration: Administration;
   private constructor(
-    private handle: any,
+    private handle: NativeDataset,
     public readonly path: string | null,
     public readonly options: DatasetOptions,
     family?: string,
@@ -290,7 +346,7 @@ export class Dataset extends Queryable {
       (name) => this.branch(name),
       async (name, params, options) =>
         this.result(
-          await this.run<any>(options, (cancel) =>
+          await this.run<NativeResult>(options, (cancel) =>
             this.handle.runQuery(
               name,
               JSON.stringify(params),
@@ -304,7 +360,7 @@ export class Dataset extends Queryable {
     );
   }
   /** @internal Native handles are never shared across JavaScript environments. */
-  static fromNative(handle: any, path: string | null, options: DatasetOptions) {
+  static fromNative(handle: NativeDataset, path: string | null, options: DatasetOptions) {
     return new Dataset(handle, handle.path() ?? path, options);
   }
   get prefixes() {
@@ -369,7 +425,7 @@ export class Dataset extends Queryable {
   }
   async branch(name: string) {
     return new Dataset(
-      await this.run<any>({}, () => this.handle.branch(name)),
+      await this.run<NativeDataset>({}, () => this.handle.branch(name)),
       this.path,
       this.options,
       this.family,
@@ -442,7 +498,7 @@ export class Dataset extends Queryable {
         'Clone accepts read controls and historical at; conditional writes are unsupported',
       );
     return Dataset.fromNative(
-      await this.run<any>(
+      await this.run<NativeDataset>(
         options,
         (cancel) => this.handle.cloneMemory(name, wireOptions(options), cancel),
         true,
@@ -660,7 +716,7 @@ export class Dataset extends Queryable {
   }
   run<T>(
     options: OperationOptions,
-    operation: (cancel: any, signal: AbortSignal) => Promise<T>,
+    operation: (cancel: NativeCancellation, signal: AbortSignal) => Promise<T>,
     write = false,
   ): Promise<T> {
     this.check(write);
@@ -715,7 +771,7 @@ export class Dataset extends Queryable {
   protected read(text: string, options: QueryOptions) {
     return this.run(options, (cancel) => this.handle.query(text, wireOptions(options), cancel));
   }
-  protected override result(handle: any, options: QueryOptions): QueryResult {
+  protected override result(handle: NativeResult, options: QueryOptions): QueryResult {
     const info = JSON.parse(handle.info());
     if (info.type === 'boolean') {
       handle.close();
@@ -743,7 +799,7 @@ export class Dataset extends Queryable {
     o?: RDF.Term | null,
     g?: RDF.Term | null,
   ): AsyncIterable<RDF.Quad> & { toArray(): Promise<RDF.Quad[]>; toStream(): Readable } {
-    const future = this.run<any>({}, () => this.handle.matched(pattern(s, p, o, g))).then(
+    const future = this.run<NativeResult>({}, () => this.handle.matched(pattern(s, p, o, g))).then(
       (handle) => this.result(handle, {}) as QuadsResult,
     );
     return deferredQuads(future);
@@ -819,7 +875,7 @@ export class Dataset extends Queryable {
     if (options.dryRun)
       throw new UnsupportedError('Transaction dryRun is unsupported; use update dryRun');
     const started = performance.now();
-    const handle = await this.run<any>(
+    const handle = await this.run<NativeTransaction>(
       options,
       (cancel) => this.handle.begin(wireOptions(options), cancel),
       true,
@@ -921,10 +977,13 @@ export class Dataset extends Queryable {
     if (options.dryRun) throw new UnsupportedError('Load dryRun is unsupported; use update dryRun');
     return { inserted: BigInt(result.inserted), receipt: receiptOf(result.receipt)! };
   }
-  private byteStream(options: OperationOptions, create: (cancel: any) => Promise<any> | any) {
+  private byteStream(
+    options: OperationOptions,
+    create: (cancel: NativeCancellation) => Promise<NativeByteStream> | NativeByteStream,
+  ) {
     this.check();
     const token = new native.Cancellation();
-    let handle: any;
+    let handle: NativeByteStream | undefined;
     let stopped = false;
     const active = this;
     let reject!: (reason: unknown) => void;
@@ -1126,7 +1185,7 @@ export class Transaction extends Queryable {
   private abortListener: () => void;
   constructor(
     private ds: Dataset,
-    private handle: any,
+    private handle: NativeTransaction,
     private options: UpdateOptions,
     private release: () => void,
   ) {
@@ -1146,7 +1205,10 @@ export class Transaction extends Queryable {
     this.interrupt(reason);
     void this.rollback().catch(() => {});
   }
-  private async call<T>(options: OperationOptions, f: (cancel: any) => Promise<T>): Promise<T> {
+  private async call<T>(
+    options: OperationOptions,
+    f: (cancel: NativeCancellation) => Promise<T>,
+  ): Promise<T> {
     if (this.ended) throw new InvalidInputError('Transaction has ended');
     options.signal?.throwIfAborted();
     const token = new native.Cancellation();
@@ -1181,7 +1243,7 @@ export class Transaction extends Queryable {
       this.tokens.delete(token);
     }
   }
-  protected override result(handle: any, options: QueryOptions): QueryResult {
+  protected override result(handle: NativeResult, options: QueryOptions): QueryResult {
     const info = JSON.parse(handle.info());
     if (info.type === 'boolean') {
       void handle.close();
@@ -1226,7 +1288,7 @@ export class Transaction extends Queryable {
   }
   match(s?: RDF.Term | null, p?: RDF.Term | null, o?: RDF.Term | null, g?: RDF.Term | null) {
     return deferredQuads(
-      this.call<any>({}, () => this.handle.matched(pattern(s, p, o, g))).then(
+      this.call<NativeResult>({}, () => this.handle.matched(pattern(s, p, o, g))).then(
         (handle) => this.result(handle, {}) as QuadsResult,
       ),
     );
@@ -1272,7 +1334,7 @@ export interface CatalogDatasetInfo {
 export class CatalogReservation {
   private closed = false;
   /** @internal */ constructor(
-    private handle: any,
+    private handle: NativeReservationHandle,
     public readonly name: string,
     private release: () => void,
   ) {}
@@ -1296,7 +1358,7 @@ export class Catalog {
   private operations = new Set<Promise<unknown>>();
   private closePromise?: Promise<void>;
   private constructor(
-    private handle: any,
+    private handle: NativeCatalog,
     public readonly path: string | null,
     private options: DatasetOptions,
   ) {}
@@ -1362,19 +1424,27 @@ export class Catalog {
   backupFiles() {
     return this.admin<{ name: string; path: string }[]>('backupFiles');
   }
-  reserve(name: string, kind: 'clone' | 'restore', holder: string) {
+  reserve(name: string, kind: 'clone' | 'restore', holder: string): Promise<CatalogReservation> {
     this.check();
-    try {
-      const reservation = new CatalogReservation(
-        this.handle.reserve(name, kind, holder),
-        name,
-        () => this.reservations.delete(reservation),
-      );
-      this.reservations.add(reservation);
-      return reservation;
-    } catch (e) {
-      throw nativeError(e);
-    }
+    return this.track(
+      (async () => {
+        let handle: NativeReservationHandle;
+        try {
+          handle = await this.handle.reserve(name, kind, holder);
+        } catch (e) {
+          throw nativeError(e);
+        }
+        if (this.closed) {
+          handle.close();
+          throw new InvalidInputError('Catalog is closed');
+        }
+        const reservation = new CatalogReservation(handle, name, () =>
+          this.reservations.delete(reservation),
+        );
+        this.reservations.add(reservation);
+        return reservation;
+      })(),
+    );
   }
   /** Offline retention is a blocking repository operation; dryRun defaults true. */
   applyRetention(
@@ -1647,8 +1717,8 @@ export class Repository {
   private operations = new Set<Promise<unknown>>();
   private tokens = new Set<any>();
   private closePromise?: Promise<void>;
-  private constructor(private handle: any) {}
-  /** @internal */ static fromNative(handle: any) {
+  private constructor(private handle: NativeRepository) {}
+  /** @internal */ static fromNative(handle: NativeRepository) {
     return new Repository(handle);
   }
   static async open(config: Configuration, options: { init?: boolean } = {}) {

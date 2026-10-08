@@ -89,10 +89,16 @@ pub fn quad(v: &Value) -> Result<Quad> {
 
 pub fn encode(t: &Term) -> Value {
     match t {
-        Term::NamedNode(n) => json!({"termType":"NamedNode","value":n.as_str()}),
-        Term::BlankNode(n) => json!({"termType":"BlankNode","value":n.as_str()}),
+        Term::NamedNode(n) => json!({ "termType": "NamedNode", "value": n.as_str() }),
+        Term::BlankNode(n) => json!({ "termType": "BlankNode", "value": n.as_str() }),
         Term::Literal(l) => {
-            json!({"termType":"Literal","value":l.value(),"language":l.language().unwrap_or(""),"direction":l.direction().map(|d| match d { BaseDirection::Ltr => "ltr", BaseDirection::Rtl => "rtl" }).unwrap_or(""),"datatype":{"value":l.datatype().as_str()}})
+            json!({
+                "termType": "Literal",
+                "value": l.value(),
+                "language": l.language().unwrap_or(""),
+                "direction": l.direction().map(|d| match d {BaseDirection::Ltr => "ltr", BaseDirection::Rtl => "rtl"}).unwrap_or(""),
+                "datatype": { "value": l.datatype().as_str() },
+            })
         }
         Term::Triple(t) => encode_quad(&Quad::new(
             t.subject.clone(),
@@ -109,9 +115,16 @@ pub fn encode_quad(q: &Quad) -> Value {
         NamedOrBlankNode::BlankNode(n) => encode(&n.clone().into()),
     };
     let graph = match &q.graph_name {
-        GraphName::DefaultGraph => json!({"termType":"DefaultGraph","value":""}),
+        GraphName::DefaultGraph => json!({ "termType": "DefaultGraph", "value": "" }),
         GraphName::NamedNode(n) => encode(&n.clone().into()),
         GraphName::BlankNode(n) => encode(&n.clone().into()),
     };
-    json!({"termType":"Quad","value":"","subject":subject,"predicate":encode(&q.predicate.clone().into()),"object":encode(&q.object),"graph":graph})
+    json!({
+        "termType": "Quad",
+        "value": "",
+        "subject": subject,
+        "predicate": encode(&q.predicate.clone().into()),
+        "object": encode(&q.object),
+        "graph": graph,
+    })
 }

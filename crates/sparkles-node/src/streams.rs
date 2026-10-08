@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 
 const CHUNK: usize = 64 << 10;
 enum StreamResult {
-    Eager(QueryResult),
+    Eager(Box<QueryResult>),
     Streaming(sparkles::sparql::QueryExecution),
 }
 pub(crate) fn format(v: &Value) -> sparkles::Result<sparkles::io::RdfFormat> {
@@ -100,17 +100,61 @@ impl Drop for NativeUpload {
     }
 }
 
+/// The reader permit of a result stream, given back while the stream waits for
+/// JavaScript to read, so that an unread stream does not block other queries.
+struct ReaderSlot {
+    readers: Arc<Semaphore>,
+    permit: Option<OwnedSemaphorePermit>,
+    flag: Arc<AtomicBool>,
+}
+impl ReaderSlot {
+    fn reacquire(&mut self) -> std::io::Result<()> {
+        loop {
+            if self.flag.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled",
+                ));
+            }
+            if let Ok(p) = self.readers.clone().try_acquire_owned() {
+                self.permit = Some(p);
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
 struct Sink {
     sender: mpsc::Sender<sparkles::Result<Vec<u8>>>,
     buffer: Vec<u8>,
+    reader: Option<ReaderSlot>,
 }
 impl Sink {
+    fn new(sender: mpsc::Sender<sparkles::Result<Vec<u8>>>, reader: Option<ReaderSlot>) -> Self {
+        Sink {
+            sender,
+            buffer: Vec::with_capacity(CHUNK),
+            reader,
+        }
+    }
     fn flush_chunk(&mut self) -> std::io::Result<()> {
-        if !self.buffer.is_empty() {
-            let bytes = std::mem::replace(&mut self.buffer, Vec::with_capacity(CHUNK));
-            self.sender
-                .blocking_send(Ok(bytes))
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stream closed"))?
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let closed = || std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stream closed");
+        let bytes = std::mem::replace(&mut self.buffer, Vec::with_capacity(CHUNK));
+        let bytes = match self.sender.try_send(Ok(bytes)) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(closed()),
+            Err(mpsc::error::TrySendError::Full(bytes)) => bytes,
+        };
+        // The reader has not caught up. Give the permit back while waiting for it.
+        if let Some(reader) = &mut self.reader {
+            reader.permit.take();
+        }
+        self.sender.blocking_send(bytes).map_err(|_| closed())?;
+        if let Some(reader) = &mut self.reader {
+            reader.reacquire()?;
         }
         Ok(())
     }
@@ -136,7 +180,6 @@ impl Write for Sink {
 pub struct NativeByteStream {
     receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<sparkles::Result<Vec<u8>>>>>,
     flag: Arc<AtomicBool>,
-    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
 }
 #[napi]
 impl NativeByteStream {
@@ -144,21 +187,16 @@ impl NativeByteStream {
     pub fn next<'env>(&self, env: &'env Env) -> napi::Result<PromiseRaw<'env, Option<Buffer>>> {
         let receiver = self.receiver.clone();
         let flag = self.flag.clone();
-        let permit = self.permit.clone();
         env.spawn_future(async move {
             let mut receiver = receiver.lock().await;
             loop {
                 if flag.load(Ordering::Relaxed) {
                     receiver.close();
-                    permit.lock().take();
                     return Err(err(EngineError::Cancelled));
                 }
                 if let Ok(value) =
                     tokio::time::timeout(Duration::from_millis(10), receiver.recv()).await
                 {
-                    if value.as_ref().is_none_or(|value| value.is_err()) {
-                        permit.lock().take();
-                    }
                     return value.transpose().map(|v| v.map(Buffer::from)).map_err(err);
                 }
             }
@@ -167,7 +205,6 @@ impl NativeByteStream {
     #[napi]
     pub fn close(&self) {
         self.flag.store(true, Ordering::Relaxed);
-        self.permit.lock().take();
         if let Ok(mut receiver) = self.receiver.try_lock() {
             receiver.close();
         }
@@ -176,7 +213,6 @@ impl NativeByteStream {
 impl Drop for NativeByteStream {
     fn drop(&mut self) {
         self.flag.store(true, Ordering::Relaxed);
-        self.permit.lock().take();
         if let Ok(mut receiver) = self.receiver.try_lock() {
             receiver.close();
         }
@@ -246,10 +282,11 @@ impl NativeDataset {
                                     }
                                     Ok(inserted)
                                 })?;
-                        Ok(
-                            json!({"inserted":inserted.to_string(),"receipt":receipt(&r)})
-                                .to_string(),
-                        )
+                        Ok(json!({
+                            "inserted": inserted.to_string(),
+                            "receipt": receipt(&r),
+                        })
+                        .to_string())
                     })();
                     let _ = answer.send(result);
                 })
@@ -301,7 +338,11 @@ impl NativeDataset {
                 sparkles::commit::CommitKind::Load,
                 &write_options(&v, flag)?,
             )?;
-            Ok(json!({"inserted":r.commit.inserted.to_string(),"receipt":receipt(&r)}).to_string())
+            Ok(json!({
+                "inserted": r.commit.inserted.to_string(),
+                "receipt": receipt(&r),
+            })
+            .to_string())
         })
         .await
     }
@@ -316,44 +357,38 @@ impl NativeDataset {
         let flag = cancel.flag.clone();
         let workerflag = flag.clone();
         let (sender, receiver) = mpsc::channel(2);
-        std::thread::Builder::new()
-            .name("sparkles-node-dump".into())
-            .spawn(move || {
-                let errors = sender.clone();
-                let result = (|| {
-                    let sink = Sink {
-                        sender,
-                        buffer: Vec::with_capacity(CHUNK),
-                    };
-                    let mut writer = codec(&v)?.writer(sink, None, 1)?;
-                    let fmt = format(&v)?;
-                    if let Some(graph) = v["fromGraph"].as_str() {
-                        shared.ds.dump_graph(
-                            oxrdf::NamedNode::new(graph)
-                                .map_err(|e| EngineError::invalid(e.to_string()))?
-                                .as_ref()
-                                .into(),
-                            &mut writer,
-                            fmt,
-                        )?;
-                    } else {
-                        shared.ds.dump(&mut writer, fmt)?;
-                    }
-                    if workerflag.load(Ordering::Relaxed) {
-                        return Err(EngineError::Cancelled);
-                    }
-                    writer.finish()?;
-                    Ok(())
-                })();
-                if let Err(e) = result {
-                    let _ = errors.blocking_send(Err(e));
+        // The dump runs on the runtime's blocking pool, which bounds and reuses threads.
+        napi::bindgen_prelude::spawn_blocking(move || {
+            let errors = sender.clone();
+            let result = (|| {
+                let sink = Sink::new(sender, None);
+                let mut writer = codec(&v)?.writer(sink, None, 1)?;
+                let fmt = format(&v)?;
+                if let Some(graph) = v["fromGraph"].as_str() {
+                    shared.ds.dump_graph(
+                        oxrdf::NamedNode::new(graph)
+                            .map_err(|e| EngineError::invalid(e.to_string()))?
+                            .as_ref()
+                            .into(),
+                        &mut writer,
+                        fmt,
+                    )?;
+                } else {
+                    shared.ds.dump(&mut writer, fmt)?;
                 }
-            })
-            .map_err(|e| err(e.into()))?;
+                if workerflag.load(Ordering::Relaxed) {
+                    return Err(EngineError::Cancelled);
+                }
+                writer.finish()?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                let _ = errors.blocking_send(Err(e));
+            }
+        });
         Ok(NativeByteStream {
             receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
             flag,
-            permit: Default::default(),
         })
     }
     #[napi]
@@ -406,7 +441,8 @@ impl NativeDataset {
         let shared = self.get(false)?;
         let v = parse(&options)?;
         let flag = cancel.flag.clone();
-        let stream_permit = permit(READERS.clone(), &v, &flag).await?;
+        let readers = readers();
+        let stream_permit = permit(readers.clone(), &v, &flag).await?;
         let result = blocking({
             let shared = shared.clone();
             let flag = flag.clone();
@@ -418,7 +454,7 @@ impl NativeDataset {
                 "eager" => shared
                     .ds
                     .query_with(&text, &query_options(&v, flag)?)
-                    .map(StreamResult::Eager),
+                    .map(|r| StreamResult::Eager(Box::new(r))),
                 _ => Err(EngineError::invalid(
                     "execution must be eager, streaming or auto",
                 )),
@@ -427,121 +463,104 @@ impl NativeDataset {
         .await?;
         let (sender, receiver) = mpsc::channel(2);
         let workerflag = flag.clone();
-        std::thread::Builder::new()
-            .name("sparkles-node-results".into())
-            .spawn(move || {
-                let errors = sender.clone();
-                let result = (|| {
-                    let mut sink = Sink {
-                        sender,
-                        buffer: Vec::with_capacity(CHUNK),
-                    };
-                    let accept = v["accept"]
-                        .as_str()
-                        .unwrap_or("application/sparql-results+json");
-                    match result {
-                        StreamResult::Streaming(mut execution) => {
-                            use sparkles::sparql::{QueryExecution, results};
-                            match &mut execution {
-                                QueryExecution::Eager(result) => {
-                                    let result = result.result();
-                                    if matches!(result.kind, QueryKind::Select | QueryKind::Ask) {
-                                        let fmt = results::SolutionsFormat::from_name(accept)
-                                            .ok_or_else(|| {
-                                                EngineError::invalid("invalid result format")
-                                            })?;
-                                        results::write_solutions(result, fmt, &mut sink, None)?;
-                                    } else {
-                                        let fmt = results::rdf_format_from_name(accept)
-                                            .ok_or_else(|| {
-                                                EngineError::invalid("invalid RDF result format")
-                                            })?;
-                                        results::write_graph(
-                                            result,
-                                            fmt,
-                                            &shared.ds.prefixes(),
-                                            &mut sink,
-                                        )?;
-                                    }
-                                }
-                                QueryExecution::Select(cursor) => {
+        let slot = ReaderSlot {
+            readers,
+            permit: Some(stream_permit),
+            flag: flag.clone(),
+        };
+        napi::bindgen_prelude::spawn_blocking(move || {
+            let errors = sender.clone();
+            let result = (|| {
+                let mut sink = Sink::new(sender, Some(slot));
+                let accept = v["accept"]
+                    .as_str()
+                    .unwrap_or("application/sparql-results+json");
+                match result {
+                    StreamResult::Streaming(mut execution) => {
+                        use sparkles::sparql::{QueryExecution, results};
+                        match &mut execution {
+                            QueryExecution::Eager(result) => {
+                                let result = result.result();
+                                if matches!(result.kind, QueryKind::Select | QueryKind::Ask) {
                                     let fmt = results::SolutionsFormat::from_name(accept)
                                         .ok_or_else(|| {
                                             EngineError::invalid("invalid result format")
                                         })?;
-                                    results::write_cursor_solutions(cursor, fmt, &mut sink, None)?;
-                                }
-                                QueryExecution::Ask(result) => {
-                                    let fmt = results::SolutionsFormat::from_name(accept)
-                                        .ok_or_else(|| {
-                                            EngineError::invalid("invalid result format")
-                                        })?;
-                                    results::write_solutions(
-                                        result.result(),
-                                        fmt,
-                                        &mut sink,
-                                        None,
-                                    )?;
-                                }
-                                QueryExecution::Graph(cursor)
-                                    if accept
-                                        == results::SolutionsFormat::Sparkles.media_type() =>
-                                {
-                                    results::write_cursor_graph_native_json(
-                                        cursor, &mut sink, None, None,
-                                    )?;
-                                }
-                                QueryExecution::Graph(cursor) => {
+                                    results::write_solutions(result, fmt, &mut sink, None)?;
+                                } else {
                                     let fmt =
                                         results::rdf_format_from_name(accept).ok_or_else(|| {
                                             EngineError::invalid("invalid RDF result format")
                                         })?;
-                                    let prefixes =
-                                        shared.ds.prefixes().into_iter().collect::<Vec<_>>();
-                                    sparkles::sparql::cursor::graph::write_cursor_graph(
-                                        cursor, fmt, &mut sink, None, &prefixes,
+                                    results::write_graph(
+                                        result,
+                                        fmt,
+                                        &shared.ds.prefixes(),
+                                        &mut sink,
                                     )?;
                                 }
                             }
-                        }
-                        StreamResult::Eager(result) => {
-                            if result.kind == QueryKind::Select || result.kind == QueryKind::Ask {
-                                let fmt = sparkles::sparql::results::SolutionsFormat::from_name(
-                                    accept,
-                                )
-                                .ok_or_else(|| EngineError::invalid("invalid result format"))?;
-                                sparkles::sparql::results::write_solutions(
-                                    &result, fmt, &mut sink, None,
+                            QueryExecution::Select(cursor) => {
+                                let fmt = results::SolutionsFormat::from_name(accept)
+                                    .ok_or_else(|| EngineError::invalid("invalid result format"))?;
+                                results::write_cursor_solutions(cursor, fmt, &mut sink, None)?;
+                            }
+                            QueryExecution::Ask(result) => {
+                                let fmt = results::SolutionsFormat::from_name(accept)
+                                    .ok_or_else(|| EngineError::invalid("invalid result format"))?;
+                                results::write_solutions(result.result(), fmt, &mut sink, None)?;
+                            }
+                            QueryExecution::Graph(cursor)
+                                if accept == results::SolutionsFormat::Sparkles.media_type() =>
+                            {
+                                results::write_cursor_graph_native_json(
+                                    cursor, &mut sink, None, None,
                                 )?;
-                            } else {
-                                let fmt = sparkles::sparql::results::rdf_format_from_name(accept)
-                                    .ok_or_else(|| {
-                                    EngineError::invalid("invalid RDF result format")
-                                })?;
-                                sparkles::sparql::results::write_graph(
-                                    &result,
-                                    fmt,
-                                    &shared.ds.prefixes(),
-                                    &mut sink,
+                            }
+                            QueryExecution::Graph(cursor) => {
+                                let fmt =
+                                    results::rdf_format_from_name(accept).ok_or_else(|| {
+                                        EngineError::invalid("invalid RDF result format")
+                                    })?;
+                                let prefixes = shared.ds.prefixes().into_iter().collect::<Vec<_>>();
+                                sparkles::sparql::cursor::graph::write_cursor_graph(
+                                    cursor, fmt, &mut sink, None, &prefixes,
                                 )?;
                             }
                         }
                     }
-                    if workerflag.load(Ordering::Relaxed) {
-                        return Err(EngineError::Cancelled);
+                    StreamResult::Eager(result) => {
+                        if result.kind == QueryKind::Select || result.kind == QueryKind::Ask {
+                            let fmt = sparkles::sparql::results::SolutionsFormat::from_name(accept)
+                                .ok_or_else(|| EngineError::invalid("invalid result format"))?;
+                            sparkles::sparql::results::write_solutions(
+                                &result, fmt, &mut sink, None,
+                            )?;
+                        } else {
+                            let fmt = sparkles::sparql::results::rdf_format_from_name(accept)
+                                .ok_or_else(|| EngineError::invalid("invalid RDF result format"))?;
+                            sparkles::sparql::results::write_graph(
+                                &result,
+                                fmt,
+                                &shared.ds.prefixes(),
+                                &mut sink,
+                            )?;
+                        }
                     }
-                    sink.flush()?;
-                    Ok(())
-                })();
-                if let Err(e) = result {
-                    let _ = errors.blocking_send(Err(e));
                 }
-            })
-            .map_err(|e| err(e.into()))?;
+                if workerflag.load(Ordering::Relaxed) {
+                    return Err(EngineError::Cancelled);
+                }
+                sink.flush()?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                let _ = errors.blocking_send(Err(e));
+            }
+        });
         Ok(NativeByteStream {
             receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
             flag,
-            permit: Arc::new(Mutex::new(Some(stream_permit))),
         })
     }
 }

@@ -105,18 +105,18 @@ test('schedule preview is deterministic and bounded', async () => {
 test('catalog reservations prevent collisions and release explicitly or on close', async () => {
   const cat = Catalog.memory();
   try {
-    const claim = cat.reserve('claimed', 'clone', '123');
+    const claim = await cat.reserve('claimed', 'clone', '123');
     await assert.rejects(cat.create('claimed', { kind: 'mem' }), ConflictError);
-    assert.throws(() => cat.reserve('claimed', 'clone', 'other'), ConflictError);
+    await assert.rejects(cat.reserve('claimed', 'clone', 'other'), ConflictError);
     claim.close();
     claim.close();
     const ds = await cat.create('claimed', { kind: 'mem' });
-    const replacement = cat.reserve('claimed', 'restore', 'restore-owner');
+    const replacement = await cat.reserve('claimed', 'restore', 'restore-owner');
     assert.equal((await cat.info('claimed')).reservedBy, 'restore-owner');
     await assert.rejects(cat.delete('claimed'), ConflictError);
     replacement.close();
     assert.equal((await cat.info('claimed')).reservedBy, null);
-    const last = cat.reserve('last', 'clone', 'last-owner');
+    const last = await cat.reserve('last', 'clone', 'last-owner');
     await ds.close();
     await cat.close();
     last.close();
@@ -153,9 +153,9 @@ test('catalog aliases observe reservation release and read-only helper protectio
   const alias = await Catalog.open(path, { readOnly: true });
   try {
     const ds = await cat.create('existing');
-    cat.reserve('existing', 'restore', 'owner');
+    await cat.reserve('existing', 'restore', 'owner');
     assert.equal((await alias.info('existing')).reservedBy, 'owner');
-    assert.throws(() => alias.reserve('new', 'clone', 'read-only'));
+    await assert.rejects(alias.reserve('new', 'clone', 'read-only'));
     await assert.rejects(
       alias.repositories.withFixed([{ name: 'local', type: 'fs', path: path + '-backups' }]),
     );

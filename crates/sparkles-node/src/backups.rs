@@ -41,7 +41,73 @@ impl NativeRepository {
         let repo = self.get()?;
         let a = parse(&args)?;
         let flag = cancel.flag.clone();
-        off_runtime(move||{let ctl=sparkles::task::Control::with_cancel(flag);ctl.check()?;let b=backup::blocking(&repo);let v=match op.as_str(){"list"=>serde_json::to_value(b.list(&backup::ListFilter{dataset:a["dataset"].as_str().map(String::from),limit:a["limit"].as_u64().map(|n|n as usize),before:a["before"].as_str().map(String::from),..Default::default()})?),"stats"=>serde_json::to_value(b.stats()?),"test"=>serde_json::to_value(b.test()?),"locks"=>serde_json::to_value(b.locks()?),"breakLock"=>serde_json::to_value(b.break_lock(a["id"].as_str().ok_or_else(||EngineError::invalid("id must be a string"))?)?),"gc"=>serde_json::to_value(b.gc(&backup::GcOptions{dry_run:a["dryRun"].as_bool().unwrap_or(true),ctl:(&ctl).into(),..Default::default()})?),"verify"=>{let names:Vec<String>=serde_json::from_value(a["names"].clone()).map_err(|e|EngineError::invalid(e.to_string()))?;serde_json::to_value(b.verify(&names,&backup::VerifyOptions{ctl:(&ctl).into(),..Default::default()})?)},"restoreToDir"=>{let r=b.restore_to_dir(a["name"].as_str().ok_or_else(||EngineError::invalid("name must be a string"))?,Path::new(a["path"].as_str().ok_or_else(||EngineError::invalid("path must be a string"))?),&backup::RestoreOptions{ctl:(&ctl).into(),..Default::default()})?;Ok(json!({"backup":r.backup,"datasetId":r.dataset_id,"identity":r.identity,"forkedFrom":r.forked_from,"check":r.check,"millis":r.millis}))},_=>return Err(EngineError::unsupported("unknown repository operation"))}.map_err(|e|EngineError::invalid(e.to_string()))?;Ok(lossless(v).to_string())}).await
+        off_runtime(move || {
+            let ctl = sparkles::task::Control::with_cancel(flag);
+            ctl.check()?;
+            let b = backup::blocking(&repo);
+            let v = match op.as_str() {
+                "list" => serde_json::to_value(b.list(&backup::ListFilter {
+                    dataset: a["dataset"].as_str().map(String::from),
+                    limit: a["limit"].as_u64().map(|n| n as usize),
+                    before: a["before"].as_str().map(String::from),
+                    ..Default::default()
+                })?),
+                "stats" => serde_json::to_value(b.stats()?),
+                "test" => serde_json::to_value(b.test()?),
+                "locks" => serde_json::to_value(b.locks()?),
+                "breakLock" => serde_json::to_value(
+                    b.break_lock(
+                        a["id"]
+                            .as_str()
+                            .ok_or_else(|| EngineError::invalid("id must be a string"))?,
+                    )?,
+                ),
+                "gc" => serde_json::to_value(b.gc(&backup::GcOptions {
+                    dry_run: a["dryRun"].as_bool().unwrap_or(true),
+                    ctl: (&ctl).into(),
+                    ..Default::default()
+                })?),
+                "verify" => {
+                    let names: Vec<String> = serde_json::from_value(a["names"].clone())
+                        .map_err(|e| EngineError::invalid(e.to_string()))?;
+                    serde_json::to_value(b.verify(
+                        &names,
+                        &backup::VerifyOptions {
+                            ctl: (&ctl).into(),
+                            ..Default::default()
+                        },
+                    )?)
+                }
+                "restoreToDir" => {
+                    let r = b.restore_to_dir(
+                        a["name"]
+                            .as_str()
+                            .ok_or_else(|| EngineError::invalid("name must be a string"))?,
+                        Path::new(
+                            a["path"]
+                                .as_str()
+                                .ok_or_else(|| EngineError::invalid("path must be a string"))?,
+                        ),
+                        &backup::RestoreOptions {
+                            ctl: (&ctl).into(),
+                            ..Default::default()
+                        },
+                    )?;
+                    Ok(json!({
+                        "backup": r.backup,
+                        "datasetId": r.dataset_id,
+                        "identity": r.identity,
+                        "forkedFrom": r.forked_from,
+                        "check": r.check,
+                        "millis": r.millis,
+                    }))
+                }
+                _ => return Err(EngineError::unsupported("unknown repository operation")),
+            }
+            .map_err(|e| EngineError::invalid(e.to_string()))?;
+            Ok(lossless(v).to_string())
+        })
+        .await
     }
     #[napi]
     pub fn close(&self) {

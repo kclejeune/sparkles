@@ -44,13 +44,35 @@ fn err(e: EngineError) -> napi::Error {
         EngineError::Service(_) => "ServiceError",
         _ => "StorageError",
     };
+    let details = match &e {
+        EngineError::Rejected(r) => json!({ "validation": r.summary, "head": r.head.to_string() }),
+        EngineError::BudgetExceeded(b) => json!({
+            "budget": format!("{:?}", b.kind),
+            "limit": b.limit.to_string(),
+            "requested": b.requested.to_string(),
+        }),
+        EngineError::Locked { path, pid } => json!({ "path": path, "pid": pid }),
+        EngineError::Io(io) => json!({
+            "errno": io.raw_os_error(),
+            "code": if io.kind() == std::io::ErrorKind::NotFound {"ENOENT"} else {"EIO"},
+        }),
+        _ => json!({}),
+    };
+    coded(kind, &e.to_string(), details)
+}
+/// A JavaScript error of `kind`, which `nativeError` turns into its class.
+fn coded(kind: &str, message: &str, details: Value) -> napi::Error {
     napi::Error::new(
         Status::GenericFailure,
-        json!({"kind":kind,"message":e.to_string(),"details":match &e {EngineError::Rejected(r)=>json!({"validation":r.summary,"head":r.head.to_string()}),EngineError::BudgetExceeded(b)=>json!({"budget":format!("{:?}",b.kind),"limit":b.limit.to_string(),"requested":b.requested.to_string()}),EngineError::Locked{path,pid}=>json!({"path":path,"pid":pid}),EngineError::Io(io)=>json!({"errno":io.raw_os_error(),"code":if io.kind()==std::io::ErrorKind::NotFound{"ENOENT"}else{"EIO"}}),_=>json!({})}}).to_string(),
+        json!({ "kind": kind, "message": message, "details": details }).to_string(),
     )
 }
 fn invalid(m: impl Into<String>) -> napi::Error {
     err(EngineError::invalid(m))
+}
+/// A failure inside the addon, such as a panic in a native task, rather than in the input.
+fn internal(m: impl std::fmt::Display) -> napi::Error {
+    coded("InternalError", &m.to_string(), json!({}))
 }
 fn parse(s: &str) -> napi::Result<Value> {
     serde_json::from_str(s).map_err(|e| invalid(e.to_string()))
@@ -60,7 +82,7 @@ async fn blocking<T: Send + 'static>(
 ) -> napi::Result<T> {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| invalid(e.to_string()))?
+        .map_err(|e| internal(format!("a native task failed: {e}")))?
         .map_err(err)
 }
 // Facade backup methods intentionally reject calls entered in a Tokio runtime.
@@ -77,7 +99,7 @@ async fn off_runtime<T: Send + 'static>(
         })
         .map_err(|e| err(e.into()))?;
     recv.await
-        .map_err(|_| invalid("backup worker ended"))?
+        .map_err(|_| internal("the backup worker ended without a result"))?
         .map_err(err)
 }
 fn lossless(mut v: Value) -> Value {
@@ -273,13 +295,30 @@ struct Shared {
 }
 static STORES: LazyLock<Mutex<HashMap<PathBuf, Weak<Shared>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static READERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
-    Arc::new(Semaphore::new(
+/// The permits of running queries, one per query executing on a blocking thread. The
+/// default is the number of cores, and `setMaxConcurrentQueries` replaces it. A streaming
+/// cursor takes a permit only while it opens and while it computes a batch, so an idle
+/// cursor never blocks other queries.
+static READERS: LazyLock<Mutex<Arc<Semaphore>>> = LazyLock::new(|| {
+    Mutex::new(Arc::new(Semaphore::new(
         std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(4),
-    ))
+    )))
 });
+fn readers() -> Arc<Semaphore> {
+    READERS.lock().clone()
+}
+/// Set the number of queries that may run at once. Queries already running keep the
+/// permits of the old limit until they finish, so for a moment both limits apply.
+#[napi]
+pub fn set_max_concurrent_queries(limit: u32) -> napi::Result<()> {
+    if limit == 0 || limit as usize > Semaphore::MAX_PERMITS {
+        return Err(invalid("maxConcurrentQueries must be a positive integer"));
+    }
+    *READERS.lock() = Arc::new(Semaphore::new(limit as usize));
+    Ok(())
+}
 async fn permit(
     s: Arc<Semaphore>,
     v: &Value,
@@ -416,15 +455,17 @@ impl NativeDataset {
         match v["execution"].as_str().unwrap_or("eager") {
             "eager" => {}
             "streaming" | "auto" => {
-                let permit = permit(READERS.clone(), &v, &flag).await?;
+                let readers = readers();
+                let permit = permit(readers.clone(), &v, &flag).await?;
                 let cancellation = flag.clone();
                 let cursor =
                     blocking(move || open_query_cursor(&shared.ds, &text, &v, flag)).await?;
-                return NativeResult::streaming(cursor, permit, cancellation).map_err(err);
+                drop(permit);
+                return NativeResult::streaming(cursor, readers, cancellation).map_err(err);
             }
             _ => return Err(invalid("execution must be eager, streaming or auto")),
         }
-        let _permit = permit(READERS.clone(), &v, &flag).await?;
+        let _permit = permit(readers(), &v, &flag).await?;
         let result = blocking(move || {
             let opts = query_options(&v, flag)?;
             if let Some(at) = v["at"].as_str() {
@@ -495,7 +536,52 @@ impl NativeDataset {
         let v = parse(&options)?;
         let flag = cancel.flag.clone();
         let _permit = permit(shared.writers.clone(), &v, &flag).await?;
-        blocking(move || {let opts=query_options(&v,flag)?;let result=shared.ds.update_with(&text,&opts);if opts.write.dry_run.is_some(){let p=sparkles::preview::catch(result)?;let inserted=p.commit.as_ref().map_or(0,|c|c.inserted);let deleted=p.commit.as_ref().map_or(0,|c|c.deleted);return Ok(json!({"inserted":inserted.to_string(),"deleted":deleted.to_string(),"preview":{"datasetId":p.dataset_id,"head":lossless(serde_json::to_value(p.head).map_err(|e|EngineError::invalid(e.to_string()))?),"commit":p.commit.as_ref().map(|c|lossless(serde_json::to_value(c).expect("commit serializes"))),"outcome":p.outcome().name(),"validation":p.validation.as_deref(),"changes":p.changes.iter().map(|(op,q)|json!({"op":if *op==sparkles::store::DiffOp::Add{"add"}else{"remove"},"quad":terms::encode_quad(q)})).collect::<Vec<_>>()}}).to_string());}let r=result?;Ok(json!({"inserted":r.inserted.to_string(),"deleted":r.deleted.to_string(),"receipt":r.commit.as_ref().map(receipt)}).to_string())}).await
+        blocking(move || {
+            let opts = query_options(&v, flag)?;
+            let result = shared.ds.update_with(&text, &opts);
+            if opts.write.dry_run.is_some() {
+                let p = sparkles::preview::catch(result)?;
+                let inserted = p.commit.as_ref().map_or(0, |c| c.inserted);
+                let deleted = p.commit.as_ref().map_or(0, |c| c.deleted);
+                let head = serde_json::to_value(p.head)
+                    .map_err(|e| EngineError::invalid(e.to_string()))?;
+                let commit = p
+                    .commit
+                    .as_ref()
+                    .map(|c| lossless(serde_json::to_value(c).expect("commit serializes")));
+                let changes: Vec<Value> = p
+                    .changes
+                    .iter()
+                    .map(|(op, q)| {
+                        json!({
+                            "op": if *op == sparkles::store::DiffOp::Add {"add"} else {"remove"},
+                            "quad": terms::encode_quad(q),
+                        })
+                    })
+                    .collect();
+                return Ok(json!({
+                    "inserted": inserted.to_string(),
+                    "deleted": deleted.to_string(),
+                    "preview": {
+                        "datasetId": p.dataset_id,
+                        "head": lossless(head),
+                        "commit": commit,
+                        "outcome": p.outcome().name(),
+                        "validation": p.validation.as_deref(),
+                        "changes": changes,
+                    },
+                })
+                .to_string());
+            }
+            let r = result?;
+            Ok(json!({
+                "inserted": r.inserted.to_string(),
+                "deleted": r.deleted.to_string(),
+                "receipt": r.commit.as_ref().map(receipt),
+            })
+            .to_string())
+        })
+        .await
     }
     #[napi]
     pub fn path(&self) -> napi::Result<Option<String>> {
@@ -698,12 +784,15 @@ struct Cursor {
     rows: Rows,
     pos: usize,
 }
+/// A query result that JavaScript pulls in batches. A streaming cursor keeps its snapshot
+/// until it is drained, closed or collected, but it holds a reader permit only while a
+/// batch is being computed.
 #[napi]
 pub struct NativeResult {
     cursor: Arc<Mutex<Option<Cursor>>>,
     metadata: String,
     statistics: Arc<Mutex<Option<String>>>,
-    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    readers: Option<Arc<Semaphore>>,
     cancel: Option<Arc<AtomicBool>>,
 }
 impl NativeResult {
@@ -713,7 +802,17 @@ impl NativeResult {
             QueryKind::Ask => "boolean",
             _ => "quads",
         };
-        let metadata=json!({"type":kind,"variables":result.vars,"size":result.len(),"value":result.boolean,"timing":result.timing,"plan":result.plan,"memoryPeakBytes":result.mem_peak_bytes.to_string(),"rowsProduced":result.rows_produced.to_string()}).to_string();
+        let metadata = json!({
+            "type": kind,
+            "variables": result.vars,
+            "size": result.len(),
+            "value": result.boolean,
+            "timing": result.timing,
+            "plan": result.plan,
+            "memoryPeakBytes": result.mem_peak_bytes.to_string(),
+            "rowsProduced": result.rows_produced.to_string(),
+        })
+        .to_string();
         Self {
             cursor: Arc::new(Mutex::new(Some(Cursor {
                 rows: Rows::Query(Box::new(result)),
@@ -721,13 +820,13 @@ impl NativeResult {
             }))),
             metadata,
             statistics: Default::default(),
-            permit: Default::default(),
+            readers: None,
             cancel: None,
         }
     }
     fn streaming(
         execution: sparkles::sparql::QueryExecution,
-        permit: OwnedSemaphorePermit,
+        readers: Arc<Semaphore>,
         cancel: Arc<AtomicBool>,
     ) -> sparkles::Result<Self> {
         use sparkles::sparql::QueryExecution;
@@ -784,7 +883,7 @@ impl NativeResult {
             cursor: Arc::new(Mutex::new(Some(Cursor { rows, pos: 0 }))),
             metadata,
             statistics: Default::default(),
-            permit: Arc::new(Mutex::new(Some(permit))),
+            readers: Some(readers),
             cancel: Some(cancel),
         })
     }
@@ -794,9 +893,9 @@ impl NativeResult {
                 rows: Rows::Scan(Box::new(scan)),
                 pos: 0,
             }))),
-            metadata: json!({"type":"quads"}).to_string(),
+            metadata: json!({ "type": "quads" }).to_string(),
             statistics: Default::default(),
-            permit: Default::default(),
+            readers: None,
             cancel: None,
         }
     }
@@ -821,7 +920,6 @@ impl NativeResult {
         }
         let cursor = self.cursor.clone();
         let statistics = self.statistics.clone();
-        let permit = self.permit.clone();
         blocking(move || {
             if let Some(mut cursor) = cursor.lock().take() {
                 match &mut cursor.rows {
@@ -836,7 +934,6 @@ impl NativeResult {
                     _ => {}
                 }
             }
-            permit.lock().take();
             Ok(())
         })
         .await
@@ -862,8 +959,13 @@ impl NativeResult {
     pub async fn next_batch(&self, max_rows: u32, max_bytes: u32) -> napi::Result<String> {
         let cursor = self.cursor.clone();
         let statistics = self.statistics.clone();
-        let permit = self.permit.clone();
         let cancel = self.cancel.clone();
+        // A streaming cursor computes its batch under a reader permit, which it gives back
+        // when the batch is done. Waiting for the permit stops when the cursor is closed.
+        let _permit = match (&self.readers, &cancel) {
+            (Some(readers), Some(flag)) => Some(permit(readers.clone(), &Value::Null, flag).await?),
+            _ => None,
+        };
         blocking(move || {
             let mut lock = cursor.lock();
             let Some(c) = lock.as_mut() else {
@@ -964,11 +1066,10 @@ impl NativeResult {
                     }
                     _ => {}
                 }
-                permit.lock().take();
                 lock.take();
                 return Ok("null".into());
             }
-            Ok(json!({"terms":terms,"rows":rows}).to_string())
+            Ok(json!({ "terms": terms, "rows": rows }).to_string())
         })
         .await
     }
@@ -1024,10 +1125,11 @@ impl NativeTransaction {
                             deleted += tx.remove(q.as_ref())? as u64
                         }
                     }
-                    Ok(
-                        json!({"inserted":inserted.to_string(),"deleted":deleted.to_string()})
-                            .to_string(),
-                    )
+                    Ok(json!({
+                        "inserted": inserted.to_string(),
+                        "deleted": deleted.to_string(),
+                    })
+                    .to_string())
                 })
             })
             .await;
@@ -1082,10 +1184,11 @@ impl NativeTransaction {
                 .ok_or_else(|| EngineError::invalid("transaction ended"))?
                 .run(move |tx| {
                     let r = tx.update_with(&text, &query_options(&v, flag)?)?;
-                    Ok(
-                        json!({"inserted":r.inserted.to_string(),"deleted":r.deleted.to_string()})
-                            .to_string(),
-                    )
+                    Ok(json!({
+                        "inserted": r.inserted.to_string(),
+                        "deleted": r.deleted.to_string(),
+                    })
+                    .to_string())
                 })
         })
         .await;

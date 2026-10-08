@@ -110,7 +110,13 @@ pub async fn utility(op: String, args: String) -> napi::Result<String> {
                     sparkles_fmt::FormatError::UnsupportedLanguage { .. } => EngineError::unsupported(e.to_string()),
                     _ => EngineError::invalid(e.to_string()),
                 })?;
-                json!({"text":output.text,"changed":output.changed,"cursor":output.cursor,"language":output.language.name(),"warnings":output.warnings.into_iter().map(|w| json!({"code":w.code,"message":w.message})).collect::<Vec<_>>()})
+                json!({
+                    "text": output.text,
+                    "changed": output.changed,
+                    "cursor": output.cursor,
+                    "language": output.language.name(),
+                    "warnings": output.warnings.into_iter().map(|w| json!({ "code": w.code, "message": w.message })).collect::<Vec<_>>(),
+                })
             }
             "lint" => {
                 let mut opts = sparkles_fmt::lint::LintOptions { deadline: deadline(&args)?, ..Default::default() };
@@ -120,7 +126,28 @@ pub async fn utility(op: String, args: String) -> napi::Result<String> {
                     sparkles_fmt::lint::LintError::UnsupportedLanguage(_) => EngineError::unsupported(e.to_string()),
                     _ => EngineError::invalid(e.to_string()),
                 })?;
-                json!({"language":output.language.name(),"diagnostics":output.diagnostics.into_iter().map(|d| json!({"rule":d.rule,"severity":d.severity.name(),"message":d.message,"start":d.start,"end":d.end,"line":d.line,"column":d.column,"endLine":d.end_line,"endColumn":d.end_column,"fix":d.fix.map(|f| json!({"title":f.title,"edits":f.edits.into_iter().map(|e| json!({"start":e.start,"end":e.end,"insert":e.insert})).collect::<Vec<_>>()}))})).collect::<Vec<_>>()})
+                json!({
+                    "language": output.language.name(),
+                    "diagnostics": output.diagnostics.into_iter().map(|d| json!({
+                        "rule": d.rule,
+                        "severity": d.severity.name(),
+                        "message": d.message,
+                        "start": d.start,
+                        "end": d.end,
+                        "line": d.line,
+                        "column": d.column,
+                        "endLine": d.end_line,
+                        "endColumn": d.end_column,
+                        "fix": d.fix.map(|f| json!({
+                            "title": f.title,
+                            "edits": f.edits.into_iter().map(|e| json!({
+                                "start": e.start,
+                                "end": e.end,
+                                "insert": e.insert,
+                            })).collect::<Vec<_>>(),
+                        })),
+                    })).collect::<Vec<_>>(),
+                })
             }
             #[cfg(feature = "geo")]
             "convertGeometries" => {

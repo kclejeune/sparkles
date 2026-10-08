@@ -9,7 +9,14 @@ struct CatalogState {
 static CATALOGS: LazyLock<Mutex<HashMap<PathBuf, Weak<CatalogState>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 fn info(i: DatasetInfo) -> Value {
-    json!({"name":i.name,"id":i.id,"kind":i.kind,"path":i.path,"attached":i.attached,"reservedBy":i.reserved_by})
+    json!({
+        "name": i.name,
+        "id": i.id,
+        "kind": i.kind,
+        "path": i.path,
+        "attached": i.attached,
+        "reservedBy": i.reserved_by,
+    })
 }
 pub(crate) fn wrap(ds: Dataset, options: Value, read_only: bool) -> NativeDataset {
     let key = ds.store() as *const _ as usize;
@@ -104,8 +111,10 @@ impl NativeCatalog {
 }
 #[napi]
 impl NativeCatalog {
+    /// Claim a name. The claim can touch the catalog's files, so it runs off the
+    /// JavaScript thread.
     #[napi]
-    pub fn reserve(
+    pub async fn reserve(
         &self,
         name: String,
         kind: String,
@@ -117,10 +126,9 @@ impl NativeCatalog {
             "restore" => sparkles::catalog::ReservationKind::Restore,
             _ => return Err(invalid("reservation kind must be clone or restore")),
         };
+        let reservation = blocking(move || state.catalog.reserve(&name, kind, &holder)).await?;
         Ok(NativeReservation {
-            reservation: Mutex::new(Some(
-                state.catalog.reserve(&name, kind, &holder).map_err(err)?,
-            )),
+            reservation: Mutex::new(Some(reservation)),
         })
     }
     #[napi]
@@ -298,7 +306,7 @@ impl NativeCatalog {
                         .catalog
                         .backup_files()?
                         .into_iter()
-                        .map(|f| json!({"name":f.name,"path":f.path}))
+                        .map(|f| json!({ "name": f.name, "path": f.path }))
                         .collect::<Vec<_>>()
                 ),
                 #[cfg(feature = "backup")]

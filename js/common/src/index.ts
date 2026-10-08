@@ -91,6 +91,12 @@ export class WriteRejectedError extends SparklesError {
     super(m, 'ERR_SPARKLES_WRITE_REJECTED', d);
   }
 }
+/** A failure inside the native addon, such as a panic, rather than in the caller's input. */
+export class InternalError extends SparklesError {
+  constructor(m: string, d = {}) {
+    super(m, 'ERR_SPARKLES_INTERNAL', d);
+  }
+}
 const errorClasses: Record<string, new (m: string, d?: Record<string, unknown>) => SparklesError> =
   {
     SparqlSyntaxError,
@@ -107,6 +113,7 @@ const errorClasses: Record<string, new (m: string, d?: Record<string, unknown>) 
     PermissionDeniedError,
     ServiceError,
     WriteRejectedError,
+    InternalError,
   };
 export function nativeError(error: unknown): Error {
   if (!(error instanceof Error)) return new SparklesError(String(error));

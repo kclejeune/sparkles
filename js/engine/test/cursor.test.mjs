@@ -3,7 +3,14 @@ import test, { after } from 'node:test';
 const keepAlive = setInterval(() => {}, 1000);
 after(() => clearInterval(keepAlive));
 import assert from 'node:assert/strict';
-import { Dataset, CancelledError, InvalidInputError } from '../dist/index.js';
+import { availableParallelism } from 'node:os';
+import {
+  Dataset,
+  CancelledError,
+  ConflictError,
+  InvalidInputError,
+  configure,
+} from '../dist/index.js';
 
 test(
   'explicit streaming queries pin snapshots and expose unknown size',
@@ -109,3 +116,80 @@ test('automatic small queries retain collected result semantics', { timeout: 300
     await ds.close();
   }
 });
+
+test('idle streaming cursors do not hold query permits', { timeout: 30000 }, async () => {
+  const ds = Dataset.memory();
+  configure({ maxConcurrentQueries: 1 });
+  try {
+    await ds.load('<urn:s1> <urn:p> 1 . <urn:s2> <urn:p> 2 . <urn:s3> <urn:p> 3 .', {
+      format: 'ttl',
+    });
+    const q = 'SELECT ?s WHERE { ?s <urn:p> ?o }';
+    const cursors = [];
+    for (let i = 0; i < 4; i++) {
+      const cursor = await ds.select(q, { execution: 'streaming', batchSize: 1, timeout: 5000 });
+      await cursor.next();
+      cursors.push(cursor);
+    }
+    // With one permit, this query runs only if the idle cursors gave theirs back.
+    assert.equal((await ds.select(q, { timeout: 5000 })).size, 3);
+    for (const cursor of cursors) assert.equal((await cursor.toArray()).length, 2);
+  } finally {
+    configure({ maxConcurrentQueries: availableParallelism() });
+    await ds.close();
+  }
+});
+
+test(
+  'maxConcurrentQueries is validated and limits running queries',
+  { timeout: 30000 },
+  async () => {
+    assert.throws(() => configure({ maxConcurrentQueries: 0 }), InvalidInputError);
+    assert.throws(() => configure({ maxConcurrentQueries: 1.5 }), InvalidInputError);
+    const ds = Dataset.memory();
+    configure({ maxConcurrentQueries: 1 });
+    try {
+      const data = Array.from({ length: 10000 }, (_, i) => `<urn:s${i}> <urn:p> ${i} .`).join('\n');
+      await ds.load(data, { format: 'ttl' });
+      // A join of 10^8 rows holds the only permit until its timeout.
+      const slow = ds
+        .select('SELECT (COUNT(*) AS ?n) { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?x + ?y < 0) }', {
+          timeout: 5000,
+        })
+        .catch((e) => e);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await assert.rejects(ds.select('SELECT * { ?s ?p ?o }', { noWait: true }), ConflictError);
+      await slow;
+    } finally {
+      configure({ maxConcurrentQueries: availableParallelism() });
+      await ds.close();
+    }
+  },
+);
+
+test(
+  'the next batch is requested once half of the current one is consumed',
+  { timeout: 30000 },
+  async () => {
+    const ds = Dataset.memory();
+    try {
+      const data = Array.from({ length: 20 }, (_, i) => `<urn:s${i}> <urn:p> ${i} .`).join('\n');
+      await ds.load(data, { format: 'ttl' });
+      const result = await ds.select('SELECT ?s WHERE { ?s <urn:p> ?o }', {
+        execution: 'streaming',
+        batchSize: 4,
+      });
+      await result.next();
+      assert.equal((await result.stats()).sentRows, 4);
+      await result.next();
+      // Two of four rows are consumed, so the next batch is on its way.
+      const deadline = Date.now() + 5000;
+      while ((await result.stats()).sentRows < 8 && Date.now() < deadline)
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal((await result.stats()).sentRows, 8);
+      assert.equal((await result.toArray()).length, 18);
+    } finally {
+      await ds.close();
+    }
+  },
+);

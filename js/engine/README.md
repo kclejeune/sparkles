@@ -30,7 +30,7 @@ try {
 
 `Dataset.memory()` makes an isolated in-memory dataset. `Catalog.open(path)` and `Catalog.memory()` manage named datasets; branches live under each dataset, accessed with `ds.branch(name)` or `ds.branches.open(name)`. Prefixes, snapshots, history, stored queries, settings, indexes, reasoning, validation, schema and GraphQL are property handles. `Repository.open(config)` opens a backup repository; `ds.backups(repository)` captures, lists, verifies and deletes this dataset's backups.
 
-Query results expose `plan`, `timing`, `variables` and an async iterator with `toArray()`, `toStream()` and `close()`. A retained row remains valid after closing its result. Stop early with `break`, or call `close()` explicitly. `ds.source()` implements RDF/JS Source with native pattern counts for Comunica. `ds.store()` additionally implements import/remove/removeMatches/deleteGraph. Use Sparkles SPARQL directly for joins executed in the native engine.
+Query results expose `plan`, `timing`, `variables` and an async iterator with `toArray()`, `toStream()` and `close()`. A retained row remains valid after closing its result. Stop early with `break`, or call `close()` explicitly. A streaming result (`execution: 'streaming'`) keeps its snapshot until it is drained, closed or garbage-collected, so close one you stop reading. It holds one of the process's query permits only while a batch is being computed, so idle cursors do not block other queries. `configure({ maxConcurrentQueries })` sets how many queries run at once, and defaults to the number of cores. `ds.source()` implements RDF/JS Source with native pattern counts for Comunica. `ds.store()` additionally implements import/remove/removeMatches/deleteGraph. Use Sparkles SPARQL directly for joins executed in the native engine.
 
 Counts and commit numbers use `bigint`; integer arguments also accept safe JavaScript numbers. RDF terms from other factories are accepted. Blank-node labels created externally identify new nodes within each write; use terms read from the dataset to refer to existing stored nodes. Directional literals and triple terms round-trip, with triple terms allowed in object position.
 
@@ -84,7 +84,7 @@ defaults to a preview; pass `dryRun: false` to delete the selected backups. Rete
 waits for completion and has no cancellation control. Policy receipts, backup byte
 counts and durations use `bigint`.
 
-For catalog integrations, `catalog.reserve(name, 'clone' | 'restore', holder)`
-returns a name claim with `close()` and async disposal; closing its catalog releases
-the claim. `catalog.backupFiles()` lists legacy catalog backup-file paths without
+For catalog integrations, `await catalog.reserve(name, 'clone' | 'restore', holder)`
+resolves to a name claim with `close()` and async disposal. Closing its catalog
+releases the claim. `catalog.backupFiles()` lists legacy catalog backup-file paths without
 reading file contents.

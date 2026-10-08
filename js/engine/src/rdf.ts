@@ -9,7 +9,7 @@ import {
   encodeTerm,
   nativeError,
 } from '@sparkles-rdf/common';
-import { native } from './native.js';
+import { native, type NativeRdfParser, type NativeRdfSerializer } from './native.js';
 
 export type RdfInput =
   | string
@@ -145,7 +145,7 @@ export function parse(
   options: ParseOptions = {},
 ): AsyncIterableIterator<RDF.Quad> {
   let life: Lifetime | undefined;
-  let handle: any;
+  let handle: NativeRdfParser | undefined;
   let ended = false;
   let serial: Promise<unknown> = Promise.resolve();
   const start = () => {
@@ -153,11 +153,12 @@ export function parse(
     life = new Lifetime(options);
     try {
       if (life.ended) throw life.reason;
-      handle = new native.NativeRdfParser(wire(options), life.token);
+      const parser = new native.NativeRdfParser(wire(options), life.token);
+      handle = parser;
       const source = inputIterator(input);
       const owner = life;
       owner.cleanup = () => {
-        handle.close();
+        parser.close();
         quietReturn(source);
       };
       if (owner.ended) owner.cleanup();
@@ -176,7 +177,7 @@ export function parse(
             }
             for (let i = 0; i < bytes.length && !owner.ended; i += CHUNK) {
               try {
-                await owner.wait(handle.push(Buffer.from(bytes.subarray(i, i + CHUNK))));
+                await owner.wait(parser.push(Buffer.from(bytes.subarray(i, i + CHUNK))));
               } catch (e) {
                 // Native parser errors arrive on its output channel. A closed
                 // input channel must not replace a syntax error with a push error.
@@ -185,7 +186,7 @@ export function parse(
               }
             }
           }
-          if (!owner.ended) handle.end();
+          if (!owner.ended) parser.end();
         } catch (e) {
           owner.stop(nativeError(e));
         }
@@ -205,7 +206,7 @@ export function parse(
         try {
           start();
           const owner = life!;
-          const row = await owner.wait(handle.nextQuad());
+          const row = await owner.wait(handle!.nextQuad());
           if (isStopped(row) || row === null || row === undefined) {
             ended = true;
             owner.stop();
@@ -244,7 +245,7 @@ export function serialize(
   options: SerializeOptions = {},
 ): ReadableStream<Uint8Array> {
   const life = new Lifetime(options);
-  let handle: any;
+  let handle: NativeRdfSerializer | undefined;
   try {
     if (life.ended) throw life.reason;
     handle = new native.NativeRdfSerializer(wire(options), life.token);
