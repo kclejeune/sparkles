@@ -316,10 +316,14 @@ run = "pnpm --dir js build"
 
 [tasks."node:test"]
 tools = { node = "24" }
-description = "Test Node bindings, remote client and transaction/lifecycle contracts"
+description = "Test Node bindings, remote client and transaction/lifecycle contracts, with the remote client's tests against a debug server"
 depends = ["node:build"]
 dir = "js"
-run = "node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs"
+env = { SPARKLES_CLIENT_TEST_SERVER_BIN = "{{config_root}}/target/debug/sparkles" }
+run = [
+  "cargo build --locked --manifest-path ../Cargo.toml -p sparkles-server --bin sparkles",
+  "node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs",
+]
 
 [tasks."node:lint"]
 description = "Clippy on the Node addon with default features and with none"

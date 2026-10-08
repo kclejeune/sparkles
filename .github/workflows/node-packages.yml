@@ -33,8 +33,14 @@ jobs:
         working-directory: js/engine
         run: pnpm native
       - run: pnpm --dir js build
+      # The remote client's real-server test runs on one runner, against a debug server.
+      - name: Build the server for the remote client test
+        if: matrix.runner == 'ubuntu-24.04'
+        run: cargo build --locked -p sparkles-server --bin sparkles
       - name: Test Node 22, 24 and 26
         shell: bash
+        env:
+          SPARKLES_CLIENT_TEST_SERVER_BIN: ${{ matrix.runner == 'ubuntu-24.04' && format('{0}/target/debug/sparkles', github.workspace) || '' }}
         run: |
           for major in 22 24 26; do
             npx --yes --package node@$major node --test js/common/test/*.test.mjs js/client/test/*.test.mjs js/engine/test/*.test.mjs
