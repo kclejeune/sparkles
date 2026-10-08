@@ -64,6 +64,42 @@ public class ImportOptions private constructor(
     }
 }
 
+/** What [DatasetGraphSparkles.applyPatch] did. */
+public class PatchReport internal constructor(
+    /** the commit the patch made, or the head when it changed nothing */
+    public val receipt: CommitReceipt,
+    /** the patch rows read */
+    public val rows: Long,
+    /** quads the patch added */
+    public val inserted: Long,
+    /** quads the patch removed */
+    public val deleted: Long,
+    private val aborted: Boolean,
+    private val prevChecked: Boolean,
+    /** prefixes the patch set */
+    public val prefixesSet: Long,
+    /** prefixes the patch removed */
+    public val prefixesRemoved: Long,
+) {
+    /** Whether the patch ended with `TA`, so that nothing was committed. */
+    public fun isAborted(): Boolean = aborted
+
+    /** Whether the patch's `H prev` header named a commit of this dataset that was the head. */
+    public fun isPrevChecked(): Boolean = prevChecked
+
+    override fun equals(other: Any?): Boolean = other is PatchReport && receipt == other.receipt &&
+        rows == other.rows && inserted == other.inserted && deleted == other.deleted &&
+        aborted == other.aborted && prevChecked == other.prevChecked &&
+        prefixesSet == other.prefixesSet && prefixesRemoved == other.prefixesRemoved
+
+    override fun hashCode(): Int =
+        Objects.hash(receipt, rows, inserted, deleted, aborted, prevChecked, prefixesSet, prefixesRemoved)
+
+    override fun toString(): String = "PatchReport(receipt=$receipt, rows=$rows, inserted=$inserted, " +
+        "deleted=$deleted, aborted=$aborted, prevChecked=$prevChecked, prefixesSet=$prefixesSet, " +
+        "prefixesRemoved=$prefixesRemoved)"
+}
+
 /** What [SparklesDatasets.importTdb2] did. */
 public class ImportReport internal constructor(
     public val quads: Long,

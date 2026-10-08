@@ -870,3 +870,190 @@ fn every_surface_key_has_a_binding_decision() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+/// Every source file under `dir` whose name ends with `ext`, concatenated.
+fn read_sources(dir: &std::path::Path, ext: &str, out: &mut String) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            read_sources(&path, ext, out);
+        } else if path.to_string_lossy().ends_with(ext) {
+            out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            out.push('\n');
+        }
+    }
+}
+
+/// The identifiers a binding name refers to: its type (or top-level function) and each
+/// member on the path to the operation. A name can list alternatives with ` / ` or ` + `,
+/// and members with `/`. Arguments in parentheses and a trailing note in parentheses are
+/// ignored. A name that starts with `Jena ` is Jena's own API, which this repository does
+/// not declare, and so is an alternative that starts with `Jena `. They yield nothing to
+/// check.
+fn binding_identifiers(name: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    let name = name.split(" (").next().unwrap_or(name).trim();
+    if name.starts_with("Jena ") {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for alternative in name.split(" / ").flat_map(|a| a.split(" + ")) {
+        let alternative = alternative.trim();
+        if alternative.starts_with("Jena ") {
+            continue;
+        }
+        let mut plain = String::new();
+        let mut depth = 0usize;
+        for c in alternative.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => plain.push(c),
+                _ => {}
+            }
+        }
+        let mut segments = plain.split('.');
+        let head = segments.next().unwrap_or("").to_string();
+        let members: Vec<String> = segments
+            .flat_map(|s| s.split('/'))
+            .map(str::to_string)
+            .collect();
+        for ident in std::iter::once(&head).chain(&members) {
+            if ident.is_empty() || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err(format!(
+                    "cannot read `{alternative}`; name a type and its members, or start with `Jena `"
+                ));
+            }
+        }
+        out.push((head, members));
+    }
+    Ok(out)
+}
+
+/// Each concrete JVM and Node name in bindings.toml is declared in the binding's sources,
+/// so that the table cannot name an operation that does not exist. The check is textual.
+/// It finds a declaration of each identifier anywhere in the binding's sources, not on
+/// the named type.
+#[test]
+fn named_jvm_and_node_bindings_exist_in_source() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut kotlin = String::new();
+    read_sources(
+        &root.join("jvm/sparkles-jena/src/main/kotlin"),
+        ".kt",
+        &mut kotlin,
+    );
+    let mut typescript = String::new();
+    read_sources(&root.join("js/engine/src"), ".ts", &mut typescript);
+    if kotlin.is_empty() && typescript.is_empty() {
+        eprintln!("the binding sources are not in this checkout, so the check is skipped");
+        return;
+    }
+    assert!(
+        !kotlin.is_empty(),
+        "no Kotlin sources under jvm/sparkles-jena"
+    );
+    assert!(
+        !typescript.is_empty(),
+        "no TypeScript sources under js/engine/src"
+    );
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/bindings.toml");
+    let bindings: toml::Table = std::fs::read_to_string(path)
+        .expect("bindings.toml")
+        .parse()
+        .expect("valid bindings TOML");
+
+    let declared = |column: &str, ident: &str, is_type: bool| -> bool {
+        let ident = regex::escape(ident);
+        let pattern = match (column, is_type) {
+            ("jvm", true) => format!(r"\b(?:class|object|interface)\s+{ident}\b"),
+            ("jvm", false) => {
+                format!(r"\b(?:fun|val|var)\s+(?:<[^>]*>\s*)?(?:[\w.]+\.)?{ident}\b")
+            }
+            (_, true) => format!(r"\b(?:class|interface|type)\s+{ident}\b"),
+            _ => format!(
+                r"(?m)(?:^|[\s{{,;])(?:(?:get|function|readonly|async|static|public)\s+)*{ident}\s*[(<=:?]"
+            ),
+        };
+        let source = if column == "jvm" {
+            &kotlin
+        } else {
+            &typescript
+        };
+        regex::Regex::new(&pattern).unwrap().is_match(source)
+    };
+
+    let mut problems = Vec::new();
+    for (key, entry) in &bindings {
+        for column in ["jvm", "node"] {
+            let Some(value) = entry.get(column).and_then(toml::Value::as_str) else {
+                continue;
+            };
+            if value.starts_with("planned:") || value.starts_with("skip:") {
+                continue;
+            }
+            let names = match binding_identifiers(value) {
+                Ok(names) => names,
+                Err(e) => {
+                    problems.push(format!("`{key}` {column}: {e}"));
+                    continue;
+                }
+            };
+            for (head, members) in names {
+                let is_type = head.starts_with(|c: char| c.is_ascii_uppercase());
+                if !declared(column, &head, is_type) {
+                    problems.push(format!("`{key}` {column}: `{head}` is not declared"));
+                }
+                for member in members {
+                    if !declared(column, &member, false) {
+                        problems.push(format!(
+                            "`{key}` {column}: `{head}` has no member `{member}`"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn binding_identifiers_reads_the_table_forms() {
+    assert_eq!(
+        binding_identifiers("DatasetGraphSparkles.backups(repository).create").unwrap(),
+        vec![(
+            "DatasetGraphSparkles".to_string(),
+            vec!["backups".to_string(), "create".to_string()]
+        )]
+    );
+    assert!(
+        binding_identifiers("Jena UpdateAction.parseExecute / UpdateExec.dataset(ds)")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        binding_identifiers("DatasetGraphSparkles.getGraph(graph).find + Jena RDFDataMgr.write")
+            .unwrap(),
+        vec![(
+            "DatasetGraphSparkles".to_string(),
+            vec!["getGraph".to_string(), "find".to_string()]
+        )]
+    );
+    assert_eq!(
+        binding_identifiers(
+            "Dataset.indexes.vector.embedUntilIdle (bounded waitMs; no AbortSignal)"
+        )
+        .unwrap()[0]
+            .1
+            .len(),
+        3
+    );
+    assert_eq!(
+        binding_identifiers("Dataset.branches.rename/protect/note").unwrap()[0]
+            .1
+            .len(),
+        4
+    );
+}

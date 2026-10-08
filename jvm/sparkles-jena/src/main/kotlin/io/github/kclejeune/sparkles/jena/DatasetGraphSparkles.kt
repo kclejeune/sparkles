@@ -394,6 +394,38 @@ public class DatasetGraphSparkles internal constructor(
     }
 
     /**
+     * Apply an RDF Patch in one commit of kind `patch`. A `TA` row aborts the whole patch,
+     * and an `H prev` header that names a commit of this dataset applies the patch only
+     * when that commit is the head. `binary` selects the RDF Thrift form instead of text.
+     */
+    @JvmOverloads
+    public fun applyPatch(input: InputStream, binary: Boolean = false): PatchReport =
+        SparklesOperation().use { applyPatch(input, binary, it) }
+
+    public fun applyPatch(input: InputStream, binary: Boolean, operation: SparklesOperation): PatchReport {
+        checkNoTxn("applyPatch")
+        val bytes = input.readAllBytes()
+        val r = ffi { handle.ffi.applyPatch(bytes, binary, operation.native) }
+        val receipt = r.receipt.toReceipt()
+        handle.lastReceipt.set(receipt)
+        if (r.prefixesSet > 0u || r.prefixesRemoved > 0u) {
+            val now = ffi { handle.ffi.prefixes() }
+            handle.prefixes.keys.retainAll(now.keys)
+            handle.prefixes.putAll(now)
+        }
+        return PatchReport(
+            receipt,
+            r.rows.toLong(),
+            r.inserted.toLong(),
+            r.deleted.toLong(),
+            r.aborted,
+            r.prevChecked,
+            r.prefixesSet.toLong(),
+            r.prefixesRemoved.toLong(),
+        )
+    }
+
+    /**
      * A `StreamRDF` that writes what Jena's parsers send it to one write transaction, in
      * batches of 65,536 quads, and commits when the stream finishes. Blank node labels are
      * scoped to the load.

@@ -38,6 +38,40 @@ class AdministrationTest {
         QueryExec.dataset(ds).query("SELECT (COUNT(*) AS ?n) { ?s ?p ?o }").context(context).select().next().get("n").literalValue.toString().toLong()
 
     @Test
+    fun apply_patch_commits_rows_and_prefixes_and_honours_abort() {
+        SparklesDatasets.memory().use { ds ->
+            val patch = """
+                TX .
+                PA "ex" <http://example/> .
+                A <http://example/s> <http://example/p> "1" .
+                A <http://example/s> <http://example/p> "2" .
+                D <http://example/s> <http://example/p> "2" .
+                TC .
+            """.trimIndent()
+            val report = ds.applyPatch(ByteArrayInputStream(patch.toByteArray()))
+            assertTrue(report.receipt.isCommitted())
+            assertEquals(1, report.prefixesSet)
+            assertFalse(report.isAborted())
+            assertEquals(1, count(ds))
+            assertEquals(report.receipt, ds.lastReceipt())
+            assertEquals("http://example/", ds.prefixes().get("ex"))
+
+            val head = ds.headCommit().seq
+            val aborted = ds.applyPatch(ByteArrayInputStream("TX .\nA <urn:a> <urn:b> <urn:c> .\nTA .\n".toByteArray()))
+            assertTrue(aborted.isAborted())
+            assertEquals(head, ds.headCommit().seq)
+            assertEquals(1, count(ds))
+
+            ds.begin(TxnType.READ)
+            try {
+                assertThrows(org.apache.jena.sparql.JenaTransactionException::class.java) {
+                    ds.applyPatch(ByteArrayInputStream(patch.toByteArray()))
+                }
+            } finally { ds.end() }
+        }
+    }
+
+    @Test
     fun pinned_views_context_and_fallback_share_the_selected_snapshot() {
         SparklesDatasets.memory().use { ds ->
             ds.load(ByteArrayInputStream("<urn:s> <urn:p> 1 .".toByteArray()), Lang.TURTLE)
