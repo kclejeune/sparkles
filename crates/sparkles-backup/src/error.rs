@@ -367,7 +367,9 @@ impl From<sparkles_core::Error> for BackupError {
             E::Cancelled => Code::Cancelled,
             E::Unsupported(_) => Code::BackupUnsupported,
             E::Conflict(m) if m.starts_with("catalog-lagging") => Code::CatalogLagging,
-            E::Invalid(_) | E::Locked { .. } => Code::InvalidRequest,
+            E::Invalid(_) => Code::InvalidRequest,
+            // another opener holds the dataset or catalog: retry once it is released
+            E::Locked { .. } => Code::DatasetBusy,
             // the temporary copy of an in-memory dataset hit the disk reserve
             E::StorageFull(_) => Code::InsufficientStorage,
             _ => Code::Internal,
@@ -396,6 +398,16 @@ mod tests {
         assert_eq!(Code::InsufficientStorage.http_status(), 507);
         assert_eq!(Code::RepositoryUnavailable.http_status(), 502);
         assert_eq!(Code::InvalidBackup.http_status(), 422);
+    }
+
+    #[test]
+    fn a_held_lock_is_busy_not_invalid() {
+        let e = BackupError::from(sparkles_core::Error::Locked {
+            path: "/data".into(),
+            pid: Some(1),
+        });
+        assert_eq!(e.code(), Code::DatasetBusy);
+        assert_eq!(e.http_status(), 409);
     }
 
     #[test]

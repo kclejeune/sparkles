@@ -5,9 +5,7 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     /// An exclusive database or catalog lock is held by another opener.
-    #[error(
-        "directory {path} is in use by another process (pid {pid:?}); stop it or talk to it over HTTP"
-    )]
+    #[error("{}", locked_message(path, *pid))]
     Locked {
         path: std::path::PathBuf,
         pid: Option<u32>,
@@ -316,5 +314,49 @@ impl Error {
     }
     pub fn unsupported(s: impl Into<String>) -> Error {
         Error::Unsupported(s.into())
+    }
+}
+
+/// The message of [`Error::Locked`], which names the holder when the lock file records it.
+fn locked_message(path: &std::path::Path, pid: Option<u32>) -> String {
+    let path = path.display();
+    match pid {
+        Some(pid) if pid == std::process::id() => format!(
+            "directory {path} is already open in this process (pid {pid}); reuse the open handle"
+        ),
+        Some(pid) => format!(
+            "directory {path} is in use by another process (pid {pid}); stop it or talk to it over HTTP"
+        ),
+        None => {
+            format!("directory {path} is in use by another opener; stop it or talk to it over HTTP")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locked_names_its_holder() {
+        let locked = |pid| {
+            Error::Locked {
+                path: "/data".into(),
+                pid,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            locked(Some(1)),
+            "directory /data is in use by another process (pid 1); stop it or talk to it over HTTP"
+        );
+        let own = locked(Some(std::process::id()));
+        assert!(own.contains("already open in this process"), "{own}");
+        assert!(!own.contains("Some("), "{own}");
+        let unknown = locked(None);
+        assert!(
+            unknown.contains("another opener") && !unknown.contains("None"),
+            "{unknown}"
+        );
     }
 }
