@@ -23,6 +23,18 @@ pub(super) struct Request {
     pub execution: ExecutionMode,
 }
 
+/// The mode actually run for a request. Automatic execution falls back to eager
+/// when the negotiated encoding has no cursor writer, which today is SPARQL
+/// Results Thrift. An explicit streaming request keeps its mode so that the
+/// unsupported combination is reported as an error.
+pub(super) fn effective_mode(execution: ExecutionMode, thrift: bool) -> ExecutionMode {
+    if thrift && execution == ExecutionMode::Auto {
+        ExecutionMode::Eager
+    } else {
+        execution
+    }
+}
+
 pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
     let Request {
         query,
@@ -37,6 +49,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         native_graph,
         execution,
     } = request;
+    let execution = effective_mode(execution, thrift);
     let at = history::at_param(&params)?;
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     let timeout = options.timeout;
