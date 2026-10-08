@@ -1201,3 +1201,280 @@ async fn error_bodies_carry_the_request_id() {
     assert_eq!(r.json()["requestId"], "client-42");
     assert_eq!(r.header("content-length"), r.body.len().to_string());
 }
+
+#[tokio::test]
+async fn cursor_formats_send_and_deferred_completion_match_eager() {
+    let s = server();
+    for format in ["json", "xml", "csv", "tsv"] {
+        let uri = format!("{ALL}&format={format}");
+        let eager = get(&s.app, &uri).await;
+        let res = s
+            .app
+            .clone()
+            .oneshot(
+                Request::get(format!("{uri}&execution=streaming"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], eager.headers["content-type"]);
+        assert_eq!(
+            res.headers()["sparkles-commit"],
+            eager.headers["sparkles-commit"]
+        );
+        let before = metrics(&s.app).await;
+        let expected = sample(
+            &before,
+            r#"sparkles_requests_total{dataset="ds",operation="query",outcome="ok"}"#,
+        )
+        .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), eager.body);
+        let after = metrics(&s.app).await;
+        assert_eq!(
+            sample(
+                &after,
+                r#"sparkles_requests_total{dataset="ds",operation="query",outcome="ok"}"#
+            ),
+            Some(expected + 1.0)
+        );
+    }
+    for n in [0, 1, 3] {
+        let r = get(
+            &s.app,
+            &format!("{ALL}&execution=streaming&format=json&send={n}"),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.json()["results"]["bindings"].as_array().unwrap().len(), n);
+    }
+    let m = metrics(&s.app).await;
+    assert_eq!(
+        sample(&m, r#"sparkles_result_rows_total{dataset="ds"}"#),
+        Some(76.0)
+    );
+}
+
+#[tokio::test]
+async fn cursor_rejects_unsupported_modes_and_preserves_early_errors() {
+    let s = server();
+    for (uri, status) in [
+        (
+            format!("{ALL}&execution=bad&format=json"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("{ALL}&execution=streaming&format=application%2Fsparql-results%2Bthrift"),
+            StatusCode::NOT_IMPLEMENTED,
+        ),
+        (
+            "/ds/sparql?execution=streaming&format=json&query=SELEKT".into(),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let r = get(&s.app, &uri).await;
+        assert_eq!(r.status, status, "{uri}: {}", r.text());
+        assert!(!r.header("x-request-id").is_empty());
+    }
+    let s = server_with(|st| st.limits.max_result_bytes = Some(20));
+    let r = get(&s.app, &format!("{ALL}&execution=streaming&format=json")).await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    assert_eq!(r.json()["budget"], "result-bytes");
+}
+
+#[tokio::test]
+async fn dropped_cursor_response_reports_cancelled_after_body_lifetime() {
+    let s = server();
+    let res = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get(format!("{ALL}&execution=streaming&format=json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let before = metrics(&s.app).await;
+    assert_eq!(
+        sample(
+            &before,
+            r#"sparkles_requests_total{dataset="ds",operation="query",outcome="ok"}"#
+        ),
+        None
+    );
+    drop(res);
+    let after = metrics(&s.app).await;
+    assert_eq!(
+        sample(
+            &after,
+            r#"sparkles_requests_total{dataset="ds",operation="query",outcome="cancelled"}"#
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        sample(
+            &after,
+            r#"sparkles_request_duration_seconds_count{dataset="ds",operation="query"}"#
+        ),
+        Some(1.0)
+    );
+}
+
+#[tokio::test]
+async fn native_cursor_metadata_records_completion_and_send_without_full_execution() {
+    let s = server();
+    for (cap, status, total) in [
+        (None, "complete", serde_json::json!(9)),
+        (Some(1), "stopped", J::Null),
+        (Some(0), "stopped", J::Null),
+    ] {
+        let uri = format!(
+            "{ALL}&execution=streaming&format=sparkles{}",
+            cap.map_or(String::new(), |n| format!("&send={n}"))
+        );
+        let r = get(&s.app, &uri).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let j = r.json();
+        assert_eq!(j["meta"]["status"], status);
+        assert_eq!(j["meta"]["totalRows"], total);
+        assert_eq!(j["meta"]["sentRows"], cap.unwrap_or(9));
+        assert_eq!(
+            j["meta"]["datasetId"],
+            s.state.get("ds").unwrap().store.dataset_id().to_string()
+        );
+    }
+}
+
+#[tokio::test]
+async fn late_cursor_byte_budget_aborts_and_reports_once() {
+    let s = server_with(|st| {
+        st.limits.max_result_bytes =
+            Some((super::stream::STREAM_AFTER + super::stream::CHUNK * 2) as u64)
+    });
+    let data = (0..5000)
+        .map(|i| format!("<urn:big:{i}> <urn:big> \"{}\" .\n", "x".repeat(512)))
+        .collect::<String>();
+    s.state
+        .get("ds")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let res = s.app.clone().oneshot(Request::get("/ds/sparql?execution=streaming&format=tsv&query=SELECT%20%3Fs%20%3Fo%20%7B%3Fs%20%3Curn:big%3E%20%3Fo%7D")
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "headers must precede the later budget failure"
+    );
+    assert!(
+        axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .is_err(),
+        "partial TSV must not end successfully"
+    );
+    let m = metrics(&s.app).await;
+    assert_eq!(
+        sample(
+            &m,
+            r#"sparkles_requests_total{dataset="ds",operation="query",outcome="budget"}"#
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        sample(
+            &m,
+            r#"sparkles_budget_exceeded_total{dataset="ds",budget="result-bytes"}"#
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        sample(
+            &m,
+            r#"sparkles_request_duration_seconds_count{dataset="ds",operation="query"}"#
+        ),
+        Some(1.0)
+    );
+    assert!(
+        sample(
+            &m,
+            r#"sparkles_response_bytes_total{dataset="ds",operation="query"}"#
+        )
+        .unwrap()
+            >= super::stream::STREAM_AFTER as f64
+    );
+}
+
+#[tokio::test]
+async fn cursor_graph_and_ask_formats_use_the_negotiated_query_form() {
+    let s = server();
+    for query in ["ASK { ?s ?p ?o }", "ASK { ?s <urn:absent> ?o }"] {
+        let uri = format!(
+            "/ds/sparql?query={}",
+            form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        );
+        for fmt in ["json", "xml", "csv", "tsv", "sparkles"] {
+            let eager = get(&s.app, &format!("{uri}&format={fmt}")).await;
+            let pull = get(&s.app, &format!("{uri}&format={fmt}&execution=streaming")).await;
+            assert_eq!(pull.status, StatusCode::OK, "{}", pull.text());
+            assert_eq!(pull.headers["content-type"], eager.headers["content-type"]);
+            if fmt == "sparkles" {
+                assert_eq!(pull.json()["boolean"], eager.json()["boolean"]);
+            } else {
+                assert_eq!(pull.body, eager.body);
+            }
+        }
+    }
+    let query = "CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s ?p ?o }";
+    let uri = format!(
+        "/ds/sparql?query={}",
+        form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+    );
+    for fmt in [
+        "nt",
+        "nq",
+        "ttl",
+        "trig",
+        "rdf",
+        "trix",
+        "rdf-json",
+        "rdf-thrift",
+        "rdf-protobuf",
+    ] {
+        let pull = get(&s.app, &format!("{uri}&format={fmt}&execution=streaming")).await;
+        assert_eq!(pull.status, StatusCode::OK, "{fmt}: {}", pull.text());
+        assert!(!pull.body.is_empty());
+    }
+    let pull = get_with(
+        &s.app,
+        &format!("{uri}&execution=streaming&format=sparkles&send=1"),
+        "accept",
+        "application/x-sparkles+json",
+    )
+    .await;
+    assert_eq!(pull.status, StatusCode::OK, "{}", pull.text());
+    let doc = pull.json();
+    assert_eq!(doc["quads"].as_array().unwrap().len(), 1);
+    assert_eq!(doc["quads"][0].as_array().unwrap().len(), 4);
+    assert_eq!(doc["meta"]["status"], "stopped");
+}
+
+#[tokio::test]
+async fn automatic_small_queries_preserve_eager_results() {
+    let s = server();
+    for fmt in ["json", "xml", "csv", "tsv"] {
+        let eager = get(&s.app, &format!("{ALL}&format={fmt}")).await;
+        let auto = get(&s.app, &format!("{ALL}&format={fmt}&execution=auto")).await;
+        assert_eq!(auto.status, StatusCode::OK, "{}", auto.text());
+        assert_eq!(auto.body, eager.body);
+    }
+}

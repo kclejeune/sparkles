@@ -27,6 +27,7 @@ mod budgets;
 mod changes;
 mod commit_graph;
 mod conditional;
+mod cursor;
 mod describe;
 mod diff;
 mod dry_run;
@@ -1143,6 +1144,17 @@ pub(crate) async fn run_query(
     query: String,
     bindings: Vec<(String, oxrdf::Term)>,
 ) -> ApiResult {
+    let execution = match params.get("execution") {
+        None | Some("eager") => sparkles::sparql::ExecutionMode::Eager,
+        Some("streaming") => sparkles::sparql::ExecutionMode::Streaming,
+        Some("auto") => sparkles::sparql::ExecutionMode::Auto,
+        Some(_) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "execution must be eager, streaming or auto",
+            ));
+        }
+    };
     let mut opts = query_options(&st, &ds, &params);
     // budgets the request asked for, never above the server's
     let asked = budgets::Overrides::parse(&params)?;
@@ -1156,6 +1168,28 @@ pub(crate) async fn run_query(
     let limit = asked.result_limit(st.limits.max_result_bytes);
     let sfmt = solutions_format(&params, &headers);
     let thrift = results_thrift(&params, &headers);
+    if execution != sparkles::sparql::ExecutionMode::Eager {
+        let rdf_format = rdf_format(&params, &headers, false);
+        let native_graph = params_wants_sparkles(&headers);
+        opts.initial_bindings = bindings;
+        return cursor::run(
+            ds,
+            cursor::Request {
+                query,
+                options: opts,
+                params,
+                uri,
+                guard: _cancel_on_drop,
+                limit,
+                format: sfmt,
+                thrift,
+                rdf_format,
+                native_graph,
+                execution,
+            },
+        )
+        .await;
+    }
     let rfmt = rdf_format(&params, &headers, false);
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     let prefixes = ds.store.prefixes();

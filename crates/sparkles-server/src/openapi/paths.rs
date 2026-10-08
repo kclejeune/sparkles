@@ -112,6 +112,7 @@ fn query_params(o: Op) -> Op {
         "at",
         "branch",
         "send",
+        "execution",
         "nocache",
         "memoryMb",
         "maxRows",
@@ -133,7 +134,7 @@ fn query_params(o: Op) -> Op {
 /// A query's success and error responses.
 fn query_responses(o: Op) -> Op {
     o.resp_ref("200", "QueryResults")
-        .errors(&[400, 408, 410, 413, 503, 507])
+        .errors(&[400, 408, 410, 413, 501, 503, 507])
 }
 
 fn query_form() -> J {
@@ -1090,7 +1091,7 @@ fn queries(p: &mut Paths) {
         let mut o = op(m.clone(), "/{ds}/queries/{name}", id, "SPARQL", summary)
             .doc("The query's parameters are request parameters by name (`minAge=40` or `$minAge=40`). The run takes the parameters of `/{ds}/sparql`, and `version`.")
             .see("stored-queries")
-            .params(&["format", "timeout", "reasoning", "nocache", "at", "send"])
+            .params(&["format", "timeout", "reasoning", "nocache", "at", "send", "execution"])
             .query("version", int(), "Run an older version.");
         if m == POST {
             o = o.body(

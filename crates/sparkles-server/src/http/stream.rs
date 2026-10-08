@@ -15,8 +15,8 @@ use sparkles::Error;
 use sparkles::sparql::results::LimitedWriter;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 /// Bodies up to this size are returned whole.
@@ -54,6 +54,62 @@ pub struct SwitchWriter {
     signal: Option<oneshot::Sender<Outcome>>,
     tx: Option<mpsc::Sender<Chunk>>,
     deferred: bool,
+    control: Option<StreamControl>,
+}
+
+/// Controls for a native cursor's producer, including time spent waiting for a
+/// slow reader. Eager serialization keeps its existing blocking-send path.
+#[derive(Clone)]
+pub(super) struct StreamControl {
+    cancel: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+    wait_ns: Arc<AtomicU64>,
+}
+
+impl StreamControl {
+    pub(super) fn new(cancel: Arc<AtomicBool>, deadline: Option<Instant>) -> Self {
+        Self {
+            cancel,
+            deadline,
+            wait_ns: Default::default(),
+        }
+    }
+    fn check(&self) -> io::Result<()> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "query cancelled",
+            ));
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "query timed out"));
+        }
+        Ok(())
+    }
+    fn classify(&self, error: Error) -> Error {
+        if let Error::Io(io) = &error {
+            if io.kind() == io::ErrorKind::TimedOut {
+                return Error::Timeout;
+            }
+            if io.kind() == io::ErrorKind::ConnectionAborted {
+                return Error::Cancelled;
+            }
+        }
+        error
+    }
+    pub(super) fn wait_ms(&self) -> f64 {
+        self.wait_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+}
+
+fn copy_error(error: &Error) -> Error {
+    match error {
+        Error::BudgetExceeded(budget) => Error::BudgetExceeded(*budget),
+        Error::Timeout => Error::Timeout,
+        Error::Cancelled => Error::Cancelled,
+        Error::Io(e) => Error::Io(io::Error::new(e.kind(), e.to_string())),
+        _ => Error::Io(io::Error::other(error.to_string())),
+    }
 }
 
 fn gone() -> io::Error {
@@ -75,12 +131,50 @@ impl SwitchWriter {
             return Ok(());
         }
         let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK));
-        tx.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| gone())
+        let Some(control) = &self.control else {
+            return tx.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| gone());
+        };
+        let mut item = Ok(Bytes::from(chunk));
+        loop {
+            control.check()?;
+            match tx.try_send(item) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(gone()),
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    item = returned;
+                    let began = Instant::now();
+                    // Capacity wakes the producer immediately; the finite timeout
+                    // also checks controls when the reader never polls again.
+                    let capacity = tokio::runtime::Handle::current().block_on(async {
+                        tokio::time::timeout(Duration::from_millis(10), tx.reserve()).await
+                    });
+                    let ns = began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    let _ =
+                        control
+                            .wait_ns
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                Some(n.saturating_add(ns))
+                            });
+                    match capacity {
+                        Ok(Ok(permit)) => {
+                            control.check()?;
+                            permit.send(item);
+                            return Ok(());
+                        }
+                        Ok(Err(_)) => return Err(gone()),
+                        Err(_) => (),
+                    }
+                }
+            }
+        }
     }
 }
 
 impl Write for SwitchWriter {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        if let Some(control) = &self.control {
+            control.check()?;
+        }
         if self.signal.is_none() && self.tx.is_none() {
             // A quick result is tried synchronously, but its row count says nothing
             // about literal size. Stop before allocating beyond the byte threshold;
@@ -152,8 +246,39 @@ where
     F: FnOnce(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
     D: FnOnce(StreamEnd) + Send + 'static,
 {
+    serialize_inner(threshold, limit, None, write, on_stream_end).await
+}
+
+pub(super) async fn serialize_controlled<F, D>(
+    limit: Option<u64>,
+    control: StreamControl,
+    write: F,
+    on_end: D,
+) -> ApiResult<Serialized>
+where
+    F: FnOnce(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
+    D: FnOnce(StreamEnd) + Send + 'static,
+{
+    serialize_inner(STREAM_AFTER, limit, Some(control), write, on_end).await
+}
+
+async fn serialize_inner<F, D>(
+    threshold: usize,
+    limit: Option<u64>,
+    control: Option<StreamControl>,
+    write: F,
+    on_stream_end: D,
+) -> ApiResult<Serialized>
+where
+    F: FnOnce(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
+    D: FnOnce(StreamEnd) + Send + 'static,
+{
     let (signal, outcome) = oneshot::channel();
+    // A terminal failure does not need space in the already full data channel.
+    let terminal: Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let body_terminal = terminal.clone();
     let span = tracing::Span::current();
+    let held = crate::ratelimit::hold();
     let t0 = Instant::now();
     tokio::task::spawn_blocking(move || {
         // released before the body is handed over: this may be the request span's last
@@ -166,24 +291,66 @@ where
             signal: Some(signal),
             tx: None,
             deferred: false,
+            control: control.clone(),
         };
         // disconnects are noticed through the channel, not a cancellation flag
         let mut w = LimitedWriter::new(sw, limit, None::<Arc<AtomicBool>>);
-        let result = write(&mut w).map_err(|e| w.classify(e));
+        let result = if control.is_some() {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write(&mut w))).unwrap_or_else(
+                |_| {
+                    Err(Error::Io(io::Error::other(
+                        "query producer stopped unexpectedly",
+                    )))
+                },
+            )
+        } else {
+            write(&mut w)
+        };
+        let result = result.map_err(|e| w.classify(e));
         let bytes = w.written();
         let mut sw = w.into_inner();
         let result = result.and_then(|()| sw.send_chunk().map_err(Error::from));
+        let result = result.map_err(|e| match &control {
+            Some(c) => c.classify(e),
+            None => e,
+        });
         let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
         match (sw.tx.take(), result) {
             (None, Ok(())) => {
                 let body = std::mem::take(&mut sw.buf);
+                if control.is_some() {
+                    on_stream_end(StreamEnd {
+                        bytes,
+                        serialize_ms,
+                        error: None,
+                        disconnected: false,
+                    });
+                }
                 drop(span);
+                // Completion may wake the handler immediately. Release the
+                // producer's share before publishing the buffered result.
+                drop(held);
                 if let Some(s) = sw.signal.take() {
                     let _ = s.send(Outcome::Whole(body));
                 }
             }
             (None, Err(e)) => {
+                if control.is_some() {
+                    on_stream_end(StreamEnd {
+                        bytes,
+                        serialize_ms,
+                        error: Some(copy_error(&e)),
+                        disconnected: false,
+                    });
+                    drop(span);
+                    drop(held);
+                    if let Some(s) = sw.signal.take() {
+                        let _ = s.send(Outcome::Failed(e));
+                    }
+                    return;
+                }
                 drop(span);
+                drop(held);
                 if let Some(s) = sw.signal.take() {
                     let _ = s.send(Outcome::Failed(e));
                 }
@@ -206,8 +373,16 @@ where
                 if let Some(msg) = abort {
                     // an error item aborts the response: the client sees a truncated
                     // transfer rather than a complete-looking one
-                    let _ = tx.blocking_send(Err(io::Error::other(msg)));
+                    if control.is_some() {
+                        *terminal.lock().expect("terminal error lock") = Some(msg);
+                    } else {
+                        let _ = tx.blocking_send(Err(io::Error::other(msg)));
+                    }
                 }
+                // Closing the sender publishes EOF. The next request must not
+                // observe the completed producer's concurrency permit.
+                drop(held);
+                drop(tx);
             }
         }
     });
@@ -217,7 +392,11 @@ where
             serialize_ms: t0.elapsed().as_secs_f64() * 1000.0,
         }),
         Ok(Outcome::Stream(rx)) => Ok(Serialized::Streamed(axum::body::Body::from_stream(
-            ChunkStream(rx),
+            ChunkStream {
+                receiver: rx,
+                terminal: body_terminal,
+                done: false,
+            },
         ))),
         Ok(Outcome::Failed(e)) => Err(ApiError::from(e)),
         Err(_) => Err(err(
@@ -275,6 +454,7 @@ where
         signal: None,
         tx: None,
         deferred: false,
+        control: None,
     };
     let mut w = LimitedWriter::new(sw, limit, None::<Arc<AtomicBool>>);
     let result = write(&mut w).map_err(|e| w.classify(e));
@@ -292,7 +472,11 @@ where
 
 /// The receiving end of a [`SwitchWriter`] as a body stream. It keeps answering `None`
 /// after the end, since the compression layer polls once more.
-struct ChunkStream(mpsc::Receiver<Chunk>);
+struct ChunkStream {
+    receiver: mpsc::Receiver<Chunk>,
+    terminal: Arc<std::sync::Mutex<Option<String>>>,
+    done: bool,
+}
 
 impl futures_util::Stream for ChunkStream {
     type Item = Chunk;
@@ -301,7 +485,17 @@ impl futures_util::Stream for ChunkStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        match self.receiver.poll_recv(cx) {
+            std::task::Poll::Ready(None) => {
+                self.done = true;
+                let error = self.terminal.lock().expect("terminal error lock").take();
+                std::task::Poll::Ready(error.map(|e| Err(io::Error::other(e))))
+            }
+            result => result,
+        }
     }
 }
 
@@ -432,6 +626,7 @@ mod tests {
                 signal: Some(signal),
                 tx: None,
                 deferred: false,
+                control: None,
             };
             w.write_all(&vec![b'x'; size])?;
             w.send_chunk()
@@ -528,5 +723,78 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert!(seen[0].disconnected, "the serializer should notice");
         assert!(seen[0].bytes < 100_000_000);
+    }
+
+    #[tokio::test]
+    async fn controlled_waits_expire_without_reading_or_terminal_channel_space() {
+        let (seen, on_end) = ends();
+        let control = StreamControl::new(
+            Default::default(),
+            Some(Instant::now() + Duration::from_millis(150)),
+        );
+        let waits = control.clone();
+        let Ok(Serialized::Streamed(body)) =
+            serialize_inner(100, None, Some(control), write_n(10_000_000, None), on_end).await
+        else {
+            panic!("expected a stream");
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seen.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a stalled reader must not hold the producer past its deadline");
+        assert!(matches!(
+            seen.lock().unwrap()[0].error,
+            Some(Error::Timeout)
+        ));
+        assert!(waits.wait_ms() > 0.0);
+        assert!(
+            axum::body::to_bytes(body, usize::MAX).await.is_err(),
+            "a late timeout must abort even when the data channel was full"
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_waits_observe_cancellation_and_report_only_once() {
+        let (seen, on_end) = ends();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let Ok(Serialized::Streamed(body)) = serialize_inner(
+            100,
+            None,
+            Some(StreamControl::new(cancel.clone(), None)),
+            write_n(10_000_000, None),
+            on_end,
+        )
+        .await
+        else {
+            panic!("expected a stream")
+        };
+        cancel.store(true, Ordering::Relaxed);
+        assert!(axum::body::to_bytes(body, usize::MAX).await.is_err());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(matches!(seen[0].error, Some(Error::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn controlled_early_errors_preserve_budget_status_and_report() {
+        let (seen, on_end) = ends();
+        let r = serialize_inner(
+            100,
+            Some(50),
+            Some(StreamControl::new(Default::default(), None)),
+            write_n(20, None),
+            on_end,
+        )
+        .await;
+        assert!(matches!(
+            r,
+            Err(ApiError(StatusCode::INSUFFICIENT_STORAGE, _))
+        ));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(matches!(seen[0].error, Some(Error::BudgetExceeded(_))));
     }
 }

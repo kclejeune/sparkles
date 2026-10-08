@@ -144,6 +144,20 @@
           "type": "string"
         }
       },
+      "execution": {
+        "description": "Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Streaming SELECT Thrift is unsupported. Deadlines include blocked response writes; late failures abort the body.",
+        "in": "query",
+        "name": "execution",
+        "schema": {
+          "default": "eager",
+          "enum": [
+            "eager",
+            "streaming",
+            "auto"
+          ],
+          "type": "string"
+        }
+      },
       "format": {
         "description": "The response format, in place of `Accept`. Fuseki's `output` and `results` are the same parameter.",
         "in": "query",
@@ -327,7 +341,7 @@
         }
       },
       "send": {
-        "description": "The most rows serialized. `meta.totalRows` still reports the full count.",
+        "description": "The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted.",
         "in": "query",
         "name": "send",
         "schema": {
@@ -3026,6 +3040,46 @@
         },
         "required": [
           "dbName"
+        ],
+        "type": "object"
+      },
+      "CursorPlan": {
+        "properties": {
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/CursorPlan"
+            },
+            "type": "array"
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "fullInputBeforeOutput": {
+            "type": "boolean"
+          },
+          "growingState": {
+            "type": "boolean"
+          },
+          "materializes": {
+            "type": "boolean"
+          },
+          "operator": {
+            "$ref": "#/components/schemas/PlanNode"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "operator",
+          "materializes",
+          "fullInputBeforeOutput",
+          "growingState",
+          "complete",
+          "children"
         ],
         "type": "object"
       },
@@ -8503,7 +8557,14 @@
                 "type": "object"
               },
               "plan": {
-                "$ref": "#/components/schemas/PlanNode"
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PlanNode"
+                  },
+                  {
+                    "$ref": "#/components/schemas/CursorPlan"
+                  }
+                ]
               },
               "rowsProduced": {
                 "type": "integer"
@@ -8511,11 +8572,23 @@
               "sentRows": {
                 "type": "integer"
               },
+              "status": {
+                "description": "Native streaming completion; absent on eager results.",
+                "enum": [
+                  "complete",
+                  "stopped"
+                ],
+                "type": "string"
+              },
               "timing": {
                 "type": "object"
               },
               "totalRows": {
-                "type": "integer"
+                "description": "Null when streaming stopped before exhaustion.",
+                "type": [
+                  "integer",
+                  "null"
+                ]
               }
             },
             "type": "object"
@@ -21862,6 +21935,9 @@
             "$ref": "#/components/parameters/send"
           },
           {
+            "$ref": "#/components/parameters/execution"
+          },
+          {
             "$ref": "#/components/parameters/nocache"
           },
           {
@@ -21933,6 +22009,9 @@
           },
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           },
           "503": {
             "$ref": "#/components/responses/Unavailable"
@@ -22063,6 +22142,9 @@
           },
           {
             "$ref": "#/components/parameters/send"
+          },
+          {
+            "$ref": "#/components/parameters/execution"
           },
           {
             "$ref": "#/components/parameters/nocache"
@@ -25247,6 +25329,9 @@
             "$ref": "#/components/parameters/send"
           },
           {
+            "$ref": "#/components/parameters/execution"
+          },
+          {
             "description": "Run an older version.",
             "in": "query",
             "name": "version",
@@ -25405,6 +25490,9 @@
           },
           {
             "$ref": "#/components/parameters/send"
+          },
+          {
+            "$ref": "#/components/parameters/execution"
           },
           {
             "description": "Run an older version.",
@@ -25616,6 +25704,9 @@
             "$ref": "#/components/parameters/send"
           },
           {
+            "$ref": "#/components/parameters/execution"
+          },
+          {
             "$ref": "#/components/parameters/nocache"
           },
           {
@@ -25679,6 +25770,9 @@
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
           },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
           "503": {
             "$ref": "#/components/responses/Unavailable"
           },
@@ -25728,6 +25822,9 @@
           },
           {
             "$ref": "#/components/parameters/send"
+          },
+          {
+            "$ref": "#/components/parameters/execution"
           },
           {
             "$ref": "#/components/parameters/nocache"
@@ -25795,6 +25892,9 @@
           },
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           },
           "503": {
             "$ref": "#/components/responses/Unavailable"
@@ -26215,6 +26315,9 @@
             "$ref": "#/components/parameters/send"
           },
           {
+            "$ref": "#/components/parameters/execution"
+          },
+          {
             "$ref": "#/components/parameters/nocache"
           },
           {
@@ -26278,6 +26381,9 @@
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
           },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
           "503": {
             "$ref": "#/components/responses/Unavailable"
           },
@@ -26327,6 +26433,9 @@
           },
           {
             "$ref": "#/components/parameters/send"
+          },
+          {
+            "$ref": "#/components/parameters/execution"
           },
           {
             "$ref": "#/components/parameters/nocache"
@@ -26394,6 +26503,9 @@
           },
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
           },
           "503": {
             "$ref": "#/components/responses/Unavailable"

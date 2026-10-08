@@ -887,6 +887,28 @@ pub(super) fn schemas() -> Map<String, J> {
         }),
     );
     put(
+        "CursorPlan",
+        obj(
+            &[
+                "operator",
+                "materializes",
+                "fullInputBeforeOutput",
+                "growingState",
+                "complete",
+                "children",
+            ],
+            json!({
+                "operator": sref("PlanNode"),
+                "materializes": { "type": "boolean" },
+                "fullInputBeforeOutput": { "type": "boolean" },
+                "growingState": { "type": "boolean" },
+                "complete": { "type": "boolean" },
+                "reason": { "type": ["string", "null"] },
+                "children": array(sref("CursorPlan")),
+            }),
+        ),
+    );
+    put(
         "SparklesResult",
         json!({
             "type": "object",
@@ -902,10 +924,11 @@ pub(super) fn schemas() -> Map<String, J> {
                     "type": "object",
                     "additionalProperties": true,
                     "properties": {
-                        "totalRows": { "type": "integer" },
+                        "totalRows": { "type": ["integer", "null"], "description": "Null when streaming stopped before exhaustion." },
+                        "status": { "type": "string", "enum": ["complete", "stopped"], "description": "Native streaming completion; absent on eager results." },
                         "sentRows": { "type": "integer" },
                         "timing": { "type": "object" },
-                        "plan": sref("PlanNode"),
+                        "plan": { "oneOf": [sref("PlanNode"), sref("CursorPlan")] },
                         "memory": { "type": "object" },
                         "rowsProduced": { "type": "integer" },
                         "commit": { "type": "integer" },

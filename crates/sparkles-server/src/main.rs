@@ -1286,6 +1286,9 @@ enum Cmd {
         /// rdfxml, trix, rt, rpb, rj)
         #[arg(long, default_value = "text")]
         results: String,
+        /// Engine execution mode (streaming text output uses TSV)
+        #[arg(long, default_value = "eager", value_parser = ["eager", "streaming", "auto"])]
+        execution: String,
         /// Print the query plan instead of executing
         #[arg(long)]
         explain: bool,
@@ -2854,6 +2857,7 @@ fn run() -> Result<()> {
             data,
             query,
             results: fmt,
+            execution,
             explain,
             time,
             timeout,
@@ -2881,6 +2885,9 @@ fn run() -> Result<()> {
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
                 // the server's DESCRIBE request parameters, over the dataset's setting
                 let mut params: Vec<(&str, String)> = Vec::new();
+                if execution != "eager" {
+                    params.push(("execution", execution.clone()));
+                }
                 if let Some(m) = &describe {
                     sparkles::sparql::describe::DescribeMode::parse(m)?;
                     params.push(("describe", m.clone()));
@@ -2955,6 +2962,106 @@ fn run() -> Result<()> {
                 }
                 None => store.snapshot(),
             };
+            if execution != "eager" {
+                use sparkles::sparql::{ExecutionMode, QueryExecution};
+                let mut cursor = sparkles::sparql::query_execution(
+                    snap,
+                    &q,
+                    &qopts,
+                    &Default::default(),
+                    if execution == "auto" {
+                        ExecutionMode::Auto
+                    } else {
+                        ExecutionMode::Streaming
+                    },
+                )?;
+                if explain {
+                    println!("{}", cursor.plan_json()?);
+                    return Ok(());
+                }
+                let out = std::io::stdout();
+                let mut out = out.lock();
+                match &mut cursor {
+                    QueryExecution::Eager(result) => {
+                        let result = result.result();
+                        match result.kind {
+                            QueryKind::Select | QueryKind::Ask => {
+                                let format = SolutionsFormat::from_name(if fmt == "text" {
+                                    "tsv"
+                                } else {
+                                    &fmt
+                                })
+                                .context("unknown result format")?;
+                                results::write_solutions(result, format, &mut out, None)?;
+                            }
+                            _ => {
+                                if let Some(format) = if fmt == "text" {
+                                    Some(oxrdfio::RdfFormat::Turtle)
+                                } else {
+                                    results::rdf_format_from_name(&fmt)
+                                } {
+                                    results::write_graph(
+                                        result,
+                                        format,
+                                        &store.prefixes(),
+                                        &mut out,
+                                    )?;
+                                } else {
+                                    let format = http::jena_formats::JenaFormat::from_name(&fmt)
+                                        .context("unknown RDF format")?;
+                                    results::write_jena_graph(result, format, &mut out)?;
+                                }
+                            }
+                        }
+                    }
+                    QueryExecution::Select(c) => {
+                        let format =
+                            SolutionsFormat::from_name(if fmt == "text" { "tsv" } else { &fmt })
+                                .context("unknown result format")?;
+                        results::write_cursor_solutions(c, format, &mut out, None)?;
+                    }
+                    QueryExecution::Ask(result) => {
+                        let format =
+                            SolutionsFormat::from_name(if fmt == "text" { "tsv" } else { &fmt })
+                                .context("unknown result format")?;
+                        results::write_solutions(result.result(), format, &mut out, None)?;
+                    }
+                    QueryExecution::Graph(c)
+                        if fmt == "sparkles" || fmt == SolutionsFormat::Sparkles.media_type() =>
+                    {
+                        results::write_cursor_graph_native_json(c, &mut out, None, None)?;
+                    }
+                    QueryExecution::Graph(c) => {
+                        let format = if fmt == "text" {
+                            Some(oxrdfio::RdfFormat::Turtle)
+                        } else {
+                            results::rdf_format_from_name(&fmt)
+                        };
+                        if let Some(format) = format {
+                            let prefixes = store.prefixes().into_iter().collect::<Vec<_>>();
+                            sparkles::sparql::cursor::graph::write_cursor_graph(
+                                c, format, &mut out, None, &prefixes,
+                            )?;
+                        } else {
+                            let format = http::jena_formats::JenaFormat::from_name(&fmt)
+                                .context("unknown RDF format")?;
+                            results::write_cursor_jena_graph(c, format, &mut out, None)?;
+                        }
+                    }
+                }
+                if time {
+                    let stats = cursor.stats();
+                    eprintln!(
+                        "\nparse {:.2} ms · plan {:.2} ms · exec {:.2} ms · total {:.2} ms",
+                        stats.timing.parse_ms,
+                        stats.timing.plan_ms,
+                        stats.timing.exec_ms,
+                        stats.timing.total_ms
+                    );
+                    eprintln!("{}", cursor.plan_json()?);
+                }
+                return Ok(());
+            }
             if explain {
                 let (sse, plan) = sparkles::sparql::explain(snap, &q, &qopts)?;
                 println!("{sse}\n");

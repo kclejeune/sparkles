@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 use tracing::Span;
 
 mod fuseki;
+mod streaming;
+pub(crate) use streaming::DeferredReport;
 
 pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
@@ -205,6 +207,9 @@ pub struct RequestReport {
     pub mem_peak_bytes: Option<u64>,
     /// queries and updates: the rows every operator produced (the `rows-produced` work)
     pub rows_produced: Option<u64>,
+    /// Native cursor completion, distinct from a consumer output cap.
+    pub cursor_status: Option<sparkles::sparql::CursorStatus>,
+    pub transport_wait_ms: Option<f64>,
     /// the limit class that refused the request (outcome `rate_limited`)
     pub limit_class: Option<crate::ratelimit::Class>,
     /// write-time validation status and time (from the `Sparkles-Validation` header)
@@ -379,7 +384,13 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
     }
     pending.auth = auth;
     crate::otel::response_headers(&pending.otel, resp.headers_mut());
-    pending.complete(resp.status().as_u16(), &report);
+    if let Some(deferred) = resp.extensions_mut().remove::<DeferredReport>() {
+        deferred.observe(pending, resp.status().as_u16());
+        let body = std::mem::replace(resp.body_mut(), axum::body::Body::empty());
+        *resp.body_mut() = deferred.wrap(body);
+    } else {
+        pending.complete(resp.status().as_u16(), &report);
+    }
     resp.headers_mut().insert(X_REQUEST_ID.clone(), id_value);
     resp
 }
@@ -539,6 +550,8 @@ fn access_event(
                 response_bytes = r.response_bytes,
                 mem_peak_bytes = r.mem_peak_bytes,
                 rows_produced = r.rows_produced,
+                cursor_status = r.cursor_status.map(|s| s.as_str()),
+                transport_wait_ms = r.transport_wait_ms.map(ms),
                 validation = r.validation,
                 validation_ms = r.validation_ms,
                 graphql_operation = r.graphql.as_ref().and_then(|g| g.operation.as_deref()),

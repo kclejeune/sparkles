@@ -624,11 +624,19 @@ fn parameters() -> Map<String, J> {
         ),
     );
     put(
+        "execution",
+        q(
+            "execution",
+            json!({ "type": "string", "enum": ["eager", "streaming", "auto"], "default": "eager" }),
+            "Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Streaming SELECT Thrift is unsupported. Deadlines include blocked response writes; late failures abort the body.",
+        ),
+    );
+    put(
         "send",
         q(
             "send",
             json!({ "type": "integer" }),
-            "The most rows serialized. `meta.totalRows` still reports the full count.",
+            "The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted.",
         ),
     );
     put(
