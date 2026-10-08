@@ -224,6 +224,36 @@ fn catalog_clones_are_independent_and_cancellation_releases_the_name() {
     assert!(cat.reserved_by("cancelled").is_none());
 }
 
+/// A catalog clone of a dataset with full-text search answers text queries as soon as
+/// the clone is returned, as an HTTP clone task's dataset is served.
+#[cfg(feature = "text")]
+#[test]
+fn catalog_clones_search_text_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+    let source = cat.create("wiki", &Default::default()).unwrap();
+    source
+        .update("INSERT DATA { <urn:s> <urn:label> \"quick brown fox\" }")
+        .unwrap();
+    source
+        .store()
+        .enable_text(sparkles::text::TextConfig::default())
+        .unwrap();
+    let cloned = cat
+        .clone_dataset(
+            "wiki",
+            "sandbox",
+            &CloneRequest::default(),
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(cloned.store().text_status().unwrap().state, "ready");
+    let r = cloned
+        .query("SELECT ?s { ?s <http://jena.apache.org/text#query> \"fox\" }")
+        .unwrap();
+    assert_eq!(r.rows().len(), 1);
+}
+
 #[test]
 fn a_clone_that_passes_its_deadline_is_not_published() {
     let dir = tempfile::tempdir().unwrap();

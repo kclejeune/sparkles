@@ -219,3 +219,106 @@ fn clones_keep_full_text_search() {
         serde_json::to_value(src.text_status().unwrap()).unwrap()["config"]["predicates"]
     );
 }
+
+/// A clone that leaves a graph out is rebuilt with new term numbers, and an in-memory
+/// clone has no files. Both answer text queries at once, without the left-out graph.
+#[cfg(feature = "text")]
+#[test]
+fn partial_and_memory_clones_search_text_at_once() {
+    use sparkles_core::text::{PredicateSet, TextConfig};
+    let tmp = tempfile::tempdir().unwrap();
+    let src = Store::open(&tmp.path().join("src"), StoreOptions::default()).unwrap();
+    src.load(&[Source::from_bytes(
+        b"<urn:a> <urn:label> \"quick brown fox\" .\n\
+          <urn:b> <urn:label> \"lazy fox\" <urn:g> .\n"
+            .to_vec(),
+        RdfFormat::NQuads,
+        None,
+    )])
+    .unwrap();
+    src.enable_text(TextConfig {
+        predicates: PredicateSet::Only(vec!["urn:label".into()]),
+        ..TextConfig::default()
+    })
+    .unwrap();
+    let opts = CloneOptions {
+        exclude_graphs: vec![NamedNode::new_unchecked("urn:g")],
+        ..Default::default()
+    };
+    let in_graphs = "SELECT ?s { GRAPH ?g { ?s <http://jena.apache.org/text#query> \"fox\" } }";
+    let in_default = "SELECT ?s { ?s <http://jena.apache.org/text#query> \"fox\" }";
+    let dst = tmp.path().join("dst");
+    src.clone_to(&dst, &opts).unwrap();
+    let c = Store::open(&dst, StoreOptions::default()).unwrap();
+    assert_eq!(c.text_status().unwrap().state, "ready");
+    assert_eq!(select(&c, in_default), ["<urn:a>"]);
+    assert!(select(&c, in_graphs).is_empty());
+    let (m, _) = src.clone_to_memory(&opts, StoreOptions::default()).unwrap();
+    assert_eq!(m.text_status().unwrap().state, "ready");
+    assert_eq!(select(&m, in_default), ["<urn:a>"]);
+    assert!(select(&m, in_graphs).is_empty());
+}
+
+/// A source whose text index is still recovering after open keeps its configuration
+/// in the clone, and the clone has its own index at once.
+#[cfg(feature = "text")]
+#[test]
+fn a_clone_of_a_recovering_source_keeps_full_text_search() {
+    use sparkles_core::text::TextConfig;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("src");
+    {
+        let src = Store::open(&root, StoreOptions::default()).unwrap();
+        src.load(&[Source::from_bytes(
+            b"<urn:a> <urn:label> \"quick brown fox\" .".to_vec(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        src.enable_text(TextConfig::default()).unwrap();
+    }
+    std::fs::remove_dir_all(root.join("text")).unwrap();
+    let src = Store::open(&root, StoreOptions::default()).unwrap();
+    let dst = tmp.path().join("dst");
+    src.clone_to(&dst, &CloneOptions::default()).unwrap();
+    let c = Store::open(&dst, StoreOptions::default()).unwrap();
+    assert_eq!(c.text_status().unwrap().state, "ready");
+    let q = "SELECT ?s { ?s <http://jena.apache.org/text#query> \"fox\" }";
+    assert_eq!(select(&c, q), ["<urn:a>"]);
+}
+
+/// Cancelling a clone while it builds the full-text index leaves no clone behind.
+#[cfg(feature = "text")]
+#[test]
+fn a_clone_cancelled_during_its_text_build_leaves_nothing() {
+    use sparkles_core::text::TextConfig;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let src = Store::open(&tmp.path().join("src"), StoreOptions::default()).unwrap();
+    src.load(&[Source::from_bytes(
+        b"<urn:a> <urn:label> \"quick brown fox\" .".to_vec(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    src.enable_text(TextConfig::default()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    let opts = CloneOptions {
+        cancel: Some(cancel),
+        progress: Some(Arc::new(move |_, msg: &str| {
+            if msg == "building the full-text index" {
+                flag.store(true, Ordering::SeqCst);
+            }
+        })),
+        ..Default::default()
+    };
+    let dst = tmp.path().join("dst");
+    let err = src.clone_to(&dst, &opts).unwrap_err();
+    assert!(
+        matches!(err, sparkles_core::error::Error::Cancelled),
+        "{err}"
+    );
+    assert!(!dst.exists());
+}

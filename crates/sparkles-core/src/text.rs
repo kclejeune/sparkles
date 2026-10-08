@@ -2163,6 +2163,41 @@ mod imp {
             build_index(Some(root), config, 1, snap, threads, 64 << 20, check)
         }
 
+        /// Build the index of `snap` into `root/text` for a store that is not open yet,
+        /// such as a new clone, and return the number of documents. The index is
+        /// committed at `snap.commit`, so opening the store reuses it. The build uses
+        /// the threads and memory of a manual rebuild, because the caller waits for it,
+        /// and `check` can stop it between documents.
+        pub(crate) fn build_unopened(
+            root: &Path,
+            config: &TextConfig,
+            snap: &Snapshot,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<u64> {
+            check()?;
+            cleanup_staging(root)?;
+            let threads = std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(8);
+            let Built {
+                index,
+                fields,
+                dir,
+                docs,
+                ..
+            } = build_index(
+                Some(root),
+                config,
+                1,
+                snap,
+                threads,
+                threads * (64 << 20),
+                check,
+            )?;
+            publish_built(Some(root), config, index, fields, dir)?;
+            Ok(docs)
+        }
+
         pub(crate) fn recovery_catch_up(
             built: &mut Built,
             config: &TextConfig,

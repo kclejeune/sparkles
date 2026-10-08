@@ -173,6 +173,10 @@ impl Store {
     /// compaction or bulk commit), the head is cloned and every graph is kept, the
     /// generation's index files are shared ([`CloneMode`]); otherwise they are rebuilt.
     ///
+    /// When this store has full-text search, the clone's text index is built from the
+    /// clone's data before this returns, so the clone serves text queries as soon as it
+    /// is opened. `opts.cancel` and `opts.deadline` stop that build too.
+    ///
     /// The writer lock is held only to capture the snapshot; this store is never written.
     /// On any error `dir` is left as it was found (removed, or emptied).
     pub fn clone_to(&self, dir: &Path, opts: &CloneOptions) -> Result<CloneReport> {
@@ -221,9 +225,26 @@ impl Store {
                 &serde_json::to_vec_pretty(&cap.prefixes).unwrap(),
             )?;
         }
-        // full-text search, the spatial index and the vector indexes stay on: the clone
-        // rebuilds them when opened
+        // Full-text search, the spatial index and the vector indexes stay configured.
+        // The full-text index is built here, before the clone exists, so the clone
+        // answers text queries as soon as it is opened. The source's index cannot be
+        // copied, because its checkpoint names a commit of the source and the clone
+        // starts again at commit 0. The spatial and vector indexes build in the
+        // background when the clone is opened, and queries give the same answers
+        // without them meanwhile.
         for (file, cfg) in self.index_config_files()? {
+            #[cfg(feature = "text")]
+            if file == "text.json" {
+                let c: crate::text::TextConfig = serde_json::from_slice(&cfg)
+                    .map_err(|e| Error::Corrupt(format!("text.json: {e}")))?;
+                report(opts, 0.9, "building the full-text index");
+                let gen_ = Arc::new(Generation::open(&gdir, name, false)?);
+                let mut text_snap = self.base_snapshot(&gen_, root.seq);
+                text_snap.dataset_id = id;
+                crate::text::TextIndex::build_unopened(dir, &c, &text_snap, &|| {
+                    check_control(opts)
+                })?;
+            }
             write_atomic(&dir.join(file), &cfg)?;
         }
         // write-time validation stays configured (the clone judges its first write in

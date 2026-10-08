@@ -1612,7 +1612,7 @@ impl Store {
 
     /// A snapshot of `gen_` alone, with an empty delta, at commit `seq` (what a
     /// compaction's new generation holds before the commits carried over).
-    fn base_snapshot(&self, gen_: &Arc<Generation>, seq: u64) -> Snapshot {
+    pub(super) fn base_snapshot(&self, gen_: &Arc<Generation>, seq: u64) -> Snapshot {
         Snapshot {
             dataset_id: self.owner_dataset_id(),
             generation: gen_.clone(),
