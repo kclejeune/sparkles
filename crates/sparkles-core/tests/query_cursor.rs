@@ -1427,7 +1427,7 @@ fn dictionary_inputs_match_eager_for_mixed_expressions_and_budget_decline() {
     let s = store(0);
     let data = (0..5000)
         .map(|i| format!(
-            "<urn:s:{i}> <urn:value> \"{}.12345678901234567890\"^^<http://www.w3.org/2001/XMLSchema#decimal> ; <urn:name> \"name {i} {}\" .\n",
+            "<urn:s:{i}> <urn:value> \"{}.123456789012345678\"^^<http://www.w3.org/2001/XMLSchema#decimal> ; <urn:name> \"name {i} {}\" .\n",
             i, "x".repeat(96)
         ))
         .collect::<String>();
@@ -1437,7 +1437,15 @@ fn dictionary_inputs_match_eager_for_mixed_expressions_and_budget_decline() {
         None,
     )])
     .unwrap();
+    let numeric = oxrdf::Literal::new_typed_literal(
+        "3.123456789012345678",
+        oxrdf::NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#decimal"),
+    );
+    assert!(sparkles_core::id::inline_id(&numeric.clone().into()).is_none());
+    assert!(sparkles_core::sparql::value::Value::from_term(&numeric.clone().into()).is_numeric());
     let mut tx = s.write();
+    let base_id = tx.intern(&numeric.into()).unwrap();
+    assert_eq!(base_id.tag(), sparkles_core::id::Tag::Vocab);
     let subject = tx
         .intern(&oxrdf::NamedNode::new_unchecked("urn:delta").into())
         .unwrap();
@@ -1445,7 +1453,7 @@ fn dictionary_inputs_match_eager_for_mixed_expressions_and_budget_decline() {
         (
             "urn:value",
             oxrdf::Literal::new_typed_literal(
-                "3.12345678901234567890",
+                "4500.987654321098765432",
                 oxrdf::NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#decimal"),
             ),
         ),
@@ -1455,36 +1463,51 @@ fn dictionary_inputs_match_eager_for_mixed_expressions_and_budget_decline() {
             .intern(&oxrdf::NamedNode::new_unchecked(predicate).into())
             .unwrap();
         let o = tx.intern(&object.into()).unwrap();
+        if predicate == "urn:value" {
+            assert_eq!(o.tag(), sparkles_core::id::Tag::Delta);
+        }
         tx.insert([subject, p, o, Id::DEFAULT_GRAPH]).unwrap();
     }
     tx.commit().unwrap();
-    for (q, ordered) in [
+    for (q, ordered, expected_count) in [
         (
             "SELECT ?s { ?s <urn:value> ?v FILTER(?v > 4000 && ?v < 4900) }",
             false,
+            901,
+        ),
+        (
+            "SELECT ?s { ?s <urn:value> ?v BIND(?v + 0.000000000000000001 AS ?x) FILTER(?x > 4000 && ?x < 4900) }",
+            false,
+            901,
         ),
         (
             "SELECT ?s { ?s <urn:value> ?v ; <urn:name> ?n FILTER(STRLEN(?n) > ?v) }",
             false,
+            105,
         ),
         (
             "SELECT ?s ?x { ?s <urn:value> ?v ; <urn:name> ?n BIND(?v + STRLEN(?n) AS ?x) }",
             false,
+            5001,
         ),
         (
             "SELECT ?s { ?s <urn:value> ?v ; <urn:name> ?n } ORDER BY (?v + STRLEN(?n)) ?s LIMIT 10",
             true,
+            10,
         ),
         (
             "SELECT ?s { ?s <urn:value> ?v ; <urn:name> ?original BIND(CONCAT(?original, \" suffix\") AS ?n) FILTER(STRLEN(?n) > ?v) }",
             false,
+            112,
         ),
     ] {
         let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        assert_eq!(expected.len(), expected_count, "{q}");
 
         for (memory, reuse, batch) in [
+            (32 << 20, true, 8192),
             (32 << 20, true, 4096),
-            (32 << 20, false, 4096),
+            (32 << 20, false, 8192),
             (32 << 20, true, 31),
         ] {
             let opts = QueryOptions {
