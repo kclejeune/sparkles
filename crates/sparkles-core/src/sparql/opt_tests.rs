@@ -1326,7 +1326,7 @@ fn optimized_operators_obey_the_memory_budget() {
         ),
         (
             "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?v) LIMIT 5",
-            "desc:top-k heap",
+            "desc:numeric prefilter",
         ),
         (
             "SELECT * WHERE { ?a ex:org ?o . ?b ex:org ?o }",

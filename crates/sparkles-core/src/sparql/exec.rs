@@ -3382,23 +3382,6 @@ fn order_by(
         ids.dedup();
         ctx.snap.generation.vocab.prefetch_sorted(&ids);
     }
-    if let Some(k) = limit
-        && k > 0
-        && k < t.len()
-        && heap_eligible(ctx)
-    {
-        let n = t.len();
-        let mut heap = TopK::new(k, keys.iter().map(|(_, asc)| *asc).collect());
-        let ranked = offer_rows(ctx, &mut heap, &t, keys, report, &mut RowIndex)?;
-        ctx.check()?;
-        let idx: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
-        ctx.check_output(idx.len(), t.width())?;
-        let note = format!(
-            "[top-k heap kept {} of {n} rows, {ranked} ranked on every key]",
-            idx.len()
-        );
-        return Ok((t.take_rows(&idx), Some(note)));
-    }
     let mut notes = Vec::new();
     let mut cursor_candidate_charge = None;
     if let Some(k) = limit
@@ -3419,6 +3402,25 @@ fn order_by(
         t = t.take_rows(&cand);
     }
     drop(cursor_candidate_charge);
+    // The numeric prefilter keeps the candidates in input order and drops only rows
+    // with k rows strictly ahead, so the heap over the candidates keeps the same rows.
+    if let Some(k) = limit
+        && k > 0
+        && k < t.len()
+        && heap_eligible(ctx)
+    {
+        let n = t.len();
+        let mut heap = TopK::new(k, keys.iter().map(|(_, asc)| *asc).collect());
+        let ranked = offer_rows(ctx, &mut heap, &t, keys, report, &mut RowIndex)?;
+        ctx.check()?;
+        let idx: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
+        ctx.check_output(idx.len(), t.width())?;
+        notes.push(format!(
+            "[top-k heap kept {} of {n} rows, {ranked} ranked on every key]",
+            idx.len()
+        ));
+        return Ok((t.take_rows(&idx), Some(notes.join(" "))));
+    }
     if let Some(k) = limit
         && ctx.opt.topk_first_key
         && keys.len() > 1
