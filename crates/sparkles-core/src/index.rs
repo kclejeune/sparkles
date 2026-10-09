@@ -413,7 +413,23 @@ fn decode_varints(raw: &[u8], rows: usize) -> Result<Vec<u64>> {
     let mut out = Vec::with_capacity(rows);
     let mut pos = 0;
     let mut prev = 0u64;
-    for _ in 0..rows {
+    while out.len() < rows {
+        // Sorted key columns mostly hold deltas below 64, one byte each. Eight such
+        // bytes in a row are decoded together, without a branch per value.
+        if rows - out.len() >= 8
+            && let Some(s) = raw.get(pos..pos + 8)
+        {
+            let w = u64::from_le_bytes(s.try_into().unwrap());
+            if w & 0x8080_8080_8080_8080 == 0 {
+                for z in w.to_le_bytes() {
+                    let d = ((z >> 1) as i64) ^ -((z & 1) as i64);
+                    prev = prev.wrapping_add(d as u64);
+                    out.push(prev);
+                }
+                pos += 8;
+                continue;
+            }
+        }
         // a varint takes at most 10 bytes: while 10 remain, read them without checking
         // for the end of the buffer at each byte
         let z = match raw.get(pos..pos + 10) {
@@ -1073,6 +1089,12 @@ mod tests {
             col.push(v);
         }
         col.extend([u64::MAX, 0, 1 << 63]);
+        // runs of one-byte deltas, up and down, that the eight-at-a-time path reads
+        for i in 0..1000u64 {
+            v = v.wrapping_add((i * 37 % 63).wrapping_sub(31));
+            col.push(v);
+        }
+        col.push(5);
         let mut scratch = Vec::new();
         for n in [0, 1, 2, 9, 10, 11, col.len()] {
             let enc = encode_column(&col[..n], &mut scratch);
