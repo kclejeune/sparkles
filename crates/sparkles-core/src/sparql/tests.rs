@@ -95,6 +95,25 @@ fn select_star_order() {
 }
 
 #[test]
+fn now_is_one_value_per_query() {
+    // NOW() is read from the clock on its first call; every row, every call and every
+    // part of the query (BIND, FILTER, projection) sees that same value
+    let s = store();
+    let r = q(
+        &s,
+        "SELECT (COUNT(DISTINCT ?t) AS ?n) (SAMPLE(?t) = MAX(?u) AS ?same) WHERE { \
+         ?p foaf:name ?name BIND(NOW() AS ?t) BIND(STR(NOW()) AS ?s) \
+         FILTER(STR(?t) = ?s) BIND(NOW() AS ?u) }",
+    );
+    assert_eq!(strs(&r), vec!["1 true"]);
+    // a query without NOW() does not need it, and a later one reads the clock again
+    let a = q(&s, "SELECT (NOW() AS ?t) {}");
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let b = q(&s, "SELECT (NOW() AS ?t) {}");
+    assert_ne!(strs(&a), strs(&b));
+}
+
+#[test]
 fn rejects_rebinding_in_scope_variable() {
     let s = store();
     let r = query(

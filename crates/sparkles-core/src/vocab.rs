@@ -465,6 +465,11 @@ impl Vocab {
         mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
         let mut ahead = self.ahead_for(ids);
+        if ahead.end == 0 && ids.len() > 1 {
+            // scattered ids: ask for their blocks at once, so that a cold vocabulary
+            // reads them in parallel instead of faulting on one after another
+            self.prefetch_sorted(ids);
+        }
         let mut key = Vec::new();
         let data = self.data.as_slice();
         let mut i = 0;
@@ -528,6 +533,10 @@ impl Vocab {
         } else {
             Ahead::default()
         };
+        if read_ahead && ahead.end == 0 && ids.len() > 1 {
+            // scattered ids, as in `get_sorted_checked`
+            self.prefetch_sorted(ids);
+        }
         // Empty and entirely out-of-range passes need no reconstruction storage.
         let mut key = if ids.first().is_some_and(|&id| id < self.len) {
             Vec::with_capacity(64)

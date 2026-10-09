@@ -350,9 +350,9 @@ pub fn write_solutions(
         // a result of one chunk is decoded row by row: under concurrent load that keeps
         // less memory live per request than a chunk's table of terms, and in the 10.5M
         // benchmark it served 25% more requests a second
-        // Medium answers can contain thousands of scattered vocabulary pages. Keep
+        // Even a small answer's terms lie on scattered vocabulary pages. Keep
         // row-by-row decoding's small working set, but overlap those cold reads.
-        if n >= 256 && crate::index::io_hints() {
+        if n >= 2 && crate::index::io_hints() {
             prefetch_answer(r, n);
         }
         for i in 0..n {
@@ -415,8 +415,23 @@ fn prefetch_answer(r: &QueryResult, n: usize) {
             .filter(|id| id.tag() == Tag::Vocab)
             .map(|id| id.payload())
     });
-    r.ctx.snap.generation.vocab.prefetch_terms(ids);
+    let vocab = &r.ctx.snap.generation.vocab;
+    if n < PREFETCH_BLOCKS_BELOW {
+        // A few hundred terms are cheap to sort, and asking for just their blocks reads
+        // far less than whole sparse-index groups. A cold 35-row star lookup at 1.05M
+        // made 93 page faults here one after another, which was most of its time.
+        let mut ids: Vec<u64> = ids.collect();
+        ids.sort_unstable();
+        ids.dedup();
+        vocab.prefetch_sorted(&ids);
+    } else {
+        vocab.prefetch_terms(ids);
+    }
 }
+
+/// Answers of fewer rows prefetch the exact vocabulary blocks of their terms rather
+/// than the sparse-index groups that hold them.
+const PREFETCH_BLOCKS_BELOW: usize = 256;
 
 /// Result rows decoded at a time for serialization.
 const DECODE_ROWS: usize = 1 << 16;

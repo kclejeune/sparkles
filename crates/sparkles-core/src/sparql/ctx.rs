@@ -407,7 +407,10 @@ pub struct Ctx {
     /// the request's graph view when it does not read every graph: `dataset` is already
     /// limited to it (see [`DatasetSpec::restrict`]), and plans are redacted
     pub graphs: Option<Arc<crate::access::GraphAccess>>,
-    pub now: oxsdatatypes::DateTime,
+    /// The query's `NOW()`, read from the clock on first use so that queries that never
+    /// call it skip the clock and the calendar conversion. One value serves the whole
+    /// query, as SPARQL requires (see [`Ctx::now`]).
+    now: std::sync::OnceLock<oxsdatatypes::DateTime>,
     pub base_iri: Option<oxiri::Iri<String>>,
     pub var_names: RwLock<Vec<String>>,
     /// Maximum number of rows any intermediate result may have (memory guard).
@@ -500,7 +503,7 @@ impl Ctx {
             cancel: Arc::new(AtomicBool::new(false)),
             dataset: DatasetSpec::default(),
             graphs: None,
-            now: oxsdatatypes::DateTime::now(),
+            now: std::sync::OnceLock::new(),
             base_iri: None,
             var_names: RwLock::new(Vec::new()),
             max_rows: 200_000_000,
@@ -523,6 +526,12 @@ impl Ctx {
             stars: Default::default(),
             probes: Default::default(),
         }
+    }
+
+    /// The query's `NOW()`: the clock at its first call, the same value at every later
+    /// call of this context.
+    pub fn now(&self) -> oxsdatatypes::DateTime {
+        *self.now.get_or_init(oxsdatatypes::DateTime::now)
     }
 
     pub(crate) fn fail_extension(&self, error: super::extensions::ScalarError) {
@@ -1332,7 +1341,22 @@ impl Ctx {
                 if let Some(v) = shard.read().get(&id) {
                     return Some(v.clone());
                 }
-                let v = Value::from_term(&self.term(id)?);
+                // straight from the key: building an RDF term first cost two string
+                // allocations per value (lexical form and datatype IRI)
+                let v = match id.tag() {
+                    Tag::Vocab => self
+                        .snap
+                        .generation
+                        .vocab
+                        .get_with(id.payload(), Value::from_key)?,
+                    Tag::Delta => self
+                        .snap
+                        .generation
+                        .dvocab
+                        .with(|v| v.get(id.payload()).map(Value::from_key))?,
+                    Tag::Local => self.local.read().get(id.payload()).map(Value::from_key)?,
+                    _ => Value::from_term(&self.term(id)?),
+                };
                 let mut w = shard.write();
                 if w.len() > VALUE_SHARD_CAP {
                     w.clear();
