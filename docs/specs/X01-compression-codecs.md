@@ -417,8 +417,13 @@ encoding that suits its contents:
   into ranges of about 8 MiB of partial vocabulary, and a finished range waits in
   memory until the ranges before it are appended. The waiting ranges hold at most
   512 MiB together, and a range past that limit is written to a file as before. This
-  memory is used during the vocabulary merge, when the parse buffers are already
-  freed, so it does not raise the load's peak RSS.
+  memory is used during the vocabulary merge, after the parse buffers are freed.
+
+The change did raise the load's peak RSS. On Forge the peak was 327 MiB higher in the
+bounded loads, 383 MiB higher in the 15-file loads and 230 MiB higher in the full
+DBpedia load. The peak falls in the parse phase, so the extra memory came from
+encoding the compressed batch quads and partial vocabularies there, and not from the
+merged ranges. The loader round of 2026-10-09 below brings the parse peak back down.
 
 The permutation and vocabulary writers also send their data to the device as they
 write it. Every 8 MiB they start writeback with `sync_file_range`, and they wait for
@@ -464,7 +469,57 @@ kept 1.5 to 3.6 cores busy before and 3.4 to 5.8 after. CPU time did not grow. U
 and system time had a median of 215 s before and 208 s after in the five unlimited
 loads of each build, which is within the noise of the busy machine.
 
-**Not built.** The Phase 2 codecs for index blocks and the vocabulary, zstd for the
-loader's temporary files, dictionaries, the pure-Rust zstd decoder and zstd repository
-blobs were not built. zstd at level 1 would make the sorted runs about a quarter smaller
-than LZ4 does, for more CPU time.
+**Loader round of 2026-10-09.** The full DBpedia load still wrote 31 GB of temporary
+files, and the partial vocabularies were 44% of them. This round made four changes:
+- Builds with the `zstd` feature, which include the server, compress the loader's
+  temporary files with zstd at level 1 instead of LZ4. This covers the partial
+  vocabularies, the batch quads, the sorted runs and the regrouping spills.
+- Keys that recur across batches are written once per load. Before a batch writes its
+  partial vocabulary, it looks each key up in a shared set of hot keys. A key that an
+  earlier batch wrote becomes hot while the set stays within its budget, and a Bloom
+  filter answers whether an earlier batch wrote it. The hot keys are written once, as
+  one more partial vocabulary, when the parse ends. On the full load, 12.8 million
+  keys became hot.
+- A batch's quads take 16 bytes each in memory instead of 32, and they are encoded
+  block by block in parallel.
+- A batch's keys live in one buffer that the encoder keeps from batch to batch, and the
+  parser reuses its decompressed input blocks. This avoids most of the allocator churn
+  of the parse.
+
+The loads below ran on Forge in a 14 GiB scope pinned to 12 CPUs, after a trim. The two
+builds alternated, with two loads each at each scale. Each value is the median of its
+two loads. Bytes are in MB.
+
+| | Bounded before | Bounded after | Full before | Full after |
+|---|---:|---:|---:|---:|
+| Batch quads | 143 | 101 | 4,345 | 4,389 |
+| Partial vocabularies | 508 | 381 | 13,747 | 7,858 |
+| Hot key lists | 0 | 1 | 0 | 196 |
+| Maps to global ids | 54 | 54 | 865 | 571 |
+| Vocabulary ranges | 0 | 0 | 1,136 | 733 |
+| Sorted runs | 436 | 318 | 9,665 | 8,027 |
+| Regrouping spills | 53 | 34 | 1,564 | 1,317 |
+| All temporary files | 1,195 | 889 | 31,322 | 23,092 |
+| Sent to storage | 2,896 | 2,590 | 62,103 | 54,106 |
+| Wall time (s) | 31.8 | 30.7 | 489.6 | 478.1 |
+| Peak RSS (MiB) | 6,521 | 5,200 | 6,892 | 6,022 |
+
+The full load takes 2.4% less time. The vocabulary merge takes 25.0 s instead of 29.2 s,
+and the parse 243.4 s instead of 247.8 s. User time fell from 4,104 to 4,033 s, and
+system time from 192 to 120 s. The peak RSS still falls in the parse phase, and it is
+now below the level it had before the spill-file change. The index files are byte for
+byte the same as before at both scales.
+
+The hot keys cost memory. They and their table take up to the budget of 1 GiB, and the
+filter takes 256 MiB. Both are held until the parse ends. Without them, the full load
+would peak about 1.1 GiB lower, which was measured as parse peaks of 4,470 and
+5,619 MB on a 12-CPU laptop. In return, the partial vocabularies are 2.2 GB smaller
+than with zstd alone. A batch numbers its hot keys after its own keys, so a column of
+its quads jumps between the two ranges. This makes the batch quads about 1.3 GB larger
+than they are with zstd alone, and the lists of the hot ids each batch uses add 0.2 GB.
+The net saving is about 1.3 GB of temporary files, and the vocabulary merge has fewer
+keys to merge.
+`BuildOptions::hot_key_bytes` sets the budget, and zero turns the hot keys off.
+
+**Not built.** The Phase 2 codecs for index blocks and the vocabulary, dictionaries, the
+pure-Rust zstd decoder and zstd repository blobs were not built.

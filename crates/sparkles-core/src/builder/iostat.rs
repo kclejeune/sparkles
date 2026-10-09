@@ -16,6 +16,8 @@ pub(super) enum Tmp {
     Quads,
     /// a batch's sorted distinct keys (`b*.voc`)
     PartialVocab,
+    /// the hot ids a batch uses (`b*.h`)
+    HotLists,
     /// a batch's map from key rank to global id (`b*.map`)
     Maps,
     /// a range of the merged vocabulary (`vocab-range-*`)
@@ -26,9 +28,10 @@ pub(super) enum Tmp {
     Spills,
 }
 
-const KINDS: [(Tmp, &str); 6] = [
+const KINDS: [(Tmp, &str); 7] = [
     (Tmp::Quads, "quads"),
     (Tmp::PartialVocab, "partial vocabularies"),
+    (Tmp::HotLists, "hot key lists"),
     (Tmp::Maps, "maps"),
     (Tmp::VocabRanges, "vocabulary ranges"),
     (Tmp::Runs, "runs"),
@@ -37,14 +40,14 @@ const KINDS: [(Tmp, &str); 6] = [
 
 /// Bytes written to temporary files, by kind.
 #[derive(Default)]
-pub(super) struct TmpBytes([AtomicU64; 6]);
+pub(super) struct TmpBytes([AtomicU64; KINDS.len()]);
 
 impl TmpBytes {
     pub(super) fn add(&self, kind: Tmp, n: u64) {
         self.0[kind as usize].fetch_add(n, Ordering::Relaxed);
     }
 
-    fn get(&self) -> [u64; 6] {
+    fn get(&self) -> [u64; KINDS.len()] {
         std::array::from_fn(|i| self.0[i].load(Ordering::Relaxed))
     }
 }
@@ -77,7 +80,7 @@ fn proc_io() -> Option<ProcIo> {
 pub(super) struct Phases {
     at: Instant,
     io: Option<ProcIo>,
-    tmp: [u64; 6],
+    tmp: [u64; KINDS.len()],
 }
 
 impl Phases {
@@ -85,7 +88,7 @@ impl Phases {
         Phases {
             at: Instant::now(),
             io: proc_io(),
-            tmp: [0; 6],
+            tmp: [0; KINDS.len()],
         }
     }
 

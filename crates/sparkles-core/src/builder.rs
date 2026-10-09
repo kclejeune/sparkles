@@ -3,9 +3,10 @@
 //! 1. **Parse & encode** (parallel): each parser chunk owns an [`Encoder`] that maps
 //!    terms to inline ids / blank-node ids, or to *batch-local* ids for vocabulary terms.
 //!    Every `batch_quads` quads, the batch's distinct keys are sorted and written as a
-//!    partial vocabulary (front-coded and LZ4-compressed blocks, see
+//!    partial vocabulary (front-coded and compressed blocks, see
 //!    [`vocabmerge::write_partial`]) together with the batch's quads (compressed blocks
-//!    of columns, in the format of a sorted run).
+//!    of columns, in the format of a sorted run). Keys that recur across batches are
+//!    kept in memory and written once, as one more partial vocabulary (see [`hotkeys`]).
 //! 2. **Vocabulary merge**: k-way merge of all partial vocabularies into the sorted,
 //!    front-coded base vocabulary; per-batch `rank → global id` maps are written
 //!    along the way as delta-coded records (see [`vocabmerge::Maps`]).
@@ -21,6 +22,8 @@
 //!    these pairs). Without named graphs GSPO is SPO behind the one graph. Writers run
 //!    in threads of their own. Statistics for the planner are gathered on the way.
 
+mod codec;
+mod hotkeys;
 mod iostat;
 mod runs;
 mod vocabmerge;
@@ -38,6 +41,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -52,6 +56,11 @@ pub struct BuildOptions {
     pub batch_key_bytes: usize,
     /// Max quads sorted in memory at once (32 bytes each).
     pub sort_mem_quads: usize,
+    /// Memory for the keys that recur across batches, which are then written once for
+    /// the whole load instead of once per batch (see [`hotkeys`]). They are held until
+    /// the parse ends, together with a filter of [`hotkeys::SEEN_BYTES`]. Zero turns
+    /// this off.
+    pub hot_key_bytes: usize,
     /// First blank node id to allocate.
     pub first_bnode: u64,
 }
@@ -63,6 +72,7 @@ impl Default for BuildOptions {
             batch_quads: 4_000_000,
             batch_key_bytes: 128 << 20,
             sort_mem_quads: 64_000_000,
+            hot_key_bytes: 1 << 30,
             first_bnode: 0,
         }
     }
@@ -155,6 +165,8 @@ struct BatchInfo {
     /// the place of the batch in the order of `id`, set before the vocabulary merge
     pos: usize,
     keys: u64,
+    /// the number of hot keys the batch uses
+    hot: u64,
     /// the size of the partial vocabulary file
     voc_bytes: u64,
     quads: u64,
@@ -204,6 +216,7 @@ pub struct Builder {
     tmp_bytes: iostat::TmpBytes,
     /// the start of the current phase and of the build
     phases: Mutex<(iostat::Phases, iostat::Phases)>,
+    hot: hotkeys::HotKeys,
 }
 
 /// The messages of a long-running build, one per phase (`building POS`). A build does
@@ -232,6 +245,7 @@ impl Builder {
             dir: dir.to_path_buf(),
             tmp,
             next_bnode: AtomicU64::new(opts.first_bnode),
+            hot: hotkeys::HotKeys::new(opts.hot_key_bytes as u64),
             opts,
             batches: Mutex::new(Vec::new()),
             next_batch: AtomicUsize::new(0),
@@ -295,49 +309,98 @@ impl Builder {
         Encoder {
             b: self,
             scope,
-            keys: FxHashMap::default(),
-            key_bytes: 0,
-            quads: Vec::new(),
+            keys: KeySet::default(),
+            quads: QuadBuf::default(),
+            order: Vec::new(),
+            rank: Vec::new(),
             keybuf: Vec::with_capacity(128),
             taken: 0,
             last: Default::default(),
         }
     }
 
-    fn write_batch(&self, keys: FxHashMap<Box<[u8]>, u32>, mut quads: Vec<[u64; 4]>) -> Result<()> {
+    /// Write a batch: its keys sorted as a partial vocabulary, and its quads with each
+    /// local id replaced by the rank of its key. The hot keys of the batch (see
+    /// [`hotkeys`]) are left out of the partial vocabulary. They are numbered after the
+    /// ranks in the order of their hot ids, and the list of their hot ids is written
+    /// instead. `order` and `rank` are buffers kept by the encoder.
+    fn write_batch(
+        &self,
+        keys: &KeySet,
+        quads: &QuadBuf,
+        order: &mut Vec<u32>,
+        rank: &mut Vec<u32>,
+    ) -> Result<()> {
         if quads.is_empty() {
             return Ok(());
         }
         let id = self.next_batch.fetch_add(1, Ordering::Relaxed);
-        let mut entries: Vec<(Box<[u8]>, u32)> = keys.into_iter().collect();
-        entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let mut rank = vec![0u64; entries.len()];
-        for (r, (_, local)) in entries.iter().enumerate() {
-            rank[*local as usize] = r as u64;
+        const NOT_HOT: u32 = u32::MAX;
+        rank.clear();
+        rank.resize(keys.len(), NOT_HOT);
+        order.clear();
+        // The first batch of each parser thread looks for no hot keys, so that a load
+        // of one batch per thread does not fill the filter of seen keys. Its keys are
+        // not recorded as seen either, which loses little on a load of many batches.
+        if self.opts.hot_key_bytes > 0 && id >= self.opts.threads.max(1) {
+            rank.par_iter_mut()
+                .enumerate()
+                .with_min_len(1 << 12)
+                .for_each(|(i, r)| {
+                    if let Some(h) = self.hot.classify(keys.key(i as u32)) {
+                        *r = h;
+                    }
+                });
+            order.extend((0..keys.len() as u32).filter(|&i| rank[i as usize] == NOT_HOT));
+        } else {
+            order.extend(0..keys.len() as u32);
+        }
+        order.par_sort_unstable_by(|&a, &b| keys.key(a).cmp(keys.key(b)));
+        let own = order.len() as u32;
+        // Numbered this way, the batch's values stay below its number of keys, as they
+        // were without hot keys, and the columns of its quads compress as well.
+        let mut used: Vec<(u32, u32)> = rank
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| **h != NOT_HOT)
+            .map(|(i, &h)| (h, i as u32))
+            .collect();
+        used.par_sort_unstable();
+        for (j, &(_, local)) in used.iter().enumerate() {
+            rank[local as usize] = own + j as u32;
+        }
+        for (r, &local) in order.iter().enumerate() {
+            rank[local as usize] = r as u32;
+        }
+        if !used.is_empty() {
+            let n = hotkeys::write_list(
+                &self.tmp.join(format!("b{id}.h")),
+                used.iter().map(|&(h, _)| h),
+            )?;
+            self.tmp_bytes.add(iostat::Tmp::HotLists, n);
         }
         let (samples, voc_bytes) = vocabmerge::write_partial(
             &self.tmp.join(format!("b{id}.voc")),
-            entries.iter().map(|(k, _)| &**k),
+            order.iter().map(|&i| keys.key(i)),
         )?;
         self.tmp_bytes.add(iostat::Tmp::PartialVocab, voc_bytes);
-        for q in quads.iter_mut() {
-            for v in q.iter_mut() {
-                if Id(*v).tag() == Tag::Local {
-                    *v = Id::local(rank[Id(*v).payload() as usize]).0;
-                }
-            }
-        }
-        let q_bytes = runs::write_run(&self.tmp.join(format!("b{id}.q")), &quads)?;
+        let q_bytes = runs::write_run_from(
+            &self.tmp.join(format!("b{id}.q")),
+            quads.len(),
+            rayon::current_num_threads(),
+            |r, out| quads.expand(r, rank, out),
+        )?;
         self.tmp_bytes.add(iostat::Tmp::Quads, q_bytes);
         self.input_quads
             .fetch_add(quads.len() as u64, Ordering::Relaxed);
-        if quads.iter().any(|q| q[3] != Id::DEFAULT_GRAPH.0) {
+        if quads.named_graphs() {
             self.named_graphs.store(true, Ordering::Relaxed);
         }
         self.batches.lock().push(BatchInfo {
             id,
             pos: 0,
-            keys: entries.len() as u64,
+            keys: own as u64,
+            hot: used.len() as u64,
             voc_bytes,
             quads: quads.len() as u64,
             samples,
@@ -346,18 +409,29 @@ impl Builder {
     }
 
     /// Run the merge / sort phases and write the generation. Returns index metadata.
-    pub fn finish(self) -> Result<IndexMeta> {
+    pub fn finish(mut self) -> Result<IndexMeta> {
         let mut batches = std::mem::take(&mut *self.batches.lock());
         batches.sort_by_key(|b| b.id);
         for (i, b) in batches.iter_mut().enumerate() {
             b.pos = i;
         }
         let total_in: u64 = batches.iter().map(|b| b.quads).sum();
+        // the hot keys are one more partial vocabulary, after the batches
+        let hot = std::mem::replace(&mut self.hot, hotkeys::HotKeys::new(0));
+        let hot_keys = hot.len() as u64;
+        let hot_voc = self.tmp.join("hot.voc");
+        let ((hot_samples, hot_bytes), hot_order) = if hot_keys > 0 {
+            hot.write(|keys| vocabmerge::write_partial(&hot_voc, keys))?
+        } else {
+            ((Vec::new(), 0), Vec::new())
+        };
+        self.tmp_bytes.add(iostat::Tmp::PartialVocab, hot_bytes);
         self.phase_done("parse");
         self.report(&format!(
-            "merging {} partial vocabularies ({} input quads)",
+            "merging {} partial vocabularies ({} input quads, {} hot keys)",
             batches.len(),
-            total_in
+            total_in,
+            hot_keys
         ));
 
         // ---- 2. vocabulary merge -------------------------------------------------
@@ -365,13 +439,13 @@ impl Builder {
         // each merging thread reads every batch's vocabulary at once: as many threads as
         // the open-file limit allows, down to one, which needs as many files as a merge
         // in one thread
-        let files = |t: usize| t as u64 * batches.len() as u64 + 256;
+        let files = |t: usize| t as u64 * (batches.len() as u64 + 1) + 256;
         let mut threads = self.opts.threads.max(1);
         while threads > 1 && crate::disk::ensure_open_files(files(threads)).is_err() {
             threads -= 1;
         }
         crate::disk::ensure_open_files(files(threads))?;
-        let parts: Vec<vocabmerge::Partial> = batches
+        let mut parts: Vec<vocabmerge::Partial> = batches
             .iter_mut()
             .map(|b| vocabmerge::Partial {
                 voc: self.tmp.join(format!("b{}.voc", b.id)),
@@ -380,6 +454,14 @@ impl Builder {
                 samples: std::mem::take(&mut b.samples),
             })
             .collect();
+        if hot_keys > 0 {
+            parts.push(vocabmerge::Partial {
+                voc: hot_voc,
+                keys: hot_keys,
+                bytes: hot_bytes,
+                samples: hot_samples,
+            });
+        }
         let (terms, maps) = vocabmerge::merge(
             &self.dir,
             &self.tmp,
@@ -391,6 +473,15 @@ impl Builder {
         for p in parts {
             std::fs::remove_file(p.voc)?;
         }
+        // the global id of each hot id
+        let mut hot = vec![0u64; hot_keys as usize];
+        if hot_keys > 0 {
+            let ids = maps.read(batches.len(), hot_keys)?;
+            for (&h, g) in hot_order.iter().zip(ids) {
+                hot[h as usize] = g;
+            }
+        }
+        drop(hot_order);
         self.phase_done("vocabulary merge");
         self.report(&format!("vocabulary: {terms} terms"));
 
@@ -403,11 +494,11 @@ impl Builder {
         drop(vocab);
         let plan = Plan::new(self.named_graphs.load(Ordering::Relaxed));
         let mut built = if total_in as usize <= self.opts.sort_mem_quads {
-            let built = self.build_in_memory(&batches, maps, &plan, rdf_type)?;
+            let built = self.build_in_memory(&batches, maps, &hot, &plan, rdf_type)?;
             self.phase_done("sort and permutations");
             built
         } else {
-            let runs = self.sorted_runs(&batches, maps, &plan)?;
+            let runs = self.sorted_runs(&batches, maps, &hot, &plan)?;
             self.phase_done("chunk sorts");
             let built = self.merge_runs(runs, &plan, rdf_type)?;
             self.phase_done("permutations");
@@ -470,12 +561,13 @@ impl Builder {
         Ok(meta)
     }
 
-    /// Read the batches of `chunk` into `buf`, remapped to global ids by `maps`, and
-    /// delete them.
+    /// Read the batches of `chunk` into `buf`, remapped to global ids by `maps` and by
+    /// `hot` (the global id of each hot id), and delete them.
     fn load_chunk(
         &self,
         chunk: &[BatchInfo],
         maps: &vocabmerge::Maps,
+        hot: &[u64],
         buf: &mut Vec<Key>,
     ) -> Result<()> {
         let n: usize = chunk.iter().map(|b| b.quads as usize).sum();
@@ -493,8 +585,15 @@ impl Builder {
             .zip(parts)
             .try_for_each(|(b, out)| -> Result<()> {
                 let qp = self.tmp.join(format!("b{}.q", b.id));
-                let map = maps.read(b.pos, b.keys)?;
                 let bad = || Error::Corrupt(format!("batch file {}", qp.display()));
+                let mut map = maps.read(b.pos, b.keys)?;
+                if b.hot > 0 {
+                    let hp = self.tmp.join(format!("b{}.h", b.id));
+                    for h in hotkeys::read_list(&hp, b.hot)? {
+                        map.push(*hot.get(h as usize).ok_or_else(bad)?);
+                    }
+                    std::fs::remove_file(&hp)?;
+                }
                 let mut r = runs::RunReader::open(&qp)?;
                 let mut at = 0;
                 while let Some(block) = r.next_block()? {
@@ -535,6 +634,7 @@ impl Builder {
         &self,
         batches: &[BatchInfo],
         maps: vocabmerge::Maps,
+        hot: &[u64],
         plan: &Plan,
     ) -> Result<Vec<Vec<PathBuf>>> {
         let budget = self.opts.sort_mem_quads.max(1) as u64;
@@ -562,7 +662,7 @@ impl Builder {
                 chunks.len(),
                 chunk.iter().map(|b| b.quads).sum::<u64>()
             ));
-            self.load_chunk(chunk, &maps, &mut buf)?;
+            self.load_chunk(chunk, &maps, hot, &mut buf)?;
             let mut cur = Perm::Spo;
             for (o, (first, _)) in plan.orders.iter().enumerate() {
                 Self::sort_as(&mut buf, cur, *first);
@@ -571,7 +671,7 @@ impl Builder {
                     buf.dedup();
                 }
                 let p = self.tmp.join(format!("run-{}-{c}", first.name()));
-                let n = runs::write_run(&p, &buf)?;
+                let n = runs::write_run(&p, &buf, runs::ENCODE_GROUP)?;
                 self.tmp_bytes.add(iostat::Tmp::Runs, n);
                 runs[o].push(p);
             }
@@ -631,11 +731,12 @@ impl Builder {
         &self,
         batches: &[BatchInfo],
         maps: vocabmerge::Maps,
+        hot: &[u64],
         plan: &Plan,
         rdf_type: Option<u64>,
     ) -> Result<Vec<Built>> {
         let mut buf: Vec<Key> = Vec::new();
-        self.load_chunk(batches, &maps, &mut buf)?;
+        self.load_chunk(batches, &maps, hot, &mut buf)?;
         maps.remove()?;
         let mut cur = Perm::Spo;
         let mut out = Vec::new();
@@ -808,14 +909,191 @@ impl Plan {
     }
 }
 
+/// The quads of a batch while it is parsed, in half the memory of `[u64; 4]`.
+///
+/// A value is a `u32`. A batch-local id below [`QuadBuf::WIDE`] is stored as itself and
+/// the default graph as [`QuadBuf::DEFAULT_GRAPH`]. Any other value (an inline literal, a
+/// blank node, a large local id) goes to `wide`, and the slot holds its index there with
+/// the [`QuadBuf::WIDE`] bit set. Most values of a batch are local ids, so a batch takes
+/// about 16 bytes per quad instead of 32. The parser threads hold one batch each, and
+/// this is most of the memory of the parse.
+#[derive(Default)]
+struct QuadBuf {
+    slots: Vec<[u32; 4]>,
+    wide: Vec<u64>,
+}
+
+impl QuadBuf {
+    const WIDE: u32 = 1 << 31;
+    const DEFAULT_GRAPH: u32 = u32::MAX;
+
+    /// Empty the buffer for the next batch, keeping its memory.
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.wide.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    #[inline]
+    fn push(&mut self, q: [u64; 4]) {
+        let slot = |v: u64, wide: &mut Vec<u64>| -> u32 {
+            let id = Id(v);
+            if id.tag() == Tag::Local && id.payload() < Self::WIDE as u64 {
+                id.payload() as u32
+            } else if v == Id::DEFAULT_GRAPH.0 {
+                Self::DEFAULT_GRAPH
+            } else {
+                wide.push(v);
+                // a batch ends long before 2^31 wide values: four per quad at most
+                Self::WIDE | (wide.len() - 1) as u32
+            }
+        };
+        let w = &mut self.wide;
+        self.slots
+            .push([slot(q[0], w), slot(q[1], w), slot(q[2], w), slot(q[3], w)]);
+    }
+
+    /// The quads of rows `r`, with each local id replaced by `Id::local(rank[id])`.
+    fn expand(&self, r: std::ops::Range<usize>, rank: &[u32], out: &mut Vec<Key>) {
+        out.extend(self.slots[r].iter().map(|q| {
+            q.map(|v| {
+                if v == Self::DEFAULT_GRAPH {
+                    Id::DEFAULT_GRAPH.0
+                } else if v & Self::WIDE != 0 {
+                    let w = self.wide[(v & !Self::WIDE) as usize];
+                    // a large local id is ranked like the others
+                    if Id(w).tag() == Tag::Local {
+                        Id::local(rank[Id(w).payload() as usize] as u64).0
+                    } else {
+                        w
+                    }
+                } else {
+                    Id::local(rank[v as usize] as u64).0
+                }
+            })
+        }));
+    }
+
+    /// Whether a quad is in a graph other than the default graph.
+    fn named_graphs(&self) -> bool {
+        self.slots.iter().any(|q| q[3] != Self::DEFAULT_GRAPH)
+    }
+}
+
+/// The distinct vocabulary keys of a batch and their batch-local ids, which number the
+/// keys in the order they were first seen.
+///
+/// The keys are stored one after another in one buffer, and a hash table maps a key to
+/// its id. An encoder keeps the buffers and the table from one batch to the next. A key
+/// boxed on its own would cost an allocation, about 30 more bytes, and a free when the
+/// batch is written. Because a parser's next block may run on another thread of the
+/// pool, the allocator also keeps much of the memory a written batch frees.
+#[derive(Default)]
+struct KeySet {
+    bytes: Vec<u8>,
+    /// the start of each key in `bytes`, by id
+    starts: Vec<usize>,
+    table: hashbrown::HashTable<u32>,
+}
+
+impl KeySet {
+    fn len(&self) -> usize {
+        self.starts.len()
+    }
+
+    /// The total length of the keys.
+    fn bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[inline]
+    fn key(&self, id: u32) -> &[u8] {
+        key_at(&self.bytes, &self.starts, id)
+    }
+
+    #[inline]
+    fn hash(key: &[u8]) -> u64 {
+        rustc_hash::FxBuildHasher.hash_one(key)
+    }
+
+    /// The id of `key`, whose hash is `hash`, if the set holds it.
+    #[inline]
+    fn find(&self, hash: u64, key: &[u8]) -> Option<u32> {
+        self.table
+            .find(hash, |&i| key_at(&self.bytes, &self.starts, i) == key)
+            .copied()
+    }
+
+    /// Add `key`, whose hash is `hash` and which the set does not hold. Returns its id.
+    fn insert(&mut self, hash: u64, key: &[u8]) -> u32 {
+        let Self {
+            bytes,
+            starts,
+            table,
+        } = self;
+        let id = starts.len() as u32;
+        table.insert_unique(hash, id, |&i| Self::hash(key_at(bytes, starts, i)));
+        starts.push(bytes.len());
+        bytes.extend_from_slice(key);
+        id
+    }
+
+    /// The id of `key`, which is added if it is new.
+    #[inline]
+    fn id(&mut self, key: &[u8]) -> u32 {
+        let Self {
+            bytes,
+            starts,
+            table,
+        } = self;
+        let entry = table.entry(
+            Self::hash(key),
+            |&i| key_at(bytes, starts, i) == key,
+            |&i| Self::hash(key_at(bytes, starts, i)),
+        );
+        match entry {
+            hashbrown::hash_table::Entry::Occupied(e) => *e.get(),
+            hashbrown::hash_table::Entry::Vacant(e) => {
+                let id = starts.len() as u32;
+                starts.push(bytes.len());
+                bytes.extend_from_slice(key);
+                e.insert(id);
+                id
+            }
+        }
+    }
+
+    /// Empty the set for the next batch, keeping its memory.
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.starts.clear();
+        self.table.clear();
+    }
+}
+
+#[inline]
+fn key_at<'k>(bytes: &'k [u8], starts: &[usize], id: u32) -> &'k [u8] {
+    let i = id as usize;
+    let end = starts.get(i + 1).copied().unwrap_or(bytes.len());
+    &bytes[starts[i]..end]
+}
+
 /// Per-chunk encoder: terms → ids, vocabulary terms → batch-local ids.
 pub struct Encoder<'b> {
     b: &'b Builder,
     scope: Arc<LabelScope>,
-    keys: FxHashMap<Box<[u8]>, u32>,
-    /// total length of `keys`
-    key_bytes: usize,
-    quads: Vec<[u64; 4]>,
+    keys: KeySet,
+    quads: QuadBuf,
+    /// buffers of [`Builder::write_batch`]
+    order: Vec<u32>,
+    rank: Vec<u32>,
     keybuf: Vec<u8>,
     /// quads taken, for the [`InterruptFn`] calls
     taken: u64,
@@ -826,13 +1104,7 @@ pub struct Encoder<'b> {
 
 impl Encoder<'_> {
     fn local(&mut self, key: &[u8]) -> u64 {
-        if let Some(&i) = self.keys.get(key) {
-            return Id::local(i as u64).0;
-        }
-        let i = self.keys.len() as u32;
-        self.keys.insert(key.into(), i);
-        self.key_bytes += key.len();
-        Id::local(i as u64).0
+        Id::local(self.keys.id(key) as u64).0
     }
 
     fn term(&mut self, t: &Term) -> u64 {
@@ -958,7 +1230,7 @@ impl Encoder<'_> {
             self.b.interrupted()?;
         }
         if self.quads.len() >= self.b.opts.batch_quads
-            || self.key_bytes >= self.b.opts.batch_key_bytes
+            || self.keys.bytes() >= self.b.opts.batch_key_bytes
         {
             self.flush()?;
         }
@@ -966,19 +1238,16 @@ impl Encoder<'_> {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        // the next batch is about as large as this one: no rehashing on the way
-        let (nk, nq) = (self.keys.len(), self.quads.len());
-        let keys = std::mem::replace(
-            &mut self.keys,
-            FxHashMap::with_capacity_and_hasher(nk, Default::default()),
-        );
-        let quads = std::mem::replace(&mut self.quads, Vec::with_capacity(nq));
-        self.key_bytes = 0;
-        // batch-local ids start over
+        let written = self
+            .b
+            .write_batch(&self.keys, &self.quads, &mut self.order, &mut self.rank);
+        // the next batch reuses the memory of this one, and its local ids start over
+        self.keys.clear();
+        self.quads.clear();
         for (_, id) in &mut self.last {
             *id = 0;
         }
-        self.b.write_batch(keys, quads)
+        written
     }
 }
 
@@ -1223,6 +1492,57 @@ mod tests {
     use crate::index::{BlockCache, PermIndex};
     use crate::io::{RdfFormat, Source};
 
+    /// Every kind of value comes back from the compact batch, with local ids ranked.
+    #[test]
+    fn quad_buf_keeps_every_value() {
+        let rank: Vec<u32> = (0..10).map(|i| 9 - i).collect();
+        let graph = Id::local(4).0;
+        let quads = [
+            [
+                Id::local(0).0,
+                Id::local(1).0,
+                Id::local(2).0,
+                Id::DEFAULT_GRAPH.0,
+            ],
+            [
+                Id::bnode(5).0,
+                Id::local(1).0,
+                Id::from_i64(-42).unwrap().0,
+                graph,
+            ],
+            [
+                Id::local(3).0,
+                Id::local(9).0,
+                Id::bnode(1 << 40).0,
+                Id::DEFAULT_GRAPH.0,
+            ],
+        ];
+        let mut buf = QuadBuf::default();
+        assert!(buf.is_empty());
+        for q in quads {
+            buf.push(q);
+        }
+        assert_eq!(buf.len(), 3);
+        // the blank nodes and the integer
+        assert_eq!(buf.wide.len(), 3);
+        assert!(buf.named_graphs());
+        let mut out = Vec::new();
+        buf.expand(1..3, &rank, &mut out);
+        buf.expand(0..1, &rank, &mut out);
+        let ranked = |v: u64| match Id(v).tag() {
+            Tag::Local => Id::local(rank[Id(v).payload() as usize] as u64).0,
+            _ => v,
+        };
+        let want: Vec<Key> = [quads[1], quads[2], quads[0]]
+            .iter()
+            .map(|q| q.map(ranked))
+            .collect();
+        assert_eq!(out, want);
+        let mut default_only = QuadBuf::default();
+        default_only.push(quads[0]);
+        assert!(!default_only.named_graphs());
+    }
+
     #[test]
     fn an_interrupt_stops_the_build() {
         let mut nt = String::new();
@@ -1266,7 +1586,8 @@ mod tests {
     }
 
     /// Tiny batch / sort budgets force many partial vocabularies and the external
-    /// sorted-runs + k-way-merge path; the result must equal the in-memory build.
+    /// sorted-runs + k-way-merge path; the result must equal the in-memory build. Hot
+    /// keys, a budget that runs out and no hot keys at all give the same index.
     #[test]
     fn external_sort_matches_in_memory() {
         let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
@@ -1317,7 +1638,22 @@ mod tests {
             batch_key_bytes: usize::MAX,
             sort_mem_quads: 50,
             threads: 3,
+            hot_key_bytes: 1 << 20,
             first_bnode: 0,
+        });
+        let no_hot = build(BuildOptions {
+            batch_quads: 7,
+            sort_mem_quads: 50,
+            threads: 3,
+            hot_key_bytes: 0,
+            ..Default::default()
+        });
+        let hot_spent = build(BuildOptions {
+            batch_quads: 7,
+            sort_mem_quads: 50,
+            threads: 3,
+            hot_key_bytes: 400,
+            ..Default::default()
         });
         // batches that end at a few keys' bytes rather than at a quad count
         let short = build(BuildOptions {
@@ -1332,6 +1668,8 @@ mod tests {
         assert_eq!(small.1, big.1);
         assert_eq!(small.2, big.2);
         assert_eq!(short, big);
+        assert_eq!(no_hot, big);
+        assert_eq!(hot_spent, big);
     }
 
     /// Every permutation holds each distinct quad once, in its own order, whether it is

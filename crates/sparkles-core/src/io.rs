@@ -607,8 +607,10 @@ fn parse_stream<S: QuadSink, F: Fn() -> S + Sync>(
     let mut sinks: Vec<S> = Vec::new();
     std::thread::scope(|scope| -> Result<()> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(u64, Vec<u8>)>>(1);
+        // parsed blocks go back to the reader, which fills them again
+        let (spare_tx, spare_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
         scope.spawn(move || {
-            if let Err(e) = read_blocks(src, codec, block, &tx) {
+            if let Err(e) = read_blocks(src, codec, block, &tx, &spare_rx) {
                 let _ = tx.send(Err(e));
             }
         });
@@ -639,6 +641,8 @@ fn parse_stream<S: QuadSink, F: Fn() -> S + Sync>(
                     }
                     Ok(())
                 })?;
+            // a full slot or a finished reader: the block is freed
+            let _ = spare_tx.try_send(bytes);
         }
         Ok(())
     })?;
@@ -664,11 +668,16 @@ fn line_pieces(bytes: &[u8], n: usize) -> Vec<&[u8]> {
 /// Send `src` decompressed in blocks of at least `block` bytes that end at a line break
 /// (the last one at the end of the data), with their offsets. Stops when the receiver
 /// is gone.
+///
+/// A block is filled into a buffer the parser has returned through `spare` when there
+/// is one. Without that, every block was a new allocation of `block` bytes, and the
+/// allocator kept several freed blocks resident while the parse went on.
 fn read_blocks(
     src: &Source,
     codec: Codec,
     block: usize,
     tx: &std::sync::mpsc::SyncSender<Result<(u64, Vec<u8>)>>,
+    spare: &std::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     let raw: Box<dyn Read + '_> = match &src.data {
         SourceData::File(p) => Box::new(File::open(p)?),
@@ -703,7 +712,9 @@ fn read_blocks(
                 continue;
             }
         };
-        let mut next = Vec::with_capacity(block.max(filled - cut));
+        let mut next = spare.try_recv().unwrap_or_default();
+        next.clear();
+        next.reserve(block.max(filled - cut));
         next.extend_from_slice(&buf[cut..filled]);
         filled -= cut;
         buf.truncate(cut);

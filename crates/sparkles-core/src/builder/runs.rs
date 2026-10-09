@@ -3,37 +3,82 @@
 //!
 //! A run file is a sequence of blocks of up to [`RUN_BLOCK`] keys. A block starts with its
 //! row count and the byte length of each column (five little-endian `u32`), followed by
-//! the four columns, each encoded as in a permutation block (delta + zig-zag varint, then
-//! LZ4). Sorted keys compress to about a third of their 32 bytes.
+//! the four columns. A column holds the differences of its values as zig-zag varints,
+//! like a permutation block, compressed with the loader's codec (see [`codec`]) after the
+//! length of the varints as a little-endian `u32`. Sorted keys compress to about a
+//! third of their 32 bytes with LZ4.
 
+use super::codec;
 use crate::error::{Error, Result};
-use crate::index::{Key, decode_column, encode_column};
+use crate::index::{Key, read_varint_checked};
+use crate::vocab::write_varint;
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::binary_heap::PeekMut;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::Scope;
 
 /// Keys per block of a run file.
 const RUN_BLOCK: usize = 32 * 1024;
-/// Blocks encoded in parallel before they are written.
-const ENCODE_GROUP: usize = 64;
+/// Blocks a sorted run encodes in parallel before it writes them.
+pub(super) const ENCODE_GROUP: usize = 64;
 /// Decoded blocks a reader thread keeps ahead of the merge.
 const READ_AHEAD: usize = 2;
 /// Bytes of a block header: rows and four column lengths.
 const HEADER: usize = 20;
 
-/// Write keys as a run file: a sorted run, or a batch's quads in the order they were read.
-/// Returns its size.
-pub(super) fn write_run(path: &Path, keys: &[Key]) -> Result<u64> {
+/// Write keys as a sorted run file. Returns its size.
+///
+/// Up to `group` blocks are encoded in parallel and held until they are written. A sorted
+/// run takes [`ENCODE_GROUP`], because it is written while nothing else runs.
+pub(super) fn write_run(path: &Path, keys: &[Key], group: usize) -> Result<u64> {
+    write_blocks(path, keys.len(), group, |r| encode_block(&keys[r]))
+}
+
+/// Write a run file of `len` keys whose blocks `fill` produces: it puts the keys of a
+/// range of rows into the buffer it is given. A batch's quads are written this way,
+/// remapped block by block from their compact form in memory (see `QuadBuf` in the
+/// builder).
+///
+/// The parser threads write their batches at about the same time, so a batch takes
+/// one block per thread of the pool as its `group`. That keeps the encoded blocks a dozen
+/// concurrent batch writes hold small.
+pub(super) fn write_run_from(
+    path: &Path,
+    len: usize,
+    group: usize,
+    fill: impl Fn(Range<usize>, &mut Vec<Key>) + Sync,
+) -> Result<u64> {
+    write_blocks(path, len, group, |r| {
+        let mut keys = Vec::with_capacity(r.len());
+        fill(r, &mut keys);
+        encode_block(&keys)
+    })
+}
+
+/// Encode the blocks of `len` rows, `group` of them in parallel, and write them in order.
+fn write_blocks(
+    path: &Path,
+    len: usize,
+    group: usize,
+    encode: impl Fn(Range<usize>) -> Result<Vec<u8>> + Sync,
+) -> Result<u64> {
     let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
     let mut n = 0;
-    for group in keys.chunks(RUN_BLOCK * ENCODE_GROUP) {
-        let blocks: Vec<Vec<u8>> = group.par_chunks(RUN_BLOCK).map(encode_block).collect();
+    let step = RUN_BLOCK * group.max(1);
+    for start in (0..len).step_by(step) {
+        let end = (start + step).min(len);
+        let blocks: Vec<Vec<u8>> = (start..end)
+            .step_by(RUN_BLOCK)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|b| encode(b..(b + RUN_BLOCK).min(end)))
+            .collect::<Result<_>>()?;
         for b in blocks {
             w.write_all(&b)?;
             n += b.len() as u64;
@@ -43,26 +88,66 @@ pub(super) fn write_run(path: &Path, keys: &[Key]) -> Result<u64> {
     Ok(n)
 }
 
-fn encode_block(rows: &[Key]) -> Vec<u8> {
-    let mut col = Vec::with_capacity(rows.len());
-    let mut scratch = Vec::new();
-    let mut out = Vec::with_capacity(HEADER + rows.len() * 12);
-    out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-    out.extend_from_slice(&[0; HEADER - 4]);
-    for c in 0..4 {
-        col.clear();
-        col.extend(rows.iter().map(|k| k[c]));
-        let enc = encode_column(&col, &mut scratch);
-        out[4 + 4 * c..8 + 4 * c].copy_from_slice(&(enc.len() as u32).to_le_bytes());
-        out.extend_from_slice(&enc);
+/// One block of a run file. Its buffer is allocated at its final size, because a group of
+/// encoded blocks waits in memory until it is written.
+fn encode_block(rows: &[Key]) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    let mut cols: [Vec<u8>; 4] = Default::default();
+    for (c, out) in cols.iter_mut().enumerate() {
+        raw.clear();
+        let mut prev = 0u64;
+        for k in rows {
+            let d = k[c].wrapping_sub(prev) as i64;
+            write_varint(&mut raw, ((d << 1) ^ (d >> 63)) as u64);
+            prev = k[c];
+        }
+        let comp = codec::compress(&raw)?;
+        out.reserve_exact(4 + comp.len());
+        out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        out.extend_from_slice(&comp);
     }
-    out
+    let mut out = Vec::with_capacity(HEADER + cols.iter().map(Vec::len).sum::<usize>());
+    out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for c in &cols {
+        out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+    }
+    for c in &cols {
+        out.extend_from_slice(c);
+    }
+    Ok(out)
+}
+
+/// Decode one column of `rows` values from `bytes` into the column `c` of `keys`, with
+/// `raw` as a buffer.
+fn decode_column(bytes: &[u8], c: usize, keys: &mut [Key], raw: &mut Vec<u8>) -> Result<()> {
+    let bad = || Error::Corrupt("run block column".into());
+    let (len, comp) = bytes.split_first_chunk::<4>().ok_or_else(bad)?;
+    let len = u32::from_le_bytes(*len) as usize;
+    // a varint takes at most 10 bytes: a larger size is damage
+    if len > keys.len().saturating_mul(10) {
+        return Err(bad());
+    }
+    codec::decompress(comp, len, raw, "run")?;
+    let mut pos = 0;
+    let mut prev = 0u64;
+    for k in keys.iter_mut() {
+        let z = read_varint_checked(raw, &mut pos).ok_or_else(bad)?;
+        let d = ((z >> 1) as i64) ^ -((z & 1) as i64);
+        prev = prev.wrapping_add(d as u64);
+        k[c] = prev;
+    }
+    if pos != raw.len() {
+        return Err(bad());
+    }
+    Ok(())
 }
 
 /// Reads a run file block by block.
 pub(super) struct RunReader {
     r: BufReader<File>,
     buf: Vec<u8>,
+    /// a decompressed column
+    raw: Vec<u8>,
 }
 
 impl RunReader {
@@ -70,6 +155,7 @@ impl RunReader {
         Ok(RunReader {
             r: BufReader::with_capacity(1 << 20, File::open(path)?),
             buf: Vec::new(),
+            raw: Vec::new(),
         })
     }
 
@@ -89,9 +175,7 @@ impl RunReader {
         for c in 0..4 {
             self.buf.resize(u32_at(4 + 4 * c), 0);
             self.r.read_exact(&mut self.buf)?;
-            for (k, v) in keys.iter_mut().zip(decode_column(&self.buf, rows)?.iter()) {
-                k[c] = *v;
-            }
+            decode_column(&self.buf, c, &mut keys, &mut self.raw)?;
         }
         Ok(Some(keys))
     }
@@ -262,7 +346,7 @@ impl Regroup {
             .tmp
             .join(format!("{}-spill-{}", self.name, self.spilled));
         self.spilled += 1;
-        self.spilled_bytes += write_run(&p, &self.buf)?;
+        self.spilled_bytes += write_run(&p, &self.buf, ENCODE_GROUP)?;
         self.spills.push(p);
         self.buf.clear();
         Ok(())
@@ -331,7 +415,7 @@ mod tests {
         let mut paths = Vec::new();
         for (i, k) in [&a, &b, &c, &Vec::new()].into_iter().enumerate() {
             let p = dir.path().join(format!("r{i}"));
-            write_run(&p, k).unwrap();
+            write_run(&p, k, 1 + i % 3).unwrap();
             paths.push(p);
             all.extend_from_slice(k);
         }
