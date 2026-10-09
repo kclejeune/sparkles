@@ -6,7 +6,7 @@ use super::exprcache::Report as ExprReport;
 use super::plan::{
     Agg, GraphFilter, JoinAlgo, Kind, Node, OrderedTopK, PathEnd, PathSpec, RangeSpec, ScanSpec,
 };
-use super::sortkey::{Entry, Screen, SortKey, TopK, sort_positions};
+use super::sortkey::{Entry, Screen, SortKey, TopK};
 use super::table::{Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
@@ -3507,7 +3507,11 @@ pub(super) fn offer_rows<P>(
                     Some(c) => {
                         let col = &t.cols[c];
                         HeapKey::Column(super::exprcache::Column::Rows {
-                            vals: map_rows(ctx, t.len(), true, |i| id_key(ctx, col[i]))?,
+                            vals: col
+                                .par_iter()
+                                .with_min_len(PAR_MIN_LEN)
+                                .map(|&id| id_key(ctx, id))
+                                .collect(),
                             _charge: None,
                         })
                     }
@@ -3803,31 +3807,31 @@ fn order_by_rows(
         })
         .collect::<Result<_>>()?;
     ctx.check()?;
-    let order = |a: usize, b: usize| {
+    // The rows compare as the heap's SortKey compares them, but classifying the values
+    // for each comparison measured about 2% slower on a 102,000-row string sort, so
+    // the full sort calls order_cmp directly. A cursor heap that kept every row sorts
+    // its rows with the same comparator and parallel merge sort (see `sort_positions`).
+    let cmp = |a: &usize, b: &usize| {
         for (k, (_, asc)) in keys.iter().enumerate() {
-            // Classifying the values again, as SortKey does, measured about 2% slower
-            // on a 102,000-row string sort, so the full sort calls order_cmp directly.
-            let o = order_cmp(key_vals[k].get(a).as_ref(), key_vals[k].get(b).as_ref());
+            let o = order_cmp(key_vals[k].get(*a).as_ref(), key_vals[k].get(*b).as_ref());
             let o = if *asc { o } else { o.reverse() };
             if o != Ordering::Equal {
                 return o;
             }
         }
-        Ordering::Equal
+        a.cmp(b)
     };
-    let idx = match limit {
-        Some(k) if k < t.len() => {
-            let cmp = |a: &usize, b: &usize| order(*a, *b).then(a.cmp(b));
-            let mut idx: Vec<usize> = (0..t.len()).collect();
+    let mut idx: Vec<usize> = (0..t.len()).collect();
+    match limit {
+        Some(k) if k < idx.len() => {
             if k > 0 {
                 idx.select_nth_unstable_by(k - 1, cmp);
             }
             idx.truncate(k);
             idx.sort_by(cmp);
-            idx
         }
-        _ => sort_positions(t.len(), order),
-    };
+        _ => idx.par_sort_by(cmp),
+    }
     ctx.check()?;
     ctx.check_output(idx.len(), t.width())?;
     Ok(t.take_rows(&idx))
