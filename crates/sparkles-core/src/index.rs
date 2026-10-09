@@ -427,7 +427,7 @@ pub(crate) fn read_varint_checked(buf: &[u8], pos: &mut usize) -> Option<u64> {
 
 /// Streaming writer for one permutation. Keys must arrive sorted and deduplicated.
 pub struct PermWriter {
-    data: BufWriter<File>,
+    data: BufWriter<crate::disk::WritebackFile>,
     meta: Vec<u8>,
     pos: u64,
     rows: u64,
@@ -441,7 +441,9 @@ impl PermWriter {
         Ok(PermWriter {
             data: BufWriter::with_capacity(
                 1 << 20,
-                File::create(dir.join(format!("{}.dat", perm.name())))?,
+                crate::disk::WritebackFile::new(File::create(
+                    dir.join(format!("{}.dat", perm.name())),
+                )?),
             ),
             meta: Vec::new(),
             pos: 0,
@@ -539,7 +541,7 @@ impl PermWriter {
     pub fn finish(mut self, dir: &Path, perm: Perm) -> Result<u64> {
         self.flush_block()?;
         self.data.flush()?;
-        self.data.get_ref().sync_all()?;
+        self.data.get_ref().get_ref().sync_all()?;
         let mut m = File::create(dir.join(format!("{}.meta", perm.name())))?;
         m.write_all(&self.meta)?;
         m.sync_all()?;

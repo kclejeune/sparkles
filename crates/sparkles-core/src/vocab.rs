@@ -11,6 +11,7 @@
 mod sync;
 pub(crate) use sync::{LazySync, PendingSync};
 
+use crate::disk::WritebackFile;
 use crate::error::Result;
 use memmap2::Mmap;
 use parking_lot::RwLock;
@@ -791,8 +792,8 @@ impl Vocab {
 
 /// Streaming writer for a sorted vocabulary.
 pub struct VocabWriter {
-    data: BufWriter<File>,
-    offsets: BufWriter<File>,
+    data: BufWriter<crate::disk::WritebackFile>,
+    offsets: BufWriter<crate::disk::WritebackFile>,
     pos: u64,
     count: u64,
     prev: Vec<u8>,
@@ -806,8 +807,11 @@ pub struct VocabWriter {
 impl VocabWriter {
     pub fn create(dir: &Path) -> Result<VocabWriter> {
         Ok(VocabWriter {
-            data: BufWriter::with_capacity(1 << 20, File::create(dir.join("vocab.dat"))?),
-            offsets: BufWriter::new(File::create(dir.join("vocab.off"))?),
+            data: BufWriter::with_capacity(
+                1 << 20,
+                WritebackFile::new(File::create(dir.join("vocab.dat"))?),
+            ),
+            offsets: BufWriter::new(WritebackFile::new(File::create(dir.join("vocab.off"))?)),
             pos: 0,
             count: 0,
             prev: Vec::new(),
@@ -860,8 +864,8 @@ impl VocabWriter {
         self.offsets.write_all(&self.count.to_le_bytes())?;
         self.data.flush()?;
         self.offsets.flush()?;
-        self.data.get_ref().sync_all()?;
-        self.offsets.get_ref().sync_all()?;
+        self.data.get_ref().get_ref().sync_all()?;
+        self.offsets.get_ref().get_ref().sync_all()?;
         write_sparse_index(&self.dir, &self.sparse)?;
         Ok(self.count)
     }
