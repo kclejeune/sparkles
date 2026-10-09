@@ -63,38 +63,13 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  # Formatting runs in this job because it takes seconds and a job of its own would pay for
-  # another runner start and checkout.
-  clippy:
-    timeout-minutes: 30
-    name: Formatting and Clippy
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-16x32-with-cache
-      - nscloud-cache-tag-sparkles-linux-amd64
-      - nscloud-cache-size-50gb
-      - nscloud-cache-allow-commit-from-main
-      - nscloud-git-mirror-5gb
-    steps:
-      - uses: namespacelabs/nscloud-checkout-action@v8
-      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
-      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with: { cache: false, rustflags: "" }
-      - name: cargo fmt
-        run: |
-          cargo fmt --all --check
-          cargo fmt --manifest-path crates/sparkles-py/Cargo.toml --check
-          cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml --check
-          cargo fmt --manifest-path crates/sparkles-node/Cargo.toml --check
-      - uses: namespacelabs/nscloud-cache-action@v1
-        with:
-          cache: rust
-      - name: cargo clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
-  test:
-    timeout-minutes: 45
-    name: Tests (${{ matrix.platform }})
+  # One job per platform, so each platform's cache volume has a single writer. Formatting
+  # is platform independent and runs once; Clippy runs on every platform because cfg-gated
+  # code differs between them. After a formatting or Clippy failure the remaining steps
+  # still run, so one push reports everything, and a cancelled run stops.
+  check:
+    timeout-minutes: 60
+    name: Check (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
@@ -106,19 +81,35 @@ jobs:
       # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
-      - uses: namespacelabs/nscloud-cache-action@v1
+      # Formatting compiles nothing, so it runs before the cache volume is attached.
+      - name: cargo fmt
+        if: matrix.platform == 'linux-amd64'
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path crates/sparkles-py/Cargo.toml --check
+          cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml --check
+          cargo fmt --manifest-path crates/sparkles-node/Cargo.toml --check
+      - if: ${{ !cancelled() }}
+        uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
-      - uses: taiki-e/install-action@v2
+      - name: cargo clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - if: ${{ !cancelled() }}
+        uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.146
       # The settings in .config/nextest.toml: every failure reported at the end, and a
       # test that runs past ten minutes stopped. nextest does not run doctests.
       - name: cargo nextest
+        if: ${{ !cancelled() }}
         run: cargo nextest run --locked --workspace --profile ci
       - name: Doctests
+        if: ${{ !cancelled() }}
         run: cargo test --locked --workspace --doc
       - name: Check that docs/openapi.json is current
+        if: ${{ !cancelled() && matrix.platform == 'linux-amd64' }}
         env:
           SPARKLES_UPDATE_OPENAPI: "1"
         run: |

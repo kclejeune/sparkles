@@ -512,14 +512,15 @@ volume reaches its 50 GB limit, raise the `nscloud-cache-size` label or split th
 release and test builds onto separate tags.
 
 Several choices keep the billed time down. The Rust workflow runs for pushes to `main`
-and for pull requests, but not for the pushes to a pull request's branch, and changes
-to the UI, the bindings' JavaScript and Kotlin sources or the documentation do not start
-it. A newer push cancels a running check of the same branch. Formatting runs in the
-Clippy job instead of a job of its own. The binding workflows run for pull requests that
-touch their sources, for release tags and by hand. For pull requests they build in the
-dev profile and only for Linux x86_64. Every job has a timeout, so a hung job stops
-instead of running for GitHub's default six hours. Builds cover Linux on x86_64 and arm64
-and macOS on Apple silicon.
+and for pull requests, but not for the pushes to a pull request's branch, and changes to
+the UI, the bindings' JavaScript and Kotlin sources or the documentation do not start
+it. A newer push cancels a running check of the same branch. Each platform runs
+formatting, Clippy and the tests in one job, so its cache volume has a single writer,
+and a formatting or Clippy failure still lets the tests report. The binding workflows
+run for pull requests that touch their sources, for release tags and by hand. For pull
+requests they build in the dev profile and only for Linux x86_64. Every job has a
+timeout, so a hung job stops instead of running for GitHub's default six hours. Builds
+cover Linux on x86_64 and arm64 and macOS on Apple silicon.
 
 Pushes and pull requests test Linux x86_64 only. The engine's shared state goes through
 snapshot swaps, locks and channels, and its relaxed atomics are counters and flags, so
