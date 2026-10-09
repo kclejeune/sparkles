@@ -561,9 +561,10 @@ implementation landed.
     structured output documentation of Ollama, OpenAI and llama.cpp;
   - the Sparkles code and specs C01, C02, C05, C09, C10, C11, C12, C12b, C15, C16, C17,
     F03, F04, F06, F08 and F09.
-- **Implementation:** not built. Phases 1 and 2 plan no new runtime dependency. Phase 3
-  reuses the outbound HTTP client of F08 for model providers. Phase 4 may add an HTML
-  extractor and a PDF text extractor, to be recorded here when chosen.
+- **Implementation:** not built. Phase 1 plans no new runtime dependency. Phase 2's
+  clients for Ollama, OpenAI-compatible endpoints and Anthropic's API reuse the
+  outbound HTTP client of F08. Phase 4 may add an HTML extractor and a PDF text
+  extractor, to be recorded here when chosen.
 - **Rejected** (spec §13):
   - the browser calling a model provider, MCP sampling, and a delegated agent as the
     UI's model;
@@ -575,6 +576,11 @@ implementation landed.
   - new predicates proposed by ingestion;
   - ask history in a graph of the dataset;
   - running queries from a handoff link automatically;
+  - holding conversation facts on a review branch by default;
+  - a review flag stored on each fact;
+  - agents that merge their own branches;
+  - model confidence as a signal for bulk acceptance;
+  - MCP Apps;
   - OCR and media transcription.
 
 ## Compression codecs
