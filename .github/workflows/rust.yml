@@ -1,0 +1,80 @@
+# The Rust workspace's checks on every push and pull request: formatting (the workspace and
+# the binding crates, which are their own workspaces), Clippy with warnings as errors over
+# all targets, the workspace tests, and the checked-in OpenAPI description. The server
+# embeds ui/build, and its build script writes a placeholder page when the UI is missing,
+# so these jobs do not build the UI. The W3C, SHACL and ShEx conformance suites need
+# local checkouts of the test files and skip themselves here. `mise run ci` runs the
+# rest (the UI, the bindings, feature combinations and license notices).
+name: Rust
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Line tables keep backtraces useful and the target directory small enough to cache.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path crates/sparkles-py/Cargo.toml --check
+          cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml --check
+          cargo fmt --manifest-path crates/sparkles-node/Cargo.toml --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+          # Only main writes the cache, so branches do not evict each other's entries.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo test
+        run: cargo test --locked --workspace
+      - name: Check that docs/openapi.json is current
+        env:
+          SPARKLES_UPDATE_OPENAPI: "1"
+        run: |
+          cargo test --locked -p sparkles-server --bin sparkles openapi::tests::checked_in_copy_is_current
+          git diff --exit-code -- docs/openapi.json
