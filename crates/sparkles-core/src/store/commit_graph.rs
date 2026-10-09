@@ -320,6 +320,11 @@ mod tests {
         update(&dev, "INSERT DATA { <urn:b> <urn:p> 2 }");
         update(&dev, "INSERT DATA { <urn:c> <urn:p> 3 }");
         update(&s, "INSERT DATA { <urn:d> <urn:p> 4 }");
+        // Commits of different branches in the same millisecond are ordered by branch
+        // ordinal, which puts dev's last commit ahead of a merge made in that millisecond.
+        // The assertions below expect the merge to be the newest commit, so it is made in a
+        // later millisecond.
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let r = s.merge("dev", MAIN, &MergeOptions::default()).unwrap();
         assert!(matches!(r, MergeOutcome::Merged(_)));
 
