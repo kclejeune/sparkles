@@ -2128,15 +2128,25 @@ answers as before, apart from the fix to hidden estimates in §6.6.5.
 | `profile` | `estimate`, the default, or `run`, which runs the query read-only under the call's timeout and the caller's budgets and explains the executed plan, partial when a budget stopped it. |
 | `notes` | Whether to add the notes and the template description of §6.6, false by default. |
 | `timeoutSeconds` | The deadline of a `run`, 30 by default. |
+| `useServerModel` | Whether the server's `explain` role rewrites the template description and notes into prose, false by default. Allowed only when the caller's grant permits it. |
 
 With `notes`, the result adds `nodes`, one entry per operator with its id, operator,
 description, estimated and actual rows, total and own time and `complete`, and `notes`
 and `asks` as §6.6.2 and §6.6.3 define them, with `source: "template"`. The text `plan`
 then starts each line with the node's id and adds `act=` and `ms=` after a run.
 
-The tool never calls the server's model providers. An agent is its own model and
-writes its own prose from the notes, and a server's provider budget is meant for the
-people who use its UI. Its annotations stay read-only and closed-world.
+By default the tool never calls the server's model providers. An agent is its own
+model and writes its own prose from the notes, and a server's provider budget is meant
+for the people who use its UI. An agent with a weak or small model can pass
+`useServerModel: true` to get the same prose the UI shows, with the same checks that
+drop sentences citing a missing node or number. The call needs the `serverModels`
+permission described below, and its tokens count against the calling principal's
+budget. Its annotations stay read-only and closed-world.
+
+The `serverModels` permission is a grant flag of C12 that an operator gives per
+principal and dataset. Without it, `useServerModel: true` fails with
+`server-model-not-allowed` and the tool answers nothing, so an agent never pays for a
+call it did not expect to be refused.
 
 ### 9.7 `optimize_query`
 
@@ -2151,12 +2161,15 @@ comparisons and verdicts of §6.7.4 to §6.7.6.
 | `rules` | Whether to try the deterministic rules, true by default. |
 | `runs` | Runs of each query for timing, 3 by default, from 1 to 5. |
 | `timeoutSeconds` | The deadline of the whole call, 120 by default. |
+| `useServerModel` | Whether the server's `optimize` role also proposes rewrites, as **Look further** does in the UI, false by default. Allowed only with the `serverModels` permission of §9.6. |
 
 The result lists the original's median time and plan summary and, for each candidate,
 its source (`rule` with the rule's name, or `agent`), its verdict and reason, its
 median time, the paired node timings, and for `results-differ` up to five differing
-rows in the compact syntax of C11 §4.3. Like `explain_query`, it never calls the
-server's providers, so the `optimize` role is used only by the UI. The tool runs
+rows in the compact syntax of C11 §4.3. Like `explain_query`, it calls the server's
+providers only with `useServerModel: true`, and the source of such a candidate is
+`server-model`. Every candidate, whatever its source, passes the same gate and
+comparisons. The tool runs
 queries but writes nothing, so its annotations are read-only and closed-world. Each run
 counts against the caller's MCP query limits.
 
@@ -2387,12 +2400,13 @@ The efforts are focused agent-days, including tests and docs.
 - **Rewrites checked by estimate alone.** An estimate can drop while the real run gets
   slower, and an estimate says nothing about the results. Every rewrite runs, its
   results are compared, and its time is measured.
-- **The server's provider behind MCP's `explain_query` and `optimize_query`.** An agent
-  is already a model, and a call from it would spend the operator's budget meant for
-  the UI. The tools return the deterministic notes and verdicts, and the agent writes
-  its own prose and proposes its own rewrites.
+- **The server's provider behind MCP's `explain_query` and `optimize_query` by
+  default.** An agent is already a model, and a default call would spend the operator's
+  budget meant for the UI. The tools return the deterministic notes and verdicts, and
+  the agent writes its own prose and proposes its own rewrites. The server's provider
+  is an opt-in fallback that needs a grant (§9.6).
 
-## 14. Decisions and open questions
+## 14. Decisions
 
 The maintainer decided these questions on 2026-10-09.
 
@@ -2469,20 +2483,18 @@ The maintainer decided these further questions later on 2026-10-09.
     Phase 2, explanations in Phase 2b right after it, and the optimizer in Phase 6,
     with its deterministic checks in 6a before the model in 6b (§12).
 
-Three questions are open.
-
-1. **Server models behind MCP.** This revision keeps MCP's `explain_query` and
-   `optimize_query` free of the server's providers (§13). An operator might want agents
-   with weak models to get the server's prose or proposals. A per-dataset switch could
-   allow it later, with the cost counted against the agent's principal.
-2. **OCR in release builds.** `pdf-ocr` is left out of release builds because it needs
-   PDFium and ONNX Runtime at run time and adds about 132 crates that the server does
-   not link today. A separate release artifact with OCR is possible if operators ask
-   for it.
-3. **Recording acceptance.** The routing log counts **Correct**, the example buttons,
-   **Not correct** and **Try harder** as outcomes, and an edited-then-run query as
-   `edited`. Whether an answer that a person runs without comment should count as
-   accepted is left to the first months of logs.
+18. **Server models behind MCP.** MCP's `explain_query` and `optimize_query` do not
+    call the server's providers by default. `useServerModel: true` opts in for agents
+    with weak models, with the `serverModels` grant and the cost counted against the
+    calling principal (§9.6, §9.7).
+19. **OCR in release builds.** `pdf-ocr` stays out of release builds, because it needs
+    PDFium and ONNX Runtime at run time and adds about 132 crates. A separate artifact
+    can follow if operators ask for one.
+20. **Recording acceptance.** An answer that a person runs without comment counts as
+    accepted with a weak weight in the routing log, beside **Correct**, the example
+    buttons, **Not correct**, **Try harder** and `edited`.
+21. **Complexity weights.** The weights and the threshold of 8 in §5.5 are starting
+    values, and the evaluation matrix of §11.4 tunes them.
 
 ## 15. Acceptance examples
 
@@ -2700,6 +2712,14 @@ it receives.
 - **A56.** A build without the `pdf` feature refuses a PDF with `unsupported-format`.
   The same PDF converted twice by one build gives the same digest and the same
   rendition IRI.
+- **A57.** MCP `explain_query` with `notes: true` and `useServerModel: true` from
+  `agent-7`, whose grant lacks `serverModels`, fails with `server-model-not-allowed`
+  and calls no provider. With the grant, the result's description has
+  `source: "model"`, every sentence links to an existing node, and the routing log
+  charges the tokens to `agent-7`.
+- **A58.** MCP `optimize_query` with `useServerModel: true` and the grant returns the
+  rule candidates and at most one candidate with source `server-model`, and each
+  carries a verdict from the same gate and comparisons as an agent's candidate.
 
 ## 16. Sources
 
