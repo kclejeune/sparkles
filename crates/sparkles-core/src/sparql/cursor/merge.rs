@@ -50,7 +50,6 @@ pub(super) struct Merge {
     inputs: [Input; 2],
     keys: [Vec<usize>; 2],
     columns: Vec<(Option<usize>, Option<usize>)>,
-    sorted: Vec<VarId>,
     pair: Option<Pair>,
     optional: bool,
     _charge: Option<RetainedCharge>,
@@ -236,7 +235,6 @@ impl Merge {
             inputs: Default::default(),
             keys: [key_columns(0), key_columns(1)],
             columns,
-            sorted: node.sorted.clone(),
             pair: None,
             optional: matches!(node.kind, Kind::LeftJoin { .. }),
             _charge: charge,
@@ -630,7 +628,6 @@ impl Merge {
                 self.pair = None;
             }
         }
-        out.table.sorted = self.sorted.clone();
         out.reconcile()?;
         Ok((!out.table.is_empty()).then_some(out))
     }
@@ -780,5 +777,47 @@ mod tests {
         };
         assert!(matches!(error, Error::BudgetExceeded(_)));
         assert!(ctx.mem_peak() <= 32 << 10);
+    }
+
+    /// A planner claim that an input is sorted is not enough: the merge join needs the
+    /// order its input operator keeps. Concatenated UNION arms keep none, so the hash
+    /// join takes over and still answers correctly.
+    #[test]
+    fn inputs_without_a_kept_order_use_the_hash_join() {
+        let arm = |rows: &[Vec<i64>]| values(vec![0, 1], rows);
+        let mut union = Node::leaf(Kind::Union, vec![0, 1], 4.0, String::new());
+        union.children = vec![
+            arm(&[vec![2, 1], vec![3, 1]]),
+            arm(&[vec![0, 2], vec![1, 2]]),
+        ];
+        union.sorted = vec![0];
+        union.certain = vec![0, 1];
+        let node = join(
+            union,
+            values(vec![0, 2], &[vec![0, 5], vec![1, 6], vec![3, 7]]),
+        );
+        assert!(eligible(&node));
+        let ctx = context(1 << 20);
+        let expected = rows(&exec::execute(&ctx, &node).unwrap().0);
+        let mut op = Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
+        assert!(matches!(op.state, super::super::State::Binary(_)));
+        let mut result = Vec::new();
+        while let Some(batch) = op.next(&ctx, &CursorOptions::default(), 1).unwrap() {
+            result.extend(rows(&batch.table));
+        }
+        result.sort();
+        assert_eq!(result, expected);
+        assert_eq!(result.len(), 3);
+    }
+
+    /// Debug builds check that output batches keep the order their operator claims.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "out of order")]
+    fn a_false_order_claim_fails_the_debug_check() {
+        let ctx = context(1 << 20);
+        let node = values(vec![0, 1], &[vec![2, 0], vec![1, 0]]);
+        let mut op = Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
+        let _ = op.next(&ctx, &CursorOptions::default(), 4096);
     }
 }

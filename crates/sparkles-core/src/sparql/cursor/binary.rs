@@ -19,6 +19,20 @@ pub(super) fn eligible(node: &Node) -> bool {
         }
 }
 
+/// The input that is streamed. It matches the planner's hash probe order: the larger
+/// input of an inner hash join, and child zero of every other join.
+pub(super) fn probe_side(node: &Node) -> usize {
+    usize::from(
+        matches!(
+            node.kind,
+            Kind::Join {
+                algo: JoinAlgo::Hash,
+                ..
+            }
+        ) && node.children[0].est < node.children[1].est,
+    )
+}
+
 #[derive(Clone, Copy)]
 enum Mode {
     Inner,
@@ -41,7 +55,6 @@ pub(super) struct Binary {
     candidate: usize,
     matched: bool,
     expression: Option<Expr>,
-    sorted: Vec<VarId>,
     _charge: Option<RetainedCharge>,
     _hash_charge: Option<RetainedCharge>,
 }
@@ -55,17 +68,7 @@ impl Binary {
             Kind::Minus => Mode::Minus,
             _ => Mode::Inner,
         };
-        // Match the planner's hash probe order; sorted metadata on a hash join
-        // belongs to the larger input. OPTIONAL/MINUS always probe child zero.
-        let probe_side = usize::from(
-            matches!(
-                node.kind,
-                Kind::Join {
-                    algo: JoinAlgo::Hash,
-                    ..
-                }
-            ) && node.children[0].est < node.children[1].est,
-        );
+        let probe_side = probe_side(node);
         let (probe, build) = (&node.children[probe_side], &node.children[1 - probe_side]);
         let charge = ctx.retained_charge(node.vars.len() as u64 * 96 + 1024)?;
         let columns = node
@@ -107,7 +110,6 @@ impl Binary {
             candidate: 0,
             matched: false,
             expression,
-            sorted: probe.sorted.clone(),
             _charge: charge,
             _hash_charge: None,
         })
@@ -280,7 +282,6 @@ impl Binary {
                 self.advance();
             }
         }
-        output.table.sorted = self.sorted.clone();
         output.reconcile()?;
         Ok((!output.table.is_empty()).then_some(output))
     }
