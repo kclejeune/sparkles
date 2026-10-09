@@ -5,73 +5,115 @@
 # so these jobs do not build the UI. The W3C, SHACL and ShEx conformance suites need
 # local checkouts of the test files and skip themselves here. `mise run ci` runs the
 # rest (the UI, the bindings, feature combinations and license notices).
+#
+# The jobs run on Namespace runners (docs/DEVELOPMENT.md, "Continuous integration"). The
+# cache volume tagged sparkles-linux-amd64 holds Cargo's registry and target directory
+# and is shared with the binding workflows; only runs on main write it back.
 name: Rust
 
+# Runners bill per second, so a branch with a pull request runs once (for the pull
+# request), not also for its pushes, and changes that cannot affect the Rust build do not
+# run it at all.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "docs/specs/**"
+      - "docs/images/**"
+      - "docs/benchmarks/**"
+      - "ui/**"
+      - "js/**"
+      - "jvm/**"
+      - ".github/workflows/python-wheels.yml"
+      - ".github/workflows/node-packages.yml"
+      - ".github/workflows/jvm-bindings.yml"
   pull_request:
+    paths-ignore:
+      - "README.md"
+      - "docs/specs/**"
+      - "docs/images/**"
+      - "docs/benchmarks/**"
+      - "ui/**"
+      - "js/**"
+      - "jvm/**"
+      - ".github/workflows/python-wheels.yml"
+      - ".github/workflows/node-packages.yml"
+      - ".github/workflows/jvm-bindings.yml"
+  # A manual run can also test Linux arm64 and macOS on Apple silicon, for example before
+  # a release. Pushes and pull requests test Linux x86_64 only.
   workflow_dispatch:
+    inputs:
+      all-platforms:
+        description: Also run the tests on Linux arm64 and macOS arm64
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# A newer push supersedes a running check of the same branch, including main.
 concurrency:
   group: rust-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # Line tables keep backtraces useful and the target directory small enough to cache.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   RUST_BACKTRACE: "1"
 
 jobs:
-  fmt:
-    name: Formatting
-    runs-on: ubuntu-24.04
+  # Formatting runs in this job because it takes seconds and a job of its own would pay for
+  # another runner start and checkout.
+  clippy:
+    timeout-minutes: 30
+    name: Formatting and Clippy
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-16x32-with-cache
+      - nscloud-cache-tag-sparkles-linux-amd64
+      - nscloud-cache-size-50gb
+      - nscloud-cache-allow-commit-from-main
+      - nscloud-git-mirror-5gb
     steps:
-      - uses: actions/checkout@v5
+      - uses: namespacelabs/nscloud-checkout-action@v8
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - name: cargo fmt
         run: |
           cargo fmt --all --check
           cargo fmt --manifest-path crates/sparkles-py/Cargo.toml --check
           cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml --check
           cargo fmt --manifest-path crates/sparkles-node/Cargo.toml --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: namespacelabs/nscloud-cache-action@v1
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: clippy
-          # Only main writes the cache, so branches do not evict each other's entries.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache: rust
       - name: cargo clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
-    name: Tests
-    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    name: Tests (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(inputs.all-platforms && '["linux-amd64", "linux-arm64", "macos-arm64"]' || '["linux-amd64"]') }}
+    runs-on: ${{ fromJSON(matrix.platform == 'macos-arm64' && '["nscloud-macos-sequoia-arm64-12x28-with-cache", "nscloud-cache-tag-sparkles-macos-arm64", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]' || format('["nscloud-ubuntu-24.04-{0}-16x32-with-cache", "nscloud-cache-tag-sparkles-{1}", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]', matrix.platform == 'linux-arm64' && 'arm64' || 'amd64', matrix.platform)) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: namespacelabs/nscloud-checkout-action@v8
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: namespacelabs/nscloud-cache-action@v1
         with:
-          shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: cargo test
-        run: cargo test --locked --workspace
+          cache: rust
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.146
+      # The settings in .config/nextest.toml: every failure reported at the end, and a
+      # test that runs past ten minutes stopped. nextest does not run doctests.
+      - name: cargo nextest
+        run: cargo nextest run --locked --workspace --profile ci
+      - name: Doctests
+        run: cargo test --locked --workspace --doc
       - name: Check that docs/openapi.json is current
         env:
           SPARKLES_UPDATE_OPENAPI: "1"

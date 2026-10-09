@@ -5,6 +5,10 @@
 # the repository variable PYPI_PUBLISH is "true" and PyPI trusted publishing is set up for
 # the `pypi` environment (docs/DEVELOPMENT.md). Until then the workflow builds and tests,
 # and publishes nothing.
+#
+# Wheels are built for Linux on x86_64 and arm64 (manylinux and musllinux) and for macOS
+# on Apple silicon. The jobs run on Namespace runners with a cache volume per platform,
+# shared with the other workflows and written back only from main.
 name: Python wheels
 
 on:
@@ -31,29 +35,47 @@ concurrency:
 env:
   MATURIN_VERSION: "1.15.0"
   MANIFEST: crates/sparkles-py/Cargo.toml
+  # Pull requests build the wheels in the dev profile, which compiles far faster than the
+  # release profile's thin LTO; tags and manual runs build what would be published.
+  PROFILE_ARG: ${{ github.event_name == 'pull_request' && '--profile dev' || '--release' }}
 
 jobs:
   linux:
+    timeout-minutes: 45
     name: Linux ${{ matrix.libc }} ${{ matrix.target }}
-    # arm64 builds and tests natively on GitHub's arm64 runners
-    runs-on: ${{ matrix.runner }}
+    # arm64 builds and tests natively on arm64 runners
+    # Pull requests build and test the x86_64 manylinux wheel only. Tags and manual runs
+    # build every wheel.
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { target: x86_64, libc: manylinux, compat: "2_28", runner: ubuntu-24.04 }
-          - { target: aarch64, libc: manylinux, compat: "2_28", runner: ubuntu-24.04-arm }
-          - { target: x86_64, libc: musllinux, compat: musllinux_1_2, runner: ubuntu-24.04 }
-          - { target: aarch64, libc: musllinux, compat: musllinux_1_2, runner: ubuntu-24.04-arm }
+        target: [x86_64, aarch64]
+        libc: [manylinux, musllinux]
+        exclude:
+          - target: ${{ github.event_name == 'pull_request' && 'aarch64' || 'none' }}
+          - libc: ${{ github.event_name == 'pull_request' && 'musllinux' || 'none' }}
+    env:
+      COMPAT: ${{ matrix.libc == 'manylinux' && '2_28' || 'musllinux_1_2' }}
+    runs-on:
+      - nscloud-ubuntu-24.04-${{ matrix.target == 'aarch64' && 'arm64' || 'amd64' }}-8x16-with-cache
+      - nscloud-cache-tag-sparkles-linux-${{ matrix.target == 'aarch64' && 'arm64' || 'amd64' }}
+      - nscloud-cache-size-50gb
+      - nscloud-cache-allow-commit-from-main
+      - nscloud-git-mirror-5gb
     steps:
-      - uses: actions/checkout@v5
+      - uses: namespacelabs/nscloud-checkout-action@v8
+      # maturin builds in a manylinux or musllinux container with the workspace mounted,
+      # so the cached target directory carries over between runs.
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          path: target
       - name: Build the wheel
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: ${{ env.MATURIN_VERSION }}
           target: ${{ matrix.target }}
-          manylinux: ${{ matrix.compat }}
-          args: --release --locked --manifest-path ${{ env.MANIFEST }} --out dist
+          manylinux: ${{ env.COMPAT }}
+          args: ${{ env.PROFILE_ARG }} --locked --manifest-path ${{ env.MANIFEST }} --out dist
       - name: Set up CPython 3.10 and 3.14
         if: matrix.libc == 'manylinux'
         uses: actions/setup-python@v6
@@ -76,19 +98,25 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: macOS ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64, runner: macos-15-intel }
-          - { target: aarch64, runner: macos-15 }
+    timeout-minutes: 45
+    name: macOS arm64
+    # tags and manual runs only
+    if: github.event_name != 'pull_request'
+    runs-on:
+      - nscloud-macos-sequoia-arm64-6x14-with-cache
+      - nscloud-cache-tag-sparkles-macos-arm64
+      - nscloud-cache-size-50gb
+      - nscloud-cache-allow-commit-from-main
+      - nscloud-git-mirror-5gb
     env:
       # the oldest macOS the wheels support (spec P01, §2.4)
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v5
+      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
       - name: Set up CPython 3.10 and 3.14
         uses: actions/setup-python@v6
         with:
@@ -99,56 +127,31 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: ${{ env.MATURIN_VERSION }}
-          target: ${{ matrix.target }}
-          args: --release --locked --manifest-path ${{ env.MANIFEST }} --out dist
+          target: aarch64
+          args: ${{ env.PROFILE_ARG }} --locked --manifest-path ${{ env.MANIFEST }} --out dist
       - name: Test the wheel on CPython 3.10 and 3.14
         run: scripts/py-wheel-test.sh dist/*.whl python3.10 python3.14
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-macos-${{ matrix.target }}
-          path: dist/*.whl
-          if-no-files-found: error
-
-  windows:
-    name: Windows x64
-    runs-on: windows-2025
-    steps:
-      - uses: actions/checkout@v5
-      - name: Set up CPython 3.10
-        id: py310
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.10"
-          architecture: x64
-      - name: Set up CPython 3.14
-        id: py314
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.14"
-          architecture: x64
-      - name: Build the wheel
-        uses: PyO3/maturin-action@v1
-        with:
-          maturin-version: ${{ env.MATURIN_VERSION }}
-          target: x64
-          args: --release --locked --manifest-path ${{ env.MANIFEST }} --out dist
-      - name: Test the wheel on CPython 3.10 and 3.14
-        shell: bash
-        env:
-          PY310: ${{ steps.py310.outputs.python-path }}
-          PY314: ${{ steps.py314.outputs.python-path }}
-        run: scripts/py-wheel-test.sh dist/*.whl "$PY310" "$PY314"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-windows-x64
+          name: wheels-macos-aarch64
           path: dist/*.whl
           if-no-files-found: error
 
   sdist:
+    timeout-minutes: 45
     name: Source distribution
-    runs-on: ubuntu-24.04
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
+      - nscloud-cache-tag-sparkles-linux-amd64
+      - nscloud-cache-size-50gb
+      - nscloud-cache-allow-commit-from-main
+      - nscloud-git-mirror-5gb
     steps:
-      - uses: actions/checkout@v5
+      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
       - name: Set up CPython 3.14
         uses: actions/setup-python@v6
         with:
@@ -166,8 +169,9 @@ jobs:
           if-no-files-found: error
 
   publish:
+    timeout-minutes: 15
     name: Publish to PyPI
-    needs: [linux, macos, windows, sdist]
+    needs: [linux, macos, sdist]
     # a release tag, and publishing switched on for the repository
     if: startsWith(github.ref, 'refs/tags/py-v') && vars.PYPI_PUBLISH == 'true'
     runs-on: ubuntu-24.04
@@ -190,6 +194,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # Trusted publishing when the PYPI_API_TOKEN secret is unset; a PyPI pending
+      # publisher lets the first release create the project without a token. A rerun
+      # skips files that are already on PyPI.
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true

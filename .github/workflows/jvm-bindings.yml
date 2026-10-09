@@ -1,3 +1,8 @@
+# The JVM bindings: native libraries for Linux on x86_64 and arm64 and for macOS on Apple
+# silicon, the jars with every native library inside, a compatibility matrix, and, for a
+# `jvm-v*` tag with publishing switched on, the release to Maven Central
+# (docs/DEVELOPMENT.md, "Releases"). The jobs run on Namespace runners with a cache volume
+# per platform, shared with the other workflows and written back only from main.
 name: JVM bindings
 
 on:
@@ -14,26 +19,38 @@ concurrency:
   group: jvm-bindings-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # Pull requests build the bindings in the dev profile, which compiles far faster than the
+  # release profile's thin LTO; tags and manual runs build what would be published.
+  JVM_PROFILE: ${{ github.event_name == 'pull_request' && 'dev' || 'release' }}
+
 jobs:
   natives:
+    timeout-minutes: 45
+    # Pull requests build and test linux-x86_64 only. Tags and manual runs build every
+    # platform, which the release jars need.
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: ubuntu-24.04, platform: linux-x86_64 }
-          - { runner: ubuntu-24.04-arm, platform: linux-aarch64 }
-          - { runner: macos-15-intel, platform: macos-x86_64 }
-          - { runner: macos-15, platform: macos-aarch64 }
-          - { runner: windows-2025, platform: windows-x86_64 }
-    runs-on: ${{ matrix.runner }}
+        platform: [linux-x86_64, linux-aarch64, macos-aarch64]
+        exclude:
+          - platform: ${{ github.event_name == 'pull_request' && 'linux-aarch64' || 'none' }}
+          - platform: ${{ github.event_name == 'pull_request' && 'macos-aarch64' || 'none' }}
+    runs-on: ${{ fromJSON(matrix.platform == 'macos-aarch64' && '["nscloud-macos-sequoia-arm64-6x14-with-cache", "nscloud-cache-tag-sparkles-macos-arm64", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]' || format('["nscloud-ubuntu-24.04-{0}-8x16-with-cache", "nscloud-cache-tag-sparkles-linux-{0}", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]', matrix.platform == 'linux-aarch64' && 'arm64' || 'amd64')) }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v5
+      - uses: namespacelabs/nscloud-checkout-action@v8
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       - uses: gradle/actions/setup-gradle@v4
+        with: { cache-disabled: true }
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: |
+            rust
+            gradle
       - name: Build native library and generate matching bindings
         shell: bash
         run: |
@@ -51,7 +68,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p "dist/${{ matrix.platform }}"
-          for library in target/release/libsparkles_ffi.so target/release/libsparkles_ffi.dylib target/release/sparkles_ffi.dll; do
+          dir=release
+          [ "$JVM_PROFILE" = dev ] && dir=debug
+          for library in target/$dir/libsparkles_ffi.so target/$dir/libsparkles_ffi.dylib target/$dir/sparkles_ffi.dll; do
             if [ -f "$library" ]; then cp "$library" "dist/${{ matrix.platform }}/"; fi
           done
       - uses: actions/upload-artifact@v4
@@ -61,14 +80,26 @@ jobs:
           if-no-files-found: error
 
   jars:
+    timeout-minutes: 30
     needs: natives
-    runs-on: ubuntu-24.04
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
+      - nscloud-cache-tag-sparkles-linux-amd64
+      - nscloud-cache-size-50gb
+      - nscloud-cache-allow-commit-from-main
+      - nscloud-git-mirror-5gb
     steps:
-      - uses: actions/checkout@v5
+      - uses: namespacelabs/nscloud-checkout-action@v8
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       - uses: gradle/actions/setup-gradle@v4
+        with: { cache-disabled: true }
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: |
+            rust
+            gradle
       - uses: actions/download-artifact@v4
         with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
       - name: Generate bindings and assemble all-platform artifacts
@@ -84,8 +115,14 @@ jobs:
           if-no-files-found: error
 
   compatibility:
+    timeout-minutes: 30
     needs: jars
-    runs-on: ubuntu-24.04
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
+      - nscloud-cache-tag-sparkles-linux-amd64
+      - nscloud-cache-size-50gb
+      - nscloud-cache-allow-commit-from-main
+      - nscloud-git-mirror-5gb
     strategy:
       fail-fast: false
       matrix:
@@ -93,11 +130,17 @@ jobs:
           - { java: "17", jena: "5.6.0" }
           - { java: "21", jena: "6.2.0" }
     steps:
-      - uses: actions/checkout@v5
+      - uses: namespacelabs/nscloud-checkout-action@v8
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "${{ matrix.java }}" }
       - uses: gradle/actions/setup-gradle@v4
+        with: { cache-disabled: true }
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: |
+            rust
+            gradle
       - uses: actions/download-artifact@v4
         with: { name: jvm-native-linux-x86_64, path: target/jvm/natives }
       - run: |
@@ -107,29 +150,65 @@ jobs:
           ./gradlew --no-daemon --console=plain -Psparkles.nativeDir=../target/jvm/natives -Psparkles.javaVersion=${{ matrix.java }} -Psparkles.jenaVersion=${{ matrix.jena }} :sparkles-jena:test :sample-java:build
 
   publish:
+    timeout-minutes: 30
     if: startsWith(github.ref, 'refs/tags/jvm-v') && vars.MAVEN_PUBLISH == 'true'
     needs: [jars, compatibility]
-    runs-on: ubuntu-24.04
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
+      - nscloud-cache-tag-sparkles-linux-amd64
+      - nscloud-cache-size-50gb
+      - nscloud-cache-allow-commit-from-main
+      - nscloud-git-mirror-5gb
     environment: maven
     steps:
-      - uses: actions/checkout@v5
+      - uses: namespacelabs/nscloud-checkout-action@v8
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       - uses: gradle/actions/setup-gradle@v4
+        with: { cache-disabled: true }
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: |
+            rust
+            gradle
       - uses: actions/download-artifact@v4
         with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
-      - name: Publish signed Maven artifacts
+      # Maven Central through the Central Portal's OSSRH Staging API: Gradle deploys the
+      # signed artifacts with a Portal user token (MAVEN_USERNAME and MAVEN_PASSWORD), and
+      # the next step, in the same job because the API matches the upload by IP address,
+      # moves the deployment into the Portal. MAVEN_PUBLISH_URL overrides the deploy URL.
+      - name: Deploy signed Maven artifacts
         env:
           SPARKLES_PUBLISH: "true"
           MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
           MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
           MAVEN_SIGNING_KEY: ${{ secrets.MAVEN_SIGNING_KEY }}
           MAVEN_SIGNING_PASSWORD: ${{ secrets.MAVEN_SIGNING_PASSWORD }}
-          MAVEN_PUBLISH_URL: ${{ vars.MAVEN_PUBLISH_URL }}
+          MAVEN_PUBLISH_URL: ${{ vars.MAVEN_PUBLISH_URL || 'https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/' }}
         run: |
-          test -n "$MAVEN_PUBLISH_URL" && test -n "$MAVEN_SIGNING_KEY"
+          for name in MAVEN_USERNAME MAVEN_PASSWORD MAVEN_SIGNING_KEY; do
+            [ -n "${!name}" ] || { echo "the $name secret is not set" >&2; exit 1; }
+          done
+          version="${GITHUB_REF_NAME#jvm-v}"
+          grep -qx "version=$version" jvm/gradle.properties || { echo "tag $GITHUB_REF_NAME does not match jvm/gradle.properties" >&2; exit 1; }
           cargo build --locked --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --features bindgen --bin uniffi-bindgen
           target/debug/uniffi-bindgen generate --library target/jvm/natives/linux-x86_64/libsparkles_ffi.so --language kotlin --no-format --metadata-no-deps --config crates/sparkles-ffi/bindgen.toml --out-dir target/jvm/uniffi
           cd jvm
-          ./gradlew --no-daemon --console=plain -Pversion="${GITHUB_REF_NAME#jvm-v}" -Psparkles.nativeDir=../target/jvm/natives -Psparkles.publishUrl="$MAVEN_PUBLISH_URL" publish
+          # The publication and classifier-jar tasks cannot be stored in the configuration cache.
+          ./gradlew --no-daemon --no-configuration-cache --console=plain -Pversion="$version" -Psparkles.nativeDir=../target/jvm/natives -Psparkles.publishUrl="$MAVEN_PUBLISH_URL" publish
+      # publishing_type user_managed leaves the deployment in the Portal for a person to
+      # release; set the MAVEN_PUBLISHING_TYPE variable to automatic to release when it
+      # validates.
+      - name: Move the deployment into the Central Portal
+        if: ${{ !vars.MAVEN_PUBLISH_URL }}
+        env:
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+          PUBLISHING_TYPE: ${{ vars.MAVEN_PUBLISHING_TYPE || 'user_managed' }}
+        run: |
+          namespace=$(sed -n 's/^group=//p' jvm/gradle.properties)
+          token=$(printf '%s:%s' "$MAVEN_USERNAME" "$MAVEN_PASSWORD" | base64 -w0)
+          curl --fail-with-body --silent --show-error -X POST \
+            -H "Authorization: Bearer $token" \
+            "https://ossrh-staging-api.central.sonatype.com/manual/upload/defaultRepository/$namespace?publishing_type=$PUBLISHING_TYPE"

@@ -218,25 +218,22 @@ and runs the pytest suite against the installation (`scripts/py-wheel-test.sh`).
 
 `.github/workflows/python-wheels.yml` runs on pull requests that touch the crates, on
 `py-v*` tags and by hand. It builds abi3 wheels with maturin-action for manylinux 2.28
-and musllinux 1.2 on x86_64 and aarch64, macOS x86_64 and arm64, and Windows x64, and
-the source distribution. The arm64 Linux wheels build on GitHub's arm64 runners, so
-their tests run natively. Each job installs what it built with `py-wheel-test.sh` and
+and musllinux 1.2 on x86_64 and aarch64 and for macOS on Apple silicon, and the source
+distribution. The arm64 wheels build on arm64 runners, so their tests run natively.
+Pull requests build the wheels in the dev profile, and tags and manual runs in the
+release profile. Each job installs what it built with `py-wheel-test.sh` and
 runs the tests on CPython 3.10 and 3.14 where the runner has both. The musllinux
 wheels are tested in an Alpine container, and the sdist job builds a wheel from the
 sdist before testing it. Every package is uploaded as an artifact.
 
-The publish job sends the artifacts to PyPI with trusted publishing, and as committed it
-never runs. It needs a `py-v<version>` tag that matches the crate's version, the
-repository variable `PYPI_PUBLISH` set to `true`, and a `pypi` environment that PyPI
-trusts for the `sparkles-rdf` project. No token is stored. To publish, register the
-workflow as a trusted publisher on PyPI, create the `pypi` environment, preferably with
-required reviewers, set the variable, and push the tag.
+The publish job sends the artifacts to PyPI. [Releases](#releases) describes how to
+set it up and run it.
 
 The x86_64 manylinux and musllinux builds can be reproduced locally with Docker in the
 `quay.io/pypa/manylinux_2_28_x86_64` and `musllinux_1_2_x86_64` images, with
 `maturin build --compatibility manylinux_2_28` or `musllinux_1_2`. Both were built that
 way, the musllinux one from the sdist, and passed the suite on CPython 3.10 and 3.14 and
-in Alpine. The macOS, Windows and aarch64 wheels are built only by the workflow.
+in Alpine. The macOS and aarch64 wheels are built only by the workflow.
 `actionlint` checks the workflow file.
 
 ### JVM bindings
@@ -272,8 +269,8 @@ The build assembles `sparkles-jena`, `sparkles-jena-natives` and a Fuseki bundle
 resources have SHA-256 checksums; Gradle dependency locks and verification metadata
 pin the release graph. The compatibility workflow uses Java 17/Jena 5.6 and Java
 21/Jena 6.2 while emitting Java 17 SDK class files. Nix builds include the host's native
-library. Maven publication requires the explicitly enabled release environment,
-credentials and signing key. Ordinary builds and tests do not publish artifacts.
+library. Ordinary builds and tests do not publish artifacts. [Releases](#releases)
+describes publication to Maven Central.
 
 ### JavaScript bindings
 
@@ -302,8 +299,7 @@ terms and adapters. Packed-package checks install concrete archives into a fresh
 project and compile a consumer of their published declarations. The remote client has
 protocol and streaming-parser tests, and its generated administrative types are
 checked against the OpenAPI document. The release workflow builds the native target
-matrix and runs runtime checks; publication requires a matching release tag and the
-explicitly enabled npm environment.
+matrix and runs runtime checks. [Releases](#releases) describes publication to npm.
 
 ### Browser integration tests
 
@@ -499,6 +495,81 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 * `scripts/backup-bench.sh DB` (`mise run bench:backup DB`) backs up an existing
   database to an `fs` repository. It times a full backup, an incremental backup after
   small commits, a restore and a data verification.
+
+## Continuous integration
+
+The workflows in `.github/workflows` run on [Namespace](https://namespace.so) runners,
+which bill per second. The repository needs Namespace's GitHub app, and each job names
+its machine and cache volume in `runs-on`. `.github/actionlint.yaml` lists the labels
+for `actionlint`. Every job on a Namespace runner checks out the repository through
+Namespace's git mirror and keeps Cargo's registry and target directory, and pnpm's or
+Gradle's caches where it uses them, on a cache volume. There is one volume per
+platform, `sparkles-linux-amd64`, `sparkles-linux-arm64`, `sparkles-linux-amd64-musl`,
+`sparkles-linux-arm64-musl` and `sparkles-macos-arm64`, shared by the workflows. Every
+run reads the volumes, and only runs on `main` write them back, so pull requests cannot
+fill them with their own builds. Watch their size in the Namespace dashboard. When a
+volume reaches its 50 GB limit, raise the `nscloud-cache-size` label or split the
+release and test builds onto separate tags.
+
+Several choices keep the billed time down. The Rust workflow runs for pushes to `main`
+and for pull requests, but not for the pushes to a pull request's branch, and changes
+to the UI, the bindings' JavaScript and Kotlin sources or the documentation do not start
+it. A newer push cancels a running check of the same branch. Formatting runs in the
+Clippy job instead of a job of its own. The binding workflows run for pull requests that
+touch their sources, for release tags and by hand. For pull requests they build in the
+dev profile and only for Linux x86_64. Every job has a timeout, so a hung job stops
+instead of running for GitHub's default six hours. Builds cover Linux on x86_64 and arm64
+and macOS on Apple silicon.
+
+Pushes and pull requests test Linux x86_64 only. The engine's shared state goes through
+snapshot swaps, locks and channels, and its relaxed atomics are counters and flags, so
+the risk of a fault that only arm64's weaker memory ordering or macOS would show is low.
+Before a release, run the Rust workflow by hand with **all-platforms** checked to test
+Linux arm64 and macOS as well. Running a binding workflow by hand, or pushing its
+release tag, builds and tests every platform.
+
+## Releases
+
+Each binding has its own release tag and workflow. A tag that starts with `py-v` runs
+`python-wheels.yml` and publishes the `sparkles-rdf` distribution to PyPI. A `node-v`
+tag runs `node-packages.yml` and publishes the `@sparkles-rdf` packages to npm. A
+`jvm-v` tag runs `jvm-bindings.yml` and publishes `sparkles-jena`,
+`sparkles-jena-natives` and `sparkles-jena-all` to Maven Central under the group in
+`jvm/gradle.properties`. The version after the prefix must equal the version in
+`crates/sparkles-py/Cargo.toml`, the `js/*/package.json` files or
+`jvm/gradle.properties`, and each workflow checks that before it publishes. The build
+and test jobs run first, and the publish job runs only when they all pass.
+
+Nothing is published until a repository variable switches it on. Set `PYPI_PUBLISH`,
+`NPM_PUBLISH` or `MAVEN_PUBLISH` to `true` under the repository's Actions variables.
+Each publish job also runs in a GitHub environment, `pypi`, `npm` or `maven`, and
+adding required reviewers to an environment makes every release wait for approval.
+
+**PyPI.** Add a pending trusted publisher for the project `sparkles-rdf` on PyPI, with
+this repository, the workflow `python-wheels.yml` and the environment `pypi`. The first
+release then creates the project, and no token is stored. As a fallback, an API token
+in the `PYPI_API_TOKEN` secret of the `pypi` environment is used instead.
+
+**npm.** Create the `sparkles-rdf` organization on npmjs.com. npm accepts trusted
+publishers only for packages that already exist, so the first release needs an
+automation token with publish rights to the organization in the `NPM_TOKEN` secret of
+the `npm` environment. After it, add this repository, the workflow `node-packages.yml`
+and the environment `npm` as the trusted publisher of each of the ten packages, and
+delete the secret. Every release carries a provenance statement either way. A rerun
+skips the packages that are already published.
+
+**Maven Central.** Sign in to the Central Portal (central.sonatype.com) with GitHub,
+which verifies the `io.github.kclejeune` namespace. A namespace under your own domain is
+verified with a DNS TXT record instead. Generate a Portal user token and store its
+username and password in the `MAVEN_USERNAME` and `MAVEN_PASSWORD` secrets of the
+`maven` environment. Create a signing key with `gpg --quick-generate-key`, publish its
+public key to `keys.openpgp.org`, and store the ASCII-armored private key
+(`gpg --armor --export-secret-keys <id>`) and its passphrase in `MAVEN_SIGNING_KEY` and
+`MAVEN_SIGNING_PASSWORD`. The job deploys the signed artifacts through the Portal's
+OSSRH Staging API and then moves them into the Portal. By default they wait there
+until someone presses Publish. Set the variable `MAVEN_PUBLISHING_TYPE` to `automatic`
+to release them as soon as they validate. Artifacts on Maven Central can never be
+changed or deleted, so check a deployment in the Portal before you release it.
 
 ## Nix
 
