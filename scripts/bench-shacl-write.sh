@@ -5,7 +5,7 @@
 #   scripts/bench-shacl-write.sh [--lang shacl|shex] [N_PEOPLE] [WORKDIR]
 #
 # SHACL (the default): the shapes are the SHACL benchmark's
-# (crates/sparkles-shacl/examples/bench.rs), which the generated data does not conform to:
+# (crates/sparkles-shacl/examples/shacl-bench.rs), which the generated data does not conform to:
 # `warn` commits and reports the results; `reject` uses the same shapes at severity
 # sh:Warning, so the same validation runs and every write passes.
 # ShEx (--lang shex): `warn` uses the ShEx benchmark's schema and map
@@ -116,7 +116,7 @@ if [ ! -f "$DATA" ]; then
 fi
 echo "dataset: $(wc -l < "$DATA") triples"
 
-# the SHACL benchmark's shapes (keep in sync with crates/sparkles-shacl/examples/bench.rs)
+# the SHACL benchmark's shapes (keep in sync with crates/sparkles-shacl/examples/shacl-bench.rs)
 cat > shapes-warn.ttl << 'EOF'
 @prefix ex: <http://example.org/> .
 @prefix foaf: <http://xmlns.com/foaf/0.1/> .

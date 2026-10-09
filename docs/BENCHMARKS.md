@@ -34,7 +34,8 @@ comparison, and `mise run bench:billion full` runs DBpedia.
 | Clear warm-query losses | `range-topk` to QLever, 1.12× | none |
 | Ties within 10% | Fluree on `count-all`, `distinct-obj`, `star-lookup`, `values-star` and `employee-docs` | Fluree on `count-all`, `distinct-obj` and `star-lookup` |
 | vs. QLever | Faster on 27 of 28, median 2.7× | Faster on 28 of 28, median 3.9× |
-| vs. Fluree | Faster on 27 of 28, median 3.5× | Faster on 26 of 27 completed queries, median 9.9× || vs. Fuseki | Faster on all 27 completed queries, median 13× | Faster on all 27 completed queries, median 79× |
+| vs. Fluree | Faster on 27 of 28, median 3.5× | Faster on 26 of 27 completed queries, median 9.9× |
+| vs. Fuseki | Faster on all 27 completed queries, median 13× | Faster on all 27 completed queries, median 79× |
 | vs. Oxigraph | Faster on all 28, median 25× | Faster on all 28, median 85× |
 | Update latency, 1 triple | 4.2 ms (**Oxigraph 3.71**, QLever 3.79, Fluree 5.60, Fuseki 32.6) | 4.9 ms (**QLever 4.19**, Oxigraph 4.27, Fluree 4.55, Fuseki 32.4) |
 | Throughput, 16 clients | **1,220 q/s** (QLever 462, Fluree 246, Fuseki 113, Oxigraph 25) | **241 q/s** (QLever 92, Fluree 22, Fuseki 11, Oxigraph 1.7) |

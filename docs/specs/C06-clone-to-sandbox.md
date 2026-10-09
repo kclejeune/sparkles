@@ -7,8 +7,8 @@
 > inferences, and the UI's Clone action. Phase 2 added task cancellation, a free-space
 > guard, the fast path that shares the source's index files, in-memory destinations, a
 > limit on concurrent clones and partial clones by graph. From Phase 3, cloning at a past
-> commit shipped with point-in-time reads. Cloning across servers and branching are not
-> built.
+> commit shipped with point-in-time reads, and branches and merges shipped as
+> [F09](F09-branches-and-merges.md). Cloning across servers is not built.
 >
 > **User docs:** [API: Clone](../API.md#clone) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
@@ -655,9 +655,8 @@ copy's and the link's were 35 MB.
 orphaned directories are reported with `409` rather than adopted, and `POST /$/datasets`
 has no `cloneFrom` alias. Question 3 is answered by `--max-clones`, which defaults to 2.
 
-**Not built.**
-- Cloning across servers through archives.
-- Branching and merging.
+**Not built.** Cloning across servers through archives is not built. Branching and
+merging shipped separately as [F09](F09-branches-and-merges.md).
 
 **UI.** The dataset page's Clone dialog offers the type (persistent by default), all
 graphs or a chosen few (the source's graphs as checkboxes, plus typed IRIs and patterns),

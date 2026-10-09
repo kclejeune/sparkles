@@ -2,7 +2,7 @@
 //!
 //! ```sh
 //! python3 scripts/gen-data.py 10000 > data.nt
-//! cargo run --release -p sparkles-shex --example bench -- data.nt [schema.shex|-] [iterations] [map.smap]
+//! cargo run --release -p sparkles-shex --example shex-bench -- data.nt [schema.shex|-] [iterations] [map.smap]
 //! ```
 //!
 //! Prints the load, parse and compile, and shape-map expansion times; the validation

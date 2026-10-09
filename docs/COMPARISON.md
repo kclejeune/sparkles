@@ -60,7 +60,7 @@ full feature list is in [FEATURES.md](FEATURES.md).
 | Area | QLever | Sparkles |
 |---|---|---|
 | Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Measured up to 1.24 billion triples (English DBpedia, [BENCHMARKS.md](BENCHMARKS.md#dbpedia-at-124-billion-triples)). It loads them in 547 s, where QLever takes 1,674 s on the same machine. |
-| Streaming execution | Lazy, block-wise scans, joins, filters and GROUP BY; results streamed to the client | Every operator materializes its result, within row and memory budgets. Responses over 1 MiB are streamed as they are serialized. Materialization and the 1 GiB block cache trade memory for speed. After the 10.5M benchmark, Sparkles' server holds 916 MiB to QLever's 653 MiB. Of that, 379 MiB is the block cache, and a server with the cache off ends at 331 MiB at about half the throughput ([BENCHMARKS.md](BENCHMARKS.md#memory-and-the-speed-it-buys)). |
+| Streaming execution | Lazy, block-wise scans, joins, filters and GROUP BY; results streamed to the client | Queries run eagerly by default, and each operator then materializes its result within row and memory budgets. Opt-in streaming execution runs scans, joins, DISTINCT and eligible aggregates batch by batch, and automatic selection uses it for large immutable scans and OPTIONAL counts. Responses over 1 MiB are streamed as they are serialized. Materialization and the 1 GiB block cache trade memory for speed. After the 10.5M benchmark, Sparkles' server holds 840 MiB to QLever's 653 MiB. Of that, 379 MiB is the block cache, and a server with the cache off ends at 304 MiB with about 46% less throughput ([BENCHMARKS.md](BENCHMARKS.md#memory-and-the-speed-it-buys)). |
 | Block prefiltering | FILTER ranges and STRSTARTS checked against block min/max to skip blocks | Numeric range FILTERs on a scan's sort column read only the matching id ranges (inline integers and decimals). Non-canonical numerals are tested row by row. `STRSTARTS` and a `REGEX` anchored on a literal start read only the vocabulary ids of the keys with that start. |
 | Pattern trick | `ql:has-predicate`, per-subject predicate patterns | ✗ (predicate counts come from index runs) |
 | Text and spatial | `ql:contains-word`, BM25 scoring, spatial joins, a geo index | BM25 search through `text:query` (no text/entity co-occurrence index). GeoSPARQL functions, a spatial index, spatial joins and nearest-neighbour ORDER BY. |
@@ -130,7 +130,7 @@ Sparkles' own.
 
 | Area | Oxigraph | Sparkles |
 |---|---|---|
-| Embedding | A Rust library, Python (`pyoxigraph`) and JavaScript/WebAssembly packages, an in-memory store | A Rust library and a Python package (`sparkles`, abi3 wheels for Linux, macOS and Windows built by a release workflow, not on PyPI), persistent or in-memory. The Python API follows pyoxigraph's names for terms, `query`, `load`, `dump` and `quads_for_pattern`, and adds transactions as context managers, reasoning, validation, history and an rdflib store plugin whose SPARQL runs in Sparkles. No WebAssembly build. |
+| Embedding | A Rust library, Python (`pyoxigraph`) and JavaScript/WebAssembly packages, an in-memory store | A Rust library and a Python package (`sparkles`, abi3 wheels for Linux and Apple silicon macOS built by a release workflow, not on PyPI), persistent or in-memory. The Python API follows pyoxigraph's names for terms, `query`, `load`, `dump` and `quads_for_pattern`, and adds transactions as context managers, reasoning, validation, history and an rdflib store plugin whose SPARQL runs in Sparkles. No WebAssembly build. |
 | Storage | RocksDB (a C++ LSM tree) with 9 index orders (6 for named graphs, 3 for the default graph) and a string dictionary; updates in place; online backups as RocksDB checkpoints (a complete copy in a new local directory, hard-linked on the same file system) | Immutable sorted blocks in 7 orders, plus an in-memory delta logged to a WAL and merged by compaction. Online backups to repositories on a file system or S3, incremental and deduplicated across backups and datasets, with restore, verification, schedules and retention. |
 | Spatial | GeoSPARQL functions (`spargeo`, on by default in the CLI); no spatial index | GeoSPARQL 1.1 functions (geodesic measures, EPSG:4326 axis order, metric buffers) and a per-dataset spatial index |
 | Write durability | One RocksDB transaction per request, written to RocksDB's WAL without an fsync (RocksDB's default) | The WAL is fsynced before a write is acknowledged. A commit waits for one `fdatasync`. When it adds terms the dataset has not seen before, they go to a separate file, which is synced at the same time as the WAL. A commit message or change digest adds one more. |
@@ -138,11 +138,11 @@ Sparkles' own.
 Oxigraph describes its query evaluation as "not optimized yet". It evaluates lazily, one
 iterator per RocksDB scan. In the benchmarks at 10.5M triples, it answers point lookups
 and single paths about as fast as Sparkles, within 1.1–1.4×. Joins, grouping, sorting and
-counting run about 20–1,700× slower, and one EXISTS join 8,295× slower. It serves 1.7
-concurrent star-join queries per second to Sparkles' 243. Its load, including
-`optimize`, takes 14.1 s to Sparkles' 3.7 s. A single-triple update takes 4.3 ms to
-Sparkles' 4.2 ms, although Oxigraph does not fsync it, and Oxigraph commits a stream of
-them 2.7× faster.
+counting run about 20–1,900× slower, and one EXISTS join about 8,400× slower. It serves 1.7
+concurrent star-join queries per second to Sparkles' 241. Its load, including
+`optimize`, takes 14.1 s to Sparkles' 3.9 s. A single-triple update takes 4.3 ms to
+Sparkles' 4.9 ms, although Oxigraph does not fsync it, and Oxigraph commits a stream of
+them 1.7× faster.
 Oxigraph has no reasoning, SHACL, full-text or vector search, path search, CSV imports,
 point-in-time reads, authentication or per-dataset permissions, Fuseki admin API, GraphQL
 endpoint, query budgets, result cache or web UI.

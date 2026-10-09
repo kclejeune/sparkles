@@ -2,7 +2,7 @@
 //!
 //! ```sh
 //! python3 scripts/gen-data.py 10000 > data.nt
-//! cargo run --release -p sparkles-shacl --example bench -- data.nt [shapes.ttl|-] [iterations] [expected-report.ttl]
+//! cargo run --release -p sparkles-shacl --example shacl-bench -- data.nt [shapes.ttl|-] [iterations] [expected-report.ttl]
 //! ```
 //!
 //! With an expected report (e.g. from Jena's `shacl validate`), the results are compared

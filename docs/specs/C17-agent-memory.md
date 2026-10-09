@@ -816,6 +816,13 @@ how well they perform, and Phase 1c needs a change to F09.
 
 The stored-query field `questions` (§5.3) is a small extension of C16.
 
+[C18](C18-natural-language-questions-and-ingest.md) builds on these tools. It turns
+questions into checked queries with a view in the UI, turns documents into reviewed
+facts, and designs the memory view of Phase 3 and the model calls of §10. Its grant
+template for agents (C18 §8.6) leaves out the `merge` endpoint, so an agent under that
+template does not use the merge right that §5.7 gives graph-limited principals, and
+only people merge.
+
 ## 10. Phase 2: model calls in the server, deferred
 
 Phase 2 would put a language model behind the server. It has two parts.
@@ -854,6 +861,15 @@ client's model for a completion, would avoid server-side keys. Few hosts support
 it reverses the direction of control that Phase 1 relies on, so it is a Phase 2 option
 only.
 
+[C18](C18-natural-language-questions-and-ingest.md) designs this phase. The maintainer
+decided that people using the UI do want to ask questions, and C18 §3.4 specifies
+model providers in the server for Ollama and other local models, any
+OpenAI-compatible endpoint and Anthropic's API, with keys held as named secrets. The
+four reasons above shaped that design. It keeps agents over MCP as the primary
+interface, runs a fixed pipeline with no tools for the model, limits what each dataset
+sends, and sets token budgets. Sampling is no longer an option. MCP revision 2026-07-28
+deprecated it and directs servers to provider APIs instead (C18 §3.3).
+
 ## 11. Phasing and evaluation
 
 | Phase | Contents |
@@ -861,8 +877,8 @@ only.
 | 1a | `check_query`, `similar_queries` with the `questions` field of stored queries, `link_entities`, `recall`. Read-only, available on every dataset. |
 | 1b | `assert_facts` with the data model of §3, the memory shapes of §3.5 as a documented example, and the `agent_memory` prompt. |
 | 1c | The `branch` argument on the MCP tools, the four branch tools, scratch branches for graph-limited grants and their optional expiry. |
-| 2 | Deferred (§10). |
-| 3 | A memory view in the UI. It shows sources and their graphs, facts with their citations, and the supersession record of an entity. |
+| 2 | Deferred here (§10). [C18](C18-natural-language-questions-and-ingest.md) designs it, with the model providers of C18 §3.4 and the asking pipeline of its Phase 2. |
+| 3 | A memory view in the UI. It shows sources and their graphs, facts with their citations, and the supersession record of an entity. [C18 §8.7](C18-natural-language-questions-and-ingest.md#87-browsing-memory-in-the-ui) designs it. |
 
 **Evaluation.** Besides the acceptance examples, three measurements show whether the
 tools help. A duplicate rate is measured on a scripted corpus of notes that mention the
@@ -913,7 +929,8 @@ keeps its graph across compactions.
 - **Agents that save stored queries.** An agent that adds its own queries and example
   questions to the catalog would feed its mistakes back as examples for later
   questions. Stored queries stay an `admin` operation that a person reviews.
-- **MCP sampling in Phase 1.** §10 gives the reasons.
+- **MCP sampling in Phase 1.** §10 gives the reasons. MCP revision 2026-07-28 later
+  deprecated sampling, and C18 rejects it for every phase.
 - **Agents that add predicates and classes.** An agent that meets a fact the ontology
   cannot express would otherwise invent a term, and invented terms are the failure
   `check_query` exists to prevent. `assert_facts` has no option to accept unknown
