@@ -816,6 +816,10 @@ how well they perform, and Phase 1c needs a change to F09.
 
 The stored-query field `questions` (§5.3) is a small extension of C16.
 
+[C18](C18-natural-language-questions-and-ingest.md) builds on these tools. It turns
+questions into checked queries with a view in the UI, turns documents into reviewed
+facts, and designs the memory view of Phase 3 and the model calls of §10.
+
 ## 10. Phase 2: model calls in the server, deferred
 
 Phase 2 would put a language model behind the server. It has two parts.
@@ -861,8 +865,8 @@ only.
 | 1a | `check_query`, `similar_queries` with the `questions` field of stored queries, `link_entities`, `recall`. Read-only, available on every dataset. |
 | 1b | `assert_facts` with the data model of §3, the memory shapes of §3.5 as a documented example, and the `agent_memory` prompt. |
 | 1c | The `branch` argument on the MCP tools, the four branch tools, scratch branches for graph-limited grants and their optional expiry. |
-| 2 | Deferred (§10). |
-| 3 | A memory view in the UI. It shows sources and their graphs, facts with their citations, and the supersession record of an entity. |
+| 2 | Deferred (§10). [C18](C18-natural-language-questions-and-ingest.md) designs it. |
+| 3 | A memory view in the UI. It shows sources and their graphs, facts with their citations, and the supersession record of an entity. [C18 §8.7](C18-natural-language-questions-and-ingest.md#87-browsing-memory-in-the-ui) designs it. |
 
 **Evaluation.** Besides the acceptance examples, three measurements show whether the
 tools help. A duplicate rate is measured on a scripted corpus of notes that mention the

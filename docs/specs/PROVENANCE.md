@@ -540,6 +540,43 @@ implementation landed.
   - stored queries saved by agents;
   - MCP sampling in Phase 1.
 
+## Questions and ingestion in natural language
+
+- **Spec:** [`C18-natural-language-questions-and-ingest.md`](C18-natural-language-questions-and-ingest.md),
+  written on 2026-10-09 from:
+  - the Model Context Protocol specification, revision 2026-07-28 and its changelog
+    (multi round-trip requests, elicitation, the deprecation of sampling), revisions
+    2025-06-18 and 2025-11-25, and the MCP Apps extension;
+  - W3C SPARQL, RDF 1.2, SHACL, PROV-O and the Web Annotation Data Model, RFC 5147 for
+    `#char=` fragments, and the NLP Interchange Format (Hellmann et al., ISWC 2013);
+  - the QALD-9, QALD-9-plus, QALD-10, LC-QuAD, DBLP-QuAD, SciQA, Spider4SPARQL and
+    TEXT2SPARQL'25 benchmarks, and SPINACH, SPARQLGEN, FIRESPARQL, mKGQAgent, SPARQL-LLM
+    and Gashkov et al. on memorization in text-to-SPARQL;
+  - DIN-SQL, DAIL-SQL, Self-Debugging, BIRD and Spider 2.0 from text-to-SQL;
+  - GraphRAG, Zhu et al. on knowledge graph construction with language models, KGGen,
+    iText2KG, Text2KGBench, REBEL, LightRAG and Docling;
+  - Zep, Mem0, A-MEM, LongMemEval and LoCoMo on agent memory;
+  - the OWASP Top 10 for LLM Applications 2025, Simon Willison's "lethal trifecta"
+    (2025), OpenAI's and Anthropic's guidance on API keys in browsers, and the
+    structured output documentation of Ollama, OpenAI and llama.cpp;
+  - the Sparkles code and specs C01, C02, C05, C09, C10, C11, C12, C12b, C15, C16, C17,
+    F03, F04, F06, F08 and F09.
+- **Implementation:** not built. Phases 1 and 2 plan no new runtime dependency. Phase 3
+  reuses the outbound HTTP client of F08 for model providers. Phase 4 may add an HTML
+  extractor and a PDF text extractor, to be recorded here when chosen.
+- **Rejected** (spec §13):
+  - the browser calling a model provider, MCP sampling, and a delegated agent as the
+    UI's model;
+  - a free agent loop inside the server;
+  - answers that hide their query;
+  - an intermediate query language compiled to SPARQL;
+  - retrieval over chunks without facts;
+  - committing ingestion to `main` by default;
+  - new predicates proposed by ingestion;
+  - ask history in a graph of the dataset;
+  - running queries from a handoff link automatically;
+  - OCR and media transcription.
+
 ## Compression codecs
 
 - **Spec:** [`X01-compression-codecs.md`](X01-compression-codecs.md), written on
