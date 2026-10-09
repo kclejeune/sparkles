@@ -823,6 +823,10 @@ fi
 python3 scripts/bench-bindings/jena.py "${args[@]}"
 '''
 
+[tasks."bench:jena-nsc"]
+description = "bench:jena on an ephemeral Namespace instance (needs nsc, uv and zstd); options as scripts/nsc-jena.sh --help, jena.py options after --"
+run = "scripts/nsc-jena.sh"
+
 [tasks."bench:backup"]
 description = "Backup repositories on an existing database: full and incremental backup, restore and verify times to an fs repository"
 depends = ["build"]
