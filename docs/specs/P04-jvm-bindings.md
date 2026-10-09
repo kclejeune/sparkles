@@ -1618,3 +1618,33 @@ was faster on the other 25 queries.
 x86_64 and arm64 and for macOS on Apple silicon, on Namespace runners. The Windows and
 Intel macOS jobs were removed to keep CI time down. The code paths for those platforms
 remain, and they come back by adding their jobs again.
+
+**Fine-grained calls (2026-10-09).** The binding comparison of `mise run
+bench:bindings` counted 13 native calls per small query through Jena and found
+`Graph.contains`, `Model.getProperty` and `find` on a bound subject 6 to 15 times
+slower than TDB2, with poor scaling from 1 to 12 threads. Profiles showed little of
+that time in Rust. UniFFI's call helper made a new call status record, a JNA
+`Structure`, for every native call, and JNA registered its native memory in a global
+table and with its cleaner until the collector found it. That bookkeeping and the
+collector's work on it cost more than the calls. Three changes followed, and none
+changes the transport.
+
+* The build rewrites the generated call helper to take its status record from a
+  per-thread pool (the `ffiBindings` task and `UniffiCallStatusPool`), and fails if the
+  generated helper is not the expected one.
+* A query result or `find` cursor that reported its last batch has freed its rows
+  natively, so its `release` is skipped. A query makes 11 native calls instead of 13.
+* The engine writes the query text without a base unless the query has `BASE`, which
+  saves jena-iri's attempt to make every IRI relative to Jena's system base, and runs
+  ASK as ASK, where it ran `SELECT * LIMIT 1`.
+
+In A/B/B/A comparisons on a busy laptop at 105,000 triples in memory, one thread,
+`Graph.contains` with its own read transaction went from 34 to 11 µs, `getProperty`
+from 40 to 16 µs, `find` on a bound subject from 63 to 20 µs, and the small `SELECT`
+from 152 to 83 µs. On four threads, `contains` went from 44,000 to 210,000 operations
+per second with a p99 of 0.03 ms instead of 0.12 ms, `find` from 26,000 to 120,000, and
+the small `SELECT` from 12,800 to 39,000. These figures are directional, and a
+quiet-machine run of §5.4's benchmark is the authority. After these changes the §5.4
+rule for moving a call to JNI is still met on `contains`, `getProperty` and `find`:
+TDB2 and TIM are faster, and the bridge, not Rust, takes most of their time. No call
+has been moved.

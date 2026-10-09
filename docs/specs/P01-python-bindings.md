@@ -843,3 +843,29 @@ returns `None`, where `set_write_validation(None)` returned a status dictionary.
 x86_64 and arm64 and for macOS on Apple silicon, on Namespace runners. The Windows and
 Intel macOS jobs were removed to keep CI time down. The code paths for those platforms
 remain, and they come back by adding their jobs again.
+
+**Fine-grained calls (2026-10-09).** The binding comparison of `mise run
+bench:bindings` measured the rdflib plugin at 105,000 triples against rdflib's Memory
+store. Iteration, pattern lookups, `contains` and `Graph.value` were 1.7 to 2.6 times
+slower, while queries were far faster. Four changes followed.
+
+* The quad and solution iterators hand out an item they have already decoded without
+  giving up the GIL. Only a refill, which reads the store, runs without it.
+* A native helper, `sparkles._RdflibNodes`, turns a whole batch of quads or SELECT rows
+  into tuples of rdflib nodes and keeps the node of each IRI and literal it has seen.
+  Blank nodes and the plugin's own `urn:x-sparkles:rdflib:` IRIs still go through the
+  plugin's Python conversion every time, because their rdflib form depends on the
+  store's state. A transaction gives the helper its matches through
+  `Transaction._quads_iter`.
+* The plugin keeps the `NamedNode` of each `URIRef` used in a pattern and the graph of
+  each plain `Graph` context it reads. Writes do not fill the IRI cache.
+* Listing the named graphs counted every quad of every graph held in the store's delta,
+  which made each SPARQL query through the plugin cost about 0.5 ms more on a store
+  filled through rdflib. The engine now stops at the first quad of each graph.
+
+In an A/B/B/A comparison on a busy laptop, with rdflib's Memory store in brackets,
+iterating every triple went from 179 to 95 ms [82], `(s ? ?)` for 1,000 subjects from
+20 to 10 ms [9.4], 1,000 `contains` probes from 6.4 to 3.7 ms [1.5], 1,000
+`Graph.value` lookups from 8.5 to 4.6 ms [3.1], and a small SELECT through
+`Graph.query` from 0.67 to about 0.11 ms. Adds were unchanged. These figures are
+directional, and a quiet-machine run of the comparison is the authority.

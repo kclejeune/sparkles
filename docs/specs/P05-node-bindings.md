@@ -1300,3 +1300,28 @@ compaction alone did not justify a separate callback path in the binding.
 x86_64 and arm64 and for macOS on Apple silicon, on Namespace runners. The Windows and
 Intel macOS jobs were removed to keep CI time down. The code paths for those platforms
 remain, and they come back by adding their jobs again.
+
+**Fine-grained calls (2026-10-09).** The binding comparison of `mise run
+bench:bindings` found the per-call APIs far slower than N3.js's `Store`, while queries
+were faster than both incumbents. A `has()` or a small `match` made three or four
+round trips through the addon's pool, each of which costs tens of microseconds, and a
+quad crossed as one JSON object that JavaScript decoded term by term. Three changes
+followed.
+
+* The call that makes a result also computes its first batch, which `takeFirst` hands
+  to JavaScript. A batch that drains a scan or a materialized result says so and frees
+  the rows, so the iterator neither prefetches nor closes it natively.
+* A quad crosses as four cells that index the batch's terms, so a term shared by many
+  quads is sent and decoded once per batch. The iterator hands out an item it has
+  already decoded at once when no earlier `next()` is pending.
+* On a dataset in memory, `match` (and so `has`) runs the scan and a first batch of up
+  to 16 quads on the JavaScript thread, which takes a few microseconds and so stays
+  within §1's rule for the event loop. Later batches, datasets on disk and transactions
+  use the pool as before.
+
+In an A/B/B/A comparison on a busy laptop at 105,000 triples, `has()` went from about
+206 to 19 µs per probe, the first match of `(s p ?)` from 232 to 25 µs, `(s ? ?)` from
+390 to 50 µs per subject, and iterating every quad from 1.0 s to 0.30 s. These figures
+are directional, and a quiet-machine run of the comparison is the authority. Single
+adds in a transaction were unchanged at about 100 µs, because each crosses to the
+transaction's worker thread through the pool.
