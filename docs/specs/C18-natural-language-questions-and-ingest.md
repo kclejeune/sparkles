@@ -3358,15 +3358,16 @@ The maintainer decided these questions on importing memory from coding agents la
     byte-identical within a harness, converts the structural parts between harnesses,
     and is for backup and migration, never a view of the graph (§8.10.10).
 
-The import revision made these further choices, which the maintainer has not yet
-confirmed.
+The maintainer confirmed the import revision's further choices on 2026-10-09.
 
 27. **The memory commands talk to a server through the Rust client by default.** `--loc`
     is the alternative for a database no server holds, and offline use needs no spool,
     because a later sync compares the files with the server's sources again (§10.2).
 28. **The CLI uses HTTP routes that share the MCP tools' handlers.** They are `POST
     /{ds}/facts`, `POST` and `GET /{ds}/sources`, `POST /{ds}/memory/brief` and `POST
-    /$/memory/{ds}/promote`, which the UI's inbox uses as well (§10.3).
+    /$/memory/{ds}/promote`, which the UI's inbox uses as well (§10.3). An MCP client in
+    the Rust client of P02 remains welcome as a later addition, so the CLI could also
+    reach a server through `/$/mcp`, but nothing in this spec depends on it.
 29. **Import graphs are per principal.** They sit under `imports.base` as
     `<principal>/<harness>/<project>/…`, so two people's imports of one repository never
     replace each other, while the project entity is shared (§8.10.2).
