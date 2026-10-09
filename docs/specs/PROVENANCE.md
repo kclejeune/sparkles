@@ -572,8 +572,9 @@ implementation landed.
     - The UI's precompression step (`ui/scripts/precompress.mjs`) uses Node's built-in
       zlib only.
   - **Not adopted:** `ruzstd` (MIT) and the `zstd-decode-pure` feature (spec §3).
-- **Deferred:** Phase 2 storage codecs for index blocks, vocabulary and spill files,
-  which wait on measurements. Phase 3 repository blobs, together with F05.
+- **Skipped:** the maintainer skipped Phase 2, the storage codecs for index blocks,
+  vocabulary and spill files. The loader's spill files later got LZ4 encodings of their
+  own. Repository blobs shipped with F05 and use LZ4, and the zstd codec byte is reserved.
 - **Rejected** (spec §1 non-goals, since the spec has no rejected-alternatives section):
   - compressing the WAL, `delta.vocab` or `commits.bin`;
   - in-memory compressed caches;
