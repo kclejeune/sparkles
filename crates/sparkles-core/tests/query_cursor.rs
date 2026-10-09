@@ -2507,7 +2507,7 @@ impl Gen {
 
     fn aggregate(&mut self) -> String {
         let x = self.var();
-        match self.rng.below(13) {
+        match self.rng.below(14) {
             0 => "COUNT(*)".into(),
             1 => format!("COUNT({x})"),
             2 => format!("COUNT(DISTINCT {x})"),
@@ -2520,6 +2520,7 @@ impl Gen {
             9 => format!("AVG({x} * 2)"),
             10 => format!("MAX(STR({x}))"),
             11 => format!("COUNT(DISTINCT COALESCE({x}, 0))"),
+            12 => "COUNT(DISTINCT *)".into(),
             _ => format!("SUM(IF({}, 1, 0))", self.exists()),
         }
     }
@@ -3086,6 +3087,9 @@ fn widened_incremental_groups_match_eager() {
         format!("SELECT ?j (COUNT(?x / 0) AS ?e) (SUM(?x / 0) AS ?f) WHERE {{ {rows} }} GROUP BY ?j"),
         "SELECT ?k ?j (COUNT(*) AS ?n) (GROUP_CONCAT(?x) AS ?g) WHERE { VALUES (?k ?j ?x) {} } GROUP BY ?k ?j".into(),
         "SELECT (COUNT(DISTINCT ?x) AS ?n) (GROUP_CONCAT(?x) AS ?g) (AVG(?x * 2) AS ?a) WHERE { VALUES ?x {} }".into(),
+        format!("SELECT ?k (COUNT(DISTINCT *) AS ?d) (COUNT(*) AS ?n) WHERE {{ {rows} {rows} }} GROUP BY ?k"),
+        format!("SELECT (COUNT(DISTINCT *) AS ?d) WHERE {{ {{ {rows} }} UNION {{ {rows} }} }}"),
+        "SELECT (COUNT(DISTINCT *) AS ?d) WHERE { VALUES ?x {} }".into(),
         "SELECT ?s ?o (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o } GROUP BY ?s ?o HAVING (?o > 30)".into(),
         "SELECT ?m (COUNT(?s) AS ?n) (SUM(?o) AS ?t) WHERE { ?s <urn:p> ?o BIND(?o - (?o / 5 - FLOOR(?o / 5)) * 5 AS ?r) } GROUP BY (FLOOR(?o / 10) AS ?m)".into(),
     ] {
