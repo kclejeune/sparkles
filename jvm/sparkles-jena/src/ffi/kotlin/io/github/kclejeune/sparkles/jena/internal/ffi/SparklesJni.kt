@@ -19,20 +19,45 @@ import java.nio.ByteBuffer
  * and objects they return are wrapped in the generated classes.
  *
  * Errors arrive as the same `FfiException` and `InternalException` that UniFFI throws.
- * Each function falls back to its UniFFI call when [ENABLED] is false: when the system
- * property `sparkles.jni` is `false`, or when the library could not be loaded for JNI (as
- * when another class loader in the JVM has loaded it already).
+ * Each function falls back to its UniFFI call when its group is off. All are off when the
+ * system property `sparkles.jni` is `false`, or when the library could not be loaded for
+ * JNI (as when another class loader in the JVM has loaded it already). The property can
+ * also list the groups to turn on, of `read`, `contains`, `find` and `query`, which the
+ * benchmark uses to measure each call on its own.
  */
 public object SparklesJni {
     /** The entry points' version, which `jni_calls.rs` must return. */
     private const val ABI_VERSION = 1
 
-    /** Whether the calls go through JNI. Read once, so the JIT can fold the checks. */
+    private val groups: Set<String> = System.getProperty("sparkles.jni")?.trim()?.lowercase().let { p ->
+        when (p) {
+            null, "", "true" -> setOf("read", "contains", "find", "query")
+            "false" -> emptySet()
+            else -> p.split(',').map { it.trim() }.toSet()
+        }
+    }
+
+    /** Whether any call goes through JNI. Each flag is read once, so the JIT can fold the checks. */
     @JvmField
-    public val ENABLED: Boolean = load()
+    public val ENABLED: Boolean = groups.isNotEmpty() && load()
+
+    /** Beginning a read transaction, and freeing one. */
+    @JvmField
+    public val READ: Boolean = ENABLED && "read" in groups
+
+    /** `contains`. */
+    @JvmField
+    public val CONTAINS: Boolean = ENABLED && "contains" in groups
+
+    /** `find` with its first batch, a cursor's later batches, and freeing the cursor. */
+    @JvmField
+    public val FIND: Boolean = ENABLED && "find" in groups
+
+    /** Preparing and executing a query, and freeing it. */
+    @JvmField
+    public val QUERY: Boolean = ENABLED && "query" in groups
 
     private fun load(): Boolean {
-        if (System.getProperty("sparkles.jni")?.trim().equals("false", ignoreCase = true)) return false
         // the library UniFFI loaded, which NativeLoader names before the first call
         val path = System.getProperty("uniffi.component.sparkles_ffi.libraryOverride")?.takeIf { it.isNotBlank() }
             ?: return false
@@ -53,26 +78,26 @@ public object SparklesJni {
     }
 
     public fun beginRead(ds: FfiDataset): FfiReadTxn {
-        if (!ENABLED) return ds.beginRead()
+        if (!READ) return ds.beginRead()
         // counted native call
         val h = ds.uniffiBorrowHandle { jni { beginRead(it) } }
         return FfiReadTxn(UniffiWithHandle, h)
     }
 
     public fun contains(ds: FfiDataset, pattern: ByteArray): Boolean {
-        if (!ENABLED) return ds.contains(pattern)
+        if (!CONTAINS) return ds.contains(pattern)
         // counted native call
         return ds.uniffiBorrowHandle { jni { containsHead(it, pattern) } }
     }
 
     public fun contains(t: FfiReadTxn, pattern: ByteArray): Boolean {
-        if (!ENABLED) return t.contains(pattern)
+        if (!CONTAINS) return t.contains(pattern)
         // counted native call
         return t.uniffiBorrowHandle { jni { containsRead(it, pattern) } }
     }
 
     public fun find(ds: FfiDataset, pattern: ByteArray, firstRows: Int): FindResult {
-        if (!ENABLED) return ds.find(pattern, firstRows.toUInt())
+        if (!FIND) return ds.find(pattern, firstRows.toUInt())
         val out = LongArray(1)
         // counted native call
         val batch = ds.uniffiBorrowHandle { jni { findHead(it, pattern, firstRows, out) } }
@@ -80,7 +105,7 @@ public object SparklesJni {
     }
 
     public fun find(t: FfiReadTxn, pattern: ByteArray, firstRows: Int): FindResult {
-        if (!ENABLED) return t.find(pattern, firstRows.toUInt())
+        if (!FIND) return t.find(pattern, firstRows.toUInt())
         val out = LongArray(1)
         // counted native call
         val batch = t.uniffiBorrowHandle { jni { findRead(it, pattern, firstRows, out) } }
@@ -91,7 +116,7 @@ public object SparklesJni {
         FindResult(batch, if (cursor == 0L) null else FfiCursor(UniffiWithHandle, cursor))
 
     public fun nextBatch(c: FfiCursor, maxRows: Int): Batch {
-        if (!ENABLED) return c.nextBatch(maxRows.toUInt())
+        if (!FIND) return c.nextBatch(maxRows.toUInt())
         val out = LongArray(1)
         // counted native call
         val batch = c.uniffiBorrowHandle { jni { cursorNext(it, maxRows, out) } }
@@ -99,7 +124,7 @@ public object SparklesJni {
     }
 
     public fun prepareQuery(ds: FfiDataset, text: String, opts: QueryOpts): FfiQuery {
-        if (!ENABLED) return ds.prepareQuery(text, opts)
+        if (!QUERY) return ds.prepareQuery(text, opts)
         val t = text.encodeToByteArray()
         val o = encode(opts)
         // counted native call
@@ -108,7 +133,7 @@ public object SparklesJni {
     }
 
     public fun prepareQuery(txn: FfiReadTxn, text: String, opts: QueryOpts): FfiQuery {
-        if (!ENABLED) return txn.prepareQuery(text, opts)
+        if (!QUERY) return txn.prepareQuery(text, opts)
         val t = text.encodeToByteArray()
         val o = encode(opts)
         // counted native call
@@ -117,7 +142,7 @@ public object SparklesJni {
     }
 
     public fun execute(q: FfiQuery, firstRows: Int): Execution {
-        if (!ENABLED) return q.execute(firstRows.toUInt())
+        if (!QUERY) return q.execute(firstRows.toUInt())
         // counted native call
         val bytes = q.uniffiBorrowHandle { jni { execute(it, firstRows) } }
         return FfiConverterTypeExecution.read(ByteBuffer.wrap(bytes))
@@ -135,7 +160,7 @@ public object SparklesJni {
 
     @JvmStatic
     internal fun freeReadTxn(handle: Long): Boolean {
-        if (!ENABLED) return false
+        if (!READ) return false
         // counted native call
         jni { freeReadTxnNative(handle) }
         return true
@@ -143,7 +168,7 @@ public object SparklesJni {
 
     @JvmStatic
     internal fun freeQuery(handle: Long): Boolean {
-        if (!ENABLED) return false
+        if (!QUERY) return false
         // counted native call
         jni { freeQueryNative(handle) }
         return true
@@ -151,7 +176,7 @@ public object SparklesJni {
 
     @JvmStatic
     internal fun freeCursor(handle: Long): Boolean {
-        if (!ENABLED) return false
+        if (!FIND) return false
         // counted native call
         jni { freeCursorNative(handle) }
         return true
