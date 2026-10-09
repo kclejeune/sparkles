@@ -41,7 +41,10 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: namespacelabs/nscloud-checkout-action@v8
-      - uses: dtolnay/rust-toolchain@stable
+      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
+      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       - uses: gradle/actions/setup-gradle@v4
@@ -90,7 +93,10 @@ jobs:
       - nscloud-git-mirror-5gb
     steps:
       - uses: namespacelabs/nscloud-checkout-action@v8
-      - uses: dtolnay/rust-toolchain@stable
+      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
+      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       - uses: gradle/actions/setup-gradle@v4
@@ -131,7 +137,10 @@ jobs:
           - { java: "21", jena: "6.2.0" }
     steps:
       - uses: namespacelabs/nscloud-checkout-action@v8
-      - uses: dtolnay/rust-toolchain@stable
+      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
+      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "${{ matrix.java }}" }
       - uses: gradle/actions/setup-gradle@v4
@@ -162,7 +171,10 @@ jobs:
     environment: maven
     steps:
       - uses: namespacelabs/nscloud-checkout-action@v8
-      - uses: dtolnay/rust-toolchain@stable
+      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
+      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       - uses: gradle/actions/setup-gradle@v4

@@ -76,9 +76,10 @@ jobs:
       - nscloud-git-mirror-5gb
     steps:
       - uses: namespacelabs/nscloud-checkout-action@v8
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
+      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
       - name: cargo fmt
         run: |
           cargo fmt --all --check
@@ -101,7 +102,10 @@ jobs:
     runs-on: ${{ fromJSON(matrix.platform == 'macos-arm64' && '["nscloud-macos-sequoia-arm64-12x28-with-cache", "nscloud-cache-tag-sparkles-macos-arm64", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]' || format('["nscloud-ubuntu-24.04-{0}-16x32-with-cache", "nscloud-cache-tag-sparkles-{1}", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]', matrix.platform == 'linux-arm64' && 'arm64' || 'amd64', matrix.platform)) }}
     steps:
       - uses: namespacelabs/nscloud-checkout-action@v8
-      - uses: dtolnay/rust-toolchain@stable
+      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
+      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
       - uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust

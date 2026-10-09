@@ -35,8 +35,8 @@ gradle = "9.7.1"
 experimental = true
 
 [task_config]
-# Rust follows the stable channel (rust-toolchain.toml), so the compiler's version is part
-# of every key. These variables change what the checks see, so they are part of it too.
+# rust-toolchain.toml pins the compiler, and its version is part of every key, so a
+# raised pin reruns every check. These variables change what the checks see, so they are part of it too.
 cache = { enabled = true, command_inputs = ["rustc -V"] }
 global_env = ["RUSTFLAGS", "CARGO_FEATURES", "SPARKLES_W3C_DIR", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS"]
 

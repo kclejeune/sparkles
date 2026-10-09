@@ -1,5 +1,7 @@
 [toolchain]
-channel = "stable"
+# An exact release, so local builds, CI and the benchmark pins use the same compiler and
+# lints. Raise it deliberately, with the lint fixes and a performance check.
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 # the formatter's browser build (crates/sparkles-fmt-wasm; `mise run fmt:wasm` in CI)
 targets = ["wasm32-unknown-unknown"]

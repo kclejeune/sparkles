@@ -41,7 +41,10 @@ jobs:
         run: node js/scripts/check-version.mjs "${{ github.ref_name }}"
       - uses: pnpm/action-setup@v4
         with: {version: '10.34.5'}
-      - uses: dtolnay/rust-toolchain@stable
+      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
+      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
       - uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: |

@@ -113,7 +113,10 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: namespacelabs/nscloud-checkout-action@v8
-      - uses: dtolnay/rust-toolchain@stable
+      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
+      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
       - uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
@@ -148,7 +151,10 @@ jobs:
       - nscloud-git-mirror-5gb
     steps:
       - uses: namespacelabs/nscloud-checkout-action@v8
-      - uses: dtolnay/rust-toolchain@stable
+      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
+      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with: { cache: false, rustflags: "" }
       - uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
