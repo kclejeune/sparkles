@@ -763,8 +763,11 @@ mod tests {
         std::fs::remove_dir_all(root.join("text")).unwrap();
         // Preparing a large RDF tail can take longer than the short pause used by
         // the other tests when the workspace suite is competing for disk I/O.
-        let mut pause = Pause::with_timeout(root, "quota-checked", Duration::from_secs(60));
+        let pause = Pause::with_timeout(root, "quota-checked", Duration::from_secs(60));
         let store = Store::open(root, StoreOptions::default()).unwrap();
+        // Rebinding the pause drops it before the store. A failed assertion then
+        // releases the paused worker instead of leaving the store's drop to wait for it.
+        let mut pause = pause;
         pause.reached();
         let job = store.text_recovery.load_full().unwrap();
         let words = (0..20_000).map(|i| format!("word{i} ")).collect::<String>();
@@ -774,6 +777,11 @@ mod tests {
                 "INSERT DATA {{ <urn:tail> <http://www.w3.org/2000/01/rdf-schema#label> \"{words}\" }}"
             ),
         );
+        // The change log's background thread appends the commit a few milliseconds
+        // after the update returns, or much later on a loaded machine. Appending it
+        // here keeps that write from landing between the projection and the check
+        // below, which would push the check over the quota set from the projection.
+        store.flush_change_log().unwrap();
         store.set_quota(Some(u64::MAX)).unwrap();
         let old = root.join("text");
         let new = root.join("text.new");
