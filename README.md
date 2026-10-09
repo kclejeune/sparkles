@@ -161,17 +161,12 @@ references rather than new interleaved runs. At 10.5M triples:
 | Server memory after the run | 840 MiB, 379 MiB of it block cache | **QLever 653 MiB** |
 
 Sparkles trades memory for speed by default, with a 1 GiB block cache per dataset. On
-English DBpedia (1.24 billion triples), the refreshed 2026-10-08 snapshot at commit
-`ed78a462` loaded the data in 1,351 s, against QLever's retained 1,674 s and Fluree's
-2,919 s. Sparkles was faster than QLever on all 29 agreeing warm queries and on
-18 of 31 cold ones.
-
-**DBpedia loading remains an open regression:** 1,351 s versus 1,248 s in the
-previous snapshot and 596 s historically. CPU work and I/O volume stayed nearly
-unchanged, while the latest load recorded substantial I/O stalls. The cause remains
-unresolved, and matched storage, binary and toolchain comparisons are the next checks
-([details](docs/BENCHMARKS.md#changes-against-the-run-of-2026-10-03)). Historical cold
-point-lookup losses also remain under review.
+English DBpedia (1.24 billion triples), the 2026-10-09 snapshot at commit `ba547b89`
+loaded the data in 547 s, against QLever's retained 1,674 s and Fluree's 2,919 s.
+Sparkles was faster than QLever on all 29 agreeing warm queries and on 28 of 31 cold
+ones. Slower loads and cold lookups measured on 2026-10-08 came from the benchmark
+machine's untrimmed SSD, as [matched controls](docs/BENCHMARKS.md#changes-against-the-run-of-2026-10-03)
+showed.
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every number, the memory tradeoff and every
 query where Sparkles loses or ties.
 
