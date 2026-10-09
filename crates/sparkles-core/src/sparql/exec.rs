@@ -3404,8 +3404,24 @@ fn order_by(
         t = t.take_rows(&cand);
     }
     drop(cursor_candidate_charge);
-    // The numeric prefilter keeps the candidates in input order and drops only rows
-    // with k rows strictly ahead, so the heap over the candidates keeps the same rows.
+    if let Some(k) = limit
+        && ctx.opt.topk_first_key
+        && keys.len() > 1
+        && k > 0
+        && k.saturating_mul(8) <= t.len()
+        && let Some(cand) = first_key_candidates(ctx, &t, keys, k, report)?
+    {
+        // As above, the later keys and the row order break the ties among the
+        // candidates. This runs before the heap: ranking the first key's distinct values
+        // and selecting among the rows' ranks is far cheaper on a large input than a
+        // sort key per row, which made DBpedia's top-linked (tens of millions of groups)
+        // about 50% slower.
+        notes.push(format!("[first-key prefilter kept {} rows]", cand.len()));
+        ctx.check_output(cand.len(), t.width())?;
+        t = t.take_rows(&cand);
+    }
+    // Both prefilters keep the candidates in input order and drop only rows with k rows
+    // strictly ahead, so the heap over the candidates keeps the same rows.
     if let Some(k) = limit
         && k > 0
         && k < t.len()
@@ -3422,18 +3438,6 @@ fn order_by(
             idx.len()
         ));
         return Ok((t.take_rows(&idx), Some(notes.join(" "))));
-    }
-    if let Some(k) = limit
-        && ctx.opt.topk_first_key
-        && keys.len() > 1
-        && k > 0
-        && k.saturating_mul(8) <= t.len()
-        && let Some(cand) = first_key_candidates(ctx, &t, keys, k, report)?
-    {
-        // as above: the later keys and the row order break the ties among the candidates
-        notes.push(format!("[first-key prefilter kept {} rows]", cand.len()));
-        ctx.check_output(cand.len(), t.width())?;
-        t = t.take_rows(&cand);
     }
     let note = (!notes.is_empty()).then(|| notes.join(" "));
     Ok((order_by_rows(ctx, t, keys, limit, report)?, note))
