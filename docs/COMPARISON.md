@@ -130,7 +130,7 @@ Sparkles' own.
 
 | Area | Oxigraph | Sparkles |
 |---|---|---|
-| Embedding | A Rust library, Python (`pyoxigraph`) and JavaScript/WebAssembly packages, an in-memory store | A Rust library and a Python package (`sparkles`, abi3 wheels for Linux, macOS and Windows built by a release workflow, not on PyPI), persistent or in-memory. The Python API follows pyoxigraph's names for terms, `query`, `load`, `dump` and `quads_for_pattern`, and adds transactions as context managers, reasoning, validation, history and an rdflib store plugin whose SPARQL runs in Sparkles. No WebAssembly build. |
+| Embedding | A Rust library, Python (`pyoxigraph`) and JavaScript/WebAssembly packages, an in-memory store | A Rust library and a Python package (`sparkles`, abi3 wheels for Linux and Apple silicon macOS built by a release workflow, not on PyPI), persistent or in-memory. The Python API follows pyoxigraph's names for terms, `query`, `load`, `dump` and `quads_for_pattern`, and adds transactions as context managers, reasoning, validation, history and an rdflib store plugin whose SPARQL runs in Sparkles. No WebAssembly build. |
 | Storage | RocksDB (a C++ LSM tree) with 9 index orders (6 for named graphs, 3 for the default graph) and a string dictionary; updates in place; online backups as RocksDB checkpoints (a complete copy in a new local directory, hard-linked on the same file system) | Immutable sorted blocks in 7 orders, plus an in-memory delta logged to a WAL and merged by compaction. Online backups to repositories on a file system or S3, incremental and deduplicated across backups and datasets, with restore, verification, schedules and retention. |
 | Spatial | GeoSPARQL functions (`spargeo`, on by default in the CLI); no spatial index | GeoSPARQL 1.1 functions (geodesic measures, EPSG:4326 axis order, metric buffers) and a per-dataset spatial index |
 | Write durability | One RocksDB transaction per request, written to RocksDB's WAL without an fsync (RocksDB's default) | The WAL is fsynced before a write is acknowledged. A commit waits for one `fdatasync`. When it adds terms the dataset has not seen before, they go to a separate file, which is synced at the same time as the WAL. A commit message or change digest adds one more. |
@@ -138,11 +138,11 @@ Sparkles' own.
 Oxigraph describes its query evaluation as "not optimized yet". It evaluates lazily, one
 iterator per RocksDB scan. In the benchmarks at 10.5M triples, it answers point lookups
 and single paths about as fast as Sparkles, within 1.1–1.4×. Joins, grouping, sorting and
-counting run about 20–1,700× slower, and one EXISTS join 8,295× slower. It serves 1.7
-concurrent star-join queries per second to Sparkles' 243. Its load, including
-`optimize`, takes 14.1 s to Sparkles' 3.7 s. A single-triple update takes 4.3 ms to
-Sparkles' 4.2 ms, although Oxigraph does not fsync it, and Oxigraph commits a stream of
-them 2.7× faster.
+counting run about 20–1,900× slower, and one EXISTS join about 8,400× slower. It serves 1.7
+concurrent star-join queries per second to Sparkles' 241. Its load, including
+`optimize`, takes 14.1 s to Sparkles' 3.9 s. A single-triple update takes 4.3 ms to
+Sparkles' 4.9 ms, although Oxigraph does not fsync it, and Oxigraph commits a stream of
+them 1.7× faster.
 Oxigraph has no reasoning, SHACL, full-text or vector search, path search, CSV imports,
 point-in-time reads, authentication or per-dataset permissions, Fuseki admin API, GraphQL
 endpoint, query budgets, result cache or web UI.
