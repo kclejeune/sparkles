@@ -4,6 +4,8 @@ export type { RDF };
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
 const RDF_NS = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
 const quote = (s: string) => JSON.stringify(s);
+/** set while the engine builds a term from text the engine has already checked */
+let trusted = false;
 const iri = (s: string) => {
   if (!/^[A-Za-z][A-Za-z0-9+.-]*:[^\s\u0000-\u0020\u007F-\u009F\uD800-\uDFFF<>"{}|\\^`]*$/u.test(s))
     throw new InvalidInputError(`Invalid absolute IRI: ${s}`);
@@ -139,11 +141,21 @@ export class NamedNode<Iri extends string = string> extends BaseTerm implements 
   readonly termType = 'NamedNode';
   declare readonly value: Iri;
   constructor(value: Iri) {
-    super(iri(value));
+    super(trusted ? value : iri(value));
   }
   toString() {
     return `<${this.value}>`;
   }
+}
+const xsdString = new NamedNode(XSD + 'string');
+const rdfLangString = new NamedNode(RDF_NS + 'langString');
+const rdfDirLangString = new NamedNode(RDF_NS + 'dirLangString');
+/** A `NamedNode` for an IRI the engine produced, which it has already validated. */
+function trustedNamedNode(value: string) {
+  trusted = true;
+  const node = new NamedNode(value);
+  trusted = false;
+  return node;
 }
 export class BlankNode extends BaseTerm implements RDF.BlankNode {
   readonly termType = 'BlankNode';
@@ -172,7 +184,7 @@ export class Literal extends BaseTerm implements RDF.Literal {
   constructor(
     value: string,
     public readonly language = '',
-    public readonly datatype: NamedNode = new NamedNode(XSD + 'string'),
+    public readonly datatype: NamedNode = xsdString,
     public readonly direction: '' | 'ltr' | 'rtl' = '',
   ) {
     super(value);
@@ -298,14 +310,16 @@ export const factory: RDF.DataFactory & { fromJs(value: unknown): Literal } = {
       if (!/^[a-z]+(?:-[a-z\d]+)*$/i.test(language))
         throw new InvalidInputError('Invalid language tag');
       if (!['', 'ltr', 'rtl'].includes(direction)) throw new InvalidInputError('Invalid direction');
-      return new Literal(
-        value,
-        language,
-        new NamedNode(RDF_NS + (direction ? 'dirLangString' : 'langString')),
-        direction,
-      );
+      return new Literal(value, language, direction ? rdfDirLangString : rdfLangString, direction);
     }
-    return new Literal(value, '', new NamedNode(languageOrDatatype?.value ?? XSD + 'string'));
+    if (languageOrDatatype == null) return new Literal(value);
+    return new Literal(
+      value,
+      '',
+      languageOrDatatype instanceof NamedNode
+        ? languageOrDatatype
+        : new NamedNode(languageOrDatatype.value),
+    );
   },
   quad: (s, p, o, g = defaultGraph) => new Quad(s, p, o, g),
   fromTerm: (term: RDF.Term): any => decodeTerm(term),
@@ -357,7 +371,11 @@ export function encodeTerm(term: RDF.Term): WireTerm {
   if (!term || typeof term.value !== 'string') throw new TypeError('Expected an RDF/JS term');
   switch (term.termType) {
     case 'NamedNode':
-      return { termType: term.termType, value: iri(term.value) };
+      // this package's NamedNode checked its IRI when it was made
+      return {
+        termType: term.termType,
+        value: term instanceof NamedNode ? term.value : iri(term.value),
+      };
     case 'BlankNode':
     case 'Variable':
     case 'DefaultGraph':
@@ -416,11 +434,16 @@ export function decodeTerm(term: WireTerm | RDF.Term, f: RDF.DataFactory = facto
   }
 }
 
+/** the map of every empty `Bindings`, which nothing changes */
+const noTerms = new Map<string, RDF.Term>();
 export class Bindings implements Iterable<[Variable, RDF.Term]> {
   readonly type = 'bindings';
   private terms: Map<string, RDF.Term>;
-  constructor(entries: Iterable<[string | RDF.Variable, RDF.Term]> = []) {
-    this.terms = new Map(Array.from(entries, ([k, v]) => [typeof k === 'string' ? k : k.value, v]));
+  constructor(entries?: Iterable<[string | RDF.Variable, RDF.Term]>) {
+    this.terms =
+      entries === undefined
+        ? noTerms
+        : new Map(Array.from(entries, ([k, v]) => [typeof k === 'string' ? k : k.value, v]));
   }
   get size() {
     return this.terms.size;
@@ -460,27 +483,39 @@ export class Bindings implements Iterable<[Variable, RDF.Term]> {
   }
 }
 export class LazyBindings extends Bindings {
+  /**
+   * `cells` holds a term index per variable, 0 for unbound, starting at `offset`.
+   * `decode` turns an index into its term.
+   */
   constructor(
     private names: string[],
-    private cells: number[],
+    private cells: ArrayLike<number>,
     private decode: (index: number) => RDF.Term,
+    private offset = 0,
   ) {
     super();
   }
+  private cell(i: number) {
+    return this.cells[this.offset + i];
+  }
   override get size() {
-    return this.cells.filter(Boolean).length;
+    let n = 0;
+    for (let i = 0; i < this.names.length; i++) if (this.cell(i)) n++;
+    return n;
   }
   override get(key: string | RDF.Variable) {
     const i = this.names.indexOf(typeof key === 'string' ? key.replace(/^[?$]/, '') : key.value);
-    return i >= 0 && this.cells[i] ? this.decode(this.cells[i]) : undefined;
+    const cell = i >= 0 ? this.cell(i) : 0;
+    return cell ? this.decode(cell) : undefined;
   }
   override *[Symbol.iterator](): Iterator<[Variable, RDF.Term]> {
-    for (let i = 0; i < this.names.length; i++)
-      if (this.cells[i]) yield [new Variable(this.names[i]), this.decode(this.cells[i])];
+    for (let i = 0; i < this.names.length; i++) {
+      const cell = this.cell(i);
+      if (cell) yield [new Variable(this.names[i]), this.decode(cell)];
+    }
   }
   override *keys() {
-    for (let i = 0; i < this.names.length; i++)
-      if (this.cells[i]) yield new Variable(this.names[i]);
+    for (let i = 0; i < this.names.length; i++) if (this.cell(i)) yield new Variable(this.names[i]);
   }
   override *values() {
     for (const [, v] of this) yield v;
@@ -488,6 +523,78 @@ export class LazyBindings extends Bindings {
   override toObject() {
     return Object.fromEntries(Array.from(this, ([k, v]) => [k.value, v]));
   }
+}
+
+/**
+ * The terms of a result batch in the engine's binary form: `text` holds the terms' text,
+ * and `data` starts with a header of four words (entries, rows, cells per row, flags),
+ * then four words per term entry, then the cells. The engine package decodes its
+ * batches with this, and other code has no use for it. Terms are made on first use and
+ * cached, with `f` when it is given and with this package's classes otherwise.
+ * @internal
+ */
+export function wireTerms(
+  text: string,
+  data: Uint32Array,
+  f?: RDF.DataFactory,
+): (index: number) => RDF.Term {
+  const cache: (RDF.Term | undefined)[] = [];
+  const decode = (i: number): RDF.Term => {
+    const cached = cache[i];
+    if (cached !== undefined) return cached;
+    const m = 4 + 4 * i;
+    const kind = data[m];
+    const a = data[m + 1];
+    const b = data[m + 2];
+    const c = data[m + 3];
+    let term: RDF.Term;
+    switch (kind) {
+      case 1:
+        term = f ? f.namedNode(text.slice(a, b)) : trustedNamedNode(text.slice(a, b));
+        break;
+      case 2:
+        term = f ? f.blankNode(text.slice(a, b)) : new BlankNode(text.slice(a, b));
+        break;
+      case 3: {
+        const datatype = decode(c) as NamedNode;
+        term = f
+          ? f.literal(text.slice(a, b), datatype)
+          : new Literal(text.slice(a, b), '', datatype);
+        break;
+      }
+      case 4:
+      case 5:
+      case 6: {
+        const direction = kind === 5 ? 'ltr' : kind === 6 ? 'rtl' : '';
+        const language = text.slice(b, c);
+        term = f
+          ? f.literal(text.slice(a, b), direction ? { language, direction } : language)
+          : new Literal(
+              text.slice(a, b),
+              language,
+              direction ? rdfDirLangString : rdfLangString,
+              direction,
+            );
+        break;
+      }
+      case 7:
+        term = f ? f.defaultGraph() : defaultGraph;
+        break;
+      case 8:
+        term = (f ?? factory).quad(
+          decode(a) as RDF.Quad_Subject,
+          decode(b) as RDF.Quad_Predicate,
+          decode(c) as RDF.Quad_Object,
+          f ? f.defaultGraph() : defaultGraph,
+        );
+        break;
+      default:
+        throw new InvalidInputError(`Unknown term kind ${kind} in a result batch`);
+    }
+    cache[i] = term;
+    return term;
+  };
+  return decode;
 }
 
 export interface OperationOptions {

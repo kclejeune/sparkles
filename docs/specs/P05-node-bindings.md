@@ -1325,3 +1325,42 @@ In an A/B/B/A comparison on a busy laptop at 105,000 triples, `has()` went from 
 are directional, and a quiet-machine run of the comparison is the authority. Single
 adds in a transaction were unchanged at about 100 µs, because each crosses to the
 transaction's worker thread through the pool.
+
+**Binary batches and the transaction hand-off (2026-10-09).** A second round closed most
+of the remaining distance to N3.js. Five changes followed.
+
+* Result batches now cross in the binary form of §6.2 instead of JSON. A batch is one
+  JavaScript string that holds the text of its distinct terms and a `Uint32Array` that
+  holds a small header, four words per term and one word per cell. The offsets count
+  UTF-16 units, so JavaScript slices term text without decoding UTF-8. A term repeated in
+  a batch is sent once and becomes one object, which the iterator makes the first time a
+  cell refers to it. IRIs that come from the engine skip the validation in the
+  `NamedNode` constructor, and the literals' common datatypes are shared objects.
+* On a dataset in memory, `has()` asks the addon with `containsNow`, which looks the quad
+  up on the JavaScript thread and returns at once. A dataset on disk keeps the pool path,
+  because a lookup there may read from a file.
+* A transaction's `add` and its other one-quad writes hand their job straight to the
+  transaction's thread, without a pool task in between. The JavaScript thread then waits
+  up to 10 µs for the answer and returns it as a plain value, which `await` accepts. A
+  slower answer arrives through a promise as before. The transaction's thread spins for
+  up to 50 µs after each job before it sleeps, so that the next job of a loop of adds
+  finds it awake. That spin costs up to 50 µs of one core's time after the last write of
+  a transaction, and the wait costs up to 10 µs of the JavaScript thread per write.
+* `run()` makes its cancellation token and its `AbortController` only when the callback
+  declares the parameters that receive them. `tx.call` does the same.
+* A result that is exhausted, drained and has no prefetch pending answers `next()` without
+  a promise round trip.
+
+Each step is an A/B/B/A comparison in fresh processes pinned to six cores of an 8-vCPU
+AMD EPYC instance on Namespace, at 105,000 triples, with four process medians per arm. The
+figures before and after the round are below, with N3.js's `Store` in brackets. Iterating
+every quad went from 327 to 125 ms [119], `(s ? ?)` from 46 to 20 µs per subject [15],
+`(? p o)` over 2,983 matches from 9.8 to 5.1 ms [2.5], `has()` from 14.8 to 4.9 µs
+[1.1], the first object of `(s p ?)` from 21.5 to 12.4 µs [6.8], a single add in a
+transaction from 84 to 29 µs [4.9], and a 500,000-row SELECT from 1.10 to 0.33 s [1.05].
+`addAll` stayed at about 14 µs per quad [5.5]. Oxigraph's JavaScript store took 38 µs per
+subject for `(s ? ?)`, 19 µs per `has()` and 16 µs per `(s p ?)` on the same machine, so
+the binding is now faster than it on every fine-grained call. Adds remain about six times
+slower than N3.js. Each still crosses to the transaction's thread and back, as §5.4
+requires, and about two thirds of its time goes to the JSON encoding of the operation
+and to the insert.

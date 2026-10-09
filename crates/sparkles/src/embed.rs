@@ -15,8 +15,9 @@ use crate::index::{G, O, P, S};
 use crate::store::Snapshot;
 use oxrdf::{BlankNode, NamedNode, NamedOrBlankNode, Term};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvError, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// Which graphs a [`QuadPattern`] matches.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,6 +257,32 @@ impl Transaction<'_> {
 
 // ------------------------------------------------------------------------ the worker ----
 
+/// How long a transaction's worker waits for its next request by spinning before it
+/// sleeps. A caller that makes one small write after another, such as single adds in a
+/// loop, sends the next request well within this time, and the worker then takes it
+/// without having to be woken. The cost is up to this much CPU time after each request.
+pub const WORKER_SPIN: Duration = Duration::from_micros(50);
+
+/// Receive from `rx`, spinning for up to `spin` before blocking. A hand-off between two
+/// threads that are both awake takes well under a microsecond, while waking a sleeping
+/// thread takes several microseconds, and far longer on a busy machine.
+pub fn recv_spin<T>(rx: &Receiver<T>, spin: Duration) -> std::result::Result<T, RecvError> {
+    let start = Instant::now();
+    let mut round = 0u32;
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return Ok(v),
+            Err(TryRecvError::Disconnected) => return Err(RecvError),
+            Err(TryRecvError::Empty) => {}
+        }
+        round = round.wrapping_add(1);
+        if round.is_multiple_of(64) && start.elapsed() >= spin {
+            return rx.recv();
+        }
+        std::hint::spin_loop();
+    }
+}
+
 type Job = Box<dyn for<'a, 'b> FnOnce(&'a mut Transaction<'b>) + Send>;
 
 enum Msg {
@@ -351,6 +378,23 @@ impl TxnWorker {
         rx.recv().map_err(|_| ended())?
     }
 
+    /// Run `f` in the transaction without waiting: the worker thread calls `reply` with
+    /// its result. A caller that waits asynchronously, such as a promise in Node.js,
+    /// then needs no thread of its own to wait on. `reply` is dropped without being
+    /// called if the transaction ends first or `f` panics.
+    pub fn submit<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Transaction<'_>) -> Result<R> + Send + 'static,
+        reply: impl FnOnce(Result<R>) + Send + 'static,
+    ) -> Result<()> {
+        let job: Job = Box::new(move |t| reply(f(t)));
+        self.jobs
+            .as_ref()
+            .ok_or_else(ended)?
+            .send(Msg::Job(job))
+            .map_err(|_| ended())
+    }
+
     /// Whether the worker still runs a transaction.
     pub fn is_open(&self) -> bool {
         self.thread.as_ref().is_some_and(|t| !t.is_finished())
@@ -410,7 +454,7 @@ fn work(
         began = true;
         let _ = started.send(Ok(Some(base)));
         loop {
-            match jobs.recv() {
+            match recv_spin(&jobs, WORKER_SPIN) {
                 Ok(Msg::Job(f)) => {
                     let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tx)));
                     if ok.is_err() {

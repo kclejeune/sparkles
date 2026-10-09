@@ -19,7 +19,7 @@ import {
   LazyBindings,
   factory,
   encodeTerm,
-  decodeTerm,
+  wireTerms,
   nativeError,
   InvalidInputError,
   UnsupportedError,
@@ -43,6 +43,7 @@ export * from '@sparkles-rdf/common';
 
 import {
   native,
+  type NativeBatch,
   type NativeByteStream,
   type NativeCancellation,
   type NativeCatalog,
@@ -56,6 +57,8 @@ const transactionContext = new AsyncLocalStorage<ReadonlySet<string>>();
 const defaults = { batchSize: 1024, batchBytes: 1 << 20 };
 /** rows of a match's first batch when it is computed on the JavaScript thread */
 const INLINE_ROWS = 16;
+/** the information of a quad scan, which `info()` would only repeat */
+const scanInfo = { type: 'quads' };
 export interface EngineConfiguration {
   /** rows per streaming batch (default 1024) */
   batchSize?: number;
@@ -186,14 +189,21 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
     private handle: NativeResult,
     private options: QueryOptions,
     private onClose: () => void = () => {},
+    info: any = JSON.parse(handle.info()),
   ) {
-    const info = JSON.parse(handle.info());
     this.type = info.type;
     this.variables = (info.variables ?? []).map(factory.variable!);
     this.names = this.variables.map((v) => v.value);
     this.size = info.size;
     this.timing = info.timing;
     this.plan = info.plan;
+    // A first batch that came with the result is decoded now, so that `next()` can hand
+    // out its items at once.
+    const first = handle.takeFirst();
+    if (first) {
+      this.batch = this.decode(first);
+      this.batchLength = this.batch.length;
+    }
     options.signal?.addEventListener('abort', this.abort, { once: true });
     if (options.signal?.aborted) this.abort();
   }
@@ -208,31 +218,40 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
         this.options.batchSize ?? defaults.batchSize,
         this.options.batchBytes ?? defaults.batchBytes,
       ));
-    const batch = JSON.parse(value);
-    if (!batch) {
-      this.drained = true;
-      return null;
-    }
-    if (batch.done) {
+    return value ? this.decode(value) : this.end();
+  }
+  private end(): null {
+    this.drained = true;
+    return null;
+  }
+  /** The items of a batch in the binary form that `wireTerms` describes. */
+  private decode({ text, data }: NativeBatch): T[] {
+    const entries = data[0];
+    const rows = data[1];
+    const width = data[2];
+    if (data[3] & 1) {
       this.exhausted = true;
       this.drained = true;
     }
-    const cache: (RDF.Term | undefined)[] = [];
-    const decode = (i: number) => (cache[i] ??= decodeTerm(batch.terms[i], this.options.factory));
+    const decode = wireTerms(text, data, this.options.factory);
+    const out: T[] = new Array(rows);
+    let cell = 4 + 4 * entries;
     if (this.type === 'bindings') {
       const names = this.names;
-      return batch.rows.map((cells: number[]) => new LazyBindings(names, cells, decode)) as T[];
+      for (let r = 0; r < rows; r++, cell += width)
+        out[r] = new LazyBindings(names, data, decode, cell) as T;
+      return out;
     }
     // a quad is four cells, subject, predicate, object and graph, each a term of the batch
     const f = this.options.factory ?? factory;
-    return batch.rows.map((c: number[]) =>
-      f.quad(
-        decode(c[0]) as RDF.Quad_Subject,
-        decode(c[1]) as RDF.Quad_Predicate,
-        decode(c[2]) as RDF.Quad_Object,
-        decode(c[3]) as RDF.Quad_Graph,
-      ),
-    ) as T[];
+    for (let r = 0; r < rows; r++, cell += 4)
+      out[r] = f.quad(
+        decode(data[cell]) as RDF.Quad_Subject,
+        decode(data[cell + 1]) as RDF.Quad_Predicate,
+        decode(data[cell + 2]) as RDF.Quad_Object,
+        decode(data[cell + 3]) as RDF.Quad_Graph,
+      ) as T;
+    return out;
   }
   /** The next decoded item, asking for the following batch once half of this one is used. */
   private take(): T {
@@ -260,13 +279,15 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
   next(): Promise<IteratorResult<T>> {
     // An item already decoded is handed out at once, unless an earlier call is still
     // queued, which it must not overtake.
-    if (
-      this.busy === 0 &&
-      !this.closed &&
-      this.position < this.batch.length &&
-      !this.options.signal?.aborted
-    ) {
-      return Promise.resolve({ done: false, value: this.take() });
+    if (this.busy === 0 && !this.closed && !this.options.signal?.aborted) {
+      if (this.position < this.batch.length)
+        return Promise.resolve({ done: false, value: this.take() });
+      // A drained result that the native side already freed ends here, since closing
+      // it needs no native call.
+      if (this.exhausted && this.drained && !this.prefetched) {
+        void this.close();
+        return Promise.resolve({ done: true, value: undefined } as IteratorResult<T>);
+      }
     }
     this.busy++;
     const task = this.queue.then(async () => {
@@ -340,13 +361,18 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
 abstract class Queryable implements SparqlDataset {
   protected abstract read(text: string, options: QueryOptions): Promise<NativeResult>;
   abstract update(text: string, options?: UpdateOptions): Promise<UpdateResult>;
-  protected result(handle: NativeResult, options: QueryOptions): QueryResult {
-    const info = JSON.parse(handle.info());
+  protected result(
+    handle: NativeResult,
+    options: QueryOptions,
+    info: any = JSON.parse(handle.info()),
+  ): QueryResult {
     if (info.type === 'boolean') {
       handle.close();
       return { type: 'boolean', value: info.value, plan: info.plan, timing: info.timing };
     }
-    return new PullResult(handle, options) as unknown as BindingsResult | QuadsResult;
+    return new PullResult(handle, options, undefined, info) as unknown as
+      | BindingsResult
+      | QuadsResult;
   }
   async query(text: string, options: QueryOptions = {}) {
     return this.result(await this.read(text, options), options);
@@ -789,19 +815,24 @@ export class Dataset extends Queryable {
   ): Promise<T> {
     this.check(write);
     options.signal?.throwIfAborted();
-    const cancel = new native.Cancellation();
-    const controller = new AbortController();
+    // The native token and the abort signal are made only for an operation that takes
+    // them, which most small calls do not.
+    const cancel = operation.length >= 1 ? new native.Cancellation() : undefined;
+    const controller = operation.length >= 2 ? new AbortController() : undefined;
+    let stopped: { reason: unknown } | undefined;
+    const stop = (reason: unknown) => {
+      if (stopped) return;
+      stopped = { reason };
+      cancel?.cancel();
+      controller?.abort(reason);
+    };
     const owner = {
       cancel() {
-        cancel.cancel();
-        controller.abort(new InvalidInputError('Dataset is closing'));
+        stop(new InvalidInputError('Dataset is closing'));
       },
     };
     this.tokens.add(owner);
-    const abort = () => {
-      cancel.cancel();
-      controller.abort(options.signal?.reason);
-    };
+    const abort = () => stop(options.signal?.reason);
     options.signal?.addEventListener('abort', abort, { once: true });
     let timedOut = false;
     const timer =
@@ -809,17 +840,16 @@ export class Dataset extends Queryable {
         ? undefined
         : setTimeout(() => {
             timedOut = true;
-            cancel.cancel();
-            controller.abort(new QueryTimeoutError());
+            stop(new QueryTimeoutError());
           }, options.timeout);
     const task = (async () => {
       try {
-        const value = await operation(cancel, controller.signal);
-        if (controller.signal.aborted) {
+        const value = await operation(cancel!, controller?.signal as AbortSignal);
+        if (stopped) {
           const handle = value as any;
           if (handle && typeof handle.end === 'function') await handle.end(false);
           else if (handle && typeof handle.close === 'function') await handle.close();
-          throw controller.signal.reason;
+          throw stopped.reason;
         }
         return value;
       } catch (e) {
@@ -841,13 +871,16 @@ export class Dataset extends Queryable {
       this.handle.query(text, queryWireOptions(options), cancel),
     );
   }
-  protected override result(handle: NativeResult, options: QueryOptions): QueryResult {
-    const info = JSON.parse(handle.info());
+  protected override result(
+    handle: NativeResult,
+    options: QueryOptions,
+    info: any = JSON.parse(handle.info()),
+  ): QueryResult {
     if (info.type === 'boolean') {
       handle.close();
       return { type: 'boolean', value: info.value, plan: info.plan, timing: info.timing };
     }
-    const r = new PullResult<unknown>(handle, options, () => this.results.delete(r));
+    const r = new PullResult<unknown>(handle, options, () => this.results.delete(r), info);
     this.results.add(r);
     return r as unknown as BindingsResult | QuadsResult;
   }
@@ -873,20 +906,13 @@ export class Dataset extends Queryable {
       // In memory, the scan and a first batch of a few rows take less time than a round
       // trip through the addon's pool, so they run here; later batches use the pool.
       this.check();
-      let future: Promise<QuadsResult>;
+      let handle: NativeResult | null;
       try {
-        const handle = this.handle.matchedNow(
-          pattern(s, p, o, g),
-          INLINE_ROWS,
-          defaults.batchBytes,
-        );
-        future = handle
-          ? Promise.resolve(this.result(handle, {}) as QuadsResult)
-          : this.matchOnPool(s, p, o, g);
+        handle = this.handle.matchedNow(pattern(s, p, o, g), INLINE_ROWS, defaults.batchBytes);
       } catch (e) {
-        future = Promise.reject(nativeError(e));
+        return deferredQuads(Promise.reject(nativeError(e)));
       }
-      return deferredQuads(future);
+      if (handle) return deferredQuads(this.result(handle, {}, scanInfo) as QuadsResult);
     }
     return deferredQuads(this.matchOnPool(s, p, o, g));
   }
@@ -898,9 +924,21 @@ export class Dataset extends Queryable {
   ): Promise<QuadsResult> {
     return this.run<NativeResult>({}, () =>
       this.handle.matched(pattern(s, p, o, g), defaults.batchSize, defaults.batchBytes),
-    ).then((handle) => this.result(handle, {}) as QuadsResult);
+    ).then((handle) => this.result(handle, {}, scanInfo) as QuadsResult);
   }
   async has(quad: RDF.Quad) {
+    if (this.path === null) {
+      // In memory, a lookup takes microseconds, so it runs on this thread.
+      this.check();
+      try {
+        const found = this.handle.containsNow(
+          pattern(quad.subject, quad.predicate, quad.object, quad.graph),
+        );
+        if (found !== null) return found;
+      } catch (e) {
+        throw nativeError(e);
+      }
+    }
     for await (const _ of this.match(quad.subject, quad.predicate, quad.object, quad.graph))
       return true;
     return false;
@@ -1250,18 +1288,26 @@ function inputChunks(
   };
 }
 
-function deferredQuads(future: Promise<QuadsResult>) {
+/**
+ * The quads of a match. Each iteration reads the one result, and a result that is ready
+ * hands its items out without waiting for a promise first.
+ */
+function deferredQuads(source: QuadsResult | Promise<QuadsResult>) {
   return {
-    async *[Symbol.asyncIterator]() {
-      const r = await future;
-      try {
-        yield* r;
-      } finally {
-        await r.close();
-      }
+    [Symbol.asyncIterator](): AsyncIterator<RDF.Quad> {
+      let it: AsyncIterator<RDF.Quad> | undefined =
+        source instanceof Promise ? undefined : source[Symbol.asyncIterator]();
+      const ready = async () => (it ??= (await source)[Symbol.asyncIterator]());
+      return {
+        next: () => (it ? it.next() : ready().then((i) => i.next())),
+        return: async () => {
+          await (await source).close();
+          return { done: true, value: undefined };
+        },
+      };
     },
     async toArray() {
-      return (await future).toArray();
+      return (await source).toArray();
     },
     toStream() {
       return Readable.from(this);
@@ -1303,13 +1349,14 @@ export class Transaction extends Queryable {
   }
   private async call<T>(
     options: OperationOptions,
-    f: (cancel: NativeCancellation) => Promise<T>,
+    f: (cancel: NativeCancellation) => T | Promise<T>,
   ): Promise<T> {
     if (this.ended) throw new InvalidInputError('Transaction has ended');
     options.signal?.throwIfAborted();
-    const token = new native.Cancellation();
-    this.tokens.add(token);
-    const abort = () => token.cancel();
+    // only an operation that takes the token gets one; a write such as `add` does not
+    const token = f.length >= 1 ? new native.Cancellation() : undefined;
+    if (token) this.tokens.add(token);
+    const abort = () => token?.cancel();
     options.signal?.addEventListener('abort', abort, { once: true });
     let timedOut = false;
     const timer =
@@ -1321,7 +1368,7 @@ export class Transaction extends Queryable {
           }, options.timeout);
     const request = this.requests.then(async () => {
       if (this.ended) throw new InvalidInputError('Transaction has ended');
-      return f(token);
+      return f(token!);
     });
     this.requests = request.catch(() => {});
     try {
@@ -1336,18 +1383,26 @@ export class Transaction extends Queryable {
     } finally {
       if (timer) clearTimeout(timer);
       options.signal?.removeEventListener('abort', abort);
-      this.tokens.delete(token);
+      if (token) this.tokens.delete(token);
     }
   }
-  protected override result(handle: NativeResult, options: QueryOptions): QueryResult {
-    const info = JSON.parse(handle.info());
+  protected override result(
+    handle: NativeResult,
+    options: QueryOptions,
+    info: any = JSON.parse(handle.info()),
+  ): QueryResult {
     if (info.type === 'boolean') {
       void handle.close();
       return { type: 'boolean', value: info.value, plan: info.plan, timing: info.timing };
     }
-    const result: PullResult<unknown> = new PullResult(handle, options, () => {
-      this.results.delete(result);
-    });
+    const result: PullResult<unknown> = new PullResult(
+      handle,
+      options,
+      () => {
+        this.results.delete(result);
+      },
+      info,
+    );
     this.results.add(result);
     return result as unknown as BindingsResult | QuadsResult;
   }
@@ -1388,7 +1443,7 @@ export class Transaction extends Queryable {
     return deferredQuads(
       this.call<NativeResult>({}, () =>
         this.handle.matched(pattern(s, p, o, g), defaults.batchSize, defaults.batchBytes),
-      ).then((handle) => this.result(handle, {}) as QuadsResult),
+      ).then((handle) => this.result(handle, {}, scanInfo) as QuadsResult),
     );
   }
   async commit(): Promise<CommitReceipt> {

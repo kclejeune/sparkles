@@ -1010,15 +1010,20 @@ impl PyDataset {
         let o: Option<Term> = opt(object, term_from_py)?;
         let g: Option<GraphName> = opt(graph_name, graph_from_py)?;
         let ds = self.ds(py)?;
-        let it = py.detach(|| {
+        let scan = || {
             ds.quads(
                 g.as_ref().map(GraphName::as_ref),
                 s.as_ref(),
                 p.as_ref(),
                 o.as_ref(),
             )
-        });
-        Ok(PyQuadIterator::from_scan(it))
+        };
+        // In memory, planning the scan and reading its first few quads take less time
+        // than giving up the GIL and taking it back, so they run with the GIL held.
+        if ds.store().root().is_none() {
+            return Ok(PyQuadIterator::from_memory_scan(scan()));
+        }
+        Ok(PyQuadIterator::from_scan(py.detach(scan)))
     }
 
     fn __iter__(&self, py: Python<'_>) -> PyResult<PyQuadIterator> {
@@ -1028,6 +1033,10 @@ impl PyDataset {
     fn __contains__(&self, py: Python<'_>, quad: &Bound<'_, PyAny>) -> PyResult<bool> {
         let q = quad_from_py(quad)?;
         let ds = self.ds(py)?;
+        // a lookup in memory takes less time than giving up the GIL and taking it back
+        if ds.store().root().is_none() {
+            return ds.contains(q.as_ref()).py(py);
+        }
         py.detach(|| ds.contains(q.as_ref())).py(py)
     }
 
