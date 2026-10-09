@@ -1,0 +1,11 @@
+{
+  "name": "sparkles-bench-bindings-node",
+  "private": true,
+  "description": "The incumbent libraries of the Node.js binding comparison (scripts/bench-bindings), installed into the work directory and never into the published packages",
+  "type": "module",
+  "dependencies": {
+    "@comunica/query-sparql-rdfjs": "5.4.1",
+    "n3": "2.13.11",
+    "oxigraph": "0.5.11"
+  }
+}
