@@ -335,6 +335,127 @@ fn without_preallocation_each_commit_appends() {
     assert_eq!(s.snapshot().len(), 7);
 }
 
+/// Whether the file system under `dir` accepts `O_DIRECT`, which the write-through
+/// WAL path needs (`StoreOptions::wal_direct_writes`).
+fn direct_io(dir: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(dir.join("direct-probe"))
+            .is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
+/// A store whose small commits go through the write-through path (direct writes with
+/// `O_DSYNC` into the preallocated log) commits what the buffered path does. Commits
+/// that cross 4 KiB blocks, add terms, delete, and a commit too long for a direct write
+/// in between all survive a crash image of the log, and later commits continue it.
+#[test]
+fn direct_wal_writes_commit_what_buffered_writes_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let supported = direct_io(dir.path());
+    for direct in [true, false] {
+        let root = dir.path().join(format!("db-{direct}"));
+        let opts = || StoreOptions {
+            wal_direct_writes: direct,
+            ..Default::default()
+        };
+        let s = Store::open(&root, opts()).unwrap();
+        // 200 one-quad commits of 66 bytes span four blocks, each adding a literal
+        for i in 0..200 {
+            upd(
+                &s,
+                &format!("INSERT DATA {{ <urn:s{i}> <urn:p> \"v{i}\" }}"),
+            );
+        }
+        assert_eq!(s.wal_direct_active(), direct && supported);
+        // 2,500 quads are about 80 KiB of records, more than one direct write takes
+        let big: String = (0..2500)
+            .map(|i| format!("<urn:b{i}> <urn:p> {i} . "))
+            .collect();
+        upd(&s, &format!("INSERT DATA {{ {big} }}"));
+        for i in 0..100 {
+            upd(
+                &s,
+                &format!("DELETE DATA {{ <urn:s{i}> <urn:p> \"v{i}\" }}"),
+            );
+        }
+        for i in 0..50 {
+            upd(
+                &s,
+                &format!("INSERT DATA {{ <urn:s{i}> <urn:p> \"v{i}\" }}"),
+            );
+        }
+        assert_eq!(s.wal_direct_active(), direct && supported);
+        let head = s.head_commit().seq;
+        assert_eq!(head, 351);
+        let len = s.snapshot().len();
+        assert_eq!(len, 200 + 2500 - 100 + 50);
+        let logical = s.wal_bytes();
+        // the log as a crash would leave it, with its preallocated zeros
+        let crashed = std::fs::read(wal(&root)).unwrap();
+        assert!(crashed.len() as u64 > logical);
+        drop(s);
+        std::fs::write(wal(&root), &crashed).unwrap();
+        let s = Store::open(&root, opts()).unwrap();
+        assert_eq!(s.head_commit().seq, head);
+        assert_eq!(s.snapshot().len(), len);
+        assert_eq!(s.wal_bytes(), logical);
+        assert!(ask(&s, "ASK { <urn:s0> <urn:p> \"v0\" }"));
+        assert!(!ask(&s, "ASK { <urn:s60> <urn:p> \"v60\" }"));
+        assert!(ask(&s, "ASK { <urn:s199> <urn:p> \"v199\" }"));
+        assert!(ask(&s, "ASK { <urn:b2499> <urn:p> 2499 }"));
+        // the reopened log is cut at its end, grows again, and takes direct writes
+        for i in 0..20 {
+            upd(&s, &format!("INSERT DATA {{ <urn:t{i}> <urn:p> {i} }}"));
+        }
+        assert_eq!(s.wal_direct_active(), direct && supported);
+        drop(s);
+        let s = Store::open(&root, opts()).unwrap();
+        assert_eq!(s.head_commit().seq, head + 20);
+        assert_eq!(s.snapshot().len(), len + 20);
+    }
+}
+
+/// A compaction switches the store to a new generation's log. The write-through
+/// handle of the old log is dropped, and the commits after the switch reach the new log.
+#[test]
+fn direct_wal_writes_follow_a_compaction_to_the_new_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let supported = direct_io(dir.path());
+    let root = dir.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    for i in 0..30 {
+        upd(&s, &format!("INSERT DATA {{ <urn:s{i}> <urn:p> {i} }}"));
+    }
+    assert_eq!(s.wal_direct_active(), supported);
+    let before = wal(&root);
+    s.compact().unwrap();
+    assert_ne!(wal(&root), before);
+    assert!(!s.wal_direct_active());
+    for i in 30..60 {
+        upd(&s, &format!("INSERT DATA {{ <urn:s{i}> <urn:p> {i} }}"));
+    }
+    assert_eq!(s.wal_direct_active(), supported);
+    let crashed = std::fs::read(wal(&root)).unwrap();
+    let head = s.head_commit().seq;
+    drop(s);
+    std::fs::write(wal(&root), &crashed).unwrap();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.head_commit().seq, head);
+    assert_eq!(s.snapshot().len(), 60);
+}
+
 fn ask(s: &Store, q: &str) -> bool {
     sparkles_core::sparql::query(s.snapshot(), q, &QueryOptions::default())
         .unwrap()

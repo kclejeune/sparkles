@@ -139,6 +139,10 @@ struct Cli {
     /// journal commit, which on ext4 and XFS takes a fraction of the time
     #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_WAL_PREALLOC_BYTES >> 10)]
     wal_prealloc_kb: u64,
+    /// Write commits to the write-ahead log with buffered writes and fdatasync instead of
+    /// direct writes with O_DSYNC (Linux), for comparing the two
+    #[arg(long, global = true, hide = true)]
+    no_wal_direct_writes: bool,
     /// Experimental durable grouping of concurrent ordinary WAL commits
     #[arg(long, global = true, hide = true)]
     experimental_group_commit: bool,
@@ -1810,6 +1814,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         max_prefixes: cli.max_prefixes,
         commit_digests: cli.commit_digests,
         wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
+        wal_direct_writes: !cli.no_wal_direct_writes,
         experimental_group_commit: cli.experimental_group_commit,
         change_log: !cli.no_change_log,
         change_log_max_bytes: cli.change_log_mb << 20,

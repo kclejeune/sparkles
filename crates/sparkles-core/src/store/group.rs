@@ -767,7 +767,11 @@ mod tests {
         queued(&s, 1);
         // The next transaction's WAL write fails: its descriptor is read-only.
         let read_only = File::open(wal_path(dir.path())).unwrap();
-        s.writer.lock().wal = Some(BufWriter::new(read_only));
+        {
+            let mut w = s.writer.lock();
+            w.wal = Some(BufWriter::new(read_only));
+            w.wal_direct = Default::default();
+        }
         assert!(insert(&s, "failed").is_err());
         go.send(()).unwrap();
         // The sealed prefix's fence succeeded, so its commit is durable and acknowledged.

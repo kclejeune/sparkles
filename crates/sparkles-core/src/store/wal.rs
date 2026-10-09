@@ -93,6 +93,184 @@ fn write_all_at(_: &File, _: &[u8], _: u64) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
+/// The unit of a direct write: its offset and length are multiples of this, which covers
+/// devices with 512-byte and 4 KiB logical blocks.
+const BLOCK: u64 = 4096;
+
+/// The most bytes one direct write covers, from the start of the log's last block to the
+/// end of the commit. A larger commit takes the buffered path.
+const DIRECT_MAX: usize = 64 << 10;
+
+/// The write-through path of a log (Linux only): a second handle on the same file, opened
+/// with `O_DIRECT | O_DSYNC`, that writes a small commit into space the log has already
+/// allocated.
+///
+/// A write with `O_DSYNC` returns once its data, and any metadata needed to read it back,
+/// are durable, the same promise as a write followed by `fdatasync`. On ext4 and XFS a
+/// direct write that overwrites allocated, written blocks needs no metadata, so the
+/// kernel sends it with the FUA flag when the device supports it, and the drive persists
+/// that one block instead of flushing its whole volatile cache. A device without FUA gets
+/// a cache flush after the write, which is what `fdatasync` sends anyway.
+///
+/// Direct I/O wants aligned offsets and lengths, so each write covers whole 4 KiB blocks
+/// from the start of the block that holds the log's logical end. The handle keeps a copy
+/// of that block's committed bytes and writes them again in front of the new records.
+/// Those bytes are already durable and unchanged, so a torn block write can only damage
+/// the new records, which the commit's checksum and replay treat as a torn tail, just as
+/// they do for a buffered write whose pages reach the disk in any order.
+pub(crate) struct DirectLog {
+    file: File,
+    /// an aligned window of `DIRECT_MAX` bytes inside `raw`
+    raw: Vec<u8>,
+    /// the start of the aligned window in `raw`
+    off: usize,
+    /// the log offset of the window's first byte (a multiple of `BLOCK`)
+    block: u64,
+    /// the window holds the log's bytes from `block` up to here (`u64::MAX`: none)
+    end: u64,
+}
+
+impl DirectLog {
+    /// Open the write-through handle of `dir/wal.log`, which `log` has open: `None` where
+    /// direct I/O is not available (another OS, a file system without `O_DIRECT`) or the
+    /// path is not the same file.
+    pub fn open(dir: &Path, log: &File) -> Option<DirectLog> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT | libc::O_DSYNC)
+                .open(dir.join("wal.log"))
+                .ok()?;
+            let (a, b) = (file.metadata().ok()?, log.metadata().ok()?);
+            if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
+                return None;
+            }
+            let raw = vec![0u8; DIRECT_MAX + BLOCK as usize];
+            let off = raw.as_ptr().align_offset(BLOCK as usize);
+            Some(DirectLog {
+                file,
+                raw,
+                off,
+                block: 0,
+                end: u64::MAX,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (dir, log);
+            None
+        }
+    }
+
+    /// Whether a commit of `len` bytes at the logical end `at` can be written through
+    /// this handle: every block it touches lies inside the log's allocated length `alloc`
+    /// (so the write changes no file size), and the write is at most `DIRECT_MAX` bytes.
+    pub fn fits(at: u64, len: usize, alloc: u64) -> bool {
+        let start = at - at % BLOCK;
+        let end = (at + len as u64).next_multiple_of(BLOCK);
+        end <= alloc && end - start <= DIRECT_MAX as u64
+    }
+
+    /// Write `data` at the log's logical end `at`, durably, through the direct handle.
+    /// The caller checked [`fits`](Self::fits), and every byte of the log after `at` up
+    /// to its allocated length is a preallocated zero. When the window does not hold the
+    /// committed bytes of the last block (the first write, or after commits written
+    /// another way), they are read from the file first.
+    ///
+    /// `Ok(false)` when the file system refused a direct read or write with `EINVAL`,
+    /// which it returns for an alignment it does not accept. The caller then writes the
+    /// commit the buffered way and stops using this handle. Even if part of the write
+    /// had reached the file, the buffered path writes the same bytes at the same offset
+    /// and syncs them. Any other error leaves the log in an unknown state, as a failed
+    /// buffered write does.
+    pub fn write(&mut self, at: u64, data: &[u8]) -> std::io::Result<bool> {
+        let start = at - at % BLOCK;
+        let end = at + data.len() as u64;
+        let len = (end.next_multiple_of(BLOCK) - start) as usize;
+        let head = (at - start) as usize;
+        let (off, block, cached) = (self.off, self.block, self.end);
+        let win = &mut self.raw[off..off + DIRECT_MAX];
+        self.end = u64::MAX;
+        if head > 0 && (block != start || cached != at) {
+            // A direct read of the whole block. The kernel writes back any of its
+            // pages still dirty in the page cache first, so this sees what buffered
+            // writes put there.
+            if let Err(e) = read_exact_at(&self.file, &mut win[..BLOCK as usize], start) {
+                return refused(e);
+            }
+        }
+        win[head..head + data.len()].copy_from_slice(data);
+        win[head + data.len()..len].fill(0);
+        self.block = start;
+        if let Err(e) = write_all_at(&self.file, &win[..len], start) {
+            return refused(e);
+        }
+        // keep the block the next commit starts in at the front of the window
+        let last = end - end % BLOCK;
+        if last > start {
+            let from = (last - start) as usize;
+            let tail = (end - last) as usize;
+            win.copy_within(from..from + tail, 0);
+            self.block = last;
+        }
+        self.end = end;
+        Ok(true)
+    }
+}
+
+/// The writer's write-through handle of the current log, opened on the first commit
+/// that can use it. A new log (a compaction or bulk commit switching generations)
+/// starts again from `Untried`.
+#[derive(Default)]
+pub(crate) enum Direct {
+    #[default]
+    Untried,
+    Open(Box<DirectLog>),
+    /// not available here, refused by the file system, or turned off
+    Off,
+}
+
+impl Direct {
+    /// The handle for a commit to the log `log` in the generation directory `dir`,
+    /// opening it if this is the first try.
+    pub fn handle(&mut self, dir: Option<&Path>, log: &File) -> Option<&mut DirectLog> {
+        if matches!(self, Direct::Untried) {
+            *self = match dir.and_then(|d| DirectLog::open(d, log)) {
+                Some(d) => Direct::Open(Box::new(d)),
+                None => Direct::Off,
+            };
+        }
+        match self {
+            Direct::Open(d) => Some(d),
+            _ => None,
+        }
+    }
+}
+
+/// The outcome of a failed direct read or write: `EINVAL`, which a file system returns
+/// for an alignment it does not accept before it writes anything, makes the caller fall
+/// back to the buffered path. Any other error is the commit's error.
+fn refused(e: std::io::Error) -> std::io::Result<bool> {
+    if e.kind() == std::io::ErrorKind::InvalidInput {
+        Ok(false)
+    } else {
+        Err(e)
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, at)
+}
+
+#[cfg(not(unix))]
+fn read_exact_at(_: &File, _: &mut [u8], _: u64) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 /// Whether a record is all zero bytes: preallocated space past the log's last commit,
 /// or a part of the last transaction that did not reach the disk before a crash.
 #[inline]
@@ -519,6 +697,46 @@ mod tests {
             offset,
             folding: false,
         }
+    }
+
+    /// Direct writes, buffered writes in between, and block boundaries leave the file
+    /// with exactly the bytes written, in order, and zeros after them.
+    #[test]
+    fn direct_writes_keep_the_log_bytes_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let log = open_for_append(&path).unwrap();
+        let Some(mut direct) = DirectLog::open(dir.path(), &log) else {
+            // no direct I/O on this file system (or OS): commits take the buffered path
+            return;
+        };
+        let (mut at, mut alloc) = (0u64, 0u64);
+        let mut expect = Vec::new();
+        let rec = |i: usize, n: usize| -> Vec<u8> {
+            (0..n * 33).map(|j| (1 + (i * 7 + j) % 251) as u8).collect()
+        };
+        for i in 0..400 {
+            // mostly one-quad commits, some longer, and every 50th written buffered
+            let data = rec(i, if i % 9 == 0 { 40 } else { 2 });
+            if i % 50 == 0 || !DirectLog::fits(at, data.len(), alloc) {
+                write_commit(&log, at, &mut alloc, &data, 64 << 10).unwrap();
+                log.sync_data().unwrap();
+            } else {
+                assert!(direct.write(at, &data).unwrap(), "commit {i}");
+            }
+            at += data.len() as u64;
+            expect.extend_from_slice(&data);
+        }
+        // a commit too long for one direct write
+        assert!(!DirectLog::fits(at, DIRECT_MAX, u64::MAX));
+        let file = std::fs::read(&path).unwrap();
+        assert_eq!(file.len() as u64, alloc);
+        assert_eq!(&file[..expect.len()], &expect[..]);
+        assert!(file[expect.len()..].iter().all(|&b| b == 0));
+        // a write may not change the file's size
+        assert!(!DirectLog::fits(alloc - 10, 33, alloc));
+        let last = alloc - alloc % BLOCK;
+        assert!(DirectLog::fits(last - BLOCK, 33, alloc));
     }
 
     #[test]

@@ -1355,6 +1355,7 @@ impl Store {
             let wal = cu.wal.take().expect("a persistent store has a log");
             w.trim_wal();
             w.wal = Some(wal);
+            w.wal_direct = Default::default();
             w.wal_len = cu.wal_len;
             w.wal_alloc = cu.wal_len;
             self.wal_end.store(cu.wal_len, Ordering::Relaxed);

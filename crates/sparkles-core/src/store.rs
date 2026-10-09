@@ -953,6 +953,13 @@ pub struct StoreOptions {
     /// its last commit ends: replay, readers and backups stop at the first zero
     /// record, and an open truncates the zero tail.
     pub wal_prealloc_bytes: u64,
+    /// Whether a persistent store on Linux writes a small commit into the log's
+    /// preallocated space with `O_DIRECT | O_DSYNC` instead of a buffered write and
+    /// `fdatasync`. The write returns once the commit is durable, as the sync did, and a
+    /// device that supports FUA persists only the written block instead of flushing its
+    /// whole cache. Where the file system does not take direct I/O, commits use the
+    /// buffered path. On by default.
+    pub wal_direct_writes: bool,
     /// Experimental durable prefix grouping for ordinary persistent WAL writes.
     /// Off by default; unsupported operations drain and use the ordinary commit path.
     pub experimental_group_commit: bool,
@@ -1015,6 +1022,7 @@ impl Default for StoreOptions {
             vector_files: true,
             commit_digests: false,
             wal_prealloc_bytes: DEFAULT_WAL_PREALLOC_BYTES,
+            wal_direct_writes: true,
             experimental_group_commit: false,
             change_log: true,
             change_log_max_bytes: DEFAULT_CHANGE_LOG_MAX_BYTES,
@@ -1032,6 +1040,8 @@ struct WriterState {
     wal_len: u64,
     /// the WAL file's length: past `wal_len` it holds preallocated zero bytes
     wal_alloc: u64,
+    /// the write-through handle of `wal` (reset whenever `wal` is replaced)
+    wal_direct: wal::Direct,
     next_bnode: u64,
     /// Latest admitted commit; speculative only while `staged` exists.
     /// General writer admission drains before exposing it as durable metadata.
@@ -1284,6 +1294,7 @@ impl Store {
                 wal: None,
                 wal_len: 0,
                 wal_alloc: 0,
+                wal_direct: Default::default(),
                 next_bnode,
                 head: root,
                 poisoned: false,
@@ -1633,6 +1644,7 @@ impl Store {
                 wal: Some(BufWriter::new(wal)),
                 wal_len,
                 wal_alloc: wal_len,
+                wal_direct: Default::default(),
                 next_bnode,
                 head,
                 poisoned: false,
@@ -4055,6 +4067,7 @@ impl Store {
             w.trim_wal();
             w.wal_alloc = wal.metadata()?.len();
             w.wal = Some(BufWriter::new(wal));
+            w.wal_direct = Default::default();
             w.wal_len = 0;
             self.wal_end.store(0, Ordering::Relaxed);
             self.quota.set_preallocated(0);
@@ -4343,6 +4356,13 @@ impl Store {
             return 0;
         }
         self.wal_end.load(Ordering::Relaxed)
+    }
+
+    /// Whether the writer has the current log's write-through handle open, so that
+    /// small commits into preallocated space use direct writes (for tests).
+    #[doc(hidden)]
+    pub fn wal_direct_active(&self) -> bool {
+        matches!(self.writer.lock().wal_direct, wal::Direct::Open(_))
     }
 }
 
@@ -5142,13 +5162,24 @@ impl WriteTxn<'_> {
             // once the first byte is written, a failure leaves the WAL in an unknown
             // state: refuse further writes, so a seq can never be written twice
             let alloc_before = w.wal_alloc;
-            let written = wal
-                .flush()
-                .and_then(|_| {
-                    wal::write_commit(wal.get_ref(), w.wal_len, &mut w.wal_alloc, &data, prealloc)
-                })
-                .map_err(Error::from)
-                .and_then(|_| sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync));
+            let dir = gen_
+                .dir
+                .as_deref()
+                .filter(|_| self.store.opts.wal_direct_writes);
+            let written = wal.flush().map_err(Error::from).and_then(|_| {
+                if wal::DirectLog::fits(w.wal_len, data.len(), w.wal_alloc)
+                    && let Some(direct) = w.wal_direct.handle(dir, wal.get_ref())
+                {
+                    if commit_direct(direct, w.wal_len, &data, &gen_.dvocab, &mut w.vocab_sync)? {
+                        return Ok(());
+                    }
+                    // the file system refused direct I/O: write this commit and the
+                    // later ones the buffered way
+                    w.wal_direct = wal::Direct::Off;
+                }
+                wal::write_commit(wal.get_ref(), w.wal_len, &mut w.wal_alloc, &data, prealloc)?;
+                sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync)
+            });
             if let Err(e) = written {
                 w.poisoned = true;
                 let _ = self.store.annotations.lock().undo(c.seq);
@@ -5644,6 +5675,35 @@ fn sync_commit_reused(
     // Always await both, including when WAL sync fails, before releasing ownership.
     synced?;
     vocab
+}
+
+/// Write a commit's WAL records `data` at the log's logical end `at` through the
+/// write-through handle (see [`wal::DirectLog`]), and sync the delta terms it added, if
+/// any, at the same time on the vocabulary worker. `Ok(true)` once both are durable;
+/// `Ok(false)` when the file system refused direct I/O, after which the caller writes
+/// and syncs the records the buffered way. The commit is acknowledged only after both
+/// succeed. A crash in between can leave either file ahead of the other, which replay
+/// handles as it does for [`sync_commit_reused`].
+fn commit_direct(
+    direct: &mut wal::DirectLog,
+    at: u64,
+    data: &[u8],
+    dvocab: &DeltaVocab,
+    worker: &mut crate::vocab::LazySync,
+) -> Result<bool> {
+    if !dvocab.needs_sync() {
+        return Ok(direct.write(at, data)?);
+    }
+    let pending = dvocab.sync_on(worker);
+    let written = direct.write(at, data);
+    let vocab = match pending {
+        Some(pending) => pending.wait(),
+        None => dvocab.sync(),
+    };
+    // Always await both, including when the WAL write fails, before releasing ownership.
+    let written = written?;
+    vocab?;
+    Ok(written)
 }
 
 fn sync_commit(wal: &File, dvocab: &DeltaVocab) -> Result<()> {
