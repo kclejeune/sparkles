@@ -5,8 +5,8 @@
 > **Phases:** The engine/Jena contract surface, Fuseki assembler, historical reads,
 > dumps, native DESCRIBE and refined ARQ fallback are implemented. Typed catalog,
 > branches, backups, settings, history, indexes, stored queries, schema, GraphQL,
-> reasoning and validation extend the SDK. Release workflows assemble five native
-> platforms, classifier jars, a Fuseki bundle and source/documentation artifacts;
+> reasoning and validation extend the SDK. Release workflows assemble three native
+> platforms (Linux on x86_64 and arm64, macOS on Apple silicon), classifier jars, a Fuseki bundle and source/documentation artifacts;
 > Linux is validated locally. Administration helpers are implemented; batched fallback graph patterns,
 > Java callbacks, musl and comparative performance targets remain follow-up work.
 > The [Outcome](#outcome) records the supported scope and deferrals.
