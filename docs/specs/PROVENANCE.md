@@ -570,7 +570,12 @@ implementation landed.
     F04, F06, F08, F09, X04 and X05.
 
   The revision of the same day added model roles with escalation, explanations, the
-  optimizer and the choice of pdf-inspector.
+  optimizer and the choice of pdf-inspector. A later revision of that day added the import of
+  coding agents' memory and the `sparkles memory` commands, written from Claude Code's
+  documentation on memory and hooks, OpenAI's Codex documentation on `AGENTS.md`, hooks
+  and memories, Gemini CLI's and Cursor's documentation of their instruction files, the
+  documented token formats of common providers for redaction, the structure of local
+  Claude Code and Codex files read only for their keys, and specs G05 and P02.
 - **Implementation:** not built. Phase 1's clients for Ollama, OpenAI-compatible
   endpoints and Anthropic's API reuse the outbound HTTP client of F08, and the rest of
   Phases 1 to 3 plans no new runtime dependency. Phase 4 adds `pdf-inspector` at an
