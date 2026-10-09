@@ -19,6 +19,7 @@ use std::time::Instant;
 mod binary;
 mod bind;
 mod distinct;
+mod expand;
 mod filter;
 pub mod graph;
 mod group;
@@ -1085,6 +1086,7 @@ enum State {
     Binary(Box<binary::Binary>),
     Group(Box<group::Group>),
     Filter(Box<filter::Filter>),
+    Expand(Box<expand::Expand>),
     Scan(Scan),
     Values {
         table: Table,
@@ -1231,6 +1233,16 @@ fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
             | Kind::Extend(..)
             | Kind::Slice { .. } => child(0).to_vec(),
             Kind::Union if children.len() == 1 => child(0).to_vec(),
+            // Each input row expands in place, but an unbound input value may be
+            // filled.
+            Kind::IndexJoin(_) | Kind::Assign(..) | Kind::Unfold { .. } | Kind::Unpack { .. } => {
+                let fills = expand::fills(node);
+                child(0)
+                    .iter()
+                    .take_while(|v| node.children[0].certain.contains(v) || !fills.contains(v))
+                    .copied()
+                    .collect()
+            }
             // Concatenated UNION arms are not ordered, and counts are a single row.
             _ => Vec::new(),
         },
@@ -1248,6 +1260,7 @@ impl Operator {
         // materializes does not depend on the order its children turn out to have.
         let joins = binary::eligible(&node);
         let incremental_group = group::eligible(&node);
+        let expanding = expand::eligible(&node);
         let native_blocking =
             matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. }) && node.children.len() == 1;
         // A native sort consumes cursor batches into charged state. It blocks before
@@ -1258,6 +1271,7 @@ impl Operator {
         let materializes = !supported(&node.kind)
             && !joins
             && !incremental_group
+            && !expanding
             && (!native_blocking || exists_keys);
         if materializes && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
@@ -1330,7 +1344,8 @@ impl Operator {
             || native_blocking
             || incremental_merge
             || incremental_binary
-            || incremental_group;
+            || incremental_group
+            || expanding;
         let order = output_order(
             &node,
             &children,
@@ -1379,6 +1394,8 @@ impl Operator {
             State::Group(Box::new(group))
         } else if filter::eligible(&node, &children) {
             State::Filter(Box::new(filter::Filter::new(node)))
+        } else if expanding {
+            State::Expand(Box::new(expand::Expand::new(node)))
         } else if native_blocking {
             State::Blocking {
                 node,
@@ -1683,8 +1700,11 @@ impl Operator {
                 .checked_add(b.table.len)
                 .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
             ctx.check_rows(self.rows)?;
-            // Eager fallback already counted all its operator work during execution.
-            if !matches!(self.state, State::Fallback { .. } | State::Scalar(_)) {
+            // Eager kernels already counted all their operator work during execution.
+            if !matches!(
+                self.state,
+                State::Fallback { .. } | State::Scalar(_) | State::Expand(_)
+            ) {
                 ctx.produced(b.table.len)?;
             }
             if !matches!(self.state, State::Fallback { .. }) {
@@ -1725,6 +1745,12 @@ impl Operator {
                 State::Filter(filter) => {
                     let batch = filter.next(ctx, &mut self.children[0], options, cap)?;
                     self.done = filter.done(self.children[0].done);
+                    batch
+                }
+                State::Expand(expand) => {
+                    let batch =
+                        expand.next(ctx, &mut self.children[0], options, &self.vars, cap)?;
+                    self.done = expand.done(self.children[0].done);
                     batch
                 }
                 State::Distinct(distinct) => {
