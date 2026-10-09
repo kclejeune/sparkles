@@ -528,7 +528,11 @@ public class DatasetGraphSparkles internal constructor(
         handle.fallbackQueries.get(),
         handle.nativeUpdates.get(),
         handle.fallbackUpdates.get(),
+        handle.smallQueries.get(),
     )
+
+    /** Whether queries on this dataset apply RDFS on read, a setting only Sparkles' engine applies. */
+    internal fun rdfsOnRead(): Boolean = ffi { SparklesJni.rdfsEnabled(handle.ffi) }
 
     /**
      * Release this handle. The native dataset closes, and its directory lock is released,

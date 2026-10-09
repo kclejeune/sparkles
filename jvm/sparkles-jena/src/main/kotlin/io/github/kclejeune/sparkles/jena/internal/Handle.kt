@@ -75,6 +75,7 @@ internal class Handle(val key: String?, val ffi: FfiDataset, val options: Sparkl
 
     val nativeQueries = AtomicLong()
     val fallbackQueries = AtomicLong()
+    val smallQueries = AtomicLong()
     val nativeUpdates = AtomicLong()
     val fallbackUpdates = AtomicLong()
 

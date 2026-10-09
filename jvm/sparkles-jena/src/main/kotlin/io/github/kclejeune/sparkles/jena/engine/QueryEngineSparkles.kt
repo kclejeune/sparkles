@@ -120,6 +120,10 @@ public object QueryEngineSparkles {
             dsg.handle.fallbackQueries.incrementAndGet()
             return arqPlan(query, dsg, input, context)
         }
+        if (mode == SparklesFallback.AUTO && SmallQueries.route(query, dsg, context, input)) {
+            dsg.handle.smallQueries.incrementAndGet()
+            return arqPlan(query, dsg, input, context)
+        }
         dsg.handle.nativeQueries.incrementAndGet()
         val text = sparklesText(query)
         val opts = requestOptions(dsg, context, input.takeUnless { it.isEmpty })

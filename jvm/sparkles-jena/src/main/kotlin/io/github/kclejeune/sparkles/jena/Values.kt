@@ -128,13 +128,18 @@ public class DatasetStats internal constructor(
     public val nativeUpdates: Long,
     /** update operations that ran in ARQ */
     public val fallbackUpdates: Long,
+    /**
+     * small queries that ran in ARQ over `find()` because that was estimated to be faster
+     * than Sparkles' engine, which neither of the other query counts includes
+     */
+    public val smallQueries: Long,
 ) {
     override fun equals(other: Any?): Boolean = other is DatasetStats && nativeQueries == other.nativeQueries &&
         fallbackQueries == other.fallbackQueries && nativeUpdates == other.nativeUpdates &&
-        fallbackUpdates == other.fallbackUpdates
+        fallbackUpdates == other.fallbackUpdates && smallQueries == other.smallQueries
 
-    override fun hashCode(): Int = Objects.hash(nativeQueries, fallbackQueries, nativeUpdates, fallbackUpdates)
+    override fun hashCode(): Int = Objects.hash(nativeQueries, fallbackQueries, nativeUpdates, fallbackUpdates, smallQueries)
 
     override fun toString(): String = "DatasetStats(nativeQueries=$nativeQueries, fallbackQueries=$fallbackQueries, " +
-        "nativeUpdates=$nativeUpdates, fallbackUpdates=$fallbackUpdates)"
+        "nativeUpdates=$nativeUpdates, fallbackUpdates=$fallbackUpdates, smallQueries=$smallQueries)"
 }

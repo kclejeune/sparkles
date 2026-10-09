@@ -27,7 +27,7 @@ import java.nio.ByteBuffer
  */
 public object SparklesJni {
     /** The entry points' version, which `jni_calls.rs` must return. */
-    private const val ABI_VERSION = 1
+    private const val ABI_VERSION = 2
 
     private val groups: Set<String> = System.getProperty("sparkles.jni")?.trim()?.lowercase().let { p ->
         when (p) {
@@ -82,6 +82,13 @@ public object SparklesJni {
         // counted native call
         val h = ds.uniffiBorrowHandle { jni { beginRead(it) } }
         return FfiReadTxn(UniffiWithHandle, h)
+    }
+
+    /** Whether the dataset applies RDFS on read, through JNI when the `find` group is on. */
+    public fun rdfsEnabled(ds: FfiDataset): Boolean {
+        if (!FIND) return ds.rdfsEnabled()
+        // counted native call
+        return ds.uniffiBorrowHandle { jni { rdfsEnabledNative(it) } }
     }
 
     public fun contains(ds: FfiDataset, pattern: ByteArray): Boolean {
@@ -194,6 +201,7 @@ public object SparklesJni {
     @JvmStatic private external fun selfTestNative(kind: Int): Int
     @JvmStatic private external fun abiVersion(): Int
     @JvmStatic private external fun beginRead(dataset: Long): Long
+    @JvmStatic private external fun rdfsEnabledNative(dataset: Long): Boolean
     @JvmStatic private external fun containsHead(dataset: Long, pattern: ByteArray): Boolean
     @JvmStatic private external fun containsRead(txn: Long, pattern: ByteArray): Boolean
     @JvmStatic private external fun findHead(dataset: Long, pattern: ByteArray, firstRows: Int, out: LongArray): ByteArray
