@@ -662,20 +662,21 @@ pub fn write_cursor_native_json(
                     writer.write_all(b",")?;
                 }
                 writer.write_all(b"[")?;
+                // One reservation covers the row's uncached cells through their
+                // serialization, as in the other result formats.
+                let bytes = match &decoded {
+                    Some(d) => d.row_bytes(row)?,
+                    None => batch.row_bytes(row)?,
+                };
+                let _charge = (bytes != 0).then(|| cursor.charge(bytes)).transpose()?;
                 for col in 0..batch.width() {
                     if col > 0 {
                         writer.write_all(b",")?;
                     }
-                    let bytes = match &decoded {
-                        Some(d) => d.cell_bytes(row, col)?,
-                        None => batch.cell_bytes(row, col)?,
-                    };
-                    let _charge = (bytes != 0).then(|| cursor.charge(bytes)).transpose()?;
                     let term = match &decoded {
                         Some(d) => d.term(row, col)?,
                         None => batch.term(row, col)?.map(Cow::Owned),
                     };
-                    // Keep the decoded cell charged through its serialization.
                     json(
                         &mut writer,
                         &term.as_ref().map(|t| NativeTerm(t.as_ref().as_ref())),
