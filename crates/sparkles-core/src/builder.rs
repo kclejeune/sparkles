@@ -3,9 +3,10 @@
 //! 1. **Parse & encode** (parallel): each parser chunk owns an [`Encoder`] that maps
 //!    terms to inline ids / blank-node ids, or to *batch-local* ids for vocabulary terms.
 //!    Every `batch_quads` quads, the batch's distinct keys are sorted and written as a
-//!    partial vocabulary (front-coded and LZ4-compressed blocks, see
+//!    partial vocabulary (front-coded and compressed blocks, see
 //!    [`vocabmerge::write_partial`]) together with the batch's quads (compressed blocks
-//!    of columns, in the format of a sorted run).
+//!    of columns, in the format of a sorted run). Keys that recur across batches are
+//!    kept in memory and written once, as one more partial vocabulary (see [`hotkeys`]).
 //! 2. **Vocabulary merge**: k-way merge of all partial vocabularies into the sorted,
 //!    front-coded base vocabulary; per-batch `rank → global id` maps are written
 //!    along the way as delta-coded records (see [`vocabmerge::Maps`]).
@@ -21,6 +22,7 @@
 //!    these pairs). Without named graphs GSPO is SPO behind the one graph. Writers run
 //!    in threads of their own. Statistics for the planner are gathered on the way.
 
+mod hotkeys;
 mod iostat;
 mod runs;
 mod vocabmerge;
@@ -53,6 +55,11 @@ pub struct BuildOptions {
     pub batch_key_bytes: usize,
     /// Max quads sorted in memory at once (32 bytes each).
     pub sort_mem_quads: usize,
+    /// Memory for the keys that recur across batches, which are then written once for
+    /// the whole load instead of once per batch (see [`hotkeys`]). They are held until
+    /// the parse ends, together with a filter of [`hotkeys::SEEN_BYTES`]. Zero turns
+    /// this off.
+    pub hot_key_bytes: usize,
     /// First blank node id to allocate.
     pub first_bnode: u64,
 }
@@ -64,6 +71,7 @@ impl Default for BuildOptions {
             batch_quads: 4_000_000,
             batch_key_bytes: 128 << 20,
             sort_mem_quads: 64_000_000,
+            hot_key_bytes: 1 << 30,
             first_bnode: 0,
         }
     }
@@ -205,6 +213,7 @@ pub struct Builder {
     tmp_bytes: iostat::TmpBytes,
     /// the start of the current phase and of the build
     phases: Mutex<(iostat::Phases, iostat::Phases)>,
+    hot: hotkeys::HotKeys,
 }
 
 /// The messages of a long-running build, one per phase (`building POS`). A build does
@@ -233,6 +242,7 @@ impl Builder {
             dir: dir.to_path_buf(),
             tmp,
             next_bnode: AtomicU64::new(opts.first_bnode),
+            hot: hotkeys::HotKeys::new(opts.hot_key_bytes as u64),
             opts,
             batches: Mutex::new(Vec::new()),
             next_batch: AtomicUsize::new(0),
@@ -307,8 +317,9 @@ impl Builder {
     }
 
     /// Write a batch: its keys sorted as a partial vocabulary, and its quads with each
-    /// local id replaced by the rank of its key. `order` and `rank` are buffers kept by
-    /// the encoder.
+    /// local id replaced by the rank of its key. A hot key (see [`hotkeys`]) is left out
+    /// of the partial vocabulary, and its local id is replaced by its hot id after the
+    /// ranks. `order` and `rank` are buffers kept by the encoder.
     fn write_batch(
         &self,
         keys: &KeySet,
@@ -320,11 +331,34 @@ impl Builder {
             return Ok(());
         }
         let id = self.next_batch.fetch_add(1, Ordering::Relaxed);
-        order.clear();
-        order.extend(0..keys.len() as u32);
-        order.par_sort_unstable_by(|&a, &b| keys.key(a).cmp(keys.key(b)));
+        const NOT_HOT: u32 = u32::MAX;
         rank.clear();
-        rank.resize(keys.len(), 0);
+        rank.resize(keys.len(), NOT_HOT);
+        order.clear();
+        // The first batch of each parser thread looks for no hot keys, so that a load
+        // of one batch per thread does not fill the filter of seen keys. Its keys are
+        // not recorded as seen either, which loses little on a load of many batches.
+        if self.opts.hot_key_bytes > 0 && id >= self.opts.threads.max(1) {
+            rank.par_iter_mut()
+                .enumerate()
+                .with_min_len(1 << 12)
+                .for_each(|(i, r)| {
+                    if let Some(h) = self.hot.classify(keys.key(i as u32)) {
+                        *r = h;
+                    }
+                });
+            order.extend((0..keys.len() as u32).filter(|&i| rank[i as usize] == NOT_HOT));
+        } else {
+            order.extend(0..keys.len() as u32);
+        }
+        order.par_sort_unstable_by(|&a, &b| keys.key(a).cmp(keys.key(b)));
+        let own = order.len() as u32;
+        for r in rank.iter_mut().filter(|r| **r != NOT_HOT) {
+            *r = own
+                .checked_add(*r)
+                .filter(|&v| v != NOT_HOT)
+                .ok_or_else(|| Error::Corrupt("too many hot keys".into()))?;
+        }
         for (r, &local) in order.iter().enumerate() {
             rank[local as usize] = r as u32;
         }
@@ -348,7 +382,7 @@ impl Builder {
         self.batches.lock().push(BatchInfo {
             id,
             pos: 0,
-            keys: keys.len() as u64,
+            keys: own as u64,
             voc_bytes,
             quads: quads.len() as u64,
             samples,
@@ -357,18 +391,29 @@ impl Builder {
     }
 
     /// Run the merge / sort phases and write the generation. Returns index metadata.
-    pub fn finish(self) -> Result<IndexMeta> {
+    pub fn finish(mut self) -> Result<IndexMeta> {
         let mut batches = std::mem::take(&mut *self.batches.lock());
         batches.sort_by_key(|b| b.id);
         for (i, b) in batches.iter_mut().enumerate() {
             b.pos = i;
         }
         let total_in: u64 = batches.iter().map(|b| b.quads).sum();
+        // the hot keys are one more partial vocabulary, after the batches
+        let hot = std::mem::replace(&mut self.hot, hotkeys::HotKeys::new(0));
+        let hot_keys = hot.len() as u64;
+        let hot_voc = self.tmp.join("hot.voc");
+        let ((hot_samples, hot_bytes), hot_order) = if hot_keys > 0 {
+            hot.write(|keys| vocabmerge::write_partial(&hot_voc, keys))?
+        } else {
+            ((Vec::new(), 0), Vec::new())
+        };
+        self.tmp_bytes.add(iostat::Tmp::PartialVocab, hot_bytes);
         self.phase_done("parse");
         self.report(&format!(
-            "merging {} partial vocabularies ({} input quads)",
+            "merging {} partial vocabularies ({} input quads, {} hot keys)",
             batches.len(),
-            total_in
+            total_in,
+            hot_keys
         ));
 
         // ---- 2. vocabulary merge -------------------------------------------------
@@ -376,13 +421,13 @@ impl Builder {
         // each merging thread reads every batch's vocabulary at once: as many threads as
         // the open-file limit allows, down to one, which needs as many files as a merge
         // in one thread
-        let files = |t: usize| t as u64 * batches.len() as u64 + 256;
+        let files = |t: usize| t as u64 * (batches.len() as u64 + 1) + 256;
         let mut threads = self.opts.threads.max(1);
         while threads > 1 && crate::disk::ensure_open_files(files(threads)).is_err() {
             threads -= 1;
         }
         crate::disk::ensure_open_files(files(threads))?;
-        let parts: Vec<vocabmerge::Partial> = batches
+        let mut parts: Vec<vocabmerge::Partial> = batches
             .iter_mut()
             .map(|b| vocabmerge::Partial {
                 voc: self.tmp.join(format!("b{}.voc", b.id)),
@@ -391,6 +436,14 @@ impl Builder {
                 samples: std::mem::take(&mut b.samples),
             })
             .collect();
+        if hot_keys > 0 {
+            parts.push(vocabmerge::Partial {
+                voc: hot_voc,
+                keys: hot_keys,
+                bytes: hot_bytes,
+                samples: hot_samples,
+            });
+        }
         let (terms, maps) = vocabmerge::merge(
             &self.dir,
             &self.tmp,
@@ -402,6 +455,15 @@ impl Builder {
         for p in parts {
             std::fs::remove_file(p.voc)?;
         }
+        // the global id of each hot id
+        let mut hot = vec![0u64; hot_keys as usize];
+        if hot_keys > 0 {
+            let ids = maps.read(batches.len(), hot_keys)?;
+            for (&h, g) in hot_order.iter().zip(ids) {
+                hot[h as usize] = g;
+            }
+        }
+        drop(hot_order);
         self.phase_done("vocabulary merge");
         self.report(&format!("vocabulary: {terms} terms"));
 
@@ -414,11 +476,11 @@ impl Builder {
         drop(vocab);
         let plan = Plan::new(self.named_graphs.load(Ordering::Relaxed));
         let mut built = if total_in as usize <= self.opts.sort_mem_quads {
-            let built = self.build_in_memory(&batches, maps, &plan, rdf_type)?;
+            let built = self.build_in_memory(&batches, maps, &hot, &plan, rdf_type)?;
             self.phase_done("sort and permutations");
             built
         } else {
-            let runs = self.sorted_runs(&batches, maps, &plan)?;
+            let runs = self.sorted_runs(&batches, maps, &hot, &plan)?;
             self.phase_done("chunk sorts");
             let built = self.merge_runs(runs, &plan, rdf_type)?;
             self.phase_done("permutations");
@@ -481,12 +543,13 @@ impl Builder {
         Ok(meta)
     }
 
-    /// Read the batches of `chunk` into `buf`, remapped to global ids by `maps`, and
-    /// delete them.
+    /// Read the batches of `chunk` into `buf`, remapped to global ids by `maps` and by
+    /// `hot` (the global id of each hot id), and delete them.
     fn load_chunk(
         &self,
         chunk: &[BatchInfo],
         maps: &vocabmerge::Maps,
+        hot: &[u64],
         buf: &mut Vec<Key>,
     ) -> Result<()> {
         let n: usize = chunk.iter().map(|b| b.quads as usize).sum();
@@ -513,7 +576,11 @@ impl Builder {
                     for (q, k) in dst.iter_mut().zip(&block) {
                         for (v, &x) in q.iter_mut().zip(k) {
                             *v = if Id(x).tag() == Tag::Local {
-                                let g = map.get(Id(x).payload() as usize).ok_or_else(bad)?;
+                                let p = Id(x).payload() as usize;
+                                let g = match map.get(p) {
+                                    Some(g) => g,
+                                    None => hot.get(p - map.len()).ok_or_else(bad)?,
+                                };
                                 Id::vocab(*g).0
                             } else {
                                 x
@@ -546,6 +613,7 @@ impl Builder {
         &self,
         batches: &[BatchInfo],
         maps: vocabmerge::Maps,
+        hot: &[u64],
         plan: &Plan,
     ) -> Result<Vec<Vec<PathBuf>>> {
         let budget = self.opts.sort_mem_quads.max(1) as u64;
@@ -573,7 +641,7 @@ impl Builder {
                 chunks.len(),
                 chunk.iter().map(|b| b.quads).sum::<u64>()
             ));
-            self.load_chunk(chunk, &maps, &mut buf)?;
+            self.load_chunk(chunk, &maps, hot, &mut buf)?;
             let mut cur = Perm::Spo;
             for (o, (first, _)) in plan.orders.iter().enumerate() {
                 Self::sort_as(&mut buf, cur, *first);
@@ -642,11 +710,12 @@ impl Builder {
         &self,
         batches: &[BatchInfo],
         maps: vocabmerge::Maps,
+        hot: &[u64],
         plan: &Plan,
         rdf_type: Option<u64>,
     ) -> Result<Vec<Built>> {
         let mut buf: Vec<Key> = Vec::new();
-        self.load_chunk(batches, &maps, &mut buf)?;
+        self.load_chunk(batches, &maps, hot, &mut buf)?;
         maps.remove()?;
         let mut cur = Perm::Spo;
         let mut out = Vec::new();
@@ -928,19 +997,45 @@ impl KeySet {
         key_at(&self.bytes, &self.starts, id)
     }
 
+    #[inline]
+    fn hash(key: &[u8]) -> u64 {
+        rustc_hash::FxBuildHasher.hash_one(key)
+    }
+
+    /// The id of `key`, whose hash is `hash`, if the set holds it.
+    #[inline]
+    fn find(&self, hash: u64, key: &[u8]) -> Option<u32> {
+        self.table
+            .find(hash, |&i| key_at(&self.bytes, &self.starts, i) == key)
+            .copied()
+    }
+
+    /// Add `key`, whose hash is `hash` and which the set does not hold. Returns its id.
+    fn insert(&mut self, hash: u64, key: &[u8]) -> u32 {
+        let Self {
+            bytes,
+            starts,
+            table,
+        } = self;
+        let id = starts.len() as u32;
+        table.insert_unique(hash, id, |&i| Self::hash(key_at(bytes, starts, i)));
+        starts.push(bytes.len());
+        bytes.extend_from_slice(key);
+        id
+    }
+
     /// The id of `key`, which is added if it is new.
     #[inline]
     fn id(&mut self, key: &[u8]) -> u32 {
-        let hash = |k: &[u8]| rustc_hash::FxBuildHasher.hash_one(k);
         let Self {
             bytes,
             starts,
             table,
         } = self;
         let entry = table.entry(
-            hash(key),
+            Self::hash(key),
             |&i| key_at(bytes, starts, i) == key,
-            |&i| hash(key_at(bytes, starts, i)),
+            |&i| Self::hash(key_at(bytes, starts, i)),
         );
         match entry {
             hashbrown::hash_table::Entry::Occupied(e) => *e.get(),
@@ -1470,7 +1565,8 @@ mod tests {
     }
 
     /// Tiny batch / sort budgets force many partial vocabularies and the external
-    /// sorted-runs + k-way-merge path; the result must equal the in-memory build.
+    /// sorted-runs + k-way-merge path; the result must equal the in-memory build. Hot
+    /// keys, a budget that runs out and no hot keys at all give the same index.
     #[test]
     fn external_sort_matches_in_memory() {
         let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
@@ -1521,7 +1617,22 @@ mod tests {
             batch_key_bytes: usize::MAX,
             sort_mem_quads: 50,
             threads: 3,
+            hot_key_bytes: 1 << 20,
             first_bnode: 0,
+        });
+        let no_hot = build(BuildOptions {
+            batch_quads: 7,
+            sort_mem_quads: 50,
+            threads: 3,
+            hot_key_bytes: 0,
+            ..Default::default()
+        });
+        let hot_spent = build(BuildOptions {
+            batch_quads: 7,
+            sort_mem_quads: 50,
+            threads: 3,
+            hot_key_bytes: 400,
+            ..Default::default()
         });
         // batches that end at a few keys' bytes rather than at a quad count
         let short = build(BuildOptions {
@@ -1536,6 +1647,8 @@ mod tests {
         assert_eq!(small.1, big.1);
         assert_eq!(small.2, big.2);
         assert_eq!(short, big);
+        assert_eq!(no_hot, big);
+        assert_eq!(hot_spent, big);
     }
 
     /// Every permutation holds each distinct quad once, in its own order, whether it is
