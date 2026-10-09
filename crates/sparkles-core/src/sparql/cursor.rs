@@ -24,6 +24,7 @@ pub mod graph;
 mod group;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 mod merge;
+mod topk;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FallbackPolicy {
@@ -1109,6 +1110,7 @@ enum State {
         loaded: Option<Buffer>,
         at: usize,
     },
+    TopK(Box<topk::TopK>),
 }
 
 struct Operator {
@@ -1332,8 +1334,14 @@ impl Operator {
         let binary = incremental_binary
             .then(|| binary::Binary::new(ctx, &node))
             .transpose()?;
+        let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
         let reason = (materializes || native_blocking).then(|| {
-            if native_blocking {
+            if let (true, Kind::OrderBy { limit: Some(k), .. }) = (heap, &node.kind) {
+                format!(
+                    "{} reads all input but keeps only its best {k} rows under the memory budget before output",
+                    node.operator()
+                )
+            } else if native_blocking {
                 format!(
                     "{} consumes all input under the memory budget before output",
                     node.operator()
@@ -1354,6 +1362,8 @@ impl Operator {
             State::Group(Box::new(group))
         } else if filter::eligible(&node, &children) {
             State::Filter(Box::new(filter::Filter::new(node)))
+        } else if heap {
+            State::TopK(Box::new(topk::TopK::new(ctx, &node, &children[0].vars)?))
         } else if native_blocking {
             State::Blocking {
                 node,
@@ -1483,7 +1493,11 @@ impl Operator {
             full_input_before_output: self.materializes
                 || matches!(
                     self.state,
-                    State::Binary(_) | State::Group(_) | State::Scalar(_) | State::Blocking { .. }
+                    State::Binary(_)
+                        | State::Group(_)
+                        | State::Scalar(_)
+                        | State::Blocking { .. }
+                        | State::TopK(_)
                 ),
             growing_state: self.growing,
             complete: false,
@@ -1716,6 +1730,11 @@ impl Operator {
                 State::Scan(scan) => {
                     let b = scan.next(ctx, &self.vars, cap)?;
                     self.done = scan.done();
+                    b
+                }
+                State::TopK(topk) => {
+                    let b = topk.next(ctx, &mut self.children[0], options, cap)?;
+                    self.done = topk.done();
                     b
                 }
                 State::Blocking { node, loaded, at } => {

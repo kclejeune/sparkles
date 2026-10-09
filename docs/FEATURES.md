@@ -47,7 +47,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 
 | Feature | Status |
 |---|---|
-| Snapshot-owning SELECT and graph cursors in Rust, Python and Node, opt-in JVM SELECT pulls, and HTTP/CLI execution selection. Direct result writers use bounded output buffers, backpressure, cumulative budgets and body-lifetime cancellation. Joins resume across batches; hash joins, DISTINCT and eligible aggregates retain charged state. Sorting and unsupported shapes expose budgeted materialization, failing explicitly when the budget is exceeded. Automatic execution selects measured eligible large immutable scans and uncached OPTIONAL COUNT queries. Eager remains the default; explicit streaming can cost more on some workloads. Disk spill is not implemented. | ✅ |
+| Snapshot-owning SELECT and graph cursors in Rust, Python and Node, opt-in JVM SELECT pulls, and HTTP/CLI execution selection. Direct result writers use bounded output buffers, backpressure, cumulative budgets and body-lifetime cancellation. Joins resume across batches; hash joins, DISTINCT and eligible aggregates retain charged state. ORDER BY with LIMIT keeps only its best rows in a bounded heap. A full sort and unsupported shapes expose budgeted materialization, failing explicitly when the budget is exceeded. Automatic execution selects measured eligible large immutable scans and uncached OPTIONAL COUNT queries. Eager remains the default; explicit streaming can cost more on some workloads. Disk spill is not implemented. | ✅ |
 | The value space: numeric promotion, comparisons, effective boolean values and the total order for ORDER BY. | ✅ |
 | SPARQL 1.1 Query: BGP, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries, GROUP BY and aggregates, ORDER BY, DISTINCT, LIMIT/OFFSET and EXISTS. | ✅ |
 | RDF 1.2 and SPARQL 1.2 in every RDF syntax. This covers triple terms (`<<( s p o )>>`), the reification syntax `<< >>`, annotations, base-direction literals (`"x"@en--rtl`), and the functions `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, `LANGDIR`, `hasLANG`, `hasLANGDIR` and `STRLANGDIR`. | ✅ |
@@ -160,8 +160,9 @@ These are features other RDF stores have and Sparkles does not have yet.
   eagerly by default, and each operator then materializes its result within budgets.
   Streaming execution ([X05](specs/X05-streaming-query-execution.md)) is opt-in, apart
   from the scans and OPTIONAL counts that automatic selection picks. It runs scans,
-  joins, DISTINCT and eligible aggregates batch by batch. Sorts and DESCRIBE still
-  collect their whole input, and EXISTS and the operators it does not support run
+  joins, DISTINCT and eligible aggregates batch by batch. ORDER BY with LIMIT reads its
+  input batch by batch into a heap of the rows it returns. Sorts without LIMIT and
+  DESCRIBE still collect their whole input, and EXISTS and the operators it does not support run
   eagerly. Operator state is never spilled to disk, so a query whose state outgrows its
   budget fails. There is no FSST vocabulary compression, IRI encoding, pattern trick,
   pinned results, materialized views or live query monitoring.

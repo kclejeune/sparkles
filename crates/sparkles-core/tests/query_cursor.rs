@@ -2947,3 +2947,139 @@ fn random_queries_agree_between_cursor_and_eager_through_a_masked_view() {
     );
     differential("masked", &snapshot, &opts, SEEDS);
 }
+
+/// Values of every ORDER BY class, including dates with and without a timezone close
+/// to each other (no total order) and numbers equal across types.
+fn mixed_order_store(seed: u64, n: usize) -> Store {
+    let mut x = seed;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut data = String::from("@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n");
+    for i in 0..n {
+        let r = next();
+        let small = (r >> 8) as i64 % 30 - 15;
+        let v = match r % 13 {
+            0 | 1 => format!("{small}"),
+            2 => format!("\"{small}.50\"^^xsd:decimal"),
+            3 => format!("{small}.0e0"),
+            4 => format!("\"{small}.25\"^^xsd:float"),
+            5 => format!("\"s{}\"", small.abs()),
+            6 => format!(
+                "\"l{}\"@{}",
+                small.abs() % 4,
+                ["en", "EN", "fr"][(r >> 20) as usize % 3]
+            ),
+            7 => format!("<urn:o:{}>", small.abs() % 6),
+            8 => format!("_:b{}", small.abs() % 3),
+            9 => format!(
+                "\"2020-01-0{}T{:02}:00:00{}\"^^xsd:dateTime",
+                1 + (r >> 24) % 2,
+                (r >> 28) % 24,
+                ["", "Z", "+14:00", "-05:00"][(r >> 33) as usize % 4]
+            ),
+            10 => format!("\"P{}D\"^^xsd:dayTimeDuration", small.abs()),
+            11 => ["true", "false", "\"x\"^^<urn:dt>", "\"NaN\"^^xsd:double"]
+                [(r >> 9) as usize % 4]
+                .to_string(),
+            _ => format!("\"2020-01-0{}\"^^xsd:date", 1 + (r >> 24) % 3),
+        };
+        let subject = i % (n / 2 + 1);
+        data.push_str(&format!("<urn:s:{subject}> <urn:v> {v} .\n"));
+        if r % 3 != 0 {
+            data.push_str(&format!("<urn:s:{subject}> <urn:w> {} .\n", small * 7));
+        }
+    }
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s
+}
+
+#[test]
+fn streaming_top_k_matches_eager_in_order_at_every_batch_size() {
+    let s = mixed_order_store(0x2545_f491_4f6c_dd1d, 3000);
+    let queries = [
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 10",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 25",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v ?s LIMIT 40 OFFSET 7",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) DESC(?s) LIMIT 1",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ABS(?v) ?s LIMIT 30",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(STR(?v)) ?v LIMIT 12",
+        "SELECT ?s ?v ?w WHERE { ?s <urn:v> ?v OPTIONAL { ?s <urn:w> ?w } } ORDER BY DESC(?w) ?v ?s LIMIT 20",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v FILTER(isNumeric(?v)) } ORDER BY DESC(?v) LIMIT 15",
+        "SELECT ?v WHERE { ?s <urn:v> ?v FILTER(DATATYPE(?v) = <http://www.w3.org/2001/XMLSchema#dateTime>) } ORDER BY ?v LIMIT 5",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY (?v * 2) LIMIT 2999",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 100000",
+    ];
+    for q in queries {
+        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        for (rows, bytes) in [
+            (1, 1 << 20),
+            (2, 1 << 20),
+            (3, 16),
+            (7, 1 << 20),
+            (4096, 1 << 20),
+        ] {
+            let c = select_cursor(
+                s.snapshot(),
+                q,
+                &Default::default(),
+                &CursorOptions {
+                    batch_bytes: bytes,
+                    ..options(rows)
+                },
+            )
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert!(!c.plan().has_materialization(), "{q}");
+            assert_eq!(all(c), expected, "{q}; batch {rows}");
+        }
+    }
+}
+
+#[test]
+fn streaming_top_k_keeps_only_its_rows_within_the_memory_budget() {
+    let s = store(200_000);
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) LIMIT 5";
+    let budget = |heap: bool| QueryOptions {
+        max_memory_bytes: Some(2 << 20),
+        optimizations: Some(sparkles_core::sparql::Optimizations {
+            topk_heap: heap,
+            ordered_topk: false,
+            ..sparkles_core::sparql::Optimizations::ALL
+        }),
+        ..Default::default()
+    };
+    let mut c = select_cursor(s.snapshot(), q, &budget(true), &options(4096)).unwrap();
+    fn reasons(p: &sparkles_core::sparql::CursorPlan, out: &mut String) {
+        out.push_str(p.reason.as_deref().unwrap_or_default());
+        p.children.iter().for_each(|c| reasons(c, out));
+    }
+    let mut reason = String::new();
+    reasons(c.plan(), &mut reason);
+    assert!(reason.contains("best 5 rows"), "{reason}");
+    assert!(!c.plan().has_materialization());
+    let mut rows = Vec::new();
+    while let Some(b) = c.next_batch().unwrap() {
+        for i in 0..b.len() {
+            rows.push(b.row(i).unwrap());
+        }
+    }
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0][1], Some(oxrdf::Literal::from(199_999).into()));
+    // the input's IDs alone take 3.2 MB, more than the budget
+    assert!(c.stats().mem_peak_bytes <= 2 << 20);
+    // collecting the whole input for a sort does not fit
+    let mut c = select_cursor(s.snapshot(), q, &budget(false), &options(4096)).unwrap();
+    assert!(matches!(
+        c.next_batch(),
+        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+    ));
+}

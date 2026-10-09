@@ -588,8 +588,8 @@ probe input and the expansion of matching rows across batches, so neither the jo
 output nor its matching row pairs are materialized. All of these joins preserve
 duplicates and unbound compatibility. DISTINCT owns a charged key set. Eligible groups
 over plain variables keep aggregate state rather than input rows. Blocking sorts
-consume normal input batches even when the requested output prefix is small. They
-reserve their input, keys and reordering state, and they report their full-input
+without LIMIT consume normal input batches even when the requested output prefix is
+small. They reserve their input, keys and reordering state, and they report their full-input
 barrier separately from eager fallback, so the strict policy admits them. Growing state
 fails explicitly when its reservation exceeds the budget, because disk spill is not
 implemented. Unsupported operators and EXISTS expressions remain visible barriers that
@@ -652,6 +652,39 @@ substring filters and TSV output remain slower. Because of their growing-state
 accounting and mode differences, those shapes stay opt-in, and the narrow automatic
 admission does not select them.
 
+ORDER BY with LIMIT keeps a bounded heap of offset plus limit rows in both modes. Each
+ORDER BY key of a row is classified once into a sort key. Two keys compare by the class
+of their values, and within a class by an exact decimal, a double, a string or a
+boolean when that decides the order. Every other pair goes to the existing comparator.
+Such pairs are equal numbers of different datatypes, NaN, signed zeros, dates, times,
+durations, composite literals and triple terms. The key therefore gives the
+comparator's result on every pair of values, and ties keep falling back to input order.
+The heap reads the first key of every row and evaluates the later keys only for rows
+that can still enter it. Eager execution offers the rows of its input table. The cursor
+operator offers each input batch as it arrives and keeps at most k + 1 rows of IDs and
+their keys under the query budget, so a top-k over an input larger than the budget
+completes. Both modes feed the same heap in the same order. They return the same rows
+at every batch size, also when dates with and without a timezone make the order
+partial, which is the case that broke the earlier chunked top-k. When every value of a
+single numeric key is a number, the existing numeric prefilter first drops the rows that
+already have k rows strictly ahead of them, and the heap ranks the rest. The full sort
+without LIMIT still calls the comparator directly, because a key for every row of a 10.5M
+sort cost about 2% more than it saved. Ordered tests compare the key with the
+comparator on every pair of random values of every class and check the full sort's
+permutation. They check the heap against the sorted prefix whenever the random values
+are totally ordered, and streaming against eager over partial dates at batch sizes from
+1 to 4,096 rows. The `topk_heap` optimization turns the heap off.
+
+A/B/B/A runs on an otherwise idle 20-CPU host, pinned to 12 CPUs with mimalloc, compared
+the heap with the previous commit. At 1.05M, the expression sort key query took 1.20 ms
+instead of 1.71 ms eagerly and 1.31 ms instead of 1.69 ms when streaming. At 10.5M it took
+11.2 ms instead of 15.6 ms eagerly and 12.9 ms instead of 18.9 ms when streaming. Range
+TopK streaming at 1.05M took 3.09 ms instead of 3.69 ms. Eager range TopK and both range
+TopK runs at 10.5M stayed within 3% of the previous commit, as did the full sort, the
+other ordered and grouped queries, and 19 other queries in both modes. NOT EXISTS was the
+exception at 3.6% slower in both modes. Its code path did not change, and it executed the
+same number of instructions in both builds, so the difference is code layout.
+
 Disk spill, broader automatic selection and removing every remaining cost of complete
 responses are follow-up work. A review of the implementation found further follow-ups:
 
@@ -677,9 +710,6 @@ responses are follow-up work. A review of the implementation found further follo
   to the remaining throughput difference needs measurement. All overlapping input,
   decoded and transport state must remain charged, cancellable and bounded under
   slow consumers. Extra producer work must respect callback ownership.
-- A total order for sort keys would let ORDER BY with LIMIT keep a bounded heap.
-  It must preserve SPARQL term/date/error and tie semantics, with independent ordered
-  tests, before replacing the current full-input sort barrier.
 - Extend charged scan sharing and selective decoding to untouched block ranges of
   snapshots with pending changes. The merged scanner already emits untouched base
   blocks, but inserts, deletes and access-control masks must still be applied.

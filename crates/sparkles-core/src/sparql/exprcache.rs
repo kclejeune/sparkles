@@ -218,6 +218,21 @@ impl<T> Column<T> {
             Column::Values(p) => p.get(row),
         }
     }
+
+    /// The same column with each stored result converted, keeping its charge.
+    pub fn map<U>(self, f: impl FnMut(T) -> U) -> Column<U> {
+        match self {
+            Column::Rows { vals, _charge } => Column::Rows {
+                vals: vals.into_iter().map(f).collect(),
+                _charge,
+            },
+            Column::Values(p) => Column::Values(PerValue {
+                vals: p.vals.into_iter().map(f).collect(),
+                slot: p.slot,
+                _charge: p._charge,
+            }),
+        }
+    }
 }
 
 /// The distinct inputs of a column: a one-column table of sorted distinct ids (one row

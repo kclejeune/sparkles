@@ -187,10 +187,13 @@ pub struct Optimizations {
     /// ORDER BY DESC(spk:cosine(?v, C)) LIMIT k (or spk:dot) over one pattern reads the
     /// k best rows by an exact vector search
     pub vector_topk: bool,
+    /// ORDER BY with LIMIT keeps the best rows in a bounded heap of offset + limit rows,
+    /// evaluating the later keys only for rows whose first key can still enter
+    pub topk_heap: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 33] = [
+    pub const NAMES: [&str; 34] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -224,6 +227,7 @@ impl Optimizations {
         "filter_id_ranges",
         "text_subject_pushdown",
         "vector_topk",
+        "topk_heap",
     ];
 
     /// Everything on.
@@ -261,6 +265,7 @@ impl Optimizations {
         filter_id_ranges: true,
         text_subject_pushdown: true,
         vector_topk: true,
+        topk_heap: true,
     };
 
     /// Everything off: the generic operators only.
@@ -298,6 +303,7 @@ impl Optimizations {
         filter_id_ranges: false,
         text_subject_pushdown: false,
         vector_topk: false,
+        topk_heap: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -335,6 +341,7 @@ impl Optimizations {
             "filter_id_ranges" => &mut self.filter_id_ranges,
             "text_subject_pushdown" => &mut self.text_subject_pushdown,
             "vector_topk" => &mut self.vector_topk,
+            "topk_heap" => &mut self.topk_heap,
             _ => return None,
         })
     }
