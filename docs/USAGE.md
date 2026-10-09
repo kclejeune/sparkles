@@ -2094,6 +2094,21 @@ The tools are read-only unless the operator turns on the write tool:
 * `search_text` runs BM25 search over a full-text index. `--text` indexes `--data` files.
 * `similar_entities` runs exact search over stored `spk:vector` embeddings. It never
   computes embeddings.
+* `check_query` checks a SPARQL query against what the caller can see without running
+  it. It reports syntax errors with their line and column, unknown predicates and
+  classes with the nearest known ones, and warnings such as a simple literal matched
+  against labels that all carry a language tag.
+* `similar_queries` ranks the stored queries the caller may run by their similarity to
+  a question, using their descriptions, parameters and example `questions`, so an agent
+  can reuse a reviewed query instead of writing one.
+* `link_entities` maps names from a question to the entities they may denote, by exact
+  label, full-text and vector search, with a verdict of `exact`, `ambiguous`,
+  `candidates` or `none` and a few triples to tell candidates apart.
+* `recall` collects the facts around the entities that best match a question, or around
+  given seeds, and returns them as compact text with a citation for each fact. A
+  citation names the fact's graph and, when a reifier records it, the source, time,
+  author, confidence and quote. Superseded facts are listed on request, and facts that
+  two graphs disagree on are marked.
 * `validate_shacl` and `validate_shex` check a shapes graph, or a ShEx schema with a
   shape map, against a snapshot. They return counts and the first 20 results with node,
   shape and reason. They do not follow imports. `validate_shacl` takes the shapes in
@@ -2113,8 +2128,10 @@ Hosts can also attach resources as context: the schema summary
 (`sparkles://{ds}/schema`) and the prefixes (`sparkles://{ds}/prefixes`) of each
 dataset, and the definition of each stored query (`sparkles://{ds}/queries/{name}`).
 The prompts `explore_dataset` and `answer_question` start a session with the tool
-workflow and the dataset's prefixes, `run_stored_query` runs a stored query with its
-parameters explained, and `explain_term` explains a class, predicate or resource. Hosts
+workflow and the dataset's prefixes. `answer_question` points the agent to `recall`,
+`similar_queries` and `check_query` before it writes a query of its own.
+`run_stored_query` runs a stored query with its parameters explained, and
+`explain_term` explains a class, predicate or resource. Hosts
 that offer completion suggest dataset names, stored queries and their parameters, named
 graphs and prefixes for these arguments, from what the caller may see.
 

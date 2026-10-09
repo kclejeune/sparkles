@@ -1,18 +1,21 @@
 # C17: Agent memory over MCP
 
-> **Status:** specified
+> **Status:** implemented in part (Phase 1a)
 >
-> **Phases:** None shipped. Phase 1a adds four read tools to the MCP server:
-> `check_query`, `similar_queries`, `link_entities` and `recall`. Phase 1b adds the
-> `assert_facts` write tool with its data model of graphs, reifiers and supersession.
-> Phase 1c adds a `branch` argument to the MCP tools and tools that create, merge and
-> delete branches. Phase 2, model calls inside the server, is described in §10 and
-> deferred.
+> **Phases:** Phase 1a shipped on 2026-10-09. It adds four read tools to the MCP server,
+> `check_query`, `similar_queries`, `link_entities` and `recall`, and the `questions`
+> field of stored queries. Phase 1b adds the `assert_facts` write tool with its data
+> model of graphs, reifiers and supersession. Phase 1c adds a `branch` argument to the
+> MCP tools and tools that create, merge and delete branches. Phase 2, model calls
+> inside the server, is described in §10 and deferred.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [API: MCP tools](../API.md#tools) ·
+> [API: Stored queries](../API.md#stored-queries) ·
+> [Usage: MCP server](../USAGE.md#mcp-server-llm-agents) ·
+> [Features](../FEATURES.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how it lands.
 
 This design was written from the Model Context Protocol specification, the W3C RDF 1.2
 Concepts, Turtle 1.2 and SPARQL 1.2 drafts, SHACL, PROV-O, SKOS, published work on
@@ -1092,4 +1095,100 @@ commit 41.
 
 ## Outcome
 
-Nothing is built.
+**Phase 1a delivered on 2026-10-09.** Phases 1b, 1c and 2 are not built.
+
+- The server's `mcp::memory` module holds the four tools, one file each, and a small
+  text module with word splitting, a light plural stemmer, an in-memory BM25 index and
+  the Damerau–Levenshtein distance. Every internal query goes through a `Reader` built
+  from the call's query options for the `query` endpoint, so it runs with the caller's
+  graph grants and protections, the call's deadline, memory budget and row limit, and
+  the snapshot that `at` or `atCommit` names. Each internal query has a `LIMIT` or a
+  `VALUES` block of known size. Schema reports come from the same code path as
+  `describe_schema`, so a restricted view gets a report of its own.
+- `sparkles::stored::Definition` has `questions`, at most 20 non-empty strings of at most
+  500 characters, checked with the rest of the definition and described in the OpenAPI
+  document.
+- `sparkles::store::embed_texts` embeds several texts through a vector index's
+  provider, with its cache, batch size and input or query prefix.
+  `embed_query_text`, which `spk:vectorSearch` uses, now calls it.
+- The four tools are listed after `similar_entities` with
+  `{"readOnlyHint": true, "openWorldHint": false}`, count as the `query` rate-limit
+  class, and can be turned off with `--mcp-disable-tool`. The `answer_question` prompt
+  and the server's instructions name `recall`, `similar_queries` and `check_query`.
+
+**Deviations and additions.**
+
+- `check_query` takes `dataset`, `reasoning`, `at`, `atCommit` and `timeoutSeconds` as
+  the other tools do. It settles existence from the schema report of the view when the
+  caller's grants reach the `info` endpoint. Otherwise, and for terms the report does not
+  settle, it asks the view with `ASK` queries, at most 200 per call, so a term found only
+  in hidden data is unknown exactly as an absent one is. Without the `info` endpoint
+  there are no suggestions. An update gets the error `not-a-query`, as C18 asks. An
+  undefined prefix also suggests the prefixes within a third of the name's length in
+  edit distance, with `why: "edit-distance"`. `class-mismatch` asks whether any instance
+  of the class has the predicate, because the kept schema report does not carry subject
+  classes, and its suggestions come from the predicates of a sample of 200 instances,
+  with `why: "class-profile"`. The suggestions of `datatype-mismatch` are the
+  predicate's datatypes, with `why: "datatype"`.
+- `similar_queries` builds the BM25 index on each call instead of keeping one per
+  catalog version, since the catalog is small. Each document's embedding is looked up
+  in the provider's cache, which is keyed by the input text, instead of a cache keyed by
+  the version's digest. A version whose document is unchanged therefore needs no new
+  request, as designed. The question is embedded with the index's query prefix. When
+  the provider fails, the ranking is `text` and the failure is logged.
+- `link_entities` normalizes labels by case folding and collapsing white space, without
+  Unicode NFKC, which would need a new dependency. The normalized pass is a phrase query
+  of the text index followed by an exact comparison, so it needs the text index. A
+  mention gets `ambiguous` also when two or more candidates of a matching type carry
+  every word of the mention in a label, which A5's "Ana" needs, since neither "Ana Lima"
+  nor "Ana Souza" equals "Ana". The vector list uses the first vector index whose
+  embedding configuration reads a label predicate or a description predicate. The
+  sample triples put the candidate's other predicates first and its types and labels
+  last. A search that the index cannot answer, at a past commit or with a provider that
+  is down, is left out and `search` says so.
+- `recall` fuses the text and vector lists itself by reciprocal rank with k = 60, as
+  `spk:hybridSearch` does, so that each list can fail on its own and the other still
+  gives seeds. Both searches read every graph of the view, because `text:query` and
+  `spk:vectorSearch` read the active graph only. With `seeds` given, a search that cannot
+  run is skipped. Without them, its error is the call's error, which is how a `query`
+  at a past commit fails, since the text index answers only at the head. Each fact takes
+  its provenance from one reifier that reifies it in the fact's graph and has no
+  `prov:wasInvalidatedBy`, and a citation names its reifier only while a single reifier
+  stands behind it. Facts with a blank node or a literal over 4 KiB are cited by their
+  graph alone, because they cannot be looked up through `VALUES`. Conflicts need the
+  caller's grants to reach the `info` endpoint, where the constraints layer is read. The
+  superseded list reads at most 10,000 invalidated reifiers. The result is fitted to
+  `maxBytes` by a binary search on the number of facts, and `maxBytes` is at least 1024.
+  Both formats return one text block without `structuredContent`, so the tool has no
+  output schema. The JSON format adds `id` to each citation, `s`, `p` and `values` to
+  each conflict, and `invalidatedAt` to superseded facts.
+- `explain_query` still reports `unknown-term` from the store's dictionary,
+  which includes hidden data. `check_query` does not share that code.
+
+**What C18 Phase 1 can build on.** The HTTP routes `/check` and `/recall` of C18 are not
+built. The tools' logic lives in methods of the MCP `Tools` context, whose inputs are
+the parsed arguments, the dataset, the principal and the deadline, and which return JSON
+or text. A route can call the same functions after moving their argument parsing out of
+the MCP request, which keeps one code path as §6 requires.
+
+**Tests at landing.**
+
+- `mcp::tests::memory_tools` runs A1 to A5, A11, A12, A15, A17 and A18 over the JSON-RPC
+  client, on the data of §14 in the state A7 leaves, with a named snapshot keeping
+  commit 1 readable. It covers the parse issues, `not-a-query`, unknown terms,
+  unbound projections, datatype and class mismatches, `maxSuggestions`, `mcp: false`,
+  the `maxTriples` and `maxBytes` cuts, the JSON format, the argument limits, a hub, a
+  call over its deadline, and a literal that tries to forge a citation and an entity
+  header. With the `shacl` feature it marks a conflict under a guard with
+  `sh:maxCount 1`. With a mock embeddings endpoint it checks the hybrid ranking, vector
+  candidates and seeds, and the fall back to text when the endpoint fails.
+- `mcp::tests::memory_tools::questions_are_checked` checks the limits of `questions`.
+- `router_tests::mcp::auth::memory_tools_follow_graph_grants` and
+  `memory_tools_follow_triple_protections` run each tool through `/$/mcp` as callers with
+  graph grants and with C12b protections. A hidden term is reported like an absent one,
+  a hidden predicate is never suggested, a hidden entity is never a candidate or a
+  seed, no fact or citation names a hidden graph, protected facts never appear, and a
+  caller without the `query` endpoint sees no stored queries.
+- The `mcp::memory::text` unit tests cover words, stems, the BM25 ranking, plain and
+  phrase queries and the edit distance. `a03_tool_list` checks the four input schemas.
+- The server's tests, the OpenAPI check and Clippy over all targets pass.
