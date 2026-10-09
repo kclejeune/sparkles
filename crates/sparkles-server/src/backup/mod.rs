@@ -774,7 +774,7 @@ impl Slots {
     }
 
     /// Slots held now.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn in_use(&self) -> usize {
         *self.used.lock()
     }

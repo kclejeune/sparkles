@@ -688,7 +688,7 @@ pub fn peer_addr(req: &Request) -> Option<PeerAddr> {
 #[derive(Clone)]
 pub enum Clock {
     System(Instant),
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Manual(Arc<AtomicU64>),
 }
 
@@ -702,6 +702,7 @@ impl Clock {
                 Clock::System(base) => {
                     u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX >> 2)
                 }
+                #[cfg(test)]
                 Clock::Manual(t) => t.load(Ordering::Relaxed),
             }
     }
@@ -1131,7 +1132,7 @@ impl RateLimiter {
     }
 
     /// Replace the clock (tests); the client state starts afresh.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn with_clock(mut self, clock: Clock) -> RateLimiter {
         let mut inner = Inner::clone(&self.inner.load());
         if let Ok(b) = Buckets::new(inner.buckets.max_keys, &clock, self.evictions.clone()) {
@@ -1172,7 +1173,7 @@ impl RateLimiter {
     }
 
     /// Clients currently tracked (over all policies).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn tracked(&self) -> usize {
         self.inner.load().buckets.slots.len()
     }

@@ -164,7 +164,7 @@ impl TokenStore {
     }
 
     /// Store a new record (expired records are pruned on the way).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn insert(&self, rec: TokenRecord, now: i64) -> Result<()> {
         self.insert_within(rec, now, usize::MAX).map(|_| ())
     }

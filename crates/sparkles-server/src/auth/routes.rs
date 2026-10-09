@@ -28,7 +28,7 @@ pub enum Need {
 /// Every route template of the router with the methods it serves. A router test checks
 /// that each registered template is listed; [`need`] answers `server-admin` for any
 /// template it does not know (fail closed).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub const ROUTES: &[(&str, &[&str])] = &[
     ("/", &["GET"]),
     ("/ui", &["GET"]),

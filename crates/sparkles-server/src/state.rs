@@ -1210,7 +1210,7 @@ impl TaskQueue {
     }
 
     /// Tasks running now and waiting.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn counts(&self) -> (usize, usize) {
         let q = self.inner.lock();
         (q.running, q.queued.len())

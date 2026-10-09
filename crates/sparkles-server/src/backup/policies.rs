@@ -357,7 +357,7 @@ impl Policies {
     }
 
     /// Replace the engine (tests).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn set_engine(&self, engine: Arc<dyn Engine>) {
         *self.engine.write() = engine;
     }

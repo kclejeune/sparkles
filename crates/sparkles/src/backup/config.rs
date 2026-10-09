@@ -460,7 +460,6 @@ impl PolicyToml {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_config(p: &PolicyConfig) -> PolicyToml {
         PolicyToml {
             repository: p.repository.clone(),
