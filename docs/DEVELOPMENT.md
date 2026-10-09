@@ -52,7 +52,7 @@ mise run lint:features # clippy -D warnings over feature combinations (in ci)
 mise run lint:doc-paths # every crates/sparkles… path cited in the docs exists (in ci)
 mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
 mise run fmt:fuzz     # fuzz the formatter with cargo-fuzz (needs nightly and cargo-fuzz; not in ci)
-mise run test         # all Rust tests            (test:w3c, test:shacl, test:shex for suite summaries)
+mise run test         # all Rust tests with cargo-nextest, then doctests (test:cargo runs plain cargo test)
 mise run ui:wasm      # the formatter's WebAssembly module for the UI (optional)
 mise run ui:dev       # UI dev server, proxying the API to $SPARKLES_API (default http://localhost:3030)
 mise run ui:mock      # mock API server for UI work without the Rust backend
@@ -68,7 +68,8 @@ mise run jvm:test     # Jena's contract tests and the binding's own tests (in ci
 mise run jvm:sample   # compile, test and run the Java sample (jvm/sample-java)
 mise run jvm:lock     # refresh crates/sparkles-ffi/Cargo.lock from Cargo.lock
 mise run jvm:nix-deps # refresh nix/jvm-deps.json after the Gradle dependencies change
-mise run ci           # fmt:check + lint + lint:features + lint:doc-paths + fmt:wasm + test + ui:test + py:lint + py:test + jvm:lint + jvm:rust-test + jvm:test + licenses:check
+mise run ci           # every check below, with a log per task and a summary (scripts/ci.sh)
+mise run ci:fast      # fmt:check + lint:doc-paths + lint + test, for iterating
 mise run doc          # API docs of the library crates
 mise run openapi      # rewrite docs/openapi.json after an API change (a test fails until then)
 mise run docs:screenshots # the README's screenshots (docs/images) from the demo dataset in docs/demo
@@ -100,6 +101,7 @@ runs every hook over the whole tree.
 
 ```sh
 mise run ci            # formatting, clippy, all workspace tests, UI, Python, JVM and JavaScript tests, license notices
+mise run ci:fast       # formatting, cited doc paths, workspace clippy and the Rust tests
 mise run lint:features # clippy over feature combinations (in ci)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites, SHACL 1.2 list tests, SHACLC pairs
@@ -107,6 +109,29 @@ mise run test:shex     # shexTest: syntax, negative syntax and structure, repres
 mise run ui:e2e        # Playwright end-to-end tests against a real server
 mise run test:jena-clients  # Apache Jena's own HTTP clients against a real server
 ```
+
+`mise run ci` builds the UI, the Node addon and the JVM native library once, then runs
+the checks with the cheap ones first. It prints a line as each task passes or fails, and
+it writes each task's output to `target/ci/logs/<task>.log`. While it runs,
+`target/ci/summary.txt` shows which tasks are waiting, running, passed or failed, with
+their times. Every task runs to the end, and the final summary repeats the last lines of
+each failed task's log. `--fail-fast` stops after the first failure, `--jobs N` runs more
+tasks at once, and naming tasks runs only those, as in `mise run ci lint test`. Only
+one run at a time can use a checkout.
+
+The checks declare their input files in `mise.toml`, and mise's task cache records each
+pass under a key made from the contents of those files, the task's definition, the tool
+versions and `rustc -V`. A check whose inputs have not changed since it passed is skipped
+and its log replayed. That also holds in another checkout or worktree with the same
+files. Failures are never cached. `mise run ci --force`, `mise run --force <task>` or
+`MISE_TASK_CACHE=off` runs the checks regardless, and
+`mise run --dry-run --task-cache-explain <task>` lists the inputs of a key.
+
+The Rust tests run under cargo-nextest, which runs test binaries in parallel and lists
+every failure at the end. A test that runs past ten minutes is stopped and counted as a
+failure. `.config/nextest.toml` holds these settings. Debug builds keep line tables only,
+so backtraces have file and line numbers but a debugger cannot show variables. Set
+`CARGO_PROFILE_DEV_DEBUG=true` for full debug information.
 
 `crates/sparkles-core/tests/w3c.rs` runs the W3C SPARQL suites vendored in an Apache
 Jena checkout. It looks for the checkout at `../../apache/jena`, next to this
