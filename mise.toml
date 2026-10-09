@@ -807,3 +807,29 @@ flag "--commits <n>" default="1000" help="single-quad commits before the increme
 run = '''
 RUNS="$usage_runs" COMMITS="$usage_commits" scripts/backup-bench.sh "$usage_db" "$(realpath -m "$usage_workdir")"
 '''
+
+[tasks."bench:nsc"]
+description = "Interleaved A/B query benchmark of two revisions or binaries on an ephemeral Namespace instance (nsc): fresh pinned servers in A,B,B,A rounds, medians, per-round ratios and the geometric mean"
+usage = '''
+arg "<a>" help="the baseline: a git revision (built locally and cached) or a sparkles binary"
+arg "<b>" help="the candidate: a git revision or a sparkles binary"
+flag "--people <n>" default="100000" help="dataset size in people (~10.5 triples each)"
+flag "--queries <list>" help="only these queries (default: all of bench.sh except export-500k)"
+flag "--query-dir <dir>" help="time DIR/*.rq instead of the bench.sh queries"
+flag "--rounds <n>" default="4" help="A,B,B,A rounds, each in fresh server processes"
+flag "--reps <n>" default="20" help="timed requests per query and server process"
+flag "--warmup <n>" default="3" help="untimed requests per query and server process"
+flag "--rayon-threads <n>" default="1" help="RAYON_NUM_THREADS of the servers, or default"
+flag "--no-spin" help="no idle-priority busy loops on the server and client CPUs"
+flag "--serve-args <flags>" help="extra sparkles serve flags for both servers"
+flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
+flag "--duration <d>" default="2h" help="the instance's lifetime cap"
+flag "--out <dir>" help="results directory (default target/nsc-bench/<UTC time>)"
+'''
+run = '''
+scripts/nsc-bench.sh --people "$usage_people" --rounds "$usage_rounds" --reps "$usage_reps" \
+  --warmup "$usage_warmup" --rayon-threads "$usage_rayon_threads" --duration "$usage_duration" \
+  ${usage_queries:+--queries "$usage_queries"} ${usage_query_dir:+--query-dir "$usage_query_dir"} \
+  ${usage_serve_args:+--serve-args "$usage_serve_args"} ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
+  ${usage_out:+--out "$usage_out"} ${usage_no_spin:+--no-spin} "$usage_a" "$usage_b"
+'''
