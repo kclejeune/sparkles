@@ -93,6 +93,12 @@ jobs:
         uses: namespacelabs/nscloud-cache-action@v1
         with:
           cache: rust
+      # Which run saved the restored cache volume, so a log shows whether the cache was
+      # warm. The last step writes the stamp for the next run.
+      - name: Cache origin
+        if: ${{ !cancelled() }}
+        run: |
+          cat target/.ci-cache-stamp 2> /dev/null || echo "no stamp, so the cache is cold"
       - name: cargo clippy
         if: ${{ !cancelled() }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -110,3 +116,8 @@ jobs:
       - name: Doctests
         if: ${{ !cancelled() }}
         run: cargo test --locked --workspace --doc
+      - name: Stamp the cache
+        if: always()
+        run: |
+          mkdir -p target
+          echo "run $GITHUB_RUN_ID ($GITHUB_EVENT_NAME on $GITHUB_REF_NAME at ${GITHUB_SHA::8}), saved $(date -u +%FT%TZ)" > target/.ci-cache-stamp
