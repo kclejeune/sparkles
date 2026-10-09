@@ -404,6 +404,13 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   range, found by binary search with the ordinary comparison. Doubles and vocabulary
   literals are read and tested; booleans, dates and blank nodes are skipped. The planner
   costs the scan from an exact count of the rows in those ranges (`IndexRangeScan`).
+* **Top-k heap** (`topk_heap`). `ORDER BY … LIMIT k` (with or without OFFSET) keeps the
+  best k rows in a bounded heap. Each key is classified once, so most comparisons are
+  of exact decimals, doubles or strings, and the remaining pairs go to the ordinary
+  comparator. The later keys are evaluated only for rows whose first key can still
+  enter. Streaming execution reads its input batch by batch into the same heap.
+  EXPLAIN notes `[top-k heap kept N of M rows]`. With the heap off, the two shortcuts
+  below apply.
 * **Numeric top-k.** `ORDER BY ?v LIMIT k` over numbers ranks cheap rounded keys first and
   computes exact values only for rows that can still reach the first k.
 * **First-key top-k** (`topk_first_key`). `ORDER BY k1 k2 … LIMIT k` finds the k-th row by
