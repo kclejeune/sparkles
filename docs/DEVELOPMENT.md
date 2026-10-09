@@ -258,6 +258,19 @@ contract tests from Jena's published test jars, the acceptance examples of the s
 jena-core's JUnit 3 graph suite. `mise run jvm:sample` builds the Java sample with
 `-Xlint:all -Werror` and runs it.
 
+The library also exports hand-written JNI entry points for the reads that small requests
+make most often (`crates/sparkles-ffi/src/jni_calls.rs`). The Kotlin side of them is
+`SparklesJni` in `jvm/sparkles-jena/src/ffi/kotlin`. They are in the same library file,
+which `SparklesJni` loads a second time with `System.load` so that the JVM binds them, and
+they work on the objects UniFFI made. The `ffiBindings` Gradle task adds a helper that
+borrows an object's handle to every generated class, and it sends the frees of read
+transactions, queries and cursors through JNI. The task fails the build when the
+generated code does not have the shape it expects, as after a UniFFI upgrade. The system
+property `sparkles.jni=false` keeps every call on UniFFI, and a list of `read`,
+`contains`, `find` and `query` turns on only those groups. `mise run jvm:test` runs the
+suite twice, as `test` with the JNI calls and as `testUniffi` without them, and
+`mise run bench:bindings --jvm-opts=-Dsparkles.jni=false` measures the UniFFI calls alone.
+
 `./gradlew :sparkles-jena:perfCheck -Pdata=DATA.nt -Pqueries=QUERIES.tsv`, run in `jvm/`,
 times queries through Jena on Sparkles, through the native library alone and on an
 in-memory TDB2 dataset. `cargo run --release --example perf --manifest-path

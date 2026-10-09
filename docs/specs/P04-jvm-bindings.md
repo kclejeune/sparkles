@@ -1577,7 +1577,7 @@ documents, formatter/linter/RDF/term validation utilities, geometry conversion,
 embedding regeneration and reasoning diagnostics. All 162 entries of the original
 administration mapping now have concrete JVM decisions. The newer Rust branch-relink
 operation remains an explicit binding follow-up. Java callbacks
-await P03; batched fallback BGPs, musl, JNI, mimalloc and worker-free transactions remain
+await P03; batched fallback BGPs, musl, mimalloc and worker-free transactions remain
 separate extensions. The earlier throughput numbers below are a loaded-machine sanity
 check. No quiet-machine performance conclusion or JNI/allocator change follows from
 concurrent implementation tests.
@@ -1648,3 +1648,68 @@ quiet-machine run of §5.4's benchmark is the authority. After these changes the
 rule for moving a call to JNI is still met on `contains`, `getProperty` and `find`:
 TDB2 and TIM are faster, and the bridge, not Rust, takes most of their time. No call
 has been moved.
+
+**Hand-written JNI calls (2026-10-09).** Four groups of calls now go through
+hand-written JNI entry points instead of UniFFI and JNA. They are beginning and freeing a
+read transaction, `contains`, `find` with its cursor's later batches and the cursor's
+free, and preparing, executing and freeing a query, each on the head snapshot or in a
+read transaction. Every other call stays on UniFFI, and the public Kotlin and Java API
+did not change.
+
+The entry points are in the same native library (`crates/sparkles-ffi/src/jni_calls.rs`),
+so the natives jars and their platforms are unchanged. `SparklesJni` loads the file that
+UniFFI loaded a second time with `System.load`, which gives the same library instance
+and lets the JVM bind the `Java_` symbols. The entry points call the same Rust methods as
+the UniFFI exports and pass the same bytes, including UniFFI's own serialization of
+`QueryOpts` and `Execution`, so only the transport changed. They work on the objects
+UniFFI made. A call borrows the object's handle while it holds the object's UniFFI call
+counter, which is UniFFI's own lifetime rule without the handle clone that costs a call
+of its own. A concurrent `close` therefore frees the object only after the call. The
+read transactions, cursors and queries that the entry points create are handed out as
+UniFFI handles and wrapped in the generated classes, so they keep UniFFI's lifecycle. The
+`ffiBindings` task adds the borrowing helper to every generated class and sends the
+frees of these three classes through JNI, and it fails the build when the generated code
+changes shape. Each entry point runs inside `catch_unwind`. An error crosses as the
+`FfiError` in UniFFI's serialization and is thrown as the same `FfiException`, and a
+panic is thrown as UniFFI's `InternalException`. Cancellation and the memory budget run
+through the same `FfiQuery`, so they behave as before, and the suite's timeout and
+budget tests pass on both paths. The system property `sparkles.jni=false` turns all of
+it off, and a list such as `sparkles.jni=read,contains` turns on only the named groups.
+JNI is also off when the library cannot be loaded for it, as when another class loader
+in the JVM has loaded it. `mise run jvm:test` runs the suite with the JNI calls and again
+without them (`testUniffi`).
+
+Following §5.4's rule, each group was measured on its own against the UniFFI path on
+atlas, with the data of `mise run bench:bindings` at 10,000 people (105,302 triples) in
+memory. Each arm ran in a fresh JVM pinned to CPUs 0 to 11, in A/B/B/A order twice, and
+the figures are the medians of the four runs' median latencies on one thread, in
+microseconds. Before is every group off and after is every group on. The share is the
+time that moving the group alone to JNI removed, as a fraction of the time before.
+
+| Group | Operation | Before | That group alone | After | TDB2 | TIM | Share |
+|---|---|---:|---:|---:|---:|---:|---:|
+| read transaction | `Graph.contains` | 9.91 | 7.24 | 1.68 | 2.47 | 0.53 | 27% |
+| `contains` | `Graph.contains` | 9.91 | 4.25 | 1.68 | 2.47 | 0.53 | 57% |
+| `find` | `Model.getProperty` | 14.29 | 5.27 | 2.64 | 3.46 | 0.68 | 63% |
+| `find` | `find` on a subject | 17.61 | 7.75 | 5.20 | 5.59 | 1.71 | 56% |
+| query | `ASK` | 61.75 | 46.21 | 42.69 | 28.75 | 26.18 | 25% |
+| query | `SELECT ?o` | 60.85 | 45.96 | 42.61 | 27.48 | 23.92 | 24% |
+| query | `star-lookup` | 272.2 | 237.4 | 233.7 | 209.8 | 115.5 | 13% |
+| query | `values-star` | 232.1 | 204.6 | 195.8 | 101.7 | 88.9 | 12% |
+
+The binding was slower than TDB2 and TIM on every operation before, and each group
+removed more than 10% of an operation's time on its own, so every group is kept. A bare
+UniFFI call measured 0.70 µs on the same machine and a JNI call 0.01 µs. Native calls
+per operation went from 6 to 3 for `contains` with its own read transaction, from 7 to 3
+for `getProperty` and `find`, and from 11 to 5 for a small query, all of them through
+JNI. The bridge's share after the change is then well under 1% of a small query and
+about 2% of `contains`, which meets T7's 10%.
+
+`contains`, `getProperty` and `find` on a subject are now faster than TDB2. On four
+threads, `contains` went from 270,000 to 1,680,000 operations per second (TDB2 678,000),
+`getProperty` from 170,000 to 1,130,000 (TDB2 657,000) and `find` on a subject from
+149,000 to 704,000 (TDB2 446,000). Small queries remain slower than TDB2, by about 14 µs
+on `ASK` and `SELECT ?o`, and on four threads `ASK` went from 37,800 to 43,200 queries
+per second against TDB2's 45,500. That gap is not the bridge. It is Jena's
+serialization of the query, Sparkles' parsing and planning of the text, and the eager
+`NOW()`, which the next steps for small queries address.

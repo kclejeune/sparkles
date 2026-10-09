@@ -302,6 +302,7 @@ class Runner:
                      f"-Dsparkles.native.path={ROOT / 'target' / 'release' / 'libsparkles_ffi.so'}"]
             if self.args.cores:
                 jopts.append(f"-XX:ActiveProcessorCount={self.args.cores}")
+            jopts += self.args.jvm_opts.split()
             return pin + [self.setup.java, *jopts, "-cp", cp, "io.github.kclejeune.sparkles.jena.bench.BindingsBench"]
         if lang == "python":
             return pin + ["env", f"PYTHONPATH={self.work / 'py'}", str(self.setup.python), "-u", str(HERE / "python" / "runner.py")]
@@ -411,7 +412,7 @@ class Runner:
         elif "qps" in e:
             log(f"  {e['case']}: {e['qps']:.0f}/s p50 {e['p50_ms']:.3f} p99 {e['p99_ms']:.3f} ms")
         elif "calls_per_op" in e:
-            log(f"  {e['case']}: {e['calls_per_op']:.2f} calls/op")
+            log(f"  {e['case']}: {e['calls_per_op']:.2f} calls/op, {e.get('jni_calls_per_op', 0):.2f} through JNI")
         elif s:
             log(f"  {e['case']}: {statistics.median(s):.3f} ms ({len(s)}), {e.get('rows')} rows")
         else:
@@ -526,7 +527,8 @@ def collect(procs):
             if e.get("event") != "case":
                 continue
             r = res.setdefault(p.engine, {}).setdefault(e["case"], {"medians": [], "status": [], "rows": set(),
-                                                                       "samples": 0, "rss_kib": [], "tp": [], "calls": []})
+                                                                       "samples": 0, "rss_kib": [], "tp": [], "calls": [],
+                                                                       "jni_calls": []})
             r["status"].append(e.get("status"))
             if e.get("rows") not in (None, -1):
                 r["rows"].add(e["rows"])
@@ -538,6 +540,7 @@ def collect(procs):
                 r["tp"].append(e)
             if "calls_per_op" in e:
                 r["calls"].append(e["calls_per_op"])
+                r["jni_calls"].append(e.get("jni_calls_per_op", 0.0))
             if p.rss_kib:
                 r["rss_kib"].append(p.rss_kib)
     return res
@@ -623,14 +626,16 @@ def summary(args, meta, answers, cmp, procs, versions, diffs):
                         cells.append(f"{med([x['qps'] for x in t]):,.0f} ({med([x['p50_ms'] for x in t]):.3f} / {med([x['p99_ms'] for x in t]):.3f})")
                     out.append(f"| {k} | " + " | ".join(cells) + " |")
                 out.append("")
-            calls = {k: v["calls"] for e in engines for k, v in res.get(e, {}).items() if v["calls"]}
+            calls = {k: v for e in engines for k, v in res.get(e, {}).items() if v["calls"]}
             if calls:
                 out += ["### Native calls per operation", "",
                         "Counted with the counting copy of the generated bindings on Jena on Sparkles (memory): calls into the"
-                        " native library per query, per lookup (`pattern-s`, `contains`, `value`) and per added triple.", "",
-                        "| Operation | Calls |", "|---|---:|"]
+                        " native library per query, per lookup (`pattern-s`, `contains`, `value`) and per added triple."
+                        " The second column counts the calls of the first that went through the hand-written JNI entry"
+                        " points rather than UniFFI.", "",
+                        "| Operation | Calls | Through JNI |", "|---|---:|---:|"]
                 for k, v in calls.items():
-                    out.append(f"| {k} | {med(v):.2f} |")
+                    out.append(f"| {k} | {med(v['calls']):.2f} | {med(v['jni_calls']):.2f} |")
                 out.append("")
     out += ["## Answers", ""]
     bad = {k: v for k, v in cmp.items() if v["wrong"] or v["failed"] or v["lexical"]}
@@ -709,6 +714,7 @@ def main():
     ap.add_argument("--keep-answers", action="store_true", help="keep every engine's answer rows in WORKDIR/answers")
     ap.add_argument("--no-build", action="store_true", help="use the built bindings as they are")
     ap.add_argument("--jvm-heap", default="8g")
+    ap.add_argument("--jvm-opts", default="", help="more JVM options, e.g. -Dsparkles.jni=false for the UniFFI calls alone")
     ap.add_argument("--python", default="", help="the Python interpreter for the virtual environment")
     args = ap.parse_args()
     args.workdir = args.workdir.resolve()

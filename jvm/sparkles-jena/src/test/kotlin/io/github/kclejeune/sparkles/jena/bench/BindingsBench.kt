@@ -582,16 +582,16 @@ internal object BindingsBench {
 
     // ------------------------------------------------------------- native call counts
 
-    /** The counter that the counting copy of the generated bindings increments. */
-    private fun callCounter(): () -> Long {
+    /** A counter that the counting copy of the generated bindings increments: `calls` for
+     * every native call, `jniCalls` for those of them through the hand-written JNI calls. */
+    private fun callCounter(name: String): java.util.concurrent.atomic.LongAdder {
         val cls = Class.forName("io.github.kclejeune.sparkles.jena.internal.ffi.UniffiCallCounter")
-        val field = cls.getField("calls")
-        val adder = field.get(null) as java.util.concurrent.atomic.LongAdder
-        return { adder.sum() }
+        return cls.getField(name).get(null) as java.util.concurrent.atomic.LongAdder
     }
 
     private fun calls(cfg: Config, ops: Ops) {
-        val count = callCounter()
+        val total = callCounter("calls")
+        val jni = callCounter("jniCalls")
         val abort = AtomicReference<QueryExec?>()
         val n = 20
         for (c in cfg.cases) {
@@ -599,27 +599,32 @@ internal object BindingsBench {
             emit(event("start", "case" to c.name))
             val result = event("case", "case" to c.name)
             try {
-                val perOp: Double = when (c.kind) {
+                // the calls of each counter per operation, over the same operations
+                var before = LongArray(2)
+                val mark = { before = longArrayOf(total.sum(), jni.sum()) }
+                val per = { ops: Long -> doubleArrayOf((total.sum() - before[0]).toDouble() / ops, (jni.sum() - before[1]).toDouble() / ops) }
+                val perOp: DoubleArray = when (c.kind) {
                     "small-query" -> {
                         smallQuery(ops, c)
-                        val before = count()
+                        mark()
                         repeat(n) { smallQuery(ops, c) }
-                        (count() - before).toDouble() / n
+                        per(n.toLong())
                     }
                     "sq-select-o", "sq-ask", "op-getProperty", "op-contains", "op-find-s" -> {
                         smallOp(ops, c.kind, 0)
-                        val before = count()
+                        mark()
                         for (i in 1..n) smallOp(ops, c.kind, i)
-                        (count() - before).toDouble() / n
+                        per(n.toLong())
                     }
                     else -> {
                         ops.run(c, Sink(null), abort)
-                        val before = count()
+                        mark()
                         val made = ops.run(c, Sink(null), abort)
-                        (count() - before).toDouble() / made
+                        per(made)
                     }
                 }
-                put(result, "calls_per_op", perOp)
+                put(result, "calls_per_op", perOp[0])
+                put(result, "jni_calls_per_op", perOp[1])
                 put(result, "status", "ok")
             } catch (e: Throwable) {
                 put(result, "status", "error")

@@ -7,6 +7,7 @@ import io.github.kclejeune.sparkles.jena.internal.ffi.FfiReadTxn
 import io.github.kclejeune.sparkles.jena.internal.ffi.FfiWriteTxn
 import io.github.kclejeune.sparkles.jena.internal.ffi.FindResult
 import io.github.kclejeune.sparkles.jena.internal.ffi.QueryOpts
+import io.github.kclejeune.sparkles.jena.internal.ffi.SparklesJni
 import org.apache.jena.graph.Node
 import org.apache.jena.graph.Triple
 import org.apache.jena.sparql.JenaTransactionException
@@ -25,20 +26,21 @@ internal sealed interface Source {
     fun graphNames(): ByteArray
     fun prepareQuery(text: String, opts: QueryOpts): FfiQuery
 
+    // The head and read transactions make their small, frequent calls through JNI (SparklesJni).
     class Head(private val ds: FfiDataset) : Source {
-        override fun find(pattern: ByteArray, firstRows: Int) = ffi { ds.find(pattern, firstRows.toUInt()) }
+        override fun find(pattern: ByteArray, firstRows: Int) = ffi { SparklesJni.find(ds, pattern, firstRows) }
         override fun count(pattern: ByteArray) = ffi { ds.count(pattern).toLong() }
-        override fun contains(pattern: ByteArray) = ffi { ds.contains(pattern) }
+        override fun contains(pattern: ByteArray) = ffi { SparklesJni.contains(ds, pattern) }
         override fun graphNames() = ffi { ds.graphNames() }
-        override fun prepareQuery(text: String, opts: QueryOpts) = ffi { ds.prepareQuery(text, opts) }
+        override fun prepareQuery(text: String, opts: QueryOpts) = ffi { SparklesJni.prepareQuery(ds, text, opts) }
     }
 
     class Read(private val t: FfiReadTxn) : Source {
-        override fun find(pattern: ByteArray, firstRows: Int) = ffi { t.find(pattern, firstRows.toUInt()) }
+        override fun find(pattern: ByteArray, firstRows: Int) = ffi { SparklesJni.find(t, pattern, firstRows) }
         override fun count(pattern: ByteArray) = ffi { t.count(pattern).toLong() }
-        override fun contains(pattern: ByteArray) = ffi { t.contains(pattern) }
+        override fun contains(pattern: ByteArray) = ffi { SparklesJni.contains(t, pattern) }
         override fun graphNames() = ffi { t.graphNames() }
-        override fun prepareQuery(text: String, opts: QueryOpts) = ffi { t.prepareQuery(text, opts) }
+        override fun prepareQuery(text: String, opts: QueryOpts) = ffi { SparklesJni.prepareQuery(t, text, opts) }
     }
 
     class Write(private val t: FfiWriteTxn) : Source {
@@ -76,7 +78,7 @@ internal class QuadIter(
 
     private fun fetch(): Boolean {
         val c = cursor ?: return false
-        val b = ffi { c.nextBatch(nextSize.toUInt()) }
+        val b = ffi { SparklesJni.nextBatch(c, nextSize) }
         nextSize = minOf(nextSize * 2, MAX_FIND_ROWS)
         batch = decoder.decode(b.batch)
         row = 0

@@ -13,6 +13,7 @@ import io.github.kclejeune.sparkles.jena.internal.ffi.FfiSelectCursor
 import io.github.kclejeune.sparkles.jena.internal.ffi.FfiQueryKind
 import io.github.kclejeune.sparkles.jena.internal.ffi.InternalException
 import io.github.kclejeune.sparkles.jena.internal.ffi.QueryOpts
+import io.github.kclejeune.sparkles.jena.internal.ffi.SparklesJni
 import io.github.kclejeune.sparkles.jena.internal.mapError
 import io.github.kclejeune.sparkles.jena.SparklesInternalException
 import org.apache.jena.atlas.io.IndentedLineBuffer
@@ -210,7 +211,7 @@ internal class QueryIterSparkles(
         val signal = cancelSignal
         if (signal != null) CancelWatcher.watch(q, signal)
         val e = try {
-            q.execute(FIRST_ROWS.toUInt())
+            SparklesJni.execute(q, FIRST_ROWS)
         } catch (e: FfiException.Engine) {
             if (e.kind == ErrorKind.SPARQL_SYNTAX || e.kind == ErrorKind.UNSUPPORTED) {
                 fallBack(e.detail)
