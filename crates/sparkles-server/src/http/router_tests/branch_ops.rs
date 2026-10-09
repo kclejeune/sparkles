@@ -560,3 +560,101 @@ async fn a32_per_branch_gauges() {
     assert!(text.contains("sparkles_branch_disk_bytes{dataset=\"ds\",branch=\"dev\"}"));
     assert!(text.contains("sparkles_branch_wal_bytes{dataset=\"ds\",branch=\"dev\"}"));
 }
+
+/// `POST /$/branches/{ds}/{name}/relink` moves a linked branch onto main's current
+/// index and keeps its id, head and data, at once or as a task.
+#[tokio::test]
+async fn relinks_linked_branches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (st, app) = setup(dir.path()).await;
+    for name in ["dev", "dev2", "own"] {
+        let (r, _) = json_req(&app, "POST", "/$/branches/ds", json!({ "name": name })).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    }
+    update(&app, "ds@dev", "INSERT DATA { <urn:c> <urn:p> 1 }").await;
+    update(&app, "ds", "INSERT DATA { <urn:d> <urn:p> 1 }").await;
+    let ds = st.get("ds").unwrap();
+    ds.store.compact_with(&Default::default()).unwrap();
+    let (before, _) = get(&app, "/$/branches/ds/dev").await;
+    let before = before.json();
+    let (r, _) = post(&app, "/$/branches/ds/dev/relink", "").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["dataset"], "ds");
+    assert_eq!(j["branch"], "dev");
+    assert_eq!(j["branchId"], before["id"]);
+    assert_eq!(j["mode"], "relink");
+    assert_eq!(j["quads"], 3);
+    assert!(j.get("abandoned").is_none(), "{j}");
+    let (after, _) = get(&app, "/$/branches/ds/dev").await;
+    let after = after.json();
+    assert_eq!(after["id"], before["id"]);
+    assert_eq!(after["head"], before["head"]);
+    assert_eq!(after["storage"]["linked"], true);
+    let s = subjects(&app, "/ds@dev/sparql").await;
+    assert!(s.contains(&"urn:c".to_string()), "{s:?}");
+    assert!(!s.contains(&"urn:d".to_string()), "{s:?}");
+    // a relinked branch keeps taking writes
+    let (r, _) = update(&app, "ds@dev", "INSERT DATA { <urn:e> <urn:p> 1 }").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // as a task, with the result as its detail
+    let (r, h) = send_h(
+        &app,
+        Request::post("/$/branches/ds/dev2/relink")
+            .header("prefer", "respond-async")
+            .body(Body::from("{}"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    assert_eq!(h["preference-applied"], "respond-async");
+    let t = r.json();
+    assert_eq!(t["kind"], "relink");
+    assert_eq!(t["target"], "dev2");
+    assert_eq!(t["cancellable"], true);
+    let id = t["id"].as_str().unwrap().to_string();
+    assert_eq!(h["location"], format!("/$/tasks/{id}").as_str());
+    let done = super::tasks::wait_done(&st, &id).await;
+    assert_eq!(done.state, "done", "{:?}", done.message);
+    assert_eq!(done.progress, Some(1.0));
+    let d = done.detail.unwrap();
+    assert_eq!(d["branch"], "dev2");
+    assert_eq!(d["quads"], 2);
+    // refusals
+    let (r, _) = post(&app, "/$/branches/ds/main/relink", "").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(r.json()["code"], "invalid-branch");
+    let (r, _) = post(&app, "/$/branches/ds/absent/relink", "").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    assert_eq!(r.json()["code"], "no-such-branch");
+    let (r, _) = post(&app, "/$/branches/ds/dev/relink", r#"{"force":true}"#).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let (r, _) = post(&app, "/$/branches/none/dev/relink", "").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    // a branch with an index of its own
+    ds.store
+        .branch("own")
+        .unwrap()
+        .compact_with(&Default::default())
+        .unwrap();
+    let (r, _) = get(&app, "/$/branches/ds/own").await;
+    assert_eq!(r.json()["storage"]["linked"], false, "{}", r.text());
+    let (r, _) = post(&app, "/$/branches/ds/own/relink", "").await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["code"], "not-relinkable");
+}
+
+/// In-memory datasets have no index files to share, so their branches cannot be
+/// relinked.
+#[tokio::test]
+async fn memory_branches_are_not_relinkable() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = super::branches::open(dir.path());
+    st.create("m", DbType::Mem).unwrap();
+    let app = router(st.clone());
+    let (r, _) = json_req(&app, "POST", "/$/branches/m", json!({ "name": "dev" })).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let (r, _) = post(&app, "/$/branches/m/dev/relink", "").await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["code"], "not-relinkable");
+}

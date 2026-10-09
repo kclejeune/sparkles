@@ -922,6 +922,9 @@ fn run_admin(
         "branches.note" => {
             value(ds.set_branch_note(text(a, "name")?, a["note"].as_str().map(String::from))?)?
         }
+        "branches.relink" => {
+            value(ds.relink_branch_with(text(a, "name")?, &Default::default(), ctl)?)?
+        }
         "branches.previewMerge" => value(ds.preview_merge(
             text(a, "source")?,
             text(a, "target")?,

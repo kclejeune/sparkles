@@ -1227,8 +1227,9 @@ Relinking works on a stopped database and takes its exclusive directory lock. Th
 branch's own writes are kept as a sparse overlay on main's index, and older indexes stay
 on disk while readers or history need them. `main` and branches that already have their
 own index cannot be relinked. Progress goes to stderr, and Ctrl-C cancels the
-operation. Ordinary compaction still gives a branch an index of its own. The server
-has no relink route.
+operation. Ordinary compaction still gives a branch an index of its own. On a running
+server, `POST /$/branches/{ds}/{name}/relink` does the same (see
+[API: Relinking](API.md#relinking)).
 
 `merge` prints the result, or the conflicts that stopped it:
 

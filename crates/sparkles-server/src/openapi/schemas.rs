@@ -631,6 +631,36 @@ pub(super) fn schemas() -> Map<String, J> {
         ),
     );
     put(
+        "RelinkResult",
+        obj(
+            &[
+                "dataset",
+                "branch",
+                "branchId",
+                "generation",
+                "quads",
+                "baseCommit",
+            ],
+            json!({
+                "dataset": { "type": "string" },
+                "branch": { "type": "string" },
+                "branchId": { "type": "string" },
+                "generation": { "type": "string", "description": "The linked generation the relink published, or the current one when it was abandoned." },
+                "quads": { "type": "integer" },
+                "baseCommit": { "type": "integer", "description": "The commit of main whose index the branch now links to." },
+                "caughtUpCommits": { "type": "integer", "description": "The branch's commits made during the relink and carried into the new generation." },
+                "abandoned": { "type": "string", "description": "Why the relink published nothing." },
+                "mode": { "type": "string" },
+                "fullReason": { "type": "string" },
+                "blocksRewritten": { "type": "integer" },
+                "blocksCopied": { "type": "integer" },
+                "lockMs": { "type": "number", "description": "How long the switch held the branch's writer lock." },
+                "buildMs": { "type": "number" },
+                "totalMs": { "type": "number" },
+            }),
+        ),
+    );
+    put(
         "CommitGraph",
         obj(
             &["dataset", "datasetId", "branches", "commits", "next"],

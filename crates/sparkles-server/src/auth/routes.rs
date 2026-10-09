@@ -88,6 +88,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // branches and merges: the handlers check each branch a request names
     ("/$/branches/{ds}", &["GET", "POST", "PATCH"]),
     ("/$/branches/{ds}/{name}", &["GET", "PATCH", "DELETE"]),
+    ("/$/branches/{ds}/{name}/relink", &["POST"]),
     ("/$/merge/{ds}", &["GET", "POST"]),
     ("/$/revert/{ds}", &["GET", "POST"]),
     ("/$/cherry-pick/{ds}", &["GET", "POST"]),
@@ -246,6 +247,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // visible on some branch: the handlers check the branches a request names
         "/$/branches/{ds}"
         | "/$/branches/{ds}/{name}"
+        | "/$/branches/{ds}/{name}/relink"
         | "/$/merge/{ds}"
         | "/$/revert/{ds}"
         | "/$/cherry-pick/{ds}"

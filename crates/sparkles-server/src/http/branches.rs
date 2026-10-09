@@ -1567,3 +1567,111 @@ pub(crate) async fn cherry_pick(
     let op = cherry_pick_op(&params)?;
     execute(&st, &p, &name, ds, &headers, &v, op, ask.o, ask.dry_run).await
 }
+
+/// The answer of a relink: the report of the new linked generation, with the branch.
+fn relink_json(name: &str, branch: &str, id: &str, r: &sparkles::store::CompactReport) -> J {
+    let mut j = json!({ "dataset": name, "branch": branch, "branchId": id });
+    if let (Some(obj), J::Object(rep)) = (j.as_object_mut(), json!(r)) {
+        obj.extend(rep);
+    }
+    j
+}
+
+/// The answer of a relink the library refuses because the branch cannot be relinked:
+/// it owns its index, or it belongs to an in-memory dataset.
+fn relink_error(e: Error) -> ApiError {
+    match e {
+        Error::Unsupported(m) => ApiError(
+            StatusCode::CONFLICT,
+            json!({ "error": m, "code": "not-relinkable" }),
+        ),
+        e => e.into(),
+    }
+}
+
+/// `POST /$/branches/{ds}/{name}/relink`: move a persistent linked branch onto main's
+/// current index. The branch keeps its id, head, commits and state. Needs admin on the
+/// branch. With `Prefer: respond-async` it runs as a cancellable task.
+pub(crate) async fn relink(
+    State(st): St,
+    Path((name, branch)): Path<(String, String)>,
+    Extension(p): Extension<Principal>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    writable(&st)?;
+    let ds = main_dataset(&st, &name)?;
+    if !body.iter().all(u8::is_ascii_whitespace) {
+        let v: J = serde_json::from_slice(&body)
+            .map_err(|e| invalid("invalid-branch", format!("invalid request body: {e}")))?;
+        match v.as_object() {
+            Some(o) if o.is_empty() => {}
+            Some(o) => {
+                let k = o.keys().next().map(String::as_str).unwrap_or_default();
+                return Err(invalid(
+                    "invalid-branch",
+                    format!("unknown field {k}: a relink takes no options"),
+                ));
+            }
+            None => return Err(invalid("invalid-branch", "the body is a JSON object")),
+        }
+    }
+    check(&p, &name, &branch, Level::Admin, None)?;
+    if branch == MAIN {
+        return Err(invalid(
+            "invalid-branch",
+            "main cannot be relinked: relinking moves a linked branch onto main's index",
+        ));
+    }
+    let id = {
+        let d = ds.clone();
+        let b = branch.clone();
+        blocking(move || Ok(d.store.branch_info(&b)?.id.to_string())).await?
+    };
+    if respond_async(&headers) {
+        task_start_check(&st, None, &name)?;
+        let (n, b) = (name.clone(), branch.clone());
+        let task = st.start_task_opts(
+            st.next_task_id(),
+            "relink",
+            &name,
+            Some(&branch),
+            true,
+            move |h| {
+                let ctl = h.control();
+                let r = ds
+                    .dataset
+                    .relink_branch_with(&b, &Default::default(), &ctl)?;
+                h.set_detail(relink_json(&n, &b, &id, &r));
+                Ok(match &r.abandoned {
+                    Some(why) => format!("relink of {b} abandoned: {why}"),
+                    None => format!(
+                        "relinked branch {b} into {} ({} quads, base commit {})",
+                        r.generation, r.quads, r.base_commit
+                    ),
+                })
+            },
+        );
+        let loc = format!("/$/tasks/{}", task.id);
+        return Ok((
+            StatusCode::ACCEPTED,
+            [
+                (header::LOCATION, loc),
+                (
+                    header::HeaderName::from_static("preference-applied"),
+                    "respond-async".to_string(),
+                ),
+            ],
+            Json(task),
+        )
+            .into_response());
+    }
+    let b = branch.clone();
+    let r = blocking(move || {
+        ds.dataset
+            .relink_branch_with(&b, &Default::default(), &sparkles::task::Control::none())
+            .map_err(relink_error)
+    })
+    .await?;
+    Ok(Json(relink_json(&name, &branch, &id, &r)).into_response())
+}

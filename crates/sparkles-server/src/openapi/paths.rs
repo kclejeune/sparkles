@@ -1341,6 +1341,15 @@ fn branches(p: &mut Paths) {
             .errors(&[400, 403, 404, 409]),
     );
     p.add(
+        op(POST, "/$/branches/{ds}/{name}/relink", "relinkBranch", "Branches", "Relink a branch to main's index")
+            .doc("Moves a persistent branch that still links to an upstream's index onto the index of `main`'s current generation. The branch's changes since its start become a sparse overlay on that index, and its id, head, commits, snapshots and state stay as they were. Writes to the branch go on during the relink and are carried into the new generation. A relink never happens on its own, and ordinary compaction still gives a branch an index of its own. Needs admin on the branch. Relinking `main` answers `400 invalid-branch`, and a branch that owns its index or belongs to an in-memory dataset answers `409 not-relinkable`. The body is empty or `{}`.")
+            .see("relinking")
+            .header("Prefer", s(), "`respond-async` runs it as a cancellable task with progress: `202` with the task and `Location: /$/tasks/{id}`. The task's `detail` is the result.")
+            .resp("202", "Started as a task (`Prefer: respond-async`).", Some(json!({ "application/json": { "schema": sref("Task") } })))
+            .json("200", "The relink.", "RelinkResult")
+            .errors(&[400, 403, 404, 409, 503]),
+    );
+    p.add(
         op(GET, "/$/merge/{ds}", "previewMerge", "Branches", "Preview a merge")
             .doc("What merging `source` into `target` would do: the merge base, the changes and the conflicts. Nothing is written, and conflicts do not fail the request.")
             .see("merges")

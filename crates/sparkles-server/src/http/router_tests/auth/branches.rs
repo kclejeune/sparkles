@@ -207,6 +207,64 @@ async fn a16_grants_limited_to_branches() {
     );
 }
 
+/// Relinking needs admin on the branch: write is not enough, and a grant limited to
+/// some branches may relink those it covers but no other.
+#[tokio::test]
+async fn relinking_needs_admin_on_the_branch() {
+    let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let extra = format!(
+        r#"{}
+[[users]]
+name = "keeper"
+password = "{}"
+[[users.grants]]
+dataset = "br"
+level = "admin"
+branches = ["dev*"]
+"#,
+        users(),
+        h("keeper-pw"),
+    );
+    let s = build(Fixture {
+        extra,
+        ..Default::default()
+    });
+    s.state.attach("br", DbType::Persistent, None).unwrap();
+    let app = &s.app;
+    for name in ["dev", "other"] {
+        let r = post_json(
+            app,
+            "owner",
+            "/$/branches/br",
+            &format!(r#"{{"name":"{name}"}}"#),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED);
+    }
+    let r = post_json(app, "devs", "/$/branches/br/dev/relink", "").await;
+    assert_eq!(
+        r.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = post_json(app, "keeper", "/$/branches/br/other/relink", "").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert_eq!(r.json()["code"], "no-such-branch");
+    let r = post_json(app, "graphy", "/$/branches/br/dev/relink", "").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    for (user, branch) in [("keeper", "dev"), ("owner", "other")] {
+        let r = post_json(app, user, &format!("/$/branches/br/{branch}/relink"), "").await;
+        assert_eq!(
+            r.status,
+            StatusCode::OK,
+            "{user} {branch}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+        assert_eq!(r.json()["branch"], branch);
+    }
+}
+
 async fn patch_json(app: &Router, user: &str, uri: &str, body: &str) -> R {
     let h = json_call(user);
     let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -456,6 +514,7 @@ async fn read_only_servers_refuse_branch_mutations() {
             json("devs"),
             "",
         ),
+        ("POST", "/$/branches/br/dev/relink", json("owner"), ""),
     ];
     for (method, uri, headers, body) in &cases {
         let h: Vec<(&str, &str)> = headers

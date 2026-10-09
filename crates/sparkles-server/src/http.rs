@@ -172,6 +172,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .patch(branches::patch_branch)
                 .delete(branches::delete_branch),
         )
+        .route("/$/branches/{ds}/{name}/relink", post(branches::relink))
         .route(
             "/$/merge/{ds}",
             get(branches::preview).post(branches::merge),

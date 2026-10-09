@@ -303,6 +303,10 @@ fn entries() -> Vec<(&'static str, Entry)> {
             ds.delete_branch("dev", false);
             ds.delete_branch_with("dev", &Default::default());
         }),
+        op!("relinkBranch", "branches.relink", |ds| {
+            ds.relink_branch("dev", &Default::default());
+            ds.relink_branch_with("dev", &Default::default(), &Control::none());
+        }),
         op!("previewMerge", "branches.preview_merge", |ds| {
             ds.preview_merge("dev", "main", &Default::default());
         }),
@@ -774,7 +778,6 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.clone_to_with",
     "dataset.clone_to_memory_with",
     "dataset.branch",
-    "dataset.relink_branch",
     "history.wait_for_commit",
     "history.prune",
     "history.tick",
@@ -807,8 +810,6 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
     ds.insert(any());
     ds.remove(any());
     ds.branch("dev");
-    ds.relink_branch("dev", &Default::default());
-    ds.relink_branch_with("dev", &Default::default(), &sparkles::task::Control::none());
     ds.clone_to_with("clone", &Default::default(), &Default::default());
     ds.clone_to_memory_with("clone", &Default::default(), &Default::default());
     ds.history().wait_for_commit(0, std::time::Duration::ZERO);

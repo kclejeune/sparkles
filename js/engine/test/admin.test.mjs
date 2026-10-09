@@ -122,6 +122,33 @@ test('history, snapshots, settings, branches, guards and validation handles', as
     await rm(path, { recursive: true, force: true });
   }
 });
+test('relinking moves a linked branch onto main and keeps its state', async (t) => {
+  const path = await temp();
+  try {
+    const ds = t.resource(await Dataset.open(path));
+    await ds.update('INSERT DATA {<urn:a> <urn:p> 1}');
+    const info = await ds.branches.create('dev');
+    const dev = t.resource(await ds.branch('dev'));
+    await dev.update('INSERT DATA {<urn:b> <urn:p> 2}');
+    await ds.update('INSERT DATA {<urn:c> <urn:p> 3}');
+    await ds.compact();
+    const head = (await ds.branches.get('dev')).head;
+    const cancelled = new AbortController();
+    cancelled.abort();
+    await assert.rejects(ds.branches.relink('dev', { signal: cancelled.signal }));
+    const report = await ds.branches.relink('dev');
+    assert.equal(report.mode, 'relink');
+    assert.equal(BigInt(report.quads), 2n);
+    const after = await ds.branches.get('dev');
+    assert.equal(after.id, info.id);
+    assert.deepEqual(after.head, head);
+    assert.equal(await dev.count(), 2n);
+    await assert.rejects(ds.branches.relink('main'));
+  } finally {
+    await t.cleanup();
+    await rm(path, { recursive: true, force: true });
+  }
+});
 test('RDF/JS Source supplies Comunica matching and native counts', async (t) => {
   const ds = t.resource(Dataset.memory());
   await ds.update('INSERT DATA {<urn:s> <urn:p> <urn:o>. <urn:o> <urn:q> 7.}');
