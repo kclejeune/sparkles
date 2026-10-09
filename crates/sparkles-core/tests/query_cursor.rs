@@ -2496,7 +2496,7 @@ impl Gen {
 
     fn aggregate(&mut self) -> String {
         let x = self.var();
-        match self.rng.below(8) {
+        match self.rng.below(12) {
             0 => "COUNT(*)".into(),
             1 => format!("COUNT({x})"),
             2 => format!("COUNT(DISTINCT {x})"),
@@ -2504,7 +2504,11 @@ impl Gen {
             4 => format!("MIN({x})"),
             5 => format!("MAX({x})"),
             6 => format!("AVG({x})"),
-            _ => format!("SUM({x} + 1)"),
+            7 => format!("SUM({x} + 1)"),
+            8 => format!("SUM(DISTINCT {x})"),
+            9 => format!("AVG({x} * 2)"),
+            10 => format!("MAX(STR({x}))"),
+            _ => format!("COUNT(DISTINCT COALESCE({x}, 0))"),
         }
     }
 
@@ -2518,6 +2522,8 @@ impl Gen {
                 "<urn:q>",
                 "(<urn:q>|<urn:p>)/(<urn:q>|<urn:p>)",
                 "<urn:q>/(<urn:q>|<urn:p>)",
+                "<urn:q>+",
+                "^<urn:q>*",
             ]);
             let scope = [s, o].into_iter().filter(|v| v.starts_with('?')).collect();
             return (format!("{s} {p} {o} ."), scope);
@@ -3022,10 +3028,10 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
         }
     }
     for q in [
-        "SELECT ?s (GROUP_CONCAT(STR(?o)) AS ?c) WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t } GROUP BY ?s",
+        "SELECT ?t (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t } GROUP BY ?t HAVING (NOT EXISTS { ?t <urn:p> 3 })",
         "SELECT ?s ?t WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t FILTER NOT EXISTS { ?t <urn:p> 3 } }",
         "SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q>+ ?x }",
-        "SELECT ?s (COUNT(DISTINCT ?t) AS ?n) WHERE { { ?s <urn:q> ?t } UNION { ?t <urn:q> ?s } } GROUP BY ?s",
+        "SELECT ?s ?x WHERE { { ?s <urn:q> ?t } UNION { ?t <urn:q> ?s } ?s <urn:q>* ?x }",
     ] {
         let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
         for rows in [1, 2, 3, 4096] {
@@ -3039,6 +3045,34 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
             assert!(!found.is_empty(), "{q}");
             assert!(found.iter().all(|nested| !nested), "{q}: {:?}", c.plan());
             assert_eq!(bag(all(c)), expected, "{q}; {rows}");
+        }
+    }
+}
+
+/// Groups with several keys, expression arguments, DISTINCT and GROUP_CONCAT keep
+/// running state rather than falling back, and match eager answers, including errors,
+/// unbound keys and empty input.
+#[test]
+fn widened_incremental_groups_match_eager() {
+    let s = store(40);
+    let rows = "VALUES (?k ?j ?x ?y) { (1 1 1 \"a\") (1 1 1 \"b\") (1 2 2 \"a\") (UNDEF 2 3 \"c\") (2 UNDEF \"x\" <urn:i>) (2 UNDEF 4 UNDEF) (1 1 UNDEF \"a\"@en) (UNDEF UNDEF 5 \"d\") (2 1 1 \"a\") (UNDEF 1 1 \"b\") }";
+    for q in [
+        format!("SELECT ?k ?j (COUNT(*) AS ?n) (SUM(?x) AS ?s) WHERE {{ {rows} }} GROUP BY ?k ?j"),
+        format!("SELECT ?k (SUM(?x * 2) AS ?s) (AVG(?x + 1) AS ?a) (MIN(STR(?y)) AS ?m) WHERE {{ {rows} }} GROUP BY ?k"),
+        format!("SELECT ?k (COUNT(DISTINCT ?x) AS ?c) (SUM(DISTINCT ?x) AS ?s) (COUNT(DISTINCT ?y) AS ?d) WHERE {{ {rows} }} GROUP BY ?k"),
+        format!("SELECT ?k (GROUP_CONCAT(?y) AS ?g) (GROUP_CONCAT(DISTINCT STR(?y); SEPARATOR=\"|\") AS ?h) WHERE {{ {rows} }} GROUP BY ?k"),
+        format!("SELECT (GROUP_CONCAT(?x; SEPARATOR=\",\") AS ?g) (SAMPLE(?x * 1) AS ?a) (MAX(?x) AS ?m) WHERE {{ {rows} }}"),
+        format!("SELECT ?j (COUNT(?x / 0) AS ?e) (SUM(?x / 0) AS ?f) WHERE {{ {rows} }} GROUP BY ?j"),
+        "SELECT ?k ?j (COUNT(*) AS ?n) (GROUP_CONCAT(?x) AS ?g) WHERE { VALUES (?k ?j ?x) {} } GROUP BY ?k ?j".into(),
+        "SELECT (COUNT(DISTINCT ?x) AS ?n) (GROUP_CONCAT(?x) AS ?g) (AVG(?x * 2) AS ?a) WHERE { VALUES ?x {} }".into(),
+        "SELECT ?s ?o (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o } GROUP BY ?s ?o HAVING (?o > 30)".into(),
+        "SELECT ?m (COUNT(?s) AS ?n) (SUM(?o) AS ?t) WHERE { ?s <urn:p> ?o BIND(?o - (?o / 5 - FLOOR(?o / 5)) * 5 AS ?r) } GROUP BY (FLOOR(?o / 10) AS ?m)".into(),
+    ] {
+        let expected = bag(query(s.snapshot(), &q, &Default::default()).unwrap().rows());
+        for cap in [1, 2, 3, 4096] {
+            let c = open(&s, &q, cap);
+            assert!(!c.plan().has_materialization(), "{q}");
+            assert_eq!(bag(all(c)), expected, "{q}; cap {cap}");
         }
     }
 }

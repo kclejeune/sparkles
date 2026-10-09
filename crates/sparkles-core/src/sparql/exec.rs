@@ -3234,7 +3234,12 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
 
 /// BIND: the value of `e` on every row (unbound on an error), once per distinct input
 /// value when the expression is pure over one variable.
-fn compute_column(ctx: &Ctx, t: &Table, e: &Expr, report: &mut ExprReport) -> Result<Vec<Id>> {
+pub(super) fn compute_column(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    report: &mut ExprReport,
+) -> Result<Vec<Id>> {
     if ctx.is_cursor() {
         return match super::exprcache::cursor_column(ctx, t, e, report, |v| column_rows(ctx, v, e))?
         {
@@ -3869,7 +3874,7 @@ pub fn incremental_group_ok(keys: &[VarId], aggs: &[(VarId, Agg)], input: &[VarI
 }
 
 /// The ARQ variance or deviation aggregate a custom aggregate is, if it is one.
-fn stat_aggregate(func: &AggregateFunction) -> Option<super::aggext::Arq> {
+pub(super) fn stat_aggregate(func: &AggregateFunction) -> Option<super::aggext::Arq> {
     match func {
         AggregateFunction::Custom(iri) => super::aggext::Arq::of(iri.as_str())
             .filter(|a| matches!(a, super::aggext::Arq::Stat { .. })),
