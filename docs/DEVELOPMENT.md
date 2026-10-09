@@ -272,6 +272,17 @@ property `sparkles.jni=false` keeps every call on UniFFI, and a list of `read`,
 suite twice, as `test` with the JNI calls and as `testUniffi` without them, and
 `mise run bench:bindings --jvm-opts=-Dsparkles.jni=false` measures the UniFFI calls alone.
 
+`mise run bench:jena` compares realistic Jena work on Sparkles, TDB2 and Jena's in-memory
+dataset at one and four threads. Its cases are Model and Graph calls, Jena's RDFS
+reasoner, small SPARQL queries, parameterized queries, small updates and Model writes, a
+bulk load and queries through Fuseki. Every arm runs in fresh JVMs in A/B/B/A order, the
+answers are checked first, and the results go to `target/bench-jena/results` as
+`summary.md` and `raw.json`. An arm is an engine with JVM options, so a system property
+that turns a feature off gives a before arm. `scripts/nsc-jena.sh` (`mise run
+bench:jena-nsc`) runs the same comparison on an ephemeral Namespace instance. It builds
+the bindings here, ships them with a Temurin JDK and a standalone CPython, and downloads
+the results to `target/nsc-jena/<time>`.
+
 `./gradlew :sparkles-jena:perfCheck -Pdata=DATA.nt -Pqueries=QUERIES.tsv`, run in `jvm/`,
 times queries through Jena on Sparkles, through the native library alone and on an
 in-memory TDB2 dataset. `cargo run --release --example perf --manifest-path

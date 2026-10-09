@@ -47,6 +47,14 @@ public object Sparkles {
     @JvmField
     public val NO_CACHE: Symbol = Symbol.create(NS + "noCache")
 
+    /**
+     * The most `find` calls a small query may be estimated to make and still run in ARQ
+     * over `find()` rather than in Sparkles' engine (a number, where 0 runs every query in
+     * Sparkles). The default is the system property `sparkles.smallQueries`, else 32.
+     */
+    @JvmField
+    public val SMALL_QUERY_FINDS: Symbol = Symbol.create(NS + "smallQueryFinds")
+
     /** The fallback mode of one query: a [SparklesFallback] or its name. */
     @JvmField
     public val FALLBACK: Symbol = Symbol.create(NS + "fallback")

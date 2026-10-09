@@ -51,16 +51,25 @@ const STATS: [&str; 6] = [
 /// The parser with every custom aggregate IRI of this build registered. The GeoSPARQL
 /// and `afn:` aggregates are spargebra's built-in list, which the formatter writes in
 /// the standard call form, so that form parses back as the same aggregate.
-pub fn register(mut p: SparqlParser) -> SparqlParser {
-    for iri in BUILT_IN_AGGREGATE_IRIS {
-        p = p.with_custom_aggregate_function(NamedNode::new_unchecked(iri));
-    }
-    for (_, local) in ARQ_AGGREGATE_KEYWORDS {
-        p = p.with_custom_aggregate_function(NamedNode::new_unchecked(format!(
-            "{ARQ_AGGREGATE_NAMESPACE}{local}"
-        )));
-    }
-    p
+///
+/// The set of IRIs is built once and shared, because every query and update parses with
+/// it and building it took a few microseconds of each small query's time.
+pub fn register(p: SparqlParser) -> SparqlParser {
+    static IRIS: std::sync::OnceLock<std::sync::Arc<std::collections::HashSet<NamedNode>>> =
+        std::sync::OnceLock::new();
+    let iris = IRIS.get_or_init(|| {
+        let mut set = std::collections::HashSet::new();
+        for iri in BUILT_IN_AGGREGATE_IRIS {
+            set.insert(NamedNode::new_unchecked(iri));
+        }
+        for (_, local) in ARQ_AGGREGATE_KEYWORDS {
+            set.insert(NamedNode::new_unchecked(format!(
+                "{ARQ_AGGREGATE_NAMESPACE}{local}"
+            )));
+        }
+        std::sync::Arc::new(set)
+    });
+    p.with_custom_aggregate_functions(iris)
 }
 
 #[cfg(test)]

@@ -101,27 +101,28 @@ internal class ByteBuf(initial: Int = 256) {
     }
 
     fun putString(s: String) {
-        // ASCII is written in place; anything else goes through the UTF-8 encoder
+        // ASCII is written in place in one pass. A string with anything else is written
+        // again from the start through the UTF-8 encoder.
         val n = s.length
-        var ascii = true
+        val start = size
+        putLen(n)
+        ensure(n)
+        val b = buf
+        val at = size
         for (i in 0 until n) {
-            if (s[i].code >= 0x80) {
-                ascii = false
-                break
+            val c = s[i].code
+            if (c >= 0x80) {
+                size = start
+                val bytes = s.toByteArray(StandardCharsets.UTF_8)
+                putLen(bytes.size)
+                ensure(bytes.size)
+                System.arraycopy(bytes, 0, buf, size, bytes.size)
+                size += bytes.size
+                return
             }
+            b[at + i] = c.toByte()
         }
-        if (ascii) {
-            putLen(n)
-            ensure(n)
-            for (i in 0 until n) buf[size + i] = s[i].code.toByte()
-            size += n
-        } else {
-            val bytes = s.toByteArray(StandardCharsets.UTF_8)
-            putLen(bytes.size)
-            ensure(bytes.size)
-            System.arraycopy(bytes, 0, buf, size, bytes.size)
-            size += bytes.size
-        }
+        size = at + n
     }
 
     fun toByteArray(): ByteArray = buf.copyOf(size)
@@ -136,13 +137,14 @@ internal class ByteBuf(initial: Int = 256) {
  * Writes terms into a batch. A term already written at the top level of the batch is
  * sent as a repeat of its position (tag 11), so a batch of quads sends each shared IRI once.
  */
-internal class TermWriter(val buf: ByteBuf = ByteBuf()) {
-    private val positions = HashMap<Node, Int>()
+internal class TermWriter(val buf: ByteBuf = ByteBuf(), repeats: Boolean = true) {
+    /** `null` when every term is written in full, which suits a pattern of a few terms */
+    private val positions: HashMap<Node, Int>? = if (repeats) HashMap() else null
     private var next = 0
 
     fun reset() {
         buf.clear()
-        positions.clear()
+        positions?.clear()
         next = 0
     }
 
@@ -164,6 +166,11 @@ internal class TermWriter(val buf: ByteBuf = ByteBuf()) {
     }
 
     fun term(n: Node) {
+        val positions = positions
+        if (positions == null) {
+            raw(n)
+            return
+        }
         val pos = positions[n]
         if (pos != null) {
             buf.put(Tag.REPEAT)
@@ -233,7 +240,7 @@ internal class TermWriter(val buf: ByteBuf = ByteBuf()) {
 
 /** The encoding of one quad pattern (graph, subject, predicate, object). */
 internal fun encodePattern(g: Node?, s: Node?, p: Node?, o: Node?): ByteArray {
-    val w = TermWriter(ByteBuf(64))
+    val w = TermWriter(ByteBuf(128), repeats = false)
     w.graph(g)
     w.slot(s)
     w.slot(p)

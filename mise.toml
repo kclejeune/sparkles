@@ -797,6 +797,36 @@ args=(--people "$usage_people" --workdir "$(realpath -m "$usage_workdir")" --lan
 python3 scripts/bench-bindings/bench.py "${args[@]}"
 '''
 
+[tasks."bench:jena"]
+description = "Realistic Jena work (Model, RDFS, small SPARQL, updates, loads, Fuseki) on Sparkles against TDB2 and TIM, one and four threads, answers checked first"
+usage = '''
+arg "[people]" default="10000" help="dataset size in people (~10.5 triples each)"
+arg "[workdir]" default="target/bench-jena" help="data, stores and results/ (summary.md, raw.json)"
+flag "--arm <arm>" var=#true help="LABEL=ENGINE[;JVM OPTION]..., repeatable, e.g. \"before=sparkles-mem;-Dsparkles.smallQueries=0\" (default: sparkles=sparkles-mem, sparkles-disk=sparkles, tdb2=tdb2, tim=tim)"
+flag "--cases <list>" help="only these cases, comma-separated"
+flag "--rounds <n>" default="2" help="timing processes per arm, in A/B/B/A order"
+flag "--seconds <s>" default="5" help="measured seconds per case and thread count"
+flag "--warmup-seconds <s>" default="2" help="warm-up seconds per case and thread count"
+flag "--threads <list>" default="1,4" help="thread counts"
+flag "--cpus <list>" help="pin every process with taskset, e.g. 8-15"
+flag "--no-build" help="use the bindings as built"
+'''
+run = '''
+args=(--people "$usage_people" --workdir "$(realpath -m "$usage_workdir")" --rounds "$usage_rounds"
+  --seconds "$usage_seconds" --warmup-seconds "$usage_warmup_seconds" --threads "$usage_threads")
+if [ -n "${usage_arm:-}" ]; then
+  while IFS= read -r a; do [ -n "$a" ] && args+=(--arm "$a"); done < <(printf '%s\n' "${usage_arm}" | tr ' ' '\n')
+fi
+[ -n "${usage_cases:-}" ] && args+=(--cases "$usage_cases")
+[ -n "${usage_cpus:-}" ] && args+=(--cpus "$usage_cpus")
+[ -n "${usage_no_build:-}" ] && args+=(--no-build)
+python3 scripts/bench-bindings/jena.py "${args[@]}"
+'''
+
+[tasks."bench:jena-nsc"]
+description = "bench:jena on an ephemeral Namespace instance (needs nsc, uv and zstd); options as scripts/nsc-jena.sh --help, jena.py options after --"
+run = "scripts/nsc-jena.sh"
+
 [tasks."bench:backup"]
 description = "Backup repositories on an existing database: full and incremental backup, restore and verify times to an fs repository"
 depends = ["build"]

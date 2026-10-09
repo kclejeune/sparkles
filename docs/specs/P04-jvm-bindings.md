@@ -1713,3 +1713,79 @@ on `ASK` and `SELECT ?o`, and on four threads `ASK` went from 37,800 to 43,200 q
 per second against TDB2's 45,500. That gap is not the bridge. It is Jena's
 serialization of the query, Sparkles' parsing and planning of the text, and the eager
 `NOW()`, which the next steps for small queries address.
+
+**Realistic Jena work (2026-10-09).** `mise run bench:jena` measures 32 cases of ordinary
+Jena use on Sparkles, TDB2 and TIM at one and four threads. Its runner is
+`scripts/bench-bindings/jena.py`, and the cases are in
+`jvm/sparkles-jena/src/test/kotlin/io/github/kclejeune/sparkles/jena/bench/JenaUseCases.kt`.
+The cases are Model and Graph calls, Jena's RDFS reasoner over the
+dataset, small SPARQL SELECT, ASK, CONSTRUCT and DESCRIBE queries, ParameterizedSparqlString,
+substitution and initial bindings on a parsed query, small updates and Model writes in
+transactions, a bulk load with RDFDataMgr, and queries through Fuseki. Every arm runs in
+fresh JVMs in A/B/B/A order, and a check process per arm fingerprints the answers first.
+TDB2 differs alone where salaries appear, because it writes inlined `xsd:decimal` literals
+in canonical form. `scripts/nsc-jena.sh` runs the comparison on an ephemeral Namespace
+instance. The figures below come from 8-vCPU AMD Zen 4 (EPYC) instances with 105,000
+triples in memory, two timing processes per arm and 5 seconds per case. They are
+directional, and runs on different instances differed by up to 30% at four threads.
+
+Five changes came out of it.
+
+* Small queries run in ARQ over the JNI `find` when an estimate says that is cheaper
+  (`SmallQueries`). A query qualifies when its pattern is a basic graph pattern of up to
+  eight triples, with an optional leading VALUES block, filters made of comparisons,
+  logic and arithmetic other than division, and COUNT as its only aggregate. ARQ is
+  estimated to make at most 32 `find` calls for it. A pattern on a bound subject is
+  assumed to match two triples, and a pattern with an unbound subject and a constant
+  predicate and object is counted in the index with one native call. Only forms whose
+  answers the SPARQL specification fixes qualify, and the tests compare ARQ's answers with
+  Sparkles' engine query by query. RDFS on read, the inferred graph, row and memory
+  budgets and write transactions keep a query in Sparkles. The system property
+  `sparkles.smallQueries` sets the limit, and 0 turns the routing off. A limit of 64 was
+  slower than 32 on the cases between the two.
+* DESCRIBE of named resources runs one native query instead of two. ARQ finds the one
+  empty solution itself, and the DESCRIBE handler writes its query text directly and runs
+  it over JNI. The description still comes from the engine, so the configured DESCRIBE
+  strategy applies.
+* The parser shares the set of custom aggregate IRIs instead of building it for every
+  query, which took 3.5% of a small star lookup.
+* A `find` pattern is encoded without the table that lets a batch send a repeated term
+  once. Encoding fell from 13% to 7% of a Model navigation's time.
+* The native library has an opt-in `mimalloc` feature. With it a bulk load took 37 ms
+  instead of 61 ms and small Model writes about 15% less time, and reads moved within the
+  noise. The process's peak RSS rose from 653 to 962 MiB on a mixed run, so the feature is
+  off by default.
+
+Against TDB2 at one thread, Sparkles is now faster on every Model and Graph case, on
+RDFS, on ASK, SELECT, CONSTRUCT, star lookups, COUNT and parameterized queries, and on
+small writes and bulk loads. These are the medians of the last run, with the routing
+turned off for the earlier figure.
+
+| Case | Before | After | TDB2 |
+|---|---:|---:|---:|
+| `ASK` on a bound triple | 41 µs | 25 µs | 27 µs |
+| `SELECT ?o` on a subject | 42 µs | 22 µs | 23 µs |
+| friends and their names | 98 µs | 54 µs | 64 µs |
+| COUNT of an organization's employees | 89 µs | 74 µs | 94 µs |
+| initial binding on a parsed query | 26 µs | 10 µs | 12 µs |
+| DESCRIBE of one resource | 120 µs | 52 µs | 36 µs |
+
+The DESCRIBE figure before is from the first run, which preceded that change. At four
+threads Sparkles is ahead on the Model calls, star lookups and writes. The remaining
+losses have these causes.
+
+* `update-modify`, a DELETE/INSERT WHERE on one resource, takes 13 to 15 ms on the
+  in-memory store against 2.3 to 3.2 ms for TDB2, and 2.4 ms on Sparkles' disk store.
+  The time is in the native update, begin and commit calls, and it grows with the number
+  of CPUs the JVM may use. This is the engine's write path and not the binding.
+* VALUES over five subjects and a FILTER over an organization's employees stay in
+  Sparkles' engine and take 160 to 200 µs against TDB2's 115 to 160 µs. Their estimates
+  are 35 and 36 `find` calls, and in ARQ they ran no faster. The cost is Sparkles'
+  parsing and planning of each new query text. A plan cache keyed by the query text would
+  not help, because each operation's text differs.
+* DESCRIBE still costs about 15 µs more than TDB2, which is the one native query and the
+  engine's DESCRIBE strategy.
+* Jena's RDFS reasoner serializes its callers, so at four threads no engine scales.
+  Sparkles' longer `find` holds that lock longer and reaches 0.6 to 0.7 of TDB2.
+* Small queries at four threads vary by more than the gap between engines on these
+  instances, so they are ties at best. NOW() is still computed eagerly for every query.

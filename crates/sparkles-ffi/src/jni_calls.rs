@@ -30,7 +30,7 @@ use uniffi::{Handle, HandleAlloc, Lift, Lower};
 
 /// Changes when an entry point's signature changes; the Kotlin side checks it before it
 /// turns these calls on.
-const ABI_VERSION: jint = 1;
+const ABI_VERSION: jint = 2;
 
 type Env = *mut JNIEnv;
 
@@ -194,6 +194,19 @@ pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_Spark
     call(env, 0, || {
         let ds = unsafe { borrow::<FfiDataset>(dataset) };
         Ok(handle(ds.begin_read()))
+    })
+}
+
+/// Whether the dataset applies RDFS on read, which the small-query routing checks per query.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_SparklesJni_rdfsEnabledNative(
+    env: Env,
+    _class: jclass,
+    dataset: jlong,
+) -> jboolean {
+    call(env, false, || {
+        let ds = unsafe { borrow::<FfiDataset>(dataset) };
+        Ok(ds.rdfs_enabled())
     })
 }
 

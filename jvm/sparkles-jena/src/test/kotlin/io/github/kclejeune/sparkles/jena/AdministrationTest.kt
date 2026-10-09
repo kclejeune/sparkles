@@ -118,7 +118,7 @@ class AdministrationTest {
         SparklesDatasets.memory().use { ds ->
             ds.load(ByteArrayInputStream("<urn:s> <urn:p> 1 .".toByteArray()), Lang.TURTLE)
             val before = ds.stats().nativeQueries
-            val iterator = Algebra.exec(Algebra.compile(QueryFactory.create("SELECT ?s { ?s <urn:p> 1 }")), ds)
+            val iterator = Algebra.exec(Algebra.compile(QueryFactory.create("SELECT ?s { ?s <urn:p> ?o }")), ds)
             try { assertTrue(iterator.hasNext()); assertEquals("urn:s",iterator.next().get("s").uri) }
             finally { iterator.close() }
             assertEquals(before + 1, ds.stats().nativeQueries)
