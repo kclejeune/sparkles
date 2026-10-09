@@ -108,4 +108,47 @@ class TransactionIsolationTest {
             pool.shutdownNow()
         }
     }
+
+    @Test
+    fun racing_close_and_commit_either_commits_or_throws() {
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            repeat(100) {
+                val ds = SparklesDatasets.memory()
+                val begun = CountDownLatch(1)
+                val race = CountDownLatch(1)
+                try {
+                    val result = pool.submit<Throwable?> {
+                        ds.begin(TxnType.WRITE)
+                        ds.add(quad("a"))
+                        begun.countDown()
+                        check(race.await(10, TimeUnit.SECONDS))
+                        try {
+                            ds.commit()
+                            // Receipts belong to the committing thread.
+                            val receipt = ds.lastReceipt()
+                            assertNotNull(receipt, "close-aborted commit returned successfully")
+                            assertTrue(receipt!!.isCommitted())
+                            assertEquals(1L, receipt.commit.inserted)
+                            null
+                        } catch (e: Throwable) {
+                            e
+                        }
+                    }
+                    assertTrue(begun.await(10, TimeUnit.SECONDS))
+                    race.countDown()
+                    ds.close()
+                    val error = result.get(10, TimeUnit.SECONDS)
+                    if (error != null) {
+                        assertInstanceOf(JenaTransactionException::class.java, error, error.stackTraceToString())
+                    }
+                } finally {
+                    race.countDown()
+                    ds.close()
+                }
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
 }

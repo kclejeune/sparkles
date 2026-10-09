@@ -811,6 +811,51 @@ async fn unlocked_master_keys_are_cached_until_the_descriptor_changes() {
 }
 
 #[tokio::test]
+async fn cached_handle_must_reject_host_epoch_rollback() {
+    let store = Arc::new(InMemory::new());
+    let opts = options(93);
+    let stale = open(store.clone(), None, &opts).await;
+    let old_marker = marker_value(&store).await;
+    let old = stale.security().await.unwrap().sealed.unwrap();
+    assert_eq!(old.descriptor.active(), 1);
+    let other = open(store.clone(), None, &opts).await;
+    assert_eq!(other.key_rotate(&Ctl::default()).await.unwrap(), 2);
+    assert_eq!(other.security().await.unwrap().epoch(), Some(2));
+    assert!(floor::record(stale.id(), None, &old.descriptor).is_err());
+    put_marker(&store, &old_marker).await;
+    assert!(
+        stale.security().await.is_err(),
+        "cached epoch 1 bypassed the host's epoch 2 floor"
+    );
+}
+
+#[tokio::test]
+async fn successful_rotation_must_advance_epoch_floor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = Some(tmp.path().join("cache"));
+    let store = Arc::new(InMemory::new());
+    let opts = options(94);
+    let repo = open(store.clone(), cache.clone(), &opts).await;
+    let old_marker = marker_value(&store).await;
+    assert_eq!(repo.key_rotate(&Ctl::default()).await.unwrap(), 2);
+    put_marker(&store, &old_marker).await;
+    for slot in repository::read_slots(&repo.store).await.unwrap() {
+        if slot.epoch == 2 {
+            store.delete(&repository::slot_key(slot.id)).await.unwrap();
+        }
+    }
+    assert!(
+        try_open(store.clone(), None, &opts).await.is_err(),
+        "successful rotation did not advance the epoch floor"
+    );
+    floor::forget(repo.id());
+    assert!(
+        try_open(store, cache, &opts).await.is_err(),
+        "successful rotation did not persist the epoch floor"
+    );
+}
+
+#[tokio::test]
 async fn planted_passphrase_slots_are_refused_before_key_derivation() {
     let store = Arc::new(InMemory::new());
     let phrase = Passphrase::new("phrase", b"correct horse".to_vec()).unwrap();

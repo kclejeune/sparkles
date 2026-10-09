@@ -284,7 +284,7 @@ pub(crate) async fn open_snapshot(
             ));
         }
         let snapshot = unlock_async(id, descriptor, slots, options, known).await?;
-        super::floor::record(id, dir, &snapshot.descriptor);
+        super::floor::record(id, dir, &snapshot.descriptor)?;
         return Ok(snapshot);
     }
     unreachable!("bounded loop returns")
@@ -331,6 +331,7 @@ impl KeyState {
         if let Some(cached) = cache.as_ref()
             && cached.descriptor == descriptor
         {
+            super::floor::check(id, dir, &cached.descriptor)?;
             return Ok(cached.clone());
         }
         let known = cache

@@ -1734,11 +1734,11 @@ impl Store {
         self.failpoint("branch-create-committed");
         self.branching
             .next_ordinal
-            .store(t.next_ordinal as u64, Ordering::Relaxed);
+            .fetch_max(t.next_ordinal as u64, Ordering::Relaxed);
         for s in set.open_stores() {
             s.branching
                 .next_ordinal
-                .store(t.next_ordinal as u64, Ordering::Relaxed);
+                .fetch_max(t.next_ordinal as u64, Ordering::Relaxed);
         }
         drop(up_store);
         tracing::info!(target: "sparkles::store::branching",
@@ -1789,13 +1789,14 @@ impl Store {
             t.next_ordinal += 1;
             (ordinal, t.next_ordinal)
         };
+        self.failpoint("memory-ordinal-reserved");
         self.branching
             .next_ordinal
-            .store(next as u64, Ordering::Relaxed);
+            .fetch_max(next as u64, Ordering::Relaxed);
         for s in set.open_stores() {
             s.branching
                 .next_ordinal
-                .store(next as u64, Ordering::Relaxed);
+                .fetch_max(next as u64, Ordering::Relaxed);
         }
         let id = uuid::Uuid::new_v4();
         let from = FromRef {
@@ -1872,11 +1873,11 @@ impl Store {
         drop(t);
         self.branching
             .next_ordinal
-            .store(next as u64, Ordering::Relaxed);
+            .fetch_max(next as u64, Ordering::Relaxed);
         for s in set.open_stores() {
             s.branching
                 .next_ordinal
-                .store(next as u64, Ordering::Relaxed);
+                .fetch_max(next as u64, Ordering::Relaxed);
         }
         set.refresh_holds(self);
         self.branch_info(name)

@@ -477,6 +477,36 @@ fn memory_branch_indexes_build_outside_the_table_lock() {
     s.create_branch("next", &Default::default()).unwrap();
 }
 
+#[test]
+fn failed_creation_cannot_lower_blank_node_ordinal_floor() {
+    let s = Store::in_memory(StoreOptions::default());
+    let once = AtomicBool::new(false);
+    s.set_failpoint(
+        "memory-ordinal-reserved",
+        Some(Arc::new(move |store: &Store| {
+            if !once.swap(true, Ordering::SeqCst) {
+                store.create_branch("taken", &Default::default()).unwrap();
+            }
+        })),
+    );
+    assert!(s.create_branch("taken", &Default::default()).is_err());
+    s.set_failpoint("memory-ordinal-reserved", None);
+    assert_eq!(s.branch_info("taken").unwrap().ordinal, 2);
+    let taken = s.branch("taken").unwrap();
+    apply(&taken, "+_:existing <urn:p> \"old\" .");
+    merged(s.merge("taken", "main", &Default::default()).unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("clone");
+    s.clone_to(&root, &Default::default()).unwrap();
+    let cloned = Store::open(&root, Default::default()).unwrap();
+    let next = cloned.create_branch("next", &Default::default()).unwrap();
+    assert!(
+        next.ordinal > 2,
+        "clone reused the ordinal of a blank node already merged into its data: {}",
+        next.ordinal
+    );
+}
+
 /// A persistent branch that compacted into its own index is backed up from its own
 /// files. The restored dataset keeps its head, the branch's commit records and its
 /// blank-node numbering.

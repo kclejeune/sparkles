@@ -275,7 +275,7 @@ impl NativeDataset {
         let params = parse(&params)?;
         let v = parse(&options)?;
         let flag = cancel.flag.clone();
-        let _permit = permit(readers(), &v, &flag).await?;
+        let _permit = query_permit(&v, &flag).await?;
         let result = blocking(move || {
             shared.ds.queries().run_version(
                 &name,

@@ -289,15 +289,19 @@ public class DatasetGraphSparkles internal constructor(
     override fun commit() {
         val t = txn() ?: throw JenaTransactionException("Not in an active transaction")
         try {
-            t.checkNotAbortedByClose()
-            val w = t.write
-            if (w != null) {
+            if (t.mode == ReadWrite.WRITE) {
+                val w = t.writeOrThrow()
                 t.flush()
                 val r = ffi { w.commit() }
                 handle.lastReceipt.set(r.toReceipt())
             }
         } catch (e: RuntimeException) {
-            t.write?.abort()
+            try {
+                t.write?.abort()
+            } catch (abortFailure: RuntimeException) {
+                // Shutdown can destroy the native writer before cleanup reaches it.
+                e.addSuppressed(abortFailure)
+            }
             throw if (e is JenaTransactionException) e else JenaTransactionException("the commit failed: ${e.message}", e)
         } finally {
             finish(t)

@@ -103,7 +103,6 @@ impl Drop for NativeUpload {
 /// The reader permit of a result stream, given back while the stream waits for
 /// JavaScript to read, so that an unread stream does not block other queries.
 struct ReaderSlot {
-    readers: Arc<Semaphore>,
     permit: Option<OwnedSemaphorePermit>,
     flag: Arc<AtomicBool>,
 }
@@ -116,7 +115,7 @@ impl ReaderSlot {
                     "cancelled",
                 ));
             }
-            if let Ok(p) = self.readers.clone().try_acquire_owned() {
+            if let Ok(p) = READERS.lock().clone().try_acquire_owned() {
                 self.permit = Some(p);
                 return Ok(());
             }
@@ -441,8 +440,7 @@ impl NativeDataset {
         let shared = self.get(false)?;
         let v = parse(&options)?;
         let flag = cancel.flag.clone();
-        let readers = readers();
-        let stream_permit = permit(readers.clone(), &v, &flag).await?;
+        let stream_permit = query_permit(&v, &flag).await?;
         let result = blocking({
             let shared = shared.clone();
             let flag = flag.clone();
@@ -464,7 +462,6 @@ impl NativeDataset {
         let (sender, receiver) = mpsc::channel(2);
         let workerflag = flag.clone();
         let slot = ReaderSlot {
-            readers,
             permit: Some(stream_permit),
             flag: flag.clone(),
         };

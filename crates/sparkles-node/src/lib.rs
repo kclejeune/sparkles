@@ -316,7 +316,11 @@ pub fn set_max_concurrent_queries(limit: u32) -> napi::Result<()> {
     if limit == 0 || limit as usize > Semaphore::MAX_PERMITS {
         return Err(invalid("maxConcurrentQueries must be a positive integer"));
     }
-    *READERS.lock() = Arc::new(Semaphore::new(limit as usize));
+    let old = std::mem::replace(
+        &mut *READERS.lock(),
+        Arc::new(Semaphore::new(limit as usize)),
+    );
+    old.close();
     Ok(())
 }
 async fn permit(
@@ -324,26 +328,52 @@ async fn permit(
     v: &Value,
     flag: &AtomicBool,
 ) -> napi::Result<OwnedSemaphorePermit> {
+    acquire_permit(s, v, flag, false).await
+}
+async fn query_permit(v: &Value, flag: &AtomicBool) -> napi::Result<OwnedSemaphorePermit> {
+    acquire_permit(readers(), v, flag, true).await
+}
+async fn acquire_permit(
+    mut s: Arc<Semaphore>,
+    v: &Value,
+    flag: &AtomicBool,
+    refresh_readers: bool,
+) -> napi::Result<OwnedSemaphorePermit> {
     let started = Instant::now();
-    let acquire = s.clone().acquire_owned();
-    tokio::pin!(acquire);
-    loop {
-        if flag.load(Ordering::Relaxed) {
-            return Err(err(EngineError::Cancelled));
-        }
-        if v["noWait"].as_bool() == Some(true) {
-            return s
-                .try_acquire_owned()
-                .map_err(|_| err(EngineError::WriterBusy));
-        }
-        if v["timeout"]
-            .as_u64()
-            .is_some_and(|ms| started.elapsed() >= Duration::from_millis(ms))
-        {
-            return Err(err(EngineError::Timeout));
-        }
-        if let Ok(p) = tokio::time::timeout(Duration::from_millis(10), &mut acquire).await {
-            return p.map_err(|e| invalid(e.to_string()));
+    'retry: loop {
+        let acquire = s.clone().acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            if flag.load(Ordering::Relaxed) {
+                return Err(err(EngineError::Cancelled));
+            }
+            if refresh_readers && s.is_closed() {
+                s = readers();
+                continue 'retry;
+            }
+            if v["noWait"].as_bool() == Some(true) {
+                match s.clone().try_acquire_owned() {
+                    Ok(p) if !refresh_readers || !s.is_closed() => return Ok(p),
+                    _ if refresh_readers && s.is_closed() => {
+                        s = readers();
+                        continue 'retry;
+                    }
+                    _ => return Err(err(EngineError::WriterBusy)),
+                }
+            }
+            if v["timeout"]
+                .as_u64()
+                .is_some_and(|ms| started.elapsed() >= Duration::from_millis(ms))
+            {
+                return Err(err(EngineError::Timeout));
+            }
+            if let Ok(p) = tokio::time::timeout(Duration::from_millis(10), &mut acquire).await {
+                if refresh_readers && s.is_closed() {
+                    s = readers();
+                    continue 'retry;
+                }
+                return p.map_err(|e| invalid(e.to_string()));
+            }
         }
     }
 }
@@ -455,17 +485,16 @@ impl NativeDataset {
         match v["execution"].as_str().unwrap_or("eager") {
             "eager" => {}
             "streaming" | "auto" => {
-                let readers = readers();
-                let permit = permit(readers.clone(), &v, &flag).await?;
+                let permit = query_permit(&v, &flag).await?;
                 let cancellation = flag.clone();
                 let cursor =
                     blocking(move || open_query_cursor(&shared.ds, &text, &v, flag)).await?;
                 drop(permit);
-                return NativeResult::streaming(cursor, readers, cancellation).map_err(err);
+                return NativeResult::streaming(cursor, cancellation).map_err(err);
             }
             _ => return Err(invalid("execution must be eager, streaming or auto")),
         }
-        let _permit = permit(readers(), &v, &flag).await?;
+        let _permit = query_permit(&v, &flag).await?;
         let result = blocking(move || {
             let opts = query_options(&v, flag)?;
             if let Some(at) = v["at"].as_str() {
@@ -792,7 +821,6 @@ pub struct NativeResult {
     cursor: Arc<Mutex<Option<Cursor>>>,
     metadata: String,
     statistics: Arc<Mutex<Option<String>>>,
-    readers: Option<Arc<Semaphore>>,
     cancel: Option<Arc<AtomicBool>>,
 }
 impl NativeResult {
@@ -820,13 +848,11 @@ impl NativeResult {
             }))),
             metadata,
             statistics: Default::default(),
-            readers: None,
             cancel: None,
         }
     }
     fn streaming(
         execution: sparkles::sparql::QueryExecution,
-        readers: Arc<Semaphore>,
         cancel: Arc<AtomicBool>,
     ) -> sparkles::Result<Self> {
         use sparkles::sparql::QueryExecution;
@@ -883,7 +909,6 @@ impl NativeResult {
             cursor: Arc::new(Mutex::new(Some(Cursor { rows, pos: 0 }))),
             metadata,
             statistics: Default::default(),
-            readers: Some(readers),
             cancel: Some(cancel),
         })
     }
@@ -895,7 +920,6 @@ impl NativeResult {
             }))),
             metadata: json!({ "type": "quads" }).to_string(),
             statistics: Default::default(),
-            readers: None,
             cancel: None,
         }
     }
@@ -962,9 +986,9 @@ impl NativeResult {
         let cancel = self.cancel.clone();
         // A streaming cursor computes its batch under a reader permit, which it gives back
         // when the batch is done. Waiting for the permit stops when the cursor is closed.
-        let _permit = match (&self.readers, &cancel) {
-            (Some(readers), Some(flag)) => Some(permit(readers.clone(), &Value::Null, flag).await?),
-            _ => None,
+        let _permit = match &cancel {
+            Some(flag) => Some(query_permit(&Value::Null, flag).await?),
+            None => None,
         };
         blocking(move || {
             let mut lock = cursor.lock();

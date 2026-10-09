@@ -721,9 +721,11 @@ Cancellation is checked between batches of documents and before each blocking st
 build. Tantivy segment merges and the publication fence cannot be interrupted, so a close
 or disable that arrives during them waits for them to finish.
 Disk reserve is checked at recovery checkpoints, and an authoritative dataset quota check
-refuses growing ready publication. The quota check walks the dataset directory before the
-final writer admission, so writes do not wait for it. Derived staging can consume transient disk space before
-that final check; refusal removes staging and preserves RDF. This does not add a hard
+refuses growing ready publication. A preliminary check walks the dataset directory before
+final writer admission. After applying the final tail, recovery checks again under the
+writer lock so concurrent writes and quota changes cannot invalidate the result. Writers
+wait for this final walk. Derived staging can consume transient disk space before that
+final check; refusal removes staging and preserves RDF. This does not add a hard
 build-space reservation.
 
 Native controls cover missing/damaged indexes, concurrent writes, generation and journal

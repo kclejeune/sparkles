@@ -223,15 +223,15 @@ impl Recovery {
                     self.check()
                 })?;
                 hook(&self.root, "caught-up");
-                // The quota walk measures the whole dataset directory. It runs before
-                // the final writer admission so writes do not wait for it. The tail
-                // applied under the writer lock adds at most FINAL_TAIL quads.
+                // Refuse an already oversized build before taking the writer lock.
+                // Publication repeats this check after applying the final tail.
                 if let Some(quota) = self.quota.upgrade() {
                     quota.check_rebuild(
                         Some(&self.root.join("text")),
                         &self.root.join("text.new"),
                     )?;
                 }
+                hook(&self.root, "quota-checked");
                 let _w = self.lock(&writer)?;
                 self.owns(&slot)?;
                 let head = current.load_full();
@@ -249,6 +249,13 @@ impl Recovery {
                 self.check()?;
                 hook(&self.root, "publishing");
                 TextIndex::recovery_catch_up(&mut built, &self.config, &head, &tail, &|| Ok(()))?;
+                // Fence writes and quota changes while validating the completed index.
+                if let Some(quota) = self.quota.upgrade() {
+                    quota.check_rebuild(
+                        Some(&self.root.join("text")),
+                        &self.root.join("text.new"),
+                    )?;
+                }
                 let (ti, view) =
                     TextIndex::recovery_install(&self.root, self.config.clone(), built, &head)?;
                 index.store(Some(Arc::new(ti)));
@@ -636,9 +643,13 @@ mod tests {
         name: &'static str,
         ready: mpsc::Receiver<()>,
         release: Option<mpsc::Sender<()>>,
+        timeout: Duration,
     }
     impl Pause {
         fn new(root: &Path, name: &'static str) -> Self {
+            Self::with_timeout(root, name, Duration::from_secs(10))
+        }
+        fn with_timeout(root: &Path, name: &'static str, timeout: Duration) -> Self {
             let (notify, ready) = mpsc::channel();
             let (release, rx) = mpsc::channel();
             let rx = Mutex::new(rx);
@@ -648,7 +659,7 @@ mod tests {
                 Arc::new(move || {
                     if !once.swap(true, Ordering::SeqCst) {
                         notify.send(()).unwrap();
-                        rx.lock().recv_timeout(Duration::from_secs(10)).unwrap();
+                        rx.lock().recv_timeout(timeout).unwrap();
                     }
                 }),
             );
@@ -657,10 +668,11 @@ mod tests {
                 name,
                 ready,
                 release: Some(release),
+                timeout,
             }
         }
         fn reached(&self) {
-            self.ready.recv_timeout(Duration::from_secs(10)).unwrap();
+            self.ready.recv_timeout(self.timeout).unwrap();
         }
         fn resume(&mut self) {
             self.release.take().unwrap().send(()).unwrap();
@@ -721,6 +733,61 @@ mod tests {
         let reopened = Store::open(root, Default::default()).unwrap();
         assert_eq!(reopened.snapshot().commit, before.commit);
         assert_eq!(count(&reopened), 1);
+    }
+
+    #[test]
+    fn recovery_rechecks_quota_before_publication() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        std::fs::remove_dir_all(root.join("text")).unwrap();
+        let mut pause = Pause::new(root, "quota-checked");
+        let store = Store::open(root, StoreOptions::default()).unwrap();
+        pause.reached();
+        let job = store.text_recovery.load_full().unwrap();
+        store.set_quota(Some(1)).unwrap();
+        pause.resume();
+        assert!(
+            job.wait().is_err(),
+            "recovery published a growing index after the quota was lowered"
+        );
+    }
+
+    #[test]
+    fn recovery_quota_includes_the_final_tail() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        std::fs::remove_dir_all(root.join("text")).unwrap();
+        // Preparing a large RDF tail can take longer than the short pause used by
+        // the other tests when the workspace suite is competing for disk I/O.
+        let mut pause = Pause::with_timeout(root, "quota-checked", Duration::from_secs(60));
+        let store = Store::open(root, StoreOptions::default()).unwrap();
+        pause.reached();
+        let job = store.text_recovery.load_full().unwrap();
+        let words = (0..20_000).map(|i| format!("word{i} ")).collect::<String>();
+        update(
+            &store,
+            &format!(
+                "INSERT DATA {{ <urn:tail> <http://www.w3.org/2000/01/rdf-schema#label> \"{words}\" }}"
+            ),
+        );
+        store.set_quota(Some(u64::MAX)).unwrap();
+        let old = root.join("text");
+        let new = root.join("text.new");
+        let (_, _, projected) = store.quota.project_rebuild(Some(&old), &new).unwrap();
+        store.set_quota(Some(projected + 4096)).unwrap();
+        // The same quota admits the staged index before the final tail is indexed.
+        store.quota.check_rebuild(Some(&old), &new).unwrap();
+        pause.resume();
+        assert!(
+            job.wait().is_err(),
+            "the final tail bypassed the quota check"
+        );
+        assert_eq!(store.snapshot().len(), 2);
+        assert!(!root.join("text.new").exists());
     }
 
     #[cfg(unix)]

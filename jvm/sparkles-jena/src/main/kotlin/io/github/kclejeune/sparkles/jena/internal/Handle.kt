@@ -126,6 +126,15 @@ internal class TxnState(val handle: Handle, val type: TxnType) {
         }
     }
 
+    /** Capture the writer before checking close; a concurrent abort then fails in native code. */
+    fun writeOrThrow(): FfiWriteTxn {
+        val w = write
+        if (abortedByClose || w == null) {
+            throw JenaTransactionException("the write transaction was aborted because the dataset was closed")
+        }
+        return w
+    }
+
     /** The commit the transaction started from (for promotion). */
     var baseSeq: Long = 0
 
@@ -154,8 +163,7 @@ internal class TxnState(val handle: Handle, val type: TxnType) {
         val bytes = writer.buf.toByteArray()
         writer.reset()
         ops = 0
-        checkNotAbortedByClose()
-        val w = write ?: return
+        val w = writeOrThrow()
         ffi { w.apply(bytes) }
     }
 

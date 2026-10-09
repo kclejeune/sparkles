@@ -60,6 +60,10 @@ fn load(repository: Uuid, dir: Option<&Path>) -> Record {
 /// unauthenticated descriptor after an authenticated one.
 pub(crate) fn check(repository: Uuid, dir: Option<&Path>, descriptor: &Descriptor) -> Result<()> {
     let seen = load(repository, dir);
+    validate(seen, descriptor)
+}
+
+fn validate(seen: Record, descriptor: &Descriptor) -> Result<()> {
     if descriptor.max_epoch() < seen.epoch {
         return Err(tampered(
             "repository key epochs are older than this host has already seen",
@@ -74,26 +78,29 @@ pub(crate) fn check(repository: Uuid, dir: Option<&Path>, descriptor: &Descripto
 }
 
 /// Raise the floor after `descriptor` has been unlocked and its tag verified.
-pub(crate) fn record(repository: Uuid, dir: Option<&Path>, descriptor: &Descriptor) {
+pub(crate) fn record(repository: Uuid, dir: Option<&Path>, descriptor: &Descriptor) -> Result<()> {
     let accepted = Record {
         epoch: descriptor.max_epoch(),
         authenticated: descriptor.mac.is_some(),
     };
-    let merged = {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = seen.entry(repository).or_default();
-        *entry = entry.merge(accepted);
-        *entry
-    };
-    let Some(path) = file(dir) else {
-        return;
-    };
-    let stored = std::fs::read(&path)
-        .ok()
+    // Serialize acceptance and persistence across handles. In particular, an unlock
+    // started before a rotation must not accept its old descriptor after that rotation.
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let path = file(dir);
+    let stored = path
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok());
-    let merged = stored.map_or(merged, |stored| stored.merge(merged));
+    let entry = seen.entry(repository).or_default();
+    *entry = entry.merge(stored.unwrap_or_default());
+    validate(*entry, descriptor)?;
+    *entry = entry.merge(accepted);
+    let merged = *entry;
+    let Some(path) = path else {
+        return Ok(());
+    };
     if stored == Some(merged) {
-        return;
+        return Ok(());
     }
     // Best effort, like the manifest cache next to it. The in-memory floor still
     // protects this process when the directory cannot be written.
@@ -113,6 +120,7 @@ pub(crate) fn record(repository: Uuid, dir: Option<&Path>, descriptor: &Descript
             path.display()
         );
     }
+    Ok(())
 }
 
 /// Forget the in-memory floor, as a process restart does.

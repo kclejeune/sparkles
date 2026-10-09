@@ -167,6 +167,65 @@ test(
   },
 );
 
+test('existing cursors use the query limit after reconfiguration', { timeout: 30000 }, async () => {
+  const ds = Dataset.memory();
+  const controller = new AbortController();
+  let cursor;
+  let slow;
+  let body;
+  let serialized;
+  configure({ maxConcurrentQueries: 1 });
+  try {
+    const data = Array.from({ length: 10000 }, (_, i) => `<urn:s${i}> <urn:p> ${i} .`).join('\n');
+    await ds.load(data, { format: 'ttl' });
+    cursor = await ds.select('SELECT ?s { ?s <urn:p> ?o }', {
+      execution: 'streaming',
+      batchSize: 1,
+    });
+    // Enough output to fill the native channel and release the stream's permit.
+    body = await ds.queryToStream('SELECT ?s { ?s <urn:p> ?o }', {
+      execution: 'streaming',
+      batchSize: 1,
+    });
+    configure({ maxConcurrentQueries: 1 });
+    slow = ds
+      .select('SELECT (COUNT(*) AS ?n) { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?x + ?y < 0) }', {
+        timeout: 10000,
+        signal: controller.signal,
+      })
+      .catch((e) => e);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await assert.rejects(ds.select('SELECT * { ?s ?p ?o }', { noWait: true }), ConflictError);
+    let delivered = false;
+    const next = cursor.next().then((row) => {
+      delivered = true;
+      return row;
+    });
+    let streamDelivered = false;
+    serialized = new Response(body).json().then((result) => {
+      streamDelivered = true;
+      return result;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(delivered, false, 'the old cursor bypassed the occupied query limit');
+    assert.equal(streamDelivered, false, 'the old byte stream bypassed the occupied query limit');
+    // Queued pulls must also migrate when the limit changes while they wait.
+    configure({ maxConcurrentQueries: 1 });
+    assert.equal((await next).done, false);
+    assert.equal((await serialized).results.bindings.length, 10000);
+    controller.abort();
+    await slow;
+  } finally {
+    controller.abort();
+    await slow;
+    if (serialized) await serialized;
+    else await body?.cancel();
+    await cursor?.close();
+    configure({ maxConcurrentQueries: availableParallelism() });
+    await ds.close();
+  }
+});
+
 test(
   'the next batch is requested once half of the current one is consumed',
   { timeout: 30000 },

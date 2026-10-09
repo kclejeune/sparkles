@@ -350,7 +350,7 @@ async fn recover(
             slots.push(proposed.clone());
         }
     }
-    repository::unlock_async(
+    let snapshot = repository::unlock_async(
         repo.marker.id,
         Descriptor::parse(
             intent
@@ -370,6 +370,11 @@ async fn recover(
     }
     ctl.check()?;
     publish(repo, guard, &intent.previous, &intent.next, ctl).await?;
+    super::floor::record(
+        repo.marker.id,
+        repo.cache.dir.as_deref(),
+        &snapshot.descriptor,
+    )?;
     repo.store.delete(&Key::from(ROTATION)).await?;
     Ok(true)
 }
