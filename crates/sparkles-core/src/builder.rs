@@ -38,6 +38,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -295,36 +296,48 @@ impl Builder {
         Encoder {
             b: self,
             scope,
-            keys: FxHashMap::default(),
-            key_bytes: 0,
+            keys: KeySet::default(),
             quads: QuadBuf::default(),
+            order: Vec::new(),
+            rank: Vec::new(),
             keybuf: Vec::with_capacity(128),
             taken: 0,
             last: Default::default(),
         }
     }
 
-    fn write_batch(&self, keys: FxHashMap<Box<[u8]>, u32>, quads: QuadBuf) -> Result<()> {
+    /// Write a batch: its keys sorted as a partial vocabulary, and its quads with each
+    /// local id replaced by the rank of its key. `order` and `rank` are buffers kept by
+    /// the encoder.
+    fn write_batch(
+        &self,
+        keys: &KeySet,
+        quads: &QuadBuf,
+        order: &mut Vec<u32>,
+        rank: &mut Vec<u32>,
+    ) -> Result<()> {
         if quads.is_empty() {
             return Ok(());
         }
         let id = self.next_batch.fetch_add(1, Ordering::Relaxed);
-        let mut entries: Vec<(Box<[u8]>, u32)> = keys.into_iter().collect();
-        entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let mut rank = vec![0u32; entries.len()];
-        for (r, (_, local)) in entries.iter().enumerate() {
-            rank[*local as usize] = r as u32;
+        order.clear();
+        order.extend(0..keys.len() as u32);
+        order.par_sort_unstable_by(|&a, &b| keys.key(a).cmp(keys.key(b)));
+        rank.clear();
+        rank.resize(keys.len(), 0);
+        for (r, &local) in order.iter().enumerate() {
+            rank[local as usize] = r as u32;
         }
         let (samples, voc_bytes) = vocabmerge::write_partial(
             &self.tmp.join(format!("b{id}.voc")),
-            entries.iter().map(|(k, _)| &**k),
+            order.iter().map(|&i| keys.key(i)),
         )?;
         self.tmp_bytes.add(iostat::Tmp::PartialVocab, voc_bytes);
         let q_bytes = runs::write_run_from(
             &self.tmp.join(format!("b{id}.q")),
             quads.len(),
             rayon::current_num_threads(),
-            |r, out| quads.expand(r, &rank, out),
+            |r, out| quads.expand(r, rank, out),
         )?;
         self.tmp_bytes.add(iostat::Tmp::Quads, q_bytes);
         self.input_quads
@@ -335,7 +348,7 @@ impl Builder {
         self.batches.lock().push(BatchInfo {
             id,
             pos: 0,
-            keys: entries.len() as u64,
+            keys: keys.len() as u64,
             voc_bytes,
             quads: quads.len() as u64,
             samples,
@@ -824,11 +837,10 @@ impl QuadBuf {
     const WIDE: u32 = 1 << 31;
     const DEFAULT_GRAPH: u32 = u32::MAX;
 
-    fn with_capacity(quads: usize) -> QuadBuf {
-        QuadBuf {
-            slots: Vec::with_capacity(quads),
-            wide: Vec::new(),
-        }
+    /// Empty the buffer for the next batch, keeping its memory.
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.wide.clear();
     }
 
     fn len(&self) -> usize {
@@ -885,14 +897,87 @@ impl QuadBuf {
     }
 }
 
+/// The distinct vocabulary keys of a batch and their batch-local ids, which number the
+/// keys in the order they were first seen.
+///
+/// The keys are stored one after another in one buffer, and a hash table maps a key to
+/// its id. An encoder keeps the buffers and the table from one batch to the next. A key
+/// boxed on its own would cost an allocation, about 30 more bytes, and a free when the
+/// batch is written. Because a parser's next block may run on another thread of the
+/// pool, the allocator also keeps much of the memory a written batch frees.
+#[derive(Default)]
+struct KeySet {
+    bytes: Vec<u8>,
+    /// the start of each key in `bytes`, by id
+    starts: Vec<usize>,
+    table: hashbrown::HashTable<u32>,
+}
+
+impl KeySet {
+    fn len(&self) -> usize {
+        self.starts.len()
+    }
+
+    /// The total length of the keys.
+    fn bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[inline]
+    fn key(&self, id: u32) -> &[u8] {
+        key_at(&self.bytes, &self.starts, id)
+    }
+
+    /// The id of `key`, which is added if it is new.
+    #[inline]
+    fn id(&mut self, key: &[u8]) -> u32 {
+        let hash = |k: &[u8]| rustc_hash::FxBuildHasher.hash_one(k);
+        let Self {
+            bytes,
+            starts,
+            table,
+        } = self;
+        let entry = table.entry(
+            hash(key),
+            |&i| key_at(bytes, starts, i) == key,
+            |&i| hash(key_at(bytes, starts, i)),
+        );
+        match entry {
+            hashbrown::hash_table::Entry::Occupied(e) => *e.get(),
+            hashbrown::hash_table::Entry::Vacant(e) => {
+                let id = starts.len() as u32;
+                starts.push(bytes.len());
+                bytes.extend_from_slice(key);
+                e.insert(id);
+                id
+            }
+        }
+    }
+
+    /// Empty the set for the next batch, keeping its memory.
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.starts.clear();
+        self.table.clear();
+    }
+}
+
+#[inline]
+fn key_at<'k>(bytes: &'k [u8], starts: &[usize], id: u32) -> &'k [u8] {
+    let i = id as usize;
+    let end = starts.get(i + 1).copied().unwrap_or(bytes.len());
+    &bytes[starts[i]..end]
+}
+
 /// Per-chunk encoder: terms → ids, vocabulary terms → batch-local ids.
 pub struct Encoder<'b> {
     b: &'b Builder,
     scope: Arc<LabelScope>,
-    keys: FxHashMap<Box<[u8]>, u32>,
-    /// total length of `keys`
-    key_bytes: usize,
+    keys: KeySet,
     quads: QuadBuf,
+    /// buffers of [`Builder::write_batch`]
+    order: Vec<u32>,
+    rank: Vec<u32>,
     keybuf: Vec<u8>,
     /// quads taken, for the [`InterruptFn`] calls
     taken: u64,
@@ -903,13 +988,7 @@ pub struct Encoder<'b> {
 
 impl Encoder<'_> {
     fn local(&mut self, key: &[u8]) -> u64 {
-        if let Some(&i) = self.keys.get(key) {
-            return Id::local(i as u64).0;
-        }
-        let i = self.keys.len() as u32;
-        self.keys.insert(key.into(), i);
-        self.key_bytes += key.len();
-        Id::local(i as u64).0
+        Id::local(self.keys.id(key) as u64).0
     }
 
     fn term(&mut self, t: &Term) -> u64 {
@@ -1035,7 +1114,7 @@ impl Encoder<'_> {
             self.b.interrupted()?;
         }
         if self.quads.len() >= self.b.opts.batch_quads
-            || self.key_bytes >= self.b.opts.batch_key_bytes
+            || self.keys.bytes() >= self.b.opts.batch_key_bytes
         {
             self.flush()?;
         }
@@ -1043,19 +1122,16 @@ impl Encoder<'_> {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        // the next batch is about as large as this one: no rehashing on the way
-        let (nk, nq) = (self.keys.len(), self.quads.len());
-        let keys = std::mem::replace(
-            &mut self.keys,
-            FxHashMap::with_capacity_and_hasher(nk, Default::default()),
-        );
-        let quads = std::mem::replace(&mut self.quads, QuadBuf::with_capacity(nq));
-        self.key_bytes = 0;
-        // batch-local ids start over
+        let written = self
+            .b
+            .write_batch(&self.keys, &self.quads, &mut self.order, &mut self.rank);
+        // the next batch reuses the memory of this one, and its local ids start over
+        self.keys.clear();
+        self.quads.clear();
         for (_, id) in &mut self.last {
             *id = 0;
         }
-        self.b.write_batch(keys, quads)
+        written
     }
 }
 

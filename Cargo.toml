@@ -32,6 +32,7 @@ imbl = "7"
 arc-swap = "1"
 parking_lot = "0.12"
 rustc-hash = "2"
+hashbrown = { version = "0.16", default-features = false }
 smallvec = "1"
 memmap2 = "0.9"
 lz4_flex = "0.14"
