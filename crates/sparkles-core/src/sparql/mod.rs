@@ -36,6 +36,7 @@ pub mod rdfs;
 mod registeredagg;
 pub mod results;
 mod sample;
+mod sortkey;
 pub mod stats;
 pub mod svccache;
 pub mod table;
