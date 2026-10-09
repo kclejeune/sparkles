@@ -6,7 +6,7 @@ use super::exprcache::Report as ExprReport;
 use super::plan::{
     Agg, GraphFilter, JoinAlgo, Kind, Node, OrderedTopK, PathEnd, PathSpec, RangeSpec, ScanSpec,
 };
-use super::sortkey::{Entry, Screen, SortKey, TopK, sort_positions};
+use super::sortkey::{Entry, Screen, SortKey, TopK, cmp_values, sort_positions};
 use super::table::{Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
@@ -3764,19 +3764,7 @@ fn order_by_rows(
         .map(|((e, _), _)| e)
         .collect();
     let dec = decode_for(ctx, &t, &rest);
-    // Each key is classified once, so a comparison rarely needs the values themselves.
-    let _key_charge = if ctx.is_cursor() {
-        Some(
-            ctx.charge(
-                (t.len() as u64)
-                    .saturating_mul(keys.len() as u64)
-                    .saturating_mul(std::mem::size_of::<SortKey>() as u64),
-            )?,
-        )
-    } else {
-        None
-    };
-    let key_vals: Vec<super::exprcache::Column<SortKey>> = keys
+    let key_vals: Vec<super::exprcache::Column<Option<Value>>> = keys
         .iter()
         .zip(cached)
         .map(|((e, _), c)| {
@@ -3787,14 +3775,14 @@ fn order_by_rows(
                     vals: key_rows(ctx, &t, e, dec.as_ref())?,
                     _charge: None,
                 },
-            }
-            .map(SortKey::new))
+            })
         })
         .collect::<Result<_>>()?;
     ctx.check()?;
     let order = |a: usize, b: usize| {
         for (k, (_, asc)) in keys.iter().enumerate() {
-            let o = key_vals[k].get(a).cmp(key_vals[k].get(b));
+            // the comparisons of order_cmp, decided without it for most pairs
+            let o = cmp_values(key_vals[k].get(a), key_vals[k].get(b));
             let o = if *asc { o } else { o.reverse() };
             if o != Ordering::Equal {
                 return o;

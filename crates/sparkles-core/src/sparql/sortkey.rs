@@ -67,33 +67,7 @@ impl SortKey {
         let Some(v) = value else {
             return SortKey::NULL;
         };
-        let (class, prim) = match &v {
-            Value::BNode(_) => (BNODE, Prim::Text),
-            Value::Iri(_) => (IRI, Prim::Text),
-            Value::Triple(_) => (TRIPLE, Prim::Plain),
-            Value::Str(_) => (LITERAL, Prim::Text),
-            Value::Lang(..) => (LITERAL + 1, Prim::Lang),
-            Value::Integer(i) => (
-                LITERAL + 2,
-                Prim::Exact(i128::from(i64::from(*i)) * 1_000_000_000_000_000_000, false),
-            ),
-            Value::Decimal(d) => (
-                LITERAL + 2,
-                Prim::Exact(i128::from_be_bytes(d.to_be_bytes()), true),
-            ),
-            Value::Float(f) => (LITERAL + 2, Prim::Approx(f64::from(f32::from(*f)), true)),
-            Value::Double(d) => (LITERAL + 2, Prim::Approx(f64::from(*d), false)),
-            Value::Bool(b) => (LITERAL + 3, Prim::Bool(*b)),
-            Value::DateTime(_) => (LITERAL + 4, Prim::Plain),
-            Value::Date(_) => (LITERAL + 5, Prim::Plain),
-            Value::Time(_) => (LITERAL + 6, Prim::Plain),
-            Value::Duration(_) | Value::YearMonth(_) | Value::DayTime(_) => {
-                (LITERAL + 7, Prim::Plain)
-            }
-            Value::Other { dt, .. } if &**dt == super::cdt::LIST => (LITERAL + 8, Prim::Plain),
-            Value::Other { dt, .. } if &**dt == super::cdt::MAP => (LITERAL + 9, Prim::Plain),
-            Value::LangDir(..) | Value::Other { .. } => (LITERAL + 10, Prim::Plain),
-        };
+        let (class, prim) = classify(&v);
         SortKey {
             class,
             prim,
@@ -115,38 +89,87 @@ impl SortKey {
     }
 
     /// The order of [`order_cmp`] on the two values (ascending).
+    #[inline]
     pub fn cmp(&self, other: &SortKey) -> Ordering {
         if self.class != other.class {
             return self.class.cmp(&other.class);
         }
-        let decided = match (self.prim, other.prim) {
-            _ if self.class == NULL => Some(Ordering::Equal),
-            (Prim::Text, Prim::Text) => Some(text(self).cmp(text(other))),
-            (Prim::Lang, Prim::Lang) => match (&self.value, &other.value) {
-                (Some(Value::Lang(x, lx)), Some(Value::Lang(y, ly))) => {
-                    Some(x.cmp(y).then_with(|| lx.cmp(ly)))
-                }
-                _ => None,
-            },
-            (Prim::Exact(x, dx), Prim::Exact(y, dy)) => (x != y || dx == dy).then(|| x.cmp(&y)),
-            (Prim::Approx(x, fx), Prim::Approx(y, fy)) => {
-                if x < y {
-                    Some(Ordering::Less)
-                } else if x > y {
-                    Some(Ordering::Greater)
-                } else {
-                    (x == y && x != 0.0 && fx == fy).then_some(Ordering::Equal)
-                }
-            }
-            (Prim::Bool(x), Prim::Bool(y)) => Some(x.cmp(&y)),
-            _ => None,
-        };
-        decided.unwrap_or_else(|| order_cmp(self.value.as_ref(), other.value.as_ref()))
+        decide(self.class, self.prim, other.prim, &self.value, &other.value)
+            .unwrap_or_else(|| order_cmp(self.value.as_ref(), other.value.as_ref()))
     }
 }
 
-fn text(k: &SortKey) -> &str {
-    match &k.value {
+/// The class and primitive of a value (see [`SortKey`]).
+fn classify(v: &Value) -> (u8, Prim) {
+    match v {
+        Value::BNode(_) => (BNODE, Prim::Text),
+        Value::Iri(_) => (IRI, Prim::Text),
+        Value::Triple(_) => (TRIPLE, Prim::Plain),
+        Value::Str(_) => (LITERAL, Prim::Text),
+        Value::Lang(..) => (LITERAL + 1, Prim::Lang),
+        Value::Integer(i) => (
+            LITERAL + 2,
+            Prim::Exact(i128::from(i64::from(*i)) * 1_000_000_000_000_000_000, false),
+        ),
+        Value::Decimal(d) => (
+            LITERAL + 2,
+            Prim::Exact(i128::from_be_bytes(d.to_be_bytes()), true),
+        ),
+        Value::Float(f) => (LITERAL + 2, Prim::Approx(f64::from(f32::from(*f)), true)),
+        Value::Double(d) => (LITERAL + 2, Prim::Approx(f64::from(*d), false)),
+        Value::Bool(b) => (LITERAL + 3, Prim::Bool(*b)),
+        Value::DateTime(_) => (LITERAL + 4, Prim::Plain),
+        Value::Date(_) => (LITERAL + 5, Prim::Plain),
+        Value::Time(_) => (LITERAL + 6, Prim::Plain),
+        Value::Duration(_) | Value::YearMonth(_) | Value::DayTime(_) => (LITERAL + 7, Prim::Plain),
+        Value::Other { dt, .. } if &**dt == super::cdt::LIST => (LITERAL + 8, Prim::Plain),
+        Value::Other { dt, .. } if &**dt == super::cdt::MAP => (LITERAL + 9, Prim::Plain),
+        Value::LangDir(..) | Value::Other { .. } => (LITERAL + 10, Prim::Plain),
+    }
+}
+
+/// The order of two values of one class when their primitives decide it.
+#[inline]
+fn decide(class: u8, a: Prim, b: Prim, va: &Option<Value>, vb: &Option<Value>) -> Option<Ordering> {
+    match (a, b) {
+        _ if class == NULL => Some(Ordering::Equal),
+        (Prim::Text, Prim::Text) => Some(text(va).cmp(text(vb))),
+        (Prim::Lang, Prim::Lang) => match (va, vb) {
+            (Some(Value::Lang(x, lx)), Some(Value::Lang(y, ly))) => {
+                Some(x.cmp(y).then_with(|| lx.cmp(ly)))
+            }
+            _ => None,
+        },
+        (Prim::Exact(x, dx), Prim::Exact(y, dy)) => (x != y || dx == dy).then(|| x.cmp(&y)),
+        (Prim::Approx(x, fx), Prim::Approx(y, fy)) => {
+            if x < y {
+                Some(Ordering::Less)
+            } else if x > y {
+                Some(Ordering::Greater)
+            } else {
+                (x == y && x != 0.0 && fx == fy).then_some(Ordering::Equal)
+            }
+        }
+        (Prim::Bool(x), Prim::Bool(y)) => Some(x.cmp(&y)),
+        _ => None,
+    }
+}
+
+/// [`order_cmp`] by the same decisions as [`SortKey::cmp`], classifying both values on
+/// the spot. A full sort compares each row many times, but keeping a key per row costs
+/// more than classifying again.
+#[inline]
+pub fn cmp_values(a: &Option<Value>, b: &Option<Value>) -> Ordering {
+    let (ca, pa) = a.as_ref().map_or((NULL, Prim::Plain), classify);
+    let (cb, pb) = b.as_ref().map_or((NULL, Prim::Plain), classify);
+    if ca != cb {
+        return ca.cmp(&cb);
+    }
+    decide(ca, pa, pb, a, b).unwrap_or_else(|| order_cmp(a.as_ref(), b.as_ref()))
+}
+
+fn text(v: &Option<Value>) -> &str {
+    match v {
         Some(Value::Iri(s) | Value::BNode(s) | Value::Str(s)) => s,
         _ => "",
     }

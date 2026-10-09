@@ -176,11 +176,9 @@ fn key_order_is_order_cmp_on_every_pair() {
         let keys: Vec<SortKey> = values.iter().cloned().map(SortKey::new).collect();
         for (a, ka) in values.iter().zip(&keys) {
             for (b, kb) in values.iter().zip(&keys) {
-                assert_eq!(
-                    ka.cmp(kb),
-                    order_cmp(a.as_ref(), b.as_ref()),
-                    "{a:?} vs {b:?}"
-                );
+                let expected = order_cmp(a.as_ref(), b.as_ref());
+                assert_eq!(ka.cmp(kb), expected, "{a:?} vs {b:?}");
+                assert_eq!(cmp_values(a, b), expected, "{a:?} vs {b:?}");
             }
         }
     }
@@ -241,6 +239,16 @@ fn full_sort_by_keys_is_the_comparator_sort() {
         let expected = sort_positions(n, reference(&rows, &asc));
         let actual = sort_positions(n, |a, b| cmp_keys(&keys[a], &keys[b], &asc));
         assert_eq!(actual, expected, "case {case}");
+        let by_values = sort_positions(n, |a, b| {
+            for (k, up) in asc.iter().enumerate() {
+                let o = cmp_values(&rows[a][k], &rows[b][k]);
+                if o != Ordering::Equal {
+                    return if *up { o } else { o.reverse() };
+                }
+            }
+            Ordering::Equal
+        });
+        assert_eq!(by_values, expected, "case {case}");
     }
 }
 
