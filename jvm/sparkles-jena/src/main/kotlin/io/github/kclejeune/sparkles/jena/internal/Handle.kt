@@ -86,9 +86,10 @@ internal class Handle(val key: String?, val ffi: FfiDataset, val options: Sparkl
     @Synchronized
     fun shutdown() {
         closed = true
-        for (sink in sinks.values.toList()) sink.close()
+        // copied with toArray, which a concurrent removal cannot break as toList can
+        for (sink in ArrayList(sinks.values)) sink.close()
         sinks.clear()
-        for (t in openWrites.toList()) {
+        for (t in ArrayList(openWrites)) {
             t.abortedByClose = true
             try {
                 t.write?.abort()
