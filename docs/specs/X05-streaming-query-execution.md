@@ -692,6 +692,8 @@ responses are follow-up work. A review of the implementation found further follo
 
 These are follow-up proposals, not measured speedups or a change to the delivered
 defaults. Strengthened tests and ordering invariants precede the operator changes,
-and disk spill follows the nearer-term fallback and output work. Full-scale cold reads
-and loading need separately matched historical controls before their dated snapshot
-differences can be attributed to query execution.
+and disk spill follows the nearer-term fallback and output work. Matched controls on
+full DBpedia attributed the slower cold reads and loads of 2026-10-08 to the state of
+the benchmark machine's SSD rather than to query execution. After a trim, the current
+and 2026-10-03 binaries loaded equally fast, and the current binary's cold reads were
+within 10% or faster on every query.

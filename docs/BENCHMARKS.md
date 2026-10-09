@@ -7,10 +7,11 @@ Data, queries and timing methods match, but these are dated reference comparison
 rather than interleaved new runs. The measured default-feature release binary has
 SHA-256 `9eaf960a14fc5cbd0b573c32674eca9a874450ff2e4a804d3679ef82676cfaa0`. It was
 built from the source that was then committed unchanged as commit `ff7acde4`.
-The DBpedia snapshot was refreshed separately at commit `ed78a462`, using binary
-SHA-256 `0c334c1920c3568b9e7c998c0ac2c43fa48d9e14259126b8ad48c8292985049c`.
-That binary was built on `stanley` and measured on `forge` on 2026-10-08 (EDT),
-with Rust 1.98.1, LLVM 22.1.8, default features, thin LTO and four codegen units.
+The DBpedia snapshot was refreshed separately at commit `ba547b89`, using binary
+SHA-256 `9e892cb3e63f2f7270ed7ddff72e38331496b7a37a850f915e0b6fb09ad4bee3`.
+That binary was built and measured on `forge` on 2026-10-09 (EDT), with Rust 1.98.1,
+LLVM 22.1.8, default features, thin LTO and four codegen units. The filesystem was
+trimmed immediately before the load.
 The other tables retain their stated binaries and dates.
 [Sparkles HTTP latency](#sparkles-http-latency) and [HTTP writes](#http-write-snapshot)
 are separately dated measurements with different timing methods. Feature and
@@ -59,18 +60,14 @@ index is smaller, and the two engines differ in which predicates they index and 
 their stemming and highlighting support.
 
 The [DBpedia results](#dbpedia-at-124-billion-triples) cover 1.24 billion input triples.
-Sparkles loaded the data in 1,351 s, against QLever's 1,674 s and Fluree's 2,919 s.
-It was faster than QLever on all 29 agreeing warm queries and 18 of 31 cold queries.
+Sparkles loaded the data in 547 s, against QLever's 1,674 s and Fluree's 2,919 s.
+It was faster than QLever on all 29 agreeing warm queries and 28 of 31 cold queries.
 
-**DBpedia loading remains an open performance regression.** The same input loaded
-in 596 s on 2026-10-03 and 1,248 s in the previous snapshot, and the current 1,351 s is
-2.27× the historical time and 8.3% above the previous snapshot. The earlier run was
-also faster than QLever on 26 of 31 cold queries rather than 18. Individual query
-times vary, and historical comparisons do not isolate source, toolchain or storage
-conditions. The cause remains unresolved, and
+Two runs on 2026-10-08 loaded the same input in 1,248 s and 1,351 s and lost 13 cold
+queries to QLever. Matched controls traced both slowdowns to the state of the SSD on
+`forge`, which had not been trimmed for several days, and not to a change in the code.
 [Changes against the run of 2026-10-03](#changes-against-the-run-of-2026-10-03)
-compares the two runs and states what is known so far. Cold point lookups and loading
-are substantial costs at this scale.
+gives the evidence.
 
 Sparkles defaults to a 1 GiB decoded-block cache per dataset and eager execution.
 Explicit [streaming execution](#streaming-execution) reduces retained result memory
@@ -393,10 +390,13 @@ outside the 10% tie band.
 | Text index size | QLever about 1.18× at 1.05M and 1.23× at 10.5M | The indexed predicates and features differ. |
 | 5,000 serial single-triple commits | Oxigraph 1.11× at 1.05M and 1.72× at 10.5M | Sparkles synchronizes acknowledgments, and Oxigraph does not. |
 | Writes during mixed load | Oxigraph 4.7× at 1.05M and 3.6× at 10.5M, Fluree 1.6× at 10.5M | Both engines serve far fewer concurrent reads than Sparkles. |
-| Billion-scale cold reads | QLever wins 13 of 31 | Warm-query wins do not remove first-use I/O costs. Sparkles won 26 of 31 in the run of 2026-10-03. |
-| Billion-scale loading regression | 2.27× the historical time and 8.3% over the previous snapshot | 1,351 s against 596 s historically and 1,248 s previously. It is still faster than QLever and Fluree, and the cause remains [unresolved](#changes-against-the-run-of-2026-10-03). |
-| Billion-scale server RSS | QLever 3.07× | Sparkles maps its index, so touched file pages count toward its RSS. |
+| Billion-scale cold reads | QLever 1.84× on `geo-box` and 1.25× on `outlink-classes-2` | Sparkles wins 28 of 31. QLever's third win, `people-no-birthdate`, is within 10%. Warm-query wins do not remove first-use I/O costs. |
+| Billion-scale server RSS | QLever 3.14× | Sparkles maps its index, so touched file pages count toward its RSS. |
 
+Billion-scale loading is no longer listed. It is 3.06× faster than QLever's retained
+load, and the slower loads of 2026-10-08 came from the state of the SSD rather than
+the code, as described under
+[Changes against the run of 2026-10-03](#changes-against-the-run-of-2026-10-03).
 WatDiv has no template loss and two instance losses, both ties. QLever's highlight
 form does not highlight words, so that comparison cannot isolate highlighting cost.
 The mixed workload combines read and write rates, and its 16 star readers differ from
@@ -787,8 +787,9 @@ remain. Sparkles' vocabulary has 205,941,262 terms.
 
 The run used `scripts/bench-billion.sh` with `SCALE=full`, `RUNS=3`, `TIMEOUT=300` and a
 query memory budget of 8 GB for Sparkles and QLever (`QUERY_MEM_GB=8`). It ran on
-`forge`, each engine alone. Sparkles was measured on 2026-10-08 with the release binary
-identified at the top of this page, built at commit `ed78a462`. The competitor
+`forge`, each engine alone. Sparkles was measured on 2026-10-09 with the release binary
+identified at the top of this page, built at commit `ba547b89`. The filesystem was
+trimmed with `fstrim` immediately before the load. The competitor
 references were retained from 2026-10-02 and 2026-10-03. QLever was the nixpkgs build
 of 0.5.48, with load figures from 2026-10-02 and query figures from 2026-10-03. Loads
 were pinned to the P-cores, CPUs 0–11. Every step ran in a systemd scope capped at
@@ -819,40 +820,40 @@ or Oxigraph's full-scale loading, memory or query performance.
 
 | query | sparkles (ms) | qlever (ms) | fluree (ms) |
 |---|---:|---:|---:|
-| **load** (s) | **1351.17** | 1673.78 | 2919.33 |
-| abstract-contains | **39.7 ± 5.0** | 234.2 ± 1.1 ‡ | 6719.1 ± 317.4 |
-| births-by-decade | **52.9 ± 0.3** | 137.9 ± 8.3 | 4300.2 ± 88.3 † |
-| category-people-1 | **13.0 ± 3.7** | 53.6 ± 3.5 | 63.2 ± 34.1 |
-| category-people-2 | **13.2 ± 2.9** | 36.3 ± 8.2 | 49.1 ± 34.3 |
-| category-tree | **270.7 ± 2.4** | 2050.1 ± 10.1 ‡ | — ⁴ |
-| class-counts | **10.6 ± 2.2** | 99.1 ± 5.8 ‡ | — ⁴ |
-| costar-birthplace | **50.9 ± 0.6** | 154.4 ± 5.6 ‡ | — ⁴ |
-| count-all | **11.4 ± 1.5** | 2616.8 ± 11.9 † | — ⁴ |
-| country-population | **14.0 ± 2.2** | 19.6 ± 6.0 ‡ | — ⁴ |
-| entity-facts-1 | **6.3 ± 1.2** | 16.1 ± 0.3 ‡ | — ⁴ |
-| entity-facts-2 | **9.8 ± 0.4** | 12.1 ± 4.0 | — ⁴ |
-| entity-summary-1 | **8.8 ± 4.0** | 21.6 ± 7.0 | — ⁴ |
-| entity-summary-2 | **10.6 ± 0.7** | 12.1 ± 3.1 | — ⁴ |
-| export-1m | **234.6 ± 3.6** | 1440.1 ± 3.3 | — ⁴ |
-| film-director-optional | **19.8 ± 0.8** | 33.3 ± 8.1 ‡ | — ⁴ |
-| geo-box | **141.0 ± 7.0** | 143.8 ± 1.4 ‡ | — ⁴ |
-| inlinks-count-1 | **6.6 ± 1.8** | 14.7 ± 1.4 ‡ | — ⁴ |
-| inlinks-count-2 | **8.8 ± 2.3** | 16.5 ± 1.1 ‡ | — ⁴ |
-| label-regex | **17.9 ± 0.7** | 19.0 ± 0.0 | — ⁴ |
-| outlink-classes-1 | **22.3 ± 6.3** | 22.6 ± 5.1 ‡ | — ⁴ |
-| outlink-classes-2 | **14.1 ± 1.4** | 23.7 ± 4.1 ‡ | — ⁴ |
-| people-no-birthdate | **50.3 ± 2.6** | 65.6 ± 4.9 ‡ | — ⁴ |
-| place-births-1 | **16.0 ± 4.4** | 43.9 ± 2.4 | — ⁴ |
-| place-births-2 | **13.9 ± 6.1** | 41.9 ± 1.0 | — ⁴ |
-| place-union-1 | **11.9 ± 0.1** | 13.7 ± 4.3 | — ⁴ |
-| place-union-2 | **6.7 ± 0.4** | 15.0 ± 0.6 | — ⁴ |
-| predicate-counts | 24.9 ± 1.5 † | 5732.6 ± 45.0 † | — ⁴ |
-| redirect-target-1 | **10.4 ± 1.2** | 22.8 ± 1.3 | — ⁴ |
-| redirect-target-2 | **22.1 ± 22.6** | 22.7 ± 1.6 | — ⁴ |
-| sameas-subjects | **7.8 ± 3.2** | 21.3 ± 2.9 ‡ | — ⁴ |
-| top-linked | **839.7 ± 132.1** | 5580.6 ± 7.6 | — ⁴ |
-| **throughput** entity-facts-1, 16 clients (queries/s) | **1537** | 1064 | — ⁴ |
-| **throughput** place-births-1, 16 clients (queries/s) | **850** | 231 | — ⁴ |
+| **load** (s) | **546.51** | 1673.78 | 2919.33 |
+| abstract-contains | **37.2 ± 7.0** | 234.2 ± 1.1 ‡ | 6719.1 ± 317.4 |
+| births-by-decade | **51.3 ± 3.5** | 137.9 ± 8.3 | 4300.2 ± 88.3 † |
+| category-people-1 | **13.0 ± 0.9** | 53.6 ± 3.5 | 63.2 ± 34.1 |
+| category-people-2 | **6.8 ± 1.8** | 36.3 ± 8.2 | 49.1 ± 34.3 |
+| category-tree | **269.3 ± 2.3** | 2050.1 ± 10.1 ‡ | — ⁴ |
+| class-counts | **10.8 ± 2.2** | 99.1 ± 5.8 ‡ | — ⁴ |
+| costar-birthplace | **50.9 ± 5.8** | 154.4 ± 5.6 ‡ | — ⁴ |
+| count-all | **8.4 ± 3.4** | 2616.8 ± 11.9 † | — ⁴ |
+| country-population | **12.2 ± 1.7** | 19.6 ± 6.0 ‡ | — ⁴ |
+| entity-facts-1 | **10.9 ± 0.5** | 16.1 ± 0.3 ‡ | — ⁴ |
+| entity-facts-2 | **5.7 ± 2.6** | 12.1 ± 4.0 | — ⁴ |
+| entity-summary-1 | **10.5 ± 0.9** | 21.6 ± 7.0 | — ⁴ |
+| entity-summary-2 | **6.4 ± 1.5** | 12.1 ± 3.1 | — ⁴ |
+| export-1m | **241.7 ± 13.2** | 1440.1 ± 3.3 | — ⁴ |
+| film-director-optional | **21.2 ± 1.2** | 33.3 ± 8.1 ‡ | — ⁴ |
+| geo-box | **141.7 ± 12.8** | 143.8 ± 1.4 ‡ | — ⁴ |
+| inlinks-count-1 | **10.4 ± 1.0** | 14.7 ± 1.4 ‡ | — ⁴ |
+| inlinks-count-2 | **11.5 ± 0.6** | 16.5 ± 1.1 ‡ | — ⁴ |
+| label-regex | **13.6 ± 3.1** | 19.0 ± 0.0 | — ⁴ |
+| outlink-classes-1 | **16.4 ± 5.3** | 22.6 ± 5.1 ‡ | — ⁴ |
+| outlink-classes-2 | **16.3 ± 6.2** | 23.7 ± 4.1 ‡ | — ⁴ |
+| people-no-birthdate | **50.7 ± 0.8** | 65.6 ± 4.9 ‡ | — ⁴ |
+| place-births-1 | **16.9 ± 0.7** | 43.9 ± 2.4 | — ⁴ |
+| place-births-2 | **15.6 ± 2.8** | 41.9 ± 1.0 | — ⁴ |
+| place-union-1 | **12.8 ± 1.1** | 13.7 ± 4.3 | — ⁴ |
+| place-union-2 | **10.0 ± 0.7** | 15.0 ± 0.6 | — ⁴ |
+| predicate-counts | 18.4 ± 2.6 † | 5732.6 ± 45.0 † | — ⁴ |
+| redirect-target-1 | **13.6 ± 4.2** | 22.8 ± 1.3 | — ⁴ |
+| redirect-target-2 | **9.1 ± 5.5** | 22.7 ± 1.6 | — ⁴ |
+| sameas-subjects | **8.8 ± 1.1** | 21.3 ± 2.9 ‡ | — ⁴ |
+| top-linked | **572.6 ± 14.9** | 5580.6 ± 7.6 | — ⁴ |
+| **throughput** entity-facts-1, 16 clients (queries/s) | **1517** | 1064 | — ⁴ |
+| **throughput** place-births-1, 16 clients (queries/s) | **830** | 231 | — ⁴ |
 
 ‡ Same values, different RDF terms. QLever returns counts as `xsd:int`.
 † The engine's answer differs from the majority, so the query is not ranked for it.
@@ -863,18 +864,17 @@ answer missing there is no majority, so the query is not ranked.
 4. Fluree's server was killed at the 14 GiB limit before it ran these queries warm.
 
 Sparkles is faster than QLever on all 29 queries that both rank. Differences on
-`geo-box`, `label-regex`, `outlink-classes-1` and `redirect-target-2` are within 10%.
-Sparkles serves 1,537
+`geo-box` and `place-union-1` are within 10%. Sparkles serves 1,517
 `entity-facts-1` requests/s under 16 clients against QLever's retained 1,064, and
-850 `place-births-1` requests/s against 231. Loading is 1.24× faster than QLever
-and 2.16× faster than Fluree. These comparisons use independently checked answers
+830 `place-births-1` requests/s against 231. Loading is 3.06× faster than QLever
+and 5.34× faster than Fluree. These comparisons use independently checked answers
 and separately dated engine runs.
 
 | memory | sparkles | qlever | fluree |
 |---|---:|---:|---:|
-| server RSS after the run (MiB) | 4,381 | **1,426** | killed at 14 GiB |
-| load time (s) | **1,351** | 1,674 | 2,919 |
-| load peak RSS (MiB) | **6,319** | 11,401 | 12,366 |
+| server RSS after the run (MiB) | 4,480 | **1,426** | killed at 14 GiB |
+| load time (s) | **547** | 1,674 | 2,919 |
+| load peak RSS (MiB) | **6,847** | 11,401 | 12,366 |
 | index size on disk | **28.7 GiB** | 33.4 GiB | 69.7 GiB |
 
 RSS does not measure the same memory composition for Sparkles and QLever.
@@ -887,55 +887,55 @@ the two engines' complete memory footprints. Cache-size costs at 10.5M are under
 
 | query (cold) | sparkles (ms) | qlever (ms) | fluree (ms) | sparkles, 2026-10-03 (ms) |
 |---|---:|---:|---:|---:|
-| abstract-contains | **735.5** | 4296.2 | 4195.1 | 738.8 |
-| births-by-decade | **127.2** | 165.2 | 6108.5 | 114.9 |
-| category-people-1 | **134.2** | 224.0 | 2886.2 | 197.3 |
-| category-people-2 | 196.3 | **166.2** | 2172.0 | 136.7 |
-| category-tree | **443.3** | 2098.1 | 4559.3 | 730.9 |
-| class-counts | **55.1** | 177.8 | 9581.4 | 9.9 |
-| costar-birthplace | **152.7** | 183.0 | 4358.2 | 156.6 |
-| count-all | **6.3** | 4630.4 | 1273.3 | 2.2 |
-| country-population | 50.4 | **45.6** | 4324.1 | 63.4 |
-| entity-facts-1 | **34.6** | 36.4 | 1312.2 | 19.6 |
-| entity-facts-2 | 41.6 | **40.4** | 837.6 | 27.4 |
-| entity-summary-1 | 53.5 | **29.0** | 1303.7 | 9.3 |
-| entity-summary-2 | 55.7 | **29.5** | 799.9 | 9.6 |
-| export-1m | **1074.5** | 4261.4 | 6647.1 | 1949.6 |
-| film-director-optional | 90.4 | **68.6** | 13434.8 | 41.3 |
-| geo-box | 332.3 | **157.9** | 12218.4 | 395.5 |
-| inlinks-count-1 | 32.9 | **30.2** | 792.6 | 11.5 |
-| inlinks-count-2 | 32.7 | **27.3** | 1275.8 | 13.1 |
-| label-regex | **59.4** | 71.3 | 4328.6 | 138.5 |
-| outlink-classes-1 | 112.0 | **73.7** | 1711.0 | 59.5 |
-| outlink-classes-2 | 97.5 | **34.9** | 1665.2 | 39.7 |
-| people-no-birthdate | 157.1 | **92.0** | 2113.6 | 105.3 |
-| place-births-1 | **132.2** | 283.9 | 3293.1 | 209.2 |
-| place-births-2 | **111.4** | 361.5 | 3956.5 | 261.1 |
-| place-union-1 | **64.6** | 220.3 | 1235.7 | 168.1 |
-| place-union-2 | **84.5** | 217.4 | 1244.6 | 164.8 |
-| predicate-counts | **40.8** | 5880.8 | 81502.3 | 32.8 |
-| redirect-target-1 | **31.1** | 45.9 | 1290.5 | 18.7 |
-| redirect-target-2 | **36.1** | 48.0 | 1276.7 | 17.1 |
-| sameas-subjects | 52.4 | **38.2** | 772.8 | 8.2 |
-| top-linked | **1219.6** | 6538.4 | 57624.6 | 1117.4 |
+| abstract-contains | **721.0** | 4296.2 | 4195.1 | 738.8 |
+| births-by-decade | **101.8** | 165.2 | 6108.5 | 114.9 |
+| category-people-1 | **118.6** | 224.0 | 2886.2 | 197.3 |
+| category-people-2 | **154.1** | 166.2 | 2172.0 | 136.7 |
+| category-tree | **368.9** | 2098.1 | 4559.3 | 730.9 |
+| class-counts | **6.4** | 177.8 | 9581.4 | 9.9 |
+| costar-birthplace | **146.6** | 183.0 | 4358.2 | 156.6 |
+| count-all | **5.5** | 4630.4 | 1273.3 | 2.2 |
+| country-population | **31.6** | 45.6 | 4324.1 | 63.4 |
+| entity-facts-1 | **18.7** | 36.4 | 1312.2 | 19.6 |
+| entity-facts-2 | **25.0** | 40.4 | 837.6 | 27.4 |
+| entity-summary-1 | **8.4** | 29.0 | 1303.7 | 9.3 |
+| entity-summary-2 | **9.3** | 29.5 | 799.9 | 9.6 |
+| export-1m | **1000.4** | 4261.4 | 6647.1 | 1949.6 |
+| film-director-optional | **35.3** | 68.6 | 13434.8 | 41.3 |
+| geo-box | 290.1 | **157.9** | 12218.4 | 395.5 |
+| inlinks-count-1 | **13.1** | 30.2 | 792.6 | 11.5 |
+| inlinks-count-2 | **10.4** | 27.3 | 1275.8 | 13.1 |
+| label-regex | **40.1** | 71.3 | 4328.6 | 138.5 |
+| outlink-classes-1 | **61.7** | 73.7 | 1711.0 | 59.5 |
+| outlink-classes-2 | 43.8 | **34.9** | 1665.2 | 39.7 |
+| people-no-birthdate | 97.3 | **92.0** | 2113.6 | 105.3 |
+| place-births-1 | **74.3** | 283.9 | 3293.1 | 209.2 |
+| place-births-2 | **85.8** | 361.5 | 3956.5 | 261.1 |
+| place-union-1 | **34.3** | 220.3 | 1235.7 | 168.1 |
+| place-union-2 | **30.9** | 217.4 | 1244.6 | 164.8 |
+| predicate-counts | **32.0** | 5880.8 | 81502.3 | 32.8 |
+| redirect-target-1 | **21.9** | 45.9 | 1290.5 | 18.7 |
+| redirect-target-2 | **20.4** | 48.0 | 1276.7 | 17.1 |
+| sameas-subjects | **9.4** | 38.2 | 772.8 | 8.2 |
+| top-linked | **938.8** | 6538.4 | 57624.6 | 1117.4 |
 
-Cold, Sparkles is faster than QLever on 18 of 31 queries. QLever wins the remaining 13:
-`category-people-2`, `country-population`, `entity-facts-2`, both entity summaries,
-`film-director-optional`, `geo-box`, both inlink counts, both outlink classes queries,
-`people-no-birthdate` and `sameas-subjects`. Small point results still pay first-use index and
-vocabulary I/O costs. Fluree is slower than Sparkles on every cold query in this
-retained reference comparison. This count includes all 31 cold probes, and the RDF
-identity qualifications on `count-all` and `predicate-counts` above still apply.
+Cold, Sparkles is faster than QLever on 28 of 31 queries. QLever wins `geo-box` at
+157.9 against 290.1 ms, `outlink-classes-2` at 34.9 against 43.8 ms and
+`people-no-birthdate` at 92.0 against 97.3 ms, and the last of these is within 10%.
+Fluree is slower than Sparkles on every cold query in this retained reference
+comparison. This count includes all 31 cold probes, and the RDF identity
+qualifications on `count-all` and `predicate-counts` above still apply.
 
-The last column gives Sparkles' cold times from the run of 2026-10-03,
-against the same QLever and Fluree references. That run was faster than QLever on 26 of
-31 cold queries. Some point lookups remain several times slower, for example
-`entity-summary-1` at 53.5 against 9.3 ms. Several scans and exports are faster,
-including `export-1m` at 1,074.5 against 1,949.6 ms and `place-births-1` at 132.2
-against 209.2 ms. These are single cold probes, so the historical losses remain a
-follow-up item rather than proof of a source-level regression.
-[Changes against the run of 2026-10-03](#changes-against-the-run-of-2026-10-03)
-describes what is known about these differences.
+The last column gives Sparkles' cold times from the run of 2026-10-03, against the
+same QLever and Fluree references. That run was faster than QLever on 26 of 31 cold
+queries. Point lookups are back at the times of that run, for example
+`entity-summary-1` at 8.4 against 9.3 ms. Scans and exports are faster, including
+`export-1m` at 1,000.4 against 1,949.6 ms and `place-births-1` at 74.3 against
+209.2 ms. Each value is a single cold probe, and a few small lookups such as
+`count-all` and `sameas-subjects` are a few milliseconds slower than in that run. A
+same-index comparison of the two binaries, described under
+[Changes against the run of 2026-10-03](#changes-against-the-run-of-2026-10-03),
+found the current binary within 10% or faster on every query.
 
 The [cold-read features](#cold-reads) favor sparse point lookups but can slow queries
 that read many pages. The following configuration comparison was measured on the index
@@ -963,7 +963,7 @@ lists this among the divergences.
 
 ### Bulk loading
 
-The DBpedia load takes 1,351 s with a peak process RSS of 6,319 MiB, versus QLever's
+The DBpedia load takes 547 s with a peak process RSS of 6,847 MiB, versus QLever's
 retained 1,674 s and 11,401 MiB. The load scope is capped at 14 GiB with no swap;
 its peak also includes file-cache pages and is distinct from GNU time's process RSS.
 This is one load of the complete normalized input, not a repeated-load mean.
@@ -978,46 +978,60 @@ repeated input reads while using the available parser and sorting cores.
 
 ### Changes against the run of 2026-10-03
 
-**Loading remains an unresolved performance regression.** The same 38 files on
-`forge` took 596 s on 2026-10-03, 1,248 s in the previous snapshot and 1,351 s in
-this snapshot. The latest load is 2.27× the historical time and 8.3% above the
-previous snapshot. Source, build toolchain and storage conditions differ between
-these dated runs, and this comparison does not identify which caused the slowdown.
+Two runs on 2026-10-08 loaded the same 38 files on `forge` in 1,248 s and 1,351 s,
+against 596 s on 2026-10-03. The current load took 547 s. The slowdown came from the
+state of the SSD and not from the code. The drive had not been trimmed since
+2026-10-05, about 1 TB had been written to it since, and the filesystem does not
+discard online. The drive ran short of erased blocks and stalled writes.
 
 Load logs give these coarse phase boundaries, rather than isolated measurements:
 
-| Phase | Sparkles, 2026-10-03 (s) | Sparkles, previous snapshot (s) | Sparkles, current snapshot (s) | QLever (s) |
-|---|---:|---:|---:|---:|
-| Parse and partial vocabularies | 297 | 664 | 774 | 914 |
-| Vocabulary merge | 67 | 215 | 198 | 183 |
-| Remap to global ids | included in the sorts | included in the sorts | included in the sorts | 117 |
-| Chunk sorts | 116 | 115 | 124 | — |
-| Permutation builds | 116 | 254 | 254 | — |
-| Total | 596 | 1,248 | 1,351 | 1,674 |
+| Phase | Sparkles, 2026-10-03 (s) | Sparkles, 2026-10-08, first run (s) | Sparkles, 2026-10-08, second run (s) | Sparkles, 2026-10-09 (s) | QLever (s) |
+|---|---:|---:|---:|---:|---:|
+| Parse and partial vocabularies | 297 | 664 | 774 | 273 | 914 |
+| Vocabulary merge | 67 | 215 | 198 | 49 | 183 |
+| Remap to global ids | included in the sorts | included in the sorts | included in the sorts | included in the sorts | 117 |
+| Chunk sorts | 116 | 115 | 124 | 112 | — |
+| Permutation builds | 116 | 254 | 254 | 112 | — |
+| Total | 596 | 1,248 | 1,351 | 547 | 1,674 |
 
-Total CPU work stayed near 4,262, 4,249 and 4,298 seconds respectively. GNU time's
-filesystem input/output counts also stayed close, and the latest output count is within
-0.1% of the historical count. Average busy cores fell from about 7.1 to 3.4 and then
-3.2. The latest load recorded about 585 seconds of full cgroup I/O pressure, roughly
-43% of elapsed time, with dirty-page, page-read and filesystem waits. There was no
-CPU quota throttling or memory-limit event. Its process RSS peaked at 6,319 MiB, and
-the complete scope, including file-cache pages, peaked at 12.27 GiB below its 14 GiB cap.
+The CPU work of the slow loads matched the fast ones. Total CPU time was 4,262,
+4,249, 4,298 and 4,138 seconds across the four loads, and GNU time's filesystem
+output counts stayed within 0.1% of each other. What changed was waiting. The second
+load of 2026-10-08 spent about 585 seconds, 43% of its elapsed time, with every task
+in its cgroup stalled on I/O. The current load spent 33.6 seconds, 6% of its elapsed
+time, in that state, and kept about 7.6 cores busy on average against 3.2.
 
-This supports investigating storage and writeback stalls before attributing the
-slowdown to extra computation. It does not establish the historical cause: pressure
-telemetry was not recorded for that original full load. Follow-up needs matched
-loads with pinned binaries and controlled storage/cache conditions, followed by
-separate source and toolchain comparisons. The regression remains open despite
-loading still being faster than the retained competitor measurements.
+Matched loads isolated the cause. They compared the binary of the 2026-10-03 run with
+the binary of the second 2026-10-08 run on the same machine, inputs, CPU set and
+memory limit, alternating the two. Before a trim, both binaries were slow. A bounded
+load of 82 million statements took a median of 62.4 and 57.1 s, and a 15-file load
+of 399 million statements took 417 and 468 s. After `fstrim`, the same loads took
+33.7 and 33.9 s, and 189 and 191 s. Full I/O stall fell from 23–33 s to about 1 s per
+bounded load and from 189–275 s to 12–17 s per 15-file load. The drive's average
+write latency fell from 240–380 ms to 5–28 ms, and its write rate while busy rose
+from 130–190 MB/s to 1.0–4.0 GB/s. Write latency rose again within that session, from
+5 ms to 28 ms over about 300 GB of writes. A full load writes about 145 GB, so it
+should start soon after a trim.
 
-Cold point lookups also remain slower than the historical snapshot. Same-index,
-counterbalanced controls against the immediately preceding binary did not reproduce
-multifold cold losses, but those controls do not explain the older historical gap.
-Readiness polling itself can add about 9–12 ms to a cold first query. The canonical
-500 ms polling interval is unchanged, and the single cold probes above remain
-sensitive to first-use I/O and device state. Historical cold performance remains a
-follow-up item. Neither the current index nor recent source changes have been
-established as its cause.
+The cold point-lookup losses of 2026-10-08 had the same cause. After the trim, the
+canonical cold probes returned to the times of 2026-10-03, for example
+`entity-summary-1` at 8.4 ms against 53.5 ms on 2026-10-08. On the current index, the
+binary of 2026-10-03 and the current binary were compared over four alternating
+rounds, with a server restart and file-cache eviction before every query. The current binary
+was within 10% or faster on all 31 queries and more than 10% faster on 10 of them,
+with a geometric mean time ratio of 0.75. Point lookups were equal, and the scans that
+benefit from the [cold-read features](#cold-reads) were faster, for example `export-1m`
+at 1,004 against 1,903 ms. That harness's readiness polling adds about 7–8 ms to each
+point lookup, so its times are higher than the canonical cold column above. A
+separate sweep of 160 cases at 1.05M, 10.5M, full-text and WatDiv found no code
+regression outside the 10% band against the snapshot binary. The tables for those
+datasets keep their snapshot numbers.
+
+`scripts/bench-billion.sh` now records the filesystem's last trim, its free space
+and the system's I/O pressure before a load or query step. It warns when the last
+trim is more than two days old or less than 30% of the filesystem is free, and it
+samples pressure once per second while the steps run.
 
 ### Prefix filtering and large results
 
@@ -1032,7 +1046,7 @@ are decoded once in id order and in parallel. Requests for the next chunk overla
 writing the current one. Smaller results are decoded row by row to limit per-request
 memory under concurrency.
 
-In the comparative DBpedia results, `export-1m` takes 234.6 ms warm and 1,074.5 ms
+In the comparative DBpedia results, `export-1m` takes 241.7 ms warm and 1,000.4 ms
 cold. Batched serialization holds up to about 70 MiB of additional memory while
 writing an export. The cold-read configuration comparison above shows the remaining
 tradeoff between sparse lookup behavior and dense export reads.

@@ -59,7 +59,7 @@ full feature list is in [FEATURES.md](FEATURES.md).
 
 | Area | QLever | Sparkles |
 |---|---|---|
-| Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Measured up to 1.24 billion triples (English DBpedia, [BENCHMARKS.md](BENCHMARKS.md#dbpedia-at-124-billion-triples)). It loads them in 596 s, where QLever takes 1,674 s on the same machine. |
+| Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Measured up to 1.24 billion triples (English DBpedia, [BENCHMARKS.md](BENCHMARKS.md#dbpedia-at-124-billion-triples)). It loads them in 547 s, where QLever takes 1,674 s on the same machine. |
 | Streaming execution | Lazy, block-wise scans, joins, filters and GROUP BY; results streamed to the client | Every operator materializes its result, within row and memory budgets. Responses over 1 MiB are streamed as they are serialized. Materialization and the 1 GiB block cache trade memory for speed. After the 10.5M benchmark, Sparkles' server holds 916 MiB to QLever's 653 MiB. Of that, 379 MiB is the block cache, and a server with the cache off ends at 331 MiB at about half the throughput ([BENCHMARKS.md](BENCHMARKS.md#memory-and-the-speed-it-buys)). |
 | Block prefiltering | FILTER ranges and STRSTARTS checked against block min/max to skip blocks | Numeric range FILTERs on a scan's sort column read only the matching id ranges (inline integers and decimals). Non-canonical numerals are tested row by row. `STRSTARTS` and a `REGEX` anchored on a literal start read only the vocabulary ids of the keys with that start. |
 | Pattern trick | `ql:has-predicate`, per-subject predicate patterns | ✗ (predicate counts come from index runs) |
