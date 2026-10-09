@@ -168,12 +168,7 @@ impl BackupState {
     /// repository that cannot be opened is `502 repository-unavailable` (and marked
     /// unreachable). Opening is lazy and cached; a config reload drops the cache of
     /// changed entries. Blocks: for task threads (handlers use [`open_repo`](Self::open_repo)).
-    #[allow(dead_code)] // Preserve the default-control convenience API for embedders.
-    pub fn repo(&self, name: &str) -> Result<Arc<Repository>, BackupError> {
-        self.repo_with_ctl(name, &sparkles_backup::Ctl::default())
-    }
-
-    /// Open from a task thread, allowing cancellation during provider resolution/cache wait.
+    /// `ctl` can cancel the wait for provider resolution and the cache.
     pub fn repo_with_ctl(
         &self,
         name: &str,
