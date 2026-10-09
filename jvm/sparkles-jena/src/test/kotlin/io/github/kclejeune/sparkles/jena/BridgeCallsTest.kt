@@ -87,4 +87,46 @@ class BridgeCallsTest {
         val streaming = Context().set(Sparkles.STREAMING_EXECUTION, true)
         assertEquals(700, count(dsg, "SELECT * { ?s ?p ?o }", streaming))
     }
+
+    @Test
+    fun native_errors_stay_errors_after_status_reuse() {
+        val dsg = filled(5)
+        // a result limit that the query exceeds fails in the native call itself
+        val limited = Context().set(Sparkles.MAX_ROWS, 2L)
+        repeat(3) {
+            // a failing call followed by succeeding ones on the same thread
+            assertThrows(RuntimeException::class.java) {
+                QueryExec.dataset(dsg).query("SELECT * { ?s ?p ?o }").context(limited).build().use { qe ->
+                    val rs = qe.select()
+                    while (rs.hasNext()) rs.next()
+                }
+            }
+            assertEquals(5, count(dsg, "SELECT * { ?s ?p ?o }"))
+            assertTrue(Txn.calculateRead(dsg) { dsg.defaultGraph.contains(iri("s1"), iri("p"), NodeFactory.createLiteralString("v1")) })
+        }
+    }
+
+    @Test
+    fun calls_on_many_threads_keep_their_own_status() {
+        val dsg = filled(50)
+        val pool = Executors.newFixedThreadPool(8)
+        try {
+            val tasks = (0 until 64).map { i ->
+                Callable {
+                    var ok = 0
+                    repeat(50) { j ->
+                        val k = (i + j) % 50
+                        if (Txn.calculateRead(dsg) { dsg.defaultGraph.contains(iri("s$k"), iri("p"), NodeFactory.createLiteralString("v$k")) }) ok++
+                        if (!Txn.calculateRead(dsg) { dsg.defaultGraph.contains(iri("s$k"), iri("p"), iri("nothing")) }) ok++
+                        if (QueryExec.dataset(dsg).query("ASK { <${ex}s$k> ?p ?o }").ask()) ok++
+                    }
+                    ok
+                }
+            }
+            val results = pool.invokeAll(tasks).map { it.get(60, TimeUnit.SECONDS) }
+            assertTrue(results.all { it == 150 }, results.toString())
+        } finally {
+            pool.shutdownNow()
+        }
+    }
 }
