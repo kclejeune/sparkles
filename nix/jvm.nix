@@ -110,7 +110,7 @@ let
     gradleBuildTask = ":sparkles-jena:assemble :sparkles-jena-natives:assemble :sparkles-jena-all:assemble";
     # everything the build and the tests resolve, for the update script
     gradleUpdateTask = "nixDownloadDeps :sparkles-jena:assemble :sparkles-jena-natives:assemble :sparkles-jena-all:assemble :sparkles-jena:testClasses :sample-java:testClasses";
-    gradleCheckTask = ":sparkles-jena:test :sample-java:test";
+    gradleCheckTask = ":sparkles-jena:test :sparkles-jena:testUniffi :sample-java:test";
     doCheck = false;
 
     installPhase = ''

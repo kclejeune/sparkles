@@ -31,6 +31,7 @@ import org.apache.jena.sparql.util.Context
 import java.io.InputStream
 import java.io.OutputStream
 import io.github.kclejeune.sparkles.jena.internal.ffi.FfiReadTxn
+import io.github.kclejeune.sparkles.jena.internal.ffi.SparklesJni
 import java.nio.file.Path
 
 /**
@@ -252,7 +253,7 @@ public class DatasetGraphSparkles internal constructor(
             t.write = w
             handle.openWrites.add(t)
         } else {
-            val r = pinned?.fork() ?: ffi { handle.ffi.beginRead() }
+            val r = pinned?.fork() ?: ffi { SparklesJni.beginRead(handle.ffi) }
             t.read = r
             if (type != TxnType.READ) t.baseSeq = r.commitSeq().toLong()
         }

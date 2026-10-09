@@ -42,6 +42,7 @@ pub use catalog::{CatalogFile, DatasetInfo, FfiCatalog, FfiReservation, catalog_
 pub use documents::{BoundQuery, QueryChange, SchemaRequest};
 pub use settings::{CompactionSettings, QuotaInfo, RetentionSettings, SnapshotSchedule};
 mod cursor;
+mod jni_calls;
 mod labels;
 mod query;
 mod read;

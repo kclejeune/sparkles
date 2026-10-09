@@ -411,10 +411,10 @@ run = "./gradlew --console=plain :sparkles-jena:assemble"
 [tasks."jvm:test"]
 sources = ["@group:rust", "@group:jvm", "scripts/jvm-native.sh"]
 outputs = []
-description = "Jena's contract tests and the binding's own tests on the host's native library; extra args go to Gradle"
+description = "Jena's contract tests and the binding's own tests on the host's native library, once with the hand-written JNI calls and once without; extra args go to Gradle"
 depends = ["jvm:native"]
 dir = "jvm"
-run = "./gradlew --console=plain :sparkles-jena:test"
+run = "./gradlew --console=plain :sparkles-jena:test :sparkles-jena:testUniffi"
 
 [tasks."jvm:sample"]
 description = "Compile the Java sample (jvm/sample-java) with -Xlint:all -Werror against the library, run its tests, and run it"

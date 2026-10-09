@@ -3193,6 +3193,7 @@ dependencies = [
 name = "sparkles-ffi"
 version = "0.1.0"
 dependencies = [
+ "jni-sys",
  "oxrdf",
  "oxrdfio",
  "parking_lot",

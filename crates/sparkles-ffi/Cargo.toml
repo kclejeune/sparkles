@@ -31,6 +31,8 @@ uniffi = "=0.32.2"
 sparkles = { path = "../sparkles", features = ["zstd", "brotli"] }
 oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
 rustc-hash = "2"
+# the hand-written JNI entry points of jni_calls.rs
+jni-sys = "0.4"
 oxrdfio = { version = "0.2", features = ["rdf-12"] }
 parking_lot = "0.12"
 serde = "1"

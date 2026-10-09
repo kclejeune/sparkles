@@ -1,5 +1,6 @@
 package io.github.kclejeune.sparkles.jena.internal
 
+import io.github.kclejeune.sparkles.jena.internal.ffi.SparklesJni
 import io.github.kclejeune.sparkles.jena.internal.ffi.ffiVersion
 import java.io.File
 import java.io.IOException
@@ -60,8 +61,15 @@ internal object NativeLoader {
                     "${v.encodingVersion}), and this jar is version $version (encoding $ENCODING_VERSION)",
             )
         }
+        // The hand-written JNI calls load the same library file, unless sparkles.jni=false.
+        jni = SparklesJni.ENABLED
         loaded = true
     }
+
+    /** Whether the hottest reads go through the hand-written JNI calls (SparklesJni). */
+    @Volatile
+    var jni = false
+        private set
 
     /** The platform directory for an `os.name` and `os.arch`, or `null` when none is built. */
     fun platform(osName: String, osArch: String): String? {

@@ -50,13 +50,51 @@ val ffiBindings = tasks.register<Sync>("ffiBindings") {
             "    }",
         ).joinToString("\n")
         val files = destinationDir.walkTopDown().filter { it.isFile && it.name.endsWith(".kt") }.toList()
-        val changed = files.count { f ->
-            val text = f.readText()
-            if (!text.contains(helper)) return@count false
-            f.writeText(text.replace(helper, pooled))
-            true
+        val changed = files.filter { it.readText().contains(helper) }
+        check(changed.size == 1) { "expected UniFFI's call helper in one generated file, found it in ${changed.size}" }
+        val file = changed.single()
+        var text = file.readText().replace(helper, pooled)
+
+        // The hand-written JNI calls (src/ffi/kotlin/.../SparklesJni.kt) borrow an object's
+        // handle under its call counter, as UniFFI's own `callWithHandle` does, but without
+        // the handle clone that is a native call of its own.
+        val callWithHandle = "    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {\n"
+        val borrow = listOf(
+            "    internal inline fun <R> uniffiBorrowHandle(block: (handle: Long) -> R): R {",
+            "        do {",
+            "            val c = this.callCounter.get()",
+            "            if (c == 0L) {",
+            "                throw IllegalStateException(\"\${this.javaClass.simpleName} object has already been destroyed\")",
+            "            }",
+            "            if (c == Long.MAX_VALUE) {",
+            "                throw IllegalStateException(\"\${this.javaClass.simpleName} call counter would overflow\")",
+            "            }",
+            "        } while (! this.callCounter.compareAndSet(c, c + 1L))",
+            "        try {",
+            "            return block(this.handle)",
+            "        } finally {",
+            "            if (this.callCounter.decrementAndGet() == 0L) {",
+            "                cleanable?.clean()",
+            "            }",
+            "        }",
+            "    }",
+            "",
+        ).joinToString("\n", postfix = "\n")
+        val objects = text.split(callWithHandle).size - 1
+        check(objects >= 4) { "expected UniFFI's callWithHandle in every generated object class, found it $objects times" }
+        text = text.replace(callWithHandle, borrow + callWithHandle)
+
+        // The objects that the JNI calls make are freed through JNI too, unless they are off.
+        for ((ffiName, hook) in listOf("ffireadtxn" to "freeReadTxn", "ffiquery" to "freeQuery", "fficursor" to "freeCursor")) {
+            val free = listOf(
+                "            uniffiRustCall { status ->",
+                "                UniffiLib.uniffi_sparkles_ffi_fn_free_$ffiName(handle, status)",
+                "            }",
+            ).joinToString("\n")
+            check(text.split(free).size == 2) { "expected one clean action for $ffiName in the generated bindings" }
+            text = text.replace(free, "            if (!SparklesJni.$hook(handle)) " + free.trimStart())
         }
-        check(changed == 1) { "expected UniFFI's call helper in one generated file, found it in $changed" }
+        file.writeText(text)
     }
 }
 
@@ -147,7 +185,7 @@ tasks.named<Jar>("sourcesJar") {
     exclude("io/github/kclejeune/sparkles/native/**")
 }
 
-tasks.test {
+tasks.withType<Test>().configureEach {
     useJUnitPlatform()
     maxHeapSize = "2g"
     jvmArgs("-XX:+EnableDynamicAgentLoading")
@@ -158,6 +196,18 @@ tasks.test {
         showStandardStreams = false
     }
 }
+
+// The suite again with the hand-written JNI calls off (SparklesJni), so that both paths
+// of every call they cover give the same answers and errors.
+val testUniffi = tasks.register<Test>("testUniffi") {
+    description = "Runs the tests with -Dsparkles.jni=false, on UniFFI's calls alone"
+    group = "verification"
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    systemProperty("sparkles.jni", "false")
+    shouldRunAfter(tasks.test)
+}
+tasks.check { dependsOn(testUniffi) }
 
 // The performance check of P04 §5.4, not part of `check`:
 // ./gradlew :sparkles-jena:perfCheck -Pdata=DATA.nt -Pqueries=QUERIES.tsv [-Piterations=10] [-Ptdb2=false]
@@ -180,17 +230,26 @@ tasks.register<JavaExec>("perfCheck") {
 // plain JVMs. `bindingsBenchClasspath` writes the classpaths it uses: the test runtime
 // classpath, and the same with a copy of the generated bindings that counts native calls
 // placed first. The counting copy increments a counter in UniFFI's call helper, which every
-// generated call goes through, and compiles with the module name of the `ffi` source set.
+// generated call goes through, and in each hand-written JNI call of SparklesJni, and
+// compiles with the module name of the `ffi` source set.
 val countingBindingsDir = layout.buildDirectory.dir("bindings-bench/counting-src")
 val callCountingBindings = tasks.register<Sync>("callCountingBindings") {
     from(ffiBindings)
+    from("src/ffi/kotlin")
     into(countingBindingsDir)
     val marker = "    val status = UniffiCallStatusPool.acquire()"
-    filter { line -> if (line == marker) "    UniffiCallCounter.calls.increment()\n$line" else line }
+    val jniMarker = "// counted native call"
+    filter { line ->
+        when {
+            line == marker -> "    UniffiCallCounter.calls.increment()\n$line"
+            line.trim() == jniMarker ->
+                line.replace(jniMarker, "UniffiCallCounter.calls.increment(); UniffiCallCounter.jniCalls.increment()")
+            else -> line
+        }
+    }
 }
 val benchCalls: SourceSet = sourceSets.create("benchCalls") {
     kotlin.srcDir(callCountingBindings)
-    kotlin.srcDir("src/ffi/kotlin")
     compileClasspath = ffi.compileClasspath
 }
 tasks.named<KotlinCompile>("compileBenchCallsKotlin") {
