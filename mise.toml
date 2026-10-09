@@ -705,7 +705,7 @@ usage = '''
 arg "[triples]" default="100000"
 arg "[profile]" default="rdfs" help="rdfs | rdfs-simple | owl-rl"
 '''
-run = 'cargo run --release -p sparkles-reasoner --example bench -- "$usage_triples" "$usage_profile"'
+run = 'cargo run --release -p sparkles-reasoner --example reasoner-bench -- "$usage_triples" "$usage_profile"'
 
 [tasks."bench:shacl"]
 description = "SHACL validation benchmark on generated data"
@@ -716,7 +716,7 @@ run = '''
 mkdir -p target/bench-data
 f="target/bench-data/shacl-$usage_people.nt"
 [ -f "$f" ] || python3 scripts/gen-data.py "$usage_people" > "$f"
-cargo run --release -p sparkles-shacl --example bench -- "$f" - 5
+cargo run --release -p sparkles-shacl --example shacl-bench -- "$f" - 5
 '''
 
 [tasks."bench:shex"]
@@ -729,7 +729,7 @@ run = '''
 mkdir -p target/bench-data
 f="target/bench-data/shacl-$usage_people.nt"
 [ -f "$f" ] || python3 scripts/gen-data.py "$usage_people" > "$f"
-cargo run --release -p sparkles-shex --example bench -- "$f" - 5
+cargo run --release -p sparkles-shex --example shex-bench -- "$f" - 5
 if [ -n "${usage_compare_rudof:-}" ]; then
   scripts/shex-diff.sh --compare-rudof "$f" crates/sparkles-shex/examples/bench.shex crates/sparkles-shex/examples/bench.smap
 fi

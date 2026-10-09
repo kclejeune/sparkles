@@ -1006,7 +1006,7 @@ crates/sparkles-shex/
   src/semact.rs       SemActHandler registry, Test extension
   src/report.rs       JSON / ShapeMap JSON / smap / text
   src/guard.rs        Phase 2: ShexGuard (CommitGuard)
-  examples/bench.rs   §9
+  examples/shex-bench.rs  §9
   tests/shextest.rs   §8
   tests/known-failures.txt
 ```
@@ -1182,7 +1182,7 @@ reason. The run fails on unlisted failures and reports listed tests that pass.
 ## 9. Performance targets and benchmark
 
 **Benchmark.** `mise run bench:shex [people]` runs
-`crates/sparkles-shex/examples/bench.rs` on `scripts/gen-data.py` data. It mirrors
+`crates/sparkles-shex/examples/shex-bench.rs` on `scripts/gen-data.py` data. It mirrors
 `bench:shacl` and prints:
 
 * load time;
@@ -1509,7 +1509,7 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
 * **Sparkles repository (read):**
   * `crates/sparkles-shacl/src/{lib.rs,data.rs,validate.rs,guard.rs}` (snapshot access,
     `GraphSel`, parallel chunking, limits, the guard and `validation.json`),
-    `crates/sparkles-shacl/examples/bench.rs`, `crates/sparkles-shacl/tests/w3c_shacl.rs`
+    `crates/sparkles-shacl/examples/shacl-bench.rs`, `crates/sparkles-shacl/tests/w3c_shacl.rs`
     and `known-failures.txt`;
   * `crates/sparkles-core/src/guard.rs` (`CommitGuard`, `Candidate`, `ValidationSummary`),
     `store.rs` (guard slots, `scan`, `count`, `term`, blank-node labels), `index.rs`

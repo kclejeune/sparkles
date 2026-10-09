@@ -2,7 +2,7 @@ PREFIX ex: <http://example.org/>
 PREFIX foaf: <http://xmlns.com/foaf/0.1/>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
-# The ShEx counterpart of the SHACL benchmark shapes (crates/sparkles-shacl/examples/bench.rs)
+# The ShEx counterpart of the SHACL benchmark shapes (crates/sparkles-shacl/examples/shacl-bench.rs)
 # on scripts/gen-data.py data. ShEx has no rdfs:subClassOf inference: class membership is
 # spelled out as value sets. The shape map is bench.smap.
 

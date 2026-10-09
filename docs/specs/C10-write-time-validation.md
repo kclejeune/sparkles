@@ -1046,7 +1046,7 @@ with strategy `incremental`, in < 5 ms.
   * `crates/sparkles-shacl/src/{lib.rs,data.rs,validate.rs,shapes.rs,path.rs,report.rs,sparql.rs}`
     for snapshot access, `GraphSel`, parallel chunking, deadlines, targets, constraints
     and the `$shapesGraph` binding;
-  * `crates/sparkles-shacl/examples/bench.rs`;
+  * `crates/sparkles-shacl/examples/shacl-bench.rs`;
   * `crates/sparkles-core/src/store.rs` for `WriteTxn`, `view`, `commit`, `publish_log`,
     `insert_bulk`, `load_as`, `replace_as`, `rebuild_locked`, `clone_to` and the
     persistence of the text config;

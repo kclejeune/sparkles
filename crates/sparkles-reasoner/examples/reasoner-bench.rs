@@ -1,7 +1,7 @@
 //! Materialization benchmark over a generated LUBM-like dataset.
 //!
 //! ```sh
-//! cargo run --release -p sparkles-reasoner --example bench -- 100000 rdfs
+//! cargo run --release -p sparkles-reasoner --example reasoner-bench -- 100000 rdfs
 //! ```
 
 use sparkles_core::io::{RdfFormat, Source};
