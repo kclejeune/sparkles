@@ -912,3 +912,41 @@ question 5.
 **Tests.** `crates/sparkles-core/tests/annotations.rs` prunes a catalog with messages and
 digests on, through a pin, a reopen, an offline read, `sparkles check` and a backup
 restore. `http/diff_tests.rs` covers the horizon over HTTP.
+
+**Write-through WAL commits** landed on 2026-10-09 in `09d03a69`. The WAL record format
+did not change. On Linux, the writer opens a second handle on `wal.log` with `O_DIRECT`
+and `O_DSYNC`. A commit of up to 64 KiB that fits inside the preallocated zero space is
+written through that handle at the log's logical end, and the write returns once the
+bytes are durable, in place of the buffered write and `fdatasync`. The blocks are already
+allocated and written, so the write changes no file metadata. On ext4 and XFS the kernel
+can then complete it as a forced-unit-access write of those blocks rather than a flush of
+the device's whole cache, when the device supports FUA.
+
+The write covers whole 4 KiB blocks. The writer keeps the last partial block in memory,
+or reads it back through the direct handle when it does not, and rewrites it with the
+same durable prefix followed by the new records and zeros. A torn write can therefore
+damage only records that were never acknowledged, which replay already treats as a torn
+tail. Dirty update-vocabulary terms are synced on the vocabulary worker while the WAL
+write runs, and the commit is acknowledged only after both finish, as on the buffered
+path. A commit larger than 64 KiB, or one that needs more preallocated space, takes the
+buffered path. If the file system rejects direct I/O with `EINVAL`, the writer falls
+back to the buffered path for that log. `StoreOptions::wal_direct_writes` turns the path
+off, and so does the hidden server flag `--no-wal-direct-writes`. Compaction and rebuild
+reopen the handle for the new log.
+
+Directional measurements compared the same binary with and without the flag in paired,
+interleaved runs. On a busy laptop with NVMe, the median single-triple HTTP update took
+0.93 times as long with direct writes on the 1.05M-triple store, and 0.82 times as long
+on the 10.5M-triple store. On a Namespace 8x16 instance at 1.05M, whose virtual disk is
+write through and reports no FUA, the pooled median was 0.53 ms against 0.56 ms, but
+the two rounds disagreed on the direction. Serial churn with literal
+inserts did not change measurably there. Those commits wait on the update vocabulary's
+sync, which appends to `delta.vocab` and needs a file-system journal commit, and that
+cost now dominates them.
+
+**Tests.** A unit test in `store/wal.rs` mixes direct and buffered commits and compares
+the file bytes, the zero tail and the size limits. `tests/commits.rs` runs the same
+commits with and without direct writes, including an 80 KiB commit that takes the
+buffered path. It restores a crash image of the log with its zero tail and checks that
+the head, the counts and the data survive a reopen. Another test checks that the handle
+follows compaction to the new log.
