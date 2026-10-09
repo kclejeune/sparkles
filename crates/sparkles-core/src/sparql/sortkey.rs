@@ -155,19 +155,6 @@ fn decide(class: u8, a: Prim, b: Prim, va: &Option<Value>, vb: &Option<Value>) -
     }
 }
 
-/// [`order_cmp`] by the same decisions as [`SortKey::cmp`], classifying both values on
-/// the spot. A full sort compares each row many times, but keeping a key per row costs
-/// more than classifying again.
-#[inline]
-pub fn cmp_values(a: &Option<Value>, b: &Option<Value>) -> Ordering {
-    let (ca, pa) = a.as_ref().map_or((NULL, Prim::Plain), classify);
-    let (cb, pb) = b.as_ref().map_or((NULL, Prim::Plain), classify);
-    if ca != cb {
-        return ca.cmp(&cb);
-    }
-    decide(ca, pa, pb, a, b).unwrap_or_else(|| order_cmp(a.as_ref(), b.as_ref()))
-}
-
 fn text(v: &Option<Value>) -> &str {
     match v {
         Some(Value::Iri(s) | Value::BNode(s) | Value::Str(s)) => s,
