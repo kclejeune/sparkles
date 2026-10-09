@@ -334,8 +334,10 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 [BENCHMARKS.md](BENCHMARKS.md) has the results and describes how each run was set up.
 
 * `scripts/bench.sh` (`mise run bench [people] [workdir]`) runs the engine comparison.
-  It compares Sparkles, Jena/Fuseki, QLever, Fluree and Oxigraph over HTTP. Its
-  `--mode` flag, or the `MODE` variable, chooses what it measures.
+  It compares Sparkles, Jena/Fuseki, QLever, Fluree and Oxigraph over HTTP. The mise
+  task's `--mode` flag chooses what it measures. The script itself takes the size and
+  the work directory as positional arguments and reads the mode from the `MODE`
+  variable, as in `MODE=updates scripts/bench.sh 100000 target/bench`.
 
   ```sh
   mise run bench 100000 target/bench                   # load, queries and memory
