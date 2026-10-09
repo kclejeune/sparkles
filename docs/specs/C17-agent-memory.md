@@ -175,7 +175,7 @@ GRAPH <https://example.org/notes/2026-10-08> {
 | `prov:wasGeneratedBy` | reifier | The activity of the `assert_facts` call that wrote the fact. |
 | `prov:wasDerivedFrom` | reifier | The source, when the call names one. |
 | `prov:generatedAtTime` | reifier | The time the call started. The commit records its own time as well. |
-| `spk:confidence` | reifier | The agent's confidence as an `xsd:decimal` from 0 to 1, when it gives one. |
+| `spk:confidence` | reifier | The agent's confidence as an `xsd:decimal` from 0 to 1, when it gives one. It is stored as given, and no tool ranks, filters or thresholds on it. |
 | `spk:quote` | reifier | The passage of the source that supports the fact, at most 1000 characters. |
 | `prov:wasAssociatedWith` | activity | The principal that made the call, as `urn:x-sparkles:principal:<name>`. Over stdio it is the operating-system user, as for stored-query versions that the CLI saves. |
 | `prov:actedOnBehalfOf` | software agent | Set when the call describes the agent (§5.6). The principal is authenticated, while the agent's own name and model are what the agent reports. |
@@ -228,7 +228,8 @@ same change, but history has a retention window and answers by commit, not by fa
 
 Supersession is not erasure. A request to forget personal data needs a real deletion of
 the triples and the reifiers, through `sparql_update` or the Graph Store, followed by the
-history retention settings of F06. §13 lists this as an open question.
+history retention settings of F06. Erasure is outside this spec. It needs a design of its
+own that covers reifiers, history retention and backups.
 
 ### 3.4 New entities and their IRIs
 
@@ -577,7 +578,6 @@ commit.
 | `idempotencyKey` | At most 128 characters. It makes a retried call a no-op and the minted IRIs deterministic (§3.4). |
 | `agent` | `{name, model?}`, a description of the software agent, recorded as a `prov:SoftwareAgent` that acted on behalf of the principal. |
 | `iriBase` | The namespace of minted IRIs (§3.4). |
-| `allowNewPredicates` | Accept predicates and classes the view does not contain. The default is false. |
 | `allowUnknownIris` | Accept IRIs that occur nowhere in the view as subjects or objects. The default is false. |
 | `dryRun`, `changes` | Preview the write, as `sparql_update` does ([C15](C15-write-previews.md)). |
 | `ifHead` | The head the write requires, as in `sparql_update`. |
@@ -587,9 +587,10 @@ together, so the agent can fix them in one round.
 
 1. Terms parse, every key used in a fact is declared in `entities`, and every key declared
    is used.
-2. Each predicate and each type is known to the view, as `check_query` defines it, unless
-   `allowNewPredicates` is set. An unknown one fails with `unknown-predicate` or
-   `unknown-class` and the suggestions of §5.2.
+2. Each predicate and each type is known to the view, as `check_query` defines it. An
+   unknown one fails with `unknown-predicate` or `unknown-class` and the suggestions of
+   §5.2. There is no option to accept new ones, because a person extends the ontology
+   (§12).
 3. Each IRI used as a subject or object occurs in the view, unless `allowUnknownIris` is
    set. An unknown one fails with `unknown-entity`, with the result of `link_entities`
    on its local name as suggestions. This refuses invented IRIs such as `ex:paymnts`.
@@ -649,8 +650,7 @@ A failed check is a tool error whose `data` holds the same `warnings` list plus 
 **Annotations.** `{"readOnlyHint": false, "destructiveHint": false, "idempotentHint":
 true, "openWorldHint": false}`. The tool is idempotent with a key. It is not marked
 destructive, because nothing it does loses a record. A superseded or retracted fact stays
-in the graph as a reifier with its provenance. §13 asks whether that is the right
-reading of the MCP hint.
+in the graph as a reifier with its provenance.
 
 ### 5.7 Branches as scratchpads
 
@@ -678,14 +678,32 @@ through MCP. Conflicts are resolved by a person on the merge page or with
 `sparkles merge`, since choosing between two sources is the kind of decision this spec
 keeps out of the server.
 
-The permissions are those of F09 §6.1. In particular, creating and merging a branch needs
-a grant without graph restrictions. An agent token limited to `memory/*` graphs therefore
-cannot create branches, and its scratch work goes into a session graph instead. §13 asks
-whether that should change.
+A branch created through `create_branch` is a scratch branch, and its metadata records
+that and the principal that created it. F09 §6.1 still governs every other branch, and
+there creating and merging a branch needs a grant without graph restrictions. Scratch
+branches relax that rule so that least-privilege agent tokens can use them.
+
+- A principal may create a scratch branch when it may write at least one graph of the
+  dataset, even when its grants cover only some graphs.
+- On the branch, the principal's grants apply as they do on `main`. It reads and writes
+  the same graphs, and the branch adds no access to hidden ones.
+- A graph-limited principal may merge or delete only scratch branches it created. Its
+  merge is refused with `forbidden` when the branch changes any graph that the principal
+  may not write on the target. That covers changes another principal made on the branch.
+- Principals with unrestricted grants keep the rights F09 gives them over every branch.
+
+This needs a matching change to F09 §6.1 (§9).
 
 A branch left behind by an agent keeps its disk use and counts against the dataset's
-quota and branch limit. `list_branches` returns each branch's creation time and its last
-commit's time, so an agent or a person can find stale ones.
+quota and branch limit. `list_branches` returns each branch's creation time, its last
+commit's time and whether it is a scratch branch, so an agent or a person can find stale
+ones. An operator can also make scratch branches expire. The `--mcp-scratch-branch-ttl`
+flag and the matching dataset setting take a duration and are off by default. With a
+duration set, a background task deletes each scratch branch whose last commit, or whose
+creation when it has no commits, is older than the duration. It skips a branch that has
+a running task or a pinned snapshot, and it logs each deletion and counts it in a metric.
+`list_branches` returns the time a scratch branch will expire. Branches created through
+HTTP, the CLI or the library are never expired.
 
 ### 5.8 Prompt and instructions
 
@@ -709,7 +727,7 @@ not see with `sparql_query`.
 | `link_entities` | Candidates from visible triples only. Full-text hits are checked against the view, as C12b requires. A hidden entity is never a candidate. |
 | `recall` | Seeds, facts, reifiers and citations from the view only. A citation never names a graph the caller cannot read, and a C12b protection that hides a predicate hides those facts. |
 | `assert_facts` | Writes need `write` on the target graph and on every graph that a supersession or retraction changes. The checks of §5.6 read the view, so a duplicate the caller cannot see is not reported. |
-| Branch tools | The permissions of F09 §6.1. |
+| Branch tools | The permissions of F09 §6.1, with the scratch-branch rules of §5.7. |
 
 The duplicate check sees only the view on purpose. Reporting a hidden duplicate would
 reveal that a hidden entity with that label exists. The cost is that two agents with
@@ -755,7 +773,7 @@ partial, as C11 §4.5 requires. The caps on output are the exception. A result c
 | The agent matches a simple literal against language-tagged labels. | `check_query` warns with `language-tag` and suggests the tagged literal. |
 | The agent is about to mint a duplicate entity. | `assert_facts` refuses it with `possible-duplicate`, unless the agent lists the candidate in `distinctFrom`. |
 | The agent uses an IRI that does not exist. | `assert_facts` refuses it with `unknown-entity` and suggestions. |
-| The agent invents a predicate. | `assert_facts` refuses it with `unknown-predicate`, unless `allowNewPredicates` is set. |
+| The agent invents a predicate. | `assert_facts` refuses it with `unknown-predicate`. A person adds new predicates and classes. |
 | A write breaks a domain constraint. | The guard rejects it, and the result carries the guard's results. |
 | The agent retries a call that timed out after committing. | With an idempotency key, the retry writes nothing and answers `alreadyApplied`. Without one, the retry's new entities fail the duplicate check against those the first call minted, which tells the agent that the first call committed. Agents should always send a key. |
 | Two agents write at once. | Each write is a transaction. An agent that previewed with a head and writes with `ifHead` fails with `precondition-failed` if another write came between. |
@@ -769,8 +787,8 @@ partial, as C11 §4.5 requires. The caps on output are the exception. A result c
 
 ## 9. Dependencies
 
-Phase 1 is correct with what exists today. Three pieces of other specs decide how well
-it performs.
+Phase 1a and 1b are correct with what exists today. Three pieces of other specs decide
+how well they perform, and Phase 1c needs a change to F09.
 
 1. **HNSW kept across compactions.** Agent memory is many small commits and frequent
    vector searches. Automatic compaction ([C13](C13-automatic-compaction.md)) folds the
@@ -791,6 +809,10 @@ it performs.
    text with the endpoint of an F08 index. A dataset without one works with BM25 and exact
    labels only. The `similar_entities` tool of C11 does not take text either, and giving
    it a `text` argument is a small change on the same path.
+
+4. **Scratch branches for graph-limited grants.** F09 §6.1 requires an unrestricted grant
+   to create or merge a branch. Phase 1c changes it for scratch branches as §5.7 describes,
+   and adds the scratch marker, the creator and the optional expiry to branch metadata.
 
 The stored-query field `questions` (§5.3) is a small extension of C16.
 
@@ -838,7 +860,7 @@ only.
 |---|---|
 | 1a | `check_query`, `similar_queries` with the `questions` field of stored queries, `link_entities`, `recall`. Read-only, available on every dataset. |
 | 1b | `assert_facts` with the data model of §3, the memory shapes of §3.5 as a documented example, and the `agent_memory` prompt. |
-| 1c | The `branch` argument on the MCP tools and the four branch tools. |
+| 1c | The `branch` argument on the MCP tools, the four branch tools, scratch branches for graph-limited grants and their optional expiry. |
 | 2 | Deferred (§10). |
 | 3 | A memory view in the UI. It shows sources and their graphs, facts with their citations, and the supersession record of an entity. |
 
@@ -892,27 +914,32 @@ keeps its graph across compactions.
   questions to the catalog would feed its mistakes back as examples for later
   questions. Stored queries stay an `admin` operation that a person reviews.
 - **MCP sampling in Phase 1.** §10 gives the reasons.
+- **Agents that add predicates and classes.** An agent that meets a fact the ontology
+  cannot express would otherwise invent a term, and invented terms are the failure
+  `check_query` exists to prevent. `assert_facts` has no option to accept unknown
+  predicates or classes. A person extends the ontology with an update or a schema change,
+  and the agent then writes with the new terms.
 
-## 13. Open questions
+## 13. Decisions on the open questions
 
-1. Whether `assert_facts` should be annotated `destructiveHint: true`. It removes
-   asserted triples on `replace` and `retract`, although their record stays. Marking it
-   destructive makes hosts ask the user before every memory write.
-2. Whether `replaceScope: "writable"` should exist, or whether an agent may only
-   supersede facts in the graph it writes. The broader scope lets an agent correct other
-   sources it may write.
-3. Whether graph-limited grants should be allowed to create branches for scratch work.
-   F09 requires an unrestricted grant, which least-privilege agent tokens do not have.
-4. Whether scratch branches should expire after a period without commits.
-5. Whether `allowNewPredicates` should exist, or whether new predicates and classes
-   should always come from a person who changes the ontology.
-6. Whether confidence should be stored at all. Models report poorly calibrated numbers,
-   and a stored number invites thresholds that mean little.
-7. How erasure requests for personal data should work, given that supersession keeps the
-   record and history keeps the commits.
-8. Whether `recall` should default to the text format or to JSON.
-9. Whether example questions belong in the stored-query definition or in a separate list
-   that people other than administrators can extend.
+The maintainer settled the questions left open in the first draft of this spec.
+
+1. `assert_facts` is not annotated `destructiveHint: true`. A superseded or retracted fact
+   keeps its record, and marking the tool destructive would make hosts ask before every
+   memory write.
+2. `replaceScope: "writable"` exists as an explicit option. The default stays `graph`, so
+   an agent corrects other sources only when it asks to.
+3. Graph-limited grants may create scratch branches, under the rules of §5.7. This needs
+   the change to F09 that §9 lists.
+4. Scratch branches can expire after a duration that the operator sets. Expiry is off by
+   default and never applies to branches created outside MCP.
+5. There is no `allowNewPredicates` option. A person extends the ontology (§12).
+6. Confidence is stored when the agent gives it, but no tool ranks, filters or thresholds
+   on it.
+7. Erasure of personal data is outside this spec and gets a design of its own.
+8. `recall` defaults to the text format, which costs fewer tokens.
+9. Example questions belong in the stored-query definition, where the people who review
+   stored queries also review them.
 
 ## 14. Acceptance examples
 
@@ -979,7 +1006,11 @@ commit 41.
   `scratch-s1`, writes with `assert_facts` and `branch: "scratch-s1"`, and finds the
   facts with `recall` on the branch but not on `main`. `merge_branch` with the default
   `dryRun` lists the changes and the guard's outcome. `delete_branch` removes the
-  branch. `agent-7` gets a permission error from `create_branch`.
+  branch. `agent-7`, whose grants cover only the notes graphs, creates the scratch branch
+  `scratch-s2`, writes a fact into `https://example.org/notes/2026-10-09` on it and merges
+  it into `main`. The same merge is refused with `forbidden` after the unrestricted
+  principal writes to `https://example.org/hr` on `scratch-s2`. `agent-7` cannot delete
+  `scratch-s1`.
 - **A15.** `recall` with `maxTriples: 5` returns five facts and a first line with
   `truncated=true`. A `recall` that exceeds its timeout fails with `timeout` and returns
   no facts.
@@ -994,6 +1025,10 @@ commit 41.
   `link_entities` still finds exact label matches and reports
   `search: {text: false, vector: false}`, and `recall` with only `query` fails with
   `no-search-index`.
+- **A19.** With `--mcp-scratch-branch-ttl 1h`, a scratch branch whose last commit is two
+  hours old is deleted by the background task and no longer appears in `list_branches`,
+  and the deletion metric counts it. A branch created over HTTP with an older last commit
+  is kept.
 
 ## 15. Sources
 
