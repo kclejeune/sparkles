@@ -1122,6 +1122,13 @@ struct Operator {
     growing: bool,
     reason: Option<String>,
     bind_reuse: Option<Box<bind::Reuse>>,
+    /// The variables every output batch, and the concatenation of all of them, is
+    /// sorted on in raw ID order. It is fixed when the operator is built, and each
+    /// output batch carries it.
+    order: Vec<VarId>,
+    /// The order key of the last row produced, to check the order across batches.
+    #[cfg(debug_assertions)]
+    last: Option<Vec<Id>>,
 }
 
 fn supported(kind: &Kind) -> bool {
@@ -1143,11 +1150,96 @@ fn supported(kind: &Kind) -> bool {
     }
 }
 
+/// What runs an operator, which decides the order its output keeps.
+enum Role {
+    Merge,
+    Binary,
+    Group,
+    Blocking,
+    Fallback,
+    Streamed,
+}
+
+/// Plan kinds whose eager output order a caller may observe without ORDER BY, such as
+/// a ranking. A fallback keeps their order rather than re-sorting them.
+fn ranked(kind: &Kind) -> bool {
+    matches!(
+        kind,
+        Kind::OrderBy { .. }
+            | Kind::OrderedTopK(_)
+            | Kind::TextSearch(_)
+            | Kind::VectorSearch(_)
+            | Kind::HybridSearch(_)
+            | Kind::SpatialKnn(_)
+            | Kind::Service { .. }
+            | Kind::PathSearch(_)
+    )
+}
+
+/// The order an operator's output keeps, from its plan node (whose children are
+/// shells carrying the order of their operators) and its child operators.
+fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
+    let child = |i: usize| children.get(i).map_or(&[][..], |c| c.order.as_slice());
+    // A join fills an unbound input value from the other input, which moves the row
+    // out of the input's order on that variable.
+    let kept = |order: &[VarId], side: &Node, other: &Node| -> Vec<VarId> {
+        order
+            .iter()
+            .take_while(|v| side.certain.contains(v) || !other.vars.contains(v))
+            .copied()
+            .collect()
+    };
+    let order = match role {
+        // Output is left-major: each left row with its matches in turn.
+        Role::Merge => kept(child(0), &node.children[0], &node.children[1]),
+        // Output is probe-major. Semi, anti and MINUS joins pass probe rows unchanged.
+        Role::Binary => {
+            let probe = binary::probe_side(node);
+            match node.kind {
+                Kind::HalfJoin { .. } | Kind::Minus => child(probe).to_vec(),
+                _ => kept(
+                    child(probe),
+                    &node.children[probe],
+                    &node.children[1 - probe],
+                ),
+            }
+        }
+        Role::Group => Vec::new(),
+        Role::Blocking => match &node.kind {
+            Kind::Sort(vars) => vars.clone(),
+            _ => Vec::new(),
+        },
+        // The eager subtree's output is re-sorted on load when it does not hold the
+        // planner's order.
+        Role::Fallback if ranked(&node.kind) => Vec::new(),
+        Role::Fallback => node.sorted.clone(),
+        Role::Streamed => match &node.kind {
+            Kind::Scan(spec) | Kind::RangeScan(spec, _) => {
+                spec.cols.iter().map(|&(_, v)| v).collect()
+            }
+            Kind::Values(table) => table.sorted.clone(),
+            Kind::Project(_)
+            | Kind::Distinct
+            | Kind::Filter(_)
+            | Kind::Extend(..)
+            | Kind::Slice { .. } => child(0).to_vec(),
+            Kind::Union if children.len() == 1 => child(0).to_vec(),
+            // Concatenated UNION arms are not ordered, and counts are a single row.
+            _ => Vec::new(),
+        },
+    };
+    order
+        .into_iter()
+        .take_while(|v| node.vars.contains(v))
+        .collect()
+}
+
 impl Operator {
     fn build(ctx: &Arc<Ctx>, mut node: Node, fallback: FallbackPolicy) -> Result<Self> {
         ctx.check()?;
-        let incremental_merge = merge::eligible(&node);
-        let incremental_binary = !incremental_merge && binary::eligible(&node);
+        // Every merge-eligible join is also binary-eligible, so whether the node
+        // materializes does not depend on the order its children turn out to have.
+        let joins = binary::eligible(&node);
         let incremental_group = group::eligible(&node);
         let native_blocking =
             matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. }) && node.children.len() == 1;
@@ -1157,8 +1249,7 @@ impl Operator {
         let exists_keys = matches!(&node.kind, Kind::OrderBy { keys, .. }
             if keys.iter().any(|(key, _)| key.has_exists()));
         let materializes = !supported(&node.kind)
-            && !incremental_merge
-            && !incremental_binary
+            && !joins
             && !incremental_group
             && (!native_blocking || exists_keys);
         if materializes && fallback == FallbackPolicy::RejectMaterialization {
@@ -1174,6 +1265,39 @@ impl Operator {
         info.children.clear();
         info.actual_rows = 0;
         let vars = node.vars.clone();
+        let children = if materializes && !native_blocking {
+            Vec::new()
+        } else {
+            let built = std::mem::take(&mut node.children)
+                .into_iter()
+                .map(|child| {
+                    let shell = (
+                        child.vars.clone(),
+                        child.certain.clone(),
+                        child.est,
+                        child.cost,
+                    );
+                    Self::build(ctx, child, fallback).map(|op| (shell, op))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Join operators read their children's shape from the node. Leave each
+            // child's variables, certainty and estimates there, with the order that
+            // its operator guarantees in place of the planner's claim.
+            let mut children = Vec::with_capacity(built.len());
+            for ((vars, certain, est, cost), op) in built {
+                let mut shell = Node::leaf(Kind::Empty, vars, est, String::new());
+                shell.certain = certain;
+                shell.cost = cost;
+                shell.sorted = op.order.clone();
+                node.children.push(shell);
+                children.push(op);
+            }
+            children
+        };
+        // A merge join needs both inputs ordered on its key. When an input cannot
+        // promise that order, the hash join takes its place.
+        let incremental_merge = !materializes && merge::eligible(&node);
+        let incremental_binary = !incremental_merge && joins;
         let growing = matches!(
             node.kind,
             Kind::Extend(..) | Kind::Filter(_) | Kind::RangeScan(..) | Kind::Distinct
@@ -1182,6 +1306,23 @@ impl Operator {
             || incremental_merge
             || incremental_binary
             || incremental_group;
+        let order = output_order(
+            &node,
+            &children,
+            if incremental_merge {
+                Role::Merge
+            } else if incremental_binary {
+                Role::Binary
+            } else if incremental_group {
+                Role::Group
+            } else if native_blocking {
+                Role::Blocking
+            } else if materializes {
+                Role::Fallback
+            } else {
+                Role::Streamed
+            },
+        );
         let merge = incremental_merge
             .then(|| merge::Merge::new(ctx, &node))
             .transpose()?;
@@ -1191,14 +1332,6 @@ impl Operator {
         let binary = incremental_binary
             .then(|| binary::Binary::new(ctx, &node))
             .transpose()?;
-        let children = if materializes && !native_blocking {
-            Vec::new()
-        } else {
-            std::mem::take(&mut node.children)
-                .into_iter()
-                .map(|n| Self::build(ctx, n, fallback))
-                .collect::<Result<Vec<_>>>()?
-        };
         let reason = (materializes || native_blocking).then(|| {
             if native_blocking {
                 format!(
@@ -1267,7 +1400,54 @@ impl Operator {
             growing,
             reason,
             bind_reuse,
+            order,
+            #[cfg(debug_assertions)]
+            last: None,
         })
+    }
+
+    /// Check, in debug builds, that a batch keeps the operator's order, within the
+    /// batch and from the last row of the previous one.
+    #[cfg(debug_assertions)]
+    fn check_order(&mut self, ctx: &Ctx, table: &Table) {
+        if self.order.is_empty() || table.is_empty() {
+            return;
+        }
+        let columns: Vec<&[Id]> = self
+            .order
+            .iter()
+            .map(|v| {
+                let c = table
+                    .col_of(*v)
+                    .expect("an operator's order names its output variables");
+                table.cols[c].as_slice()
+            })
+            .collect();
+        let describe = |op: &Self| {
+            let names: Vec<String> = op.order.iter().map(|v| ctx.var_name(*v)).collect();
+            format!("{} claims order on {names:?}", op.info.operator)
+        };
+        if let Some(last) = &self.last {
+            let first: Vec<Id> = columns.iter().map(|c| c[0]).collect();
+            assert!(
+                *last <= first,
+                "{}, but a batch starts before the end of the previous one",
+                describe(self)
+            );
+        }
+        for row in 1..table.len {
+            let ordering = columns
+                .iter()
+                .map(|c| c[row - 1].cmp(&c[row]))
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal);
+            assert!(
+                ordering.is_le(),
+                "{}, but row {row} of a batch is out of order",
+                describe(self)
+            );
+        }
+        self.last = Some(columns.iter().map(|c| c[table.len - 1]).collect());
     }
 
     fn describe(&self, ctx: &Ctx) -> CursorPlan {
@@ -1344,6 +1524,8 @@ impl Operator {
         {
             scan.spec.cols.retain(|(_, v)| *v == key);
             self.vars.retain(|v| *v == key);
+            let kept = self.order.iter().take_while(|v| **v == key).count();
+            self.order.truncate(kept);
             self.info.columns = vec![ctx.var_name(key)];
             self.info.sorted_on = vec![ctx.var_name(key)];
         }
@@ -1460,8 +1642,11 @@ impl Operator {
         let cap = cap.min(ctx.rows_within_budget(self.vars.len()).max(1));
         let result = self.next_inner(ctx, options, cap);
         self.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
-        let batch = result?;
-        if let Some(b) = &batch {
+        let mut batch = result?;
+        if let Some(b) = &mut batch {
+            b.table.sorted.clone_from(&self.order);
+            #[cfg(debug_assertions)]
+            self.check_order(ctx, &b.table);
             self.rows = self
                 .rows
                 .checked_add(b.table.len)
@@ -1536,11 +1721,13 @@ impl Operator {
                 State::Blocking { node, loaded, at } => {
                     if loaded.is_none() {
                         let mut input = Buffer::new(ctx, &self.children[0].vars, 0)?;
+                        // The concatenated input keeps the child's order, which lets a
+                        // sort on a prefix of it skip reordering.
+                        input.table.sorted.clone_from(&self.children[0].order);
                         // Blocking input demand is independent of the requested output prefix.
                         while let Some(batch) =
                             self.children[0].next(ctx, options, options.batch_rows)?
                         {
-                            input.table.sorted = batch.table.sorted.clone();
                             merge::append(ctx, &mut input, &batch.table, 0..batch.table.len)?;
                         }
                         // Row reordering/output copies and their index arrays can
@@ -1565,13 +1752,26 @@ impl Operator {
                 }
                 State::Fallback { node, loaded, at } => {
                     if loaded.is_none() {
-                        let (table, mut info) = exec::execute(ctx, node)?;
+                        let (mut table, mut info) = exec::execute(ctx, node)?;
                         if ctx.graphs.is_some() {
                             info.redact();
                         }
                         info.time_ms = self.info.time_ms;
                         self.info = info;
-                        let charge = OwnedCharge::new(ctx, capacity_bytes(&table))?;
+                        let mut charge = OwnedCharge::new(ctx, capacity_bytes(&table))?;
+                        // Parents rely on the planner's order, which the eager result
+                        // reports only when its rows hold it.
+                        if !table.sorted.starts_with(&self.order) {
+                            // Row indices and the reordered copy coexist with the input.
+                            charge.resize(
+                                capacity_bytes(&table)
+                                    .saturating_mul(2)
+                                    .saturating_add(table.len as u64 * 8),
+                            )?;
+                            table.sort_by_vars(&self.order);
+                            ctx.check()?;
+                            charge.resize(capacity_bytes(&table))?;
+                        }
                         *loaded = Some(Buffer { table, charge });
                     }
                     let table = &loaded.as_ref().expect("loaded fallback").table;
@@ -1648,12 +1848,6 @@ impl Operator {
                     match self.children[*at].next(ctx, options, cap)? {
                         Some(mut b) => {
                             b.project(&self.vars)?;
-                            // Each arm may be sorted, but their concatenation is not.
-                            // A consumer such as a blocking sort reads a batch's order
-                            // as the order of the whole stream.
-                            if self.children.len() > 1 {
-                                b.table.sorted.clear();
-                            }
                             if self.children[*at].done {
                                 *at += 1;
                             }
@@ -1686,7 +1880,6 @@ fn copy_rows(ctx: &Arc<Ctx>, table: &Table, at: usize, cap: usize) -> Result<Opt
         to.extend_from_slice(&from[at..at + n]);
     }
     b.table.len = n;
-    b.table.sorted = table.sorted.clone();
     b.reconcile()?;
     Ok(Some(b))
 }
@@ -1979,7 +2172,6 @@ impl Scan {
             let _scratch = ctx.charge(out.table.len as u64 * 16 + ctx.nvars() as u64 * 16)?;
             exec::apply_filter(ctx, &mut out.table, &self.filter)?;
         }
-        out.table.sorted = self.spec.cols.iter().map(|&(_, v)| v).collect();
         out.reconcile()?;
         ctx.check()?;
         Ok(Some(out))
@@ -2078,12 +2270,6 @@ impl Scan {
             exec::apply_filter(ctx, &mut b.table, &self.filter)?;
             drop(scratch);
         }
-        b.table.sorted = self
-            .spec
-            .cols
-            .iter()
-            .map(|&(_, variable)| variable)
-            .collect();
         ctx.check()?;
         b.reconcile()?;
         Ok(Some(b))
