@@ -20,7 +20,7 @@ pub enum ShexCmd {
     /// Validate a database (or data files) against a ShEx schema and a shape map; exits
     /// with status 1 when an association does not conform
     #[command(visible_aliases = ["val", "v"])]
-    Validate(ValidateArgs),
+    Validate(Box<ValidateArgs>),
     /// Parse schemas and print them (ShExC, ShExJ or a structural dump)
     #[command(visible_aliases = ["p", "print"])]
     Parse(ParseArgs),
@@ -202,7 +202,7 @@ pub(crate) fn write_report(
 #[cfg(feature = "shex")]
 pub fn run(args: ShexArgs, opts: StoreOptions) -> Result<()> {
     match args.cmd {
-        ShexCmd::Validate(v) => enabled::validate(v, opts),
+        ShexCmd::Validate(v) => enabled::validate(*v, opts),
         ShexCmd::Parse(p) => enabled::parse(p),
     }
 }
