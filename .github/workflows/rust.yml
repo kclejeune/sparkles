@@ -101,17 +101,12 @@ jobs:
         with:
           tool: cargo-nextest@0.9.146
       # The settings in .config/nextest.toml: every failure reported at the end, and a
-      # test that runs past ten minutes stopped. nextest does not run doctests.
+      # test that runs past ten minutes stopped. nextest does not run doctests. The suite
+      # includes openapi::tests::checked_in_copy_is_current, which fails when
+      # docs/openapi.json is out of date.
       - name: cargo nextest
         if: ${{ !cancelled() }}
         run: cargo nextest run --locked --workspace --profile ci
       - name: Doctests
         if: ${{ !cancelled() }}
         run: cargo test --locked --workspace --doc
-      - name: Check that docs/openapi.json is current
-        if: ${{ !cancelled() && matrix.platform == 'linux-amd64' }}
-        env:
-          SPARKLES_UPDATE_OPENAPI: "1"
-        run: |
-          cargo test --locked -p sparkles-server --bin sparkles openapi::tests::checked_in_copy_is_current
-          git diff --exit-code -- docs/openapi.json
