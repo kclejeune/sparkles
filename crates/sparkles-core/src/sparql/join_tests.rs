@@ -181,6 +181,40 @@ fn merge_left_joins_keep_the_left_order_and_the_rows_of_hash_left_joins() {
     assert!(merged > 400);
 }
 
+/// The zippers of merge left joins and anti joins, alone, side by side over parts of the
+/// inputs, or galloping, give every left id's lower bound in the right column. The inputs
+/// include runs of duplicates, gaps that leave a part without rows on one side, and sizes
+/// on both sides of the threshold for several zippers.
+#[test]
+fn merge_lower_bounds_match_a_binary_search() {
+    let s = Store::in_memory(StoreOptions::default());
+    let ctx = ctx_with(&s, Optimizations::ALL);
+    let mut next = xorshift(0x2545_f491_4f6c_dd1d);
+    for round in 0..400 {
+        let an = (next() % [10, 300, 3000, 20_000][round % 4]) as usize;
+        let bn = (next() % [10, 300, 6000, 40_000][(round / 4) % 4]) as usize;
+        let domain = [3, 50, 10_000, u64::MAX / 2][(round / 16) % 4];
+        let column = |n: usize, next: &mut dyn FnMut() -> u64| {
+            let mut c: Vec<Id> = (0..n).map(|_| Id(1 + next() % domain)).collect();
+            c.sort();
+            c
+        };
+        let a = column(an, &mut next);
+        let mut b = column(bn, &mut next);
+        // now and then a right side that is all below or all above a stretch of the left
+        if round % 5 == 3 && !a.is_empty() {
+            let mid = a[a.len() / 2];
+            b.retain(|y| *y < mid || *y > Id(mid.0.saturating_add(domain / 4)));
+        }
+        let want: Vec<u32> = a
+            .iter()
+            .map(|x| b.partition_point(|y| y < x) as u32)
+            .collect();
+        let got = super::zipper::lower_bounds(&ctx, &a, &b).unwrap();
+        assert_eq!(got, want, "round {round}: {an} x {bn} in 1..={domain}");
+    }
+}
+
 fn load(s: &Store, text: &str) {
     s.load(&[Source::from_bytes(
         text.as_bytes().to_vec(),

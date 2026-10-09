@@ -2097,7 +2097,7 @@ fn has_undef(t: &Table, c: usize) -> bool {
 
 /// Exponential + binary search for the first index `>= target` starting at `from`.
 #[inline]
-fn gallop(col: &[Id], from: usize, target: Id) -> usize {
+pub(super) fn gallop(col: &[Id], from: usize, target: Id) -> usize {
     let mut step = 1;
     let mut hi = from;
     while hi < col.len() && col[hi] < target {
@@ -2713,30 +2713,7 @@ fn merge_left_join(
 ) -> Result<Table> {
     let (a, b) = (&l.cols[lc], &r.cols[rc]);
     // `first[i]`: the first right row whose key is at least left row i's
-    let mut first = vec![b.len() as u32; a.len()];
-    let (mut i, mut j) = (0, 0);
-    if b.len() > 8 * a.len() {
-        // gallop over a much larger right side
-        for (i, &x) in a.iter().enumerate() {
-            if j < b.len() && b[j] < x {
-                j = gallop(b, j, x);
-            }
-            first[i] = j as u32;
-        }
-    } else {
-        // branch-free zipper: each step advances the side with the smaller id (the left
-        // one on equal ids, which may repeat), and the left row's position is final once
-        // it advances
-        while i < a.len() && j < b.len() {
-            if (i + j) % 65536 == 0 {
-                ctx.check()?;
-            }
-            let (x, y) = (a[i], b[j]);
-            first[i] = j as u32;
-            i += (x <= y) as usize;
-            j += (x > y) as usize;
-        }
-    }
+    let first = super::zipper::lower_bounds(ctx, a, b)?;
     // each left row with the right rows of its key, or with none
     let w = lay.vars.len() + 1;
     let mut li: Vec<u32> = Vec::with_capacity(a.len());
@@ -3049,30 +3026,13 @@ fn anti_join(
     let lsorted = l.sorted.first().is_some_and(|v| l.col_of(*v) == Some(lc));
     let rsorted = r.sorted.first().is_some_and(|v| r.col_of(*v) == Some(rc));
     if lsorted && rsorted {
-        let mut keep = vec![true; a.len()];
-        let (mut i, mut j) = (0, 0);
-        if b.len() > 8 * a.len() {
-            // gallop over a much larger right side
-            for (i, &x) in a.iter().enumerate() {
-                if j < b.len() && b[j] < x {
-                    j = gallop(b, j, x);
-                }
-                keep[i] = j == b.len() || b[j] != x;
-            }
-            return Ok((keep, "merge"));
-        }
-        // branch-free zipper: each step advances the side with the smaller id (the left
-        // one on equal ids, which may repeat), and the left row's flag is final once it
-        // advances
-        while i < a.len() && j < b.len() {
-            if (i + j) % 65536 == 0 {
-                ctx.check()?;
-            }
-            let (x, y) = (a[i], b[j]);
-            keep[i] = x != y;
-            i += (x <= y) as usize;
-            j += (x > y) as usize;
-        }
+        // a left row is kept when the first right id not less than its own differs
+        let first = super::zipper::lower_bounds(ctx, a, b)?;
+        let keep = a
+            .iter()
+            .zip(&first)
+            .map(|(&x, &j)| b.get(j as usize) != Some(&x))
+            .collect();
         return Ok((keep, "merge"));
     }
     let _held = ctx.charge((b.len() * 16) as u64)?;
