@@ -36,9 +36,9 @@ assert_eq!(query.to_string(), query_str);
 
 This project is licensed under either of
 
-* Apache License, Version 2.0, ([LICENSE-APACHE](../LICENSE-APACHE) or
+* Apache License, Version 2.0, ([LICENSE-APACHE](https://github.com/oxigraph/oxigraph/blob/v0.4.7/LICENSE-APACHE) or
   `<http://www.apache.org/licenses/LICENSE-2.0>`)
-* MIT license ([LICENSE-MIT](../LICENSE-MIT) or
+* MIT license ([LICENSE-MIT](https://github.com/oxigraph/oxigraph/blob/v0.4.7/LICENSE-MIT) or
   `<http://opensource.org/licenses/MIT>`)
 
 at your option.
