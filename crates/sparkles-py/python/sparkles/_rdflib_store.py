@@ -484,6 +484,12 @@ class SparklesStore(Store):
         convert = self._conv.triples
         if g is not None:
             ctx = context if isinstance(context, Graph) else self._context_for(g)
+            if s is not None and p is not None and o is not None:
+                # a fully bound pattern, as `(s, p, o) in graph` asks: one lookup, and
+                # the caller's own nodes stand for the stored ones they equal
+                if Quad(s, p, o, g) in reader:  # type: ignore[arg-type]
+                    yield tuple(triple_pattern), iter((ctx,))  # type: ignore[misc]
+                return
             if isinstance(reader, Transaction):
                 quads = reader._quads_iter(s, p, o, g)  # type: ignore[arg-type]
             else:

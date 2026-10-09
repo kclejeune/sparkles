@@ -16,6 +16,10 @@ use std::sync::{Arc, Mutex};
 
 /// Items decoded per batch without the GIL.
 const BATCH: usize = 1024;
+/// Quads of the first batch of a scan of a dataset in memory, which is read with the GIL
+/// held: reading a few quads from memory takes less time than giving up the GIL and
+/// taking it back.
+const INLINE: usize = 16;
 
 // ------------------------------------------------------------------------- quads ----
 
@@ -30,6 +34,8 @@ enum QuadSource {
 
 struct QuadState {
     source: QuadSource,
+    /// the first refill reads `INLINE` quads with the GIL held (a scan of memory)
+    inline: bool,
     buf: VecDeque<Quad>,
     done: bool,
     /// the error that ended the source, raised after the quads read before it
@@ -51,6 +57,13 @@ impl PyQuadIterator {
         PyQuadIterator::new(QuadSource::Scan(Box::new(it)))
     }
 
+    /// A scan of a dataset in memory, whose first few quads are read with the GIL held.
+    pub fn from_memory_scan(it: QuadIter) -> PyQuadIterator {
+        let it = PyQuadIterator::new(QuadSource::Scan(Box::new(it)));
+        it.state.lock().unwrap().inline = true;
+        it
+    }
+
     pub fn from_stream(
         it: Box<dyn Iterator<Item = sparkles::Result<Quad>> + Send>,
     ) -> PyQuadIterator {
@@ -61,6 +74,7 @@ impl PyQuadIterator {
         PyQuadIterator {
             state: Mutex::new(QuadState {
                 source,
+                inline: false,
                 buf: VecDeque::new(),
                 done: false,
                 error: None,
@@ -78,14 +92,24 @@ impl PyQuadIterator {
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
         // A decoded quad is handed out without giving up the GIL. Only a refill, which
         // reads the store, runs detached. Nothing holds the lock while it needs the GIL.
-        let ready = self.state.lock().unwrap().buf.pop_front();
+        let ready = {
+            let mut st = self.state.lock().unwrap();
+            if st.inline {
+                st.inline = false;
+                refill(&mut st, INLINE);
+                if st.buf.is_empty() {
+                    return st.error.take().map_or(Ok(None), |e| Err(e).py(py));
+                }
+            }
+            st.buf.pop_front()
+        };
         if let Some(q) = ready {
             return quad_to_py(py, q).map(Some);
         }
         let next = py
             .detach(|| {
                 let mut st = self.state.lock().unwrap();
-                refill(&mut st);
+                refill(&mut st, BATCH);
                 match st.buf.pop_front() {
                     Some(q) => Ok(Some(q)),
                     None => st.error.take().map_or(Ok(None), Err),
@@ -108,7 +132,7 @@ impl PyQuadIterator {
         }
         py.detach(|| {
             let mut st = self.state.lock().unwrap();
-            refill(&mut st);
+            refill(&mut st, BATCH);
             let quads: Vec<Quad> = st.buf.drain(..).collect();
             match st.error.take() {
                 Some(e) if quads.is_empty() => Err(e),
@@ -123,15 +147,16 @@ impl PyQuadIterator {
     }
 }
 
-/// Read the next batch from the source into an empty buffer.
-fn refill(st: &mut QuadState) {
+/// Read the next batch of up to `limit` quads from the source into an empty buffer. A
+/// batch that comes out short ends the source, so that no later call has to ask it again.
+fn refill(st: &mut QuadState, limit: usize) {
     if !st.buf.is_empty() || st.done {
         return;
     }
     let fallible: &mut dyn Iterator<Item = sparkles::Result<Quad>> = match &mut st.source {
         QuadSource::List(it) => {
-            st.buf.extend(it.by_ref().take(BATCH));
-            if st.buf.is_empty() {
+            st.buf.extend(it.by_ref().take(limit));
+            if st.buf.len() < limit {
                 st.done = true;
             }
             return;
@@ -139,7 +164,9 @@ fn refill(st: &mut QuadState) {
         QuadSource::Scan(it) => it.as_mut(),
         QuadSource::Stream(it) => it.as_mut(),
     };
-    for q in fallible.take(BATCH) {
+    let mut read = 0;
+    for q in fallible.take(limit) {
+        read += 1;
         match q {
             Ok(q) => st.buf.push_back(q),
             Err(e) => {
@@ -150,7 +177,7 @@ fn refill(st: &mut QuadState) {
             }
         }
     }
-    if st.buf.is_empty() {
+    if read < limit {
         st.done = true;
     }
 }

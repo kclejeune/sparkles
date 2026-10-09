@@ -13,6 +13,7 @@ use crate::terms::{
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
+use sparkles::embed::{WORKER_SPIN, recv_spin};
 use sparkles::sparql::update::UpdateStats;
 use sparkles::sparql::{QueryKind, QueryOptions, QueryResult};
 use std::collections::BTreeMap;
@@ -21,6 +22,12 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 use std::time::Duration;
+
+/// How long a caller waits for an answer by spinning, without the GIL, before it sleeps.
+/// A small write answers within a few microseconds, so the caller usually takes the
+/// answer without being woken. The worker spins in the same way for the next request
+/// (`WORKER_SPIN`), so that `tx.add` in a loop wakes no thread.
+const CALLER_SPIN: Duration = Duration::from_micros(20);
 
 /// The thread of the open transaction of a dataset, if any: a write on the dataset from
 /// that thread would wait for its own lock.
@@ -118,6 +125,15 @@ impl PyTransaction {
     /// Take the channel for one request, waiting without the GIL while another thread
     /// uses it.
     fn take(&self, py: Python<'_>) -> PyResult<Chan> {
+        // the usual case: the channel is free, so there is nothing to wait for
+        {
+            let mut slot = self.slot.lock().unwrap();
+            if matches!(*slot, Slot::Open(_))
+                && let Slot::Open(c) = std::mem::replace(&mut *slot, Slot::Busy)
+            {
+                return Ok(c);
+            }
+        }
         py.detach(|| {
             loop {
                 let mut slot = self.slot.lock().unwrap();
@@ -154,7 +170,7 @@ impl PyTransaction {
             None => {
                 let rx = chan.resp;
                 py.detach(move || {
-                    let r = rx.recv().ok();
+                    let r = recv_spin(&rx, CALLER_SPIN).ok();
                     (rx, Ok(r))
                 })
             }
@@ -520,7 +536,7 @@ fn run(ds: sparkles::Dataset, req: Receiver<Req>, resp: Sender<Resp>) {
         // set by a failure that may have left part of its changes behind
         let mut aborted: Option<String> = None;
         loop {
-            let Ok(r) = req.recv() else {
+            let Ok(r) = recv_spin(&req, WORKER_SPIN) else {
                 // the Python object is gone
                 rolled_back = true;
                 return Err(sparkles::Error::Cancelled);
