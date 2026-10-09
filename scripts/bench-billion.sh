@@ -422,7 +422,8 @@ stop() { # stop <engine>: by port, since wrapper scripts (fuseki-server) outlive
   unset "PORT[$e]"
 }
 stop_all() { for e in $ENGINES; do stop "$e"; done; }
-trap stop_all EXIT
+PSI_PID= # the pressure sampler of the preflight, stopped on exit
+trap 'stop_all; [ -z "$PSI_PID" ] || kill "$PSI_PID" 2> /dev/null || true' EXIT
 # drop an engine's files from the page cache (no root needed: posix_fadvise DONTNEED);
 # a running server's mapped pages stay, so this runs between a stop and a start. One
 # process for all files: Fluree's index has about 90,000 files at full scale, and a dd
@@ -555,8 +556,80 @@ step_report() {
   log "summary: $S/results/summary.md"
 }
 
+# ------------------------------------------------------------------------- preflight
+# A full load writes about 145 GB. On Forge (an SSD without online discard) DBpedia
+# loads went from 596 s to 1,351 s and back to 547 s after an fstrim. The extra time was
+# write stall on a drive that had not been trimmed for days. Before a load or a
+# query step, record how long ago the filesystem was trimmed, how full it is and the
+# PSI I/O pressure, warn when they look like that state, and sample PSI once per second
+# while the steps run (logs/psi-<time>.tsv). This warns and never refuses.
+# TRIM_WARN_DAYS (default 2) and FREE_WARN_PCT (default 30) set the thresholds.
+# last_trim <mount point>: the epoch of the last trim of that filesystem that the journal
+# shows (by fstrim.service, or an fstrim run through sudo), or nothing
+last_trim() {
+  command -v journalctl > /dev/null || return 0
+  {
+    journalctl -u fstrim.service -o short-unix --no-pager -q -g ' trimmed on ' 2> /dev/null |
+      awk -v m="$1:" '$4 == m {print int($1)}'
+    journalctl -t sudo -o short-unix --no-pager -q -g 'COMMAND=[^ ]*/fstrim( |$)' 2> /dev/null | awk '{print int($1)}'
+  } | sort -n | tail -1 || true
+}
+preflight() {
+  [ "$(uname -s)" = Linux ] || return 0
+  local stamp f out t now days size avail pct
+  stamp=$(date +%Y%m%dT%H%M%S)
+  f=$S/logs/preflight-$stamp.txt
+  now=$(date +%s)
+  t=$(last_trim "$(findmnt -no TARGET --target "$S" 2> /dev/null)")
+  read -r size avail < <(df -B1 --output=size,avail "$S" | tail -1)
+  pct=$((avail * 100 / size))
+  {
+    echo "date $(date -Is)"
+    echo "steps ${STEPS[*]}"
+    echo "filesystem $(df --output=source,target "$S" | tail -1)"
+    echo "size_bytes $size"
+    echo "avail_bytes $avail"
+    echo "avail_pct $pct"
+    if [ -n "$t" ]; then
+      echo "last_trim $(date -d "@$t" -Is)"
+      echo "days_since_trim $(awk "BEGIN {printf \"%.1f\", ($now - $t) / 86400}")"
+    else
+      echo "last_trim unknown"
+    fi
+    echo "fstrim_timer_last $(systemctl show fstrim.timer -p LastTriggerUSec --value 2> /dev/null)"
+    echo "fstrim_timer_next $(systemctl show fstrim.timer -p NextElapseUSecRealtime --value 2> /dev/null)"
+    echo "mount_options $(findmnt -no OPTIONS --target "$S" 2> /dev/null)"
+    sed 's/^/io_pressure /' /proc/pressure/io 2> /dev/null
+    echo "dirty_ratio $(cat /proc/sys/vm/dirty_ratio 2> /dev/null) dirty_background_ratio $(cat /proc/sys/vm/dirty_background_ratio 2> /dev/null)"
+  } > "$f"
+  log "preflight: $((avail >> 30)) GiB free ($pct% of the filesystem), last trim $([ -n "$t" ] && date -d "@$t" '+%F %H:%M' || echo unknown) ($f)"
+  if [ -z "$t" ]; then
+    log "warning: no trim of the filesystem found in the journal; on an SSD without online discard, writes may stall (fstrim -v / before a full load)"
+  else
+    days=$(((now - t) / 86400))
+    [ "$days" -ge "${TRIM_WARN_DAYS:-2}" ] &&
+      log "warning: the filesystem was last trimmed $days days ago; on an SSD without online discard, writes may stall (fstrim -v / before a full load)"
+  fi
+  [ "$pct" -lt "${FREE_WARN_PCT:-30}" ] &&
+    log "warning: only $pct% of the filesystem is free; a full load needs about 100 GiB of temporary space and a full SSD writes more slowly"
+  if [ -r /proc/pressure/io ] && [ -z "$PSI_PID" ]; then
+    out=$S/logs/psi-$stamp.tsv
+    # cumulative stall in microseconds (the total= fields of /proc/pressure/*), once per second
+    (
+      echo -e "epoch\tio_some_us\tio_full_us\tcpu_some_us\tmem_some_us\tmem_full_us\tnr_dirty\tnr_writeback"
+      while :; do
+        echo -e "$(date +%s.%N)\t$(awk '{split($5, a, "="); printf "%s\t", a[2]}' /proc/pressure/io)$(awk 'NR == 1 {split($5, a, "="); printf "%s\t", a[2]}' /proc/pressure/cpu)$(awk '{split($5, a, "="); printf "%s\t", a[2]}' /proc/pressure/memory)$(awk '$1 == "nr_dirty" {d = $2} $1 == "nr_writeback" {w = $2} END {printf "%s\t%s", d, w}' /proc/vmstat)"
+        sleep 1
+      done
+    ) > "$out" 2> /dev/null &
+    PSI_PID=$!
+    log "PSI pressure sampled once per second to $out"
+  fi
+  return 0
+}
 STEPS=("$@")
 [ ${#STEPS[@]} -gt 0 ] || STEPS=(fetch prepare slice load queries report)
+[[ " ${STEPS[*]} " == *" load "* || " ${STEPS[*]} " == *" queries "* ]] && preflight
 for st in "${STEPS[@]}"; do
   case $st in
     fetch | prepare | slice | load | queries | report) "step_$st" ;;
