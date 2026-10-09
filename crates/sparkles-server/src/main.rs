@@ -2567,6 +2567,15 @@ fn run() -> Result<()> {
             if let Some(f) = &fuseki {
                 fuseki_config::start(&st, f)?;
             }
+            // Rayon starts its query pool on first use, and every query asks for its size.
+            // Started there, the first query paid for reading the cgroup CPU limits and
+            // spawning a thread per core, which made a cold point lookup several times
+            // slower than the second. Starting the pool here, and waiting until each
+            // worker has run once, moves that cost before the server listens.
+            let _ = rayon::ThreadPoolBuilder::new()
+                .thread_name(|i| format!("query-{i}"))
+                .build_global();
+            rayon::broadcast(|_| ());
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .thread_stack_size(THREAD_STACK)
