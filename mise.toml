@@ -606,6 +606,38 @@ run = '''
 WARMUP="$usage_warmup" RUNS="$usage_runs" DELTA="$usage_delta" scripts/bench-shacl-write.sh --lang shex "$usage_people" "$(realpath -m "$usage_workdir")"
 '''
 
+[tasks."bench:bindings"]
+description = "Each binding against its incumbent: Jena on Sparkles vs TDB2 and TIM, sparkles and rdflib-on-Sparkles vs pyoxigraph and rdflib, the Node engine vs Oxigraph JS and N3.js with Comunica; answers checked first"
+tools = { node = "24" }
+usage = '''
+arg "[people]" default="100000" help="dataset size in people (~10.5 triples each)"
+arg "[workdir]" default="target/bench-bindings" help="data, stores, the third-party libraries and results/ (summary.md, raw.json)"
+flag "--langs <list>" default="jvm,python,node" help="the bindings to compare, comma-separated"
+flag "--engines <list>" help="only these engines, e.g. jvm:tdb2,python:pyoxigraph"
+flag "--cases <list>" help="only these cases, e.g. iter-all,q:star-join"
+flag "--runs <n>" default="10" help="measured samples per case and process"
+flag "--warmup <n>" default="2" help="warm-up samples per case and process"
+flag "--processes <n>" default="3" help="fresh processes per engine and mode"
+flag "--timeout <s>" default="300" help="seconds per sample before it counts as a timeout"
+flag "--budget <s>" default="120" help="seconds per case before it stops after its first measured sample"
+flag "--cpus <list>" help="pin every process with taskset, e.g. 0-11"
+flag "--cores <n>" help="the JVM's processor count, the Rayon pool and the throughput's all cores (default: the pinned CPUs)"
+flag "--answers-only" help="check the answers and time nothing"
+flag "--no-build" help="use the bindings as built"
+'''
+run = '''
+args=(--people "$usage_people" --workdir "$(realpath -m "$usage_workdir")" --langs "$usage_langs"
+  --runs "$usage_runs" --warmup "$usage_warmup" --processes "$usage_processes"
+  --timeout "$usage_timeout" --budget "$usage_budget")
+[ -n "${usage_engines:-}" ] && args+=(--engines "$usage_engines")
+[ -n "${usage_cases:-}" ] && args+=(--cases "$usage_cases")
+[ -n "${usage_cpus:-}" ] && args+=(--cpus "$usage_cpus")
+[ -n "${usage_cores:-}" ] && args+=(--cores "$usage_cores")
+[ -n "${usage_answers_only:-}" ] && args+=(--answers-only)
+[ -n "${usage_no_build:-}" ] && args+=(--no-build)
+python3 scripts/bench-bindings/bench.py "${args[@]}"
+'''
+
 [tasks."bench:backup"]
 description = "Backup repositories on an existing database: full and incremental backup, restore and verify times to an fs repository"
 depends = ["build"]
