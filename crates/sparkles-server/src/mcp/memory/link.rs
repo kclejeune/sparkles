@@ -174,6 +174,7 @@ pub(crate) fn unavailable(e: &Error) -> bool {
             | Error::TextUnavailable(_)
             | Error::Service(_)
             | Error::NotPermitted(_)
+            | Error::HistoryUnsupported(_)
     )
 }
 
@@ -715,7 +716,8 @@ fn same_as(
 }
 
 /// Up to `n` outgoing triples of `s`, sampled round-robin by predicate from its first
-/// rows, leaving out its types, its labels and vectors.
+/// rows, without vectors. Its types and labels come last, since the candidate shows
+/// them already.
 fn sample(
     r: &Reader,
     s: &NamedNode,
@@ -727,35 +729,37 @@ fn sample(
         "SELECT ?p ?o WHERE {{ {} }} LIMIT {SAMPLE_ROWS}",
         r.quads("?r ?p ?o", graphs)
     );
-    let mut by_pred: BTreeMap<String, Vec<Term>> = BTreeMap::new();
+    // the other predicates first, then the types and labels the candidate shows anyway
+    let mut by_pred: [BTreeMap<String, Vec<Term>>; 2] = Default::default();
     for row in r.rows(&q, vec![("r".into(), s.clone().into())])? {
         if let [Some(Term::NamedNode(p)), Some(o)] = row.as_slice()
-            && p.as_str() != RDF_TYPE
-            && !labels.contains(p)
             && !is_vector(o)
         {
-            let v = by_pred.entry(p.as_str().to_string()).or_default();
+            let known = usize::from(p.as_str() == RDF_TYPE || labels.contains(p));
+            let v = by_pred[known].entry(p.as_str().to_string()).or_default();
             if !v.contains(o) {
                 v.push(o.clone());
             }
         }
     }
     let mut out = Vec::new();
-    let mut i = 0;
-    while out.len() < n {
-        let mut any = false;
-        for (p, os) in &by_pred {
-            if let Some(o) = os.get(i) {
-                any = true;
-                if out.len() < n {
-                    out.push((s.clone(), iri(p), o.clone()));
+    for preds in &by_pred {
+        let mut i = 0;
+        while out.len() < n {
+            let mut any = false;
+            for (p, os) in preds {
+                if let Some(o) = os.get(i) {
+                    any = true;
+                    if out.len() < n {
+                        out.push((s.clone(), iri(p), o.clone()));
+                    }
                 }
             }
+            if !any {
+                break;
+            }
+            i += 1;
         }
-        if !any {
-            break;
-        }
-        i += 1;
     }
     Ok(out)
 }

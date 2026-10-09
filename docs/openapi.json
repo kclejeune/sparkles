@@ -8789,6 +8789,14 @@
           "query": {
             "type": "string"
           },
+          "questions": {
+            "description": "Example questions the query answers, at most 500 characters each. The MCP tool similar_queries ranks queries by them.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "type": "array"
+          },
           "results": {
             "additionalProperties": true,
             "type": "object"
@@ -8867,6 +8875,14 @@
                   "additionalProperties": true,
                   "description": "The parameters by name, with their types and defaults.",
                   "type": "object"
+                },
+                "questions": {
+                  "description": "Example questions the query answers, at most 500 characters each. The MCP tool similar_queries ranks queries by them.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
                 },
                 "results": {
                   "additionalProperties": true,

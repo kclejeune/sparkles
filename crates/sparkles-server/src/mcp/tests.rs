@@ -171,6 +171,9 @@ mod format;
 #[path = "phase3_tests.rs"]
 mod phase3;
 
+#[path = "memory_tests.rs"]
+mod memory_tools;
+
 fn head(s: &McpServer, ds: &str) -> u64 {
     s.state.get(ds).unwrap().store.head_commit().seq
 }

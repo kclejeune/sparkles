@@ -19,9 +19,6 @@ mod recall;
 mod similar;
 pub(crate) mod text;
 
-#[cfg(test)]
-mod tests;
-
 use super::errors::{ErrorContext, ToolError};
 use super::tools::{Tools, remaining};
 use crate::state::Dataset;

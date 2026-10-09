@@ -373,16 +373,32 @@ fn prefix_suggestions(name: &str, prefixes: &BTreeMap<String, String>) -> Vec<Va
     let mut out: Vec<Value> = Vec::new();
     for (k, ns) in prefixes {
         let same = k.eq_ignore_ascii_case(name);
-        let in_ns = !lname.is_empty() && words(ns).iter().any(|w| *w == lname);
-        if same || in_ns {
-            out.push(json!({
-                "term": format!("{k}:"),
-                "label": crate::mcp::render::label_text(ns),
-                "count": 0,
-                "why": if same { "same-name" } else { "namespace" },
-            }));
-        }
+        let in_ns = !lname.is_empty() && words(ns).contains(&lname);
+        let close = !lname.is_empty()
+            && edit_distance(&k.to_lowercase(), &lname)
+                <= k.chars().count().max(lname.chars().count()) / 3;
+        let why = if same {
+            "same-name"
+        } else if in_ns {
+            "namespace"
+        } else if close {
+            "edit-distance"
+        } else {
+            continue;
+        };
+        out.push(json!({
+            "term": format!("{k}:"),
+            "label": crate::mcp::render::label_text(ns),
+            "count": 0,
+            "why": why,
+        }));
     }
+    let rank = |v: &Value| match v["why"].as_str() {
+        Some("same-name") => 0,
+        Some("namespace") => 1,
+        _ => 2,
+    };
+    out.sort_by_key(rank);
     out.truncate(10);
     out
 }
@@ -757,15 +773,26 @@ fn finish(mut out: Value, issues: &[Issue], estimated: Option<u64>, terms: &Term
 
 /// The prefix name of the prefixed name at a 1-based line and column.
 fn prefix_at(q: &str, line: usize, col: usize) -> Option<String> {
-    let l = q.lines().nth(line.checked_sub(1)?)?;
-    let start: usize = l.char_indices().nth(col.checked_sub(1)?).map(|(i, _)| i)?;
-    let rest = &l[start..];
-    let end = rest.find(':')?;
-    let name = &rest[..end];
-    (name
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')))
-    .then(|| name.to_string())
+    let l: Vec<char> = q.lines().nth(line.checked_sub(1)?)?.chars().collect();
+    let pn = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':');
+    let at = col.checked_sub(1)?.min(l.len());
+    // the prefixed name at the position, or the one that ends just before it
+    let (mut start, mut end) = (at, at);
+    while end < l.len() && pn(l[end]) {
+        end += 1;
+    }
+    if start == end {
+        while start > 0 && l[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        end = start;
+    }
+    while start > 0 && pn(l[start - 1]) {
+        start -= 1;
+    }
+    let token: String = l[start..end].iter().collect();
+    let (name, _) = token.split_once(':')?;
+    Some(name.to_string())
 }
 
 fn pattern(q: &Query) -> &GraphPattern {

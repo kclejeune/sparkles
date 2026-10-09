@@ -255,6 +255,7 @@ fn queries(put: &mut dyn FnMut(&str, J)) {
         "parameters": { "type": "object", "additionalProperties": true, "description": "The parameters by name, with their types and defaults." },
         "results": { "type": "object", "additionalProperties": true },
         "mcp": { "type": "boolean", "description": "Whether the MCP server offers it as a tool." },
+        "questions": { "type": "array", "items": string(), "maxItems": 20, "description": "Example questions the query answers, at most 500 characters each. The MCP tool similar_queries ranks queries by them." },
         "version": version,
         "changed": { "type": "boolean", "description": "On a PUT: whether a new version was stored." },
     });
