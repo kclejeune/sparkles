@@ -790,7 +790,9 @@ query memory budget of 8 GB for Sparkles and QLever (`QUERY_MEM_GB=8`). It ran o
 `forge`, each engine alone. Sparkles was measured on 2026-10-09 with the release binary
 identified at the top of this page, built at commit `ba547b89`. The filesystem was
 trimmed with `fstrim` immediately before the load. The competitor
-references were retained from 2026-10-02 and 2026-10-03. QLever was the nixpkgs build
+references were retained from 2026-10-02 and 2026-10-03. Those runs did not start
+from a fresh trim, so their load times may include write stalls like the ones described
+under [Changes against the run of 2026-10-03](#changes-against-the-run-of-2026-10-03). QLever was the nixpkgs build
 of 0.5.48, with load figures from 2026-10-02 and query figures from 2026-10-03. Loads
 were pinned to the P-cores, CPUs 0–11. Every step ran in a systemd scope capped at
 14 GiB with no swap, with an open-file limit of 65,536. QLever indexed with 8 GB of sort
