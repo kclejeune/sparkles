@@ -232,7 +232,9 @@ rules of a `shiro.ini` into Sparkles' auth configuration.
   The runs of each order are merged in a thread of their own. As in QLever, the
   permutations are built in pairs: SOP, OPS and POS come from the merged SPO, OSP and PSO
   streams by sorting each run of the shared first column. Data that fits into the sort
-  budget is sorted in memory the same way.
+  budget is sorted in memory the same way. The temporary files are compressed too. The
+  batches' quads use the column blocks of the runs, the partial vocabularies are
+  front-coded LZ4 blocks, and the maps from batch ids to global ids are delta-coded.
 * **Immutable base plus delta.** Updates are layered on the immutable index, in the style
   of QLever's `DeltaTriples`. Snapshots are versioned, and caches are keyed by snapshot
   version. A scan merges the delta into the blocks it changes. It finds the base rows

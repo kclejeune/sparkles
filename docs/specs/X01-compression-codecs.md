@@ -5,8 +5,10 @@
 > **Phases:** Phase 1 shipped. It covers the codec module, compressed inputs and request
 > bodies, codecs for dumps and backups, configurable response compression, precompressed
 > UI assets and a zstd full-text doc store. The maintainer decided not to build Phase 2
-> (zstd index blocks, vocabulary and spill files). Phase 3's blobs shipped with
-> [F05](F05-snapshot-repositories.md), compressed with LZ4 rather than zstd.
+> (zstd index blocks, vocabulary and spill files). The bulk loader's spill files (U9)
+> were compressed later with LZ4 and the existing column encoding, without a codec
+> option. Phase 3's blobs shipped with [F05](F05-snapshot-repositories.md), compressed
+> with LZ4 rather than zstd.
 >
 > **User docs:** [API: Compression](../API.md#compression) · [Features](../FEATURES.md#storage-tdb2-equivalent) · [Benchmarks: Compression](../BENCHMARKS.md#compression-105m-triples)
 >
@@ -398,5 +400,71 @@ the [benchmarks](../BENCHMARKS.md#compression-105m-triples).
 - The full-text doc store is 106 MB with zstd and 118 MB with LZ4, with the same build
   time.
 
-**Not built.** The Phase 2 codecs for index blocks, the vocabulary and spill files;
-dictionaries; the pure-Rust zstd decoder; and zstd repository blobs.
+**Spill files of the bulk loader (U9), 2026-10-09.** Loads on a busy SSD slowed down
+while their CPU work stayed the same. The extra time was spent waiting for the device,
+so the loader's temporary files were compressed after all. The work followed U9 in
+spirit but not in form. There is no `spill_codec` option. Each temporary file got an
+encoding that suits its contents:
+- A batch's quads are written in the column blocks of the sorted runs (delta, zig-zag
+  varint and LZ4 per column) instead of 32 raw bytes per quad.
+- A partial vocabulary is a sequence of LZ4 blocks of front-coded keys. A block holds
+  at most 256 keys or about 16 KiB, and a block starts at every sampled key, so the
+  merge can still start reading a batch in the middle.
+- The map from a batch key's rank to its global id is written as delta-coded varints
+  instead of 8 bytes per key. The ranges of the vocabulary merge append these records
+  to one shared file.
+- The merged ranges of keys no longer go through a file. The merge now cuts the keys
+  into ranges of about 8 MiB of partial vocabulary, and a finished range waits in
+  memory until the ranges before it are appended. The waiting ranges hold at most
+  512 MiB together, and a range past that limit is written to a file as before. This
+  memory is used during the vocabulary merge, when the parse buffers are already
+  freed, so it does not raise the load's peak RSS.
+
+The permutation and vocabulary writers also send their data to the device as they
+write it. Every 8 MiB they start writeback with `sync_file_range`, and they wait for
+the data 64 MiB back. This keeps the dirty pages of the final index small, so the
+kernel does not throttle all writing threads in bursts, and the temporary files have
+room to be deleted before they are ever written. `SPARKLES_WRITEBACK=off` turns this
+off. The temporary files are left to the kernel's writeback, because many of them are
+deleted before it writes them.
+
+A build now logs, for each phase, the bytes it sent to storage, the bytes it read and
+the bytes of each kind of temporary file. The index files are byte for byte the same
+as before.
+
+The loads below ran on a 16-CPU laptop with an NVMe SSD under LUKS, pinned to 12 CPUs.
+Other jobs kept the machine busy (load average 10 to 58), so the wall times vary a
+lot. The byte counts do not depend on that. The first input is 82.1M triples from
+`scripts/gen-data.py` and the second is 87.9M WatDiv triples. Both inputs were
+compressed with zstd. The table gives the bytes written per kind of file, in MB.
+
+| File | Synthetic before | Synthetic after | WatDiv before | WatDiv after |
+|---|---:|---:|---:|---:|
+| Batch quads | 2,628 | 428 | 2,812 | 270 |
+| Partial vocabularies | 2,033 | 165 | 1,874 | 291 |
+| Maps to global ids | 449 | 56 | 270 | 34 |
+| Vocabulary ranges | 155 | 0 | 313 | 0 |
+| Sorted runs | 940 | 940 | 736 | 736 |
+| Regrouping spills | 82 | 82 | 178 | 178 |
+| All temporary files | 6,287 | 1,671 | 6,183 | 1,509 |
+| Index | 2,542 | 2,542 | 2,063 | 2,063 |
+| Sent to storage | 8,829 | 4,214 | 8,246 | 3,573 |
+
+The temporary files went from 2.5 and 3.0 times the size of the index to 0.66 and 0.73
+times. On the synthetic input, the parse phase now sends 593 MB to storage instead of
+4,661 MB, and the vocabulary merge 265 MB instead of 814 MB. The sorted runs are now
+the largest temporary files.
+
+Five loads of each build alternated on the synthetic input without limits. The load
+took a median of 80 s before (60 to 154 s) and 39 s after (35 to 51 s). Two loads with
+`SPARKLES_WRITEBACK=off` in the same series took 62 and 55 s. In a series that capped
+the load's writes at 150 MB/s with a systemd scope, to stand in for a slow SSD, it took
+160 and 102 s before, 64 and 37 s after, and 75 and 46 s with writeback off. The load
+kept 1.5 to 3.6 cores busy before and 3.4 to 5.8 after. CPU time did not grow. User
+and system time had a median of 215 s before and 208 s after in the five unlimited
+loads of each build, which is within the noise of the busy machine.
+
+**Not built.** The Phase 2 codecs for index blocks and the vocabulary, zstd for the
+loader's temporary files, dictionaries, the pure-Rust zstd decoder and zstd repository
+blobs were not built. zstd at level 1 would make the sorted runs about a quarter smaller
+than LZ4 does, for more CPU time.

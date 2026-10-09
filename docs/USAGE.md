@@ -743,10 +743,13 @@ pages, so `man sparkles-serve` works after `nix profile install`.
 `--format yaml` prints it as YAML. A running server serves the same document at
 `/$/openapi.json` ([API.md](API.md#openapi-description)).
 
-Two environment variables switch off read paths for comparisons.
+Three environment variables switch off I/O paths for comparisons.
 `SPARKLES_IO_HINTS=off` maps the index and vocabulary files without access hints, so
 that a page fault reads the device's whole read-ahead window and blocks are not read
 ahead. `SPARKLES_SPARSE_VOCAB=off` looks terms up without `vocab.idx`.
+`SPARKLES_WRITEBACK=off` leaves the permutation and vocabulary files of an index build
+to the kernel's own writeback. By default the build sends them to the device as it
+writes them.
 
 `SPARKLES_UI_DIR=DIR` makes the server read the web UI from a UI build directory, such as
 `ui/build`, instead of the copy embedded in the binary. The Nix package sets it to its UI

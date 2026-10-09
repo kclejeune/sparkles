@@ -141,6 +141,103 @@ pub fn raise_open_file_limit() -> Option<u64> {
     None
 }
 
+/// Whether files written through [`WritebackFile`] send their data to the device as
+/// they grow (on by default, `off` in `SPARKLES_WRITEBACK` turns it off for a process).
+pub fn steady_writeback() -> bool {
+    STEADY_WRITEBACK.get()
+}
+
+/// Turn [`steady_writeback`] on or off for writes from now on.
+pub fn set_steady_writeback(on: bool) {
+    STEADY_WRITEBACK.set(on);
+}
+
+static STEADY_WRITEBACK: crate::index::EnvSwitch =
+    crate::index::EnvSwitch::new("SPARKLES_WRITEBACK");
+
+/// A [`WritebackFile`] starts writeback of its data every this many bytes.
+const WRITEBACK_EVERY: u64 = 8 << 20;
+/// A [`WritebackFile`] waits until the data this many bytes behind the end has reached
+/// the device before it writes on.
+const WRITEBACK_BEHIND: u64 = 64 << 20;
+
+/// A file written front to back that sends its data to the device as it grows.
+///
+/// Linux keeps written data in dirty pages until a share of memory is dirty and then
+/// throttles every thread that writes, whatever file it writes to. A build that writes
+/// a large index in a few streams fills that share quickly and is then held in bursts.
+/// This file starts writeback of every [`WRITEBACK_EVERY`] bytes as soon as they are
+/// written (`sync_file_range`), and waits for the data [`WRITEBACK_BEHIND`] bytes
+/// back, so each file keeps a bounded amount of dirty data and its final `fsync` has
+/// little left to do. Elsewhere it is a plain file.
+pub struct WritebackFile {
+    f: std::fs::File,
+    written: u64,
+    /// the end of the data whose writeback was started
+    started: u64,
+}
+
+impl WritebackFile {
+    pub fn new(f: std::fs::File) -> WritebackFile {
+        WritebackFile {
+            f,
+            written: 0,
+            started: 0,
+        }
+    }
+
+    pub fn get_ref(&self) -> &std::fs::File {
+        &self.f
+    }
+
+    #[cfg(target_os = "linux")]
+    fn writeback(&mut self) {
+        use std::os::fd::AsRawFd;
+        if self.written - self.started < WRITEBACK_EVERY || !steady_writeback() {
+            return;
+        }
+        let fd = self.f.as_raw_fd();
+        // SAFETY: sync_file_range only reads the open descriptor; a failure (a file
+        // system without it) leaves the data to the kernel's own writeback
+        unsafe {
+            libc::sync_file_range(
+                fd,
+                self.started as libc::off64_t,
+                (self.written - self.started) as libc::off64_t,
+                libc::SYNC_FILE_RANGE_WRITE,
+            );
+            // a length of 0 would mean the whole file
+            if let Some(end) = self.started.checked_sub(WRITEBACK_BEHIND)
+                && end > 0
+            {
+                libc::sync_file_range(
+                    fd,
+                    0,
+                    end as libc::off64_t,
+                    libc::SYNC_FILE_RANGE_WAIT_BEFORE,
+                );
+            }
+        }
+        self.started = self.written;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn writeback(&mut self) {}
+}
+
+impl std::io::Write for WritebackFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.f.write(buf)?;
+        self.written += n as u64;
+        self.writeback();
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.f.flush()
+    }
+}
+
 #[cfg(all(test, unix))]
 mod open_file_tests {
     use super::*;
