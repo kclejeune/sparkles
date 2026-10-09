@@ -12,6 +12,7 @@ pub use utilities::utility;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use oxrdf::Term;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use sparkles::embed::{GraphMatch, QuadPattern, TxnWorker};
@@ -766,19 +767,61 @@ fn query_result_len(r: &QueryResult) -> usize {
         r.triples.len() + r.quads.len()
     }
 }
-fn query_result_row(r: &QueryResult, pos: usize) -> Option<Vec<Value>> {
+/// A cell of a wire row: a term, or the default graph in the fourth cell of a quad.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Cell {
+    Term(Term),
+    DefaultGraph,
+}
+
+impl Cell {
+    fn encode(&self) -> Value {
+        match self {
+            Cell::Term(t) => terms::encode(t),
+            Cell::DefaultGraph => json!({ "termType": "DefaultGraph", "value": "" }),
+        }
+    }
+
+    /// About the bytes of the cell's JSON, for the batch's byte limit.
+    fn size(&self) -> usize {
+        match self {
+            Cell::Term(Term::NamedNode(n)) => n.as_str().len() + 40,
+            Cell::Term(Term::BlankNode(n)) => n.as_str().len() + 40,
+            Cell::Term(Term::Literal(l)) => {
+                l.value().len()
+                    + l.datatype().as_str().len()
+                    + l.language().map_or(0, str::len)
+                    + 90
+            }
+            Cell::Term(Term::Triple(t)) => t.to_string().len() * 3,
+            Cell::DefaultGraph => 40,
+        }
+    }
+}
+
+/// A quad as the four cells of a wire row: subject, predicate, object and graph.
+fn quad_cells(q: oxrdf::Quad) -> Vec<Option<Cell>> {
+    let graph = match q.graph_name {
+        oxrdf::GraphName::DefaultGraph => Cell::DefaultGraph,
+        oxrdf::GraphName::NamedNode(n) => Cell::Term(n.into()),
+        oxrdf::GraphName::BlankNode(n) => Cell::Term(n.into()),
+    };
+    vec![
+        Some(Cell::Term(q.subject.into())),
+        Some(Cell::Term(q.predicate.into())),
+        Some(Cell::Term(q.object)),
+        Some(graph),
+    ]
+}
+
+fn query_result_row(r: &QueryResult, pos: usize) -> Option<Vec<Option<Cell>>> {
     if r.kind == QueryKind::Select {
         if pos < r.table.len() {
             Some(
                 r.table
                     .row(pos)
                     .iter()
-                    .map(|id| {
-                        r.term(*id)
-                            .as_ref()
-                            .map(terms::encode)
-                            .unwrap_or(Value::Null)
-                    })
+                    .map(|id| r.term(*id).map(Cell::Term))
                     .collect(),
             )
         } else {
@@ -786,20 +829,23 @@ fn query_result_row(r: &QueryResult, pos: usize) -> Option<Vec<Value>> {
         }
     } else if pos < r.triples.len() {
         let t = &r.triples[pos];
-        Some(vec![terms::encode_quad(&oxrdf::Quad::new(
+        Some(quad_cells(oxrdf::Quad::new(
             t.subject.clone(),
             t.predicate.clone(),
             t.object.clone(),
             oxrdf::GraphName::DefaultGraph,
-        ))])
+        )))
     } else {
         r.quads
             .get(pos - r.triples.len())
-            .map(|q| vec![terms::encode_quad(q)])
+            .map(|q| quad_cells(q.clone()))
     }
 }
 
 /// One batch of a result as the JSON that JavaScript decodes, or `null` once it is drained.
+/// The batch holds each distinct term once, and each row is a list of indexes into those
+/// terms (0 for unbound). A quad is a row of four cells, subject, predicate, object and
+/// graph, so a term that many quads share is sent and decoded once per batch.
 /// A batch that drains a materialized result or a scan says `"done":true`, and the rows
 /// are freed in the same call, so that JavaScript neither asks for another batch nor has
 /// anything to close.
@@ -815,7 +861,7 @@ fn pull(
         return Ok("null".into());
     };
     let mut terms = vec![Value::Null];
-    let mut dictionary = HashMap::<String, u32>::new();
+    let mut dictionary = HashMap::<Cell, u32>::new();
     let mut rows = Vec::new();
     let mut bytes = 0;
     let mut drained = false;
@@ -828,7 +874,7 @@ fn pull(
         {
             return Err(EngineError::Cancelled);
         }
-        let row: Option<Vec<Value>> = match &mut c.rows {
+        let row: Option<Vec<Option<Cell>>> = match &mut c.rows {
             Rows::Streaming(state) => {
                 if state
                     .batch
@@ -845,7 +891,7 @@ fn pull(
                         let row = batch
                             .row(state.row)?
                             .into_iter()
-                            .map(|term| term.as_ref().map(terms::encode).unwrap_or(Value::Null))
+                            .map(|term| term.map(Cell::Term))
                             .collect();
                         state.row += 1;
                         Some(row)
@@ -859,19 +905,16 @@ fn pull(
                     state.batch = state.cursor.next_batch()?;
                 }
                 state.batch.as_ref().map(|batch| {
-                    let value = terms::encode_quad(&batch.quads()[state.row]);
+                    let row = quad_cells(batch.quads()[state.row].clone());
                     state.row += 1;
-                    vec![value]
+                    row
                 })
             }
             Rows::Ask(result) => {
                 debug_assert_eq!(result.result().kind, QueryKind::Ask);
                 None
             }
-            Rows::Scan(scan) => scan
-                .next()
-                .transpose()?
-                .map(|q| vec![terms::encode_quad(&q)]),
+            Rows::Scan(scan) => scan.next().transpose()?.map(quad_cells),
             Rows::Query(r) => query_result_row(r, c.pos),
             Rows::Collected(r) => query_result_row(r.result(), c.pos),
         };
@@ -880,20 +923,19 @@ fn pull(
             break;
         };
         c.pos += 1;
-        let mut cells = Vec::new();
-        for term in row {
-            if term.is_null() {
+        let mut cells = Vec::with_capacity(row.len());
+        for cell in row {
+            let Some(cell) = cell else {
                 cells.push(0);
                 continue;
-            }
-            let key = term.to_string();
-            let id = if let Some(id) = dictionary.get(&key) {
+            };
+            let id = if let Some(id) = dictionary.get(&cell) {
                 *id
             } else {
                 let id = terms.len() as u32;
-                bytes += key.len();
-                dictionary.insert(key, id);
-                terms.push(term);
+                bytes += cell.size();
+                terms.push(cell.encode());
+                dictionary.insert(cell, id);
                 id
             };
             cells.push(id);

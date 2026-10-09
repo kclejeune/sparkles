@@ -1,5 +1,6 @@
-// The wire batches of results: the first batch comes with the result, and a drained
-// result needs no native close.
+// The wire batches of results: the first batch comes with the result, a drained result
+// needs no native close, quads travel as four term cells, and decoded items are handed
+// out in order without waiting for the queue.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Dataset, configure, factory as f } from '../dist/index.js';
@@ -78,6 +79,30 @@ test('has, a first match and CONSTRUCT quads', async () => {
     assert(triples.length > 0);
     assert(triples.every((t) => t.termType === 'Quad' && t.graph.termType === 'DefaultGraph'));
   } finally {
+    await ds.close();
+  }
+});
+
+test('next() calls made at once resolve in order', async () => {
+  const ds = await filled();
+  try {
+    configure({ batchSize: 4 });
+    const r = await ds.select('SELECT ?o WHERE { GRAPH ?g { ?s ?p ?o } } ORDER BY STR(?o)');
+    const expected = (
+      await (
+        await ds.select('SELECT ?o WHERE { GRAPH ?g { ?s ?p ?o } } ORDER BY STR(?o)')
+      ).toArray()
+    ).map((b) => b.get('o').value);
+    const pending = [];
+    for (let i = 0; i < expected.length + 2; i++) pending.push(r.next());
+    const results = await Promise.all(pending);
+    assert.deepEqual(
+      results.filter((x) => !x.done).map((x) => x.value.get('o').value),
+      expected,
+    );
+    assert(results.slice(expected.length).every((x) => x.done));
+  } finally {
+    configure({ batchSize: 1024 });
     await ds.close();
   }
 });

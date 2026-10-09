@@ -163,8 +163,13 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
   readonly timing: unknown;
   readonly plan: unknown;
   private batch: T[] = [];
+  /** the index in `batch` of the next item */
+  private position = 0;
   /** the size of the batch being consumed, for the prefetch threshold */
   private batchLength = 0;
+  /** `next()` calls queued or running, which a ready item must not overtake */
+  private busy = 0;
+  private names: string[] = [];
   /** the next batch, requested once half of the current one has been consumed */
   private prefetched?: Promise<T[] | null>;
   private exhausted = false;
@@ -183,6 +188,7 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
     const info = JSON.parse(handle.info());
     this.type = info.type;
     this.variables = (info.variables ?? []).map(factory.variable!);
+    this.names = this.variables.map((v) => v.value);
     this.size = info.size;
     this.timing = info.timing;
     this.plan = info.plan;
@@ -211,54 +217,90 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
     }
     const cache: (RDF.Term | undefined)[] = [];
     const decode = (i: number) => (cache[i] ??= decodeTerm(batch.terms[i], this.options.factory));
-    return batch.rows.map((cells: number[]) =>
-      this.type === 'bindings'
-        ? new LazyBindings(
-            this.variables.map((v) => v.value),
-            cells,
-            decode,
-          )
-        : decode(cells[0]),
+    if (this.type === 'bindings') {
+      const names = this.names;
+      return batch.rows.map((cells: number[]) => new LazyBindings(names, cells, decode)) as T[];
+    }
+    // a quad is four cells, subject, predicate, object and graph, each a term of the batch
+    const f = this.options.factory ?? factory;
+    return batch.rows.map((c: number[]) =>
+      f.quad(
+        decode(c[0]) as RDF.Quad_Subject,
+        decode(c[1]) as RDF.Quad_Predicate,
+        decode(c[2]) as RDF.Quad_Object,
+        decode(c[3]) as RDF.Quad_Graph,
+      ),
     ) as T[];
   }
+  /** The next decoded item, asking for the following batch once half of this one is used. */
+  private take(): T {
+    const value = this.batch[this.position++];
+    if (this.position >= this.batch.length) {
+      this.batch = [];
+      this.position = 0;
+    }
+    // Once half of the batch has been consumed, ask for the next one, so that it is
+    // computed while the caller works through the rest.
+    if (
+      !this.prefetched &&
+      !this.exhausted &&
+      this.batch.length - this.position <= this.batchLength / 2
+    ) {
+      const next = this.fetch().then((rows) => {
+        if (!rows) this.exhausted = true;
+        return rows;
+      });
+      next.catch(() => {});
+      this.prefetched = next;
+    }
+    return value;
+  }
   next(): Promise<IteratorResult<T>> {
+    // An item already decoded is handed out at once, unless an earlier call is still
+    // queued, which it must not overtake.
+    if (
+      this.busy === 0 &&
+      !this.closed &&
+      this.position < this.batch.length &&
+      !this.options.signal?.aborted
+    ) {
+      return Promise.resolve({ done: false, value: this.take() });
+    }
+    this.busy++;
     const task = this.queue.then(async () => {
-      this.options.signal?.throwIfAborted();
-      if (this.closed) return { done: true, value: undefined } as IteratorResult<T>;
-      if (!this.batch.length) {
-        let batch: T[] | null;
-        try {
-          const pending = this.prefetched;
-          this.prefetched = undefined;
-          batch = this.exhausted ? null : await (pending ?? this.fetch());
-        } catch (e) {
-          await this.close();
-          throw nativeError(e);
-        }
-        this.options.signal?.throwIfAborted();
-        if (this.closed) return { done: true, value: undefined } as IteratorResult<T>;
-        if (!batch || !batch.length) {
-          await this.close();
-          return { done: true, value: undefined } as IteratorResult<T>;
-        }
-        this.batch = batch;
-        this.batchLength = batch.length;
+      try {
+        return await this.step();
+      } finally {
+        this.busy--;
       }
-      const value = this.batch.shift()!;
-      // Once half of the batch has been consumed, ask for the next one, so that it is
-      // computed while the caller works through the rest.
-      if (!this.prefetched && !this.exhausted && this.batch.length <= this.batchLength / 2) {
-        const next = this.fetch().then((rows) => {
-          if (!rows) this.exhausted = true;
-          return rows;
-        });
-        next.catch(() => {});
-        this.prefetched = next;
-      }
-      return { done: false, value } as IteratorResult<T>;
     });
     this.queue = task.catch(() => {});
     return task;
+  }
+  private async step(): Promise<IteratorResult<T>> {
+    this.options.signal?.throwIfAborted();
+    if (this.closed) return { done: true, value: undefined } as IteratorResult<T>;
+    if (this.position >= this.batch.length) {
+      let batch: T[] | null;
+      try {
+        const pending = this.prefetched;
+        this.prefetched = undefined;
+        batch = this.exhausted ? null : await (pending ?? this.fetch());
+      } catch (e) {
+        await this.close();
+        throw nativeError(e);
+      }
+      this.options.signal?.throwIfAborted();
+      if (this.closed) return { done: true, value: undefined } as IteratorResult<T>;
+      if (!batch || !batch.length) {
+        await this.close();
+        return { done: true, value: undefined } as IteratorResult<T>;
+      }
+      this.batch = batch;
+      this.position = 0;
+      this.batchLength = batch.length;
+    }
+    return { done: false, value: this.take() } as IteratorResult<T>;
   }
   async return(): Promise<IteratorResult<T>> {
     await this.close();
@@ -268,6 +310,7 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
     if (this.closed) return;
     this.closed = true;
     this.batch = [];
+    this.position = 0;
     this.prefetched = undefined;
     this.options.signal?.removeEventListener('abort', this.abort);
     try {
