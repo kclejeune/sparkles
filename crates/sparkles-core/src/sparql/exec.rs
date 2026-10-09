@@ -197,12 +197,45 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
 }
 
 fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
+    execute_node(ctx, n, None)
+}
+
+/// The inputs of an operator, from a caller that produces each child's table itself.
+pub(super) type Inputs<'a> = &'a mut dyn FnMut(usize) -> Result<(Table, PlanInfo)>;
+
+/// Whether `execute_with_inputs` reads every child of a node of this kind only as an
+/// input table. Other kinds run a child plan themselves, read their child scans in
+/// their own way, or may never need a child.
+pub(super) fn reads_inputs(n: &Node) -> bool {
+    match &n.kind {
+        Kind::CountJoinRuns { .. } | Kind::SpatialKnn(_) | Kind::Join { .. } => false,
+        Kind::VectorSearch(spec) => !spec.order_fallback,
+        Kind::Slice { limit, .. } => limit.is_none(),
+        _ => true,
+    }
+}
+
+/// Run one operator over input tables that `inputs` produces, child by child, without
+/// the result cache. Only kinds that `reads_inputs` admits may run this way.
+pub(super) fn execute_with_inputs(
+    ctx: &Ctx,
+    n: &Node,
+    inputs: Inputs<'_>,
+) -> Result<(Table, PlanInfo)> {
+    debug_assert!(reads_inputs(n));
+    execute_node(ctx, n, Some(inputs))
+}
+
+fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(Table, PlanInfo)> {
     let start = Instant::now();
     let mut infos = Vec::new();
     // the children's tables count against the memory budget until this operator is done
     let held = ctx.charge(0)?;
-    let child = |i: usize, infos: &mut Vec<PlanInfo>| -> Result<Table> {
-        let (t, info) = execute(ctx, &n.children[i])?;
+    let mut child = |i: usize, infos: &mut Vec<PlanInfo>| -> Result<Table> {
+        let (t, info) = match inputs.as_mut() {
+            Some(inputs) => inputs(i)?,
+            None => execute(ctx, &n.children[i])?,
+        };
         infos.push(info);
         held.add(t.mem_bytes())?;
         Ok(t)

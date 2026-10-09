@@ -2998,3 +2998,47 @@ fn random_queries_agree_between_cursor_and_eager_through_a_masked_view() {
     );
     differential("masked", &snapshot, &opts, SEEDS);
 }
+
+/// An operator without a cursor implementation materializes only itself. Its inputs
+/// are cursors of their own, and they stream into it.
+#[test]
+fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
+    let s = store(60);
+    let data = (0..60)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7) % 60))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    fn fallbacks(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<bool>) {
+        if plan.materializes {
+            out.push(plan.children.iter().any(|c| c.has_materialization()));
+        }
+        for child in &plan.children {
+            fallbacks(child, out);
+        }
+    }
+    for q in [
+        "SELECT ?s (GROUP_CONCAT(STR(?o)) AS ?c) WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t } GROUP BY ?s",
+        "SELECT ?s ?t WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t FILTER NOT EXISTS { ?t <urn:p> 3 } }",
+        "SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q>+ ?x }",
+        "SELECT ?s (COUNT(DISTINCT ?t) AS ?n) WHERE { { ?s <urn:q> ?t } UNION { ?t <urn:q> ?s } } GROUP BY ?s",
+    ] {
+        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        for rows in [1, 2, 3, 4096] {
+            let opts = CursorOptions {
+                batch_rows: rows,
+                ..Default::default()
+            };
+            let c = select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap();
+            let mut found = Vec::new();
+            fallbacks(c.plan(), &mut found);
+            assert!(!found.is_empty(), "{q}");
+            assert!(found.iter().all(|nested| !nested), "{q}: {:?}", c.plan());
+            assert_eq!(bag(all(c)), expected, "{q}; {rows}");
+        }
+    }
+}

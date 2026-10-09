@@ -1099,10 +1099,17 @@ enum State {
     Union {
         at: usize,
     },
+    /// An operator without a cursor implementation. With `inputs`, its children are
+    /// cursors whose output it collects before running. Otherwise its whole subtree
+    /// runs eagerly.
     Fallback {
         node: Node,
         loaded: Option<Buffer>,
         at: usize,
+        inputs: bool,
+        /// Scans among the inputs, which an eager scan reads straight into a table of
+        /// the right size. The fallback holds its whole input either way.
+        scans: Vec<Option<Node>>,
     },
     Blocking {
         node: Node,
@@ -1265,7 +1272,25 @@ impl Operator {
         info.children.clear();
         info.actual_rows = 0;
         let vars = node.vars.clone();
-        let children = if materializes && !native_blocking {
+        // A fallback materializes only its own operator when it reads its children as
+        // input tables. Those children then stream as cursors of their own.
+        let inputs = materializes
+            && !native_blocking
+            && !node.children.is_empty()
+            && exec::reads_inputs(&node);
+        let scans: Vec<Option<Node>> = if inputs {
+            node.children
+                .iter()
+                .map(|child| {
+                    (matches!(child.kind, Kind::Scan(_) | Kind::RangeScan(..))
+                        && supported(&child.kind))
+                    .then(|| child.clone())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let children = if materializes && !native_blocking && !inputs {
             Vec::new()
         } else {
             let built = std::mem::take(&mut node.children)
@@ -1365,6 +1390,8 @@ impl Operator {
                 node,
                 loaded: None,
                 at: 0,
+                inputs,
+                scans,
             }
         } else {
             match &node.kind {
@@ -1452,7 +1479,11 @@ impl Operator {
 
     fn describe(&self, ctx: &Ctx) -> CursorPlan {
         let children = match &self.state {
-            State::Fallback { node, .. } => node
+            State::Fallback {
+                node,
+                inputs: false,
+                ..
+            } => node
                 .children
                 .iter()
                 .map(|n| {
@@ -1750,9 +1781,36 @@ impl Operator {
                     self.done = *at == table.len;
                     batch
                 }
-                State::Fallback { node, loaded, at } => {
+                State::Fallback {
+                    node,
+                    loaded,
+                    at,
+                    inputs,
+                    scans,
+                } => {
                     if loaded.is_none() {
-                        let (mut table, mut info) = exec::execute(ctx, node)?;
+                        let (mut table, mut info) = if *inputs {
+                            let children = &mut self.children;
+                            let mut collect = |i: usize| match &scans[i] {
+                                Some(scan) => {
+                                    let (table, info) = exec::execute(ctx, scan)?;
+                                    let child = &mut children[i];
+                                    child.rows = table.len;
+                                    child.info.actual_rows = info.actual_rows;
+                                    child.info.time_ms = info.time_ms;
+                                    child.done = true;
+                                    Ok((table, info))
+                                }
+                                None => collect_input(ctx, &mut children[i], options),
+                            };
+                            exec::execute_with_inputs(ctx, node, &mut collect)?
+                        } else {
+                            exec::execute(ctx, node)?
+                        };
+                        if *inputs {
+                            // The child operators describe themselves.
+                            info.children.clear();
+                        }
                         if ctx.graphs.is_some() {
                             info.redact();
                         }
@@ -1868,6 +1926,25 @@ impl Operator {
             }
         }
     }
+}
+
+/// Collect a child cursor's output as the input table of an eager operator. The table
+/// keeps the order of its operator, and its charge passes to the eager operator, which
+/// holds its input tables while it runs.
+fn collect_input(
+    ctx: &Arc<Ctx>,
+    child: &mut Operator,
+    options: &CursorOptions,
+) -> Result<(Table, PlanInfo)> {
+    let mut input = Buffer::new(ctx, &child.vars, 0)?;
+    input.table.sorted.clone_from(&child.order);
+    while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
+        merge::append(ctx, &mut input, &batch.table, 0..batch.table.len)?;
+    }
+    let Buffer { mut table, charge } = input;
+    drop(charge);
+    table.sorted.clone_from(&child.order);
+    Ok((table, child.info.clone()))
 }
 
 fn copy_rows(ctx: &Arc<Ctx>, table: &Table, at: usize, cap: usize) -> Result<Option<Buffer>> {
