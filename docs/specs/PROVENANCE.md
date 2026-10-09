@@ -498,6 +498,48 @@ implementation landed.
   - listing the search tools only when the data supports them;
   - SSE responses and progress notifications.
 
+## Agent memory over MCP
+
+- **Spec:** [`C17-agent-memory.md`](C17-agent-memory.md), written on 2026-10-08 from:
+  - the Model Context Protocol specification, revisions 2025-06-18 and 2026-07-28 (tools,
+    annotations, structured content, prompts and sampling), cited from working knowledge;
+  - W3C RDF 1.2 Concepts, Turtle 1.2 and SPARQL 1.2 Query and Update drafts for triple
+    terms and reifiers, and RDF 1.1 Concepts §3.5 for skolemization;
+  - W3C SHACL, PROV-O, SKOS and the Web Annotation Data Model, and RFC 9562 for UUIDs;
+  - Lewis et al., "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks"
+    (NeurIPS 2020), Edge et al., "From Local to Global: A Graph RAG Approach to
+    Query-Focused Summarization" (arXiv:2404.16130), Peng et al., "Graph
+    Retrieval-Augmented Generation: A Survey" (arXiv:2408.08921), and Pan et al.,
+    "Unifying Large Language Models and Knowledge Graphs: A Roadmap" (IEEE TKDE, 2024);
+  - Shen, Wang and Han, "Entity Linking with a Knowledge Base" (IEEE TKDE, 2015), and Wu
+    et al., "Scalable Zero-shot Entity Linking with Dense Entity Retrieval" (EMNLP 2020);
+  - Liu et al., "What Makes Good In-Context Examples for GPT-3?" (DeeLIO 2022);
+  - the QALD challenge series and Dubey et al., "LC-QuAD 2.0" (ISWC 2019), for evaluation;
+  - Packer et al., "MemGPT" (arXiv:2310.08560), Park et al., "Generative Agents" (UIST
+    2023), and Rasmussen et al., "Zep: A Temporal Knowledge Graph Architecture for Agent
+    Memory" (arXiv:2501.13956);
+  - Robertson and Zaragoza on BM25 (2009), Cormack, Clarke and Büttcher on reciprocal rank
+    fusion (SIGIR 2009), Malkov and Yashunin on HNSW (IEEE TPAMI, 2020), and Damerau on
+    edit distance (CACM, 1964);
+  - the Sparkles code and specs C02, C10, C11, C12, C12b, C13, C15, C16, F03, F04, F06,
+    F08 and F09.
+- **Implementation:** not built. The spec plans no new runtime dependency. The tools
+  compose the MCP server, schema reports, stored queries, full-text and vector search,
+  the embeddings client, write previews, the write guard and the branch API.
+- **Rejected** (spec §12):
+  - question answering or ingestion with a model inside the server in Phase 1;
+  - a separate memory store next to the graph;
+  - provenance in commit metadata only;
+  - a named graph per fact;
+  - RDF 1.1 reification, singleton properties and n-ary relations for provenance;
+  - deleting old values, and keeping superseded values asserted with a flag;
+  - automatic merging of duplicate entities;
+  - extending `explain_query` in place of `check_query`;
+  - one `memory` tool with an action argument;
+  - Web Annotation selectors for source spans;
+  - stored queries saved by agents;
+  - MCP sampling in Phase 1.
+
 ## Compression codecs
 
 - **Spec:** [`X01-compression-codecs.md`](X01-compression-codecs.md), written on
