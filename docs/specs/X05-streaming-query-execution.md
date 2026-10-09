@@ -653,6 +653,24 @@ accounting and mode differences, those shapes stay opt-in, and the narrow automa
 admission does not select them.
 
 Disk spill, broader automatic selection and removing every remaining cost of complete
-responses are follow-up work. Full-scale cold reads and loading need separately matched
+responses are follow-up work. A review of the implementation found further follow-ups:
+
+- An operator without a cursor implementation runs its whole subtree eagerly, and that
+  fallback does not use the early stop that LIMIT gets in eager execution. The fallback
+  should materialize only the unsupported operator and read its inputs from child
+  cursors, which is also the path toward one engine instead of two.
+- Index joins already run per input table, so they can stream instead of falling back.
+- The streaming hash join picks its key from the plan's certainty alone and scans the
+  build side for every probe row otherwise. It should check the built data for unbound
+  values, as eager execution does.
+- Sort order travels as a claim on each batch. It should be a property of the operator,
+  checked at batch boundaries in debug builds.
+- The result writer should decode several batches in parallel and prefetch the next one,
+  as the eager writer does.
+- A total order for sort keys would let ORDER BY with LIMIT keep a bounded heap.
+- Scans should use the fast path for blocks without pending changes.
+- Explicit streaming over HTTP should send its first bytes sooner than after 1 MiB.
+- The differential test should cover filters, ordering, slicing, grouping, pending
+  changes and access-restricted views. Full-scale cold reads and loading need separately matched
 historical controls before their dated snapshot differences can be attributed to query
 execution.
