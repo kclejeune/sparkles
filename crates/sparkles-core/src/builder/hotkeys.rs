@@ -9,9 +9,10 @@
 //! When a batch is written, each of its keys is looked up here first. A key that is
 //! already hot gets its hot id. A key that an earlier batch wrote is made hot while
 //! the memory budget allows. Other keys are recorded as seen and stay in the batch.
-//! The batch's quads refer to a hot key by its hot id after the ranks of the batch's
-//! own keys. The hot keys are written once, as one more partial vocabulary, when the
-//! parse ends.
+//! The batch writes the hot ids it uses as a list (see [`write_list`]), and its quads
+//! refer to a hot key by its place in that list after the ranks of the batch's own
+//! keys. The hot keys are written once, as one more partial vocabulary, when the parse
+//! ends.
 //!
 //! Whether an earlier batch wrote a key is answered by a Bloom filter. A false
 //! positive makes a key hot that did not need to be, which costs memory but changes
@@ -23,10 +24,15 @@
 //! when a load's memory peaks. This trades that memory for fewer bytes of partial
 //! vocabularies and a shorter vocabulary merge.
 
-use super::KeySet;
+use super::{KeySet, codec};
 use crate::error::{Error, Result};
+use crate::index::read_varint_checked;
+use crate::vocab::write_varint;
 use parking_lot::Mutex;
 use rayon::prelude::*;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// The hot keys are split into this many shards, each behind a lock of its own.
@@ -146,6 +152,48 @@ impl HotKeys {
     }
 }
 
+/// Write the increasing hot `ids` a batch uses to `path`. Returns the size of the file.
+///
+/// The file holds the differences of the ids as varints, compressed with the loader's
+/// codec, after the length of the varints as a little-endian `u32`.
+pub(super) fn write_list(path: &Path, ids: impl Iterator<Item = u32>) -> Result<u64> {
+    let mut raw = Vec::new();
+    let mut prev = 0;
+    for id in ids {
+        write_varint(&mut raw, (id - prev) as u64);
+        prev = id;
+    }
+    let comp = codec::compress(&raw)?;
+    let mut f = BufWriter::new(File::create(path)?);
+    f.write_all(&(raw.len() as u32).to_le_bytes())?;
+    f.write_all(&comp)?;
+    f.flush()?;
+    Ok(4 + comp.len() as u64)
+}
+
+/// Read the `n` hot ids of a batch that [`write_list`] wrote to `path`.
+pub(super) fn read_list(path: &Path, n: u64) -> Result<Vec<u32>> {
+    let bad = || Error::Corrupt(format!("hot key list {}", path.display()));
+    let bytes = std::fs::read(path)?;
+    let (len, comp) = bytes.split_first_chunk::<4>().ok_or_else(bad)?;
+    let len = u32::from_le_bytes(*len) as usize;
+    if len as u64 > n.saturating_mul(5) {
+        return Err(bad());
+    }
+    let mut raw = Vec::new();
+    codec::decompress(comp, len, &mut raw, "hot key list")?;
+    let mut ids = Vec::with_capacity(n as usize);
+    let (mut pos, mut id) = (0, 0u64);
+    while pos < raw.len() {
+        id += read_varint_checked(&raw, &mut pos).ok_or_else(bad)?;
+        ids.push(u32::try_from(id).map_err(|_| bad())?);
+    }
+    if ids.len() as u64 != n {
+        return Err(bad());
+    }
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +213,16 @@ mod tests {
             })
             .unwrap();
         assert_eq!(order, [0, 1]);
+    }
+
+    #[test]
+    fn a_list_of_hot_ids_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("b0.h");
+        let ids = [0, 1, 7, 300, 70_000, u32::MAX - 1];
+        write_list(&p, ids.iter().copied()).unwrap();
+        assert_eq!(read_list(&p, ids.len() as u64).unwrap(), ids);
+        assert!(read_list(&p, 5).is_err());
     }
 
     #[test]

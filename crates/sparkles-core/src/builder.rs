@@ -165,6 +165,8 @@ struct BatchInfo {
     /// the place of the batch in the order of `id`, set before the vocabulary merge
     pos: usize,
     keys: u64,
+    /// the number of hot keys the batch uses
+    hot: u64,
     /// the size of the partial vocabulary file
     voc_bytes: u64,
     quads: u64,
@@ -318,9 +320,10 @@ impl Builder {
     }
 
     /// Write a batch: its keys sorted as a partial vocabulary, and its quads with each
-    /// local id replaced by the rank of its key. A hot key (see [`hotkeys`]) is left out
-    /// of the partial vocabulary, and its local id is replaced by its hot id after the
-    /// ranks. `order` and `rank` are buffers kept by the encoder.
+    /// local id replaced by the rank of its key. The hot keys of the batch (see
+    /// [`hotkeys`]) are left out of the partial vocabulary. They are numbered after the
+    /// ranks in the order of their hot ids, and the list of their hot ids is written
+    /// instead. `order` and `rank` are buffers kept by the encoder.
     fn write_batch(
         &self,
         keys: &KeySet,
@@ -354,14 +357,27 @@ impl Builder {
         }
         order.par_sort_unstable_by(|&a, &b| keys.key(a).cmp(keys.key(b)));
         let own = order.len() as u32;
-        for r in rank.iter_mut().filter(|r| **r != NOT_HOT) {
-            *r = own
-                .checked_add(*r)
-                .filter(|&v| v != NOT_HOT)
-                .ok_or_else(|| Error::Corrupt("too many hot keys".into()))?;
+        // Numbered this way, the batch's values stay below its number of keys, as they
+        // were without hot keys, and the columns of its quads compress as well.
+        let mut used: Vec<(u32, u32)> = rank
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| **h != NOT_HOT)
+            .map(|(i, &h)| (h, i as u32))
+            .collect();
+        used.par_sort_unstable();
+        for (j, &(_, local)) in used.iter().enumerate() {
+            rank[local as usize] = own + j as u32;
         }
         for (r, &local) in order.iter().enumerate() {
             rank[local as usize] = r as u32;
+        }
+        if !used.is_empty() {
+            let n = hotkeys::write_list(
+                &self.tmp.join(format!("b{id}.h")),
+                used.iter().map(|&(h, _)| h),
+            )?;
+            self.tmp_bytes.add(iostat::Tmp::HotLists, n);
         }
         let (samples, voc_bytes) = vocabmerge::write_partial(
             &self.tmp.join(format!("b{id}.voc")),
@@ -384,6 +400,7 @@ impl Builder {
             id,
             pos: 0,
             keys: own as u64,
+            hot: used.len() as u64,
             voc_bytes,
             quads: quads.len() as u64,
             samples,
@@ -568,8 +585,15 @@ impl Builder {
             .zip(parts)
             .try_for_each(|(b, out)| -> Result<()> {
                 let qp = self.tmp.join(format!("b{}.q", b.id));
-                let map = maps.read(b.pos, b.keys)?;
                 let bad = || Error::Corrupt(format!("batch file {}", qp.display()));
+                let mut map = maps.read(b.pos, b.keys)?;
+                if b.hot > 0 {
+                    let hp = self.tmp.join(format!("b{}.h", b.id));
+                    for h in hotkeys::read_list(&hp, b.hot)? {
+                        map.push(*hot.get(h as usize).ok_or_else(bad)?);
+                    }
+                    std::fs::remove_file(&hp)?;
+                }
                 let mut r = runs::RunReader::open(&qp)?;
                 let mut at = 0;
                 while let Some(block) = r.next_block()? {
@@ -577,11 +601,7 @@ impl Builder {
                     for (q, k) in dst.iter_mut().zip(&block) {
                         for (v, &x) in q.iter_mut().zip(k) {
                             *v = if Id(x).tag() == Tag::Local {
-                                let p = Id(x).payload() as usize;
-                                let g = match map.get(p) {
-                                    Some(g) => g,
-                                    None => hot.get(p - map.len()).ok_or_else(bad)?,
-                                };
+                                let g = map.get(Id(x).payload() as usize).ok_or_else(bad)?;
                                 Id::vocab(*g).0
                             } else {
                                 x
