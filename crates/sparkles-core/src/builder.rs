@@ -22,6 +22,7 @@
 //!    these pairs). Without named graphs GSPO is SPO behind the one graph. Writers run
 //!    in threads of their own. Statistics for the planner are gathered on the way.
 
+mod codec;
 mod hotkeys;
 mod iostat;
 mod runs;

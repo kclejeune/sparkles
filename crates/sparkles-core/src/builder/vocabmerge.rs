@@ -13,6 +13,7 @@
 //! they hold at most [`RANGE_MEMORY`] together. A range that would go past that writes its
 //! keys to a file instead.
 
+use super::codec::{self, BlockCodec};
 use super::iostat::{Tmp, TmpBytes};
 use crate::error::{Error, Result};
 use crate::index::read_varint_checked;
@@ -114,69 +115,6 @@ fn write_block(w: &mut impl Write, codec: &mut BlockCodec, raw: &[u8]) -> Result
     w.write_all(&(raw.len() as u32).to_le_bytes())?;
     w.write_all(&c)?;
     Ok(8 + c.len() as u64)
-}
-
-/// The compression of the blocks of a partial vocabulary. Builds with the `zstd` feature
-/// use zstd at level 1, and other builds use LZ4. The files are written and read by the
-/// same build, so they do not record the codec.
-///
-/// Sorted and front-coded keys still repeat a lot within a block, such as the paths of
-/// IRIs, language tags and datatypes. On DBpedia, zstd makes the blocks about a quarter
-/// smaller than LZ4 does. It takes about twice as long to compress them and four times as
-/// long to decompress them. The partial vocabularies are the largest temporary files of
-/// a load, and the vocabulary merge reads every byte of them back.
-struct BlockCodec {
-    #[cfg(feature = "zstd")]
-    z: zstd::bulk::Compressor<'static>,
-}
-
-impl BlockCodec {
-    fn new() -> Result<BlockCodec> {
-        Ok(BlockCodec {
-            #[cfg(feature = "zstd")]
-            z: zstd::bulk::Compressor::new(1)?,
-        })
-    }
-
-    fn compress(&mut self, raw: &[u8]) -> Result<Vec<u8>> {
-        #[cfg(feature = "zstd")]
-        return Ok(self.z.compress(raw)?);
-        #[cfg(not(feature = "zstd"))]
-        return Ok(lz4_flex::block::compress(raw));
-    }
-
-    /// Decompress a block of `len` bytes into `out`. Each thread keeps one zstd context.
-    fn decompress(comp: &[u8], len: usize, out: &mut Vec<u8>) -> Result<()> {
-        let bad =
-            |e: &dyn std::fmt::Display| Error::Corrupt(format!("partial vocabulary block: {e}"));
-        out.clear();
-        #[cfg(feature = "zstd")]
-        {
-            thread_local! {
-                static DECODER: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
-                    const { std::cell::RefCell::new(None) };
-            }
-            out.reserve(len);
-            DECODER.with_borrow_mut(|d| -> Result<()> {
-                let d = match d {
-                    Some(d) => d,
-                    None => d.insert(zstd::bulk::Decompressor::new()?),
-                };
-                d.decompress_to_buffer(comp, out).map_err(|e| bad(&e))?;
-                Ok(())
-            })?;
-        }
-        #[cfg(not(feature = "zstd"))]
-        {
-            out.resize(len, 0);
-            let n = lz4_flex::block::decompress_into(comp, out).map_err(|e| bad(&e))?;
-            out.truncate(n);
-        }
-        if out.len() != len {
-            return Err(bad(&format!("{} bytes instead of {len}", out.len())));
-        }
-        Ok(())
-    }
 }
 
 /// Where some map entries of a batch are: their range and their bytes in the map file.
@@ -408,7 +346,7 @@ impl Cursor {
             let raw = u32::from_le_bytes(len[4..].try_into().unwrap()) as usize;
             self.comp.resize(comp, 0);
             self.r.read_exact(&mut self.comp)?;
-            BlockCodec::decompress(&self.comp, raw, &mut self.block)?;
+            codec::decompress(&self.comp, raw, &mut self.block, "partial vocabulary")?;
             self.pos = 0;
             self.key.clear();
         }

@@ -3,11 +3,15 @@
 //!
 //! A run file is a sequence of blocks of up to [`RUN_BLOCK`] keys. A block starts with its
 //! row count and the byte length of each column (five little-endian `u32`), followed by
-//! the four columns, each encoded as in a permutation block (delta + zig-zag varint, then
-//! LZ4). Sorted keys compress to about a third of their 32 bytes.
+//! the four columns. A column holds the differences of its values as zig-zag varints,
+//! like a permutation block, compressed with the loader's codec (see [`codec`]) after the
+//! length of the varints as a little-endian `u32`. Sorted keys compress to about a
+//! third of their 32 bytes with LZ4.
 
+use super::codec;
 use crate::error::{Error, Result};
-use crate::index::{Key, decode_column, encode_column};
+use crate::index::{Key, read_varint_checked};
+use crate::vocab::write_varint;
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -62,7 +66,7 @@ fn write_blocks(
     path: &Path,
     len: usize,
     group: usize,
-    encode: impl Fn(Range<usize>) -> Vec<u8> + Sync,
+    encode: impl Fn(Range<usize>) -> Result<Vec<u8>> + Sync,
 ) -> Result<u64> {
     let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
     let mut n = 0;
@@ -74,7 +78,7 @@ fn write_blocks(
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|b| encode(b..(b + RUN_BLOCK).min(end)))
-            .collect();
+            .collect::<Result<_>>()?;
         for b in blocks {
             w.write_all(&b)?;
             n += b.len() as u64;
@@ -86,14 +90,22 @@ fn write_blocks(
 
 /// One block of a run file. Its buffer is allocated at its final size, because a group of
 /// encoded blocks waits in memory until it is written.
-fn encode_block(rows: &[Key]) -> Vec<u8> {
-    let mut col = Vec::with_capacity(rows.len());
-    let mut scratch = Vec::new();
-    let cols: [Vec<u8>; 4] = std::array::from_fn(|c| {
-        col.clear();
-        col.extend(rows.iter().map(|k| k[c]));
-        encode_column(&col, &mut scratch)
-    });
+fn encode_block(rows: &[Key]) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    let mut cols: [Vec<u8>; 4] = Default::default();
+    for (c, out) in cols.iter_mut().enumerate() {
+        raw.clear();
+        let mut prev = 0u64;
+        for k in rows {
+            let d = k[c].wrapping_sub(prev) as i64;
+            write_varint(&mut raw, ((d << 1) ^ (d >> 63)) as u64);
+            prev = k[c];
+        }
+        let comp = codec::compress(&raw)?;
+        out.reserve_exact(4 + comp.len());
+        out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        out.extend_from_slice(&comp);
+    }
     let mut out = Vec::with_capacity(HEADER + cols.iter().map(Vec::len).sum::<usize>());
     out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
     for c in &cols {
@@ -102,13 +114,40 @@ fn encode_block(rows: &[Key]) -> Vec<u8> {
     for c in &cols {
         out.extend_from_slice(c);
     }
-    out
+    Ok(out)
+}
+
+/// Decode one column of `rows` values from `bytes` into the column `c` of `keys`, with
+/// `raw` as a buffer.
+fn decode_column(bytes: &[u8], c: usize, keys: &mut [Key], raw: &mut Vec<u8>) -> Result<()> {
+    let bad = || Error::Corrupt("run block column".into());
+    let (len, comp) = bytes.split_first_chunk::<4>().ok_or_else(bad)?;
+    let len = u32::from_le_bytes(*len) as usize;
+    // a varint takes at most 10 bytes: a larger size is damage
+    if len > keys.len().saturating_mul(10) {
+        return Err(bad());
+    }
+    codec::decompress(comp, len, raw, "run")?;
+    let mut pos = 0;
+    let mut prev = 0u64;
+    for k in keys.iter_mut() {
+        let z = read_varint_checked(raw, &mut pos).ok_or_else(bad)?;
+        let d = ((z >> 1) as i64) ^ -((z & 1) as i64);
+        prev = prev.wrapping_add(d as u64);
+        k[c] = prev;
+    }
+    if pos != raw.len() {
+        return Err(bad());
+    }
+    Ok(())
 }
 
 /// Reads a run file block by block.
 pub(super) struct RunReader {
     r: BufReader<File>,
     buf: Vec<u8>,
+    /// a decompressed column
+    raw: Vec<u8>,
 }
 
 impl RunReader {
@@ -116,6 +155,7 @@ impl RunReader {
         Ok(RunReader {
             r: BufReader::with_capacity(1 << 20, File::open(path)?),
             buf: Vec::new(),
+            raw: Vec::new(),
         })
     }
 
@@ -135,9 +175,7 @@ impl RunReader {
         for c in 0..4 {
             self.buf.resize(u32_at(4 + 4 * c), 0);
             self.r.read_exact(&mut self.buf)?;
-            for (k, v) in keys.iter_mut().zip(decode_column(&self.buf, rows)?) {
-                k[c] = v;
-            }
+            decode_column(&self.buf, c, &mut keys, &mut self.raw)?;
         }
         Ok(Some(keys))
     }
