@@ -657,20 +657,41 @@ responses are follow-up work. A review of the implementation found further follo
 
 - An operator without a cursor implementation runs its whole subtree eagerly, and that
   fallback does not use the early stop that LIMIT gets in eager execution. The fallback
-  should materialize only the unsupported operator and read its inputs from child
-  cursors, which is also the path toward one engine instead of two.
-- Index joins already run per input table, so they can stream instead of falling back.
+  should eventually materialize only the unsupported operator and read its inputs from
+  child cursors. Prefix demand may pass only through operators that preserve the
+  required solutions, including OFFSET and callback effects. The absence of ORDER alone
+  is not enough. Sharing kernels and accounting is incremental work. Replacing eager
+  execution with cursor collection is subject to the existing performance gates.
+- Index joins already run per input table, so they are candidates for streaming instead
+  of fallback. Because a batch can expand into many solutions, the operator needs charged
+  fan-out state and resumable output before it counts as bounded.
 - The streaming hash join picks its key from the plan's certainty alone and scans the
   build side for every probe row otherwise. It should check the built data for unbound
-  values, as eager execution does.
+  values, as eager execution does. Bound probes must also match unbound build rows,
+  and an unbound probe must consider all compatible build rows. Compact row chains need
+  checked index-width limits, charges and duplicate/OPTIONAL/MINUS coverage.
 - Sort order travels as a claim on each batch. It should be a property of the operator,
   checked at batch boundaries in debug builds.
-- The result writer should decode several batches in parallel and prefetch the next one,
-  as the eager writer does.
+- Profile bounded coalescing, parallel batch decoding and one-batch prefetch in the
+  result writer. The serial decoding mechanism is established, but its contribution
+  to the remaining throughput difference needs measurement. All overlapping input,
+  decoded and transport state must remain charged, cancellable and bounded under
+  slow consumers. Extra producer work must respect callback ownership.
 - A total order for sort keys would let ORDER BY with LIMIT keep a bounded heap.
-- Scans should use the fast path for blocks without pending changes.
+  It must preserve SPARQL term/date/error and tie semantics, with independent ordered
+  tests, before replacing the current full-input sort barrier.
+- Extend charged scan sharing and selective decoding to untouched block ranges of
+  snapshots with pending changes. The merged scanner already emits untouched base
+  blocks, but inserts, deletes and access-control masks must still be applied.
 - Explicit streaming over HTTP should send its first bytes sooner than after 1 MiB.
+  Earlier response commitment needs explicit truncated-body behavior for later errors,
+  bounded admission of slow streaming bodies and documented transfer deadlines.
 - The differential test should cover filters, ordering, slicing, grouping, pending
-  changes and access-restricted views. Full-scale cold reads and loading need separately matched
-historical controls before their dated snapshot differences can be attributed to query
-execution.
+  changes, multiple blocks and access-restricted views. This extends the combined
+  generated matrix alongside existing focused tests and W3C cursor coverage.
+
+These are follow-up proposals, not measured speedups or a change to the delivered
+defaults. Strengthened tests and ordering invariants precede the operator changes,
+and disk spill follows the nearer-term fallback and output work. Full-scale cold reads
+and loading need separately matched historical controls before their dated snapshot
+differences can be attributed to query execution.
