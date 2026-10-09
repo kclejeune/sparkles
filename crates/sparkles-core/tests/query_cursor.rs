@@ -1626,6 +1626,57 @@ fn resumable_binary_joins_preserve_bags_compatibility_and_optional_filters() {
     }
 }
 
+/// The hash join keys on the shared column that its build data leaves unbound least
+/// often. Bound probes must still meet build rows that leave the key unbound, and an
+/// unbound probe meets every build row, with duplicates kept.
+#[test]
+fn hash_join_keys_cover_unbound_build_and_probe_values_with_duplicates() {
+    let s = store(0);
+    let left = "VALUES (?x ?y ?a) { (1 UNDEF 10) (UNDEF 2 11) (1 2 12) (1 2 12) (UNDEF UNDEF 13) (3 UNDEF 14) (2 3 15) }";
+    let right = "VALUES (?x ?y ?b) { (1 2 20) (1 2 20) (UNDEF 2 21) (1 UNDEF 22) (UNDEF UNDEF 23) (2 3 24) (2 UNDEF 25) (4 4 26) }";
+    // Every build row binds ?y here except one, and ?x is unbound in two.
+    let mostly =
+        "VALUES (?x ?y ?b) { (UNDEF 2 20) (1 2 21) (1 2 21) (UNDEF 3 22) (2 UNDEF 23) (3 4 24) }";
+    let mut queries = Vec::new();
+    for (l, r) in [(left, right), (right, left), (left, mostly), (mostly, left)] {
+        queries.push(format!("SELECT * WHERE {{ {l} {r} }}"));
+        queries.push(format!("SELECT * WHERE {{ {l} OPTIONAL {{ {r} }} }}"));
+        queries.push(format!(
+            "SELECT * WHERE {{ {l} OPTIONAL {{ {r} FILTER(?b > ?a + 10) }} }}"
+        ));
+        queries.push(format!("SELECT * WHERE {{ {l} MINUS {{ {r} }} }}"));
+    }
+    // Long runs of one key, so that chains are longer than a batch.
+    let many: String = (0..300).map(|i| format!("({} {}) ", i % 3, i)).collect();
+    let few: String = (0..40)
+        .map(|i| {
+            if i % 7 == 0 {
+                format!("(UNDEF {i}) ")
+            } else {
+                format!("({} {i}) ", i % 4)
+            }
+        })
+        .collect();
+    queries.push(format!(
+        "SELECT * WHERE {{ VALUES (?x ?a) {{ {many} }} VALUES (?x ?b) {{ {few} }} }}"
+    ));
+    queries.push(format!(
+        "SELECT * WHERE {{ VALUES (?x ?a) {{ {many} }} OPTIONAL {{ VALUES (?x ?b) {{ {few} }} }} }}"
+    ));
+    queries.push(format!(
+        "SELECT * WHERE {{ VALUES (?x ?a) {{ {few} }} MINUS {{ VALUES (?x ?b) {{ {many} }} }} }}"
+    ));
+    for q in &queries {
+        let q = q.as_str();
+        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        for cap in [1, 2, 3, 4096] {
+            let c = open(&s, q, cap);
+            assert!(!c.plan().has_materialization());
+            assert_eq!(bag(all(c)), expected, "{q}; cap {cap}");
+        }
+    }
+}
+
 #[test]
 fn incremental_groups_match_eager_for_empty_unbound_numeric_and_text_inputs() {
     let s = store(0);
