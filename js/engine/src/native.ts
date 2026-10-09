@@ -9,17 +9,27 @@ import { fileURLToPath } from 'node:url';
 export interface NativeCancellation {
   cancel(): void;
 }
+/**
+ * A batch of a result: the terms' text and one array with a header, the term entries
+ * and the cells, as `wireTerms` in the common package describes.
+ */
+export interface NativeBatch {
+  text: string;
+  data: Uint32Array;
+}
 /** A query result that JavaScript pulls in batches. */
 export interface NativeResult {
   info(): string;
   close(): Promise<void>;
   stats(): Promise<string>;
-  nextBatch(maxRows: number, maxBytes: number): Promise<string>;
+  /** the next batch, or null once the result is drained */
+  nextBatch(maxRows: number, maxBytes: number): Promise<NativeBatch | null>;
   /** the first batch, when the call that made the result computed it; given once */
-  takeFirst(): string | null;
+  takeFirst(): NativeBatch | null;
 }
 export interface NativeTransaction {
-  apply(operations: string): Promise<string>;
+  /** the answer itself when the transaction answers within microseconds, else a promise */
+  apply(operations: string): string | Promise<string>;
   query(text: string, options: string, cancel: NativeCancellation): Promise<NativeResult>;
   update(text: string, options: string, cancel: NativeCancellation): Promise<string>;
   matched(pattern: string, firstRows?: number, firstBytes?: number): Promise<NativeResult>;
@@ -42,6 +52,8 @@ export interface NativeDataset {
   count(): Promise<string>;
   countPattern(pattern: string): Promise<string>;
   matchedNow(pattern: string, firstRows: number, firstBytes: number): NativeResult | null;
+  /** whether a quad matches the pattern, for a dataset in memory; null for one on disk */
+  containsNow(pattern: string): boolean | null;
   matched(pattern: string, firstRows?: number, firstBytes?: number): Promise<NativeResult>;
   query(text: string, options: string, cancel: NativeCancellation): Promise<NativeResult>;
   update(text: string, options: string, cancel: NativeCancellation): Promise<string>;

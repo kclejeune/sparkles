@@ -8,11 +8,11 @@ mod rdf;
 mod streams;
 mod terms;
 mod utilities;
+mod wire;
 pub use utilities::utility;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use oxrdf::Term;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use sparkles::embed::{GraphMatch, QuadPattern, TxnWorker};
@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use wire::{Cell, TermTable, WireBatch};
 
 fn err(e: EngineError) -> napi::Error {
     let kind = match &e {
@@ -714,6 +715,20 @@ impl NativeDataset {
             .map(Some)
             .map_err(err)
     }
+    /// Whether a quad matches the pattern, on the calling thread, for a dataset in
+    /// memory, where the lookup takes microseconds. Returns `null` for a dataset on disk,
+    /// whose reads can wait for the device; JavaScript then matches through the pool.
+    #[napi]
+    pub fn contains_now(&self, pattern: String) -> napi::Result<Option<bool>> {
+        let shared = self.get(false)?;
+        if shared.ds.store().root().is_some() {
+            return Ok(None);
+        }
+        let pattern = parse(&pattern)?;
+        sparkles::embed::contains_in(&shared.ds.snapshot(), &quad_pattern(&pattern).map_err(err)?)
+            .map(Some)
+            .map_err(err)
+    }
     #[napi]
     pub async fn matched(
         &self,
@@ -790,38 +805,6 @@ fn query_result_len(r: &QueryResult) -> usize {
         r.triples.len() + r.quads.len()
     }
 }
-/// A cell of a wire row: a term, or the default graph in the fourth cell of a quad.
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum Cell {
-    Term(Term),
-    DefaultGraph,
-}
-
-impl Cell {
-    fn encode(&self) -> Value {
-        match self {
-            Cell::Term(t) => terms::encode(t),
-            Cell::DefaultGraph => json!({ "termType": "DefaultGraph", "value": "" }),
-        }
-    }
-
-    /// About the bytes of the cell's JSON, for the batch's byte limit.
-    fn size(&self) -> usize {
-        match self {
-            Cell::Term(Term::NamedNode(n)) => n.as_str().len() + 40,
-            Cell::Term(Term::BlankNode(n)) => n.as_str().len() + 40,
-            Cell::Term(Term::Literal(l)) => {
-                l.value().len()
-                    + l.datatype().as_str().len()
-                    + l.language().map_or(0, str::len)
-                    + 90
-            }
-            Cell::Term(Term::Triple(t)) => t.to_string().len() * 3,
-            Cell::DefaultGraph => 40,
-        }
-    }
-}
-
 /// A quad as the four cells of a wire row: subject, predicate, object and graph.
 fn quad_cells(q: oxrdf::Quad) -> Vec<Option<Cell>> {
     let graph = match q.graph_name {
@@ -865,11 +848,11 @@ fn query_result_row(r: &QueryResult, pos: usize) -> Option<Vec<Option<Cell>>> {
     }
 }
 
-/// One batch of a result as the JSON that JavaScript decodes, or `null` once it is drained.
+/// One batch of a result in the binary form of `wire`, or `None` once it is drained.
 /// The batch holds each distinct term once, and each row is a list of indexes into those
 /// terms (0 for unbound). A quad is a row of four cells, subject, predicate, object and
 /// graph, so a term that many quads share is sent and decoded once per batch.
-/// A batch that drains a materialized result or a scan says `"done":true`, and the rows
+/// A batch that drains a materialized result or a scan says it is done, and the rows
 /// are freed in the same call, so that JavaScript neither asks for another batch nor has
 /// anything to close.
 fn pull(
@@ -878,19 +861,19 @@ fn pull(
     cancel: &Option<Arc<AtomicBool>>,
     max_rows: u32,
     max_bytes: u32,
-) -> sparkles::Result<String> {
+) -> sparkles::Result<Option<WireBatch>> {
     let mut lock = cursor.lock();
     let Some(c) = lock.as_mut() else {
-        return Ok("null".into());
+        return Ok(None);
     };
-    let mut terms = vec![Value::Null];
-    let mut dictionary = HashMap::<Cell, u32>::new();
-    let mut rows = Vec::new();
-    let mut bytes = 0;
+    let mut table = TermTable::new();
+    let mut cells: Vec<u32> = Vec::new();
+    let mut rows = 0usize;
+    let mut width = 0usize;
     let mut drained = false;
-    while rows.len() < (max_rows.clamp(1, 65536) as usize)
-        && bytes < (max_bytes.clamp(1024, 16 << 20) as usize)
-    {
+    let max_rows = max_rows.clamp(1, 65536) as usize;
+    let max_bytes = max_bytes.clamp(1024, 16 << 20) as usize;
+    while rows < max_rows && table.text_bytes() + 4 * (cells.len() + 4 * table.len()) < max_bytes {
         if cancel
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Relaxed))
@@ -946,25 +929,14 @@ fn pull(
             break;
         };
         c.pos += 1;
-        let mut cells = Vec::with_capacity(row.len());
+        width = row.len();
         for cell in row {
-            let Some(cell) = cell else {
-                cells.push(0);
-                continue;
-            };
-            let id = if let Some(id) = dictionary.get(&cell) {
-                *id
-            } else {
-                let id = terms.len() as u32;
-                bytes += cell.size();
-                terms.push(cell.encode());
-                dictionary.insert(cell, id);
-                id
-            };
-            cells.push(id);
+            cells.push(match cell {
+                Some(cell) => table.cell(cell),
+                None => 0,
+            });
         }
-        bytes += cells.len() * 12 + 16;
-        rows.push(cells);
+        rows += 1;
     }
     // Materialized results and scans know they are drained once a row is missing. A
     // materialized result also knows it when the last row has been sent.
@@ -975,21 +947,21 @@ fn pull(
             _ => false,
         };
     }
-    if rows.is_empty() {
+    if rows == 0 {
         match &c.rows {
             Rows::Streaming(state) => *statistics.lock() = Some(state.stats_json(c.pos, false)?),
             Rows::Graph(state) => *statistics.lock() = Some(state.stats_json(c.pos, false)?),
             _ => {}
         }
         lock.take();
-        return Ok("null".into());
+        return Ok(None);
     }
     let eager = matches!(c.rows, Rows::Query(_) | Rows::Collected(_) | Rows::Scan(_));
-    if drained && eager {
+    let done = drained && eager;
+    if done {
         lock.take();
-        return Ok(json!({ "terms": terms, "rows": rows, "done": true }).to_string());
     }
-    Ok(json!({ "terms": terms, "rows": rows }).to_string())
+    Ok(Some(table.finish(cells, rows, width, done)))
 }
 
 struct SelectCursor {
@@ -1065,7 +1037,7 @@ pub struct NativeResult {
     statistics: Arc<Mutex<Option<String>>>,
     cancel: Option<Arc<AtomicBool>>,
     /// the first batch, computed in the call that made the result (see `with_first`)
-    first: Mutex<Option<String>>,
+    first: Mutex<Option<WireBatch>>,
 }
 impl NativeResult {
     fn query(result: QueryResult) -> Self {
@@ -1164,8 +1136,11 @@ impl NativeResult {
     /// under a reader permit.
     fn with_first(self, first: Option<(u32, u32)>) -> sparkles::Result<Self> {
         if let Some((rows, bytes)) = first {
+            // A drained result still sends an empty batch that says so, so that
+            // JavaScript does not ask the pool for a batch that cannot come.
             let batch = pull(&self.cursor, &self.statistics, &self.cancel, rows, bytes)?;
-            *self.first.lock() = Some(batch);
+            *self.first.lock() =
+                Some(batch.unwrap_or_else(|| TermTable::new().finish(Vec::new(), 0, 0, true)));
         }
         Ok(self)
     }
@@ -1240,11 +1215,15 @@ impl NativeResult {
     /// The first batch, when the call that made this result computed it. It is handed
     /// out once.
     #[napi]
-    pub fn take_first(&self) -> Option<String> {
+    pub fn take_first(&self) -> Option<WireBatch> {
         self.first.lock().take()
     }
     #[napi]
-    pub async fn next_batch(&self, max_rows: u32, max_bytes: u32) -> napi::Result<String> {
+    pub async fn next_batch(
+        &self,
+        max_rows: u32,
+        max_bytes: u32,
+    ) -> napi::Result<Option<WireBatch>> {
         let cursor = self.cursor.clone();
         let statistics = self.statistics.clone();
         let cancel = self.cancel.clone();
@@ -1256,6 +1235,88 @@ impl NativeResult {
         };
         blocking(move || pull(&cursor, &statistics, &cancel, max_rows, max_bytes)).await
     }
+}
+
+/// How long `apply` waits on the JavaScript thread for the answer of the transaction's
+/// thread before it returns a promise instead. P05 §1 allows a few microseconds there.
+const INLINE_WAIT: Duration = Duration::from_micros(10);
+
+/// The answer of a write that the transaction's thread sends back: not there yet, there,
+/// or owed to a promise because the caller stopped waiting for it.
+enum Handoff {
+    Waiting,
+    Ready(sparkles::Result<String>),
+    Promised(tokio::sync::oneshot::Sender<sparkles::Result<String>>),
+}
+
+impl Handoff {
+    fn take_ready(&mut self) -> Option<sparkles::Result<String>> {
+        match std::mem::replace(self, Handoff::Waiting) {
+            Handoff::Ready(r) => Some(r),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+}
+
+/// Sends the answer of a write to its `Handoff`. One dropped without an answer, because
+/// the transaction ended or the write panicked, answers that the transaction ended.
+struct Reply(Option<Arc<Mutex<Handoff>>>);
+
+impl Reply {
+    fn send(mut self, r: sparkles::Result<String>) {
+        if let Some(handoff) = self.0.take() {
+            deliver(&handoff, r);
+        }
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        if let Some(handoff) = self.0.take() {
+            deliver(&handoff, Err(EngineError::invalid("transaction ended")));
+        }
+    }
+}
+
+fn deliver(handoff: &Mutex<Handoff>, r: sparkles::Result<String>) {
+    let mut state = handoff.lock();
+    match std::mem::replace(&mut *state, Handoff::Waiting) {
+        Handoff::Promised(send) => {
+            let _ = send.send(r);
+        }
+        _ => *state = Handoff::Ready(r),
+    }
+}
+
+/// Apply `[insert, quad]` operations in order, returning the counts as JSON.
+fn apply_operations(
+    tx: &mut sparkles::Transaction<'_>,
+    values: &Value,
+) -> sparkles::Result<String> {
+    let mut inserted = 0u64;
+    let mut deleted = 0u64;
+    for v in values
+        .as_array()
+        .ok_or_else(|| EngineError::invalid("operations must be an array"))?
+    {
+        let insert = v[0]
+            .as_bool()
+            .ok_or_else(|| EngineError::invalid("operation must be boolean"))?;
+        let q = terms::quad(&v[1])?;
+        if insert {
+            inserted += tx.insert(q.as_ref())? as u64
+        } else {
+            deleted += tx.remove(q.as_ref())? as u64
+        }
+    }
+    Ok(json!({
+        "inserted": inserted.to_string(),
+        "deleted": deleted.to_string(),
+    })
+    .to_string())
 }
 
 #[napi]
@@ -1272,55 +1333,86 @@ impl NativeTransaction {
         &self,
         env: &'env napi::Env,
         operations: String,
-    ) -> napi::Result<PromiseRaw<'env, String>> {
+    ) -> napi::Result<Either<String, PromiseRaw<'env, String>>> {
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(invalid("transaction was aborted by an earlier failure"));
         }
         let poisoned = self.poisoned.clone();
         let values = parse(&operations)?;
         let worker = self.inner.clone();
-        env.spawn_future(async move {
-            let result = blocking(move || {
-                let worker = worker.lock();
-                let worker = worker
-                    .as_ref()
-                    .ok_or_else(|| EngineError::invalid("transaction ended"))?;
-                worker.run(move |tx| {
-                    let mut inserted = 0u64;
-                    let mut deleted = 0u64;
-                    let operations = values
-                        .as_array()
-                        .ok_or_else(|| EngineError::invalid("operations must be an array"))?
-                        .iter()
-                        .map(|v| {
-                            Ok((
-                                v[0].as_bool().ok_or_else(|| {
-                                    EngineError::invalid("operation must be boolean")
-                                })?,
-                                terms::quad(&v[1])?,
-                            ))
+        // The operations go straight to the transaction's thread. A small write answers
+        // within microseconds, so this thread waits for it for a few microseconds and
+        // returns the answer itself, which wakes no other thread. A later answer comes
+        // through a promise.
+        let handoff = Arc::new(Mutex::new(Handoff::Waiting));
+        let submitted = {
+            let Some(guard) = worker.try_lock() else {
+                // another call holds the worker, so wait for it on the pool
+                return env
+                    .spawn_future(async move {
+                        let result = blocking(move || {
+                            worker
+                                .lock()
+                                .as_ref()
+                                .ok_or_else(|| EngineError::invalid("transaction ended"))?
+                                .run(move |tx| apply_operations(tx, &values))
                         })
-                        .collect::<sparkles::Result<Vec<_>>>()?;
-                    for (insert, q) in operations {
-                        if insert {
-                            inserted += tx.insert(q.as_ref())? as u64
-                        } else {
-                            deleted += tx.remove(q.as_ref())? as u64
+                        .await;
+                        if result.is_err() {
+                            poisoned.store(true, Ordering::Relaxed)
                         }
-                    }
-                    Ok(json!({
-                        "inserted": inserted.to_string(),
-                        "deleted": deleted.to_string(),
+                        result
                     })
-                    .to_string())
-                })
-            })
-            .await;
-            if result.is_err() {
+                    .map(Either::B);
+            };
+            match guard.as_ref() {
+                None => Err(EngineError::invalid("transaction ended")),
+                Some(w) => {
+                    let reply = Reply(Some(handoff.clone()));
+                    w.submit(
+                        move |tx| apply_operations(tx, &values),
+                        move |r| reply.send(r),
+                    )
+                }
+            }
+        };
+        let settle = move |r: sparkles::Result<String>| {
+            if r.is_err() {
                 poisoned.store(true, Ordering::Relaxed)
             }
-            result
+            r.map_err(err)
+        };
+        if let Err(e) = submitted {
+            return settle(Err(e)).map(Either::A);
+        }
+        let start = Instant::now();
+        let mut round = 0u32;
+        loop {
+            if let Some(r) = handoff.lock().take_ready() {
+                return settle(r).map(Either::A);
+            }
+            round = round.wrapping_add(1);
+            if round.is_multiple_of(64) && start.elapsed() >= INLINE_WAIT {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        let (send, answer) = tokio::sync::oneshot::channel();
+        {
+            let mut state = handoff.lock();
+            if let Some(r) = state.take_ready() {
+                return settle(r).map(Either::A);
+            }
+            *state = Handoff::Promised(send);
+        }
+        env.spawn_future(async move {
+            settle(
+                answer
+                    .await
+                    .unwrap_or_else(|_| Err(EngineError::invalid("transaction ended"))),
+            )
         })
+        .map(Either::B)
     }
     #[napi]
     pub async fn query(
