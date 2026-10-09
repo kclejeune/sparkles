@@ -1081,6 +1081,13 @@ fn plan_bytes(node: &Node) -> u64 {
 
 enum State {
     Scalar(Node),
+    /// Counts per key, read from the index or its statistics into charged group state
+    /// before the first output.
+    Counts {
+        node: Node,
+        loaded: Option<Buffer>,
+        at: usize,
+    },
     Merge(Box<merge::Merge>),
     Distinct(distinct::Distinct),
     Binary(Box<binary::Binary>),
@@ -1149,6 +1156,7 @@ fn supported(kind: &Kind) -> bool {
         | Kind::Distinct
         | Kind::CountScan { .. }
         | Kind::CountDistinctScan { .. }
+        | Kind::GroupCountScan { .. }
         | Kind::Slice { .. }
         | Kind::Union => true,
         Kind::RangeScan(_, r) => !r.filter.iter().any(super::expr::Expr::has_exists),
@@ -1227,6 +1235,8 @@ fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
                 spec.cols.iter().map(|&(_, v)| v).collect()
             }
             Kind::Values(table) => table.sorted.clone(),
+            // Keys come in index order, one row each.
+            Kind::GroupCountScan { key, .. } => vec![*key],
             Kind::Project(_)
             | Kind::Distinct
             | Kind::Filter(_)
@@ -1339,7 +1349,11 @@ impl Operator {
         let incremental_binary = !incremental_merge && joins;
         let growing = matches!(
             node.kind,
-            Kind::Extend(..) | Kind::Filter(_) | Kind::RangeScan(..) | Kind::Distinct
+            Kind::Extend(..)
+                | Kind::Filter(_)
+                | Kind::RangeScan(..)
+                | Kind::Distinct
+                | Kind::GroupCountScan { .. }
         ) || materializes
             || native_blocking
             || incremental_merge
@@ -1424,6 +1438,11 @@ impl Operator {
                 Kind::CountScan { .. }
                 | Kind::CountDistinctScan { .. }
                 | Kind::CountFilterScan { .. } => State::Scalar(node),
+                Kind::GroupCountScan { .. } => State::Counts {
+                    node,
+                    loaded: None,
+                    at: 0,
+                },
                 Kind::Distinct => State::Distinct(distinct::Distinct::new(ctx)?),
                 Kind::Slice { offset, limit } => State::Slice {
                     offset: *offset,
@@ -1531,7 +1550,11 @@ impl Operator {
             full_input_before_output: self.materializes
                 || matches!(
                     self.state,
-                    State::Binary(_) | State::Group(_) | State::Scalar(_) | State::Blocking { .. }
+                    State::Binary(_)
+                        | State::Group(_)
+                        | State::Scalar(_)
+                        | State::Counts { .. }
+                        | State::Blocking { .. }
                 ),
             growing_state: self.growing,
             complete: false,
@@ -1703,7 +1726,7 @@ impl Operator {
             // Eager kernels already counted all their operator work during execution.
             if !matches!(
                 self.state,
-                State::Fallback { .. } | State::Scalar(_) | State::Expand(_)
+                State::Fallback { .. } | State::Scalar(_) | State::Counts { .. } | State::Expand(_)
             ) {
                 ctx.produced(b.table.len)?;
             }
@@ -1732,6 +1755,20 @@ impl Operator {
                     debug_assert!(table.len <= 1);
                     self.done = true;
                     Some(Buffer { table, charge })
+                }
+                State::Counts { node, loaded, at } => {
+                    if loaded.is_none() {
+                        let (table, _) = exec::execute(ctx, node)?;
+                        let charge = OwnedCharge::new(ctx, capacity_bytes(&table))?;
+                        *loaded = Some(Buffer { table, charge });
+                    }
+                    let table = &loaded.as_ref().expect("loaded counts").table;
+                    let batch = copy_rows(ctx, table, *at, cap)?;
+                    if let Some(batch) = &batch {
+                        *at += batch.table.len;
+                    }
+                    self.done = *at == table.len;
+                    batch
                 }
                 State::Merge(merge) => {
                     merge.next(ctx, &mut self.children, options, &self.vars, cap)?

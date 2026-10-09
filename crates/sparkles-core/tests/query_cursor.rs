@@ -3076,3 +3076,45 @@ fn widened_incremental_groups_match_eager() {
         }
     }
 }
+
+/// Counts per key, from the index statistics or from key runs, keep group state and
+/// emit it across batches without falling back, also over pending changes.
+#[test]
+fn group_count_scans_stream_their_counts() {
+    fn has(plan: &sparkles_core::sparql::CursorPlan, prefix: &str) -> bool {
+        plan.operator.operator.starts_with(prefix) || plan.children.iter().any(|c| has(c, prefix))
+    }
+    let s = store(50);
+    let data = (0..50)
+        .map(|i| format!("<urn:s:{}> <urn:q> <urn:s:{i}> .\n", i % 7))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.compact().unwrap();
+    let queries = [
+        "SELECT ?p (COUNT(*) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?p",
+        "SELECT ?s (COUNT(*) AS ?c) WHERE { ?s <urn:q> ?o } GROUP BY ?s",
+        "SELECT ?o (COUNT(?s) AS ?c) WHERE { ?s <urn:q> ?o } GROUP BY ?o",
+    ];
+    for round in 0..2 {
+        for q in queries {
+            let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+            for cap in [1, 2, 3, 4096] {
+                let c = open(&s, q, cap);
+                assert!(has(c.plan(), "GroupCount"), "{q}: {:?}", c.plan());
+                assert!(!c.plan().has_materialization());
+                assert_eq!(bag(all(c)), expected, "{q}; cap {cap}; round {round}");
+            }
+        }
+        sparkles_core::sparql::update::update(
+            &s,
+            "INSERT DATA { <urn:s:1> <urn:q> <urn:new> . <urn:s:9> <urn:q> <urn:s:1> } ; DELETE DATA { <urn:s:3> <urn:q> <urn:s:3> }",
+            &Default::default(),
+        )
+        .unwrap();
+    }
+}
