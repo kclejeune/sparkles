@@ -2581,6 +2581,10 @@ fn run() -> Result<()> {
                 .thread_stack_size(THREAD_STACK)
                 .enable_all()
                 .build()?;
+            // Queries run on the runtime's blocking threads, which it also starts on first
+            // use. One started here serves a first query that arrives soon after the
+            // server is ready, which then does not wait for a thread to be created.
+            rt.block_on(async { tokio::task::spawn_blocking(|| ()).await })?;
             // backup tasks drive the repository engine on this runtime
             #[cfg(feature = "backup")]
             backup::start(&st, rt.handle());
