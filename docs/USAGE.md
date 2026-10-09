@@ -124,6 +124,27 @@ only from the UI itself, with its inline start-up scripts allowed by hash. Their
 WebAssembly module. That permits WebAssembly compilation only, not JavaScript's `eval`.
 API responses have `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`.
 
+### Limits that are off by default
+
+Several limits are off or generous by default on purpose, so that a server on a laptop
+or behind trusted callers never refuses a large but legitimate request. A server that
+untrusted callers can reach should set them:
+
+* `--max-export-mb` is `0`, so a Graph Store GET may export a whole dataset of any size.
+  The query budgets do not apply to it.
+* `--update-timeout` is `0`, so an update without a `timeout` parameter runs until it
+  finishes. `--max-timeout` only caps the timeout that a request asks for.
+* `--max-dataset-mb` is `0`, so a persistent dataset has no storage quota. Only the
+  free-disk reserve (`--min-free-disk-mb`) stops writes.
+* `--max-decompressed-mb` is `65536` (64 GiB), the most that a request body or an RDF
+  source may decompress to.
+* `--rate-limit` is off without `--auth-config`. With it, the default limits only
+  authentication failures per address (`preauth`), and queries, updates and admin
+  requests have no limit.
+
+The [`serve` options](#serve-options) table describes the flags, and
+[API.md](API.md#compression) describes `--max-decompressed-mb`.
+
 ### TLS
 
 Most deployments terminate TLS at a reverse proxy, such as the nginx virtual host of the
