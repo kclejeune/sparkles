@@ -96,6 +96,33 @@ impl PyQuadIterator {
     }
 }
 
+impl PyQuadIterator {
+    /// The next batch of quads, empty once the source is drained (`sparkles.rdflib`
+    /// converts whole batches). An error is raised after the quads read before it.
+    pub(crate) fn take_batch(&self, py: Python<'_>) -> PyResult<Vec<Quad>> {
+        {
+            let mut st = self.state.lock().unwrap();
+            if !st.buf.is_empty() {
+                return Ok(st.buf.drain(..).collect());
+            }
+        }
+        py.detach(|| {
+            let mut st = self.state.lock().unwrap();
+            refill(&mut st);
+            let quads: Vec<Quad> = st.buf.drain(..).collect();
+            match st.error.take() {
+                Some(e) if quads.is_empty() => Err(e),
+                Some(e) => {
+                    st.error = Some(e);
+                    Ok(quads)
+                }
+                None => Ok(quads),
+            }
+        })
+        .py(py)
+    }
+}
+
 /// Read the next batch from the source into an empty buffer.
 fn refill(st: &mut QuadState) {
     if !st.buf.is_empty() || st.done {
@@ -145,6 +172,22 @@ pub struct PyQuerySolutions {
 }
 
 impl PyQuerySolutions {
+    /// The next batch of rows, empty once all have been handed out (`sparkles.rdflib`
+    /// converts whole batches).
+    pub(crate) fn take_batch(&self, py: Python<'_>) -> Vec<Vec<Option<Term>>> {
+        {
+            let mut st = self.state.lock().unwrap();
+            if !st.buf.is_empty() {
+                return st.buf.drain(..).collect();
+            }
+        }
+        py.detach(|| {
+            let mut st = self.state.lock().unwrap();
+            fill_solutions(&mut st);
+            st.buf.drain(..).collect()
+        })
+    }
+
     pub fn new(result: QueryResult) -> PyQuerySolutions {
         PyQuerySolutions {
             vars: result.vars.clone().into(),

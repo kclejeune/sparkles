@@ -553,6 +553,87 @@ def test_parse_and_serialize_match_rdflib_memory(store: SparklesStore) -> None:
     assert isomorphic(again, theirs)
 
 
+def mixed_data(n: int) -> str:
+    """N-Triples with every kind of term, more triples than one native batch (1,024)."""
+    lines = []
+    for i in range(n):
+        s = f"<urn:example:s{i % 211}>"
+        lines.append(f'{s} <urn:example:plain> "v{i % 53}" .')
+        lines.append(f'{s} <urn:example:lang> "w{i % 17}"@en-gb .')
+        lines.append(f'{s} <urn:example:typed> "{i}"^^<http://www.w3.org/2001/XMLSchema#integer> .')
+        lines.append(f"{s} <urn:example:link> _:b{i % 13} .")
+        lines.append(f"_:b{i % 13} <urn:example:name> <urn:example:o{i % 29}> .")
+    return "\n".join(lines)
+
+
+def test_batch_conversion_matches_rdflib_memory(store: SparklesStore) -> None:
+    data = mixed_data(800)
+    ours = Graph(store, identifier=C1)
+    ours.parse(data=data, format="nt")
+    theirs = Graph()
+    theirs.parse(data=data, format="nt")
+    from rdflib.compare import isomorphic
+
+    assert isomorphic(ours, theirs)
+    # node by node, with the blank nodes read back under their rdflib labels
+    labels = {o for o in ours.objects(None, URIRef("urn:example:link"))}
+    assert len(labels) == 13 and all(isinstance(b, BNode) for b in labels)
+    counts = sorted(len(list(ours.triples((b, None, None)))) for b in labels)
+    expected = sorted(
+        len(list(theirs.triples((b, None, None)))) for b in set(theirs.objects(None, URIRef("urn:example:link")))
+    )
+    assert counts == expected
+    lang = {o for o in ours.objects(EX.s5, URIRef("urn:example:lang"))}
+    assert lang and all(o.language == "en-gb" for o in lang)
+    typed = list(ours.objects(EX.s5, URIRef("urn:example:typed")))
+    assert typed and all(o.datatype == URIRef("http://www.w3.org/2001/XMLSchema#integer") for o in typed)
+    # the union of the contexts, which groups the quads of each triple
+    cg = ConjunctiveGraph(store)
+    Graph(store, identifier=C2).add((EX.s5, URIRef("urn:example:plain"), Literal("v5")))
+    contexts = {
+        t: {c.identifier for c in cs} for t, cs in store.triples((EX.s5, URIRef("urn:example:plain"), None), context=cg)
+    }
+    assert contexts[(EX.s5, URIRef("urn:example:plain"), Literal("v5"))] == {C1, C2}
+    assert len(contexts) == len(set(ours.objects(EX.s5, URIRef("urn:example:plain"))))
+
+
+def test_query_rows_convert_in_batches(store: SparklesStore) -> None:
+    g = Graph(store, identifier=C1)
+    g.parse(data=mixed_data(800), format="nt")
+    rows = list(
+        g.query(
+            "SELECT ?s ?o ?n WHERE { ?s <urn:example:typed> ?o OPTIONAL { ?s <urn:example:none> ?n } }"
+        )
+    )
+    assert len(rows) == 800
+    assert all(r.n is None and isinstance(r.o, Literal) and isinstance(r.s, URIRef) for r in rows)
+    assert {int(r.o) for r in rows} == set(range(800))
+    blanks = {r.b for r in g.query("SELECT ?b WHERE { <urn:example:s3> <urn:example:link> ?b }")}
+    assert blanks and all(isinstance(b, BNode) for b in blanks)
+    assert all((b, URIRef("urn:example:name"), None) in g for b in blanks)
+
+
+def test_patterns_with_iris_that_cannot_be_stored_match_nothing(store: SparklesStore) -> None:
+    g = Graph(store, identifier=C1)
+    populate(g)
+    for _ in range(2):  # the second read uses the kept pattern terms
+        assert (TAREK, LIKES, PIZZA) in g
+        assert (URIRef("not an iri"), LIKES, PIZZA) not in g
+        assert g.value(URIRef("relative"), LIKES) is None
+
+
+def test_blank_graph_name_learned_after_a_read() -> None:
+    ds = sparkles.Dataset()
+    ds.load("_:g { <urn:example:a> <urn:example:p> <urn:example:o> . }", "trig")
+    (name,) = ds.named_graphs()
+    store = SparklesStore(dataset=ds)
+    g = Graph(store, identifier=BNode(name.value))
+    # until the store has read that blank-node graph, the identifier is a graph: IRI
+    assert len(list(g.triples((None, None, None)))) == 0
+    assert [c.identifier for c in ConjunctiveGraph(store).contexts()] == [BNode(name.value)]
+    assert len(list(g.triples((None, None, None)))) == 1
+
+
 def test_entry_point() -> None:
     eps = importlib.metadata.entry_points(group="rdflib.plugins.store")
     found = [ep for ep in eps if ep.name == "Sparkles"]
