@@ -27,7 +27,8 @@ const READ_AHEAD: usize = 2;
 /// Bytes of a block header: rows and four column lengths.
 const HEADER: usize = 20;
 
-/// Write sorted keys as a run file. Returns its size.
+/// Write keys as a run file: a sorted run, or a batch's quads in the order they were read.
+/// Returns its size.
 pub(super) fn write_run(path: &Path, keys: &[Key]) -> Result<u64> {
     let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
     let mut n = 0;

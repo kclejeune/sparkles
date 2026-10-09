@@ -3,10 +3,12 @@
 //! 1. **Parse & encode** (parallel): each parser chunk owns an [`Encoder`] that maps
 //!    terms to inline ids / blank-node ids, or to *batch-local* ids for vocabulary terms.
 //!    Every `batch_quads` quads, the batch's distinct keys are sorted and written as a
-//!    partial vocabulary together with the batch's quads.
+//!    partial vocabulary (front-coded and LZ4-compressed blocks, see
+//!    [`vocabmerge::write_partial`]) together with the batch's quads (compressed blocks
+//!    of columns, in the format of a sorted run).
 //! 2. **Vocabulary merge**: k-way merge of all partial vocabularies into the sorted,
 //!    front-coded base vocabulary; per-batch `rank → global id` maps are written
-//!    sequentially along the way.
+//!    along the way as delta-coded records (see [`vocabmerge::Maps`]).
 //! 3. **Remap and sort**: the batches are read once, in chunks of `sort_mem_quads`
 //!    quads, and remapped to global ids in parallel. Each chunk is sorted in place in the
 //!    order of SPO, OSP and PSO (and GSPO when there are named graphs) and written as a
@@ -29,7 +31,6 @@ use crate::index::{Key, Perm, PermWriter};
 use crate::io::{QuadSink, Source, parse_source};
 use crate::sparql::cdt;
 use crate::vocab::Vocab;
-use memmap2::Mmap;
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -37,8 +38,6 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -153,6 +152,8 @@ pub const FORMAT_VERSION: u32 = 2;
 
 struct BatchInfo {
     id: usize,
+    /// the place of the batch in the order of `id`, set before the vocabulary merge
+    pos: usize,
     keys: u64,
     quads: u64,
     /// every [`vocabmerge::SAMPLE_EVERY`]th key of the partial vocabulary
@@ -312,16 +313,11 @@ impl Builder {
         for (r, (_, local)) in entries.iter().enumerate() {
             rank[*local as usize] = r as u64;
         }
-        let mut w = BufWriter::new(File::create(self.tmp.join(format!("b{id}.voc")))?);
-        let mut voc_bytes = 0;
-        for (k, _) in &entries {
-            w.write_all(&(k.len() as u32).to_le_bytes())?;
-            w.write_all(k)?;
-            voc_bytes += 4 + k.len() as u64;
-        }
-        w.flush()?;
+        let (samples, voc_bytes) = vocabmerge::write_partial(
+            &self.tmp.join(format!("b{id}.voc")),
+            entries.iter().map(|(k, _)| &**k),
+        )?;
         self.tmp_bytes.add(iostat::Tmp::PartialVocab, voc_bytes);
-        let samples = vocabmerge::samples(entries.iter().map(|(k, _)| &**k));
         for q in quads.iter_mut() {
             for v in q.iter_mut() {
                 if Id(*v).tag() == Tag::Local {
@@ -329,9 +325,8 @@ impl Builder {
                 }
             }
         }
-        write_u64s(&self.tmp.join(format!("b{id}.q")), quads.as_flattened())?;
-        self.tmp_bytes
-            .add(iostat::Tmp::Quads, quads.len() as u64 * 32);
+        let q_bytes = runs::write_run(&self.tmp.join(format!("b{id}.q")), &quads)?;
+        self.tmp_bytes.add(iostat::Tmp::Quads, q_bytes);
         self.input_quads
             .fetch_add(quads.len() as u64, Ordering::Relaxed);
         if quads.iter().any(|q| q[3] != Id::DEFAULT_GRAPH.0) {
@@ -339,6 +334,7 @@ impl Builder {
         }
         self.batches.lock().push(BatchInfo {
             id,
+            pos: 0,
             keys: entries.len() as u64,
             quads: quads.len() as u64,
             samples,
@@ -350,6 +346,9 @@ impl Builder {
     pub fn finish(self) -> Result<IndexMeta> {
         let mut batches = std::mem::take(&mut *self.batches.lock());
         batches.sort_by_key(|b| b.id);
+        for (i, b) in batches.iter_mut().enumerate() {
+            b.pos = i;
+        }
         let total_in: u64 = batches.iter().map(|b| b.quads).sum();
         self.phase_done("parse");
         self.report(&format!(
@@ -373,12 +372,11 @@ impl Builder {
             .iter_mut()
             .map(|b| vocabmerge::Partial {
                 voc: self.tmp.join(format!("b{}.voc", b.id)),
-                map: self.tmp.join(format!("b{}.map", b.id)),
                 keys: b.keys,
                 samples: std::mem::take(&mut b.samples),
             })
             .collect();
-        let (terms, starts) = vocabmerge::merge(
+        let (terms, maps) = vocabmerge::merge(
             &self.dir,
             &self.tmp,
             &parts,
@@ -401,11 +399,11 @@ impl Builder {
         drop(vocab);
         let plan = Plan::new(self.named_graphs.load(Ordering::Relaxed));
         let mut built = if total_in as usize <= self.opts.sort_mem_quads {
-            let built = self.build_in_memory(&batches, &starts, &plan, rdf_type)?;
+            let built = self.build_in_memory(&batches, maps, &plan, rdf_type)?;
             self.phase_done("sort and permutations");
             built
         } else {
-            let runs = self.sorted_runs(&batches, &starts, &plan)?;
+            let runs = self.sorted_runs(&batches, maps, &plan)?;
             self.phase_done("chunk sorts");
             let built = self.merge_runs(runs, &plan, rdf_type)?;
             self.phase_done("permutations");
@@ -468,9 +466,14 @@ impl Builder {
         Ok(meta)
     }
 
-    /// Read the batches of `chunk` into `buf`, remapped to global ids (`starts`: the first
-    /// id of each range of the vocabulary merge), and delete them.
-    fn load_chunk(&self, chunk: &[BatchInfo], starts: &[u64], buf: &mut Vec<Key>) -> Result<()> {
+    /// Read the batches of `chunk` into `buf`, remapped to global ids by `maps`, and
+    /// delete them.
+    fn load_chunk(
+        &self,
+        chunk: &[BatchInfo],
+        maps: &vocabmerge::Maps,
+        buf: &mut Vec<Key>,
+    ) -> Result<()> {
         let n: usize = chunk.iter().map(|b| b.quads as usize).sum();
         buf.clear();
         buf.resize(n, [0; 4]);
@@ -485,31 +488,28 @@ impl Builder {
             .par_iter()
             .zip(parts)
             .try_for_each(|(b, out)| -> Result<()> {
-                let mp = self.tmp.join(format!("b{}.map", b.id));
                 let qp = self.tmp.join(format!("b{}.q", b.id));
-                let map = read_map(&mp)?;
-                let f = File::open(&qp)?;
-                if f.metadata()?.len() != b.quads * 32 {
-                    return Err(Error::Corrupt(format!("batch file {}", qp.display())));
-                }
-                if b.quads > 0 {
-                    // SAFETY: temporary file written by this builder and not modified
-                    // concurrently.
-                    let m = unsafe { Mmap::map(&f)? };
-                    let _ = m.advise(memmap2::Advice::Sequential);
-                    for (q, raw) in out.iter_mut().zip(m.as_chunks::<32>().0) {
-                        for (i, v) in q.iter_mut().enumerate() {
-                            let x = u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+                let map = maps.read(b.pos, b.keys)?;
+                let bad = || Error::Corrupt(format!("batch file {}", qp.display()));
+                let mut r = runs::RunReader::open(&qp)?;
+                let mut at = 0;
+                while let Some(block) = r.next_block()? {
+                    let dst = out.get_mut(at..at + block.len()).ok_or_else(bad)?;
+                    for (q, k) in dst.iter_mut().zip(&block) {
+                        for (v, &x) in q.iter_mut().zip(k) {
                             *v = if Id(x).tag() == Tag::Local {
-                                Id::vocab(vocabmerge::global(starts, map[Id(x).payload() as usize]))
-                                    .0
+                                let g = map.get(Id(x).payload() as usize).ok_or_else(bad)?;
+                                Id::vocab(*g).0
                             } else {
                                 x
                             };
                         }
                     }
+                    at += block.len();
                 }
-                std::fs::remove_file(&mp)?;
+                if at != out.len() {
+                    return Err(bad());
+                }
                 std::fs::remove_file(&qp)?;
                 Ok(())
             })
@@ -530,7 +530,7 @@ impl Builder {
     fn sorted_runs(
         &self,
         batches: &[BatchInfo],
-        starts: &[u64],
+        maps: vocabmerge::Maps,
         plan: &Plan,
     ) -> Result<Vec<Vec<PathBuf>>> {
         let budget = self.opts.sort_mem_quads.max(1) as u64;
@@ -558,7 +558,7 @@ impl Builder {
                 chunks.len(),
                 chunk.iter().map(|b| b.quads).sum::<u64>()
             ));
-            self.load_chunk(chunk, starts, &mut buf)?;
+            self.load_chunk(chunk, &maps, &mut buf)?;
             let mut cur = Perm::Spo;
             for (o, (first, _)) in plan.orders.iter().enumerate() {
                 Self::sort_as(&mut buf, cur, *first);
@@ -572,6 +572,7 @@ impl Builder {
                 runs[o].push(p);
             }
         }
+        maps.remove()?;
         Ok(runs)
     }
 
@@ -625,12 +626,13 @@ impl Builder {
     fn build_in_memory(
         &self,
         batches: &[BatchInfo],
-        starts: &[u64],
+        maps: vocabmerge::Maps,
         plan: &Plan,
         rdf_type: Option<u64>,
     ) -> Result<Vec<Built>> {
         let mut buf: Vec<Key> = Vec::new();
-        self.load_chunk(batches, starts, &mut buf)?;
+        self.load_chunk(batches, &maps, &mut buf)?;
+        maps.remove()?;
         let mut cur = Perm::Spo;
         let mut out = Vec::new();
         for (first, derived) in &plan.orders {
@@ -1183,29 +1185,6 @@ impl StatsCollector {
             _ => {}
         }
     }
-}
-
-fn write_u64s(path: &Path, vals: &[u64]) -> Result<()> {
-    let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
-    for v in vals {
-        w.write_all(&v.to_le_bytes())?;
-    }
-    w.flush()?;
-    Ok(())
-}
-
-fn read_map(path: &Path) -> Result<Vec<u64>> {
-    let f = File::open(path)?;
-    if f.metadata()?.len() == 0 {
-        return Ok(Vec::new());
-    }
-    // SAFETY: temporary file written by this builder and not modified concurrently.
-    let m = unsafe { Mmap::map(&f)? };
-    Ok(m.as_chunks::<8>()
-        .0
-        .iter()
-        .map(|c| u64::from_le_bytes(*c))
-        .collect())
 }
 
 pub fn now_rfc3339() -> String {
