@@ -857,7 +857,17 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
 #[test]
 fn eager_fallback_is_visible_lazy_and_budgeted() {
     let s = store(100);
-    let q = "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o BIND(STR(?o) AS ?t) ?x <http://jena.apache.org/ARQ/property#strSplit> (?t \"1\") }";
+    let data = (0..100)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7) % 100))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q =
+        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }";
     assert!(matches!(
         select_cursor(s.snapshot(), q, &Default::default(), &options(2)),
         Err(Error::Unsupported(_))
@@ -2039,7 +2049,7 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            "SELECT * {?s ?p ?o BIND(STR(?o) AS ?t) ?x <http://jena.apache.org/ARQ/property#strSplit> (?t \"1\")}",
+            "SELECT (COUNT(*) AS ?n) {{?s ?p ?o} UNION {?o ?p ?s} ?s ?q ?t}",
             &Default::default(),
             &strict,
             ExecutionMode::Auto,
@@ -2562,7 +2572,24 @@ impl Gen {
         if depth == 0 || self.rng.below(3) == 0 {
             return self.leaf();
         }
-        match self.rng.below(9) {
+        match self.rng.below(10) {
+            9 => {
+                // A LATERAL that is not a join: the right side keeps one ordered
+                // solution per left row, or keeps the left row without one.
+                let (left, mut scope) = self.pattern(depth - 1);
+                let x = self.var();
+                let others: Vec<&'static str> = VARS.iter().copied().filter(|v| *v != x).collect();
+                let y = self.pick(&others);
+                let p = self.pick(&["<urn:p>", "<urn:q>"]);
+                let right = if self.rng.below(2) == 0 {
+                    scope.insert(x);
+                    format!("SELECT {x} {y} WHERE {{ {x} {p} {y} }} ORDER BY {y} LIMIT 1")
+                } else {
+                    format!("SELECT {y} WHERE {{ {x} {p} {y} }} ORDER BY DESC({y}) LIMIT 2")
+                };
+                scope.insert(y);
+                (format!("{{ {left} }} LATERAL {{ {right} }}"), scope)
+            }
             0..=4 => {
                 let (left, mut ls) = self.pattern(depth - 1);
                 let (right, rs) = self.pattern(depth - 1);
@@ -3052,8 +3079,8 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
         }
     }
     for q in [
-        "SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(?o < 20) BIND(STR(?o) AS ?t) ?x <http://jena.apache.org/ARQ/property#strSplit> (?t \"1\") }",
-        "SELECT ?s ?x WHERE { { ?s <urn:q> ?t } UNION { ?t <urn:q> ?s } BIND(STR(?s) AS ?u) ?x <http://jena.apache.org/ARQ/property#strSplit> (?u \":\") }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }",
+        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }",
     ] {
         let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
         for rows in [1, 2, 3, 4096] {

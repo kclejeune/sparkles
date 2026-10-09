@@ -1,6 +1,7 @@
 //! Operators that map each input row to any number of output rows on their own: index
-//! joins, LET, UNFOLD and triple-term decomposition in input order, and transitive
-//! paths from the start nodes of their input. Each input
+//! joins, LET, UNFOLD and triple-term decomposition in input order, transitive paths
+//! from the start nodes of their input, local LATERAL and ARQ property functions over
+//! an input. Each input
 //! batch runs through the eager kernel. A path over a sequence or alternative first
 //! reads its edge plan into a charged edge relation, which every batch then walks. Its output is charged state that later pulls
 //! resume, so one batch that expands into many solutions leaves the following batches
@@ -18,6 +19,12 @@ pub(super) fn eligible(node: &Node) -> bool {
         Kind::IndexJoin(_) | Kind::Assign(..) | Kind::Unfold { .. } | Kind::Unpack { .. } => {
             node.children.len() == 1
         }
+        // LATERAL evaluates its right side for each left row, and an ARQ property
+        // function solves each input row, so the output of an input batch is the
+        // output of those rows, and a prefix of the input gives a subset of the
+        // output. A remote LATERAL sends several groups per request and stays eager.
+        Kind::Lateral(spec) => spec.service.is_none() && node.children.len() == 1,
+        Kind::PropertyFn(_) => node.children.len() == 1,
         // A path from the start nodes of its input (the last child), after the edge
         // plan when it has one.
         Kind::Path {
