@@ -204,7 +204,7 @@ fn entries() -> Vec<(&'static str, Entry)> {
             ds.dump_graph(oxrdf::GraphNameRef::DefaultGraph, Vec::new(), any());
         }),
         op!("datasetHead", "dataset.dump", |ds| {
-            ds.dump(Vec::new(), any());
+            ds.dump(Vec::new(), any::<sparkles::RdfSyntax>());
         }),
         op!("gspPost", "dataset.load_sources_receipt", |ds| {
             ds.load_sources_receipt(Vec::new());
