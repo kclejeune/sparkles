@@ -121,3 +121,28 @@ test('a drained result still reports its statistics and closes cleanly', async (
     await ds.close();
   }
 });
+
+test('a match runs inline in memory and on the pool on disk, with the same answers', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'sparkles-batches-'));
+  const memory = await filled();
+  const disk = await Dataset.open(join(dir, 'db'));
+  try {
+    await disk.addAll(quads());
+    for (const ds of [memory, disk]) {
+      // more matches than the inline first batch of 16
+      const all = await ds.match(null, ex('p1'), null, null).toArray();
+      assert.equal(all.length, quads().filter((q) => q.predicate.equals(ex('p1'))).length);
+      assert.equal(await ds.has(quads()[11]), true);
+      // a term that cannot be a subject fails when the matches are read, as before
+      await assert.rejects(ds.match(f.literal('x'), null, null, null).toArray());
+    }
+    await memory.close();
+    assert.throws(() => memory.match());
+  } finally {
+    await disk.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

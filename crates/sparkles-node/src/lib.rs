@@ -691,6 +691,29 @@ impl NativeDataset {
         })
         .await
     }
+    /// `matched` on the calling thread, for a dataset in memory: the scan reads memory
+    /// only, and the first batch is kept to a few rows, so the call takes microseconds,
+    /// less than a round trip through the pool. Returns `null` for a dataset on disk,
+    /// whose reads can wait for the device; JavaScript then calls `matched`.
+    #[napi]
+    pub fn matched_now(
+        &self,
+        pattern: String,
+        first_rows: u32,
+        first_bytes: u32,
+    ) -> napi::Result<Option<NativeResult>> {
+        let shared = self.get(false)?;
+        if shared.ds.store().root().is_some() {
+            return Ok(None);
+        }
+        let pattern = parse(&pattern)?;
+        let scan =
+            sparkles::embed::quads_in(shared.ds.snapshot(), &quad_pattern(&pattern).map_err(err)?);
+        NativeResult::scan(scan)
+            .with_first(first_batch(Some(first_rows), Some(first_bytes)))
+            .map(Some)
+            .map_err(err)
+    }
     #[napi]
     pub async fn matched(
         &self,

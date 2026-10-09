@@ -41,6 +41,7 @@ export interface NativeDataset {
   path(): string | null;
   count(): Promise<string>;
   countPattern(pattern: string): Promise<string>;
+  matchedNow(pattern: string, firstRows: number, firstBytes: number): NativeResult | null;
   matched(pattern: string, firstRows?: number, firstBytes?: number): Promise<NativeResult>;
   query(text: string, options: string, cancel: NativeCancellation): Promise<NativeResult>;
   update(text: string, options: string, cancel: NativeCancellation): Promise<string>;

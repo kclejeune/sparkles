@@ -54,6 +54,8 @@ import {
 } from './native.js';
 const transactionContext = new AsyncLocalStorage<ReadonlySet<string>>();
 const defaults = { batchSize: 1024, batchBytes: 1 << 20 };
+/** rows of a match's first batch when it is computed on the JavaScript thread */
+const INLINE_ROWS = 16;
 export interface EngineConfiguration {
   /** rows per streaming batch (default 1024) */
   batchSize?: number;
@@ -867,10 +869,36 @@ export class Dataset extends Queryable {
     o?: RDF.Term | null,
     g?: RDF.Term | null,
   ): AsyncIterable<RDF.Quad> & { toArray(): Promise<RDF.Quad[]>; toStream(): Readable } {
-    const future = this.run<NativeResult>({}, () =>
+    if (this.path === null) {
+      // In memory, the scan and a first batch of a few rows take less time than a round
+      // trip through the addon's pool, so they run here; later batches use the pool.
+      this.check();
+      let future: Promise<QuadsResult>;
+      try {
+        const handle = this.handle.matchedNow(
+          pattern(s, p, o, g),
+          INLINE_ROWS,
+          defaults.batchBytes,
+        );
+        future = handle
+          ? Promise.resolve(this.result(handle, {}) as QuadsResult)
+          : this.matchOnPool(s, p, o, g);
+      } catch (e) {
+        future = Promise.reject(nativeError(e));
+      }
+      return deferredQuads(future);
+    }
+    return deferredQuads(this.matchOnPool(s, p, o, g));
+  }
+  private matchOnPool(
+    s?: RDF.Term | null,
+    p?: RDF.Term | null,
+    o?: RDF.Term | null,
+    g?: RDF.Term | null,
+  ): Promise<QuadsResult> {
+    return this.run<NativeResult>({}, () =>
       this.handle.matched(pattern(s, p, o, g), defaults.batchSize, defaults.batchBytes),
     ).then((handle) => this.result(handle, {}) as QuadsResult);
-    return deferredQuads(future);
   }
   async has(quad: RDF.Quad) {
     for await (const _ of this.match(quad.subject, quad.predicate, quad.object, quad.graph))
