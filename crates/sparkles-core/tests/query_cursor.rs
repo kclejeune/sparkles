@@ -4,8 +4,9 @@ use sparkles_core::io::Source;
 use sparkles_core::sparql::{
     CursorOptions, CursorStatus, FallbackPolicy, QueryCursor, QueryOptions, query, select_cursor,
 };
-use sparkles_core::store::{Store, StoreOptions};
+use sparkles_core::store::{Snapshot, Store, StoreOptions};
 use sparkles_core::{BudgetKind, Error};
+use std::collections::BTreeSet;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -2328,81 +2329,621 @@ const TERMS: [&str; 7] = [
 ];
 const VARS: [&str; 4] = ["?a", "?b", "?c", "?d"];
 
-fn random_pattern(rng: &mut Rng, depth: u32) -> String {
-    if depth == 0 || rng.below(3) == 0 {
-        if rng.below(3) == 0 {
-            let s = [VARS[rng.below(4) as usize], "<urn:s:0>"][rng.below(2) as usize];
-            let o = VARS[rng.below(4) as usize];
+/// How a generated query fixes the order of its solutions.
+enum Order {
+    None,
+    /// ORDER BY on these projected variables, so equal keys may come in any order.
+    Vars(Vec<String>),
+    /// ORDER BY on an expression, compared as a bag.
+    Expr,
+}
+
+struct Shape {
+    query: String,
+    /// The same query without LIMIT and OFFSET, when it has either.
+    unsliced: Option<String>,
+    order: Order,
+    offset: bool,
+    limit: bool,
+}
+
+/// A seeded query generator. Each pattern reports the variables it binds, so that BIND
+/// and subquery aggregates can target a variable that is not yet in scope.
+struct Gen {
+    rng: Rng,
+    fresh: usize,
+    fresh_vars: Vec<String>,
+}
+
+impl Gen {
+    fn new(seed: u64) -> Self {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        // Neighbouring seeds start with similar xorshift states.
+        for _ in 0..8 {
+            rng.next();
+        }
+        Self {
+            rng,
+            fresh: 0,
+            fresh_vars: Vec::new(),
+        }
+    }
+
+    fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+        xs[self.rng.below(xs.len() as u64) as usize]
+    }
+
+    fn var(&mut self) -> &'static str {
+        self.pick(&VARS)
+    }
+
+    /// A variable for a new binding: an unused one of `VARS`, so it can join with
+    /// the rest of the query, or a fresh one that the top level projects.
+    fn target(&mut self, scope: &BTreeSet<&'static str>, avoid: &[&str]) -> String {
+        let free: Vec<&str> = VARS
+            .iter()
+            .copied()
+            .filter(|v| !scope.contains(v) && !avoid.contains(v))
+            .collect();
+        if !free.is_empty() && self.rng.below(3) != 0 {
+            return self.pick(&free).to_string();
+        }
+        let v = format!("?e{}", self.fresh);
+        self.fresh += 1;
+        self.fresh_vars.push(v.clone());
+        v
+    }
+
+    fn condition(&mut self, depth: u32) -> String {
+        let (x, y) = (self.var(), self.var());
+        match self.rng.below(if depth == 0 { 11 } else { 14 }) {
+            0 => format!("BOUND({x})"),
+            1 => format!("!BOUND({x})"),
+            2 => format!("{x} = {y}"),
+            3 => format!("{x} != {y}"),
+            4 => format!("{x} < {}", self.rng.below(3)),
+            5 => format!("{x} >= {}", self.rng.below(3)),
+            6 => format!("isIRI({x})"),
+            7 => format!("sameTerm({x}, {y})"),
+            8 => format!("{x} IN (0, <urn:s:1>)"),
+            9 => format!("COALESCE({x}, 0) <= 1"),
+            10 => format!("{x} > {y}"),
+            11 => format!(
+                "({}) && ({})",
+                self.condition(depth - 1),
+                self.condition(depth - 1)
+            ),
+            12 => format!(
+                "({}) || ({})",
+                self.condition(depth - 1),
+                self.condition(depth - 1)
+            ),
+            _ => self.exists(),
+        }
+    }
+
+    fn exists(&mut self) -> String {
+        let (x, y) = (self.var(), self.var());
+        let p = self.pick(&["<urn:p>", "<urn:q>"]);
+        let not = ["", "NOT "][self.rng.below(2) as usize];
+        format!("{not}EXISTS {{ {x} {p} {y} }}")
+    }
+
+    fn value(&mut self) -> String {
+        let (x, y) = (self.var(), self.var());
+        match self.rng.below(8) {
+            0 => x.to_string(),
+            1 => format!("({x} + 1)"),
+            2 => format!("COALESCE({x}, {y})"),
+            3 => format!("IF(BOUND({x}), {x}, -1)"),
+            4 => format!("STR({x})"),
+            5 => format!("({x} * 2)"),
+            6 => format!("isIRI({x})"),
+            _ => format!("ABS({x})"),
+        }
+    }
+
+    fn aggregate(&mut self) -> String {
+        let x = self.var();
+        match self.rng.below(8) {
+            0 => "COUNT(*)".into(),
+            1 => format!("COUNT({x})"),
+            2 => format!("COUNT(DISTINCT {x})"),
+            3 => format!("SUM({x})"),
+            4 => format!("MIN({x})"),
+            5 => format!("MAX({x})"),
+            6 => format!("AVG({x})"),
+            _ => format!("SUM({x} + 1)"),
+        }
+    }
+
+    fn leaf(&mut self) -> (String, BTreeSet<&'static str>) {
+        if self.rng.below(2) == 0 {
+            let s = [self.var(), "<urn:s:0>"][self.rng.below(2) as usize];
+            let o = self.var();
             // Alternatives in a sequence plan sorted UNION arms under a merge join.
-            let p = [
+            let p = self.pick(&[
                 "<urn:p>",
                 "<urn:q>",
                 "(<urn:q>|<urn:p>)/(<urn:q>|<urn:p>)",
                 "<urn:q>/(<urn:q>|<urn:p>)",
-            ][rng.below(4) as usize];
-            return format!("{s} {p} {o} .");
+            ]);
+            let scope = [s, o].into_iter().filter(|v| v.starts_with('?')).collect();
+            return (format!("{s} {p} {o} ."), scope);
         }
-        let width = 1 + rng.below(2) as usize;
-        let first = rng.below(4) as usize;
-        let vars: Vec<&str> = (0..width).map(|i| VARS[(first + i) % 4]).collect();
-        let rows = (0..rng.below(6))
+        let width = 1 + self.rng.below(2) as usize;
+        let first = self.rng.below(4) as usize;
+        let vars: Vec<&'static str> = (0..width).map(|i| VARS[(first + i) % 4]).collect();
+        let rows = (0..self.rng.below(6))
             .map(|_| {
-                let cells: Vec<&str> = (0..width).map(|_| TERMS[rng.below(7) as usize]).collect();
+                let cells: Vec<&str> = (0..width).map(|_| self.pick(&TERMS)).collect();
                 format!("({})", cells.join(" "))
             })
             .collect::<Vec<_>>()
             .join(" ");
-        return format!("VALUES ({}) {{ {rows} }}", vars.join(" "));
+        let scope = vars.iter().copied().collect();
+        (format!("VALUES ({}) {{ {rows} }}", vars.join(" ")), scope)
     }
-    let left = random_pattern(rng, depth - 1);
-    let right = random_pattern(rng, depth - 1);
-    match rng.below(4) {
-        0 => format!("{{ {left} }} {{ {right} }}"),
-        1 => format!("{{ {left} }} OPTIONAL {{ {right} }}"),
-        2 => format!("{{ {left} }} MINUS {{ {right} }}"),
-        _ => format!("{{ {left} }} UNION {{ {right} }}"),
+
+    fn pattern(&mut self, depth: u32) -> (String, BTreeSet<&'static str>) {
+        if depth == 0 || self.rng.below(3) == 0 {
+            return self.leaf();
+        }
+        match self.rng.below(9) {
+            0..=4 => {
+                let (left, mut ls) = self.pattern(depth - 1);
+                let (right, rs) = self.pattern(depth - 1);
+                let text = match self.rng.below(4) {
+                    0 => format!("{{ {left} }} {{ {right} }}"),
+                    1 => format!("{{ {left} }} OPTIONAL {{ {right} }}"),
+                    2 => {
+                        return (format!("{{ {left} }} MINUS {{ {right} }}"), ls);
+                    }
+                    _ => format!("{{ {left} }} UNION {{ {right} }}"),
+                };
+                ls.extend(rs);
+                (text, ls)
+            }
+            5 => {
+                let (inner, scope) = self.pattern(depth - 1);
+                let condition = if self.rng.below(5) == 0 {
+                    self.exists()
+                } else {
+                    self.condition(1)
+                };
+                (format!("{{ {inner} }} FILTER({condition})"), scope)
+            }
+            6 => {
+                let (inner, mut scope) = self.pattern(depth - 1);
+                let value = self.value();
+                let target = self.target(&scope, &[]);
+                if let Some(v) = VARS.iter().find(|v| **v == target) {
+                    scope.insert(v);
+                }
+                (format!("{{ {inner} }} BIND({value} AS {target})"), scope)
+            }
+            7 => {
+                // ORDER BY every projected variable makes the slice deterministic up to
+                // identical rows.
+                let (inner, _) = self.pattern(depth - 1);
+                let width = 1 + self.rng.below(3) as usize;
+                let first = self.rng.below(4) as usize;
+                let vars: Vec<&'static str> = (0..width).map(|i| VARS[(first + i) % 4]).collect();
+                let keys = vars
+                    .iter()
+                    .map(|v| {
+                        if self.rng.below(2) == 0 {
+                            format!("DESC({v})")
+                        } else {
+                            v.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let distinct = ["", "DISTINCT "][self.rng.below(2) as usize];
+                let limit = self.rng.below(5);
+                let offset = self.rng.below(3);
+                let text = format!(
+                    "{{ SELECT {distinct}{} WHERE {{ {inner} }} ORDER BY {keys} LIMIT {limit} OFFSET {offset} }}",
+                    vars.join(" ")
+                );
+                (text, vars.into_iter().collect())
+            }
+            _ => {
+                let (inner, scope) = self.pattern(depth - 1);
+                let key = (self.rng.below(3) != 0).then(|| self.var());
+                let target = self.target(&scope, key.as_slice());
+                let aggregate = self.aggregate();
+                let text = match key {
+                    Some(k) => format!(
+                        "{{ SELECT {k} ({aggregate} AS {target}) WHERE {{ {inner} }} GROUP BY {k} }}"
+                    ),
+                    None => {
+                        format!("{{ SELECT ({aggregate} AS {target}) WHERE {{ {inner} }} }}")
+                    }
+                };
+                let mut scope: BTreeSet<&'static str> = key.into_iter().collect();
+                if let Some(v) = VARS.iter().find(|v| **v == target) {
+                    scope.insert(v);
+                }
+                (text, scope)
+            }
+        }
+    }
+
+    fn query(&mut self) -> Shape {
+        let (pattern, _) = self.pattern(3);
+        let (head, tail, projected) = if self.rng.below(10) < 3 {
+            let keys: Vec<&str> = VARS
+                .iter()
+                .copied()
+                .filter(|_| self.rng.below(3) == 0)
+                .collect();
+            let aggregates = (0..1 + self.rng.below(3))
+                .map(|i| format!("({} AS ?n{i})", self.aggregate()))
+                .collect::<Vec<_>>();
+            let mut projected: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+            projected.extend((0..aggregates.len()).map(|i| format!("?n{i}")));
+            let group = if keys.is_empty() {
+                String::new()
+            } else {
+                format!(" GROUP BY {}", keys.join(" "))
+            };
+            let having = if self.rng.below(4) == 0 {
+                " HAVING (COUNT(*) > 1)"
+            } else {
+                ""
+            };
+            (
+                format!("SELECT {} {}", keys.join(" "), aggregates.join(" ")),
+                format!("{group}{having}"),
+                projected,
+            )
+        } else {
+            let mut projected: Vec<String> = VARS.iter().map(|v| v.to_string()).collect();
+            projected.extend(self.fresh_vars.iter().cloned());
+            let distinct = ["", "DISTINCT "][(self.rng.below(4) == 0) as usize];
+            (
+                format!("SELECT {distinct}{}", projected.join(" ")),
+                String::new(),
+                projected,
+            )
+        };
+        let (order_text, order) = match self.rng.below(6) {
+            0 | 1 => (String::new(), Order::None),
+            2 => {
+                let v = self.var();
+                (format!(" ORDER BY DESC(STR({v})) {v}"), Order::Expr)
+            }
+            _ => {
+                let n = 1 + self.rng.below(projected.len().min(2) as u64) as usize;
+                let first = self.rng.below(projected.len() as u64) as usize;
+                let keys: Vec<String> = (0..n)
+                    .map(|i| projected[(first + i) % projected.len()].clone())
+                    .collect();
+                let text = keys
+                    .iter()
+                    .map(|k| {
+                        if self.rng.below(2) == 0 {
+                            format!("DESC({k})")
+                        } else {
+                            k.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (format!(" ORDER BY {text}"), Order::Vars(keys))
+            }
+        };
+        let limit = (self.rng.below(3) == 0).then(|| self.rng.below(6));
+        let offset = (self.rng.below(4) == 0).then(|| self.rng.below(4));
+        let base = format!("{head} WHERE {{ {pattern} }}{tail}{order_text}");
+        let mut query = base.clone();
+        if let Some(n) = limit {
+            query.push_str(&format!(" LIMIT {n}"));
+        }
+        if let Some(n) = offset {
+            query.push_str(&format!(" OFFSET {n}"));
+        }
+        Shape {
+            unsliced: (limit.is_some() || offset.is_some()).then_some(base),
+            query,
+            order,
+            offset: offset.is_some_and(|n| n > 0),
+            limit: limit.is_some(),
+        }
     }
 }
 
-/// Seeded differential: cursor and eager answers agree as bags at batch sizes that put
-/// boundaries everywhere, over generated VALUES, scans, joins, OPTIONAL, MINUS and
-/// UNION with unbound columns.
-#[test]
-fn random_patterns_agree_between_cursor_and_eager_execution() {
-    let s = Store::in_memory(StoreOptions::default());
-    let mut rng = Rng(0x5eed_cafe_f00d_d00d);
-    let mut data = String::new();
+type Rows = Vec<Vec<Option<Term>>>;
+
+fn eager(snapshot: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> (Vec<String>, Rows) {
+    let r = query(snapshot, q, opts).unwrap_or_else(|e| panic!("{q}: {e}"));
+    (r.vars.clone(), r.rows())
+}
+
+/// Cursor rows, reordered to the columns of `vars`.
+fn streamed(
+    snapshot: Arc<Snapshot>,
+    q: &str,
+    opts: &QueryOptions,
+    rows: usize,
+    vars: &[String],
+) -> Rows {
+    let c = select_cursor(
+        snapshot,
+        q,
+        opts,
+        &CursorOptions {
+            batch_rows: rows,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("{q}: {e}"));
+    let columns: Vec<usize> = vars
+        .iter()
+        .map(|v| {
+            c.variables()
+                .iter()
+                .position(|x| x == v)
+                .unwrap_or_else(|| panic!("{q}: cursor lacks {v}"))
+        })
+        .collect();
+    all(c)
+        .into_iter()
+        .map(|row| columns.iter().map(|&i| row[i].clone()).collect())
+        .collect()
+}
+
+/// Consecutive rows with equal ORDER BY keys, with the rows of each run as a bag.
+fn runs(rows: &Rows, keys: &[usize]) -> Vec<(Vec<Option<Term>>, Vec<String>)> {
+    let mut out: Vec<(Vec<Option<Term>>, Vec<String>)> = Vec::new();
+    for row in rows {
+        let key: Vec<Option<Term>> = keys.iter().map(|&k| row[k].clone()).collect();
+        match out.last_mut() {
+            Some((last, members)) if *last == key => members.push(format!("{row:?}")),
+            _ => out.push((key, vec![format!("{row:?}")])),
+        }
+    }
+    for (_, members) in &mut out {
+        members.sort();
+    }
+    out
+}
+
+fn contained(got: &Rows, all: &Rows) -> bool {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for row in all {
+        *counts.entry(format!("{row:?}")).or_default() += 1;
+    }
+    got.iter().all(|row| {
+        counts
+            .get_mut(&format!("{row:?}"))
+            .is_some_and(|n| std::mem::replace(n, n.wrapping_sub(1)) > 0)
+    })
+}
+
+fn compare(shape: &Shape, vars: &[String], expected: &Rows, got: &Rows, unsliced: Option<&Rows>) {
+    let q = &shape.query;
+    assert_eq!(got.len(), expected.len(), "row count: {q}");
+    if let Some(all) = unsliced {
+        assert!(contained(got, all), "rows outside the unsliced answer: {q}");
+    }
+    match &shape.order {
+        Order::Vars(keys) => {
+            let keys: Vec<usize> = keys
+                .iter()
+                .map(|k| {
+                    vars.iter()
+                        .position(|v| format!("?{v}") == *k || v == k)
+                        .unwrap()
+                })
+                .collect();
+            let (e, g) = (runs(expected, &keys), runs(got, &keys));
+            assert_eq!(e.len(), g.len(), "ordered runs: {q}");
+            let last = e.len().saturating_sub(1);
+            for (i, (a, b)) in e.iter().zip(&g).enumerate() {
+                assert_eq!(a.0, b.0, "order key of run {i}: {q}");
+                assert_eq!(a.1.len(), b.1.len(), "size of run {i}: {q}");
+                // A slice may cut a run of ties, and either engine may keep any of it.
+                let cut = (i == 0 && shape.offset) || (i == last && shape.limit);
+                if !cut {
+                    assert_eq!(a.1, b.1, "rows of run {i}: {q}");
+                }
+            }
+        }
+        _ if unsliced.is_some() => {}
+        _ => assert_eq!(bag(got.clone()), bag(expected.clone()), "{q}"),
+    }
+}
+
+/// Run `seeds` generated queries against one view of the data and compare cursor
+/// answers at several batch sizes with the eager answer.
+fn differential(name: &str, snapshot: &Arc<Snapshot>, opts: &QueryOptions, seeds: u64) {
+    let seeds = std::env::var("SPARKLES_CURSOR_SEEDS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(seeds);
+    for seed in 1..=seeds {
+        let shape = Gen::new(seed).query();
+        let q = &shape.query;
+        let (vars, expected) = eager(snapshot.clone(), q, opts);
+        let unsliced = shape
+            .unsliced
+            .as_ref()
+            .map(|u| eager(snapshot.clone(), u, opts).1);
+        for rows in [1, 2, 3, 4096] {
+            let got = streamed(snapshot.clone(), q, opts, rows, &vars);
+            let message = format!("{name} seed {seed}, {rows} rows");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                compare(&shape, &vars, &expected, &got, unsliced.as_ref())
+            }));
+            if let Err(e) = result {
+                eprintln!("{message}");
+                std::panic::resume_unwind(e);
+            }
+        }
+    }
+}
+
+/// The triples the differential queries read, drawn from a fixed seed.
+fn differential_triples(seed: u64) -> Vec<String> {
+    let int = |n: i32| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
+    let mut rng = Rng(seed);
+    let mut out = Vec::new();
     for i in 0..3 {
         for j in 0..3 {
             if rng.below(2) == 0 {
-                data.push_str(&format!("<urn:s:{i}> <urn:p> {j} .\n"));
+                out.push(format!("<urn:s:{i}> <urn:p> {}", int(j)));
             }
             if rng.below(2) == 0 {
-                data.push_str(&format!("<urn:s:{i}> <urn:q> <urn:s:{j}> .\n"));
+                out.push(format!("<urn:s:{i}> <urn:q> <urn:s:{j}>"));
+            }
+            if rng.below(6) == 0 {
+                out.push(format!("<urn:s:{i}> <urn:p> <urn:s:{j}>"));
+            }
+            if rng.below(6) == 0 {
+                out.push(format!("<urn:s:{i}> <urn:q> {}", int(j)));
+            }
+        }
+    }
+    out
+}
+
+fn load_triples(s: &Store, triples: &[String]) {
+    let data: String = triples.iter().map(|t| format!("{t} .\n")).collect();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NQuads,
+        None,
+    )])
+    .unwrap();
+}
+
+/// How many seeds each view runs by default; `SPARKLES_CURSOR_SEEDS` overrides it.
+const SEEDS: u64 = 300;
+
+/// Seeded differential over a compacted base: generated VALUES, scans, property path
+/// sequences, joins, OPTIONAL, MINUS, UNION, FILTER (with EXISTS), BIND, ordered and
+/// sliced subqueries, grouped subqueries, and top-level DISTINCT, GROUP BY with
+/// aggregates, ORDER BY, LIMIT and OFFSET.
+#[test]
+fn random_queries_agree_between_cursor_and_eager_on_a_compacted_base() {
+    let s = Store::in_memory(StoreOptions::default());
+    load_triples(&s, &differential_triples(0x5eed_cafe_f00d_d00d));
+    s.compact().unwrap();
+    let snapshot = s.snapshot();
+    assert!(snapshot.delta.is_empty());
+    differential("compacted", &snapshot, &Default::default(), SEEDS);
+}
+
+/// The same over a base with a pending delta of inserts and deletes.
+#[test]
+fn random_queries_agree_between_cursor_and_eager_over_a_pending_delta() {
+    let s = Store::in_memory(StoreOptions::default());
+    let triples = differential_triples(0xdead_beef_1234_5678);
+    let (old, new) = triples.split_at(triples.len() / 2);
+    load_triples(&s, old);
+    s.compact().unwrap();
+    let deleted: Vec<&String> = old.iter().step_by(3).collect();
+    let inserts: String = new.iter().map(|t| format!("{t} . ")).collect();
+    let deletes: String = deleted.iter().map(|t| format!("{t} . ")).collect();
+    sparkles_core::sparql::update::update(
+        &s,
+        &format!("INSERT DATA {{ {inserts} }} ; DELETE DATA {{ {deletes} }}"),
+        &Default::default(),
+    )
+    .unwrap();
+    let snapshot = s.snapshot();
+    assert!(!snapshot.delta.is_empty());
+    differential("delta", &snapshot, &Default::default(), SEEDS);
+}
+
+/// The same over data that spans several index blocks. Copies of each triple in named
+/// graphs sit between the default graph's rows in every permutation, so the scans of
+/// the default graph cross block boundaries.
+#[test]
+fn random_queries_agree_between_cursor_and_eager_across_index_blocks() {
+    let s = Store::in_memory(StoreOptions::default());
+    let triples = differential_triples(0x0b10_c4ed_0000_0001);
+    let copies = (sparkles_core::index::BLOCK_ROWS * 2).div_ceil(triples.len());
+    let mut data = String::new();
+    for (i, t) in triples.iter().enumerate() {
+        data.push_str(&format!("{t} .\n"));
+        // Leave some triples without copies, so that some ranges pass whole.
+        if i % 4 != 3 {
+            for g in 0..copies {
+                data.push_str(&format!("{t} <urn:g:{g}> .\n"));
             }
         }
     }
     s.load(&[Source::from_bytes(
         data.into_bytes(),
-        RdfFormat::Turtle,
+        RdfFormat::NQuads,
         None,
     )])
     .unwrap();
-    for seed in 1..=400u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-        let pattern = random_pattern(&mut rng, 3);
-        let q = format!("SELECT ?a ?b ?c ?d WHERE {{ {pattern} }}");
-        let expected = bag(query(s.snapshot(), &q, &Default::default())
-            .unwrap_or_else(|e| panic!("seed {seed}: {q}: {e}"))
-            .rows());
-        for rows in [1, 2, 3, 4096] {
-            let opts = CursorOptions {
-                batch_rows: rows,
-                ..Default::default()
-            };
-            let c = select_cursor(s.snapshot(), &q, &Default::default(), &opts)
-                .unwrap_or_else(|e| panic!("seed {seed}: {q}: {e}"));
-            assert_eq!(bag(all(c)), expected, "seed {seed}, {rows} rows: {q}");
-        }
-    }
+    s.compact().unwrap();
+    let snapshot = s.snapshot();
+    assert!(snapshot.perm(sparkles_core::index::Perm::Pso).blocks.len() > 1);
+    differential("blocks", &snapshot, &Default::default(), SEEDS / 3);
+}
+
+/// The same through a view that hides some triples, which reads a masked snapshot, over
+/// a base with a pending delta.
+#[test]
+fn random_queries_agree_between_cursor_and_eager_through_a_masked_view() {
+    use sparkles_core::access::{
+        Caller, GraphAccess, Graphs, Limits, Protection, Rule, TripleRules,
+    };
+    let s = Store::in_memory(StoreOptions::default());
+    let mut triples = differential_triples(0x0a11_0ced_0000_0002);
+    triples.push("<urn:s:1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:Hidden>".into());
+    let extra = triples.split_off(triples.len() - 4);
+    load_triples(&s, &triples);
+    s.compact().unwrap();
+    let inserts: String = extra.iter().map(|t| format!("{t} . ")).collect();
+    sparkles_core::sparql::update::update(
+        &s,
+        &format!("INSERT DATA {{ {inserts} <urn:s:2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:Hidden> }}"),
+        &Default::default(),
+    )
+    .unwrap();
+    let protection = Protection {
+        name: "hidden".into(),
+        predicates: Some(vec!["urn:p".into()]),
+        classes: Some(vec!["urn:Hidden".into()]),
+        subclasses: true,
+        graphs: None,
+        pattern: None,
+        prefixes: Default::default(),
+        hide_inferences: false,
+    };
+    let access = GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::All,
+        TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(protection),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    );
+    let opts = QueryOptions {
+        graphs: Some(Arc::new(access)),
+        ..Default::default()
+    };
+    let snapshot = s.snapshot();
+    // The view must hide something, or this would repeat the delta test.
+    let q = "SELECT * WHERE { ?s <urn:p> ?o }";
+    assert!(
+        query(snapshot.clone(), q, &opts).unwrap().len()
+            < query(snapshot.clone(), q, &Default::default())
+                .unwrap()
+                .len()
+    );
+    differential("masked", &snapshot, &opts, SEEDS);
 }
