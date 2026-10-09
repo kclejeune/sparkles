@@ -91,6 +91,8 @@ main() {
   mapfile -t prep < <(printf '%s\n' "${prep[@]}" | sort -u | sed '/^$/d')
 
   write_summary() {
+    # Local, so that the main loop's task variable survives a summary update.
+    local t f
     {
       printf 'CI started %s, %ds elapsed\n\n' "$started" "$((SECONDS - start))"
       for t in "${all[@]}"; do
@@ -160,6 +162,7 @@ main() {
 
   # stop_all: end every running task's process group and mark it stopped.
   stop_all() {
+    local pid
     for pid in "${!pids[@]}"; do
       kill -TERM -- "-$pid" 2> /dev/null || true
       echo stopped > "$out/state/${pids[$pid]//:/_}"
