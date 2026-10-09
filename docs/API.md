@@ -2828,11 +2828,12 @@ including `main`.
 | GET | `/$/branches/{ds}/{name}` | The `Branch`, or `404 no-such-branch`. |
 | PATCH | `/$/branches/{ds}/{name}` | Changes `name`, `protected` or `note` (`null` removes the note). |
 | DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits, and `?reparent=true` one that other branches start from. Answers `204`. |
+| POST | `/$/branches/{ds}/{name}/relink` | Moves a linked branch onto `main`'s current index and answers the `RelinkResult`. See [Relinking](#relinking). |
 
 A read-only server (`serve --read-only`) refuses every route that changes branches with
 `403` and the update endpoint's error. That covers the `POST`, `PATCH` and `DELETE` routes
-above, and the `POST` routes of merges, reverts and cherry-picks, dry runs and
-asynchronous merges included. The `GET` routes and the previews still answer.
+above, relinking included, and the `POST` routes of merges, reverts and cherry-picks, dry
+runs and asynchronous merges included. The `GET` routes and the previews still answer.
 
 ```ts
 type Branch = {
@@ -3160,6 +3161,57 @@ retained are left out. Each commit carries `reconstructable` and `snapshots` as 
 `/$/commits`, and a caller whose grants cover some graphs only gets the commits
 without their counts.
 
+### Relinking
+
+A new branch reads the index files of the generation it started from. When `main`
+compacts afterwards, the branch keeps reading the old generation, which then stays on
+disk for it, and its own changes since the start keep growing in its delta. Relinking
+moves such a branch onto the index of `main`'s current generation without changing what
+the branch holds. The branch's differences from that index become a sparse overlay, so a
+relink writes those differences rather than a full index.
+
+```
+POST /$/branches/prod/dev/relink
+```
+
+The body is empty or `{}`. The branch keeps its id, head, commits, snapshots, blank-node
+identities and settings, and writes to it go on during the relink and are carried into
+the new generation. The old upstream generation stays on disk while history, snapshots
+or open readers still need it. A relink never happens on its own. The compaction
+scheduler and `POST /$/compact/{ds}?branch=NAME` still give a branch an index of its own,
+after which it can no longer be relinked.
+
+The answer describes the new generation:
+
+```ts
+type RelinkResult = {
+  dataset: string; branch: string; branchId: string;
+  generation: string;            // the branch's new linked generation
+  quads: number;                 // the branch's quads, unchanged by the relink
+  baseCommit: number;            // the commit of main whose index the branch now reads
+  caughtUpCommits: number;       // the branch's commits made during the relink
+  abandoned?: string;            // why it published nothing
+  mode: "relink";
+  lockMs: number; buildMs: number; totalMs: number;
+};
+```
+
+With `Prefer: respond-async` the relink runs as a cancellable task. The answer is `202`
+with the task and `Location: /$/tasks/{id}`, the task reports its progress, and its
+`detail` is the `RelinkResult`. `DELETE /$/tasks/{id}` cancels it, and a cancelled relink
+leaves the branch as it was.
+
+Relinking needs `admin` on the branch, which a grant limited to some branches may give.
+Relinking `main` answers `400 invalid-branch`, and a branch the caller cannot see answers
+`404 no-such-branch`. A branch that already owns its index, and a branch of an in-memory
+dataset, answer `409 not-relinkable`. A relinked generation needs reader version 3, so
+older Sparkles versions refuse to open the dataset afterwards.
+
+The same operation is `Dataset::relink_branch` and `relink_branch_with` in Rust,
+`Dataset.branches.relink` in Python and Node, and `branches().relink` on
+`DatasetGraphSparkles` in Java and Kotlin. `sparkles branch relink --loc DB NAME` runs it on
+a stopped database.
+
 ### Storage, history and access
 
 A backup to a [backup repository](#backup-repositories) captures one branch as a
@@ -3200,8 +3252,8 @@ names and `*` patterns; without the list, it covers every branch. Reading a bran
 `read` on it, writing it needs `write`, creating one needs `read` on the source branch
 and `write` on the new name, and a merge needs `read` on the source and `write` on the
 target. Creating branches and merging act on whole datasets, so they need grants without
-graph restrictions. Protecting a branch, and deleting a protected one, need `admin` on
-it. A revert needs `write` on its branch, a cherry-pick `read` on the source and
+graph restrictions. Protecting a branch, deleting a protected one and relinking one
+need `admin` on it. A revert needs `write` on its branch, a cherry-pick `read` on the source and
 `write` on its branch, and a rename `write` on both names. The endpoint names `branches`
 and `merge` limit a grant to the branch routes and to merges, reverts and cherry-picks.
 

@@ -14,9 +14,9 @@
 > left-out branches have shipped, and so have Python bindings, in-memory branches,
 > selected-branch backups, upstream full-text/spatial/vector index reuse, and
 > cherry-picks and automatic recursive virtual merge bases from Phase 3. Explicit
-> relinking is implemented in Rust, the offline CLI and the Python bindings for
-> persistent linked branches. Its HTTP surface and the Node and C bindings are not built,
-> and neither are cross-server clones.
+> relinking of persistent linked branches is available in Rust, the offline CLI, the
+> HTTP API (`POST /$/branches/{ds}/{name}/relink`) and the Python, Node and JVM
+> bindings. Cross-server clones are not built.
 >
 > **User docs:** [API: Branches and merges](../API.md#branches-and-merges) ·
 > [Usage: Branches and merges](../USAGE.md#branches-and-merges) ·
@@ -1745,7 +1745,8 @@ uses the controlled facade with responsive Ctrl-C handling, progress on stderr a
 text/JSON reports. The facade reports the fraction reached at each stage of the relink.
 It requires an existing database and exclusive directory lock, and remote mode and a
 global branch selector are refused. Python's `Branches.relink` uses the same facade.
-The HTTP surface, the Node and C bindings and cross-server clones are not built.
+This first scope left out the HTTP surface, the Node and C bindings and cross-server
+clones. The first three came later, as the last part of this section describes.
 
 The relink records its hold on main's generation before the branch's `CURRENT` names
 the relinked generation, so that main never collects a generation the branch reads. A
@@ -1765,3 +1766,34 @@ creation keeps the branch selector in its Location, including for dataset admini
 Memory branch backups preserve graph-sourced ShEx validation settings as well as inline
 schemas. Focused concurrency, authenticated link-following and restore/write-rejection
 regressions cover these cases.
+
+**Phase 3: relinking over HTTP and in the Node and JVM bindings.**
+
+* **HTTP.** `POST /$/branches/{ds}/{name}/relink` relinks a branch through the same
+  facade call as the CLI, `Dataset::relink_branch_with`. The body is empty or `{}`. The
+  answer is the compaction report of the new linked generation with `dataset`, `branch`
+  and `branchId`, described as `RelinkResult` in the OpenAPI description. With
+  `Prefer: respond-async` the relink runs as a cancellable task of kind `relink`, whose
+  `target` is the branch, whose progress follows the stages of the relink, and whose
+  `detail` is the result. The route needs `admin` on the branch, so a grant limited to
+  some branches may relink those it covers, and a read-only server refuses it as it
+  refuses other branch mutations. Relinking `main` answers `400 invalid-branch`, a
+  branch the caller cannot see `404 no-such-branch`, and a branch that owns its index or
+  belongs to an in-memory dataset `409 not-relinkable`. The route is in `auth::ROUTES`,
+  and the Node remote client's types were regenerated from the OpenAPI description.
+* **Bindings.** Node's `Dataset.branches.relink(name, options)` and the JVM's
+  `DatasetGraphSparkles.branches().relink(name[, operation])` call the same facade
+  method. The JVM call goes through `branches_relink` of the native library's C ABI and
+  returns a `RelinkReport`. Both take cancellation from their usual operation options.
+  The parity table now maps the `relinkBranch` operation to the surface key
+  `branches.relink`, with names in all three bindings, in place of the library-only key
+  `dataset.relink_branch`.
+* **CLI.** `sparkles branch relink` stays offline. It still refuses `--server`, since a
+  server's own relink route serves that case.
+
+The router tests cover relinking at once and as a task, a relinked branch that keeps
+its id, head and data and takes writes afterwards, the refusals for `main`, a missing
+branch, unknown body fields, a branch that owns its index and an in-memory dataset, the
+grants that allow and refuse it, and the read-only server. The JVM and Node binding
+tests relink a persistent branch after `main` compacts and check its id, head and
+data.
