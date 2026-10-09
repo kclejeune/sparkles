@@ -150,6 +150,7 @@ pub fn validate_at_startup(st: &crate::state::AppState, spec: &str) -> Result<St
             let resolver = sparkles_shex::FileResolver {
                 dirs: dir.into_iter().collect(),
                 outbound: Some((st.outbound.clone(), budget)),
+                limits: st.shex_import_limits,
                 ..Default::default()
             };
             guard.set_shex(cfg, &resolver)?

@@ -922,6 +922,9 @@ enum Cmd {
         #[cfg(feature = "graphql")]
         #[command(flatten)]
         graphql: graphql::GraphqlServeArgs,
+        // what the imports of a ShEx schema may read
+        #[command(flatten)]
+        shex_imports: shex_cmd::ImportArgs,
         /// Fuseki's Graph Store direct naming on every dataset: a request to
         /// /{ds}/{path} that names no endpoint reads or writes the graph whose IRI is
         /// the request URL
@@ -2252,6 +2255,7 @@ fn run() -> Result<()> {
             schema_max_entries,
             #[cfg(feature = "graphql")]
             graphql,
+            shex_imports,
             mut gsp_direct_naming,
             no_access_log,
             no_metrics,
@@ -2412,6 +2416,12 @@ fn run() -> Result<()> {
             });
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
             st.schema_max_entries = schema_max_entries;
+            #[cfg(feature = "shex")]
+            {
+                st.shex_import_limits = shex_imports.limits()?;
+            }
+            #[cfg(not(feature = "shex"))]
+            let _ = shex_imports;
             #[cfg(feature = "graphql")]
             {
                 st.graphql_limits = graphql.limits();

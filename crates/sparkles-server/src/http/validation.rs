@@ -143,6 +143,7 @@ mod handlers {
             },
             files: st.file_loads.clone(),
             outbound: Some((st.outbound.clone(), budget)),
+            limits: st.shex_import_limits,
             ..Default::default()
         };
         Ok(ds.dataset.validation().guard().set_shex(cfg, &resolver)?)

@@ -72,6 +72,8 @@ pub struct ValidationArgs {
     /// text or json
     #[arg(long, default_value = "text")]
     pub format: String,
+    #[command(flatten)]
+    pub imports: crate::shex_cmd::ImportArgs,
 }
 
 /// The language a `--mode` asks for (`--lang`, or ShEx when `--schema` or `--shape-map`
@@ -324,6 +326,7 @@ fn set_shex(
     let resolver = sparkles_shex::FileResolver {
         dirs: abs.parent().map(PathBuf::from).into_iter().collect(),
         outbound: Some((policy, budget)),
+        limits: a.imports.limits()?,
         ..Default::default()
     };
     let cfg = ShexValidationConfig {

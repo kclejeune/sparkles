@@ -507,6 +507,43 @@ async fn file_imports_need_the_load_directory() {
     assert!(error_of(&r).contains("import not allowed"), "{}", r.text());
 }
 
+/// `--shex-max-imports` and `--shex-max-import-mb` bound the imports of `/{ds}/shex`.
+#[tokio::test]
+async fn import_limits_follow_the_server_flags() {
+    let files = tempfile::tempdir().unwrap();
+    std::fs::write(
+        files.path().join("common.shex"),
+        "<http://ex.org/Named> { <http://xmlns.com/foaf/0.1/name> . }",
+    )
+    .unwrap();
+    let url = sparkles_shex::resolve::file_url(&files.path().join("common"));
+    let schema = format!(
+        "IMPORT <{url}> <http://ex.org/K> {{ <http://xmlns.com/foaf/0.1/knows> @<http://ex.org/Named> }}"
+    );
+    let map = enc("<http://ex.org/carol>@<http://ex.org/K>");
+    let limited = |f: fn(&mut sparkles_shex::resolve::ImportLimits)| {
+        let dir = files.path().to_path_buf();
+        server_with(PEOPLE, move |st| {
+            st.file_loads = sparkles::sparql::FileLoads::under(&dir).unwrap();
+            f(&mut st.shex_import_limits);
+        })
+    };
+    let (_d1, none) = limited(|l| l.max_schemas = 0);
+    let r = send(&none, post(&format!("/ds/shex?map={map}"), &schema)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(error_of(&r).contains("limit of 0 schemas"), "{}", r.text());
+    let (_d2, tiny) = limited(|l| l.max_bytes = 8);
+    let r = send(&tiny, post(&format!("/ds/shex?map={map}"), &schema)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let (_d3, one) = limited(|l| l.max_schemas = 1);
+    let r = send(
+        &one,
+        post(&format!("/ds/shex?map={map}&format=smap"), &schema),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
 /// The imports of one validation share `--outbound-request-max-mb`: past it the request
 /// answers 507 naming the budget, as SPARQL `LOAD` does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

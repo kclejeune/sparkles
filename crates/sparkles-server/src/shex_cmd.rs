@@ -81,6 +81,39 @@ pub struct ValidateArgs {
     /// report, or print them to stderr with the other formats
     #[arg(long)]
     pub stats: bool,
+    #[command(flatten)]
+    pub imports: ImportArgs,
+}
+
+/// `--shex-max-imports`, `--shex-max-import-mb` and `--shex-import-timeout`: what the
+/// imports of one ShEx schema may read.
+#[derive(Args, Clone, Debug)]
+pub struct ImportArgs {
+    /// Most schemas one ShEx schema may import, directly or through its imports
+    #[arg(long, value_name = "N", default_value_t = 64)]
+    pub shex_max_imports: usize,
+    /// Most schema text the imports of one ShEx schema may read, in MiB, from files and
+    /// the network together
+    #[arg(long, value_name = "N", default_value_t = 16)]
+    pub shex_max_import_mb: u64,
+    /// Time one http(s) import may take, in seconds (also held to the outbound timeout)
+    #[arg(long, value_name = "SECS", default_value_t = 10.0)]
+    pub shex_import_timeout: f64,
+}
+
+impl ImportArgs {
+    /// The limits these flags give.
+    #[cfg(feature = "shex")]
+    pub fn limits(&self) -> Result<sparkles_shex::resolve::ImportLimits> {
+        if !(self.shex_import_timeout.is_finite() && self.shex_import_timeout > 0.0) {
+            anyhow::bail!("--shex-import-timeout must be a positive number of seconds");
+        }
+        Ok(sparkles_shex::resolve::ImportLimits {
+            max_schemas: self.shex_max_imports,
+            max_bytes: self.shex_max_import_mb.saturating_mul(1 << 20),
+            timeout: std::time::Duration::from_secs_f64(self.shex_import_timeout),
+        })
+    }
 }
 
 #[derive(Args, Debug)]
@@ -265,6 +298,7 @@ mod enabled {
             dirs: dir.into_iter().collect(),
             outbound: Some((policy, budget)),
             externs,
+            limits: a.imports.limits().unwrap_or_else(|e| usage(e)),
             ..Default::default()
         };
         let schema = sparkles_shex::compile(&schema, &resolver)
@@ -392,6 +426,43 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<ShexCmd, clap::Error> {
         Cli::try_parse_from(std::iter::once("shex").chain(args.iter().copied())).map(|c| c.cmd)
+    }
+
+    #[cfg(feature = "shex")]
+    #[test]
+    fn import_flags_give_the_limits() {
+        let ShexCmd::Validate(v) =
+            parse(&["v", "-s", "s.shex", "--loc", "db", "-n", "<x>"]).unwrap()
+        else {
+            panic!("not validate");
+        };
+        let defaults = sparkles_shex::resolve::ImportLimits::default();
+        assert_eq!(v.imports.limits().unwrap(), defaults);
+        let ShexCmd::Validate(v) = parse(&[
+            "v",
+            "-s",
+            "s.shex",
+            "--loc",
+            "db",
+            "-n",
+            "<x>",
+            "--shex-max-imports",
+            "3",
+            "--shex-max-import-mb",
+            "2",
+            "--shex-import-timeout",
+            "1.5",
+        ])
+        .unwrap() else {
+            panic!("not validate");
+        };
+        let l = v.imports.limits().unwrap();
+        assert_eq!(l.max_schemas, 3);
+        assert_eq!(l.max_bytes, 2 << 20);
+        assert_eq!(l.timeout, std::time::Duration::from_millis(1500));
+        let mut bad = v.imports.clone();
+        bad.shex_import_timeout = 0.0;
+        assert!(bad.limits().is_err());
     }
 
     #[test]

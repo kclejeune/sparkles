@@ -6442,8 +6442,9 @@ with them per (node, shape).
 then as `file:` IRIs under `--load-dir` (none without it), then as http(s) IRIs through
 the `--outbound-*` policy of SPARQL `LOAD`. An IRI that does not resolve as given is tried
 with `.shex` appended, then with `.json`. One validation reads at most 64 schemas and
-16 MiB of imports, and its http(s) imports share the `outbound-bytes` budget of one
-request.
+16 MiB of imports by default, which `serve --shex-max-imports` and
+`--shex-max-import-mb` change. Its http(s) imports share the `outbound-bytes` budget of
+one request.
 
 **Semantic actions.** Actions of the Test extension (`http://shex.io/extensions/Test/`,
 `fail` and `print`) run. Actions of other extensions are skipped, with a warning in the

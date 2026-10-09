@@ -360,6 +360,7 @@ mod enabled {
         };
         let policy = st.outbound.clone();
         let files = st.file_loads.clone();
+        let limits = st.shex_import_limits;
         blocking(move || {
             let req = read_request(&ct, &body, &p)?;
             // one resolver, and one outbound request budget, per validation
@@ -369,6 +370,7 @@ mod enabled {
                 files,
                 outbound: Some((policy.clone(), budget.clone())),
                 externs: req.externs,
+                limits,
                 ..Default::default()
             };
             let schema = {

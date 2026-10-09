@@ -1651,7 +1651,7 @@ third-party crates were added.
   the file is internal to Sparkles and only older Sparkles binaries are affected.
 * Node-constraint annotations and semantic actions stay rejected, because ShExJ 2.1 has
   no slot for them. An exhausted outbound budget while fetching imports answers `507`,
-  not `400`. Imports are capped at 64 schemas and 16 MiB per validation.
+  not `400`. Imports are capped at 64 schemas and 16 MiB per validation by default.
 
 **Decided by the maintainer.**
 * The `sparkles_validation_*` series gain a `language` label. The SHACL series become
@@ -1659,7 +1659,9 @@ third-party crates were added.
 * SPARQL selectors are refused in the write-time guard (`400` when the configuration is
   set) and allowed on demand.
 * Server flags for the import limits, and CLI `--outbound-*` flags for imports, are
-  deferred.
+  deferred. The import-limit flags came later. `--shex-max-imports`,
+  `--shex-max-import-mb` and `--shex-import-timeout` apply to `serve`, `shex validate`
+  and `validation`. The CLI `--outbound-*` flags for imports are still open.
 
 **Chosen during implementation** (open to revision).
 * The SHACL `Sparkles-Validation` header is unchanged, and ShEx adds `lang=shex`.

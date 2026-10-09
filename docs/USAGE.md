@@ -427,6 +427,9 @@ happens to materialized inferences, and the limits.
 | `--service-bulk-size N` | `10` | Inputs per request of `SERVICE <loop:bulk:…>` (see [Correlated and cached SERVICE](#correlated-bulk-and-cached-service)). |
 | `--service-bulk-max N` | `100` | The most inputs per request of any bulk SERVICE. `bulk+n` is capped to it. |
 | `--service-cache-mb N` | `64` | The cache of remote results that `SERVICE <cache:…>` uses, per dataset. `0` turns it off. A global flag. |
+| `--shex-max-imports N` | `64` | Most schemas that the imports of one ShEx schema may bring in, directly or through other imports. `shex validate` and `validation` take it too. |
+| `--shex-max-import-mb N` | `16` | Most schema text that the imports of one ShEx schema may read, from files and the network together. `shex validate` and `validation` take it too. |
+| `--shex-import-timeout S` | `10` | Time that one http(s) import may take. The import is also held to `--outbound-timeout` and the request's budget. |
 | `--load-dir DIR` | | Let `LOAD <file:…>` read the regular files under `DIR`, with symbolic links resolved and nothing outside it. Without this flag, the server refuses file loads. |
 | `--embedding-secret NAME=SOURCE` | | A secret that vector indexes may name as their embedding API key: `NAME=env:VARIABLE` or `NAME=file:PATH`, read when a request is made. Repeatable. See [Embeddings computed on write](#embeddings-computed-on-write). |
 | `--no-embedding` | | Compute no embeddings. No worker sends text to a provider, and searches cannot pass text. The configurations are kept. |
@@ -960,6 +963,8 @@ sparkles validation --loc db --off
 Both commands read the default graph unless `--graph` names another, and include the
 materialized inferences unless `--no-inferences` is given. `shex validate` also takes a
 shape map file (`--map`) or a single node (`--node`), and Jena's flag names as aliases.
+`--shex-max-imports` and `--shex-max-import-mb` bound what a schema's imports may read,
+64 schemas and 16 MiB by default, as on the server.
 `validation --grandfather` blocks only the results a write introduces, so a guard in
 `reject` mode can be installed on data that does not conform.
 
