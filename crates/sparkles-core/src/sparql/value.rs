@@ -495,8 +495,33 @@ fn triple_equals(x: &oxrdf::Triple, y: &oxrdf::Triple) -> EvalResult<bool> {
 /// A numeric value as `f64` (rounded; monotone in the value: `x < y` implies
 /// `f(x) <= f(y)`), `None` for non-numeric values and NaN.
 pub fn approx_f64(v: &Value) -> Option<f64> {
+    if let Value::Decimal(d) = v {
+        return Some(decimal_f64(*d));
+    }
     let d = f64::from(Num::of(v).ok()?.to_double());
     (!d.is_nan()).then_some(d)
+}
+
+/// `xsd:decimal` to `xsd:double` with the result of oxsdatatypes' conversion, which
+/// strips the trailing zeros of the 18 fraction digits with 128-bit divisions. Values
+/// whose scaled magnitude fits in 64 bits, which covers every inline decimal, take the
+/// same steps in 64-bit arithmetic, and the rest use that conversion.
+pub fn decimal_f64(d: Decimal) -> f64 {
+    const POW: u64 = 1_000_000_000_000_000_000;
+    let v = i128::from_be_bytes(d.to_be_bytes());
+    let Ok(mut a) = u64::try_from(v.unsigned_abs()) else {
+        return f64::from(Double::from(d));
+    };
+    let mut shift = POW;
+    if a != 0 {
+        while shift != 1 && a.is_multiple_of(10) {
+            a /= 10;
+            shift /= 10;
+        }
+    }
+    // IEEE division rounds symmetrically, so the sign can be applied afterwards
+    let f = a as f64 / shift as f64;
+    if v < 0 { -f } else { f }
 }
 
 pub fn order_cmp(a: Option<&Value>, b: Option<&Value>) -> Ordering {
@@ -596,6 +621,41 @@ mod tests {
         Value::from_literal(&Literal::new_typed_literal(lex, dt))
     }
     use oxrdf::NamedNodeRef;
+
+    #[test]
+    fn decimal_f64_matches_the_decimal_conversion() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let same = |d: Decimal| {
+            let want = f64::from(Double::from(d));
+            assert_eq!(decimal_f64(d).to_bits(), want.to_bits(), "{d}");
+        };
+        for s in [
+            "0",
+            "-0.0",
+            "1",
+            "-1",
+            "0.1",
+            "-175000.5",
+            "1e-18",
+            "9.5",
+            "100",
+        ] {
+            let s = s.replace("1e-18", "0.000000000000000001");
+            same(s.parse().unwrap());
+        }
+        same(Decimal::MAX);
+        same(Decimal::MIN);
+        for _ in 0..100_000 {
+            let bits: i128 = match rng.random_range(0..4) {
+                0 => rng.random_range(-1_000_000i128..1_000_000),
+                1 => i128::from(rng.random::<i64>()),
+                2 => rng.random::<i64>() as i128 * 10i128.pow(rng.random_range(0..18)),
+                _ => rng.random::<i128>() >> rng.random_range(0..100),
+            };
+            same(Decimal::from_be_bytes(bits.to_be_bytes()));
+        }
+    }
 
     #[test]
     fn promotion() {

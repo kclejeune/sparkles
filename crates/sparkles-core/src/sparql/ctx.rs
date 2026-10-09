@@ -1341,7 +1341,22 @@ impl Ctx {
                 if let Some(v) = shard.read().get(&id) {
                     return Some(v.clone());
                 }
-                let v = Value::from_term(&self.term(id)?);
+                // straight from the key: building an RDF term first cost two string
+                // allocations per value (lexical form and datatype IRI)
+                let v = match id.tag() {
+                    Tag::Vocab => self
+                        .snap
+                        .generation
+                        .vocab
+                        .get_with(id.payload(), Value::from_key)?,
+                    Tag::Delta => self
+                        .snap
+                        .generation
+                        .dvocab
+                        .with(|v| v.get(id.payload()).map(Value::from_key))?,
+                    Tag::Local => self.local.read().get(id.payload()).map(Value::from_key)?,
+                    _ => Value::from_term(&self.term(id)?),
+                };
                 let mut w = shard.write();
                 if w.len() > VALUE_SHARD_CAP {
                     w.clear();

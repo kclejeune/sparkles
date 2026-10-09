@@ -3255,7 +3255,10 @@ fn topk_candidates(ctx: &Ctx, t: &Table, keys: &[(Expr, bool)], k: usize) -> Opt
         match id.tag() {
             Tag::Int => Some(id.as_i64() as f64),
             Tag::Double => Some(id.as_f64()).filter(|d| !d.is_nan()),
-            Tag::Decimal | Tag::Vocab | Tag::Delta => super::value::approx_f64(&ctx.value(id)?),
+            Tag::Decimal => Some(super::value::decimal_f64(crate::id::unpack_decimal(
+                id.payload(),
+            ))),
+            Tag::Vocab | Tag::Delta => super::value::approx_f64(&ctx.value(id)?),
             _ => None,
         }
     };
@@ -3309,9 +3312,10 @@ fn cursor_topk_candidates(
                 .get(i)
                 .as_ref()
                 .and_then(super::value::approx_f64),
-            Tag::Decimal | Tag::Vocab | Tag::Delta => {
-                ctx.value(id).as_ref().and_then(super::value::approx_f64)
-            }
+            Tag::Decimal => Some(super::value::decimal_f64(crate::id::unpack_decimal(
+                id.payload(),
+            ))),
+            Tag::Vocab | Tag::Delta => ctx.value(id).as_ref().and_then(super::value::approx_f64),
             _ => None,
         };
         number.map(|v| v * sign)
