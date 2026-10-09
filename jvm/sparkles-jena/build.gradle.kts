@@ -141,6 +141,44 @@ tasks.register<JavaExec>("perfCheck") {
     )
 }
 
+// The binding comparison of scripts/bench-bindings/bench.py runs
+// io.github.kclejeune.sparkles.jena.bench.BindingsBench (a test class, so not shipped) in
+// plain JVMs. `bindingsBenchClasspath` writes the classpaths it uses: the test runtime
+// classpath, and the same with a copy of the generated bindings that counts native calls
+// placed first. The counting copy increments a counter in UniFFI's call helper, which every
+// generated call goes through, and compiles with the module name of the `ffi` source set.
+val countingBindingsDir = layout.buildDirectory.dir("bindings-bench/counting-src")
+val callCountingBindings = tasks.register<Sync>("callCountingBindings") {
+    from(bindingsDir)
+    into(countingBindingsDir)
+    val marker = "    var status = UniffiRustCallStatus()"
+    filter { line -> if (line == marker) "    UniffiCallCounter.calls.increment()\n$line" else line }
+}
+val benchCalls: SourceSet = sourceSets.create("benchCalls") {
+    kotlin.srcDir(callCountingBindings)
+    compileClasspath = ffi.compileClasspath
+}
+tasks.named<KotlinCompile>("compileBenchCallsKotlin") {
+    compilerOptions {
+        moduleName.set("sparkles-jena_ffi")
+        allWarningsAsErrors = false
+        suppressWarnings = true
+    }
+}
+tasks.register("bindingsBenchClasspath") {
+    description = "Compiles the binding comparison and writes its classpaths to build/bindings-bench"
+    val runtime = sourceSets.test.get().runtimeClasspath
+    val counting: FileCollection = files(benchCalls.output)
+    dependsOn(runtime, counting)
+    val dir = layout.buildDirectory.dir("bindings-bench")
+    outputs.dir(dir)
+    doLast {
+        val d = dir.get().asFile
+        d.resolve("classpath.txt").writeText(runtime.files.joinToString(File.pathSeparator) + "\n")
+        d.resolve("classpath-calls.txt").writeText((counting.files + runtime.files).joinToString(File.pathSeparator) + "\n")
+    }
+}
+
 publishing { publications { create<MavenPublication>("maven") { from(components["java"]) } } }
 
 configurations.configureEach { resolutionStrategy.eachDependency { if (requested.group == "org.apache.jena" && providers.gradleProperty("sparkles.jenaVersion").isPresent) useVersion(providers.gradleProperty("sparkles.jenaVersion").get()) } }
