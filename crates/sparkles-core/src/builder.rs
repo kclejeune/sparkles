@@ -155,6 +155,8 @@ struct BatchInfo {
     /// the place of the batch in the order of `id`, set before the vocabulary merge
     pos: usize,
     keys: u64,
+    /// the size of the partial vocabulary file
+    voc_bytes: u64,
     quads: u64,
     /// every [`vocabmerge::SAMPLE_EVERY`]th key of the partial vocabulary
     samples: Vec<vocabmerge::Sample>,
@@ -336,6 +338,7 @@ impl Builder {
             id,
             pos: 0,
             keys: entries.len() as u64,
+            voc_bytes,
             quads: quads.len() as u64,
             samples,
         });
@@ -359,10 +362,10 @@ impl Builder {
 
         // ---- 2. vocabulary merge -------------------------------------------------
         self.interrupted()?;
-        // each merging thread reads every batch's vocabulary, and the maps are open: as
-        // many threads as the open-file limit allows, down to one, which needs as many
-        // files as a merge in one thread
-        let files = |t: usize| (t as u64 + 1) * batches.len() as u64 + 256;
+        // each merging thread reads every batch's vocabulary at once: as many threads as
+        // the open-file limit allows, down to one, which needs as many files as a merge
+        // in one thread
+        let files = |t: usize| t as u64 * batches.len() as u64 + 256;
         let mut threads = self.opts.threads.max(1);
         while threads > 1 && crate::disk::ensure_open_files(files(threads)).is_err() {
             threads -= 1;
@@ -373,6 +376,7 @@ impl Builder {
             .map(|b| vocabmerge::Partial {
                 voc: self.tmp.join(format!("b{}.voc", b.id)),
                 keys: b.keys,
+                bytes: b.voc_bytes,
                 samples: std::mem::take(&mut b.samples),
             })
             .collect();
