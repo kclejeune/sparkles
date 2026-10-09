@@ -297,41 +297,39 @@ impl Builder {
             scope,
             keys: FxHashMap::default(),
             key_bytes: 0,
-            quads: Vec::new(),
+            quads: QuadBuf::default(),
             keybuf: Vec::with_capacity(128),
             taken: 0,
             last: Default::default(),
         }
     }
 
-    fn write_batch(&self, keys: FxHashMap<Box<[u8]>, u32>, mut quads: Vec<[u64; 4]>) -> Result<()> {
+    fn write_batch(&self, keys: FxHashMap<Box<[u8]>, u32>, quads: QuadBuf) -> Result<()> {
         if quads.is_empty() {
             return Ok(());
         }
         let id = self.next_batch.fetch_add(1, Ordering::Relaxed);
         let mut entries: Vec<(Box<[u8]>, u32)> = keys.into_iter().collect();
         entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let mut rank = vec![0u64; entries.len()];
+        let mut rank = vec![0u32; entries.len()];
         for (r, (_, local)) in entries.iter().enumerate() {
-            rank[*local as usize] = r as u64;
+            rank[*local as usize] = r as u32;
         }
         let (samples, voc_bytes) = vocabmerge::write_partial(
             &self.tmp.join(format!("b{id}.voc")),
             entries.iter().map(|(k, _)| &**k),
         )?;
         self.tmp_bytes.add(iostat::Tmp::PartialVocab, voc_bytes);
-        for q in quads.iter_mut() {
-            for v in q.iter_mut() {
-                if Id(*v).tag() == Tag::Local {
-                    *v = Id::local(rank[Id(*v).payload() as usize]).0;
-                }
-            }
-        }
-        let q_bytes = runs::write_run(&self.tmp.join(format!("b{id}.q")), &quads)?;
+        let q_bytes = runs::write_run_from(
+            &self.tmp.join(format!("b{id}.q")),
+            quads.len(),
+            rayon::current_num_threads(),
+            |r, out| quads.expand(r, &rank, out),
+        )?;
         self.tmp_bytes.add(iostat::Tmp::Quads, q_bytes);
         self.input_quads
             .fetch_add(quads.len() as u64, Ordering::Relaxed);
-        if quads.iter().any(|q| q[3] != Id::DEFAULT_GRAPH.0) {
+        if quads.named_graphs() {
             self.named_graphs.store(true, Ordering::Relaxed);
         }
         self.batches.lock().push(BatchInfo {
@@ -571,7 +569,7 @@ impl Builder {
                     buf.dedup();
                 }
                 let p = self.tmp.join(format!("run-{}-{c}", first.name()));
-                let n = runs::write_run(&p, &buf)?;
+                let n = runs::write_run(&p, &buf, runs::ENCODE_GROUP)?;
                 self.tmp_bytes.add(iostat::Tmp::Runs, n);
                 runs[o].push(p);
             }
@@ -808,6 +806,85 @@ impl Plan {
     }
 }
 
+/// The quads of a batch while it is parsed, in half the memory of `[u64; 4]`.
+///
+/// A value is a `u32`. A batch-local id below [`QuadBuf::WIDE`] is stored as itself and
+/// the default graph as [`QuadBuf::DEFAULT_GRAPH`]. Any other value (an inline literal, a
+/// blank node, a large local id) goes to `wide`, and the slot holds its index there with
+/// the [`QuadBuf::WIDE`] bit set. Most values of a batch are local ids, so a batch takes
+/// about 16 bytes per quad instead of 32. The parser threads hold one batch each, and
+/// this is most of the memory of the parse.
+#[derive(Default)]
+struct QuadBuf {
+    slots: Vec<[u32; 4]>,
+    wide: Vec<u64>,
+}
+
+impl QuadBuf {
+    const WIDE: u32 = 1 << 31;
+    const DEFAULT_GRAPH: u32 = u32::MAX;
+
+    fn with_capacity(quads: usize) -> QuadBuf {
+        QuadBuf {
+            slots: Vec::with_capacity(quads),
+            wide: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    #[inline]
+    fn push(&mut self, q: [u64; 4]) {
+        let slot = |v: u64, wide: &mut Vec<u64>| -> u32 {
+            let id = Id(v);
+            if id.tag() == Tag::Local && id.payload() < Self::WIDE as u64 {
+                id.payload() as u32
+            } else if v == Id::DEFAULT_GRAPH.0 {
+                Self::DEFAULT_GRAPH
+            } else {
+                wide.push(v);
+                // a batch ends long before 2^31 wide values: four per quad at most
+                Self::WIDE | (wide.len() - 1) as u32
+            }
+        };
+        let w = &mut self.wide;
+        self.slots
+            .push([slot(q[0], w), slot(q[1], w), slot(q[2], w), slot(q[3], w)]);
+    }
+
+    /// The quads of rows `r`, with each local id replaced by `Id::local(rank[id])`.
+    fn expand(&self, r: std::ops::Range<usize>, rank: &[u32], out: &mut Vec<Key>) {
+        out.extend(self.slots[r].iter().map(|q| {
+            q.map(|v| {
+                if v == Self::DEFAULT_GRAPH {
+                    Id::DEFAULT_GRAPH.0
+                } else if v & Self::WIDE != 0 {
+                    let w = self.wide[(v & !Self::WIDE) as usize];
+                    // a large local id is ranked like the others
+                    if Id(w).tag() == Tag::Local {
+                        Id::local(rank[Id(w).payload() as usize] as u64).0
+                    } else {
+                        w
+                    }
+                } else {
+                    Id::local(rank[v as usize] as u64).0
+                }
+            })
+        }));
+    }
+
+    /// Whether a quad is in a graph other than the default graph.
+    fn named_graphs(&self) -> bool {
+        self.slots.iter().any(|q| q[3] != Self::DEFAULT_GRAPH)
+    }
+}
+
 /// Per-chunk encoder: terms → ids, vocabulary terms → batch-local ids.
 pub struct Encoder<'b> {
     b: &'b Builder,
@@ -815,7 +892,7 @@ pub struct Encoder<'b> {
     keys: FxHashMap<Box<[u8]>, u32>,
     /// total length of `keys`
     key_bytes: usize,
-    quads: Vec<[u64; 4]>,
+    quads: QuadBuf,
     keybuf: Vec<u8>,
     /// quads taken, for the [`InterruptFn`] calls
     taken: u64,
@@ -972,7 +1049,7 @@ impl Encoder<'_> {
             &mut self.keys,
             FxHashMap::with_capacity_and_hasher(nk, Default::default()),
         );
-        let quads = std::mem::replace(&mut self.quads, Vec::with_capacity(nq));
+        let quads = std::mem::replace(&mut self.quads, QuadBuf::with_capacity(nq));
         self.key_bytes = 0;
         // batch-local ids start over
         for (_, id) in &mut self.last {
@@ -1222,6 +1299,57 @@ mod tests {
     use super::*;
     use crate::index::{BlockCache, PermIndex};
     use crate::io::{RdfFormat, Source};
+
+    /// Every kind of value comes back from the compact batch, with local ids ranked.
+    #[test]
+    fn quad_buf_keeps_every_value() {
+        let rank: Vec<u32> = (0..10).map(|i| 9 - i).collect();
+        let graph = Id::local(4).0;
+        let quads = [
+            [
+                Id::local(0).0,
+                Id::local(1).0,
+                Id::local(2).0,
+                Id::DEFAULT_GRAPH.0,
+            ],
+            [
+                Id::bnode(5).0,
+                Id::local(1).0,
+                Id::from_i64(-42).unwrap().0,
+                graph,
+            ],
+            [
+                Id::local(3).0,
+                Id::local(9).0,
+                Id::bnode(1 << 40).0,
+                Id::DEFAULT_GRAPH.0,
+            ],
+        ];
+        let mut buf = QuadBuf::default();
+        assert!(buf.is_empty());
+        for q in quads {
+            buf.push(q);
+        }
+        assert_eq!(buf.len(), 3);
+        // the blank nodes and the integer
+        assert_eq!(buf.wide.len(), 3);
+        assert!(buf.named_graphs());
+        let mut out = Vec::new();
+        buf.expand(1..3, &rank, &mut out);
+        buf.expand(0..1, &rank, &mut out);
+        let ranked = |v: u64| match Id(v).tag() {
+            Tag::Local => Id::local(rank[Id(v).payload() as usize] as u64).0,
+            _ => v,
+        };
+        let want: Vec<Key> = [quads[1], quads[2], quads[0]]
+            .iter()
+            .map(|q| q.map(ranked))
+            .collect();
+        assert_eq!(out, want);
+        let mut default_only = QuadBuf::default();
+        default_only.push(quads[0]);
+        assert!(!default_only.named_graphs());
+    }
 
     #[test]
     fn an_interrupt_stops_the_build() {
