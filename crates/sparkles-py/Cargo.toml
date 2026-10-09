@@ -50,8 +50,14 @@ graphql = ["sparkles/graphql"]
 lto = "thin"
 codegen-units = 4
 
+# The same debug settings as the root workspace, so builds in the shared target directory
+# reuse its compiled dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
 
 # the root workspace's patch (see vendor/spargebra/PATCHED.md)
 [patch.crates-io]

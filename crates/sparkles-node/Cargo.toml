@@ -46,8 +46,14 @@ lto = "thin"
 codegen-units = 4
 panic = "unwind"
 
+# The same debug settings as the root workspace, so builds in the shared target directory
+# reuse its compiled dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
 
 [patch.crates-io]
 spargebra = { path = "../../vendor/spargebra" }
