@@ -503,24 +503,29 @@ pub fn approx_f64(v: &Value) -> Option<f64> {
 }
 
 /// `xsd:decimal` to `xsd:double` with the result of oxsdatatypes' conversion, which
-/// strips the trailing zeros of the 18 fraction digits with 128-bit divisions. Values
-/// whose scaled magnitude fits in 64 bits, which covers every inline decimal, take the
-/// same steps in 64-bit arithmetic, and the rest use that conversion.
+/// strips the trailing zeros of the 18 fraction digits with one 128-bit division per
+/// digit and then divides by the remaining power of ten. Here one 128-bit division
+/// splits off the fraction, its trailing zeros are counted in 64 bits, and the same
+/// quotient and power of ten give the same double.
 pub fn decimal_f64(d: Decimal) -> f64 {
     const POW: u64 = 1_000_000_000_000_000_000;
     let v = i128::from_be_bytes(d.to_be_bytes());
-    let Ok(mut a) = u64::try_from(v.unsigned_abs()) else {
-        return f64::from(Double::from(d));
-    };
-    let mut shift = POW;
-    if a != 0 {
-        while shift != 1 && a.is_multiple_of(10) {
-            a /= 10;
+    let a = v.unsigned_abs();
+    let (int, mut frac) = ((a / u128::from(POW)), (a % u128::from(POW)) as u64);
+    let f = if frac == 0 {
+        // every fraction digit is zero: the shift goes down to 1
+        int as f64
+    } else {
+        let mut shift = POW;
+        while frac.is_multiple_of(10) {
+            frac /= 10;
             shift /= 10;
         }
-    }
-    // IEEE division rounds symmetrically, so the sign can be applied afterwards
-    let f = a as f64 / shift as f64;
+        // the value without its trailing zeros, as oxsdatatypes divides it down
+        let m = int * u128::from(shift) + u128::from(frac);
+        m as f64 / shift as f64
+    };
+    // IEEE conversion and division round symmetrically, so the sign comes last
     if v < 0 { -f } else { f }
 }
 
