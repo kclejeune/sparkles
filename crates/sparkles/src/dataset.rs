@@ -375,23 +375,24 @@ impl Dataset {
     // ------------------------------------------------------------------ loading ------
 
     /// Load a file; the format is taken from the extension (`.ttl`, `.nt.gz`, `.trig`, …).
+    /// Jena's TriX (`.trix`), RDF Thrift (`.rt`, `.trdf`), RDF Protobuf (`.rpb`,
+    /// `.pbrdf`) and RDF/JSON (`.rj`) are read too, by way of a temporary N-Quads file.
     /// Returns the number of new quads.
     pub fn load_file(&self, path: impl AsRef<Path>) -> Result<u64> {
-        self.load_sources(vec![Source::from_path(path.as_ref(), None)?])
+        self.load_files([path])
     }
 
-    /// Load a file's triples into a named graph.
+    /// Load a file's triples into a named graph. Named graphs of a quad syntax are kept.
     pub fn load_file_into(&self, path: impl AsRef<Path>, graph: &str) -> Result<u64> {
         let g = NamedNode::new(graph).map_err(|e| Error::invalid(e.to_string()))?;
-        self.load_sources(vec![Source::from_path(path.as_ref(), Some(g))?])
+        let (sources, _spooled) = crate::syntax::file_sources([path], Some(g))?;
+        self.load_sources(sources)
     }
 
-    /// Load many files at once (parallel bulk path for large inputs).
+    /// Load many files at once (parallel bulk path for large inputs), in the syntaxes
+    /// [`load_file`](Self::load_file) reads.
     pub fn load_files(&self, paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Result<u64> {
-        let sources = paths
-            .into_iter()
-            .map(|p| Source::from_path(p.as_ref(), None))
-            .collect::<Result<Vec<_>>>()?;
+        let (sources, _spooled) = crate::syntax::file_sources(paths, None)?;
         self.load_sources(sources)
     }
 
@@ -844,9 +845,15 @@ impl Dataset {
         )
     }
 
-    /// Serialize the dataset. Quad formats (N-Quads, TriG) write every graph; triple
-    /// formats write the default graph only.
-    pub fn dump(&self, w: impl Write, format: RdfFormat) -> Result<u64> {
+    /// Serialize the dataset in a W3C syntax ([`RdfFormat`]) or one of Jena's
+    /// ([`JenaFormat`](crate::jena_formats::JenaFormat)). Quad syntaxes (N-Quads, TriG,
+    /// TriX, RDF Thrift, RDF Protobuf) write every graph, and triple syntaxes write the
+    /// default graph only.
+    pub fn dump(&self, w: impl Write, format: impl Into<crate::RdfSyntax>) -> Result<u64> {
+        let format = match format.into() {
+            crate::RdfSyntax::Rdf(f) => f,
+            crate::RdfSyntax::Jena(j) => return self.dump_jena(w, j),
+        };
         let snap = self.inner.store.snapshot();
         let quads_format = format.supports_datasets();
         let ser = crate::io::with_prefixes(
@@ -867,6 +874,33 @@ impl Dataset {
                         &quad.subject,
                         &quad.predicate,
                         &quad.object,
+                    ))?;
+                }
+                n += 1;
+            }
+            Ok(())
+        })?;
+        out.finish()?;
+        Ok(n)
+    }
+
+    fn dump_jena(&self, w: impl Write, format: crate::jena_formats::JenaFormat) -> Result<u64> {
+        let snap = self.inner.store.snapshot();
+        let quads_format = format.quads();
+        let mut out = crate::jena_formats::RdfWriter::new(format, w);
+        let mut n = 0;
+        snap.for_each_quad(|q| {
+            if !quads_format && q[3] != Id::DEFAULT_GRAPH {
+                return Ok(());
+            }
+            if let Some(quad) = snap.quad_to_terms(q) {
+                if quads_format {
+                    out.quad(&quad)?;
+                } else {
+                    out.triple(&oxrdf::Triple::new(
+                        quad.subject,
+                        quad.predicate,
+                        quad.object,
                     ))?;
                 }
                 n += 1;
@@ -1654,6 +1688,112 @@ mod tests {
             );
             let _ = NamedNodeRef::new_unchecked("x");
         }
+    }
+
+    /// Two quads in the default graph and one, with a triple term, in a named graph.
+    fn jena_fixture() -> Dataset {
+        let ds = Dataset::memory();
+        ds.load_str(
+            "@prefix ex: <http://ex.org/> . ex:a ex:p 1, \"x\"@en . \
+             ex:g { ex:b ex:p <<( ex:a ex:p ex:b )>> }",
+            RdfFormat::TriG,
+        )
+        .unwrap();
+        ds
+    }
+
+    fn canonical(ds: &Dataset) -> String {
+        let mut buf = Vec::new();
+        ds.dump(&mut buf, RdfFormat::NQuads).unwrap();
+        let mut lines: Vec<_> = String::from_utf8(buf)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        lines.sort();
+        lines.join("\n")
+    }
+
+    #[test]
+    fn jena_quad_syntaxes_round_trip_through_dump_and_load_file() {
+        use crate::jena_formats::JenaFormat;
+        let ds = jena_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        for (format, name) in [
+            (JenaFormat::TriX, "d.trix"),
+            (JenaFormat::Thrift, "d.rt"),
+            (JenaFormat::Protobuf, "d.rpb"),
+        ] {
+            let path = dir.path().join(name);
+            let written = ds
+                .dump(std::fs::File::create(&path).unwrap(), format)
+                .unwrap();
+            assert_eq!(written, 3, "{name}");
+            let back = Dataset::memory();
+            assert_eq!(back.load_file(&path).unwrap(), 3, "{name}");
+            assert_eq!(canonical(&back), canonical(&ds), "{name}");
+        }
+        let trix = std::fs::read_to_string(dir.path().join("d.trix")).unwrap();
+        assert_eq!(trix.matches("<graph>").count(), 2, "{trix}");
+    }
+
+    #[test]
+    fn rdf_json_dump_writes_the_default_graph() {
+        let ds = jena_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.rj");
+        let written = ds
+            .dump(
+                std::fs::File::create(&path).unwrap(),
+                crate::jena_formats::JenaFormat::RdfJson,
+            )
+            .unwrap();
+        assert_eq!(written, 2);
+        let back = Dataset::memory();
+        assert_eq!(back.load_file(&path).unwrap(), 2);
+        assert!(back.graph_names().unwrap().is_empty());
+    }
+
+    #[test]
+    fn compressed_jena_files_load_with_load_files_and_into_a_graph() {
+        let ds = jena_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let gz = dir.path().join("d.trix.gz");
+        let mut w = crate::codec::Codec::Gzip
+            .writer(std::fs::File::create(&gz).unwrap(), None, 1)
+            .unwrap();
+        ds.dump(&mut w, crate::jena_formats::JenaFormat::TriX)
+            .unwrap();
+        w.finish().unwrap();
+        let ttl = dir.path().join("more.ttl");
+        std::fs::write(&ttl, "<http://ex.org/c> <http://ex.org/p> 9 .").unwrap();
+        let back = Dataset::memory();
+        assert_eq!(back.load_files([&gz, &ttl]).unwrap(), 4);
+        let into = Dataset::memory();
+        into.load_file_into(&gz, "http://ex.org/target").unwrap();
+        assert_eq!(
+            into.named_graph("http://ex.org/target")
+                .unwrap()
+                .len()
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            into.named_graph("http://ex.org/g").unwrap().len().unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_jena_file_is_a_parse_error_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.trix");
+        std::fs::write(&path, "<trix><graph><triple><uri>x</uri></graph>").unwrap();
+        let err = Dataset::memory().load_file(&path).unwrap_err();
+        assert!(
+            matches!(&err, Error::RdfParse(m) if m.contains("bad.trix") && m.contains("TriX")),
+            "{err}"
+        );
     }
 
     #[test]

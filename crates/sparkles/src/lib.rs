@@ -22,9 +22,11 @@ pub mod handles;
 pub mod querybuilder;
 pub mod reasoning;
 pub mod stats;
+pub mod syntax;
 pub mod terms;
 pub mod write_guard;
 
 pub use catalog::{Catalog, CatalogOptions};
 pub use dataset::{Dataset, DatasetOptions, GraphView, QuadIter, Solution, Solutions, Transaction};
 pub use sparkles_core::{Budget, BudgetKind, Error, Result};
+pub use syntax::RdfSyntax;

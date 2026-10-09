@@ -3104,6 +3104,7 @@ dependencies = [
  "sparkles-reasoner",
  "sparkles-shacl",
  "sparkles-shex",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

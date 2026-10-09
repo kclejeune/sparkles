@@ -2216,6 +2216,7 @@ use sparkles::querybuilder::{SelectBuilder, UpdateBuilder, expr, lit, var};
 
 let ds = Dataset::open("mydb")?;                 // or Dataset::memory()
 ds.load_file("data.ttl.gz")?;                    // parallel bulk path for large inputs
+ds.load_file("export.rt")?;                      // Jena's TriX, RDF Thrift, RDF Protobuf, RDF/JSON
 
 // SPARQL text
 let q = "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
@@ -2246,6 +2247,7 @@ ds.transaction(|tx| {                              // committed on Ok, rolled ba
     Ok(())
 })?;
 ds.dump(std::io::stdout(), RdfFormat::TriG)?;
+ds.dump(std::fs::File::create("out.trix")?, sparkles::jena_formats::JenaFormat::TriX)?;
 ```
 
 | Jena | Sparkles |

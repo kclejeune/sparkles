@@ -214,7 +214,7 @@ pub fn run(
         .count();
     if !cancelled && !disabled {
         ctl.progress.report(0.95, "retention");
-        let retention = match apply_retention(engine, p, false, engine.now()) {
+        let mut retention = match apply_retention(engine, p, false, engine.now()) {
             Ok(r) => RunRetention {
                 deleted: r.delete.into_iter().map(|b| b.name).collect(),
                 error: r.errors.map(|e| e.join("; ")),
@@ -225,10 +225,20 @@ pub fn run(
             },
         };
         if p.gc_after_retention && !retention.deleted.is_empty() && ctl.check().is_ok() {
-            run.gc = engine
-                .start_gc(&p.repository)
-                .ok()
-                .map(|task| RunGc { task });
+            match engine.start_gc(&p.repository) {
+                Ok(task) => run.gc = Some(RunGc { task }),
+                // The check below reports a cancelled collection as the run's cancellation.
+                Err(e) if e.code() == Code::Cancelled => {}
+                // The run result has no GC error field, so a collection that fails to
+                // start is reported with the retention it follows.
+                Err(e) => {
+                    let gc = format!("gc after retention failed: {}", e.message());
+                    retention.error = Some(match retention.error.take() {
+                        Some(earlier) => format!("{earlier}; {gc}"),
+                        None => gc,
+                    });
+                }
+            }
         }
         run.retention = Some(retention);
     }
@@ -417,7 +427,8 @@ impl crate::Catalog {
             catalog: self,
             repository,
             selected: Some(&p.datasets),
-            ctl: ctl.into(),
+            // `run` reports retention at 0.95, so the collection's progress fills the rest.
+            ctl: (&ctl.part(0.95, 1.0)).into(),
         };
         let mut report = run(
             &engine,
@@ -472,6 +483,8 @@ mod tests {
         Delete,
         AfterDelete,
         OrdinaryFailure,
+        GcFailure,
+        GcCancelled,
     }
     struct StoppingEngine {
         control: Control,
@@ -560,7 +573,17 @@ mod tests {
         }
         fn start_gc(&self, _: &str) -> std::result::Result<String, BackupError> {
             self.gc.set(self.gc.get() + 1);
-            Ok("gc".into())
+            match self.stop {
+                StopAt::GcFailure => Err(BackupError::new(
+                    Code::RepositoryUnavailable,
+                    "repository locked",
+                )),
+                StopAt::GcCancelled => {
+                    self.control.cancel.cancel();
+                    Err(BackupError::cancelled())
+                }
+                _ => Ok("gc".into()),
+            }
         }
     }
     fn stopping_run(stop: StopAt) -> (PolicyRun, StoppingEngine) {
@@ -616,6 +639,30 @@ mod tests {
         assert_eq!(engine.listed.get(), 1);
         assert_eq!(engine.deleted.get(), 1);
         assert_eq!(engine.gc.get(), 1);
+    }
+
+    #[test]
+    fn failed_gc_start_is_reported_with_retention() {
+        let (report, engine) = stopping_run(StopAt::GcFailure);
+        assert_eq!(engine.gc.get(), 1);
+        assert!(report.gc.is_none());
+        let retention = report.retention.unwrap();
+        assert_eq!(retention.deleted, ["old"]);
+        assert_eq!(
+            retention.error.as_deref(),
+            Some("gc after retention failed: repository locked")
+        );
+        assert_eq!(report.result, RunResult::Ok);
+        assert_eq!(report.reason, None);
+    }
+    #[test]
+    fn cancelled_gc_is_the_run_cancellation_not_a_retention_error() {
+        let (report, engine) = stopping_run(StopAt::GcCancelled);
+        assert_eq!(engine.gc.get(), 1);
+        assert!(report.gc.is_none());
+        assert_eq!(report.retention.unwrap().error, None);
+        assert_eq!(report.reason.as_deref(), Some("cancelled"));
+        assert_eq!(report.result, RunResult::Partial);
     }
 
     #[test]

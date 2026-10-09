@@ -19,6 +19,8 @@ serde_json.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 libc = "0.2"
+# the temporary N-Quads files of loads in Jena's syntaxes
+tempfile.workspace = true
 # the cursors of the schema report's lists (base64url JSON)
 base64 = "0.23"
 # the IRI and language tag checks of `sparkles::terms`

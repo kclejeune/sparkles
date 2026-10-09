@@ -144,7 +144,8 @@ impl Backups<'_> {
         ctl: &Control,
     ) -> Result<crate::backup::PolicyRun> {
         use crate::backup::policy::{DatasetInfo, Engine, to_backup};
-        struct Single<'a>(Backups<'a>);
+        /// The dataset's backups, and the control the collection after retention follows.
+        struct Single<'a>(Backups<'a>, crate::backup::Ctl);
         impl Engine for Single<'_> {
             fn datasets(&self) -> Vec<DatasetInfo> {
                 vec![DatasetInfo {
@@ -185,7 +186,10 @@ impl Backups<'_> {
             }
             fn start_gc(&self, _: &str) -> std::result::Result<String, crate::backup::BackupError> {
                 crate::backup::blocking(self.0.repo)
-                    .gc(&Default::default())
+                    .gc(&crate::backup::GcOptions {
+                        ctl: self.1.clone(),
+                        ..Default::default()
+                    })
                     .map_err(to_backup)?;
                 Ok("completed".into())
             }
@@ -195,7 +199,8 @@ impl Backups<'_> {
             return Err(crate::Error::invalid("the policy names another repository"));
         }
         let report = crate::backup::policy::run(
-            &Single(self.clone()),
+            // `run` reports retention at 0.95, so the collection's progress fills the rest.
+            &Single(self.clone(), (&ctl.part(0.95, 1.0)).into()),
             policy,
             crate::backup::RunTrigger::Manual,
             None,
@@ -264,5 +269,101 @@ mod policy_metadata_tests {
             result.expect("single policy cancellation waited for the retained writer"),
             Err(crate::Error::Cancelled)
         ));
+    }
+
+    /// A dataset whose repository holds two policy backups, and a policy that keeps one
+    /// and collects the repository after retention.
+    fn gc_fixture(root: &std::path::Path) -> (crate::Catalog, backup::Repository, PolicyConfig) {
+        let catalog = crate::Catalog::memory(Default::default());
+        let dataset = catalog
+            .create(
+                "ds",
+                &crate::catalog::CreateDataset {
+                    kind: crate::catalog::DatasetKind::Memory,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        dataset.update("INSERT DATA { <urn:s> <urn:p> 1 }").unwrap();
+        let config = RepoConfig::from_url("local", &format!("file://{}", root.display())).unwrap();
+        let repository = backup::open(
+            &config,
+            &OpenEnv {
+                init: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut policy: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "name":"manual", "repository":"local", "datasets":["ds"],
+            "schedule":"every 1h", "nameTemplate":"{policy}-{dataset}-{run}"
+        }))
+        .unwrap();
+        for _ in 0..2 {
+            dataset
+                .backups(&repository)
+                .run_policy(&policy, &Control::default())
+                .unwrap();
+        }
+        policy.retention.min_count = 0;
+        policy.retention.max_count = Some(1);
+        policy.gc_after_retention = true;
+        (catalog, repository, policy)
+    }
+
+    type Reports = std::sync::Arc<std::sync::Mutex<Vec<(f32, String)>>>;
+
+    /// A control that records each progress report and cancels at `cancel_at`.
+    fn recording(cancel_at: Option<&'static str>) -> (Control, Reports) {
+        let reports = Reports::default();
+        let mut control = Control::default();
+        let cancel = control.cancel.clone();
+        let seen = reports.clone();
+        control.progress = crate::task::Progress::new(move |fraction, message| {
+            seen.lock().unwrap().push((fraction, message.to_string()));
+            if cancel_at == Some(message) {
+                cancel.cancel();
+            }
+        });
+        (control, reports)
+    }
+
+    #[test]
+    fn single_dataset_policy_gc_reports_progress_after_retention() {
+        let root = tempfile::tempdir().unwrap();
+        let (catalog, repository, policy) = gc_fixture(root.path());
+        let (control, reports) = recording(None);
+        let run = catalog
+            .get("ds")
+            .unwrap()
+            .backups(&repository)
+            .run_policy(&policy, &control)
+            .unwrap();
+        let retention = run.retention.unwrap();
+        assert_eq!(retention.deleted.len(), 2);
+        assert_eq!(retention.error, None);
+        assert_eq!(run.gc.unwrap().task, "completed");
+        let reports = reports.lock().unwrap();
+        let manifests = reports
+            .iter()
+            .find(|(_, message)| message == "reading manifests")
+            .expect("the collection reports through the caller's control");
+        assert!((0.95..=1.0).contains(&manifests.0), "{manifests:?}");
+    }
+
+    #[test]
+    fn single_dataset_policy_gc_observes_cancellation_and_releases_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let (catalog, repository, policy) = gc_fixture(root.path());
+        let (control, _) = recording(Some("reading manifests"));
+        assert!(matches!(
+            catalog
+                .get("ds")
+                .unwrap()
+                .backups(&repository)
+                .run_policy(&policy, &control),
+            Err(crate::Error::Cancelled)
+        ));
+        assert!(backup::blocking(&repository).locks().unwrap().is_empty());
     }
 }

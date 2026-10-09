@@ -22,7 +22,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | A bulk write path. Large update and inference batches are merged into a rebuilt generation, published by an atomic `CURRENT` switch. | ✅ |
 | A sorted, front-coded, memory-mapped base vocabulary, and an append-only delta vocabulary. | ✅ |
 | 7 permutations (SPO, SOP, PSO, POS, OSP, OPS, GSPO) in compressed blocks of 32k rows. | ✅ |
-| A parallel bulk loader for Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD. Reader-based loading is available for every supported format, with automatic selection and explicit streaming or buffered modes. Input can be compressed with gzip, xz, bzip2, zstd, brotli or LZ4. `sparkles load` also takes Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON, which it reads into N-Quads first. | ✅ |
+| A parallel bulk loader for Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD. Reader-based loading is available for every supported format, with automatic selection and explicit streaming or buffered modes. Input can be compressed with gzip, xz, bzip2, zstd, brotli or LZ4. `sparkles load` and the library's `Dataset::load_file` also take Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON, which they read into N-Quads first. | ✅ |
 | External sort for inputs larger than the memory budget. | ✅ |
 | CSV and TSV imports ([C05](specs/C05-tabular-imports.md)). `sparkles load`, `sparkles csv`, `POST /{ds}/upload` and the web UI's upload form map tables to triples with a default mapping (a key column or the row number names each row), with W3C CSVW metadata (datatypes and formats, null values, defaults, lists, virtual columns and RFC 6570 URI templates), or with Tarql-style CONSTRUCT templates run in batches by the SPARQL engine. Tables stream, compressed or not, and an invalid cell stops the load with its row and column ([USAGE.md](USAGE.md#loading-csv-and-tsv)). | ✅ |
 | Planner statistics for predicates (counts, distinct subjects and objects), classes and graphs. | ✅ |
@@ -156,10 +156,15 @@ These are features other RDF stores have and Sparkles does not have yet.
 [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) covers performance.
 
 * **Scale and execution.** The largest measured dataset is English DBpedia, 1.24 billion
-  triples on one machine. Nothing larger, such as Wikidata, has been tried. Every
-  operator materializes its result, within budgets. There is no lazy, block-wise
-  execution, FSST vocabulary compression, IRI encoding, pattern trick, pinned results,
-  materialized views or live query monitoring.
+  triples on one machine. Nothing larger, such as Wikidata, has been tried. Queries run
+  eagerly by default, and each operator then materializes its result within budgets.
+  Streaming execution ([X05](specs/X05-streaming-query-execution.md)) is opt-in, apart
+  from the scans and OPTIONAL counts that automatic selection picks. It runs scans,
+  joins, DISTINCT and eligible aggregates batch by batch. Sorts and DESCRIBE still
+  collect their whole input, and EXISTS and the operators it does not support run
+  eagerly. Operator state is never spilled to disk, so a query whose state outgrows its
+  budget fails. There is no FSST vocabulary compression, IRI encoding, pattern trick,
+  pinned results, materialized views or live query monitoring.
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the
@@ -194,13 +199,13 @@ These are features other RDF stores have and Sparkles does not have yet.
   typing across a restart, so after one the first writes to a recursive schema over a
   large connected graph may be validated in full.
 * **Formats and change logs.** TriX, RDF Thrift, RDF Protobuf and RDF/JSON are read and
-  written by the server, `sparkles load`, `sparkles convert` and the Python bindings.
-  The library's `Dataset::load_file` and `dump` take only the W3C syntaxes, although the
-  library has readers and writers for them (`sparkles::jena_formats`, `sparkles::trix`)
-  and its `LOAD` reads TriX. A patch is applied
-  as one commit, even when it holds several `TX … TC` transactions, and a patch from
-  another dataset cannot name its existing blank nodes. There are no patch logs and no
-  replicas that follow a server.
+  written by the server, `sparkles load`, `sparkles convert`, the Python bindings and the
+  library's `Dataset::load_file` and `dump`. The loader reads them by rewriting each file
+  as N-Quads in a temporary file first. The library's `load_str` and `dump_graph` take
+  only the W3C syntaxes, and SPARQL `LOAD` reads TriX but not the other three. A patch
+  is applied as one commit, even when it holds several `TX … TC` transactions, and a
+  patch from another dataset cannot name its existing blank nodes. There are no patch
+  logs and no replicas that follow a server.
 * **Tabular imports.** CSV and TSV tables are mapped by CSVW metadata in its minimal
   mode or by CONSTRUCT templates. There are no RML or R2RML mappings, no CSVW standard
   mode, and no primary-key or foreign-key checks, and a template cannot read the target
