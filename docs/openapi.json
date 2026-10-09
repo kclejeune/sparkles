@@ -7295,6 +7295,69 @@
         ],
         "type": "object"
       },
+      "RelinkResult": {
+        "properties": {
+          "abandoned": {
+            "description": "Why the relink published nothing.",
+            "type": "string"
+          },
+          "baseCommit": {
+            "description": "The commit of main whose index the branch now links to.",
+            "type": "integer"
+          },
+          "blocksCopied": {
+            "type": "integer"
+          },
+          "blocksRewritten": {
+            "type": "integer"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "branchId": {
+            "type": "string"
+          },
+          "buildMs": {
+            "type": "number"
+          },
+          "caughtUpCommits": {
+            "description": "The branch's commits made during the relink and carried into the new generation.",
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "fullReason": {
+            "type": "string"
+          },
+          "generation": {
+            "description": "The linked generation the relink published, or the current one when it was abandoned.",
+            "type": "string"
+          },
+          "lockMs": {
+            "description": "How long the switch held the branch's writer lock.",
+            "type": "number"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "quads": {
+            "type": "integer"
+          },
+          "totalMs": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "dataset",
+          "branch",
+          "branchId",
+          "generation",
+          "quads",
+          "baseCommit"
+        ],
+        "type": "object"
+      },
       "Repository": {
         "description": "A backup repository with its settings, status and totals.",
         "externalDocs": {
@@ -13299,6 +13362,97 @@
           }
         ],
         "summary": "Rename, protect or annotate a branch",
+        "tags": [
+          "Branches"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/branches/{ds}/{name}/relink": {
+      "post": {
+        "description": "Moves a persistent branch that still links to an upstream's index onto the index of `main`'s current generation. The branch's changes since its start become a sparse overlay on that index, and its id, head, commits, snapshots and state stay as they were. Writes to the branch go on during the relink and are carried into the new generation. A relink never happens on its own, and ordinary compaction still gives a branch an index of its own. Needs admin on the branch. Relinking `main` answers `400 invalid-branch`, and a branch that owns its index or belongs to an in-memory dataset answers `409 not-relinkable`. The body is empty or `{}`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#relinking"
+        },
+        "operationId": "relinkBranch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "description": "`respond-async` runs it as a cancellable task with progress: `202` with the task and `Location: /$/tasks/{id}`. The task's `detail` is the result.",
+            "in": "header",
+            "name": "Prefer",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelinkResult"
+                }
+              }
+            },
+            "description": "The relink."
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Started as a task (`Prefer: respond-async`)."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Relink a branch to main's index",
         "tags": [
           "Branches"
         ],

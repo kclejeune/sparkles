@@ -1,11 +1,6 @@
 # P06 library surface. Concrete names describe the shipped bindings.
 # Planned entries are intentional and become required in their binding phase.
 
-["dataset.relink_branch"]
-python = "Dataset.branches.relink"
-jvm = "planned: explicit persistent branch relinking binding"
-node = "planned: explicit persistent branch relinking binding"
-
 ["backup.policy.next_runs"]
 python = "preview_schedule"
 jvm = "SparklesHelpers.previewSchedule"
@@ -115,6 +110,11 @@ node = "Dataset.branches.previewMerge"
 python = "Dataset.branches.preview_revert"
 jvm = "DatasetGraphSparkles.branches().previewRevert"
 node = "Dataset.branches.previewRevert"
+
+["branches.relink"]
+python = "Dataset.branches.relink"
+jvm = "DatasetGraphSparkles.branches().relink"
+node = "Dataset.branches.relink"
 
 ["branches.revert"]
 python = "Dataset.branches.revert"

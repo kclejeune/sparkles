@@ -567,6 +567,26 @@ export interface paths {
         patch: operations["updateBranch"];
         trace?: never;
     };
+    "/$/branches/{ds}/{name}/relink": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Relink a branch to main's index
+         * @description Moves a persistent branch that still links to an upstream's index onto the index of `main`'s current generation. The branch's changes since its start become a sparse overlay on that index, and its id, head, commits, snapshots and state stay as they were. Writes to the branch go on during the relink and are carried into the new generation. A relink never happens on its own, and ordinary compaction still gives a branch an index of its own. Needs admin on the branch. Relinking `main` answers `400 invalid-branch`, and a branch that owns its index or belongs to an in-memory dataset answers `409 not-relinkable`. The body is empty or `{}`.
+         */
+        post: operations["relinkBranch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/cache/clear/{ds}": {
         parameters: {
             query?: never;
@@ -4362,6 +4382,28 @@ export interface components {
             dataset: string;
             datasetId: string;
         };
+        RelinkResult: {
+            /** @description Why the relink published nothing. */
+            abandoned?: string;
+            /** @description The commit of main whose index the branch now links to. */
+            baseCommit: number;
+            blocksCopied?: number;
+            blocksRewritten?: number;
+            branch: string;
+            branchId: string;
+            buildMs?: number;
+            /** @description The branch's commits made during the relink and carried into the new generation. */
+            caughtUpCommits?: number;
+            dataset: string;
+            fullReason?: string;
+            /** @description The linked generation the relink published, or the current one when it was abandoned. */
+            generation: string;
+            /** @description How long the switch held the branch's writer lock. */
+            lockMs?: number;
+            mode?: string;
+            quads: number;
+            totalMs?: number;
+        };
         /** @description A backup repository with its settings, status and totals. */
         Repository: {
             allowHttp?: boolean;
@@ -6865,6 +6907,50 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    relinkBranch: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description `respond-async` runs it as a cancellable task with progress: `202` with the task and `Location: /$/tasks/{id}`. The task's `detail` is the result. */
+                Prefer?: string;
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index or branch. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The relink. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelinkResult"];
+                };
+            };
+            /** @description Started as a task (`Prefer: respond-async`). */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
