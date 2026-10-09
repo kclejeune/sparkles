@@ -34,7 +34,7 @@ pub struct PropertyContext<'q> {
 
 impl<'q> PropertyContext<'q> {
     pub fn timestamp(&self) -> oxsdatatypes::DateTime {
-        self.scope.ctx.now
+        self.scope.ctx.now()
     }
     pub fn check(&self) -> std::result::Result<(), ScalarError> {
         self.guarded(|| self.scope.ctx.check())

@@ -1226,7 +1226,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 }),
             }
         }
-        F::Now => Val::V(Value::DateTime(ctx.now)),
+        F::Now => Val::V(Value::DateTime(ctx.now())),
         F::Uuid => Val::V(Value::Iri(
             format!("urn:uuid:{}", uuid::Uuid::new_v4()).into(),
         )),
@@ -1909,7 +1909,7 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
             }
             "system-timezone" => v(Value::DayTime(DayTimeDuration::new(fnlib::local_offset()))),
             "nowtz" => v(fnlib::adjust(
-                &Value::DateTime(ctx.now),
+                &Value::DateTime(ctx.now()),
                 fnlib::TzArg::Offset(DayTimeDuration::new(fnlib::local_offset())),
                 None,
             )?),

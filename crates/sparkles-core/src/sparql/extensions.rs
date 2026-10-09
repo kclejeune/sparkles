@@ -315,7 +315,7 @@ pub struct ScalarContext<'a> {
 
 impl ScalarContext<'_> {
     pub fn timestamp(&self) -> oxsdatatypes::DateTime {
-        self.ctx.now
+        self.ctx.now()
     }
 
     /// Cancellation, deadline and prior execution failures remain fatal even if the
