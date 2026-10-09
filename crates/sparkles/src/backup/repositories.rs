@@ -51,11 +51,7 @@ impl Repositories {
         Ok(self)
     }
     pub fn list(&self) -> Vec<super::types::Repository> {
-        let names: Vec<_> = self.registry.repos.read().keys().cloned().collect();
-        names
-            .iter()
-            .filter_map(|n| self.registry.view(n).ok())
-            .collect()
+        self.registry.views()
     }
     pub fn get(&self, name: &str) -> Result<super::types::Repository> {
         self.registry.view(name).map_err(error)

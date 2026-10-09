@@ -561,6 +561,24 @@ impl Registry {
             .collect()
     }
 
+    /// The API form of every repository, ordered by name. One read of the map serves the
+    /// whole list, so a repository removed meanwhile is either listed or absent and never
+    /// fails the call.
+    pub fn views(&self) -> Vec<sparkles_backup::types::Repository> {
+        let mut users: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for p in self.policies.read().values() {
+            users
+                .entry(p.config.repository.clone())
+                .or_default()
+                .push(p.config.name.clone());
+        }
+        self.repos
+            .read()
+            .iter()
+            .map(|(name, e)| e.view(users.remove(name).unwrap_or_default()))
+            .collect()
+    }
+
     /// The API form of repository `name` (`404 no-such-repository`).
     pub fn view(&self, name: &str) -> Result<sparkles_backup::types::Repository, BackupError> {
         let users = self.policy_users(name);
@@ -728,6 +746,41 @@ mod tests {
             let token = reg.repos.read()["enc"].generation();
             reg.replace_configured(&plain).unwrap();
             assert_eq!(reg.repos.read()["enc"].generation(), token);
+        }
+    }
+
+    #[test]
+    fn views_list_every_repository_with_its_policies() {
+        let reg = Registry::default();
+        for (n, p) in [("b", "/srv/b"), ("a", "/srv/a")] {
+            reg.repos
+                .write()
+                .insert(n.into(), RepoEntry::new(fs_repo(n, p), ConfigSource::Api));
+        }
+        for (n, repo) in [("p2", "a"), ("p1", "a"), ("p3", "b")] {
+            let config = serde_json::from_value(serde_json::json!({
+                "name": n, "repository": repo, "datasets": ["*"],
+                "schedule": "every 1h", "nameTemplate": "{policy}-{dataset}-{run}"
+            }))
+            .unwrap();
+            reg.policies.write().insert(
+                n.into(),
+                PolicyEntry {
+                    config,
+                    source: ConfigSource::Api,
+                },
+            );
+        }
+        let all = reg.views();
+        let names: Vec<_> = all.iter().map(|r| r.config.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(all[0].policies, ["p1", "p2"]);
+        assert_eq!(all[1].policies, ["p3"]);
+        for r in &all {
+            assert_eq!(
+                serde_json::to_value(r).unwrap(),
+                serde_json::to_value(reg.view(&r.config.name).unwrap()).unwrap()
+            );
         }
     }
 
