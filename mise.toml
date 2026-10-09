@@ -781,6 +781,7 @@ flag "--cpus <list>" help="pin every process with taskset, e.g. 0-11"
 flag "--cores <n>" help="the JVM's processor count, the Rayon pool and the throughput's all cores (default: the pinned CPUs)"
 flag "--answers-only" help="check the answers and time nothing"
 flag "--no-build" help="use the bindings as built"
+flag "--jvm-opts <opts>" help="more JVM options, e.g. -Dsparkles.jni=false for the UniFFI calls alone"
 '''
 run = '''
 args=(--people "$usage_people" --workdir "$(realpath -m "$usage_workdir")" --langs "$usage_langs"
@@ -792,6 +793,7 @@ args=(--people "$usage_people" --workdir "$(realpath -m "$usage_workdir")" --lan
 [ -n "${usage_cores:-}" ] && args+=(--cores "$usage_cores")
 [ -n "${usage_answers_only:-}" ] && args+=(--answers-only)
 [ -n "${usage_no_build:-}" ] && args+=(--no-build)
+[ -n "${usage_jvm_opts:-}" ] && args+=(--jvm-opts="$usage_jvm_opts")
 python3 scripts/bench-bindings/bench.py "${args[@]}"
 '''
 
