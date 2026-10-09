@@ -417,6 +417,60 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "withLabels": {"type":"boolean","default":true},
                 "reasoning": rs, "atCommit": at, "at": sel}}),
         ),
+        (
+            "check_query",
+            json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
+                "dataset": ds,
+                "query": {"type":"string","minLength":1,"maxLength":65536,"description":"A SPARQL query; the dataset prefixes are predeclared"},
+                "explain": {"type":"boolean","default":false,"description":"Add the plan's estimated rows and the no-limit and large-estimate warnings of explain_query"},
+                "maxSuggestions": {"type":"integer","minimum":0,"maximum":10,"default":3,"description":"Suggestions per issue"},
+                "reasoning": rs,
+                "timeoutSeconds": to,
+                "atCommit": at, "at": sel}}),
+        ),
+        (
+            "similar_queries",
+            json!({"type":"object","additionalProperties":false,"required":["question"],"properties":{
+                "dataset": ds,
+                "question": {"type":"string","minLength":1,"maxLength":2000},
+                "k": {"type":"integer","minimum":1,"maximum":20,"default":5},
+                "withText": {"type":"boolean","default":true,"description":"Include each query's text"},
+                "embeddingIndex": {"type":"string","description":"The vector index whose embedding endpoint embeds the texts (default: the dataset's only index that embeds query text)"},
+                "timeoutSeconds": to}}),
+        ),
+        (
+            "link_entities",
+            json!({"type":"object","additionalProperties":false,"required":["mentions"],"properties":{
+                "dataset": ds,
+                "mentions": {"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","additionalProperties":false,"required":["text"],"properties":{
+                    "text":{"type":"string","minLength":1,"maxLength":200},
+                    "types":{"type":"array","items":{"type":"string"},"maxItems":5,"description":"Class IRIs the entity should have"},
+                    "context":{"type":"string","maxLength":500,"description":"Surrounding text, read only by the vector search"}}}},
+                "k": {"type":"integer","minimum":1,"maximum":20,"default":5,"description":"Candidates per mention"},
+                "labelPredicates": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20,"description":"The predicates that hold labels (default: rdfs:label, skos:prefLabel, schema:name and the other usual ones, then skos:altLabel)"},
+                "graphs": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20,"description":"Graph IRIs to search, or `default` (default: every graph you may read)"},
+                "reasoning": rs,
+                "timeoutSeconds": to,
+                "atCommit": at, "at": sel}}),
+        ),
+        (
+            "recall",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "dataset": ds,
+                "query": {"type":"string","minLength":1,"maxLength":2000,"description":"The question or the words to search for. Give query, seeds or both"},
+                "seeds": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"Entity IRIs to start from, for example from link_entities"},
+                "types": {"type":"array","items":{"type":"string"},"maxItems":5,"description":"Class IRIs that seeds found by search must have"},
+                "graphs": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20,"description":"Graph IRIs to read, or `default` (default: every graph you may read)"},
+                "hops": {"type":"integer","minimum":0,"maximum":2,"default":1},
+                "seedLimit": {"type":"integer","minimum":1,"maximum":50,"default":10,"description":"Seeds found by search"},
+                "maxTriples": {"type":"integer","minimum":1,"maximum":1000,"default":150},
+                "maxBytes": {"type":"integer","minimum":1024,"maximum":1048576,"default":32768},
+                "includeSuperseded": {"type":"boolean","default":false,"description":"List the superseded and retracted facts of the entities returned"},
+                "format": {"enum":["text","json"],"default":"text"},
+                "reasoning": rs,
+                "timeoutSeconds": to,
+                "atCommit": at, "at": sel}}),
+        ),
         #[cfg(feature = "shacl")]
         (
             "validate_shacl",
@@ -482,6 +536,10 @@ async fn a03_tool_list() {
             #[cfg(feature = "text")]
             "search_text",
             "similar_entities",
+            "check_query",
+            "similar_queries",
+            "link_entities",
+            "recall",
             #[cfg(feature = "shacl")]
             "validate_shacl",
             #[cfg(feature = "shex")]
@@ -503,7 +561,7 @@ async fn a03_tool_list() {
         assert!(tool["title"].is_string() && tool["description"].is_string());
         assert_eq!(
             tool.get("outputSchema").is_some(),
-            name != "sparql_query",
+            name != "sparql_query" && name != "recall",
             "{name}"
         );
         // no composition keywords or references anywhere

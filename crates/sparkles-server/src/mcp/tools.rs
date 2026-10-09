@@ -58,6 +58,10 @@ pub fn run(
         "format" => t.format(args),
         #[cfg(feature = "graphql")]
         "graphql_query" => t.graphql_query(args),
+        "check_query" => t.check_query(args),
+        "similar_queries" => t.similar_queries(args),
+        "link_entities" => t.link_entities(args),
+        "recall" => t.recall(args),
         "sparql_update" => t.sparql_update(args),
         // a stored query of a dataset (`<dataset>__<query>`)
         name => t.stored_query(name, args),
@@ -223,7 +227,7 @@ fn pattern_mut(q: &mut Query) -> &mut GraphPattern {
     }
 }
 
-fn pattern(q: &Query) -> &GraphPattern {
+pub(super) fn pattern(q: &Query) -> &GraphPattern {
     match q {
         Query::Select { pattern, .. }
         | Query::Ask { pattern, .. }
@@ -890,7 +894,7 @@ impl Tools<'_> {
     /// The schema report of `snap`: the dataset's cached one when it matches, else a
     /// fresh one (which replaces the cache, as `/$/schema` does).
     #[allow(clippy::too_many_arguments)]
-    fn schema_report(
+    pub(super) fn schema_report(
         &self,
         ds: &Dataset,
         snap: &Arc<Snapshot>,
@@ -1103,26 +1107,8 @@ impl Tools<'_> {
         }
         let root = plan.estimated_rows;
         let kind = query_type(&parsed);
-        if matches!(kind, "SELECT" | "CONSTRUCT") && !has_limit(pattern(&parsed)) && root > 10_000.0
-        {
-            warnings.push(json!({
-                "code": "no-limit",
-                "message": format!(
-                    "No LIMIT and about {} result rows estimated; sparql_query returns only the first {}. Add LIMIT or aggregate with COUNT/GROUP BY.",
-                    approx(root),
-                    100.min(self.cfg().max_rows)
-                ),
-            }));
-        }
-        let largest = max_estimate(&plan);
-        if largest > 50_000_000.0 {
-            warnings.push(json!({
-                "code": "large-estimate",
-                "message": format!(
-                    "An intermediate result of about {} rows is estimated; the query may exceed the timeout or memory budget. Add selective patterns (a class, a constant) first.",
-                    approx(largest)
-                ),
-            }));
+        for (code, message) in plan_warnings(&plan, &parsed, 100.min(self.cfg().max_rows)) {
+            warnings.push(json!({ "code": code, "message": message }));
         }
         let service =
             self.cfg().allow_service && self.call.principal.has(crate::auth::ServerPerm::Federate);
@@ -1596,6 +1582,39 @@ fn plan_lines(p: &PlanInfo, depth: usize, out: &mut String) {
     }
 }
 
+/// The `no-limit` and `large-estimate` warnings of a query's plan.
+pub(super) fn plan_warnings(
+    plan: &PlanInfo,
+    parsed: &Query,
+    default_rows: usize,
+) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    let root = plan.estimated_rows;
+    if matches!(query_type(parsed), "SELECT" | "CONSTRUCT")
+        && !has_limit(pattern(parsed))
+        && root > 10_000.0
+    {
+        out.push((
+            "no-limit",
+            format!(
+                "No LIMIT and about {} result rows estimated; sparql_query returns only the first {default_rows}. Add LIMIT or aggregate with COUNT/GROUP BY.",
+                approx(root),
+            ),
+        ));
+    }
+    let largest = max_estimate(plan);
+    if largest > 50_000_000.0 {
+        out.push((
+            "large-estimate",
+            format!(
+                "An intermediate result of about {} rows is estimated; the query may exceed the timeout or memory budget. Add selective patterns (a class, a constant) first.",
+                approx(largest)
+            ),
+        ));
+    }
+    out
+}
+
 fn max_estimate(p: &PlanInfo) -> f64 {
     p.children
         .iter()
@@ -1617,7 +1636,7 @@ fn has_limit(p: &GraphPattern) -> bool {
     }
 }
 
-fn children(p: &GraphPattern) -> Vec<&GraphPattern> {
+pub(super) fn children(p: &GraphPattern) -> Vec<&GraphPattern> {
     use GraphPattern as G;
     match p {
         G::Join { left, right }
@@ -1649,7 +1668,7 @@ fn has_service(p: &GraphPattern) -> bool {
 }
 
 /// Constant IRIs and literals of the triple patterns outside SERVICE.
-fn constant_terms(p: &GraphPattern, out: &mut Vec<Term>) {
+pub(super) fn constant_terms(p: &GraphPattern, out: &mut Vec<Term>) {
     let add = |t: &TermPattern, out: &mut Vec<Term>| match t {
         TermPattern::NamedNode(n) => out.push(Term::NamedNode(n.clone())),
         TermPattern::Literal(l) => out.push(Term::Literal(l.clone())),

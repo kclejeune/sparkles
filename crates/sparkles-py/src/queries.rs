@@ -48,6 +48,7 @@ impl PyStoredQueries {
             description,
             results,
             mcp,
+            questions: Vec::new(),
         };
         let change = sparkles::stored::Change {
             author,
