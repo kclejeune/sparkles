@@ -47,7 +47,7 @@ mimalloc = { version = "0.1.52", optional = true }
 tempfile = "3"
 
 [features]
-default = ["text", "geo", "reasoning", "shacl", "shex", "backup", "graphql", "fmt"]
+default = ["text", "geo", "reasoning", "shacl", "shex", "backup", "graphql", "fmt", "mimalloc"]
 fmt = ["sparkles/fmt", "dep:sparkles-fmt"]
 graphql = ["sparkles/graphql"]
 reasoning = ["sparkles/reasoning", "dep:sparkles-reasoner"]

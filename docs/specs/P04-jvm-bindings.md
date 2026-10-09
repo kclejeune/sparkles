@@ -1369,8 +1369,9 @@ its items are independent.
 8. **The writer's thread hop.** A write transaction could hold an owned writer lock guard
    (parking_lot's `ArcMutexGuard`) that may move between threads, which removes the hop.
    Default: keep the worker, which is also correct for virtual threads.
-9. **Allocator.** Default: the system allocator in Phase 1, with mimalloc measured in
-   Phase 3.
+9. **Allocator.** Decided on 2026-10-09. The native library uses mimalloc by default,
+   after the Phase 3 measurement showed faster writes and bulk loads at the cost of a
+   higher peak RSS.
 10. **Sharing with P01.** The transaction worker moves into `sparkles::embed`. Default:
     P04 uses it, and the Python bindings move onto it when they next change.
 11. **Generated code's license.** Decided on 2026-10-03. UniFFI is licensed MPL-2.0,
@@ -1751,10 +1752,12 @@ Five changes came out of it.
   query, which took 3.5% of a small star lookup.
 * A `find` pattern is encoded without the table that lets a batch send a repeated term
   once. Encoding fell from 13% to 7% of a Model navigation's time.
-* The native library has an opt-in `mimalloc` feature. With it a bulk load took 37 ms
-  instead of 61 ms and small Model writes about 15% less time, and reads moved within the
-  noise. The process's peak RSS rose from 653 to 962 MiB on a mixed run, so the feature is
-  off by default.
+* The native library uses mimalloc for its own allocations by default. With it a bulk
+  load took 37 ms instead of 61 ms and small Model writes about 15% less time, and reads
+  moved within the noise. The cost is memory, because the process's peak RSS rose from
+  653 to 962 MiB on a mixed run. The maintainer chose speed, so `mimalloc` is a default
+  feature, and a build with `--no-default-features` plus the features it needs keeps the
+  system allocator.
 
 Against TDB2 at one thread, Sparkles is now faster on every Model and Graph case, on
 RDFS, on ASK, SELECT, CONSTRUCT, star lookups, COUNT and parameterized queries, and on
