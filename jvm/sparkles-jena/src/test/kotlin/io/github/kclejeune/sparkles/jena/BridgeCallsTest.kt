@@ -61,6 +61,33 @@ class BridgeCallsTest {
     }
 
     @Test
+    fun ask_runs_natively_and_answers_both_ways() {
+        val dsg = filled(3)
+        val before = dsg.stats()
+        assertTrue(QueryExec.dataset(dsg).query("ASK { <${ex}s1> <${ex}p> ?o }").ask())
+        assertFalse(QueryExec.dataset(dsg).query("ASK { <${ex}s9> <${ex}p> ?o }").ask())
+        assertTrue(QueryExec.dataset(dsg).query("ASK {}").ask())
+        assertTrue(Txn.calculateRead(dsg) { QueryExec.dataset(dsg).query("ASK { ?s <${ex}p> \"v2\" }").ask() })
+        val after = dsg.stats()
+        assertEquals(before.nativeQueries + 4, after.nativeQueries)
+        assertEquals(before.fallbackQueries, after.fallbackQueries)
+    }
+
+    @Test
+    fun ask_takes_input_bindings_and_streaming_mode() {
+        val dsg = filled(3)
+        val s = Var.alloc("s")
+        val yes = BindingFactory.binding(s, iri("s2"))
+        val no = BindingFactory.binding(s, iri("s7"))
+        val q = "ASK { ?s <${ex}p> ?o }"
+        assertTrue(QueryExec.dataset(dsg).query(q).substitution(yes).build().use { it.ask() })
+        assertFalse(QueryExec.dataset(dsg).query(q).substitution(no).build().use { it.ask() })
+        val streaming = Context().set(Sparkles.STREAMING_EXECUTION, true)
+        assertTrue(QueryExec.dataset(dsg).query(q).context(streaming).build().use { it.ask() })
+        assertFalse(QueryExec.dataset(dsg).query("ASK { ?s <${ex}q> ?o }").context(streaming).build().use { it.ask() })
+    }
+
+    @Test
     fun results_that_free_themselves_are_read_to_the_end_or_closed_early() {
         // more rows than the first batch (256) and the first find batch (64)
         val dsg = filled(700)
@@ -86,6 +113,26 @@ class BridgeCallsTest {
         assertEquals(700, count(dsg, "SELECT * { ?s ?p ?o }"))
         val streaming = Context().set(Sparkles.STREAMING_EXECUTION, true)
         assertEquals(700, count(dsg, "SELECT * { ?s ?p ?o }", streaming))
+    }
+
+    @Test
+    fun query_text_keeps_iris_absolute_and_an_explicit_base() {
+        val dsg = memory()
+        // an IRI under Jena's system base, which the serializer used to write relative
+        val local = NodeFactory.createURI(org.apache.jena.irix.IRIs.getBaseStr() + "local/thing")
+        Txn.executeWrite(dsg) { dsg.add(Quad.defaultGraphIRI, local, iri("p"), iri("o")) }
+        assertEquals(1, count(dsg, "SELECT ?o { <${local.uri}> <${ex}p> ?o }"))
+        assertEquals(1, count(dsg, "SELECT ?o { <local/thing> <${ex}p> ?o }"))
+        // with BASE, IRI() resolves against it at run time
+        val resolved = QueryExec.dataset(dsg)
+            .query("BASE <http://base.example/dir/> SELECT (IRI(\"rel\") AS ?i) {}")
+            .build().use { qe -> qe.select().next().get(Var.alloc("i")) }
+        assertEquals("http://base.example/dir/rel", resolved.uri)
+        // a prepared query with prefixes, run twice
+        val q = QueryFactory.create("PREFIX ex: <$ex> SELECT ?o { <${local.uri}> ex:p ?o }")
+        repeat(2) {
+            assertEquals(1, QueryExec.dataset(dsg).query(q).build().use { qe -> qe.select().asSequence().count() })
+        }
     }
 
     @Test
