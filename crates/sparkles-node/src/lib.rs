@@ -515,6 +515,7 @@ impl NativeDataset {
             _ => return Err(invalid("execution must be eager, streaming or auto")),
         }
         let _permit = query_permit(&v, &flag).await?;
+        let first = first_batch_option(&v);
         let result = blocking(move || {
             let opts = query_options(&v, flag)?;
             if let Some(at) = v["at"].as_str() {
@@ -529,9 +530,10 @@ impl NativeDataset {
             } else {
                 shared.ds.query_with(&text, &opts)
             }
+            .and_then(|result| NativeResult::query(result).with_first(first))
         })
         .await?;
-        Ok(NativeResult::query(result))
+        Ok(result)
     }
     #[napi]
     pub fn begin<'env>(
@@ -689,19 +691,38 @@ impl NativeDataset {
         .await
     }
     #[napi]
-    pub async fn matched(&self, pattern: String) -> napi::Result<NativeResult> {
+    pub async fn matched(
+        &self,
+        pattern: String,
+        first_rows: Option<u32>,
+        first_bytes: Option<u32>,
+    ) -> napi::Result<NativeResult> {
         let shared = self.get(false)?;
         let pattern = parse(&pattern)?;
+        let first = first_batch(first_rows, first_bytes);
         blocking(move || {
-            Ok(NativeResult::scan(sparkles::embed::quads_in(
+            NativeResult::scan(sparkles::embed::quads_in(
                 shared.ds.snapshot(),
                 &quad_pattern(&pattern)?,
-            )))
+            ))
+            .with_first(first)
         })
         .await
     }
 }
 
+/// The size of a first batch that JavaScript asks to receive with the result.
+fn first_batch(rows: Option<u32>, bytes: Option<u32>) -> Option<(u32, u32)> {
+    Some((rows?, bytes?))
+}
+/// `firstBatch: [rows, bytes]` in a query's options.
+fn first_batch_option(v: &Value) -> Option<(u32, u32)> {
+    let f = v["firstBatch"].as_array()?;
+    first_batch(
+        f.first()?.as_u64()?.try_into().ok(),
+        f.get(1)?.as_u64()?.try_into().ok(),
+    )
+}
 fn quad_pattern(v: &Value) -> sparkles::Result<QuadPattern> {
     let node = |v: &Value| {
         if v.is_null() {
@@ -737,6 +758,14 @@ fn quad_pattern(v: &Value) -> sparkles::Result<QuadPattern> {
     })
 }
 
+/// The rows `query_result_row` gives for a result.
+fn query_result_len(r: &QueryResult) -> usize {
+    if r.kind == QueryKind::Select {
+        r.table.len()
+    } else {
+        r.triples.len() + r.quads.len()
+    }
+}
 fn query_result_row(r: &QueryResult, pos: usize) -> Option<Vec<Value>> {
     if r.kind == QueryKind::Select {
         if pos < r.table.len() {
@@ -768,6 +797,134 @@ fn query_result_row(r: &QueryResult, pos: usize) -> Option<Vec<Value>> {
             .get(pos - r.triples.len())
             .map(|q| vec![terms::encode_quad(q)])
     }
+}
+
+/// One batch of a result as the JSON that JavaScript decodes, or `null` once it is drained.
+/// A batch that drains a materialized result or a scan says `"done":true`, and the rows
+/// are freed in the same call, so that JavaScript neither asks for another batch nor has
+/// anything to close.
+fn pull(
+    cursor: &Mutex<Option<Cursor>>,
+    statistics: &Mutex<Option<String>>,
+    cancel: &Option<Arc<AtomicBool>>,
+    max_rows: u32,
+    max_bytes: u32,
+) -> sparkles::Result<String> {
+    let mut lock = cursor.lock();
+    let Some(c) = lock.as_mut() else {
+        return Ok("null".into());
+    };
+    let mut terms = vec![Value::Null];
+    let mut dictionary = HashMap::<String, u32>::new();
+    let mut rows = Vec::new();
+    let mut bytes = 0;
+    let mut drained = false;
+    while rows.len() < (max_rows.clamp(1, 65536) as usize)
+        && bytes < (max_bytes.clamp(1024, 16 << 20) as usize)
+    {
+        if cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(EngineError::Cancelled);
+        }
+        let row: Option<Vec<Value>> = match &mut c.rows {
+            Rows::Streaming(state) => {
+                if state
+                    .batch
+                    .as_ref()
+                    .is_none_or(|batch| state.row == batch.len())
+                {
+                    state.batch = None;
+                    state.row = 0;
+                    state.batch = state.cursor.next_batch()?;
+                }
+                match &state.batch {
+                    None => None,
+                    Some(batch) => {
+                        let row = batch
+                            .row(state.row)?
+                            .into_iter()
+                            .map(|term| term.as_ref().map(terms::encode).unwrap_or(Value::Null))
+                            .collect();
+                        state.row += 1;
+                        Some(row)
+                    }
+                }
+            }
+            Rows::Graph(state) => {
+                if state.batch.as_ref().is_none_or(|b| state.row == b.len()) {
+                    state.batch = None;
+                    state.row = 0;
+                    state.batch = state.cursor.next_batch()?;
+                }
+                state.batch.as_ref().map(|batch| {
+                    let value = terms::encode_quad(&batch.quads()[state.row]);
+                    state.row += 1;
+                    vec![value]
+                })
+            }
+            Rows::Ask(result) => {
+                debug_assert_eq!(result.result().kind, QueryKind::Ask);
+                None
+            }
+            Rows::Scan(scan) => scan
+                .next()
+                .transpose()?
+                .map(|q| vec![terms::encode_quad(&q)]),
+            Rows::Query(r) => query_result_row(r, c.pos),
+            Rows::Collected(r) => query_result_row(r.result(), c.pos),
+        };
+        let Some(row) = row else {
+            drained = true;
+            break;
+        };
+        c.pos += 1;
+        let mut cells = Vec::new();
+        for term in row {
+            if term.is_null() {
+                cells.push(0);
+                continue;
+            }
+            let key = term.to_string();
+            let id = if let Some(id) = dictionary.get(&key) {
+                *id
+            } else {
+                let id = terms.len() as u32;
+                bytes += key.len();
+                dictionary.insert(key, id);
+                terms.push(term);
+                id
+            };
+            cells.push(id);
+        }
+        bytes += cells.len() * 12 + 16;
+        rows.push(cells);
+    }
+    // Materialized results and scans know they are drained once a row is missing. A
+    // materialized result also knows it when the last row has been sent.
+    if !drained {
+        drained = match &c.rows {
+            Rows::Query(r) => c.pos >= query_result_len(r),
+            Rows::Collected(r) => c.pos >= query_result_len(r.result()),
+            _ => false,
+        };
+    }
+    if rows.is_empty() {
+        match &c.rows {
+            Rows::Streaming(state) => *statistics.lock() = Some(state.stats_json(c.pos, false)?),
+            Rows::Graph(state) => *statistics.lock() = Some(state.stats_json(c.pos, false)?),
+            _ => {}
+        }
+        lock.take();
+        return Ok("null".into());
+    }
+    let eager = matches!(c.rows, Rows::Query(_) | Rows::Collected(_) | Rows::Scan(_));
+    if drained && eager {
+        lock.take();
+        return Ok(json!({ "terms": terms, "rows": rows, "done": true }).to_string());
+    }
+    Ok(json!({ "terms": terms, "rows": rows }).to_string())
 }
 
 struct SelectCursor {
@@ -842,6 +999,8 @@ pub struct NativeResult {
     metadata: String,
     statistics: Arc<Mutex<Option<String>>>,
     cancel: Option<Arc<AtomicBool>>,
+    /// the first batch, computed in the call that made the result (see `with_first`)
+    first: Mutex<Option<String>>,
 }
 impl NativeResult {
     fn query(result: QueryResult) -> Self {
@@ -869,6 +1028,7 @@ impl NativeResult {
             metadata,
             statistics: Default::default(),
             cancel: None,
+            first: Mutex::new(None),
         }
     }
     fn streaming(
@@ -930,7 +1090,19 @@ impl NativeResult {
             metadata,
             statistics: Default::default(),
             cancel: Some(cancel),
+            first: Mutex::new(None),
         })
+    }
+    /// Compute the first batch now, in the native task that made the result, so that
+    /// JavaScript gets it without another round trip through the thread pool. Only
+    /// materialized results and scans take it: a streaming cursor computes each batch
+    /// under a reader permit.
+    fn with_first(self, first: Option<(u32, u32)>) -> sparkles::Result<Self> {
+        if let Some((rows, bytes)) = first {
+            let batch = pull(&self.cursor, &self.statistics, &self.cancel, rows, bytes)?;
+            *self.first.lock() = Some(batch);
+        }
+        Ok(self)
     }
     fn scan(scan: sparkles::QuadIter) -> Self {
         Self {
@@ -941,6 +1113,7 @@ impl NativeResult {
             metadata: json!({ "type": "quads" }).to_string(),
             statistics: Default::default(),
             cancel: None,
+            first: Mutex::new(None),
         }
     }
 }
@@ -999,6 +1172,12 @@ impl NativeResult {
         })
         .await
     }
+    /// The first batch, when the call that made this result computed it. It is handed
+    /// out once.
+    #[napi]
+    pub fn take_first(&self) -> Option<String> {
+        self.first.lock().take()
+    }
     #[napi]
     pub async fn next_batch(&self, max_rows: u32, max_bytes: u32) -> napi::Result<String> {
         let cursor = self.cursor.clone();
@@ -1010,112 +1189,7 @@ impl NativeResult {
             Some(flag) => Some(query_permit(&Value::Null, flag).await?),
             None => None,
         };
-        blocking(move || {
-            let mut lock = cursor.lock();
-            let Some(c) = lock.as_mut() else {
-                return Ok("null".into());
-            };
-            let mut terms = vec![Value::Null];
-            let mut dictionary = HashMap::<String, u32>::new();
-            let mut rows = Vec::new();
-            let mut bytes = 0;
-            while rows.len() < (max_rows.clamp(1, 65536) as usize)
-                && bytes < (max_bytes.clamp(1024, 16 << 20) as usize)
-            {
-                if cancel
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
-                {
-                    return Err(EngineError::Cancelled);
-                }
-                let row: Option<Vec<Value>> = match &mut c.rows {
-                    Rows::Streaming(state) => {
-                        if state
-                            .batch
-                            .as_ref()
-                            .is_none_or(|batch| state.row == batch.len())
-                        {
-                            state.batch = None;
-                            state.row = 0;
-                            state.batch = state.cursor.next_batch()?;
-                        }
-                        match &state.batch {
-                            None => None,
-                            Some(batch) => {
-                                let row = batch
-                                    .row(state.row)?
-                                    .into_iter()
-                                    .map(|term| {
-                                        term.as_ref().map(terms::encode).unwrap_or(Value::Null)
-                                    })
-                                    .collect();
-                                state.row += 1;
-                                Some(row)
-                            }
-                        }
-                    }
-                    Rows::Graph(state) => {
-                        if state.batch.as_ref().is_none_or(|b| state.row == b.len()) {
-                            state.batch = None;
-                            state.row = 0;
-                            state.batch = state.cursor.next_batch()?;
-                        }
-                        state.batch.as_ref().map(|batch| {
-                            let value = terms::encode_quad(&batch.quads()[state.row]);
-                            state.row += 1;
-                            vec![value]
-                        })
-                    }
-                    Rows::Ask(result) => {
-                        debug_assert_eq!(result.result().kind, QueryKind::Ask);
-                        None
-                    }
-                    Rows::Scan(scan) => scan
-                        .next()
-                        .transpose()?
-                        .map(|q| vec![terms::encode_quad(&q)]),
-                    Rows::Query(r) => query_result_row(r, c.pos),
-                    Rows::Collected(r) => query_result_row(r.result(), c.pos),
-                };
-                let Some(row) = row else { break };
-                c.pos += 1;
-                let mut cells = Vec::new();
-                for term in row {
-                    if term.is_null() {
-                        cells.push(0);
-                        continue;
-                    }
-                    let key = term.to_string();
-                    let id = if let Some(id) = dictionary.get(&key) {
-                        *id
-                    } else {
-                        let id = terms.len() as u32;
-                        bytes += key.len();
-                        dictionary.insert(key, id);
-                        terms.push(term);
-                        id
-                    };
-                    cells.push(id);
-                }
-                bytes += cells.len() * 12 + 16;
-                rows.push(cells);
-            }
-            if rows.is_empty() {
-                match &c.rows {
-                    Rows::Streaming(state) => {
-                        *statistics.lock() = Some(state.stats_json(c.pos, false)?)
-                    }
-                    Rows::Graph(state) => {
-                        *statistics.lock() = Some(state.stats_json(c.pos, false)?)
-                    }
-                    _ => {}
-                }
-                lock.take();
-                return Ok("null".into());
-            }
-            Ok(json!({ "terms": terms, "rows": rows }).to_string())
-        })
-        .await
+        blocking(move || pull(&cursor, &statistics, &cancel, max_rows, max_bytes)).await
     }
 }
 
@@ -1198,13 +1272,14 @@ impl NativeTransaction {
             ));
         }
         let flag = cancel.flag.clone();
+        let first = first_batch_option(&v);
         blocking(move || {
             let worker = worker.lock();
             worker
                 .as_ref()
                 .ok_or_else(|| EngineError::invalid("transaction ended"))?
                 .run(move |tx| tx.query_with(&text, &query_options(&v, flag)?))
-                .map(NativeResult::query)
+                .and_then(|result| NativeResult::query(result).with_first(first))
         })
         .await
     }
@@ -1245,19 +1320,23 @@ impl NativeTransaction {
         result
     }
     #[napi]
-    pub async fn matched(&self, pattern: String) -> napi::Result<NativeResult> {
+    pub async fn matched(
+        &self,
+        pattern: String,
+        first_rows: Option<u32>,
+        first_bytes: Option<u32>,
+    ) -> napi::Result<NativeResult> {
         let worker = self.inner.clone();
         let v = parse(&pattern)?;
+        let first = first_batch(first_rows, first_bytes);
         blocking(move || {
             let worker = worker.lock();
             worker
                 .as_ref()
                 .ok_or_else(|| EngineError::invalid("transaction ended"))?
                 .run(move |tx| {
-                    Ok(NativeResult::scan(sparkles::embed::quads_in(
-                        tx.snapshot(),
-                        &quad_pattern(&v)?,
-                    )))
+                    NativeResult::scan(sparkles::embed::quads_in(tx.snapshot(), &quad_pattern(&v)?))
+                        .with_first(first)
                 })
         })
         .await

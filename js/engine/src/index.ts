@@ -103,6 +103,9 @@ export interface DumpOptions extends OperationOptions {
 import type { RdfInput } from './rdf.js';
 export type { RdfInput } from './rdf.js';
 function wireOptions(options: QueryOptions | UpdateOptions = {}) {
+  return JSON.stringify(wireObject(options));
+}
+function wireObject(options: QueryOptions | UpdateOptions) {
   const { signal, ...rest } = options;
   const object: any = { ...rest };
   delete object.factory;
@@ -126,7 +129,7 @@ function wireOptions(options: QueryOptions | UpdateOptions = {}) {
     (!Number.isSafeInteger(options.timeout) || options.timeout < 0)
   )
     throw new InvalidInputError('timeout must be a nonnegative integer');
-  return JSON.stringify(object);
+  return object;
 }
 function updateResult(text: string): UpdateResult {
   const v = JSON.parse(text);
@@ -136,6 +139,15 @@ function updateResult(text: string): UpdateResult {
     deleted: BigInt(v.deleted),
     receipt: receiptOf(v.receipt),
   };
+}
+/** A query's wire options, asking for the first batch to come with the result. */
+function queryWireOptions(options: QueryOptions) {
+  const object = wireObject(options);
+  object.firstBatch = [
+    options.batchSize ?? defaults.batchSize,
+    options.batchBytes ?? defaults.batchBytes,
+  ];
+  return JSON.stringify(object);
 }
 const pattern = (
   s?: RDF.Term | null,
@@ -156,6 +168,8 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
   /** the next batch, requested once half of the current one has been consumed */
   private prefetched?: Promise<T[] | null>;
   private exhausted = false;
+  /** the native side freed the rows with the last batch, so closing needs no native call */
+  private drained = false;
   private closed = false;
   private queue: Promise<unknown> = Promise.resolve();
   private abort = () => {
@@ -180,12 +194,21 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
   }
   /** Pull and decode one batch, or `null` once the cursor is drained. */
   private async fetch(): Promise<T[] | null> {
-    const value = await this.handle.nextBatch(
-      this.options.batchSize ?? defaults.batchSize,
-      this.options.batchBytes ?? defaults.batchBytes,
-    );
+    const value =
+      this.handle.takeFirst() ??
+      (await this.handle.nextBatch(
+        this.options.batchSize ?? defaults.batchSize,
+        this.options.batchBytes ?? defaults.batchBytes,
+      ));
     const batch = JSON.parse(value);
-    if (!batch) return null;
+    if (!batch) {
+      this.drained = true;
+      return null;
+    }
+    if (batch.done) {
+      this.exhausted = true;
+      this.drained = true;
+    }
     const cache: (RDF.Term | undefined)[] = [];
     const decode = (i: number) => (cache[i] ??= decodeTerm(batch.terms[i], this.options.factory));
     return batch.rows.map((cells: number[]) =>
@@ -248,7 +271,7 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
     this.prefetched = undefined;
     this.options.signal?.removeEventListener('abort', this.abort);
     try {
-      await this.handle.close();
+      if (!this.drained) await this.handle.close();
     } finally {
       this.onClose();
     }
@@ -769,7 +792,9 @@ export class Dataset extends Queryable {
     return task;
   }
   protected read(text: string, options: QueryOptions) {
-    return this.run(options, (cancel) => this.handle.query(text, wireOptions(options), cancel));
+    return this.run(options, (cancel) =>
+      this.handle.query(text, queryWireOptions(options), cancel),
+    );
   }
   protected override result(handle: NativeResult, options: QueryOptions): QueryResult {
     const info = JSON.parse(handle.info());
@@ -799,9 +824,9 @@ export class Dataset extends Queryable {
     o?: RDF.Term | null,
     g?: RDF.Term | null,
   ): AsyncIterable<RDF.Quad> & { toArray(): Promise<RDF.Quad[]>; toStream(): Readable } {
-    const future = this.run<NativeResult>({}, () => this.handle.matched(pattern(s, p, o, g))).then(
-      (handle) => this.result(handle, {}) as QuadsResult,
-    );
+    const future = this.run<NativeResult>({}, () =>
+      this.handle.matched(pattern(s, p, o, g), defaults.batchSize, defaults.batchBytes),
+    ).then((handle) => this.result(handle, {}) as QuadsResult);
     return deferredQuads(future);
   }
   async has(quad: RDF.Quad) {
@@ -1256,7 +1281,9 @@ export class Transaction extends Queryable {
     return result as unknown as BindingsResult | QuadsResult;
   }
   protected read(text: string, options: QueryOptions) {
-    return this.call(options, (cancel) => this.handle.query(text, wireOptions(options), cancel));
+    return this.call(options, (cancel) =>
+      this.handle.query(text, queryWireOptions(options), cancel),
+    );
   }
   async update(text: string, options: UpdateOptions = {}) {
     if (options.dryRun)
@@ -1288,9 +1315,9 @@ export class Transaction extends Queryable {
   }
   match(s?: RDF.Term | null, p?: RDF.Term | null, o?: RDF.Term | null, g?: RDF.Term | null) {
     return deferredQuads(
-      this.call<NativeResult>({}, () => this.handle.matched(pattern(s, p, o, g))).then(
-        (handle) => this.result(handle, {}) as QuadsResult,
-      ),
+      this.call<NativeResult>({}, () =>
+        this.handle.matched(pattern(s, p, o, g), defaults.batchSize, defaults.batchBytes),
+      ).then((handle) => this.result(handle, {}) as QuadsResult),
     );
   }
   async commit(): Promise<CommitReceipt> {

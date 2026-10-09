@@ -15,12 +15,14 @@ export interface NativeResult {
   close(): Promise<void>;
   stats(): Promise<string>;
   nextBatch(maxRows: number, maxBytes: number): Promise<string>;
+  /** the first batch, when the call that made the result computed it; given once */
+  takeFirst(): string | null;
 }
 export interface NativeTransaction {
   apply(operations: string): Promise<string>;
   query(text: string, options: string, cancel: NativeCancellation): Promise<NativeResult>;
   update(text: string, options: string, cancel: NativeCancellation): Promise<string>;
-  matched(pattern: string): Promise<NativeResult>;
+  matched(pattern: string, firstRows?: number, firstBytes?: number): Promise<NativeResult>;
   end(commit: boolean): Promise<string>;
 }
 export interface NativeByteStream {
@@ -39,7 +41,7 @@ export interface NativeDataset {
   path(): string | null;
   count(): Promise<string>;
   countPattern(pattern: string): Promise<string>;
-  matched(pattern: string): Promise<NativeResult>;
+  matched(pattern: string, firstRows?: number, firstBytes?: number): Promise<NativeResult>;
   query(text: string, options: string, cancel: NativeCancellation): Promise<NativeResult>;
   update(text: string, options: string, cancel: NativeCancellation): Promise<string>;
   begin(options: string, cancel: NativeCancellation): Promise<NativeTransaction>;
