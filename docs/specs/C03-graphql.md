@@ -1196,7 +1196,8 @@ French. `ex:Employee rdfs:subClassOf ex:Person`. Some `ex:Org` nodes have `ex:na
   1,000 + 1,000 × 100 = 101,000 nodes with the default `defaultFirst`, one more than
   `maxNodes` allows. The tests run it with `knows(first: 10)` or a raised limit.
 - `persistedOnly: true` is refused at `PUT`, because stored GraphQL queries are Phase 2.
-  The CLI's `--force` is accepted and does nothing yet.
+  The CLI's `schema put` has no `--force` flag, because no stored query can break. The
+  flag arrives with stored queries.
 - A cursor's `h` hashes the field's name, not its alias, with its filter and order and
   the schema version.
 - A `PUT` with `application/graphql` replaces the SDL and keeps the other fields of the

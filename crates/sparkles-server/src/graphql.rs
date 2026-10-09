@@ -102,10 +102,6 @@ enum SchemaCmd {
         /// A message recorded with the version
         #[arg(long)]
         message: Option<String>,
-        /// Accepted for the stored GraphQL queries of a later version; nothing depends
-        /// on the schema yet
-        #[arg(long)]
-        force: bool,
     },
     /// Remove the configuration and its versions
     Delete,
@@ -238,11 +234,7 @@ pub fn run(args: GraphqlArgs, opts: StoreOptions) -> Result<()> {
                     }
                 }
             }
-            SchemaCmd::Put {
-                file,
-                message,
-                force: _,
-            } => {
+            SchemaCmd::Put { file, message } => {
                 let text = std::fs::read_to_string(&file)
                     .with_context(|| format!("reading {}", file.display()))?;
                 // the store's lock keeps a server from changing the configuration meanwhile

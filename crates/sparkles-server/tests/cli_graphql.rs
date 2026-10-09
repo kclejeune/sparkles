@@ -83,6 +83,22 @@ fn draft_install_and_run() {
     );
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert_eq!(out(&o).trim(), "version 1");
+    // `--force` has nothing to override until stored queries exist, so it is refused
+    // rather than accepted and ignored
+    let o = sparkles(
+        dir,
+        &[
+            "graphql",
+            "--loc",
+            "db",
+            "schema",
+            "put",
+            "schema.graphql",
+            "--force",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("--force"), "{}", err(&o));
 
     let o = with_stdin(
         dir,
