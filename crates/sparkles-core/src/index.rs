@@ -384,14 +384,43 @@ pub(crate) fn decode_column(bytes: &[u8], rows: usize) -> Result<Vec<u64>> {
             "decompressed size {size} is too large for {rows} rows"
         )));
     }
-    let raw = lz4_flex::decompress_size_prepended(bytes)
-        .map_err(|e| Error::Corrupt(format!("block decompression: {e}")))?;
+    // The varints are decompressed into a buffer each thread keeps. A fresh one per
+    // column made every cold block decode fault in new pages, which was a tenth of a
+    // cold point lookup. A thread keeps at most one column's varints, BLOCK_ROWS * 10
+    // bytes and usually far less.
+    thread_local! {
+        static RAW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    RAW.with_borrow_mut(|raw| {
+        if raw.len() < size {
+            raw.resize(size, 0);
+        }
+        let raw = &mut raw[..size];
+        let n = lz4_flex::block::decompress_into(&bytes[4..], raw)
+            .map_err(|e| Error::Corrupt(format!("block decompression: {e}")))?;
+        if n != size {
+            return Err(Error::Corrupt(format!(
+                "block decompression: {n} bytes instead of {size}"
+            )));
+        }
+        decode_varints(raw, rows)
+    })
+}
+
+/// The `rows` zigzag-delta varints that make up all of `raw`.
+fn decode_varints(raw: &[u8], rows: usize) -> Result<Vec<u64>> {
+    let bad = |m: &str| Error::Corrupt(format!("block column: {m}"));
     let mut out = Vec::with_capacity(rows);
     let mut pos = 0;
     let mut prev = 0u64;
     for _ in 0..rows {
-        let z = read_varint_checked(&raw, &mut pos)
-            .ok_or_else(|| bad(&format!("holds fewer than {rows} values")))?;
+        // a varint takes at most 10 bytes: while 10 remain, read them without checking
+        // for the end of the buffer at each byte
+        let z = match raw.get(pos..pos + 10) {
+            Some(s) => read_varint10(s.try_into().unwrap(), &mut pos),
+            None => read_varint_checked(raw, &mut pos),
+        }
+        .ok_or_else(|| bad(&format!("holds fewer than {rows} values")))?;
         let d = ((z >> 1) as i64) ^ -((z & 1) as i64);
         prev = prev.wrapping_add(d as u64);
         out.push(prev);
@@ -403,6 +432,20 @@ pub(crate) fn decode_column(bytes: &[u8], rows: usize) -> Result<Vec<u64>> {
         )));
     }
     Ok(out)
+}
+
+/// [`read_varint_checked`] on a buffer known to hold the 10 bytes a varint can take.
+#[inline(always)]
+fn read_varint10(s: &[u8; 10], pos: &mut usize) -> Option<u64> {
+    let mut v = 0u64;
+    for (i, &b) in s.iter().enumerate() {
+        v |= ((b & 0x7F) as u64) << (7 * i);
+        if b < 0x80 {
+            *pos += i + 1;
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// [`read_varint`](crate::vocab::read_varint) that returns `None` at the end of `buf` or
@@ -1010,6 +1053,36 @@ mod tests {
         assert!(!idx.contains(&cache, &[5, 5, 10, 0]).unwrap());
         let est = idx.estimate(&[7]);
         assert!(est > 0);
+    }
+
+    #[test]
+    fn columns_of_every_varint_width_round_trip() {
+        // deltas of 1 to 10 varint bytes, in the fast part and in the last 10 bytes
+        let mut col = Vec::new();
+        let mut v = 0u64;
+        for i in 0..2000u64 {
+            v = v.wrapping_add(match i % 7 {
+                0 => 1,
+                1 => 300,
+                2 => 1 << 20,
+                3 => 1 << 40,
+                4 => u64::MAX / 3,
+                5 => 0,
+                _ => (1 << 62) + i,
+            });
+            col.push(v);
+        }
+        col.extend([u64::MAX, 0, 1 << 63]);
+        let mut scratch = Vec::new();
+        for n in [0, 1, 2, 9, 10, 11, col.len()] {
+            let enc = encode_column(&col[..n], &mut scratch);
+            assert_eq!(decode_column(&enc, n).unwrap(), &col[..n]);
+            let tail = encode_column(&col[col.len() - n..], &mut scratch);
+            assert_eq!(decode_column(&tail, n).unwrap(), &col[col.len() - n..]);
+        }
+        // a varint that runs past 10 bytes is damage
+        assert!(decode_varints(&[0xff; 11], 1).is_err());
+        assert!(decode_varints(&[0xff; 20], 1).is_err());
     }
 
     #[test]
