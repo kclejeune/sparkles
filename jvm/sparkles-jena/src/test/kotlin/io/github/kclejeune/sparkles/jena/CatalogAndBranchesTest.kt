@@ -111,4 +111,23 @@ class CatalogAndBranchesTest {
             assertEquals(listOf("main"), branches.list().map { it.name })
         }
     }
+    @Test fun relink_moves_a_linked_branch_and_keeps_its_state(@TempDir directory: Path) {
+        SparklesDatasets.open(directory.resolve("db")).use { ds ->
+            UpdateAction.parseExecute("INSERT DATA { <urn:example:a> <urn:example:p> 1 }", ds)
+            val branches = ds.branches(); val info = branches.create("dev")
+            ds.branch("dev").use { dev ->
+                UpdateAction.parseExecute("INSERT DATA { <urn:example:b> <urn:example:p> 2 }", dev)
+                UpdateAction.parseExecute("INSERT DATA { <urn:example:c> <urn:example:p> 3 }", ds)
+                ds.compact()
+                val head = branches.get("dev").head
+                val report = branches.relink("dev")
+                assertNull(report.abandoned); assertEquals(2L, report.quads)
+                val after = branches.get("dev")
+                assertEquals(info.id, after.id); assertEquals(head, after.head); assertTrue(after.linked)
+                QueryExec.dataset(dev).query("ASK { <urn:example:b> ?p ?o }").build().use { assertTrue(it.ask()) }
+                QueryExec.dataset(dev).query("ASK { <urn:example:c> ?p ?o }").build().use { assertFalse(it.ask()) }
+            }
+            assertThrows(SparklesUnsupportedException::class.java) { branches.relink("main") }
+        }
+    }
 }

@@ -17,6 +17,9 @@ private fun MergeOptions.native(): MergeSettings {
 public data class ConflictCell(public val graph: String?, public val subject: String, public val predicate: String?, public val base: List<String>, public val ours: List<String>, public val theirs: List<String>)
 public data class MergeReport(public val merged: Boolean, public val upToDate: Boolean, public val fastForward: Boolean, public val squashed: Boolean, public val inserted: Long, public val deleted: Long, public val conflictsFound: Long, public val conflictsResolved: Long, public val conflicts: List<ConflictCell>, public val truncated: Boolean, public val receipt: CommitReceipt?)
 private fun io.github.kclejeune.sparkles.jena.internal.ffi.MergeInfo.toReport(): MergeReport = MergeReport(merged, upToDate, fastForward, squashed, inserted.toLong(), deleted.toLong(), conflictsFound.toLong(), conflictsResolved.toLong(), conflicts.map { ConflictCell(it.graph, it.subject, it.predicate, it.base, it.ours, it.theirs) }, truncated, receipt?.toReceipt())
+/** What relinking a branch to main's index did. */
+public data class RelinkReport(public val generation: String, public val quads: Long, public val baseCommit: Long, public val caughtUpCommits: Long, public val abandoned: String?, public val lockMs: Double, public val buildMs: Double, public val totalMs: Double)
+private fun io.github.kclejeune.sparkles.jena.internal.ffi.RelinkInfo.toReport(): RelinkReport = RelinkReport(generation, quads.toLong(), baseCommit.toLong(), caughtUpCommits.toLong(), abandoned, lockMs, buildMs, totalMs)
 public class SparklesBranches internal constructor(private val owner: DatasetGraphSparkles) {
     @JvmOverloads public fun commitGraph(branches: List<String>? = null, before: String? = null, limit: Int = 100): org.apache.jena.atlas.json.JsonObject {
         require(limit >= 0); owner.checkCapture("branches.commitGraph"); Registry.checkNoTransactionsForDataset(owner.handle.ownerDatasetId)
@@ -32,6 +35,9 @@ public class SparklesBranches internal constructor(private val owner: DatasetGra
     public fun rename(name: String, to: String): BranchInfo { capture(listOf(name)); owner.checkNoTxn("branches.rename"); return ffi { owner.handle.ffi.branchesRename(name, to) }.toInfo() }
     public fun protect(name: String, on: Boolean): BranchInfo { capture(listOf(name)); owner.checkNoTxn("branches.protect"); return ffi { owner.handle.ffi.branchesProtect(name, on) }.toInfo() }
     public fun note(name: String, note: String?): BranchInfo { owner.checkNoTxn("branches.note"); return ffi { owner.handle.ffi.branchesNote(name, note) }.toInfo() }
+    /** Move persistent linked branch [name] onto main's current index. Its head, identity and state stay as they were. */
+    public fun relink(name: String): RelinkReport = SparklesOperation().use { relink(name, it) }
+    public fun relink(name: String, operation: SparklesOperation): RelinkReport { capture(listOf(name)); owner.checkNoTxn("branches.relink"); return ffi { owner.handle.ffi.branchesRelink(name, operation.native) }.toReport() }
     public fun settings(): List<String> { owner.checkOpen(); return ffi { owner.handle.ffi.branchesSettings() } }
     public fun setSettings(predicates: List<String>): List<String> { owner.checkNoTxn("branches.settings"); return ffi { owner.handle.ffi.branchesSetSettings(predicates) } }
     private fun capture(names: List<String>) { owner.checkCapture("branches.capture"); Registry.checkNoTransactions(ffi { owner.handle.ffi.branchesIds(names) }) }

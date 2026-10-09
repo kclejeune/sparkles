@@ -27,6 +27,18 @@ fn info(b: sparkles::branch::BranchInfo) -> BranchInfo {
         broken: b.broken,
     }
 }
+/// What relinking a branch to main's index did.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RelinkInfo {
+    pub generation: String,
+    pub quads: u64,
+    pub base_commit: u64,
+    pub caught_up_commits: u64,
+    pub abandoned: Option<String>,
+    pub lock_ms: f64,
+    pub build_ms: f64,
+    pub total_ms: f64,
+}
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MergeSettings {
     pub ff_only: bool,
@@ -200,6 +212,28 @@ impl FfiDataset {
     pub fn branches_note(&self, name: String, note: Option<String>) -> FfiResult<BranchInfo> {
         self.inner.check_writable()?;
         Ok(info(self.inner.ds.set_branch_note(&name, note)?))
+    }
+    pub fn branches_relink(
+        &self,
+        name: String,
+        operation: Arc<FfiOperation>,
+    ) -> FfiResult<RelinkInfo> {
+        self.inner.check_writable()?;
+        operation.control.check()?;
+        let r = self
+            .inner
+            .ds
+            .relink_branch_with(&name, &Default::default(), &operation.control)?;
+        Ok(RelinkInfo {
+            generation: r.generation,
+            quads: r.quads,
+            base_commit: r.base_commit,
+            caught_up_commits: r.caught_up_commits,
+            abandoned: r.abandoned,
+            lock_ms: r.lock_ms,
+            build_ms: r.build_ms,
+            total_ms: r.total_ms,
+        })
     }
     pub fn branches_settings(&self) -> FfiResult<Vec<String>> {
         Ok(self

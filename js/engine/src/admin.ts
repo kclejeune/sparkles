@@ -36,6 +36,19 @@ export interface BranchInfo {
   head: CommitInfo;
   upstream?: string;
 }
+/** What relinking a branch to main's index did. */
+export interface RelinkResult {
+  generation: string;
+  quads: bigint;
+  baseCommit: bigint;
+  caughtUpCommits: bigint;
+  abandoned?: string;
+  mode: string;
+  lockMs: number;
+  buildMs: number;
+  totalMs: number;
+  [key: string]: unknown;
+}
 export interface MergeResult {
   merged: boolean;
   upToDate?: boolean;
@@ -304,6 +317,8 @@ export class Administration {
         call<BranchInfo>('branches.protect', { name, protected: protect }, o, true),
       note: (name: string, note: string | null, o?: UpdateOptions) =>
         call<BranchInfo>('branches.note', { name, note }, o, true),
+      relink: (name: string, o?: UpdateOptions) =>
+        call<RelinkResult>('branches.relink', { name }, o, true),
       merge: (source: string, target = 'main', options: Configuration & UpdateOptions = {}) =>
         call<MergeResult>('branches.merge', { ...options, source, target }, options, true),
       previewMerge: (
