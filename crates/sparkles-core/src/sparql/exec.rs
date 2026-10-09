@@ -3490,9 +3490,33 @@ pub(super) fn offer_rows<P>(
     report: &mut ExprReport,
     rows: &mut impl HeapRows<P>,
 ) -> Result<usize> {
+    // the first key's column of SortKeys, beyond the values a cursor column charges
+    let _first_charge = if ctx.is_cursor() {
+        Some(ctx.charge(t.len() as u64 * std::mem::size_of::<SortKey>() as u64 + 128)?)
+    } else {
+        None
+    };
     let mut sources = Vec::with_capacity(keys.len());
     for (i, (e, _)) in keys.iter().enumerate() {
         sources.push(match e {
+            // A large first key is decoded in parallel in eager execution, where values
+            // come from the shared cache. A cursor has no such cache, and decodes each
+            // dictionary value of the batch once, in key order.
+            Expr::Var(v) if i == 0 && !ctx.is_cursor() && t.len() > PAR_THRESHOLD => {
+                match t.col_of(*v) {
+                    Some(c) => {
+                        let col = &t.cols[c];
+                        HeapKey::Column(super::exprcache::Column::Rows {
+                            vals: map_rows(ctx, t.len(), true, |i| id_key(ctx, col[i]))?,
+                            _charge: None,
+                        })
+                    }
+                    None => HeapKey::Var(None),
+                }
+            }
+            Expr::Var(_) if i == 0 && ctx.is_cursor() => {
+                HeapKey::Column(key_column(ctx, t, e, report)?.map(SortKey::new))
+            }
             Expr::Var(v) => HeapKey::Var(t.col_of(*v).map(|c| t.cols[c].as_slice())),
             _ if i == 0 => HeapKey::Column(key_column(ctx, t, e, report)?.map(SortKey::new)),
             _ => HeapKey::Expr(e),
