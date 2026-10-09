@@ -76,38 +76,16 @@ impl PyQuadIterator {
     }
 
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        // A decoded quad is handed out without giving up the GIL. Only a refill, which
+        // reads the store, runs detached. Nothing holds the lock while it needs the GIL.
+        let ready = self.state.lock().unwrap().buf.pop_front();
+        if let Some(q) = ready {
+            return quad_to_py(py, q).map(Some);
+        }
         let next = py
             .detach(|| {
                 let mut st = self.state.lock().unwrap();
-                let st = &mut *st;
-                if st.buf.is_empty() && !st.done {
-                    let fallible: &mut dyn Iterator<Item = sparkles::Result<Quad>> =
-                        match &mut st.source {
-                            QuadSource::List(it) => {
-                                st.buf.extend(it.by_ref().take(BATCH));
-                                if st.buf.is_empty() {
-                                    st.done = true;
-                                }
-                                return Ok(st.buf.pop_front());
-                            }
-                            QuadSource::Scan(it) => it.as_mut(),
-                            QuadSource::Stream(it) => it.as_mut(),
-                        };
-                    for q in fallible.take(BATCH) {
-                        match q {
-                            Ok(q) => st.buf.push_back(q),
-                            Err(e) => {
-                                // the quads before the error come first
-                                st.done = true;
-                                st.error = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                    if st.buf.is_empty() {
-                        st.done = true;
-                    }
-                }
+                refill(&mut st);
                 match st.buf.pop_front() {
                     Some(q) => Ok(Some(q)),
                     None => st.error.take().map_or(Ok(None), Err),
@@ -115,6 +93,65 @@ impl PyQuadIterator {
             })
             .py(py)?;
         next.map(|q| quad_to_py(py, q)).transpose()
+    }
+}
+
+impl PyQuadIterator {
+    /// The next batch of quads, empty once the source is drained (`sparkles.rdflib`
+    /// converts whole batches). An error is raised after the quads read before it.
+    pub(crate) fn take_batch(&self, py: Python<'_>) -> PyResult<Vec<Quad>> {
+        {
+            let mut st = self.state.lock().unwrap();
+            if !st.buf.is_empty() {
+                return Ok(st.buf.drain(..).collect());
+            }
+        }
+        py.detach(|| {
+            let mut st = self.state.lock().unwrap();
+            refill(&mut st);
+            let quads: Vec<Quad> = st.buf.drain(..).collect();
+            match st.error.take() {
+                Some(e) if quads.is_empty() => Err(e),
+                Some(e) => {
+                    st.error = Some(e);
+                    Ok(quads)
+                }
+                None => Ok(quads),
+            }
+        })
+        .py(py)
+    }
+}
+
+/// Read the next batch from the source into an empty buffer.
+fn refill(st: &mut QuadState) {
+    if !st.buf.is_empty() || st.done {
+        return;
+    }
+    let fallible: &mut dyn Iterator<Item = sparkles::Result<Quad>> = match &mut st.source {
+        QuadSource::List(it) => {
+            st.buf.extend(it.by_ref().take(BATCH));
+            if st.buf.is_empty() {
+                st.done = true;
+            }
+            return;
+        }
+        QuadSource::Scan(it) => it.as_mut(),
+        QuadSource::Stream(it) => it.as_mut(),
+    };
+    for q in fallible.take(BATCH) {
+        match q {
+            Ok(q) => st.buf.push_back(q),
+            Err(e) => {
+                // the quads before the error come first
+                st.done = true;
+                st.error = Some(e);
+                break;
+            }
+        }
+    }
+    if st.buf.is_empty() {
+        st.done = true;
     }
 }
 
@@ -135,6 +172,22 @@ pub struct PyQuerySolutions {
 }
 
 impl PyQuerySolutions {
+    /// The next batch of rows, empty once all have been handed out (`sparkles.rdflib`
+    /// converts whole batches).
+    pub(crate) fn take_batch(&self, py: Python<'_>) -> Vec<Vec<Option<Term>>> {
+        {
+            let mut st = self.state.lock().unwrap();
+            if !st.buf.is_empty() {
+                return st.buf.drain(..).collect();
+            }
+        }
+        py.detach(|| {
+            let mut st = self.state.lock().unwrap();
+            fill_solutions(&mut st);
+            st.buf.drain(..).collect()
+        })
+    }
+
     pub fn new(result: QueryResult) -> PyQuerySolutions {
         PyQuerySolutions {
             vars: result.vars.clone().into(),
@@ -163,22 +216,17 @@ impl PyQuerySolutions {
     }
 
     fn __next__(&self, py: Python<'_>) -> Option<PyQuerySolution> {
+        // as for quads, only a refill gives up the GIL
+        let ready = self.state.lock().unwrap().buf.pop_front();
+        if let Some(values) = ready {
+            return Some(PyQuerySolution {
+                vars: self.vars.clone(),
+                values,
+            });
+        }
         let values = py.detach(|| {
             let mut st = self.state.lock().unwrap();
-            let st = &mut *st;
-            if st.buf.is_empty()
-                && let Some(r) = &st.result
-            {
-                let end = (st.row + BATCH).min(r.table.len());
-                for i in st.row..end {
-                    st.buf.push_back(
-                        (0..r.table.width())
-                            .map(|c| r.term(r.table.get(i, c)))
-                            .collect(),
-                    );
-                }
-                st.row = end;
-            }
+            fill_solutions(&mut st);
             st.buf.pop_front()
         })?;
         Some(PyQuerySolution {
@@ -221,6 +269,23 @@ impl PyQuerySolutions {
 
     fn __repr__(&self) -> String {
         format!("<QuerySolutions variables={:?}>", self.vars)
+    }
+}
+
+/// Decode the next batch of rows into an empty buffer.
+fn fill_solutions(st: &mut SolState) {
+    if st.buf.is_empty()
+        && let Some(r) = &st.result
+    {
+        let end = (st.row + BATCH).min(r.table.len());
+        for i in st.row..end {
+            st.buf.push_back(
+                (0..r.table.width())
+                    .map(|c| r.term(r.table.get(i, c)))
+                    .collect(),
+            );
+        }
+        st.row = end;
     }
 }
 

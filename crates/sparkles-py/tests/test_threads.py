@@ -64,3 +64,24 @@ def test_concurrent_writers() -> None:
     with ThreadPoolExecutor(4) as pool:
         list(pool.map(write, range(4)))
     assert len(ds) == 200
+
+
+def test_shared_iterators_hand_out_each_item_once() -> None:
+    # a buffered item is handed out without giving up the GIL, a refill without it
+    ds = big()
+    quads = iter(ds)
+    rows = ds.query("SELECT ?s ?x WHERE { ?s <http://ex.org/p> ?x }")
+    seen_quads: list[object] = []
+    seen_rows: list[object] = []
+
+    def drain() -> None:
+        for q in quads:
+            seen_quads.append(q)
+        for r in rows:
+            seen_rows.append(r["x"])
+
+    with ThreadPoolExecutor(4) as pool:
+        for f in [pool.submit(drain) for _ in range(4)]:
+            f.result()
+    assert len(seen_quads) == len(set(seen_quads)) == 2500
+    assert sorted(x.to_python() for x in seen_rows) == list(range(2500))

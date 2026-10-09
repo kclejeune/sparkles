@@ -54,6 +54,8 @@ import {
 } from './native.js';
 const transactionContext = new AsyncLocalStorage<ReadonlySet<string>>();
 const defaults = { batchSize: 1024, batchBytes: 1 << 20 };
+/** rows of a match's first batch when it is computed on the JavaScript thread */
+const INLINE_ROWS = 16;
 export interface EngineConfiguration {
   /** rows per streaming batch (default 1024) */
   batchSize?: number;
@@ -103,6 +105,9 @@ export interface DumpOptions extends OperationOptions {
 import type { RdfInput } from './rdf.js';
 export type { RdfInput } from './rdf.js';
 function wireOptions(options: QueryOptions | UpdateOptions = {}) {
+  return JSON.stringify(wireObject(options));
+}
+function wireObject(options: QueryOptions | UpdateOptions) {
   const { signal, ...rest } = options;
   const object: any = { ...rest };
   delete object.factory;
@@ -126,7 +131,7 @@ function wireOptions(options: QueryOptions | UpdateOptions = {}) {
     (!Number.isSafeInteger(options.timeout) || options.timeout < 0)
   )
     throw new InvalidInputError('timeout must be a nonnegative integer');
-  return JSON.stringify(object);
+  return object;
 }
 function updateResult(text: string): UpdateResult {
   const v = JSON.parse(text);
@@ -136,6 +141,15 @@ function updateResult(text: string): UpdateResult {
     deleted: BigInt(v.deleted),
     receipt: receiptOf(v.receipt),
   };
+}
+/** A query's wire options, asking for the first batch to come with the result. */
+function queryWireOptions(options: QueryOptions) {
+  const object = wireObject(options);
+  object.firstBatch = [
+    options.batchSize ?? defaults.batchSize,
+    options.batchBytes ?? defaults.batchBytes,
+  ];
+  return JSON.stringify(object);
 }
 const pattern = (
   s?: RDF.Term | null,
@@ -151,11 +165,18 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
   readonly timing: unknown;
   readonly plan: unknown;
   private batch: T[] = [];
+  /** the index in `batch` of the next item */
+  private position = 0;
   /** the size of the batch being consumed, for the prefetch threshold */
   private batchLength = 0;
+  /** `next()` calls queued or running, which a ready item must not overtake */
+  private busy = 0;
+  private names: string[] = [];
   /** the next batch, requested once half of the current one has been consumed */
   private prefetched?: Promise<T[] | null>;
   private exhausted = false;
+  /** the native side freed the rows with the last batch, so closing needs no native call */
+  private drained = false;
   private closed = false;
   private queue: Promise<unknown> = Promise.resolve();
   private abort = () => {
@@ -169,6 +190,7 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
     const info = JSON.parse(handle.info());
     this.type = info.type;
     this.variables = (info.variables ?? []).map(factory.variable!);
+    this.names = this.variables.map((v) => v.value);
     this.size = info.size;
     this.timing = info.timing;
     this.plan = info.plan;
@@ -180,62 +202,107 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
   }
   /** Pull and decode one batch, or `null` once the cursor is drained. */
   private async fetch(): Promise<T[] | null> {
-    const value = await this.handle.nextBatch(
-      this.options.batchSize ?? defaults.batchSize,
-      this.options.batchBytes ?? defaults.batchBytes,
-    );
+    const value =
+      this.handle.takeFirst() ??
+      (await this.handle.nextBatch(
+        this.options.batchSize ?? defaults.batchSize,
+        this.options.batchBytes ?? defaults.batchBytes,
+      ));
     const batch = JSON.parse(value);
-    if (!batch) return null;
+    if (!batch) {
+      this.drained = true;
+      return null;
+    }
+    if (batch.done) {
+      this.exhausted = true;
+      this.drained = true;
+    }
     const cache: (RDF.Term | undefined)[] = [];
     const decode = (i: number) => (cache[i] ??= decodeTerm(batch.terms[i], this.options.factory));
-    return batch.rows.map((cells: number[]) =>
-      this.type === 'bindings'
-        ? new LazyBindings(
-            this.variables.map((v) => v.value),
-            cells,
-            decode,
-          )
-        : decode(cells[0]),
+    if (this.type === 'bindings') {
+      const names = this.names;
+      return batch.rows.map((cells: number[]) => new LazyBindings(names, cells, decode)) as T[];
+    }
+    // a quad is four cells, subject, predicate, object and graph, each a term of the batch
+    const f = this.options.factory ?? factory;
+    return batch.rows.map((c: number[]) =>
+      f.quad(
+        decode(c[0]) as RDF.Quad_Subject,
+        decode(c[1]) as RDF.Quad_Predicate,
+        decode(c[2]) as RDF.Quad_Object,
+        decode(c[3]) as RDF.Quad_Graph,
+      ),
     ) as T[];
   }
+  /** The next decoded item, asking for the following batch once half of this one is used. */
+  private take(): T {
+    const value = this.batch[this.position++];
+    if (this.position >= this.batch.length) {
+      this.batch = [];
+      this.position = 0;
+    }
+    // Once half of the batch has been consumed, ask for the next one, so that it is
+    // computed while the caller works through the rest.
+    if (
+      !this.prefetched &&
+      !this.exhausted &&
+      this.batch.length - this.position <= this.batchLength / 2
+    ) {
+      const next = this.fetch().then((rows) => {
+        if (!rows) this.exhausted = true;
+        return rows;
+      });
+      next.catch(() => {});
+      this.prefetched = next;
+    }
+    return value;
+  }
   next(): Promise<IteratorResult<T>> {
+    // An item already decoded is handed out at once, unless an earlier call is still
+    // queued, which it must not overtake.
+    if (
+      this.busy === 0 &&
+      !this.closed &&
+      this.position < this.batch.length &&
+      !this.options.signal?.aborted
+    ) {
+      return Promise.resolve({ done: false, value: this.take() });
+    }
+    this.busy++;
     const task = this.queue.then(async () => {
-      this.options.signal?.throwIfAborted();
-      if (this.closed) return { done: true, value: undefined } as IteratorResult<T>;
-      if (!this.batch.length) {
-        let batch: T[] | null;
-        try {
-          const pending = this.prefetched;
-          this.prefetched = undefined;
-          batch = this.exhausted ? null : await (pending ?? this.fetch());
-        } catch (e) {
-          await this.close();
-          throw nativeError(e);
-        }
-        this.options.signal?.throwIfAborted();
-        if (this.closed) return { done: true, value: undefined } as IteratorResult<T>;
-        if (!batch || !batch.length) {
-          await this.close();
-          return { done: true, value: undefined } as IteratorResult<T>;
-        }
-        this.batch = batch;
-        this.batchLength = batch.length;
+      try {
+        return await this.step();
+      } finally {
+        this.busy--;
       }
-      const value = this.batch.shift()!;
-      // Once half of the batch has been consumed, ask for the next one, so that it is
-      // computed while the caller works through the rest.
-      if (!this.prefetched && !this.exhausted && this.batch.length <= this.batchLength / 2) {
-        const next = this.fetch().then((rows) => {
-          if (!rows) this.exhausted = true;
-          return rows;
-        });
-        next.catch(() => {});
-        this.prefetched = next;
-      }
-      return { done: false, value } as IteratorResult<T>;
     });
     this.queue = task.catch(() => {});
     return task;
+  }
+  private async step(): Promise<IteratorResult<T>> {
+    this.options.signal?.throwIfAborted();
+    if (this.closed) return { done: true, value: undefined } as IteratorResult<T>;
+    if (this.position >= this.batch.length) {
+      let batch: T[] | null;
+      try {
+        const pending = this.prefetched;
+        this.prefetched = undefined;
+        batch = this.exhausted ? null : await (pending ?? this.fetch());
+      } catch (e) {
+        await this.close();
+        throw nativeError(e);
+      }
+      this.options.signal?.throwIfAborted();
+      if (this.closed) return { done: true, value: undefined } as IteratorResult<T>;
+      if (!batch || !batch.length) {
+        await this.close();
+        return { done: true, value: undefined } as IteratorResult<T>;
+      }
+      this.batch = batch;
+      this.position = 0;
+      this.batchLength = batch.length;
+    }
+    return { done: false, value: this.take() } as IteratorResult<T>;
   }
   async return(): Promise<IteratorResult<T>> {
     await this.close();
@@ -245,10 +312,11 @@ class PullResult<T> implements AsyncIterable<T>, AsyncIterator<T> {
     if (this.closed) return;
     this.closed = true;
     this.batch = [];
+    this.position = 0;
     this.prefetched = undefined;
     this.options.signal?.removeEventListener('abort', this.abort);
     try {
-      await this.handle.close();
+      if (!this.drained) await this.handle.close();
     } finally {
       this.onClose();
     }
@@ -769,7 +837,9 @@ export class Dataset extends Queryable {
     return task;
   }
   protected read(text: string, options: QueryOptions) {
-    return this.run(options, (cancel) => this.handle.query(text, wireOptions(options), cancel));
+    return this.run(options, (cancel) =>
+      this.handle.query(text, queryWireOptions(options), cancel),
+    );
   }
   protected override result(handle: NativeResult, options: QueryOptions): QueryResult {
     const info = JSON.parse(handle.info());
@@ -799,10 +869,36 @@ export class Dataset extends Queryable {
     o?: RDF.Term | null,
     g?: RDF.Term | null,
   ): AsyncIterable<RDF.Quad> & { toArray(): Promise<RDF.Quad[]>; toStream(): Readable } {
-    const future = this.run<NativeResult>({}, () => this.handle.matched(pattern(s, p, o, g))).then(
-      (handle) => this.result(handle, {}) as QuadsResult,
-    );
-    return deferredQuads(future);
+    if (this.path === null) {
+      // In memory, the scan and a first batch of a few rows take less time than a round
+      // trip through the addon's pool, so they run here; later batches use the pool.
+      this.check();
+      let future: Promise<QuadsResult>;
+      try {
+        const handle = this.handle.matchedNow(
+          pattern(s, p, o, g),
+          INLINE_ROWS,
+          defaults.batchBytes,
+        );
+        future = handle
+          ? Promise.resolve(this.result(handle, {}) as QuadsResult)
+          : this.matchOnPool(s, p, o, g);
+      } catch (e) {
+        future = Promise.reject(nativeError(e));
+      }
+      return deferredQuads(future);
+    }
+    return deferredQuads(this.matchOnPool(s, p, o, g));
+  }
+  private matchOnPool(
+    s?: RDF.Term | null,
+    p?: RDF.Term | null,
+    o?: RDF.Term | null,
+    g?: RDF.Term | null,
+  ): Promise<QuadsResult> {
+    return this.run<NativeResult>({}, () =>
+      this.handle.matched(pattern(s, p, o, g), defaults.batchSize, defaults.batchBytes),
+    ).then((handle) => this.result(handle, {}) as QuadsResult);
   }
   async has(quad: RDF.Quad) {
     for await (const _ of this.match(quad.subject, quad.predicate, quad.object, quad.graph))
@@ -1256,7 +1352,9 @@ export class Transaction extends Queryable {
     return result as unknown as BindingsResult | QuadsResult;
   }
   protected read(text: string, options: QueryOptions) {
-    return this.call(options, (cancel) => this.handle.query(text, wireOptions(options), cancel));
+    return this.call(options, (cancel) =>
+      this.handle.query(text, queryWireOptions(options), cancel),
+    );
   }
   async update(text: string, options: UpdateOptions = {}) {
     if (options.dryRun)
@@ -1288,9 +1386,9 @@ export class Transaction extends Queryable {
   }
   match(s?: RDF.Term | null, p?: RDF.Term | null, o?: RDF.Term | null, g?: RDF.Term | null) {
     return deferredQuads(
-      this.call<NativeResult>({}, () => this.handle.matched(pattern(s, p, o, g))).then(
-        (handle) => this.result(handle, {}) as QuadsResult,
-      ),
+      this.call<NativeResult>({}, () =>
+        this.handle.matched(pattern(s, p, o, g), defaults.batchSize, defaults.batchBytes),
+      ).then((handle) => this.result(handle, {}) as QuadsResult),
     );
   }
   async commit(): Promise<CommitReceipt> {

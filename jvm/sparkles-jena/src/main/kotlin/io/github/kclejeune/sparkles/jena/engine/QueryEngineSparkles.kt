@@ -15,6 +15,7 @@ import io.github.kclejeune.sparkles.jena.internal.ffi.InternalException
 import io.github.kclejeune.sparkles.jena.internal.ffi.QueryOpts
 import io.github.kclejeune.sparkles.jena.internal.mapError
 import io.github.kclejeune.sparkles.jena.SparklesInternalException
+import org.apache.jena.atlas.io.IndentedLineBuffer
 import org.apache.jena.atlas.io.IndentedWriter
 import org.apache.jena.graph.Node
 import org.apache.jena.query.Query
@@ -28,6 +29,7 @@ import org.apache.jena.sparql.algebra.op.OpTable
 import org.apache.jena.sparql.algebra.AlgebraQuad
 import org.apache.jena.sparql.algebra.TransformGraphRename
 import org.apache.jena.sparql.core.DatasetGraph
+import org.apache.jena.sparql.core.Prologue
 import org.apache.jena.sparql.core.Quad
 import org.apache.jena.sparql.core.Var
 import org.apache.jena.sparql.engine.Plan
@@ -40,6 +42,7 @@ import org.apache.jena.sparql.engine.binding.BindingBase
 import org.apache.jena.sparql.engine.iterator.QueryIteratorBase
 import org.apache.jena.sparql.engine.main.QueryEngineMain
 import org.apache.jena.sparql.serializer.SerializationContext
+import org.apache.jena.sparql.serializer.SerializerRegistry
 import org.apache.jena.sparql.syntax.ElementGroup
 import org.apache.jena.sparql.util.Context
 import org.slf4j.LoggerFactory
@@ -134,18 +137,31 @@ public object QueryEngineSparkles {
     }
 
     /**
-     * The text Sparkles runs. Jena applies the CONSTRUCT template, takes the first solution
-     * for ASK and runs the DESCRIBE handlers itself, so every form becomes a SELECT.
+     * The text Sparkles runs. SELECT and ASK run as they are, and an ASK whose answer is
+     * true gives Jena one empty solution. Jena applies the CONSTRUCT template and runs the
+     * DESCRIBE handlers itself, so those forms become a SELECT.
      */
     internal fun sparklesText(query: Query): String {
-        if (query.isSelectType) return query.serialize(Syntax.syntaxARQ)
+        if (query.isSelectType || query.isAskType) return serialize(query)
         val q = query.cloneQuery()
-        val ask = q.isAskType
         q.setQuerySelectType()
         q.setQueryResultStar(true)
         if (q.queryPattern == null) q.queryPattern = ElementGroup()
-        if (ask) q.limit = 1
-        return q.serialize(Syntax.syntaxARQ)
+        return serialize(q)
+    }
+
+    /**
+     * The query as ARQ syntax. Jena's `Query.serialize` tries to write each IRI relative to
+     * the query's base, which costs two IRI parses per IRI. The parser has already made
+     * every IRI absolute, and the base it used is Jena's system base unless the query set
+     * one with `BASE`. Only then does the text need the base, and only then is it used.
+     */
+    private fun serialize(query: Query): String {
+        if (query.explicitlySetBaseURI()) return query.serialize(Syntax.syntaxARQ)
+        val out = IndentedLineBuffer()
+        val factory = SerializerRegistry.get().getQuerySerializerFactory(Syntax.syntaxARQ)
+        query.visit(factory.create(Syntax.syntaxARQ, Prologue(query.prefixMapping), out))
+        return out.toString()
     }
 }
 
@@ -171,6 +187,12 @@ internal class QueryIterSparkles(
     private var cursor: FfiSelectCursor? = null
     private var started = false
     private var done = false
+    /**
+     * The prepared query holds no rows: its eager result reported `done`, which frees them
+     * natively, or a cursor holds them. Its `release` is then skipped. A cursor's own
+     * `release` always runs, because it also records the cursor's final statistics.
+     */
+    private var drained = false
     private var delegate: QueryIterator? = null
     private val decoder = RowDecoder()
     private var batch: RowBatch? = null
@@ -180,7 +202,8 @@ internal class QueryIterSparkles(
     private fun start() {
         started = true
         val q = ffiQuery ?: return
-        if (context.get<Boolean>(Sparkles.STREAMING_EXECUTION) == true) {
+        // an ASK has one boolean to return, which needs no cursor
+        if (context.get<Boolean>(Sparkles.STREAMING_EXECUTION) == true && !query.isAskType) {
             startCursor(q)
             return
         }
@@ -204,13 +227,17 @@ internal class QueryIterSparkles(
         vars = e.variables.map { Var.alloc(it) }.toTypedArray()
         if (e.kind == FfiQueryKind.ASK) {
             done = true
+            drained = true
             release()
+            // true is one solution that binds nothing, which is how Jena reads an ASK
+            if (e.boolean) batch = RowBatch(1, 0, IntArray(0))
             return
         }
         batch = decoder.decode(e.batch)
         row = 0
         if (e.done) {
             done = true
+            drained = true
             release()
         }
     }
@@ -221,6 +248,8 @@ internal class QueryIterSparkles(
         val first = try {
             val c = q.openCursor(4096u, 1048576uL, context.get<Boolean>(Sparkles.STREAMING_STRICT) != true)
             cursor = c
+            // the rows are the cursor's, so the prepared query holds none to release
+            drained = true
             vars = c.variables().map { Var.alloc(it) }.toTypedArray()
             c.nextBatch(FIRST_ROWS.toUInt())
         } catch (e: FfiException.Engine) {
@@ -272,6 +301,7 @@ internal class QueryIterSparkles(
         row = 0
         if (b.done) {
             done = true
+            drained = true
             release()
         }
         return batch!!.rows > 0
@@ -303,7 +333,7 @@ internal class QueryIterSparkles(
         }
         cursor = null
         ffiQuery?.let {
-            it.release()
+            if (!drained) it.release()
             it.close()
         }
         ffiQuery = null

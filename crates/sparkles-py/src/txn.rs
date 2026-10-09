@@ -307,6 +307,29 @@ impl PyTransaction {
         PyList::new(py, items)
     }
 
+    /// `quads_for_pattern` as a `QuadIterator` (for `sparkles.rdflib`).
+    #[pyo3(signature = (subject = None, predicate = None, object = None, graph_name = None))]
+    fn _quads_iter(
+        &self,
+        py: Python<'_>,
+        subject: Option<&Bound<'_, PyAny>>,
+        predicate: Option<&Bound<'_, PyAny>>,
+        object: Option<&Bound<'_, PyAny>>,
+        graph_name: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<crate::results::PyQuadIterator> {
+        let req = Req::Find(
+            opt(graph_name, graph_from_py)?,
+            opt(subject, subject_from_py)?,
+            opt(predicate, named_node_from_py)?,
+            opt(object, term_from_py)?,
+        );
+        let quads = match self.call(py, req, None)? {
+            Resp::Quads(q) => q,
+            _ => Vec::new(),
+        };
+        Ok(crate::results::PyQuadIterator::from_vec(quads))
+    }
+
     fn __contains__(&self, py: Python<'_>, quad: &Bound<'_, PyAny>) -> PyResult<bool> {
         let q = quad_from_py(quad)?;
         let req = Req::Find(

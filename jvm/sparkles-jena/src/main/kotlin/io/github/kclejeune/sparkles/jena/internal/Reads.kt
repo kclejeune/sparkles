@@ -80,7 +80,7 @@ internal class QuadIter(
         nextSize = minOf(nextSize * 2, MAX_FIND_ROWS)
         batch = decoder.decode(b.batch)
         row = 0
-        if (b.done) closeCursor()
+        if (b.done) closeCursor(drained = true)
         return batch.rows > 0
     }
 
@@ -115,9 +115,10 @@ internal class QuadIter(
 
     override fun remove() = throw UnsupportedOperationException("remove")
 
-    private fun closeCursor() {
+    /** Free the cursor. One that reported `done` has freed its state natively already. */
+    private fun closeCursor(drained: Boolean = false) {
         cursor?.let {
-            it.release()
+            if (!drained) it.release()
             it.close()
         }
         cursor = null

@@ -790,7 +790,17 @@ impl Snapshot {
                 (a, b) => a.or(b),
             };
             let Some(v) = next else { break };
-            if self.count(perm, &[v])? > 0 {
+            // whether any quad remains under `v`: the first one found answers it, where
+            // a count would walk every inserted and deleted key of the delta under `v`
+            let mut any = false;
+            self.scan(perm, &[v], |c| {
+                any = match c {
+                    Chunk::Block(_, start, end) => start < end,
+                    Chunk::Row(_) => true,
+                };
+                Ok(!any)
+            })?;
+            if any {
                 out.push(v);
             }
             cur = Some(v);
@@ -6679,12 +6689,42 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         assert_eq!(s.len(), 5);
         assert_eq!(s.delta.inserts(), 1);
         assert_eq!(s.graph_ids().unwrap().len(), 3);
+        // deleting every quad of a graph through the delta drops it, and deleting some
+        // of a graph's quads keeps it
+        let gquad = |o: &str, g: &str| {
+            Quad::new(
+                named("http://ex.org/s"),
+                named("http://ex.org/p"),
+                named(o),
+                named(g),
+            )
+        };
+        let mut w = store.write();
+        for (o, g) in [
+            ("http://ex.org/o1", "http://ex.org/g1"),
+            ("http://ex.org/o2", "http://ex.org/g2"),
+        ] {
+            let k = w
+                .encode_quad(&gquad(o, g), &mut Default::default())
+                .unwrap();
+            assert!(w.delete(k).unwrap());
+        }
+        w.commit().unwrap();
+        let s = store.snapshot();
+        let names: Vec<_> = s
+            .graph_ids()
+            .unwrap()
+            .into_iter()
+            .filter_map(|g| s.term(g))
+            .map(|t| t.to_string())
+            .collect();
+        assert_eq!(names, ["<http://ex.org/g2>", "<http://ex.org/g3>"]);
         let mut n = 0;
         s.for_each_quad(|_| {
             n += 1;
             Ok(())
         })
         .unwrap();
-        assert_eq!(n, 5);
+        assert_eq!(n, 3);
     }
 }

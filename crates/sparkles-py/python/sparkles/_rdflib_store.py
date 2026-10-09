@@ -27,7 +27,7 @@ from collections.abc import Generator, Iterable, Iterator, Mapping
 from typing import Any
 from urllib.parse import quote, unquote
 
-from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, Graph, QuotedGraph
+from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph, Graph, QuotedGraph
 from rdflib.namespace import _NAMESPACE_PREFIXES_CORE, _NAMESPACE_PREFIXES_RDFLIB
 from rdflib.query import Result
 from rdflib.store import NO_STORE, VALID_STORE, Store, TripleAddedEvent, TripleRemovedEvent
@@ -47,6 +47,7 @@ from sparkles._sparkles import (
     QueryTriples,
     Transaction,
     Triple,
+    _RdflibNodes,
 )
 
 __all__ = ["SparklesStore"]
@@ -120,6 +121,13 @@ class SparklesStore(Store):
         self._graphs: set[Identifier] = set()
         self._contexts: dict[Any, Graph] = {}
         self._nodes: dict[str, Node] = {}
+        # the Sparkles NamedNode of each URIRef used in a pattern (writes, whose IRIs
+        # are often new, do not fill it)
+        self._iris: dict[URIRef, NamedNode] = {}
+        # the Sparkles graph of each plain Graph context read through
+        self._graph_names: dict[Identifier, DefaultGraph | NamedNode] = {}
+        # converts whole batches of quads and solutions to rdflib nodes natively
+        self._conv = _RdflibNodes(URIRef, self._node, PREFIX)
         self._ns: dict[str, URIRef] = {}
         self._pfx: dict[URIRef, str] = {}
         self._ns_loaded = False
@@ -190,6 +198,10 @@ class SparklesStore(Store):
         self._ns.clear()
         self._pfx.clear()
         self._ns_loaded = False
+        self._nodes.clear()
+        self._iris.clear()
+        self._graph_names.clear()
+        self._conv.clear()
 
     def gc(self) -> None:
         pass
@@ -275,6 +287,18 @@ class SparklesStore(Store):
         quad has, such as a blank node label this store never wrote or read."""
         if t is None:
             return None
+        if type(t) is URIRef:
+            # (a URIRef equals only a URIRef, so the cache is keyed by exact type)
+            n = self._iris.get(t)
+            if n is None:
+                try:
+                    n = NamedNode(t)
+                except ValueError:
+                    raise _NoMatch from None
+                if len(self._iris) >= 100_000:
+                    self._iris.clear()
+                self._iris[t] = n
+            return n
         # (rdflib nodes hash with their type, so the label maps are keyed by str)
         if isinstance(t, BNode) and str(t) not in self._bn_out and not _STORED_LABEL.fullmatch(t):
             # a label in the gathered writes gets its node when they are committed
@@ -289,7 +313,9 @@ class SparklesStore(Store):
     def _spo(self, triple: tuple[Any, Any, Any]) -> tuple[Any, Any, Any]:
         """The pattern terms of a triple pattern. Raises _NoMatch when a position holds
         a term that it cannot hold, such as a literal subject."""
-        s, p, o = (self._pattern(t) for t in triple)
+        pattern = self._pattern
+        s, p, o = triple
+        s, p, o = pattern(s), pattern(p), pattern(o)
         if isinstance(s, Literal) or (p is not None and not isinstance(p, NamedNode)):
             raise _NoMatch
         return s, p, o
@@ -361,10 +387,22 @@ class SparklesStore(Store):
 
     def _graph_pattern(self, context: Any) -> DefaultGraph | NamedNode | BlankNode:
         """`_graph_name` for a read: a context Sparkles cannot hold raises _NoMatch."""
+        if type(context) is Graph:
+            # the common case, a plain Graph read again and again: its graph is kept,
+            # except for a blank-node graph name, whose label can be learned later
+            ident = context.identifier
+            found = self._graph_names.get(ident)
+            if found is not None:
+                return found
         try:
-            return self._graph_name(context)
+            g = self._graph_name(context)
         except (TypeError, ValueError):
             raise _NoMatch from None
+        if type(context) is Graph and not isinstance(g, BlankNode):
+            if len(self._graph_names) >= 10_000:
+                self._graph_names.clear()
+            self._graph_names[context.identifier] = g
+        return g
 
     def _context_for(self, g: DefaultGraph | NamedNode | BlankNode) -> Graph:
         """The rdflib context of a Sparkles graph."""
@@ -378,6 +416,8 @@ class SparklesStore(Store):
         elif isinstance(g, BlankNode):
             self._blank_graphs.add(g.value)
             ctx = Graph(store=self, identifier=BNode(g.value))
+            # that identifier now names the stored blank node, not a `graph:` IRI
+            self._graph_names.pop(ctx.identifier, None)
         elif g.value.startswith(FORMULA):
             ctx = QuotedGraph(self, _formula_id(g.value))
         elif g.value.startswith(GRAPH):
@@ -441,41 +481,44 @@ class SparklesStore(Store):
         except _NoMatch:
             return
         reader = self._reader()
-        node = self._node
+        convert = self._conv.triples
         if g is not None:
             ctx = context if isinstance(context, Graph) else self._context_for(g)
-            for q in reader.quads_for_pattern(s, p, o, g):  # type: ignore[arg-type]
-                yield (node(q.subject), node(q.predicate), node(q.object)), iter((ctx,))
+            if isinstance(reader, Transaction):
+                quads = reader._quads_iter(s, p, o, g)  # type: ignore[arg-type]
+            else:
+                quads = reader.quads_for_pattern(s, p, o, g)  # type: ignore[arg-type]
+            while (batch := convert(quads)) is not None:
+                for t in batch:
+                    yield t, iter((ctx,))  # type: ignore[misc]
             return
         # every asserted triple once, with the contexts it is in
         if isinstance(reader, Transaction):
-            groups: dict[Triple, list[Any]] = {}
-            for q in reader.quads_for_pattern(s, p, o):  # type: ignore[arg-type]
-                if not _is_formula(q.graph_name):
-                    groups.setdefault(q.triple, []).append(q.graph_name)
+            groups: dict[tuple[Any, ...], list[Any]] = {}
+            quads = reader._quads_iter(s, p, o)  # type: ignore[arg-type]
+            while (batch := convert(quads, True)) is not None:
+                for row in batch:
+                    if not _is_formula(row[3]):
+                        groups.setdefault(row[:3], []).append(row[3])
             for t, gs in groups.items():
-                yield (node(t.subject), node(t.predicate), node(t.object)), iter(
-                    [self._context_for(g) for g in gs]
-                )
+                yield t, iter([self._context_for(g) for g in gs])  # type: ignore[misc]
             return
-        last: Triple | None = None
+        last: tuple[Any, ...] | None = None
         graphs: list[Any] = []
-        for q in reader._quads_by_triple(s, p, o):  # type: ignore[arg-type]
-            gn = q.graph_name
-            if _is_formula(gn):
-                continue
-            t = q.triple
-            if t != last:
-                if last is not None:
-                    yield (node(last.subject), node(last.predicate), node(last.object)), iter(
-                        [self._context_for(g) for g in graphs]
-                    )
-                last, graphs = t, []
-            graphs.append(gn)
+        quads = reader._quads_by_triple(s, p, o)  # type: ignore[arg-type]
+        while (batch := convert(quads, True)) is not None:
+            for row in batch:
+                gn = row[3]
+                if _is_formula(gn):
+                    continue
+                t = row[:3]
+                if t != last:
+                    if last is not None:
+                        yield last, iter([self._context_for(g) for g in graphs])  # type: ignore[misc]
+                    last, graphs = t, []
+                graphs.append(gn)
         if last is not None:
-            yield (node(last.subject), node(last.predicate), node(last.object)), iter(
-                [self._context_for(g) for g in graphs]
-            )
+            yield last, iter([self._context_for(g) for g in graphs])  # type: ignore[misc]
 
     def __len__(self, context: Any = None) -> int:  # type: ignore[override]
         reader = self._reader()
@@ -645,11 +688,12 @@ class SparklesStore(Store):
             names = [v.value for v in r.variables]
             rvars = [RVariable(n) for n in names]
             res.vars = rvars
-            node = self._node
+            convert = self._conv.solutions
 
             def rows() -> Generator[dict[RVariable, Node], None, None]:
-                for sol in r:
-                    yield {v: node(t) for v, t in zip(rvars, sol) if t is not None}
+                while (batch := convert(r)) is not None:
+                    for sol in batch:
+                        yield {v: n for v, n in zip(rvars, sol) if n is not None}
 
             res.bindings = rows()  # type: ignore[assignment]
             return res
@@ -713,9 +757,7 @@ def _is_formula(g: Any) -> bool:
 
 def _is_union(context: Any) -> bool:
     """A ConjunctiveGraph or Dataset passed as a context stands for all of them."""
-    from rdflib.graph import ConjunctiveGraph
-
-    return isinstance(context, ConjunctiveGraph)
+    return type(context) is not Graph and isinstance(context, ConjunctiveGraph)
 
 
 def _is_default(graph: Any) -> bool:

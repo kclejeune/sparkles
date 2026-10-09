@@ -26,10 +26,44 @@ java {
 }
 tasks.withType<JavaCompile>().configureEach { options.release = 17 }
 
+// The generated bindings, with UniFFI's call helper changed to reuse its call status
+// records (src/ffi/kotlin/.../UniffiCallStatusPool.kt says why). The build fails if the
+// helper is not the one this expects, as after a UniFFI upgrade.
+val ffiBindings = tasks.register<Sync>("ffiBindings") {
+    from(bindingsDir)
+    into(layout.buildDirectory.dir("generated/uniffi"))
+    doLast {
+        val helper = listOf(
+            "    var status = UniffiRustCallStatus()",
+            "    val return_value = callback(status)",
+            "    uniffiCheckCallStatus(errorHandler, status)",
+            "    return return_value",
+        ).joinToString("\n")
+        val pooled = listOf(
+            "    val status = UniffiCallStatusPool.acquire()",
+            "    try {",
+            "        val return_value = callback(status)",
+            "        uniffiCheckCallStatus(errorHandler, status)",
+            "        return return_value",
+            "    } finally {",
+            "        UniffiCallStatusPool.release(status)",
+            "    }",
+        ).joinToString("\n")
+        val files = destinationDir.walkTopDown().filter { it.isFile && it.name.endsWith(".kt") }.toList()
+        val changed = files.count { f ->
+            val text = f.readText()
+            if (!text.contains(helper)) return@count false
+            f.writeText(text.replace(helper, pooled))
+            true
+        }
+        check(changed == 1) { "expected UniFFI's call helper in one generated file, found it in $changed" }
+    }
+}
+
 // The generated bindings compile on their own: they are public Kotlin that explicit API mode
 // would reject, and their warnings are not ours. Their classes go into this jar.
 val ffi: SourceSet = sourceSets.create("ffi") {
-    kotlin.srcDir(bindingsDir)
+    kotlin.srcDir(ffiBindings)
 }
 
 kotlin {
@@ -149,13 +183,14 @@ tasks.register<JavaExec>("perfCheck") {
 // generated call goes through, and compiles with the module name of the `ffi` source set.
 val countingBindingsDir = layout.buildDirectory.dir("bindings-bench/counting-src")
 val callCountingBindings = tasks.register<Sync>("callCountingBindings") {
-    from(bindingsDir)
+    from(ffiBindings)
     into(countingBindingsDir)
-    val marker = "    var status = UniffiRustCallStatus()"
+    val marker = "    val status = UniffiCallStatusPool.acquire()"
     filter { line -> if (line == marker) "    UniffiCallCounter.calls.increment()\n$line" else line }
 }
 val benchCalls: SourceSet = sourceSets.create("benchCalls") {
     kotlin.srcDir(callCountingBindings)
+    kotlin.srcDir("src/ffi/kotlin")
     compileClasspath = ffi.compileClasspath
 }
 tasks.named<KotlinCompile>("compileBenchCallsKotlin") {

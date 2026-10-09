@@ -16,6 +16,7 @@ mod io;
 mod queries;
 mod query_cursor;
 mod querybuilder;
+mod rdflib_nodes;
 mod reasoning;
 mod results;
 mod schema;
@@ -62,6 +63,7 @@ fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     reasoning::register(m)?;
     querybuilder::register(m)?;
     queries::register(m)?;
+    rdflib_nodes::register(m)?;
     m.add_class::<dataset::PyDataset>()?;
     m.add_class::<txn::PyTransaction>()?;
     m.add_class::<interrupt::PyCancelToken>()?;
