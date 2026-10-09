@@ -164,6 +164,29 @@ fn text(v: &Option<Value>) -> &str {
 
 /// The composite order of several keys, each ascending or descending.
 #[inline]
+/// Whether a value belongs to the kinds on which [`order_cmp`] is a total order: unbound,
+/// blank nodes, IRIs, strings, language-tagged strings, integers, decimals, booleans and
+/// floats and doubles other than NaN. Dates, times and durations are only partially
+/// ordered, and the remaining kinds are left out to be safe. A sort or selection that
+/// needs a total order checks its values with this first.
+pub fn totally_ordered(v: Option<&Value>) -> bool {
+    match v {
+        None => true,
+        Some(
+            Value::BNode(_)
+            | Value::Iri(_)
+            | Value::Str(_)
+            | Value::Lang(..)
+            | Value::Integer(_)
+            | Value::Decimal(_)
+            | Value::Bool(_),
+        ) => true,
+        Some(Value::Float(f)) => !f32::from(*f).is_nan(),
+        Some(Value::Double(d)) => !f64::from(*d).is_nan(),
+        Some(_) => false,
+    }
+}
+
 pub fn cmp_keys(a: &[SortKey], b: &[SortKey], asc: &[bool]) -> Ordering {
     for ((x, y), up) in a.iter().zip(b).zip(asc) {
         let o = x.cmp(y);

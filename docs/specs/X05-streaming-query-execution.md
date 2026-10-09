@@ -710,6 +710,30 @@ other ordered and grouped queries, and 19 other queries in both modes. NOT EXIST
 exception at 3.6% slower in both modes. Its code path did not change, and it executed the
 same number of instructions in both builds, so the difference is code layout.
 
+The heap first ran ahead of the prefilter on the first key of several keys, so a top-k
+over a large input built a sort key for every row before any row was screened.
+DBpedia's top-linked query orders tens of millions of grouped counts, and it became
+about 46% slower. The first-key prefilter now runs before the heap. It ranks the
+distinct values of the first key, keeps the rows that can still reach the first k, and
+the heap orders only those. Ranking needs a total order, so the prefilter steps aside
+when the first key holds dates, times, durations, NaN or other values that the
+comparator orders only partially, and the heap ranks those rows. On the billion-triple DBpedia index, 64 interleaved runs per
+build gave 543.5 ms for top-linked, against 795.2 ms with the heap first and 537.5 ms
+before the heap existed. Class counts, co-star birthplaces, country population and
+entity facts stayed within 1% of the build before the heap. At 1.05M the expression sort
+key, grouped average and expression aggregate queries stayed within 2.2%.
+
+A range TopK whose input is a monotone piece of an index reads that piece from its best
+end. The planner charged placing the read a whole block of rows, so at 1.05M it kept the
+full scan, which ran 16% slower than the ordered read. Placing the read decodes the
+leading key columns of one block, which the block cache keeps, and the planner now
+charges an eighth of a block for it. At 10.5M the plan and its time did not change. The
+1.05M range TopK also filters about ten thousand salaries stored as non-canonical
+decimals in the dictionary. Those values now decode straight into numbers without a
+detour through RDF terms, and they convert to doubles without 128-bit division. The
+conversion gives the same bits as the decimal type's own conversion on random values and
+on the extreme ones.
+
 The fallback work was measured on the 1.05M suite against the previous commit with
 both servers running at once, pinned to the same three cores with the result cache
 off. Requests alternated in A, B, B, A order and the change is the median of 41 paired

@@ -812,7 +812,10 @@ fn first_key_prefilter_keeps_the_exact_order() {
         );
         kept += has_desc(&fast.plan, "first-key prefilter") as usize;
     }
-    assert!(kept >= queries.len() - 2, "{kept} of {}", queries.len());
+    // The two queries ordered first by ?v itself meet dates with and without a
+    // timezone, which are only partially ordered, so the prefilter leaves them to the
+    // full sort; the tied first key has nothing to drop.
+    assert!(kept >= queries.len() - 3, "{kept} of {}", queries.len());
 }
 
 #[test]

@@ -3614,6 +3614,16 @@ fn first_key_candidates(
         if *asc { o } else { o.reverse() }
     };
     ctx.check()?;
+    // Ranking and selecting need a total order. Dates with and without a timezone, for
+    // example, are only partially ordered, and the heap ranks those rows instead.
+    let total = match &col {
+        super::exprcache::Column::Values(p) => p.vals.iter(),
+        super::exprcache::Column::Rows { vals, .. } => vals.iter(),
+    }
+    .all(|v| super::sortkey::totally_ordered(v.as_ref()));
+    if !total {
+        return Ok(None);
+    }
     let cand: Vec<usize> = match &col {
         super::exprcache::Column::Values(p) => {
             // rank the distinct values once (equal values share a rank), then select
