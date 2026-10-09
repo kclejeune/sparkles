@@ -25,6 +25,7 @@ pub mod graph;
 mod group;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 mod merge;
+mod walk;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FallbackPolicy {
@@ -1094,6 +1095,7 @@ enum State {
     Group(Box<group::Group>),
     Filter(Box<filter::Filter>),
     Expand(Box<expand::Expand>),
+    Walk(Box<walk::Walk>),
     Scan(Scan),
     Values {
         table: Table,
@@ -1235,6 +1237,9 @@ fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
                 spec.cols.iter().map(|&(_, v)| v).collect()
             }
             Kind::Values(table) => table.sorted.clone(),
+            Kind::Path { .. } if node.children.is_empty() => walk::order(node),
+            // A path over its input joins each batch with the paths of its start nodes.
+            Kind::Path { .. } => Vec::new(),
             // Keys come in index order, one row each.
             Kind::GroupCountScan { key, .. } => vec![*key],
             Kind::Project(_)
@@ -1271,6 +1276,7 @@ impl Operator {
         let joins = binary::eligible(&node);
         let incremental_group = group::eligible(&node);
         let expanding = expand::eligible(&node);
+        let walking = walk::eligible(&node);
         let native_blocking =
             matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. }) && node.children.len() == 1;
         // A native sort consumes cursor batches into charged state. It blocks before
@@ -1282,6 +1288,7 @@ impl Operator {
             && !joins
             && !incremental_group
             && !expanding
+            && !walking
             && (!native_blocking || exists_keys);
         if materializes && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
@@ -1359,7 +1366,8 @@ impl Operator {
             || incremental_merge
             || incremental_binary
             || incremental_group
-            || expanding;
+            || expanding
+            || walking;
         let order = output_order(
             &node,
             &children,
@@ -1410,6 +1418,8 @@ impl Operator {
             State::Filter(Box::new(filter::Filter::new(node)))
         } else if expanding {
             State::Expand(Box::new(expand::Expand::new(node)))
+        } else if walking {
+            State::Walk(Box::new(walk::Walk::new(ctx, &node)?))
         } else if native_blocking {
             State::Blocking {
                 node,
@@ -1782,6 +1792,11 @@ impl Operator {
                 State::Filter(filter) => {
                     let batch = filter.next(ctx, &mut self.children[0], options, cap)?;
                     self.done = filter.done(self.children[0].done);
+                    batch
+                }
+                State::Walk(walk) => {
+                    let batch = walk.next(ctx, &self.vars, cap)?;
+                    self.done = walk.done();
                     batch
                 }
                 State::Expand(expand) => {

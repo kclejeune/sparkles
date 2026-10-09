@@ -1,5 +1,6 @@
-//! Operators that map each input row to any number of output rows on their own, in
-//! input order: index joins, LET, UNFOLD and triple-term decomposition. Each input
+//! Operators that map each input row to any number of output rows on their own: index
+//! joins, LET, UNFOLD and triple-term decomposition in input order, and transitive
+//! paths from the start nodes of their input. Each input
 //! batch runs through the eager kernel. Its output is charged state that later pulls
 //! resume, so one batch that expands into many solutions leaves the following batches
 //! bounded by the caller's cap. The input demand follows the expansion seen so far.
@@ -22,6 +23,11 @@ pub(super) fn eligible(node: &Node) -> bool {
             Kind::Assign(_, expr) => !expr.has_exists(),
             Kind::Unfold { expr, .. } => !expr.has_exists(),
             Kind::Unpack { .. } => true,
+            // A path from the start nodes of its input, without an edge input.
+            Kind::Path {
+                bound_from_left: true,
+                ..
+            } => true,
             _ => false,
         }
 }

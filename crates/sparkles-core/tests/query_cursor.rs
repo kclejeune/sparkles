@@ -857,7 +857,7 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
 #[test]
 fn eager_fallback_is_visible_lazy_and_budgeted() {
     let s = store(100);
-    let q = "SELECT ?s ?o WHERE { ?s <urn:p>+ ?o }";
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o FILTER NOT EXISTS { ?s <urn:q> ?o } }";
     assert!(matches!(
         select_cursor(s.snapshot(), q, &Default::default(), &options(2)),
         Err(Error::Unsupported(_))
@@ -2039,7 +2039,7 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            "SELECT * {?s <urn:p>+ ?o}",
+            "SELECT * {?s ?p ?o FILTER NOT EXISTS {?o ?p ?s}}",
             &Default::default(),
             &strict,
             ExecutionMode::Auto,
@@ -3030,8 +3030,8 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
     for q in [
         "SELECT ?t (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t } GROUP BY ?t HAVING (NOT EXISTS { ?t <urn:p> 3 })",
         "SELECT ?s ?t WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t FILTER NOT EXISTS { ?t <urn:p> 3 } }",
-        "SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q>+ ?x }",
-        "SELECT ?s ?x WHERE { { ?s <urn:q> ?t } UNION { ?t <urn:q> ?s } ?s <urn:q>* ?x }",
+        "SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s (<urn:q>/<urn:q>)+ ?x }",
+        "SELECT ?s ?x WHERE { { ?s <urn:q> ?t } UNION { ?t <urn:q> ?s } ?s (<urn:q>|^<urn:q>)* ?x }",
     ] {
         let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
         for rows in [1, 2, 3, 4096] {
@@ -3113,6 +3113,63 @@ fn group_count_scans_stream_their_counts() {
         sparkles_core::sparql::update::update(
             &s,
             "INSERT DATA { <urn:s:1> <urn:q> <urn:new> . <urn:s:9> <urn:q> <urn:s:1> } ; DELETE DATA { <urn:s:3> <urn:q> <urn:s:3> }",
+            &Default::default(),
+        )
+        .unwrap();
+    }
+}
+
+/// Transitive paths walk one start node at a time, from their own start nodes or from
+/// the rows of their input, and match eager answers under the strict policy, over
+/// pending changes and in named graphs.
+#[test]
+fn transitive_paths_stream_one_start_at_a_time() {
+    let s = store(30);
+    let data = (0..40)
+        .map(|i| {
+            format!(
+                "<urn:n:{i}> <urn:q> <urn:n:{}> .\n<urn:g:{}> {{ <urn:n:{i}> <urn:r> <urn:n:{}> }}\n",
+                (i * 7 + 3) % 40,
+                i % 3,
+                (i + 1) % 40
+            )
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+    s.compact().unwrap();
+    let queries = [
+        "SELECT ?s ?o WHERE { ?s <urn:q>+ ?o }",
+        "SELECT ?s ?o WHERE { ?s <urn:q>* ?o }",
+        "SELECT ?s WHERE { ?s <urn:q>+ ?s }",
+        "SELECT ?o WHERE { <urn:n:1> <urn:q>+ ?o }",
+        "SELECT ?s WHERE { ?s ^<urn:q>* <urn:n:2> }",
+        "SELECT ?g ?s ?o WHERE { GRAPH ?g { ?s <urn:r>+ ?o } }",
+        "SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(?o < 5) ?s <urn:q>* ?x }",
+        "SELECT ?s ?o WHERE { ?s <urn:q>+ ?o } LIMIT 7",
+    ];
+    for round in 0..2 {
+        for q in queries {
+            let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+            for cap in [1, 2, 5, 4096] {
+                let c = open(&s, q, cap);
+                assert!(!c.plan().has_materialization(), "{q}: {:?}", c.plan());
+                let got = bag(all(c));
+                if q.contains("LIMIT") {
+                    let full = "SELECT ?s ?o WHERE { ?s <urn:q>+ ?o }";
+                    let full = bag(query(s.snapshot(), full, &Default::default())
+                        .unwrap()
+                        .rows());
+                    assert_eq!(got.len(), expected.len(), "{q}; cap {cap}");
+                    assert!(got.iter().all(|r| full.contains(r)), "{q}; cap {cap}");
+                } else {
+                    assert_eq!(got, expected, "{q}; cap {cap}; round {round}");
+                }
+            }
+        }
+        sparkles_core::sparql::update::update(
+            &s,
+            "INSERT DATA { <urn:n:1> <urn:q> <urn:new> . <urn:new> <urn:q> <urn:n:2> . GRAPH <urn:g:0> { <urn:n:5> <urn:r> <urn:new> } } ; DELETE DATA { <urn:n:3> <urn:q> <urn:n:24> }",
             &Default::default(),
         )
         .unwrap();

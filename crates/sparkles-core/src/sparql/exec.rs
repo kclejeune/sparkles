@@ -4438,6 +4438,12 @@ impl Graph<'_> {
         }
         let mut out = Vec::new();
         let mut seen = FxHashSet::default();
+        // A cursor charges the visited set and the reached nodes as they grow.
+        let held = if self.ctx.is_cursor() {
+            Some(self.ctx.charge(64)?)
+        } else {
+            None
+        };
         if self.spec.min == 0 {
             out.push(start);
             seen.insert(start);
@@ -4445,6 +4451,7 @@ impl Graph<'_> {
         let mut frontier = vec![start];
         let mut depth = 0;
         let mut found = Vec::new();
+        let mut found_charged = 0usize;
         while !frontier.is_empty() {
             self.ctx.check()?;
             depth += 1;
@@ -4457,6 +4464,13 @@ impl Graph<'_> {
                     out.push(y);
                     next.push(y);
                 }
+            }
+            if let Some(held) = &held {
+                // the set entry, the reached node and the frontier node of each, and
+                // the growth of the neighbour buffer
+                let grown = found.capacity().saturating_sub(found_charged);
+                found_charged = found_charged.max(found.capacity());
+                held.add(next.len() as u64 * 48 + grown as u64 * 8)?;
             }
             if self.spec.max_one && depth >= 1 {
                 break;
@@ -4815,6 +4829,207 @@ fn path(
         None => out.project(vars),
     };
     Ok((t, sweeps.get()))
+}
+
+/// A transitive path without inputs, evaluated one start node at a time for cursors.
+/// Between calls it keeps the start nodes of the graph it is walking.
+pub(super) struct PathWalk {
+    spec: PathSpec,
+    vars: Vec<VarId>,
+    graphs: Vec<(GraphFilter, Option<Id>)>,
+    graph: usize,
+    starts: Option<Vec<u64>>,
+    start: usize,
+    sweeps: std::cell::Cell<usize>,
+}
+
+impl PathWalk {
+    pub(super) fn new(ctx: &Ctx, spec: &PathSpec, vars: &[VarId]) -> Result<Self> {
+        let graphs = match spec.graph_var {
+            None => vec![(spec.graph.clone(), None)],
+            Some(_) => ctx
+                .snap
+                .graph_ids()?
+                .into_iter()
+                .filter(|g| spec.graph.accepts(g.0))
+                .map(|g| (GraphFilter::One(g.0), Some(g)))
+                .collect(),
+        };
+        Ok(Self {
+            spec: spec.clone(),
+            vars: vars.to_vec(),
+            graphs,
+            graph: 0,
+            starts: None,
+            start: 0,
+            sweeps: std::cell::Cell::new(0),
+        })
+    }
+
+    /// Whether the output is in order of its subject variable: every start node of one
+    /// graph, in order.
+    pub(super) fn ordered_on(spec: &PathSpec) -> Option<VarId> {
+        match (&spec.subj, &spec.obj) {
+            (PathEnd::Var(a), PathEnd::Var(b)) if a != b && spec.graph_var.is_none() => Some(*a),
+            _ => None,
+        }
+    }
+
+    /// The start nodes kept for the graph being walked.
+    pub(super) fn retained(&self) -> usize {
+        self.starts.as_ref().map_or(0, Vec::capacity)
+    }
+
+    /// The solutions of the next start node with any, or None when every graph has
+    /// been walked. A constant end is walked in one step.
+    pub(super) fn next(&mut self, ctx: &Ctx) -> Result<Option<Table>> {
+        let spec = &self.spec;
+        let (sv, ov) = (
+            match spec.subj {
+                PathEnd::Var(v) => Some(v),
+                _ => None,
+            },
+            match spec.obj {
+                PathEnd::Var(v) => Some(v),
+                _ => None,
+            },
+        );
+        let mut pvars = Vec::new();
+        for v in [sv, ov].into_iter().flatten() {
+            if !pvars.contains(&v) {
+                pvars.push(v);
+            }
+        }
+        if let Some(g) = spec.graph_var {
+            pvars.push(g);
+        }
+        loop {
+            ctx.check()?;
+            let Some((gf, gid)) = self.graphs.get(self.graph).cloned() else {
+                return Ok(None);
+            };
+            let g = Graph {
+                ctx,
+                spec,
+                graph: gf,
+                fwd: None,
+                bwd: None,
+                sweeps: &self.sweeps,
+            };
+            let mut out = Table::new(pvars.clone());
+            let push = |s: u64, o: u64, out: &mut Table| {
+                if sv.is_some() && sv == ov && s != o {
+                    return;
+                }
+                let mut row = Vec::with_capacity(pvars.len());
+                if sv.is_some() {
+                    row.push(Id(s));
+                }
+                if ov.is_some() && ov != sv {
+                    row.push(Id(o));
+                }
+                if let Some(g) = gid {
+                    row.push(g);
+                }
+                out.push_row(&row);
+            };
+            match (&spec.subj, &spec.obj) {
+                (PathEnd::Const(s), PathEnd::Const(o)) => {
+                    for _ in g.reach(s.0, true)?.into_iter().filter(|y| *y == o.0) {
+                        push(s.0, o.0, &mut out);
+                    }
+                    self.graph += 1;
+                }
+                (PathEnd::Const(s), PathEnd::Var(_)) => {
+                    for o in g.reach(s.0, true)? {
+                        push(s.0, o, &mut out);
+                    }
+                    self.graph += 1;
+                }
+                (PathEnd::Var(_), PathEnd::Const(o)) => {
+                    for s in g.reach(o.0, false)? {
+                        push(s, o.0, &mut out);
+                    }
+                    self.graph += 1;
+                }
+                (PathEnd::Var(_), PathEnd::Var(_)) => {
+                    if self.starts.is_none() {
+                        self.starts = Some(walk_starts(ctx, spec, &g.graph)?);
+                        self.start = 0;
+                    }
+                    let starts = self.starts.as_ref().expect("start nodes");
+                    let Some(&x) = starts.get(self.start) else {
+                        self.starts = None;
+                        self.graph += 1;
+                        continue;
+                    };
+                    self.start += 1;
+                    for y in g.reach(x, true)? {
+                        push(x, y, &mut out);
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return Ok(Some(out.project(&self.vars)));
+            }
+        }
+    }
+}
+
+/// The start nodes of a path with two variable ends, in order, as
+/// [`Graph::all_nodes`] finds them, read block by block under a charge rather than as
+/// a list of every key.
+fn walk_starts(ctx: &Ctx, spec: &PathSpec, graph: &GraphFilter) -> Result<Vec<u64>> {
+    let held = ctx.charge(0)?;
+    let mut set: FxHashSet<u64> = FxHashSet::default();
+    let mut charged = 0usize;
+    let mut grow = |set: &FxHashSet<u64>| -> Result<()> {
+        if set.len() >= charged + 1024 {
+            // a set entry and its share of a growing table
+            held.add((set.len() - charged) as u64 * 48)?;
+            charged = set.len();
+            ctx.check()?;
+        }
+        Ok(())
+    };
+    let (perm, prefix, columns): (Perm, Vec<u64>, Vec<usize>) = if spec.min > 0 {
+        let Some((p, rev)) = spec.simple else {
+            return Ok(Vec::new());
+        };
+        let perm = if rev { Perm::Pos } else { Perm::Pso };
+        (perm, vec![p], vec![1])
+    } else {
+        // every subject and object of the active graph
+        (Perm::Spo, Vec::new(), vec![S, Perm::Spo.col_of(O)])
+    };
+    let gc = perm.col_of(crate::index::G);
+    ctx.snap.scan(perm, &prefix, |chunk| {
+        match chunk {
+            Chunk::Block(b, s, e) => {
+                for i in s..e {
+                    let k = b.key(i);
+                    if graph.accepts(k[gc]) {
+                        for &c in &columns {
+                            set.insert(k[c]);
+                        }
+                    }
+                    grow(&set)?;
+                }
+            }
+            Chunk::Row(k) => {
+                if graph.accepts(k[gc]) {
+                    for &c in &columns {
+                        set.insert(k[c]);
+                    }
+                }
+                grow(&set)?;
+            }
+        }
+        Ok(true)
+    })?;
+    let mut v: Vec<u64> = set.into_iter().collect();
+    v.sort_unstable();
+    Ok(v)
 }
 
 // ----------------------------------------------------------------- vectors ------
