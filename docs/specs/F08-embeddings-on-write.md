@@ -5,7 +5,9 @@
 > **Phases:** Phase 1 shipped: the configuration, the worker, the input record, full
 > passes, `reembed`, status, text queries, the HTTP, CLI, Python and UI surfaces, and tests
 > with a mock provider. Phase 2 shipped: the metrics, chunking of long texts and a
-> token-based rate limit.
+> token-based rate limit. The Similar page and the MCP tool `similar_entities` cannot
+> search with text, chunk offsets are not stored, and the NixOS module has no embedding
+> options.
 >
 > **User docs:** [API: Embeddings on write](../API.md#embeddings-on-write) · [Usage: Embeddings](../USAGE.md#embeddings-computed-on-write) · [Features](../FEATURES.md#sparql-arq-equivalent)
 >
