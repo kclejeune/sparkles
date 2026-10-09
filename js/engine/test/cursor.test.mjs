@@ -209,8 +209,8 @@ test('existing cursors use the query limit after reconfiguration', { timeout: 30
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(delivered, false, 'the old cursor bypassed the occupied query limit');
     assert.equal(streamDelivered, false, 'the old byte stream bypassed the occupied query limit');
-    // Queued pulls must also migrate when the limit changes while they wait.
-    configure({ maxConcurrentQueries: 1 });
+    // Raising the limit admits pulls that are already queued.
+    configure({ maxConcurrentQueries: 2 });
     assert.equal((await next).done, false);
     assert.equal((await serialized).results.bindings.length, 10000);
     controller.abort();
@@ -221,6 +221,42 @@ test('existing cursors use the query limit after reconfiguration', { timeout: 30
     if (serialized) await serialized;
     else await body?.cancel();
     await cursor?.close();
+    configure({ maxConcurrentQueries: availableParallelism() });
+    await ds.close();
+  }
+});
+
+test('a lowered query limit is not exceeded by running queries', { timeout: 30000 }, async () => {
+  const ds = Dataset.memory();
+  const controllers = [new AbortController(), new AbortController()];
+  let slow = [];
+  configure({ maxConcurrentQueries: 2 });
+  try {
+    const data = Array.from({ length: 10000 }, (_, i) => `<urn:s${i}> <urn:p> ${i} .`).join('\n');
+    await ds.load(data, { format: 'ttl' });
+    slow = controllers.map((controller) =>
+      ds
+        .select('SELECT (COUNT(*) AS ?n) { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?x + ?y < 0) }', {
+          timeout: 10000,
+          signal: controller.signal,
+        })
+        .catch((e) => e),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Both running queries keep their permits, so the lowered limit owes one.
+    configure({ maxConcurrentQueries: 1 });
+    await assert.rejects(ds.select('SELECT * { ?s ?p ?o }', { noWait: true }), ConflictError);
+    controllers[0].abort();
+    await slow[0];
+    // The first finished query pays the debt instead of admitting a second query.
+    await assert.rejects(ds.select('SELECT * { ?s ?p ?o }', { noWait: true }), ConflictError);
+    controllers[1].abort();
+    await slow[1];
+    const r = await ds.select('SELECT * { ?s ?p ?o } LIMIT 1', { noWait: true });
+    assert.equal((await r.toArray()).length, 1);
+  } finally {
+    for (const controller of controllers) controller.abort();
+    await Promise.all(slow);
     configure({ maxConcurrentQueries: availableParallelism() });
     await ds.close();
   }

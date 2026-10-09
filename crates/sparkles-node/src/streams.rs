@@ -103,7 +103,7 @@ impl Drop for NativeUpload {
 /// The reader permit of a result stream, given back while the stream waits for
 /// JavaScript to read, so that an unread stream does not block other queries.
 struct ReaderSlot {
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<ReaderPermit>,
     flag: Arc<AtomicBool>,
 }
 impl ReaderSlot {
@@ -115,7 +115,7 @@ impl ReaderSlot {
                     "cancelled",
                 ));
             }
-            if let Ok(p) = READERS.lock().clone().try_acquire_owned() {
+            if let Some(p) = try_reader() {
                 self.permit = Some(p);
                 return Ok(());
             }

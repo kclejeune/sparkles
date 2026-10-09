@@ -36,6 +36,8 @@ impl Record {
 }
 
 static SEEN: LazyLock<Mutex<HashMap<Uuid, Record>>> = LazyLock::new(Default::default);
+/// Serializes writes of the floor files.
+static PERSIST: Mutex<()> = Mutex::new(());
 
 fn file(dir: Option<&Path>) -> Option<PathBuf> {
     dir.map(|dir| dir.join(FILE))
@@ -46,10 +48,7 @@ fn file(dir: Option<&Path>) -> Option<PathBuf> {
 fn load(repository: Uuid, dir: Option<&Path>) -> Record {
     // An unreadable or malformed file counts as absent. A local attacker who can
     // edit the cache directory is outside what this check defends against.
-    let disk = file(dir)
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
-        .unwrap_or_default();
+    let disk = file(dir).as_deref().and_then(read).unwrap_or_default();
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let entry = seen.entry(repository).or_default();
     *entry = entry.merge(disk);
@@ -77,28 +76,52 @@ fn validate(seen: Record, descriptor: &Descriptor) -> Result<()> {
     Ok(())
 }
 
-/// Raise the floor after `descriptor` has been unlocked and its tag verified.
+/// Raise the floor after `descriptor` has been unlocked and its tag verified, and refuse
+/// it if this host has seen a newer one meanwhile. In particular, an unlock started
+/// before a rotation must not accept its old descriptor after that rotation.
 pub(crate) fn record(repository: Uuid, dir: Option<&Path>, descriptor: &Descriptor) -> Result<()> {
+    accept(repository, dir, descriptor, true)
+}
+
+/// Raise the floor to a rotation this handle has just published. The rotation stands
+/// even if a newer epoch was seen meanwhile, and the floor never goes down, so this
+/// does not check the descriptor.
+pub(crate) fn raise(repository: Uuid, dir: Option<&Path>, descriptor: &Descriptor) {
+    accept(repository, dir, descriptor, false).expect("an unchecked raise cannot fail");
+}
+
+fn accept(
+    repository: Uuid,
+    dir: Option<&Path>,
+    descriptor: &Descriptor,
+    checked: bool,
+) -> Result<()> {
     let accepted = Record {
         epoch: descriptor.max_epoch(),
         authenticated: descriptor.mac.is_some(),
     };
-    // Serialize acceptance and persistence across handles. In particular, an unlock
-    // started before a rotation must not accept its old descriptor after that rotation.
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let path = file(dir);
-    let stored = path
-        .as_ref()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok());
-    let entry = seen.entry(repository).or_default();
-    *entry = entry.merge(stored.unwrap_or_default());
-    validate(*entry, descriptor)?;
-    *entry = entry.merge(accepted);
-    let merged = *entry;
+    let stored = path.as_deref().and_then(read);
+    // Check and raise under one lock, so that two handles cannot both accept against
+    // the same floor. File I/O stays outside it.
+    let merged = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = seen.entry(repository).or_default();
+        *entry = entry.merge(stored.unwrap_or_default());
+        if checked {
+            validate(*entry, descriptor)?;
+        }
+        *entry = entry.merge(accepted);
+        *entry
+    };
     let Some(path) = path else {
         return Ok(());
     };
+    // Writers take turns and merge with the file as it is now, so a lower record never
+    // replaces a higher one written in between.
+    let _turn = PERSIST.lock().unwrap_or_else(|e| e.into_inner());
+    let stored = read(&path);
+    let merged = stored.map_or(merged, |stored| stored.merge(merged));
     if stored == Some(merged) {
         return Ok(());
     }
@@ -121,6 +144,12 @@ pub(crate) fn record(repository: Uuid, dir: Option<&Path>, descriptor: &Descript
         );
     }
     Ok(())
+}
+
+fn read(path: &Path) -> Option<Record> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
 }
 
 /// Forget the in-memory floor, as a process restart does.

@@ -509,7 +509,8 @@ the result comes back to the JavaScript thread through napi-rs's completion call
 waits for a writer. The addon limits how many run at a time with a semaphore, so that a
 burst of requests does not create hundreds of threads. The limit defaults to the number
 of available cores and is set with `configure({ maxConcurrentQueries })`. Queries beyond
-it wait in a queue without holding a thread. A streaming result takes a permit only while
+it wait in a queue without holding a thread. Lowering the limit takes back free permits
+at once and the rest as running queries finish, so no query starts above the new limit. A streaming result takes a permit only while
 it opens and while it computes a batch, and gives it back between pulls. An idle cursor
 therefore keeps its snapshot but never blocks other queries. The engine's own parallel operators use
 rayon's global pool, which is shared by all queries, as in the server.

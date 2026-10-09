@@ -370,11 +370,11 @@ async fn recover(
     }
     ctl.check()?;
     publish(repo, guard, &intent.previous, &intent.next, ctl).await?;
-    super::floor::record(
+    super::floor::raise(
         repo.marker.id,
         repo.cache.dir.as_deref(),
         &snapshot.descriptor,
-    )?;
+    );
     repo.store.delete(&Key::from(ROTATION)).await?;
     Ok(true)
 }

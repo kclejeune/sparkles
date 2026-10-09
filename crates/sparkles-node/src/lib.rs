@@ -296,84 +296,104 @@ struct Shared {
 static STORES: LazyLock<Mutex<HashMap<PathBuf, Weak<Shared>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// The permits of running queries, one per query executing on a blocking thread. The
-/// default is the number of cores, and `setMaxConcurrentQueries` replaces it. A streaming
+/// default is the number of cores, and `setMaxConcurrentQueries` changes it. A streaming
 /// cursor takes a permit only while it opens and while it computes a batch, so an idle
 /// cursor never blocks other queries.
-static READERS: LazyLock<Mutex<Arc<Semaphore>>> = LazyLock::new(|| {
-    Mutex::new(Arc::new(Semaphore::new(
-        std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(4),
-    )))
+static READERS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(default_query_limit())));
+/// The query limit, and the permits a lowered limit still has to take back from running
+/// queries. Changes to both and the release of a permit happen under this lock.
+static READER_LIMIT: LazyLock<Mutex<ReaderLimit>> = LazyLock::new(|| {
+    Mutex::new(ReaderLimit {
+        limit: default_query_limit(),
+        debt: 0,
+    })
 });
-fn readers() -> Arc<Semaphore> {
-    READERS.lock().clone()
+fn default_query_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
 }
-/// Set the number of queries that may run at once. Queries already running keep the
-/// permits of the old limit until they finish, so for a moment both limits apply.
+struct ReaderLimit {
+    limit: usize,
+    debt: usize,
+}
+/// A query permit. While a lowered limit is owed permits, dropping one forgets it
+/// instead of giving it back.
+pub(crate) struct ReaderPermit(Option<OwnedSemaphorePermit>);
+impl Drop for ReaderPermit {
+    fn drop(&mut self) {
+        let mut l = READER_LIMIT.lock();
+        if let Some(p) = self.0.take() {
+            if l.debt > 0 {
+                l.debt -= 1;
+                p.forget();
+            } else {
+                // Give the permit back before unlocking, so a concurrent lowering
+                // either sees it free or counts it as owed.
+                drop(p);
+            }
+        }
+    }
+}
+pub(crate) fn try_reader() -> Option<ReaderPermit> {
+    READERS
+        .clone()
+        .try_acquire_owned()
+        .ok()
+        .map(|p| ReaderPermit(Some(p)))
+}
+/// Set the number of queries that may run at once. Lowering the limit takes back free
+/// permits at once and the rest as running queries finish, so no query starts until
+/// fewer than the new limit run.
 #[napi]
 pub fn set_max_concurrent_queries(limit: u32) -> napi::Result<()> {
     if limit == 0 || limit as usize > Semaphore::MAX_PERMITS {
         return Err(invalid("maxConcurrentQueries must be a positive integer"));
     }
-    let old = std::mem::replace(
-        &mut *READERS.lock(),
-        Arc::new(Semaphore::new(limit as usize)),
-    );
-    old.close();
+    let limit = limit as usize;
+    let mut l = READER_LIMIT.lock();
+    if limit > l.limit {
+        let raise = limit - l.limit;
+        let paid = raise.min(l.debt);
+        l.debt -= paid;
+        READERS.add_permits(raise - paid);
+    } else {
+        let lower = l.limit - limit;
+        l.debt += lower - READERS.forget_permits(lower);
+    }
+    l.limit = limit;
     Ok(())
+}
+async fn query_permit(v: &Value, flag: &AtomicBool) -> napi::Result<ReaderPermit> {
+    let p = permit(READERS.clone(), v, flag).await?;
+    Ok(ReaderPermit(Some(p)))
 }
 async fn permit(
     s: Arc<Semaphore>,
     v: &Value,
     flag: &AtomicBool,
 ) -> napi::Result<OwnedSemaphorePermit> {
-    acquire_permit(s, v, flag, false).await
-}
-async fn query_permit(v: &Value, flag: &AtomicBool) -> napi::Result<OwnedSemaphorePermit> {
-    acquire_permit(readers(), v, flag, true).await
-}
-async fn acquire_permit(
-    mut s: Arc<Semaphore>,
-    v: &Value,
-    flag: &AtomicBool,
-    refresh_readers: bool,
-) -> napi::Result<OwnedSemaphorePermit> {
     let started = Instant::now();
-    'retry: loop {
-        let acquire = s.clone().acquire_owned();
-        tokio::pin!(acquire);
-        loop {
-            if flag.load(Ordering::Relaxed) {
-                return Err(err(EngineError::Cancelled));
-            }
-            if refresh_readers && s.is_closed() {
-                s = readers();
-                continue 'retry;
-            }
-            if v["noWait"].as_bool() == Some(true) {
-                match s.clone().try_acquire_owned() {
-                    Ok(p) if !refresh_readers || !s.is_closed() => return Ok(p),
-                    _ if refresh_readers && s.is_closed() => {
-                        s = readers();
-                        continue 'retry;
-                    }
-                    _ => return Err(err(EngineError::WriterBusy)),
-                }
-            }
-            if v["timeout"]
-                .as_u64()
-                .is_some_and(|ms| started.elapsed() >= Duration::from_millis(ms))
-            {
-                return Err(err(EngineError::Timeout));
-            }
-            if let Ok(p) = tokio::time::timeout(Duration::from_millis(10), &mut acquire).await {
-                if refresh_readers && s.is_closed() {
-                    s = readers();
-                    continue 'retry;
-                }
-                return p.map_err(|e| invalid(e.to_string()));
-            }
+    let acquire = s.clone().acquire_owned();
+    tokio::pin!(acquire);
+    loop {
+        if flag.load(Ordering::Relaxed) {
+            return Err(err(EngineError::Cancelled));
+        }
+        if v["noWait"].as_bool() == Some(true) {
+            return s
+                .try_acquire_owned()
+                .map_err(|_| err(EngineError::WriterBusy));
+        }
+        if v["timeout"]
+            .as_u64()
+            .is_some_and(|ms| started.elapsed() >= Duration::from_millis(ms))
+        {
+            return Err(err(EngineError::Timeout));
+        }
+        if let Ok(p) = tokio::time::timeout(Duration::from_millis(10), &mut acquire).await {
+            return p.map_err(|e| invalid(e.to_string()));
         }
     }
 }
