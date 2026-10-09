@@ -127,11 +127,8 @@ impl Oidc {
     pub fn new(settings: OidcSettings) -> Result<Oidc> {
         check_url("oidc.issuer", &settings.issuer)?;
         // redirects are not followed (a discovery or token endpoint must not bounce
-        // requests elsewhere)
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        // requests elsewhere), and `idp_client` documents the proxy rule
+        let http = jwt::idp_client(&settings.issuer)?;
         Ok(Oidc {
             settings,
             keys: jwt::Jwks::new(http.clone()),
@@ -254,7 +251,7 @@ impl Oidc {
             .await
             .context("OIDC token request")?;
         let status = r.status();
-        let body = r.bytes().await?;
+        let body = jwt::read_capped(r, "OIDC token request").await?;
         if !status.is_success() {
             // the error body is OAuth's {error, error_description}: no secrets
             let e: J = serde_json::from_slice(&body).unwrap_or(J::Null);
@@ -298,7 +295,7 @@ impl Oidc {
             .send()
             .await?;
         let status = r.status();
-        let body = r.bytes().await?;
+        let body = jwt::read_capped(r, "OIDC UserInfo").await?;
         if !status.is_success() {
             bail!("{status}");
         }

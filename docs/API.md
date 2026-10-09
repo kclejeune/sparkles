@@ -7658,6 +7658,15 @@ OIDC or proxy identity. A token login counts for the token's owner. The server k
 most 10,000 sessions. When it is full, the owner that holds the most loses its oldest
 session, so that no one can sign the others out by opening sessions.
 
+The server's requests to the provider follow no redirects and time out after 10 seconds.
+It reads at most 1 MiB of each answer, whether that is the discovery document, the key
+set, a token response or UserInfo. The same rules apply to the key set of
+`[cloudflare_access]`. These requests use the proxy that the environment names in
+`HTTPS_PROXY` and `NO_PROXY`, because a provider outside the network is often reachable
+only through one. Over HTTPS the proxy carries a tunnel and sees only the provider's host
+name. A provider on loopback over plain HTTP never goes through a proxy, since the proxy
+would see the codes and tokens.
+
 ### Access tokens of the identity provider
 
 With `oidc.api_audience` set, an API client may send an access token issued by the OIDC

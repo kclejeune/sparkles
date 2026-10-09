@@ -123,6 +123,46 @@ impl Jwks {
     }
 }
 
+/// The largest response body read from an identity provider. Discovery documents, key
+/// sets, token responses and UserInfo answers are a few KiB.
+pub const MAX_IDP_BODY: usize = 1 << 20;
+
+/// The HTTP client for an identity provider at `base` (an issuer or team domain).
+///
+/// It has a 10 s timeout and follows no redirects. It uses the proxy named by the
+/// environment (`HTTPS_PROXY`, `NO_PROXY`), because a provider outside the network is
+/// often reachable only through one. HTTPS goes through such a proxy as a tunnel, so the
+/// proxy sees the host name and not the token exchange. A loopback provider over plain
+/// HTTP never uses a proxy, since the proxy would then see the codes and tokens.
+pub fn idp_client(base: &str) -> Result<reqwest::Client> {
+    let b = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none());
+    let loopback = reqwest::Url::parse(base).is_ok_and(|u| {
+        matches!(
+            u.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        )
+    });
+    Ok(if loopback { b.no_proxy() } else { b }.build()?)
+}
+
+/// Read a provider's response body, refusing one larger than [`MAX_IDP_BODY`].
+pub async fn read_capped(mut r: reqwest::Response, what: &str) -> Result<Vec<u8>> {
+    let too_large = || anyhow::anyhow!("{what}: the response is larger than {MAX_IDP_BODY} bytes");
+    if r.content_length().is_some_and(|n| n > MAX_IDP_BODY as u64) {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = r.chunk().await.with_context(|| what.to_string())? {
+        if body.len() + chunk.len() > MAX_IDP_BODY {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// GET a JSON document (no redirects are followed: the client is built without them).
 pub async fn get_json<T: serde::de::DeserializeOwned>(
     http: &reqwest::Client,
@@ -135,7 +175,7 @@ pub async fn get_json<T: serde::de::DeserializeOwned>(
         .await
         .with_context(|| format!("GET {url}"))?;
     let status = r.status();
-    let body = r.bytes().await?;
+    let body = read_capped(r, &format!("GET {url}")).await?;
     if !status.is_success() {
         bail!("GET {url}: {status}");
     }
@@ -321,10 +361,7 @@ impl CloudflareAccess {
         audiences: Vec<String>,
         groups_claim: Option<String>,
     ) -> Result<CloudflareAccess> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let http = idp_client(team_domain)?;
         Ok(CloudflareAccess {
             team_domain: team_domain.trim_end_matches('/').to_string(),
             audiences,
@@ -367,6 +404,35 @@ impl CloudflareAccess {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A body over the cap fails, with or without a `Content-Length`.
+    #[tokio::test]
+    async fn provider_bodies_are_capped() {
+        use axum::body::Body;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let big = || vec![b' '; MAX_IDP_BODY + 1];
+        let app = axum::Router::new()
+            .route("/small", axum::routing::get(|| async { "{}" }))
+            .route("/sized", axum::routing::get(move || async move { big() }))
+            .route(
+                "/chunked",
+                axum::routing::get(move || async move {
+                    let chunks = (0..17).map(|_| Ok::<_, std::io::Error>(vec![b' '; 64 * 1024]));
+                    Body::from_stream(futures_util::stream::iter(chunks))
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = idp_client(&base).unwrap();
+        let ok: J = get_json(&http, &format!("{base}/small")).await.unwrap();
+        assert_eq!(ok, json!({}));
+        for path in ["sized", "chunked"] {
+            let e = get_json::<J>(&http, &format!("{base}/{path}"))
+                .await
+                .unwrap_err();
+            assert!(format!("{e:#}").contains("larger than"), "{path}: {e:#}");
+        }
+    }
 
     #[test]
     fn shapes() {
