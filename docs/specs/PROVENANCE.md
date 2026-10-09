@@ -559,12 +559,25 @@ implementation landed.
   - the OWASP Top 10 for LLM Applications 2025, Simon Willison's "lethal trifecta"
     (2025), OpenAI's and Anthropic's guidance on API keys in browsers, and the
     structured output documentation of Ollama, OpenAI and llama.cpp;
-  - the Sparkles code and specs C01, C02, C05, C09, C10, C11, C12, C12b, C15, C16, C17,
-    F03, F04, F06, F08 and F09.
-- **Implementation:** not built. Phase 1 plans no new runtime dependency. Phase 2's
-  clients for Ollama, OpenAI-compatible endpoints and Anthropic's API reuse the
-  outbound HTTP client of F08. Phase 4 may add an HTML extractor and a PDF text
-  extractor, to be recorded here when chosen.
+  - FrugalGPT (Chen, Zaharia and Zou, 2023) and RouteLLM (Ong et al., ICLR 2025) on
+    cascades and routers, and Anthropic's model and pricing documentation of October
+    2026 for the example configuration;
+  - pdf-inspector 1.25.2 (MIT), its README, crate documentation and source, read for
+    its API, OCR reasons, Markdown options and features, and its dependency tree with
+    `cargo tree`;
+  - the Sparkles code, including the plan structures of `sparkles-core` and the UI's
+    `PlanView`, and specs C01, C02, C05, C09, C10, C11, C12, C12b, C15, C16, C17, F03,
+    F04, F06, F08, F09, X04 and X05.
+
+  The revision of the same day added model roles with escalation, explanations, the
+  optimizer and the choice of pdf-inspector.
+- **Implementation:** not built. Phase 1's clients for Ollama, OpenAI-compatible
+  endpoints and Anthropic's API reuse the outbound HTTP client of F08, and the rest of
+  Phases 1 to 3 plans no new runtime dependency. Phase 4 adds `pdf-inspector` at an
+  exact version (MIT) behind the `pdf` feature, which brings 22 crates under MIT,
+  Apache-2.0 or Unlicense, and optionally its OCR features behind `pdf-ocr`, which
+  bring about 132 more under permissive licenses, rav1e's patent license among their
+  notices. An HTML extractor for Phase 4 will be recorded here when chosen.
 - **Rejected** (spec §13):
   - the browser calling a model provider, MCP sampling, and a delegated agent as the
     UI's model;
@@ -581,7 +594,14 @@ implementation landed.
   - agents that merge their own branches;
   - model confidence as a signal for bulk acceptance;
   - MCP Apps;
-  - OCR and media transcription.
+  - OCR by default, and media transcription;
+  - a built-in PDF text extractor, and an external PDF converter configured like a
+    provider;
+  - a router model that picks the model for each question, and a single model per
+    dataset;
+  - applying rewrites automatically, a planner that calls a model, and rewrites
+    checked by estimate alone;
+  - the server's providers behind MCP's `explain_query` and `optimize_query`.
 
 ## Compression codecs
 

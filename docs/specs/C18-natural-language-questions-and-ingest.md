@@ -4,13 +4,18 @@
 >
 > **Phases:** None shipped. Phase 1 lets an agent connected over MCP hand the query it
 > wrote for a question to the web UI, where a person reads, edits and runs it, and adds
-> a memory browser that shows each fact's source, passage and history. Phase 2 adds
+> a memory browser that shows each fact's source, passage and history. It also adds
 > model providers to the server, for Ollama and other local models, any
-> OpenAI-compatible endpoint and Anthropic's API, and an **Ask** bar on the query page
-> that runs the whole question-to-query flow. Phase 3 lets an agent turn documents into
+> OpenAI-compatible endpoint and Anthropic's API, with an ordered list of provider and
+> model pairs for each use, and an evaluation matrix that measures every pair. Phase 2
+> adds an **Ask** bar on the query page that runs the whole question-to-query flow and
+> escalates to a stronger model on signals the server can verify. Phase 2b explains any
+> query in plain language next to its plan. Phase 3 lets an agent turn documents into
 > proposed facts on a review branch, which a person accepts or rejects in the UI.
-> Phase 4 runs ingestion inside the server. Phase 5 adds the maintenance of agent
-> memory. Every phase builds on the tools of [C17](C17-agent-memory.md).
+> Phase 4 runs ingestion inside the server, with PDF conversion by pdf-inspector.
+> Phase 5 adds the maintenance of agent memory. Phase 6 suggests faster rewrites of a
+> query and proves that they return the same results. Every phase builds on the tools
+> of [C17](C17-agent-memory.md).
 >
 > **User docs:** none, because nothing is built.
 >
@@ -54,6 +59,15 @@ This spec designs both directions on top of C17's tools.
   dataset's own vocabulary, linked to existing entities, cited to the passage they came
   from, validated by the dataset's shapes and previewed, so that a person reviews them
   on a branch before they reach `main`.
+
+Two further uses help with any query, whoever wrote it.
+
+- **Explaining.** A query's plan, with its estimated and actual rows, time and warnings,
+  becomes a plain description of what the query asks and a note on each operator that
+  matters, linked to the plan tree, so a person can see why a query is slow (§6.6).
+- **Optimizing.** A query gets suggested rewrites that the server has proven to return
+  the same results faster. A person applies one to the editor, and nothing is applied
+  for them (§6.7).
 
 Together the two directions give an agent persistent semantic memory. What it learns is
 written as facts with provenance, what it needs is recalled or queried, and corrections
@@ -105,14 +119,27 @@ in the UI (§8.8, §8.9).
    hosted model, with keys held only by the server, a per-dataset choice of what data
    may leave the machine, and token budgets.
 10. A benchmark measures question accuracy, ingestion precision and recall, latency and
-    cost, and every phase reports against it.
+    cost, and every phase reports against it. It measures each provider and model pair
+    on its own, and its results choose the recommended model lists.
+11. Each use of a model, such as drafting or summarizing, has its own ordered list of
+    provider and model pairs. A cheap model answers first, and the server moves to the
+    next pair only on a failure it can verify, never on another model's judgement.
+12. Any query, generated or written by hand, can be explained in plain language next to
+    its plan, with each sentence linked to the operator it describes, including a query
+    that ran out of its time or memory budget.
+13. A query can get suggested rewrites that the server has run against the original
+    and found to return the same results faster. The person applies a rewrite to the
+    editor, and the planner never calls a model.
 
-**Non-goals.** This spec does not train or fine-tune models, ship model weights or run
-inference in the Sparkles process. It does not learn ontologies. New classes and
-predicates are still added by a person, as C17 §12 decides. It does not do OCR of
-scanned documents, transcribe audio or read images. It does not change C17's tools
-except where §7 and §9 name an added argument. Erasure of personal data stays outside,
-as in C17 §3.3.
+**Non-goals.** This spec does not train or fine-tune models, ship model weights, or run
+language models in the Sparkles process. The optional OCR of §7.1 is the one exception
+to running a model in the process. It runs a small OCR model through a dynamically
+loaded ONNX Runtime, only in builds with the `pdf-ocr` feature and only when the
+operator supplies the model files. It does not learn ontologies. New classes and
+predicates are still added by a person, as C17 §12 decides. It does not transcribe
+audio or describe images. It does not change C17's tools except where §7 and §9 name an
+added argument. Erasure of personal data stays outside, as in C17 §3.3. The optimizer
+does not change the planner or apply rewrites by itself.
 
 ## 2. What exists
 
@@ -132,6 +159,8 @@ Phases 1b and 1c for ingestion. Everything else that this spec composes has ship
 | History (F06) and branches (F09) | Shipped. The merge page exists in the UI. | Review branches and the record of changes. |
 | Access control (C09, C12, C12b) | Shipped. | Running every step as the caller, and graphs per agent. |
 | Web UI | The query page has tabs in localStorage, a Saved menu, table, graph, map and plan views, a branch field and a handoff of queries from other pages. The dataset page has uploads, branches and history. | The surfaces of §6 and §8. |
+| Plans and profiles | `/{ds}/explain` returns the estimated plan. An executed query in the `application/x-sparkles+json` format carries its plan with estimated and actual rows, `timeMs` and warnings, and a streaming query carries a `CursorPlan`. `PlanView` draws the tree and a flame view, derives each operator's own time and marks the slowest three and estimates off by ten times or more. MCP's `explain_query` returns the estimated plan as text. | The explanations of §6.6 and the comparisons of §6.7. §6.6.5 lists what the plans lack today. |
+| Linter (X04) | Shipped, with rules for cartesian products, filter scope, unbound variables and more, through `POST /$/lint` and the browser module. | Findings for the explanations and the deterministic rewrites of §6.7. |
 
 The UI holds no secrets. It signs in with the server's HttpOnly session cookie, keeps only
 the CSRF token in memory, and is served with a content security policy whose
@@ -193,8 +222,9 @@ host's confirmation and Sparkles' own opt-in. The person's agent is also usually
 strongest model available. Sparkles' part is the grounding, the checks and the review
 surfaces, and those are the same whichever model drafts the query.
 
-B ships in Phase 2, right after the handoff of Phase 1, and gives the UI the whole flow
-of §4 without an agent. It is off until the operator configures a provider, and each
+B's provider clients and model lists ship in Phase 1, where the evaluation matrix of
+§11 uses them, and B's Ask bar ships in Phase 2 and gives the UI the whole flow of §4
+without an agent. It is off until the operator configures a provider, and each
 dataset must then enable it separately. Ollama and other local models, any
 OpenAI-compatible endpoint, and Anthropic's API are all supported (§3.4). The server
 runs a fixed pipeline, not a free agent loop, so that small local models can follow it
@@ -237,49 +267,62 @@ log line or the UI. Every request goes through the server's outbound policy, so 
 provider on a private address, such as Ollama on `127.0.0.1`, needs `--outbound-allow`
 as an embedding endpoint does.
 
-**Providers.** The server configuration lists providers by name, and `--model-config
-FILE` or the `models` member of the server's settings supplies it. Each provider has
-one of three kinds.
+**Providers.** The server configuration registers any number of named providers, and
+`--model-config FILE` or the `models` member of the server's settings supplies it. A
+provider is an endpoint with its key and limits. The models it serves are named where
+they are used, in the role lists of §3.7, and the provider's `models` member describes
+the ones that need more than the defaults. Each provider has one of three kinds.
 
 ```json
 {
   "models": {
-    "local": {
-      "kind": "ollama", "endpoint": "http://127.0.0.1:11434", "model": "qwen3:14b",
-      "contextTokens": 32768, "keepAlive": "10m"
+    "providers": {
+      "local": {
+        "kind": "ollama", "endpoint": "http://127.0.0.1:11434", "keepAlive": "10m",
+        "models": { "qwen3:14b": { "contextTokens": 32768 } }
+      },
+      "gateway": {
+        "kind": "openai", "endpoint": "https://llm.internal.example/v1",
+        "apiKey": { "secret": "gateway" }, "structuredOutput": "json-schema"
+      },
+      "anthropic": {
+        "kind": "anthropic", "endpoint": "https://api.anthropic.com",
+        "apiKey": { "secret": "anthropic" }
+      }
     },
-    "gateway": {
-      "kind": "openai", "endpoint": "https://llm.internal.example/v1",
-      "model": "llama-3.3-70b-instruct", "apiKey": { "secret": "gateway" },
-      "structuredOutput": "json-schema"
-    },
-    "claude": {
-      "kind": "anthropic", "endpoint": "https://api.anthropic.com",
-      "model": "<model id>", "apiKey": { "secret": "anthropic" },
-      "pricing": { "inputPerMTok": 3.0, "outputPerMTok": 15.0 }
+    "roles": {
+      "draft": [ { "provider": "local", "model": "qwen3:14b" },
+                 { "provider": "anthropic", "model": "claude-sonnet-5-5" } ]
     }
   }
 }
 ```
 
-These members apply to every kind.
+These members apply to the provider as a whole.
 
 | Member | Default | Meaning |
 |---|---|---|
 | `kind` | none | `ollama`, `openai` or `anthropic`. |
 | `endpoint` | none | The base URL, without credentials. |
-| `model` | none | The model name the provider expects. A dataset may name another model of the same provider (§3.5). |
 | `apiKey` | none | A secret reference. Ollama on the same host needs none. |
-| `contextTokens` | 8192 | The model's context window. The pipeline trims its grounding context to fit (§3.6). |
-| `maxOutputTokens` | 2048 | The cap on one response. |
-| `temperature` | 0 | Drafts and extraction run deterministic by default. |
-| `structuredOutput` | `auto` | How the server constrains output to a JSON Schema (§3.6). |
 | `connectTimeoutSecs` | 10 | The time to connect. |
-| `requestTimeoutSecs` | 60 | The time one model call may take, within the outbound policy's own timeout. |
+| `requestTimeoutSecs` | 60 | The time one model call may take, within the outbound policy's own timeout. A model's entry may lower it. |
 | `concurrency` | 4 | Model calls in flight to this provider across the server. Further calls wait in a queue with the request's deadline. |
 | `requestsPerMinute` | none | Spacing of requests, as in F08. |
-| `pricing` | none | Prices per million input and output tokens, used only for cost estimates (§5.4, §7.9). |
 | `budget` | none | Token caps for the provider as a whole, per day. Datasets add their own (§3.5). |
+| `allowedModels` | any | The model names that role lists may use with this provider. A dataset's override of §3.5 cannot name another. |
+| `models` | none | Members for single models, keyed by the name the provider expects, from the next table. A model without an entry gets the provider's values and the defaults. |
+
+These members describe one model. Each can be set on the provider, as the default for
+its models, or in an entry of its `models`.
+
+| Member | Default | Meaning |
+|---|---|---|
+| `contextTokens` | 8192 | The model's context window. The pipeline trims its grounding context to fit (§3.6). |
+| `maxOutputTokens` | 2048 | The cap on one response. |
+| `temperature` | 0 | Drafts and extraction run deterministic by default. Models that reject the parameter, such as current Claude models, never get it. |
+| `structuredOutput` | `auto` | How the server constrains output to a JSON Schema (§3.6). |
+| `pricing` | none | Prices per million input and output tokens, used only for cost estimates (§5.4, §7.9) and the evaluation (§11). |
 
 The three kinds differ in the protocol and in a few members of their own.
 
@@ -289,25 +332,28 @@ The three kinds differ in the protocol and in a few members of their own.
 | `openai` | `POST /v1/chat/completions`. | `headers`, extra non-secret headers that some gateways need. | vLLM, llama.cpp's server, LM Studio, LocalAI, OpenAI itself, and gateways such as LiteLLM. |
 | `anthropic` | Anthropic's `POST /v1/messages`, with the `anthropic-version` header. | `version`, the API version header value. | Claude models through Anthropic's API. |
 
-`GET /$/models` lists the configured providers with their kind, endpoint, model,
-detected capabilities and status, for server admins. `POST /$/models/{name}/test` sends
-a short prompt and reports the latency, whether structured output worked and the
-tokens used. Neither returns a key.
+`GET /$/models` lists the configured providers with their kind, endpoint, the models
+that the role lists name, each model's detected capabilities and status, and the role
+lists themselves, for server admins. `POST /$/models/{name}/test` with an optional
+`model` sends a short prompt to that pair and reports the latency, whether structured
+output worked and the tokens used. Neither returns a key.
 
 ### 3.5 Per-dataset policy, privacy and cost
 
-A dataset uses a provider only when its settings name one. The setting lives in
+A dataset uses providers only when it enables the assistant. The setting lives in
 `<db>/assistant.json`, next to `text.json` and `queries.json`, and changes only through
 the admin API.
 
 | Field | Meaning |
 |---|---|
-| `provider` | The provider's name. Without it, the dataset has no assistant. |
-| `model` | Another model of the same provider, such as a larger one for this dataset. The provider's `model` is the default. |
-| `summaryProvider` | Optionally a second provider for summaries only, so that a local model can summarize rows that the dataset does not send to a hosted one. |
+| `enabled` | Whether the dataset has an assistant. Without it, the dataset has none, whatever the server configures. |
+| `roles` | Overrides of the server's role lists (§3.7), in the same shape. A role named here replaces the server's list for that role in this dataset, and a role left out keeps the server's list. An empty list turns the role off for the dataset. Each entry must name a provider that the server defines and a model that its `allowedModels` permits. |
 | `ask` | Whether `POST /{ds}/ask` is enabled. |
-| `ingest` | Whether ingestion tasks may use the provider. |
-| `send` | What may leave the server. `schema` sends the schema report, prefixes, stored-query examples and entity labels found by linking. `rows` also sends up to `rowsForSummary` result rows for the answer summary. `documents` also sends source text for ingestion. Each level includes the ones before it. |
+| `explain` | Whether the `explain` role writes prose for this dataset (§6.6). The deterministic notes need no model and are always available. |
+| `optimize` | Whether the `optimize` role proposes rewrites for this dataset (§6.7). The deterministic rewrites are always available. |
+| `ingest` | Whether ingestion tasks may use the providers. |
+| `send` | What may leave the server. `schema` sends the schema report, prefixes, stored-query examples, entity labels found by linking, query text and plans. `rows` also sends up to `rowsForSummary` result rows for the answer summary. `documents` also sends source text for ingestion. Each level includes the ones before it. |
+| `sendByProvider` | A lower `send` level for named providers, such as `{"anthropic": "schema"}`, so that a hosted provider never sees rows while a local one summarizes them. A role entry whose provider may not receive what its step needs is skipped, as if it were not in the list. |
 | `rowsForSummary` | The number of rows sent for a summary, 50 by default. |
 | `budget` | Token caps per request, per principal per day and per dataset per day. The defaults are 50,000 per request and none per day. |
 | `deadlineSecs` | The deadline of one ask, 120 seconds by default. |
@@ -316,8 +362,12 @@ the admin API.
 With `send: "schema"`, asking still works and returns the query and its results, but
 the answer summary is left out, because the model never sees the rows. That level
 suits a hosted provider and sensitive data. Every request's metadata, but never its
-content, is logged with the provider, the model, the tokens in and out, the estimated
-cost, the principal and the dataset.
+content, is logged with the role, the provider, the model, the tokens in and out, the
+estimated cost, the principal and the dataset.
+
+`PUT /$/assistant/{ds}` refuses a body with any `endpoint` or `apiKey` member, a role
+name outside §3.7, a provider that the server does not define, or a model outside its
+`allowedModels`, with `400`.
 
 **Cost.** Token use is counted per request from the provider's response. The budgets
 refuse a request that would start over a daily cap and stop a pipeline at the next
@@ -339,7 +389,10 @@ in different ways, and `structuredOutput` chooses one or lets the server detect 
 
 With `auto`, `POST /$/models/{name}/test` and the first call try `json-schema`, then
 `json-object`, then plain text, and the server remembers the first that returns valid
-JSON until the configuration changes.
+JSON for each provider and model pair until the configuration changes. The level is a
+property of the pair, not of the provider, because one gateway can serve models with
+different abilities. Current Claude models refuse a forced `tool_choice` with `400`, so
+the `tool` level of the `anthropic` kind applies only to older models that accept it.
 
 Constrained decoding on local servers often supports only part of JSON Schema.
 llama.cpp's server, for instance, skips keywords it does not support without saying so.
@@ -366,6 +419,118 @@ three candidates per mention. Under 8,192 it also leaves out the summary step an
 the rows only. The `usage` event reports the level and the trimming, and the UI shows
 "answered by a small model" with the model's name, so a person can judge the result.
 
+### 3.7 Model roles
+
+Each step that calls a model has a role, and each role has an ordered list of provider
+and model pairs. The first pair answers by default. The server moves along the list
+only on the signals of §5.5, which it verifies itself.
+
+| Role | Step | Output |
+|---|---|---|
+| `draft` | Step 3 of §4.1, the first draft of a query. | `Draft` (§5.3). |
+| `repair` | Step 6 of §4.1, a new draft after a diagnosis. | `Draft`. |
+| `summarize` | Step 7 of §4.1, the answer from the rows. | `Summary` (§5.3). |
+| `extract` | Extraction from chunks (§7.4) and the CSV mapping draft (§7.8). | `Extraction`, or a C05 mapping. |
+| `explain` | The prose of an explanation (§6.6). | `Explanation` (§6.6.3). |
+| `optimize` | A proposed rewrite (§6.7). | `Rewrite` (§6.7.3). |
+
+A list entry is `{provider, model}`, with an optional `maxOutputTokens` and
+`requestTimeoutSecs` for that use. A list may name the same model twice with different
+limits, and may mix providers. When a role has no list, `repair` uses the `draft` list.
+The other roles are then off, so a dataset without `summarize` gets no summary, one
+without `explain` gets the deterministic explanation only, and one without `extract`
+or `optimize` cannot use those features through the server. The same pair may serve
+several roles, and the server keeps one remembered structured-output level per pair.
+
+Three configurations show the intended shapes. The model names are examples. The
+evaluation matrix of §11.4 measures the candidates and chooses the lists that the
+documentation recommends.
+
+**Hosted, cheapest first.** A Haiku-class model drafts and summarizes, a Sonnet-class
+model repairs and extracts, and an Opus-class model is only the last escalation.
+
+```json
+{
+  "models": {
+    "providers": {
+      "anthropic": {
+        "kind": "anthropic", "endpoint": "https://api.anthropic.com",
+        "apiKey": { "secret": "anthropic" },
+        "allowedModels": ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"],
+        "models": {
+          "claude-haiku-5-5":  { "contextTokens": 200000, "pricing": { "inputPerMTok": 0.10, "outputPerMTok": 0.50 } },
+          "claude-sonnet-5-5": { "contextTokens": 200000, "pricing": { "inputPerMTok": 2.00, "outputPerMTok": 10.00 } },
+          "claude-opus-5-5":   { "contextTokens": 200000, "pricing": { "inputPerMTok": 4.00, "outputPerMTok": 20.00 } }
+        }
+      }
+    },
+    "roles": {
+      "draft":     [ { "provider": "anthropic", "model": "claude-haiku-5-5" },
+                     { "provider": "anthropic", "model": "claude-sonnet-5-5" },
+                     { "provider": "anthropic", "model": "claude-opus-5-5" } ],
+      "repair":    [ { "provider": "anthropic", "model": "claude-sonnet-5-5" },
+                     { "provider": "anthropic", "model": "claude-opus-5-5" } ],
+      "summarize": [ { "provider": "anthropic", "model": "claude-haiku-5-5" },
+                     { "provider": "anthropic", "model": "claude-sonnet-5-5" } ],
+      "extract":   [ { "provider": "anthropic", "model": "claude-sonnet-5-5" },
+                     { "provider": "anthropic", "model": "claude-opus-5-5" } ],
+      "explain":   [ { "provider": "anthropic", "model": "claude-haiku-5-5" },
+                     { "provider": "anthropic", "model": "claude-sonnet-5-5" } ],
+      "optimize":  [ { "provider": "anthropic", "model": "claude-sonnet-5-5" },
+                     { "provider": "anthropic", "model": "claude-opus-5-5" } ]
+    }
+  }
+}
+```
+
+The context windows are set below what the models accept, because the pipeline's
+prompts are small and a lower value bounds the grounding that a large schema could
+otherwise send. The prices are Anthropic's list prices on 2026-10-09 and serve only
+the estimates.
+
+**All local.** Every role runs on Ollama, so no data leaves the machine and no key is
+needed. A small model drafts and summarizes, a larger one repairs and extracts, and
+the largest the host can run is the last step.
+
+```json
+{
+  "models": {
+    "providers": {
+      "local": {
+        "kind": "ollama", "endpoint": "http://127.0.0.1:11434", "keepAlive": "30m",
+        "concurrency": 2, "requestTimeoutSecs": 180,
+        "models": {
+          "qwen3:8b":  { "contextTokens": 16384 },
+          "qwen3:32b": { "contextTokens": 32768 },
+          "llama3.3:70b": { "contextTokens": 32768, "requestTimeoutSecs": 300 }
+        }
+      }
+    },
+    "roles": {
+      "draft":     [ { "provider": "local", "model": "qwen3:8b" },
+                     { "provider": "local", "model": "qwen3:32b" },
+                     { "provider": "local", "model": "llama3.3:70b" } ],
+      "repair":    [ { "provider": "local", "model": "qwen3:32b" },
+                     { "provider": "local", "model": "llama3.3:70b" } ],
+      "summarize": [ { "provider": "local", "model": "qwen3:8b" } ],
+      "extract":   [ { "provider": "local", "model": "qwen3:32b" } ],
+      "explain":   [ { "provider": "local", "model": "qwen3:8b" } ],
+      "optimize":  [ { "provider": "local", "model": "qwen3:32b" } ]
+    }
+  }
+}
+```
+
+Ollama loads one model at a time per slot by default, so a list that moves between
+models pays the load time. `keepAlive` keeps them warm, and the evaluation reports the
+latency of each step with and without a model swap.
+
+**Mixed, with rows kept local.** A dataset whose rows must stay on the machine sets
+`sendByProvider: {"anthropic": "schema"}` and lists the local model first for
+`summarize`. The hosted models still draft and repair from the schema, and the summary
+is written locally. A `summarize` list with only hosted models would then be skipped,
+and the UI shows the rows without a summary.
+
 ## 4. Asking: the pipeline
 
 ### 4.1 Steps
@@ -374,7 +539,9 @@ Every path that turns a question into a query runs the same steps. An external a
 runs them by calling tools, guided by the `ask_graph` prompt of §9.3. From Phase 2 the
 server runs them itself for the UI's Ask bar, with the same tools behind each step, so
 a question asked in the UI is grounded, checked and repaired exactly as an agent's
-would be. The steps are fixed. Only steps 3 and 7 call a model.
+would be. The steps are fixed. Only steps 3 and 7 call a model. Step 3 uses the
+`draft` role the first time and the `repair` role after a diagnosis, and step 7 uses
+`summarize` (§3.7).
 
 1. **Ground.** Collect the context for the question. That is the schema summary of
    `describe_schema`, restricted to the classes and predicates whose labels, local names
@@ -416,6 +583,18 @@ An empty result is a correct answer often enough that repair must not hide it. A
 two repairs, or when `why_empty` finds that every pattern matches but the join is
 empty, the pipeline stops and shows the empty result with the diagnosis. The answer
 says that no data matched, not that the fact is false.
+
+`why_empty` gives that judgement as a `verdict`, which the escalation of §5.5 also
+reads.
+
+| Verdict | When |
+|---|---|
+| `query` | The first element without solutions has a `check_query` issue that explains it, such as `language-tag`, `datatype-mismatch`, `class-mismatch`, or an unknown term with a suggestion. The query asks for something the data holds in another form. |
+| `data` | Every triple pattern has solutions alone, every constant occurs in the view, and no check issue concerns the element without solutions. The query is well formed for the data, and the data holds no match. A constant that does not occur in the view and has no suggestion also gives `data`, so that a hidden graph and a missing term look the same, as C17 §6 requires. |
+| `unknown` | Neither holds, or the deadline of `why_empty` ran out. |
+
+A `data` verdict stops the repair loop at once. A `query` verdict repairs, and a
+repair that leaves the verdict at `query` escalates (§5.5).
 
 ### 4.3 Read-only enforcement
 
@@ -500,6 +679,7 @@ The body is JSON.
 | `run` | Whether to run the query. The default is true. With false the response stops after the check, with the checked query, which is how the UI's preview mode works (§6.2). |
 | `summary` | Whether to summarize. The default is true when the dataset's `send` allows rows. |
 | `maxRows` | The rows returned in `result`, 1000 by default and at most the server's result cap. |
+| `tryHarder` | The id of an earlier ask by the same principal. The pipeline drafts again, starting at the pair after the one that answered that ask (§5.5). |
 
 ### 5.2 The response
 
@@ -510,13 +690,14 @@ happens. Each event is one JSON object.
 |---|---|
 | `ground` | The stored examples, the linked entities and the schema terms used as context, as IRIs with labels. |
 | `clarify` | `{id, question, choices: [{label, value}]}`. The stream ends, and the client answers with a new request. |
-| `draft` | `{attempt, query, explanation, assumptions, graph}`. |
+| `draft` | `{attempt, role, provider, model, query, explanation, assumptions, graph}`. |
+| `escalate` | `{role, from: {provider, model}, to: {provider, model}, signal}`, where `signal` is one of the signals of §5.5. |
 | `check` | The `check_query` result of the draft. |
 | `run` | `{attempt, commit, rows, truncated, elapsedMs}` or the error. |
 | `diagnosis` | The diagnosis of §4.2 that starts a repair. |
 | `result` | `{query, explanation, assumptions, terms, graph, commit, results, truncated}`. `results` is the result in the SPARQL 1.1 JSON results format, with at most `maxRows` rows, or the triples of a `CONSTRUCT` or `DESCRIBE` in the form `/{ds}/sparql` returns them to the UI. The UI renders these rows directly, so the rows that the summary cites are the rows on screen. |
 | `summary` | `{text, citations}`. `citations` lists the 1-based row numbers that the summary used, each within the first `rowsForSummary` rows. |
-| `usage` | `{provider, model, inputTokens, outputTokens, estimatedCost, steps}`. |
+| `usage` | `{askId, inputTokens, outputTokens, estimatedCost, complexity, steps}`. Each step names its role, provider, model, tokens, latency and outcome, so the answer shows which model wrote the final query. |
 | `error` | A code and message, such as `no-assistant`, `provider-unavailable`, `budget-exceeded` or `unanswerable`. |
 
 A client that cannot read event streams sends `Accept: application/json` and gets one
@@ -524,9 +705,12 @@ object with the final `result`, `summary`, `usage` and the list of attempts.
 
 ### 5.3 Model calls
 
-The pipeline makes at most four model calls per question. These are one draft, two
-repairs and one summary. Each call asks for JSON that matches a fixed schema, through
-the provider's structured output where it has one.
+The pipeline makes at most four model calls per question whose output it uses. These
+are one draft, two repairs and one summary. A call that fails with a timeout, a refusal
+or invalid output after its one retry does not count among the four, but at most two
+such failures are allowed per question, and their tokens and time count against the
+budgets. Each call asks for JSON that matches a fixed schema, through the provider's
+structured output where it has one.
 
 ```ts
 type Draft = {
@@ -567,7 +751,102 @@ The pipeline checks the remaining deadline before each step and skips the summar
 too little is left, rather than failing an ask whose query already ran. The query's
 own budgets are those of
 `/{ds}/sparql` for the caller. When the provider is unreachable, the endpoint answers
-with `provider-unavailable` at once and the UI offers the plain editor.
+with `provider-unavailable` at once and the UI offers the plain editor. When only the
+current pair is unreachable and the role's list has another, the step moves to it as
+§5.5 describes.
+
+### 5.5 Routing and escalation
+
+The server picks a model for each step from the role's list (§3.7) without asking a
+model which one to use. It starts at the first pair, or one pair later when the
+complexity check below says so, and moves to the next pair only when one of these
+signals fires. Each signal is something the server observes itself.
+
+| Signal | When it fires | What moves |
+|---|---|---|
+| `check-failed` | A repaired draft still has `check_query` errors, still fails to parse, or its run again exceeds a query budget. | The next repair uses the next pair of `repair`. |
+| `empty-query` | A repaired query returns no rows and `why_empty` gives the verdict `query` (§4.2). A first draft with that verdict is repaired as usual, by the `repair` list. | The next repair uses the next pair of `repair`. |
+| `provider-failure` | The call times out, the provider refuses, or the output is still invalid after the one retry of §3.6. A refusal is `stop_reason: "refusal"` from the `anthropic` kind and `finish_reason: "content_filter"` or a `refusal` member from the `openai` kind. A `429` or `5xx` that outlasts the client's own retries counts too. | The same step runs again on the next pair of its role. |
+| `try-harder` | The person presses **Try harder** on an answer, or a client sends `tryHarder` (§5.1). | A new ask drafts from the pair after the one that answered the earlier ask. |
+| `complexity` | The complexity check below scores a query at or above the threshold. | The role starts one pair later. |
+
+A pointer per role holds the current pair for the rest of the ask, so an escalated
+repair is not followed by a repair from the cheaper model. The pointer never passes the
+end of the list. When the last pair fails, the failure states of §6.5 apply. Signals
+never skip a pair, and one ask moves at most two pairs in each role. **Try harder** is
+offered while a later pair exists in the `draft` list and is hidden after that.
+
+**The complexity check.** The check scores a parsed query from its syntax alone, in
+microseconds and without the planner. It counts five things.
+
+| Count | What counts |
+|---|---|
+| `joins` | In each group, the number of triple patterns, property paths, `VALUES` blocks, `BIND`s and nested groups, minus one. |
+| `aggregates` | Aggregate calls, plus one for a `GROUP BY` or `HAVING`. |
+| `subqueries` | Nested `SELECT`s. |
+| `negations` | `MINUS`, `FILTER NOT EXISTS`, and an `OPTIONAL` whose variable a `FILTER(!BOUND(…))` tests. |
+| `terms` | Distinct constant IRIs in predicate position or as the object of `rdf:type`. |
+
+The score is `joins + 2·aggregates + 3·subqueries + 2·negations + max(0, terms − 6)`.
+The threshold is `routing.complexityThreshold`, 8 by default, in the server's `models`
+configuration, and `assistant.json` can override it per dataset. The weights start from
+the share of each construct among the failed drafts of published text-to-SPARQL
+evaluations and are tuned by the measurements below.
+
+The check runs on queries that already exist, so it needs no extra model call. It
+scores three of them.
+
+- The draft. When the draft scores at or above the threshold, the `repair` role starts
+  at its second pair for this ask, so the first repair of a hard query comes from the
+  stronger model.
+- The best stored example from `similar_queries`, when it ranks first and its score is
+  at least `routing.exampleScore`, 0.8 by default. A question whose nearest accepted
+  query is complex starts `draft` at its second pair.
+- The query of the earlier turn, for a follow-up question with `context`. A follow-up
+  to a complex query starts `draft` at its second pair.
+
+**Why no router model.** A router that asks a model, even a small one, which model
+should answer was rejected for five reasons.
+
+1. It adds a model call, with its latency and cost, to every question, including the
+   easy majority that the first pair answers.
+2. Its judgement cannot be verified. A wrong routing decision looks the same as a hard
+   question, while the signals above are facts the server checks.
+3. It reads the question, which is untrusted text, and lets that text choose how much
+   the operator pays. A question written to look hard would always reach the most
+   expensive model. The signals depend on what the server observes, not on the
+   question's wording.
+4. Learned routers need labelled preference data about the models they choose between,
+   and they are trained for general chat. Sparkles has no such data for SPARQL until the
+   logs below exist.
+5. A fixed rule is reproducible. The same question, data and configuration take the
+   same path, which tests and the evaluation need.
+
+Published cascades and routers, such as FrugalGPT and RouteLLM, show that answering
+with a cheap model first and escalating saves most of the cost at little loss of
+quality. Their gains come from a scorer trained on labelled data. The logs below
+collect that data, and a trained scorer can be reconsidered once they hold enough
+accepted and rejected answers.
+
+**The routing log.** Each ask records its routing in the principal's history (§6.4).
+The record holds the complexity score and its counts, each step's role, provider,
+model, signal, tokens and latency, the pair that wrote the final query, and the
+outcome. The outcome is `accepted` after **Correct**, **Save as example** or **Suggest as
+example**, `edited` when the person changed the query and ran it, `rejected` after
+**Not correct** or **Try harder**, and `none` otherwise. With `historyDays: 0` the record
+is not kept, but the counters still count.
+
+Metrics count answers by role, provider, model and outcome, escalations by role and
+signal, and outcomes by complexity bucket. `GET /$/models/usage?days=N`, for server
+admins, returns the same counts per dataset with no question or query text.
+
+**Tuning.** The threshold and the lists are tuned from two sources. The evaluation of
+§11.4 reports each pair's accuracy by complexity bucket, and the threshold is the
+lowest score at which the first pair's accuracy falls more than 10 points below the
+second's. The usage counts show how often each pair's answers are accepted in practice,
+and a pair whose acceptance falls well below its measured accuracy points to questions
+the evaluation does not cover. Changes to the defaults are made by a person from these
+reports and recorded in the Outcome. The server never changes its own configuration.
 
 ## 6. Asking in the UI
 
@@ -631,7 +910,7 @@ or "Summarizing", and **Stop** cancels it.
 ```
 ┌─ Query ──────────────────────────────────────────────────────────── ds: org ▾ ─┐
 │ Ask  [ Who works on the payments team and since when?    ] [Ask ⏎]            │
-│      Mode (•) Preview first  ( ) Run, then show          local · qwen3:14b    │
+│      Mode (•) Preview first  ( ) Run, then show          local · qwen3:8b     │
 ├────────────────────────────────────────────────────────────────────────────────┤
 │ [ tab 1 ] [ Who works on the payments… ✕ ] [ + ]                     Saved ▾   │
 ├────────────────────────────────────────────────────────────────────────────────┤
@@ -648,7 +927,7 @@ or "Summarizing", and **Stop** cancels it.
 │  3           foaf:name ?name .                                                │
 │  4   OPTIONAL { ?person ex:startDate ?since }                                 │
 │  5 } ORDER BY DESC(?since) LIMIT 1000                                         │
-│                                                    [Format] [Run ⌘⏎] [Plan]   │
+│                               [Format] [Run ⌘⏎] [Plan] [Explain] [Optimize]   │
 ├────────────────────────────────────────────────────────────────────────────────┤
 │ Answer  Four people are on the payments team [1–4]. The most recent is Kai    │
 │         Ito, who joined on 2026-03-02 [1].   generated · cites 4 of 4 rows  ▾ │
@@ -657,12 +936,16 @@ or "Summarizing", and **Stop** cancels it.
 │  1  res:kai         "Kai Ito"     2026-03-02   ◂ cited                        │
 │  2  res:ana         "Ana Lima"    2025-11-14                                  │
 │  …                                                                            │
-│                         [✓ Correct] [✗ Not correct] [Save as example] [Copy]  │
+│ qwen3:8b   [✓ Correct] [✗ Not correct] [Try harder] [Save as example] [Copy]  │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 The figure shows the state after **Run** in either mode. In preview mode the tab first
 shows everything above the result area, with **Run** highlighted and no result yet.
+The bar under the result names the model that wrote the final query, and its tooltip
+lists every step with its model and any escalation. **Try harder** asks again from the
+next model of the `draft` list (§5.5). **Explain** and **Optimize** open the panels of
+§6.6 and §6.7 and work for any query in the editor, not only for answers.
 
 The person can edit the query at any point. An edit clears the answer summary, because
 the summary described the old query, and the header marks the query as edited. Running
@@ -716,8 +999,8 @@ the other tabs, and an **Asked** list in the Saved menu shows the last 50 questi
 this browser with their queries. Nothing is stored on the server.
 
 From Phase 2 the server keeps each principal's asks for the dataset, with the question,
-the final query, the commit, the feedback and the usage, but not the rows or the
-summary text. Only the principal sees its own history, through
+the final query, the commit, the feedback, the usage and the routing record of §5.5,
+but not the rows or the summary text. Only the principal sees its own history, through
 `GET /$/asks/{ds}`, and can delete entries. No role can read another principal's
 questions, including dataset and server admins, because a question can contain
 personal or confidential text (§14). Admins see counts and usage only.
@@ -736,14 +1019,404 @@ hour, and lowering the value deletes the older entries at its next run.
 | The dataset has no assistant | No Ask bar. Tabs opened from agent links still work. |
 | The provider is unreachable or times out | "The model provider is not responding." The question stays in the bar, and the plain editor is usable. |
 | A token budget is exhausted | "This dataset's question budget for today is used up," with the reset time. |
-| The draft still fails the check after repairs | The last draft in the editor with the issues highlighted and their suggested terms as quick fixes, and "Sparkles could not write a valid query for this question." |
+| The draft still fails the check after repairs and escalation | The last draft in the editor with the issues highlighted and their suggested terms as quick fixes, and "Sparkles could not write a valid query for this question." |
 | The query exceeds a query budget | The budget that stopped it, the plan, and the suggestion to narrow the question. |
 | The result is empty after repairs | The empty table, the diagnosis of `why_empty` in words, and "No data you can read matched." |
 | The model says the schema cannot answer the question | "The data does not seem to describe this," with the closest classes and predicates as links into the schema browser. |
 | The handoff link holds an update | "This link contains an update. Links can only open queries," and the text is not loaded into the editor. |
 | The handoff link names a dataset the person cannot read | The normal `403` handling of the query page. |
-| The model returns output that does not match the schema twice | The step of §3.6 that was reached, and the plain editor with any query the server could extract. |
+| The last pair of the role's list returns output that does not match the schema twice | The step of §3.6 that was reached, and the plain editor with any query the server could extract. |
 | The provider runs a small model, or one without structured output | A note "answered by a small model" with the model's name, and no clarification choices or summary when the level of §3.6 does not allow them. |
+| **Try harder** after the last pair of the `draft` list | The button is hidden, and the routing record says which models were tried. |
+
+### 6.6 Explaining a query
+
+**Explain** turns a query's plan into a plain description of what the query asks and a
+note on each operator that matters. It works for any query in the editor, whether a
+person wrote it, an agent handed it over or the Ask bar drafted it. It also answers
+"why is this slow" for a query that ran out of its budget. Most of it is computed
+without a model, and the `explain` role (§3.7) only rewrites the computed facts as
+prose. A dataset without that role still gets every note.
+
+#### 6.6.1 What it reads
+
+| Input | Source |
+|---|---|
+| The estimated plan | `/{ds}/explain`, the planner's `PlanNode` tree with estimated rows and cost and the planner's warnings. |
+| The executed plan | The plan of the `application/x-sparkles+json` result, or the `CursorPlan` of a streaming one, with actual rows, `timeMs`, counters, `complete` and the warnings raised while it ran. |
+| Lint findings | X04's findings for the query text, such as `cartesian-product`, `filter-scope` and `unbound-variable`. |
+| Schema findings | `check_query`'s issues and the terms list of §4.5, which give each IRI its label, kind and count. |
+| Planner warnings | `explain_query`'s `unknown-term`, `no-limit`, `large-estimate` and `service-disabled`, and the plan's own codes, such as `geo-not-pushed`. |
+
+The explanation never reads result rows, so it needs only the `schema` level of `send`
+when the `explain` role runs on a provider.
+
+Each operator is named by a **node id**, the path of child indexes from the root, such
+as `0.1.2`. That is the id `PlanView` already derives. The server adds it to every node
+it returns (§6.6.5), so a note, a sentence and a row of the tree agree on which node
+they mean. Ids are only valid for the plan returned in the same response.
+
+#### 6.6.2 The notes
+
+The server computes the notes from the inputs alone. Each note has a node id, a code, a
+severity and a sentence from a fixed template, filled with the numbers it rests on.
+
+| Code | When | Template |
+|---|---|---|
+| `dominant` | The node with the largest own time, which is its `timeMs` minus its children's, when it takes at least 20% of the total. For a plan that did not run, the node with the largest share of estimated cost. | "{operator} took {self} of the {total}." |
+| `misestimate` | Actual and estimated rows differ by ten times or more in either direction, and both are known. | "{operator} was estimated at {est} rows and produced {act}." |
+| `blowup` | A join's output is ten times larger than its larger input. | "{operator} on {vars} produced {act} rows from inputs of {left} and {right}." |
+| `late-filter` | A filter keeps under 1% of at least 10,000 input rows. | "{operator} kept {act} of {input} rows." |
+| `large-sort` | A sort, group or distinct reads over a million rows. | "{operator} read {input} rows before its first output." |
+| `open-path` | A transitive path has neither end bound. | "The path {path} starts from every node." |
+| `skipped` | A node did not run, with the reason the plan gives. | "{operator} did not run because {reason}." |
+| `budget` | The query stopped at a budget (§6.6.4). | "The {budget} stopped the query after {elapsed}." |
+| `stopped-early` | A node was cut short by a `LIMIT` or by an `EXISTS` test. | "{operator} stopped after {act} rows, which was enough." |
+| `hidden-estimates` | The caller's view is limited, so estimates are `-1` (C12). | "Estimates are hidden for your view, so only actual counts are shown." |
+| The planner's, lint and schema codes | As their sources define them. | Their own messages. |
+
+A lint finding is placed on a node when the finding names the variables of that node,
+such as `cartesian-product` on the `CartesianProduct` join of the same variables.
+Otherwise it is shown under the heading **Query**, linked to its range in the editor
+instead of a node.
+
+The notes are ordered by severity and then by the node's share of time. At most twelve
+are shown, and the rest are behind **More**.
+
+#### 6.6.3 The description
+
+**What it asks** is one to four sentences that say what the query looks for, each
+linked to the nodes it describes. Without the `explain` role, the server writes it from
+templates over the algebra. A scan reads as "people who are members of Payments" from
+the labels of its terms, a join as "and", an `OPTIONAL` as "with, when known", a
+`FILTER` as "keeping those where", a `GROUP BY` as "grouped by", an `ORDER BY` as
+"sorted by" and a `LIMIT` as "the first n". The template text is plain but always
+accurate.
+
+With the `explain` role, a model writes the description and rewrites the notes as
+prose. Its prompt holds the query, the plan as one line per node with its id,
+operator, description, estimated and actual rows and times, the notes, and the labels
+of the terms list. It gets no rows. The answer has this shape.
+
+```ts
+type Explanation = {
+  asks: { text: string; nodes: string[] }[];   // 1 to 4 sentences
+  notes: { node: string; text: string }[];     // at most 12, one per node
+};
+```
+
+The server checks the answer before showing it. A sentence or note whose node ids are
+not in the plan is dropped. A note with a number that its node's facts do not contain,
+after rounding, is replaced by the deterministic note for that node. When no sentence
+of `asks` survives, the template description is shown. The panel labels model text as
+generated and keeps the template text one click away.
+
+#### 6.6.4 Why it is slow
+
+A query that ran out of a budget, whether the timeout, `memory`, `rows` or
+`rows-produced`, is explained from the plan it had when it stopped. That plan carries
+the counts so far, with `complete: false` on the nodes that were still running, and
+the explanation marks those counts as partial. The `budget` note comes first and names
+the budget and its limit. The `dominant` note then names the node that spent the most
+of it, by own time for the timeout and by rows or estimated memory for the other
+budgets.
+
+A failed query's error display on the query page gains **Explain why**, which opens
+the panel with that plan. The panel ends with a link to **Optimize** (§6.7) when a
+deterministic rewrite applies, and with the C01 limits that the person may raise.
+
+#### 6.6.5 What the plans need first
+
+An audit of the engine on 2026-10-09 found that every node in a returned plan carries
+estimated rows and cost from the planner, and that both executors fill in actual rows
+and an inclusive `timeMs` for every node they run. The gaps below stand between those
+plans and explanations that are correct, and they are a prerequisite of Phase 2b.
+
+1. **Node ids.** No node has an id, and the tree's shape differs between `/explain`,
+   eager execution and streaming. A cache hit clears a node's children. `SpatialKnn`
+   replaces its template child with one node per batch. `IndexTopK` shows its fallback
+   child only when the fallback ran. A streaming graph query adds a `CONSTRUCT` or
+   `DESCRIBE` root, and a streaming `CountJoinFromRuns` has no children. The server
+   must add an `id` to each node of `PlanNode` and `CursorPlan`, and the shapes must
+   agree, or the response must say which nodes were replaced.
+2. **Skipped nodes.** A node that never ran reports `-1` rows and 0 ms with no reason.
+   That happens to the right side of a join whose left side is empty, to `Union`
+   branches after a `LIMIT` was met, to `CountJoin`'s right side and to a vector
+   search's fallback. Each needs a `skipped` reason.
+3. **Plans under `LIMIT`, `ASK` and `EXISTS`.** The executor reruns `Filter`, `Bind`,
+   `Project`, `Distinct`, `IndexJoin` and joins with a growing budget. The node's time
+   spans every round while its children keep only the last round's counts, which
+   inflates the derived own time. The rebuilt node also loses `IndexJoin`'s note and
+   counters. The children must accumulate across rounds, and the node must say it
+   stopped early with more than a suffix on its description.
+4. **Cache hits.** A cached node shows only the lookup time and drops its subtree. It
+   should keep the subtree it was computed from, marked as cached.
+5. **Streaming plans.** A streamed operator keeps its static description and counters
+   from planning. A node labelled `MergeJoin` may run as a hash join. A fallback
+   subtree reports its whole table as rows even when fewer were emitted, and its
+   children stay at `-1` when a cache hit cleared them. `complete` stays false on
+   children that a `LIMIT` stopped while the query itself completed. The error path
+   of a shared pull does not refresh the plan.
+6. **Work with no node.** `EXISTS` bodies, the inner plans of `Lateral`, `REDUCED`, the
+   remote side of `SERVICE`, the eager `CONSTRUCT` and `DESCRIBE` stage, and filters
+   pushed into a range scan or an index join have no node of their own. Their time
+   lands in the parent. Each needs a node, or for pushed filters a list on the node
+   that absorbed them, and `SERVICE` needs its constant estimate marked as a guess.
+7. **Plans of failed queries.** A query stopped by a budget answers `507` or a timeout
+   with an error body and no plan. The error body of the `application/x-sparkles+json`
+   format must carry the plan as it stood, with `complete: false` where counting
+   stopped.
+8. **MCP's text plan.** `explain_query` prints `est=` only and turns a hidden `-1` into
+   `0`, so a caller with a limited view sees `estimatedRows: 0` and never gets the
+   `no-limit` or `large-estimate` warnings. It must show hidden estimates as hidden.
+9. **The UI.** `PlanView` flags a misestimate for a hidden `-1` estimate and does not
+   read `CursorPlan`, so a streamed plan loses `complete`, `materializes` and its
+   reason. It must handle both.
+
+`timeMs` includes the children in both executors, so each operator's own time is
+derived, as `PlanView` does now. Items 3 and 4 are the cases where that derivation is
+wrong today.
+
+#### 6.6.6 The endpoint and the panel
+
+`POST /{ds}/sparql/explain` takes JSON. It needs `read`, counts against the `query`
+rate-limit class, and shares the planner with `/{ds}/explain`.
+
+| Member | Meaning |
+|---|---|
+| `query` | Required. Any query form. An update is refused with `not-a-query`. |
+| `profile` | `estimate`, the default, plans without running. `run` runs the query read-only as the caller under the caller's budgets, counts the rows without returning them, and explains the executed plan. `given` explains the plan in `plan`. |
+| `plan`, `commit` | With `profile: "given"`, the plan and commit that the client received for this query, such as the plan of a run that stopped at a budget. The server checks the plan against the schema of `PlanNode` and `CursorPlan`, with at most 10,000 nodes and 2 MiB, and treats its text as data. |
+| `describe` | Whether to call the `explain` role, true by default when the dataset enables it. |
+| `at`, `branch`, `reasoning` | As for `/{ds}/sparql`. |
+
+The response is a stream of server-sent events, `plan` with the plan and its node ids,
+`notes`, `explanation` with the description and its source, `usage` and `error`, so the
+notes appear before the model has answered. `Accept: application/json` returns one
+object with the same members.
+
+On the query page the explanation is a panel to the right of the plan tree, opened by
+**Explain** or by the **Explanation** switch in the Plan tab. It sits in the result
+area, next to the existing `PlanView`, and leaves the tree and flame views as they
+are.
+
+```
+┌─ Query › Plan · ds: org ──────────────────────────────────────────────────────┐
+│ Table  Graph  Map  [Plan]  Raw        stopped by the 30 s timeout             │
+│ [Tree] Flame                              ☑ Explanation   [Optimize ▸]        │
+├─────────────────────────────────────────┬─────────────────────────────────────┤
+│ Operator                est   act  self │ What it asks                        │
+│ ▾ Project ?name           9   14ᵖ  0 ms │ Finds people in teams that are part │
+│ ● ▾ Filter regex        900   14ᵖ  29 s │ of Commerce at any depth ‹Join›,    │
+│     ▾ HashJoin ?team    900  1.2Mᵖ 0.4 s│ and keeps those whose name starts   │
+│         Scan memberOf   214   214  1 ms │ with "Ana" ‹Filter›.                │
+│       ⚠ Path partOf+      9  4.1K 0.3 s │                                     │
+│                                         │ Why it is slow                      │
+│                                         │ ● The regex filter took 29 s of the │
+│                                         │   30 s and had kept 14 of 1.2M rows │
+│                                         │   when the timeout stopped it       │
+│                                         │   ‹Filter›                          │
+│                                         │ ⚠ partOf+ was estimated at 9 rows   │
+│                                         │   and produced 4,100 ‹Path›         │
+│                                         │ ⓘ A prefix test can replace the     │
+│                                         │   regex ‹Filter›     [Optimize ▸]   │
+│ ᵖ partial, counted until the timeout    │   written by local · qwen3:8b  ▾    │
+└─────────────────────────────────────────┴─────────────────────────────────────┘
+```
+
+Each `‹…›` link selects its node in the tree, expands the path to it and scrolls it
+into view, and hovering a node highlights the sentences that cite it. The marks in the
+tree are the notes' severities, so the slowest node is visible without reading the
+panel. A partial count carries a mark that the legend explains. The panel works on the
+estimated plan too, before a run, and then says that the figures are estimates.
+
+### 6.7 Suggesting a faster query
+
+**Optimize** looks for a rewrite of a query that returns the same results faster. It
+suggests and never applies. The person reads the rewrite next to the original and
+applies it to the editor themselves. The planner never calls a model, and nothing in
+this section changes how the planner plans.
+
+#### 6.7.1 Steps
+
+1. **Baseline.** Plan the original, and check that it can be compared at all
+   (§6.7.4).
+2. **Deterministic rewrites.** Apply the rules of §6.7.2 that match.
+3. **Proposed rewrites.** When no deterministic rewrite was verified faster and the
+   dataset enables `optimize`, ask the `optimize` role for up to three rewrites
+   (§6.7.3). The person can also ask for more with **Look further**.
+4. **Gate.** Drop each candidate that changes the query's form, fails its check, or
+   whose estimated plan cost does not drop (§6.7.4).
+5. **Run and compare.** Run the original and each remaining candidate at the same
+   commit under the caller's budgets, compare their results (§6.7.5) and their
+   profiles (§6.7.6).
+6. **Show.** List the verified rewrites with their diffs, plans and timings, and the
+   rejected ones with the reason (§6.7.7).
+
+#### 6.7.2 Deterministic rewrites
+
+The deterministic rewrites are lint rules of X04 with a suggested rewrite. Each rule
+states a condition under which the rewrite cannot change the results. They are not
+safe fixes in X04's sense, because their conditions are checked on the syntax tree and
+can miss a case, so every one is verified by running it like any other candidate.
+
+| Rule | Rewrite | Condition |
+|---|---|---|
+| `regex-prefix` | `regex(?x, "^abc")` becomes `STRSTARTS(?x, "abc")`. | The pattern is a plain literal, has no flags, and after `^` has no regular expression syntax. |
+| `regex-contains` | `regex(?x, "abc")` becomes `CONTAINS(?x, "abc")`. | As above, with no anchor. |
+| `optional-not-bound` | `OPTIONAL { P } FILTER(!BOUND(?v))` becomes `FILTER NOT EXISTS { P }`. | `?v` is bound only in `P`, and no other variable of `P` is used outside it. |
+| `in-to-values` | `FILTER(?v IN (<a>, <b>))` becomes `VALUES ?v { <a> <b> }`. | Every member is an IRI, the list has no duplicates, and a triple pattern of the same group binds `?v`. |
+| `same-term-variables` | `FILTER(?a = ?b)` is removed and `?b` is renamed `?a`. | Both variables occur only in subject, predicate or graph positions, so they are IRIs or blank nodes and `=` is term equality, and `?b` is not projected. |
+
+The planner already substitutes a constant for `FILTER(?v = <iri>)` and orders joins
+itself, so those changes are explained (§6.6) and never suggested as rewrites. A rule
+joins this table only with an argument for its condition and a measured case where it
+helps.
+
+#### 6.7.3 Proposed rewrites
+
+The `optimize` role's prompt holds the query, its executed plan with the node ids and
+the notes of §6.6, the profiles of the terms it uses from the schema report, including
+counts and values per subject, and the deterministic candidates with their verdicts. It
+gets no rows. The answer has this shape.
+
+```ts
+type Rewrite = {
+  candidates: { query: string; rationale: string; nodes: string[] }[];  // at most 3
+};
+```
+
+`rationale` is at most 300 characters and `nodes` names the operators the rewrite is
+meant to help. The role escalates as §5.5 describes on `provider-failure` and on **Look
+further**, which asks the next pair. A rejected candidate does not escalate by itself,
+because a rewrite that changes the results is a normal outcome, not a failure.
+
+#### 6.7.4 The gate
+
+Before anything runs, each candidate must pass these checks, in this order.
+
+1. It parses as a query of the same form. A `SELECT` projects the same variables in the
+   same order. A `CONSTRUCT` has the same template. A `DESCRIBE` names the same
+   resources. `ORDER BY`, `LIMIT` and `OFFSET` at the top level are unchanged.
+2. It adds no `SERVICE`, no `FROM` or `FROM NAMED`, and no call to `RAND`, `NOW`,
+   `UUID`, `STRUUID` or `BNODE`.
+3. `check_query` reports no error.
+4. Its estimated plan cost is at most 90% of the original's. When the caller's view is
+   limited, estimates are hidden (C12), and this check is skipped, so that comparing
+   two costs cannot reveal anything about hidden graphs. The measured comparison of
+   §6.7.6 then decides alone.
+
+A rule whose gain is in the cost of evaluating an expression, such as `regex-prefix`,
+passes the fourth check only when the planner prices expressions. The planner's filter
+cost must therefore count a regular expression above a string comparison before those
+rules can be offered. That change is part of Phase 6a.
+
+The original itself must be comparable. When it calls one of the functions of the
+second check, or has a subquery with a `LIMIT` and no `ORDER BY`, its results can
+differ from run to run, and optimizing stops with `not-verifiable`.
+
+#### 6.7.5 Comparing results
+
+The original and each candidate run at the same commit, read-only, as the caller,
+under the caller's C01 budgets. The comparison streams. It keeps hashes, not rows, so it
+needs no more memory than the queries do.
+
+Each solution is reduced to its projected terms in order, with unbound variables as a
+marker, and hashed with a 128-bit keyed hash whose key is random for each comparison.
+Terms are compared as RDF terms, so `"1"^^xsd:integer` and `"01"^^xsd:integer` differ.
+Blank nodes from the store compare by identity, because both runs read one snapshot.
+
+| Query | Equal when |
+|---|---|
+| `SELECT` without `ORDER BY` | The two results are equal as bags. The server compares the count and the sum of the row hashes, which does not depend on order. |
+| `SELECT` with `ORDER BY` | The results are equal in order, up to rows that tie on every sort key. Rows are grouped into runs of equal sort keys, each run is hashed as a bag, and the sequence of runs is hashed in order. |
+| `DISTINCT` | As above, over the distinct rows. |
+| `REDUCED` | The results are equal as sets, because `REDUCED` lets each run keep any number of duplicates. |
+| `LIMIT` or `OFFSET` | Both queries run again without the top-level `LIMIT` and `OFFSET`, and the full results are compared by the rules above. Without `ORDER BY`, a limited query may return any of its solutions, so two equal full results mean that every answer of one is a correct answer of the other, although the rows shown may differ. The panel says so. |
+| `ASK` | The booleans are equal. |
+| `CONSTRUCT` | The templates are equal, so the server compares the bags of solutions of the template's variables. |
+| `DESCRIBE` | The described resources are equal as sets, in the same `DESCRIBE` mode. |
+
+When a full result exceeds the caller's result or memory budget during the comparison,
+the candidate is rejected with `not-verifiable`, because equality was not shown. When
+both results have at most 10,000 rows and differ, the server runs them once more to
+find the first rows that one has and the other lacks, and shows up to five of each.
+
+#### 6.7.6 Comparing profiles
+
+The original and the candidates run in turn, original then candidate, three times by
+default, so that a cache or a page fault favours neither. The first run of each also
+computes the hashes. A candidate's run has a deadline of twice the original's slowest
+run plus a second, within the caller's timeout, so a slow candidate cannot hold the
+query slots for long.
+
+The panel compares the median total time, `rows_produced`, the peak memory estimate
+and the own time of each node. Nodes are paired by operator and description where the
+trees allow, and the dominant node of the original is always paired. A candidate is
+**verified faster** when its results are equal and its median time is at most 90% of
+the original's. A candidate with equal results whose time is within 10% but whose peak
+memory is at most half is **verified smaller**. Any other candidate is rejected with
+the reason.
+
+| Reason | Meaning |
+|---|---|
+| `syntax`, `form-changed`, `check-failed` | The first three checks of §6.7.4. |
+| `not-cheaper` | The estimated cost did not drop. |
+| `results-differ` | The comparison of §6.7.5 failed, with the first differing rows when they were found. |
+| `not-verifiable` | Equality could not be shown within the budgets, or the query is not deterministic. |
+| `not-faster` | The results are equal, but the measured time did not drop. |
+| `original-unfinished` | The original ran out of its budget, so its results are unknown. A person with a higher limit can run **Optimize** with a longer timeout. |
+
+#### 6.7.7 The endpoint and the panel
+
+`POST /{ds}/sparql/optimize` takes JSON. It needs `read` and counts each run against
+the `query` rate-limit class.
+
+| Member | Meaning |
+|---|---|
+| `query` | Required. The query to optimize. An update is refused with `not-a-query`. |
+| `candidates` | Up to three rewrites to verify, such as ones a person wrote. |
+| `rules` | Whether to try the deterministic rules, true by default. |
+| `propose` | Whether to ask the `optimize` role, true by default when the dataset enables it. |
+| `runs` | Runs of each query for timing, 3 by default, from 1 to 5. |
+| `timeoutSecs` | The deadline of the whole request, 120 seconds by default and at most the caller's query timeout times eight. |
+| `at`, `branch`, `reasoning` | As for `/{ds}/sparql`. The server pins the commit for every run. |
+
+The response is a stream of server-sent events, `baseline`, then one `candidate` per
+rewrite with its verdict, diff, plans and timings, then `usage` and `done`.
+`Accept: application/json` returns one object.
+
+The panel opens from **Optimize** under the editor, from the explanation panel or from
+**Explain why** on a failed query.
+
+```
+┌─ Query › Optimize · ds: org ──────────────────────────────────────────────────┐
+│ 2 rewrites checked at commit 42 · 1 verified faster · 1 rejected              │
+├───────────────────────────────────────┬───────────────────────────────────────┤
+│ Original                              │ Rewrite 1 · rule regex-prefix         │
+│   ?p ex:memberOf ?team ;              │   ?p ex:memberOf ?team ;              │
+│      foaf:name ?name .                │      foaf:name ?name .                │
+│ − FILTER(regex(?name, "^Ana"))        │ + FILTER(STRSTARTS(?name, "Ana"))     │
+├───────────────────────────────────────┼───────────────────────────────────────┤
+│ Filter         2.1 s   14 rows        │ Filter        0.05 s   14 rows        │
+│ HashJoin       0.4 s 1.2M rows        │ HashJoin       0.4 s 1.2M rows        │
+│ total median   2.4 s (3 runs)         │ total median   0.5 s (3 runs)         │
+├───────────────────────────────────────┴───────────────────────────────────────┤
+│ Results   identical, a bag of 14 rows at commit 42                            │
+│ Cost      estimated cost 3.1M → 2.4M · rows produced unchanged                │
+│                                     [Show plans side by side] [Apply ▸]       │
+├───────────────────────────────────────────────────────────────────────────────┤
+│ Rewrite 2 · optimize · anthropic · claude-sonnet-5-5           ✗ rejected     │
+│   Results differ: the original returns 14 rows and the rewrite 12.            │
+│   Missing from the rewrite: res:ana2 "Ana Souza" …          [Show diff]       │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+The text diff is computed on the formatted queries, so only real changes show. **Show
+plans side by side** opens two `PlanView`s with paired nodes aligned. **Apply** replaces
+the editor's text with the rewrite as one undoable change and marks the tab as
+rewritten. It never runs the query. A rejected rewrite stays in the list with its
+reason, so a person can see what was tried.
 
 ## 7. Ingestion
 
@@ -754,7 +1427,7 @@ hour, and lowering the value deletes the older entries at its next run.
 | Plain text | None, after NFC normalization and line ending folding. | |
 | Markdown | Kept as is, so headings guide chunking. | |
 | HTML | Main content extracted, scripts, styles and navigation removed, headings and lists kept as Markdown. | |
-| PDF | The text layer of born-digital PDFs, page by page. | Scanned PDFs without text are refused with `no-text-layer`. OCR is a non-goal. |
+| PDF | Markdown from pdf-inspector, with headings, lists, tables and reading order across columns, and a page marker before each page. | A page without usable text needs OCR. Without the `pdf-ocr` feature, such a PDF is refused with `needs-ocr` and the pages concerned (§7.1.1). |
 | CSV and TSV | Not converted to text. | The model drafts a C05 mapping, and C05 converts every row deterministically (§7.8). |
 | RDF in any format | Not ingested. | It goes through the existing upload. |
 
@@ -762,6 +1435,91 @@ In Phase 3 the external agent converts the document, since hosts already read PD
 web pages, and sends the text. In Phase 4 the server converts Markdown, HTML and PDF
 itself. Converters run under a size limit of 10 MiB of input and 2 MiB of text per
 source by default.
+
+#### 7.1.1 PDF conversion with pdf-inspector
+
+The server converts PDFs with [pdf-inspector](https://github.com/firecrawl/pdf-inspector),
+a Rust crate under the MIT license that Firecrawl publishes on crates.io. It reads a
+PDF with lopdf, classifies it as text-based, scanned, image-based or mixed, and turns
+the text layer into Markdown. It detects tables from ruled lines and from aligned text,
+orders multi-column pages, decodes CID fonts through their ToUnicode maps, and reports
+broken font encodings and the pages that need OCR. It replaces the text-layer
+extractor that this spec first planned to build.
+
+**Features.** The crate is behind a `pdf` cargo feature of `sparkles-server`, and the
+dependency names an exact version, `=1.25.2` when this was written. The crate reached
+1.0 in mid-2026 and has published about two dozen minor versions since, so an exact pin
+and a deliberate upgrade with the conversion tests keep the Markdown, and therefore the
+offsets of stored renditions, from changing under a routine `cargo update`. A build
+without `pdf` refuses PDFs with `unsupported-format`. The feature is part of the
+default and release builds, like `text` and `geo`.
+
+**Licenses.** With its default features, pdf-inspector 1.25.2 brings 22 crates that the
+server does not link today, among them lopdf, ttf-parser, the RustCrypto block cipher
+crates for encrypted PDFs, jiff and env_logger. All are MIT, Apache-2.0 or MIT with
+Unlicense, so `scripts/third-party-licenses.py` covers them, and `mise run licenses`
+regenerates `THIRD_PARTY_LICENSES.md` when the dependency lands. The OCR features bring
+about 132 more, from the `image` stack, `oar-ocr`, `ort` and PDFium's bindings. Their
+licenses are also permissive, adding BSD-2-Clause (rav1e, av1-grain, v_frame),
+BSL-1.0 (clipper2-rust), ISC (libloading) and CC0-1.0 or Apache-2.0 (imgref). Every one
+either ships a license file or names a license that the script has a standard text
+for. rav1e also ships a `PATENTS` file with the Alliance for Open Media patent license,
+which the script's file pattern does not collect, so a build that ships `pdf-ocr` must
+add it to the script's notices. `oar-ocr`'s crates and `ort` are Apache-2.0 or MIT, the
+PDFium library that the operator installs is BSD-3-Clause, and ONNX Runtime is MIT.
+The PP-OCR model files are reported as Apache-2.0 by the repackagings that pdf-inspector
+uses, and the official PaddleOCR model cards must confirm that before `pdf-ocr` ships.
+Sparkles redistributes none of the libraries or models.
+
+OCR is a second feature, `pdf-ocr`, off by default and not part of release builds. It
+enables pdf-inspector's `render-pdfium` and `ocr-oar` features, which render pages with
+PDFium and run the PP-OCR models through ONNX Runtime. Both libraries are loaded
+dynamically from paths the operator gives, and the OCR models are read from a
+directory the operator provides through pdf-inspector's `model_directory` option.
+Sparkles does not enable pdf-inspector's `model-download` feature, so the server never
+fetches a model at run time. `serve --pdf-ocr-models DIR`, `--pdfium-lib PATH` and
+`--onnxruntime-lib PATH` configure it, and a server without them treats OCR as
+unavailable.
+
+**Classification first.** The server runs pdf-inspector with `ProcessMode::Full` and
+reads its result. A PDF is accepted without OCR only when `pages_needing_ocr` is empty
+and `has_encoding_issues` is false. Otherwise the outcome depends on OCR.
+
+| Classification | Without OCR | With OCR |
+|---|---|---|
+| Text-based, no pages needing OCR | Converted. | Converted, with no OCR. |
+| Scanned or image-based | Refused with `needs-ocr`, listing every page. Never an empty rendition. | Every page is read by OCR. |
+| Mixed | Refused with `needs-ocr`, listing the pages and pdf-inspector's reason for each, such as `scanned`, `vector_text` or `invisible_text_layer`. With `allowPartial: true`, the text pages are converted and the rendition records the pages left out. | The listed pages are read by OCR and the others from their text layer. |
+| Broken encodings | Refused with `needs-ocr` and the fonts whose codes could not be mapped. `allowPartial` keeps the text with its replacement characters marked. | The affected pages are read by OCR. |
+
+A refusal is an error result of the ingestion task and of `register_source`, with the
+code, the page numbers, the reasons and a message that says OCR is needed. It never
+registers a source with empty or partial text unless `allowPartial` asked for it. A page
+read by OCR is marked in the rendition, and the review page of §7.10 shows those pages
+with a note that the text came from OCR, because OCR mistakes are common enough that a
+reviewer should check quotes against the page.
+
+**Offsets.** The rendition of a PDF is the Markdown that pdf-inspector returns, after
+the NFC normalization and line-ending folding of every rendition. Spans, chunk
+fragments and the span check of §7.6 all count code points in that Markdown, never in
+the PDF's content streams, so a quote is checked against exactly the text the model
+saw. pdf-inspector's `include_page_numbers` option writes `<!-- Page N -->` before each
+page. The server keeps those markers in the rendition and records the offset at which
+each page starts as `spk:pageStart` values on the rendition, so the review page can
+show a span's page and a citation can name it. Chunking prefers page and heading
+boundaries. The other Markdown options are fixed in the server's source, so the same
+PDF gives the same rendition and the same IRIs, as §7.2 requires, until the pinned
+version changes. An upgrade that changes the Markdown of the conversion test corpus is
+recorded in the Outcome, and re-registering an old source then yields a new rendition
+with its own digest, which re-ingestion handles as a changed source (§7.9).
+
+**Isolation.** Parsing a PDF is the riskiest step of ingestion, because the file comes
+from outside. The conversion runs on a blocking thread of its own under the task's
+deadline, with the input limit of §7.1 checked before parsing. A panic inside the crate
+is caught and becomes a `conversion-failed` result. A conversion that overruns its
+deadline cannot be interrupted inside the library, so the task reports
+`conversion-timeout` at once and the thread is left to finish, with at most
+`--pdf-workers` conversions, 2 by default, running at any time.
 
 ### 7.2 Sources, renditions and chunks
 
@@ -844,7 +1602,9 @@ type Extraction = {
 
 `s` and `o` are mention keys. Spans are offsets in the rendition. In Phase 3 the
 external agent produces this structure itself and sends the facts to `assert_facts`.
-In Phase 4 the server asks the provider for it.
+In Phase 4 the server asks the `extract` role for it (§3.7). A chunk whose answer
+fails validation twice, or whose provider fails, moves to the next pair of the list as
+§5.5 describes, and the pair that answered is recorded on the task with each chunk.
 
 ### 7.5 Linking and deduplication
 
@@ -1300,8 +2060,8 @@ The title is "Explain an empty result". For a query that returned no rows, it ev
 each triple pattern alone and then each join in the order of the plan, with `LIMIT 1`
 under a deadline of a tenth of the query timeout, and reports the first pattern or join
 without solutions. Filters are checked the same way. The result names the pattern, says
-whether its constants occur in the view at all, and adds the `check_query` warnings that
-concern it, such as a language tag mismatch. Annotations are read-only. Over HTTP the
+whether its constants occur in the view at all, adds the `check_query` warnings that
+concern it, such as a language tag mismatch, and gives the `verdict` of §4.2. Annotations are read-only. Over HTTP the
 same check is `POST /{ds}/sparql/diagnose`, which the UI uses for its empty-result
 message.
 
@@ -1356,6 +2116,50 @@ conversation or sets `distinctFrom`.
 **MCP Apps** is rejected (§13). The main client is Claude Code in a terminal, and the
 visual path is the Sparkles UI itself, which `share_query` links open.
 
+### 9.6 `explain_query`
+
+C11 already has a tool of this name, which returns the estimated plan as text with
+`unknown-term`, `no-limit`, `large-estimate` and `service-disabled` warnings. This spec
+extends it rather than adding a second tool, and a call without the new arguments
+answers as before, apart from the fix to hidden estimates in §6.6.5.
+
+| Argument | Meaning |
+|---|---|
+| `profile` | `estimate`, the default, or `run`, which runs the query read-only under the call's timeout and the caller's budgets and explains the executed plan, partial when a budget stopped it. |
+| `notes` | Whether to add the notes and the template description of §6.6, false by default. |
+| `timeoutSeconds` | The deadline of a `run`, 30 by default. |
+
+With `notes`, the result adds `nodes`, one entry per operator with its id, operator,
+description, estimated and actual rows, total and own time and `complete`, and `notes`
+and `asks` as §6.6.2 and §6.6.3 define them, with `source: "template"`. The text `plan`
+then starts each line with the node's id and adds `act=` and `ms=` after a run.
+
+The tool never calls the server's model providers. An agent is its own model and
+writes its own prose from the notes, and a server's provider budget is meant for the
+people who use its UI. Its annotations stay read-only and closed-world.
+
+### 9.7 `optimize_query`
+
+The title is "Check rewrites of a SPARQL query". It runs the deterministic rules of
+§6.7.2 and verifies them and any rewrites the agent proposes, with the gate,
+comparisons and verdicts of §6.7.4 to §6.7.6.
+
+| Argument | Meaning |
+|---|---|
+| `query` | Required. The query to optimize. |
+| `candidates` | Up to three rewrites written by the agent. |
+| `rules` | Whether to try the deterministic rules, true by default. |
+| `runs` | Runs of each query for timing, 3 by default, from 1 to 5. |
+| `timeoutSeconds` | The deadline of the whole call, 120 by default. |
+
+The result lists the original's median time and plan summary and, for each candidate,
+its source (`rule` with the rule's name, or `agent`), its verdict and reason, its
+median time, the paired node timings, and for `results-differ` up to five differing
+rows in the compact syntax of C11 §4.3. Like `explain_query`, it never calls the
+server's providers, so the `optimize` role is used only by the UI. The tool runs
+queries but writes nothing, so its annotations are read-only and closed-world. Each run
+counts against the caller's MCP query limits.
+
 ## 10. HTTP and CLI surface
 
 | Method and path | Phase | Need | Purpose |
@@ -1363,10 +2167,13 @@ visual path is the Sparkles UI itself, which `share_query` links open.
 | `POST /{ds}/sparql/diagnose` | 1 | `read` | The check of `why_empty`. |
 | `POST /{ds}/check` | 1 | `read` | `check_query` over HTTP, for the question header and the terms list. |
 | `POST /{ds}/recall` | 1 | `read` | C17's `recall` in its JSON format, for the memory browser. |
-| `GET /$/models`, `POST /$/models/{name}/test` | 2 | server `admin` | The configured providers and a test call (§3.4). |
+| `GET /$/models`, `POST /$/models/{name}/test` | 1 | server `admin` | The configured providers, models and role lists, and a test call of one pair (§3.4). |
+| `GET /$/models/usage` | 2 | server `admin` | Counts of answers, escalations and outcomes per role and pair, with no text (§5.5). |
 | `GET`, `PUT /$/assistant/{ds}` | 2 | `read`, `admin` | The dataset's assistant settings of §3.5. |
 | `POST /{ds}/ask` | 2 | `read` | The pipeline of §5. |
 | `GET`, `DELETE /$/asks/{ds}` | 2 | `read` | The caller's own history. |
+| `POST /{ds}/sparql/explain` | 2b | `read` | The explanation of §6.6. |
+| `POST /{ds}/sparql/optimize` | 6 | `read` | The verified rewrites of §6.7. |
 | `GET`, `POST`, `DELETE /$/queries/{ds}/suggestions` | 1 | `admin` to list and promote, `read` to suggest | Suggested examples. |
 | `GET`, `PUT /$/memory/{ds}` | 1 | `read`, `admin` | The memory settings of §8.8: agent graphs, the consolidated graph and per-agent policies. |
 | `GET /$/memory/{ds}/inbox` | 3 | `read` | The review inbox of §8.9, for the caller's view, with the signals per fact. |
@@ -1375,9 +2182,11 @@ visual path is the Sparkles UI itself, which `share_query` links open.
 | `GET /$/ingest/{ds}/{task}` | 4 | `read` | Progress, usage and the result. |
 
 `sparkles ask --loc DB DATASET "question"` runs the asking pipeline from the command
-line from Phase 2, and `sparkles ingest --loc DB DATASET FILE…` runs ingestion from
-Phase 4. Both read the provider configuration of `--model-config` and the secrets of
-`--model-secret`.
+line from Phase 1, where the evaluation of §11.4 drives it. In Phase 1 it uses the first
+pair of each role, and `--pair ROLE=PROVIDER/MODEL` forces a pair for one role. From
+Phase 2 it also escalates as §5.5 describes and reads the dataset's `assistant.json`.
+`sparkles ingest --loc DB DATASET FILE…` runs ingestion from Phase 4. Both read the
+provider configuration of `--model-config` and the secrets of `--model-secret`.
 
 ## 11. Evaluation
 
@@ -1419,11 +2228,11 @@ Each run fixes the model, the provider and the prompts and reports these numbers
 | Cost | Input and output tokens per question, and the estimated cost at the provider's list price. |
 
 The ablations of C17 §11 are run for the pipeline as a whole, with and without the
-stored examples, the linking step, the check and the repair. Runs use an external agent
-harness in Phase 1 and both the harness and the server pipeline from Phase 2, so the
-two can be compared on the same questions. The server pipeline is run with one model of
-each provider kind, so that the effect of the degradation steps of §3.6 is measured
-rather than assumed.
+stored examples, the linking step, the check and the repair. Runs use both an external
+agent harness and the server pipeline from Phase 1, so the two can be compared on the
+same questions. The server pipeline runs every pair of the matrix of §11.4, which
+includes models of each provider kind, so the effect of the degradation steps of §3.6 is
+measured rather than assumed.
 
 ### 11.2 Ingestion
 
@@ -1448,26 +2257,64 @@ rather than assumed.
 ### 11.3 Targets
 
 The targets are set after the first measured run of Phase 1, because they depend on the
-model. Two are fixed now. Asking through the server must not exceed 4 model calls per
-question, and every query that the pipeline runs must have passed `check_query`. The
-evaluation scripts live under `scripts/` and write their reports outside the
-repository, as the benchmarks do.
+model. Three are fixed now. Asking through the server must not use more than four model
+answers per question, plus at most two failed calls (§5.3). Every query that the
+pipeline runs must have passed `check_query`. Every rewrite that §6.7 offers must have
+returned results equal to the original's under §6.7.5. The evaluation scripts live
+under `scripts/` and write their reports outside the repository, as the benchmarks do.
+
+### 11.4 The model matrix
+
+The matrix measures each provider and model pair in each role on its own, and then the
+configured lists as cascades. `scripts/eval-ask` takes a model configuration, a list of
+pairs and a question set, runs `sparkles ask` with `--pair` for every pair and role, and
+runs it again with the lists and escalation of §5.5. Each run fixes the prompts and the
+dataset's commit.
+
+| Column | Meaning |
+|---|---|
+| Pair | The provider, the model and its structured-output level. |
+| Role | `draft` alone, `repair` from a fixed set of failed drafts, `summarize` scored on citation validity and a judged sample, `explain` scored on node validity and numbers, and `optimize` scored on the share of verified rewrites. |
+| Accuracy | The execution accuracy of §11.1 for `draft` and `repair`, and the role's own score otherwise, overall and by complexity bucket of §5.5. |
+| Valid output | The share of answers that passed the schema check without a retry. |
+| Latency | Median and 95th percentile per call, with and without a model load for local providers. |
+| Cost | Tokens and estimated cost per question and per correct answer, at the pair's `pricing`. |
+| Escalation | For cascades, the share of questions answered by each pair and the signals that moved them. |
+
+The matrix runs on the demo set, QALD-9-plus and Text2SPARQL'25 for asking, and on the
+labelled local documents for `extract`. Its report chooses the defaults. The
+recommended list for each role puts first the cheapest pair whose accuracy is within
+five points of the best pair's on the demo set and Text2SPARQL'25, followed by the other
+pairs in order of accuracy, and the complexity threshold follows the rule of §5.5. The
+example configurations of §3.7 are then replaced in the documentation by the measured
+lists, and the Outcome records the report that chose them. A run with hosted models
+costs tens of dollars per full public set, and a run with local models takes hours, so
+the full matrix runs before each release and a subset on the demo set runs on every
+change to the prompts.
 
 ## 12. Phasing
 
 Each phase ships something a person can use. C17 Phase 1a is a prerequisite of
-Phases 1 and 2, and C17 Phases 1b and 1c are prerequisites of Phase 3. Phases 1 and 2
-can be built in parallel once C17 Phase 1a's `check_query`, `similar_queries` and
-`link_entities` exist, because they share only the question header, which Phase 1
-builds first. Phase 2 is the core of the UI's experience and comes before ingestion.
+Phases 1 and 2, and C17 Phases 1b and 1c are prerequisites of Phase 3. Phase 1 builds
+the provider clients and the role lists, because the evaluation matrix needs them
+before any UI does. Phase 2 starts once those clients exist, and the rest of Phase 1
+can run alongside it. Phase 2 is the core of the UI's experience and comes before
+ingestion. Phase 2b needs the plan fixes of §6.6.5, which can start at any time.
+Phase 6 comes after Phase 2b, because it reuses the explanation's notes and node ids,
+and its deterministic part ships before the model's.
 
-| Phase | Contents | Useful because |
-|---|---|---|
-| 1 | `share_query`, `why_empty` and `POST /{ds}/sparql/diagnose`, `POST /{ds}/check` and `POST /{ds}/recall`, the `ask_graph` prompt, the question header on query tabs with the terms list, the local **Asked** history, **Save as example** and **Suggest as example** with the suggestion list, `not-a-query` in `check_query`, the memory browser of §8.7, `memory.json` with the review status of §8.8 in `recall` and the Memory tab, `statuses` and `unreviewedWeight` in `recall`, the new rules of the `agent_memory` prompt, the agent grant template of §8.6 with `sparkles auth grant --template agent`, and the demo question set with an evaluation harness. | A person asks their own agent, gets a checked query and opens it in the UI to see, edit and run it. Accepted queries feed `similar_queries`. An agent's conversation facts are usable at once and marked unreviewed, and a person sees what memory holds about an entity, where each fact came from and what it replaced. |
-| 2 | The three provider kinds of §3.4 with named model secrets, capability detection and the degradation steps of §3.6, `GET /$/models` and the test call, `assistant.json`, `POST /{ds}/ask` with the fixed pipeline over server-sent events, the Ask bar with both run modes, the step indicator, clarification choices, the summary with row citations, graph variables for the graph view, follow-up questions, `reviewedOnly`, server-side history with `historyDays`, token budgets and metrics, `sparkles ask`, and runs of the demo set, QALD-9-plus and Text2SPARQL'25 against one model of each kind. | A person without an agent asks questions in the UI, previews or runs the query, edits it, sees the rows in the table, graph or map, and reads a summary that cites them. |
-| 3 | `register_source`, `read_chunks`, `ingest_profile`, `list_sources`, `span` on `assert_facts`, ingest profiles, the review page, re-ingestion with supersession, consolidation and proposals as agent workflows, the review inbox of §8.9 with its signals, promotion and rejection, `GET /$/memory/{ds}/inbox`, the stricter `conversationFacts: "review"` policy, elicitation for ambiguous candidates where the client supports it (§9.5), and the ingestion evaluation on the local sample. | An agent turns notes and documents into facts with citations, and a person reviews ingestions, proposals and unreviewed session facts in one inbox and promotes them. |
-| 4 | Server-side conversion of Markdown, HTML and PDF, `POST /$/ingest/{ds}` as a task, extraction through the provider, cost estimates and confirmation, CSV mapping drafts for C05, `sparkles ingest`, and the Text2KGBench run. | A person uploads a document in the UI and reviews the proposed facts without an agent. |
-| 5 | Consolidation as a server task, `recency` in `recall`, and retention of session graphs. | Memory that many sessions write stays compact, current and ranked by recency. |
+The efforts are focused agent-days, including tests and docs.
+
+| Phase | Contents | Useful because | Effort |
+|---|---|---|---|
+| 1 | `share_query`, `why_empty` and `POST /{ds}/sparql/diagnose`, `POST /{ds}/check` and `POST /{ds}/recall`, the `ask_graph` prompt, the question header on query tabs with the terms list, the local **Asked** history, **Save as example** and **Suggest as example** with the suggestion list, `not-a-query` in `check_query`, the memory browser of §8.7, `memory.json` with the review status of §8.8 in `recall` and the Memory tab, `statuses` and `unreviewedWeight` in `recall`, the new rules of the `agent_memory` prompt, the agent grant template of §8.6 with `sparkles auth grant --template agent`, the three provider kinds of §3.4 with named model secrets, capability detection per pair and the degradation steps of §3.6, the role lists of §3.7, `GET /$/models` and the test call, the pipeline as a library with `sparkles ask` and `--pair`, the demo question set, and the evaluation matrix of §11.4 on the demo set, QALD-9-plus and Text2SPARQL'25. | A person asks their own agent, gets a checked query and opens it in the UI to see, edit and run it. Accepted queries feed `similar_queries`. An agent's conversation facts are usable at once and marked unreviewed, and a person sees what memory holds about an entity, where each fact came from and what it replaced. An operator can measure which models answer their data well and at what cost before the Ask bar exists. | 15–19 days |
+| 2 | `assistant.json` with role overrides and `sendByProvider`, `POST /{ds}/ask` with the fixed pipeline over server-sent events, the escalation of §5.5 with its signals, the complexity check, **Try harder** and the routing log with `GET /$/models/usage`, the `verdict` of `why_empty`, the Ask bar with both run modes, the step indicator, clarification choices, the summary with row citations, graph variables for the graph view, follow-up questions, `reviewedOnly`, server-side history with `historyDays`, token budgets and metrics, and the matrix's cascade runs. | A person without an agent asks questions in the UI, previews or runs the query, edits it, sees the rows in the table, graph or map, and reads a summary that cites them. A cheap model answers most questions, and a stronger one takes over when the server sees the cheap one fail. | 13–17 days |
+| 2b | The plan fixes of §6.6.5, node ids in plans, the notes and template description of §6.6, the `explain` role, `POST /{ds}/sparql/explain`, the explanation panel beside `PlanView`, **Explain why** on failed queries, and `profile` and `notes` on MCP's `explain_query`. | A person sees what any query asks and why it is slow, with each sentence pointing at the operator it is about, with or without a model. | 9–13 days |
+| 3 | `register_source`, `read_chunks`, `ingest_profile`, `list_sources`, `span` on `assert_facts`, ingest profiles, the review page, re-ingestion with supersession, consolidation and proposals as agent workflows, the review inbox of §8.9 with its signals, promotion and rejection, `GET /$/memory/{ds}/inbox`, the stricter `conversationFacts: "review"` policy, elicitation for ambiguous candidates where the client supports it (§9.5), and the ingestion evaluation on the local sample. | An agent turns notes and documents into facts with citations, and a person reviews ingestions, proposals and unreviewed session facts in one inbox and promotes them. | 15–19 days |
+| 4 | Server-side conversion of Markdown and HTML, PDF conversion with pdf-inspector behind the `pdf` feature with `needs-ocr` refusals and page offsets (§7.1.1), optional OCR behind `pdf-ocr`, `POST /$/ingest/{ds}` as a task, extraction through the `extract` role, cost estimates and confirmation, CSV mapping drafts for C05, `sparkles ingest`, and the Text2KGBench run. | A person uploads a document in the UI and reviews the proposed facts without an agent. | 11–14 days, plus 2–3 for OCR |
+| 5 | Consolidation as a server task, `recency` in `recall`, and retention of session graphs. | Memory that many sessions write stays compact, current and ranked by recency. | 4–6 days |
+| 6a | The gate, result comparison and profile comparison of §6.7.4 to §6.7.6, the deterministic rules of §6.7.2 as lint rules with rewrites, expression costs in the planner's filter cost, `POST /{ds}/sparql/optimize` without a model, the optimize panel with **Apply**, and MCP's `optimize_query`. | A person or an agent gets rewrites that are proven to return the same results and measured to run faster, and checks rewrites of their own the same way. | 9–12 days |
+| 6b | The `optimize` role with **Look further**, and its column in the matrix. | Rewrites that no rule covers, still verified before they are shown. | 3–4 days |
 
 ## 13. Rejected alternatives
 
@@ -1513,8 +2360,37 @@ builds first. Phase 2 is the core of the UI's experience and comes before ingest
   of the UI components that runs in the host's sandbox without the session cookie. The
   main client is Claude Code in a terminal, and a person who wants the visual opens the
   Sparkles UI through a `share_query` link.
-- **OCR and media transcription.** They need models that Sparkles does not run. An
-  agent or an external converter can produce the text and register it.
+- **OCR by default, and media transcription.** OCR needs native libraries and model
+  files that most deployments do not want, so it is an opt-in build feature with
+  operator-supplied models (§7.1.1). Audio and images need models that Sparkles does
+  not run. An agent or an external converter can produce the text and register it.
+- **A built-in PDF text extractor.** The first draft planned one for the text layer of
+  born-digital PDFs. pdf-inspector already classifies pages, finds tables and columns,
+  decodes CID fonts and reports the pages that need OCR, under the MIT license, so
+  building a weaker extractor would duplicate it.
+- **An external PDF converter configured like a provider.** It would send documents to
+  another service, add a deployment to run, and make offsets depend on a converter that
+  Sparkles does not pin. An agent that prefers another converter can still send its own
+  text in Phase 3.
+- **A router model that picks the model for each question.** It costs a call on every
+  question, cannot be verified, lets untrusted question text decide the cost, and needs
+  labelled data that does not exist yet (§5.5). Escalation on verified signals and a
+  syntactic complexity check do the same job without those costs.
+- **A single model per dataset.** One model is either too expensive for the easy
+  majority of questions or too weak for the hard ones, and the uses differ. A summary
+  needs far less than a repair. Role lists let each use pick its own pairs.
+- **Applying rewrites automatically, or letting the planner call a model.** A rewrite
+  is only as safe as the comparison that verified it on one commit, so a person decides
+  whether to use it. A planner that called a model would make planning slow, costly,
+  non-deterministic and dependent on a provider being up. The optimizer runs beside the
+  planner and only suggests (§6.7).
+- **Rewrites checked by estimate alone.** An estimate can drop while the real run gets
+  slower, and an estimate says nothing about the results. Every rewrite runs, its
+  results are compared, and its time is measured.
+- **The server's provider behind MCP's `explain_query` and `optimize_query`.** An agent
+  is already a model, and a call from it would spend the operator's budget meant for
+  the UI. The tools return the deterministic notes and verdicts, and the agent writes
+  its own prose and proposes its own rewrites.
 
 ## 14. Decisions and open questions
 
@@ -1561,11 +2437,52 @@ The maintainer decided these questions on 2026-10-09.
     rejected, because the main client is Claude Code in a terminal and the visual path
     is the Sparkles UI (§13).
 
-One question remains open.
+The maintainer decided these further questions later on 2026-10-09.
 
-1. **PDF conversion.** The recommendation is a built-in extractor for the text layer
-   of born-digital PDFs, with an external converter as an option configured like a
-   provider (§7.1). It is needed only in Phase 4.
+12. **PDF conversion uses pdf-inspector.** It replaces the planned text-layer
+    extractor, behind a `pdf` cargo feature with an exact version pin. OCR is a
+    separate opt-in feature, `pdf-ocr`. A PDF that needs OCR in a build or server
+    without it is refused with `needs-ocr` and its pages, never registered with empty
+    text. Spans and offsets count code points in the Markdown rendition (§7.1.1). This
+    closes the only open question of the first revision.
+13. **Several providers, with provider and model pairs per use.** The server registers
+    any number of named providers. Each role, `draft`, `repair`, `summarize`, `extract`,
+    `explain` and `optimize`, has an ordered list of pairs, and `assistant.json`
+    overrides the lists per dataset (§3.7, §3.5).
+14. **Escalation without a router model.** The server moves along a role's list only on
+    signals it verifies, which are a failed check after a repair, an empty result that
+    `why_empty` blames on the query, a provider timeout, refusal or invalid output, and
+    the person's **Try harder**. A syntactic complexity check can start a role one pair
+    later. A router model was rejected. The routing log and the evaluation matrix tune
+    the thresholds, and the matrix chooses the recommended lists (§5.5, §11.4).
+15. **Explanations are built into the existing profiling.** They read `/{ds}/explain`,
+    the executed plan's estimated and actual rows, `timeMs` and warnings, the linter's
+    findings and the schema's labels. They work for any query, answer "why is this
+    slow" for a query stopped by a budget, sit beside `PlanView` with each sentence
+    linked to its node, and come to MCP through `explain_query` (§6.6, §9.6).
+16. **The optimizer suggests and never applies.** Deterministic rewrites come first and
+    the `optimize` role second. A candidate must lower the estimated cost, return equal
+    results under §6.7.5 and run faster before it is offered, and the person applies it
+    to the editor. The planner never calls a model. MCP gets `optimize_query` with the
+    same checks (§6.7, §9.7).
+17. **Phasing.** The role lists and the evaluation matrix are in Phase 1, escalation in
+    Phase 2, explanations in Phase 2b right after it, and the optimizer in Phase 6,
+    with its deterministic checks in 6a before the model in 6b (§12).
+
+Three questions are open.
+
+1. **Server models behind MCP.** This revision keeps MCP's `explain_query` and
+   `optimize_query` free of the server's providers (§13). An operator might want agents
+   with weak models to get the server's prose or proposals. A per-dataset switch could
+   allow it later, with the cost counted against the agent's principal.
+2. **OCR in release builds.** `pdf-ocr` is left out of release builds because it needs
+   PDFium and ONNX Runtime at run time and adds about 132 crates that the server does
+   not link today. A separate release artifact with OCR is possible if operators ask
+   for it.
+3. **Recording acceptance.** The routing log counts **Correct**, the example buttons,
+   **Not correct** and **Try harder** as outcomes, and an edited-then-run query as
+   `edited`. Whether an answer that a person runs without comment should count as
+   accepted is left to the first months of logs.
 
 ## 15. Acceptance examples
 
@@ -1612,7 +2529,8 @@ dataset `org` with a text index over `rdfs:label` and `foaf:name` and the shapes
 - **A11.** Registering a changed version of the note, in which Ana's team is no longer
   mentioned, and re-extracting retracts `res:ana ex:memberOf res:payments` from the
   source's graph on the review branch, and the old reifier has `prov:wasInvalidatedBy`.
-- **A12.** With `assistant.json` naming a mock provider and `send: "schema"`,
+- **A12.** With the assistant enabled, a mock provider as the only pair of every role
+  and `send: "schema"`,
   `POST /org/ask` with "How many people work for Acme?" streams `ground`, `draft`,
   `check`, `run` and `result` events and no `summary`, and the mock provider's log shows
   no result rows in any request.
@@ -1632,8 +2550,9 @@ dataset `org` with a text index over `rdfs:label` and `foaf:name` and the shapes
   provider that returns an update in response gets `not-a-query` and no write happens.
 - **A18.** A CSV of 10,000 rows ingested with a provider makes at most two model calls
   for the mapping, and the dry run of the converted upload shows 10,000 rows' triples.
-- **A19.** `PUT /$/assistant/org` with a `provider` that the server does not define, or
-  with any `apiKey` or `endpoint` member, answers `400`. A provider whose secret is
+- **A19.** `PUT /$/assistant/org` with a role entry whose `provider` the server does
+  not define, with a model outside that provider's `allowedModels`, with an unknown
+  role, or with any `apiKey` or `endpoint` member, answers `400`. A provider whose secret is
   missing shows `secret-missing` in `GET /$/models`, and no response of any endpoint
   contains a configured key.
 - **A22.** With the run mode set to **Preview first**, asking "Who is on the payments
@@ -1689,6 +2608,98 @@ dataset `org` with a text index over `rdfs:label` and `foaf:name` and the shapes
 - **A21.** As a principal with `read` on `https://example.org/hr` only, the Memory page
   lists no agent, source or review branch from the notes graphs, and the Memory tab of
   `ex:ana` shows only the facts of the HR graph.
+
+The examples below cover the decisions added later on 2026-10-09. Mock providers named
+`cheap`, `mid` and `top` stand for three pairs of one list, and each logs the requests
+it receives.
+
+- **A35.** With `roles.draft` set to `cheap`, `mid` and `top`, and `roles.summarize` to
+  `cheap`, an easy question is drafted and summarized by `cheap` alone. The `usage`
+  event lists two steps, both answered by `cheap`, and `mid` and `top` received no
+  request.
+- **A36.** With `roles.repair` set to `mid` and `top`, a draft from `cheap` that uses
+  `foaf:Organisation` is repaired by `mid`. When `mid`'s repair still has an
+  `unknown-class` error, an `escalate` event with signal `check-failed` follows, and
+  the next repair comes from `top`. No later step of that ask uses `mid` for `repair`.
+- **A37.** A repaired query that matches `foaf:name "Ana Lima"` against names tagged
+  `@en` returns no rows, `why_empty` answers `verdict: "query"` with the
+  `language-tag` issue, and the next repair uses the next pair. A query whose patterns
+  all match alone but whose join is empty gets `verdict: "data"`, and the pipeline
+  stops with the empty result and makes no further model call.
+- **A38.** When `cheap` times out, the same draft step runs on `mid` with signal
+  `provider-failure`. When `cheap` answers `stop_reason: "refusal"` as an `anthropic`
+  mock, or returns invalid JSON twice, the same happens. An ask in which every pair
+  fails ends with `provider-unavailable`, and no more than two failed calls were made.
+- **A39.** A draft with two aggregates, a subquery and a `MINUS` scores at least 8, and
+  its first repair goes to the second pair of `repair`. A draft with one triple pattern
+  scores 0, and its repair goes to the first pair. A follow-up question whose
+  `context` query scores 9 is drafted by `mid`.
+- **A40.** **Try harder** on an answer drafted by `cheap` sends `tryHarder` with the
+  ask's id, and the new draft comes from `mid`. On an answer drafted by `top`, the
+  button is not shown.
+- **A41.** After **Correct** on one answer and **Not correct** on another, the asker's
+  history holds both routing records with outcomes `accepted` and `rejected`, and
+  `GET /$/models/usage` as a server admin counts one of each for the pairs that
+  answered, with no question or query text in the response. With `historyDays: 0`,
+  the counts still change and no record is kept.
+- **A42.** With `sendByProvider: {"top": "schema"}` and `roles.summarize` set to `top`
+  only, an ask that runs its query returns the rows and no summary, and `top`'s log
+  holds no result row. With `summarize` set to `cheap` and `top`, `cheap` writes the
+  summary.
+- **A43.** `scripts/eval-ask` with two pairs on the demo set writes a report with a row
+  per pair and role, giving accuracy overall and by complexity bucket, the valid-output
+  rate, median and 95th-percentile latency, tokens and estimated cost per question and
+  per correct answer, and a cascade row with the share answered by each pair.
+- **A44.** With no `explain` role, `POST /org/sparql/explain` with `profile: "run"` for
+  a query whose `HashJoin` takes most of the time returns a plan whose nodes all have
+  `id`s, a `dominant` note on that join's id, a `misestimate` note where actual and
+  estimated rows differ ten times, and a description with `source: "template"` whose
+  every sentence names at least one node id of the plan.
+- **A45.** With an `explain` mock that returns one sentence citing node `0.9`, which the
+  plan lacks, and a note on node `0.1` that says "took 40 s" when the node took 2 s,
+  the response drops the sentence and replaces the note with the deterministic one.
+- **A46.** A query stopped by a 2-second timeout fails as before, and its error body in
+  the `application/x-sparkles+json` format carries the plan with `complete: false` on
+  the nodes still running. **Explain why** shows the `budget` note first, naming the
+  timeout, then the `dominant` note on the node with the most own time, with its counts
+  marked partial.
+- **A47.** MCP `explain_query` without new arguments answers as before. With
+  `profile: "run"` and `notes: true` it adds `nodes` and `notes` with node ids and
+  `asks` with `source: "template"`, and the server's providers receive no request.
+  As a principal limited by C12, `estimatedRows` is reported as hidden, not as 0.
+- **A48.** In the UI, selecting a `‹Filter›` link in the explanation panel selects and
+  scrolls to that node in the plan tree, and hovering the node highlights the sentences
+  that cite it.
+- **A49.** `POST /org/sparql/optimize` for a query with `FILTER(regex(?name, "^Ana"))`
+  offers the `regex-prefix` rewrite with `verdict: "faster"`, results equal as a bag,
+  median times of both queries and paired node timings. The editor's text is unchanged
+  until **Apply**, which replaces it as one undoable change and does not run it.
+- **A50.** A mock `optimize` candidate that removes a `DISTINCT` and returns 12 rows
+  where the original returns 14 is rejected with `results-differ`, listing the missing
+  rows. A candidate that changes the projected variables is rejected with
+  `form-changed` before anything runs. A candidate whose estimated cost does not drop is
+  rejected with `not-cheaper` before anything runs.
+- **A51.** For a query with `LIMIT 10` and no `ORDER BY`, a rewrite whose limited rows
+  differ from the original's is accepted when both queries without the `LIMIT` return
+  equal bags, and the panel says that the rows shown may differ. For a query ordered by
+  `?year` in which three rows tie on 2024, a rewrite that returns those three rows in
+  another order is equal, and one that moves a 2023 row before a 2024 row is not.
+- **A52.** A query that calls `NOW()` gets `not-verifiable` from **Optimize**. A query
+  that runs out of its timeout gets `original-unfinished`.
+- **A53.** MCP `optimize_query` with one rewrite from the agent returns its verdict with
+  `source: "agent"` next to the rule-based candidates, and the server's providers
+  receive no request.
+- **A54.** With the `pdf` feature, ingesting a born-digital PDF of three pages registers
+  a Markdown rendition with a `<!-- Page N -->` marker before each page and three
+  `spk:pageStart` values. A fact whose span covers a sentence of page 2 passes the span
+  check, and the review page shows it on page 2.
+- **A55.** Without the `pdf-ocr` feature, a scanned PDF is refused with `needs-ocr`
+  listing every page, and no source is registered. A mixed PDF whose page 3 is scanned
+  is refused with page 3 and the reason `scanned`. With `allowPartial: true`, it is
+  registered from pages 1, 2 and 4, and the rendition records page 3 as left out.
+- **A56.** A build without the `pdf` feature refuses a PDF with `unsupported-format`.
+  The same PDF converted twice by one build gives the same digest and the same
+  rendition IRI.
 
 ## 16. Sources
 
@@ -1763,10 +2774,26 @@ dataset `org` with a text index over `rdfs:label` and `foaf:name` and the shapes
   `tool_choice` as not supported. OpenAI, "Introducing Structured Outputs in the API"
   (2024). The llama.cpp server's documentation of JSON Schema and grammar constraints,
   including the subset of JSON Schema it supports.
+- pdf-inspector, its README, crate documentation and source at version 1.25.2
+  (github.com/firecrawl/pdf-inspector, crates.io/crates/pdf-inspector), for
+  `process_pdf`, `PdfProcessResult`, `pages_needing_ocr`, the OCR reasons, the Markdown
+  options and the cargo features. Its dependency tree and licenses were read with
+  `cargo tree` in a scratch crate, for the default features and for `ocr`. PDFium's
+  BSD-3-Clause license and ONNX Runtime's MIT license, for the OCR feature's native
+  libraries.
+- Chen, Zaharia and Zou, "FrugalGPT: How to Use Large Language Models While Reducing
+  Cost and Improving Performance" (arXiv:2305.05176, 2023), for cascades of models.
+  Ong et al., "RouteLLM: Learning to Route LLMs with Preference Data" (ICLR 2025,
+  arXiv:2406.18665), for learned routers and the preference data they need.
+- Anthropic's model and pricing documentation of October 2026, for the model names and
+  list prices of the example configuration, and for the `refusal` stop reason and the
+  refusal of forced `tool_choice` by current models.
 - The Sparkles code, in particular the MCP server in `crates/sparkles-server/src/mcp/`,
-  the UI in `ui/` and its content security policy in `crates/sparkles-server/src/ui.rs`,
-  and the specs C01, C02, C05, C09, C10, C11, C12, C12b, C15, C16, C17, F03, F04, F06,
-  F08 and F09.
+  the UI in `ui/` with `PlanView` in `ui/src/lib/components/PlanView.svelte`, the plan
+  structures in `crates/sparkles-core/src/sparql/exec.rs`, `plan.rs` and `cursor.rs`,
+  and the content security policy in `crates/sparkles-server/src/ui.rs`, and the specs
+  C01, C02, C05, C09, C10, C11, C12, C12b, C15, C16, C17, F03, F04, F06, F08, F09, X04
+  and X05.
 
 ## Outcome
 
