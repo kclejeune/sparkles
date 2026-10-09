@@ -14,6 +14,7 @@ use rand::random;
 use std::borrow::Cow;
 use std::char;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::mem::take;
 #[cfg(feature = "standard-unicode-escaping")]
 use std::str::Chars;
@@ -39,7 +40,8 @@ fn arq_aggregate(local: &str) -> NamedNode {
 pub struct SparqlParser {
     base_iri: Option<Iri<String>>,
     prefixes: HashMap<String, String>,
-    custom_aggregate_functions: HashSet<NamedNode>,
+    /// shared, so that a parser with many custom aggregates is cheap to clone
+    custom_aggregate_functions: Arc<HashSet<NamedNode>>,
     /// Reject Jena ARQ's syntax extensions (see [`SparqlParser::with_arq_syntax`]).
     sparql_only: bool,
 }
@@ -107,7 +109,19 @@ impl SparqlParser {
     /// ```
     #[inline]
     pub fn with_custom_aggregate_function(mut self, name: impl Into<NamedNode>) -> Self {
-        self.custom_aggregate_functions.insert(name.into());
+        Arc::make_mut(&mut self.custom_aggregate_functions).insert(name.into());
+        self
+    }
+
+    /// Adds a set of custom aggregate functions at once. A parser that has none yet shares
+    /// the set rather than copying it, so a set built once costs nothing per parser.
+    #[inline]
+    pub fn with_custom_aggregate_functions(mut self, names: &Arc<HashSet<NamedNode>>) -> Self {
+        if self.custom_aggregate_functions.is_empty() {
+            self.custom_aggregate_functions = Arc::clone(names);
+        } else {
+            Arc::make_mut(&mut self.custom_aggregate_functions).extend(names.iter().cloned());
+        }
         self
     }
 
@@ -1062,7 +1076,7 @@ enum Either<L, R> {
 pub struct ParserState {
     base_iri: Option<Iri<String>>,
     prefixes: HashMap<String, String>,
-    custom_aggregate_functions: HashSet<NamedNode>,
+    custom_aggregate_functions: Arc<HashSet<NamedNode>>,
     used_bnodes: HashSet<BlankNode>,
     currently_used_bnodes: HashSet<BlankNode>,
     aggregates: Vec<Vec<(Variable, AggregateExpression)>>,
@@ -1074,7 +1088,7 @@ impl ParserState {
     pub(crate) fn new(
         base_iri: Option<Iri<String>>,
         prefixes: HashMap<String, String>,
-        custom_aggregate_functions: HashSet<NamedNode>,
+        custom_aggregate_functions: Arc<HashSet<NamedNode>>,
     ) -> Self {
         Self {
             base_iri,
