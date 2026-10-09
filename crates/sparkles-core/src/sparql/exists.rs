@@ -682,6 +682,24 @@ fn build_streaming(
     let mut charge = ctx.retained_charge(1024)?;
     let mut one: FxHashSet<Id> = FxHashSet::default();
     let mut many: FxHashSet<Box<[Id]>> = FxHashSet::default();
+    // Size the set for the pattern's estimated solutions when a quarter of the
+    // remaining budget covers them, so that it does not rehash as it fills. Growing
+    // from empty spent a fifth of a NOT EXISTS query in rehashing.
+    let expected = node.est.clamp(0.0, u32::MAX as f64) as usize;
+    let mut floor = 1024;
+    let presized = expected as u64 * entry + 1024;
+    if let Some(retained) = charge.as_mut()
+        && expected > 0
+        && presized < ctx.memory_remaining() / 4
+    {
+        retained.resize(presized)?;
+        floor = presized;
+        if width == 1 {
+            one.reserve(expected);
+        } else {
+            many.reserve(expected);
+        }
+    }
     let mut solutions = 0usize;
     super::cursor::drain(ctx, node.clone(), &mut |t: &Table| {
         let cols: Vec<&[Id]> = keys
@@ -698,7 +716,7 @@ fn build_streaming(
         let held = one.len() + many.len();
         // Reserve for every row of the batch being new before the set grows.
         if let Some(charge) = charge.as_mut() {
-            charge.resize((held + t.len()) as u64 * entry + 1024)?;
+            charge.resize(((held + t.len()) as u64 * entry + 1024).max(floor))?;
         }
         if width == 1 {
             one.extend(cols[0].iter().copied());
@@ -709,7 +727,7 @@ fn build_streaming(
         }
         solutions += t.len();
         if let Some(charge) = charge.as_mut() {
-            charge.resize((one.len() + many.len()) as u64 * entry + 1024)?;
+            charge.resize(((one.len() + many.len()) as u64 * entry + 1024).max(floor))?;
         }
         Ok(())
     })?;
