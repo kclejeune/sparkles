@@ -1684,9 +1684,12 @@ listed in `known-failures.txt`.
 [FEATURES.md](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) has the
 current numbers. SHACL stayed at 98/98 + 20/20 through the shared-code moves.
 
-**Performance.** `mise run bench:shex` and `bench:shex-write` exist, but
-[BENCHMARKS.md](../BENCHMARKS.md) publishes no ShEx numbers, so the §9 targets are
-unverified.
+**Performance.** [BENCHMARKS.md](../BENCHMARKS.md) now publishes ShEx numbers from
+`forge` on 2026-10-08. Full validation of 152,000 shape associations over 1.05M triples
+took 1.532 s in parallel and 2.192 s sequentially, medians of 5. Both miss the §9
+targets of 350 ms and 1.5 s. On the same run SHACL took 449 ms and 933 ms, so ShEx is
+3.4 and 2.3 times slower than SHACL, where §9 allowed twice. The write-time comparison
+meets its target, because `reject` stays within full validation plus 10 ms.
 
 **Incremental guard validation** landed on 2026-10-02 with C10 Phase 2. The guard keeps
 the counts of the head's result map, in memory and in `validation-status.json`. A write

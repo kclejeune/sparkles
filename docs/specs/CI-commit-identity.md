@@ -880,8 +880,9 @@ writes, `If-None-Match: *` creation, concurrent `PUT`s with one tag, messages on
 Graph Store writes and uploads, their rejection, and CORS.
 
 **Not built in Phase 3.** Catalog pruning and the long-poll change feed were left to
-later work, and both landed afterwards, as the next paragraph describes. The UI does not
-show messages. `/{ds}/update` takes no `If-Match`, because a tag names a
+later work, and both landed afterwards, as the next paragraph describes. The UI showed
+no messages at first. Its commit graph now shows each commit's message in the list and
+in the commit's details. `/{ds}/update` takes no `If-Match`, because a tag names a
 representation of a graph and an update has none.
 
 **Pruning and the change feed** landed on 2026-10-02, after Phase 3. This answers open

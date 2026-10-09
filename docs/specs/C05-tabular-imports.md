@@ -561,9 +561,10 @@ file takes about five times the table's size on disk until the load ends.
 
 **Not built.** RML, R2RML and YARRRML mappings, CSVW's standard mode, primary-key and
 foreign-key checks, templates over the target dataset, Tarql's extension functions, CSV
-in the Graph Store protocol, mappings stored on the server, and CSV loading in the Python
-package (`Dataset.load`) were not built. Python was left out because it needs a new
-method, its type stubs and tests, and the CLI covers the use until then.
+in the Graph Store protocol and mappings stored on the server were not built. CSV loading
+in the Python package was left out at first and came later. `Dataset.load` reads a CSV
+or TSV table, with the `mapping`, `template` and `key` arguments, when its format or the
+file's extension says so.
 
 **Later.** The UI's upload form at first sent no `base`, `mapping` or `template`, so a
 CSV file uploaded from it was refused with `400`. Once a CSV or TSV file is chosen, the

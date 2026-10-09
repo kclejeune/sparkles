@@ -1141,7 +1141,8 @@ French. `ex:Employee rdfs:subClassOf ex:Person`. Some `ex:Org` nodes have `ex:na
 
 ## Outcome
 
-**Phase 1 delivered on 2026-10-02.** Phases 2 and 3 are not built.
+**Phase 1 delivered on 2026-10-02.** Of Phase 2, only the MCP tool `graphql_query` is
+built, as the later additions below describe. Phase 3 is not built.
 
 - The crate `sparkles-graphql` holds the adapter. `mapping` parses the SDL with
   `apollo-compiler` next to a prelude that declares the four directives, the scalars the
@@ -1246,9 +1247,10 @@ Assembly runs the generic executor once per object and builds a JSON value per f
 and it was not profiled further. The single SPARQL query was slower than the adapter for
 the lookup and the filtered page, and faster for the two pages of 1,000 people.
 
-**Not built.** Phases 2 and 3 were not built. Phase 2 holds the UI's GraphQL page and
-schema editor, stored GraphQL queries, `persistedOnly`, the MCP tools,
-`QueryOptions::seed` and the per-group top-k, and Phase 3 holds subscriptions. Nested
+**Not built.** Phase 2 holds the UI's GraphQL page and schema editor, stored GraphQL
+queries, `persistedOnly`, the MCP tools of stored queries, `QueryOptions::seed` and the
+per-group top-k, and none of these is built. Its `graphql_query` tool came later. Phase 3
+holds subscriptions and is not built. Nested
 lists are not connections, and a nested `first` limits the response while the engine
 produces every value of the field.
 

@@ -427,7 +427,8 @@ was already a workspace dependency.
 
 **Deviations from the spec.**
 * **The Python bindings** gained `Dataset.validate_shacl(..., format="shaclc")`, which §2.1
-  did not list. The MCP tool `draft_shapes` still returns Turtle or ShExC only.
+  did not list. The MCP tool `draft_shapes` returned Turtle or ShExC only at first. It
+  now takes `shapesFormat: "shaclc"` for a SHACL draft in the compact syntax.
 * **The writer's order of atoms.** A property line is written as its path, the node kind,
   the type, the count, shape references, parameters, `!` and `|`, and nested bodies last.
   This follows the Note's examples (`ex:ssn xsd:string [0..1] pattern=…`). §5 did not fix

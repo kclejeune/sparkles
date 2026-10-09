@@ -787,9 +787,11 @@ that other builds kept at a load of about 55:
 - eight of the benchmark's ordinary queries get the same plans from main and from this
   branch, and their timings, interleaved over 11 rounds, differ only by noise.
 
-**Not built.** ARQ's other path forms (`:p^:q`, `distinct(…)`, `shortest(…)`,
+**Not built in Phase 1.** ARQ's other path forms (`:p^:q`, `distinct(…)`, `shortest(…)`,
 `multi(…)`), `SEMIJOIN`, `ANTIJOIN`, `LET`, `UNFOLD` and the `JSON` query form (§1
-non-goals), and parallel evaluation of `LATERAL` groups.
+non-goals), and parallel evaluation of `LATERAL` groups. Phase 3 later built the path
+forms, `SEMIJOIN`, `ANTIJOIN`, `LET` and `UNFOLD`. The `JSON` query form and parallel
+`LATERAL` are still not built.
 
 **Phase 2, delivered.** Configurable DESCRIBE landed on 2026-10-02 as §11 designs it:
 - `sparql/describe.rs` with `DescribeMode` (`cbd`, `scbd`, `outgoing`) and
@@ -851,8 +853,10 @@ filter them, so no extra scans are made. Reifier lookups run only when the store
 scan per described triple. `scbd` adds one object-prefix scan per node.
 
 **Phase 2, not built.** Handlers registered by users, the inverse functional form of the
-submission, DESCRIBE options in Python, in Python transactions and in the remote
-client, and a UI control for the setting.
+submission, and DESCRIBE options in the remote client. DESCRIBE options in Python and in
+Python transactions came later, as the `describe` argument of queries, and so did the UI
+control, the dataset page's DESCRIBE panel. The local `sparkles query` takes
+`--describe` too.
 
 **Phase 3, delivered.** The rest of ARQ's language and library landed on 2026-10-03 as
 §12 designs it:

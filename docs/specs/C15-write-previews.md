@@ -716,5 +716,6 @@ path. No separate benchmark was run.
 the same flags, so a patch can be previewed like any other write.
 
 **Not built.** The open questions of §9 keep their defaults. Dry runs are refused on
-read-only servers, a bulk dry run builds its generation, only dry runs roll their
-vocabulary back, and the CLI has no `--dry-run`. The UI does not offer previews.
+read-only servers, and a bulk dry run builds its generation. Only dry runs rolled their
+vocabulary back at first. A failed load now removes its terms too. The local `update`,
+`load` and `infer` commands have no `--dry-run`, and the UI does not offer previews.

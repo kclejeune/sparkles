@@ -1500,10 +1500,12 @@ tags, the budget, `Accept-Datetime`, the history settings and metrics, in-memory
 and `at` on stats, schema, SHACL, clone and backup. `ui/src/lib/history.test.ts` covers
 selector parsing, the result label and diff formatting.
 
-**Not built.** The replay speedups of §5.3 (reusing a cached delta, replaying backwards
-and the sparse offset index), `warm` pins, and clones into an in-memory dataset are not
-built. Nor is Phase 3: a generation-independent change log, full-text search at pins,
-history queries and pin rebasing.
+**Not built in Phase 2.** The replay speedups of §5.3 (reusing a cached delta, replaying
+backwards and the sparse offset index), `warm` pins, clones into an in-memory dataset and
+Phase 3 were left for later. The sections below record what came afterwards. The replay
+speedups and `warm` pins came next, clones into an in-memory dataset came with C06, and
+Phase 3 brought the change log and history queries. Full-text search at pins and pin
+rebasing are still not built.
 
 ### Replay speedups, RDF Patch and the change feed
 
@@ -1621,8 +1623,8 @@ gaps and the commit watch. `http/diff_tests.rs` covers the patch formats, the fe
 JSON and patches, long polling, server-sent events with `Last-Event-ID`, the budget,
 `410` and warm pins over HTTP. Unit tests cover the index and the Thrift encoding.
 
-**Still not built.** The feed is per dataset, not per graph, and Phase 3 remains later
-work. Applying RDF Patch came later with [F10](F10-replication.md) Phase 1, at
+**Still not built.** The feed is per dataset, not per graph. Phase 3 was later work at
+the time and has since landed, as the Phase 3 section describes. Applying RDF Patch came later with [F10](F10-replication.md) Phase 1, at
 `/{ds}/patch`. Clones into an in-memory dataset came with
 [C06](C06-clone-to-sandbox.md).
 

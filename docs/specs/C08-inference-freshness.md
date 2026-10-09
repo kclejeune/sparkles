@@ -1089,8 +1089,9 @@ hierarchies. The server tests cover the input fields, the recorded status, stale
 from named graphs before and after a restart, re-runs, fetched imports under
 `--load-dir` with a refresh, and `/$/rdfs/{ds}` with persistence.
 
-**Phase 4 not built.** The Python bindings and the UI have no input graph or RDFS-on-read
-settings. Inside `*`, `+` and `?`, an `rdf:type` link and a negated property set match
+**Phase 4 not built.** The UI has no input graph or RDFS-on-read settings. The Python
+bindings lacked them at first and have them now, as `inputs` on `reasoning.run` and the
+`reasoning.rdfs` setting. Inside `*`, `+` and `?`, an `rdf:type` link and a negated property set match
 stored triples only, and Graph Store reads and DESCRIBE's descriptions show stored
 triples. Diagnostics still include the inferences by default only when the default graph
 is checked. Jena's ontology document manager also reads an `ont-policy.rdf`, can skip

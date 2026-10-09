@@ -1835,7 +1835,10 @@ query rewrite, and the others against the plain data. Without the extensions the
 buffer computed another way, and rewrite answers that DE-9IM does not give.
 
 **Performance.** The index adds no measurable commit latency ([commit
-cost](../BENCHMARKS.md#spatial-index-commit-cost)). The §9 query targets have not been
-measured. The cell grid made 200,000 `sfContains` tests against a 1,024-vertex polygon
+cost](../BENCHMARKS.md#spatial-index-commit-cost)). The §9 query targets are set at
+N = 1M and have not been measured at that size.
+[BENCHMARKS.md](../BENCHMARKS.md#spatial-queries) publishes Q1 to Q9 at 100,000 points
+from `forge` on 2026-10-08, with the index 1.3 to 68 times faster than without it and
+the same answers both ways. The cell grid made 200,000 `sfContains` tests against a 1,024-vertex polygon
 4.3 times faster (60 ms instead of 256 ms) and 5.4 times faster against a 16,384-vertex
 one, for about 16 bytes per region vertex, up to 64 KiB per region.
