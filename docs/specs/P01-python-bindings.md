@@ -869,3 +869,41 @@ iterating every triple went from 179 to 95 ms [82], `(s ? ?)` for 1,000 subjects
 `Graph.value` lookups from 8.5 to 4.6 ms [3.1], and a small SELECT through
 `Graph.query` from 0.67 to about 0.11 ms. Adds were unchanged. These figures are
 directional, and a quiet-machine run of the comparison is the authority.
+
+**Transaction writes and pyoxigraph (2026-10-09).** A second round compared the native
+API with pyoxigraph and the plugin with rdflib's Memory store again. Four changes
+followed.
+
+* A transaction's request no longer has to wake a sleeping thread in either direction.
+  The caller waits for the answer by spinning for up to 20 µs without the GIL before it
+  sleeps, and the transaction's thread spins for up to 50 µs for the next request. The
+  caller also takes a free request channel without giving up the GIL. The spins cost up
+  to 20 µs of the caller's core per slow request and up to 50 µs of one core after the
+  last request of a transaction.
+* On a dataset in memory, `quads_for_pattern` plans its scan and reads the first 16 quads
+  with the GIL held, and `in` looks the quad up with the GIL held. Both take less time
+  than giving up the GIL and taking it back. A dataset on disk keeps the detached path,
+  because its reads may wait on a file.
+* A scan that returns fewer quads than a batch ends there, so the iterator does not ask
+  the source again.
+* The rdflib plugin answers a fully bound pattern in a known graph, which is what
+  `(s, p, o) in graph` asks, with one lookup. It yields the caller's own nodes, which
+  equal the stored ones.
+
+A variant that kept the Python object of each term on its `Quad`, so that a second read
+of `q.subject` returned the same object, made iteration about 25% slower when each term
+is read once, which is the common case. It was dropped.
+
+The comparison ran A/B/B/A in fresh processes pinned to six cores of an 8-vCPU AMD EPYC
+instance on Namespace, at 105,000 triples, with six process medians per arm. Figures
+before and after are below, with pyoxigraph in brackets. A single `tx.add` went from 13
+to 17 µs before to between 4 and 7 µs after [5.0], so it now ties pyoxigraph's `extend`.
+Iterating every quad took 106 and 102 ms [119], `(s ? ?)` took 9.7 and 9.4 µs per subject
+[9.7], `(? p o)` over 2,983 matches took 2.5 ms in both [2.9], `in` took 1.1 µs in both
+[1.4], and the first object of `(s p ?)` took 1.7 µs in both [1.6]. The laptop runs that
+had shown iteration 1.2 to 1.4 times slower than pyoxigraph did not reproduce on this
+machine. A small SELECT with a `VALUES` block of five subjects took about 260 µs against
+pyoxigraph's 126 µs, and that gap lies in query planning and evaluation, not in the
+binding. Through the plugin, with the Memory store in brackets, 1,000 `contains` probes
+went from 4.6 to 3.3 µs each [2.6] and `Graph.value` from 6.2 to 5.7 µs [4.7], while
+`(? p o)` stayed at about 5.1 ms [3.5].
