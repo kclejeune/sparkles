@@ -638,28 +638,55 @@ mod tests {
         assert_eq!(s.text_status().unwrap().state, "ready");
     }
 
+    /// The threads whose panic has started. A pause releases its worker once the test
+    /// that set it panics, because the test's stores are dropped before the pause and
+    /// their drop waits for that worker.
+    fn panicked() -> &'static Mutex<Vec<std::thread::ThreadId>> {
+        static PANICKED: OnceLock<Mutex<Vec<std::thread::ThreadId>>> = OnceLock::new();
+        PANICKED.get_or_init(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                panicked().lock().push(std::thread::current().id());
+                previous(info);
+            }));
+            Default::default()
+        })
+    }
+
+    /// Stops the recovery worker of `root` at the hook `name` until [`Pause::resume`],
+    /// until the pause is dropped, or until the test that set it panics. The worker
+    /// waits without a time limit, so the test may take as long as it needs between
+    /// [`Pause::reached`] and [`Pause::resume`] on a loaded machine.
     struct Pause {
         root: PathBuf,
         name: &'static str,
         ready: mpsc::Receiver<()>,
         release: Option<mpsc::Sender<()>>,
-        timeout: Duration,
     }
     impl Pause {
         fn new(root: &Path, name: &'static str) -> Self {
-            Self::with_timeout(root, name, Duration::from_secs(10))
-        }
-        fn with_timeout(root: &Path, name: &'static str, timeout: Duration) -> Self {
             let (notify, ready) = mpsc::channel();
-            let (release, rx) = mpsc::channel();
+            let (release, rx) = mpsc::channel::<()>();
             let rx = Mutex::new(rx);
             let once = AtomicBool::new(false);
+            let owner = std::thread::current().id();
+            panicked();
             hooks().lock().insert(
                 (root.to_path_buf(), name),
                 Arc::new(move || {
-                    if !once.swap(true, Ordering::SeqCst) {
-                        notify.send(()).unwrap();
-                        rx.lock().recv_timeout(timeout).unwrap();
+                    if once.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    notify.send(()).unwrap();
+                    let rx = rx.lock();
+                    // A resume or a dropped pause releases the worker. The poll only
+                    // looks for a panic of the test that owns the pause.
+                    while let Err(mpsc::RecvTimeoutError::Timeout) =
+                        rx.recv_timeout(Duration::from_millis(20))
+                    {
+                        if panicked().lock().contains(&owner) {
+                            return;
+                        }
                     }
                 }),
             );
@@ -668,11 +695,12 @@ mod tests {
                 name,
                 ready,
                 release: Some(release),
-                timeout,
             }
         }
+        /// Wait for the worker to reach the hook. The bound is on the progress of a
+        /// small recovery build, not on anything the test does.
         fn reached(&self) {
-            self.ready.recv_timeout(self.timeout).unwrap();
+            self.ready.recv_timeout(Duration::from_secs(10)).unwrap();
         }
         fn resume(&mut self) {
             self.release.take().unwrap().send(()).unwrap();
@@ -761,13 +789,8 @@ mod tests {
         let root = dir.path();
         populate(root);
         std::fs::remove_dir_all(root.join("text")).unwrap();
-        // Preparing a large RDF tail can take longer than the short pause used by
-        // the other tests when the workspace suite is competing for disk I/O.
-        let pause = Pause::with_timeout(root, "quota-checked", Duration::from_secs(60));
+        let mut pause = Pause::new(root, "quota-checked");
         let store = Store::open(root, StoreOptions::default()).unwrap();
-        // Rebinding the pause drops it before the store. A failed assertion then
-        // releases the paused worker instead of leaving the store's drop to wait for it.
-        let mut pause = pause;
         pause.reached();
         let job = store.text_recovery.load_full().unwrap();
         let words = (0..20_000).map(|i| format!("word{i} ")).collect::<String>();
