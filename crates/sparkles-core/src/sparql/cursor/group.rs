@@ -15,26 +15,25 @@ use spargebra::algebra::AggregateFunction;
 use std::sync::Arc;
 
 /// Whether an aggregate keeps running state: COUNT(*), or COUNT, SUM, AVG, MIN, MAX,
-/// SAMPLE, GROUP_CONCAT or an ARQ statistics aggregate of an expression without
-/// EXISTS, with or without DISTINCT. FOLD and registered aggregates need their group's
+/// SAMPLE, GROUP_CONCAT or an ARQ statistics aggregate of an expression, with or
+/// without DISTINCT. FOLD and registered aggregates need their group's
 /// rows, and so do the other custom aggregates.
 fn admitted(agg: &Agg) -> bool {
     agg.registered.is_none()
         && agg.fold.is_none()
         && match &agg.expr {
             None => matches!(agg.func, AggregateFunction::Count) && !agg.distinct,
-            Some(expr) => {
-                !expr.has_exists()
-                    && (matches!(
-                        agg.func,
-                        AggregateFunction::Count
-                            | AggregateFunction::Sum
-                            | AggregateFunction::Avg
-                            | AggregateFunction::Min
-                            | AggregateFunction::Max
-                            | AggregateFunction::Sample
-                            | AggregateFunction::GroupConcat { .. }
-                    ) || stat_aggregate(&agg.func).is_some())
+            Some(_) => {
+                matches!(
+                    agg.func,
+                    AggregateFunction::Count
+                        | AggregateFunction::Sum
+                        | AggregateFunction::Avg
+                        | AggregateFunction::Min
+                        | AggregateFunction::Max
+                        | AggregateFunction::Sample
+                        | AggregateFunction::GroupConcat { .. }
+                ) || stat_aggregate(&agg.func).is_some()
             }
         }
 }

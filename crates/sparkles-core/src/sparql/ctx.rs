@@ -757,6 +757,12 @@ impl Ctx {
         }
     }
 
+    /// The cursor's own context, for state that runs a cursor operator tree of its own
+    /// (the key set of an EXISTS pattern). `None` in eager execution.
+    pub(super) fn cursor_owner(&self) -> Option<Arc<Ctx>> {
+        self.cursor_memory.as_ref()?.owner.lock().upgrade()
+    }
+
     /// A retained cache belongs to the plan, which may also occur in context
     /// bookkeeping. Use a weak owner to avoid a plan/context reference cycle.
     pub(super) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
@@ -1445,6 +1451,10 @@ pub(super) struct RetainedCharge {
 impl RetainedCharge {
     pub(super) fn owner(&self) -> Option<Arc<Ctx>> {
         self.owner.upgrade()
+    }
+
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
     }
 
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {

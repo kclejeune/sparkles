@@ -12,11 +12,10 @@ use std::sync::Arc;
 
 pub(super) fn eligible(node: &Node) -> bool {
     node.children.len() == 2
-        && match &node.kind {
-            Kind::Join { .. } | Kind::HalfJoin { .. } | Kind::Minus => true,
-            Kind::LeftJoin { expr } => expr.as_ref().is_none_or(|e| !e.has_exists()),
-            _ => false,
-        }
+        && matches!(
+            node.kind,
+            Kind::Join { .. } | Kind::HalfJoin { .. } | Kind::Minus | Kind::LeftJoin { .. }
+        )
 }
 
 /// The input that is streamed. It matches the planner's hash probe order: the larger

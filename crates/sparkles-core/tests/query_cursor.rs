@@ -857,7 +857,7 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
 #[test]
 fn eager_fallback_is_visible_lazy_and_budgeted() {
     let s = store(100);
-    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o FILTER NOT EXISTS { ?s <urn:q> ?o } }";
+    let q = "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o BIND(STR(?o) AS ?t) ?x <http://jena.apache.org/ARQ/property#strSplit> (?t \"1\") }";
     assert!(matches!(
         select_cursor(s.snapshot(), q, &Default::default(), &options(2)),
         Err(Error::Unsupported(_))
@@ -2039,7 +2039,7 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            "SELECT * {?s ?p ?o FILTER NOT EXISTS {?o ?p ?s}}",
+            "SELECT * {?s ?p ?o BIND(STR(?o) AS ?t) ?x <http://jena.apache.org/ARQ/property#strSplit> (?t \"1\")}",
             &Default::default(),
             &strict,
             ExecutionMode::Auto,
@@ -2069,17 +2069,15 @@ fn strict_policy_admits_a_budgeted_sort_and_reports_it_as_blocking() {
             "{q}"
         );
     }
-    // An ORDER key that evaluates EXISTS runs subqueries outside the cursor, so the
-    // strict policy still refuses it.
-    assert!(matches!(
-        select_cursor(
-            s.snapshot(),
-            "SELECT ?s WHERE { ?s <urn:p> ?o } ORDER BY (EXISTS { ?s <urn:q> ?x })",
-            &Default::default(),
-            &options(2),
-        ),
-        Err(Error::Unsupported(_))
-    ));
+    // An ORDER key that evaluates EXISTS runs its pattern under the cursor's charges,
+    // so the strict policy admits it.
+    let q = "SELECT ?s WHERE { ?s <urn:p> ?o } ORDER BY (EXISTS { ?s <urn:q> ?x }) ?s";
+    let c = open(&s, q, 2);
+    assert!(!c.plan().has_materialization(), "{q}");
+    assert_eq!(
+        all(c),
+        query(s.snapshot(), q, &Default::default()).unwrap().rows()
+    );
 }
 
 #[test]
@@ -2473,16 +2471,29 @@ impl Gen {
         }
     }
 
+    /// An EXISTS or NOT EXISTS. Single triples and joins are answered from a key
+    /// set on one or more variables, a FILTER inside can make an outer variable risky,
+    /// and OPTIONAL and nested EXISTS patterns are evaluated per row.
     fn exists(&mut self) -> String {
-        let (x, y) = (self.var(), self.var());
+        let (x, y, z) = (self.var(), self.var(), self.var());
         let p = self.pick(&["<urn:p>", "<urn:q>"]);
+        let r = self.pick(&["<urn:p>", "<urn:q>"]);
         let not = ["", "NOT "][self.rng.below(2) as usize];
-        format!("{not}EXISTS {{ {x} {p} {y} }}")
+        let body = match self.rng.below(7) {
+            0 | 1 => format!("{x} {p} {y}"),
+            2 => format!("{x} {p} {y} . {y} {r} {z}"),
+            3 => format!("{x} {p} {y} FILTER({z} != {y})"),
+            4 => format!("{x} {p} {y} OPTIONAL {{ {y} {r} {z} }}"),
+            5 => format!("{x} {p}+ {y} FILTER NOT EXISTS {{ {y} {r} {z} }}"),
+            _ => format!("<urn:s:1> {p} {y} . {y} {r} {x}"),
+        };
+        format!("{not}EXISTS {{ {body} }}")
     }
 
     fn value(&mut self) -> String {
         let (x, y) = (self.var(), self.var());
-        match self.rng.below(8) {
+        match self.rng.below(9) {
+            7 => self.exists(),
             0 => x.to_string(),
             1 => format!("({x} + 1)"),
             2 => format!("COALESCE({x}, {y})"),
@@ -2496,7 +2507,7 @@ impl Gen {
 
     fn aggregate(&mut self) -> String {
         let x = self.var();
-        match self.rng.below(12) {
+        match self.rng.below(13) {
             0 => "COUNT(*)".into(),
             1 => format!("COUNT({x})"),
             2 => format!("COUNT(DISTINCT {x})"),
@@ -2508,7 +2519,8 @@ impl Gen {
             8 => format!("SUM(DISTINCT {x})"),
             9 => format!("AVG({x} * 2)"),
             10 => format!("MAX(STR({x}))"),
-            _ => format!("COUNT(DISTINCT COALESCE({x}, 0))"),
+            11 => format!("COUNT(DISTINCT COALESCE({x}, 0))"),
+            _ => format!("SUM(IF({}, 1, 0))", self.exists()),
         }
     }
 
@@ -2524,6 +2536,9 @@ impl Gen {
                 "<urn:q>/(<urn:q>|<urn:p>)",
                 "<urn:q>+",
                 "^<urn:q>*",
+                "(<urn:q>|<urn:p>)+",
+                "(<urn:q>/<urn:q>)*",
+                "^(<urn:p>|<urn:q>/<urn:q>)+",
             ]);
             let scope = [s, o].into_iter().filter(|v| v.starts_with('?')).collect();
             return (format!("{s} {p} {o} ."), scope);
@@ -2552,6 +2567,10 @@ impl Gen {
                 let (right, rs) = self.pattern(depth - 1);
                 let text = match self.rng.below(4) {
                     0 => format!("{{ {left} }} {{ {right} }}"),
+                    1 if self.rng.below(3) == 0 => {
+                        let condition = self.exists();
+                        format!("{{ {left} }} OPTIONAL {{ {right} FILTER({condition}) }}")
+                    }
                     1 => format!("{{ {left} }} OPTIONAL {{ {right} }}"),
                     2 => {
                         return (format!("{{ {left} }} MINUS {{ {right} }}"), ls);
@@ -2668,6 +2687,10 @@ impl Gen {
         };
         let (order_text, order) = match self.rng.below(6) {
             0 | 1 => (String::new(), Order::None),
+            2 if self.rng.below(3) == 0 => {
+                let condition = self.exists();
+                (format!(" ORDER BY ({condition})"), Order::Expr)
+            }
             2 => {
                 let v = self.var();
                 (format!(" ORDER BY DESC(STR({v})) {v}"), Order::Expr)
@@ -3028,10 +3051,8 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
         }
     }
     for q in [
-        "SELECT ?t (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t } GROUP BY ?t HAVING (NOT EXISTS { ?t <urn:p> 3 })",
-        "SELECT ?s ?t WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t FILTER NOT EXISTS { ?t <urn:p> 3 } }",
-        "SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s (<urn:q>/<urn:q>)+ ?x }",
-        "SELECT ?s ?x WHERE { { ?s <urn:q> ?t } UNION { ?t <urn:q> ?s } ?s (<urn:q>|^<urn:q>)* ?x }",
+        "SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(?o < 20) BIND(STR(?o) AS ?t) ?x <http://jena.apache.org/ARQ/property#strSplit> (?t \"1\") }",
+        "SELECT ?s ?x WHERE { { ?s <urn:q> ?t } UNION { ?t <urn:q> ?s } BIND(STR(?s) AS ?u) ?x <http://jena.apache.org/ARQ/property#strSplit> (?u \":\") }",
     ] {
         let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
         for rows in [1, 2, 3, 4096] {

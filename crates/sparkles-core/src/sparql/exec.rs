@@ -4441,8 +4441,8 @@ struct Graph<'a> {
     ctx: &'a Ctx,
     spec: &'a PathSpec,
     graph: GraphFilter,
-    fwd: Option<FxHashMap<u64, Vec<u64>>>,
-    bwd: Option<FxHashMap<u64, Vec<u64>>>,
+    fwd: Option<&'a FxHashMap<u64, Vec<u64>>>,
+    bwd: Option<&'a FxHashMap<u64, Vec<u64>>>,
     /// frontier levels expanded by one sweep over the predicate's index range
     sweeps: &'a std::cell::Cell<usize>,
 }
@@ -4560,11 +4560,8 @@ impl Graph<'_> {
             out.dedup();
             return Ok(out);
         }
-        let m = if forward { &self.fwd } else { &self.bwd };
-        Ok(m.as_ref()
-            .and_then(|m| m.get(&x))
-            .cloned()
-            .unwrap_or_default())
+        let m = if forward { self.fwd } else { self.bwd };
+        Ok(m.and_then(|m| m.get(&x)).cloned().unwrap_or_default())
     }
 
     /// Nodes reachable from `start` according to min/max length (ARQ ranges: once per
@@ -4790,7 +4787,7 @@ impl Graph<'_> {
                         set.insert(k[1]);
                     }
                 }
-            } else if let Some(f) = &self.fwd {
+            } else if let Some(f) = self.fwd {
                 set.extend(f.keys().copied());
             }
         } else {
@@ -4810,25 +4807,9 @@ impl Graph<'_> {
     }
 }
 
-fn path(
-    ctx: &Ctx,
-    spec: &PathSpec,
-    bound_from_left: bool,
-    mut inputs: Vec<Table>,
-    vars: &[VarId],
-) -> Result<(Table, usize)> {
-    let left = if bound_from_left { inputs.pop() } else { None };
-    let edges = inputs.pop();
-    let graphs: Vec<(GraphFilter, Option<Id>)> = match spec.graph_var {
-        None => vec![(spec.graph.clone(), None)],
-        Some(_) => {
-            let all = ctx.snap.graph_ids()?;
-            all.into_iter()
-                .filter(|g| spec.graph.accepts(g.0))
-                .map(|g| (GraphFilter::One(g.0), Some(g)))
-                .collect()
-        }
-    };
+/// The variables of a path's own solutions: its variable ends, then its graph
+/// variable.
+fn path_vars(spec: &PathSpec) -> (Option<VarId>, Option<VarId>, Vec<VarId>) {
     let (sv, ov) = (
         match spec.subj {
             PathEnd::Var(v) => Some(v),
@@ -4848,6 +4829,34 @@ fn path(
     if let Some(g) = spec.graph_var {
         pvars.push(g);
     }
+    (sv, ov, pvars)
+}
+
+/// The graphs a path is evaluated in, each with the id that its graph variable takes.
+fn path_graphs(ctx: &Ctx, spec: &PathSpec) -> Result<Vec<(GraphFilter, Option<Id>)>> {
+    Ok(match spec.graph_var {
+        None => vec![(spec.graph.clone(), None)],
+        Some(_) => {
+            let all = ctx.snap.graph_ids()?;
+            all.into_iter()
+                .filter(|g| spec.graph.accepts(g.0))
+                .map(|g| (GraphFilter::One(g.0), Some(g)))
+                .collect()
+        }
+    })
+}
+
+fn path(
+    ctx: &Ctx,
+    spec: &PathSpec,
+    bound_from_left: bool,
+    mut inputs: Vec<Table>,
+    vars: &[VarId],
+) -> Result<(Table, usize)> {
+    let left = if bound_from_left { inputs.pop() } else { None };
+    let edges = inputs.pop();
+    let graphs = path_graphs(ctx, spec)?;
+    let (sv, ov, pvars) = path_vars(spec);
     let mut out = Table::new(pvars.clone());
     let sweeps = std::cell::Cell::new(0);
     for (gf, gid) in graphs {
@@ -4878,94 +4887,204 @@ fn path(
             ctx,
             spec,
             graph: gf,
-            fwd,
-            bwd,
+            fwd: fwd.as_ref(),
+            bwd: bwd.as_ref(),
             sweeps: &sweeps,
         };
-        let push = |s: u64, o: u64, out: &mut Table| {
-            let mut row = Vec::with_capacity(pvars.len());
-            if let Some(v) = sv {
-                let _ = v;
-                row.push(Id(s));
-            }
-            if let Some(v) = ov
-                && Some(v) != sv
-            {
-                row.push(Id(o));
-            }
-            if sv.is_some() && sv == ov && s != o {
-                return;
-            }
-            if let Some(g) = gid {
-                row.push(g);
-            }
-            out.push_row(&row);
-        };
-        match (&spec.subj, &spec.obj) {
-            (PathEnd::Const(s), PathEnd::Const(o)) => {
-                // once, or once per way for a range
-                for _ in g.reach(s.0, true)?.into_iter().filter(|y| *y == o.0) {
-                    push(s.0, o.0, &mut out);
-                }
-            }
-            (PathEnd::Const(s), PathEnd::Var(_)) => {
-                for o in g.reach(s.0, true)? {
-                    push(s.0, o, &mut out);
-                }
-            }
-            (PathEnd::Var(_), PathEnd::Const(o)) => {
-                for s in g.reach(o.0, false)? {
-                    push(s, o.0, &mut out);
-                }
-            }
-            (PathEnd::Var(a), PathEnd::Var(b)) => {
-                let starts: Vec<u64> = match &left {
-                    Some(l) => {
-                        let (col, forward) = match (l.col_of(*a), l.col_of(*b)) {
-                            (Some(c), _) => (c, true),
-                            (None, Some(c)) => (c, false),
-                            _ => return Err(Error::invalid("path bound variable missing")),
-                        };
-                        let mut s: Vec<u64> = l.cols[col]
-                            .iter()
-                            .map(|x| x.0)
-                            .filter(|x| *x != 0)
-                            .collect();
-                        s.sort_unstable();
-                        s.dedup();
-                        for x in s {
-                            // variable–variable paths range over graph nodes only: a
-                            // zero-length match needs the start term to occur in the graph
-                            let in_graph = spec.min > 0 || g.is_node(x)?;
-                            for y in g.reach(x, forward)? {
-                                if y == x && spec.min == 0 && !in_graph {
-                                    continue;
-                                }
-                                if forward {
-                                    push(x, y, &mut out)
-                                } else {
-                                    push(y, x, &mut out)
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    None => g.all_nodes()?,
-                };
-                for x in starts {
-                    for y in g.reach(x, true)? {
-                        push(x, y, &mut out);
-                    }
-                    ctx.check_output(out.len(), out.width())?;
-                }
-            }
-        }
+        path_graph(&g, gid, left.as_ref(), (sv, ov, &pvars), &mut out)?;
     }
     let t = match left {
         Some(l) => join_tables(ctx, &l, &out, &[], false)?.project(vars),
         None => out.project(vars),
     };
     Ok((t, sweeps.get()))
+}
+
+/// Add the solutions of a path in one graph to `out`: from the start nodes of `left`
+/// when it has one, otherwise from every node of the graph.
+fn path_graph(
+    g: &Graph<'_>,
+    gid: Option<Id>,
+    left: Option<&Table>,
+    (sv, ov, pvars): (Option<VarId>, Option<VarId>, &[VarId]),
+    out: &mut Table,
+) -> Result<()> {
+    let (ctx, spec) = (g.ctx, g.spec);
+    let push = |s: u64, o: u64, out: &mut Table| {
+        let mut row = Vec::with_capacity(pvars.len());
+        if let Some(v) = sv {
+            let _ = v;
+            row.push(Id(s));
+        }
+        if let Some(v) = ov
+            && Some(v) != sv
+        {
+            row.push(Id(o));
+        }
+        if sv.is_some() && sv == ov && s != o {
+            return;
+        }
+        if let Some(g) = gid {
+            row.push(g);
+        }
+        out.push_row(&row);
+    };
+    match (&spec.subj, &spec.obj) {
+        (PathEnd::Const(s), PathEnd::Const(o)) => {
+            // once, or once per way for a range
+            for _ in g.reach(s.0, true)?.into_iter().filter(|y| *y == o.0) {
+                push(s.0, o.0, out);
+            }
+        }
+        (PathEnd::Const(s), PathEnd::Var(_)) => {
+            for o in g.reach(s.0, true)? {
+                push(s.0, o, out);
+            }
+        }
+        (PathEnd::Var(_), PathEnd::Const(o)) => {
+            for s in g.reach(o.0, false)? {
+                push(s, o.0, out);
+            }
+        }
+        (PathEnd::Var(a), PathEnd::Var(b)) => {
+            let starts: Vec<u64> = match left {
+                Some(l) => {
+                    let (col, forward) = match (l.col_of(*a), l.col_of(*b)) {
+                        (Some(c), _) => (c, true),
+                        (None, Some(c)) => (c, false),
+                        _ => return Err(Error::invalid("path bound variable missing")),
+                    };
+                    let mut s: Vec<u64> = l.cols[col]
+                        .iter()
+                        .map(|x| x.0)
+                        .filter(|x| *x != 0)
+                        .collect();
+                    s.sort_unstable();
+                    s.dedup();
+                    for x in s {
+                        // variable–variable paths range over graph nodes only: a
+                        // zero-length match needs the start term to occur in the graph
+                        let in_graph = spec.min > 0 || g.is_node(x)?;
+                        for y in g.reach(x, forward)? {
+                            if y == x && spec.min == 0 && !in_graph {
+                                continue;
+                            }
+                            if forward {
+                                push(x, y, out)
+                            } else {
+                                push(y, x, out)
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                None => g.all_nodes()?,
+            };
+            for x in starts {
+                for y in g.reach(x, true)? {
+                    push(x, y, out);
+                }
+                ctx.check_output(out.len(), out.width())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+type Adjacency = FxHashMap<u64, Vec<u64>>;
+
+/// The edge relation of a path over a sequence or alternative, read batch by batch
+/// from a cursor over its edge plan, as adjacency lists in both directions. When the
+/// edge plan binds the path's graph variable, the edges are kept per graph, the way
+/// [`path`] filters them.
+#[derive(Default)]
+pub(super) struct PathEdges {
+    shared: (Adjacency, Adjacency),
+    per_graph: FxHashMap<Id, (Adjacency, Adjacency)>,
+    keys: usize,
+    edges: usize,
+}
+
+impl PathEdges {
+    /// Estimated bytes once `more` edges are added. Each edge is in both lists, and
+    /// each may add a map entry with a list header at both of its ends.
+    pub(super) fn bytes_with(&self, more: usize) -> u64 {
+        let edges = self.edges.saturating_add(more) as u64;
+        let keys = self.keys.saturating_add(more.saturating_mul(2)) as u64;
+        edges
+            .saturating_mul(32)
+            .saturating_add(keys.saturating_mul(80))
+    }
+
+    /// Add the edges of one batch of the edge plan.
+    pub(super) fn add(&mut self, spec: &PathSpec, e: &Table) -> Result<()> {
+        let Some((a, b)) = spec.edge_vars else {
+            return Err(Error::invalid("a path without an edge plan"));
+        };
+        let (Some(ac), Some(bc)) = (e.col_of(a), e.col_of(b)) else {
+            return Err(Error::invalid("a path's edge plan does not bind its ends"));
+        };
+        let gc = spec.graph_var.and_then(|g| e.col_of(g));
+        for i in 0..e.len() {
+            let (x, y) = (e.cols[ac][i].0, e.cols[bc][i].0);
+            if x == 0 || y == 0 {
+                continue;
+            }
+            let (f, bw) = match gc {
+                Some(gc) => self.per_graph.entry(e.cols[gc][i]).or_default(),
+                None => &mut self.shared,
+            };
+            let fwd = f.entry(x).or_default();
+            self.keys += usize::from(fwd.is_empty());
+            fwd.push(y);
+            let back = bw.entry(y).or_default();
+            self.keys += usize::from(back.is_empty());
+            back.push(x);
+            self.edges += 1;
+        }
+        Ok(())
+    }
+
+    /// The adjacency lists of the graph that `gid` names, or of every graph.
+    fn maps(&self, gid: Option<Id>) -> (&Adjacency, &Adjacency) {
+        static EMPTY: std::sync::OnceLock<Adjacency> = std::sync::OnceLock::new();
+        match gid.map(|g| self.per_graph.get(&g)) {
+            Some(Some((f, b))) => (f, b),
+            // The edge plan binds the graph, and none of its edges is in this one.
+            Some(None) if !self.per_graph.is_empty() || self.shared.0.is_empty() => {
+                let empty = EMPTY.get_or_init(Adjacency::default);
+                (empty, empty)
+            }
+            _ => (&self.shared.0, &self.shared.1),
+        }
+    }
+}
+
+/// A path over its edge relation from the start nodes of one input batch, joined with
+/// the batch, as [`path`] evaluates it over its whole input.
+pub(super) fn path_batch(
+    ctx: &Ctx,
+    spec: &PathSpec,
+    edges: &PathEdges,
+    left: &Table,
+    vars: &[VarId],
+) -> Result<Table> {
+    let (sv, ov, pvars) = path_vars(spec);
+    let mut out = Table::new(pvars.clone());
+    let sweeps = std::cell::Cell::new(0);
+    for (gf, gid) in path_graphs(ctx, spec)? {
+        let (fwd, bwd) = edges.maps(gid);
+        let g = Graph {
+            ctx,
+            spec,
+            graph: gf,
+            fwd: Some(fwd),
+            bwd: Some(bwd),
+            sweeps: &sweeps,
+        };
+        path_graph(&g, gid, Some(left), (sv, ov, &pvars), &mut out)?;
+    }
+    Ok(join_tables(ctx, left, &out, &[], false)?.project(vars))
 }
 
 /// A transitive path without inputs, evaluated one start node at a time for cursors.
@@ -4978,21 +5097,15 @@ pub(super) struct PathWalk {
     starts: Option<Vec<u64>>,
     start: usize,
     sweeps: std::cell::Cell<usize>,
+    /// The edge relation of a path over a sequence or alternative.
+    edges: Option<PathEdges>,
 }
 
 impl PathWalk {
     pub(super) fn new(ctx: &Ctx, spec: &PathSpec, vars: &[VarId]) -> Result<Self> {
-        let graphs = match spec.graph_var {
-            None => vec![(spec.graph.clone(), None)],
-            Some(_) => ctx
-                .snap
-                .graph_ids()?
-                .into_iter()
-                .filter(|g| spec.graph.accepts(g.0))
-                .map(|g| (GraphFilter::One(g.0), Some(g)))
-                .collect(),
-        };
+        let graphs = path_graphs(ctx, spec)?;
         Ok(Self {
+            edges: None,
             spec: spec.clone(),
             vars: vars.to_vec(),
             graphs,
@@ -5010,6 +5123,11 @@ impl PathWalk {
             (PathEnd::Var(a), PathEnd::Var(b)) if a != b && spec.graph_var.is_none() => Some(*a),
             _ => None,
         }
+    }
+
+    /// Walk the edge relation read from the path's edge plan rather than the index.
+    pub(super) fn set_edges(&mut self, edges: PathEdges) {
+        self.edges = Some(edges);
     }
 
     /// The start nodes kept for the graph being walked.
@@ -5045,12 +5163,19 @@ impl PathWalk {
             let Some((gf, gid)) = self.graphs.get(self.graph).cloned() else {
                 return Ok(None);
             };
+            let (fwd, bwd) = match &self.edges {
+                Some(edges) => {
+                    let (f, b) = edges.maps(gid);
+                    (Some(f), Some(b))
+                }
+                None => (None, None),
+            };
             let g = Graph {
                 ctx,
                 spec,
                 graph: gf,
-                fwd: None,
-                bwd: None,
+                fwd,
+                bwd,
                 sweeps: &self.sweeps,
             };
             let mut out = Table::new(pvars.clone());
@@ -5091,7 +5216,16 @@ impl PathWalk {
                 }
                 (PathEnd::Var(_), PathEnd::Var(_)) => {
                     if self.starts.is_none() {
-                        self.starts = Some(walk_starts(ctx, spec, &g.graph)?);
+                        // As [`Graph::all_nodes`] finds them: the sources of the edge
+                        // relation when the path has no zero-length match.
+                        self.starts = Some(match g.fwd {
+                            Some(f) if spec.min > 0 => {
+                                let mut starts: Vec<u64> = f.keys().copied().collect();
+                                starts.sort_unstable();
+                                starts
+                            }
+                            _ => walk_starts(ctx, spec, &g.graph)?,
+                        });
                         self.start = 0;
                     }
                     let starts = self.starts.as_ref().expect("start nodes");
