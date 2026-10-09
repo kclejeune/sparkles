@@ -4,10 +4,11 @@
 >
 > **Phases:** Phase 1 is complete: Basic users, API tokens, OIDC sign-in for the UI,
 > trusted proxy headers, CLI logins, remote `query`/`update`/`load`, and the UI pages.
-> Phase 2 is complete: rate limiting of failed logins, a Content Security Policy for the
+> Phase 2 shipped: rate limiting of failed logins, a Content Security Policy for the
 > UI, native TLS, the OIDC provider's access tokens on the API, Cloudflare Access
-> assertions, idle timeouts for sessions and back-channel logout (§12.5). Open questions
-> 9 and 10 were decided with it. Phase 3, graph-level ACLs and endpoint permissions,
+> assertions, idle timeouts for sessions and back-channel logout (§12.5). Its audit
+> events for dataset admin operations were not built. Open questions 9 and 10 were
+> decided with it. Phase 3, graph-level ACLs and endpoint permissions,
 > shipped as [C12](C12-graph-access-control.md).
 >
 > **User docs:** [API: Authentication and access control](../API.md#authentication-and-access-control) · [API: Rate limiting](../API.md#rate-limiting) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
@@ -2180,5 +2181,8 @@ storing it, because a token at rest would violate §1.1.
 
 **Not built.** Sparkles has no client certificates (mutual TLS), OCSP stapling, token
 introspection (RFC 7662) for opaque access tokens or front-channel logout, and it does
-not read groups from Access's identity endpoint. Endpoint-level permissions and graph-level ACLs (Phase 3) were built later,
+not read groups from Access's identity endpoint. Phase 2's audit events for dataset
+admin operations were not built either. Sign-ins, tokens and backups emit audit events
+under `sparkles::audit`, but creating, deleting and cloning a dataset do not.
+Endpoint-level permissions and graph-level ACLs (Phase 3) were built later,
 as [C12](C12-graph-access-control.md) describes.
