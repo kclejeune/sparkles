@@ -231,14 +231,6 @@ fn graph_views_limit_the_draft() {
     assert!(!view.shacl.contains("secret"), "{}", view.shacl);
 }
 
-#[test]
-#[ignore]
-fn print_draft() {
-    let s = store(&fixture());
-    let d = draft(&s, 0.9, true, &[]);
-    println!("{}\n{}\n{}\n{}", d.shacl, d.shaclc, d.shex, d.shape_map);
-}
-
 /// Distinct focus nodes per (path, component) of a report, and the exclusions a draft
 /// of one class promises for them.
 type Counts = BTreeMap<(String, String), usize>;

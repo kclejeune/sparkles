@@ -1,5 +1,0 @@
-# Golden files whose expected outputs were written by hand from the formatting rules
-# before the printers that produce them exist. `cargo test -p sparkles-fmt --test golden`
-# skips them (and never blesses them); `-- --ignored` checks them and reports the ones
-# that pass, which then leave this list. One `<language>/<name>` per line (all its
-# variants) or `<language>/<name>.<variant>` (that variant), whitespace, and the reason.

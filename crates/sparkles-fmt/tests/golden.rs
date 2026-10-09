@@ -3,9 +3,7 @@
 //! width 40), and `<name>.<variant>.out.<ext>` with the options of
 //! `<name>.<variant>.toml` (config file keys).
 //!
-//! `SPARKLES_FMT_BLESS=1` writes the outputs instead of comparing them. Names listed in
-//! `tests/golden/pending.txt` (outputs written by hand ahead of the printers) are left
-//! out of the default run and never blessed; `-- --ignored` checks them.
+//! `SPARKLES_FMT_BLESS=1` writes the outputs instead of comparing them.
 
 use sparkles_fmt::options::{self, Value};
 use sparkles_fmt::{Language, Options, format};
@@ -102,45 +100,11 @@ fn variants(dir: &Path, name: &str, ext: &str) -> Vec<String> {
     v
 }
 
-/// `tests/golden/pending.txt`: golden names (`<language>/<name>`, every variant, or
-/// `<language>/<name>.<variant>`, that variant only) whose outputs were written by hand
-/// ahead of the printers, with the reason. The default run skips them;
-/// `cargo test -p sparkles-fmt --test golden -- --ignored` checks them.
-fn pending() -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/pending.txt");
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| {
-            let (name, reason) = l.split_once(char::is_whitespace).unwrap_or((l, ""));
-            assert!(
-                !reason.trim().is_empty(),
-                "golden/pending.txt: {name}: no reason"
-            );
-            name.to_string()
-        })
-        .collect()
-}
-
-/// Whether the golden check `key` (`<language>/<name>` for the default output,
-/// `<language>/<name>.<variant>` for a variant) is pending, by its name or by itself.
-fn is_pending(pending: &[String], key: &str) -> bool {
-    let name = match key.split_once('.') {
-        Some((name, _)) => name,
-        None => key,
-    };
-    pending.iter().any(|p| p == key || p == name)
-}
-
-/// Check the golden files `select` picks (by `<language>/<name>` for the default output,
-/// `<language>/<name>.<variant>` for a variant): `(checks, failures, keys that passed
-/// their checks)`. `bless` writes the outputs instead of comparing.
-fn run_golden(select: &dyn Fn(&str) -> bool, bless: bool) -> (usize, Vec<String>, Vec<String>) {
+/// Check every golden file: `(checks, failures)`. `bless` writes the outputs instead of
+/// comparing.
+fn run_golden(bless: bool) -> (usize, Vec<String>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
     let mut failures = Vec::new();
-    let mut passed = Vec::new();
     let mut checked = 0;
     let mut langs: Vec<_> = std::fs::read_dir(&root)
         .unwrap()
@@ -154,20 +118,8 @@ fn run_golden(select: &dyn Fn(&str) -> bool, bless: bool) -> (usize, Vec<String>
         let lang = Language::from_name(&lang_name)
             .unwrap_or_else(|| panic!("tests/golden/{lang_name}: not a language"));
         for (input, name, ext) in inputs(&dir) {
-            let key = |variant: &str| match variant {
-                "" => format!("{lang_name}/{name}"),
-                v => format!("{lang_name}/{name}.{v}"),
-            };
-            let selected: Vec<String> = variants(&dir, &name, &ext)
-                .into_iter()
-                .filter(|v| select(&key(v)))
-                .collect();
-            if selected.is_empty() {
-                continue;
-            }
             let text = std::fs::read_to_string(&input).unwrap();
-            for variant in selected {
-                let before = failures.len();
+            for variant in variants(&dir, &name, &ext) {
                 checked += 1;
                 let label = match variant.as_str() {
                     "" => format!("{lang_name}/{name}"),
@@ -212,19 +164,15 @@ fn run_golden(select: &dyn Fn(&str) -> bool, bless: bool) -> (usize, Vec<String>
                     )),
                     Err(e) => failures.push(format!("{label}: formatting the output: {e}")),
                 }
-                if failures.len() == before {
-                    passed.push(key(&variant));
-                }
             }
         }
     }
-    (checked, failures, passed)
+    (checked, failures)
 }
 
 #[test]
 fn golden_files() {
-    let pending = pending();
-    let (checked, failures, _) = run_golden(&|key| !is_pending(&pending, key), bless());
+    let (checked, failures) = run_golden(bless());
     assert!(checked > 0, "no golden files");
     assert!(
         failures.is_empty(),
@@ -234,34 +182,8 @@ fn golden_files() {
     );
 }
 
-/// The pending golden files, never blessed: their outputs are the specification.
-#[test]
-#[ignore = "golden outputs written ahead of the printers (tests/golden/pending.txt)"]
-fn pending_golden_files() {
-    let pending = pending();
-    let (checked, failures, passed) = run_golden(&|key| is_pending(&pending, key), false);
-    eprintln!(
-        "pending golden files: {} names, {checked} checks, {} failures",
-        pending.len(),
-        failures.len()
-    );
-    if !passed.is_empty() {
-        eprintln!(
-            "passing now (remove from tests/golden/pending.txt): {}",
-            passed.join(", ")
-        );
-    }
-    assert!(
-        failures.is_empty(),
-        "{} of {checked} pending golden checks failed:\n\n{}",
-        failures.len(),
-        failures.join("\n\n")
-    );
-}
-
-/// Every expected SPARQL output, pending ones included, parses to the algebra of its
-/// input and keeps its comments: the hand-written outputs pass the formatter's own
-/// safety checks before any printer produces them.
+/// Every expected SPARQL output parses to the algebra of its input and keeps its
+/// comments, so the expected outputs pass the formatter's own safety checks.
 #[test]
 fn sparql_outputs_mean_what_their_inputs_mean() {
     use sparkles_fmt::check::{comments, sparql_equivalent, sparql_reference};
@@ -293,10 +215,9 @@ fn sparql_outputs_mean_what_their_inputs_mean() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Every expected output of the RDF syntaxes, pending ones included, parses to a graph or
-/// dataset isomorphic to its input's and keeps its comments, and every expected JSON-LD
-/// output gives its input's dataset: like the SPARQL ones, the hand-written outputs pass
-/// the safety checks before any printer produces them.
+/// Every expected output of the RDF syntaxes parses to a graph or dataset isomorphic to
+/// its input's and keeps its comments, and every expected JSON-LD output gives its
+/// input's dataset.
 #[test]
 fn rdf_outputs_mean_what_their_inputs_mean() {
     use sparkles_fmt::check::{comments, graph};
