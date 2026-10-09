@@ -1641,5 +1641,8 @@ An end-to-end test runs the bridge binary against a server with authentication, 
 a login, with `--token` and with the saved login.
 
 **Not built.** OAuth protected-resource metadata, audience validation and scope
-challenges (deviation 3 of Phase 2) are still not built. MCP has no measurements in
+challenges (deviation 3 of Phase 2) are still not built. Neither are `--allow-load`, the
+`sparkles_mcp_tool_*` metrics and the access log's `mcp_tool` field (deviation 5 of
+Phase 2). Legacy `resources/subscribe` is not served, and no tool sends progress
+notifications (deviations 1 and 3 of Phase 3). MCP has no measurements in
 [BENCHMARKS](../BENCHMARKS.md).
