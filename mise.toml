@@ -17,6 +17,90 @@ shellcheck = "0.11.0"
 # version the wrapper and nixpkgs' gradle_9 pin, for `gradle wrapper` and the Nix lock file.
 java = ["temurin-17.0.20+8", "temurin-21.0.12+8.0.LTS"]
 gradle = "9.7.1"
+# Runs the Rust tests (`mise run test`), with test binaries in parallel and a summary of
+# every failure at the end
+"github:nextest-rs/nextest" = { version = "0.9.146", version_prefix = "cargo-nextest-" }
+
+# ---------------------------------------------------------------------- task caching ----
+# The check tasks of `ci` declare their inputs as `sources` and write no files
+# (`outputs = []`), so mise's task cache records each success under a key built from the
+# contents of those files, the task's definition, the resolved tools and the values below.
+# A check whose inputs have not changed since it last passed is skipped and its log
+# replayed, also in another checkout or worktree with the same files. Failures are never
+# cached. `mise run --force <task>` or `MISE_TASK_CACHE=off` runs a check regardless, and
+# `mise run --dry-run --task-cache-explain <task>` lists a key's inputs.
+
+[settings]
+# the task cache is experimental in mise
+experimental = true
+
+[task_config]
+# Rust follows the stable channel (rust-toolchain.toml), so the compiler's version is part
+# of every key. These variables change what the checks see, so they are part of it too.
+cache = { enabled = true, command_inputs = ["rustc -V"] }
+global_env = ["RUSTFLAGS", "CARGO_FEATURES", "SPARKLES_W3C_DIR", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS"]
+
+[task_config.input_groups]
+# Everything the Rust workspaces compile or read in their tests, listed by directory so the
+# globs do not walk the binding crates' own target directories.
+rust = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "rust-toolchain.toml",
+  ".config/nextest.toml",
+  "crates/*/*.toml",
+  "crates/*/Cargo.lock",
+  "crates/*/build.rs",
+  "crates/*/src/**",
+  "crates/*/tests/**",
+  "crates/*/examples/**",
+  "crates/*/benches/**",
+  "crates/*/diagnostics/**",
+  "crates/*/rules/**",
+  "crates/*/vocab/**",
+  "crates/*/fuzz/**",
+  "crates/*/python/**",
+  "vendor/**",
+]
+# The UI's sources; the server embeds its build.
+ui = [
+  "ui/package.json",
+  "ui/pnpm-lock.yaml",
+  "ui/*.ts",
+  "ui/*.js",
+  "ui/tsconfig.json",
+  "ui/.oxfmtrc.json",
+  "ui/src/**",
+  "ui/static/**",
+  "ui/tests/**",
+  "ui/mock/**",
+  "ui/scripts/**",
+]
+js = [
+  "js/package.json",
+  "js/pnpm-lock.yaml",
+  "js/pnpm-workspace.yaml",
+  "js/tsconfig.json",
+  "js/.oxfmtrc.json",
+  "js/scripts/**",
+  "js/*/package.json",
+  "js/*/tsconfig.json",
+  "js/*/src/**",
+  "js/*/test/**",
+  "js/engine/npm/**",
+]
+jvm = [
+  "jvm/*.kts",
+  "jvm/*.properties",
+  "jvm/*.lockfile",
+  "jvm/gradle/**",
+  "jvm/*/build.gradle.kts",
+  "jvm/*/gradle.lockfile",
+  "jvm/*/src/**",
+  "jvm/*/testing/**",
+]
+# The documents that tests and the doc-path check read. docs/plans is left out.
+docs = ["README.md", "docs/*.md", "docs/*.json", "docs/specs/**"]
 
 # ------------------------------------------------------------------------------ UI ----
 
@@ -26,6 +110,9 @@ dir = "ui"
 run = "pnpm install --frozen-lockfile"
 sources = ["package.json", "pnpm-lock.yaml"]
 outputs = ["node_modules/.modules.yaml"]
+# The output above marks a finished run; the task writes more than it, so the task
+# cache, which restores only declared outputs, stays off.
+cache = { enabled = false }
 
 [tasks."ui:wasm"]
 description = "Build the formatter for the browser into ui/src/lib/wasm (optional: the UI uses it when present, else POST /$/format; later UI builds keep it up to date)"
@@ -34,6 +121,9 @@ tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.129" }
 run = "scripts/build-fmt-wasm.sh"
 sources = ["crates/sparkles-fmt/src/**/*", "crates/sparkles-fmt/Cargo.toml", "crates/sparkles-fmt-wasm/**/*", "Cargo.lock", "rust-toolchain.toml", "scripts/build-fmt-wasm.sh"]
 outputs = ["ui/src/lib/wasm/sparkles_fmt_wasm_bg.wasm"]
+# The output above marks a finished run; the task writes more than it, so the task
+# cache, which restores only declared outputs, stays off.
+cache = { enabled = false }
 
 [tasks."ui:wasm:refresh"]
 description = "Rebuild the browser formatter if it was built before (`mise run ui:wasm`) and the formatter changed since"
@@ -48,6 +138,9 @@ run = "pnpm build"
 sources = ["src/**/*", "static/**/*", "scripts/**/*", "svelte.config.js", "vite.config.ts", "package.json", "pnpm-lock.yaml"]
 # not index.html: the server build writes a placeholder one when the UI is missing
 outputs = ["build/_app/version.json"]
+# The output above marks a finished run; the task writes more than it, so the task
+# cache, which restores only declared outputs, stays off.
+cache = { enabled = false }
 
 [tasks."ui:dev"]
 description = "UI dev server (proxies the API to $SPARKLES_API, default http://localhost:3030)"
@@ -62,6 +155,8 @@ dir = "ui"
 run = "pnpm mock"
 
 [tasks."ui:check"]
+sources = ["@group:ui"]
+outputs = []
 description = "Type-check the UI (svelte-check)"
 # after ui:build: both regenerate ui/.svelte-kit, and running them at once races
 depends = ["ui:install", "ui:build"]
@@ -69,6 +164,8 @@ dir = "ui"
 run = "pnpm check"
 
 [tasks."ui:test"]
+sources = ["@group:ui"]
+outputs = []
 description = "UI unit tests (Vitest)"
 depends = ["ui:install", "ui:build"]
 dir = "ui"
@@ -109,6 +206,8 @@ dir = "ui"
 run = "pnpm format"
 
 [tasks."ui:fmt:check"]
+sources = ["@group:ui"]
+outputs = []
 description = "Check UI formatting (oxfmt)"
 depends = ["ui:install"]
 dir = "ui"
@@ -140,6 +239,8 @@ run = [
 ]
 
 [tasks."fmt:check"]
+sources = ["@group:rust"]
+outputs = []
 description = "Check formatting (CI)"
 depends = ["ui:fmt:check", "node:fmt:check"]
 run = [
@@ -167,22 +268,30 @@ flag "--jobs <n>" help="fuzzing processes per target" default="2"
 run = 'crates/sparkles-fmt/fuzz/run.sh --time "$usage_time" --jobs "$usage_jobs" ${usage_target:-}'
 
 [tasks."fmt:wasm"]
+sources = ["@group:rust"]
+outputs = []
 description = "Check that the formatter builds for the browser (wasm32-unknown-unknown, which rust-toolchain.toml installs), with Clippy"
 run = "cargo clippy -p sparkles-fmt-wasm --target wasm32-unknown-unknown -- -D warnings"
 
 [tasks.lint]
+sources = ["@group:rust", "@group:ui"]
+outputs = []
 description = "Clippy (warnings are errors) + svelte-check"
 # ui:build first: the server embeds ui/build, which a concurrent UI build rewrites
 depends = ["ui:check", "ui:build"]
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks."lint:features"]
+sources = ["@group:rust", "@group:ui", "scripts/lint-features.sh"]
+outputs = []
 description = "Clippy (warnings are errors) over feature combinations: the server with no optional feature, each default feature alone (geo-epsg included), and the pairs that share code such as mcp with shacl, shex or fmt and graphql with shacl; the library crates with their features off"
 # ui:build first, as for lint: the server embeds ui/build
 depends = ["ui:build"]
 run = "scripts/lint-features.sh"
 
 [tasks."lint:doc-paths"]
+sources = ["@group:rust", "@group:docs", "scripts/check-doc-paths.py"]
+outputs = []
 description = "Check that every crates/sparkles… path cited in the README, docs/*.md, docs/specs and the Rust comments exists"
 run = "python3 scripts/check-doc-paths.py --code"
 
@@ -192,7 +301,25 @@ depends = ["ui:check", "ui:build"]
 run = "cargo check --workspace --all-targets"
 
 [tasks.test]
-description = "All Rust tests (unit, W3C SPARQL + SHACL suites when the Jena checkout is present, doctests)"
+sources = ["@group:rust", "@group:ui", "@group:docs", "testsuite/**"]
+outputs = []
+# The W3C, SHACL, ShEx and JSON-LD suites read checkouts of Apache Jena and Oxigraph
+# next to this repository when they exist, so their commits are part of the key.
+cache = { enabled = true, command_inputs = [
+  "rustc -V",
+  "git -C ../../apache/jena rev-parse HEAD 2> /dev/null || echo absent",
+  "git -C ../../oxigraph/oxigraph rev-parse HEAD 2> /dev/null || echo absent",
+] }
+description = "All Rust tests with cargo-nextest (unit, W3C SPARQL + SHACL suites when the Jena checkout is present), then the doctests"
+depends = ["ui:build"]
+# nextest does not run doctests, so `cargo test --doc` runs them afterwards
+run = [
+  "cargo nextest run --workspace --no-fail-fast",
+  "cargo test --workspace --doc",
+]
+
+[tasks."test:cargo"]
+description = "All Rust tests with plain `cargo test`, one test binary after another"
 depends = ["ui:build"]
 run = "cargo test --workspace"
 
@@ -213,8 +340,18 @@ description = "Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectio
 run = "scripts/test-jena-clients.sh"
 
 [tasks.ci]
-description = "Everything CI should run: formatting, lints, cited paths in the docs, the formatter's browser build, Rust, UI, Python, JVM and Node binding tests, third-party license notices up to date"
-depends = ["fmt:check", "lint", "lint:features", "lint:doc-paths", "fmt:wasm", "test", "ui:test", "py:lint", "py:test", "jvm:lint", "jvm:rust-test", "jvm:test", "node:lint", "node:test", "node:client:check", "licenses:check"]
+description = "Everything CI should run: formatting, lints, cited paths in the docs, the formatter's browser build, Rust, UI, Python, JVM and Node binding tests, third-party license notices up to date. Logs go to target/ci/logs, and target/ci/summary.txt shows each task's state while it runs"
+usage = '''
+flag "--fail-fast" help="stop the remaining tasks after the first failure"
+flag "--force" help="run every check even when the task cache has a pass for it"
+flag "--jobs <n>" help="tasks run at once" default="2"
+arg "[task]..." help="run only these CI tasks" var=#true
+'''
+run = 'scripts/ci.sh --jobs "$usage_jobs" ${usage_fail_fast:+--fail-fast} ${usage_force:+--force} ${usage_task:-}'
+
+[tasks."ci:fast"]
+description = "The quick CI subset for iterating: formatting, cited doc paths, Clippy on the workspace and the Rust tests"
+run = "scripts/ci.sh --fast"
 
 # ------------------------------------------------------------------- Python bindings ----
 # crates/sparkles-py is its own cargo workspace (see its Cargo.toml). These tasks build it
@@ -231,6 +368,8 @@ tools = { "github:PyO3/maturin" = "1.15.0" }
 run = "python3 scripts/py-sdist.py target/wheels"
 
 [tasks."py:test"]
+sources = ["@group:rust", "scripts/py-test.sh"]
+outputs = []
 description = "Build the Python extension and run its pytest suite (python3 from PATH, with pytest from the dev shell or a venv in target/py-venv); extra args go to pytest"
 run = "scripts/py-test.sh"
 
@@ -239,6 +378,8 @@ description = "Install a built wheel or sdist into a fresh venv for each given p
 run = "scripts/py-wheel-test.sh"
 
 [tasks."py:lint"]
+sources = ["@group:rust"]
+outputs = []
 description = "Clippy (warnings are errors) on the Python bindings, with their default features and with none"
 run = [
   "cargo clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets -- -D warnings",
@@ -268,6 +409,8 @@ dir = "jvm"
 run = "./gradlew --console=plain :sparkles-jena:assemble"
 
 [tasks."jvm:test"]
+sources = ["@group:rust", "@group:jvm", "scripts/jvm-native.sh"]
+outputs = []
 description = "Jena's contract tests and the binding's own tests on the host's native library; extra args go to Gradle"
 depends = ["jvm:native"]
 dir = "jvm"
@@ -280,6 +423,8 @@ dir = "jvm"
 run = "./gradlew --console=plain :sample-java:build :sample-java:run"
 
 [tasks."jvm:lint"]
+sources = ["@group:rust"]
+outputs = []
 description = "Clippy (warnings are errors) on the JVM bindings' native library, with its default features and with none"
 run = [
   "cargo clippy --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target --all-targets -- -D warnings",
@@ -287,6 +432,8 @@ run = [
 ]
 
 [tasks."jvm:rust-test"]
+sources = ["@group:rust"]
+outputs = []
 description = "The native library's Rust tests (the batch encoding and the objects the Kotlin library uses)"
 run = "cargo test --manifest-path crates/sparkles-ffi/Cargo.toml --target-dir target"
 
@@ -315,6 +462,8 @@ depends = ["node:native"]
 run = "pnpm --dir js build"
 
 [tasks."node:test"]
+sources = ["@group:rust", "@group:js", "scripts/node-native.sh"]
+outputs = []
 tools = { node = "24" }
 description = "Test Node bindings, remote client and transaction/lifecycle contracts, with the remote client's tests against a debug server"
 depends = ["node:build"]
@@ -326,6 +475,8 @@ run = [
 ]
 
 [tasks."node:lint"]
+sources = ["@group:rust"]
+outputs = []
 description = "Clippy on the Node addon with default features and with none"
 run = [
   "cargo clippy --manifest-path crates/sparkles-node/Cargo.toml --target-dir target --all-targets -- -D warnings",
@@ -338,6 +489,8 @@ description = "Regenerate the remote TypeScript client's OpenAPI types"
 run = "pnpm --dir js client:gen"
 
 [tasks."node:client:check"]
+sources = ["@group:js", "docs/openapi.json"]
+outputs = []
 tools = { node = "24" }
 description = "Check that the TypeScript client's generated OpenAPI types are current"
 run = "pnpm --dir js client:check"
@@ -348,6 +501,8 @@ description = "Format the JavaScript and TypeScript bindings"
 run = "pnpm --dir js format"
 
 [tasks."node:fmt:check"]
+sources = ["@group:js"]
+outputs = []
 tools = { node = "24" }
 description = "Check JavaScript and TypeScript formatting"
 run = "pnpm --dir js format:check"
@@ -379,6 +534,8 @@ run = [
 ]
 
 [tasks."licenses:check"]
+sources = ["@group:rust", "@group:ui", "THIRD_PARTY_LICENSES.md", "THIRD_PARTY_LICENSES-UI.md", "scripts/third-party-licenses.py"]
+outputs = []
 description = "Check that THIRD_PARTY_LICENSES.md matches Cargo.lock and THIRD_PARTY_LICENSES-UI.md the UI bundle (the UI build fails on a non-permissive license)"
 depends = ["ui:build"]
 run = [
