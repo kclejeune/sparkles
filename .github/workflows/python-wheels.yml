@@ -19,6 +19,7 @@ on:
       - "crates/**"
       - "vendor/**"
       - "Cargo.toml"
+      - "Cargo.lock"
       - "rust-toolchain.toml"
       - "scripts/py-sdist.py"
       - "scripts/py-wheel-test.sh"

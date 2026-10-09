@@ -9,7 +9,7 @@ on:
   push:
     tags: ["jvm-v*"]
   pull_request:
-    paths: ["crates/**", "vendor/**", "Cargo.toml", "jvm/**", "scripts/jvm-native.sh", ".github/workflows/jvm-bindings.yml"]
+    paths: ["crates/**", "vendor/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "jvm/**", "scripts/jvm-native.sh", ".github/workflows/jvm-bindings.yml"]
   workflow_dispatch:
 
 permissions:

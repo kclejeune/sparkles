@@ -8,7 +8,7 @@ on:
   push:
     tags: ['node-v*']
   pull_request:
-    paths: ['crates/**', 'vendor/**', 'js/**', 'Cargo.toml', 'scripts/node-native.sh', '.github/workflows/node-packages.yml']
+    paths: ['crates/**', 'vendor/**', 'js/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'scripts/node-native.sh', '.github/workflows/node-packages.yml']
   workflow_dispatch:
 permissions:
   contents: read
