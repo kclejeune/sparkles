@@ -47,6 +47,7 @@ pub(crate) mod text_recovery;
 mod test_support;
 mod vector;
 pub(crate) use embed::embed_query_text;
+pub use embed::embed_texts;
 pub(crate) mod wal;
 pub use backup::{
     BackupBranch, BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard,

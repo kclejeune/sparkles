@@ -1567,6 +1567,240 @@ mod auth {
         assert_eq!(r["structuredContent"]["committed"], true, "{r}");
     }
 
+    /// A memory tool's result as text: the text block, or the structured content.
+    fn result_text(r: &J) -> String {
+        match r.get("structuredContent") {
+            Some(s) => s.to_string(),
+            None => r["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        }
+    }
+
+    /// The memory tools of C17 §6 through graph grants (C12): checks, candidates,
+    /// facts and citations come from the caller's view only, and a term that exists
+    /// only in a hidden graph is reported as an absent one is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_tools_follow_graph_grants() {
+        use crate::http::router_tests::auth::graphs::{DATA, users};
+        let s = authed(&[], &[], &users());
+        let ds = s.state.attach("graphs", DbType::Mem, None).unwrap();
+        ds.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        ds.store
+            .enable_text(sparkles::text::TextConfig::default())
+            .unwrap();
+        let def: sparkles::stored::Definition = serde_json::from_value(json!({
+            "query": "SELECT ?s WHERE { ?s <http://ex/p> ?label } LIMIT 10",
+            "description": "Things with a fox label",
+            "questions": ["Which foxes are there?"]
+        }))
+        .unwrap();
+        ds.queries
+            .put("foxes", def, sparkles::stored::Change::default())
+            .unwrap();
+        let call = |user: &'static str, name: &'static str, args: J| {
+            let app = s.app.clone();
+            async move { tool(&app, name, args, &[("authorization", &b(user))]).await }
+        };
+
+        // check_query: ex:b1 occurs only in http://ex/b/1
+        let check = |user: &'static str, term: &'static str| {
+            call(
+                user,
+                "check_query",
+                json!({"dataset": "graphs", "query": format!("SELECT ?s WHERE {{ ?s <http://ex/q> <{term}> }} LIMIT 5")}),
+            )
+        };
+        let full = check("gfull", "http://ex/b1").await;
+        assert_eq!(full["structuredContent"]["issues"], json!([]), "{full}");
+        let hidden = check("gra", "http://ex/b1").await;
+        let absent = check("gra", "http://ex/zz").await;
+        let issue = |r: &J, term: &str| {
+            let mut i = r["structuredContent"]["issues"][0].clone();
+            assert_eq!(i["code"], "unknown-term", "{r}");
+            i["term"] = J::Null;
+            i["message"] = i["message"].as_str().unwrap().replace(term, "T").into();
+            i
+        };
+        assert_eq!(issue(&hidden, "ex:b1"), issue(&absent, "ex:zz"));
+
+        // similar_queries: only callers who may run queries see stored ones
+        let r = call(
+            "gra",
+            "similar_queries",
+            json!({"dataset": "graphs", "question": "which foxes"}),
+        )
+        .await;
+        assert_eq!(r["structuredContent"]["queries"][0]["name"], "foxes", "{r}");
+        let r = call(
+            "gep",
+            "similar_queries",
+            json!({"dataset": "graphs", "question": "which foxes"}),
+        )
+        .await;
+        assert_eq!(r["structuredContent"]["queries"], json!([]), "{r}");
+        // check_query and recall need the query endpoint
+        let r = call(
+            "gep",
+            "check_query",
+            json!({"dataset": "graphs", "query": "ASK {}"}),
+        )
+        .await;
+        assert_eq!(tool_error(&r), "forbidden");
+
+        // link_entities: a hidden entity is never a candidate
+        let link = |user: &'static str| {
+            call(
+                user,
+                "link_entities",
+                json!({"dataset": "graphs", "labelPredicates": ["http://ex/p"],
+                       "mentions": [{"text": "secret fox"}, {"text": "fox"}]}),
+            )
+        };
+        let r = link("gfull").await;
+        let m = &r["structuredContent"]["mentions"];
+        assert_eq!(m[0]["verdict"], "exact", "{r}");
+        assert_eq!(m[0]["candidates"][0]["iri"], "ex:b1", "{r}");
+        let r = link("gra").await;
+        let m = &r["structuredContent"]["mentions"];
+        // the words match a visible entity, never the hidden one
+        assert_eq!(m[0]["verdict"], "candidates", "{r}");
+        let fox: Vec<&str> = m[1]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["iri"].as_str().unwrap())
+            .collect();
+        assert_eq!(fox, ["ex:a1"], "{r}");
+        assert!(!result_text(&r).contains("b1"), "{r}");
+
+        // recall: facts and citations of the view only
+        for args in [
+            json!({"dataset": "graphs", "seeds": ["http://ex/a1"], "hops": 2}),
+            json!({"dataset": "graphs", "query": "fox", "includeSuperseded": true}),
+        ] {
+            let r = call("gfull", "recall", args.clone()).await;
+            let t = result_text(&r);
+            assert!(
+                t.contains("ex:b1") && t.contains("graph=<http://ex/b/1>"),
+                "{t}"
+            );
+            let r = call("gra", "recall", args.clone()).await;
+            assert_eq!(r["isError"], false, "{r}");
+            let t = result_text(&r);
+            assert!(t.contains("ex:a1"), "{t}");
+            for hidden in ["b1", "http://ex/b/1", "default fox", "graph=default"] {
+                assert!(!t.contains(hidden), "{hidden} in {t}");
+            }
+        }
+        let r = call(
+            "gra",
+            "recall",
+            json!({"dataset": "graphs", "seeds": ["http://ex/b1"]}),
+        )
+        .await;
+        let t = result_text(&r);
+        assert!(t.starts_with("# dataset=graphs "), "{t}");
+        assert!(!t.contains("secret") && !t.contains("ex:a1"), "{t}");
+    }
+
+    /// The memory tools under protections of triples (C12b): a protected predicate is
+    /// unknown to `check_query`, never suggested, and its facts never reach `recall`; a
+    /// protected entity is never a candidate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_tools_follow_triple_protections() {
+        use crate::http::router_tests::auth::triples::{DATA, users};
+        let s = authed(&[], &[], &users());
+        let ds = s.state.attach("hr", DbType::Mem, None).unwrap();
+        ds.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        ds.store
+            .enable_text(sparkles::text::TextConfig::default())
+            .unwrap();
+        let call = |user: &'static str, name: &'static str, args: J| {
+            let app = s.app.clone();
+            async move { tool(&app, name, args, &[("authorization", &b(user))]).await }
+        };
+        let check = |user: &'static str, p: &'static str| {
+            call(
+                user,
+                "check_query",
+                json!({"dataset": "hr", "query": format!("SELECT ?v WHERE {{ ?s <{p}> ?v }} LIMIT 5")}),
+            )
+        };
+        let r = check("thr", "http://ex/salary").await;
+        assert_eq!(r["structuredContent"]["ok"], true, "{r}");
+        let hidden = check("tstaff", "http://ex/salary").await;
+        let absent = check("tstaff", "http://ex/wage").await;
+        let issue = |r: &J, term: &str| {
+            let mut i = r["structuredContent"]["issues"][0].clone();
+            assert_eq!(i["code"], "unknown-predicate", "{r}");
+            i["term"] = J::Null;
+            i["message"] = i["message"].as_str().unwrap().replace(term, "T").into();
+            i
+        };
+        assert_eq!(issue(&hidden, "ex:salary"), issue(&absent, "ex:wage"));
+        // a misspelling suggests the predicate only to those who may see it
+        let r = check("thr", "http://ex/salry").await;
+        assert!(result_text(&r).contains("salary"), "{r}");
+        let r = check("tstaff", "http://ex/salry").await;
+        assert!(!result_text(&r).contains("salary\""), "{r}");
+        assert!(
+            r["structuredContent"]["issues"][0]["suggestions"]
+                .as_array()
+                .is_none_or(|s| s.iter().all(|s| s["term"] != "ex:salary")),
+            "{r}"
+        );
+
+        // link_entities: Bob is a patient
+        let link = |user: &'static str| {
+            call(
+                user,
+                "link_entities",
+                json!({"dataset": "hr", "mentions": [{"text": "bob fox"}, {"text": "fox"}]}),
+            )
+        };
+        let r = link("tdoc").await;
+        assert_eq!(
+            r["structuredContent"]["mentions"][0]["verdict"], "exact",
+            "{r}"
+        );
+        let r = link("tstaff").await;
+        assert_ne!(
+            r["structuredContent"]["mentions"][0]["verdict"], "exact",
+            "{r}"
+        );
+        assert!(!result_text(&r).contains("ex:bob"), "{r}");
+
+        // recall: no salary without the role
+        let args = json!({"dataset": "hr", "seeds": ["http://ex/alice"], "format": "json"});
+        let r = call("thr", "recall", args.clone()).await;
+        assert!(result_text(&r).contains("salary"), "{r}");
+        let r = call("tstaff", "recall", args).await;
+        let t = result_text(&r);
+        assert!(t.contains("ex:alice") && !t.contains("salary"), "{t}");
+        let r = call(
+            "tstaff",
+            "recall",
+            json!({"dataset": "hr", "query": "fox", "hops": 2}),
+        )
+        .await;
+        let t = result_text(&r);
+        assert!(!t.contains("salary") && !t.contains("ex:bob"), "{t}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn service_needs_federate() {
         let s = authed(&["--mcp-allow-service"], &[], "");

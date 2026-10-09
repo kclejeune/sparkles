@@ -40,6 +40,12 @@ pub const MAX_NAME: usize = 64;
 /// Largest query text, in bytes.
 pub const MAX_QUERY_BYTES: usize = 1 << 20;
 
+/// Most example questions of a definition.
+pub const MAX_QUESTIONS: usize = 20;
+
+/// Longest example question, in characters.
+pub const MAX_QUESTION_CHARS: usize = 500;
+
 /// Request parameters of `/{ds}/queries/{name}` that are not query parameters, so no
 /// query parameter may be named so.
 pub const RESERVED: &[&str] = &[
@@ -178,6 +184,11 @@ pub struct Definition {
     /// Offer the query as an MCP tool.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub mcp: bool,
+    /// Questions in natural language that the query answers, at most [`MAX_QUESTIONS`]
+    /// of at most [`MAX_QUESTION_CHARS`] characters each. The MCP tool
+    /// `similar_queries` ranks stored queries by them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<String>,
 }
 
 /// The kind of a stored query.
@@ -313,6 +324,21 @@ impl Definition {
     pub fn check(&self) -> Result<Kind> {
         if self.query.len() > MAX_QUERY_BYTES {
             return Err(invalid(format!("query: at most {MAX_QUERY_BYTES} bytes")));
+        }
+        if self.questions.len() > MAX_QUESTIONS {
+            return Err(invalid(format!(
+                "questions: at most {MAX_QUESTIONS} questions"
+            )));
+        }
+        for q in &self.questions {
+            if q.trim().is_empty() {
+                return Err(invalid("questions: a question must not be empty"));
+            }
+            if q.chars().count() > MAX_QUESTION_CHARS {
+                return Err(invalid(format!(
+                    "questions: a question has at most {MAX_QUESTION_CHARS} characters"
+                )));
+            }
         }
         let parsed = parse(&self.query).map_err(|e| {
             if SparqlParser::new().parse_update(&self.query).is_ok() {

@@ -1076,6 +1076,24 @@ fn backoff_until(d: Duration) -> (Instant, i64) {
 /// The vector of a search's text for the index on predicate `iri` (`400` when it has
 /// no embedding, `502` when the provider fails).
 pub(crate) fn embed_query_text(snap: &Snapshot, iri: &str, text: &str) -> Result<Arc<[f32]>> {
+    let mut v = embed_texts(snap, iri, &[text], true)?;
+    v.pop()
+        .ok_or_else(|| Error::Service("embedding the query text: no vector".into()))
+}
+
+/// The vectors of `texts` from the embedding provider of the vector index on predicate
+/// `iri`, in order: as search texts (with the index's `queryPrefix`) when `query` is
+/// true, else as stored inputs (with its `inputPrefix`). Vectors the dataset's cache
+/// holds are not requested again, and the others go out in batches of the index's
+/// `batchSize`. Fails with `Invalid` when the index has no provider or does not embed
+/// query text, `NotPermitted` when the outbound policy refuses the endpoint, and
+/// `Service` when the provider fails.
+pub fn embed_texts(
+    snap: &Snapshot,
+    iri: &str,
+    texts: &[&str],
+    query: bool,
+) -> Result<Vec<Arc<[f32]>>> {
     let configured = snap.generation.vectors.configured();
     let Some((_, cfg)) = configured.iter().find(|(_, c)| c.predicate == iri) else {
         return Err(Error::invalid(format!(
@@ -1101,15 +1119,22 @@ pub(crate) fn embed_query_text(snap: &Snapshot, iri: &str, text: &str) -> Result
             "spk:vectorSearch: embedding is disabled on this server; pass an spk:vector literal",
         ));
     }
-    let input = emb.query_input(text);
     let identity = emb.identity(cfg.dimension);
-    if let Some(v) = embedder
-        .as_ref()
-        .and_then(|e| e.cache.get(identity, &input))
-    {
-        return Ok(v);
-    }
-    let mut n = 0;
+    let inputs: Vec<String> = texts
+        .iter()
+        .map(|t| {
+            if query {
+                emb.query_input(t)
+            } else {
+                emb.input(t)
+            }
+        })
+        .collect();
+    let mut out: Vec<Option<Arc<[f32]>>> = inputs
+        .iter()
+        .map(|i| embedder.as_ref().and_then(|e| e.cache.get(identity, i)))
+        .collect();
+    let missing: Vec<usize> = (0..inputs.len()).filter(|&i| out[i].is_none()).collect();
     // a search waits for a short retry at most
     let sleep = |d: Duration| {
         if d > Duration::from_secs(2) {
@@ -1118,29 +1143,37 @@ pub(crate) fn embed_query_text(snap: &Snapshot, iri: &str, text: &str) -> Result
         std::thread::sleep(d);
         true
     };
-    let r = client::embed(
-        &env,
-        emb,
-        cfg.dimension,
-        std::slice::from_ref(&input),
-        &Waits { sleep: &sleep },
-        &mut n,
-    );
-    match r {
-        Ok(mut v) => match v.pop() {
-            Some(Ok(v)) => {
-                let v: Arc<[f32]> = v.into();
-                if let Some(e) = &embedder {
-                    e.cache.insert(identity, input, v.clone());
-                }
-                Ok(v)
+    let what = if query { "the query text" } else { "the texts" };
+    for chunk in missing.chunks(emb.batch_size.max(1)) {
+        let batch: Vec<String> = chunk.iter().map(|&i| inputs[i].clone()).collect();
+        let mut n = 0;
+        let r = client::embed(
+            &env,
+            emb,
+            cfg.dimension,
+            &batch,
+            &Waits { sleep: &sleep },
+            &mut n,
+        );
+        let vectors = match r {
+            Ok(v) => v,
+            Err(CallError::Refused(m)) => {
+                return Err(Error::NotPermitted(format!("embedding {what}: {m}")));
             }
-            Some(Err(m)) => Err(Error::Service(format!("embedding the query text: {m}"))),
-            None => Err(Error::Service("embedding the query text: no vector".into())),
-        },
-        Err(CallError::Refused(m)) => Err(Error::NotPermitted(format!(
-            "embedding the query text: {m}"
-        ))),
-        Err(e) => Err(Error::Service(format!("embedding the query text: {e}"))),
+            Err(e) => return Err(Error::Service(format!("embedding {what}: {e}"))),
+        };
+        if vectors.len() != chunk.len() {
+            return Err(Error::Service(format!("embedding {what}: no vector")));
+        }
+        for (&i, v) in chunk.iter().zip(vectors) {
+            let v: Arc<[f32]> = v
+                .map_err(|m| Error::Service(format!("embedding {what}: {m}")))?
+                .into();
+            if let Some(e) = &embedder {
+                e.cache.insert(identity, inputs[i].clone(), v.clone());
+            }
+            out[i] = Some(v);
+        }
     }
+    Ok(out.into_iter().flatten().collect())
 }

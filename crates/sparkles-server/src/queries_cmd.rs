@@ -261,6 +261,7 @@ pub fn run(cmd: QueriesCmd, opts: StoreOptions) -> Result<()> {
                             .collect::<Result<BTreeMap<_, _>>>()?,
                         results,
                         mcp: !no_mcp,
+                        questions: Vec::new(),
                     }
                 }
             };
