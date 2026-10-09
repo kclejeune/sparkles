@@ -6,6 +6,7 @@ use crate::id::Id;
 use crate::sparql::ctx::{Ctx, RetainedCharge};
 use crate::sparql::plan::{JoinAlgo, Kind, Node};
 use crate::sparql::table::{Table, VarId};
+use crate::sparql::zipper;
 use std::cmp::Ordering;
 use std::ops::Range;
 use std::sync::Arc;
@@ -293,7 +294,6 @@ impl Merge {
         mut out: Option<&mut Buffer>,
     ) -> Result<usize> {
         let mut passed = 0usize;
-        let mut steps = 0usize;
         while passed < cap {
             ctx.check()?;
             if !self.inputs[0].ensure(ctx, &mut children[0], options, pull)? {
@@ -321,42 +321,41 @@ impl Merge {
                     out.table.len += rows.len();
                 }
             };
-            while li < lk.len() && passed < cap {
-                steps += 1;
-                if steps.is_multiple_of(1024) {
-                    ctx.check()?;
-                }
-                if ri == rk.len() {
-                    if more {
-                        // The next right batch decides the rest of this one.
-                        break;
+            if !more {
+                // The right input is exhausted, so the rest of the left rows pass.
+                let end = lk.len().min(li.saturating_add(cap - passed));
+                emit(li..end);
+                passed += end - li;
+                li = end;
+            } else if ri < rk.len() {
+                // The loaded right batch decides every left row up to its last key.
+                // Their lower bounds in it come from the branch-free zipper of eager
+                // MINUS, because a compare per row mispredicts on interleaved keys.
+                let last = rk[rk.len() - 1];
+                let covered = li + lk[li..].partition_point(|k| *k <= last);
+                let end = covered.min(li.saturating_add(cap - passed));
+                if end > li {
+                    let _scratch = ctx.charge((end - li) as u64 * 4 + 64)?;
+                    let first = zipper::lower_bounds(ctx, &lk[li..end], &rk[ri..])?;
+                    let mut run = li;
+                    for (j, &at) in first.iter().enumerate() {
+                        let row = li + j;
+                        let hit = rk.get(ri + at as usize) == Some(&lk[row]);
+                        if hit != keep_matched {
+                            emit(run..row);
+                            passed += row - run;
+                            run = row + 1;
+                        }
                     }
-                    let end = lk.len().min(li.saturating_add(cap - passed));
-                    emit(li..end);
-                    passed += end - li;
+                    emit(run..end);
+                    passed += end - run;
+                    // Later left keys are not less than the last one decided here.
+                    ri += first[first.len() - 1] as usize;
                     li = end;
-                    continue;
                 }
-                match lk[li].cmp(&rk[ri]) {
-                    Ordering::Less => {
-                        let n = before(lk, li, rk[ri]);
-                        if keep_matched {
-                            li += n;
-                        } else {
-                            let end = li + n.min(cap - passed);
-                            emit(li..end);
-                            passed += end - li;
-                            li = end;
-                        }
-                    }
-                    Ordering::Greater => ri += before(rk, ri, lk[li]),
-                    Ordering::Equal => {
-                        if keep_matched {
-                            emit(li..li + 1);
-                            passed += 1;
-                        }
-                        li += 1;
-                    }
+                if li == covered && covered < lk.len() {
+                    // Every remaining left key follows this right batch.
+                    ri = rk.len();
                 }
             }
             self.inputs[0].at = li;
