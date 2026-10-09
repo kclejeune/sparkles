@@ -1,6 +1,6 @@
 # F05 — Backup repositories: incremental backup and restore, policies, GC
 
-> **Status:** implemented in part
+> **Status:** implemented in part (Phase 1, most of Phase 2)
 >
 > **Phases:** Phase 1 shipped: repositories, incremental backups, restore, verify, the
 > CLI, the server and the Backups panel. Most of Phase 2 shipped with it: lifecycle

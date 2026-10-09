@@ -1,6 +1,7 @@
 # F06: Named snapshots and point-in-time queries
 
-> **Status:** implemented in part
+> **Status:** implemented in part (Phases 1–3, with full-text search at pins and pin
+> rebasing deferred)
 >
 > **Phases:** Phase 1 shipped. It covers point-in-time reads with `?at=`, named
 > snapshots, the `keepCommits`/`keepAge` retention window, `/$/snapshots`, `/$/history`,
