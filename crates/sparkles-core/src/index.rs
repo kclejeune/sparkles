@@ -372,7 +372,7 @@ pub(crate) fn encode_column(col: &[u64], scratch: &mut Vec<u8>) -> Vec<u8> {
 /// Decode one compressed column of `rows` values. Damaged input is an error, never a
 /// panic: the size prefix must fit `rows` varints, and the values must use exactly the
 /// decompressed bytes.
-pub(crate) fn decode_column(bytes: &[u8], rows: usize) -> Result<Vec<u64>> {
+pub(crate) fn decode_column(bytes: &[u8], rows: usize) -> Result<Arc<[u64]>> {
     let bad = |m: &str| Error::Corrupt(format!("block column: {m}"));
     let size = bytes
         .get(..4)
@@ -408,25 +408,28 @@ pub(crate) fn decode_column(bytes: &[u8], rows: usize) -> Result<Vec<u64>> {
 }
 
 /// The `rows` zigzag-delta varints that make up all of `raw`.
-fn decode_varints(raw: &[u8], rows: usize) -> Result<Vec<u64>> {
+fn decode_varints(raw: &[u8], rows: usize) -> Result<Arc<[u64]>> {
     let bad = |m: &str| Error::Corrupt(format!("block column: {m}"));
-    let mut out = Vec::with_capacity(rows);
+    // Allocated as the shared slice the block cache keeps: decoding into a Vec and
+    // converting it copied every column into a second fresh allocation.
+    let mut col: Arc<[u64]> = std::iter::repeat_n(0, rows).collect();
+    let out = Arc::get_mut(&mut col).expect("a new Arc is unique");
     let mut pos = 0;
     let mut prev = 0u64;
-    while out.len() < rows {
+    let mut i = 0;
+    while i < rows {
         // Sorted key columns mostly hold deltas below 64, one byte each. Eight such
         // bytes in a row are decoded together, without a branch per value.
-        if rows - out.len() >= 8
-            && let Some(s) = raw.get(pos..pos + 8)
-        {
+        if let (Some(dst), Some(s)) = (out.get_mut(i..i + 8), raw.get(pos..pos + 8)) {
             let w = u64::from_le_bytes(s.try_into().unwrap());
             if w & 0x8080_8080_8080_8080 == 0 {
-                for z in w.to_le_bytes() {
+                for (o, z) in dst.iter_mut().zip(w.to_le_bytes()) {
                     let d = ((z >> 1) as i64) ^ -((z & 1) as i64);
                     prev = prev.wrapping_add(d as u64);
-                    out.push(prev);
+                    *o = prev;
                 }
                 pos += 8;
+                i += 8;
                 continue;
             }
         }
@@ -439,7 +442,8 @@ fn decode_varints(raw: &[u8], rows: usize) -> Result<Vec<u64>> {
         .ok_or_else(|| bad(&format!("holds fewer than {rows} values")))?;
         let d = ((z >> 1) as i64) ^ -((z & 1) as i64);
         prev = prev.wrapping_add(d as u64);
-        out.push(prev);
+        out[i] = prev;
+        i += 1;
     }
     if pos != raw.len() {
         return Err(bad(&format!(
@@ -447,7 +451,7 @@ fn decode_varints(raw: &[u8], rows: usize) -> Result<Vec<u64>> {
             raw.len() - pos
         )));
     }
-    Ok(out)
+    Ok(col)
 }
 
 /// [`read_varint_checked`] on a buffer known to hold the 10 bytes a varint can take.
@@ -680,7 +684,7 @@ impl PermIndex {
         let m = &self.blocks[b];
         let mut cols: [Arc<[u64]>; 4] = std::array::from_fn(|_| empty_col());
         for (c, col) in cols.iter_mut().enumerate() {
-            *col = self.decode_col(b, c)?.into();
+            *col = self.decode_col(b, c)?;
         }
         Ok(Block {
             cols,
@@ -710,7 +714,7 @@ impl PermIndex {
     }
 
     /// Decode one column of a block (columns are compressed separately).
-    pub fn decode_col(&self, b: usize, c: usize) -> Result<Vec<u64>> {
+    pub fn decode_col(&self, b: usize, c: usize) -> Result<Arc<[u64]>> {
         let m = &self.blocks[b];
         let data = self
             .data
@@ -834,7 +838,7 @@ impl BlockCache {
                 None => {
                     self.misses
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let v: Arc<[u64]> = idx.decode_col(b, c)?.into();
+                    let v = idx.decode_col(b, c)?;
                     if self.fill {
                         self.cache.insert(key, v.clone());
                     }
@@ -1098,9 +1102,9 @@ mod tests {
         let mut scratch = Vec::new();
         for n in [0, 1, 2, 9, 10, 11, col.len()] {
             let enc = encode_column(&col[..n], &mut scratch);
-            assert_eq!(decode_column(&enc, n).unwrap(), &col[..n]);
+            assert_eq!(&decode_column(&enc, n).unwrap()[..], &col[..n]);
             let tail = encode_column(&col[col.len() - n..], &mut scratch);
-            assert_eq!(decode_column(&tail, n).unwrap(), &col[col.len() - n..]);
+            assert_eq!(&decode_column(&tail, n).unwrap()[..], &col[col.len() - n..]);
         }
         // a varint that runs past 10 bytes is damage
         assert!(decode_varints(&[0xff; 11], 1).is_err());
@@ -1112,7 +1116,7 @@ mod tests {
         let col: Vec<u64> = (0..1000u64).map(|i| i * 7).collect();
         let mut scratch = Vec::new();
         let enc = encode_column(&col, &mut scratch);
-        assert_eq!(decode_column(&enc, 1000).unwrap(), col);
+        assert_eq!(&decode_column(&enc, 1000).unwrap()[..], &col[..]);
         // fewer values than rows, values left over, a size prefix that is too large
         assert!(decode_column(&enc, 1001).is_err());
         assert!(decode_column(&enc, 999).is_err());

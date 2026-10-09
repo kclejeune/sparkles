@@ -89,8 +89,8 @@ impl RunReader {
         for c in 0..4 {
             self.buf.resize(u32_at(4 + 4 * c), 0);
             self.r.read_exact(&mut self.buf)?;
-            for (k, v) in keys.iter_mut().zip(decode_column(&self.buf, rows)?) {
-                k[c] = v;
+            for (k, v) in keys.iter_mut().zip(decode_column(&self.buf, rows)?.iter()) {
+                k[c] = *v;
             }
         }
         Ok(Some(keys))
