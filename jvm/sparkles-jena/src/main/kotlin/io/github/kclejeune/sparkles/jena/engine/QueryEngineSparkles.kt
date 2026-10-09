@@ -171,6 +171,12 @@ internal class QueryIterSparkles(
     private var cursor: FfiSelectCursor? = null
     private var started = false
     private var done = false
+    /**
+     * The prepared query holds no rows: its eager result reported `done`, which frees them
+     * natively, or a cursor holds them. Its `release` is then skipped. A cursor's own
+     * `release` always runs, because it also records the cursor's final statistics.
+     */
+    private var drained = false
     private var delegate: QueryIterator? = null
     private val decoder = RowDecoder()
     private var batch: RowBatch? = null
@@ -204,6 +210,7 @@ internal class QueryIterSparkles(
         vars = e.variables.map { Var.alloc(it) }.toTypedArray()
         if (e.kind == FfiQueryKind.ASK) {
             done = true
+            drained = true
             release()
             return
         }
@@ -211,6 +218,7 @@ internal class QueryIterSparkles(
         row = 0
         if (e.done) {
             done = true
+            drained = true
             release()
         }
     }
@@ -221,6 +229,8 @@ internal class QueryIterSparkles(
         val first = try {
             val c = q.openCursor(4096u, 1048576uL, context.get<Boolean>(Sparkles.STREAMING_STRICT) != true)
             cursor = c
+            // the rows are the cursor's, so the prepared query holds none to release
+            drained = true
             vars = c.variables().map { Var.alloc(it) }.toTypedArray()
             c.nextBatch(FIRST_ROWS.toUInt())
         } catch (e: FfiException.Engine) {
@@ -272,6 +282,7 @@ internal class QueryIterSparkles(
         row = 0
         if (b.done) {
             done = true
+            drained = true
             release()
         }
         return batch!!.rows > 0
@@ -303,7 +314,7 @@ internal class QueryIterSparkles(
         }
         cursor = null
         ffiQuery?.let {
-            it.release()
+            if (!drained) it.release()
             it.close()
         }
         ffiQuery = null
