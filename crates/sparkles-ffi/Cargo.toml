@@ -41,6 +41,7 @@ sparkles-reasoner = { path = "../sparkles-reasoner", optional = true }
 sparkles-shacl = { path = "../sparkles-shacl", optional = true }
 sparkles-shex = { path = "../sparkles-shex", optional = true }
 sparkles-fmt = { path = "../sparkles-fmt", optional = true }
+mimalloc = { version = "0.1.52", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -56,6 +57,8 @@ backup = ["sparkles/backup"]
 # the same names as the server's features
 text = ["sparkles/text"]
 geo = ["sparkles/geo"]
+# mimalloc as the global allocator of the library's own allocations, as in the server
+mimalloc = ["dep:mimalloc"]
 # the uniffi-bindgen binary
 bindgen = ["uniffi/cli"]
 

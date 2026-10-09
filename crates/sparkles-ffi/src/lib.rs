@@ -7,6 +7,12 @@
 
 uniffi::setup_scaffolding!();
 
+/// The library's own allocations go to mimalloc when the feature is on. The JVM keeps its
+/// own heap, so this changes only the native side's allocations.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod admin;
 pub mod encode;
 mod error;
