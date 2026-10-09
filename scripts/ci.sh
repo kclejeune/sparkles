@@ -143,7 +143,13 @@ main() {
     t0=$SECONDS
     echo running > "$out/state/$key"
     write_summary
-    if mise run --output interleave "${prep[@]}" > "$out/logs/$key.log" 2>&1; then
+    # `mise run a b` passes b to a as an argument; tasks are separated by `:::`.
+    local_args=()
+    for t in "${prep[@]}"; do
+      [ ${#local_args[@]} -eq 0 ] || local_args+=(:::)
+      local_args+=("$t")
+    done
+    if mise run --output interleave "${local_args[@]}" > "$out/logs/$key.log" 2>&1; then
       echo "pass $((SECONDS - t0))s" > "$out/state/$key"
       printf 'PASS %-20s %5ds\n' prepare "$((SECONDS - t0))"
     else
