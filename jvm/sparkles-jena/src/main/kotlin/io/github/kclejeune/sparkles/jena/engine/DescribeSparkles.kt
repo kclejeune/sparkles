@@ -5,6 +5,7 @@ import io.github.kclejeune.sparkles.jena.Sparkles
 import io.github.kclejeune.sparkles.jena.internal.CancelWatcher
 import io.github.kclejeune.sparkles.jena.internal.RowDecoder
 import io.github.kclejeune.sparkles.jena.internal.ffi
+import io.github.kclejeune.sparkles.jena.internal.ffi.SparklesJni
 import org.apache.jena.graph.Node
 import org.apache.jena.graph.Triple
 import org.apache.jena.rdf.model.Model
@@ -25,6 +26,15 @@ internal object DescribeSparkles {
     fun select(query: org.apache.jena.query.Query, context: Context) {
         context.set(selection, Selection(query.graphURIs.toList(), query.namedGraphURIs.toList()))
     }
+    /** The IRI as an IRIREF, with the characters an IRIREF cannot hold escaped. */
+    private fun iri(uri: String): String {
+        val out = StringBuilder(uri.length + 2).append('<')
+        for (c in uri) {
+            if (c <= ' ' || c in "<>\"{}|^`\\") out.append(String.format("\\u%04X", c.code)) else out.append(c)
+        }
+        return out.append('>').toString()
+    }
+
     fun register() {
         val registry = DescribeHandlerRegistry.get()
         val originals = registry.handlers().asSequence().toList()
@@ -59,19 +69,23 @@ internal object DescribeSparkles {
                     try {
                         val binding = BindingBuilder.create()
                         resources.forEachIndexed { i, node -> binding.add(Var.alloc("resource$i"), node) }
-                        val vars = (0 until resources.size).joinToString(" ") { "?description$it" }
-                        val binds = (0 until resources.size).joinToString(" ") { "BIND(?resource$it AS ?description$it)" }
                         val selected = ctx.get<Selection>(selection)
-                        val queryText = org.apache.jena.query.QueryFactory.create("DESCRIBE $vars WHERE { $binds }")
-                        selected?.defaultGraphs?.forEach(queryText::addGraphURI)
-                        selected?.namedGraphs?.forEach(queryText::addNamedGraphURI)
-                        val query = view.source().prepareQuery(queryText.toString(), requestOptions(view, ctx, binding.build()))
+                        val text = StringBuilder("DESCRIBE")
+                        for (i in 0 until resources.size) text.append(" ?description").append(i)
+                        selected?.defaultGraphs?.forEach { text.append(" FROM ").append(iri(it)) }
+                        selected?.namedGraphs?.forEach { text.append(" FROM NAMED ").append(iri(it)) }
+                        text.append(" WHERE {")
+                        for (i in 0 until resources.size) {
+                            text.append(" BIND(?resource").append(i).append(" AS ?description").append(i).append(')')
+                        }
+                        text.append(" }")
+                        val query = view.source().prepareQuery(text.toString(), requestOptions(view, ctx, binding.build()))
                         query.use { q ->
                             val signal = Context.getCancelSignal(ctx)
                             if (signal != null) CancelWatcher.watch(q, signal)
                             try {
                                 val decoder = RowDecoder()
-                                val execution = ffi { q.execute(256u) }
+                                val execution = ffi { SparklesJni.execute(q, 256) }
                                 var bytes = execution.batch
                                 var done = execution.done
                                 while (true) {

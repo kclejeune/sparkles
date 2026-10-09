@@ -120,6 +120,12 @@ public object QueryEngineSparkles {
             dsg.handle.fallbackQueries.incrementAndGet()
             return arqPlan(query, dsg, input, context)
         }
+        if (mode == SparklesFallback.AUTO && query.isDescribeType && query.queryPattern == null) {
+            // DESCRIBE of named resources alone has one empty solution to find, and the
+            // DESCRIBE handler asks Sparkles for the descriptions in one query
+            dsg.handle.nativeQueries.incrementAndGet()
+            return QueryEngineMain(query, dsg, input, context).plan
+        }
         if (mode == SparklesFallback.AUTO && SmallQueries.route(query, dsg, context, input)) {
             dsg.handle.smallQueries.incrementAndGet()
             return arqPlan(query, dsg, input, context)
